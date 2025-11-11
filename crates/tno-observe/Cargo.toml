@@ -1,0 +1,20 @@
+[package]
+name = "tno-observe"
+version = "0.0.1"
+edition = "2024"
+
+[features]
+default = []
+journald = ["dep:tracing-journald"]
+subscriber = ["dep:taskvisor", "dep:async-trait"]
+
+[dependencies]
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+time = { workspace = true }
+atty = { workspace = true }
+
+taskvisor = { version = "0.0.10", features = ["controller"], optional = true }
+tracing-journald = { version = "0.3", optional = true }
+async-trait = { version = "0.1", optional = true }

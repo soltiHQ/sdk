@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "crates/tno-observe",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time"] }
+time = { version = "0.3", features = ["formatting", "local-offset"] }
+taskvisor = { version = "0.0.10", features = ["controller"] }
+thiserror = "2"
+tracing = "0.1"
+atty = "0.2"
