@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tno_model::CreateSpec;
+use tracing::{trace, instrument};
 
 use crate::{
     error::CoreError,
@@ -37,10 +38,14 @@ impl RunnerRouter {
         self.runners.iter().find(|r| r.supports(spec))
     }
 
+    #[instrument(level = "trace", skip(self, spec), fields(kind = ?spec.kind))]
     pub fn build(&self, spec: &CreateSpec) -> Result<taskvisor::TaskRef, CoreError> {
         let r = self
             .pick(spec)
             .ok_or_else(|| CoreError::NoRunner(format!("{:?}", spec.kind)))?;
-        r.build_task(spec, &self.ctx).map_err(CoreError::from)
+
+        let task = r.build_task(spec, &self.ctx).map_err(CoreError::from)?;
+        trace!(runner = r.name(), "runner built task successfully");
+        Ok(task)
     }
 }
