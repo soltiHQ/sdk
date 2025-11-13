@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use tno_model::CreateSpec;
-use tracing::{trace, instrument};
+use tracing::{instrument, trace};
 
 use crate::{
     error::CoreError,

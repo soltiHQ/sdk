@@ -1,0 +1,15 @@
+[package]
+name = "tno-agentd"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+tno-observe = { path = "../tno-observe" }
+tno-core    = { path = "../tno-core" }
+tno-exec    = { path = "../tno-exec" }
+tno-model   = { path = "../tno-model" }
+
+taskvisor  = { workspace = true }
+tracing    = { workspace = true }
+anyhow     = { workspace = true }
+tokio      = { workspace = true }

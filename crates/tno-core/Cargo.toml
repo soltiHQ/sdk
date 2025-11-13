@@ -12,3 +12,4 @@ taskvisor = { workspace = true }
 tracing = { workspace = true }
 
 tno-model = { path = "../tno-model" }
+tokio = "1.48.0"
