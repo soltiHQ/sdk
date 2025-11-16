@@ -1,13 +1,10 @@
-pub mod logger;
+mod logger;
+mod subscriber;
 
-//#[cfg(feature = "subscriber")]
-pub mod subscriber;
+pub use logger::*;
 
-pub mod prelude {
-    pub use crate::logger::{LoggerConfig, LoggerError, LoggerFormat, logger_init};
-    pub use subscriber::Subscriber;
-    use tracing::subscriber;
+#[cfg(feature = "subscriber")]
+pub use subscriber::*;
 
-    // #[cfg(feature = "subscriber")]
-    pub use crate::subscriber::Journal;
-}
+#[cfg(feature = "timezone-sync")]
+pub use logger::timezone_sync;

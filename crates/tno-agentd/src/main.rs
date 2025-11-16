@@ -6,25 +6,24 @@ use tno_exec::proc::ProcConfig;
 use tno_model::{
     AdmissionStrategy, BackoffStrategy, CreateSpec, JitterStrategy, RestartStrategy, TaskKind,
 };
-use tno_observe::prelude::*;
+use tno_observe::*;
 use tracing::info;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     // 1) Логгер (text по умолчанию; уровень берётся из cfg.level или RUST_LOG)
     let mut cfg = LoggerConfig::default();
-    cfg.level = "tno_observe=trace,tno_observe::subscriber=trace,tno_observe::subscriber::view=trace,tno.exec.proc=trace,tno_core=debug,taskvisor=debug,info".into();
+    cfg.level = tno_observe::LoggerLevel::new("debug")?;
 
-    logger_init(&cfg)?;
+    init_logger(&cfg)?;
     info!("after log");
 
-    let journal =
-        Arc::new(tno_observe::subscriber::Journal::new()) as Arc<dyn taskvisor::Subscribe>;
+    let journal = Arc::new(Subscriber::default()) as Arc<dyn taskvisor::Subscribe>;
     let subscribers: Vec<Arc<dyn taskvisor::Subscribe>> =
-        vec![Arc::new(tno_observe::subscriber::Journal::new()) as Arc<dyn taskvisor::Subscribe>];
+        vec![Arc::new(Subscriber::default()) as Arc<dyn taskvisor::Subscribe>];
     // 2) Готовим runner: "ls /tmp"
     let runner = ProcRunner::new(ProcConfig {
-        program: "top".into(),
+        program: "ls".into(),
         args: vec![],
         env: vec![], // можно добавить пары ("KEY".into(), "VALUE".into())
         cwd: None,   // можно задать рабочую директорию
@@ -58,6 +57,9 @@ async fn main() -> anyhow::Result<()> {
     // 6) Сабмитим
     api.submit(&spec).await?;
 
+    api.sup.submit(tno_observe::timezone_sync()).await?;
+
+    //
     // Небольшая пауза, чтобы увидеть вывод команды в логах/консоли процесса
     // (taskvisor выполняет задачу асинхронно)
     tokio::time::sleep(Duration::from_secs(10)).await;

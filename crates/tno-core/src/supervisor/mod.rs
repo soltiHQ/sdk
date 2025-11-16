@@ -7,7 +7,7 @@ use tracing::{debug, info, instrument};
 use crate::{error::CoreError, map::to_controller_spec, router::RunnerRouter};
 
 pub struct SupervisorApi {
-    sup: Arc<Supervisor>,
+    pub sup: Arc<Supervisor>,
     router: RunnerRouter,
 }
 
@@ -30,7 +30,6 @@ impl SupervisorApi {
 
         // 🔧 Дождаться готовности (в твоей версии метод есть — ты же уже вызывал его ранее)
         sup.wait_ready().await;
-
         info!("supervisor is ready");
         Ok(Self { sup, router })
     }

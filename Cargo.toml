@@ -12,14 +12,16 @@ resolver = "2"
 edition = "2024"
 
 [workspace.dependencies]
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time"] }
-time = { version = "0.3", features = ["formatting", "local-offset"] }
+tracing-subscriber = { version = "0.3" }
+tokio = { version = "1" }
+tokio-util = "0.7.17"
+time = { version = "0.3" }
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
-taskvisor = { version = "0.0.10", features = ["controller"] }
+tracing-journald = "0.3.1"
+taskvisor = { version = "0.0.10" }
+async-trait = { version = "0.1" }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 anyhow  = "1"
-atty = "0.2"

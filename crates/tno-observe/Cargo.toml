@@ -5,16 +5,20 @@ edition = "2024"
 
 [features]
 default = []
-#journald = ["dep:tracing-journald"]
-#subscriber = ["dep:async-trait"]
+timezone-sync = ["dep:taskvisor", "dep:tokio-util"]
+subscriber = ["dep:taskvisor", "dep:async-trait"]
 
 [dependencies]
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+time = { workspace = true, features = ["formatting", "local-offset"] }
+serde = { workspace = true, features = ["derive"] }
+tracing-journald = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-time = { workspace = true }
-atty = { workspace = true }
 
-taskvisor = { workspace = true }
-tracing-journald = { version = "0.3", optional = true }
-async-trait = { version = "0.1" }
+taskvisor = { workspace = true, optional = true, features = ["controller"] }
+async-trait = { workspace = true, optional = true}
+tokio-util = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

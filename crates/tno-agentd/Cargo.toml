@@ -4,7 +4,7 @@ version = "0.0.1"
 edition = "2024"
 
 [dependencies]
-tno-observe = { path = "../tno-observe" }
+tno-observe = { path = "../tno-observe", features = ["timezone-sync", "subscriber"] }
 tno-core    = { path = "../tno-core" }
 tno-exec    = { path = "../tno-exec" }
 tno-model   = { path = "../tno-model" }
