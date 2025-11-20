@@ -83,24 +83,25 @@ impl fmt::Display for LoggerTimeZone {
 /// ```
 pub fn init_local_offset() {
     let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
-    *LOCAL_OFFSET.write().unwrap() = offset;
+    if let Ok(mut guard) = LOCAL_OFFSET.write() {
+        *guard = offset;
+    }
 }
 
 /// Synchronizes local offset.
 pub(crate) fn sync_local_offset() -> Result<(), LoggerError> {
-    let new_offset =
-        UtcOffset::current_local_offset().map_err(|_| LoggerError::LocalTimezoneInitFailed)?;
+    let new_offset = UtcOffset::current_local_offset()
+        .map_err(|_| LoggerError::LocalTimezoneInitFailed)?;
 
-    let mut guard = LOCAL_OFFSET.write().unwrap();
+    let Ok(mut guard) = LOCAL_OFFSET.write() else {
+        return Ok(());
+    };
+
     let old_offset = *guard;
-
     if old_offset != new_offset {
         *guard = new_offset;
-        debug!(
-            "TZ offset updated: {} -> {}",
-            format_offset(old_offset),
-            format_offset(new_offset)
-        );
+        debug!("TZ offset updated: {} -> {}",
+               format_offset(old_offset), format_offset(new_offset));
     }
     Ok(())
 }
@@ -109,10 +110,15 @@ pub(crate) fn sync_local_offset() -> Result<(), LoggerError> {
 pub(crate) fn get_or_detect_local_offset() -> UtcOffset {
     INIT_DONE.get_or_init(|| {
         if let Ok(detected) = UtcOffset::current_local_offset() {
-            *LOCAL_OFFSET.write().unwrap() = detected;
+            if let Ok(mut guard) = LOCAL_OFFSET.write() {
+                *guard = detected;
+            }
         }
     });
-    *LOCAL_OFFSET.read().unwrap()
+
+    LOCAL_OFFSET.read()
+        .map(|guard| *guard)
+        .unwrap_or(UtcOffset::UTC)
 }
 
 /// Formats offset as `UTC±HH` or `UTC±HH:MM`.
