@@ -7,9 +7,9 @@ edition = "2024"
 default = []
 
 [dependencies]
+taskvisor = { workspace = true, features = ["controller"] }
 thiserror = { workspace = true }
-taskvisor = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
 
 tno-model = { path = "../tno-model" }
-tokio = "1.48.0"

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
-use tno_core::prelude::*;
+use tno_core::{RunnerRouter, SupervisorApi};
 use tno_exec::prelude::*;
 use tno_exec::proc::ProcConfig;
 use tno_model::{
