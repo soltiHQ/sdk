@@ -1,4 +1,3 @@
-mod api;
 mod common;
 mod domain;
 mod error;
@@ -6,7 +5,6 @@ mod kind;
 mod spec;
 mod strategy;
 
-pub use api::CreateRequest;
 pub use error::{ModelError, ModelResult};
 pub use kind::TaskKind;
 pub use spec::CreateSpec;
@@ -17,7 +15,7 @@ pub use schemars::{JsonSchema, schema_for};
 
 pub mod prelude {
     pub use crate::{
-        AdmissionStrategy, BackoffStrategy, CreateRequest, CreateSpec, JitterStrategy,
+        AdmissionStrategy, BackoffStrategy, CreateSpec, JitterStrategy,
         RestartStrategy, TaskKind,
     };
     #[cfg(feature = "schema")]
