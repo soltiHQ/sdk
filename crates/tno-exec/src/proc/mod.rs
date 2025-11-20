@@ -4,7 +4,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
-use tno_core::runner::{BuildContext, Runner, RunnerError};
+use tno_core::{BuildContext, Runner, RunnerError};
 use tno_model::TaskKind;
 
 use crate::{

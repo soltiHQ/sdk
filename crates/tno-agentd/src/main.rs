@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
     router.register(Arc::new(runner));
 
     // 4) Поднимаем SupervisorApi
-    let api = SupervisorApi::new_default(router, subscribers).await?;
+    let api = SupervisorApi::new(taskvisor::Config::default(), taskvisor::ControllerConfig::default(), subscribers, router).await?;
 
     // 5) Спека на задачу (TaskKind::Exec)
     let spec = CreateSpec {
@@ -57,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
     // 6) Сабмитим
     api.submit(&spec).await?;
 
-    api.sup.submit(tno_observe::timezone_sync()).await?;
+    //api.submit_internal(tno_observe::timezone_sync()).await?;
 
     //
     // Небольшая пауза, чтобы увидеть вывод команды в логах/консоли процесса

@@ -21,8 +21,7 @@ pub enum AdmissionStrategy {
     /// If the slot already has a running task, ignore the new one.
     /// The caller receives success, but the new task is not executed.
     DropIfRunning,
-    /// Cancel the currently running task in the slot and replace it
-    /// with the newly submitted task.
+    /// Cancel the currently running task in the slot and replace it with the newly submitted task.
     Replace,
     /// Enqueue the new task to be executed after the current one completes.
     Queue,
