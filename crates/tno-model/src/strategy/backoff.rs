@@ -10,9 +10,6 @@ use serde::{Deserialize, Serialize};
 /// ## Fields
 /// - `jitter` — Jitter strategy applied to every computed delay.
 ///   Helps avoid synchronized retry storms.
-/// - `delay_ms` — Optional fixed delay (in milliseconds).
-///   If provided, this value overrides exponential backoff and is used
-///   as the constant retry delay *before jitter is applied*.
 /// - `first_ms` — Initial backoff delay (in milliseconds)
 ///   used for the first retry attempt when `delay_ms` is not set.
 /// - `max_ms` — Maximum allowed delay (in milliseconds).
@@ -27,8 +24,6 @@ use serde::{Deserialize, Serialize};
 pub struct BackoffStrategy {
     /// Jitter policy applied to each computed delay.
     pub jitter: super::JitterStrategy,
-    /// Optional fixed delay (ms) after success execution.
-    pub delay_ms: Option<u64>,
     /// Initial delay (ms) for exponential backoff.
     pub first_ms: u64,
     /// Maximum allowed delay (ms).

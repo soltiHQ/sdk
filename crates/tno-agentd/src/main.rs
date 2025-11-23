@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 4) Поднимаем SupervisorApi
     let api = SupervisorApi::new(
-        taskvisor::Config::default(),
+        taskvisor::SupervisorConfig::default(),
         taskvisor::ControllerConfig::default(),
         subscribers,
         router,
@@ -49,9 +49,8 @@ async fn main() -> anyhow::Result<()> {
         slot: "demo".into(),
         kind: TaskKind::Exec,
         admission: AdmissionStrategy::Replace,
-        restart: RestartStrategy::Always,
+        restart: RestartStrategy::Always { interval_ms: None },
         backoff: BackoffStrategy {
-            delay_ms: None, // пауза после УСПЕХА не нужна в этом тесте
             first_ms: 5000, // базовая задержка после фейла
             max_ms: 30_000,
             factor: 2.0,
