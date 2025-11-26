@@ -63,7 +63,7 @@ impl RunnerRouter {
 
         let r = self
             .pick(spec)
-            .ok_or_else(|| CoreError::NoRunner(format!("{:?}", spec.kind)))?;
+            .ok_or_else(|| CoreError::NoRunner(spec.kind.kind().to_string()))?;
 
         let task = r.build_task(spec, &self.ctx).map_err(CoreError::from)?;
         debug!(runner = r.name(), "runner built task successfully");
