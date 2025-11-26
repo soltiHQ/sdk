@@ -13,5 +13,8 @@ pub use router::RunnerRouter;
 mod runner;
 pub use runner::{BuildContext, Runner, RunnerError};
 
+mod policy;
+pub use policy::TaskPolicy;
+
 pub mod supervisor;
 pub use supervisor::SupervisorApi;

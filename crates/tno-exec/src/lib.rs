@@ -1,10 +1,10 @@
-pub mod error;
-pub mod proc;
-pub mod util;
+mod error;
+pub use error::{ExecError, ExecResult};
+
+pub mod r#fn;
+pub use r#fn::FnRunner;
 
 pub mod prelude {
-    pub use crate::error::ExecError;
-    pub use crate::proc::ProcRunner;
-    #[cfg(feature = "shell")]
-    pub use crate::proc::ShellRunner;
+    pub use crate::FnRunner;
+    pub use crate::error::{ExecError, ExecResult};
 }

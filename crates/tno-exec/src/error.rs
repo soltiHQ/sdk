@@ -1,25 +1,33 @@
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
 pub enum ExecError {
-    #[error("unsupported kind for this runner")]
-    UnsupportedKind,
-    #[error("non-zero exit code: {code}")]
-    NonZeroExit { code: i32 },
+    #[error("unsupported task kind: expected {expected}, got {actual}")]
+    UnsupportedKind {
+        expected: &'static str,
+        actual: String,
+    },
+
+    #[error("function not found in registry: {0}")]
+    FunctionNotFound(String),
+
+    #[error("invalid specification: {0}")]
+    InvalidSpec(String),
+
     #[error("spawn failed: {0}")]
     Spawn(String),
-    #[error("killed by signal")]
-    KilledBySignal,
-    #[error("missing program")]
-    MissingProgram,
+
+    #[error("process exited with non-zero code: {0}")]
+    NonZeroExit(i32),
+
+    #[error("process terminated by signal")]
+    Signal,
+
     #[error("io error: {0}")]
     Io(String),
-    #[error("cancelled")]
-    Cancelled,
+
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
-impl From<std::io::Error> for ExecError {
-    fn from(e: std::io::Error) -> Self {
-        ExecError::Io(e.to_string())
-    }
-}
+pub type ExecResult<T> = Result<T, ExecError>;

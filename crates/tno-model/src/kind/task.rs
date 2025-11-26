@@ -10,8 +10,6 @@ use crate::{Env, Flag};
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TaskKind {
-    /// Execute a function registered inside the runtime.
-    Fn,
     /// Execute a native process on the host.
     Exec {
         /// Command to execute (e.g., `"ls"`, `"/usr/bin/python"`).
@@ -60,28 +58,27 @@ pub enum TaskKind {
         #[serde(default, skip_serializing_if = "Env::is_empty")]
         env: Env,
     },
+    /// Built-in task that does not require a runner.
+    ///
+    /// Used only with `SupervisorApi::submit_with_task()`.
+    /// Any attempt to submit this via `submit()` (which builds via runners) must be rejected.
+    None,
 }
 
 impl TaskKind {
     /// Returns a short symbolic identifier for the runtime kind.
     ///
     /// This is primarily intended for logging, metrics and routing:
-    /// - `"fn"`
+    /// - `"none"`
     /// - `"exec"`
     /// - `"wasm"`
     /// - `"container"`
     pub fn kind(&self) -> &'static str {
         match self {
-            TaskKind::Fn => "fn",
+            TaskKind::None { .. } => "none",
             TaskKind::Exec { .. } => "exec",
             TaskKind::Wasm { .. } => "wasm",
             TaskKind::Container { .. } => "container",
         }
-    }
-}
-
-impl Default for TaskKind {
-    fn default() -> Self {
-        TaskKind::Fn
     }
 }
