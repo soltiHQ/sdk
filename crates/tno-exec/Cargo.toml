@@ -5,10 +5,7 @@ edition = "2024"
 
 [features]
 default = []
-exec = []
-shell = ["exec"]
-wasm = []
-container = []
+subprocess = []
 
 [dependencies]
 taskvisor = { workspace = true }
@@ -17,5 +14,3 @@ thiserror = { workspace = true }
 
 tno-core = { path = "../tno-core" }
 tno-model = { path = "../tno-model" }
-
-tokio = { version = "1", features = ["sync"] }

@@ -11,7 +11,7 @@ use crate::{Env, Flag};
 #[serde(rename_all = "camelCase")]
 pub enum TaskKind {
     /// Execute a native process on the host.
-    Exec {
+    Subprocess {
         /// Command to execute (e.g., `"ls"`, `"/usr/bin/python"`).
         command: String,
         /// Command-line arguments.
@@ -70,15 +70,15 @@ impl TaskKind {
     ///
     /// This is primarily intended for logging, metrics and routing:
     /// - `"none"`
-    /// - `"exec"`
+    /// - `"subprocess"`
     /// - `"wasm"`
     /// - `"container"`
     pub fn kind(&self) -> &'static str {
         match self {
             TaskKind::None { .. } => "none",
-            TaskKind::Exec { .. } => "exec",
             TaskKind::Wasm { .. } => "wasm",
             TaskKind::Container { .. } => "container",
+            TaskKind::Subprocess { .. } => "subprocess",
         }
     }
 }

@@ -24,7 +24,7 @@ pub struct CreateSpec {
     pub slot: Slot,
     /// Execution backend used to run the task.
     ///
-    /// This selects which runner is responsible (exec process, wasm, container, etc.).
+    /// This selects which runner is responsible (subprocess process, wasm, container, etc.).
     /// If no runner supports the given kind at runtime, task creation will fail.
     pub kind: TaskKind,
     /// Hard timeout for the task in milliseconds.

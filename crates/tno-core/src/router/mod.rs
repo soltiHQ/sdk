@@ -93,11 +93,11 @@ mod tests {
 
     impl Runner for ExecOnlyRunner {
         fn name(&self) -> &'static str {
-            "exec-only"
+            "subprocess-only"
         }
 
         fn supports(&self, spec: &CreateSpec) -> bool {
-            matches!(spec.kind, TaskKind::Exec { .. })
+            matches!(spec.kind, TaskKind::Subprocess { .. })
         }
 
         fn build_task(
@@ -105,9 +105,10 @@ mod tests {
             _spec: &CreateSpec,
             _ctx: &BuildContext,
         ) -> Result<TaskRef, RunnerError> {
-            let task = TaskFn::arc("test-exec-runner", |_ctx: CancellationToken| async move {
-                Ok::<(), TaskError>(())
-            });
+            let task = TaskFn::arc(
+                "test-subprocess-runner",
+                |_ctx: CancellationToken| async move { Ok::<(), TaskError>(()) },
+            );
             Ok(task)
         }
     }
@@ -156,7 +157,7 @@ mod tests {
         let mut router = RunnerRouter::new();
         router.register(Arc::new(ExecOnlyRunner));
 
-        let spec = mk_spec(TaskKind::Exec {
+        let spec = mk_spec(TaskKind::Subprocess {
             command: "echo".to_string(),
             args: vec!["hello".into()],
             env: Env::default(),
@@ -170,7 +171,7 @@ mod tests {
             Ok(_task) => {
                 // ok
             }
-            Err(e) => panic!("expected Ok(TaskRef) for exec, got error: {e:?}"),
+            Err(e) => panic!("expected Ok(TaskRef) for subprocess, got error: {e:?}"),
         }
     }
 
