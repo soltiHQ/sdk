@@ -20,14 +20,12 @@ pub struct CreateSpec {
     /// Logical slot name used for concurrency control.
     ///
     /// All tasks with the same slot share a single execution lane:
-    /// admission rules decide what happens when a new task targets
-    /// an already busy slot.
+    /// admission rules decide what happens when a new task targets an already busy slot.
     pub slot: Slot,
     /// Execution backend used to run the task.
     ///
-    /// This selects which runner is responsible (exec process, wasm,
-    /// container, etc.). If no runner supports the given kind at runtime,
-    /// task creation will fail.
+    /// This selects which runner is responsible (exec process, wasm, container, etc.).
+    /// If no runner supports the given kind at runtime, task creation will fail.
     pub kind: TaskKind,
     /// Hard timeout for the task in milliseconds.
     ///
@@ -43,7 +41,6 @@ pub struct CreateSpec {
     pub backoff: BackoffStrategy,
     /// Admission for handling conflicts within the same slot.
     ///
-    /// Controls what happens when a new task is submitted while a task
-    /// in the same slot is already running (drop, replace, queue).
+    /// Controls what happens when a new task is submitted while a task in the same slot is already running (drop, replace, queue).
     pub admission: AdmissionStrategy,
 }
