@@ -4,7 +4,7 @@ use tracing::info;
 
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 use tno_core::{RunnerRouter, SupervisorApi, TaskPolicy};
-use tno_exec::subprocess::SubprocessRunner;
+use tno_exec::subprocess::{SubprocessRunner, register_subprocess_runner};
 use tno_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
 
 use tno_model::{
@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 3) Router
     let mut router = RunnerRouter::new();
-    router.register(Arc::new(SubprocessRunner::new()));
+    register_subprocess_runner(&mut router, "runner");
 
     // 4) SupervisorApi
     let api = SupervisorApi::new(
@@ -64,7 +64,70 @@ async fn main() -> anyhow::Result<()> {
         admission: AdmissionStrategy::DropIfRunning,
     };
 
+    let pwd_spec = CreateSpec {
+        slot: "demo-pwd-tmp".to_string(),
+        kind: TaskKind::Subprocess {
+            command: "pwd".into(),
+            args: vec![],
+            env: Env::default(),
+            cwd: None,
+            fail_on_non_zero: Flag::enabled(),
+        },
+        timeout_ms: 5_000,
+        restart: RestartStrategy::Never,
+        backoff: BackoffStrategy {
+            jitter: JitterStrategy::None,
+            first_ms: 0,
+            max_ms: 0,
+            factor: 1.0,
+        },
+        admission: AdmissionStrategy::DropIfRunning,
+    };
+
+    let date_spec = CreateSpec {
+        slot: "demo-date-tmp".to_string(),
+        kind: TaskKind::Subprocess {
+            command: "date".into(),
+            args: vec![],
+            env: Env::default(),
+            cwd: None,
+            fail_on_non_zero: Flag::enabled(),
+        },
+        timeout_ms: 5_000,
+        restart: RestartStrategy::Never,
+        backoff: BackoffStrategy {
+            jitter: JitterStrategy::None,
+            first_ms: 0,
+            max_ms: 0,
+            factor: 1.0,
+        },
+        admission: AdmissionStrategy::DropIfRunning,
+    };
+
+    let sleep_spec = CreateSpec {
+        slot: "demo-sleep-tmp".to_string(),
+        kind: TaskKind::Subprocess {
+            command: "sleep".into(),
+            args: vec!["3".into()],
+            env: Env::default(),
+            cwd: None,
+            fail_on_non_zero: Flag::enabled(),
+        },
+        timeout_ms: 5_000,
+        restart: RestartStrategy::Never,
+        backoff: BackoffStrategy {
+            jitter: JitterStrategy::None,
+            first_ms: 0,
+            max_ms: 0,
+            factor: 1.0,
+        },
+        admission: AdmissionStrategy::DropIfRunning,
+    };
+
+    api.submit(&sleep_spec).await?;
     api.submit(&ls_spec).await?;
+    api.submit(&pwd_spec).await?;
+    api.submit(&date_spec).await?;
 
     tokio::time::sleep(Duration::from_secs(5)).await;
     Ok(())

@@ -1,3 +1,5 @@
+use std::process::Stdio;
+
 use taskvisor::{TaskError, TaskFn, TaskRef};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -14,15 +16,9 @@ pub struct SubprocessRunner {
 }
 
 impl SubprocessRunner {
-    /// Create a new subprocess runner with default name `"subprocess"`.
-    pub fn new() -> Self {
-        Self { name: "subprocess" }
-    }
-
-    /// Override the runner name (useful for debugging / metrics).
-    pub fn with_name(mut self, name: &'static str) -> Self {
-        self.name = name;
-        self
+    /// Create a new subprocess with name.
+    pub fn new(name: &'static str) -> Self {
+        Self { name }
     }
 
     /// Build normalized subprocess configuration from `CreateSpec` + `BuildContext`.
@@ -41,7 +37,6 @@ impl SubprocessRunner {
             } => SubprocessConfig {
                 command: command.clone(),
                 args: args.clone(),
-                // merge BuildContext env + spec env (spec overrides context)
                 env: ctx.env().merged(env),
                 cwd: cwd.clone(),
                 fail_on_non_zero: *fail_on_non_zero,
@@ -61,12 +56,6 @@ impl SubprocessRunner {
     }
 }
 
-impl Default for SubprocessRunner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Runner for SubprocessRunner {
     fn name(&self) -> &'static str {
         self.name
@@ -78,26 +67,22 @@ impl Runner for SubprocessRunner {
 
     fn build_task(&self, spec: &CreateSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
         let cfg = self.build_config(spec, ctx)?;
-
         let slot = spec.slot.clone();
+
         trace!(
             slot = %slot,
-            "building subprocess task"
+            "building subprocess task",
         );
 
-        let task_name: &'static str = Box::leak(slot.into_boxed_str());
-
-        let task: TaskRef = TaskFn::arc(task_name, move |cancel: CancellationToken| {
+        let task: TaskRef = TaskFn::arc(slot, move |cancel: CancellationToken| {
             let cfg = cfg.clone();
 
             async move {
-                use std::process::Stdio;
-
                 trace!(
                     command = %cfg.command,
                     args = ?cfg.args,
                     cwd = ?cfg.cwd,
-                    "spawning subprocess"
+                    "spawning subprocess",
                 );
 
                 let mut cmd = Command::new(&cfg.command);
@@ -106,19 +91,15 @@ impl Runner for SubprocessRunner {
                 if let Some(cwd) = &cfg.cwd {
                     cmd.current_dir(cwd);
                 }
-
-                // apply merged env
                 for kv in cfg.env.iter() {
                     cmd.env(kv.key(), kv.value());
                 }
-
                 cmd.stdout(Stdio::piped());
                 cmd.stderr(Stdio::inherit());
 
                 let mut child = cmd.spawn().map_err(|e| TaskError::Fatal {
                     reason: format!("spawn failed: {e}"),
                 })?;
-
                 let status_fut = child.wait();
 
                 tokio::select! {
@@ -128,34 +109,30 @@ impl Runner for SubprocessRunner {
                         })?;
 
                         if !status.success() && cfg.fail_on_non_zero.is_enabled() {
-                            if let Some(code) = status.code() {
-                                return Err(TaskError::Fail {
+                            return if let Some(code) = status.code() {
+                                Err(TaskError::Fail {
                                     reason: format!("process exited with non-zero code: {code}"),
-                                });
+                                })
                             } else {
-                                return Err(TaskError::Fail {
+                                Err(TaskError::Fail {
                                     reason: "process terminated by signal".into(),
-                                });
+                                })
                             }
                         }
-
                         debug!("subprocess exited successfully");
                         Ok(())
                     }
-
                     _ = cancel.cancelled() => {
                         debug!("cancellation requested; killing subprocess");
 
                         if let Err(e) = child.kill().await {
                             debug!("failed to kill subprocess: {e}");
                         }
-
                         Err(TaskError::Canceled)
                     }
                 }
             }
         });
-
         Ok(task)
     }
 }
