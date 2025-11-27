@@ -8,9 +8,6 @@ pub enum ExecError {
         actual: String,
     },
 
-    #[error("function not found in registry: {0}")]
-    FunctionNotFound(String),
-
     #[error("invalid specification: {0}")]
     InvalidSpec(String),
 
@@ -24,7 +21,7 @@ pub enum ExecError {
     Signal,
 
     #[error("io error: {0}")]
-    Io(String),
+    Io(#[from] std::io::Error),
 
     #[error("internal error: {0}")]
     Internal(String),

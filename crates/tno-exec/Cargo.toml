@@ -8,9 +8,11 @@ default = []
 subprocess = []
 
 [dependencies]
+tokio = { workspace = true, features = ["process"] }
+tokio-util = { workspace = true }
 taskvisor = { workspace = true }
-tracing = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 tno-core = { path = "../tno-core" }
 tno-model = { path = "../tno-model" }
