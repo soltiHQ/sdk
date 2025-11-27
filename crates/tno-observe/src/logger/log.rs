@@ -33,7 +33,7 @@ pub fn logger_json(cfg: &LoggerConfig) -> LoggerResult<()> {
 }
 
 /// Initializes journald logger (Linux only).
-#[cfg(all(target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub fn logger_journald(cfg: &LoggerConfig) -> LoggerResult<()> {
     let filter = cfg.level.to_env_filter();
     let journald =

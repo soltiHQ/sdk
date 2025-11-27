@@ -27,4 +27,3 @@ pub enum ExecError {
     Internal(String),
 }
 
-pub type ExecResult<T> = Result<T, ExecError>;

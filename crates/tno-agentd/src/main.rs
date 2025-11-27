@@ -2,26 +2,28 @@ use std::{sync::Arc, time::Duration};
 
 use tracing::info;
 
+use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 use tno_core::{RunnerRouter, SupervisorApi, TaskPolicy};
 use tno_exec::subprocess::SubprocessRunner;
-use tno_observe::{init_logger, LoggerConfig, LoggerLevel, Subscriber, timezone_sync};
-use taskvisor::{ControllerConfig, SupervisorConfig, Subscribe};
+use tno_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
 
 use tno_model::{
-    AdmissionStrategy, BackoffStrategy, CreateSpec, Env, Flag, JitterStrategy,
-    RestartStrategy, TaskKind,
+    AdmissionStrategy, BackoffStrategy, CreateSpec, Env, Flag, JitterStrategy, RestartStrategy,
+    TaskKind,
 };
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     // 1) logger
-    let mut cfg = LoggerConfig::default();
-    cfg.level = LoggerLevel::new("debug")?;
+    let cfg = LoggerConfig {
+        level: LoggerLevel::new("debug")?,
+        ..Default::default()
+    };
     init_logger(&cfg)?;
     info!("logger initialized");
 
     // 2) Subscribe
-    let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(Subscriber::default())];
+    let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(Subscriber)];
 
     // 3) Router
     let mut router = RunnerRouter::new();
@@ -34,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         subscribers,
         router,
     )
-        .await?;
+    .await?;
 
     // 5) Internal timezone-sync
     let (tz_task, tz_spec) = timezone_sync();

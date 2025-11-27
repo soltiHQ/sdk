@@ -75,7 +75,7 @@ impl TaskKind {
     /// - `"container"`
     pub fn kind(&self) -> &'static str {
         match self {
-            TaskKind::None { .. } => "none",
+            TaskKind::None => "none",
             TaskKind::Wasm { .. } => "wasm",
             TaskKind::Container { .. } => "container",
             TaskKind::Subprocess { .. } => "subprocess",

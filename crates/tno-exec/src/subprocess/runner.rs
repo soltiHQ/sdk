@@ -50,13 +50,20 @@ impl SubprocessRunner {
                 return Err(RunnerError::UnsupportedKind {
                     runner: self.name,
                     kind: other.kind().to_string(),
-                })
+                });
             }
         };
 
-        cfg.validate().map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
+        cfg.validate()
+            .map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
         cfg.trace_state(&spec.slot);
         Ok(cfg)
+    }
+}
+
+impl Default for SubprocessRunner {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -69,11 +76,7 @@ impl Runner for SubprocessRunner {
         matches!(spec.kind, TaskKind::Subprocess { .. })
     }
 
-    fn build_task(
-        &self,
-        spec: &CreateSpec,
-        ctx: &BuildContext,
-    ) -> Result<TaskRef, RunnerError> {
+    fn build_task(&self, spec: &CreateSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
         let cfg = self.build_config(spec, ctx)?;
 
         let slot = spec.slot.clone();

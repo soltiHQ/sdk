@@ -2,8 +2,8 @@
 //!
 //! Translates `TaskKind::Exec` specs into `TaskRef` instances that
 //! spawn child processes via `tokio::process::Command`.
-mod runner;
 mod config;
+mod runner;
 
 pub use runner::SubprocessRunner;
 

@@ -80,7 +80,6 @@ impl Default for Env {
 #[cfg(test)]
 mod tests {
     use super::Env;
-    use crate::KeyValue;
 
     #[test]
     fn env_new_is_empty() {

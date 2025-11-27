@@ -15,7 +15,7 @@ use crate::error::{ModelError, ModelResult};
 /// - `Decorrelated`: Decorrelated jitter (a.k.a. "decorrelated exponential"), commonly used to avoid coordinated retries while still converging.
 ///
 /// The exact math is implemented in the backoff subsystem. This enum only specifies the policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum JitterStrategy {
     /// No randomness applied. Backoff durations remain fixed.
@@ -23,17 +23,12 @@ pub enum JitterStrategy {
     /// Full jitter: delay is uniformly sampled from `[0, base]`.
     ///
     /// This is the most collision-resistant strategy.
+    #[default]
     Full,
     /// Equal jitter: delay is sampled around the midpoint (`base / 2`), providing a balance between stability and randomness.
     Equal,
     /// Decorrelated jitter: delay is sampled from `min(max, rand(base * 3))`.
     Decorrelated,
-}
-
-impl Default for JitterStrategy {
-    fn default() -> Self {
-        JitterStrategy::Full
-    }
 }
 
 impl FromStr for JitterStrategy {

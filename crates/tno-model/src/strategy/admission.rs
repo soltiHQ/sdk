@@ -15,22 +15,17 @@ use crate::error::{ModelError, ModelResult};
 ///
 /// This value is typically provided in task creation requests or in controller configuration.
 /// How a strategy is enforced at runtime depends on the runner and the supervisor admission logic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AdmissionStrategy {
     /// If the slot already has a running task, ignore the new one.
     /// The caller receives success, but the new task is not executed.
+    #[default]
     DropIfRunning,
     /// Cancel the currently running task in the slot and replace it with the newly submitted task.
     Replace,
     /// Enqueue the new task to be executed after the current one completes.
     Queue,
-}
-
-impl Default for AdmissionStrategy {
-    fn default() -> Self {
-        AdmissionStrategy::DropIfRunning
-    }
 }
 
 impl FromStr for AdmissionStrategy {

@@ -1,6 +1,6 @@
 mod config;
 mod error;
-mod logger;
+mod log;
 mod object;
 mod tasks;
 
@@ -25,17 +25,16 @@ pub use tasks::timezone_sync;
 /// ```rust
 /// use tno_observe::{LoggerConfig, init_logger};
 ///
-/// fn main() {
-///     let config = LoggerConfig::default();
-///     init_logger(&config).expect("Failed to initialize logger");
+/// let config = LoggerConfig::default();
+/// init_logger(&config).expect("Failed to initialize logger");
 ///
-///     tracing::info!("Logger initialized successfully");
-/// }
+/// tracing::info!("Logger initialized successfully");
+///
 /// ```
 pub fn init_logger(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     match cfg.format {
-        LoggerFormat::Text => logger::logger_text(cfg),
-        LoggerFormat::Json => logger::logger_json(cfg),
-        LoggerFormat::Journald => logger::logger_journald(cfg),
+        LoggerFormat::Text => log::logger_text(cfg),
+        LoggerFormat::Json => log::logger_json(cfg),
+        LoggerFormat::Journald => log::logger_journald(cfg),
     }
 }

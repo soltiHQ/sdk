@@ -3,7 +3,7 @@ use std::fmt;
 use tno_model::Env;
 
 /// Shared build context passed to all runners.
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
 pub struct BuildContext {
     env: Env,
 }
@@ -23,14 +23,6 @@ impl BuildContext {
     pub fn with_env(mut self, env: Env) -> Self {
         self.env = env;
         self
-    }
-}
-
-impl Default for BuildContext {
-    fn default() -> Self {
-        Self {
-            env: Env::default(),
-        }
     }
 }
 

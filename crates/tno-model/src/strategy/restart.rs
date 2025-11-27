@@ -18,12 +18,13 @@ use crate::error::{ModelError, ModelResult};
 /// Restart behavior is evaluated after each task execution cycle.
 /// If a task is canceled (via controller or shutdown), it is **not** considered a failure
 /// and will not be restarted unless explicitly treated as such by the runner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum RestartStrategy {
     /// Never restart the task.
     Never,
     /// Restart the task only if it failed (non-zero exit, error, panic, etc.).
+    #[default]
     OnFailure,
     /// Always restart after completion.
     ///
@@ -47,12 +48,6 @@ impl RestartStrategy {
         RestartStrategy::Always {
             interval_ms: Some(interval_ms),
         }
-    }
-}
-
-impl Default for RestartStrategy {
-    fn default() -> Self {
-        RestartStrategy::OnFailure
     }
 }
 
