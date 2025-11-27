@@ -16,16 +16,7 @@ permissions: {
 jobs:
   docs:
     name: Docs
-    strategy:
-      matrix:
-        crate:
-          - tno-core
-          - tno-exec
-          - tno-model
-          - tno-observe
     uses: ./.github/workflows/.docs.yml
-    with:
-      crate: ${{ matrix.crate }}
 
   audit:
     name: Audit

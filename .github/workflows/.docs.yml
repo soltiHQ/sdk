@@ -2,16 +2,19 @@ name: Docs
 
 on:
   workflow_call:
-    inputs:
-      crate:
-        required: true
-        type: string
 
 jobs:
   docs:
     runs-on: ${{ vars.RUNS_ON }}
+    strategy:
+      matrix:
+        crate:
+          - tno-core
+          - tno-exec
+          - tno-model
+          - tno-observe
     steps:
       - uses: actions/checkout@v4
       - name: Run docs gen
         uses: soltiHQ/actions/taskfile@main
-        with: { command: cargo/docs CRATE=${{ inputs.crate }} }
+        with: { command: cargo/docs CRATE=${{ matrix.crate }} }
