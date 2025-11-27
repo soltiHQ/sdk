@@ -82,7 +82,6 @@ impl Runner for SubprocessRunner {
             "building subprocess task"
         );
 
-        // Имя задачи = слот. TaskFn::arc требует &'static str — линкуем строку.
         let task_name: &'static str = Box::leak(slot.into_boxed_str());
 
         let task: TaskRef = TaskFn::arc(task_name, move |cancel: CancellationToken| {
