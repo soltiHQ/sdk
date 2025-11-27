@@ -4,7 +4,7 @@ use tracing::info;
 
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 use tno_core::{RunnerRouter, SupervisorApi, TaskPolicy};
-use tno_exec::subprocess::{SubprocessRunner, register_subprocess_runner};
+use tno_exec::subprocess::register_subprocess_runner;
 use tno_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
 
 use tno_model::{
