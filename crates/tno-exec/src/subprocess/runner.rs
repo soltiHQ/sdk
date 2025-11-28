@@ -35,6 +35,7 @@ impl SubprocessRunner {
                 cwd,
                 fail_on_non_zero,
             } => SubprocessConfig {
+                run_id: self.build_run_id(&spec.slot),
                 command: command.clone(),
                 args: args.clone(),
                 env: ctx.env().merged(env),
@@ -67,18 +68,19 @@ impl Runner for SubprocessRunner {
 
     fn build_task(&self, spec: &CreateSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
         let cfg = self.build_config(spec, ctx)?;
-        let slot = spec.slot.clone();
 
         trace!(
-            slot = %slot,
+            slot = %spec.slot.clone(),
+            task = %cfg.run_id,
             "building subprocess task",
         );
 
-        let task: TaskRef = TaskFn::arc(slot, move |cancel: CancellationToken| {
+        let task: TaskRef = TaskFn::arc(cfg.run_id.clone(), move |cancel: CancellationToken| {
             let cfg = cfg.clone();
 
             async move {
                 trace!(
+                    task = %cfg.run_id,
                     command = %cfg.command,
                     args = ?cfg.args,
                     cwd = ?cfg.cwd,

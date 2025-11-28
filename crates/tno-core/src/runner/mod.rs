@@ -7,6 +7,9 @@ pub use error::RunnerError;
 mod context;
 pub use context::BuildContext;
 
+mod id;
+pub use id::make_run_id;
+
 use taskvisor::TaskRef;
 use tno_model::CreateSpec;
 
@@ -26,4 +29,12 @@ pub trait Runner: Send + Sync {
     ///
     /// The provided [`BuildContext`] carries shared dependencies injected at router setup time.
     fn build_task(&self, spec: &CreateSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError>;
+
+    /// Builds a default run id for a given slot.
+    ///
+    /// Runners may override this if they need custom id format,
+    /// otherwise the core helper is used.
+    fn build_run_id(&self, slot: &str) -> String {
+        make_run_id(self.name(), slot)
+    }
 }

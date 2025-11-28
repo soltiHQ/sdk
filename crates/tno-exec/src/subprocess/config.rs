@@ -8,6 +8,8 @@ use crate::ExecError;
 /// Internal configuration for a subprocess.
 #[derive(Debug, Clone)]
 pub struct SubprocessConfig {
+    /// End-to-End log identifier.
+    pub(crate) run_id: String,
     /// Command to execute (e.g. `"ls"`, `"/usr/bin/python"`).
     pub(crate) command: String,
     /// Command-line arguments passed to the command.
@@ -39,14 +41,14 @@ impl SubprocessConfig {
     /// Emit a trace-level log with the essential configuration fields.
     pub fn trace_state(&self, slot: &str) {
         trace!(
-            target: "tno.exec.subprocess.config",
+            task = %self.run_id,
             slot = slot,
             command = %self.command,
             args = ?self.args,
             cwd = ?self.cwd,
             env_len = self.env.len(),
             fail_on_non_zero = self.fail_on_non_zero.is_enabled(),
-            "prepared subprocess config"
+            "subprocess config resolved"
         );
     }
 }

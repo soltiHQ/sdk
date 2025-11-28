@@ -11,6 +11,7 @@ mod router;
 pub use router::RunnerRouter;
 
 mod runner;
+pub use runner::make_run_id;
 pub use runner::{BuildContext, Runner, RunnerError};
 
 mod policy;
