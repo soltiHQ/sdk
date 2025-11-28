@@ -28,4 +28,7 @@ pub enum ExecError {
 
     #[error("duplicate runner-tag detected: runner with tag '{tag}' is already registered")]
     DuplicateRunnerTag { tag: String },
+
+    #[error("process limits are not supported on this OS (os={os})")]
+    UnsupportedLimits { os: String },
 }

@@ -16,3 +16,4 @@ tracing = { workspace = true }
 
 tno-core = { path = "../tno-core" }
 tno-model = { path = "../tno-model" }
+libc = "0.2.177"
