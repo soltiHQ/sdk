@@ -25,4 +25,7 @@ pub enum ExecError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("duplicate runner-tag detected: runner with tag '{tag}' is already registered")]
+    DuplicateRunnerTag { tag: String },
 }

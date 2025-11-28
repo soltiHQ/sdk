@@ -1,5 +1,6 @@
 mod domain;
-pub use domain::{Env, Flag, KeyValue, Slot, TimeoutMs};
+pub use domain::LABEL_RUNNER_TAG;
+pub use domain::{Env, Flag, KeyValue, Labels, Slot, TimeoutMs};
 
 mod error;
 pub use error::ModelError;

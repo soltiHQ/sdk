@@ -119,7 +119,7 @@ mod tests {
 
     use taskvisor::{TaskError, TaskFn};
     use tno_model::{
-        AdmissionStrategy, BackoffStrategy, JitterStrategy, RestartStrategy, TaskKind,
+        AdmissionStrategy, BackoffStrategy, JitterStrategy, Labels, RestartStrategy, TaskKind,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -182,8 +182,8 @@ mod tests {
             restart: RestartStrategy::Never,
             backoff: mk_backoff(),
             admission: AdmissionStrategy::DropIfRunning,
+            labels: Labels::default(),
         };
-
         let res = api.submit(&spec).await;
 
         match res {

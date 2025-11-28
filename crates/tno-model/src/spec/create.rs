@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    LABEL_RUNNER_TAG, Labels,
     domain::{Slot, TimeoutMs},
     kind::TaskKind,
     strategy::{AdmissionStrategy, BackoffStrategy, RestartStrategy},
@@ -43,4 +44,58 @@ pub struct CreateSpec {
     ///
     /// Controls what happens when a new task is submitted while a task in the same slot is already running (drop, replace, queue).
     pub admission: AdmissionStrategy,
+    /// Optional metadata for routing / scheduling / observability.
+    ///
+    /// Router uses key `runner-tag` (if present) to select a specific runner among those that support this `TaskKind`.
+    #[serde(default, skip_serializing_if = "Labels::is_empty")]
+    pub labels: Labels,
+}
+
+impl CreateSpec {
+    /// Attach a runner tag label used by the router.
+    ///
+    /// The tag is stored under the [`LABEL_RUNNER_TAG`] key and later
+    /// consumed by `RunnerRouter` to pick a specific runner instance.
+    ///
+    /// This is a builder-style helper:
+    ///
+    /// ```rust
+    /// # use tno_model::{
+    /// #   CreateSpec, Labels, TaskKind, RestartStrategy, BackoffStrategy,
+    /// #   AdmissionStrategy, JitterStrategy, Env, Flag,
+    /// # };
+    /// let spec = CreateSpec {
+    ///     slot: "demo".into(),
+    ///     kind: TaskKind::Subprocess {
+    ///         command: "ls".into(),
+    ///         args: vec!["/tmp".into()],
+    ///         env: Env::default(),
+    ///         cwd: None,
+    ///         fail_on_non_zero: Flag::enabled(),
+    ///     },
+    ///     timeout_ms: 5_000,
+    ///     restart: RestartStrategy::Never,
+    ///     backoff: BackoffStrategy {
+    ///         jitter: JitterStrategy::None,
+    ///         first_ms: 0,
+    ///         max_ms: 0,
+    ///         factor: 1.0,
+    ///     },
+    ///     admission: AdmissionStrategy::DropIfRunning,
+    ///     labels: Labels::new(),
+    /// }
+    /// .with_runner_tag("runner-a");
+    /// ```
+    pub fn with_runner_tag(mut self, tag: impl Into<String>) -> Self {
+        self.labels.insert(LABEL_RUNNER_TAG, tag);
+        self
+    }
+
+    /// Return the runner tag label (if present).
+    ///
+    /// This is a thin wrapper over `labels.get(LABEL_RUNNER_TAG)` and is
+    /// intended for consumers that perform routing / placement.
+    pub fn runner_tag(&self) -> Option<&str> {
+        self.labels.get(LABEL_RUNNER_TAG)
+    }
 }

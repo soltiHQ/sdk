@@ -7,6 +7,12 @@ pub use env::Env;
 mod flag;
 pub use flag::Flag;
 
+mod labels;
+pub use labels::Labels;
+
+mod constants;
+pub use constants::LABEL_RUNNER_TAG;
+
 /// Logical identifier for a controller slot.
 ///
 /// A slot groups tasks that must not run concurrently.
