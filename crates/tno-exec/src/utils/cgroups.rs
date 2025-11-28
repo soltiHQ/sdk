@@ -2,11 +2,9 @@
 //!
 //! ## Overview
 //!
-//! This module exposes a small, structured API for applying cgroup v2 limits to child processes created via `tokio::process::Command`.
-//!
+//! This module exposes structured API for applying cgroup v2 limits to child processes created via `tokio::process::Command`.
 //! - On **Linux with cgroup v2**, limits are applied by creating a dedicated cgroup under `/sys/fs/cgroup/<group_name>`, configuring controllers
 //!   (`cpu.max`, `memory.max`, `pids.max`), and placing the child PID into `cgroup.procs` via a `pre_exec` hook.
-//!
 //! - On **non-Linux platforms**, limits are ignored: a warning is emitted and the call returns `Ok(())`.
 //!   This allows the same code path to run unchanged on macOS/Windows without failing early.
 use tokio::process::Command;
@@ -88,7 +86,7 @@ pub fn attach_cgroup_limits(
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    use super::{ CgroupLimits, CpuMax};
+    use super::{CgroupLimits, CpuMax};
 
     use std::{
         fs,
@@ -239,6 +237,9 @@ mod tests {
 
         let mut cmd = Command::new("true");
         let r = attach_cgroup_limits(&mut cmd, "cg-any", &limits);
-        assert!(r.is_ok(), "non-Linux must ignore limits but still return Ok");
+        assert!(
+            r.is_ok(),
+            "non-Linux must ignore limits but still return Ok"
+        );
     }
 }
