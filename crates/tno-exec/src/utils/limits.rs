@@ -8,6 +8,14 @@
 //!   This guarantees that the process never runs without the intended restrictions.
 //! - On **non-Unix platforms**, rlimits are not supported.
 //!   The module emits a warning and treats the request as a no-op, keeping the API consistent and allowing cross-platform execution without failing early.
+//!
+//! ## Limit semantics
+//!
+//! When applying rlimits, this module:
+//! - Sets the **soft limit** to the requested value
+//! - Preserves the existing **hard limit** if it's higher than the requested value
+//! - Validates that requested values don't exceed platform maximums
+//! - Treats overflow/out-of-range values as errors
 use tokio::process::Command;
 use tracing::warn;
 
@@ -78,8 +86,8 @@ pub fn attach_rlimits(cmd: &mut Command, config: &RlimitConfig) {
 mod unix_impl {
     use super::RlimitConfig;
     use std::io;
+    use std::os::unix::prelude::CommandExt;
     use tokio::process::Command;
-    use libc;
 
     pub fn attach_rlimits(cmd: &mut Command, config: &RlimitConfig) {
         if config.is_empty() {
@@ -93,21 +101,24 @@ mod unix_impl {
         unsafe {
             cmd.pre_exec(move || {
                 if let Some(nofile) = max_open_files {
-                    apply_rlimit(libc::RLIMIT_NOFILE as libc::c_int, nofile)?;
+                    if let Err(e) = apply_rlimit(libc::RLIMIT_NOFILE, nofile) {
+                        log_to_stderr(b"tno-exec: failed to set RLIMIT_NOFILE: ");
+                        log_errno_to_stderr(e.raw_os_error().unwrap_or(0));
+                        return Err(e);
+                    }
                 }
                 if let Some(fsize) = max_file_size_bytes {
-                    apply_rlimit(libc::RLIMIT_FSIZE as libc::c_int, fsize)?;
+                    if let Err(e) = apply_rlimit(libc::RLIMIT_FSIZE, fsize) {
+                        log_to_stderr(b"tno-exec: failed to set RLIMIT_FSIZE: ");
+                        log_errno_to_stderr(e.raw_os_error().unwrap_or(0));
+                        return Err(e);
+                    }
                 }
                 if disable_core_dumps {
-                    let rlim = libc::rlimit {
-                        rlim_cur: 0 as libc::rlim_t,
-                        rlim_max: 0 as libc::rlim_t,
-                    };
-                    let rc = unsafe {
-                        setrlimit_compat(libc::RLIMIT_CORE as libc::c_int, &rlim)
-                    };
-                    if rc != 0 {
-                        return Err(io::Error::last_os_error());
+                    if let Err(e) = apply_rlimit(libc::RLIMIT_CORE, 0) {
+                        log_to_stderr(b"tno-exec: failed to set RLIMIT_CORE: ");
+                        log_errno_to_stderr(e.raw_os_error().unwrap_or(0));
+                        return Err(e);
                     }
                 }
                 Ok(())
@@ -115,13 +126,124 @@ mod unix_impl {
         }
     }
 
-    /// Small compatibility shim around `libc::setrlimit`:
-    /// - on Linux: it expects `__rlimit_resource_t` (u32);
-    /// - on other Unix (e.g. macOS): it expects `c_int`.
+    /// Apply an rlimit, preserving the hard limit if it's already higher.
+    ///
+    /// This function:
+    /// 1. Gets the current rlimit
+    /// 2. Sets soft limit to the requested value
+    /// 3. Keeps hard limit at max(current_hard, requested_value)
+    /// 4. Validates that the value fits in rlim_t
+    fn apply_rlimit(resource: libc::c_int, value: u64) -> io::Result<()> {
+        // Check for overflow before casting
+        let max_rlim = libc::rlim_t::MAX as u64;
+        if value > max_rlim {
+            log_to_stderr(b"tno-exec: rlimit value exceeds platform maximum\n");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rlimit value exceeds platform maximum",
+            ));
+        }
+
+        // Get current limits
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+
+        if unsafe { getrlimit_compat(resource, &mut current) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Set new limits:
+        // - soft limit = requested value
+        // - hard limit = max(current_hard, requested_value)
+        // This allows the process to raise soft limit later if needed
+        let new_soft = value as libc::rlim_t;
+        let new_hard = if current.rlim_max == libc::RLIM_INFINITY {
+            // If current hard limit is unlimited, keep it unlimited
+            libc::RLIM_INFINITY
+        } else if current.rlim_max > new_soft {
+            // If current hard limit is higher, preserve it
+            current.rlim_max
+        } else {
+            // Otherwise set hard = soft
+            new_soft
+        };
+
+        let rlim = libc::rlimit {
+            rlim_cur: new_soft,
+            rlim_max: new_hard,
+        };
+
+        if unsafe { setrlimit_compat(resource, &rlim) } != 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Write a static message to stderr using only libc (safe for pre_exec).
+    fn log_to_stderr(msg: &[u8]) {
+        unsafe {
+            libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
+    }
+
+    /// Write errno value to stderr (safe for pre_exec).
+    fn log_errno_to_stderr(errno: i32) {
+        // Simple integer to string conversion without allocation
+        let mut buf = [b'0'; 16];
+        let mut n = errno.unsigned_abs();
+        let mut i = buf.len();
+
+        if n == 0 {
+            i -= 1;
+            buf[i] = b'0';
+        } else {
+            while n > 0 {
+                i -= 1;
+                buf[i] = b'0' + (n % 10) as u8;
+                n /= 10;
+            }
+        }
+
+        if errno < 0 {
+            i -= 1;
+            buf[i] = b'-';
+        }
+
+        unsafe {
+            libc::write(
+                libc::STDERR_FILENO,
+                buf[i..].as_ptr() as *const libc::c_void,
+                buf.len() - i,
+            );
+            libc::write(libc::STDERR_FILENO, b"\n".as_ptr() as *const libc::c_void, 1);
+        }
+    }
+
+    /// Compatibility shim for getrlimit
+    #[inline]
+    unsafe fn getrlimit_compat(
+        resource: libc::c_int,
+        rlim: *mut libc::rlimit,
+    ) -> libc::c_int {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            libc::getrlimit(resource as libc::__rlimit_resource_t, rlim)
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            libc::getrlimit(resource, rlim)
+        }
+    }
+
+    /// Compatibility shim for setrlimit
     #[inline]
     unsafe fn setrlimit_compat(
         resource: libc::c_int,
-        rlim: &libc::rlimit,
+        rlim: *const libc::rlimit,
     ) -> libc::c_int {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
@@ -131,20 +253,6 @@ mod unix_impl {
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             libc::setrlimit(resource, rlim)
-        }
-    }
-
-    fn apply_rlimit(resource: libc::c_int, value: u64) -> io::Result<()> {
-        let rlim = libc::rlimit {
-            rlim_cur: value as libc::rlim_t,
-            rlim_max: value as libc::rlim_t,
-        };
-
-        let rc = unsafe { setrlimit_compat(resource, &rlim) };
-        if rc != 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
         }
     }
 }
@@ -186,5 +294,23 @@ mod tests {
 
         let mut cmd = Command::new("sh");
         attach_rlimits(&mut cmd, &config);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rlimits_can_be_applied() {
+        let config = RlimitConfig {
+            max_open_files: Some(512),
+            max_file_size_bytes: Some(1024 * 1024),
+            disable_core_dumps: true,
+        };
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("ulimit -a");
+        attach_rlimits(&mut cmd, &config);
+
+        let result = cmd.status().await;
+        assert!(result.is_ok(), "rlimits should be applied successfully");
+        assert!(result.unwrap().success());
     }
 }
