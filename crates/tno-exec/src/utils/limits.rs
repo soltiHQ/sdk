@@ -145,7 +145,6 @@ mod tests {
         assert!(config.is_empty());
 
         let mut cmd = Command::new("sh");
-        // Should not panic or log anything special
         attach_rlimits(&mut cmd, &config);
     }
 
@@ -160,10 +159,6 @@ mod tests {
 
         let mut cmd = Command::new("sh");
         attach_rlimits(&mut cmd, &config);
-
-        // We cannot easily assert rlimits from the parent, but this at least
-        // verifies that the function does not panic on Unix and that the API
-        // is callable with a non-empty config.
     }
 
     #[cfg(not(unix))]
@@ -176,7 +171,6 @@ mod tests {
         };
 
         let mut cmd = Command::new("sh");
-        // On non-Unix this should just log a warning and do nothing.
         attach_rlimits(&mut cmd, &config);
     }
 }
