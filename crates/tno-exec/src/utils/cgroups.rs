@@ -3,19 +3,13 @@
 //! ## Overview
 //!
 //! This module exposes structured API for applying cgroup v2 limits to child processes created via `tokio::process::Command`.
-//! - On **Linux with cgroup v2**, limits are applied by creating a dedicated cgroup under `/sys/fs/cgroup/<group_name>`, configuring controllers
-//!   (`cpu.max`, `memory.max`, `pids.max`), and placing the child PID into `cgroup.procs` via a `pre_exec` hook.
+//! - On **Linux with cgroup v2**, limits are applied by creating a dedicated cgroup under `/sys/fs/cgroup/<group_name>`
 //! - On **non-Linux platforms**, limits are ignored: a warning is emitted and the call returns `Ok(())`.
-//!   This allows the same code path to run unchanged on macOS/Windows without failing early.
 use tokio::process::Command;
 
 use crate::ExecError;
 
 /// CPU limit (`cpu.max`) for cgroup v2.
-///
-/// `quota` and `period` follow the cgroup v2 contract:
-/// - `max` indicates no CPU limit,
-/// - `<quota> <period>` sets a quota/period time window.
 #[derive(Debug, Clone, Copy)]
 pub struct CpuMax {
     /// CPU quota in microseconds for each period.
@@ -95,7 +89,8 @@ mod linux_impl {
     };
 
     use tokio::process::Command;
-    use tracing::{debug, warn};
+
+    use crate::utils::log::{pre_exec_log, pre_exec_log_errno};
 
     const CONTROLLERS_FILE: &str = "cgroup.controllers";
     const CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -107,48 +102,37 @@ mod linux_impl {
         unsafe {
             cmd.pre_exec(move || {
                 if !is_cgroup_v2(Path::new(CGROUP_ROOT)) {
-                    warn!(
-                        "cgroup v2 not detected at {} (missing {}); limits for group '{}' will be ignored",
-                        CGROUP_ROOT,
-                        CONTROLLERS_FILE,
-                        name,
+                    pre_exec_log(
+                        b"tno-exec: cgroup v2 not detected at /sys/fs/cgroup (missing cgroup.controllers); limits will be ignored\n",
                     );
                     return Ok(());
                 }
+
                 let cg_dir = Path::new(CGROUP_ROOT).join(&name);
 
                 if let Err(e) = fs::create_dir_all(&cg_dir) {
-                    warn!(
-                        "failed to create cgroup '{}': {}; limits will be ignored",
-                        cg_dir.display(),
-                        e
-                    );
+                    pre_exec_log(b"tno-exec: failed to create cgroup directory; limits will be ignored\n");
+                    if let Some(code) = e.raw_os_error() {
+                        pre_exec_log_errno(code);
+                    }
                     return Ok(());
                 }
+
                 if let Err(e) = apply_limits(&cg_dir, &limits) {
-                    warn!(
-                        "failed to apply cgroup limits for '{}': {}; limits ignored",
-                        cg_dir.display(),
-                        e
-                    );
+                    pre_exec_log(b"tno-exec: failed to apply cgroup limits; limits will be ignored\n");
+                    if let Some(code) = e.raw_os_error() {
+                        pre_exec_log_errno(code);
+                    }
                     return Ok(());
                 }
 
                 if let Err(e) = add_self_to_cgroup(&cg_dir) {
-                    warn!(
-                        "failed to attach PID to cgroup '{}': {}; limits ignored",
-                        cg_dir.display(),
-                        e
-                    );
+                    pre_exec_log(b"tno-exec: failed to attach PID to cgroup; limits will be ignored\n");
+                    if let Some(code) = e.raw_os_error() {
+                        pre_exec_log_errno(code);
+                    }
                     return Ok(());
                 }
-                debug!(
-                    "applied cgroup v2 limits: dir={} cpu={:?} memory={:?} pids={:?}",
-                    cg_dir.display(),
-                    limits.cpu,
-                    limits.memory,
-                    limits.pids
-                );
                 Ok(())
             });
         }

@@ -16,7 +16,7 @@ use tno_model::{
 async fn main() -> anyhow::Result<()> {
     // 1) logger
     let cfg = LoggerConfig {
-        level: LoggerLevel::new("info")?,
+        level: LoggerLevel::new("trace")?,
         ..Default::default()
     };
     init_logger(&cfg)?;

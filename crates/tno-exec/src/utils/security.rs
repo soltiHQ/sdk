@@ -19,6 +19,7 @@
 //!
 //! The `no_new_privs` flag works without root privileges and is enforced strictly.
 //! Failure to set this flag will cause the spawn to fail.
+
 use tokio::process::Command;
 use tracing::warn;
 
@@ -174,6 +175,8 @@ mod linux_impl {
 
     use tokio::process::Command;
 
+    use crate::utils::log::{pre_exec_log, pre_exec_log_errno};
+
     const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
     const PR_CAP_AMBIENT: libc::c_int = 47;
     const PR_CAP_AMBIENT_CLEAR_ALL: libc::c_ulong = 4;
@@ -225,8 +228,12 @@ mod linux_impl {
                 if cfg.drop_all_caps {
                     // Capability operations are non-fatal - we log to stderr and continue
                     if let Err(e) = drop_capabilities(&cfg.keep_caps) {
-                        log_to_stderr(b"tno-exec: failed to drop capabilities (continuing): ");
-                        log_errno_to_stderr(e.raw_os_error().unwrap_or(0));
+                        pre_exec_log(
+                            b"tno-exec: failed to drop capabilities (continuing): ",
+                        );
+                        if let Some(code) = e.raw_os_error() {
+                            pre_exec_log_errno(code);
+                        }
                     }
                 }
 
@@ -367,54 +374,6 @@ mod linux_impl {
             Err(io::Error::last_os_error())
         } else {
             Ok(())
-        }
-    }
-
-    /// Write a static message to stderr using only libc (safe for pre_exec).
-    fn log_to_stderr(msg: &[u8]) {
-        unsafe {
-            libc::write(
-                libc::STDERR_FILENO,
-                msg.as_ptr() as *const libc::c_void,
-                msg.len(),
-            );
-        }
-    }
-
-    /// Write errno value to stderr (safe for pre_exec).
-    fn log_errno_to_stderr(errno: i32) {
-        // Simple integer to string conversion without allocation
-        let mut buf = [b'0'; 16];
-        let mut n = errno.unsigned_abs();
-        let mut i = buf.len();
-
-        if n == 0 {
-            i -= 1;
-            buf[i] = b'0';
-        } else {
-            while n > 0 {
-                i -= 1;
-                buf[i] = b'0' + (n % 10) as u8;
-                n /= 10;
-            }
-        }
-
-        if errno < 0 {
-            i -= 1;
-            buf[i] = b'-';
-        }
-
-        unsafe {
-            libc::write(
-                libc::STDERR_FILENO,
-                buf[i..].as_ptr() as *const libc::c_void,
-                buf.len() - i,
-            );
-            libc::write(
-                libc::STDERR_FILENO,
-                b"\n".as_ptr() as *const libc::c_void,
-                1,
-            );
         }
     }
 
