@@ -51,25 +51,24 @@ impl SubprocessBackendConfig {
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), crate::ExecError> {
         if let Some(cgroups) = &self.cgroups {
-            if let Some(mem) = cgroups.memory {
-                if mem == 0 {
-                    return Err(InvalidRunnerConfig("cgroups.memory cannot be zero".into()));
-                }
+            if let Some(mem) = cgroups.memory
+                && mem == 0
+            {
+                return Err(InvalidRunnerConfig("cgroups.memory cannot be zero".into()));
             }
-            if let Some(pids) = cgroups.pids {
-                if pids == 0 {
-                    return Err(InvalidRunnerConfig("cgroups.pids cannot be zero".into()));
-                }
+            if let Some(pids) = cgroups.pids
+                && pids == 0
+            {
+                return Err(InvalidRunnerConfig("cgroups.pids cannot be zero".into()));
             }
         }
-        if let Some(rlimits) = &self.rlimits {
-            if let Some(fsize) = rlimits.max_file_size_bytes {
-                if fsize == 0 {
-                    return Err(InvalidRunnerConfig(
-                        "rlimits.max_file_size_bytes cannot be zero".into(),
-                    ));
-                }
-            }
+        if let Some(rlimits) = &self.rlimits
+            && let Some(fsize) = rlimits.max_file_size_bytes
+            && fsize == 0
+        {
+            return Err(InvalidRunnerConfig(
+                "rlimits.max_file_size_bytes cannot be zero".into(),
+            ));
         }
         Ok(())
     }

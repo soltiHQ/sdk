@@ -23,6 +23,8 @@
 //! - Treats overflow/out-of-range values as errors
 
 use tokio::process::Command;
+
+#[cfg(not(target_os = "linux"))]
 use tracing::warn;
 
 /// Declarative rlimit-based config for a child process.
@@ -94,7 +96,6 @@ pub fn attach_rlimits(cmd: &mut Command, config: &RlimitConfig) {
 mod unix_impl {
     use super::RlimitConfig;
     use std::io;
-    use std::os::unix::prelude::CommandExt;
     use tokio::process::Command;
 
     use crate::utils::log::{pre_exec_log, pre_exec_log_errno};
@@ -110,42 +111,38 @@ mod unix_impl {
 
         unsafe {
             cmd.pre_exec(move || {
-                if let Some(nofile) = max_open_files {
-                    if let Err(e) = apply_rlimit(rlimit_nofile(), nofile) {
-                        pre_exec_log(b"tno-exec: failed to set RLIMIT_NOFILE: ");
-                        if let Some(code) = e.raw_os_error() {
-                            pre_exec_log_errno(code);
-                        }
-                        return Err(e);
+                if let Some(nofile) = max_open_files
+                    && let Err(e) = apply_rlimit(rlimit_nofile(), nofile)
+                {
+                    pre_exec_log(b"tno-exec: failed to set RLIMIT_NOFILE: ");
+                    if let Some(code) = e.raw_os_error() {
+                        pre_exec_log_errno(code);
                     }
+                    return Err(e);
                 }
 
-                if let Some(fsize) = max_file_size_bytes {
-                    if let Err(e) = apply_rlimit(rlimit_fsize(), fsize) {
-                        pre_exec_log(b"tno-exec: failed to set RLIMIT_FSIZE: ");
-                        if let Some(code) = e.raw_os_error() {
-                            pre_exec_log_errno(code);
-                        }
-                        return Err(e);
+                if let Some(fsize) = max_file_size_bytes
+                    && let Err(e) = apply_rlimit(rlimit_fsize(), fsize)
+                {
+                    pre_exec_log(b"tno-exec: failed to set RLIMIT_FSIZE: ");
+                    if let Some(code) = e.raw_os_error() {
+                        pre_exec_log_errno(code);
                     }
+                    return Err(e);
                 }
 
-                if disable_core_dumps {
-                    if let Err(e) = apply_rlimit(rlimit_core(), 0) {
-                        pre_exec_log(b"tno-exec: failed to set RLIMIT_CORE: ");
-                        if let Some(code) = e.raw_os_error() {
-                            pre_exec_log_errno(code);
-                        }
-                        return Err(e);
+                if disable_core_dumps && let Err(e) = apply_rlimit(rlimit_core(), 0) {
+                    pre_exec_log(b"tno-exec: failed to set RLIMIT_CORE: ");
+                    if let Some(code) = e.raw_os_error() {
+                        pre_exec_log_errno(code);
                     }
+                    return Err(e);
                 }
 
                 Ok(())
             });
         }
     }
-
-    /// Map RLIMIT_* constants to `libc::c_int` portably.
 
     #[inline]
     fn rlimit_nofile() -> libc::c_int {
@@ -191,8 +188,7 @@ mod unix_impl {
     /// 3. Keeps hard limit at max(current_hard, requested_value)
     /// 4. Validates that the value fits in `rlim_t`
     fn apply_rlimit(resource: libc::c_int, value: u64) -> io::Result<()> {
-        // Check for overflow before casting
-        let max_rlim = libc::rlim_t::MAX as u64;
+        let max_rlim = libc::rlim_t::MAX;
         if value > max_rlim {
             pre_exec_log(b"tno-exec: rlimit value exceeds platform maximum\n");
             return Err(io::Error::new(
@@ -242,28 +238,28 @@ mod unix_impl {
     /// Compatibility shim for getrlimit
     #[inline]
     unsafe fn getrlimit_compat(resource: libc::c_int, rlim: *mut libc::rlimit) -> libc::c_int {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(target_os = "linux")]
         {
-            libc::getrlimit(resource as libc::__rlimit_resource_t, rlim)
+            unsafe { libc::getrlimit(resource as libc::__rlimit_resource_t, rlim) }
         }
 
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(target_os = "linux"))]
         {
-            libc::getrlimit(resource, rlim)
+            unsafe { libc::getrlimit(resource, rlim) }
         }
     }
 
     /// Compatibility shim for setrlimit
     #[inline]
     unsafe fn setrlimit_compat(resource: libc::c_int, rlim: *const libc::rlimit) -> libc::c_int {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(target_os = "linux")]
         {
-            libc::setrlimit(resource as libc::__rlimit_resource_t, rlim)
+            unsafe { libc::setrlimit(resource as libc::__rlimit_resource_t, rlim) }
         }
 
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(target_os = "linux"))]
         {
-            libc::setrlimit(resource, rlim)
+            unsafe { libc::setrlimit(resource, rlim) }
         }
     }
 }

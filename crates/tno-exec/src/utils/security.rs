@@ -21,6 +21,8 @@
 //! Failure to set this flag will cause the spawn to fail.
 
 use tokio::process::Command;
+
+#[cfg(not(target_os = "linux"))]
 use tracing::warn;
 
 /// Declarative security policy for a child process.
@@ -117,7 +119,7 @@ pub enum LinuxCapability {
 
 impl LinuxCapability {
     /// Human-readable name for debugging.
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Chown => "CHOWN",
             Self::DacOverride => "DAC_OVERRIDE",
@@ -171,7 +173,7 @@ pub fn attach_security(cmd: &mut Command, config: &SecurityConfig) {
 mod linux_impl {
     use super::{LinuxCapability, SecurityConfig};
 
-    use std::{io, os::unix::prelude::CommandExt};
+    use std::io;
 
     use tokio::process::Command;
 

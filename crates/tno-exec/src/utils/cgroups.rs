@@ -63,7 +63,6 @@ pub fn attach_cgroup_limits(
     #[cfg(target_os = "linux")]
     {
         linux_impl::attach(cmd, name, limits);
-        return Ok(());
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -73,8 +72,8 @@ pub fn attach_cgroup_limits(
             name,
             std::env::consts::OS
         );
-        Ok(())
     }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -84,7 +83,6 @@ mod linux_impl {
     use std::{
         fs,
         io::{self, Write},
-        os::unix::process::CommandExt,
         path::{Path, PathBuf},
     };
 
