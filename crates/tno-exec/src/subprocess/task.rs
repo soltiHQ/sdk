@@ -16,9 +16,7 @@ pub struct SubprocessTaskConfig {
     pub(crate) command: String,
     /// Command-line arguments passed to the command.
     pub(crate) args: Vec<String>,
-    /// Final merged environment for the subprocess.
-    ///
-    /// Usually this is `BuildContext.env()` merged with the `Env` from `TaskKind::Exec`, where task-level entries override context ones.
+    /// Environment for the subprocess.
     pub(crate) env: Env,
     /// Working directory for the subprocess.
     ///
@@ -38,20 +36,6 @@ impl SubprocessTaskConfig {
             return Err(ExecError::InvalidSpec("Subprocess command is empty".into()));
         }
         Ok(())
-    }
-
-    /// Emit a trace-level log with the essential configuration fields.
-    pub fn trace_state(&self, slot: &str) {
-        trace!(
-            task = %self.run_id,
-            slot = slot,
-            command = %self.command,
-            args = ?self.args,
-            cwd = ?self.cwd,
-            env_len = self.env.len(),
-            fail_on_non_zero = self.fail_on_non_zero.is_enabled(),
-            "subprocess config resolved"
-        );
     }
 }
 

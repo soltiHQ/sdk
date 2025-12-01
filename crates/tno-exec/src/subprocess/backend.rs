@@ -3,7 +3,7 @@ use tracing::trace;
 
 use crate::ExecError::InvalidRunnerConfig;
 use crate::utils::{CgroupLimits, RlimitConfig, SecurityConfig};
-use crate::{attach_cgroup_limits, attach_rlimits, attach_security};
+use crate::utils::{attach_cgroup_limits, attach_rlimits, attach_security};
 
 /// Low-level OS/kernel configuration for subprocess execution.
 ///
@@ -93,7 +93,7 @@ impl SubprocessBackendConfig {
         }
 
         if let Some(rlimits) = &self.rlimits {
-            trace!("subprocess backend: nothing to apply (empty config)");
+            trace!("subprocess backend: attaching rlimits: {:?}", rlimits);
             attach_rlimits(cmd, rlimits);
         }
         if let Some(cgroups) = &self.cgroups {

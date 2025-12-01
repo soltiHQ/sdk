@@ -5,42 +5,38 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
-use crate::subprocess::backend::SubprocessBackendConfig;
-use crate::subprocess::task::SubprocessTaskConfig;
 use tno_core::{BuildContext, Runner, RunnerError};
 use tno_model::{CreateSpec, TaskKind};
 
+use crate::subprocess::{backend::SubprocessBackendConfig, task::SubprocessTaskConfig};
+
 /// Runner that executes `TaskKind::Subprocess` as OS subprocesses.
 pub struct SubprocessRunner {
+    /// Runner name.
     name: &'static str,
-    /// Backend configuration applied to all tasks spawned by this runner.
-    ///
-    /// Set once during runner initialization/registration.
-    backend: Option<SubprocessBackendConfig>,
+    /// Configuration applied to all tasks spawned by this runner.
+    config: Option<SubprocessBackendConfig>,
 }
 
 impl SubprocessRunner {
     /// Create a new subprocess with name.
     pub fn new(name: &'static str) -> Self {
-        Self {
-            name,
-            backend: None,
-        }
+        Self { name, config: None }
     }
 
     /// Create a subprocess runner with explicit backend configuration.
     ///
     /// Backend settings (rlimits, cgroups, security) will be applied to
     /// all tasks spawned by this runner instance.
-    pub fn with_backend(name: &'static str, backend: SubprocessBackendConfig) -> Self {
+    pub fn with_config(name: &'static str, config: SubprocessBackendConfig) -> Self {
         Self {
             name,
-            backend: Some(backend),
+            config: Some(config),
         }
     }
 
-    /// Build normalized subprocess configuration from `CreateSpec` + `BuildContext`.
-    fn build_config(
+    /// Build configuration from `CreateSpec`.
+    fn build_task_config(
         &self,
         spec: &CreateSpec,
         ctx: &BuildContext,
@@ -70,7 +66,6 @@ impl SubprocessRunner {
 
         cfg.validate()
             .map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
-        cfg.trace_state(&spec.slot);
         Ok(cfg)
     }
 }
@@ -85,84 +80,85 @@ impl Runner for SubprocessRunner {
     }
 
     fn build_task(&self, spec: &CreateSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
-        let cfg = self.build_config(spec, ctx)?;
-        let backend = self.backend.clone();
+        let task_cfg = self.build_task_config(spec, ctx)?;
+        let runner_cfg = self.config.clone();
 
         trace!(
             slot = %spec.slot.clone(),
-            task = %cfg.run_id,
+            task = %task_cfg.run_id,
             "building subprocess task",
         );
 
-        let task: TaskRef = TaskFn::arc(cfg.run_id.clone(), move |cancel: CancellationToken| {
-            let cfg = cfg.clone();
-            let backend = backend.clone();
+        let task: TaskRef = TaskFn::arc(
+            task_cfg.run_id.clone(),
+            move |cancel: CancellationToken| {
+                let task_cfg = task_cfg.clone();
+                let runner_cfg = runner_cfg.clone();
 
-            async move {
-                trace!(
-                    task = %cfg.run_id,
-                    command = %cfg.command,
-                    args = ?cfg.args,
-                    cwd = ?cfg.cwd,
-                    "spawning subprocess",
-                );
+                async move {
+                    let mut cmd = Command::new(&task_cfg.command);
+                    cmd.args(&task_cfg.args);
 
-                let mut cmd = Command::new(&cfg.command);
-                cmd.args(&cfg.args);
+                    trace!(
+                        task = %task_cfg.run_id,
+                        command = %task_cfg.command,
+                        args = ?task_cfg.args,
+                        cwd = ?task_cfg.cwd,
+                        "spawning subprocess",
+                    );
 
-                if let Some(cwd) = &cfg.cwd {
-                    cmd.current_dir(cwd);
-                }
-                for kv in cfg.env.iter() {
-                    cmd.env(kv.key(), kv.value());
-                }
-                cmd.stdout(Stdio::piped());
-                cmd.stderr(Stdio::inherit());
+                    if let Some(cwd) = &task_cfg.cwd {
+                        cmd.current_dir(cwd);
+                    }
+                    for kv in task_cfg.env.iter() {
+                        cmd.env(kv.key(), kv.value());
+                    }
+                    cmd.stdout(Stdio::piped());
+                    cmd.stderr(Stdio::inherit());
 
-                if let Some(backend) = &backend {
-                    backend
-                        .apply_to_command(&mut cmd, &cfg.run_id)
-                        .map_err(|e| TaskError::Fatal {
-                            reason: format!("backend config failed: {e}"),
-                        })?;
-                }
+                    if let Some(runner_cfg) = &runner_cfg {
+                        runner_cfg
+                            .apply_to_command(&mut cmd, &task_cfg.run_id)
+                            .map_err(|e| TaskError::Fatal {
+                                reason: format!("failed apply runner configs: {e}"),
+                            })?;
+                    }
+                    let mut child = cmd.spawn().map_err(|e| TaskError::Fatal {
+                        reason: format!("spawn failed: {e}"),
+                    })?;
 
-                let mut child = cmd.spawn().map_err(|e| TaskError::Fatal {
-                    reason: format!("spawn failed: {e}"),
-                })?;
-                let status_fut = child.wait();
-
-                tokio::select! {
-                    res = status_fut => {
-                        let status = res.map_err(|e| TaskError::Fatal {
-                            reason: format!("wait failed: {e}"),
-                        })?;
-
-                        if !status.success() && cfg.fail_on_non_zero.is_enabled() {
-                            return if let Some(code) = status.code() {
-                                Err(TaskError::Fail {
-                                    reason: format!("process exited with non-zero code: {code}"),
-                                })
-                            } else {
-                                Err(TaskError::Fail {
-                                    reason: "process terminated by signal".into(),
-                                })
+                    let status_fut = child.wait();
+                    tokio::select! {
+                        res = status_fut => {
+                            let status = res.map_err(|e| TaskError::Fatal {
+                                reason: format!("wait failed: {e}"),
+                            })?;
+                            if !status.success() && task_cfg.fail_on_non_zero.is_enabled() {
+                                return if let Some(code) = status.code() {
+                                    Err(TaskError::Fail {
+                                        reason: format!("process exited with non-zero code: {code}"),
+                                    })
+                                } else {
+                                    Err(TaskError::Fail {
+                                        reason: "process terminated by signal".into(),
+                                    })
+                                }
                             }
+                            debug!("subprocess exited successfully");
+                            Ok(())
                         }
-                        debug!("subprocess exited successfully");
-                        Ok(())
-                    }
-                    _ = cancel.cancelled() => {
-                        debug!("cancellation requested; killing subprocess");
+                        _ = cancel.cancelled() => {
+                            debug!("cancellation requested; killing subprocess");
 
-                        if let Err(e) = child.kill().await {
-                            debug!("failed to kill subprocess: {e}");
+                            if let Err(e) = child.kill().await {
+                                debug!("failed to kill subprocess: {e}");
+                            }
+                            Err(TaskError::Canceled)
                         }
-                        Err(TaskError::Canceled)
                     }
                 }
-            }
-        });
+            },
+        );
         Ok(task)
     }
 }
