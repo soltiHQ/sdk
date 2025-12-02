@@ -13,17 +13,17 @@ pub enum LinuxCapability {
     /// `CAP_DAC_READ_SEARCH`: Bypass file read permission checks and directory read/execute checks
     DacReadSearch,
     /// `CAP_FOWNER`: Bypass permission checks on operations that normally require the filesystem UID
-    Fowner,
+    FOwner,
     /// `CAP_FSETID`: Don't clear set-user-ID and set-group-ID mode bits
-    Fsetid,
+    FSetId,
     /// `CAP_KILL`: Bypass permission checks for sending signals
     Kill,
     /// `CAP_SETGID`: Make arbitrary manipulations of process GIDs and supplementary GID list
-    Setgid,
+    SetGid,
     /// `CAP_SETUID`: Make arbitrary manipulations of process UIDs
-    Setuid,
+    SetUid,
     /// `CAP_SETPCAP`: Modify process capabilities
-    Setpcap,
+    SetPCap,
     /// `CAP_NET_BIND_SERVICE`: Bind a socket to privileged ports (port numbers less than 1024)
     NetBindService,
     /// `CAP_NET_RAW`: Use RAW and PACKET sockets; bind to any address for transparent proxying
@@ -45,13 +45,13 @@ pub enum LinuxCapability {
     /// `CAP_SYS_TIME`: Set system clock; set real-time (hardware) clock
     SysTime,
     /// `CAP_MKNOD`: Create special files using mknod()
-    Mknod,
+    MkNod,
     /// `CAP_AUDIT_WRITE`: Write records to kernel auditing log
     AuditWrite,
     /// `CAP_AUDIT_CONTROL`: Enable and disable kernel auditing
     AuditControl,
     /// `CAP_SETFCAP`: Set file capabilities
-    Setfcap,
+    SetFCap,
 }
 
 impl LinuxCapability {
@@ -61,12 +61,12 @@ impl LinuxCapability {
             Self::Chown => "CHOWN",
             Self::DacOverride => "DAC_OVERRIDE",
             Self::DacReadSearch => "DAC_READ_SEARCH",
-            Self::Fowner => "FOWNER",
-            Self::Fsetid => "FSETID",
+            Self::FOwner => "FOWNER",
+            Self::FSetId => "FSETID",
             Self::Kill => "KILL",
-            Self::Setgid => "SETGID",
-            Self::Setuid => "SETUID",
-            Self::Setpcap => "SETPCAP",
+            Self::SetGid => "SETGID",
+            Self::SetUid => "SETUID",
+            Self::SetPCap => "SETPCAP",
             Self::NetBindService => "NET_BIND_SERVICE",
             Self::NetRaw => "NET_RAW",
             Self::NetAdmin => "NET_ADMIN",
@@ -77,10 +77,10 @@ impl LinuxCapability {
             Self::SysNice => "SYS_NICE",
             Self::SysResource => "SYS_RESOURCE",
             Self::SysTime => "SYS_TIME",
-            Self::Mknod => "MKNOD",
+            Self::MkNod => "MKNOD",
             Self::AuditWrite => "AUDIT_WRITE",
             Self::AuditControl => "AUDIT_CONTROL",
-            Self::Setfcap => "SETFCAP",
+            Self::SetFCap => "SETFCAP",
         }
     }
 
@@ -90,12 +90,12 @@ impl LinuxCapability {
             Self::Chown => 0,           // CAP_CHOWN
             Self::DacOverride => 1,     // CAP_DAC_OVERRIDE
             Self::DacReadSearch => 2,   // CAP_DAC_READ_SEARCH
-            Self::Fowner => 3,          // CAP_FOWNER
-            Self::Fsetid => 4,          // CAP_FSETID
+            Self::FOwner => 3,          // CAP_FOWNER
+            Self::FSetId => 4,          // CAP_FSETID
             Self::Kill => 5,            // CAP_KILL
-            Self::Setgid => 6,          // CAP_SETGID
-            Self::Setuid => 7,          // CAP_SETUID
-            Self::Setpcap => 8,         // CAP_SETPCAP
+            Self::SetGid => 6,          // CAP_SETGID
+            Self::SetUid => 7,          // CAP_SETUID
+            Self::SetPCap => 8,         // CAP_SETPCAP
             Self::NetBindService => 10, // CAP_NET_BIND_SERVICE
             Self::NetRaw => 13,         // CAP_NET_RAW
             Self::NetAdmin => 12,       // CAP_NET_ADMIN
@@ -106,10 +106,10 @@ impl LinuxCapability {
             Self::SysNice => 23,        // CAP_SYS_NICE
             Self::SysResource => 24,    // CAP_SYS_RESOURCE
             Self::SysTime => 25,        // CAP_SYS_TIME
-            Self::Mknod => 27,          // CAP_MKNOD
+            Self::MkNod => 27,          // CAP_MKNOD
             Self::AuditWrite => 29,     // CAP_AUDIT_WRITE
             Self::AuditControl => 30,   // CAP_AUDIT_CONTROL
-            Self::Setfcap => 31,        // CAP_SETFCAP
+            Self::SetFCap => 31,        // CAP_SETFCAP
         }
     }
 }
