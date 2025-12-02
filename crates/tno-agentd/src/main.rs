@@ -33,11 +33,11 @@ async fn main() -> anyhow::Result<()> {
     // 3) router + runners with DIFFERENT security profiles
     let mut router = RunnerRouter::new();
 
-    // 3a) Development runner - NO restrictions (для отладки)
+    // 3a) Development runner - NO restrictions
     register_subprocess_runner_with_backend(
         &mut router,
         "dev-runner",
-        SubprocessBackendConfig::new(), // пустой config
+        SubprocessBackendConfig::new(),
     )?;
     info!("registered dev-runner (no restrictions)");
 
@@ -68,19 +68,18 @@ async fn main() -> anyhow::Result<()> {
         })
         .with_cgroups(CgroupLimits {
             cpu: Some(CpuMax {
-                quota: Some(25_000), // 25% CPU
+                quota: Some(25_000),
                 period: 100_000,
             }),
-            memory: Some(64 * 1024 * 1024), // только 64 MB!
-            pids: Some(16),                 // только 16 процессов
+            memory: Some(64 * 1024 * 1024),
+            pids: Some(16),
         })
         .with_security(SecurityConfig {
             drop_all_caps: true,
             keep_caps: vec![
-                // Минимальный набор capabilities для базовой работы
-                LinuxCapability::NetBindService, // если нужно биндить низкие порты
+                LinuxCapability::NetBindService,
             ],
-            no_new_privs: true, // CRITICAL для untrusted code
+            no_new_privs: true, // CRITICAL  untrusted code
         });
     register_subprocess_runner_with_backend(&mut router, "untrusted-runner", untrusted_backend)?;
     info!("registered untrusted-runner (MAXIMUM security)");
@@ -99,9 +98,8 @@ async fn main() -> anyhow::Result<()> {
     let tz_policy = TaskPolicy::from_spec(&tz_spec);
     api.submit_with_task(tz_task, &tz_policy).await?;
 
-    // 6) TASKS с разными runner'ами
 
-    // 6a) Dev runner - безопасные команды для разработки
+    // 6a) Dev runner
     let ls_spec = CreateSpec {
         slot: "dev-ls-tmp".to_string(),
         kind: TaskKind::Subprocess {
@@ -124,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
     }
     .with_runner_tag("dev-runner");
 
-    // 6b) Production runner - бизнес-логика
+    // 6b) Production runner
     let date_spec = CreateSpec {
         slot: "prod-date".to_string(),
         kind: TaskKind::Subprocess {
@@ -147,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
     }
     .with_runner_tag("prod-runner");
 
-    // 6c) Untrusted runner - пользовательский код (максимальная изоляция)
+    // 6c) Untrusted runner
     let sleep_spec = CreateSpec {
         slot: "untrusted-sleep".to_string(),
         kind: TaskKind::Subprocess {
@@ -170,19 +168,18 @@ async fn main() -> anyhow::Result<()> {
     }
     .with_runner_tag("untrusted-runner");
 
-    // 6d) Untrusted runner - команда которая попытается нагадить
+    // 6d) Untrusted runner
     let stress_spec = CreateSpec {
         slot: "untrusted-stress".to_string(),
         kind: TaskKind::Subprocess {
             command: "sh".into(),
             args: vec![
                 "-c".into(),
-                // Попытка создать много процессов (будет ограничено pids=16)
                 "for i in $(seq 1 100); do sleep 1 & done; wait".into(),
             ],
             env: Env::default(),
             cwd: None,
-            fail_on_non_zero: Flag::disabled(), // не фейлим на ошибку
+            fail_on_non_zero: Flag::disabled(),
         },
         timeout_ms: 5_000,
         restart: RestartStrategy::Never,
