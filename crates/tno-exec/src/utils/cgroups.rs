@@ -172,11 +172,14 @@ mod linux_impl {
                     }
                     return Ok(());
                 }
-                if let Err(e) = add_self_to_cgroup(&cg_dir) {
+                // CRITICAL: This may fail with `EINVAL` for very short-lived processesthat complete before pre_exec finishes (~1-5ms window).
+                //
+                // Common errno values:
+                // - EINVAL (22): Process state changed (e.g., already exec'd or exited)
+                // - EACCES (13): Permission denied (should have been caught at mkdir)
+                // - ESRCH  ( 3): Process doesn't exist (already terminated)
+                if let Err(_e) = add_self_to_cgroup(&cg_dir) {
                     pre_exec_log(b"tno-exec: failed to attach PID to cgroup; limits will be ignored\n");
-                    if let Some(code) = e.raw_os_error() {
-                        pre_exec_log_errno(code);
-                    }
                     return Ok(());
                 }
                 Ok(())

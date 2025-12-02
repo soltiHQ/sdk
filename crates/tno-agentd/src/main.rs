@@ -4,7 +4,12 @@ use tracing::info;
 
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 use tno_core::{RunnerRouter, SupervisorApi, TaskPolicy};
-use tno_exec::subprocess::register_subprocess_runner;
+
+use tno_exec::subprocess::SubprocessBackendConfig;
+use tno_exec::subprocess::register_subprocess_runner_with_backend;
+
+use tno_exec::{CgroupLimits, CpuMax, LinuxCapability, RlimitConfig, SecurityConfig};
+
 use tno_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
 
 use tno_model::{
@@ -25,10 +30,60 @@ async fn main() -> anyhow::Result<()> {
     // 2) subscribers
     let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(Subscriber)];
 
-    // 3) router + runners
+    // 3) router + runners with DIFFERENT security profiles
     let mut router = RunnerRouter::new();
-    register_subprocess_runner(&mut router, "runner").expect("message");
-    register_subprocess_runner(&mut router, "etc").expect("message");
+
+    // 3a) Development runner - NO restrictions (для отладки)
+    register_subprocess_runner_with_backend(
+        &mut router,
+        "dev-runner",
+        SubprocessBackendConfig::new(), // пустой config
+    )?;
+    info!("registered dev-runner (no restrictions)");
+
+    // 3b) Production runner - moderate restrictions
+    let prod_backend = SubprocessBackendConfig::new()
+        .with_rlimits(RlimitConfig {
+            max_open_files: Some(1024),
+            max_file_size_bytes: Some(100 * 1024 * 1024), // 100 MB
+            disable_core_dumps: true,
+        })
+        .with_cgroups(CgroupLimits {
+            cpu: Some(CpuMax {
+                quota: Some(50_000), // 50% CPU (50ms per 100ms)
+                period: 100_000,     // 100ms
+            }),
+            memory: Some(256 * 1024 * 1024), // 256 MB
+            pids: Some(64),                  // max 64 processes
+        });
+    register_subprocess_runner_with_backend(&mut router, "prod-runner", prod_backend)?;
+    info!("registered prod-runner (moderate restrictions)");
+
+    // 3c) Untrusted runner - MAXIMUM security
+    let untrusted_backend = SubprocessBackendConfig::new()
+        .with_rlimits(RlimitConfig {
+            max_open_files: Some(128),
+            max_file_size_bytes: Some(10 * 1024 * 1024), // 10 MB only
+            disable_core_dumps: true,
+        })
+        .with_cgroups(CgroupLimits {
+            cpu: Some(CpuMax {
+                quota: Some(25_000), // 25% CPU
+                period: 100_000,
+            }),
+            memory: Some(64 * 1024 * 1024), // только 64 MB!
+            pids: Some(16),                 // только 16 процессов
+        })
+        .with_security(SecurityConfig {
+            drop_all_caps: true,
+            keep_caps: vec![
+                // Минимальный набор capabilities для базовой работы
+                LinuxCapability::NetBindService, // если нужно биндить низкие порты
+            ],
+            no_new_privs: true, // CRITICAL для untrusted code
+        });
+    register_subprocess_runner_with_backend(&mut router, "untrusted-runner", untrusted_backend)?;
+    info!("registered untrusted-runner (MAXIMUM security)");
 
     // 4) SupervisorApi
     let api = SupervisorApi::new(
@@ -44,12 +99,14 @@ async fn main() -> anyhow::Result<()> {
     let tz_policy = TaskPolicy::from_spec(&tz_spec);
     api.submit_with_task(tz_task, &tz_policy).await?;
 
-    // 6) subprocess
+    // 6) TASKS с разными runner'ами
+
+    // 6a) Dev runner - безопасные команды для разработки
     let ls_spec = CreateSpec {
-        slot: "demo-ls-tmp".to_string(),
+        slot: "dev-ls-tmp".to_string(),
         kind: TaskKind::Subprocess {
             command: "ls".into(),
-            args: vec!["/tmp".into()],
+            args: vec!["-lah".into(), "/tmp".into()],
             env: Env::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
@@ -65,37 +122,14 @@ async fn main() -> anyhow::Result<()> {
         admission: AdmissionStrategy::DropIfRunning,
         labels: Labels::default(),
     }
-    .with_runner_tag("runner");
+    .with_runner_tag("dev-runner");
 
-    // pwd
-    let pwd_spec = CreateSpec {
-        slot: "demo-pwd-tmp".to_string(),
-        kind: TaskKind::Subprocess {
-            command: "pwd".into(),
-            args: vec![],
-            env: Env::default(),
-            cwd: None,
-            fail_on_non_zero: Flag::enabled(),
-        },
-        timeout_ms: 5_000,
-        restart: RestartStrategy::Never,
-        backoff: BackoffStrategy {
-            jitter: JitterStrategy::None,
-            first_ms: 0,
-            max_ms: 0,
-            factor: 1.0,
-        },
-        admission: AdmissionStrategy::DropIfRunning,
-        labels: Labels::default(),
-    }
-    .with_runner_tag("runner");
-
-    // date
+    // 6b) Production runner - бизнес-логика
     let date_spec = CreateSpec {
-        slot: "demo-date-tmp".to_string(),
+        slot: "prod-date".to_string(),
         kind: TaskKind::Subprocess {
             command: "date".into(),
-            args: vec![],
+            args: vec!["+%Y-%m-%d %H:%M:%S".into()],
             env: Env::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
@@ -111,14 +145,14 @@ async fn main() -> anyhow::Result<()> {
         admission: AdmissionStrategy::DropIfRunning,
         labels: Labels::default(),
     }
-    .with_runner_tag("runner");
+    .with_runner_tag("prod-runner");
 
-    // sleep 3
+    // 6c) Untrusted runner - пользовательский код (максимальная изоляция)
     let sleep_spec = CreateSpec {
-        slot: "demo-sleep-tmp".to_string(),
+        slot: "untrusted-sleep".to_string(),
         kind: TaskKind::Subprocess {
             command: "sleep".into(),
-            args: vec!["3".into()],
+            args: vec!["2".into()],
             env: Env::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
@@ -134,13 +168,45 @@ async fn main() -> anyhow::Result<()> {
         admission: AdmissionStrategy::DropIfRunning,
         labels: Labels::default(),
     }
-    .with_runner_tag("etc");
+    .with_runner_tag("untrusted-runner");
 
-    api.submit(&sleep_spec).await?;
+    // 6d) Untrusted runner - команда которая попытается нагадить
+    let stress_spec = CreateSpec {
+        slot: "untrusted-stress".to_string(),
+        kind: TaskKind::Subprocess {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                // Попытка создать много процессов (будет ограничено pids=16)
+                "for i in $(seq 1 100); do sleep 1 & done; wait".into(),
+            ],
+            env: Env::default(),
+            cwd: None,
+            fail_on_non_zero: Flag::disabled(), // не фейлим на ошибку
+        },
+        timeout_ms: 5_000,
+        restart: RestartStrategy::Never,
+        backoff: BackoffStrategy {
+            jitter: JitterStrategy::None,
+            first_ms: 0,
+            max_ms: 0,
+            factor: 1.0,
+        },
+        admission: AdmissionStrategy::DropIfRunning,
+        labels: Labels::default(),
+    }
+    .with_runner_tag("untrusted-runner");
+
+    // Submit tasks
+    info!("submitting tasks...");
     api.submit(&ls_spec).await?;
-    api.submit(&pwd_spec).await?;
     api.submit(&date_spec).await?;
+    api.submit(&sleep_spec).await?;
+    api.submit(&stress_spec).await?;
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    info!("all tasks submitted, waiting for completion...");
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    info!("demo completed");
     Ok(())
 }

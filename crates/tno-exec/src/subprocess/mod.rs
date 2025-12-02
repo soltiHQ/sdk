@@ -1,11 +1,12 @@
 //! Subprocess runner for `tno_model::TaskKind::Subprocess`.
 mod backend;
+pub use backend::SubprocessBackendConfig;
+
+mod task;
+pub use task::SubprocessTaskConfig;
 
 mod runner;
 pub use runner::SubprocessRunner;
-
-mod task;
-use crate::subprocess::backend::SubprocessBackendConfig;
 
 use std::sync::Arc;
 
