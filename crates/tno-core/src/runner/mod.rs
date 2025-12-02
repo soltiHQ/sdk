@@ -16,7 +16,8 @@ use tno_model::CreateSpec;
 /// Generic task runner used by the core layer.
 ///
 ///  [`unknown::unknown`](unknown::unknown)
-/// 
+///
+///
 /// A runner is responsible for:
 /// - deciding whether it can handle a given [`CreateSpec`] (`supports`)
 /// - building a concrete [`TaskRef`] that the supervisor can execute (`build_task`)
