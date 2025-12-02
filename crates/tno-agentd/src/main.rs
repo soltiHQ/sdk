@@ -76,9 +76,7 @@ async fn main() -> anyhow::Result<()> {
         })
         .with_security(SecurityConfig {
             drop_all_caps: true,
-            keep_caps: vec![
-                LinuxCapability::NetBindService,
-            ],
+            keep_caps: vec![LinuxCapability::NetBindService],
             no_new_privs: true, // CRITICAL  untrusted code
         });
     register_subprocess_runner_with_backend(&mut router, "untrusted-runner", untrusted_backend)?;
@@ -97,7 +95,6 @@ async fn main() -> anyhow::Result<()> {
     let (tz_task, tz_spec) = timezone_sync();
     let tz_policy = TaskPolicy::from_spec(&tz_spec);
     api.submit_with_task(tz_task, &tz_policy).await?;
-
 
     // 6a) Dev runner
     let ls_spec = CreateSpec {
