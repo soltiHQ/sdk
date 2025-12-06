@@ -1,0 +1,15 @@
+[package]
+name = "agentd"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+tno-observe = { path = "../../crates/tno-observe", features = ["timezone-sync", "subscriber"] }
+tno-exec    = { path = "../../crates/tno-exec", features = ["subprocess"] }
+tno-core    = { path = "../../crates/tno-core" }
+tno-model   = { path = "../../crates/tno-model" }
+
+taskvisor  = { workspace = true }
+tracing    = { workspace = true }
+anyhow     = { workspace = true }
+tokio      = { workspace = true }
