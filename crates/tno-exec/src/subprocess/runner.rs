@@ -1,6 +1,6 @@
 use std::{
     process::Stdio,
-    time::{Duration as StdDuration, SystemTime, UNIX_EPOCH}
+    time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 
 use taskvisor::{TaskError, TaskFn, TaskRef};
