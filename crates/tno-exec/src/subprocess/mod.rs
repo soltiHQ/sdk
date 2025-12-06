@@ -5,6 +5,9 @@ pub use backend::SubprocessBackendConfig;
 mod task;
 pub use task::SubprocessTaskConfig;
 
+mod logger;
+pub use logger::LogConfig;
+
 mod runner;
 pub use runner::SubprocessRunner;
 

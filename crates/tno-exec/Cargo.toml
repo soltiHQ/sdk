@@ -8,7 +8,7 @@ default = []
 subprocess = []
 
 [dependencies]
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["process", "io-util"] }
 tokio-util = { workspace = true }
 taskvisor = { workspace = true }
 thiserror = { workspace = true }

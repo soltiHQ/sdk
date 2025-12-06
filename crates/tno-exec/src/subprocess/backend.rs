@@ -2,6 +2,7 @@ use tokio::process::Command;
 use tracing::trace;
 
 use crate::ExecError::InvalidRunnerConfig;
+use crate::subprocess::logger::LogConfig;
 use crate::utils::{CgroupLimits, RlimitConfig, SecurityConfig};
 use crate::utils::{attach_cgroup, attach_rlimits, attach_security};
 
@@ -17,6 +18,8 @@ pub struct SubprocessBackendConfig {
     cgroups: Option<CgroupLimits>,
     /// Security hardening.
     security: Option<SecurityConfig>,
+    /// Subprocess output logging configuration.
+    logger: LogConfig,
 }
 
 impl SubprocessBackendConfig {
@@ -41,6 +44,17 @@ impl SubprocessBackendConfig {
     pub fn with_security(mut self, security: SecurityConfig) -> Self {
         self.security = Some(security);
         self
+    }
+
+    /// Set logger configuration.
+    pub fn with_logger(mut self, config: LogConfig) -> Self {
+        self.logger = config;
+        self
+    }
+
+    // Get log configuration.
+    pub(crate) fn log_config(&self) -> &LogConfig {
+        &self.logger
     }
 
     /// Check if any backend features are configured.
@@ -68,6 +82,11 @@ impl SubprocessBackendConfig {
         {
             return Err(InvalidRunnerConfig(
                 "rlimits.max_file_size_bytes cannot be zero".into(),
+            ));
+        }
+        if self.logger.max_line_length == 0 {
+            return Err(InvalidRunnerConfig(
+                "log_config.max_line_length cannot be zero".into(),
             ));
         }
         Ok(())
