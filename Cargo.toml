@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/tno-prometheus",
     "crates/tno-observe",
     "crates/tno-model",
     "crates/tno-core",
@@ -19,8 +20,10 @@ time = { version = "0.3" }
 serde = { version = "1", features = ["derive"] }
 tracing-journald = "0.3.1"
 taskvisor = { version = "0.0.12" }
+prometheus = "0.14.0"
 async-trait = { version = "0.1" }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 anyhow  = "1"
+libc = "0.2.177"

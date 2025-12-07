@@ -13,7 +13,7 @@ tokio-util = { workspace = true }
 taskvisor = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+libc = { workspace = true }
 
 tno-core = { path = "../tno-core" }
 tno-model = { path = "../tno-model" }
-libc = "0.2.177"

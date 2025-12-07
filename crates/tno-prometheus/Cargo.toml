@@ -1,0 +1,15 @@
+[package]
+name = "tno-prometheus"
+version = "0.0.1"
+edition = "2024"
+
+[features]
+default = []
+
+[dependencies]
+prometheus = { workspace = true }
+
+tno-core = { path = "../tno-core" }
+
+[dev-dependencies]
+tno-model = { path = "../tno-model" }
