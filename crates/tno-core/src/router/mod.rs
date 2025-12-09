@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use taskvisor::TaskRef;
-use tno_model::{CreateSpec, LABEL_RUNNER_TAG, Labels, TaskKind};
+use tno_model::{CreateSpec, LABEL_RUNNER_TAG, RunnerLabels, TaskKind};
 use tracing::{debug, instrument, trace};
 
 use crate::{
@@ -18,7 +18,7 @@ pub struct RunnerEntry {
     /// Concrete runner implementation.
     pub runner: Arc<dyn Runner>,
     /// Static labels attached to this runner (e.g. capacity class, backend tag).
-    pub labels: Labels,
+    pub labels: RunnerLabels,
 }
 
 /// Router that selects an appropriate [`Runner`] for a given [`CreateSpec`].
@@ -57,7 +57,7 @@ impl RunnerRouter {
     pub fn register(&mut self, runner: Arc<dyn Runner>) {
         self.runners.push(RunnerEntry {
             runner,
-            labels: Labels::default(),
+            labels: RunnerLabels::default(),
         });
     }
 
@@ -65,7 +65,7 @@ impl RunnerRouter {
     ///
     /// These labels are used by the router to further narrow down candidates when [`CreateSpec::runner_tag`] is set.
     #[inline]
-    pub fn register_with_labels(&mut self, runner: Arc<dyn Runner>, labels: Labels) {
+    pub fn register_with_labels(&mut self, runner: Arc<dyn Runner>, labels: RunnerLabels) {
         self.runners.push(RunnerEntry { runner, labels });
     }
 
@@ -132,7 +132,7 @@ mod tests {
     use std::path::PathBuf;
     use taskvisor::{TaskError, TaskFn};
     use tno_model::{
-        AdmissionStrategy, BackoffStrategy, Env, Flag, JitterStrategy, Labels, RestartStrategy,
+        AdmissionStrategy, BackoffStrategy, Env, Flag, JitterStrategy, RunnerLabels, RestartStrategy,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -177,7 +177,7 @@ mod tests {
             restart: RestartStrategy::default(),
             backoff: mk_backoff(),
             admission: AdmissionStrategy::DropIfRunning,
-            labels: Labels::default(),
+            labels: RunnerLabels::default(),
         }
     }
 
@@ -290,9 +290,9 @@ mod tests {
             }
         }
 
-        let mut labels_r1 = Labels::new();
+        let mut labels_r1 = RunnerLabels::new();
         labels_r1.insert(LABEL_RUNNER_TAG, "runner-a");
-        let mut labels_r2 = Labels::new();
+        let mut labels_r2 = RunnerLabels::new();
         labels_r2.insert(LABEL_RUNNER_TAG, "runner-b");
 
         let mut router = RunnerRouter::new();

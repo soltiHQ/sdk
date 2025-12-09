@@ -14,7 +14,7 @@ pub use runner::SubprocessRunner;
 use std::sync::Arc;
 
 use tno_core::RunnerRouter;
-use tno_model::{LABEL_RUNNER_TAG, Labels};
+use tno_model::{LABEL_RUNNER_TAG, RunnerLabels};
 
 use crate::ExecError;
 
@@ -29,7 +29,7 @@ pub fn register_subprocess_runner(
         });
     }
 
-    let mut labels = Labels::new();
+    let mut labels = RunnerLabels::new();
     labels.insert(LABEL_RUNNER_TAG, name);
     router.register_with_labels(Arc::new(SubprocessRunner::new(name)), labels);
     Ok(())
@@ -48,7 +48,7 @@ pub fn register_subprocess_runner_with_backend(
     }
     backend.validate()?;
 
-    let mut labels = Labels::new();
+    let mut labels = RunnerLabels::new();
     labels.insert(LABEL_RUNNER_TAG, name);
     router.register_with_labels(
         Arc::new(SubprocessRunner::with_config(name, backend)),

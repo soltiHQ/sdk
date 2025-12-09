@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    LABEL_RUNNER_TAG, Labels,
+    LABEL_RUNNER_TAG, RunnerLabels,
     domain::{Slot, TimeoutMs},
     kind::TaskKind,
     strategy::{AdmissionStrategy, BackoffStrategy, RestartStrategy},
@@ -47,8 +47,8 @@ pub struct CreateSpec {
     /// Optional metadata for routing / scheduling / observability.
     ///
     /// Router uses key `runner-tag` (if present) to select a specific runner among those that support this `TaskKind`.
-    #[serde(default, skip_serializing_if = "Labels::is_empty")]
-    pub labels: Labels,
+    #[serde(default, skip_serializing_if = "RunnerLabels::is_empty")]
+    pub labels: RunnerLabels,
 }
 
 impl CreateSpec {
@@ -61,7 +61,7 @@ impl CreateSpec {
     ///
     /// ```rust
     /// # use tno_model::{
-    /// #   CreateSpec, Labels, TaskKind, RestartStrategy, BackoffStrategy,
+    /// #   CreateSpec, RunnerLabels, TaskKind, RestartStrategy, BackoffStrategy,
     /// #   AdmissionStrategy, JitterStrategy, Env, Flag,
     /// # };
     /// let spec = CreateSpec {
@@ -82,7 +82,7 @@ impl CreateSpec {
     ///         factor: 1.0,
     ///     },
     ///     admission: AdmissionStrategy::DropIfRunning,
-    ///     labels: Labels::new(),
+    ///     labels: RunnerLabels::new(),
     /// }
     /// .with_runner_tag("runner-a");
     /// ```

@@ -1,6 +1,6 @@
 mod domain;
 pub use domain::LABEL_RUNNER_TAG;
-pub use domain::{Env, Flag, KeyValue, Labels, Slot, TaskId, TaskInfo, TaskStatus, TimeoutMs};
+pub use domain::{Env, Flag, KeyValue, RunnerLabels, Slot, TaskId, TaskInfo, TaskStatus, TimeoutMs};
 
 mod error;
 pub use error::ModelError;

@@ -1,6 +1,6 @@
 use tno_model::{
-    AdmissionStrategy, BackoffStrategy, CreateSpec, Env, Flag, JitterStrategy, Labels,
-    RestartStrategy, TaskInfo, TaskKind, TaskStatus,
+    AdmissionStrategy, BackoffStrategy, CreateSpec, Env, Flag, JitterStrategy, RestartStrategy,
+    RunnerLabels, TaskInfo, TaskKind, TaskStatus,
 };
 
 use crate::error::ApiError;
@@ -219,8 +219,8 @@ fn convert_admission_strategy(
     }
 }
 
-fn convert_labels(map: std::collections::HashMap<String, String>) -> Labels {
-    let mut labels = Labels::new();
+fn convert_labels(map: std::collections::HashMap<String, String>) -> RunnerLabels {
+    let mut labels = RunnerLabels::new();
     for (k, v) in map {
         labels.insert(k, v);
     }

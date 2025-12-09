@@ -13,7 +13,7 @@ use tno_exec::{CgroupLimits, CpuMax, LinuxCapability, RlimitConfig, SecurityConf
 use tno_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
 
 use tno_model::{
-    AdmissionStrategy, BackoffStrategy, CreateSpec, Env, Flag, JitterStrategy, Labels,
+    AdmissionStrategy, BackoffStrategy, CreateSpec, Env, Flag, JitterStrategy, RunnerLabels,
     RestartStrategy, TaskKind,
 };
 
@@ -117,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
             factor: 1.0,
         },
         admission: AdmissionStrategy::DropIfRunning,
-        labels: Labels::default(),
+        labels: RunnerLabels::default(),
     }
     .with_runner_tag("dev-runner");
 
@@ -140,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
             factor: 1.0,
         },
         admission: AdmissionStrategy::DropIfRunning,
-        labels: Labels::default(),
+        labels: RunnerLabels::default(),
     }
     .with_runner_tag("prod-runner");
 
@@ -163,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
             factor: 1.0,
         },
         admission: AdmissionStrategy::DropIfRunning,
-        labels: Labels::default(),
+        labels: RunnerLabels::default(),
     }
     .with_runner_tag("untrusted-runner");
 
@@ -189,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
             factor: 1.0,
         },
         admission: AdmissionStrategy::DropIfRunning,
-        labels: Labels::default(),
+        labels: RunnerLabels::default(),
     }
     .with_runner_tag("untrusted-runner");
 

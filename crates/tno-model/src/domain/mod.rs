@@ -7,8 +7,8 @@ pub use env::Env;
 mod flag;
 pub use flag::Flag;
 
-mod labels;
-pub use labels::Labels;
+mod runner_labels;
+pub use runner_labels::RunnerLabels;
 
 mod constants;
 pub use constants::LABEL_RUNNER_TAG;
