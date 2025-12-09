@@ -1,24 +1,24 @@
 use std::fmt;
 
-use tno_model::Env;
+use tno_model::TaskEnv;
 
 use crate::metrics::MetricsHandle;
 
 /// Shared build context passed to all runners.
 #[derive(Clone)]
 pub struct BuildContext {
-    env: Env,
+    env: TaskEnv,
     metrics: MetricsHandle,
 }
 
 impl BuildContext {
     /// Create a new build context with the given params.
-    pub fn new(env: Env, metrics: MetricsHandle) -> Self {
+    pub fn new(env: TaskEnv, metrics: MetricsHandle) -> Self {
         Self { env, metrics }
     }
 
     /// Get a reference to the shared environment.
-    pub fn env(&self) -> &Env {
+    pub fn env(&self) -> &TaskEnv {
         &self.env
     }
 
@@ -28,7 +28,7 @@ impl BuildContext {
     }
 
     /// Replace the environment and return updated context.
-    pub fn with_env(mut self, env: Env) -> Self {
+    pub fn with_env(mut self, env: TaskEnv) -> Self {
         self.env = env;
         self
     }
@@ -43,7 +43,7 @@ impl BuildContext {
 impl Default for BuildContext {
     fn default() -> Self {
         Self {
-            env: Env::default(),
+            env: TaskEnv::default(),
             metrics: crate::metrics::noop_metrics(),
         }
     }
@@ -67,7 +67,7 @@ impl fmt::Display for BuildContext {
 #[cfg(test)]
 mod tests {
     use super::BuildContext;
-    use tno_model::Env;
+    use tno_model::TaskEnv;
 
     #[test]
     fn default_build_context_has_empty_env_and_noop_metrics() {
@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn new_uses_provided_env_and_metrics() {
-        let mut env = Env::new();
+        let mut env = TaskEnv::new();
         env.push("FOO", "bar");
         env.push("BAZ", "qux");
 
@@ -91,10 +91,10 @@ mod tests {
 
     #[test]
     fn with_env_replaces_existing_env() {
-        let mut env1 = Env::new();
+        let mut env1 = TaskEnv::new();
         env1.push("FOO", "one");
 
-        let mut env2 = Env::new();
+        let mut env2 = TaskEnv::new();
         env2.push("BAR", "two");
 
         let metrics = crate::metrics::noop_metrics();
@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn with_metrics_replaces_backend() {
-        let env = Env::new();
+        let env = TaskEnv::new();
         let metrics1 = crate::metrics::noop_metrics();
         let metrics2 = crate::metrics::noop_metrics();
 
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn display_includes_env_length() {
-        let mut env = Env::new();
+        let mut env = TaskEnv::new();
         env.push("FOO", "bar");
 
         let metrics = crate::metrics::noop_metrics();

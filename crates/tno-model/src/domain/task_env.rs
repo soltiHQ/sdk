@@ -7,9 +7,9 @@ use crate::KeyValue;
 /// Internally stored as a list of key–value pairs and serialized as a transparent array wrapper.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Env(pub Vec<KeyValue>);
+pub struct TaskEnv(pub Vec<KeyValue>);
 
-impl Env {
+impl TaskEnv {
     /// Create an empty environment.
     pub fn new() -> Self {
         Self(Vec::new())
@@ -52,7 +52,7 @@ impl Env {
 
     /// Append a key–value pair to the environment.
     ///
-    /// Later entries override earlier ones when queried via [`Env::get`].
+    /// Later entries override earlier ones when queried via [`RunnerEnv::get`].
     pub fn push<K, V>(&mut self, key: K, value: V)
     where
         K: Into<String>,
@@ -63,15 +63,15 @@ impl Env {
 
     /// Merge two environments, where entries from `other` override earlier ones.
     ///
-    /// The environments are combined by simple concatenation, allowing [`Env::get`] to resolve overrides naturally by scanning from the end.
-    pub fn merged(&self, other: &Env) -> Env {
+    /// The environments are combined by simple concatenation, allowing [`RunnerEnv::get`] to resolve overrides naturally by scanning from the end.
+    pub fn merged(&self, other: &TaskEnv) -> TaskEnv {
         let mut out = self.0.clone();
         out.extend(other.0.clone());
-        Env(out)
+        TaskEnv(out)
     }
 }
 
-impl Default for Env {
+impl Default for TaskEnv {
     fn default() -> Self {
         Self::new()
     }
@@ -79,18 +79,18 @@ impl Default for Env {
 
 #[cfg(test)]
 mod tests {
-    use super::Env;
+    use super::TaskEnv;
 
     #[test]
     fn env_new_is_empty() {
-        let env = Env::new();
+        let env = TaskEnv::new();
         assert_eq!(env.0.len(), 0);
         assert!(env.get("FOO").is_none());
     }
 
     #[test]
     fn env_single_creates_one_entry() {
-        let env = Env::single("FOO", "bar");
+        let env = TaskEnv::single("FOO", "bar");
         let items: Vec<_> = env.iter().collect();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].key(), "FOO");
@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn env_push_and_override_last_wins() {
-        let mut env = Env::new();
+        let mut env = TaskEnv::new();
         env.push("FOO", "one");
         env.push("BAR", "x");
         env.push("FOO", "two");
@@ -113,14 +113,14 @@ mod tests {
     #[test]
     fn env_merged_other_overrides_base() {
         let base = {
-            let mut e = Env::new();
+            let mut e = TaskEnv::new();
             e.push("FOO", "base");
             e.push("BAR", "bar");
             e
         };
 
         let other = {
-            let mut e = Env::new();
+            let mut e = TaskEnv::new();
             e.push("FOO", "override");
             e.push("BAZ", "baz");
             e
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn serde_transparent_roundtrip_json() {
-        let mut env = Env::new();
+        let mut env = TaskEnv::new();
         env.push("FOO", "bar");
         env.push("BAZ", "qux");
 
@@ -144,7 +144,7 @@ mod tests {
         assert!(json.contains("\"key\":\"FOO\""));
         assert!(json.contains("\"value\":\"bar\""));
 
-        let back: Env = serde_json::from_str(&json).unwrap();
+        let back: TaskEnv = serde_json::from_str(&json).unwrap();
         assert_eq!(back.get("FOO"), Some("bar"));
         assert_eq!(back.get("BAZ"), Some("qux"));
     }

@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package tno.v1;
+
+import "tno/v1/types.proto";
+
+// Task management API
+service TnoApi {
+  // Submit a new task for execution
+  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+
+  // Get current task status
+  rpc GetTaskStatus(GetTaskStatusRequest) returns (GetTaskStatusResponse);
+}
+
+// SubmitTask request
+message SubmitTaskRequest {
+  CreateSpec spec = 1;
+}
+
+// SubmitTask response
+message SubmitTaskResponse {
+  string task_id = 1;
+}
+
+// GetTaskStatus request
+message GetTaskStatusRequest {
+  string task_id = 1;
+}
+
+// GetTaskStatus response
+message GetTaskStatusResponse {
+  optional TaskInfo info = 1;
+}

@@ -8,10 +8,12 @@ jobs:
     strategy:
       matrix:
         crate:
+          - tno-api
           - tno-core
           - tno-exec
           - tno-model
           - tno-observe
+          - tno-prometheus
     steps:
       - uses: actions/checkout@v4
       - name: Run docs gen

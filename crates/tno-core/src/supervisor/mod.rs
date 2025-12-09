@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Duration};
 use taskvisor::{
     ControllerConfig, ControllerSpec, Subscribe, Supervisor, SupervisorConfig, TaskRef, TaskSpec,
 };
-use tno_model::CreateSpec;
+use tno_model::{CreateSpec, TaskId, TaskInfo, TaskStatus};
 use tracing::{debug, info, instrument};
 
 use crate::{
@@ -17,6 +17,7 @@ use crate::{
     map::{to_admission_policy, to_backoff_policy, to_restart_policy},
     policy::TaskPolicy,
     router::RunnerRouter,
+    state::{StateSubscriber, TaskState},
 };
 
 /// Thin wrapper around taskvisor [`Supervisor`] with a runner router.
@@ -28,6 +29,7 @@ use crate::{
 pub struct SupervisorApi {
     sup: Arc<Supervisor>,
     router: RunnerRouter,
+    state: TaskState,
 }
 
 impl SupervisorApi {
@@ -42,9 +44,12 @@ impl SupervisorApi {
     pub async fn new(
         sup_cfg: SupervisorConfig,
         ctrl_cfg: ControllerConfig,
-        subscribers: Vec<Arc<dyn Subscribe>>,
+        mut subscribers: Vec<Arc<dyn Subscribe>>,
         router: RunnerRouter,
     ) -> Result<Self, CoreError> {
+        let state = TaskState::new();
+        subscribers.push(Arc::new(StateSubscriber::new(state.clone())));
+
         let sup = Supervisor::builder(sup_cfg)
             .with_subscribers(subscribers)
             .with_controller(ctrl_cfg)
@@ -59,7 +64,27 @@ impl SupervisorApi {
 
         sup.wait_ready().await;
         info!("supervisor is ready to accept tasks");
-        Ok(Self { sup, router })
+        Ok(Self { sup, router, state })
+    }
+
+    /// Get task information by ID.
+    pub fn get_task(&self, id: &TaskId) -> Option<TaskInfo> {
+        self.state.get(id)
+    }
+
+    /// List all tasks in a specific slot.
+    pub fn list_tasks_by_slot(&self, slot: &str) -> Vec<TaskInfo> {
+        self.state.list_by_slot(slot)
+    }
+
+    /// List all tasks.
+    pub fn list_all_tasks(&self) -> Vec<TaskInfo> {
+        self.state.list_all()
+    }
+
+    /// List tasks by status.
+    pub fn list_tasks_by_status(&self, status: TaskStatus) -> Vec<TaskInfo> {
+        self.state.list_by_status(status)
     }
 
     /// Get a clone of the underlying supervisor handle.
@@ -76,10 +101,15 @@ impl SupervisorApi {
     ///
     /// This is the primary entrypoint for tasks that are fully described by the public [`tno_model::TaskKind`] model.
     #[instrument(level = "debug", skip(self, spec), fields(slot = %spec.slot, kind = ?spec.kind))]
-    pub async fn submit(&self, spec: &CreateSpec) -> Result<(), CoreError> {
+    pub async fn submit(&self, spec: &CreateSpec) -> Result<TaskId, CoreError> {
         let task = self.router.build(spec)?;
+        let task_id = TaskId::from(task.name());
+
+        self.state.add_task(task_id.clone(), spec.slot.clone());
         let policy = TaskPolicy::from_spec(spec);
-        self.submit_with_task(task, &policy).await
+
+        self.submit_with_task(task, &policy).await?;
+        Ok(task_id)
     }
 
     /// Submit a pre-built task together with its runtime policy.
@@ -93,7 +123,10 @@ impl SupervisorApi {
         &self,
         task: TaskRef,
         policy: &TaskPolicy,
-    ) -> Result<(), CoreError> {
+    ) -> Result<TaskId, CoreError> {
+        let task_id = TaskId::from(task.name());
+        self.state.add_task(task_id.clone(), policy.slot.clone());
+
         let task_spec = TaskSpec::new(
             task,
             to_restart_policy(policy.restart),
@@ -109,7 +142,8 @@ impl SupervisorApi {
         self.sup
             .submit(controller_spec)
             .await
-            .map_err(|e| CoreError::Supervisor(e.to_string()))
+            .map_err(|e| CoreError::Supervisor(e.to_string()))?;
+        Ok(task_id)
     }
 }
 
@@ -119,7 +153,7 @@ mod tests {
 
     use taskvisor::{TaskError, TaskFn};
     use tno_model::{
-        AdmissionStrategy, BackoffStrategy, JitterStrategy, Labels, RestartStrategy, TaskKind,
+        AdmissionStrategy, BackoffStrategy, JitterStrategy, RestartStrategy, RunnerLabels, TaskKind,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -158,8 +192,12 @@ mod tests {
         );
 
         let res = api.submit_with_task(task, &policy).await;
-        if let Err(e) = res {
-            panic!("expected Ok(()), got error: {e:?}");
+        match res {
+            Ok(task_id) => {
+                assert!(!task_id.as_str().is_empty());
+                assert!(task_id.as_str().contains("test-task"));
+            }
+            Err(e) => panic!("expected Ok(TaskId), got error: {e:?}"),
         }
     }
 
@@ -182,18 +220,15 @@ mod tests {
             restart: RestartStrategy::Never,
             backoff: mk_backoff(),
             admission: AdmissionStrategy::DropIfRunning,
-            labels: Labels::default(),
+            labels: RunnerLabels::default(),
         };
         let res = api.submit(&spec).await;
 
         match res {
             Err(CoreError::NoRunner(msg)) => {
-                assert!(
-                    msg.contains("TaskKind::None"),
-                    "unexpected NoRunner message: {msg}"
-                );
+                assert!(msg.contains("TaskKind::None"));
             }
-            Ok(()) => panic!("expected error for TaskKind::None, got Ok(())"),
+            Ok(_) => panic!("expected error for TaskKind::None, got Ok(TaskId)"),
             Err(e) => panic!("expected CoreError::NoRunner, got {e:?}"),
         }
     }

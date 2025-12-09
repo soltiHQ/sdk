@@ -8,6 +8,7 @@ default = []
 
 [dependencies]
 taskvisor = { workspace = true, features = ["controller"] }
+async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

@@ -1,6 +1,6 @@
 use std::{fmt, path::PathBuf};
 
-use tno_model::{Env, Flag};
+use tno_model::{Flag, TaskEnv};
 
 use crate::ExecError;
 
@@ -16,7 +16,7 @@ pub struct SubprocessTaskConfig {
     /// Command-line arguments passed to the command.
     pub(crate) args: Vec<String>,
     /// Environment for the subprocess.
-    pub(crate) env: Env,
+    pub(crate) env: TaskEnv,
     /// Working directory for the subprocess.
     ///
     /// If `None`, the subprocess inherits the parent process working directory.

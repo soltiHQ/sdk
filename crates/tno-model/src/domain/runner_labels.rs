@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 /// Structured key–value metadata based on [`BTreeMap`].
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Labels(pub BTreeMap<String, String>);
+pub struct RunnerLabels(pub BTreeMap<String, String>);
 
-impl Labels {
+impl RunnerLabels {
     /// Create an empty set of labels.
     pub fn new() -> Self {
         Self(BTreeMap::new())

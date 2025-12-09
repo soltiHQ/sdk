@@ -1,6 +1,6 @@
 use taskvisor::{TaskError, TaskFn, TaskRef};
 use tno_model::{
-    AdmissionStrategy, BackoffStrategy, CreateSpec, JitterStrategy, Labels, RestartStrategy,
+    AdmissionStrategy, BackoffStrategy, CreateSpec, JitterStrategy, RestartStrategy, RunnerLabels,
     TaskKind,
 };
 use tokio_util::sync::CancellationToken;
@@ -60,7 +60,7 @@ pub fn timezone_sync() -> (TaskRef, CreateSpec) {
         backoff,
         admission: AdmissionStrategy::Replace,
         kind: TaskKind::None,
-        labels: Labels::default(),
+        labels: RunnerLabels::default(),
     };
     (task, spec)
 }

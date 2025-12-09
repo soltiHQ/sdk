@@ -22,3 +22,5 @@ pub use supervisor::SupervisorApi;
 
 mod metrics;
 pub use metrics::{MetricsBackend, MetricsHandle, NoOpMetrics, TaskOutcome, noop_metrics};
+
+mod state;

@@ -13,8 +13,8 @@ use tno_exec::{CgroupLimits, CpuMax, LinuxCapability, RlimitConfig, SecurityConf
 use tno_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
 
 use tno_model::{
-    AdmissionStrategy, BackoffStrategy, CreateSpec, Env, Flag, JitterStrategy, Labels,
-    RestartStrategy, TaskKind,
+    AdmissionStrategy, BackoffStrategy, CreateSpec, Flag, JitterStrategy, RestartStrategy,
+    RunnerLabels, TaskEnv, TaskKind,
 };
 
 #[tokio::main(flavor = "multi_thread")]
@@ -95,7 +95,8 @@ async fn main() -> anyhow::Result<()> {
     // 5) internal timezone-sync
     let (tz_task, tz_spec) = timezone_sync();
     let tz_policy = TaskPolicy::from_spec(&tz_spec);
-    api.submit_with_task(tz_task, &tz_policy).await?;
+    let tz_id = api.submit_with_task(tz_task, &tz_policy).await?;
+    info!("submitted timezone-sync task: {}", tz_id);
 
     // 6a) Dev runner
     let ls_spec = CreateSpec {
@@ -103,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
         kind: TaskKind::Subprocess {
             command: "ls".into(),
             args: vec!["-lah".into(), "/tmp".into()],
-            env: Env::default(),
+            env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
@@ -116,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
             factor: 1.0,
         },
         admission: AdmissionStrategy::DropIfRunning,
-        labels: Labels::default(),
+        labels: RunnerLabels::default(),
     }
     .with_runner_tag("dev-runner");
 
@@ -126,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
         kind: TaskKind::Subprocess {
             command: "date".into(),
             args: vec!["+%Y-%m-%d %H:%M:%S".into()],
-            env: Env::default(),
+            env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
@@ -139,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
             factor: 1.0,
         },
         admission: AdmissionStrategy::DropIfRunning,
-        labels: Labels::default(),
+        labels: RunnerLabels::default(),
     }
     .with_runner_tag("prod-runner");
 
@@ -149,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
         kind: TaskKind::Subprocess {
             command: "sleep".into(),
             args: vec!["2".into()],
-            env: Env::default(),
+            env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
@@ -162,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
             factor: 1.0,
         },
         admission: AdmissionStrategy::DropIfRunning,
-        labels: Labels::default(),
+        labels: RunnerLabels::default(),
     }
     .with_runner_tag("untrusted-runner");
 
@@ -175,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
                 "-c".into(),
                 "for i in $(seq 1 100); do sleep 1 & done; wait".into(),
             ],
-            env: Env::default(),
+            env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::disabled(),
         },
@@ -188,19 +189,36 @@ async fn main() -> anyhow::Result<()> {
             factor: 1.0,
         },
         admission: AdmissionStrategy::DropIfRunning,
-        labels: Labels::default(),
+        labels: RunnerLabels::default(),
     }
     .with_runner_tag("untrusted-runner");
 
     // Submit tasks
     info!("submitting tasks...");
-    api.submit(&ls_spec).await?;
-    api.submit(&date_spec).await?;
-    api.submit(&sleep_spec).await?;
-    api.submit(&stress_spec).await?;
+    let task_id = api.submit(&ls_spec).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    if let Some(info) = api.get_task(&task_id) {
+        info!("task {} status: {:?}", task_id, info.status);
+    }
+
+    info!("submitted task: {}", task_id);
+    let date_id = api.submit(&date_spec).await?;
+    info!("submitted date: {}", date_id);
+    let sleep_id = api.submit(&sleep_spec).await?;
+    info!("submitted sleep: {}", sleep_id);
+    let stress_id = api.submit(&stress_spec).await?;
+    info!("submitted stress: {}", stress_id);
 
     info!("all tasks submitted, waiting for completion...");
     tokio::time::sleep(Duration::from_secs(8)).await;
+
+    info!("=== Task Summary ===");
+    for task in api.list_all_tasks() {
+        info!(
+            "task {}: status={:?}, attempt={}, slot={}",
+            task.id, task.status, task.attempt, task.slot
+        );
+    }
 
     info!("demo completed");
     Ok(())

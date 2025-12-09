@@ -1,17 +1,26 @@
 mod kv;
 pub use kv::KeyValue;
 
-mod env;
-pub use env::Env;
+mod task_env;
+pub use task_env::TaskEnv;
 
 mod flag;
 pub use flag::Flag;
 
-mod labels;
-pub use labels::Labels;
+mod runner_labels;
+pub use runner_labels::RunnerLabels;
 
 mod constants;
 pub use constants::LABEL_RUNNER_TAG;
+
+mod task_id;
+pub use task_id::TaskId;
+
+mod task_info;
+pub use task_info::TaskInfo;
+
+mod task_status;
+pub use task_status::TaskStatus;
 
 /// Logical identifier for a controller slot.
 ///
