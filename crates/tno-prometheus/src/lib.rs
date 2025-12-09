@@ -7,7 +7,7 @@
 //! use std::sync::Arc;
 //! use tno_prometheus::PrometheusMetrics;
 //! use tno_core::BuildContext;
-//! use tno_model::Env;
+//! use tno_model::TaskEnv;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // Create prometheus metrics backend
@@ -15,7 +15,7 @@
 //! let metrics_handle = Arc::new(metrics.clone());
 //!
 //! // Inject into build context
-//! let ctx = BuildContext::new(Env::default(), metrics_handle);
+//! let ctx = BuildContext::new(TaskEnv::default(), metrics_handle);
 //!
 //! // Expose /metrics endpoint (example with custom HTTP server)
 //! // let metric_families = metrics.gather();

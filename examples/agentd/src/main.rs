@@ -13,7 +13,7 @@ use tno_exec::{CgroupLimits, CpuMax, LinuxCapability, RlimitConfig, SecurityConf
 use tno_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
 
 use tno_model::{
-    AdmissionStrategy, BackoffStrategy, CreateSpec, Env, Flag, JitterStrategy, RunnerLabels,
+    AdmissionStrategy, BackoffStrategy, CreateSpec, TaskEnv, Flag, JitterStrategy, RunnerLabels,
     RestartStrategy, TaskKind,
 };
 
@@ -104,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
         kind: TaskKind::Subprocess {
             command: "ls".into(),
             args: vec!["-lah".into(), "/tmp".into()],
-            env: Env::default(),
+            env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
@@ -127,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
         kind: TaskKind::Subprocess {
             command: "date".into(),
             args: vec!["+%Y-%m-%d %H:%M:%S".into()],
-            env: Env::default(),
+            env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
@@ -150,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
         kind: TaskKind::Subprocess {
             command: "sleep".into(),
             args: vec!["2".into()],
-            env: Env::default(),
+            env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
@@ -176,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
                 "-c".into(),
                 "for i in $(seq 1 100); do sleep 1 & done; wait".into(),
             ],
-            env: Env::default(),
+            env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::disabled(),
         },

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Env, Flag};
+use crate::{TaskEnv, Flag};
 
 /// Execution configuration for a task.
 ///
@@ -18,8 +18,8 @@ pub enum TaskKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
         /// Environment variables for the process.
-        #[serde(default, skip_serializing_if = "Env::is_empty")]
-        env: Env,
+        #[serde(default, skip_serializing_if = "TaskEnv::is_empty")]
+        env: TaskEnv,
         /// Working directory.
         ///
         /// If `None`, the process inherits the working directory of the parent (agent) process.
@@ -39,8 +39,8 @@ pub enum TaskKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
         /// Environment variables exposed to the WASI module.
-        #[serde(default, skip_serializing_if = "Env::is_empty")]
-        env: Env,
+        #[serde(default, skip_serializing_if = "TaskEnv::is_empty")]
+        env: TaskEnv,
     },
     /// Run a task inside an OCI-compatible container.
     Container {
@@ -55,8 +55,8 @@ pub enum TaskKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
         /// Environment variables for the container.
-        #[serde(default, skip_serializing_if = "Env::is_empty")]
-        env: Env,
+        #[serde(default, skip_serializing_if = "TaskEnv::is_empty")]
+        env: TaskEnv,
     },
     /// Built-in task that does not require a runner.
     ///

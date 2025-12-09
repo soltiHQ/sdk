@@ -62,14 +62,14 @@ impl CreateSpec {
     /// ```rust
     /// # use tno_model::{
     /// #   CreateSpec, RunnerLabels, TaskKind, RestartStrategy, BackoffStrategy,
-    /// #   AdmissionStrategy, JitterStrategy, Env, Flag,
+    /// #   AdmissionStrategy, JitterStrategy, TaskEnv, Flag,
     /// # };
     /// let spec = CreateSpec {
     ///     slot: "demo".into(),
     ///     kind: TaskKind::Subprocess {
     ///         command: "ls".into(),
     ///         args: vec!["/tmp".into()],
-    ///         env: Env::default(),
+    ///         env: TaskEnv::default(),
     ///         cwd: None,
     ///         fail_on_non_zero: Flag::enabled(),
     ///     },

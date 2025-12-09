@@ -132,7 +132,7 @@ mod tests {
     use std::path::PathBuf;
     use taskvisor::{TaskError, TaskFn};
     use tno_model::{
-        AdmissionStrategy, BackoffStrategy, Env, Flag, JitterStrategy, RunnerLabels, RestartStrategy,
+        AdmissionStrategy, BackoffStrategy, TaskEnv, Flag, JitterStrategy, RunnerLabels, RestartStrategy,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -208,7 +208,7 @@ mod tests {
         let spec = mk_spec(TaskKind::Subprocess {
             command: "echo".to_string(),
             args: vec!["hello".into()],
-            env: Env::default(),
+            env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::default(),
         });
@@ -229,7 +229,7 @@ mod tests {
         let spec = mk_spec(TaskKind::Wasm {
             module: PathBuf::from("mod.wasm"),
             args: Vec::new(),
-            env: Env::default(),
+            env: TaskEnv::default(),
         });
 
         let res = router.build(&spec);
@@ -303,7 +303,7 @@ mod tests {
             let base = mk_spec(TaskKind::Subprocess {
                 command: "echo".into(),
                 args: vec!["hi".into()],
-                env: Env::default(),
+                env: TaskEnv::default(),
                 cwd: None,
                 fail_on_non_zero: Flag::enabled(),
             });

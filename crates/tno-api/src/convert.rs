@@ -1,5 +1,5 @@
 use tno_model::{
-    AdmissionStrategy, BackoffStrategy, CreateSpec, Env, Flag, JitterStrategy, RestartStrategy,
+    AdmissionStrategy, BackoffStrategy, CreateSpec, TaskEnv, Flag, JitterStrategy, RestartStrategy,
     RunnerLabels, TaskInfo, TaskKind, TaskStatus,
 };
 
@@ -144,8 +144,8 @@ fn convert_task_kind(kind: proto::task_kind::Kind) -> Result<TaskKind, ApiError>
     }
 }
 
-fn convert_env(kvs: Vec<proto::KeyValue>) -> Env {
-    let mut env = Env::new();
+fn convert_env(kvs: Vec<proto::KeyValue>) -> TaskEnv {
+    let mut env = TaskEnv::new();
     for kv in kvs {
         env.push(kv.key, kv.value);
     }
