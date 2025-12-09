@@ -5,6 +5,7 @@ members = [
     "crates/tno-model",
     "crates/tno-core",
     "crates/tno-exec",
+    "crates/tno-api",
     "examples/agentd",
 ]
 resolver = "2"
@@ -27,3 +28,7 @@ thiserror = "2"
 tracing = "0.1"
 anyhow  = "1"
 libc = "0.2.177"
+tonic = "0.14.2"
+tonic-build = "0.14.2"
+prost = "0.14.1"
+axum = "0.8.7"
