@@ -13,6 +13,9 @@ pub use labels::Labels;
 mod constants;
 pub use constants::LABEL_RUNNER_TAG;
 
+mod id;
+pub use id::TaskId;
+
 /// Logical identifier for a controller slot.
 ///
 /// A slot groups tasks that must not run concurrently.

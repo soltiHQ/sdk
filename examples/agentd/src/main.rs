@@ -95,7 +95,8 @@ async fn main() -> anyhow::Result<()> {
     // 5) internal timezone-sync
     let (tz_task, tz_spec) = timezone_sync();
     let tz_policy = TaskPolicy::from_spec(&tz_spec);
-    api.submit_with_task(tz_task, &tz_policy).await?;
+    let tz_id = api.submit_with_task(tz_task, &tz_policy).await?;
+    info!("submitted timezone-sync task: {}", tz_id);
 
     // 6a) Dev runner
     let ls_spec = CreateSpec {
@@ -194,10 +195,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Submit tasks
     info!("submitting tasks...");
-    api.submit(&ls_spec).await?;
-    api.submit(&date_spec).await?;
-    api.submit(&sleep_spec).await?;
-    api.submit(&stress_spec).await?;
+    let task_id = api.submit(&ls_spec).await?;
+    info!("submitted task: {}", task_id);
+    let date_id = api.submit(&date_spec).await?;
+    info!("submitted date: {}", date_id);
+    let sleep_id = api.submit(&sleep_spec).await?;
+    info!("submitted sleep: {}", sleep_id);
+    let stress_id = api.submit(&stress_spec).await?;
+    info!("submitted stress: {}", stress_id);
 
     info!("all tasks submitted, waiting for completion...");
     tokio::time::sleep(Duration::from_secs(8)).await;

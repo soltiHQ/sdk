@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Duration};
 use taskvisor::{
     ControllerConfig, ControllerSpec, Subscribe, Supervisor, SupervisorConfig, TaskRef, TaskSpec,
 };
-use tno_model::CreateSpec;
+use tno_model::{CreateSpec, TaskId};
 use tracing::{debug, info, instrument};
 
 use crate::{
@@ -76,10 +76,13 @@ impl SupervisorApi {
     ///
     /// This is the primary entrypoint for tasks that are fully described by the public [`tno_model::TaskKind`] model.
     #[instrument(level = "debug", skip(self, spec), fields(slot = %spec.slot, kind = ?spec.kind))]
-    pub async fn submit(&self, spec: &CreateSpec) -> Result<(), CoreError> {
+    pub async fn submit(&self, spec: &CreateSpec) -> Result<TaskId, CoreError> {
         let task = self.router.build(spec)?;
+        let task_id = TaskId::from(task.name());
         let policy = TaskPolicy::from_spec(spec);
-        self.submit_with_task(task, &policy).await
+
+        self.submit_with_task(task, &policy).await?;
+        Ok(task_id)
     }
 
     /// Submit a pre-built task together with its runtime policy.
@@ -93,7 +96,9 @@ impl SupervisorApi {
         &self,
         task: TaskRef,
         policy: &TaskPolicy,
-    ) -> Result<(), CoreError> {
+    ) -> Result<TaskId, CoreError> {
+        let task_id = TaskId::from(task.name());
+
         let task_spec = TaskSpec::new(
             task,
             to_restart_policy(policy.restart),
@@ -109,7 +114,8 @@ impl SupervisorApi {
         self.sup
             .submit(controller_spec)
             .await
-            .map_err(|e| CoreError::Supervisor(e.to_string()))
+            .map_err(|e| CoreError::Supervisor(e.to_string()))?;
+        Ok(task_id)
     }
 }
 
@@ -158,8 +164,12 @@ mod tests {
         );
 
         let res = api.submit_with_task(task, &policy).await;
-        if let Err(e) = res {
-            panic!("expected Ok(()), got error: {e:?}");
+        match res {
+            Ok(task_id) => {
+                assert!(!task_id.as_str().is_empty());
+                assert!(task_id.as_str().contains("test-task"));
+            }
+            Err(e) => panic!("expected Ok(TaskId), got error: {e:?}"),
         }
     }
 
@@ -188,12 +198,9 @@ mod tests {
 
         match res {
             Err(CoreError::NoRunner(msg)) => {
-                assert!(
-                    msg.contains("TaskKind::None"),
-                    "unexpected NoRunner message: {msg}"
-                );
+                assert!(msg.contains("TaskKind::None"));
             }
-            Ok(()) => panic!("expected error for TaskKind::None, got Ok(())"),
+            Ok(_) => panic!("expected error for TaskKind::None, got Ok(TaskId)"),
             Err(e) => panic!("expected CoreError::NoRunner, got {e:?}"),
         }
     }
