@@ -21,6 +21,7 @@ axum = { workspace = true, optional = true }
 
 tno-core = { path = "../tno-core" }
 tno-model = { path = "../tno-model" }
+serde = { version = "1.0.228", features = ["derive"] }
 
 [build-dependencies]
 tonic-build = { workspace = true }

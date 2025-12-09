@@ -26,3 +26,23 @@ impl From<ApiError> for tonic::Status {
         }
     }
 }
+
+#[cfg(feature = "http")]
+impl axum::response::IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        use axum::http::StatusCode;
+
+        let (status, message) = match self {
+            ApiError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            ApiError::TaskNotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::Core(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+
+        let body = serde_json::json!({
+            "error": message
+        });
+
+        (status, axum::Json(body)).into_response()
+    }
+}

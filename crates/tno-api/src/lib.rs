@@ -26,3 +26,12 @@ pub use proto::tno_api_server::TnoApiServer;
 
 #[cfg(feature = "grpc")]
 pub use tonic;
+
+#[cfg(feature = "http")]
+mod http;
+
+#[cfg(feature = "http")]
+pub use http::HttpApi;
+
+#[cfg(feature = "http")]
+pub use axum;

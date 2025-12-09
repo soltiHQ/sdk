@@ -1,0 +1,18 @@
+[package]
+name = "http-server"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[dependencies]
+tno-prometheus = { path = "../../crates/tno-prometheus" }
+tno-observe = { path = "../../crates/tno-observe", features = ["timezone-sync", "subscriber"] }
+tno-exec = { path = "../../crates/tno-exec", features = ["subprocess"] }
+tno-api = { path = "../../crates/tno-api", features = ["http"] }
+tno-core = { path = "../../crates/tno-core" }
+tno-model = { path = "../../crates/tno-model" }
+
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+taskvisor = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
