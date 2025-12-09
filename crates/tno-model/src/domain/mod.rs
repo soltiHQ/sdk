@@ -13,8 +13,14 @@ pub use labels::Labels;
 mod constants;
 pub use constants::LABEL_RUNNER_TAG;
 
-mod id;
-pub use id::TaskId;
+mod task_id;
+pub use task_id::TaskId;
+
+mod task_info;
+pub use task_info::TaskInfo;
+
+mod task_status;
+pub use task_status::TaskStatus;
 
 /// Logical identifier for a controller slot.
 ///

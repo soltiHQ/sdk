@@ -196,6 +196,11 @@ async fn main() -> anyhow::Result<()> {
     // Submit tasks
     info!("submitting tasks...");
     let task_id = api.submit(&ls_spec).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    if let Some(info) = api.get_task(&task_id) {
+        info!("task {} status: {:?}", task_id, info.status);
+    }
+
     info!("submitted task: {}", task_id);
     let date_id = api.submit(&date_spec).await?;
     info!("submitted date: {}", date_id);
@@ -206,6 +211,14 @@ async fn main() -> anyhow::Result<()> {
 
     info!("all tasks submitted, waiting for completion...");
     tokio::time::sleep(Duration::from_secs(8)).await;
+
+    info!("=== Task Summary ===");
+    for task in api.list_all_tasks() {
+        info!(
+            "task {}: status={:?}, attempt={}, slot={}",
+            task.id, task.status, task.attempt, task.slot
+        );
+    }
 
     info!("demo completed");
     Ok(())
