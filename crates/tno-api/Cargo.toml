@@ -23,4 +23,6 @@ tno-core = { path = "../tno-core" }
 tno-model = { path = "../tno-model" }
 
 [build-dependencies]
-tonic-build = { workspace = true, optional = true }
+tonic-build = { workspace = true }
+prost-build = { workspace = true }
+protoc-bin-vendored = "3"
