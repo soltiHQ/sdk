@@ -8,10 +8,10 @@ use tno_api::{SupervisorApiAdapter, TnoApiServer, TnoApiService};
 use tno_core::{RunnerRouter, SupervisorApi};
 use tno_exec::subprocess::register_subprocess_runner;
 use tno_model::{
-    AdmissionStrategy, BackoffStrategy, CreateSpec, TaskEnv, Flag, JitterStrategy, RunnerLabels,
-    RestartStrategy, TaskKind,
+    AdmissionStrategy, BackoffStrategy, CreateSpec, Flag, JitterStrategy, RestartStrategy,
+    RunnerLabels, TaskEnv, TaskKind,
 };
-use tno_observe::{init_logger, LoggerConfig, LoggerLevel, Subscriber, timezone_sync};
+use tno_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         subscribers,
         router,
     )
-        .await?;
+    .await?;
     info!("supervisor ready");
 
     // 4) Submit timezone sync task
