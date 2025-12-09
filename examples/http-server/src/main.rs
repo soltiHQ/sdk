@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         subscribers,
         router,
     )
-        .await?;
+    .await?;
     info!("supervisor ready");
 
     // 5) Submit timezone sync task
@@ -63,7 +63,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 8) Add /metrics endpoint
     let metrics_clone = metrics.clone();
-    let app = app.route("/metrics", get(move || metrics_handler(metrics_clone.clone())));
+    let app = app.route(
+        "/metrics",
+        get(move || metrics_handler(metrics_clone.clone())),
+    );
 
     // 9) Start HTTP server
     let addr = "0.0.0.0:8080";
