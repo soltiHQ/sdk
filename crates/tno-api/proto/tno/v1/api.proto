@@ -11,6 +11,18 @@ service TnoApi {
 
   // Get current task status
   rpc GetTaskStatus(GetTaskStatusRequest) returns (GetTaskStatusResponse);
+
+  // List all tasks
+  rpc ListAllTasks(ListAllTasksRequest) returns (ListAllTasksResponse);
+
+  // List tasks in a specific slot
+  rpc ListTasksBySlot(ListTasksBySlotRequest) returns (ListTasksBySlotResponse);
+
+  // List tasks by status
+  rpc ListTasksByStatus(ListTasksByStatusRequest) returns (ListTasksByStatusResponse);
+
+  // Cancel a running task
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
 }
 
 // SubmitTask request
@@ -32,3 +44,39 @@ message GetTaskStatusRequest {
 message GetTaskStatusResponse {
   optional TaskInfo info = 1;
 }
+
+// ListAllTasks request
+message ListAllTasksRequest {}
+
+// ListAllTasks response
+message ListAllTasksResponse {
+  repeated TaskInfo tasks = 1;
+}
+
+// ListTasksBySlot request
+message ListTasksBySlotRequest {
+  string slot = 1;
+}
+
+// ListTasksBySlot response
+message ListTasksBySlotResponse {
+  repeated TaskInfo tasks = 1;
+}
+
+// ListTasksByStatus request
+message ListTasksByStatusRequest {
+  TaskStatus status = 1;
+}
+
+// ListTasksByStatus response
+message ListTasksByStatusResponse {
+  repeated TaskInfo tasks = 1;
+}
+
+// CancelTask request
+message CancelTaskRequest {
+  string task_id = 1;
+}
+
+// CancelTask response (empty on success)
+message CancelTaskResponse {}

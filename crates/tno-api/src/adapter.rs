@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tno_core::SupervisorApi;
-use tno_model::{CreateSpec, TaskId, TaskInfo};
+use tno_model::{CreateSpec, TaskId, TaskInfo, TaskStatus};
 
 use crate::error::ApiError;
 use crate::handler::ApiHandler;
@@ -29,5 +29,24 @@ impl ApiHandler for SupervisorApiAdapter {
 
     async fn get_task_status(&self, id: &TaskId) -> Result<Option<TaskInfo>, ApiError> {
         Ok(self.supervisor.get_task(id))
+    }
+
+    async fn list_all_tasks(&self) -> Result<Vec<TaskInfo>, ApiError> {
+        Ok(self.supervisor.list_all_tasks())
+    }
+
+    async fn list_tasks_by_slot(&self, slot: &str) -> Result<Vec<TaskInfo>, ApiError> {
+        Ok(self.supervisor.list_tasks_by_slot(slot))
+    }
+
+    async fn list_tasks_by_status(&self, status: TaskStatus) -> Result<Vec<TaskInfo>, ApiError> {
+        Ok(self.supervisor.list_tasks_by_status(status))
+    }
+
+    async fn cancel_task(&self, id: &TaskId) -> Result<(), ApiError> {
+        self.supervisor
+            .cancel_task(id)
+            .await
+            .map_err(ApiError::from)
     }
 }

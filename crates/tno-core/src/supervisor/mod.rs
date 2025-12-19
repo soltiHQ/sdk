@@ -145,6 +145,47 @@ impl SupervisorApi {
             .map_err(|e| CoreError::Supervisor(e.to_string()))?;
         Ok(task_id)
     }
+
+    /// Cancel a running task by ID.
+    ///
+    /// This sends cancellation signal to the task and waits for confirmation
+    /// with the configured grace period (from SupervisorConfig).
+    ///
+    /// The task must be cooperative and respect the `CancellationToken`
+    /// passed during execution.
+    ///
+    /// Returns:
+    /// - `Ok(())` if task was found and successfully cancelled
+    /// - `Err(CoreError::Supervisor)` if task not found or cancellation timed out
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// api.cancel_task(&task_id).await?;
+    /// ```
+    #[instrument(level = "debug", skip(self), fields(task_id = %id))]
+    pub async fn cancel_task(&self, id: &TaskId) -> Result<(), CoreError> {
+        debug!("cancelling task: {}", id);
+
+        if self.state.get(id).is_none() {
+            return Err(CoreError::Supervisor(format!("task not found: {}", id)));
+        }
+
+        let was_cancelled = self
+            .sup
+            .cancel(id.as_str())
+            .await
+            .map_err(|e| CoreError::Supervisor(format!("cancel failed: {}", e)))?;
+
+        if !was_cancelled {
+            return Err(CoreError::Supervisor(format!(
+                "task not found in registry: {}",
+                id
+            )));
+        }
+
+        debug!("task cancelled successfully: {}", id);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

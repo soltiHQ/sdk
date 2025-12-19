@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use tno_model::{CreateSpec, TaskId, TaskInfo};
+use tno_model::{CreateSpec, TaskId, TaskInfo, TaskStatus};
 
 use crate::error::ApiError;
 
@@ -15,4 +15,19 @@ pub trait ApiHandler: Send + Sync + 'static {
 
     /// Get current status of a task by ID.
     async fn get_task_status(&self, id: &TaskId) -> Result<Option<TaskInfo>, ApiError>;
+
+    /// List all tasks.
+    async fn list_all_tasks(&self) -> Result<Vec<TaskInfo>, ApiError>;
+
+    /// List tasks in a specific slot.
+    async fn list_tasks_by_slot(&self, slot: &str) -> Result<Vec<TaskInfo>, ApiError>;
+
+    /// List tasks by status.
+    async fn list_tasks_by_status(&self, status: TaskStatus) -> Result<Vec<TaskInfo>, ApiError>;
+
+    /// Cancel a running task.
+    ///
+    /// Sends cancellation signal to the task. The task must cooperate
+    /// by checking its `CancellationToken`.
+    async fn cancel_task(&self, id: &TaskId) -> Result<(), ApiError>;
 }
