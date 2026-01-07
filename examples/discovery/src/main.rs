@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     autodiscovery_config.validate()?;
     info!(
-        "autodiscovery configured: lighthouse={}",
+        "discovery configured: lighthouse={}",
         autodiscovery_config.lighthouse_endpoint
     );
 
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("heartbeat task submitted: {}", heartbeat_id);
 
     // 6) Keep running
-    info!("agent is running with autodiscovery enabled");
+    info!("agent is running with discovery enabled");
     info!("press Ctrl+C to stop");
 
     tokio::signal::ctrl_c().await?;

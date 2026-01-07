@@ -1,5 +1,5 @@
 #[derive(Debug, Clone)]
-pub struct AutodiscoveryConfig {
+pub struct DiscoveryConfig {
     /// Unique agent identifier.
     pub agent_id: String,
     /// Agent's own API endpoint (what lighthouse should call back).
@@ -12,7 +12,7 @@ pub struct AutodiscoveryConfig {
     pub heartbeat_timeout_ms: u64,
 }
 
-impl Default for AutodiscoveryConfig {
+impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
             agent_id: hostname::get()
@@ -27,7 +27,7 @@ impl Default for AutodiscoveryConfig {
     }
 }
 
-impl AutodiscoveryConfig {
+impl DiscoveryConfig {
     pub fn validate(&self) -> Result<(), String> {
         Ok(())
     }

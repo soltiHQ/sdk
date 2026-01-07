@@ -7,9 +7,9 @@ members = [
     "crates/tno-exec",
     "crates/tno-api",
 
-    "examples/autodiscovery",
     "examples/grpc-server",
     "examples/http-server",
+    "examples/discovery",
     "examples/agentd",
 ]
 resolver = "2"

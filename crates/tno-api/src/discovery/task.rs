@@ -8,14 +8,14 @@ use tno_model::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use super::config::AutodiscoveryConfig;
+use super::config::DiscoveryConfig;
 use crate::proto_autodiscovery::{
     HeartbeatRequest, lighthouse_discovery_client::LighthouseDiscoveryClient,
 };
 
-const HEARTBEAT_SLOT: &str = "tno-api-autodiscovery-heartbeat";
+const HEARTBEAT_SLOT: &str = "tno-api-discovery-heartbeat";
 
-pub fn build_heartbeat_task(config: AutodiscoveryConfig) -> (TaskRef, CreateSpec) {
+pub fn build_heartbeat_task(config: DiscoveryConfig) -> (TaskRef, CreateSpec) {
     let config_for_task = config.clone();
     let config_for_spec = config.clone();
 
@@ -61,7 +61,7 @@ pub fn build_heartbeat_task(config: AutodiscoveryConfig) -> (TaskRef, CreateSpec
     (task, spec)
 }
 
-async fn send_heartbeat(config: &AutodiscoveryConfig) -> Result<(), String> {
+async fn send_heartbeat(config: &DiscoveryConfig) -> Result<(), String> {
     let endpoint = config.lighthouse_endpoint.clone();
 
     let mut client = LighthouseDiscoveryClient::connect(endpoint)

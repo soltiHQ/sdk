@@ -7,7 +7,7 @@ edition = "2024"
 default = []
 grpc = ["dep:tonic", "dep:prost"]
 http = ["dep:axum", "dep:serde_json"]
-autodiscovery = ["grpc", "dep:tokio", "dep:taskvisor", "dep:tokio-util"]
+discovery = ["grpc", "dep:tokio", "dep:taskvisor", "dep:tokio-util"]
 
 [dependencies]
 async-trait = { workspace = true }

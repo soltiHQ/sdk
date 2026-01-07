@@ -36,16 +36,16 @@ pub use http::HttpApi;
 #[cfg(feature = "http")]
 pub use axum;
 
-#[cfg(feature = "autodiscovery")]
+#[cfg(feature = "discovery")]
 mod proto_autodiscovery {
     tonic::include_proto!("lighthouse.v1");
 }
 
-#[cfg(feature = "autodiscovery")]
-mod autodiscovery;
+#[cfg(feature = "discovery")]
+mod discovery;
 
-#[cfg(feature = "autodiscovery")]
-pub use autodiscovery::AutodiscoveryConfig;
+#[cfg(feature = "discovery")]
+pub use discovery::DiscoveryConfig;
 
-#[cfg(feature = "autodiscovery")]
-pub use autodiscovery::build_heartbeat_task;
+#[cfg(feature = "discovery")]
+pub use discovery::build_heartbeat_task;
