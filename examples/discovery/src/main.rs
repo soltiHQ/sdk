@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
-use tno_api::{AutodiscoveryConfig, build_heartbeat_task};
+use tno_api::{DiscoveryConfig, build_heartbeat_task};
 use tno_core::{RunnerRouter, SupervisorApi, TaskPolicy};
 use tno_exec::subprocess::register_subprocess_runner;
 use tno_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger};
@@ -34,8 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     info!("supervisor ready");
 
-    // 4) Autodiscovery configuration
-    let autodiscovery_config = AutodiscoveryConfig {
+    // 4) Discovery configuration
+    let autodiscovery_config = DiscoveryConfig {
         agent_id: "demo-agent-1".to_string(),
         agent_endpoint: "http://localhost:8080".to_string(),
         lighthouse_endpoint: "http://localhost:50051".to_string(),
