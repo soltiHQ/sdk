@@ -9,6 +9,7 @@ members = [
 
     "examples/grpc-server",
     "examples/http-server",
+    "examples/discovery",
     "examples/agentd",
 ]
 resolver = "2"
@@ -32,6 +33,7 @@ tracing = "0.1"
 anyhow  = "1"
 libc = "0.2.177"
 axum = "0.8.7"
+hostname = "0.4.2"
 
 tonic = "0.12"
 tonic-build = "0.12"
