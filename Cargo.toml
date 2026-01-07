@@ -7,6 +7,7 @@ members = [
     "crates/tno-exec",
     "crates/tno-api",
 
+    "examples/autodiscovery",
     "examples/grpc-server",
     "examples/http-server",
     "examples/agentd",
@@ -32,6 +33,7 @@ tracing = "0.1"
 anyhow  = "1"
 libc = "0.2.177"
 axum = "0.8.7"
+hostname = "0.4.2"
 
 tonic = "0.12"
 tonic-build = "0.12"

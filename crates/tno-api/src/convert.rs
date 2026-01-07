@@ -4,22 +4,22 @@ use tno_model::{
 };
 
 use crate::error::ApiError;
-use crate::proto;
+use crate::proto_api;
 
 // ============================================================================
 // TaskStatus conversions
 // ============================================================================
 
-impl From<TaskStatus> for proto::TaskStatus {
+impl From<TaskStatus> for proto_api::TaskStatus {
     fn from(status: TaskStatus) -> Self {
         match status {
-            TaskStatus::Pending => proto::TaskStatus::Pending,
-            TaskStatus::Running => proto::TaskStatus::Running,
-            TaskStatus::Succeeded => proto::TaskStatus::Succeeded,
-            TaskStatus::Failed => proto::TaskStatus::Failed,
-            TaskStatus::Timeout => proto::TaskStatus::Timeout,
-            TaskStatus::Canceled => proto::TaskStatus::Canceled,
-            TaskStatus::Exhausted => proto::TaskStatus::Exhausted,
+            TaskStatus::Pending => proto_api::TaskStatus::Pending,
+            TaskStatus::Running => proto_api::TaskStatus::Running,
+            TaskStatus::Succeeded => proto_api::TaskStatus::Succeeded,
+            TaskStatus::Failed => proto_api::TaskStatus::Failed,
+            TaskStatus::Timeout => proto_api::TaskStatus::Timeout,
+            TaskStatus::Canceled => proto_api::TaskStatus::Canceled,
+            TaskStatus::Exhausted => proto_api::TaskStatus::Exhausted,
         }
     }
 }
@@ -28,7 +28,7 @@ impl From<TaskStatus> for proto::TaskStatus {
 // TaskInfo conversions
 // ============================================================================
 
-impl From<TaskInfo> for proto::TaskInfo {
+impl From<TaskInfo> for proto_api::TaskInfo {
     fn from(info: TaskInfo) -> Self {
         use std::time::UNIX_EPOCH;
 
@@ -44,10 +44,10 @@ impl From<TaskInfo> for proto::TaskInfo {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        proto::TaskInfo {
+        proto_api::TaskInfo {
             id: info.id.to_string(),
             slot: info.slot,
-            status: proto::TaskStatus::from(info.status) as i32,
+            status: proto_api::TaskStatus::from(info.status) as i32,
             attempt: info.attempt,
             created_at,
             updated_at,
@@ -60,10 +60,10 @@ impl From<TaskInfo> for proto::TaskInfo {
 // CreateSpec conversions (Proto → Domain)
 // ============================================================================
 
-impl TryFrom<proto::CreateSpec> for CreateSpec {
+impl TryFrom<proto_api::CreateSpec> for CreateSpec {
     type Error = ApiError;
 
-    fn try_from(spec: proto::CreateSpec) -> Result<Self, Self::Error> {
+    fn try_from(spec: proto_api::CreateSpec) -> Result<Self, Self::Error> {
         let kind = spec
             .kind
             .ok_or_else(|| ApiError::InvalidRequest("missing task kind".into()))?
@@ -73,7 +73,7 @@ impl TryFrom<proto::CreateSpec> for CreateSpec {
         let task_kind = convert_task_kind(kind)?;
 
         let restart = convert_restart_strategy(
-            proto::RestartStrategy::try_from(spec.restart)
+            proto_api::RestartStrategy::try_from(spec.restart)
                 .map_err(|_| ApiError::InvalidRequest("invalid restart strategy".into()))?,
             spec.restart_interval_ms,
         )?;
@@ -89,7 +89,7 @@ impl TryFrom<proto::CreateSpec> for CreateSpec {
             restart,
             backoff: convert_backoff_strategy(backoff)?,
             admission: convert_admission_strategy(
-                proto::AdmissionStrategy::try_from(spec.admission)
+                proto_api::AdmissionStrategy::try_from(spec.admission)
                     .map_err(|_| ApiError::InvalidRequest("invalid admission strategy".into()))?,
             )?,
             labels: convert_labels(spec.labels),
@@ -97,9 +97,9 @@ impl TryFrom<proto::CreateSpec> for CreateSpec {
     }
 }
 
-fn convert_task_kind(kind: proto::task_kind::Kind) -> Result<TaskKind, ApiError> {
+fn convert_task_kind(kind: proto_api::task_kind::Kind) -> Result<TaskKind, ApiError> {
     match kind {
-        proto::task_kind::Kind::Subprocess(sub) => {
+        proto_api::task_kind::Kind::Subprocess(sub) => {
             if sub.command.trim().is_empty() {
                 return Err(ApiError::InvalidRequest(
                     "subprocess command is empty".into(),
@@ -114,7 +114,7 @@ fn convert_task_kind(kind: proto::task_kind::Kind) -> Result<TaskKind, ApiError>
                 fail_on_non_zero: Flag::from(sub.fail_on_non_zero),
             })
         }
-        proto::task_kind::Kind::Wasm(wasm) => {
+        proto_api::task_kind::Kind::Wasm(wasm) => {
             if wasm.module.trim().is_empty() {
                 return Err(ApiError::InvalidRequest("wasm module path is empty".into()));
             }
@@ -125,7 +125,7 @@ fn convert_task_kind(kind: proto::task_kind::Kind) -> Result<TaskKind, ApiError>
                 env: convert_env(wasm.env),
             })
         }
-        proto::task_kind::Kind::Container(cont) => {
+        proto_api::task_kind::Kind::Container(cont) => {
             if cont.image.trim().is_empty() {
                 return Err(ApiError::InvalidRequest("container image is empty".into()));
             }
@@ -144,7 +144,7 @@ fn convert_task_kind(kind: proto::task_kind::Kind) -> Result<TaskKind, ApiError>
     }
 }
 
-fn convert_env(kvs: Vec<proto::KeyValue>) -> TaskEnv {
+fn convert_env(kvs: Vec<proto_api::KeyValue>) -> TaskEnv {
     let mut env = TaskEnv::new();
     for kv in kvs {
         env.push(kv.key, kv.value);
@@ -153,29 +153,31 @@ fn convert_env(kvs: Vec<proto::KeyValue>) -> TaskEnv {
 }
 
 fn convert_restart_strategy(
-    strategy: proto::RestartStrategy,
+    strategy: proto_api::RestartStrategy,
     interval_ms: Option<u64>,
 ) -> Result<RestartStrategy, ApiError> {
     match strategy {
-        proto::RestartStrategy::Never => Ok(RestartStrategy::Never),
-        proto::RestartStrategy::OnFailure => Ok(RestartStrategy::OnFailure),
-        proto::RestartStrategy::Always => Ok(RestartStrategy::Always { interval_ms }),
-        proto::RestartStrategy::Unspecified => Err(ApiError::InvalidRequest(
+        proto_api::RestartStrategy::Never => Ok(RestartStrategy::Never),
+        proto_api::RestartStrategy::OnFailure => Ok(RestartStrategy::OnFailure),
+        proto_api::RestartStrategy::Always => Ok(RestartStrategy::Always { interval_ms }),
+        proto_api::RestartStrategy::Unspecified => Err(ApiError::InvalidRequest(
             "restart strategy not specified".into(),
         )),
     }
 }
 
-fn convert_backoff_strategy(backoff: proto::BackoffStrategy) -> Result<BackoffStrategy, ApiError> {
-    let jitter = proto::JitterStrategy::try_from(backoff.jitter)
+fn convert_backoff_strategy(
+    backoff: proto_api::BackoffStrategy,
+) -> Result<BackoffStrategy, ApiError> {
+    let jitter = proto_api::JitterStrategy::try_from(backoff.jitter)
         .map_err(|_| ApiError::InvalidRequest("invalid jitter strategy".into()))?;
 
     let jitter = match jitter {
-        proto::JitterStrategy::None => JitterStrategy::None,
-        proto::JitterStrategy::Full => JitterStrategy::Full,
-        proto::JitterStrategy::Equal => JitterStrategy::Equal,
-        proto::JitterStrategy::Decorrelated => JitterStrategy::Decorrelated,
-        proto::JitterStrategy::Unspecified => {
+        proto_api::JitterStrategy::None => JitterStrategy::None,
+        proto_api::JitterStrategy::Full => JitterStrategy::Full,
+        proto_api::JitterStrategy::Equal => JitterStrategy::Equal,
+        proto_api::JitterStrategy::Decorrelated => JitterStrategy::Decorrelated,
+        proto_api::JitterStrategy::Unspecified => {
             return Err(ApiError::InvalidRequest(
                 "jitter strategy not specified".into(),
             ));
@@ -207,13 +209,13 @@ fn convert_backoff_strategy(backoff: proto::BackoffStrategy) -> Result<BackoffSt
 }
 
 fn convert_admission_strategy(
-    strategy: proto::AdmissionStrategy,
+    strategy: proto_api::AdmissionStrategy,
 ) -> Result<AdmissionStrategy, ApiError> {
     match strategy {
-        proto::AdmissionStrategy::DropIfRunning => Ok(AdmissionStrategy::DropIfRunning),
-        proto::AdmissionStrategy::Replace => Ok(AdmissionStrategy::Replace),
-        proto::AdmissionStrategy::Queue => Ok(AdmissionStrategy::Queue),
-        proto::AdmissionStrategy::Unspecified => Err(ApiError::InvalidRequest(
+        proto_api::AdmissionStrategy::DropIfRunning => Ok(AdmissionStrategy::DropIfRunning),
+        proto_api::AdmissionStrategy::Replace => Ok(AdmissionStrategy::Replace),
+        proto_api::AdmissionStrategy::Queue => Ok(AdmissionStrategy::Queue),
+        proto_api::AdmissionStrategy::Unspecified => Err(ApiError::InvalidRequest(
             "admission strategy not specified".into(),
         )),
     }

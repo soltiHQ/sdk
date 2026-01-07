@@ -1,0 +1,15 @@
+[package]
+name = "autodiscovery"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[dependencies]
+tno-observe = { path = "../../crates/tno-observe", features = ["timezone-sync", "subscriber"] }
+tno-exec = { path = "../../crates/tno-exec", features = ["subprocess"] }
+tno-api = { path = "../../crates/tno-api", features = ["grpc", "autodiscovery"] }
+tno-core = { path = "../../crates/tno-core" }
+
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+taskvisor = { workspace = true }
+tracing = { workspace = true }
