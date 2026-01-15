@@ -115,7 +115,9 @@ fn parse_container_id_from_cgroup() -> Option<String> {
                 return Some(id.to_string());
             }
         }
-        if let Some(id) = line.split("/docker/").nth(1)
+        if let Some(id) = line
+            .split("/docker/")
+            .nth(1)
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
         {
