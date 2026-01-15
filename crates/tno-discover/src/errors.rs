@@ -11,6 +11,9 @@ pub enum DiscoverError {
     #[error("http request failed: {0}")]
     HttpRequest(#[from] reqwest::Error),
 
+    #[error("invalid response: {0}")]
+    InvalidResponse(String),
+
     #[error("control plane rejected sync: {0}")]
     Rejected(String),
 }

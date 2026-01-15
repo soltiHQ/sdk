@@ -38,8 +38,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5) Discovery configuration
     let discover_config = DiscoverConfig {
         name: "demo-agent".to_string(),
-        endpoint: "http://localhost:50051".to_string(),
-        transport: DiscoveryTransport::Grpc,
+        endpoint: "http://localhost:8081".to_string(),
+        transport: DiscoveryTransport::Http,
         metadata: HashMap::new(),
         delay_ms: 10_000,
     };

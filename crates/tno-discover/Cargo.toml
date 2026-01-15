@@ -19,6 +19,7 @@ prost = { workspace = true }
 
 tno-model = { path = "../tno-model" }
 tno-core = { path = "../tno-core" }
+serde_json = "1.0.145"
 
 [build-dependencies]
 tonic-build = { workspace = true }

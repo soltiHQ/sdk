@@ -86,11 +86,13 @@ async fn invoke_http_sync(cfg: &DiscoverConfig) -> Result<(), DiscoverError> {
         .post(format!("{}/v1/sync", cfg.endpoint))
         .json(&request)
         .send()
-        .await?
-        .json::<SyncResponse>()
         .await?;
 
-    validate_response(response)
+    let body = response.text().await?;
+    let sync_response: SyncResponse = serde_json::from_str(&body)
+        .map_err(|e| DiscoverError::InvalidResponse(format!("failed to parse response: {}, body: {}", e, body)))?;
+
+    validate_response(sync_response)
 }
 
 fn build_sync_request(cfg: &DiscoverConfig) -> SyncRequest {
