@@ -8,8 +8,11 @@ default = []
 
 [dependencies]
 taskvisor = { workspace = true, features = ["controller"] }
+uuid = { workspace = true, features = ["v4"] }
+
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+hostname = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 

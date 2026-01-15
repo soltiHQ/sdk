@@ -1,7 +1,5 @@
 syntax = "proto3";
 
-import "google/protobuf/timestamp.proto";
-
 package tno.discover.v1;
 
 service DiscoverService {
@@ -18,7 +16,7 @@ message SyncRequest {
     string arch = 6;
     string os = 7;
 
-    google.protobuf.Timestamp ts = 8;
+    int64 ts = 8;
     map<string, string> metadata = 9;
 }
 

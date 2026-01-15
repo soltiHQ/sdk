@@ -12,6 +12,7 @@ use taskvisor::{
 use tno_model::{CreateSpec, TaskId, TaskInfo, TaskStatus};
 use tracing::{debug, info, instrument};
 
+use crate::system::init_uptime;
 use crate::{
     error::CoreError,
     map::{to_admission_policy, to_backoff_policy, to_restart_policy},
@@ -63,6 +64,8 @@ impl SupervisorApi {
         });
 
         sup.wait_ready().await;
+        init_uptime();
+
         info!("supervisor is ready to accept tasks");
         Ok(Self { sup, router, state })
     }
