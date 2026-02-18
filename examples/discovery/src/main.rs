@@ -46,7 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     info!(
         "discovery configured: control_plane={}, agent={}, transport={:?}",
-        discover_config.control_plane_endpoint, discover_config.agent_endpoint, discover_config.transport
+        discover_config.control_plane_endpoint,
+        discover_config.agent_endpoint,
+        discover_config.transport
     );
 
     // 6) Submit sync task
