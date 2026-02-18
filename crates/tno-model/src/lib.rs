@@ -1,7 +1,8 @@
 mod domain;
 pub use domain::LABEL_RUNNER_TAG;
 pub use domain::{
-    Flag, KeyValue, RunnerLabels, Slot, TaskEnv, TaskId, TaskInfo, TaskStatus, TimeoutMs,
+    Flag, KeyValue, RunnerLabels, Slot, TaskEnv, TaskId, TaskInfo, TaskPage, TaskQuery, TaskStatus,
+    TimeoutMs,
 };
 
 mod error;

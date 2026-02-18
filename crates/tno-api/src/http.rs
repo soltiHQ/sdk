@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use tno_model::{CreateSpec, TaskId, TaskInfo, TaskStatus};
+use tno_model::{CreateSpec, TaskId, TaskInfo, TaskQuery, TaskStatus};
 use tracing::debug;
 
 use crate::{error::ApiError, handler::ApiHandler};
@@ -63,16 +63,21 @@ struct GetTaskStatusResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct ListTasksQuery {
+struct ListTasksParams {
     /// Filter by slot name
     slot: Option<String>,
     /// Filter by task status
     status: Option<String>,
+    /// Max items per page (default 100, max 1000)
+    limit: Option<usize>,
+    /// Offset for pagination (default 0)
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ListTasksResponse {
     tasks: Vec<TaskInfo>,
+    total: usize,
 }
 
 // ============================================================================
@@ -116,42 +121,51 @@ where
 
 /// GET /api/v1/tasks
 ///
-/// Query params:
-/// - ?slot=name - filter by slot
+/// Query params (all optional, combinable):
+/// - ?slot=name    - filter by slot
 /// - ?status=running - filter by status
-/// - no params - list all tasks
+/// - ?limit=50     - max items per page (default 100, max 1000)
+/// - ?offset=0     - pagination offset (default 0)
 async fn list_tasks<H>(
     State(handler): State<Arc<H>>,
-    Query(query): Query<ListTasksQuery>,
+    Query(params): Query<ListTasksParams>,
 ) -> Result<impl IntoResponse, ApiError>
 where
     H: ApiHandler,
 {
-    let tasks = match (query.slot, query.status) {
-        (Some(slot), None) => {
-            if slot.trim().is_empty() {
-                return Err(ApiError::InvalidRequest("slot cannot be empty".into()));
-            }
-            handler.list_tasks_by_slot(&slot).await?
-        }
-        (None, Some(status_str)) => {
-            let status = parse_status(&status_str)?;
-            handler.list_tasks_by_status(status).await?
-        }
-        (Some(_), Some(_)) => {
-            return Err(ApiError::InvalidRequest(
-                "cannot filter by both slot and status simultaneously".into(),
-            ));
-        }
-        (None, None) => handler.list_all_tasks().await?,
-    };
+    let mut query = TaskQuery::new();
 
-    debug!(count = tasks.len(), "tasks listed");
-    let response = ListTasksResponse { tasks };
+    if let Some(slot) = params.slot {
+        if slot.trim().is_empty() {
+            return Err(ApiError::InvalidRequest("slot cannot be empty".into()));
+        }
+        query = query.with_slot(slot);
+    }
+
+    if let Some(status_str) = params.status {
+        let status = parse_status(&status_str)?;
+        query = query.with_status(status);
+    }
+
+    if let Some(limit) = params.limit {
+        query = query.with_limit(limit);
+    }
+
+    if let Some(offset) = params.offset {
+        query = query.with_offset(offset);
+    }
+
+    let page = handler.query_tasks(query).await?;
+    debug!(count = page.items.len(), total = page.total, "tasks listed");
+
+    let response = ListTasksResponse {
+        tasks: page.items,
+        total: page.total,
+    };
     Ok(Json(response))
 }
 
-/// Parse TaskStatus from string
+/// Parse TaskStatus from string.
 fn parse_status(s: &str) -> Result<TaskStatus, ApiError> {
     match s.to_lowercase().as_str() {
         "pending" => Ok(TaskStatus::Pending),

@@ -3,6 +3,8 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
+use tno_model::TaskQuery;
+
 use crate::error::ApiError;
 use crate::handler::ApiHandler;
 use crate::proto_api::{self, tno_api_server::TnoApi};
@@ -69,6 +71,50 @@ where
         }))
     }
 
+    async fn list_tasks(
+        &self,
+        request: Request<proto_api::ListTasksRequest>,
+    ) -> Result<Response<proto_api::ListTasksResponse>, Status> {
+        let req = request.into_inner();
+
+        let mut query = TaskQuery::new();
+
+        if let Some(slot) = req.slot {
+            if slot.trim().is_empty() {
+                return Err(Status::invalid_argument("slot cannot be empty"));
+            }
+            query = query.with_slot(slot);
+        }
+
+        if let Some(status_raw) = req.status {
+            let status = proto_to_domain_status(status_raw)?;
+            query = query.with_status(status);
+        }
+
+        if req.limit > 0 {
+            query = query.with_limit(req.limit as usize);
+        }
+
+        if req.offset > 0 {
+            query = query.with_offset(req.offset as usize);
+        }
+
+        let page = self
+            .handler
+            .query_tasks(query)
+            .await
+            .map_err(Status::from)?;
+
+        debug!(count = page.items.len(), total = page.total, "grpc: tasks listed");
+
+        let tasks = page.items.into_iter().map(proto_api::TaskInfo::from).collect();
+
+        Ok(Response::new(proto_api::ListTasksResponse {
+            tasks,
+            total: page.total as u32,
+        }))
+    }
+
     async fn list_all_tasks(
         &self,
         _request: Request<proto_api::ListAllTasksRequest>,
@@ -109,23 +155,7 @@ where
     ) -> Result<Response<proto_api::ListTasksByStatusResponse>, Status> {
         let req = request.into_inner();
 
-        let status = proto_api::TaskStatus::try_from(req.status)
-            .map_err(|_| Status::invalid_argument("invalid status"))?;
-
-        if status == proto_api::TaskStatus::Unspecified {
-            return Err(Status::invalid_argument("status cannot be unspecified"));
-        }
-
-        let domain_status = match status {
-            proto_api::TaskStatus::Pending => tno_model::TaskStatus::Pending,
-            proto_api::TaskStatus::Running => tno_model::TaskStatus::Running,
-            proto_api::TaskStatus::Succeeded => tno_model::TaskStatus::Succeeded,
-            proto_api::TaskStatus::Failed => tno_model::TaskStatus::Failed,
-            proto_api::TaskStatus::Timeout => tno_model::TaskStatus::Timeout,
-            proto_api::TaskStatus::Canceled => tno_model::TaskStatus::Canceled,
-            proto_api::TaskStatus::Exhausted => tno_model::TaskStatus::Exhausted,
-            proto_api::TaskStatus::Unspecified => unreachable!(),
-        };
+        let domain_status = proto_to_domain_status(req.status)?;
 
         let tasks = self
             .handler
@@ -159,5 +189,24 @@ where
 
         debug!(%task_id, "grpc: task canceled");
         Ok(Response::new(proto_api::CancelTaskResponse {}))
+    }
+}
+
+/// Convert proto TaskStatus i32 to domain TaskStatus.
+fn proto_to_domain_status(raw: i32) -> Result<tno_model::TaskStatus, Status> {
+    let status = proto_api::TaskStatus::try_from(raw)
+        .map_err(|_| Status::invalid_argument("invalid status"))?;
+
+    match status {
+        proto_api::TaskStatus::Pending => Ok(tno_model::TaskStatus::Pending),
+        proto_api::TaskStatus::Running => Ok(tno_model::TaskStatus::Running),
+        proto_api::TaskStatus::Succeeded => Ok(tno_model::TaskStatus::Succeeded),
+        proto_api::TaskStatus::Failed => Ok(tno_model::TaskStatus::Failed),
+        proto_api::TaskStatus::Timeout => Ok(tno_model::TaskStatus::Timeout),
+        proto_api::TaskStatus::Canceled => Ok(tno_model::TaskStatus::Canceled),
+        proto_api::TaskStatus::Exhausted => Ok(tno_model::TaskStatus::Exhausted),
+        proto_api::TaskStatus::Unspecified => {
+            Err(Status::invalid_argument("status cannot be unspecified"))
+        }
     }
 }

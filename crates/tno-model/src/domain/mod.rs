@@ -22,6 +22,9 @@ pub use task_info::TaskInfo;
 mod task_status;
 pub use task_status::TaskStatus;
 
+mod task_query;
+pub use task_query::{TaskPage, TaskQuery};
+
 /// Logical identifier for a controller slot.
 ///
 /// A slot groups tasks that must not run concurrently.

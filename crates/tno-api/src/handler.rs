@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use tno_model::{CreateSpec, TaskId, TaskInfo, TaskStatus};
+use tno_model::{CreateSpec, TaskId, TaskInfo, TaskPage, TaskQuery, TaskStatus};
 
 use crate::error::ApiError;
 
@@ -24,6 +24,12 @@ pub trait ApiHandler: Send + Sync + 'static {
 
     /// List tasks by status.
     async fn list_tasks_by_status(&self, status: TaskStatus) -> Result<Vec<TaskInfo>, ApiError>;
+
+    /// Query tasks with combined filters and pagination.
+    ///
+    /// Supports filtering by slot and/or status simultaneously,
+    /// with offset/limit pagination. Returns a page with total count.
+    async fn query_tasks(&self, query: TaskQuery) -> Result<TaskPage<TaskInfo>, ApiError>;
 
     /// Cancel a running task.
     ///
