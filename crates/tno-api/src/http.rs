@@ -8,6 +8,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tno_model::{CreateSpec, TaskId, TaskInfo, TaskStatus};
+use tracing::debug;
 
 use crate::{error::ApiError, handler::ApiHandler};
 
@@ -86,13 +87,14 @@ async fn submit_task<H>(
 where
     H: ApiHandler,
 {
+    debug!(slot = %req.spec.slot, kind = ?req.spec.kind, "submitting task");
     let task_id = handler.submit_task(req.spec).await?;
 
     let response = SubmitTaskResponse {
         task_id: task_id.to_string(),
     };
 
-    Ok(Json(response))
+    Ok((axum::http::StatusCode::CREATED, Json(response)))
 }
 
 /// GET /api/v1/tasks/:id
@@ -104,6 +106,7 @@ where
     H: ApiHandler,
 {
     let task_id = TaskId::from(id);
+    debug!(%task_id, "getting task status");
     let info = handler.get_task_status(&task_id).await?;
 
     let response = GetTaskStatusResponse { info };
@@ -125,30 +128,26 @@ where
     H: ApiHandler,
 {
     let tasks = match (query.slot, query.status) {
-        // Filter by slot
         (Some(slot), None) => {
             if slot.trim().is_empty() {
                 return Err(ApiError::InvalidRequest("slot cannot be empty".into()));
             }
             handler.list_tasks_by_slot(&slot).await?
         }
-        // Filter by status
         (None, Some(status_str)) => {
             let status = parse_status(&status_str)?;
             handler.list_tasks_by_status(status).await?
         }
-        // Both filters - not supported
         (Some(_), Some(_)) => {
             return Err(ApiError::InvalidRequest(
                 "cannot filter by both slot and status simultaneously".into(),
             ));
         }
-        // No filters - list all
         (None, None) => handler.list_all_tasks().await?,
     };
 
+    debug!(count = tasks.len(), "tasks listed");
     let response = ListTasksResponse { tasks };
-
     Ok(Json(response))
 }
 
@@ -183,6 +182,7 @@ where
 
     let task_id = TaskId::from(id);
     handler.cancel_task(&task_id).await?;
+    debug!(%task_id, "task canceled");
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

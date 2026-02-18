@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
+use tracing::debug;
 
 use crate::error::ApiError;
 use crate::handler::ApiHandler;
@@ -40,6 +41,7 @@ where
 
         let spec = tno_model::CreateSpec::try_from(spec).map_err(|e: ApiError| Status::from(e))?;
 
+        debug!(slot = %spec.slot, kind = ?spec.kind, "grpc: submitting task");
         let task_id = self.handler.submit_task(spec).await.map_err(Status::from)?;
 
         Ok(Response::new(proto_api::SubmitTaskResponse {
@@ -54,6 +56,7 @@ where
         let req = request.into_inner();
 
         let task_id = tno_model::TaskId::from(req.task_id);
+        debug!(%task_id, "grpc: getting task status");
 
         let info = self
             .handler
@@ -71,6 +74,7 @@ where
         _request: Request<proto_api::ListAllTasksRequest>,
     ) -> Result<Response<proto_api::ListAllTasksResponse>, Status> {
         let tasks = self.handler.list_all_tasks().await.map_err(Status::from)?;
+        debug!(count = tasks.len(), "grpc: tasks listed");
 
         let tasks = tasks.into_iter().map(proto_api::TaskInfo::from).collect();
 
@@ -87,6 +91,7 @@ where
             return Err(Status::invalid_argument("slot cannot be empty"));
         }
 
+        debug!(slot = %req.slot, "grpc: listing tasks by slot");
         let tasks = self
             .handler
             .list_tasks_by_slot(&req.slot)
@@ -152,6 +157,7 @@ where
             .await
             .map_err(Status::from)?;
 
+        debug!(%task_id, "grpc: task canceled");
         Ok(Response::new(proto_api::CancelTaskResponse {}))
     }
 }
