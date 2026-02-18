@@ -38,14 +38,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5) Discovery configuration
     let discover_config = DiscoverConfig {
         name: "demo-agent".to_string(),
-        endpoint: "http://localhost:8081".to_string(),
+        control_plane_endpoint: "http://localhost:8082".to_string(),
+        agent_endpoint: "http://localhost:8085".to_string(),
         transport: DiscoveryTransport::Http,
         metadata: HashMap::new(),
         delay_ms: 10_000,
     };
     info!(
-        "discovery configured: endpoint={}, transport={:?}",
-        discover_config.endpoint, discover_config.transport
+        "discovery configured: control_plane={}, agent={}, transport={:?}",
+        discover_config.control_plane_endpoint, discover_config.agent_endpoint, discover_config.transport
     );
 
     // 6) Submit sync task

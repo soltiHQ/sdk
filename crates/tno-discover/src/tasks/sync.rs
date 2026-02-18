@@ -71,7 +71,7 @@ async fn invoke_sync(cfg: &DiscoverConfig) -> Result<(), DiscoverError> {
 }
 
 async fn invoke_grpc_sync(cfg: &DiscoverConfig) -> Result<(), DiscoverError> {
-    let mut client = DiscoverServiceClient::connect(cfg.endpoint.clone()).await?;
+    let mut client = DiscoverServiceClient::connect(cfg.control_plane_endpoint.clone()).await?;
     let request = tonic::Request::new(build_sync_request(cfg));
     let response = client.sync(request).await?.into_inner();
 
@@ -83,7 +83,7 @@ async fn invoke_http_sync(cfg: &DiscoverConfig) -> Result<(), DiscoverError> {
     let request = build_sync_request(cfg);
 
     let response = client
-        .post(format!("{}/v1/sync", cfg.endpoint))
+        .post(format!("{}/api/v1/discovery/sync", cfg.control_plane_endpoint))
         .json(&request)
         .send()
         .await?;
@@ -105,7 +105,7 @@ fn build_sync_request(cfg: &DiscoverConfig) -> SyncRequest {
         uptime_seconds: uptime_seconds() as i64,
         platform: platform().to_string(),
         metadata: cfg.metadata.clone(),
-        endpoint: cfg.endpoint.clone(),
+        endpoint: cfg.agent_endpoint.clone(),
         id: agent_id().to_string(),
         arch: arch().to_string(),
         name: cfg.name.clone(),
@@ -116,7 +116,7 @@ fn build_sync_request(cfg: &DiscoverConfig) -> SyncRequest {
 
 fn validate_response(response: SyncResponse) -> Result<(), DiscoverError> {
     if !response.success {
-        return Err(DiscoverError::Rejected(response.message));
+        return Err(DiscoverError::Rejected);
     }
     Ok(())
 }

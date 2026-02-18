@@ -14,8 +14,8 @@ pub enum DiscoverError {
     #[error("invalid response: {0}")]
     InvalidResponse(String),
 
-    #[error("control plane rejected sync: {0}")]
-    Rejected(String),
+    #[error("control plane rejected sync")]
+    Rejected,
 }
 
 impl From<tonic::Status> for DiscoverError {
