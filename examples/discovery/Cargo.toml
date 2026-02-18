@@ -8,8 +8,12 @@ publish = false
 tno-observe = { path = "../../crates/tno-observe", features = ["timezone-sync", "subscriber"] }
 tno-exec = { path = "../../crates/tno-exec", features = ["subprocess"] }
 tno-core = { path = "../../crates/tno-core" }
+tno-model = { path = "../../crates/tno-model" }
+tno-api = { path = "../../crates/tno-api", features = ["http"] }
 tno-discover = { path = "../../crates/tno-discover" }
+tno-prometheus = { path = "../../crates/tno-prometheus" }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 taskvisor = { workspace = true }
 tracing = { workspace = true }
+axum = { workspace = true }
