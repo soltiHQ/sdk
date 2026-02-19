@@ -1,4 +1,4 @@
-# tno HTTP Server Example
+# solti HTTP Server Example
 Demonstrates HTTP REST API server with periodic background tasks.
 
 ## Running
@@ -87,7 +87,7 @@ curl -X POST http://localhost:8080/api/v1/tasks \
           "command": "sh",
           "args": ["-c", "echo MESSAGE=$MESSAGE"],
           "env": [
-            {"key": "MESSAGE", "value": "Hello from tno!"}
+            {"key": "MESSAGE", "value": "Hello from solti!"}
           ],
           "failOnNonZero": true
         }
@@ -266,13 +266,13 @@ Response (200 OK):
          ▼
 ┌──────────────────────┐
 │ SupervisorApi        │
-│ (tno-core)           │
+│ (solti-core)           │
 └────────┬─────────────┘
          │
          ▼
 ┌──────────────────────┐
 │ SubprocessRunner     │
-│ (tno-exec)           │
+│ (solti-exec)           │
 └──────────────────────┘
 ```
 

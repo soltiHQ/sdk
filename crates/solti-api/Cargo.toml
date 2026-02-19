@@ -1,0 +1,27 @@
+[package]
+name = "solti-api"
+version = "0.0.1"
+edition = "2024"
+
+[features]
+default = []
+grpc = ["dep:tonic", "dep:prost"]
+http = ["dep:axum", "dep:serde_json"]
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+serde_json = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+
+solti-core = { path = "../solti-core" }
+solti-model = { path = "../solti-model" }
+serde = { version = "1.0.228", features = ["derive"] }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+protoc-bin-vendored = "3"

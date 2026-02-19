@@ -1,12 +1,12 @@
 [workspace]
 members = [
-    "crates/tno-prometheus",
-    "crates/tno-discover",
-    "crates/tno-observe",
-    "crates/tno-model",
-    "crates/tno-core",
-    "crates/tno-exec",
-    "crates/tno-api",
+    "crates/solti-prometheus",
+    "crates/solti-discover",
+    "crates/solti-observe",
+    "crates/solti-model",
+    "crates/solti-core",
+    "crates/solti-exec",
+    "crates/solti-api",
 
     "examples/grpc-server",
     "examples/http-server",

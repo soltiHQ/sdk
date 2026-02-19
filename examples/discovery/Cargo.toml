@@ -5,13 +5,13 @@ edition = "2024"
 publish = false
 
 [dependencies]
-tno-observe = { path = "../../crates/tno-observe", features = ["timezone-sync", "subscriber"] }
-tno-exec = { path = "../../crates/tno-exec", features = ["subprocess"] }
-tno-core = { path = "../../crates/tno-core" }
-tno-model = { path = "../../crates/tno-model" }
-tno-api = { path = "../../crates/tno-api", features = ["http"] }
-tno-discover = { path = "../../crates/tno-discover" }
-tno-prometheus = { path = "../../crates/tno-prometheus" }
+solti-observe = { path = "../../crates/solti-observe", features = ["timezone-sync", "subscriber"] }
+solti-exec = { path = "../../crates/solti-exec", features = ["subprocess"] }
+solti-core = { path = "../../crates/solti-core" }
+solti-model = { path = "../../crates/solti-model" }
+solti-api = { path = "../../crates/solti-api", features = ["http"] }
+solti-discover = { path = "../../crates/solti-discover" }
+solti-prometheus = { path = "../../crates/solti-prometheus" }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 taskvisor = { workspace = true }

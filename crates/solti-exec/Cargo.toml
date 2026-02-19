@@ -1,0 +1,19 @@
+[package]
+name = "solti-exec"
+version = "0.0.1"
+edition = "2024"
+
+[features]
+default = []
+subprocess = []
+
+[dependencies]
+tokio = { workspace = true, features = ["process", "io-util"] }
+tokio-util = { workspace = true }
+taskvisor = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+
+solti-core = { path = "../solti-core" }
+solti-model = { path = "../solti-model" }

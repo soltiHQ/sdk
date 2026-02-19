@@ -8,4 +8,4 @@ labels: [enhancement]
 Why do you need this feature? What problem does it solve?
 
 ### Proposed Solution
-Describe how you would like tno to behave.
+Describe how you would like solti to behave.

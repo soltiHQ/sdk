@@ -3,15 +3,15 @@ use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::info;
 
-use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
-use tno_api::{SupervisorApiAdapter, TnoApiServer, TnoApiService};
-use tno_core::{RunnerRouter, SupervisorApi};
-use tno_exec::subprocess::register_subprocess_runner;
-use tno_model::{
+use solti_api::{SoltiApiServer, SoltiApiService, SupervisorApiAdapter};
+use solti_core::{RunnerRouter, SupervisorApi};
+use solti_exec::subprocess::register_subprocess_runner;
+use solti_model::{
     AdmissionStrategy, BackoffStrategy, CreateSpec, Flag, JitterStrategy, RestartStrategy,
     RunnerLabels, TaskEnv, TaskKind,
 };
-use tno_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
+use solti_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
+use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4) Submit timezone sync task
     let (tz_task, tz_spec) = timezone_sync();
-    let tz_policy = tno_core::TaskPolicy::from_spec(&tz_spec);
+    let tz_policy = solti_core::TaskPolicy::from_spec(&tz_spec);
     supervisor.submit_with_task(tz_task, &tz_policy).await?;
     info!("timezone sync task submitted");
 
@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 6) Create API handler and gRPC service
     let handler = Arc::new(SupervisorApiAdapter::new(Arc::new(supervisor)));
-    let service = TnoApiService::new(handler);
+    let service = SoltiApiService::new(handler);
 
     // 7) Start gRPC server
     let addr = "[::1]:50051".parse()?;
@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("use grpcurl to interact with the API");
 
     Server::builder()
-        .add_service(TnoApiServer::new(service))
+        .add_service(SoltiApiServer::new(service))
         .serve(addr)
         .await?;
 
@@ -117,7 +117,7 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
         slot: "periodic-echo".to_string(),
         kind: TaskKind::Subprocess {
             command: "echo".into(),
-            args: vec!["Hello from tno periodic task!".into()],
+            args: vec!["Hello from solti periodic task!".into()],
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
