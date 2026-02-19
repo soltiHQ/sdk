@@ -105,9 +105,17 @@ where
             .await
             .map_err(Status::from)?;
 
-        debug!(count = page.items.len(), total = page.total, "grpc: tasks listed");
+        debug!(
+            count = page.items.len(),
+            total = page.total,
+            "grpc: tasks listed"
+        );
 
-        let tasks = page.items.into_iter().map(proto_api::TaskInfo::from).collect();
+        let tasks = page
+            .items
+            .into_iter()
+            .map(proto_api::TaskInfo::from)
+            .collect();
 
         Ok(Response::new(proto_api::ListTasksResponse {
             tasks,
@@ -193,6 +201,7 @@ where
 }
 
 /// Convert proto TaskStatus i32 to domain TaskStatus.
+#[allow(clippy::result_large_err)]
 fn proto_to_domain_status(raw: i32) -> Result<tno_model::TaskStatus, Status> {
     let status = proto_api::TaskStatus::try_from(raw)
         .map_err(|_| Status::invalid_argument("invalid status"))?;

@@ -374,7 +374,9 @@ mod tests {
         };
 
         let cs = CreateSpec::try_from(spec).unwrap();
-        assert!(matches!(cs.kind, TaskKind::Wasm { ref module, .. } if module.to_str() == Some("/app/module.wasm")));
+        assert!(
+            matches!(cs.kind, TaskKind::Wasm { ref module, .. } if module.to_str() == Some("/app/module.wasm"))
+        );
     }
 
     #[test]
@@ -394,7 +396,9 @@ mod tests {
         };
 
         let cs = CreateSpec::try_from(spec).unwrap();
-        assert!(matches!(cs.kind, TaskKind::Container { ref image, .. } if image == "alpine:latest"));
+        assert!(
+            matches!(cs.kind, TaskKind::Container { ref image, .. } if image == "alpine:latest")
+        );
     }
 
     #[test]
@@ -506,7 +510,9 @@ mod tests {
             ..make_valid_create_spec()
         };
         let err = CreateSpec::try_from(spec).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("subprocess command is empty")));
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("subprocess command is empty"))
+        );
     }
 
     #[test]
@@ -516,7 +522,9 @@ mod tests {
             ..make_valid_create_spec()
         };
         let err = CreateSpec::try_from(spec).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("subprocess command is empty")));
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("subprocess command is empty"))
+        );
     }
 
     #[test]
@@ -532,7 +540,9 @@ mod tests {
             ..make_valid_create_spec()
         };
         let err = CreateSpec::try_from(spec).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("wasm module path is empty")));
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("wasm module path is empty"))
+        );
     }
 
     #[test]
@@ -551,7 +561,9 @@ mod tests {
             ..make_valid_create_spec()
         };
         let err = CreateSpec::try_from(spec).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("container image is empty")));
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("container image is empty"))
+        );
     }
 
     #[test]
@@ -561,7 +573,9 @@ mod tests {
             ..make_valid_create_spec()
         };
         let err = CreateSpec::try_from(spec).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("slot cannot be empty")));
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("slot cannot be empty"))
+        );
     }
 
     #[test]
@@ -571,7 +585,9 @@ mod tests {
             ..make_valid_create_spec()
         };
         let err = CreateSpec::try_from(spec).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("slot cannot be empty")));
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("slot cannot be empty"))
+        );
     }
 
     #[test]
@@ -581,7 +597,9 @@ mod tests {
             ..make_valid_create_spec()
         };
         let err = CreateSpec::try_from(spec).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("timeout_ms cannot be zero")));
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("timeout_ms cannot be zero"))
+        );
     }
 
     #[test]
@@ -604,7 +622,9 @@ mod tests {
             ..make_valid_create_spec()
         };
         let err = CreateSpec::try_from(spec).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("first_ms cannot be zero")));
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("first_ms cannot be zero"))
+        );
     }
 
     #[test]
@@ -617,7 +637,9 @@ mod tests {
             ..make_valid_create_spec()
         };
         let err = CreateSpec::try_from(spec).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("max_ms cannot be zero")));
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("max_ms cannot be zero"))
+        );
     }
 
     #[test]
@@ -630,7 +652,9 @@ mod tests {
             ..make_valid_create_spec()
         };
         let err = CreateSpec::try_from(spec).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be positive")));
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be positive"))
+        );
     }
 
     #[test]
@@ -643,7 +667,9 @@ mod tests {
             ..make_valid_create_spec()
         };
         let err = CreateSpec::try_from(spec).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be positive")));
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be positive"))
+        );
     }
 
     #[test]

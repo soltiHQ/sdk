@@ -77,9 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let (sync_task, sync_spec) = tno_discover::sync(discover_config);
     let sync_policy = TaskPolicy::from_spec(&sync_spec);
-    supervisor
-        .submit_with_task(sync_task, &sync_policy)
-        .await?;
+    supervisor.submit_with_task(sync_task, &sync_policy).await?;
     info!("discovery sync task submitted");
 
     // 7) Submit 5 demo background tasks
@@ -207,10 +205,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
         slot: "flaky-job".to_string(),
         kind: TaskKind::Subprocess {
             command: "sh".into(),
-            args: vec![
-                "-c".into(),
-                "echo 'attempt running...'; exit 1".into(),
-            ],
+            args: vec!["-c".into(), "echo 'attempt running...'; exit 1".into()],
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),

@@ -139,7 +139,12 @@ impl TaskState {
                 let ids = inner.by_slot.get(slot.as_str());
                 match ids {
                     Some(ids) => Box::new(ids.iter().filter_map(|id| inner.tasks.get(id))),
-                    None => return TaskPage { items: vec![], total: 0 },
+                    None => {
+                        return TaskPage {
+                            items: vec![],
+                            total: 0,
+                        };
+                    }
                 }
             }
             None => Box::new(inner.tasks.values()),
