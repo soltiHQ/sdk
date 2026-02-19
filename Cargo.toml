@@ -26,7 +26,7 @@ tokio-util = "0.7.17"
 time = { version = "0.3" }
 serde = { version = "1", features = ["derive"] }
 tracing-journald = "0.3.1"
-taskvisor = { version = "0.0.13" }
+taskvisor = { version = "0.1.0" }
 prometheus = "0.14.0"
 reqwest = "0.13.1"
 async-trait = "0.1"
