@@ -3,7 +3,7 @@
 Agent simulator with discovery sync, HTTP API, and 5 background tasks.
 
 Simulates a real agent that:
-- Periodically syncs with a control plane via `tno-discover`
+- Periodically syncs with a control plane via `solti-discover`
 - Exposes an HTTP API on `:8085` for task management
 - Runs 5 background tasks with different strategies
 
@@ -17,7 +17,7 @@ Simulates a real agent that:
 | 4 | `oneshot-date`    | `date`           | `Never`        | One-shot, completes immediately    |
 | 5 | `flaky-job`       | `sh -c "exit 1"` | `OnFailure`    | Always fails, retries with backoff |
 
-Plus 2 internal tasks: `tno-discover-sync` and `tno-observe-timezone-sync`.
+Plus 2 internal tasks: `solti-discover-sync` and `solti-observe-timezone-sync`.
 
 ## Run
 
@@ -197,7 +197,7 @@ curl -s http://localhost:8085/metrics
 Proto path for `-import-path` / `-proto`:
 
 ```
-crates/tno-api/proto
+crates/solti-api/proto
 ```
 
 ---
@@ -205,7 +205,7 @@ crates/tno-api/proto
 ### List services
 
 ```bash
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
   localhost:50051 list
 ```
 
@@ -213,81 +213,81 @@ grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
 
 ```bash
 # All tasks (default limit=100)
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
-  localhost:50051 tno.v1.TnoApi/ListTasks
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
+  localhost:50051 solti.v1.SoltiApi/ListTasks
 
 # Filter by slot
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
   -d '{"slot": "flaky-job"}' \
-  localhost:50051 tno.v1.TnoApi/ListTasks
+  localhost:50051 solti.v1.SoltiApi/ListTasks
 
 # Filter by status (TASK_STATUS_RUNNING = 2)
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
   -d '{"status": "TASK_STATUS_RUNNING"}' \
-  localhost:50051 tno.v1.TnoApi/ListTasks
+  localhost:50051 solti.v1.SoltiApi/ListTasks
 
 # Combined: slot + status
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
   -d '{"slot": "flaky-job", "status": "TASK_STATUS_FAILED"}' \
-  localhost:50051 tno.v1.TnoApi/ListTasks
+  localhost:50051 solti.v1.SoltiApi/ListTasks
 
 # Pagination: limit 2, offset 0
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
   -d '{"limit": 2, "offset": 0}' \
-  localhost:50051 tno.v1.TnoApi/ListTasks
+  localhost:50051 solti.v1.SoltiApi/ListTasks
 
 # Next page
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
   -d '{"limit": 2, "offset": 2}' \
-  localhost:50051 tno.v1.TnoApi/ListTasks
+  localhost:50051 solti.v1.SoltiApi/ListTasks
 
 # All combined: running tasks in slot, page 1
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
   -d '{"slot": "agent-heartbeat", "status": "TASK_STATUS_RUNNING", "limit": 5, "offset": 0}' \
-  localhost:50051 tno.v1.TnoApi/ListTasks
+  localhost:50051 solti.v1.SoltiApi/ListTasks
 ```
 
 ### ListAllTasks (legacy — no pagination)
 
 ```bash
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
-  localhost:50051 tno.v1.TnoApi/ListAllTasks
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
+  localhost:50051 solti.v1.SoltiApi/ListAllTasks
 ```
 
 ### ListTasksBySlot (legacy)
 
 ```bash
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
   -d '{"slot": "sys-monitor"}' \
-  localhost:50051 tno.v1.TnoApi/ListTasksBySlot
+  localhost:50051 solti.v1.SoltiApi/ListTasksBySlot
 ```
 
 ### ListTasksByStatus (legacy)
 
 ```bash
 # TASK_STATUS_PENDING=1, RUNNING=2, SUCCEEDED=3, FAILED=4, TIMEOUT=5, CANCELED=6, EXHAUSTED=7
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
   -d '{"status": "TASK_STATUS_RUNNING"}' \
-  localhost:50051 tno.v1.TnoApi/ListTasksByStatus
+  localhost:50051 solti.v1.SoltiApi/ListTasksByStatus
 
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
   -d '{"status": "TASK_STATUS_FAILED"}' \
-  localhost:50051 tno.v1.TnoApi/ListTasksByStatus
+  localhost:50051 solti.v1.SoltiApi/ListTasksByStatus
 ```
 
 ### GetTaskStatus
 
 ```bash
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
   -d '{"task_id": "TASK_ID"}' \
-  localhost:50051 tno.v1.TnoApi/GetTaskStatus
+  localhost:50051 solti.v1.SoltiApi/GetTaskStatus
 ```
 
 ### SubmitTask
 
 ```bash
 # One-shot: ls /tmp
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
   -d '{
     "spec": {
       "slot": "grpc-ls",
@@ -309,12 +309,12 @@ grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
       "admission": "ADMISSION_STRATEGY_DROP_IF_RUNNING"
     }
   }' \
-  localhost:50051 tno.v1.TnoApi/SubmitTask
+  localhost:50051 solti.v1.SoltiApi/SubmitTask
 ```
 
 ```bash
 # Periodic: echo every 10s
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
   -d '{
     "spec": {
       "slot": "grpc-echo",
@@ -336,12 +336,12 @@ grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
       "admission": "ADMISSION_STRATEGY_REPLACE"
     }
   }' \
-  localhost:50051 tno.v1.TnoApi/SubmitTask
+  localhost:50051 solti.v1.SoltiApi/SubmitTask
 ```
 
 ```bash
 # Long-running: sleep 30s (good for testing cancel)
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
   -d '{
     "spec": {
       "slot": "grpc-sleep",
@@ -362,15 +362,15 @@ grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
       "admission": "ADMISSION_STRATEGY_DROP_IF_RUNNING"
     }
   }' \
-  localhost:50051 tno.v1.TnoApi/SubmitTask
+  localhost:50051 solti.v1.SoltiApi/SubmitTask
 ```
 
 ### CancelTask
 
 ```bash
-grpcurl -plaintext -import-path crates/tno-api/proto -proto tno/v1/api.proto \
+grpcurl -plaintext -import-path crates/solti-api/proto -proto solti/v1/api.proto \
   -d '{"task_id": "TASK_ID"}' \
-  localhost:50051 tno.v1.TnoApi/CancelTask
+  localhost:50051 solti.v1.SoltiApi/CancelTask
 ```
 
 ### Proto enum reference
@@ -425,5 +425,5 @@ curl -s 'http://localhost:8085/api/v1/tasks?limit=2&offset=2' | jq
 curl -s 'http://localhost:8085/api/v1/tasks?limit=2&offset=4' | jq
 
 # 7. Metrics
-curl -s http://localhost:8085/metrics | grep tno
+curl -s http://localhost:8085/metrics | grep solti
 ```

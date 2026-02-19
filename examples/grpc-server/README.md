@@ -28,12 +28,12 @@ grpcurl -plaintext localhost:50051 list
 
 Expected output:
 ```
-tno.v1.TnoApi
+solti.v1.SoltiApi
 ```
 
 ### Describe service methods
 ```bash
-grpcurl -plaintext localhost:50051 describe tno.v1.TnoApi
+grpcurl -plaintext localhost:50051 describe solti.v1.SoltiApi
 ```
 
 ### Submit a new task
@@ -58,7 +58,7 @@ grpcurl -plaintext -d '{
     },
     "admission": "ADMISSION_STRATEGY_DROP_IF_RUNNING"
   }
-}' localhost:50051 tno.v1.TnoApi/SubmitTask
+}' localhost:50051 solti.v1.SoltiApi/SubmitTask
 ```
 
 Expected response:
@@ -72,7 +72,7 @@ Expected response:
 ```bash
 grpcurl -plaintext -d '{
   "taskId": "default-runner-test-task-5"
-}' localhost:50051 tno.v1.TnoApi/GetTaskStatus
+}' localhost:50051 solti.v1.SoltiApi/GetTaskStatus
 ```
 
 Expected response (if task still running):
@@ -99,7 +99,7 @@ grpcurl -plaintext -d '{
         "command": "sh",
         "args": ["-c", "echo MESSAGE=$MESSAGE"],
         "env": [
-          {"key": "MESSAGE", "value": "Hello from tno!"}
+          {"key": "MESSAGE", "value": "Hello from solti!"}
         ],
         "failOnNonZero": true
       }
@@ -114,7 +114,7 @@ grpcurl -plaintext -d '{
     },
     "admission": "ADMISSION_STRATEGY_DROP_IF_RUNNING"
   }
-}' localhost:50051 tno.v1.TnoApi/SubmitTask
+}' localhost:50051 solti.v1.SoltiApi/SubmitTask
 ```
 
 ### Submit periodic task (runs every 15 seconds)
@@ -139,15 +139,15 @@ grpcurl -plaintext -d '{
     },
     "admission": "ADMISSION_STRATEGY_REPLACE"
   }
-}' localhost:50051 tno.v1.TnoApi/SubmitTask
+}' localhost:50051 solti.v1.SoltiApi/SubmitTask
 ```
 
 ## Proto Schema
 
 View full proto definitions:
 ```bash
-grpcurl -plaintext localhost:50051 describe tno.v1.CreateSpec
-grpcurl -plaintext localhost:50051 describe tno.v1.TaskInfo
+grpcurl -plaintext localhost:50051 describe solti.v1.CreateSpec
+grpcurl -plaintext localhost:50051 describe solti.v1.TaskInfo
 ```
 
 ## Architecture
@@ -159,8 +159,8 @@ grpcurl -plaintext localhost:50051 describe tno.v1.TaskInfo
        │ gRPC
        ▼
 ┌─────────────────┐
-│ TnoApiService   │
-│ (tno-api)       │
+│ SoltiApiService   │
+│ (solti-api)       │
 └────────┬────────┘
          │
          ▼
@@ -171,12 +171,12 @@ grpcurl -plaintext localhost:50051 describe tno.v1.TaskInfo
          ▼
 ┌──────────────────────┐
 │ SupervisorApi        │
-│ (tno-core)           │
+│ (solti-core)           │
 └────────┬─────────────┘
          │
          ▼
 ┌──────────────────────┐
 │ SubprocessRunner     │
-│ (tno-exec)           │
+│ (solti-exec)           │
 └──────────────────────┘
 ```
