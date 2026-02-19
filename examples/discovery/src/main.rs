@@ -118,7 +118,7 @@ async fn metrics_handler(metrics: PrometheusMetrics) -> String {
 /// Submit 5 diverse background tasks to simulate a real agent workload.
 async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error::Error>> {
     let backoff = BackoffStrategy {
-        jitter: JitterStrategy::None,
+        jitter: JitterStrategy::Equal,
         first_ms: 1_000,
         max_ms: 5_000,
         factor: 2.0,
@@ -213,7 +213,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
         timeout_ms: 5_000,
         restart: RestartStrategy::OnFailure,
         backoff: BackoffStrategy {
-            jitter: JitterStrategy::None,
+            jitter: JitterStrategy::Full,
             first_ms: 2_000,
             max_ms: 10_000,
             factor: 2.0,
