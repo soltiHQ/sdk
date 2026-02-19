@@ -4,17 +4,17 @@ use std::sync::Arc;
 use axum::routing::get;
 use tracing::info;
 
-use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
-use tno_api::{HttpApi, SupervisorApiAdapter};
-use tno_core::{BuildContext, RunnerRouter, SupervisorApi, TaskPolicy};
-use tno_discover::{DiscoverConfig, DiscoveryTransport};
-use tno_exec::subprocess::register_subprocess_runner;
-use tno_model::{
+use solti_api::{HttpApi, SupervisorApiAdapter};
+use solti_core::{BuildContext, RunnerRouter, SupervisorApi, TaskPolicy};
+use solti_discover::{DiscoverConfig, DiscoveryTransport};
+use solti_exec::subprocess::register_subprocess_runner;
+use solti_model::{
     AdmissionStrategy, BackoffStrategy, CreateSpec, Flag, JitterStrategy, RestartStrategy,
     RunnerLabels, TaskEnv, TaskKind,
 };
-use tno_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
-use tno_prometheus::PrometheusMetrics;
+use solti_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
+use solti_prometheus::PrometheusMetrics;
+use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
 const AGENT_HTTP_ADDR: &str = "0.0.0.0:8085";
 const CONTROL_PLANE_ENDPOINT: &str = "http://localhost:8082";
@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         discover_config.agent_endpoint,
         discover_config.transport,
     );
-    let (sync_task, sync_spec) = tno_discover::sync(discover_config);
+    let (sync_task, sync_spec) = solti_discover::sync(discover_config);
     let sync_policy = TaskPolicy::from_spec(&sync_spec);
     supervisor.submit_with_task(sync_task, &sync_policy).await?;
     info!("discovery sync task submitted");
@@ -106,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn metrics_handler(metrics: PrometheusMetrics) -> String {
-    use tno_prometheus::{Encoder, TextEncoder};
+    use solti_prometheus::{Encoder, TextEncoder};
 
     let families = metrics.gather();
     let encoder = TextEncoder::new();

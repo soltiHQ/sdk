@@ -2,17 +2,17 @@ use std::{sync::Arc, time::Duration};
 
 use tracing::info;
 
+use solti_core::{RunnerRouter, SupervisorApi, TaskPolicy};
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
-use tno_core::{RunnerRouter, SupervisorApi, TaskPolicy};
 
-use tno_exec::subprocess::SubprocessBackendConfig;
-use tno_exec::subprocess::register_subprocess_runner_with_backend;
+use solti_exec::subprocess::SubprocessBackendConfig;
+use solti_exec::subprocess::register_subprocess_runner_with_backend;
 
-use tno_exec::{CgroupLimits, CpuMax, LinuxCapability, RlimitConfig, SecurityConfig};
+use solti_exec::{CgroupLimits, CpuMax, LinuxCapability, RlimitConfig, SecurityConfig};
 
-use tno_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
+use solti_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
 
-use tno_model::{
+use solti_model::{
     AdmissionStrategy, BackoffStrategy, CreateSpec, Flag, JitterStrategy, RestartStrategy,
     RunnerLabels, TaskEnv, TaskKind,
 };

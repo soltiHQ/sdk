@@ -1,0 +1,15 @@
+[package]
+name = "solti-prometheus"
+version = "0.0.1"
+edition = "2024"
+
+[features]
+default = []
+
+[dependencies]
+prometheus = { workspace = true }
+
+solti-core = { path = "../solti-core" }
+
+[dev-dependencies]
+solti-model = { path = "../solti-model" }

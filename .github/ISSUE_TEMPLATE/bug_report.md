@@ -16,7 +16,7 @@ Clear and concise description of the bug.
 What you expected to happen.
 
 ### Environment
-- tno:
+- solti:
 - Rust:
 - OS:
 

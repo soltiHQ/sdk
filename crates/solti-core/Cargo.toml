@@ -1,0 +1,22 @@
+[package]
+name = "solti-core"
+version = "0.0.1"
+edition = "2024"
+
+[features]
+default = []
+
+[dependencies]
+taskvisor = { workspace = true, features = ["controller"] }
+uuid = { workspace = true, features = ["v4"] }
+
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+hostname = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+solti-model = { path = "../solti-model" }
+
+[dev-dependencies]
+tokio-util = { workspace = true }
