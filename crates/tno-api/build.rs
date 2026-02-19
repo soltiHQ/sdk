@@ -11,11 +11,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .build_server(true)
         .build_client(true)
         .compile_protos(
-            &[
-                "proto/tno/v1/types.proto",
-                "proto/tno/v1/api.proto",
-                "proto/lighthouse/v1/discovery.proto",
-            ],
+            &["proto/tno/v1/types.proto", "proto/tno/v1/api.proto"],
             &["proto"],
         )?;
     Ok(())

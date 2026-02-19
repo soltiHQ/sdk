@@ -7,7 +7,7 @@ use std::{
     time::SystemTime,
 };
 
-use tno_model::{Slot, TaskId, TaskInfo, TaskStatus};
+use tno_model::{Slot, TaskId, TaskInfo, TaskPage, TaskQuery, TaskStatus};
 
 /// In-memory task state storage.
 #[derive(Clone)]
@@ -122,6 +122,57 @@ impl TaskState {
             .filter(|info| info.status == status)
             .cloned()
             .collect()
+    }
+
+    /// Query tasks with combined filters and pagination.
+    ///
+    /// Filters are applied inside a single read lock.
+    /// When `slot` is specified, uses the `by_slot` index to narrow the scan.
+    /// `total` in the result reflects the count *after* filtering, *before* pagination.
+    pub fn query(&self, q: &TaskQuery) -> TaskPage<TaskInfo> {
+        let inner = self.inner.read().unwrap();
+
+        // Choose the iterator source based on whether slot filter is present.
+        // When slot is given we use the by_slot index to avoid full scan.
+        let iter: Box<dyn Iterator<Item = &TaskInfo>> = match &q.slot {
+            Some(slot) => {
+                let ids = inner.by_slot.get(slot.as_str());
+                match ids {
+                    Some(ids) => Box::new(ids.iter().filter_map(|id| inner.tasks.get(id))),
+                    None => {
+                        return TaskPage {
+                            items: vec![],
+                            total: 0,
+                        };
+                    }
+                }
+            }
+            None => Box::new(inner.tasks.values()),
+        };
+
+        // Apply status filter if present.
+        let iter: Box<dyn Iterator<Item = &TaskInfo>> = match &q.status {
+            Some(status) => {
+                let status = *status;
+                Box::new(iter.filter(move |info| info.status == status))
+            }
+            None => iter,
+        };
+
+        // Collect refs that pass all filters — we need total count
+        // and then paginate, so we must know the full filtered set size.
+        // We avoid cloning here by collecting references first.
+        let filtered: Vec<&TaskInfo> = iter.collect();
+        let total = filtered.len();
+
+        let items = filtered
+            .into_iter()
+            .skip(q.offset)
+            .take(q.limit)
+            .cloned()
+            .collect();
+
+        TaskPage { items, total }
     }
 }
 
@@ -245,5 +296,118 @@ mod tests {
 
         let all_tasks = state.list_all();
         assert_eq!(all_tasks.len(), 3);
+    }
+
+    fn setup_query_state() -> TaskState {
+        let state = TaskState::new();
+        // slot-a: 3 tasks (2 running, 1 pending)
+        state.add_task(TaskId::from("a1"), "slot-a".to_string());
+        state.add_task(TaskId::from("a2"), "slot-a".to_string());
+        state.add_task(TaskId::from("a3"), "slot-a".to_string());
+        state.update_status(&TaskId::from("a1"), TaskStatus::Running, None);
+        state.update_status(&TaskId::from("a2"), TaskStatus::Running, None);
+
+        // slot-b: 2 tasks (1 failed, 1 pending)
+        state.add_task(TaskId::from("b1"), "slot-b".to_string());
+        state.add_task(TaskId::from("b2"), "slot-b".to_string());
+        state.update_status(&TaskId::from("b1"), TaskStatus::Failed, Some("err".into()));
+
+        state
+    }
+
+    #[test]
+    fn query_no_filters_returns_all() {
+        let state = setup_query_state();
+        let page = state.query(&TaskQuery::new().with_limit(100));
+        assert_eq!(page.total, 5);
+        assert_eq!(page.items.len(), 5);
+    }
+
+    #[test]
+    fn query_by_slot_only() {
+        let state = setup_query_state();
+        let page = state.query(&TaskQuery::new().with_slot("slot-a"));
+        assert_eq!(page.total, 3);
+        assert_eq!(page.items.len(), 3);
+    }
+
+    #[test]
+    fn query_by_status_only() {
+        let state = setup_query_state();
+        let page = state.query(&TaskQuery::new().with_status(TaskStatus::Running));
+        assert_eq!(page.total, 2);
+        assert_eq!(page.items.len(), 2);
+    }
+
+    #[test]
+    fn query_by_slot_and_status() {
+        let state = setup_query_state();
+        let page = state.query(
+            &TaskQuery::new()
+                .with_slot("slot-a")
+                .with_status(TaskStatus::Running),
+        );
+        assert_eq!(page.total, 2);
+        assert!(page.items.iter().all(|t| t.status == TaskStatus::Running));
+    }
+
+    #[test]
+    fn query_by_slot_and_status_no_match() {
+        let state = setup_query_state();
+        let page = state.query(
+            &TaskQuery::new()
+                .with_slot("slot-b")
+                .with_status(TaskStatus::Running),
+        );
+        assert_eq!(page.total, 0);
+        assert!(page.items.is_empty());
+    }
+
+    #[test]
+    fn query_unknown_slot_returns_empty() {
+        let state = setup_query_state();
+        let page = state.query(&TaskQuery::new().with_slot("nonexistent"));
+        assert_eq!(page.total, 0);
+        assert!(page.items.is_empty());
+    }
+
+    #[test]
+    fn query_pagination_offset_and_limit() {
+        let state = setup_query_state();
+        // 5 total tasks, offset 2 limit 2 => items 2, total 5
+        let page = state.query(&TaskQuery::new().with_limit(2).with_offset(2));
+        assert_eq!(page.total, 5);
+        assert_eq!(page.items.len(), 2);
+    }
+
+    #[test]
+    fn query_offset_beyond_total() {
+        let state = setup_query_state();
+        let page = state.query(&TaskQuery::new().with_offset(100));
+        assert_eq!(page.total, 5);
+        assert!(page.items.is_empty());
+    }
+
+    #[test]
+    fn query_limit_larger_than_remaining() {
+        let state = setup_query_state();
+        // offset 3, limit 100 => only 2 remaining
+        let page = state.query(&TaskQuery::new().with_offset(3).with_limit(100));
+        assert_eq!(page.total, 5);
+        assert_eq!(page.items.len(), 2);
+    }
+
+    #[test]
+    fn query_slot_with_pagination() {
+        let state = setup_query_state();
+        // slot-a has 3 tasks, offset 1 limit 1 => 1 item, total 3
+        let page = state.query(
+            &TaskQuery::new()
+                .with_slot("slot-a")
+                .with_offset(1)
+                .with_limit(1),
+        );
+        assert_eq!(page.total, 3);
+        assert_eq!(page.items.len(), 1);
     }
 }

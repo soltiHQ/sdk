@@ -9,9 +9,10 @@ use std::{sync::Arc, time::Duration};
 use taskvisor::{
     ControllerConfig, ControllerSpec, Subscribe, Supervisor, SupervisorConfig, TaskRef, TaskSpec,
 };
-use tno_model::{CreateSpec, TaskId, TaskInfo, TaskStatus};
+use tno_model::{CreateSpec, TaskId, TaskInfo, TaskPage, TaskQuery, TaskStatus};
 use tracing::{debug, info, instrument};
 
+use crate::system::init_uptime;
 use crate::{
     error::CoreError,
     map::{to_admission_policy, to_backoff_policy, to_restart_policy},
@@ -63,6 +64,8 @@ impl SupervisorApi {
         });
 
         sup.wait_ready().await;
+        init_uptime();
+
         info!("supervisor is ready to accept tasks");
         Ok(Self { sup, router, state })
     }
@@ -85,6 +88,11 @@ impl SupervisorApi {
     /// List tasks by status.
     pub fn list_tasks_by_status(&self, status: TaskStatus) -> Vec<TaskInfo> {
         self.state.list_by_status(status)
+    }
+
+    /// Query tasks with combined filters and pagination.
+    pub fn query_tasks(&self, query: &TaskQuery) -> TaskPage<TaskInfo> {
+        self.state.query(query)
     }
 
     /// Get a clone of the underlying supervisor handle.

@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package tno.discover.v1;
+
+service DiscoverService {
+  rpc Sync(SyncRequest) returns (SyncResponse);
+}
+
+message SyncRequest {
+    string id = 1;
+    string name = 2;
+    string endpoint = 3;
+    
+    int64 uptime_seconds = 4;
+    string platform = 5;
+    string arch = 6;
+    string os = 7;
+
+    int64 ts = 8;
+    map<string, string> metadata = 9;
+}
+
+message SyncResponse {
+    bool success = 1;
+}

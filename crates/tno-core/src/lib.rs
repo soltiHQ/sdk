@@ -23,4 +23,7 @@ pub use supervisor::SupervisorApi;
 mod metrics;
 pub use metrics::{MetricsBackend, MetricsHandle, NoOpMetrics, TaskOutcome, noop_metrics};
 
+mod system;
+pub use system::{agent_id, arch, os_info, platform, uptime_seconds};
+
 mod state;

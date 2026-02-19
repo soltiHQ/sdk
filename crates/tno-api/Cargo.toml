@@ -7,20 +7,15 @@ edition = "2024"
 default = []
 grpc = ["dep:tonic", "dep:prost"]
 http = ["dep:axum", "dep:serde_json"]
-discovery = ["grpc", "dep:tokio", "dep:taskvisor", "dep:tokio-util"]
 
 [dependencies]
 async-trait = { workspace = true }
 thiserror = { workspace = true }
-hostname = { workspace = true }
 tracing = { workspace = true }
 
 serde_json = { workspace = true, optional = true }
-tokio-util = { workspace = true, optional = true }
-taskvisor = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 
 tno-core = { path = "../tno-core" }

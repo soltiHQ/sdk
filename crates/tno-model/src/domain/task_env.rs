@@ -52,7 +52,7 @@ impl TaskEnv {
 
     /// Append a key–value pair to the environment.
     ///
-    /// Later entries override earlier ones when queried via [`RunnerEnv::get`].
+    /// Later entries override earlier ones when queried via [`TaskEnv::get`].
     pub fn push<K, V>(&mut self, key: K, value: V)
     where
         K: Into<String>,
@@ -63,7 +63,7 @@ impl TaskEnv {
 
     /// Merge two environments, where entries from `other` override earlier ones.
     ///
-    /// The environments are combined by simple concatenation, allowing [`RunnerEnv::get`] to resolve overrides naturally by scanning from the end.
+    /// The environments are combined by simple concatenation, allowing [`TaskEnv::get`] to resolve overrides naturally by scanning from the end.
     pub fn merged(&self, other: &TaskEnv) -> TaskEnv {
         let mut out = self.0.clone();
         out.extend(other.0.clone());

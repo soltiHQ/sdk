@@ -12,6 +12,9 @@ service TnoApi {
   // Get current task status
   rpc GetTaskStatus(GetTaskStatusRequest) returns (GetTaskStatusResponse);
 
+  // Query tasks with combined filters and pagination
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+
   // List all tasks
   rpc ListAllTasks(ListAllTasksRequest) returns (ListAllTasksResponse);
 
@@ -43,6 +46,20 @@ message GetTaskStatusRequest {
 // GetTaskStatus response
 message GetTaskStatusResponse {
   optional TaskInfo info = 1;
+}
+
+// ListTasks request — unified query with optional filters and pagination
+message ListTasksRequest {
+  optional string slot = 1;
+  optional TaskStatus status = 2;
+  uint32 limit = 3;   // 0 = default (100), max 1000
+  uint32 offset = 4;  // default 0
+}
+
+// ListTasks response — paginated result
+message ListTasksResponse {
+  repeated TaskInfo tasks = 1;
+  uint32 total = 2;
 }
 
 // ListAllTasks request
