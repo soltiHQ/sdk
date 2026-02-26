@@ -44,6 +44,8 @@ message SyncRequest {
     EndpointType endpoint_type = 10;
     // API version the agent supports.
     APIVersion api_version = 11;
+    // Agent-reported heartbeat interval in seconds.
+    int32 heartbeat_interval_s = 12;
 }
 
 message SyncResponse {

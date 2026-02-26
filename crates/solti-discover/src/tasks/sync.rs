@@ -128,6 +128,7 @@ fn build_base_request(cfg: &DiscoverConfig) -> SyncRequest {
         uptime_seconds: 0,
         endpoint_type: cfg.transport.as_proto(),
         api_version: ApiVersion::V1.into(),
+        heartbeat_interval_s: (cfg.delay_ms / 1000) as i32,
     }
 }
 
