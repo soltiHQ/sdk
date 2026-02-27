@@ -2,24 +2,53 @@ syntax = "proto3";
 
 package solti.discover.v1;
 
+option go_package = "github.com/soltiHQ/control-plane/domain/gen/v1;genv1";
+
 service DiscoverService {
+  // Sync is invoked periodically by agent to report their status.
   rpc Sync(SyncRequest) returns (SyncResponse);
 }
 
-message SyncRequest {
-    string id = 1;
-    string name = 2;
-    string endpoint = 3;
-    
-    int64 uptime_seconds = 4;
-    string platform = 5;
-    string arch = 6;
-    string os = 7;
+// EndpointType describes the transport protocol an agent exposes.
+enum EndpointType {
+    ENDPOINT_TYPE_GRPC = 0;
+    ENDPOINT_TYPE_HTTP = 1;
+}
 
+// APIVersion describes the agent API version.
+enum APIVersion {
+    API_VERSION_UNSPECIFIED = 0;
+    API_VERSION_V1 = 1;
+}
+
+message SyncRequest {
+    // Unique agent identifier.
+    string id = 1;
+    // Agent name.
+    string name = 2;
+    // Where control plane can reach this agent.
+    string endpoint = 3;
+    // Seconds since start.
+    int64 uptime_seconds = 4;
+    // Operating system (e.g. "ubuntu", "debian").
+    string os = 5;
+    // Architecture (e.g. "amd64", "arm64").
+    string arch = 6;
+    // Platform ("linux", "macos").
+    string platform = 7;
+    // Unix timestamp when message was sent.
     int64 ts = 8;
+    // Metadata provided by the agent.
     map<string, string> metadata = 9;
+    // Transport type for the agent endpoint.
+    EndpointType endpoint_type = 10;
+    // API version the agent supports.
+    APIVersion api_version = 11;
+    // Agent-reported heartbeat interval in seconds.
+    int32 heartbeat_interval_s = 12;
 }
 
 message SyncResponse {
+    // Indicates success or failure.
     bool success = 1;
 }

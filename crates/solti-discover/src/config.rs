@@ -6,6 +6,15 @@ pub enum DiscoveryTransport {
     Http,
 }
 
+impl DiscoveryTransport {
+    pub fn as_proto(&self) -> i32 {
+        match self {
+            DiscoveryTransport::Grpc => 0,
+            DiscoveryTransport::Http => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiscoverConfig {
     pub metadata: HashMap<String, String>,

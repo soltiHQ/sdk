@@ -13,7 +13,9 @@ use taskvisor::{TaskError, TaskFn, TaskRef};
 
 use crate::config::{DiscoverConfig, DiscoveryTransport};
 use crate::errors::DiscoverError;
-use crate::{SyncRequest, SyncResponse, discover_service_client::DiscoverServiceClient};
+use crate::{
+    ApiVersion, SyncRequest, SyncResponse, discover_service_client::DiscoverServiceClient,
+};
 
 const SLOT: &str = "solti-discover-sync";
 
@@ -124,6 +126,9 @@ fn build_base_request(cfg: &DiscoverConfig) -> SyncRequest {
         metadata: cfg.metadata.clone(),
         ts: 0,
         uptime_seconds: 0,
+        endpoint_type: cfg.transport.as_proto(),
+        api_version: ApiVersion::V1.into(),
+        heartbeat_interval_s: (cfg.delay_ms / 1000) as i32,
     }
 }
 
