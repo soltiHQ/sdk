@@ -13,7 +13,7 @@ use solti_model::{
     RunnerLabels, TaskEnv, TaskKind,
 };
 use solti_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
-use solti_prometheus::PrometheusMetrics;
+use solti_prometheus::{PrometheusMetrics, PrometheusSubscriber};
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
 const AGENT_HTTP_ADDR: &str = "0.0.0.0:8085";
@@ -29,9 +29,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logger(&cfg)?;
     info!("logger initialized");
 
-    // 2) Prometheus metrics
-    let metrics = PrometheusMetrics::new()?;
+    // 2) Prometheus metrics (shared registry)
+    let registry = Arc::new(prometheus::Registry::new());
+    let metrics = PrometheusMetrics::new_with_registry(registry.clone())?;
     let metrics_handle = Arc::new(metrics.clone());
+    let prom_subscriber = PrometheusSubscriber::new(registry)?;
     info!("prometheus metrics initialized");
 
     // 3) Router + subprocess runner
@@ -41,7 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("registered default subprocess runner");
 
     // 4) Supervisor
-    let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(Subscriber)];
+    let subscribers: Vec<Arc<dyn Subscribe>> =
+        vec![Arc::new(Subscriber), Arc::new(prom_subscriber)];
     let supervisor = SupervisorApi::new(
         SupervisorConfig::default(),
         ControllerConfig::default(),

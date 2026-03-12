@@ -5,11 +5,15 @@ edition = "2024"
 
 [features]
 default = []
+controller = ["taskvisor/controller"]
 
 [dependencies]
 prometheus = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
 
 solti-core = { path = "../solti-core" }
+taskvisor = { workspace = true }
 
 [dev-dependencies]
-solti-model = { path = "../solti-model" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

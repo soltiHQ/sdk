@@ -4,21 +4,26 @@ use prometheus::{CounterVec, HistogramVec, Opts, Registry, proto::MetricFamily};
 
 use solti_core::{MetricsBackend, TaskOutcome};
 
-/// Prometheus metrics backend for solti.
+/// Prometheus metrics backend for solti runners.
 ///
-/// Implements [`MetricsBackend`] and exposes prometheus metrics that can be scraped via HTTP endpoint.
+/// Implements [`MetricsBackend`] and exposes runner-level metrics in Prometheus format.
 ///
 /// ## Metrics
-/// - `solti_tasks_started_total{runner_type}` - Counter of spawned tasks
-/// - `solti_tasks_completed_total{runner_type, outcome}` - Counter of completed tasks
-/// - `solti_task_duration_seconds{runner_type}` - Histogram of task execution time
-/// - `solti_runner_errors_total{runner_type, error_kind}` - Counter of runner errors
 ///
-/// ## Label cardinality
-/// All labels are bounded (low cardinality):
-/// - `runner_type`: "subprocess", "wasm", "container"
-/// - `outcome`: "success", "failure", "canceled", "timeout"
-/// - `error_kind`: "spawn_failed", "backend_config_failed", etc
+/// | Metric                               | Type      | Labels              | Description                    |
+/// |--------------------------------------|-----------|---------------------|--------------------------------|
+/// | `solti_runner_tasks_started_total`   | Counter   | `runner`            | Task spawn events              |
+/// | `solti_runner_tasks_completed_total` | Counter   | `runner`, `outcome` | Task completion events         |
+/// | `solti_runner_task_duration_seconds` | Histogram | `runner`            | Per-attempt execution duration |
+/// | `solti_runner_errors_total`          | Counter   | `runner`, `error`   | Runner setup/teardown errors   |
+///
+/// ## Labels
+///
+/// | Label     | Values                                      | Cardinality |
+/// |-----------|---------------------------------------------|-------------|
+/// | `runner`  | `subprocess`, `wasm`, `container`           | Low         |
+/// | `outcome` | `success`, `failure`, `canceled`, `timeout` | Low         |
+/// | `error`   | `spawn_failed`, `backend_config_failed`, …  | Low         |
 #[derive(Clone)]
 pub struct PrometheusMetrics {
     tasks_started: CounterVec,
@@ -32,36 +37,40 @@ impl PrometheusMetrics {
     /// Create a new prometheus metrics backend with custom registry.
     pub fn new_with_registry(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
         let tasks_started = CounterVec::new(
-            Opts::new("solti_tasks_started_total", "Total number of tasks started")
-                .namespace("solti"),
-            &["runner_type"],
+            Opts::new("tasks_started_total", "Total number of tasks started")
+                .namespace("solti")
+                .subsystem("runner"),
+            &["runner"],
         )?;
         registry.register(Box::new(tasks_started.clone()))?;
 
         let tasks_completed = CounterVec::new(
-            Opts::new(
-                "solti_tasks_completed_total",
-                "Total number of tasks completed",
-            )
-            .namespace("solti"),
-            &["runner_type", "outcome"],
+            Opts::new("tasks_completed_total", "Total number of tasks completed")
+                .namespace("solti")
+                .subsystem("runner"),
+            &["runner", "outcome"],
         )?;
         registry.register(Box::new(tasks_completed.clone()))?;
 
         let tasks_duration = HistogramVec::new(
             prometheus::HistogramOpts::new(
-                "solti_task_duration_seconds",
+                "task_duration_seconds",
                 "Task execution duration in seconds",
             )
             .namespace("solti")
-            .buckets(vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0]),
-            &["runner_type"],
+            .subsystem("runner")
+            .buckets(vec![
+                0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+            ]),
+            &["runner"],
         )?;
         registry.register(Box::new(tasks_duration.clone()))?;
 
         let runner_errors = CounterVec::new(
-            Opts::new("solti_runner_errors_total", "Total runner-level errors").namespace("solti"),
-            &["runner_type", "error_kind"],
+            Opts::new("errors_total", "Total runner-level errors")
+                .namespace("solti")
+                .subsystem("runner"),
+            &["runner", "error"],
         )?;
         registry.register(Box::new(runner_errors.clone()))?;
 
@@ -82,14 +91,6 @@ impl PrometheusMetrics {
     /// Gather all metrics for exposition.
     ///
     /// Use this to implement `/metrics` HTTP endpoint.
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let metrics = PrometheusMetrics::new()?;
-    /// let metrics_families = metrics.gather();
-    /// let encoder = prometheus::TextEncoder::new();
-    /// encoder.encode(&metrics_families, &mut buffer)?;
-    /// ```
     pub fn gather(&self) -> Vec<MetricFamily> {
         self.registry.gather()
     }
@@ -97,7 +98,6 @@ impl PrometheusMetrics {
     /// Get reference to underlying prometheus registry.
     ///
     /// Useful for registering custom metrics alongside solti metrics.
-    #[allow(dead_code)]
     pub fn registry(&self) -> &Arc<Registry> {
         &self.registry
     }
@@ -146,7 +146,7 @@ mod tests {
         let families = metrics.gather();
         let started = families
             .iter()
-            .find(|f| f.name() == "solti_solti_tasks_started_total")
+            .find(|f| f.name() == "solti_runner_tasks_started_total")
             .expect("metric not found");
 
         assert_eq!(started.get_metric().len(), 2);
@@ -163,13 +163,13 @@ mod tests {
 
         let completed = families
             .iter()
-            .find(|f| f.name() == "solti_solti_tasks_completed_total")
+            .find(|f| f.name() == "solti_runner_tasks_completed_total")
             .expect("completed counter not found");
         assert_eq!(completed.get_metric().len(), 2);
 
         let duration = families
             .iter()
-            .find(|f| f.name() == "solti_solti_task_duration_seconds")
+            .find(|f| f.name() == "solti_runner_task_duration_seconds")
             .expect("duration histogram not found");
         assert_eq!(duration.get_metric().len(), 1);
     }
@@ -185,7 +185,7 @@ mod tests {
         let families = metrics.gather();
         let errors = families
             .iter()
-            .find(|f| f.name() == "solti_solti_runner_errors_total")
+            .find(|f| f.name() == "solti_runner_errors_total")
             .expect("errors counter not found");
 
         assert_eq!(errors.get_metric().len(), 2);
