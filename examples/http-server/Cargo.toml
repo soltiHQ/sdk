@@ -5,7 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
-solti-prometheus = { path = "../../crates/solti-prometheus" }
+solti-prometheus = { path = "../../crates/solti-prometheus", features = ["controller"] }
+prometheus = { workspace = true }
 solti-observe = { path = "../../crates/solti-observe", features = ["timezone-sync", "subscriber"] }
 solti-exec = { path = "../../crates/solti-exec", features = ["subprocess"] }
 solti-api = { path = "../../crates/solti-api", features = ["http"] }

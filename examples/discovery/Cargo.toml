@@ -11,7 +11,8 @@ solti-core = { path = "../../crates/solti-core" }
 solti-model = { path = "../../crates/solti-model" }
 solti-api = { path = "../../crates/solti-api", features = ["http"] }
 solti-discover = { path = "../../crates/solti-discover" }
-solti-prometheus = { path = "../../crates/solti-prometheus" }
+solti-prometheus = { path = "../../crates/solti-prometheus", features = ["controller"] }
+prometheus = { workspace = true }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 taskvisor = { workspace = true }
