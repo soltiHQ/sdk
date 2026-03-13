@@ -5,12 +5,19 @@ use tracing_subscriber::fmt::{format::Writer, time::FormatTime};
 
 use crate::logger::object::timezone::{LoggerTimeZone, get_or_detect_local_offset};
 
-/// Dynamic RFC3339 timestamp formatter that respects [`LoggerTimeZone`].
+/// RFC 3339 timestamp formatter for [`tracing_subscriber`] that respects the configured [`LoggerTimeZone`].
 ///
-/// - [`LoggerTimeZone::Utc`] — always formats as `…+00:00`
-/// - [`LoggerTimeZone::Local`] — reads the cached local offset on every call,
-///   so DST changes picked up by [`crate::timezone_sync`] are reflected
-///   without subscriber reinitialization.
+/// Implements [`FormatTime`](tracing_subscriber::fmt::time::FormatTime) and is injected into the `fmt::Layer` by [`crate::init_logger`].
+///
+/// ## Behaviour
+///
+/// | Timezone                  | Offset source                 | Example output                 |
+/// |---------------------------|-------------------------------|--------------------------------|
+/// | [`LoggerTimeZone::Utc`]   | Always `+00:00`               | `2025-01-15T10:30:00+00:00`    |
+/// | [`LoggerTimeZone::Local`] | Cached local offset (per-call)| `2025-01-15T13:30:00+03:00`    |
+///
+/// In `Local` mode the cached offset is read on **every** call, so DST changes picked up
+/// by [`timezone_sync`](crate::timezone_sync) are reflected without restarting the logger.
 #[derive(Debug, Clone, Copy)]
 pub struct LoggerRfc3339 {
     tz: LoggerTimeZone,

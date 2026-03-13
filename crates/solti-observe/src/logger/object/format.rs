@@ -5,17 +5,37 @@ use serde::{Deserialize, Serialize, Serializer};
 use crate::logger::LoggerError;
 
 /// Output format for the logger.
-/// - `Text` - colored (when enabled) text logs.
-/// - `Json` — structured JSON logs.
-/// - `Journald` — logs are sent to systemd-journald (Linux only).
+///
+/// Determines which [`tracing_subscriber`] layer [`crate::init_logger`] installs.
+///
+/// ## Variants
+///
+/// | Variant    | Backend                          | Use case                         |
+/// |------------|----------------------------------|----------------------------------|
+/// | `Text`     | `tracing_subscriber::fmt`        | Local development, human reading |
+/// | `Json`     | `tracing_subscriber::fmt::json`  | Log aggregation (ELK, Loki)      |
+/// | `Journald` | `tracing_journald`               | systemd services (Linux only)    |
+///
+/// ## Parsing
+///
+/// Supports case-insensitive [`FromStr`] and serde deserialization:
+///
+/// ```rust
+/// use solti_observe::LoggerFormat;
+///
+/// let fmt: LoggerFormat = "json".parse().unwrap();
+/// assert_eq!(fmt, LoggerFormat::Json);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LoggerFormat {
-    /// Human-readable text logs (default).
+    /// Text logs with optional ANSI colors (default).
     Text,
-    /// Structured JSON logs.
+    /// Structured JSON logs (ANSI colors always disabled).
     Json,
     /// systemd-journald output (Linux only).
+    ///
+    /// Parsing or deserializing this variant on non-Linux returns an error.
     Journald,
 }
 

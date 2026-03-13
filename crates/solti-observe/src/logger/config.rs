@@ -3,19 +3,45 @@ use std::io::IsTerminal;
 
 use crate::logger::object::{LoggerFormat, LoggerLevel, LoggerTimeZone};
 
-/// Logger configuration.
+/// Logger configuration passed to [`crate::init_logger`].
+///
+/// ```rust
+/// use solti_observe::LoggerConfig;
+///
+/// // Empty JSON → all defaults
+/// let cfg: LoggerConfig = serde_json::from_str("{}").unwrap();
+/// assert_eq!(cfg.format, solti_observe::LoggerFormat::Text);
+///
+/// // Override only what you need
+/// let cfg: LoggerConfig = serde_json::from_str(r#"{"level":"debug"}"#).unwrap();
+/// assert_eq!(cfg.level.as_str(), "debug");
+/// ```
+///
+/// ## Defaults
+///
+/// | Field          | Default | Description                                |
+/// |----------------|---------|--------------------------------------------|
+/// | `format`       | `Text`  | Human-readable colored output              |
+/// | `level`        | `info`  | `tracing_subscriber::EnvFilter` expression |
+/// | `tz`           | `Utc`   | Timestamp timezone                         |
+/// | `with_targets` | `true`  | Include module/target names in output      |
+/// | `use_color`    | `true`  | Colored output (auto-disabled if not TTY)  |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoggerConfig {
-    /// Output format.
+    /// Output format: [`LoggerFormat::Text`], [`LoggerFormat::Json`], or [`LoggerFormat::Journald`].
     pub format: LoggerFormat,
-    /// Log level filter expression (e.g., "info", "my_crate=debug,info").
+    /// Log level filter expression (e.g. `"info"`, `"solti_exec=trace,info"`).
+    ///
+    /// Validated on construction — see [`LoggerLevel`] for syntax.
     pub level: LoggerLevel,
-    /// Timezone for timestamps.
+    /// Timestamp timezone: [`LoggerTimeZone::Utc`] or [`LoggerTimeZone::Local`].
     pub tz: LoggerTimeZone,
     /// Whether to include module/target names in log output.
     pub with_targets: bool,
     /// Whether to use colored output.
+    ///
+    /// Actual color usage also depends on stdout being a terminal - see [`should_use_color`](Self::should_use_color).
     pub use_color: bool,
 }
 
@@ -35,8 +61,7 @@ impl LoggerConfig {
     /// Determines whether colored output should be used.
     ///
     /// Color is enabled only if:
-    /// 1. `use_color` config is `true` (user hasn't explicitly disabled it), AND
-    /// 2. stdout is a terminal (not redirected to a file/pipe)
+    /// `use_color` config is `true` AND stdout is a terminal.
     ///
     /// This method should be called during logger initialization, not during
     /// config parsing, to ensure accurate terminal detection.

@@ -1,23 +1,29 @@
-#![cfg(feature = "subscriber")]
-
 //! Taskvisor event logger built on the [`tracing`] framework.
 //!
-//! [`TracingEventSubscriber`] implements [`Subscribe`] and maps every
-//! [`EventKind`] to the appropriate tracing severity level with structured
-//! fields (`task`, `attempt`, `delay_ms`, `reason`, …).
-//!
-//! Events are consumed asynchronously via a bounded queue so the
-//! subscriber never blocks the supervision loop.
+//! [`TracingEventSubscriber`] implements [`Subscribe`] and maps every [`EventKind`] to the appropriate
+//! tracing severity level with structured fields (`task`, `attempt`, `delay_ms`, `reason`, …).
 //!
 //! ## Log level mapping
 //!
-//! | Level   | Events                                                       |
-//! |---------|--------------------------------------------------------------|
+//! | Level   | Events                                                                               |
+//! |---------|--------------------------------------------------------------------------------------|
 //! | `trace` | TaskAddRequested, TaskRemoveRequested, TaskRemoved, TaskStopped, ControllerSubmitted |
-//! | `debug` | TaskAdded, ActorExhausted, BackoffScheduled, ControllerSlotTransition |
-//! | `info`  | TaskStarting, ShutdownRequested, AllStoppedWithinGrace       |
-//! | `warn`  | GraceExceeded, TimeoutHit, ControllerRejected                |
-//! | `error` | TaskFailed, ActorDead, SubscriberPanicked, SubscriberOverflow |
+//! | `debug` | TaskAdded, ActorExhausted, BackoffScheduled, ControllerSlotTransition                |
+//! | `info`  | TaskStarting, ShutdownRequested, AllStoppedWithinGrace                               |
+//! | `warn`  | GraceExceeded, TimeoutHit, ControllerRejected                                        |
+//! | `error` | TaskFailed, ActorDead, SubscriberPanicked, SubscriberOverflow                        |
+//!
+//! ## Structured fields
+//!
+//! Each log line includes relevant structured fields from the event:
+//!
+//! | Field        | Type  | Present when                                 |
+//! |--------------|-------|----------------------------------------------|
+//! | `task`       | `str` | Most events (task name)                      |
+//! | `attempt`    | `u32` | TaskStarting, TaskFailed, BackoffScheduled   |
+//! | `reason`     | `str` | TaskFailed, ActorDead, SubscriberPanicked, … |
+//! | `delay_ms`   | `u32` | BackoffScheduled                             |
+//! | `timeout_ms` | `u32` | TimeoutHit                                   |
 
 use std::borrow::Borrow;
 
@@ -27,19 +33,22 @@ use tracing::{debug, error, info, trace, warn};
 
 /// Taskvisor event subscriber that logs every event via [`tracing`].
 ///
-/// Register as a [`Subscribe`] implementation alongside other subscribers
-/// (e.g. [`crate::PrometheusSubscriber`]) so that supervision events appear
-/// in the application log output.
+/// Zero-config: no fields, no constructor arguments.
+/// Just wrap in `Arc` and register alongside other subscribers.
 ///
-/// # Example
+/// See the module-level docs for the complete event → log level mapping and the list of structured fields.
+///
+/// ## Example
 ///
 /// ```rust,ignore
 /// use std::sync::Arc;
 /// use solti_observe::TracingEventSubscriber;
+/// use solti_prometheus::PrometheusSubscriber;
 /// use taskvisor::Subscribe;
 ///
 /// let subscribers: Vec<Arc<dyn Subscribe>> = vec![
-///     Arc::new(TracingEventSubscriber),
+///     Arc::new(TracingEventSubscriber),  // logs events via tracing
+///     Arc::new(prom_subscriber),         // records events as metrics
 /// ];
 /// ```
 #[derive(Default)]
@@ -47,20 +56,23 @@ pub struct TracingEventSubscriber;
 
 /// Queue capacity sized for ~2K events/sec burst with sub-millisecond processing.
 ///
-/// On overflow events are dropped and a [`EventKind::SubscriberOverflow`] event
-/// is emitted by taskvisor (non-blocking).
+/// On overflow events are dropped and a [`EventKind::SubscriberOverflow`] event is emitted by taskvisor (non-blocking).
 const QUEUE_CAPACITY: usize = 2048;
 
 #[async_trait]
 impl Subscribe for TracingEventSubscriber {
+    /// Delegates to [`log_event`] which maps the event kind to the
+    /// appropriate tracing macro at the correct severity level.
     async fn on_event(&self, event: &Event) {
         log_event(event);
     }
 
+    /// Returns `"tracing"` which used by the supervisor for diagnostics.
     fn name(&self) -> &'static str {
         "tracing"
     }
 
+    /// Returns `2048`.
     fn queue_capacity(&self) -> usize {
         QUEUE_CAPACITY
     }
@@ -68,8 +80,7 @@ impl Subscribe for TracingEventSubscriber {
 
 /// Logs a single event at the appropriate tracing level with structured fields.
 ///
-/// Accepts anything that implements [`Borrow<Event>`], so both `&Event` and
-/// owned `Event` work transparently.
+/// Accepts anything that implements [`Borrow<Event>`], so both `&Event` and owned `Event` work transparently.
 pub fn log_event<E: View>(e: E) {
     let msg = message_for(e.kind());
 
