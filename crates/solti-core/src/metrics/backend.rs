@@ -3,7 +3,7 @@ use std::sync::Arc;
 /// Task execution outcome for metrics classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskOutcome {
-    /// Task completed sucessfully.
+    /// Task completed successfully.
     Success,
     /// Task failed.
     Failure,
