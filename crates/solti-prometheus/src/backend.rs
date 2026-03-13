@@ -7,6 +7,7 @@ use solti_core::{MetricsBackend, TaskOutcome};
 /// Prometheus metrics backend for solti runners.
 ///
 /// Implements [`MetricsBackend`] and exposes runner-level metrics in Prometheus format.
+/// Runners call the trait methods during task lifecycle.
 ///
 /// ## Metrics
 ///
@@ -14,16 +15,23 @@ use solti_core::{MetricsBackend, TaskOutcome};
 /// |--------------------------------------|-----------|---------------------|--------------------------------|
 /// | `solti_runner_tasks_started_total`   | Counter   | `runner`            | Task spawn events              |
 /// | `solti_runner_tasks_completed_total` | Counter   | `runner`, `outcome` | Task completion events         |
-/// | `solti_runner_task_duration_seconds` | Histogram | `runner`            | Per-attempt execution duration |
+/// | `solti_runner_task_duration_seconds` | Histogram | `runner`, `outcome` | Per-attempt execution duration |
 /// | `solti_runner_errors_total`          | Counter   | `runner`, `error`   | Runner setup/teardown errors   |
 ///
 /// ## Labels
+///
+/// All label sets have low, bounded cardinality:
 ///
 /// | Label     | Values                                      | Cardinality |
 /// |-----------|---------------------------------------------|-------------|
 /// | `runner`  | `subprocess`, `wasm`, `container`           | Low         |
 /// | `outcome` | `success`, `failure`, `canceled`, `timeout` | Low         |
 /// | `error`   | `spawn_failed`, `backend_config_failed`, …  | Low         |
+///
+/// ## Duration histogram buckets
+///
+/// Buckets (seconds): `0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600`.
+/// Covers sub-second scripts up to 1-hour long-running tasks.
 #[derive(Clone)]
 pub struct PrometheusMetrics {
     tasks_started: CounterVec,
@@ -34,7 +42,10 @@ pub struct PrometheusMetrics {
 }
 
 impl PrometheusMetrics {
-    /// Create a new prometheus metrics backend with custom registry.
+    /// Create a new metrics backend, registering all counters and histograms into the given [`Registry`].
+    ///
+    /// Use a **shared** registry when you need [`PrometheusMetrics`] and [`PrometheusSubscriber`](crate::PrometheusSubscriber)
+    /// to appear on the same `metrics` endpoint.
     pub fn new_with_registry(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
         let tasks_started = CounterVec::new(
             Opts::new("tasks_started_total", "Total number of tasks started")
@@ -60,9 +71,10 @@ impl PrometheusMetrics {
             .namespace("solti")
             .subsystem("runner")
             .buckets(vec![
-                0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+                0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
+                3600.0,
             ]),
-            &["runner"],
+            &["runner", "outcome"],
         )?;
         registry.register(Box::new(tasks_duration.clone()))?;
 
@@ -83,14 +95,16 @@ impl PrometheusMetrics {
         })
     }
 
-    /// Create a new prometheus metrics backend with default registry.
+    /// Create a new metrics backend with an **isolated** registry.
+    ///
+    /// Tests only.
     pub fn new() -> Result<Self, prometheus::Error> {
         Self::new_with_registry(Arc::new(Registry::new()))
     }
 
     /// Gather all metrics for exposition.
     ///
-    /// Use this to implement `/metrics` HTTP endpoint.
+    /// Use this to implement `metrics` HTTP endpoint.
     pub fn gather(&self) -> Vec<MetricFamily> {
         self.registry.gather()
     }
@@ -104,21 +118,37 @@ impl PrometheusMetrics {
 }
 
 impl MetricsBackend for PrometheusMetrics {
+    /// Increments `solti_runner_tasks_started_total{runner=<runner_type>}`.
     fn record_task_started(&self, runner_type: &str) {
         self.tasks_started.with_label_values(&[runner_type]).inc();
     }
 
+    /// Records a task completion event.
+    ///
+    /// Updates two metrics:
+    /// - `solti_runner_tasks_completed_total{runner, outcome}` — incremented by 1.
+    /// - `solti_runner_task_duration_seconds{runner, outcome}` — observes the duration
+    ///   converted from milliseconds to seconds (`duration_ms / 1000`).
+    ///
+    /// The `outcome` label is derived from [`TaskOutcome::as_label`]:
+    /// `success` | `failure` | `canceled` | `timeout`.
     fn record_task_completed(&self, runner_type: &str, outcome: TaskOutcome, duration_ms: u64) {
+        let label = outcome.as_label();
+
         self.tasks_completed
-            .with_label_values(&[runner_type, outcome.as_label()])
+            .with_label_values(&[runner_type, label])
             .inc();
 
         let duration_seconds = duration_ms as f64 / 1000.0;
         self.tasks_duration
-            .with_label_values(&[runner_type])
+            .with_label_values(&[runner_type, label])
             .observe(duration_seconds);
     }
 
+    /// Increments `solti_runner_errors_total{runner=<runner_type>, error=<error_kind>}`.
+    ///
+    /// Called for runner setup/teardown errors (e.g. spawn failures), **not** for task-level failures
+    /// which go through [`record_task_completed`](MetricsBackend::record_task_completed).
     fn record_runner_error(&self, runner_type: &str, error_kind: &str) {
         self.runner_errors
             .with_label_values(&[runner_type, error_kind])
@@ -171,7 +201,7 @@ mod tests {
             .iter()
             .find(|f| f.name() == "solti_runner_task_duration_seconds")
             .expect("duration histogram not found");
-        assert_eq!(duration.get_metric().len(), 1);
+        assert_eq!(duration.get_metric().len(), 2);
     }
 
     #[test]
