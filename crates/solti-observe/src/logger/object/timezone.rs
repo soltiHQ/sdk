@@ -90,9 +90,14 @@ pub fn init_local_offset() {
     if let Ok(mut guard) = LOCAL_OFFSET.write() {
         *guard = offset;
     }
+    let _ = INIT_DONE.set(());
 }
 
-/// Synchronizes local offset.
+/// Re-detects the system UTC offset and updates the global cache.
+///
+/// Called periodically by the [`crate::timezone_sync`] task.
+/// If detection fails (common in multi-threaded contexts on Unix),
+/// the existing cached offset is preserved and no error is returned.
 pub(crate) fn sync_local_offset() -> Result<(), LoggerError> {
     match UtcOffset::current_local_offset() {
         Ok(new_offset) => {
@@ -118,7 +123,11 @@ pub(crate) fn sync_local_offset() -> Result<(), LoggerError> {
     }
 }
 
-/// Returns current local offset for timestamp formatting.
+/// Returns the cached local offset for timestamp formatting.
+///
+/// On first call (if [`init_local_offset`] was never called) attempts a
+/// one-shot detection. On failure prints a warning to stderr and falls
+/// back to UTC.
 pub(crate) fn get_or_detect_local_offset() -> UtcOffset {
     INIT_DONE.get_or_init(|| match UtcOffset::current_local_offset() {
         Ok(detected) => {

@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize, Serializer};
 use crate::logger::LoggerError;
 
 /// Output format for the logger.
-/// - `Text`     — human-friendly, colored (when enabled) text logs.
-/// - `Json`     — structured JSON logs for machines / log collectors.
+/// - `Text` - colored (when enabled) text logs.
+/// - `Json` — structured JSON logs.
 /// - `Journald` — logs are sent to systemd-journald (Linux only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -29,6 +29,7 @@ impl FromStr for LoggerFormat {
     type Err = LoggerError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let norm = s.trim().to_ascii_lowercase();
+
         match norm.as_str() {
             "text" => Ok(Self::Text),
             "json" => Ok(Self::Json),

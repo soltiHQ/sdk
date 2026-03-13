@@ -10,7 +10,9 @@ use solti_model::{
     AdmissionStrategy, BackoffStrategy, CreateSpec, Flag, JitterStrategy, RestartStrategy,
     RunnerLabels, TaskEnv, TaskKind,
 };
-use solti_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
+use solti_observe::{
+    LoggerConfig, LoggerLevel, TracingEventSubscriber, init_logger, timezone_sync,
+};
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
 #[tokio::main]
@@ -29,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("registered default subprocess runner");
 
     // 3) Create supervisor
-    let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(Subscriber)];
+    let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(TracingEventSubscriber)];
     let supervisor = SupervisorApi::new(
         SupervisorConfig::default(),
         ControllerConfig::default(),
