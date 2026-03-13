@@ -8,27 +8,33 @@ use tracing::debug;
 
 use crate::logger::object::timezone::sync_local_offset;
 
-/// Logical slot name used for timezone sync task.
-///
-/// Ensures that only one sync operation runs at any time.
+/// Logical slot name for the timezone sync task.
 pub const TZ_SYNC_SLOT: &str = "solti-logger-tz-sync";
 
-/// Per-attempt timeout in milliseconds.
-///
-/// If syncing the timezone offset takes longer than this limit,
-/// the task is considered failed and restart/backoff logic applies.
+/// Per-attempt timeout (ms).
 pub const TZ_SYNC_TIMEOUT_MS: u64 = 60_000;
 
-/// Delay between successful sync attempts in milliseconds.
-///
-/// This defines the periodic nature of the timezone-sync task.
-pub const TZ_SYNC_RETRY_MS: u64 = 3_600_000;
+/// Interval between successful sync attempts (ms).
+pub const TZ_SYNC_PERIOD_MS: u64 = 3_600_000;
 
-/// Build the timezone sync task and its model-level specification.
+/// Initial backoff delay on failure (ms).
+const BACKOFF_FIRST_MS: u64 = 5_000;
+
+/// Maximum backoff delay on repeated failures (ms).
+const BACKOFF_MAX_MS: u64 = 300_000;
+
+/// Backoff multiplier per consecutive failure.
+const BACKOFF_FACTOR: f64 = 2.0;
+
+/// Builds the timezone sync task and its supervision specification.
 ///
-/// Returns:
-/// - [`TaskRef`]    — executable task body.
-/// - [`CreateSpec`] — restart/backoff/admission policy and slot binding.
+/// Returns a `(TaskRef, CreateSpec)` pair ready to be submitted to a [`taskvisor::Supervisor`] via `submit_with_task`.
+///
+/// # Behaviour
+/// - On **success**: next run is scheduled after [`TZ_SYNC_PERIOD_MS`].
+/// - On **failure**: exponential backoff from 5 s to 5 min with equal jitter.
+/// - **Admission**: [`AdmissionStrategy::Replace`] — duplicate submissions
+///   cancel the in-flight attempt and reschedule.
 pub fn timezone_sync() -> (TaskRef, CreateSpec) {
     let task: TaskRef = TaskFn::arc(TZ_SYNC_SLOT, |ctx: CancellationToken| async move {
         debug!("timezone sync started");
@@ -49,18 +55,21 @@ pub fn timezone_sync() -> (TaskRef, CreateSpec) {
 
     let backoff = BackoffStrategy {
         jitter: JitterStrategy::Equal,
-        first_ms: TZ_SYNC_TIMEOUT_MS,
-        max_ms: TZ_SYNC_TIMEOUT_MS,
-        factor: 1.0,
+        first_ms: BACKOFF_FIRST_MS,
+        max_ms: BACKOFF_MAX_MS,
+        factor: BACKOFF_FACTOR,
     };
+
     let spec = CreateSpec {
+        restart: RestartStrategy::periodic(TZ_SYNC_PERIOD_MS),
         slot: TZ_SYNC_SLOT.to_string(),
         timeout_ms: TZ_SYNC_TIMEOUT_MS,
-        restart: RestartStrategy::periodic(TZ_SYNC_RETRY_MS),
-        backoff,
+
         admission: AdmissionStrategy::Replace,
-        kind: TaskKind::None,
         labels: RunnerLabels::default(),
+        kind: TaskKind::None,
+        backoff,
     };
+
     (task, spec)
 }

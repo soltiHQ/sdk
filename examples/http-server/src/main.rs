@@ -10,7 +10,7 @@ use solti_model::{
     AdmissionStrategy, BackoffStrategy, CreateSpec, Flag, JitterStrategy, RestartStrategy,
     RunnerLabels, TaskEnv, TaskKind,
 };
-use solti_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
+use solti_observe::{LoggerConfig, LoggerLevel, TracingEventSubscriber, init_logger, timezone_sync};
 use solti_prometheus::{PrometheusMetrics, PrometheusSubscriber};
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4) Create supervisor
     let subscribers: Vec<Arc<dyn Subscribe>> =
-        vec![Arc::new(Subscriber), Arc::new(prom_subscriber)];
+        vec![Arc::new(TracingEventSubscriber), Arc::new(prom_subscriber)];
     let supervisor = SupervisorApi::new(
         SupervisorConfig::default(),
         ControllerConfig::default(),

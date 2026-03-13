@@ -8,8 +8,6 @@
 //! | [`PrometheusSubscriber`]                | `solti_sv_*`     | [`taskvisor::Subscribe`]       |
 //! | `taskvisor::Controller` (feature-gated) | `solti_ctrl_*`   | [`taskvisor::Subscribe`]       |
 //!
-//! All share a single [`Registry`] for a unified `/metrics` endpoint.
-//!
 //! ## Example
 //! ```rust,ignore
 //! use std::sync::Arc;

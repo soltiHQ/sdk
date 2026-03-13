@@ -1,30 +1,40 @@
 use std::fmt;
 
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use tracing_subscriber::fmt::{format::Writer, time::FormatTime};
 
-use crate::logger::object::timezone::get_or_detect_local_offset;
+use crate::logger::object::timezone::{LoggerTimeZone, get_or_detect_local_offset};
 
-/// Dynamic RFC3339 timestamp formatter with local timezone support.
+/// Dynamic RFC3339 timestamp formatter that respects [`LoggerTimeZone`].
 ///
-/// Reads the current local offset on every invocation, allowing timezone
-/// changes to be reflected in logs without subscriber reinitialization.
-///
-/// Falls back to UTC if offset detection fails.
+/// - [`LoggerTimeZone::Utc`] — always formats as `…+00:00`
+/// - [`LoggerTimeZone::Local`] — reads the cached local offset on every call,
+///   so DST changes picked up by [`crate::timezone_sync`] are reflected
+///   without subscriber reinitialization.
 #[derive(Debug, Clone, Copy)]
-pub struct LoggerRfc3339;
+pub struct LoggerRfc3339 {
+    tz: LoggerTimeZone,
+}
+
+impl LoggerRfc3339 {
+    /// Create a formatter for the given timezone setting.
+    pub fn new(tz: LoggerTimeZone) -> Self {
+        Self { tz }
+    }
+}
 
 impl FormatTime for LoggerRfc3339 {
     fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
-        let local = OffsetDateTime::now_utc().to_offset(get_or_detect_local_offset());
+        let offset = match self.tz {
+            LoggerTimeZone::Utc => UtcOffset::UTC,
+            LoggerTimeZone::Local => get_or_detect_local_offset(),
+        };
 
-        match local.format(&Rfc3339) {
-            Ok(ts) => {
-                write!(w, "{} ", ts)
-            }
-            Err(_) => {
-                write!(w, "<invalid-time> ")
-            }
+        let ts = OffsetDateTime::now_utc().to_offset(offset);
+
+        match ts.format(&Rfc3339) {
+            Ok(s) => write!(w, "{s} "),
+            Err(_) => write!(w, "<invalid-time> "),
         }
     }
 }

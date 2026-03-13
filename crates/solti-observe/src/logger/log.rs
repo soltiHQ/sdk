@@ -1,32 +1,30 @@
 use tracing::Subscriber;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::logger::{
-    config::LoggerConfig,
-    error::{LoggerError, LoggerResult},
-    object::LoggerRfc3339,
-};
+use crate::logger::{config::LoggerConfig, error::LoggerError, object::LoggerRfc3339};
 
 /// Initializes text logger.
-pub fn logger_text(cfg: &LoggerConfig) -> LoggerResult<()> {
+pub fn logger_text(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     let filter = cfg.level.to_env_filter();
+    let timer = LoggerRfc3339::new(cfg.tz);
     let fmt_layer = fmt::layer()
         .with_ansi(cfg.should_use_color())
         .with_target(cfg.with_targets)
-        .with_timer(LoggerRfc3339);
+        .with_timer(timer);
 
     let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
     init_subscriber(subscriber)
 }
 
 /// Initializes JSON (structured) logger.
-pub fn logger_json(cfg: &LoggerConfig) -> LoggerResult<()> {
+pub fn logger_json(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     let filter = cfg.level.to_env_filter();
+    let timer = LoggerRfc3339::new(cfg.tz);
     let fmt_layer = fmt::layer()
         .json()
         .with_ansi(false)
         .with_target(cfg.with_targets)
-        .with_timer(LoggerRfc3339);
+        .with_timer(timer);
 
     let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
     init_subscriber(subscriber)
@@ -34,7 +32,7 @@ pub fn logger_json(cfg: &LoggerConfig) -> LoggerResult<()> {
 
 /// Initializes journald logger (Linux only).
 #[cfg(target_os = "linux")]
-pub fn logger_journald(cfg: &LoggerConfig) -> LoggerResult<()> {
+pub fn logger_journald(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     let filter = cfg.level.to_env_filter();
     let journald =
         tracing_journald::layer().map_err(|e| LoggerError::JournaldInitFailed(e.to_string()))?;
@@ -45,12 +43,12 @@ pub fn logger_journald(cfg: &LoggerConfig) -> LoggerResult<()> {
 
 /// Stub for journald on non-Linux platforms.
 #[cfg(not(all(target_os = "linux")))]
-pub fn logger_journald(_cfg: &LoggerConfig) -> LoggerResult<()> {
+pub fn logger_journald(_cfg: &LoggerConfig) -> Result<(), LoggerError> {
     Err(LoggerError::JournaldNotSupported)
 }
 
 /// Installs the subscriber as the global default.
-fn init_subscriber<S>(subscriber: S) -> LoggerResult<()>
+fn init_subscriber<S>(subscriber: S) -> Result<(), LoggerError>
 where
     S: Subscriber + Send + Sync + 'static,
 {

@@ -1,9 +1,23 @@
 #![cfg(feature = "subscriber")]
 
-//! Event logging subscriber for Taskvisor.
+//! Taskvisor event logger built on the [`tracing`] framework.
 //!
-//! Maps Taskvisor events to structured tracing logs with appropriate severity levels.
-//! Processes events asynchronously via bounded queue to avoid blocking the event system.
+//! [`TracingEventSubscriber`] implements [`Subscribe`] and maps every
+//! [`EventKind`] to the appropriate tracing severity level with structured
+//! fields (`task`, `attempt`, `delay_ms`, `reason`, …).
+//!
+//! Events are consumed asynchronously via a bounded queue so the
+//! subscriber never blocks the supervision loop.
+//!
+//! ## Log level mapping
+//!
+//! | Level   | Events                                                       |
+//! |---------|--------------------------------------------------------------|
+//! | `trace` | TaskAddRequested, TaskRemoveRequested, TaskRemoved, TaskStopped, ControllerSubmitted |
+//! | `debug` | TaskAdded, ActorExhausted, BackoffScheduled, ControllerSlotTransition |
+//! | `info`  | TaskStarting, ShutdownRequested, AllStoppedWithinGrace       |
+//! | `warn`  | GraceExceeded, TimeoutHit, ControllerRejected                |
+//! | `error` | TaskFailed, ActorDead, SubscriberPanicked, SubscriberOverflow |
 
 use std::borrow::Borrow;
 
@@ -11,51 +25,67 @@ use async_trait::async_trait;
 use taskvisor::{Event, EventKind, Subscribe};
 use tracing::{debug, error, info, trace, warn};
 
-/// Subscriber that logs all Taskvisor events using the tracing framework.
+/// Taskvisor event subscriber that logs every event via [`tracing`].
 ///
-/// Events are processed asynchronously with structured fields (task, attempt, etc.).
-/// Queue overflow results in `SubscriberOverflow` events being emitted.
+/// Register as a [`Subscribe`] implementation alongside other subscribers
+/// (e.g. [`crate::PrometheusSubscriber`]) so that supervision events appear
+/// in the application log output.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::sync::Arc;
+/// use solti_observe::TracingEventSubscriber;
+/// use taskvisor::Subscribe;
+///
+/// let subscribers: Vec<Arc<dyn Subscribe>> = vec![
+///     Arc::new(TracingEventSubscriber),
+/// ];
+/// ```
 #[derive(Default)]
-pub struct Subscriber;
+pub struct TracingEventSubscriber;
 
 /// Queue capacity sized for ~2K events/sec burst with sub-millisecond processing.
-/// On overflow, events are dropped and `SubscriberOverflow` event is emitted (non-blocking).
-const SUBSCRIBER_QUEUE_CAPACITY: usize = 2048;
+///
+/// On overflow events are dropped and a [`EventKind::SubscriberOverflow`] event
+/// is emitted by taskvisor (non-blocking).
+const QUEUE_CAPACITY: usize = 2048;
 
 #[async_trait]
-impl Subscribe for Subscriber {
+impl Subscribe for TracingEventSubscriber {
     async fn on_event(&self, event: &Event) {
         log_event(event);
     }
 
     fn name(&self) -> &'static str {
-        "subscriber"
+        "tracing"
     }
 
     fn queue_capacity(&self) -> usize {
-        SUBSCRIBER_QUEUE_CAPACITY
+        QUEUE_CAPACITY
     }
 }
 
-/// Logs an event with appropriate tracing level and structured fields.
+/// Logs a single event at the appropriate tracing level with structured fields.
 ///
-/// This is public to allow custom subscribers to reuse the same logging logic.
-fn log_event<E: View>(e: E) {
+/// Accepts anything that implements [`Borrow<Event>`], so both `&Event` and
+/// owned `Event` work transparently.
+pub fn log_event<E: View>(e: E) {
     let msg = message_for(e.kind());
 
     match e.kind() {
-        // Management - trace level for routine operations
+        // Management — trace level for routine operations
         EventKind::TaskRemoveRequested => trace!(task = e.as_task(), "{msg}"),
         EventKind::TaskAddRequested => trace!(task = e.as_task(), "{msg}"),
         EventKind::TaskRemoved => trace!(task = e.as_task(), "{msg}"),
         EventKind::TaskAdded => debug!(task = e.as_task(), "{msg}"),
 
-        // Shutdown - info/warn for lifecycle events
+        // Shutdown — info/warn for lifecycle events
         EventKind::ShutdownRequested => info!("{msg}"),
         EventKind::AllStoppedWithinGrace => info!("{msg}"),
         EventKind::GraceExceeded => warn!("{msg}"),
 
-        // Subscriber errors - always error level
+        // Subscriber errors — always error level
         EventKind::SubscriberPanicked => {
             error!(task = e.as_task(), reason = e.as_reason(), "{msg}")
         }
@@ -63,7 +93,7 @@ fn log_event<E: View>(e: E) {
             error!(task = e.as_task(), reason = e.as_reason(), "{msg}")
         }
 
-        // Terminal states - debug for exhausted, error for dead
+        // Terminal states — debug for exhausted, error for dead
         EventKind::ActorExhausted => {
             debug!(task = e.as_task(), reason = e.as_reason(), "{msg}")
         }
@@ -71,7 +101,7 @@ fn log_event<E: View>(e: E) {
             error!(task = e.as_task(), reason = e.as_reason(), "{msg}")
         }
 
-        // Lifecycle events
+        // Lifecycle
         EventKind::TimeoutHit => {
             warn!(task = e.as_task(), timeout_ms = e.timeout_ms(), "{msg}")
         }
@@ -88,7 +118,7 @@ fn log_event<E: View>(e: E) {
             "{msg}"
         ),
 
-        // Backoff - differentiate retry vs scheduled next run
+        // Backoff — differentiate retry vs scheduled next run
         EventKind::BackoffScheduled => {
             if e.has_reason() {
                 debug!(
@@ -108,7 +138,7 @@ fn log_event<E: View>(e: E) {
             }
         }
 
-        // Controller events
+        // Controller
         EventKind::ControllerRejected => {
             warn!(task = e.as_task(), reason = e.as_reason(), "{msg}")
         }
@@ -123,14 +153,22 @@ fn log_event<E: View>(e: E) {
 
 /// Helper trait for extracting event fields with sensible defaults.
 ///
-/// This is internal to reduce boilerplate in `log_event`.
-trait View {
+/// Blanket-implemented for anything that implements [`Borrow<Event>`].
+/// Used internally by [`log_event`] to reduce boilerplate.
+pub trait View {
+    /// Task name, or `"unknown"` if absent.
     fn as_task(&self) -> &str;
+    /// Reason string, or `"unknown"` if absent.
     fn as_reason(&self) -> &str;
+    /// Attempt number, or `0` if absent.
     fn attempt(&self) -> u32;
+    /// Backoff delay in milliseconds, or `0` if absent.
     fn delay_ms(&self) -> u32;
+    /// Timeout in milliseconds, or `0` if absent.
     fn timeout_ms(&self) -> u32;
+    /// The event kind.
     fn kind(&self) -> EventKind;
+    /// Whether the event carries a reason field.
     fn has_reason(&self) -> bool;
 }
 
@@ -174,9 +212,9 @@ where
     }
 }
 
-/// Returns a human-readable description for each event kind.
+/// Human-readable description for each event kind.
 ///
-/// These messages are used as the primary log message, with structured fields providing additional context.
+/// Used as the primary log message; structured fields provide additional context.
 #[inline]
 fn message_for(kind: EventKind) -> &'static str {
     match kind {

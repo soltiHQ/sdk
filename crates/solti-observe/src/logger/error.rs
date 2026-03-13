@@ -23,5 +23,3 @@ pub enum LoggerError {
     #[error("Invalid log level: {0}")]
     InvalidLevel(String),
 }
-
-pub type LoggerResult<T> = Result<T, LoggerError>;

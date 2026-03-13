@@ -12,18 +12,25 @@ use solti_model::{
     AdmissionStrategy, BackoffStrategy, CreateSpec, Flag, JitterStrategy, RestartStrategy,
     RunnerLabels, TaskEnv, TaskKind,
 };
-use solti_observe::{LoggerConfig, LoggerLevel, Subscriber, init_logger, timezone_sync};
+use solti_observe::{LoggerConfig, LoggerLevel, TracingEventSubscriber, init_local_offset, init_logger, timezone_sync, LoggerTimeZone};
 use solti_prometheus::{PrometheusMetrics, PrometheusSubscriber};
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
 const AGENT_HTTP_ADDR: &str = "0.0.0.0:8085";
 const CONTROL_PLANE_ENDPOINT: &str = "http://localhost:8082";
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Must be called before spawning threads (tokio runtime).
+    init_local_offset();
+
+    tokio::runtime::Runtime::new()?.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // 1) Logger
     let cfg = LoggerConfig {
         level: LoggerLevel::new("info")?,
+        tz: LoggerTimeZone::Local,
         ..Default::default()
     };
     init_logger(&cfg)?;
@@ -44,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4) Supervisor
     let subscribers: Vec<Arc<dyn Subscribe>> =
-        vec![Arc::new(Subscriber), Arc::new(prom_subscriber)];
+        vec![Arc::new(TracingEventSubscriber), Arc::new(prom_subscriber)];
     let supervisor = SupervisorApi::new(
         SupervisorConfig::default(),
         ControllerConfig::default(),
