@@ -5,12 +5,46 @@ use tracing_subscriber::EnvFilter;
 
 use crate::logger::LoggerError;
 
-/// Wrapper around a `tracing_subscriber::EnvFilter` expression.
+/// Validated wrapper around a [`tracing_subscriber::EnvFilter`] expression.
 ///
-/// This type is used at the configuration layer:
-/// - It stores the raw filter string (e.g. `"info"`, `"solti_exec=trace,solti_core=debug,info"`).
-/// - It validates the value using `EnvFilter::try_new` when parsing from config / user input.
-/// - It can be converted into an actual `EnvFilter` on demand.
+/// Stores the raw filter string and validates it on construction via `EnvFilter::try_new`.
+///
+/// ## Accepted syntax
+///
+/// Any expression accepted by [`EnvFilter`](tracing_subscriber::EnvFilter):
+///
+/// | Expression                                 | Meaning                                          |
+/// |--------------------------------------------|--------------------------------------------------|
+/// | `"info"`                                   | Global info level                                |
+/// | `"debug"`                                  | Global debug level                               |
+/// | `"solti_exec=trace,info"`                  | Trace for `solti_exec`, info for everything else |
+/// | `"solti_core=debug,solti_exec=trace,warn"` | Per-crate overrides with global fallback         |
+///
+/// ## Construction
+///
+/// ```rust
+/// use solti_observe::LoggerLevel;
+///
+/// // From &str
+/// let lvl = LoggerLevel::new("info").unwrap();
+///
+/// // Via FromStr / parse
+/// let lvl: LoggerLevel = "solti_exec=trace,info".parse().unwrap();
+///
+/// // Invalid expressions are rejected
+/// assert!(LoggerLevel::new("my_crate=lol").is_err());
+/// ```
+///
+/// ## Serialization
+///
+/// Serializes to / deserializes from a plain JSON string:
+///
+/// ```rust
+/// # use solti_observe::LoggerLevel;
+/// let lvl = LoggerLevel::new("debug").unwrap();
+/// let json = serde_json::to_string(&lvl).unwrap();
+/// assert_eq!(json, r#""debug""#);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "String")]
 #[serde(into = "String")]

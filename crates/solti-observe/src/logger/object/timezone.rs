@@ -22,13 +22,31 @@ static INIT_DONE: OnceLock<()> = OnceLock::new();
 
 /// Timezone configuration for log timestamps.
 ///
-/// - `Utc`: All timestamps in UTC (always works, default)
-/// - `Local`: Uses system timezone
+/// Controls which UTC offset is applied to RFC 3339 timestamps in log output.
+///
+/// ## Variants
+///
+/// | Variant | Timestamps look like         | Requirement                        |
+/// |---------|------------------------------|------------------------------------|
+/// | `Utc`   | `2025-01-15T10:30:00+00:00`  | None (always works)                |
+/// | `Local` | `2025-01-15T13:30:00+03:00`  | [`init_local_offset`] before tokio |
+///
+/// ## Default
+///
+/// Defaults to `Utc` — the safe choice that works without any setup.
+///
+/// ## Parsing
+///
+/// Case-insensitive [`FromStr`]: `"utc"`, `"UTC"`, `"local"`, `"LOCAL"`.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub enum LoggerTimeZone {
-    /// UTC timezone.
+    /// UTC timezone — always safe, no setup required.
     Utc,
     /// Local system timezone.
+    ///
+    /// Requires [`init_local_offset`] to be called in `main()` before
+    /// spawning the tokio runtime. Without it, falls back to UTC with
+    /// a warning on stderr.
     Local,
 }
 
@@ -61,17 +79,27 @@ impl fmt::Display for LoggerTimeZone {
     }
 }
 
-/// Initializes local timezone offset early in the program.
+/// Detects the local UTC offset and caches it for timestamp formatting.
 ///
-/// **CRITICAL**: Call in `main()` **before spawning any threads** (before tokio runtime).
-/// Timezone detection fails in multi-thread contexts on most Unix platforms.
+/// **Must be called in `main()` before spawning the tokio runtime.**
 ///
-/// Falls back to UTC silently if detection fails.
+/// ## Why
 ///
-/// # Example
+/// On most Unix platforms, reading `/etc/localtime` is only safe in a single-threaded process.
+/// Once tokio spawns its worker threads, the `time` crate's `UtcOffset::current_local_offset()`
+/// will return `Err` and timestamps would silently fall back to UTC.
+///
+/// ## Behaviour
+///
+/// - Caches the detected offset in a global `RwLock<UtcOffset>`.
+/// - Falls back to UTC silently if detection fails.
+/// - Idempotent — safe to call multiple times; only the first call
+///   triggers detection.
+///
+/// ## Example
+///
 /// ```no_run
 /// use solti_observe::init_local_offset;
-/// use tokio;
 ///
 /// fn main() {
 ///     init_local_offset();
@@ -82,7 +110,7 @@ impl fmt::Display for LoggerTimeZone {
 /// }
 ///
 /// async fn async_main() {
-///     // Async code
+///     // timestamps will use local timezone
 /// }
 /// ```
 pub fn init_local_offset() {
@@ -96,8 +124,6 @@ pub fn init_local_offset() {
 /// Re-detects the system UTC offset and updates the global cache.
 ///
 /// Called periodically by the [`crate::timezone_sync`] task.
-/// If detection fails (common in multi-threaded contexts on Unix),
-/// the existing cached offset is preserved and no error is returned.
 pub(crate) fn sync_local_offset() -> Result<(), LoggerError> {
     match UtcOffset::current_local_offset() {
         Ok(new_offset) => {
@@ -125,9 +151,8 @@ pub(crate) fn sync_local_offset() -> Result<(), LoggerError> {
 
 /// Returns the cached local offset for timestamp formatting.
 ///
-/// On first call (if [`init_local_offset`] was never called) attempts a
-/// one-shot detection. On failure prints a warning to stderr and falls
-/// back to UTC.
+/// On first call (if [`init_local_offset`] was never called) attempts a one-shot detection.
+/// On failure prints a warning to stderr and falls back to UTC.
 pub(crate) fn get_or_detect_local_offset() -> UtcOffset {
     INIT_DONE.get_or_init(|| match UtcOffset::current_local_offset() {
         Ok(detected) => {

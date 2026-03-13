@@ -64,7 +64,7 @@ mod tests {
     use crate::logger::object::format::LoggerFormat;
 
     #[test]
-    fn init_text_builds_config() {
+    fn text_config_has_correct_fields() {
         let config = LoggerConfig {
             format: LoggerFormat::Text,
             tz: LoggerTimeZone::Utc,
@@ -78,7 +78,7 @@ mod tests {
     }
 
     #[test]
-    fn init_json_builds_config() {
+    fn json_config_has_correct_fields() {
         let config = LoggerConfig {
             format: LoggerFormat::Json,
             tz: LoggerTimeZone::Utc,

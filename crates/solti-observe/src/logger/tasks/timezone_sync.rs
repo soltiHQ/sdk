@@ -11,10 +11,10 @@ use crate::logger::object::timezone::sync_local_offset;
 /// Logical slot name for the timezone sync task.
 pub const TZ_SYNC_SLOT: &str = "solti-logger-tz-sync";
 
-/// Per-attempt timeout (ms).
+/// Per-attempt timeout in milliseconds (60 seconds).
 pub const TZ_SYNC_TIMEOUT_MS: u64 = 60_000;
 
-/// Interval between successful sync attempts (ms).
+/// Interval between successful sync attempts in milliseconds (1 hour).
 pub const TZ_SYNC_PERIOD_MS: u64 = 3_600_000;
 
 /// Initial backoff delay on failure (ms).
@@ -28,13 +28,27 @@ const BACKOFF_FACTOR: f64 = 2.0;
 
 /// Builds the timezone sync task and its supervision specification.
 ///
-/// Returns a `(TaskRef, CreateSpec)` pair ready to be submitted to a [`taskvisor::Supervisor`] via `submit_with_task`.
+/// The task re-detects the local UTC offset by calling `UtcOffset::current_local_offset()` and updating the global cache.
+/// This keeps log timestamps correct across DST transitions in long-running daemons.
 ///
-/// # Behaviour
-/// - On **success**: next run is scheduled after [`TZ_SYNC_PERIOD_MS`].
-/// - On **failure**: exponential backoff from 5 s to 5 min with equal jitter.
-/// - **Admission**: [`AdmissionStrategy::Replace`] — duplicate submissions
-///   cancel the in-flight attempt and reschedule.
+/// ## Scheduling
+///
+/// | Scenario      | Delay           | Strategy                              |
+/// |---------------|-----------------|---------------------------------------|
+/// | Success       | 1 hour          | Periodic restart                      |
+/// | Failure       | 5 s → 5 min     | Exponential backoff with equal jitter |
+/// | Duplicate     | Replaces        | [`AdmissionStrategy::Replace`]        |
+///
+/// ## Example
+///
+/// ```rust,ignore
+/// use solti_observe::timezone_sync;
+/// use solti_core::TaskPolicy;
+///
+/// let (task, spec) = timezone_sync();
+/// let policy = TaskPolicy::from_spec(&spec);
+/// supervisor.submit_with_task(task, &policy).await?;
+/// ```
 pub fn timezone_sync() -> (TaskRef, CreateSpec) {
     let task: TaskRef = TaskFn::arc(TZ_SYNC_SLOT, |ctx: CancellationToken| async move {
         debug!("timezone sync started");
