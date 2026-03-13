@@ -15,7 +15,7 @@ impl TaskEnv {
         Self(Vec::new())
     }
 
-    // Return len.
+    /// Returns the number of key–value pairs in the environment.
     pub fn len(&self) -> usize {
         self.0.len()
     }

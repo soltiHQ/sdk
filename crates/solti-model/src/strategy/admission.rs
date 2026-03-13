@@ -32,8 +32,8 @@ impl FromStr for AdmissionStrategy {
     type Err = ModelError;
     fn from_str(s: &str) -> ModelResult<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "drop-if-running" | "drop" => Ok(AdmissionStrategy::DropIfRunning),
-            "queue" | "add" | "new" | "" => Ok(AdmissionStrategy::Queue),
+            "drop-if-running" | "drop" | "" => Ok(AdmissionStrategy::DropIfRunning),
+            "queue" | "add" | "new" => Ok(AdmissionStrategy::Queue),
             "replace" => Ok(AdmissionStrategy::Replace),
             other => Err(ModelError::UnknownAdmission(other.to_string())),
         }

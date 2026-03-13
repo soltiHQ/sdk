@@ -4,20 +4,19 @@ use serde::{Deserialize, Serialize};
 ///
 /// This structure combines:
 /// - exponential backoff parameters (`first_ms`, `max_ms`, `factor`)
-/// - optional fixed delay (`delay_ms`)
 /// - a jitter policy (`jitter`)
 ///
 /// ## Fields
 /// - `jitter` — Jitter strategy applied to every computed delay.
 ///   Helps avoid synchronized retry storms.
 /// - `first_ms` — Initial backoff delay (in milliseconds)
-///   used for the first retry attempt when `delay_ms` is not set.
+///   used for the first retry attempt.
 /// - `max_ms` — Maximum allowed delay (in milliseconds).
 ///   The exponential backoff will never exceed this cap.
 /// - `factor` — Multiplier for exponential growth.
 ///   For example:
 ///   - `factor = 2.0` → classic doubling (100 → 200 → 400 → ...)
-///   - `factor = 1.0` → linear growth
+///   - `factor = 1.0` → constant delay
 ///   - `factor < 1.0` → decaying backoff (rare, but allowed)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,4 +29,16 @@ pub struct BackoffStrategy {
     pub max_ms: u64,
     /// Exponential growth multiplier.
     pub factor: f64,
+}
+
+impl Default for BackoffStrategy {
+    /// Returns a sensible default: full jitter, 1s initial, 30s max, factor 2.
+    fn default() -> Self {
+        Self {
+            jitter: super::JitterStrategy::Full,
+            first_ms: 1_000,
+            max_ms: 30_000,
+            factor: 2.0,
+        }
+    }
 }
