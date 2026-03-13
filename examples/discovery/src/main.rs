@@ -12,7 +12,10 @@ use solti_model::{
     AdmissionStrategy, BackoffStrategy, CreateSpec, Flag, JitterStrategy, RestartStrategy,
     RunnerLabels, TaskEnv, TaskKind,
 };
-use solti_observe::{LoggerConfig, LoggerLevel, TracingEventSubscriber, init_local_offset, init_logger, timezone_sync, LoggerTimeZone};
+use solti_observe::{
+    LoggerConfig, LoggerLevel, LoggerTimeZone, TracingEventSubscriber, init_local_offset,
+    init_logger, timezone_sync,
+};
 use solti_prometheus::{PrometheusMetrics, PrometheusSubscriber};
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 

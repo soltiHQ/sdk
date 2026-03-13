@@ -29,7 +29,7 @@ impl FromStr for LoggerFormat {
     type Err = LoggerError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let norm = s.trim().to_ascii_lowercase();
-        
+
         match norm.as_str() {
             "text" => Ok(Self::Text),
             "json" => Ok(Self::Json),

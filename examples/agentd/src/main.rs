@@ -10,7 +10,9 @@ use solti_exec::subprocess::register_subprocess_runner_with_backend;
 
 use solti_exec::{CgroupLimits, CpuMax, LinuxCapability, RlimitConfig, SecurityConfig};
 
-use solti_observe::{LoggerConfig, LoggerLevel, TracingEventSubscriber, init_logger, timezone_sync};
+use solti_observe::{
+    LoggerConfig, LoggerLevel, TracingEventSubscriber, init_logger, timezone_sync,
+};
 
 use solti_model::{
     AdmissionStrategy, BackoffStrategy, CreateSpec, Flag, JitterStrategy, RestartStrategy,
