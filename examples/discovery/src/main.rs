@@ -139,7 +139,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
 
     // ── Task 1: Heartbeat — echo every 5s (periodic, never fails) ───────────
     let heartbeat = CreateSpec {
-        slot: "agent-heartbeat".to_string(),
+        slot: "agent-heartbeat".into(),
         kind: TaskKind::Subprocess {
             command: "echo".into(),
             args: vec!["heartbeat: alive".into()],
@@ -147,7 +147,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 3_000,
+        timeout_ms: 3_000_u64.into(),
         restart: RestartStrategy::periodic(5_000),
         backoff: backoff.clone(),
         admission: AdmissionStrategy::DropIfRunning,
@@ -158,7 +158,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
 
     // ── Task 2: System monitor — uptime every 15s ───────────────────────────
     let sysmon = CreateSpec {
-        slot: "sys-monitor".to_string(),
+        slot: "sys-monitor".into(),
         kind: TaskKind::Subprocess {
             command: "uptime".into(),
             args: vec![],
@@ -166,7 +166,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000,
+        timeout_ms: 5_000_u64.into(),
         restart: RestartStrategy::periodic(15_000),
         backoff: backoff.clone(),
         admission: AdmissionStrategy::DropIfRunning,
@@ -177,7 +177,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
 
     // ── Task 3: Disk check — df every 30s ───────────────────────────────────
     let disk_check = CreateSpec {
-        slot: "disk-check".to_string(),
+        slot: "disk-check".into(),
         kind: TaskKind::Subprocess {
             command: "df".into(),
             args: vec!["-h".into()],
@@ -185,7 +185,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000,
+        timeout_ms: 5_000_u64.into(),
         restart: RestartStrategy::periodic(30_000),
         backoff: backoff.clone(),
         admission: AdmissionStrategy::DropIfRunning,
@@ -196,7 +196,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
 
     // ── Task 4: One-shot date — runs once and completes ─────────────────────
     let oneshot = CreateSpec {
-        slot: "oneshot-date".to_string(),
+        slot: "oneshot-date".into(),
         kind: TaskKind::Subprocess {
             command: "date".into(),
             args: vec!["+%Y-%m-%d %H:%M:%S".into()],
@@ -204,7 +204,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 3_000,
+        timeout_ms: 3_000_u64.into(),
         restart: RestartStrategy::Never,
         backoff: backoff.clone(),
         admission: AdmissionStrategy::DropIfRunning,
@@ -215,7 +215,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
 
     // ── Task 5: Flaky job — fails intentionally, retries on failure ─────────
     let flaky = CreateSpec {
-        slot: "flaky-job".to_string(),
+        slot: "flaky-job".into(),
         kind: TaskKind::Subprocess {
             command: "sh".into(),
             args: vec!["-c".into(), "echo 'attempt running...'; exit 1".into()],
@@ -223,7 +223,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000,
+        timeout_ms: 5_000_u64.into(),
         restart: RestartStrategy::OnFailure,
         backoff: BackoffStrategy {
             jitter: JitterStrategy::Full,

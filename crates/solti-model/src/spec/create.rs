@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     LABEL_RUNNER_TAG, RunnerLabels,
     domain::{Slot, TimeoutMs},
+    error::{ModelError, ModelResult},
     kind::TaskKind,
     strategy::{AdmissionStrategy, BackoffStrategy, RestartStrategy},
 };
@@ -73,14 +74,9 @@ impl CreateSpec {
     ///         cwd: None,
     ///         fail_on_non_zero: Flag::enabled(),
     ///     },
-    ///     timeout_ms: 5_000,
+    ///     timeout_ms: 5_000_u64.into(),
     ///     restart: RestartStrategy::Never,
-    ///     backoff: BackoffStrategy {
-    ///         jitter: JitterStrategy::None,
-    ///         first_ms: 0,
-    ///         max_ms: 0,
-    ///         factor: 1.0,
-    ///     },
+    ///     backoff: BackoffStrategy::default(),
     ///     admission: AdmissionStrategy::DropIfRunning,
     ///     labels: RunnerLabels::new(),
     /// }
@@ -97,5 +93,84 @@ impl CreateSpec {
     /// intended for consumers that perform routing / placement.
     pub fn runner_tag(&self) -> Option<&str> {
         self.labels.get(LABEL_RUNNER_TAG)
+    }
+
+    /// Validate the spec at the model level.
+    ///
+    /// Checks:
+    /// - `slot` is not empty
+    /// - `kind` is not [`TaskKind::None`] (internal-only, must use
+    ///   `submit_with_task` instead)
+    /// - `timeout_ms` is greater than zero
+    ///
+    /// Called automatically by `SupervisorApi::submit()`. Does **not** need
+    /// to be called for specs built by internal tasks (timezone sync, discovery)
+    /// which use `TaskKind::None` + `submit_with_task`.
+    pub fn validate(&self) -> ModelResult<()> {
+        if self.slot.as_str().is_empty() {
+            return Err(ModelError::Invalid("slot must not be empty".into()));
+        }
+        if matches!(self.kind, TaskKind::None) {
+            return Err(ModelError::Invalid(
+                "TaskKind::None cannot be submitted via runner; use submit_with_task".into(),
+            ));
+        }
+        if self.timeout_ms.as_millis() == 0 {
+            return Err(ModelError::Invalid("timeout_ms must be greater than zero".into()));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Flag, TaskEnv};
+
+    fn valid_spec() -> CreateSpec {
+        CreateSpec {
+            slot: "test".into(),
+            kind: TaskKind::Subprocess {
+                command: "echo".into(),
+                args: vec![],
+                env: TaskEnv::default(),
+                cwd: None,
+                fail_on_non_zero: Flag::enabled(),
+            },
+            timeout_ms: 5_000_u64.into(),
+            restart: RestartStrategy::Never,
+            backoff: BackoffStrategy::default(),
+            admission: AdmissionStrategy::DropIfRunning,
+            labels: RunnerLabels::new(),
+        }
+    }
+
+    #[test]
+    fn valid_spec_passes() {
+        assert!(valid_spec().validate().is_ok());
+    }
+
+    #[test]
+    fn empty_slot_fails() {
+        let mut spec = valid_spec();
+        spec.slot = "".into();
+        let err = spec.validate().unwrap_err();
+        assert!(err.to_string().contains("slot"));
+    }
+
+    #[test]
+    fn kind_none_fails() {
+        let mut spec = valid_spec();
+        spec.kind = TaskKind::None;
+        let err = spec.validate().unwrap_err();
+        assert!(err.to_string().contains("TaskKind::None"));
+    }
+
+    #[test]
+    fn zero_timeout_fails() {
+        let mut spec = valid_spec();
+        spec.timeout_ms = 0_u64.into();
+        let err = spec.validate().unwrap_err();
+        assert!(err.to_string().contains("timeout_ms"));
     }
 }

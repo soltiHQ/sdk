@@ -56,7 +56,7 @@ pub fn to_task_spec(task: TaskRef, s: &CreateSpec) -> TaskSpec {
         task,
         to_restart_policy(s.restart),
         to_backoff_policy(&s.backoff),
-        Some(Duration::from_millis(s.timeout_ms)),
+        Some(Duration::from_millis(s.timeout_ms.into())),
     )
 }
 

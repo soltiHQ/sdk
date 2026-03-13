@@ -57,7 +57,7 @@ mod tests {
     fn task_info_serde_roundtrip() {
         let info = TaskInfo {
             id: TaskId::from("test-task-1"),
-            slot: "demo-slot".to_string(),
+            slot: "demo-slot".into(),
             status: TaskStatus::Running,
             attempt: 2,
             created_at: SystemTime::now(),
@@ -79,7 +79,7 @@ mod tests {
     fn task_info_optional_error() {
         let info = TaskInfo {
             id: TaskId::from("test-task"),
-            slot: "slot".to_string(),
+            slot: "slot".into(),
             status: TaskStatus::Succeeded,
             attempt: 1,
             created_at: SystemTime::now(),

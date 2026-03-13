@@ -172,9 +172,9 @@ mod tests {
 
     fn mk_spec(kind: TaskKind) -> CreateSpec {
         CreateSpec {
-            slot: "test-slot".to_string(),
+            slot: "test-slot".into(),
             kind,
-            timeout_ms: 10_000,
+            timeout_ms: 10_000_u64.into(),
             restart: RestartStrategy::default(),
             backoff: mk_backoff(),
             admission: AdmissionStrategy::DropIfRunning,

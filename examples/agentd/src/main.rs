@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 6a) Dev runner
     let ls_spec = CreateSpec {
-        slot: "dev-ls-tmp".to_string(),
+        slot: "dev-ls-tmp".into(),
         kind: TaskKind::Subprocess {
             command: "ls".into(),
             args: vec!["-lah".into(), "/tmp".into()],
@@ -110,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000,
+        timeout_ms: 5_000_u64.into(),
         restart: RestartStrategy::Never,
         backoff: BackoffStrategy {
             jitter: JitterStrategy::None,
@@ -125,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 6b) Production runner
     let date_spec = CreateSpec {
-        slot: "prod-date".to_string(),
+        slot: "prod-date".into(),
         kind: TaskKind::Subprocess {
             command: "date".into(),
             args: vec!["+%Y-%m-%d %H:%M:%S".into()],
@@ -133,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000,
+        timeout_ms: 5_000_u64.into(),
         restart: RestartStrategy::Never,
         backoff: BackoffStrategy {
             jitter: JitterStrategy::None,
@@ -148,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 6c) Untrusted runner
     let sleep_spec = CreateSpec {
-        slot: "untrusted-sleep".to_string(),
+        slot: "untrusted-sleep".into(),
         kind: TaskKind::Subprocess {
             command: "sleep".into(),
             args: vec!["2".into()],
@@ -156,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000,
+        timeout_ms: 5_000_u64.into(),
         restart: RestartStrategy::Never,
         backoff: BackoffStrategy {
             jitter: JitterStrategy::None,
@@ -171,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 6d) Untrusted runner
     let stress_spec = CreateSpec {
-        slot: "untrusted-stress".to_string(),
+        slot: "untrusted-stress".into(),
         kind: TaskKind::Subprocess {
             command: "sh".into(),
             args: vec![
@@ -182,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
             cwd: None,
             fail_on_non_zero: Flag::disabled(),
         },
-        timeout_ms: 5_000,
+        timeout_ms: 5_000_u64.into(),
         restart: RestartStrategy::Never,
         backoff: BackoffStrategy {
             jitter: JitterStrategy::None,

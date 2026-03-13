@@ -46,7 +46,7 @@ impl From<TaskInfo> for proto_api::TaskInfo {
 
         proto_api::TaskInfo {
             id: info.id.to_string(),
-            slot: info.slot,
+            slot: info.slot.to_string(),
             status: proto_api::TaskStatus::from(info.status) as i32,
             attempt: info.attempt,
             created_at,
@@ -79,9 +79,9 @@ impl TryFrom<proto_api::CreateSpec> for CreateSpec {
             .ok_or_else(|| ApiError::InvalidRequest("missing backoff strategy".into()))?;
 
         Ok(CreateSpec {
-            slot: validate_slot(spec.slot)?,
+            slot: validate_slot(spec.slot)?.into(),
             kind: task_kind,
-            timeout_ms: validate_timeout(spec.timeout_ms)?,
+            timeout_ms: validate_timeout(spec.timeout_ms)?.into(),
             restart,
             backoff: convert_backoff_strategy(backoff)?,
             admission: convert_admission_strategy(
@@ -309,7 +309,7 @@ mod tests {
 
         let info = TaskInfo {
             id: solti_model::TaskId::from("task-42"),
-            slot: "my-slot".to_string(),
+            slot: "my-slot".into(),
             status: TaskStatus::Running,
             attempt: 3,
             created_at: now,
@@ -332,7 +332,7 @@ mod tests {
     fn task_info_no_error() {
         let info = TaskInfo {
             id: solti_model::TaskId::from("task-1"),
-            slot: "slot".to_string(),
+            slot: "slot".into(),
             status: TaskStatus::Succeeded,
             attempt: 1,
             created_at: SystemTime::now(),
@@ -352,7 +352,7 @@ mod tests {
 
         let cs = result.unwrap();
         assert_eq!(cs.slot, "test-slot");
-        assert_eq!(cs.timeout_ms, 5_000);
+        assert_eq!(cs.timeout_ms.as_millis(), 5_000);
         assert!(matches!(cs.kind, TaskKind::Subprocess { ref command, .. } if command == "ls"));
         assert!(matches!(cs.restart, RestartStrategy::OnFailure));
         assert!(matches!(cs.admission, AdmissionStrategy::DropIfRunning));

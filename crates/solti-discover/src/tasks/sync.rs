@@ -29,8 +29,8 @@ pub fn sync(config: DiscoverConfig) -> (TaskRef, CreateSpec) {
         factor: 2.0,
     };
     let spec = CreateSpec {
-        slot: SLOT.to_string(),
-        timeout_ms: delay_ms,
+        slot: SLOT.into(),
+        timeout_ms: delay_ms.into(),
         restart: RestartStrategy::periodic(delay_ms),
         backoff,
         admission: AdmissionStrategy::Replace,

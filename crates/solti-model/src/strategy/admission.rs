@@ -39,3 +39,44 @@ impl FromStr for AdmissionStrategy {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_drop_if_running_variants() {
+        assert_eq!("drop-if-running".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::DropIfRunning);
+        assert_eq!("drop".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::DropIfRunning);
+        assert_eq!("DROP".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::DropIfRunning);
+    }
+
+    #[test]
+    fn parse_queue_variants() {
+        assert_eq!("queue".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::Queue);
+        assert_eq!("add".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::Queue);
+        assert_eq!("new".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::Queue);
+    }
+
+    #[test]
+    fn parse_replace() {
+        assert_eq!("replace".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::Replace);
+        assert_eq!("REPLACE".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::Replace);
+    }
+
+    #[test]
+    fn empty_string_maps_to_default() {
+        let parsed: AdmissionStrategy = "".parse().unwrap();
+        assert_eq!(parsed, AdmissionStrategy::default());
+    }
+
+    #[test]
+    fn whitespace_trimmed() {
+        assert_eq!("  queue  ".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::Queue);
+    }
+
+    #[test]
+    fn unknown_value_fails() {
+        assert!("foobar".parse::<AdmissionStrategy>().is_err());
+    }
+}

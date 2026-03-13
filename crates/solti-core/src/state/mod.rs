@@ -48,8 +48,8 @@ impl TaskState {
             error: None,
         };
 
-        inner.tasks.insert(id.clone(), info);
-        inner.by_slot.entry(slot).or_default().push(id);
+        inner.by_slot.entry(slot).or_default().push(id.clone());
+        inner.tasks.insert(id, info);
     }
 
     /// Update task status (called on state transition events).
@@ -165,11 +165,12 @@ impl TaskState {
         let filtered: Vec<&TaskInfo> = iter.collect();
         let total = filtered.len();
 
-        let items = filtered
-            .into_iter()
-            .skip(q.offset)
+        // Slice-based pagination — O(1) index vs O(offset) iterator skip.
+        let start = q.offset.min(total);
+        let items = filtered[start..]
+            .iter()
             .take(q.limit)
-            .cloned()
+            .map(|info| (*info).clone())
             .collect();
 
         TaskPage { items, total }
@@ -190,13 +191,13 @@ mod tests {
     fn add_and_get_task() {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
-        let slot = "demo-slot".to_string();
+        let slot: Slot = "demo-slot".into();
 
         state.add_task(id.clone(), slot.clone());
 
         let info = state.get(&id).expect("task should exist");
         assert_eq!(info.id, id);
-        assert_eq!(info.slot, slot);
+        assert_eq!(info.slot, "demo-slot");
         assert_eq!(info.status, TaskStatus::Pending);
         assert_eq!(info.attempt, 0);
     }
@@ -206,7 +207,7 @@ mod tests {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
-        state.add_task(id.clone(), "slot".to_string());
+        state.add_task(id.clone(), "slot".into());
         state.update_status(&id, TaskStatus::Running, None);
 
         let info = state.get(&id).unwrap();
@@ -219,7 +220,7 @@ mod tests {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
-        state.add_task(id.clone(), "slot".to_string());
+        state.add_task(id.clone(), "slot".into());
         state.update_status(&id, TaskStatus::Failed, Some("timeout".to_string()));
 
         let info = state.get(&id).unwrap();
@@ -232,7 +233,7 @@ mod tests {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
-        state.add_task(id.clone(), "slot".to_string());
+        state.add_task(id.clone(), "slot".into());
         state.increment_attempt(&id);
         state.increment_attempt(&id);
 
@@ -245,7 +246,7 @@ mod tests {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
-        state.add_task(id.clone(), "slot".to_string());
+        state.add_task(id.clone(), "slot".into());
         assert!(state.get(&id).is_some());
 
         state.remove_task(&id);
@@ -256,9 +257,9 @@ mod tests {
     fn list_by_slot_returns_correct_tasks() {
         let state = TaskState::new();
 
-        state.add_task(TaskId::from("task-1"), "slot-a".to_string());
-        state.add_task(TaskId::from("task-2"), "slot-a".to_string());
-        state.add_task(TaskId::from("task-3"), "slot-b".to_string());
+        state.add_task(TaskId::from("task-1"), "slot-a".into());
+        state.add_task(TaskId::from("task-2"), "slot-a".into());
+        state.add_task(TaskId::from("task-3"), "slot-b".into());
 
         let slot_a_tasks = state.list_by_slot("slot-a");
         assert_eq!(slot_a_tasks.len(), 2);
@@ -273,8 +274,8 @@ mod tests {
         let id1 = TaskId::from("task-1");
         let id2 = TaskId::from("task-2");
 
-        state.add_task(id1.clone(), "slot".to_string());
-        state.add_task(id2.clone(), "slot".to_string());
+        state.add_task(id1.clone(), "slot".into());
+        state.add_task(id2.clone(), "slot".into());
         state.update_status(&id1, TaskStatus::Running, None);
 
         let running_tasks = state.list_by_status(TaskStatus::Running);
@@ -290,9 +291,9 @@ mod tests {
     fn list_all_returns_all_tasks() {
         let state = TaskState::new();
 
-        state.add_task(TaskId::from("task-1"), "slot-a".to_string());
-        state.add_task(TaskId::from("task-2"), "slot-b".to_string());
-        state.add_task(TaskId::from("task-3"), "slot-c".to_string());
+        state.add_task(TaskId::from("task-1"), "slot-a".into());
+        state.add_task(TaskId::from("task-2"), "slot-b".into());
+        state.add_task(TaskId::from("task-3"), "slot-c".into());
 
         let all_tasks = state.list_all();
         assert_eq!(all_tasks.len(), 3);
@@ -301,15 +302,15 @@ mod tests {
     fn setup_query_state() -> TaskState {
         let state = TaskState::new();
         // slot-a: 3 tasks (2 running, 1 pending)
-        state.add_task(TaskId::from("a1"), "slot-a".to_string());
-        state.add_task(TaskId::from("a2"), "slot-a".to_string());
-        state.add_task(TaskId::from("a3"), "slot-a".to_string());
+        state.add_task(TaskId::from("a1"), "slot-a".into());
+        state.add_task(TaskId::from("a2"), "slot-a".into());
+        state.add_task(TaskId::from("a3"), "slot-a".into());
         state.update_status(&TaskId::from("a1"), TaskStatus::Running, None);
         state.update_status(&TaskId::from("a2"), TaskStatus::Running, None);
 
         // slot-b: 2 tasks (1 failed, 1 pending)
-        state.add_task(TaskId::from("b1"), "slot-b".to_string());
-        state.add_task(TaskId::from("b2"), "slot-b".to_string());
+        state.add_task(TaskId::from("b1"), "slot-b".into());
+        state.add_task(TaskId::from("b2"), "slot-b".into());
         state.update_status(&TaskId::from("b1"), TaskStatus::Failed, Some("err".into()));
 
         state

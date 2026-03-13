@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use taskvisor::{Event, EventKind, Subscribe};
 use tracing::trace;
@@ -16,9 +18,9 @@ impl StateSubscriber {
         Self { state }
     }
 
-    /// Extract TaskId from event.
+    /// Extract TaskId from event, reusing the existing `Arc<str>` allocation.
     fn task_id_from_event(event: &Event) -> Option<TaskId> {
-        event.task.as_ref().map(|s| TaskId::from(&**s))
+        event.task.as_ref().map(|s| TaskId::from(Arc::clone(s)))
     }
 }
 

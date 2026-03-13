@@ -55,7 +55,7 @@ impl SubprocessRunner {
                 cwd,
                 fail_on_non_zero,
             } => SubprocessTaskConfig {
-                run_id: self.build_run_id(&spec.slot),
+                run_id: self.build_run_id(spec.slot.as_str()),
                 command: command.clone(),
                 args: args.clone(),
                 env: ctx.env().merged(env),
@@ -104,7 +104,7 @@ impl Runner for SubprocessRunner {
 
                 Some(crate::utils::build_cgroup_name(
                     self.name,
-                    &spec.slot,
+                    spec.slot.as_str(),
                     extract_seq_from_run_id(&task_cfg.run_id),
                     timestamp,
                 ))

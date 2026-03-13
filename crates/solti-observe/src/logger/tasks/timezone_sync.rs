@@ -76,8 +76,8 @@ pub fn timezone_sync() -> (TaskRef, CreateSpec) {
 
     let spec = CreateSpec {
         restart: RestartStrategy::periodic(TZ_SYNC_PERIOD_MS),
-        slot: TZ_SYNC_SLOT.to_string(),
-        timeout_ms: TZ_SYNC_TIMEOUT_MS,
+        slot: TZ_SYNC_SLOT.into(),
+        timeout_ms: TZ_SYNC_TIMEOUT_MS.into(),
 
         admission: AdmissionStrategy::Replace,
         labels: RunnerLabels::default(),

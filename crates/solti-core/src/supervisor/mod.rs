@@ -110,14 +110,12 @@ impl SupervisorApi {
     /// This is the primary entrypoint for tasks that are fully described by the public [`solti_model::TaskKind`] model.
     #[instrument(level = "debug", skip(self, spec), fields(slot = %spec.slot, kind = ?spec.kind))]
     pub async fn submit(&self, spec: &CreateSpec) -> Result<TaskId, CoreError> {
-        let task = self.router.build(spec)?;
-        let task_id = TaskId::from(task.name());
+        spec.validate()?;
 
-        self.state.add_task(task_id.clone(), spec.slot.clone());
+        let task = self.router.build(spec)?;
         let policy = TaskPolicy::from_spec(spec);
 
-        self.submit_with_task(task, &policy).await?;
-        Ok(task_id)
+        self.submit_with_task(task, &policy).await
     }
 
     /// Submit a pre-built task together with its runtime policy.
@@ -139,7 +137,7 @@ impl SupervisorApi {
             task,
             to_restart_policy(policy.restart),
             to_backoff_policy(&policy.backoff),
-            Some(Duration::from_millis(policy.timeout_ms)),
+            Some(Duration::from_millis(policy.timeout_ms.into())),
         );
         let controller_spec = ControllerSpec {
             admission: to_admission_policy(policy.admission),
@@ -233,8 +231,8 @@ mod tests {
         });
 
         let policy = TaskPolicy::new(
-            "test-slot".to_string(),
-            1_000,
+            "test-slot".into(),
+            1_000_u64.into(),
             RestartStrategy::Never,
             mk_backoff(),
             AdmissionStrategy::DropIfRunning,
@@ -263,9 +261,9 @@ mod tests {
         .expect("failed to create SupervisorApi");
 
         let spec = CreateSpec {
-            slot: "test-slot-none".to_string(),
+            slot: "test-slot-none".into(),
             kind: TaskKind::None,
-            timeout_ms: 1_000,
+            timeout_ms: 1_000_u64.into(),
             restart: RestartStrategy::Never,
             backoff: mk_backoff(),
             admission: AdmissionStrategy::DropIfRunning,
@@ -274,11 +272,11 @@ mod tests {
         let res = api.submit(&spec).await;
 
         match res {
-            Err(CoreError::NoRunner(msg)) => {
-                assert!(msg.contains("TaskKind::None"));
+            Err(CoreError::InvalidSpec(e)) => {
+                assert!(e.to_string().contains("TaskKind::None"));
             }
             Ok(_) => panic!("expected error for TaskKind::None, got Ok(TaskId)"),
-            Err(e) => panic!("expected CoreError::NoRunner, got {e:?}"),
+            Err(e) => panic!("expected CoreError::InvalidSpec, got {e:?}"),
         }
     }
 }

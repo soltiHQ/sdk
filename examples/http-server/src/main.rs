@@ -101,7 +101,7 @@ async fn metrics_handler(metrics: PrometheusMetrics) -> String {
 async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error::Error>> {
     // Task 1: Print date every 10 seconds
     let date_spec = CreateSpec {
-        slot: "periodic-date".to_string(),
+        slot: "periodic-date".into(),
         kind: TaskKind::Subprocess {
             command: "date".into(),
             args: vec!["+%Y-%m-%d %H:%M:%S".into()],
@@ -109,7 +109,7 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000,
+        timeout_ms: 5_000_u64.into(),
         restart: RestartStrategy::periodic(10_000), // Every 10 seconds
         backoff: BackoffStrategy {
             jitter: JitterStrategy::None,
@@ -123,7 +123,7 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
 
     // Task 2: Print uptime every 30 seconds
     let uptime_spec = CreateSpec {
-        slot: "periodic-uptime".to_string(),
+        slot: "periodic-uptime".into(),
         kind: TaskKind::Subprocess {
             command: "uptime".into(),
             args: vec![],
@@ -131,7 +131,7 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000,
+        timeout_ms: 5_000_u64.into(),
         restart: RestartStrategy::periodic(30_000), // Every 30 seconds
         backoff: BackoffStrategy {
             jitter: JitterStrategy::Equal,
@@ -145,7 +145,7 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
 
     // Task 3: Echo message every 5 seconds
     let echo_spec = CreateSpec {
-        slot: "periodic-echo".to_string(),
+        slot: "periodic-echo".into(),
         kind: TaskKind::Subprocess {
             command: "echo".into(),
             args: vec!["Hello from solti periodic task!".into()],
@@ -153,7 +153,7 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000,
+        timeout_ms: 5_000_u64.into(),
         restart: RestartStrategy::periodic(5_000), // Every 5 seconds
         backoff: BackoffStrategy {
             jitter: JitterStrategy::Full,
