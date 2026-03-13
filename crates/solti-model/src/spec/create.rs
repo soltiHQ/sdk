@@ -116,7 +116,9 @@ impl CreateSpec {
             ));
         }
         if self.timeout_ms.as_millis() == 0 {
-            return Err(ModelError::Invalid("timeout_ms must be greater than zero".into()));
+            return Err(ModelError::Invalid(
+                "timeout_ms must be greater than zero".into(),
+            ));
         }
         Ok(())
     }

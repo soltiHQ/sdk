@@ -46,22 +46,46 @@ mod tests {
 
     #[test]
     fn parse_drop_if_running_variants() {
-        assert_eq!("drop-if-running".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::DropIfRunning);
-        assert_eq!("drop".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::DropIfRunning);
-        assert_eq!("DROP".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::DropIfRunning);
+        assert_eq!(
+            "drop-if-running".parse::<AdmissionStrategy>().unwrap(),
+            AdmissionStrategy::DropIfRunning
+        );
+        assert_eq!(
+            "drop".parse::<AdmissionStrategy>().unwrap(),
+            AdmissionStrategy::DropIfRunning
+        );
+        assert_eq!(
+            "DROP".parse::<AdmissionStrategy>().unwrap(),
+            AdmissionStrategy::DropIfRunning
+        );
     }
 
     #[test]
     fn parse_queue_variants() {
-        assert_eq!("queue".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::Queue);
-        assert_eq!("add".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::Queue);
-        assert_eq!("new".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::Queue);
+        assert_eq!(
+            "queue".parse::<AdmissionStrategy>().unwrap(),
+            AdmissionStrategy::Queue
+        );
+        assert_eq!(
+            "add".parse::<AdmissionStrategy>().unwrap(),
+            AdmissionStrategy::Queue
+        );
+        assert_eq!(
+            "new".parse::<AdmissionStrategy>().unwrap(),
+            AdmissionStrategy::Queue
+        );
     }
 
     #[test]
     fn parse_replace() {
-        assert_eq!("replace".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::Replace);
-        assert_eq!("REPLACE".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::Replace);
+        assert_eq!(
+            "replace".parse::<AdmissionStrategy>().unwrap(),
+            AdmissionStrategy::Replace
+        );
+        assert_eq!(
+            "REPLACE".parse::<AdmissionStrategy>().unwrap(),
+            AdmissionStrategy::Replace
+        );
     }
 
     #[test]
@@ -72,7 +96,10 @@ mod tests {
 
     #[test]
     fn whitespace_trimmed() {
-        assert_eq!("  queue  ".parse::<AdmissionStrategy>().unwrap(), AdmissionStrategy::Queue);
+        assert_eq!(
+            "  queue  ".parse::<AdmissionStrategy>().unwrap(),
+            AdmissionStrategy::Queue
+        );
     }
 
     #[test]
