@@ -10,8 +10,8 @@
 //!  └────────────────────────────────────────────┘
 //! ```
 //!
-//! - [`Slot`]   — logical execution lane, stays the same across submissions.
-//! - [`TaskId`] — unique per run, format `{runner}-{slot}-{seq:x}`.
+//! - [`Slot`]   - logical execution lane, stays the same across submissions.
+//! - [`TaskId`] - unique per run, format `{runner}-{slot}-{seq:x}`.
 
 mod slot;
 pub use slot::Slot;

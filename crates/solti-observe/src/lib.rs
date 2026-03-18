@@ -4,13 +4,13 @@
 //!
 //! This crate wires [`tracing`] into solti, covering three concerns:
 //!
-//! 1. **Logger initialization** — [`init_logger`] installs a global tracing
+//! 1. **Logger initialization** - [`init_logger`] installs a global tracing
 //!    subscriber configured via [`LoggerConfig`] (format, level filter,
 //!    timezone, color).
-//! 2. **Event logging** — [`TracingEventSubscriber`] (feature `subscriber`)
+//! 2. **Event logging** - [`TracingEventSubscriber`] (feature `subscriber`)
 //!    maps every [`taskvisor`] supervision event to a structured tracing call
 //!    at the appropriate severity level.
-//! 3. **Timezone sync** — [`timezone_sync`] (feature `timezone-sync`) is a
+//! 3. **Timezone sync** - [`timezone_sync`] (feature `timezone-sync`) is a
 //!    periodic task that re-detects the local UTC offset so log timestamps
 //!    stay correct across DST transitions.
 //!
@@ -37,13 +37,13 @@
 //!
 //! | Item                                     | Feature         | Description                                              |
 //! |------------------------------------------|-----------------|----------------------------------------------------------|
-//! | [`LoggerConfig`]                         | —               | Logger configuration (format, level, timezone, color)    |
-//! | [`init_logger`]                          | —               | Install global tracing subscriber                        |
-//! | [`init_local_offset`]                    | —               | Detect local UTC offset (call before tokio runtime)      |
-//! | [`LoggerFormat`]                         | —               | Output format: `Text` / `Json` / `Journald`              |
-//! | [`LoggerLevel`]                          | —               | Validated `EnvFilter` expression wrapper                 |
-//! | [`LoggerTimeZone`]                       | —               | Timestamp timezone: `Utc` / `Local`                      |
-//! | [`LoggerError`]                          | —               | Error type for logger initialization                     |
+//! | [`LoggerConfig`]                         | -               | Logger configuration (format, level, timezone, color)    |
+//! | [`init_logger`]                          | -               | Install global tracing subscriber                        |
+//! | [`init_local_offset`]                    | -               | Detect local UTC offset (call before tokio runtime)      |
+//! | [`LoggerFormat`]                         | -               | Output format: `Text` / `Json` / `Journald`              |
+//! | [`LoggerLevel`]                          | -               | Validated `EnvFilter` expression wrapper                 |
+//! | [`LoggerTimeZone`]                       | -               | Timestamp timezone: `Utc` / `Local`                      |
+//! | [`LoggerError`]                          | -               | Error type for logger initialization                     |
 //! | [`TracingEventSubscriber`]               | `subscriber`    | Logs [`taskvisor`] events via tracing                    |
 //! | [`timezone_sync`]                        | `timezone-sync` | Periodic task that re-detects the local UTC offset       |
 //!

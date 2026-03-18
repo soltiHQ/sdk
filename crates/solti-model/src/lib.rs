@@ -26,8 +26,8 @@
 //! | Section         | Type             | Responsibility                                       |
 //! |-----------------|------------------|------------------------------------------------------|
 //! | **metadata**    | [`ObjectMeta`]   | Identity, versioning, timestamps                     |
-//! | **spec**        | [`TaskSpec`]     | Desired state — what to run, how to supervise        |
-//! | **status**      | [`TaskStatus`]   | Observed state — phase, attempt count, last error    |
+//! | **spec**        | [`TaskSpec`]     | Desired state: what to run, how to supervise         |
+//! | **status**      | [`TaskStatus`]   | Observed state: phase, attempt count, last error     |
 //!
 //! Slot and labels live in `spec` as the single source of truth.
 //! [`Task`] provides convenience accessors ([`Task::slot`], [`Task::labels`]) that delegate to `spec`.
@@ -35,8 +35,8 @@
 //! ## Versioning
 //!
 //! [`ObjectMeta`] tracks two counters inspired by K8s:
-//! - **`generation`** — bumped on spec mutations (user-driven changes)
-//! - **`resource_version`** — bumped on any change (spec or status)
+//! - **`generation`** bumped on spec mutations (user-driven changes)
+//! - **`resource_version`** bumped on any change (spec or status)
 //!
 //! ## Task lifecycle
 //!

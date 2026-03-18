@@ -85,18 +85,18 @@ pub fn log_event<E: View>(e: E) {
     let msg = message_for(e.kind());
 
     match e.kind() {
-        // Management — trace level for routine operations
+        // Management - trace level for routine operations
         EventKind::TaskRemoveRequested => trace!(task = e.as_task(), "{msg}"),
         EventKind::TaskAddRequested => trace!(task = e.as_task(), "{msg}"),
         EventKind::TaskRemoved => trace!(task = e.as_task(), "{msg}"),
         EventKind::TaskAdded => debug!(task = e.as_task(), "{msg}"),
 
-        // Shutdown — info/warn for lifecycle events
+        // Shutdown - info/warn for lifecycle events
         EventKind::ShutdownRequested => info!("{msg}"),
         EventKind::AllStoppedWithinGrace => info!("{msg}"),
         EventKind::GraceExceeded => warn!("{msg}"),
 
-        // Subscriber errors — always error level
+        // Subscriber errors - always error level
         EventKind::SubscriberPanicked => {
             error!(task = e.as_task(), reason = e.as_reason(), "{msg}")
         }
@@ -104,7 +104,7 @@ pub fn log_event<E: View>(e: E) {
             error!(task = e.as_task(), reason = e.as_reason(), "{msg}")
         }
 
-        // Terminal states — debug for exhausted, error for dead
+        // Terminal states - debug for exhausted, error for dead
         EventKind::ActorExhausted => {
             debug!(task = e.as_task(), reason = e.as_reason(), "{msg}")
         }
@@ -129,7 +129,7 @@ pub fn log_event<E: View>(e: E) {
             "{msg}"
         ),
 
-        // Backoff — differentiate retry vs scheduled next run
+        // Backoff: differentiate retry vs scheduled next run
         EventKind::BackoffScheduled => {
             if e.has_reason() {
                 debug!(

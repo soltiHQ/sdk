@@ -149,13 +149,13 @@ impl TaskState {
             Box::new(iter.filter(|task| q.matches_phase(&task.status.phase)))
         };
 
-        // Collect refs that pass all filters — we need total count
+        // Collect refs that pass all filters - we need total count
         // and then paginate, so we must know the full filtered set size.
         // We avoid cloning here by collecting references first.
         let filtered: Vec<&Task> = iter.collect();
         let total = filtered.len();
 
-        // Slice-based pagination — O(1) index vs O(offset) iterator skip.
+        // Slice-based paginatior - O(1) index vs O(offset) iterator skip.
         let start = q.offset().min(total);
         let items = filtered[start..]
             .iter()

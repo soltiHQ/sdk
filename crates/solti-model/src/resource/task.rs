@@ -34,7 +34,7 @@ impl Task {
 
     /// Transition phase with optional error and exit code.
     ///
-    /// Bumps `resource_version` once (not `generation` — this is a status change, not spec).
+    /// Bumps `resource_version`.
     pub fn update_phase(
         &mut self,
         phase: TaskPhase,

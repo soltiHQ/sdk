@@ -39,21 +39,21 @@ use tracing::debug;
 ///
 /// | Metric                                   | Type      | Labels   | Description                  |
 /// |------------------------------------------|-----------|----------|------------------------------|
-/// | `solti_sv_tasks_in_flight`               | Gauge     | —        | Currently executing tasks    |
-/// | `solti_sv_task_restarts_total`           | Counter   | —        | Restarts (attempt > 1)       |
+/// | `solti_sv_tasks_in_flight`               | Gauge     | -        | Currently executing tasks    |
+/// | `solti_sv_task_restarts_total`           | Counter   | -        | Restarts (attempt > 1)       |
 /// | `solti_sv_task_backoff_count_total`      | Counter   | `source` | Backoff events               |
-/// | `solti_sv_task_backoff_duration_seconds` | Histogram | —        | Backoff delay duration       |
+/// | `solti_sv_task_backoff_duration_seconds` | Histogram | -        | Backoff delay duration       |
 /// | `solti_sv_task_terminal_total`           | Counter   | `reason` | Terminal task states         |
-/// | `solti_sv_task_timeouts_total`           | Counter   | —        | Timeout events               |
-/// | `solti_sv_subscriber_overflow_total`     | Counter   | —        | Queue overflow (lost events) |
-/// | `solti_sv_subscriber_panicked_total`     | Counter   | —        | Subscriber panics            |
+/// | `solti_sv_task_timeouts_total`           | Counter   | -        | Timeout events               |
+/// | `solti_sv_subscriber_overflow_total`     | Counter   | -        | Queue overflow (lost events) |
+/// | `solti_sv_subscriber_panicked_total`     | Counter   | -        | Subscriber panics            |
 ///
 /// ## Controller metrics (`solti_ctrl_*`, feature `controller`)
 ///
 /// | Metric                         | Type    | Labels | Description            |
 /// |--------------------------------|---------|--------|------------------------|
-/// | `solti_ctrl_submissions_total` | Counter | —      | Controller submissions |
-/// | `solti_ctrl_rejections_total`  | Counter | —      | Controller rejections  |
+/// | `solti_ctrl_submissions_total` | Counter | -      | Controller submissions |
+/// | `solti_ctrl_rejections_total`  | Counter | -      | Controller rejections  |
 ///
 /// ## Labels
 ///
@@ -223,7 +223,7 @@ impl Subscribe for PrometheusSubscriber {
             EventKind::SubscriberOverflow => {
                 tracing::warn!(
                     task = event.task.as_deref().unwrap_or("unknown"),
-                    "subscriber queue overflow — events are being dropped"
+                    "subscriber queue overflow: events are being dropped"
                 );
                 self.subscriber_overflow.inc();
             }

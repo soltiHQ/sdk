@@ -48,7 +48,7 @@ message GetTaskStatusResponse {
   optional TaskInfo info = 1;
 }
 
-// ListTasks request — unified query with optional filters and pagination
+// ListTasks request - unified query with optional filters and pagination
 message ListTasksRequest {
   optional string slot = 1;
   optional TaskStatus status = 2;
@@ -56,7 +56,7 @@ message ListTasksRequest {
   uint32 offset = 4;  // default 0
 }
 
-// ListTasks response — paginated result
+// ListTasks response - paginated result
 message ListTasksResponse {
   repeated TaskInfo tasks = 1;
   uint32 total = 2;

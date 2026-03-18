@@ -35,10 +35,10 @@ pub struct SupervisorApi {
 
 impl SupervisorApi {
     /// Create a supervisor with explicit configs and start its run loop in the background.
-    /// - `sup_cfg`     — supervisor configuration;
-    /// - `ctrl_cfg`    — controller configuration;
-    /// - `subscribers` — event subscribers to attach to the supervisor;
-    /// - `router`      — runner router [`solti_model::TaskKind`].
+    /// - `sup_cfg`     - supervisor configuration;
+    /// - `ctrl_cfg`    - controller configuration;
+    /// - `subscribers` - event subscribers to attach to the supervisor;
+    /// - `router`      - runner router [`solti_model::TaskKind`].
     ///
     /// The supervisor run loop is spawned on the current Tokio runtime.
     /// This method waits until the supervisor reports readiness before returning.

@@ -16,9 +16,9 @@
 //!  └──────────────────────────────────────────────────────┘
 //! ```
 //!
-//! - [`RunnerSelector`]        — top-level selector with `match_labels` + `match_expressions`.
-//! - [`SelectorOperator`]      — comparison operator enum.
-//! - [`SelectorRequirement`]   — single set-based requirement (`In`, `NotIn`, `Exists`, `DoesNotExist`).
+//! - [`RunnerSelector`]        - top-level selector with `match_labels` + `match_expressions`.
+//! - [`SelectorOperator`]      - comparison operator enum.
+//! - [`SelectorRequirement`]   - single set-based requirement (`In`, `NotIn`, `Exists`, `DoesNotExist`).
 
 mod operator;
 pub use operator::SelectorOperator;
