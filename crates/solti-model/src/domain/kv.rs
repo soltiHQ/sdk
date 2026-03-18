@@ -1,10 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Key–value pair used for environment variables or generic metadata.
-///
-/// Both fields are plain UTF-8 strings with no validation applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct KeyValue {
     /// Name of the variable or key.
     key: String,
@@ -14,6 +11,7 @@ pub struct KeyValue {
 
 impl KeyValue {
     /// Create a new key–value pair.
+    #[inline]
     pub fn new<K, V>(key: K, value: V) -> Self
     where
         K: Into<String>,
@@ -26,23 +24,27 @@ impl KeyValue {
     }
 
     /// Get the key.
+    #[inline]
     pub fn key(&self) -> &str {
         &self.key
     }
 
     /// Get the value.
+    #[inline]
     pub fn value(&self) -> &str {
         &self.value
     }
 }
 
 impl From<(String, String)> for KeyValue {
+    #[inline]
     fn from((key, value): (String, String)) -> Self {
         Self { key, value }
     }
 }
 
 impl From<(&str, &str)> for KeyValue {
+    #[inline]
     fn from((key, value): (&str, &str)) -> Self {
         Self {
             key: key.to_string(),
@@ -90,7 +92,7 @@ mod tests {
     fn serde_roundtrip_json() {
         let kv = KeyValue::new("FOO", "bar");
         let json = serde_json::to_string(&kv).unwrap();
-        // due to rename_all = "camelCase"
+        
         assert!(json.contains("\"key\":\"FOO\""));
         assert!(json.contains("\"value\":\"bar\""));
 

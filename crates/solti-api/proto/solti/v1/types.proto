@@ -107,4 +107,7 @@ message TaskInfo {
   int64 created_at = 5;     // Unix timestamp
   int64 updated_at = 6;     // Unix timestamp
   optional string error = 7;
+  uint64 generation = 8;
+  uint64 resource_version = 9;
+  optional int32 exit_code = 10;
 }

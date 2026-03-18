@@ -1,24 +1,26 @@
+use std::borrow::Cow;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ModelError {
-    #[error("feature is disabled for kind: {0}")]
-    FeatureDisabled(String),
+    #[error("conflict: resource_version mismatch (expected {expected}, got {actual})")]
+    Conflict { expected: u64, actual: u64 },
 
-    #[error("unknown admission strategy: {0}")]
+    #[error("unknown admission policy: {0}")]
     UnknownAdmission(String),
 
-    #[error("unknown restart strategy: {0}")]
+    #[error("unknown restart policy: {0}")]
     UnknownRestart(String),
 
-    #[error("unknown jitter strategy: {0}")]
+    #[error("unknown jitter policy: {0}")]
     UnknownJitter(String),
 
     #[error("unknown task kind: {0}")]
     UnknownTaskKind(String),
 
     #[error("invalid model: {0}")]
-    Invalid(String),
+    Invalid(Cow<'static, str>),
 }
 
 pub type ModelResult<T> = Result<T, ModelError>;

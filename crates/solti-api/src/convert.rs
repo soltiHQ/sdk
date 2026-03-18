@@ -1,96 +1,106 @@
 use tracing::warn;
 
 use solti_model::{
-    AdmissionStrategy, BackoffStrategy, CreateSpec, Flag, JitterStrategy, RestartStrategy,
-    RunnerLabels, TaskEnv, TaskInfo, TaskKind, TaskStatus,
+    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, Slot, Task,
+    TaskEnv, TaskKind, TaskPhase, TaskSpec,
 };
 
 use crate::error::ApiError;
 use crate::proto_api;
 
-impl From<TaskStatus> for proto_api::TaskStatus {
-    fn from(status: TaskStatus) -> Self {
-        match status {
-            TaskStatus::Pending => proto_api::TaskStatus::Pending,
-            TaskStatus::Running => proto_api::TaskStatus::Running,
-            TaskStatus::Succeeded => proto_api::TaskStatus::Succeeded,
-            TaskStatus::Failed => proto_api::TaskStatus::Failed,
-            TaskStatus::Timeout => proto_api::TaskStatus::Timeout,
-            TaskStatus::Canceled => proto_api::TaskStatus::Canceled,
-            TaskStatus::Exhausted => proto_api::TaskStatus::Exhausted,
+impl From<TaskPhase> for proto_api::TaskStatus {
+    fn from(phase: TaskPhase) -> Self {
+        match phase {
+            TaskPhase::Pending => proto_api::TaskStatus::Pending,
+            TaskPhase::Running => proto_api::TaskStatus::Running,
+            TaskPhase::Succeeded => proto_api::TaskStatus::Succeeded,
+            TaskPhase::Failed => proto_api::TaskStatus::Failed,
+            TaskPhase::Timeout => proto_api::TaskStatus::Timeout,
+            TaskPhase::Canceled => proto_api::TaskStatus::Canceled,
+            TaskPhase::Exhausted => proto_api::TaskStatus::Exhausted,
+            _ => proto_api::TaskStatus::Pending,
         }
     }
 }
 
-impl From<TaskInfo> for proto_api::TaskInfo {
-    fn from(info: TaskInfo) -> Self {
+impl From<Task> for proto_api::TaskInfo {
+    fn from(task: Task) -> Self {
         use std::time::UNIX_EPOCH;
 
-        let created_at = info
+        let created_at = task
+            .metadata
             .created_at
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|e| {
-                warn!(task_id = %info.id, error = %e, "created_at is before unix epoch, defaulting to 0");
+                warn!(task_id = %task.metadata.id, error = %e, "created_at is before unix epoch, defaulting to 0");
                 std::time::Duration::ZERO
             })
             .as_secs() as i64;
 
-        let updated_at = info
+        let updated_at = task
+            .metadata
             .updated_at
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|e| {
-                warn!(task_id = %info.id, error = %e, "updated_at is before unix epoch, defaulting to 0");
+                warn!(task_id = %task.metadata.id, error = %e, "updated_at is before unix epoch, defaulting to 0");
                 std::time::Duration::ZERO
             })
             .as_secs() as i64;
 
         proto_api::TaskInfo {
-            id: info.id.to_string(),
-            slot: info.slot.to_string(),
-            status: proto_api::TaskStatus::from(info.status) as i32,
-            attempt: info.attempt,
+            id: task.metadata.id.to_string(),
+            slot: task.slot().to_string(),
+            status: proto_api::TaskStatus::from(task.status.phase) as i32,
+            attempt: task.status.attempt,
             created_at,
             updated_at,
-            error: info.error,
+            error: task.status.error,
+            generation: task.metadata.generation,
+            resource_version: task.metadata.resource_version,
+            exit_code: task.status.exit_code,
         }
     }
 }
 
-impl TryFrom<proto_api::CreateSpec> for CreateSpec {
-    type Error = ApiError;
+/// Convert a proto `CreateSpec` into a [`TaskSpec`].
+///
+/// Slot is extracted from the proto message and placed inside [`TaskSpec`].
+pub fn convert_create_spec(spec: proto_api::CreateSpec) -> Result<TaskSpec, ApiError> {
+    let slot: Slot = validate_slot(spec.slot)?.into();
 
-    fn try_from(spec: proto_api::CreateSpec) -> Result<Self, Self::Error> {
-        let kind = spec
-            .kind
-            .ok_or_else(|| ApiError::InvalidRequest("missing task kind".into()))?
-            .kind // добавить .kind для unwrap oneof
-            .ok_or_else(|| ApiError::InvalidRequest("missing task kind variant".into()))?;
+    let kind = spec
+        .kind
+        .ok_or_else(|| ApiError::InvalidRequest("missing task kind".into()))?
+        .kind
+        .ok_or_else(|| ApiError::InvalidRequest("missing task kind variant".into()))?;
 
-        let task_kind = convert_task_kind(kind)?;
+    let task_kind = convert_task_kind(kind)?;
 
-        let restart = convert_restart_strategy(
-            proto_api::RestartStrategy::try_from(spec.restart)
-                .map_err(|_| ApiError::InvalidRequest("invalid restart strategy".into()))?,
-            spec.restart_interval_ms,
-        )?;
+    let restart = convert_restart_policy(
+        proto_api::RestartStrategy::try_from(spec.restart)
+            .map_err(|_| ApiError::InvalidRequest("invalid restart strategy".into()))?,
+        spec.restart_interval_ms,
+    )?;
 
-        let backoff = spec
-            .backoff
-            .ok_or_else(|| ApiError::InvalidRequest("missing backoff strategy".into()))?;
+    let backoff = spec
+        .backoff
+        .ok_or_else(|| ApiError::InvalidRequest("missing backoff strategy".into()))?;
 
-        Ok(CreateSpec {
-            slot: validate_slot(spec.slot)?.into(),
-            kind: task_kind,
-            timeout_ms: validate_timeout(spec.timeout_ms)?.into(),
-            restart,
-            backoff: convert_backoff_strategy(backoff)?,
-            admission: convert_admission_strategy(
-                proto_api::AdmissionStrategy::try_from(spec.admission)
-                    .map_err(|_| ApiError::InvalidRequest("invalid admission strategy".into()))?,
-            )?,
-            labels: convert_labels(spec.labels),
-        })
-    }
+    let task_spec = TaskSpec {
+        slot,
+        kind: task_kind,
+        timeout: validate_timeout(spec.timeout_ms)?.into(),
+        restart,
+        backoff: convert_backoff_policy(backoff)?,
+        admission: convert_admission_policy(
+            proto_api::AdmissionStrategy::try_from(spec.admission)
+                .map_err(|_| ApiError::InvalidRequest("invalid admission strategy".into()))?,
+        )?,
+        runner_selector: None,
+        labels: convert_labels(spec.labels),
+    };
+
+    Ok(task_spec)
 }
 
 fn convert_task_kind(kind: proto_api::task_kind::Kind) -> Result<TaskKind, ApiError> {
@@ -148,31 +158,29 @@ fn convert_env(kvs: Vec<proto_api::KeyValue>) -> TaskEnv {
     env
 }
 
-fn convert_restart_strategy(
+fn convert_restart_policy(
     strategy: proto_api::RestartStrategy,
     interval_ms: Option<u64>,
-) -> Result<RestartStrategy, ApiError> {
+) -> Result<RestartPolicy, ApiError> {
     match strategy {
-        proto_api::RestartStrategy::Never => Ok(RestartStrategy::Never),
-        proto_api::RestartStrategy::OnFailure => Ok(RestartStrategy::OnFailure),
-        proto_api::RestartStrategy::Always => Ok(RestartStrategy::Always { interval_ms }),
+        proto_api::RestartStrategy::Never => Ok(RestartPolicy::Never),
+        proto_api::RestartStrategy::OnFailure => Ok(RestartPolicy::OnFailure),
+        proto_api::RestartStrategy::Always => Ok(RestartPolicy::Always { interval_ms }),
         proto_api::RestartStrategy::Unspecified => Err(ApiError::InvalidRequest(
             "restart strategy not specified".into(),
         )),
     }
 }
 
-fn convert_backoff_strategy(
-    backoff: proto_api::BackoffStrategy,
-) -> Result<BackoffStrategy, ApiError> {
+fn convert_backoff_policy(backoff: proto_api::BackoffStrategy) -> Result<BackoffPolicy, ApiError> {
     let jitter = proto_api::JitterStrategy::try_from(backoff.jitter)
         .map_err(|_| ApiError::InvalidRequest("invalid jitter strategy".into()))?;
 
     let jitter = match jitter {
-        proto_api::JitterStrategy::None => JitterStrategy::None,
-        proto_api::JitterStrategy::Full => JitterStrategy::Full,
-        proto_api::JitterStrategy::Equal => JitterStrategy::Equal,
-        proto_api::JitterStrategy::Decorrelated => JitterStrategy::Decorrelated,
+        proto_api::JitterStrategy::None => JitterPolicy::None,
+        proto_api::JitterStrategy::Full => JitterPolicy::Full,
+        proto_api::JitterStrategy::Equal => JitterPolicy::Equal,
+        proto_api::JitterStrategy::Decorrelated => JitterPolicy::Decorrelated,
         proto_api::JitterStrategy::Unspecified => {
             return Err(ApiError::InvalidRequest(
                 "jitter strategy not specified".into(),
@@ -196,7 +204,7 @@ fn convert_backoff_strategy(
         ));
     }
 
-    Ok(BackoffStrategy {
+    Ok(BackoffPolicy {
         jitter,
         first_ms: backoff.first_ms,
         max_ms: backoff.max_ms,
@@ -204,21 +212,21 @@ fn convert_backoff_strategy(
     })
 }
 
-fn convert_admission_strategy(
+fn convert_admission_policy(
     strategy: proto_api::AdmissionStrategy,
-) -> Result<AdmissionStrategy, ApiError> {
+) -> Result<AdmissionPolicy, ApiError> {
     match strategy {
-        proto_api::AdmissionStrategy::DropIfRunning => Ok(AdmissionStrategy::DropIfRunning),
-        proto_api::AdmissionStrategy::Replace => Ok(AdmissionStrategy::Replace),
-        proto_api::AdmissionStrategy::Queue => Ok(AdmissionStrategy::Queue),
+        proto_api::AdmissionStrategy::DropIfRunning => Ok(AdmissionPolicy::DropIfRunning),
+        proto_api::AdmissionStrategy::Replace => Ok(AdmissionPolicy::Replace),
+        proto_api::AdmissionStrategy::Queue => Ok(AdmissionPolicy::Queue),
         proto_api::AdmissionStrategy::Unspecified => Err(ApiError::InvalidRequest(
             "admission strategy not specified".into(),
         )),
     }
 }
 
-fn convert_labels(map: std::collections::HashMap<String, String>) -> RunnerLabels {
-    let mut labels = RunnerLabels::new();
+fn convert_labels(map: std::collections::HashMap<String, String>) -> Labels {
+    let mut labels = Labels::new();
     for (k, v) in map {
         labels.insert(k, v);
     }
@@ -285,15 +293,15 @@ mod tests {
     }
 
     #[test]
-    fn task_status_all_variants() {
+    fn task_phase_all_variants() {
         let cases = [
-            (TaskStatus::Pending, proto_api::TaskStatus::Pending),
-            (TaskStatus::Running, proto_api::TaskStatus::Running),
-            (TaskStatus::Succeeded, proto_api::TaskStatus::Succeeded),
-            (TaskStatus::Failed, proto_api::TaskStatus::Failed),
-            (TaskStatus::Timeout, proto_api::TaskStatus::Timeout),
-            (TaskStatus::Canceled, proto_api::TaskStatus::Canceled),
-            (TaskStatus::Exhausted, proto_api::TaskStatus::Exhausted),
+            (TaskPhase::Pending, proto_api::TaskStatus::Pending),
+            (TaskPhase::Running, proto_api::TaskStatus::Running),
+            (TaskPhase::Succeeded, proto_api::TaskStatus::Succeeded),
+            (TaskPhase::Failed, proto_api::TaskStatus::Failed),
+            (TaskPhase::Timeout, proto_api::TaskStatus::Timeout),
+            (TaskPhase::Canceled, proto_api::TaskStatus::Canceled),
+            (TaskPhase::Exhausted, proto_api::TaskStatus::Exhausted),
         ];
 
         for (domain, expected_proto) in cases {
@@ -303,21 +311,33 @@ mod tests {
     }
 
     #[test]
-    fn task_info_converts_correctly() {
-        let now = SystemTime::now();
-        let now_secs = now.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-
-        let info = TaskInfo {
-            id: solti_model::TaskId::from("task-42"),
+    fn task_converts_correctly() {
+        let spec = TaskSpec {
             slot: "my-slot".into(),
-            status: TaskStatus::Running,
-            attempt: 3,
-            created_at: now,
-            updated_at: now,
-            error: Some("boom".to_string()),
+            kind: TaskKind::Embedded,
+            timeout: 5_000_u64.into(),
+            restart: RestartPolicy::default(),
+            backoff: BackoffPolicy::default(),
+            admission: AdmissionPolicy::default(),
+            runner_selector: None,
+            labels: Labels::new(),
         };
+        let mut task = Task::new("task-42".into(), spec);
+        // Simulate multiple spec/status changes
+        task.metadata.generation = 5;
+        task.metadata.resource_version = 12;
+        task.status.phase = TaskPhase::Running;
+        task.status.attempt = 3;
+        task.status.error = Some("boom".to_string());
 
-        let proto: proto_api::TaskInfo = info.into();
+        let now_secs = task
+            .metadata
+            .created_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let proto: proto_api::TaskInfo = task.into();
 
         assert_eq!(proto.id, "task-42");
         assert_eq!(proto.slot, "my-slot");
@@ -326,36 +346,42 @@ mod tests {
         assert_eq!(proto.created_at, now_secs);
         assert_eq!(proto.updated_at, now_secs);
         assert_eq!(proto.error, Some("boom".to_string()));
+        assert_eq!(proto.generation, 5);
+        assert_eq!(proto.resource_version, 12);
     }
 
     #[test]
-    fn task_info_no_error() {
-        let info = TaskInfo {
-            id: solti_model::TaskId::from("task-1"),
+    fn task_no_error() {
+        let spec = TaskSpec {
             slot: "slot".into(),
-            status: TaskStatus::Succeeded,
-            attempt: 1,
-            created_at: SystemTime::now(),
-            updated_at: SystemTime::now(),
-            error: None,
+            kind: TaskKind::Embedded,
+            timeout: 5_000_u64.into(),
+            restart: RestartPolicy::default(),
+            backoff: BackoffPolicy::default(),
+            admission: AdmissionPolicy::default(),
+            runner_selector: None,
+            labels: Labels::new(),
         };
+        let mut task = Task::new("task-1".into(), spec);
+        task.status.phase = TaskPhase::Succeeded;
+        task.status.attempt = 1;
 
-        let proto: proto_api::TaskInfo = info.into();
+        let proto: proto_api::TaskInfo = task.into();
         assert_eq!(proto.error, None);
     }
 
     #[test]
     fn create_spec_subprocess_valid() {
         let spec = make_valid_create_spec();
-        let result = CreateSpec::try_from(spec);
+        let result = convert_create_spec(spec);
         assert!(result.is_ok());
 
         let cs = result.unwrap();
         assert_eq!(cs.slot, "test-slot");
-        assert_eq!(cs.timeout_ms.as_millis(), 5_000);
+        assert_eq!(cs.timeout.as_millis(), 5_000);
         assert!(matches!(cs.kind, TaskKind::Subprocess { ref command, .. } if command == "ls"));
-        assert!(matches!(cs.restart, RestartStrategy::OnFailure));
-        assert!(matches!(cs.admission, AdmissionStrategy::DropIfRunning));
+        assert!(matches!(cs.restart, RestartPolicy::OnFailure));
+        assert!(matches!(cs.admission, AdmissionPolicy::DropIfRunning));
         assert_eq!(cs.backoff.first_ms, 100);
         assert_eq!(cs.backoff.max_ms, 10_000);
     }
@@ -373,7 +399,7 @@ mod tests {
             ..make_valid_create_spec()
         };
 
-        let cs = CreateSpec::try_from(spec).unwrap();
+        let cs = convert_create_spec(spec).unwrap();
         assert!(
             matches!(cs.kind, TaskKind::Wasm { ref module, .. } if module.to_str() == Some("/app/module.wasm"))
         );
@@ -395,7 +421,7 @@ mod tests {
             ..make_valid_create_spec()
         };
 
-        let cs = CreateSpec::try_from(spec).unwrap();
+        let cs = convert_create_spec(spec).unwrap();
         assert!(
             matches!(cs.kind, TaskKind::Container { ref image, .. } if image == "alpine:latest")
         );
@@ -417,7 +443,7 @@ mod tests {
             ..make_valid_create_spec()
         };
 
-        let cs = CreateSpec::try_from(spec).unwrap();
+        let cs = convert_create_spec(spec).unwrap();
         assert!(matches!(cs.kind, TaskKind::Container { command: None, .. }));
     }
 
@@ -429,10 +455,10 @@ mod tests {
             ..make_valid_create_spec()
         };
 
-        let cs = CreateSpec::try_from(spec).unwrap();
+        let cs = convert_create_spec(spec).unwrap();
         assert!(matches!(
             cs.restart,
-            RestartStrategy::Always {
+            RestartPolicy::Always {
                 interval_ms: Some(5_000)
             }
         ));
@@ -446,17 +472,17 @@ mod tests {
             ..make_valid_create_spec()
         };
 
-        let cs = CreateSpec::try_from(spec).unwrap();
+        let cs = convert_create_spec(spec).unwrap();
         assert!(matches!(
             cs.restart,
-            RestartStrategy::Always { interval_ms: None }
+            RestartPolicy::Always { interval_ms: None }
         ));
     }
 
     #[test]
     fn create_spec_with_labels() {
         let mut labels = HashMap::new();
-        labels.insert("runner-tag".to_string(), "gpu".to_string());
+        labels.insert("runner-name".to_string(), "gpu".to_string());
         labels.insert("env".to_string(), "prod".to_string());
 
         let spec = proto_api::CreateSpec {
@@ -464,15 +490,15 @@ mod tests {
             ..make_valid_create_spec()
         };
 
-        let cs = CreateSpec::try_from(spec).unwrap();
-        assert_eq!(cs.labels.get("runner-tag"), Some("gpu"));
+        let cs = convert_create_spec(spec).unwrap();
+        assert_eq!(cs.labels.get("runner-name"), Some("gpu"));
         assert_eq!(cs.labels.get("env"), Some("prod"));
     }
 
     #[test]
     fn create_spec_env_conversion() {
         let spec = make_valid_create_spec();
-        let cs = CreateSpec::try_from(spec).unwrap();
+        let cs = convert_create_spec(spec).unwrap();
 
         if let TaskKind::Subprocess { ref env, .. } = cs.kind {
             assert_eq!(env.get("PATH"), Some("/usr/bin"));
@@ -487,7 +513,7 @@ mod tests {
             kind: None,
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing task kind")));
     }
 
@@ -497,7 +523,7 @@ mod tests {
             kind: Some(proto_api::TaskKind { kind: None }),
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing task kind variant"))
         );
@@ -509,7 +535,7 @@ mod tests {
             kind: Some(make_subprocess_kind("")),
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("subprocess command is empty"))
         );
@@ -521,7 +547,7 @@ mod tests {
             kind: Some(make_subprocess_kind("   ")),
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("subprocess command is empty"))
         );
@@ -539,7 +565,7 @@ mod tests {
             }),
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("wasm module path is empty"))
         );
@@ -560,7 +586,7 @@ mod tests {
             }),
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("container image is empty"))
         );
@@ -572,7 +598,7 @@ mod tests {
             slot: "".to_string(),
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("slot cannot be empty"))
         );
@@ -584,7 +610,7 @@ mod tests {
             slot: "   ".to_string(),
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("slot cannot be empty"))
         );
@@ -596,7 +622,7 @@ mod tests {
             timeout_ms: 0,
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("timeout_ms cannot be zero"))
         );
@@ -608,7 +634,7 @@ mod tests {
             backoff: None,
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing backoff")));
     }
 
@@ -621,7 +647,7 @@ mod tests {
             }),
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("first_ms cannot be zero"))
         );
@@ -636,7 +662,7 @@ mod tests {
             }),
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("max_ms cannot be zero"))
         );
@@ -651,7 +677,7 @@ mod tests {
             }),
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be positive"))
         );
@@ -666,7 +692,7 @@ mod tests {
             }),
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be positive"))
         );
@@ -681,19 +707,19 @@ mod tests {
             }),
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("jitter")));
     }
 
     #[test]
-    fn all_jitter_strategies_convert() {
+    fn all_jitter_policies_convert() {
         let cases = [
-            (proto_api::JitterStrategy::None, JitterStrategy::None),
-            (proto_api::JitterStrategy::Full, JitterStrategy::Full),
-            (proto_api::JitterStrategy::Equal, JitterStrategy::Equal),
+            (proto_api::JitterStrategy::None, JitterPolicy::None),
+            (proto_api::JitterStrategy::Full, JitterPolicy::Full),
+            (proto_api::JitterStrategy::Equal, JitterPolicy::Equal),
             (
                 proto_api::JitterStrategy::Decorrelated,
-                JitterStrategy::Decorrelated,
+                JitterPolicy::Decorrelated,
             ),
         ];
 
@@ -705,7 +731,7 @@ mod tests {
                 }),
                 ..make_valid_create_spec()
             };
-            let cs = CreateSpec::try_from(spec).unwrap();
+            let cs = convert_create_spec(spec).unwrap();
             assert_eq!(cs.backoff.jitter, expected);
         }
     }
@@ -716,7 +742,7 @@ mod tests {
             restart: proto_api::RestartStrategy::Unspecified as i32,
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("restart")));
     }
 
@@ -726,8 +752,8 @@ mod tests {
             restart: proto_api::RestartStrategy::Never as i32,
             ..make_valid_create_spec()
         };
-        let cs = CreateSpec::try_from(spec).unwrap();
-        assert!(matches!(cs.restart, RestartStrategy::Never));
+        let cs = convert_create_spec(spec).unwrap();
+        assert!(matches!(cs.restart, RestartPolicy::Never));
     }
 
     #[test]
@@ -736,25 +762,22 @@ mod tests {
             admission: proto_api::AdmissionStrategy::Unspecified as i32,
             ..make_valid_create_spec()
         };
-        let err = CreateSpec::try_from(spec).unwrap_err();
+        let err = convert_create_spec(spec).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("admission")));
     }
 
     #[test]
-    fn all_admission_strategies_convert() {
+    fn all_admission_policies_convert() {
         let cases = [
             (
                 proto_api::AdmissionStrategy::DropIfRunning,
-                AdmissionStrategy::DropIfRunning,
+                AdmissionPolicy::DropIfRunning,
             ),
             (
                 proto_api::AdmissionStrategy::Replace,
-                AdmissionStrategy::Replace,
+                AdmissionPolicy::Replace,
             ),
-            (
-                proto_api::AdmissionStrategy::Queue,
-                AdmissionStrategy::Queue,
-            ),
+            (proto_api::AdmissionStrategy::Queue, AdmissionPolicy::Queue),
         ];
 
         for (proto_adm, expected) in cases {
@@ -762,7 +785,7 @@ mod tests {
                 admission: proto_adm as i32,
                 ..make_valid_create_spec()
             };
-            let cs = CreateSpec::try_from(spec).unwrap();
+            let cs = convert_create_spec(spec).unwrap();
             assert_eq!(cs.admission, expected);
         }
     }

@@ -14,7 +14,7 @@ fn next_seq() -> u64 {
 ///
 /// Format: `{runner}-{slot}-{seq:x}`.
 /// - `runner` — Runner::name()
-/// - `slot`   — CreateSpec.slot
+/// - `slot`   — TaskSpec.slot
 /// - `seq`    — per-process hex sequence
 pub fn make_run_id(runner_name: &str, slot: &str) -> String {
     format!("{runner_name}-{slot}-{seq:x}", seq = next_seq())

@@ -14,23 +14,26 @@ pub use runner::SubprocessRunner;
 use std::sync::Arc;
 
 use solti_core::RunnerRouter;
-use solti_model::{LABEL_RUNNER_TAG, RunnerLabels};
+use solti_model::Labels;
 
 use crate::ExecError;
+
+/// Well-known label key used to identify a runner by name.
+pub const LABEL_RUNNER_NAME: &str = "runner-name";
 
 /// Register a subprocess runner with default settings.
 pub fn register_subprocess_runner(
     router: &mut RunnerRouter,
     name: &'static str,
 ) -> Result<(), ExecError> {
-    if router.contains_runner_tag(name) {
-        return Err(ExecError::DuplicateRunnerTag {
-            tag: name.to_string(),
+    if router.contains_label(LABEL_RUNNER_NAME, name) {
+        return Err(ExecError::DuplicateRunner {
+            name: name.to_string(),
         });
     }
 
-    let mut labels = RunnerLabels::new();
-    labels.insert(LABEL_RUNNER_TAG, name);
+    let mut labels = Labels::new();
+    labels.insert(LABEL_RUNNER_NAME, name);
     router.register_with_labels(Arc::new(SubprocessRunner::new(name)), labels);
     Ok(())
 }
@@ -41,15 +44,15 @@ pub fn register_subprocess_runner_with_backend(
     name: &'static str,
     backend: SubprocessBackendConfig,
 ) -> Result<(), ExecError> {
-    if router.contains_runner_tag(name) {
-        return Err(ExecError::DuplicateRunnerTag {
-            tag: name.to_string(),
+    if router.contains_label(LABEL_RUNNER_NAME, name) {
+        return Err(ExecError::DuplicateRunner {
+            name: name.to_string(),
         });
     }
     backend.validate()?;
 
-    let mut labels = RunnerLabels::new();
-    labels.insert(LABEL_RUNNER_TAG, name);
+    let mut labels = Labels::new();
+    labels.insert(LABEL_RUNNER_NAME, name);
     router.register_with_labels(
         Arc::new(SubprocessRunner::with_config(name, backend)),
         labels,

@@ -5,7 +5,7 @@ use taskvisor::{Event, EventKind, Subscribe};
 use tracing::trace;
 
 use super::TaskState;
-use solti_model::{TaskId, TaskStatus};
+use solti_model::{TaskId, TaskPhase};
 
 /// Subscriber that updates TaskState from taskvisor events.
 pub struct StateSubscriber {
@@ -39,12 +39,12 @@ impl Subscribe for StateSubscriber {
                 trace!(task = %task_id, "task starting");
                 self.state.increment_attempt(&task_id);
                 self.state
-                    .update_status(&task_id, TaskStatus::Running, None);
+                    .update_phase(&task_id, TaskPhase::Running, None, None);
             }
             EventKind::TaskStopped => {
                 trace!(task = %task_id, "task stopped (success)");
                 self.state
-                    .update_status(&task_id, TaskStatus::Succeeded, None);
+                    .update_phase(&task_id, TaskPhase::Succeeded, None, None);
             }
             EventKind::TaskFailed => {
                 let reason = event
@@ -54,14 +54,15 @@ impl Subscribe for StateSubscriber {
                     .unwrap_or_else(|| "unknown".to_string());
                 trace!(task = %task_id, reason = %reason, "task failed");
                 self.state
-                    .update_status(&task_id, TaskStatus::Failed, Some(reason));
+                    .update_phase(&task_id, TaskPhase::Failed, Some(reason), None);
             }
             EventKind::TimeoutHit => {
                 trace!(task = %task_id, "task timeout");
-                self.state.update_status(
+                self.state.update_phase(
                     &task_id,
-                    TaskStatus::Timeout,
+                    TaskPhase::Timeout,
                     Some("timeout".to_string()),
+                    None,
                 );
             }
             EventKind::ActorExhausted => {
@@ -72,7 +73,7 @@ impl Subscribe for StateSubscriber {
                     .unwrap_or_else(|| "exhausted".to_string());
                 trace!(task = %task_id, "task exhausted");
                 self.state
-                    .update_status(&task_id, TaskStatus::Exhausted, Some(reason));
+                    .update_phase(&task_id, TaskPhase::Exhausted, Some(reason), None);
             }
             EventKind::TaskRemoved => {
                 trace!(task = %task_id, "task removed from state");

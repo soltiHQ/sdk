@@ -7,8 +7,8 @@ use solti_api::{HttpApi, SupervisorApiAdapter};
 use solti_core::{BuildContext, RunnerRouter, SupervisorApi};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
-    AdmissionStrategy, BackoffStrategy, CreateSpec, Flag, JitterStrategy, RestartStrategy,
-    RunnerLabels, TaskEnv, TaskKind,
+    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, RunnerEnv, TaskEnv,
+    TaskKind, TaskSpec,
 };
 use solti_observe::{
     LoggerConfig, LoggerLevel, TracingEventSubscriber, init_logger, timezone_sync,
@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("prometheus metrics initialized");
 
     // 3) Setup router with subprocess runner
-    let ctx = BuildContext::new(TaskEnv::default(), metrics_handle);
+    let ctx = BuildContext::new(RunnerEnv::default(), metrics_handle);
     let mut router = RunnerRouter::new().with_context(ctx);
     register_subprocess_runner(&mut router, "default-runner")?;
     info!("registered default subprocess runner");
@@ -53,8 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5) Submit timezone sync task
     let (tz_task, tz_spec) = timezone_sync();
-    let tz_policy = solti_core::TaskPolicy::from_spec(&tz_spec);
-    supervisor.submit_with_task(tz_task, &tz_policy).await?;
+    supervisor.submit_with_task(tz_task, &tz_spec).await?;
     info!("timezone sync task submitted");
 
     // 6) Submit demo periodic tasks
@@ -100,7 +99,7 @@ async fn metrics_handler(metrics: PrometheusMetrics) -> String {
 /// Submit demo periodic tasks that run continuously
 async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error::Error>> {
     // Task 1: Print date every 10 seconds
-    let date_spec = CreateSpec {
+    let date_spec = TaskSpec {
         slot: "periodic-date".into(),
         kind: TaskKind::Subprocess {
             command: "date".into(),
@@ -109,20 +108,21 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000_u64.into(),
-        restart: RestartStrategy::periodic(10_000), // Every 10 seconds
-        backoff: BackoffStrategy {
-            jitter: JitterStrategy::None,
+        timeout: 5_000_u64.into(),
+        restart: RestartPolicy::periodic(10_000), // Every 10 seconds
+        backoff: BackoffPolicy {
+            jitter: JitterPolicy::None,
             first_ms: 1_000,
             max_ms: 5_000,
             factor: 2.0,
         },
-        admission: AdmissionStrategy::DropIfRunning,
-        labels: RunnerLabels::default(),
+        admission: AdmissionPolicy::DropIfRunning,
+        runner_selector: None,
+        labels: Labels::default(),
     };
 
     // Task 2: Print uptime every 30 seconds
-    let uptime_spec = CreateSpec {
+    let uptime_spec = TaskSpec {
         slot: "periodic-uptime".into(),
         kind: TaskKind::Subprocess {
             command: "uptime".into(),
@@ -131,20 +131,21 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000_u64.into(),
-        restart: RestartStrategy::periodic(30_000), // Every 30 seconds
-        backoff: BackoffStrategy {
-            jitter: JitterStrategy::Equal,
+        timeout: 5_000_u64.into(),
+        restart: RestartPolicy::periodic(30_000), // Every 30 seconds
+        backoff: BackoffPolicy {
+            jitter: JitterPolicy::Equal,
             first_ms: 1_000,
             max_ms: 5_000,
             factor: 2.0,
         },
-        admission: AdmissionStrategy::DropIfRunning,
-        labels: RunnerLabels::default(),
+        admission: AdmissionPolicy::DropIfRunning,
+        runner_selector: None,
+        labels: Labels::default(),
     };
 
     // Task 3: Echo message every 5 seconds
-    let echo_spec = CreateSpec {
+    let echo_spec = TaskSpec {
         slot: "periodic-echo".into(),
         kind: TaskKind::Subprocess {
             command: "echo".into(),
@@ -153,16 +154,17 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000_u64.into(),
-        restart: RestartStrategy::periodic(5_000), // Every 5 seconds
-        backoff: BackoffStrategy {
-            jitter: JitterStrategy::Full,
+        timeout: 5_000_u64.into(),
+        restart: RestartPolicy::periodic(5_000), // Every 5 seconds
+        backoff: BackoffPolicy {
+            jitter: JitterPolicy::Full,
             first_ms: 500,
             max_ms: 2_000,
             factor: 1.5,
         },
-        admission: AdmissionStrategy::Replace,
-        labels: RunnerLabels::default(),
+        admission: AdmissionPolicy::Replace,
+        runner_selector: None,
+        labels: Labels::default(),
     };
 
     let date_id = api.submit(&date_spec).await?;

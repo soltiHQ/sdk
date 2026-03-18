@@ -6,8 +6,7 @@ use tracing::{debug, warn};
 
 use solti_core::{agent_id, arch, os_info, platform, uptime_seconds};
 use solti_model::{
-    AdmissionStrategy, BackoffStrategy, CreateSpec, JitterStrategy, RestartStrategy, RunnerLabels,
-    TaskKind,
+    AdmissionPolicy, BackoffPolicy, JitterPolicy, Labels, RestartPolicy, TaskKind, TaskSpec,
 };
 use taskvisor::{TaskError, TaskFn, TaskRef};
 
@@ -19,23 +18,24 @@ use crate::{
 
 const SLOT: &str = "solti-discover-sync";
 
-pub fn sync(config: DiscoverConfig) -> (TaskRef, CreateSpec) {
+pub fn sync(config: DiscoverConfig) -> (TaskRef, TaskSpec) {
     let delay_ms = config.delay_ms;
 
-    let backoff = BackoffStrategy {
-        jitter: JitterStrategy::Equal,
+    let backoff = BackoffPolicy {
+        jitter: JitterPolicy::Equal,
         first_ms: delay_ms / 2,
         max_ms: delay_ms * 3,
         factor: 2.0,
     };
-    let spec = CreateSpec {
+    let spec = TaskSpec {
         slot: SLOT.into(),
-        timeout_ms: delay_ms.into(),
-        restart: RestartStrategy::periodic(delay_ms),
+        timeout: delay_ms.into(),
+        restart: RestartPolicy::periodic(delay_ms),
         backoff,
-        admission: AdmissionStrategy::Replace,
-        kind: TaskKind::None,
-        labels: RunnerLabels::default(),
+        admission: AdmissionPolicy::Replace,
+        kind: TaskKind::Embedded,
+        runner_selector: None,
+        labels: Labels::default(),
     };
 
     let base_request = build_base_request(&config);

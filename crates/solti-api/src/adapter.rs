@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use solti_core::SupervisorApi;
-use solti_model::{CreateSpec, TaskId, TaskInfo, TaskPage, TaskQuery, TaskStatus};
+use solti_model::{Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskSpec};
 
 use crate::error::ApiError;
 use crate::handler::ApiHandler;
@@ -23,27 +23,30 @@ impl SupervisorApiAdapter {
 
 #[async_trait]
 impl ApiHandler for SupervisorApiAdapter {
-    async fn submit_task(&self, spec: CreateSpec) -> Result<TaskId, ApiError> {
-        self.supervisor.submit(&spec).await.map_err(ApiError::from)
+    async fn submit_task(&self, spec: TaskSpec) -> Result<TaskId, ApiError> {
+        self.supervisor
+            .submit(&spec)
+            .await
+            .map_err(ApiError::from)
     }
 
-    async fn get_task_status(&self, id: &TaskId) -> Result<Option<TaskInfo>, ApiError> {
+    async fn get_task_status(&self, id: &TaskId) -> Result<Option<Task>, ApiError> {
         Ok(self.supervisor.get_task(id))
     }
 
-    async fn list_all_tasks(&self) -> Result<Vec<TaskInfo>, ApiError> {
+    async fn list_all_tasks(&self) -> Result<Vec<Task>, ApiError> {
         Ok(self.supervisor.list_all_tasks())
     }
 
-    async fn list_tasks_by_slot(&self, slot: &str) -> Result<Vec<TaskInfo>, ApiError> {
+    async fn list_tasks_by_slot(&self, slot: &str) -> Result<Vec<Task>, ApiError> {
         Ok(self.supervisor.list_tasks_by_slot(slot))
     }
 
-    async fn list_tasks_by_status(&self, status: TaskStatus) -> Result<Vec<TaskInfo>, ApiError> {
+    async fn list_tasks_by_status(&self, status: TaskPhase) -> Result<Vec<Task>, ApiError> {
         Ok(self.supervisor.list_tasks_by_status(status))
     }
 
-    async fn query_tasks(&self, query: TaskQuery) -> Result<TaskPage<TaskInfo>, ApiError> {
+    async fn query_tasks(&self, query: TaskQuery) -> Result<TaskPage<Task>, ApiError> {
         Ok(self.supervisor.query_tasks(&query))
     }
 

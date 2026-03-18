@@ -7,92 +7,106 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// Logical identifier for a controller slot.
 ///
 /// A slot groups tasks that share a single execution lane.
-/// The controller enforces admission policies per slot, ensuring
-/// that only one task occupies a slot at a time.
 ///
-/// Internally backed by `Arc<str>` — cloning a `Slot` is an atomic
-/// reference-count increment (no heap allocation).
-///
+/// ```text
+///  Slot: "build-pipeline"         Slot: "deploy"
+///  ┌───────────────────────┐      ┌────────────────────────┐
+///  │  TaskId: sub-build-1  │      │  TaskId: sub-deploy-1  │
+///  │  TaskId: sub-build-2  │      │  TaskId: sub-deploy-2  │
+///  │  TaskId: sub-build-3  │      │  TaskId: sub-deploy-3  │
+///  │        ...            │      │        ...             │
+///  └───────────────────────┘      └────────────────────────┘
+///         one lane                        one lane
+///     (one at a time)                  (one at a time)
 /// ```
+/// ```rust
 /// use solti_model::Slot;
 ///
 /// let slot = Slot::new("build-pipeline");
 /// assert_eq!(slot.as_str(), "build-pipeline");
 ///
-/// // From &str / String
 /// let slot: Slot = "deploy".into();
 /// assert_eq!(format!("{slot}"), "deploy");
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Slot(Arc<str>);
 
 impl Slot {
     /// Create a new slot identifier.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(Arc::from(name.into()))
+    #[inline]
+    pub fn new(name: &str) -> Self {
+        Self(Arc::from(name))
     }
 
     /// Get the slot name as a string slice.
+    #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// Convert into the underlying `Arc<str>`.
+    #[inline]
     pub fn into_inner(self) -> Arc<str> {
         self.0
     }
 }
 
 impl From<String> for Slot {
+    #[inline]
     fn from(s: String) -> Self {
         Self(Arc::from(s))
     }
 }
 
 impl From<&str> for Slot {
+    #[inline]
     fn from(s: &str) -> Self {
         Self(Arc::from(s))
     }
 }
 
 impl AsRef<str> for Slot {
+    #[inline]
     fn as_ref(&self) -> &str {
         &self.0
     }
 }
 
 impl Borrow<str> for Slot {
+    #[inline]
     fn borrow(&self) -> &str {
         &self.0
     }
 }
 
 impl fmt::Display for Slot {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-// Allow `==` comparisons with &str and String for ergonomics.
 impl PartialEq<str> for Slot {
+    #[inline]
     fn eq(&self, other: &str) -> bool {
         &*self.0 == other
     }
 }
 
 impl PartialEq<&str> for Slot {
+    #[inline]
     fn eq(&self, other: &&str) -> bool {
         &*self.0 == *other
     }
 }
 
 impl PartialEq<String> for Slot {
+    #[inline]
     fn eq(&self, other: &String) -> bool {
         &*self.0 == other.as_str()
     }
 }
 
-// Manual serde: serialize as plain string, deserialize via String → Arc<str>.
 impl Serialize for Slot {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.0)
@@ -132,7 +146,7 @@ mod tests {
     #[test]
     fn partial_eq_with_str() {
         let slot = Slot::new("test");
-        assert!(slot == *"test");
+        assert_eq!(slot, *"test");
     }
 
     #[test]
@@ -156,7 +170,6 @@ mod tests {
     fn clone_is_cheap() {
         let slot = Slot::new("shared");
         let cloned = slot.clone();
-        // Both point to the same Arc allocation.
         assert!(Arc::ptr_eq(&slot.0, &cloned.0));
     }
 }

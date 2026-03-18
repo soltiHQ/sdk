@@ -42,10 +42,14 @@ where
             .ok_or_else(|| Status::invalid_argument("missing spec"))?;
 
         let spec =
-            solti_model::CreateSpec::try_from(spec).map_err(|e: ApiError| Status::from(e))?;
+            crate::convert::convert_create_spec(spec).map_err(|e: ApiError| Status::from(e))?;
 
         debug!(slot = %spec.slot, kind = ?spec.kind, "grpc: submitting task");
-        let task_id = self.handler.submit_task(spec).await.map_err(Status::from)?;
+        let task_id = self
+            .handler
+            .submit_task(spec)
+            .await
+            .map_err(Status::from)?;
 
         Ok(Response::new(proto_api::SubmitTaskResponse {
             task_id: task_id.to_string(),
@@ -201,20 +205,20 @@ where
     }
 }
 
-/// Convert proto TaskStatus i32 to domain TaskStatus.
+/// Convert proto TaskStatus i32 to domain TaskPhase.
 #[allow(clippy::result_large_err)]
-fn proto_to_domain_status(raw: i32) -> Result<solti_model::TaskStatus, Status> {
+fn proto_to_domain_status(raw: i32) -> Result<solti_model::TaskPhase, Status> {
     let status = proto_api::TaskStatus::try_from(raw)
         .map_err(|_| Status::invalid_argument("invalid status"))?;
 
     match status {
-        proto_api::TaskStatus::Pending => Ok(solti_model::TaskStatus::Pending),
-        proto_api::TaskStatus::Running => Ok(solti_model::TaskStatus::Running),
-        proto_api::TaskStatus::Succeeded => Ok(solti_model::TaskStatus::Succeeded),
-        proto_api::TaskStatus::Failed => Ok(solti_model::TaskStatus::Failed),
-        proto_api::TaskStatus::Timeout => Ok(solti_model::TaskStatus::Timeout),
-        proto_api::TaskStatus::Canceled => Ok(solti_model::TaskStatus::Canceled),
-        proto_api::TaskStatus::Exhausted => Ok(solti_model::TaskStatus::Exhausted),
+        proto_api::TaskStatus::Pending => Ok(solti_model::TaskPhase::Pending),
+        proto_api::TaskStatus::Running => Ok(solti_model::TaskPhase::Running),
+        proto_api::TaskStatus::Succeeded => Ok(solti_model::TaskPhase::Succeeded),
+        proto_api::TaskStatus::Failed => Ok(solti_model::TaskPhase::Failed),
+        proto_api::TaskStatus::Timeout => Ok(solti_model::TaskPhase::Timeout),
+        proto_api::TaskStatus::Canceled => Ok(solti_model::TaskPhase::Canceled),
+        proto_api::TaskStatus::Exhausted => Ok(solti_model::TaskPhase::Exhausted),
         proto_api::TaskStatus::Unspecified => {
             Err(Status::invalid_argument("status cannot be unspecified"))
         }

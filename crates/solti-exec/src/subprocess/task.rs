@@ -1,6 +1,6 @@
-use std::{fmt, path::PathBuf};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
-use solti_model::{Flag, TaskEnv};
+use solti_model::Flag;
 
 use crate::ExecError;
 
@@ -15,8 +15,8 @@ pub struct SubprocessTaskConfig {
     pub(crate) command: String,
     /// Command-line arguments passed to the command.
     pub(crate) args: Vec<String>,
-    /// Environment for the subprocess.
-    pub(crate) env: TaskEnv,
+    /// Merged environment (runner overrides task). Ready for `Command::envs()`.
+    pub(crate) env: BTreeMap<String, String>,
     /// Working directory for the subprocess.
     ///
     /// If `None`, the subprocess inherits the parent process working directory.

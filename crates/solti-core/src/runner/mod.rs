@@ -1,4 +1,4 @@
-//! Runner abstraction used by `solti-core` to build taskvisor tasks from `CreateSpec`.
+//! Runner abstraction used by `solti-core` to build taskvisor tasks from `TaskSpec`.
 //!
 //! Concrete runners implement this trait and are plugged into the router.
 mod error;
@@ -10,25 +10,26 @@ pub use context::BuildContext;
 mod id;
 pub use id::make_run_id;
 
-use solti_model::CreateSpec;
+use solti_model::TaskSpec;
 use taskvisor::TaskRef;
 
 /// Generic task runner used by the core layer.
 ///
 /// A runner is responsible for:
-/// - deciding whether it can handle a given [`CreateSpec`] (`supports`)
+/// - deciding whether it can handle a given [`TaskSpec`] (`supports`)
 /// - building a concrete [`TaskRef`] that the supervisor can execute (`build_task`)
 pub trait Runner: Send + Sync {
     /// Runner name used in logs and diagnostics.
     fn name(&self) -> &'static str;
 
     /// Returns `true` if this runner can handle the given spec.
-    fn supports(&self, spec: &CreateSpec) -> bool;
+    fn supports(&self, spec: &TaskSpec) -> bool;
 
     /// Build a concrete [`TaskRef`] for the given spec.
     ///
     /// The provided [`BuildContext`] carries shared dependencies injected at router setup time.
-    fn build_task(&self, spec: &CreateSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError>;
+    /// Slot is extracted from `spec.slot`.
+    fn build_task(&self, spec: &TaskSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError>;
 
     /// Builds a default run id for a given slot.
     ///
