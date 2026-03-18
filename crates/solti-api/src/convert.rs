@@ -251,7 +251,7 @@ fn validate_timeout(timeout_ms: u64) -> Result<u64, ApiError> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{UNIX_EPOCH};
 
     fn make_subprocess_kind(command: &str) -> proto_api::TaskKind {
         proto_api::TaskKind {
