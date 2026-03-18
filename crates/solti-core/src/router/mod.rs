@@ -82,11 +82,9 @@ impl RunnerRouter {
         self.runners
             .iter()
             .filter(|entry| entry.runner.supports(spec))
-            .filter(move |entry| {
-                match selector {
-                    Some(sel) => sel.matches(&entry.labels),
-                    None => true,
-                }
+            .filter(move |entry| match selector {
+                Some(sel) => sel.matches(&entry.labels),
+                None => true,
             })
             .map(|entry| &entry.runner)
             .next()
@@ -127,8 +125,8 @@ mod tests {
     use crate::runner::RunnerError;
 
     use solti_model::{
-        AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy,
-        RunnerSelector, TaskEnv,
+        AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, RunnerSelector,
+        TaskEnv,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -307,9 +305,10 @@ mod tests {
                 cwd: None,
                 fail_on_non_zero: Flag::enabled(),
             });
-            base.with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([
-                ("runner-name".into(), "runner-b".into()),
-            ])))
+            base.with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
+                "runner-name".into(),
+                "runner-b".into(),
+            )])))
         };
 
         let picked = router.pick(&spec).expect("runner should be picked");

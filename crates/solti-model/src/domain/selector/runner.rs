@@ -125,33 +125,28 @@ mod tests {
 
     #[test]
     fn match_labels_exact_hit() {
-        let sel = RunnerSelector::from_labels(BTreeMap::from([
-            ("zone".into(), "eu".into()),
-        ]));
+        let sel = RunnerSelector::from_labels(BTreeMap::from([("zone".into(), "eu".into())]));
         assert!(sel.matches(&labels(&[("zone", "eu"), ("extra", "x")])));
     }
 
     #[test]
     fn match_labels_value_mismatch() {
-        let sel = RunnerSelector::from_labels(BTreeMap::from([
-            ("zone".into(), "eu".into()),
-        ]));
+        let sel = RunnerSelector::from_labels(BTreeMap::from([("zone".into(), "eu".into())]));
         assert!(!sel.matches(&labels(&[("zone", "us")])));
     }
 
     #[test]
     fn match_labels_key_missing() {
-        let sel = RunnerSelector::from_labels(BTreeMap::from([
-            ("zone".into(), "eu".into()),
-        ]));
+        let sel = RunnerSelector::from_labels(BTreeMap::from([("zone".into(), "eu".into())]));
         assert!(!sel.matches(&labels(&[])));
     }
 
     #[test]
     fn expr_in_matches() {
-        let sel = RunnerSelector::from_expressions(vec![
-            SelectorRequirement::r#in("gpu", vec!["a100".into(), "h100".into()]),
-        ]);
+        let sel = RunnerSelector::from_expressions(vec![SelectorRequirement::r#in(
+            "gpu",
+            vec!["a100".into(), "h100".into()],
+        )]);
         assert!(sel.matches(&labels(&[("gpu", "a100")])));
         assert!(sel.matches(&labels(&[("gpu", "h100")])));
         assert!(!sel.matches(&labels(&[("gpu", "t4")])));
@@ -160,9 +155,10 @@ mod tests {
 
     #[test]
     fn expr_not_in_matches() {
-        let sel = RunnerSelector::from_expressions(vec![
-            SelectorRequirement::not_in("tier", vec!["dev".into()]),
-        ]);
+        let sel = RunnerSelector::from_expressions(vec![SelectorRequirement::not_in(
+            "tier",
+            vec!["dev".into()],
+        )]);
         assert!(sel.matches(&labels(&[("tier", "prod")])));
         assert!(!sel.matches(&labels(&[("tier", "dev")])));
         assert!(sel.matches(&labels(&[])));
@@ -170,18 +166,15 @@ mod tests {
 
     #[test]
     fn expr_exists_matches() {
-        let sel = RunnerSelector::from_expressions(vec![
-            SelectorRequirement::exists("gpu"),
-        ]);
+        let sel = RunnerSelector::from_expressions(vec![SelectorRequirement::exists("gpu")]);
         assert!(sel.matches(&labels(&[("gpu", "any")])));
         assert!(!sel.matches(&labels(&[])));
     }
 
     #[test]
     fn expr_does_not_exist_matches() {
-        let sel = RunnerSelector::from_expressions(vec![
-            SelectorRequirement::does_not_exist("tainted"),
-        ]);
+        let sel =
+            RunnerSelector::from_expressions(vec![SelectorRequirement::does_not_exist("tainted")]);
         assert!(sel.matches(&labels(&[])));
         assert!(!sel.matches(&labels(&[("tainted", "true")])));
     }
@@ -190,9 +183,7 @@ mod tests {
     fn labels_and_expressions_anded() {
         let sel = RunnerSelector {
             match_labels: BTreeMap::from([("zone".into(), "eu".into())]),
-            match_expressions: vec![
-                SelectorRequirement::exists("gpu"),
-            ],
+            match_expressions: vec![SelectorRequirement::exists("gpu")],
         };
         assert!(sel.matches(&labels(&[("zone", "eu"), ("gpu", "a100")])));
         assert!(!sel.matches(&labels(&[("zone", "us"), ("gpu", "a100")])));
@@ -214,9 +205,7 @@ mod tests {
     fn serde_roundtrip() {
         let sel = RunnerSelector {
             match_labels: BTreeMap::from([("zone".into(), "eu".into())]),
-            match_expressions: vec![
-                SelectorRequirement::exists("gpu"),
-            ],
+            match_expressions: vec![SelectorRequirement::exists("gpu")],
         };
         let json = serde_json::to_string_pretty(&sel).unwrap();
         let back: RunnerSelector = serde_json::from_str(&json).unwrap();
@@ -235,8 +224,8 @@ mod tests {
     #[test]
     fn is_empty() {
         assert!(RunnerSelector::new().is_empty());
-        assert!(!RunnerSelector::from_labels(BTreeMap::from([
-            ("k".into(), "v".into()),
-        ])).is_empty());
+        assert!(
+            !RunnerSelector::from_labels(BTreeMap::from([("k".into(), "v".into()),])).is_empty()
+        );
     }
 }

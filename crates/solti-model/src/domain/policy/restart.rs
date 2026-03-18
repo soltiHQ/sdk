@@ -62,9 +62,7 @@ impl FromStr for RestartPolicy {
 
         if head.eq_ignore_ascii_case("never") {
             Ok(RestartPolicy::Never)
-        } else if head.eq_ignore_ascii_case("on-failure")
-            || head.eq_ignore_ascii_case("failure")
-        {
+        } else if head.eq_ignore_ascii_case("on-failure") || head.eq_ignore_ascii_case("failure") {
             Ok(RestartPolicy::OnFailure)
         } else if head.eq_ignore_ascii_case("always") {
             let interval_ms = match rest {
@@ -94,10 +92,7 @@ mod tests {
 
     #[test]
     fn parse_never_and_empty() {
-        assert_eq!(
-            RestartPolicy::from_str("").unwrap(),
-            RestartPolicy::Never
-        );
+        assert_eq!(RestartPolicy::from_str("").unwrap(), RestartPolicy::Never);
         assert_eq!(
             RestartPolicy::from_str("never").unwrap(),
             RestartPolicy::Never

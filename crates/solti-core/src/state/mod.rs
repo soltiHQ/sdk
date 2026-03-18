@@ -318,7 +318,12 @@ mod tests {
         // slot-b: 2 tasks (1 failed, 1 pending)
         state.add_task(TaskId::from("b1"), default_spec_with_slot("slot-b"));
         state.add_task(TaskId::from("b2"), default_spec_with_slot("slot-b"));
-        state.update_phase(&TaskId::from("b1"), TaskPhase::Failed, Some("err".into()), None);
+        state.update_phase(
+            &TaskId::from("b1"),
+            TaskPhase::Failed,
+            Some("err".into()),
+            None,
+        );
 
         state
     }
@@ -356,7 +361,11 @@ mod tests {
                 .with_status(TaskPhase::Running),
         );
         assert_eq!(page.total, 2);
-        assert!(page.items.iter().all(|t| t.status.phase == TaskPhase::Running));
+        assert!(
+            page.items
+                .iter()
+                .all(|t| t.status.phase == TaskPhase::Running)
+        );
     }
 
     #[test]

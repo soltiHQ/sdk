@@ -123,9 +123,10 @@ async fn main() -> anyhow::Result<()> {
         runner_selector: None,
         labels: Labels::default(),
     }
-    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([
-        ("runner-name".into(), "dev-runner".into()),
-    ])));
+    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
+        "runner-name".into(),
+        "dev-runner".into(),
+    )])));
 
     // 6b) Production runner
     let date_spec = TaskSpec {
@@ -149,9 +150,10 @@ async fn main() -> anyhow::Result<()> {
         runner_selector: None,
         labels: Labels::default(),
     }
-    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([
-        ("runner-name".into(), "prod-runner".into()),
-    ])));
+    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
+        "runner-name".into(),
+        "prod-runner".into(),
+    )])));
 
     // 6c) Untrusted runner
     let sleep_spec = TaskSpec {
@@ -175,9 +177,10 @@ async fn main() -> anyhow::Result<()> {
         runner_selector: None,
         labels: Labels::default(),
     }
-    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([
-        ("runner-name".into(), "untrusted-runner".into()),
-    ])));
+    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
+        "runner-name".into(),
+        "untrusted-runner".into(),
+    )])));
 
     // 6d) Untrusted runner
     let stress_spec = TaskSpec {
@@ -204,9 +207,10 @@ async fn main() -> anyhow::Result<()> {
         runner_selector: None,
         labels: Labels::default(),
     }
-    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([
-        ("runner-name".into(), "untrusted-runner".into()),
-    ])));
+    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
+        "runner-name".into(),
+        "untrusted-runner".into(),
+    )])));
 
     // Submit tasks
     info!("submitting tasks...");
@@ -231,7 +235,10 @@ async fn main() -> anyhow::Result<()> {
     for task in api.list_all_tasks() {
         info!(
             "task {}: status={:?}, attempt={}, slot={}",
-            task.id(), task.status.phase, task.status.attempt, task.slot()
+            task.id(),
+            task.status.phase,
+            task.status.attempt,
+            task.slot()
         );
     }
 

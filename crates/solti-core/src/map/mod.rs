@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use solti_model::{
     AdmissionPolicy as ModelAdmissionPolicy, BackoffPolicy as ModelBackoffPolicy,
-    JitterPolicy as ModelJitterPolicy, RestartPolicy as ModelRestartPolicy, TaskSpec as ModelTaskSpec,
+    JitterPolicy as ModelJitterPolicy, RestartPolicy as ModelRestartPolicy,
+    TaskSpec as ModelTaskSpec,
 };
 use taskvisor::{
     AdmissionPolicy, BackoffPolicy, ControllerSpec, JitterPolicy, RestartPolicy, TaskRef, TaskSpec,

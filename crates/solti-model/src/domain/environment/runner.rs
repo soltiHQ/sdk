@@ -88,7 +88,7 @@ mod tests {
     #[test]
     fn new_is_empty() {
         let env = RunnerEnv::new();
-        
+
         assert_eq!(env.len(), 0);
         assert!(env.is_empty());
         assert!(env.get("FOO").is_none());

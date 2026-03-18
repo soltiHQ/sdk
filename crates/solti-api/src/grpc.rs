@@ -45,11 +45,7 @@ where
             crate::convert::convert_create_spec(spec).map_err(|e: ApiError| Status::from(e))?;
 
         debug!(slot = %spec.slot, kind = ?spec.kind, "grpc: submitting task");
-        let task_id = self
-            .handler
-            .submit_task(spec)
-            .await
-            .map_err(Status::from)?;
+        let task_id = self.handler.submit_task(spec).await.map_err(Status::from)?;
 
         Ok(Response::new(proto_api::SubmitTaskResponse {
             task_id: task_id.to_string(),

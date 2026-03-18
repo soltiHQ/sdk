@@ -108,10 +108,7 @@ impl SupervisorApi {
     ///
     /// This is the primary entrypoint for tasks that are fully described by the public [`solti_model::TaskKind`] model.
     #[instrument(level = "debug", skip(self, spec), fields(slot = %spec.slot, kind = ?spec.kind))]
-    pub async fn submit(
-        &self,
-        spec: &TaskSpec,
-    ) -> Result<TaskId, CoreError> {
+    pub async fn submit(&self, spec: &TaskSpec) -> Result<TaskId, CoreError> {
         spec.validate()?;
 
         let task = self.router.build(spec)?;

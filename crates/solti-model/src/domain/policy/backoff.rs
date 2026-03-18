@@ -37,19 +37,19 @@ impl BackoffPolicy {
     /// - `factor >= 1.0` and finite
     pub fn validate(&self) -> ModelResult<()> {
         if self.first_ms == 0 {
-            return Err(ModelError::Invalid(
-                Cow::Borrowed("backoff first_ms must be greater than zero"),
-            ));
+            return Err(ModelError::Invalid(Cow::Borrowed(
+                "backoff first_ms must be greater than zero",
+            )));
         }
         if self.max_ms < self.first_ms {
-            return Err(ModelError::Invalid(
-                Cow::Borrowed("backoff max_ms must be >= first_ms"),
-            ));
+            return Err(ModelError::Invalid(Cow::Borrowed(
+                "backoff max_ms must be >= first_ms",
+            )));
         }
         if !self.factor.is_finite() || self.factor < 1.0 {
-            return Err(ModelError::Invalid(
-                Cow::Borrowed("backoff factor must be finite and >= 1.0"),
-            ));
+            return Err(ModelError::Invalid(Cow::Borrowed(
+                "backoff factor must be finite and >= 1.0",
+            )));
         }
         Ok(())
     }

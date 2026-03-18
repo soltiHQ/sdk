@@ -34,9 +34,9 @@ impl SelectorRequirement {
         use std::borrow::Cow;
 
         if self.key.is_empty() {
-            return Err(crate::ModelError::Invalid(
-                Cow::Borrowed("selector requirement key must not be empty"),
-            ));
+            return Err(crate::ModelError::Invalid(Cow::Borrowed(
+                "selector requirement key must not be empty",
+            )));
         }
         match self.operator {
             SelectorOperator::In | SelectorOperator::NotIn => {
@@ -144,6 +144,9 @@ mod tests {
     fn serde_skips_empty_values() {
         let req = SelectorRequirement::exists("gpu");
         let json = serde_json::to_string(&req).unwrap();
-        assert!(!json.contains("values"), "empty values should be skipped: {json}");
+        assert!(
+            !json.contains("values"),
+            "empty values should be skipped: {json}"
+        );
     }
 }

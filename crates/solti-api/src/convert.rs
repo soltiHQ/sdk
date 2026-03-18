@@ -1,8 +1,8 @@
 use tracing::warn;
 
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, Slot, Task,
-    TaskEnv, TaskKind, TaskPhase, TaskSpec,
+    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, Slot, Task, TaskEnv,
+    TaskKind, TaskPhase, TaskSpec,
 };
 
 use crate::error::ApiError;

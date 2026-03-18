@@ -92,7 +92,7 @@ mod tests {
     fn serde_roundtrip_json() {
         let kv = KeyValue::new("FOO", "bar");
         let json = serde_json::to_string(&kv).unwrap();
-        
+
         assert!(json.contains("\"key\":\"FOO\""));
         assert!(json.contains("\"value\":\"bar\""));
 

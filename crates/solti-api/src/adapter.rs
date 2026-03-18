@@ -24,10 +24,7 @@ impl SupervisorApiAdapter {
 #[async_trait]
 impl ApiHandler for SupervisorApiAdapter {
     async fn submit_task(&self, spec: TaskSpec) -> Result<TaskId, ApiError> {
-        self.supervisor
-            .submit(&spec)
-            .await
-            .map_err(ApiError::from)
+        self.supervisor.submit(&spec).await.map_err(ApiError::from)
     }
 
     async fn get_task_status(&self, id: &TaskId) -> Result<Option<Task>, ApiError> {

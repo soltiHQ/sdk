@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn env_new_is_empty() {
         let env = TaskEnv::new();
-        
+
         assert_eq!(env.len(), 0);
         assert!(env.get("FOO").is_none());
     }
@@ -112,7 +112,7 @@ mod tests {
     fn env_single_creates_one_entry() {
         let env = TaskEnv::single("FOO", "bar");
         let items: Vec<_> = env.iter().collect();
-        
+
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].key(), "FOO");
         assert_eq!(items[0].value(), "bar");
