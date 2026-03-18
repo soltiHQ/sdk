@@ -126,12 +126,10 @@ impl MetricsBackend for PrometheusMetrics {
     /// Records a task completion event.
     ///
     /// Updates two metrics:
-    /// - `solti_runner_tasks_completed_total{runner, outcome}` — incremented by 1.
-    /// - `solti_runner_task_duration_seconds{runner, outcome}` — observes the duration
-    ///   converted from milliseconds to seconds (`duration_ms / 1000`).
+    /// - `solti_runner_tasks_completed_total{runner, outcome}` - incremented by 1.
+    /// - `solti_runner_task_duration_seconds{runner, outcome}` - observes the duration converted from milliseconds to seconds.
     ///
-    /// The `outcome` label is derived from [`TaskOutcome::as_label`]:
-    /// `success` | `failure` | `canceled` | `timeout`.
+    /// The `outcome` label is derived from [`TaskOutcome::as_label`]: `success` | `failure` | `canceled` | `timeout`.
     fn record_task_completed(&self, runner_type: &str, outcome: TaskOutcome, duration_ms: u64) {
         let label = outcome.as_label();
 

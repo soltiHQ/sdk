@@ -4,10 +4,9 @@ pub use subscriber::StateSubscriber;
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
-    time::SystemTime,
 };
 
-use solti_model::{Slot, TaskId, TaskInfo, TaskPage, TaskQuery, TaskStatus};
+use solti_model::{Slot, Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskSpec};
 
 /// In-memory task state storage.
 #[derive(Clone)]
@@ -17,7 +16,7 @@ pub struct TaskState {
 
 struct TaskStateInner {
     /// Tasks indexed by TaskId.
-    tasks: HashMap<TaskId, TaskInfo>,
+    tasks: HashMap<TaskId, Task>,
     /// Index: slot -> list of task IDs in that slot.
     by_slot: HashMap<Slot, Vec<TaskId>>,
 }
@@ -34,34 +33,28 @@ impl TaskState {
     }
 
     /// Register a new task (called on TaskAdded event).
-    pub fn add_task(&self, id: TaskId, slot: Slot) {
+    pub fn add_task(&self, id: TaskId, spec: TaskSpec) {
         let mut inner = self.inner.write().unwrap();
 
-        let now = SystemTime::now();
-        let info = TaskInfo {
-            id: id.clone(),
-            slot: slot.clone(),
-            status: TaskStatus::Pending,
-            attempt: 0,
-            created_at: now,
-            updated_at: now,
-            error: None,
-        };
+        let slot = spec.slot.clone();
+        let task = Task::new(id.clone(), spec);
 
-        inner.tasks.insert(id.clone(), info);
-        inner.by_slot.entry(slot).or_default().push(id);
+        inner.by_slot.entry(slot).or_default().push(id.clone());
+        inner.tasks.insert(id, task);
     }
 
-    /// Update task status (called on state transition events).
-    pub fn update_status(&self, id: &TaskId, status: TaskStatus, error: Option<String>) {
+    /// Update task phase (called on state transition events).
+    pub fn update_phase(
+        &self,
+        id: &TaskId,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+    ) {
         let mut inner = self.inner.write().unwrap();
 
-        if let Some(info) = inner.tasks.get_mut(id) {
-            info.status = status;
-            info.updated_at = SystemTime::now();
-            if let Some(err) = error {
-                info.error = Some(err);
-            }
+        if let Some(task) = inner.tasks.get_mut(id) {
+            task.update_phase(phase, error, exit_code);
         }
     }
 
@@ -69,9 +62,8 @@ impl TaskState {
     pub fn increment_attempt(&self, id: &TaskId) {
         let mut inner = self.inner.write().unwrap();
 
-        if let Some(info) = inner.tasks.get_mut(id) {
-            info.attempt += 1;
-            info.updated_at = SystemTime::now();
+        if let Some(task) = inner.tasks.get_mut(id) {
+            task.increment_attempt();
         }
     }
 
@@ -79,21 +71,21 @@ impl TaskState {
     pub fn remove_task(&self, id: &TaskId) {
         let mut inner = self.inner.write().unwrap();
 
-        if let Some(info) = inner.tasks.remove(id)
-            && let Some(ids) = inner.by_slot.get_mut(&info.slot)
+        if let Some(task) = inner.tasks.remove(id)
+            && let Some(ids) = inner.by_slot.get_mut(task.slot())
         {
             ids.retain(|task_id| task_id != id);
         }
     }
 
-    /// Get task info by ID.
-    pub fn get(&self, id: &TaskId) -> Option<TaskInfo> {
+    /// Get task by ID.
+    pub fn get(&self, id: &TaskId) -> Option<Task> {
         let inner = self.inner.read().unwrap();
         inner.tasks.get(id).cloned()
     }
 
     /// List all tasks in a specific slot.
-    pub fn list_by_slot(&self, slot: &str) -> Vec<TaskInfo> {
+    pub fn list_by_slot(&self, slot: &str) -> Vec<Task> {
         let inner = self.inner.read().unwrap();
 
         inner
@@ -108,18 +100,18 @@ impl TaskState {
     }
 
     /// List all tasks.
-    pub fn list_all(&self) -> Vec<TaskInfo> {
+    pub fn list_all(&self) -> Vec<Task> {
         let inner = self.inner.read().unwrap();
         inner.tasks.values().cloned().collect()
     }
 
-    /// List tasks matching a status filter.
-    pub fn list_by_status(&self, status: TaskStatus) -> Vec<TaskInfo> {
+    /// List tasks matching a phase filter.
+    pub fn list_by_status(&self, phase: TaskPhase) -> Vec<Task> {
         let inner = self.inner.read().unwrap();
         inner
             .tasks
             .values()
-            .filter(|info| info.status == status)
+            .filter(|task| task.status.phase == phase)
             .cloned()
             .collect()
     }
@@ -129,12 +121,12 @@ impl TaskState {
     /// Filters are applied inside a single read lock.
     /// When `slot` is specified, uses the `by_slot` index to narrow the scan.
     /// `total` in the result reflects the count *after* filtering, *before* pagination.
-    pub fn query(&self, q: &TaskQuery) -> TaskPage<TaskInfo> {
+    pub fn query(&self, q: &TaskQuery) -> TaskPage<Task> {
         let inner = self.inner.read().unwrap();
 
         // Choose the iterator source based on whether slot filter is present.
         // When slot is given we use the by_slot index to avoid full scan.
-        let iter: Box<dyn Iterator<Item = &TaskInfo>> = match &q.slot {
+        let iter: Box<dyn Iterator<Item = &Task>> = match q.slot() {
             Some(slot) => {
                 let ids = inner.by_slot.get(slot.as_str());
                 match ids {
@@ -150,26 +142,25 @@ impl TaskState {
             None => Box::new(inner.tasks.values()),
         };
 
-        // Apply status filter if present.
-        let iter: Box<dyn Iterator<Item = &TaskInfo>> = match &q.status {
-            Some(status) => {
-                let status = *status;
-                Box::new(iter.filter(move |info| info.status == status))
-            }
-            None => iter,
+        // Apply status (phase) filter if present.
+        let iter: Box<dyn Iterator<Item = &Task>> = if q.status_filters().is_empty() {
+            iter
+        } else {
+            Box::new(iter.filter(|task| q.matches_phase(&task.status.phase)))
         };
 
-        // Collect refs that pass all filters — we need total count
+        // Collect refs that pass all filters - we need total count
         // and then paginate, so we must know the full filtered set size.
         // We avoid cloning here by collecting references first.
-        let filtered: Vec<&TaskInfo> = iter.collect();
+        let filtered: Vec<&Task> = iter.collect();
         let total = filtered.len();
 
-        let items = filtered
-            .into_iter()
-            .skip(q.offset)
-            .take(q.limit)
-            .cloned()
+        // Slice-based paginatior - O(1) index vs O(offset) iterator skip.
+        let start = q.offset().min(total);
+        let items = filtered[start..]
+            .iter()
+            .take(q.limit())
+            .map(|task| (*task).clone())
             .collect();
 
         TaskPage { items, total }
@@ -185,46 +176,63 @@ impl Default for TaskState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solti_model::{AdmissionPolicy, BackoffPolicy, Labels, RestartPolicy, TaskKind};
+
+    fn default_spec_with_slot(slot: &str) -> TaskSpec {
+        TaskSpec {
+            slot: slot.into(),
+            kind: TaskKind::Embedded,
+            timeout: 5_000_u64.into(),
+            restart: RestartPolicy::default(),
+            backoff: BackoffPolicy::default(),
+            admission: AdmissionPolicy::default(),
+            runner_selector: None,
+            labels: Labels::new(),
+        }
+    }
+
+    fn default_spec() -> TaskSpec {
+        default_spec_with_slot("slot")
+    }
 
     #[test]
     fn add_and_get_task() {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
-        let slot = "demo-slot".to_string();
 
-        state.add_task(id.clone(), slot.clone());
+        state.add_task(id.clone(), default_spec_with_slot("demo-slot"));
 
-        let info = state.get(&id).expect("task should exist");
-        assert_eq!(info.id, id);
-        assert_eq!(info.slot, slot);
-        assert_eq!(info.status, TaskStatus::Pending);
-        assert_eq!(info.attempt, 0);
+        let task = state.get(&id).expect("task should exist");
+        assert_eq!(task.metadata.id, id);
+        assert_eq!(task.slot(), "demo-slot");
+        assert_eq!(task.status.phase, TaskPhase::Pending);
+        assert_eq!(task.status.attempt, 0);
     }
 
     #[test]
-    fn update_status_changes_task_state() {
+    fn update_phase_changes_task_state() {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
-        state.add_task(id.clone(), "slot".to_string());
-        state.update_status(&id, TaskStatus::Running, None);
+        state.add_task(id.clone(), default_spec());
+        state.update_phase(&id, TaskPhase::Running, None, None);
 
-        let info = state.get(&id).unwrap();
-        assert_eq!(info.status, TaskStatus::Running);
-        assert!(info.error.is_none());
+        let task = state.get(&id).unwrap();
+        assert_eq!(task.status.phase, TaskPhase::Running);
+        assert!(task.status.error.is_none());
     }
 
     #[test]
-    fn update_status_with_error() {
+    fn update_phase_with_error() {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
-        state.add_task(id.clone(), "slot".to_string());
-        state.update_status(&id, TaskStatus::Failed, Some("timeout".to_string()));
+        state.add_task(id.clone(), default_spec());
+        state.update_phase(&id, TaskPhase::Failed, Some("timeout".to_string()), None);
 
-        let info = state.get(&id).unwrap();
-        assert_eq!(info.status, TaskStatus::Failed);
-        assert_eq!(info.error.as_deref(), Some("timeout"));
+        let task = state.get(&id).unwrap();
+        assert_eq!(task.status.phase, TaskPhase::Failed);
+        assert_eq!(task.status.error.as_deref(), Some("timeout"));
     }
 
     #[test]
@@ -232,12 +240,12 @@ mod tests {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
-        state.add_task(id.clone(), "slot".to_string());
+        state.add_task(id.clone(), default_spec());
         state.increment_attempt(&id);
         state.increment_attempt(&id);
 
-        let info = state.get(&id).unwrap();
-        assert_eq!(info.attempt, 2);
+        let task = state.get(&id).unwrap();
+        assert_eq!(task.status.attempt, 2);
     }
 
     #[test]
@@ -245,7 +253,7 @@ mod tests {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
-        state.add_task(id.clone(), "slot".to_string());
+        state.add_task(id.clone(), default_spec());
         assert!(state.get(&id).is_some());
 
         state.remove_task(&id);
@@ -256,9 +264,9 @@ mod tests {
     fn list_by_slot_returns_correct_tasks() {
         let state = TaskState::new();
 
-        state.add_task(TaskId::from("task-1"), "slot-a".to_string());
-        state.add_task(TaskId::from("task-2"), "slot-a".to_string());
-        state.add_task(TaskId::from("task-3"), "slot-b".to_string());
+        state.add_task(TaskId::from("task-1"), default_spec_with_slot("slot-a"));
+        state.add_task(TaskId::from("task-2"), default_spec_with_slot("slot-a"));
+        state.add_task(TaskId::from("task-3"), default_spec_with_slot("slot-b"));
 
         let slot_a_tasks = state.list_by_slot("slot-a");
         assert_eq!(slot_a_tasks.len(), 2);
@@ -273,26 +281,26 @@ mod tests {
         let id1 = TaskId::from("task-1");
         let id2 = TaskId::from("task-2");
 
-        state.add_task(id1.clone(), "slot".to_string());
-        state.add_task(id2.clone(), "slot".to_string());
-        state.update_status(&id1, TaskStatus::Running, None);
+        state.add_task(id1.clone(), default_spec());
+        state.add_task(id2.clone(), default_spec());
+        state.update_phase(&id1, TaskPhase::Running, None, None);
 
-        let running_tasks = state.list_by_status(TaskStatus::Running);
+        let running_tasks = state.list_by_status(TaskPhase::Running);
         assert_eq!(running_tasks.len(), 1);
-        assert_eq!(running_tasks[0].id, id1);
+        assert_eq!(running_tasks[0].metadata.id, id1);
 
-        let pending_tasks = state.list_by_status(TaskStatus::Pending);
+        let pending_tasks = state.list_by_status(TaskPhase::Pending);
         assert_eq!(pending_tasks.len(), 1);
-        assert_eq!(pending_tasks[0].id, id2);
+        assert_eq!(pending_tasks[0].metadata.id, id2);
     }
 
     #[test]
     fn list_all_returns_all_tasks() {
         let state = TaskState::new();
 
-        state.add_task(TaskId::from("task-1"), "slot-a".to_string());
-        state.add_task(TaskId::from("task-2"), "slot-b".to_string());
-        state.add_task(TaskId::from("task-3"), "slot-c".to_string());
+        state.add_task(TaskId::from("task-1"), default_spec_with_slot("slot-a"));
+        state.add_task(TaskId::from("task-2"), default_spec_with_slot("slot-b"));
+        state.add_task(TaskId::from("task-3"), default_spec_with_slot("slot-c"));
 
         let all_tasks = state.list_all();
         assert_eq!(all_tasks.len(), 3);
@@ -301,16 +309,21 @@ mod tests {
     fn setup_query_state() -> TaskState {
         let state = TaskState::new();
         // slot-a: 3 tasks (2 running, 1 pending)
-        state.add_task(TaskId::from("a1"), "slot-a".to_string());
-        state.add_task(TaskId::from("a2"), "slot-a".to_string());
-        state.add_task(TaskId::from("a3"), "slot-a".to_string());
-        state.update_status(&TaskId::from("a1"), TaskStatus::Running, None);
-        state.update_status(&TaskId::from("a2"), TaskStatus::Running, None);
+        state.add_task(TaskId::from("a1"), default_spec_with_slot("slot-a"));
+        state.add_task(TaskId::from("a2"), default_spec_with_slot("slot-a"));
+        state.add_task(TaskId::from("a3"), default_spec_with_slot("slot-a"));
+        state.update_phase(&TaskId::from("a1"), TaskPhase::Running, None, None);
+        state.update_phase(&TaskId::from("a2"), TaskPhase::Running, None, None);
 
         // slot-b: 2 tasks (1 failed, 1 pending)
-        state.add_task(TaskId::from("b1"), "slot-b".to_string());
-        state.add_task(TaskId::from("b2"), "slot-b".to_string());
-        state.update_status(&TaskId::from("b1"), TaskStatus::Failed, Some("err".into()));
+        state.add_task(TaskId::from("b1"), default_spec_with_slot("slot-b"));
+        state.add_task(TaskId::from("b2"), default_spec_with_slot("slot-b"));
+        state.update_phase(
+            &TaskId::from("b1"),
+            TaskPhase::Failed,
+            Some("err".into()),
+            None,
+        );
 
         state
     }
@@ -334,7 +347,7 @@ mod tests {
     #[test]
     fn query_by_status_only() {
         let state = setup_query_state();
-        let page = state.query(&TaskQuery::new().with_status(TaskStatus::Running));
+        let page = state.query(&TaskQuery::new().with_status(TaskPhase::Running));
         assert_eq!(page.total, 2);
         assert_eq!(page.items.len(), 2);
     }
@@ -345,10 +358,14 @@ mod tests {
         let page = state.query(
             &TaskQuery::new()
                 .with_slot("slot-a")
-                .with_status(TaskStatus::Running),
+                .with_status(TaskPhase::Running),
         );
         assert_eq!(page.total, 2);
-        assert!(page.items.iter().all(|t| t.status == TaskStatus::Running));
+        assert!(
+            page.items
+                .iter()
+                .all(|t| t.status.phase == TaskPhase::Running)
+        );
     }
 
     #[test]
@@ -357,7 +374,7 @@ mod tests {
         let page = state.query(
             &TaskQuery::new()
                 .with_slot("slot-b")
-                .with_status(TaskStatus::Running),
+                .with_status(TaskPhase::Running),
         );
         assert_eq!(page.total, 0);
         assert!(page.items.is_empty());

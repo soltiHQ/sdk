@@ -2,13 +2,14 @@
 //!
 //! Responsibilities:
 //! - owns a [`Supervisor`] instance and runs its event loop in the background;
-//! - uses [`RunnerRouter`] to build concrete tasks from [`CreateSpec`];
+//! - uses [`RunnerRouter`] to build concrete tasks from [`TaskSpec`];
 //! - maps model-level specs / policies into controller specs and submits them.
 use std::{sync::Arc, time::Duration};
 
-use solti_model::{CreateSpec, TaskId, TaskInfo, TaskPage, TaskQuery, TaskStatus};
+use solti_model::{Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskSpec};
 use taskvisor::{
-    ControllerConfig, ControllerSpec, Subscribe, Supervisor, SupervisorConfig, TaskRef, TaskSpec,
+    ControllerConfig, ControllerSpec, Subscribe, Supervisor, SupervisorConfig, TaskRef,
+    TaskSpec as TvTaskSpec,
 };
 use tracing::{debug, info, instrument};
 
@@ -16,7 +17,6 @@ use crate::system::init_uptime;
 use crate::{
     error::CoreError,
     map::{to_admission_policy, to_backoff_policy, to_restart_policy},
-    policy::TaskPolicy,
     router::RunnerRouter,
     state::{StateSubscriber, TaskState},
 };
@@ -25,7 +25,7 @@ use crate::{
 ///
 /// This type is responsible for:
 /// - constructing and running the supervisor;
-/// - selecting a concrete runner for each [`CreateSpec`];
+/// - selecting a concrete runner for each [`TaskSpec`];
 /// - mapping model-level specs into controller specs and submitting them.
 pub struct SupervisorApi {
     sup: Arc<Supervisor>,
@@ -35,10 +35,10 @@ pub struct SupervisorApi {
 
 impl SupervisorApi {
     /// Create a supervisor with explicit configs and start its run loop in the background.
-    /// - `sup_cfg`     — supervisor configuration;
-    /// - `ctrl_cfg`    — controller configuration;
-    /// - `subscribers` — event subscribers to attach to the supervisor;
-    /// - `router`      — runner router [`solti_model::TaskKind`].
+    /// - `sup_cfg`     - supervisor configuration;
+    /// - `ctrl_cfg`    - controller configuration;
+    /// - `subscribers` - event subscribers to attach to the supervisor;
+    /// - `router`      - runner router [`solti_model::TaskKind`].
     ///
     /// The supervisor run loop is spawned on the current Tokio runtime.
     /// This method waits until the supervisor reports readiness before returning.
@@ -71,27 +71,27 @@ impl SupervisorApi {
     }
 
     /// Get task information by ID.
-    pub fn get_task(&self, id: &TaskId) -> Option<TaskInfo> {
+    pub fn get_task(&self, id: &TaskId) -> Option<Task> {
         self.state.get(id)
     }
 
     /// List all tasks in a specific slot.
-    pub fn list_tasks_by_slot(&self, slot: &str) -> Vec<TaskInfo> {
+    pub fn list_tasks_by_slot(&self, slot: &str) -> Vec<Task> {
         self.state.list_by_slot(slot)
     }
 
     /// List all tasks.
-    pub fn list_all_tasks(&self) -> Vec<TaskInfo> {
+    pub fn list_all_tasks(&self) -> Vec<Task> {
         self.state.list_all()
     }
 
-    /// List tasks by status.
-    pub fn list_tasks_by_status(&self, status: TaskStatus) -> Vec<TaskInfo> {
-        self.state.list_by_status(status)
+    /// List tasks by phase.
+    pub fn list_tasks_by_status(&self, phase: TaskPhase) -> Vec<Task> {
+        self.state.list_by_status(phase)
     }
 
     /// Query tasks with combined filters and pagination.
-    pub fn query_tasks(&self, query: &TaskQuery) -> TaskPage<TaskInfo> {
+    pub fn query_tasks(&self, query: &TaskQuery) -> TaskPage<Task> {
         self.state.query(query)
     }
 
@@ -100,49 +100,45 @@ impl SupervisorApi {
         Arc::clone(&self.sup)
     }
 
-    /// Build and submit a task described by [`CreateSpec`].
+    /// Build and submit a task described by [`TaskSpec`].
     ///
     /// Steps:
     /// 1. Ask the [`RunnerRouter`] to pick a runner and build a [`TaskRef`].
-    /// 2. Convert [`CreateSpec`] into [`TaskPolicy`] (dropping the [`solti_model::TaskKind`] information).
-    /// 3. Delegate to [`SupervisorApi::submit_with_task`].
+    /// 2. Delegate to [`SupervisorApi::submit_with_task`].
     ///
     /// This is the primary entrypoint for tasks that are fully described by the public [`solti_model::TaskKind`] model.
     #[instrument(level = "debug", skip(self, spec), fields(slot = %spec.slot, kind = ?spec.kind))]
-    pub async fn submit(&self, spec: &CreateSpec) -> Result<TaskId, CoreError> {
+    pub async fn submit(&self, spec: &TaskSpec) -> Result<TaskId, CoreError> {
+        spec.validate()?;
+
         let task = self.router.build(spec)?;
-        let task_id = TaskId::from(task.name());
-
-        self.state.add_task(task_id.clone(), spec.slot.clone());
-        let policy = TaskPolicy::from_spec(spec);
-
-        self.submit_with_task(task, &policy).await?;
-        Ok(task_id)
+        self.submit_with_task(task, spec).await
     }
 
-    /// Submit a pre-built task together with its runtime policy.
+    /// Submit a pre-built task together with its spec.
     ///
-    /// This API is intended for in-process / code-defined tasks (without `TaskKind`).
+    /// This API is intended for in-process / code-defined tasks (with `TaskKind::Embedded`).
     ///
     /// The caller is responsible for constructing the [`TaskRef`];
-    /// `TaskPolicy` controls slot, timeout, restart and backoff behavior.
-    #[instrument(level = "debug", skip(self, task, policy), fields(slot = %policy.slot))]
+    /// the spec controls timeout, restart, backoff and admission behavior.
+    #[instrument(level = "debug", skip(self, task, spec), fields(slot = %spec.slot))]
     pub async fn submit_with_task(
         &self,
         task: TaskRef,
-        policy: &TaskPolicy,
+        spec: &TaskSpec,
     ) -> Result<TaskId, CoreError> {
         let task_id = TaskId::from(task.name());
-        self.state.add_task(task_id.clone(), policy.slot.clone());
 
-        let task_spec = TaskSpec::new(
+        self.state.add_task(task_id.clone(), spec.clone());
+
+        let task_spec = TvTaskSpec::new(
             task,
-            to_restart_policy(policy.restart),
-            to_backoff_policy(&policy.backoff),
-            Some(Duration::from_millis(policy.timeout_ms)),
+            to_restart_policy(spec.restart),
+            to_backoff_policy(&spec.backoff),
+            Some(Duration::from_millis(spec.timeout.as_millis())),
         );
         let controller_spec = ControllerSpec {
-            admission: to_admission_policy(policy.admission),
+            admission: to_admission_policy(spec.admission),
             task_spec,
         };
 
@@ -201,14 +197,14 @@ mod tests {
     use super::*;
 
     use solti_model::{
-        AdmissionStrategy, BackoffStrategy, JitterStrategy, RestartStrategy, RunnerLabels, TaskKind,
+        AdmissionPolicy, BackoffPolicy, JitterPolicy, Labels, RestartPolicy, TaskKind,
     };
     use taskvisor::{TaskError, TaskFn};
     use tokio_util::sync::CancellationToken;
 
-    fn mk_backoff() -> BackoffStrategy {
-        BackoffStrategy {
-            jitter: JitterStrategy::Equal,
+    fn mk_backoff() -> BackoffPolicy {
+        BackoffPolicy {
+            jitter: JitterPolicy::Equal,
             first_ms: 1_000,
             max_ms: 5_000,
             factor: 2.0,
@@ -227,20 +223,22 @@ mod tests {
         .await
         .expect("failed to create SupervisorApi");
 
-        // Простейшая задача, которая сразу успешно завершается.
         let task: TaskRef = TaskFn::arc("test-task", |_ctx: CancellationToken| async move {
             Ok::<(), TaskError>(())
         });
 
-        let policy = TaskPolicy::new(
-            "test-slot".to_string(),
-            1_000,
-            RestartStrategy::Never,
-            mk_backoff(),
-            AdmissionStrategy::DropIfRunning,
-        );
+        let spec = TaskSpec {
+            slot: "test-slot".into(),
+            kind: TaskKind::Embedded,
+            timeout: 1_000_u64.into(),
+            restart: RestartPolicy::Never,
+            backoff: mk_backoff(),
+            admission: AdmissionPolicy::DropIfRunning,
+            runner_selector: None,
+            labels: Labels::default(),
+        };
 
-        let res = api.submit_with_task(task, &policy).await;
+        let res = api.submit_with_task(task, &spec).await;
         match res {
             Ok(task_id) => {
                 assert!(!task_id.as_str().is_empty());
@@ -251,7 +249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_rejects_taskkind_none() {
+    async fn submit_rejects_taskkind_embedded() {
         let router = RunnerRouter::new();
         let api = SupervisorApi::new(
             SupervisorConfig::default(),
@@ -262,23 +260,24 @@ mod tests {
         .await
         .expect("failed to create SupervisorApi");
 
-        let spec = CreateSpec {
-            slot: "test-slot-none".to_string(),
-            kind: TaskKind::None,
-            timeout_ms: 1_000,
-            restart: RestartStrategy::Never,
+        let spec = TaskSpec {
+            slot: "test-slot-none".into(),
+            kind: TaskKind::Embedded,
+            timeout: 1_000_u64.into(),
+            restart: RestartPolicy::Never,
             backoff: mk_backoff(),
-            admission: AdmissionStrategy::DropIfRunning,
-            labels: RunnerLabels::default(),
+            admission: AdmissionPolicy::DropIfRunning,
+            runner_selector: None,
+            labels: Labels::default(),
         };
         let res = api.submit(&spec).await;
 
         match res {
-            Err(CoreError::NoRunner(msg)) => {
-                assert!(msg.contains("TaskKind::None"));
+            Err(CoreError::InvalidSpec(e)) => {
+                assert!(e.to_string().contains("TaskKind::Embedded"));
             }
-            Ok(_) => panic!("expected error for TaskKind::None, got Ok(TaskId)"),
-            Err(e) => panic!("expected CoreError::NoRunner, got {e:?}"),
+            Ok(_) => panic!("expected error for TaskKind::Embedded, got Ok(TaskId)"),
+            Err(e) => panic!("expected CoreError::InvalidSpec, got {e:?}"),
         }
     }
 }

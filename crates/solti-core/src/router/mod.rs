@@ -1,10 +1,10 @@
-//! Runner router that selects an appropriate `Runner` implementation for a given `CreateSpec`.
+//! Runner router that selects an appropriate `Runner` implementation for a given `TaskSpec`.
 //!
 //! The router checks registered runners in order and delegates task construction
 //! to the first one that reports `supports(spec) == true` and matches label constraints (if any).
 use std::sync::Arc;
 
-use solti_model::{CreateSpec, LABEL_RUNNER_TAG, RunnerLabels, TaskKind};
+use solti_model::{Labels, TaskKind, TaskSpec};
 use taskvisor::TaskRef;
 use tracing::{debug, instrument, trace};
 
@@ -18,13 +18,13 @@ pub struct RunnerEntry {
     /// Concrete runner implementation.
     pub runner: Arc<dyn Runner>,
     /// Static labels attached to this runner (e.g. capacity class, backend tag).
-    pub labels: RunnerLabels,
+    pub labels: Labels,
 }
 
-/// Router that selects an appropriate [`Runner`] for a given [`CreateSpec`].
+/// Router that selects an appropriate [`Runner`] for a given [`TaskSpec`].
 ///
 /// Runners are checked in the order they were registered.
-/// The first runner whose [`Runner::supports`] method returns `true` and satisfies label constraints (see [`CreateSpec::runner_tag`]) is used to build the task.
+/// The first runner whose [`Runner::supports`] method returns `true` and satisfies the [`TaskSpec::runner_selector`] (if any) is used to build the task.
 #[derive(Default)]
 pub struct RunnerRouter {
     runners: Vec<RunnerEntry>,
@@ -57,39 +57,34 @@ impl RunnerRouter {
     pub fn register(&mut self, runner: Arc<dyn Runner>) {
         self.runners.push(RunnerEntry {
             runner,
-            labels: RunnerLabels::default(),
+            labels: Labels::default(),
         });
     }
 
     /// Register a new runner with static labels.
     ///
-    /// These labels are used by the router to further narrow down candidates when [`CreateSpec::runner_tag`] is set.
+    /// These labels are used by the router to further narrow down candidates when [`TaskSpec::runner_selector`] is set.
     #[inline]
-    pub fn register_with_labels(&mut self, runner: Arc<dyn Runner>, labels: RunnerLabels) {
+    pub fn register_with_labels(&mut self, runner: Arc<dyn Runner>, labels: Labels) {
         self.runners.push(RunnerEntry { runner, labels });
     }
 
-    /// Pick the first runner that claims to support the given spec and matches label selector.
+    /// Pick the first runner that claims to support the given spec and matches the runner selector.
     ///
     /// Routing rules:
     /// - filter runners by `Runner::supports(spec)`;
-    /// - if `spec.runner_tag()` is set, keep only runners whose `labels` contain this tag;
+    /// - if `spec.runner_selector()` is set, keep only runners whose `labels`
+    ///   satisfy all `match_labels` and `match_expressions` requirements;
     /// - pick the first matching entry.
-    pub fn pick(&self, spec: &CreateSpec) -> Option<&Arc<dyn Runner>> {
-        let wanted = spec.runner_tag();
+    pub fn pick(&self, spec: &TaskSpec) -> Option<&Arc<dyn Runner>> {
+        let selector = spec.runner_selector();
 
         self.runners
             .iter()
             .filter(|entry| entry.runner.supports(spec))
-            .filter(move |entry| {
-                if let Some(wanted) = wanted {
-                    match entry.labels.get(LABEL_RUNNER_TAG) {
-                        Some(actual) => actual == wanted,
-                        None => false,
-                    }
-                } else {
-                    true
-                }
+            .filter(move |entry| match selector {
+                Some(sel) => sel.matches(&entry.labels),
+                None => true,
             })
             .map(|entry| &entry.runner)
             .next()
@@ -97,14 +92,14 @@ impl RunnerRouter {
 
     /// Build a [`TaskRef`] for the given spec using the selected runner.
     ///
-    /// `TaskKind::None` is not routable and must be used with [`SupervisorApi::submit_with_task`](crate::supervisor::SupervisorApi::submit_with_task).
-    #[instrument(level = "debug", skip(self, spec), fields(kind = ?spec.kind, slot = %spec.slot))]
-    pub fn build(&self, spec: &CreateSpec) -> Result<TaskRef, CoreError> {
+    /// `TaskKind::Embedded` is not routable and must be used with [`SupervisorApi::submit_with_task`](crate::supervisor::SupervisorApi::submit_with_task).
+    #[instrument(level = "debug", skip(self, spec), fields(kind = ?spec.kind))]
+    pub fn build(&self, spec: &TaskSpec) -> Result<TaskRef, CoreError> {
         trace!(spec = ?spec, "router received spec");
 
-        if matches!(spec.kind, TaskKind::None) {
+        if matches!(spec.kind, TaskKind::Embedded) {
             return Err(CoreError::NoRunner(
-                "TaskKind::None requires submit_with_task()".to_string(),
+                "TaskKind::Embedded requires submit_with_task()".to_string(),
             ));
         }
         let r = self
@@ -116,11 +111,11 @@ impl RunnerRouter {
         Ok(task)
     }
 
-    /// Returns `true` if at least one registered runner advertises the given runner-tag.
-    pub fn contains_runner_tag(&self, tag: &str) -> bool {
+    /// Returns `true` if at least one registered runner has `label_key == label_value`.
+    pub fn contains_label(&self, label_key: &str, label_value: &str) -> bool {
         self.runners
             .iter()
-            .any(|e| e.labels.get(LABEL_RUNNER_TAG) == Some(tag))
+            .any(|e| e.labels.get(label_key) == Some(label_value))
     }
 }
 
@@ -130,9 +125,10 @@ mod tests {
     use crate::runner::RunnerError;
 
     use solti_model::{
-        AdmissionStrategy, BackoffStrategy, Flag, JitterStrategy, RestartStrategy, RunnerLabels,
+        AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, RunnerSelector,
         TaskEnv,
     };
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use taskvisor::{TaskError, TaskFn};
     use tokio_util::sync::CancellationToken;
@@ -144,13 +140,13 @@ mod tests {
             "subprocess-only"
         }
 
-        fn supports(&self, spec: &CreateSpec) -> bool {
+        fn supports(&self, spec: &TaskSpec) -> bool {
             matches!(spec.kind, TaskKind::Subprocess { .. })
         }
 
         fn build_task(
             &self,
-            _spec: &CreateSpec,
+            _spec: &TaskSpec,
             _ctx: &BuildContext,
         ) -> Result<TaskRef, RunnerError> {
             let task = TaskFn::arc(
@@ -161,43 +157,44 @@ mod tests {
         }
     }
 
-    fn mk_backoff() -> BackoffStrategy {
-        BackoffStrategy {
-            jitter: JitterStrategy::Equal,
+    fn mk_backoff() -> BackoffPolicy {
+        BackoffPolicy {
+            jitter: JitterPolicy::Equal,
             first_ms: 1_000,
             max_ms: 5_000,
             factor: 2.0,
         }
     }
 
-    fn mk_spec(kind: TaskKind) -> CreateSpec {
-        CreateSpec {
-            slot: "test-slot".to_string(),
+    fn mk_spec(kind: TaskKind) -> TaskSpec {
+        TaskSpec {
+            slot: "test-slot".into(),
             kind,
-            timeout_ms: 10_000,
-            restart: RestartStrategy::default(),
+            timeout: 10_000_u64.into(),
+            restart: RestartPolicy::default(),
             backoff: mk_backoff(),
-            admission: AdmissionStrategy::DropIfRunning,
-            labels: RunnerLabels::default(),
+            admission: AdmissionPolicy::DropIfRunning,
+            runner_selector: None,
+            labels: Labels::default(),
         }
     }
 
     #[test]
-    fn build_fails_for_taskkind_none() {
+    fn build_fails_for_taskkind_embedded() {
         let router = RunnerRouter::new();
-        let spec = mk_spec(TaskKind::None);
+        let spec = mk_spec(TaskKind::Embedded);
 
         let res = router.build(&spec);
 
         match res {
             Err(CoreError::NoRunner(msg)) => {
                 assert!(
-                    msg.contains("TaskKind::None"),
+                    msg.contains("TaskKind::Embedded"),
                     "unexpected NoRunner message: {msg}"
                 );
             }
-            Ok(_) => panic!("expected CoreError::NoRunner for TaskKind::None, got Ok(..)"),
-            Err(e) => panic!("expected CoreError::NoRunner for TaskKind::None, got {e:?}"),
+            Ok(_) => panic!("expected CoreError::NoRunner for TaskKind::Embedded, got Ok(..)"),
+            Err(e) => panic!("expected CoreError::NoRunner for TaskKind::Embedded, got {e:?}"),
         }
     }
 
@@ -245,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_respects_runner_tag() {
+    fn pick_respects_runner_selector() {
         struct R1;
         struct R2;
 
@@ -254,13 +251,13 @@ mod tests {
                 "r1"
             }
 
-            fn supports(&self, _spec: &CreateSpec) -> bool {
+            fn supports(&self, _spec: &TaskSpec) -> bool {
                 true
             }
 
             fn build_task(
                 &self,
-                _spec: &CreateSpec,
+                _spec: &TaskSpec,
                 _ctx: &BuildContext,
             ) -> Result<TaskRef, RunnerError> {
                 Ok(TaskFn::arc(
@@ -275,13 +272,13 @@ mod tests {
                 "r2"
             }
 
-            fn supports(&self, _spec: &CreateSpec) -> bool {
+            fn supports(&self, _spec: &TaskSpec) -> bool {
                 true
             }
 
             fn build_task(
                 &self,
-                _spec: &CreateSpec,
+                _spec: &TaskSpec,
                 _ctx: &BuildContext,
             ) -> Result<TaskRef, RunnerError> {
                 Ok(TaskFn::arc(
@@ -291,10 +288,10 @@ mod tests {
             }
         }
 
-        let mut labels_r1 = RunnerLabels::new();
-        labels_r1.insert(LABEL_RUNNER_TAG, "runner-a");
-        let mut labels_r2 = RunnerLabels::new();
-        labels_r2.insert(LABEL_RUNNER_TAG, "runner-b");
+        let mut labels_r1 = Labels::new();
+        labels_r1.insert("runner-name", "runner-a");
+        let mut labels_r2 = Labels::new();
+        labels_r2.insert("runner-name", "runner-b");
 
         let mut router = RunnerRouter::new();
         router.register_with_labels(Arc::new(R1), labels_r1);
@@ -308,7 +305,10 @@ mod tests {
                 cwd: None,
                 fail_on_non_zero: Flag::enabled(),
             });
-            base.with_runner_tag("runner-b")
+            base.with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
+                "runner-name".into(),
+                "runner-b".into(),
+            )])))
         };
 
         let picked = router.pick(&spec).expect("runner should be picked");

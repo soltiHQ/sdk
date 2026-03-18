@@ -1,6 +1,5 @@
 use solti_model::{
-    AdmissionStrategy, BackoffStrategy, CreateSpec, JitterStrategy, RestartStrategy, RunnerLabels,
-    TaskKind,
+    AdmissionPolicy, BackoffPolicy, JitterPolicy, Labels, RestartPolicy, TaskKind, TaskSpec,
 };
 use taskvisor::{TaskError, TaskFn, TaskRef};
 use tokio_util::sync::CancellationToken;
@@ -37,19 +36,17 @@ const BACKOFF_FACTOR: f64 = 2.0;
 /// |---------------|-----------------|---------------------------------------|
 /// | Success       | 1 hour          | Periodic restart                      |
 /// | Failure       | 5 s → 5 min     | Exponential backoff with equal jitter |
-/// | Duplicate     | Replaces        | [`AdmissionStrategy::Replace`]        |
+/// | Duplicate     | Replaces        | [`AdmissionPolicy::Replace`]          |
 ///
 /// ## Example
 ///
 /// ```rust,ignore
 /// use solti_observe::timezone_sync;
-/// use solti_core::TaskPolicy;
 ///
 /// let (task, spec) = timezone_sync();
-/// let policy = TaskPolicy::from_spec(&spec);
-/// supervisor.submit_with_task(task, &policy).await?;
+/// supervisor.submit_with_task(task, &spec).await?;
 /// ```
-pub fn timezone_sync() -> (TaskRef, CreateSpec) {
+pub fn timezone_sync() -> (TaskRef, TaskSpec) {
     let task: TaskRef = TaskFn::arc(TZ_SYNC_SLOT, |ctx: CancellationToken| async move {
         debug!("timezone sync started");
 
@@ -67,21 +64,23 @@ pub fn timezone_sync() -> (TaskRef, CreateSpec) {
         }
     });
 
-    let backoff = BackoffStrategy {
-        jitter: JitterStrategy::Equal,
+    let backoff = BackoffPolicy {
+        jitter: JitterPolicy::Equal,
         first_ms: BACKOFF_FIRST_MS,
         max_ms: BACKOFF_MAX_MS,
         factor: BACKOFF_FACTOR,
     };
+    let spec = TaskSpec {
+        restart: RestartPolicy::periodic(TZ_SYNC_PERIOD_MS),
+        timeout: TZ_SYNC_TIMEOUT_MS.into(),
 
-    let spec = CreateSpec {
-        restart: RestartStrategy::periodic(TZ_SYNC_PERIOD_MS),
-        slot: TZ_SYNC_SLOT.to_string(),
-        timeout_ms: TZ_SYNC_TIMEOUT_MS,
+        slot: TZ_SYNC_SLOT.into(),
+        labels: Labels::default(),
 
-        admission: AdmissionStrategy::Replace,
-        labels: RunnerLabels::default(),
-        kind: TaskKind::None,
+        admission: AdmissionPolicy::Replace,
+        kind: TaskKind::Embedded,
+        runner_selector: None,
+
         backoff,
     };
 

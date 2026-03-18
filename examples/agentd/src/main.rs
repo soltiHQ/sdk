@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use tracing::info;
 
-use solti_core::{RunnerRouter, SupervisorApi, TaskPolicy};
+use solti_core::{RunnerRouter, SupervisorApi};
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
 use solti_exec::subprocess::SubprocessBackendConfig;
@@ -14,9 +14,11 @@ use solti_observe::{
     LoggerConfig, LoggerLevel, TracingEventSubscriber, init_logger, timezone_sync,
 };
 
+use std::collections::BTreeMap;
+
 use solti_model::{
-    AdmissionStrategy, BackoffStrategy, CreateSpec, Flag, JitterStrategy, RestartStrategy,
-    RunnerLabels, TaskEnv, TaskKind,
+    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, RunnerSelector,
+    TaskEnv, TaskKind, TaskSpec,
 };
 
 #[tokio::main(flavor = "multi_thread")]
@@ -96,13 +98,12 @@ async fn main() -> anyhow::Result<()> {
 
     // 5) internal timezone-sync
     let (tz_task, tz_spec) = timezone_sync();
-    let tz_policy = TaskPolicy::from_spec(&tz_spec);
-    let tz_id = api.submit_with_task(tz_task, &tz_policy).await?;
+    let tz_id = api.submit_with_task(tz_task, &tz_spec).await?;
     info!("submitted timezone-sync task: {}", tz_id);
 
     // 6a) Dev runner
-    let ls_spec = CreateSpec {
-        slot: "dev-ls-tmp".to_string(),
+    let ls_spec = TaskSpec {
+        slot: "dev-ls-tmp".into(),
         kind: TaskKind::Subprocess {
             command: "ls".into(),
             args: vec!["-lah".into(), "/tmp".into()],
@@ -110,22 +111,26 @@ async fn main() -> anyhow::Result<()> {
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000,
-        restart: RestartStrategy::Never,
-        backoff: BackoffStrategy {
-            jitter: JitterStrategy::None,
+        timeout: 5_000_u64.into(),
+        restart: RestartPolicy::Never,
+        backoff: BackoffPolicy {
+            jitter: JitterPolicy::None,
             first_ms: 0,
             max_ms: 0,
             factor: 1.0,
         },
-        admission: AdmissionStrategy::DropIfRunning,
-        labels: RunnerLabels::default(),
+        admission: AdmissionPolicy::DropIfRunning,
+        runner_selector: None,
+        labels: Labels::default(),
     }
-    .with_runner_tag("dev-runner");
+    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
+        "runner-name".into(),
+        "dev-runner".into(),
+    )])));
 
     // 6b) Production runner
-    let date_spec = CreateSpec {
-        slot: "prod-date".to_string(),
+    let date_spec = TaskSpec {
+        slot: "prod-date".into(),
         kind: TaskKind::Subprocess {
             command: "date".into(),
             args: vec!["+%Y-%m-%d %H:%M:%S".into()],
@@ -133,22 +138,26 @@ async fn main() -> anyhow::Result<()> {
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000,
-        restart: RestartStrategy::Never,
-        backoff: BackoffStrategy {
-            jitter: JitterStrategy::None,
+        timeout: 5_000_u64.into(),
+        restart: RestartPolicy::Never,
+        backoff: BackoffPolicy {
+            jitter: JitterPolicy::None,
             first_ms: 0,
             max_ms: 0,
             factor: 1.0,
         },
-        admission: AdmissionStrategy::DropIfRunning,
-        labels: RunnerLabels::default(),
+        admission: AdmissionPolicy::DropIfRunning,
+        runner_selector: None,
+        labels: Labels::default(),
     }
-    .with_runner_tag("prod-runner");
+    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
+        "runner-name".into(),
+        "prod-runner".into(),
+    )])));
 
     // 6c) Untrusted runner
-    let sleep_spec = CreateSpec {
-        slot: "untrusted-sleep".to_string(),
+    let sleep_spec = TaskSpec {
+        slot: "untrusted-sleep".into(),
         kind: TaskKind::Subprocess {
             command: "sleep".into(),
             args: vec!["2".into()],
@@ -156,22 +165,26 @@ async fn main() -> anyhow::Result<()> {
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000,
-        restart: RestartStrategy::Never,
-        backoff: BackoffStrategy {
-            jitter: JitterStrategy::None,
+        timeout: 5_000_u64.into(),
+        restart: RestartPolicy::Never,
+        backoff: BackoffPolicy {
+            jitter: JitterPolicy::None,
             first_ms: 0,
             max_ms: 0,
             factor: 1.0,
         },
-        admission: AdmissionStrategy::DropIfRunning,
-        labels: RunnerLabels::default(),
+        admission: AdmissionPolicy::DropIfRunning,
+        runner_selector: None,
+        labels: Labels::default(),
     }
-    .with_runner_tag("untrusted-runner");
+    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
+        "runner-name".into(),
+        "untrusted-runner".into(),
+    )])));
 
     // 6d) Untrusted runner
-    let stress_spec = CreateSpec {
-        slot: "untrusted-stress".to_string(),
+    let stress_spec = TaskSpec {
+        slot: "untrusted-stress".into(),
         kind: TaskKind::Subprocess {
             command: "sh".into(),
             args: vec![
@@ -182,25 +195,29 @@ async fn main() -> anyhow::Result<()> {
             cwd: None,
             fail_on_non_zero: Flag::disabled(),
         },
-        timeout_ms: 5_000,
-        restart: RestartStrategy::Never,
-        backoff: BackoffStrategy {
-            jitter: JitterStrategy::None,
+        timeout: 5_000_u64.into(),
+        restart: RestartPolicy::Never,
+        backoff: BackoffPolicy {
+            jitter: JitterPolicy::None,
             first_ms: 0,
             max_ms: 0,
             factor: 1.0,
         },
-        admission: AdmissionStrategy::DropIfRunning,
-        labels: RunnerLabels::default(),
+        admission: AdmissionPolicy::DropIfRunning,
+        runner_selector: None,
+        labels: Labels::default(),
     }
-    .with_runner_tag("untrusted-runner");
+    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
+        "runner-name".into(),
+        "untrusted-runner".into(),
+    )])));
 
     // Submit tasks
     info!("submitting tasks...");
     let task_id = api.submit(&ls_spec).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
     if let Some(info) = api.get_task(&task_id) {
-        info!("task {} status: {:?}", task_id, info.status);
+        info!("task {} status: {:?}", task_id, info.status.phase);
     }
 
     info!("submitted task: {}", task_id);
@@ -218,7 +235,10 @@ async fn main() -> anyhow::Result<()> {
     for task in api.list_all_tasks() {
         info!(
             "task {}: status={:?}, attempt={}, slot={}",
-            task.id, task.status, task.attempt, task.slot
+            task.id(),
+            task.status.phase,
+            task.status.attempt,
+            task.slot()
         );
     }
 

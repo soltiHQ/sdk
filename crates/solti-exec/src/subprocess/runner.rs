@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 use solti_core::{BuildContext, Runner, RunnerError};
-use solti_model::{CreateSpec, TaskKind};
+use solti_model::{TaskKind, TaskSpec, merge_env};
 
 use crate::metrics::{RUNNER_TYPE_SUBPROCESS, task_error_to_outcome};
 use crate::subprocess::{
@@ -41,12 +41,13 @@ impl SubprocessRunner {
         }
     }
 
-    /// Build task configuration from `CreateSpec`.
+    /// Build task configuration from `TaskSpec`.
     fn build_task_config(
         &self,
-        spec: &CreateSpec,
+        spec: &TaskSpec,
         ctx: &BuildContext,
     ) -> Result<SubprocessTaskConfig, RunnerError> {
+        let slot = &spec.slot;
         let cfg = match &spec.kind {
             TaskKind::Subprocess {
                 command,
@@ -55,10 +56,10 @@ impl SubprocessRunner {
                 cwd,
                 fail_on_non_zero,
             } => SubprocessTaskConfig {
-                run_id: self.build_run_id(&spec.slot),
+                run_id: self.build_run_id(slot.as_str()),
                 command: command.clone(),
                 args: args.clone(),
-                env: ctx.env().merged(env),
+                env: merge_env(env, ctx.env()),
                 cwd: cwd.clone(),
                 fail_on_non_zero: *fail_on_non_zero,
             },
@@ -80,11 +81,11 @@ impl Runner for SubprocessRunner {
         self.name
     }
 
-    fn supports(&self, spec: &CreateSpec) -> bool {
+    fn supports(&self, spec: &TaskSpec) -> bool {
         matches!(spec.kind, TaskKind::Subprocess { .. })
     }
 
-    fn build_task(&self, spec: &CreateSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
+    fn build_task(&self, spec: &TaskSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
         let task_cfg = self.build_task_config(spec, ctx)?;
         let runner_cfg = self.config.clone();
         let metrics = ctx.metrics().clone();
@@ -104,7 +105,7 @@ impl Runner for SubprocessRunner {
 
                 Some(crate::utils::build_cgroup_name(
                     self.name,
-                    &spec.slot,
+                    spec.slot.as_str(),
                     extract_seq_from_run_id(&task_cfg.run_id),
                     timestamp,
                 ))
@@ -140,8 +141,8 @@ impl Runner for SubprocessRunner {
                     if let Some(cwd) = &task_cfg.cwd {
                         cmd.current_dir(cwd);
                     }
-                    for kv in task_cfg.env.iter() {
-                        cmd.env(kv.key(), kv.value());
+                    for (k, v) in &task_cfg.env {
+                        cmd.env(k, v);
                     }
                     cmd.stdout(Stdio::piped());
                     cmd.stderr(Stdio::piped());

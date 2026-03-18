@@ -14,9 +14,6 @@ mod runner;
 pub use runner::make_run_id;
 pub use runner::{BuildContext, Runner, RunnerError};
 
-mod policy;
-pub use policy::TaskPolicy;
-
 pub mod supervisor;
 pub use supervisor::SupervisorApi;
 

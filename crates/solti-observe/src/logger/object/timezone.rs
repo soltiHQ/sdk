@@ -33,14 +33,14 @@ static INIT_DONE: OnceLock<()> = OnceLock::new();
 ///
 /// ## Default
 ///
-/// Defaults to `Utc` — the safe choice that works without any setup.
+/// Defaults to `Utc.
 ///
 /// ## Parsing
 ///
 /// Case-insensitive [`FromStr`]: `"utc"`, `"UTC"`, `"local"`, `"LOCAL"`.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub enum LoggerTimeZone {
-    /// UTC timezone — always safe, no setup required.
+    /// UTC timezone.
     Utc,
     /// Local system timezone.
     ///
@@ -93,7 +93,7 @@ impl fmt::Display for LoggerTimeZone {
 ///
 /// - Caches the detected offset in a global `RwLock<UtcOffset>`.
 /// - Falls back to UTC silently if detection fails.
-/// - Idempotent — safe to call multiple times; only the first call
+/// - Idempotent - safe to call multiple times; only the first call
 ///   triggers detection.
 ///
 /// ## Example

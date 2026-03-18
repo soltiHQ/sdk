@@ -2,15 +2,11 @@
 //!
 //! Prometheus metrics for the solti task execution system.
 //!
-//! This crate provides two complementary metric collectors that together
-//! give full observability into the task execution pipeline:
-//! - [`PrometheusMetrics`] — runner-level counters and histograms, injected
-//!   into runners via [`solti_core::BuildContext`].
-//! - [`PrometheusSubscriber`] — supervision-level gauges and counters, driven
-//!   by the [`taskvisor`] event stream.
+//! This crate provides two complementary metric collectors that together give full observability into the task execution pipeline:
+//! - [`PrometheusMetrics`]    - runner-level counters and histograms, injected into runners via [`solti_core::BuildContext`].
+//! - [`PrometheusSubscriber`] - supervision-level gauges and counters, driven by the [`taskvisor`] event stream.
 //!
-//! Both collectors register into a shared [`prometheus::Registry`] so that a
-//! single `metrics` HTTP endpoint can expose the complete picture.
+//! Both collectors register into a shared [`prometheus::Registry`] so that a single `metrics` HTTP endpoint can expose the complete picture.
 //!
 //! ## Architecture
 //!
@@ -62,21 +58,16 @@
 //! use prometheus::Registry;
 //! use solti_prometheus::{PrometheusMetrics, PrometheusSubscriber};
 //!
-//! // 1) Shared registry — both collectors write here
 //! let registry = Arc::new(Registry::new());
 //!
-//! // 2) Runner metrics (injected into BuildContext)
 //! let metrics = PrometheusMetrics::new_with_registry(registry.clone())?;
 //! let metrics_handle = Arc::new(metrics.clone());
 //!
-//! // 3) Supervision metrics (registered as taskvisor subscriber)
 //! let subscriber = PrometheusSubscriber::new(registry)?;
 //!
-//! // 4) Wire into supervisor
-//! let ctx = BuildContext::new(TaskEnv::default(), metrics_handle);
+//! let ctx = BuildContext::new(RunnerEnv::default(), metrics_handle);
 //! let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(subscriber)];
 //!
-//! // 5) Expose via HTTP (gather + encode)
 //! async fn metrics_handler(metrics: PrometheusMetrics) -> String {
 //!     use solti_prometheus::{Encoder, TextEncoder};
 //!     let encoder = TextEncoder::new();

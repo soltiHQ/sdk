@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use solti_model::{CreateSpec, TaskId, TaskInfo, TaskQuery, TaskStatus};
+use solti_model::{Task, TaskId, TaskPhase, TaskQuery, TaskSpec};
 use tracing::debug;
 
 use crate::{error::ApiError, handler::ApiHandler};
@@ -48,7 +48,7 @@ where
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SubmitTaskRequest {
-    spec: CreateSpec,
+    spec: TaskSpec,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,7 +59,7 @@ struct SubmitTaskResponse {
 #[derive(Debug, Serialize, Deserialize)]
 struct GetTaskStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
-    info: Option<TaskInfo>,
+    info: Option<Task>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,7 +76,7 @@ struct ListTasksParams {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ListTasksResponse {
-    tasks: Vec<TaskInfo>,
+    tasks: Vec<Task>,
     total: usize,
 }
 
@@ -165,16 +165,16 @@ where
     Ok(Json(response))
 }
 
-/// Parse TaskStatus from string.
-fn parse_status(s: &str) -> Result<TaskStatus, ApiError> {
+/// Parse TaskPhase from string.
+fn parse_status(s: &str) -> Result<TaskPhase, ApiError> {
     match s.to_lowercase().as_str() {
-        "pending" => Ok(TaskStatus::Pending),
-        "running" => Ok(TaskStatus::Running),
-        "succeeded" => Ok(TaskStatus::Succeeded),
-        "failed" => Ok(TaskStatus::Failed),
-        "timeout" => Ok(TaskStatus::Timeout),
-        "canceled" => Ok(TaskStatus::Canceled),
-        "exhausted" => Ok(TaskStatus::Exhausted),
+        "pending" => Ok(TaskPhase::Pending),
+        "running" => Ok(TaskPhase::Running),
+        "succeeded" => Ok(TaskPhase::Succeeded),
+        "failed" => Ok(TaskPhase::Failed),
+        "timeout" => Ok(TaskPhase::Timeout),
+        "canceled" => Ok(TaskPhase::Canceled),
+        "exhausted" => Ok(TaskPhase::Exhausted),
         _ => Err(ApiError::InvalidRequest(format!(
             "invalid status: '{}' (valid: pending, running, succeeded, failed, timeout, canceled, exhausted)",
             s

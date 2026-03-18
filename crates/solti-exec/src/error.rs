@@ -20,6 +20,6 @@ pub enum ExecError {
     #[error("internal error: {0}")]
     Internal(String),
 
-    #[error("duplicate runner-tag detected: runner with tag '{tag}' is already registered")]
-    DuplicateRunnerTag { tag: String },
+    #[error("duplicate runner detected: runner with name '{name}' is already registered")]
+    DuplicateRunner { name: String },
 }

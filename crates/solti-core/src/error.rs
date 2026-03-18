@@ -15,4 +15,7 @@ pub enum CoreError {
 
     #[error("runner error: {0}")]
     Runner(#[from] RunnerError),
+
+    #[error("invalid spec: {0}")]
+    InvalidSpec(#[from] solti_model::ModelError),
 }

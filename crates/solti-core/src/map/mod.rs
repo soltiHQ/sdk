@@ -1,47 +1,52 @@
 //! Adapter layer between `solti-model` (public specs) and the taskvisor runtime.
 //!
-//! This crate maps high-level API types into taskvisor’s internal execution structures.
+//! This crate maps high-level API types into taskvisor's internal execution structures.
 use std::time::Duration;
 
 use solti_model::{
-    AdmissionStrategy, BackoffStrategy, CreateSpec, JitterStrategy, RestartStrategy,
+    AdmissionPolicy as ModelAdmissionPolicy, BackoffPolicy as ModelBackoffPolicy,
+    JitterPolicy as ModelJitterPolicy, RestartPolicy as ModelRestartPolicy,
+    TaskSpec as ModelTaskSpec,
 };
 use taskvisor::{
     AdmissionPolicy, BackoffPolicy, ControllerSpec, JitterPolicy, RestartPolicy, TaskRef, TaskSpec,
 };
 
-/// Convert a high-level admission strategy from the public model into the controller admission policy used by taskvisor.
-pub fn to_admission_policy(s: AdmissionStrategy) -> AdmissionPolicy {
+/// Convert a high-level admission policy from the public model into the controller admission policy used by taskvisor.
+pub fn to_admission_policy(s: ModelAdmissionPolicy) -> AdmissionPolicy {
     match s {
-        AdmissionStrategy::DropIfRunning => AdmissionPolicy::DropIfRunning,
-        AdmissionStrategy::Replace => AdmissionPolicy::Replace,
-        AdmissionStrategy::Queue => AdmissionPolicy::Queue,
+        ModelAdmissionPolicy::DropIfRunning => AdmissionPolicy::DropIfRunning,
+        ModelAdmissionPolicy::Replace => AdmissionPolicy::Replace,
+        ModelAdmissionPolicy::Queue => AdmissionPolicy::Queue,
+        _ => AdmissionPolicy::DropIfRunning,
     }
 }
 
-/// Convert a high-level jitter strategy into the jitter policy used by taskvisor.
-pub fn to_jitter_policy(s: JitterStrategy) -> JitterPolicy {
+/// Convert a high-level jitter policy into the jitter policy used by taskvisor.
+pub fn to_jitter_policy(s: ModelJitterPolicy) -> JitterPolicy {
     match s {
-        JitterStrategy::Decorrelated => JitterPolicy::Decorrelated,
-        JitterStrategy::Equal => JitterPolicy::Equal,
-        JitterStrategy::Full => JitterPolicy::Full,
-        JitterStrategy::None => JitterPolicy::None,
+        ModelJitterPolicy::Decorrelated => JitterPolicy::Decorrelated,
+        ModelJitterPolicy::Equal => JitterPolicy::Equal,
+        ModelJitterPolicy::Full => JitterPolicy::Full,
+        ModelJitterPolicy::None => JitterPolicy::None,
+        _ => JitterPolicy::Full,
     }
 }
 
-/// Convert a high-level restart strategy into the restart policy used by taskvisor.
-pub fn to_restart_policy(s: RestartStrategy) -> RestartPolicy {
+/// Convert a high-level restart policy into the restart policy used by taskvisor.
+pub fn to_restart_policy(s: ModelRestartPolicy) -> RestartPolicy {
     match s {
-        RestartStrategy::Always { interval_ms } => RestartPolicy::Always {
+        ModelRestartPolicy::Always { interval_ms } => RestartPolicy::Always {
             interval: interval_ms.map(Duration::from_millis),
         },
-        RestartStrategy::OnFailure => RestartPolicy::OnFailure,
-        RestartStrategy::Never => RestartPolicy::Never,
+        ModelRestartPolicy::OnFailure => RestartPolicy::OnFailure,
+        ModelRestartPolicy::Never => RestartPolicy::Never,
+        _ => RestartPolicy::Never,
     }
 }
 
-/// Convert a high-level backoff strategy into a backoff policy used by taskvisor.
-pub fn to_backoff_policy(s: &BackoffStrategy) -> BackoffPolicy {
+/// Convert a high-level backoff policy into a backoff policy used by taskvisor.
+pub fn to_backoff_policy(s: &ModelBackoffPolicy) -> BackoffPolicy {
     BackoffPolicy {
         first: Duration::from_millis(s.first_ms),
         max: Duration::from_millis(s.max_ms),
@@ -50,18 +55,18 @@ pub fn to_backoff_policy(s: &BackoffStrategy) -> BackoffPolicy {
     }
 }
 
-/// Build a `TaskSpec` from a public `CreateSpec`.
-pub fn to_task_spec(task: TaskRef, s: &CreateSpec) -> TaskSpec {
+/// Build a `TaskSpec` from a public `ModelTaskSpec`.
+pub fn to_task_spec(task: TaskRef, s: &ModelTaskSpec) -> TaskSpec {
     TaskSpec::new(
         task,
         to_restart_policy(s.restart),
         to_backoff_policy(&s.backoff),
-        Some(Duration::from_millis(s.timeout_ms)),
+        Some(Duration::from_millis(s.timeout.as_millis())),
     )
 }
 
-/// Build a `ControllerSpec` from a public `CreateSpec`.
-pub fn to_controller_spec(task: TaskRef, s: &CreateSpec) -> ControllerSpec {
+/// Build a `ControllerSpec` from a public `ModelTaskSpec`.
+pub fn to_controller_spec(task: TaskRef, s: &ModelTaskSpec) -> ControllerSpec {
     ControllerSpec {
         admission: to_admission_policy(s.admission),
         task_spec: to_task_spec(task, s),

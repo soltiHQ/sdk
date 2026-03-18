@@ -33,7 +33,7 @@ pub struct LoggerConfig {
     pub format: LoggerFormat,
     /// Log level filter expression (e.g. `"info"`, `"solti_exec=trace,info"`).
     ///
-    /// Validated on construction — see [`LoggerLevel`] for syntax.
+    /// Validated on construction: see [`LoggerLevel`] for syntax.
     pub level: LoggerLevel,
     /// Timestamp timezone: [`LoggerTimeZone::Utc`] or [`LoggerTimeZone::Local`].
     pub tz: LoggerTimeZone,

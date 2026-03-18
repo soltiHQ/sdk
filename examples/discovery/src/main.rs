@@ -5,12 +5,12 @@ use axum::routing::get;
 use tracing::info;
 
 use solti_api::{HttpApi, SupervisorApiAdapter};
-use solti_core::{BuildContext, RunnerRouter, SupervisorApi, TaskPolicy};
+use solti_core::{BuildContext, RunnerRouter, SupervisorApi};
 use solti_discover::{DiscoverConfig, DiscoveryTransport};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
-    AdmissionStrategy, BackoffStrategy, CreateSpec, Flag, JitterStrategy, RestartStrategy,
-    RunnerLabels, TaskEnv, TaskKind,
+    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, RunnerEnv, TaskEnv,
+    TaskKind, TaskSpec,
 };
 use solti_observe::{
     LoggerConfig, LoggerLevel, LoggerTimeZone, TracingEventSubscriber, init_local_offset,
@@ -47,7 +47,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     info!("prometheus metrics initialized");
 
     // 3) Router + subprocess runner
-    let ctx = BuildContext::new(TaskEnv::default(), metrics_handle);
+    let ctx = BuildContext::new(RunnerEnv::default(), metrics_handle);
     let mut router = RunnerRouter::new().with_context(ctx);
     register_subprocess_runner(&mut router, "default-runner")?;
     info!("registered default subprocess runner");
@@ -66,8 +66,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5) Internal tasks: timezone sync
     let (tz_task, tz_spec) = timezone_sync();
-    let tz_policy = TaskPolicy::from_spec(&tz_spec);
-    supervisor.submit_with_task(tz_task, &tz_policy).await?;
+    supervisor.submit_with_task(tz_task, &tz_spec).await?;
     info!("timezone sync task submitted");
 
     // 6) Discovery — periodic sync with control plane
@@ -89,8 +88,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         discover_config.transport,
     );
     let (sync_task, sync_spec) = solti_discover::sync(discover_config);
-    let sync_policy = TaskPolicy::from_spec(&sync_spec);
-    supervisor.submit_with_task(sync_task, &sync_policy).await?;
+    supervisor.submit_with_task(sync_task, &sync_spec).await?;
     info!("discovery sync task submitted");
 
     // 7) Submit 5 demo background tasks
@@ -130,16 +128,16 @@ async fn metrics_handler(metrics: PrometheusMetrics) -> String {
 
 /// Submit 5 diverse background tasks to simulate a real agent workload.
 async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error::Error>> {
-    let backoff = BackoffStrategy {
-        jitter: JitterStrategy::Equal,
+    let backoff = BackoffPolicy {
+        jitter: JitterPolicy::Equal,
         first_ms: 1_000,
         max_ms: 5_000,
         factor: 2.0,
     };
 
     // ── Task 1: Heartbeat — echo every 5s (periodic, never fails) ───────────
-    let heartbeat = CreateSpec {
-        slot: "agent-heartbeat".to_string(),
+    let heartbeat = TaskSpec {
+        slot: "agent-heartbeat".into(),
         kind: TaskKind::Subprocess {
             command: "echo".into(),
             args: vec!["heartbeat: alive".into()],
@@ -147,18 +145,19 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 3_000,
-        restart: RestartStrategy::periodic(5_000),
+        timeout: 3_000_u64.into(),
+        restart: RestartPolicy::periodic(5_000),
         backoff: backoff.clone(),
-        admission: AdmissionStrategy::DropIfRunning,
-        labels: RunnerLabels::default(),
+        admission: AdmissionPolicy::DropIfRunning,
+        runner_selector: None,
+        labels: Labels::default(),
     };
     let id = api.submit(&heartbeat).await?;
     info!("[1/5] agent-heartbeat submitted: {}", id);
 
     // ── Task 2: System monitor — uptime every 15s ───────────────────────────
-    let sysmon = CreateSpec {
-        slot: "sys-monitor".to_string(),
+    let sysmon = TaskSpec {
+        slot: "sys-monitor".into(),
         kind: TaskKind::Subprocess {
             command: "uptime".into(),
             args: vec![],
@@ -166,18 +165,19 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000,
-        restart: RestartStrategy::periodic(15_000),
+        timeout: 5_000_u64.into(),
+        restart: RestartPolicy::periodic(15_000),
         backoff: backoff.clone(),
-        admission: AdmissionStrategy::DropIfRunning,
-        labels: RunnerLabels::default(),
+        admission: AdmissionPolicy::DropIfRunning,
+        runner_selector: None,
+        labels: Labels::default(),
     };
     let id = api.submit(&sysmon).await?;
     info!("[2/5] sys-monitor submitted: {}", id);
 
     // ── Task 3: Disk check — df every 30s ───────────────────────────────────
-    let disk_check = CreateSpec {
-        slot: "disk-check".to_string(),
+    let disk_check = TaskSpec {
+        slot: "disk-check".into(),
         kind: TaskKind::Subprocess {
             command: "df".into(),
             args: vec!["-h".into()],
@@ -185,18 +185,19 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000,
-        restart: RestartStrategy::periodic(30_000),
+        timeout: 5_000_u64.into(),
+        restart: RestartPolicy::periodic(30_000),
         backoff: backoff.clone(),
-        admission: AdmissionStrategy::DropIfRunning,
-        labels: RunnerLabels::default(),
+        admission: AdmissionPolicy::DropIfRunning,
+        runner_selector: None,
+        labels: Labels::default(),
     };
     let id = api.submit(&disk_check).await?;
     info!("[3/5] disk-check submitted: {}", id);
 
     // ── Task 4: One-shot date — runs once and completes ─────────────────────
-    let oneshot = CreateSpec {
-        slot: "oneshot-date".to_string(),
+    let oneshot = TaskSpec {
+        slot: "oneshot-date".into(),
         kind: TaskKind::Subprocess {
             command: "date".into(),
             args: vec!["+%Y-%m-%d %H:%M:%S".into()],
@@ -204,18 +205,19 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 3_000,
-        restart: RestartStrategy::Never,
+        timeout: 3_000_u64.into(),
+        restart: RestartPolicy::Never,
         backoff: backoff.clone(),
-        admission: AdmissionStrategy::DropIfRunning,
-        labels: RunnerLabels::default(),
+        admission: AdmissionPolicy::DropIfRunning,
+        runner_selector: None,
+        labels: Labels::default(),
     };
     let id = api.submit(&oneshot).await?;
     info!("[4/5] oneshot-date submitted: {}", id);
 
     // ── Task 5: Flaky job — fails intentionally, retries on failure ─────────
-    let flaky = CreateSpec {
-        slot: "flaky-job".to_string(),
+    let flaky = TaskSpec {
+        slot: "flaky-job".into(),
         kind: TaskKind::Subprocess {
             command: "sh".into(),
             args: vec!["-c".into(), "echo 'attempt running...'; exit 1".into()],
@@ -223,16 +225,17 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout_ms: 5_000,
-        restart: RestartStrategy::OnFailure,
-        backoff: BackoffStrategy {
-            jitter: JitterStrategy::Full,
+        timeout: 5_000_u64.into(),
+        restart: RestartPolicy::OnFailure,
+        backoff: BackoffPolicy {
+            jitter: JitterPolicy::Full,
             first_ms: 2_000,
             max_ms: 10_000,
             factor: 2.0,
         },
-        admission: AdmissionStrategy::Replace,
-        labels: RunnerLabels::default(),
+        admission: AdmissionPolicy::Replace,
+        runner_selector: None,
+        labels: Labels::default(),
     };
     let id = api.submit(&flaky).await?;
     info!("[5/5] flaky-job submitted: {}", id);

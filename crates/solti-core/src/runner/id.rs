@@ -13,9 +13,9 @@ fn next_seq() -> u64 {
 /// Build a human-readable run id used as task name for taskvisor.
 ///
 /// Format: `{runner}-{slot}-{seq:x}`.
-/// - `runner` — Runner::name()
-/// - `slot`   — CreateSpec.slot
-/// - `seq`    — per-process hex sequence
+/// - `runner` - Runner::name()
+/// - `slot`   - TaskSpec.slot
+/// - `seq`    - per-process hex sequence
 pub fn make_run_id(runner_name: &str, slot: &str) -> String {
     format!("{runner_name}-{slot}-{seq:x}", seq = next_seq())
 }
