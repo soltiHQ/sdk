@@ -2,12 +2,6 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ExecError {
-    #[error("unsupported task kind: expected {expected}, got {actual}")]
-    UnsupportedKind {
-        expected: &'static str,
-        actual: String,
-    },
-
     #[error("invalid specification: {0}")]
     InvalidSpec(String),
 

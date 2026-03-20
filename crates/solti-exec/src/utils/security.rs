@@ -84,23 +84,29 @@ mod linux_impl {
             return;
         }
 
-        let cfg = config.clone();
+        // Pre-compute a stack-local bitmask from keep_caps Vec — avoids cloning the Vec
+        // into the closure (which would heap-allocate between closure creation and fork).
+        let drop_all_caps = config.drop_all_caps;
+        let no_new_privs = config.no_new_privs;
+        let keep_mask = KeepMask::from_caps(&config.keep_caps);
+
         // SAFETY: The pre_exec closure runs between fork() and execve() in the child process.
         // It calls prctl, capget/capset (async-signal-safe syscalls) and pre_exec_log
         // (raw libc::write). Error paths use io::Error::last_os_error() which stores errno
         // inline without heap allocation (Rust >= 1.74). Capability drop failures are non-fatal
         // (logged and continued); no_new_privs failure is fatal (returns Err, aborting spawn).
+        // The closure captures only Copy types (two bools + [u32; 2]) — zero heap allocation.
         unsafe {
             cmd.pre_exec(move || {
-                if cfg.drop_all_caps
-                    && let Err(e) = drop_capabilities(&cfg.keep_caps)
+                if drop_all_caps
+                    && let Err(e) = drop_capabilities_batch(keep_mask)
                 {
                     pre_exec_log(b"solti-exec: failed to drop capabilities (continuing): ");
                     if let Some(code) = e.raw_os_error() {
                         pre_exec_log_errno(code);
                     }
                 }
-                if cfg.no_new_privs {
+                if no_new_privs {
                     apply_no_new_privs()?;
                 }
                 Ok(())
@@ -108,35 +114,46 @@ mod linux_impl {
         }
     }
 
-    /// Drop all capabilities, then re-add only those in `keep_caps`.
+    /// Drop all capabilities except those in `keep_mask`, using batch capget/capset.
     ///
-    /// This operates on all capability sets: permitted, effective, inheritable, and ambient.
-    fn drop_capabilities(keep_caps: &[LinuxCapability]) -> io::Result<()> {
+    /// This performs exactly 1 capget + 1 capset + 1 prctl (clear ambient),
+    /// plus optional ambient raises for kept caps — instead of the previous
+    /// O(CAP_LAST_CAP × 3) individual syscall pairs.
+    fn drop_capabilities_batch(keep_mask: KeepMask) -> io::Result<()> {
         clear_ambient_caps()?;
 
-        let mut keep_mask = CapabilityMask::empty();
-        for cap in keep_caps {
-            keep_mask.set(cap.to_cap_value());
+        let mut header = CapUserHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapUserData::default(); 2];
+
+        // SAFETY: header and data are valid stack-local #[repr(C)] structs matching
+        // the kernel's __user_cap_header_struct / __user_cap_data_struct layout.
+        if unsafe { capget(&mut header, data.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
         }
+
+        // Apply keep_mask: clear all bits not in the mask for all three sets.
+        data[0].effective &= keep_mask.bits[0];
+        data[0].permitted &= keep_mask.bits[0];
+        data[0].inheritable &= keep_mask.bits[0];
+        data[1].effective &= keep_mask.bits[1];
+        data[1].permitted &= keep_mask.bits[1];
+        data[1].inheritable &= keep_mask.bits[1];
+
+        // SAFETY: Same structs, modified in-place. Single capset writes the new state.
+        if unsafe { capset(&mut header, data.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Raise kept caps in ambient set (best-effort, may fail on older kernels).
         for cap_value in 0..=CAP_LAST_CAP {
-            if !keep_mask.is_set(cap_value) {
-                let _ = drop_cap(cap_value, CapSet::Effective);
-                let _ = drop_cap(cap_value, CapSet::Permitted);
-                let _ = drop_cap(cap_value, CapSet::Inheritable);
+            if keep_mask.is_set(cap_value) {
+                let _ = raise_ambient_cap(cap_value);
             }
         }
-        for cap in keep_caps {
-            let cap_value = cap.to_cap_value();
-            let _ = raise_cap(cap_value, CapSet::Effective);
-        }
-        for cap in keep_caps {
-            let cap_value = cap.to_cap_value();
 
-            // Only raise in ambient if it's in permitted and inheritable
-            // We ignore errors here - ambient might not be supported on older kernels,
-            // or the cap might not be in the required sets
-            let _ = raise_ambient_cap(cap_value);
-        }
         Ok(())
     }
 
@@ -171,70 +188,6 @@ mod linux_impl {
         Ok(())
     }
 
-    /// Drop a capability from a specific set.
-    fn drop_cap(cap: u32, set: CapSet) -> io::Result<()> {
-        let mut header = CapUserHeader {
-            version: LINUX_CAPABILITY_VERSION_3,
-            pid: 0,
-        };
-
-        let mut data = [CapUserData::default(); 2];
-        // SAFETY: header and data are valid stack-local #[repr(C)] structs matching
-        // the kernel's __user_cap_header_struct / __user_cap_data_struct layout.
-        // Version 3 (0x20080522) requires a 2-element data array.
-        if unsafe { capget(&mut header, data.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let idx = (cap / 32) as usize;
-        if idx >= 2 {
-            return Ok(());
-        }
-        let bit = 1u32 << (cap % 32);
-
-        match set {
-            CapSet::Effective => data[idx].effective &= !bit,
-            CapSet::Permitted => data[idx].permitted &= !bit,
-            CapSet::Inheritable => data[idx].inheritable &= !bit,
-        }
-        // SAFETY: Same structs, modified in-place. capset writes the new capability state.
-        if unsafe { capset(&mut header, data.as_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    /// Raise a capability in a specific set.
-    fn raise_cap(cap: u32, set: CapSet) -> io::Result<()> {
-        let mut header = CapUserHeader {
-            version: LINUX_CAPABILITY_VERSION_3,
-            pid: 0,
-        };
-
-        let mut data = [CapUserData::default(); 2];
-        // SAFETY: Same as drop_cap — valid #[repr(C)] structs for capability v3 syscall.
-        if unsafe { capget(&mut header, data.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let idx = (cap / 32) as usize;
-        if idx >= 2 {
-            return Ok(());
-        }
-        let bit = 1u32 << (cap % 32);
-
-        match set {
-            CapSet::Effective => data[idx].effective |= bit,
-            CapSet::Permitted => data[idx].permitted |= bit,
-            CapSet::Inheritable => data[idx].inheritable |= bit,
-        }
-        // SAFETY: Same structs, modified in-place.
-        if unsafe { capset(&mut header, data.as_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
     fn apply_no_new_privs() -> io::Result<()> {
         let rc = unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
         if rc != 0 {
@@ -263,38 +216,35 @@ mod linux_impl {
         fn capset(hdrp: *mut CapUserHeader, datap: *const CapUserData) -> libc::c_int;
     }
 
-    #[derive(Debug, Clone, Copy)]
-    enum CapSet {
-        Effective,
-        Permitted,
-        Inheritable,
+    /// Stack-only bitmask matching the kernel's capability v3 layout ([u32; 2]).
+    /// Captures the keep-list without heap allocation (no Vec clone).
+    #[derive(Clone, Copy)]
+    struct KeepMask {
+        /// bits[0] covers caps 0..31, bits[1] covers caps 32..63.
+        bits: [u32; 2],
     }
 
-    struct CapabilityMask {
-        bits: [u64; 2],
-    }
-
-    impl CapabilityMask {
-        fn empty() -> Self {
-            Self { bits: [0, 0] }
-        }
-
-        fn set(&mut self, cap: u32) {
-            let idx = (cap / 64) as usize;
-            if idx >= 2 {
-                return;
+    impl KeepMask {
+        /// Build a keep-mask from a slice of capabilities.
+        /// Called once before fork — safe to iterate a slice here.
+        fn from_caps(caps: &[LinuxCapability]) -> Self {
+            let mut bits = [0u32; 2];
+            for cap in caps {
+                let v = cap.to_cap_value();
+                let idx = (v / 32) as usize;
+                if idx < 2 {
+                    bits[idx] |= 1u32 << (v % 32);
+                }
             }
-            let bit = cap % 64;
-            self.bits[idx] |= 1u64 << bit;
+            Self { bits }
         }
 
-        fn is_set(&self, cap: u32) -> bool {
-            let idx = (cap / 64) as usize;
+        fn is_set(self, cap: u32) -> bool {
+            let idx = (cap / 32) as usize;
             if idx >= 2 {
                 return false;
             }
-            let bit = cap % 64;
-            (self.bits[idx] & (1u64 << bit)) != 0
+            (self.bits[idx] & (1u32 << (cap % 32))) != 0
         }
     }
 }

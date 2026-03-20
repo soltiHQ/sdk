@@ -52,7 +52,7 @@ impl SubprocessBackendConfig {
         self
     }
 
-    // Get log configuration.
+    /// Get log configuration.
     pub(crate) fn log_config(&self) -> &LogConfig {
         &self.logger
     }

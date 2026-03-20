@@ -120,9 +120,13 @@ mod unix_impl {
             #[inline]
             fn $fn_name() -> libc::c_int {
                 #[cfg(any(target_os = "linux", target_os = "android"))]
-                { libc::$constant as libc::c_int }
+                {
+                    libc::$constant as libc::c_int
+                }
                 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                { libc::$constant }
+                {
+                    libc::$constant
+                }
             }
         };
     }

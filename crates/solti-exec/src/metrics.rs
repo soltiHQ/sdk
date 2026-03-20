@@ -13,10 +13,14 @@ pub const RUNNER_TYPE_WASM: &str = "wasm";
 pub const RUNNER_TYPE_CONTAINER: &str = "container";
 
 /// Convert TaskError to TaskOutcome for metrics.
+///
+/// Note: `TaskError` is `#[non_exhaustive]`, so the catch-all arm is required.
+/// All currently unknown future variants map to `Failure`.
 pub fn task_error_to_outcome(error: &TaskError) -> TaskOutcome {
     match error {
         TaskError::Timeout { .. } => TaskOutcome::Timeout,
         TaskError::Canceled => TaskOutcome::Canceled,
+        TaskError::Fail { .. } | TaskError::Fatal { .. } => TaskOutcome::Failure,
         _ => TaskOutcome::Failure,
     }
 }

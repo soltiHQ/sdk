@@ -64,10 +64,7 @@ impl CgroupLimits {
 /// # Cgroup lifecycle
 /// - Kernel auto-removes empty cgroups when all processes exit
 /// - Use [`cleanup_cgroup`] to explicitly remove a cgroup (best-effort)
-pub(crate) fn prepare_cgroup(
-    cgroup_name: &str,
-    limits: &CgroupLimits,
-) -> Result<bool, ExecError> {
+pub(crate) fn prepare_cgroup(cgroup_name: &str, limits: &CgroupLimits) -> Result<bool, ExecError> {
     if limits.is_empty() {
         return Ok(false);
     }
@@ -133,7 +130,9 @@ pub fn cleanup_cgroup(cgroup_name: &str) -> Result<(), ExecError> {
             tracing::debug!("cgroup '{}' is busy, skipping cleanup", cgroup_name);
             Ok(())
         }
-        Err(e) if e.raw_os_error() == Some(libc::EACCES) => {
+        Err(e) if e.raw_os_error() == Some(libc::EACCES)
+            || e.raw_os_error() == Some(libc::EPERM) =>
+        {
             tracing::debug!("cgroup '{}' cleanup: permission denied", cgroup_name);
             Ok(())
         }
@@ -163,7 +162,7 @@ mod linux_impl {
 
     use std::{
         fs,
-        io::{self, Write},
+        io::self,
         path::{Path, PathBuf},
     };
 
@@ -175,10 +174,7 @@ mod linux_impl {
 
     /// Phase 1: Create cgroup directory and write limit files.
     /// Runs before spawn in normal async context — safe to use std::fs.
-    pub fn prepare(
-        cgroup_name: &str,
-        limits: &CgroupLimits,
-    ) -> Result<bool, crate::ExecError> {
+    pub fn prepare(cgroup_name: &str, limits: &CgroupLimits) -> Result<bool, crate::ExecError> {
         if !is_cgroup_v2(Path::new(CGROUP_ROOT)) {
             tracing::warn!("cgroup v2 not detected at /sys/fs/cgroup; limits will be ignored");
             return if limits.fail_on_error {
@@ -209,7 +205,9 @@ mod linux_impl {
     /// Phase 2: pre_exec hook that only writes the child PID to cgroup.procs.
     /// Uses raw libc syscalls — fully async-signal-safe.
     pub fn attach_join_hook(cmd: &mut Command, cgroup_name: &str, fail_on_error: bool) {
-        let mut procs_path = Vec::with_capacity(CGROUP_ROOT.len() + 1 + cgroup_name.len() + CGROUP_PROCS_SUFFIX.len());
+        let mut procs_path = Vec::with_capacity(
+            CGROUP_ROOT.len() + 1 + cgroup_name.len() + CGROUP_PROCS_SUFFIX.len(),
+        );
         procs_path.extend_from_slice(CGROUP_ROOT.as_bytes());
         procs_path.push(b'/');
         procs_path.extend_from_slice(cgroup_name.as_bytes());
@@ -220,9 +218,7 @@ mod linux_impl {
         // It uses only libc::open, libc::write, libc::close, libc::getpid —
         // all async-signal-safe per POSIX. No heap allocation occurs.
         unsafe {
-            cmd.pre_exec(move || {
-                join_cgroup_raw(&procs_path, fail_on_error)
-            });
+            cmd.pre_exec(move || join_cgroup_raw(&procs_path, fail_on_error));
         }
     }
 
@@ -285,9 +281,8 @@ mod linux_impl {
 
         // SAFETY: fd is a valid open file descriptor. pid_str is a valid byte slice.
         // libc::write is async-signal-safe per POSIX.
-        let written = unsafe {
-            libc::write(fd, pid_str.as_ptr() as *const libc::c_void, pid_str.len())
-        };
+        let written =
+            unsafe { libc::write(fd, pid_str.as_ptr() as *const libc::c_void, pid_str.len()) };
         // SAFETY: libc::close is async-signal-safe.
         unsafe { libc::close(fd) };
 

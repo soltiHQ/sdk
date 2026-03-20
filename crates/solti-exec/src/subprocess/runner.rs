@@ -182,17 +182,12 @@ fn prepare_backend(ctx: &TaskExecContext) -> Result<(), TaskError> {
 }
 
 /// Apply backend configuration (rlimits, cgroup join, security) to the command.
-fn apply_backend(
-    cmd: &mut Command,
-    ctx: &TaskExecContext,
-) -> Result<(), TaskError> {
+fn apply_backend(cmd: &mut Command, ctx: &TaskExecContext) -> Result<(), TaskError> {
     if let Some(backend_cfg) = &ctx.runner_cfg {
         let cgroup_name_ref = ctx.cgroup_name.as_deref().unwrap_or(&ctx.task_cfg.run_id);
         if let Err(e) = backend_cfg.apply_to_command(cmd, cgroup_name_ref) {
-            ctx.metrics.record_runner_error(
-                RUNNER_TYPE_SUBPROCESS,
-                "backend_config_failed",
-            );
+            ctx.metrics
+                .record_runner_error(RUNNER_TYPE_SUBPROCESS, "backend_config_failed");
             return Err(TaskError::Fatal {
                 reason: format!("failed to apply runner config: {e}"),
             });
@@ -242,7 +237,8 @@ async fn run_subprocess(
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            ctx.metrics.record_runner_error(RUNNER_TYPE_SUBPROCESS, "spawn_failed");
+            ctx.metrics
+                .record_runner_error(RUNNER_TYPE_SUBPROCESS, "spawn_failed");
             return Err(TaskError::Fatal {
                 reason: format!("spawn failed: {e}"),
             });
@@ -289,7 +285,8 @@ async fn run_subprocess(
         Ok(()) => solti_core::TaskOutcome::Success,
         Err(e) => task_error_to_outcome(e),
     };
-    ctx.metrics.record_task_completed(RUNNER_TYPE_SUBPROCESS, outcome, duration_ms);
+    ctx.metrics
+        .record_task_completed(RUNNER_TYPE_SUBPROCESS, outcome, duration_ms);
 
     let _ = tokio::join!(stdout_task, stderr_task);
     if let Some(cgroup_name) = &ctx.cgroup_name {
@@ -358,11 +355,8 @@ where
             }
         };
 
-        let line: Cow<'_, str> = if config.max_line_length > 0 {
-            truncate_line(&raw_line, config.max_line_length)
-        } else {
-            Cow::Owned(raw_line)
-        };
+        // max_line_length is guaranteed > 0 by SubprocessBackendConfig::validate().
+        let line = truncate_line(&raw_line, config.max_line_length);
 
         line_count += 1;
 
@@ -548,7 +542,10 @@ mod tests {
         ctx.task_cfg.env.insert("FOO".into(), "bar".into());
         let cmd = build_command(&ctx);
         let envs: Vec<_> = cmd.as_std().get_envs().collect();
-        assert!(envs.iter().any(|(k, v)| *k == "FOO" && *v == Some(std::ffi::OsStr::new("bar"))));
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "FOO" && *v == Some(std::ffi::OsStr::new("bar")))
+        );
     }
 
     #[test]
