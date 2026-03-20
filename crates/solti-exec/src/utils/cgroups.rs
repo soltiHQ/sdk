@@ -39,6 +39,9 @@ pub struct CgroupLimits {
     pub memory: Option<u64>,
     /// Max number of processes (pids).
     pub pids: Option<u64>,
+    /// If `true`, cgroup setup failures abort the subprocess spawn.
+    /// If `false` (default), failures are logged and the process runs without cgroup isolation.
+    pub fail_on_error: bool,
 }
 
 impl CgroupLimits {
@@ -76,6 +79,7 @@ pub fn attach_cgroup(
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = &cmd;
         tracing::warn!(
             "cgroup v2 limits requested for '{}', but OS={} does not support them; limits will be ignored",
             cgroup_name,
@@ -111,7 +115,7 @@ pub fn cleanup_cgroup(cgroup_name: &str) -> Result<(), ExecError> {
         }
         Err(e) => {
             tracing::warn!("failed to remove cgroup '{}': {}", cgroup_name, e);
-            Ok(())
+            Err(ExecError::Io(e))
         }
     }
 }
@@ -146,6 +150,7 @@ mod linux_impl {
 
     pub fn attach(cmd: &mut Command, cgroup_name: &str, limits: &CgroupLimits) {
         let cgroup_name = cgroup_name.to_string();
+        let fail_on_error = limits.fail_on_error;
         let limits = limits.clone();
 
         unsafe {
@@ -154,33 +159,38 @@ mod linux_impl {
                     pre_exec_log(
                         b"solti-exec: cgroup v2 not detected at /sys/fs/cgroup; limits will be ignored\n",
                     );
-                    return Ok(());
+                    return if fail_on_error {
+                        Err(io::Error::new(io::ErrorKind::Unsupported, "cgroup v2 not available"))
+                    } else {
+                        Ok(())
+                    };
                 }
 
                 let cg_dir = Path::new(CGROUP_ROOT).join(&cgroup_name);
                 if let Err(e) = fs::create_dir_all(&cg_dir) {
-                    pre_exec_log(b"solti-exec: failed to create cgroup directory; limits will be ignored\n");
+                    pre_exec_log(b"solti-exec: failed to create cgroup directory\n");
                     if let Some(code) = e.raw_os_error() {
                         pre_exec_log_errno(code);
                     }
-                    return Ok(());
+                    return if fail_on_error { Err(e) } else { Ok(()) };
                 }
                 if let Err(e) = apply_limits(&cg_dir, &limits) {
-                    pre_exec_log(b"solti-exec: failed to apply cgroup limits; limits will be ignored\n");
+                    pre_exec_log(b"solti-exec: failed to apply cgroup limits\n");
                     if let Some(code) = e.raw_os_error() {
                         pre_exec_log_errno(code);
                     }
-                    return Ok(());
+                    return if fail_on_error { Err(e) } else { Ok(()) };
                 }
-                // CRITICAL: This may fail with `EINVAL` for very short-lived processesthat complete before pre_exec finishes (~1-5ms window).
+                // CRITICAL: This may fail with `EINVAL` for very short-lived processes
+                // that complete before pre_exec finishes (~1-5ms window).
                 //
                 // Common errno values:
                 // - EINVAL (22): Process state changed (e.g., already exec'd or exited)
                 // - EACCES (13): Permission denied (should have been caught at mkdir)
                 // - ESRCH  ( 3): Process doesn't exist (already terminated)
-                if let Err(_e) = add_self_to_cgroup(&cg_dir) {
-                    pre_exec_log(b"solti-exec: failed to attach PID to cgroup; limits will be ignored\n");
-                    return Ok(());
+                if let Err(e) = add_self_to_cgroup(&cg_dir) {
+                    pre_exec_log(b"solti-exec: failed to attach PID to cgroup\n");
+                    return if fail_on_error { Err(e) } else { Ok(()) };
                 }
                 Ok(())
             });
@@ -280,6 +290,7 @@ mod tests {
             cpu: Some(CpuMax::default()),
             memory: Some(128 * 1024 * 1024),
             pids: Some(32),
+            ..Default::default()
         };
         let name = build_cgroup_name("test", "slot", 1, 1733045913);
         let mut cmd = Command::new("true");
@@ -294,6 +305,7 @@ mod tests {
             cpu: Some(CpuMax::default()),
             memory: Some(1),
             pids: Some(1),
+            ..Default::default()
         };
         let mut cmd = Command::new("true");
         let r = attach_cgroup(&mut cmd, "test-cgroup", &limits);

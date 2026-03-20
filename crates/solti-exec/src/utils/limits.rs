@@ -111,41 +111,21 @@ mod unix_impl {
         }
     }
 
-    #[inline]
-    fn rlimit_nofile() -> libc::c_int {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            libc::RLIMIT_NOFILE as libc::c_int
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        {
-            libc::RLIMIT_NOFILE
-        }
+    macro_rules! rlimit_resource {
+        ($fn_name:ident, $constant:ident) => {
+            #[inline]
+            fn $fn_name() -> libc::c_int {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                { libc::$constant as libc::c_int }
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                { libc::$constant }
+            }
+        };
     }
 
-    #[inline]
-    fn rlimit_fsize() -> libc::c_int {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            libc::RLIMIT_FSIZE as libc::c_int
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        {
-            libc::RLIMIT_FSIZE
-        }
-    }
-
-    #[inline]
-    fn rlimit_core() -> libc::c_int {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            libc::RLIMIT_CORE as libc::c_int
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        {
-            libc::RLIMIT_CORE
-        }
-    }
+    rlimit_resource!(rlimit_nofile, RLIMIT_NOFILE);
+    rlimit_resource!(rlimit_fsize, RLIMIT_FSIZE);
+    rlimit_resource!(rlimit_core, RLIMIT_CORE);
 
     /// Apply rlimit, preserving the hard limit if it's already higher.
     fn apply_rlimit(resource: libc::c_int, value: u64) -> io::Result<()> {

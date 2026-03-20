@@ -51,6 +51,7 @@ pub fn attach_security(cmd: &mut Command, config: &SecurityConfig) {
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = &cmd;
         warn!(
             ?config,
             "security configuration is only enforced on Linux; current OS={} – settings will be ignored",

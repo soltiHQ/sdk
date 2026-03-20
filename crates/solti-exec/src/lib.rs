@@ -1,8 +1,8 @@
 mod error;
 pub use error::ExecError;
 
-mod utils;
-pub use utils::*;
+pub(crate) mod utils;
+pub use utils::{CgroupLimits, CpuMax, LinuxCapability, RlimitConfig, SecurityConfig};
 
 mod metrics;
 pub use metrics::task_error_to_outcome;

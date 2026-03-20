@@ -85,6 +85,7 @@ impl LinuxCapability {
     }
 
     /// Numeric value as in `<linux/capability.h>`.
+    #[cfg(target_os = "linux")]
     pub(crate) fn to_cap_value(self) -> u32 {
         match self {
             Self::Chown => 0,           // CAP_CHOWN

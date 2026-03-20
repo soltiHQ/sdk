@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt, path::PathBuf};
+use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Arc};
 
 use solti_model::Flag;
 
@@ -10,7 +10,7 @@ use crate::ExecError;
 #[derive(Debug, Clone)]
 pub struct SubprocessTaskConfig {
     /// End-to-End log identifier.
-    pub(crate) run_id: String,
+    pub(crate) run_id: Arc<str>,
     /// Command to execute (e.g. `"ls"`, `"/usr/bin/python"`).
     pub(crate) command: String,
     /// Command-line arguments passed to the command.

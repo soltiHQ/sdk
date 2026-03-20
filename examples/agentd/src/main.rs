@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
             }),
             memory: Some(256 * 1024 * 1024), // 256 MB
             pids: Some(64),                  // max 64 processes
+            ..Default::default()
         });
     register_subprocess_runner_with_backend(&mut router, "prod-runner", prod_backend)?;
     info!("registered prod-runner (moderate restrictions)");
@@ -75,9 +76,9 @@ async fn main() -> anyhow::Result<()> {
                 quota: Some(25_000),
                 period: 100_000,
             }),
-
             memory: Some(64 * 1024 * 1024),
             pids: Some(16),
+            ..Default::default()
         })
         .with_security(SecurityConfig {
             drop_all_caps: true,

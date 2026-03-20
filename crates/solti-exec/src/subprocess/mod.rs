@@ -26,16 +26,7 @@ pub fn register_subprocess_runner(
     router: &mut RunnerRouter,
     name: &'static str,
 ) -> Result<(), ExecError> {
-    if router.contains_label(LABEL_RUNNER_NAME, name) {
-        return Err(ExecError::DuplicateRunner {
-            name: name.to_string(),
-        });
-    }
-
-    let mut labels = Labels::new();
-    labels.insert(LABEL_RUNNER_NAME, name);
-    router.register_with_labels(Arc::new(SubprocessRunner::new(name)), labels);
-    Ok(())
+    register_runner_inner(router, name, Arc::new(SubprocessRunner::new(name)))
 }
 
 /// Register a subprocess runner with explicit runner configuration.
@@ -44,18 +35,25 @@ pub fn register_subprocess_runner_with_backend(
     name: &'static str,
     backend: SubprocessBackendConfig,
 ) -> Result<(), ExecError> {
+    register_runner_inner(
+        router,
+        name,
+        Arc::new(SubprocessRunner::with_config(name, backend)?),
+    )
+}
+
+fn register_runner_inner(
+    router: &mut RunnerRouter,
+    name: &'static str,
+    runner: Arc<SubprocessRunner>,
+) -> Result<(), ExecError> {
     if router.contains_label(LABEL_RUNNER_NAME, name) {
         return Err(ExecError::DuplicateRunner {
             name: name.to_string(),
         });
     }
-    backend.validate()?;
-
     let mut labels = Labels::new();
     labels.insert(LABEL_RUNNER_NAME, name);
-    router.register_with_labels(
-        Arc::new(SubprocessRunner::with_config(name, backend)),
-        labels,
-    );
+    router.register_with_labels(runner, labels);
     Ok(())
 }
