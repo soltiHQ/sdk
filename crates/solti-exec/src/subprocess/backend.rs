@@ -97,11 +97,27 @@ impl SubprocessBackendConfig {
         self.cgroups.is_some()
     }
 
+    /// Prepare cgroup directory and write limit files (before spawn).
+    ///
+    /// Must be called before `apply_to_command`. Returns `Ok(true)` if a cgroup
+    /// was created successfully. Runs in normal async context (safe to use std::fs).
+    pub(crate) fn prepare_cgroups(&self, cgroup_name: &str) -> Result<bool, crate::ExecError> {
+        if let Some(cgroups) = &self.cgroups {
+            trace!(
+                "subprocess backend: preparing cgroup: {:?} (group={})",
+                cgroups, cgroup_name
+            );
+            crate::utils::prepare_cgroup(cgroup_name, cgroups)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Apply all configured backend features to a `tokio::process::Command`.
     ///
     /// This method mutates the command by attaching pre_exec hooks for:
     /// - rlimits
-    /// - cgroups
+    /// - cgroups (join only — directory must be created via [`prepare_cgroups`] first)
     /// - security policies
     ///
     /// Call this immediately before spawning the subprocess.
@@ -121,8 +137,8 @@ impl SubprocessBackendConfig {
         }
         if let Some(cgroups) = &self.cgroups {
             trace!(
-                "subprocess backend: attaching cgroup limits: {:?} (group={})",
-                cgroups, cgroup_name
+                "subprocess backend: attaching cgroup join hook (group={})",
+                cgroup_name
             );
             attach_cgroup(cmd, cgroup_name, cgroups)?;
         }

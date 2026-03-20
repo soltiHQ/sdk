@@ -79,6 +79,10 @@ mod unix_impl {
         let max_open_files = config.max_open_files;
         let disable_core_dumps = config.disable_core_dumps;
 
+        // SAFETY: The pre_exec closure runs between fork() and execve() in the child process.
+        // It only calls setrlimit/getrlimit (async-signal-safe syscalls) and pre_exec_log
+        // (raw libc::write to stderr). Error paths use io::Error::last_os_error() which
+        // stores errno inline without heap allocation (Rust >= 1.74).
         unsafe {
             cmd.pre_exec(move || {
                 if let Some(nofile) = max_open_files
@@ -132,15 +136,13 @@ mod unix_impl {
         let max_rlim = libc::rlim_t::MAX;
         if value > max_rlim {
             pre_exec_log(b"solti-exec: rlimit value exceeds platform maximum\n");
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "rlimit value exceeds platform maximum",
-            ));
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
         let mut current = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
         };
+        // SAFETY: `current` is a valid stack-local rlimit struct, passed by pointer.
         if unsafe { getrlimit_compat(resource, &mut current) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -158,6 +160,7 @@ mod unix_impl {
             rlim_max: new_hard,
         };
 
+        // SAFETY: `rlim` is a valid stack-local rlimit struct, passed by pointer.
         if unsafe { setrlimit_compat(resource, &rlim) } != 0 {
             Err(io::Error::last_os_error())
         } else {

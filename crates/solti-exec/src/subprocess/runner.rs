@@ -166,7 +166,22 @@ fn build_command(ctx: &TaskExecContext) -> Command {
     cmd
 }
 
-/// Apply backend configuration (rlimits, cgroups, security) to the command.
+/// Prepare backend resources (cgroup directories) before spawn.
+fn prepare_backend(ctx: &TaskExecContext) -> Result<(), TaskError> {
+    if let Some(backend_cfg) = &ctx.runner_cfg {
+        let cgroup_name_ref = ctx.cgroup_name.as_deref().unwrap_or(&ctx.task_cfg.run_id);
+        if let Err(e) = backend_cfg.prepare_cgroups(cgroup_name_ref) {
+            ctx.metrics
+                .record_runner_error(RUNNER_TYPE_SUBPROCESS, "cgroup_prepare_failed");
+            return Err(TaskError::Fatal {
+                reason: format!("failed to prepare cgroup: {e}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Apply backend configuration (rlimits, cgroup join, security) to the command.
 fn apply_backend(
     cmd: &mut Command,
     ctx: &TaskExecContext,
@@ -218,6 +233,8 @@ async fn run_subprocess(
         cwd = ?ctx.task_cfg.cwd,
         "spawning subprocess",
     );
+
+    prepare_backend(&ctx)?;
 
     let mut cmd = build_command(&ctx);
     apply_backend(&mut cmd, &ctx)?;
@@ -453,6 +470,47 @@ mod tests {
         assert_eq!(extract_seq_from_run_id(""), 0);
     }
 
+    fn mk_backoff() -> solti_model::BackoffPolicy {
+        solti_model::BackoffPolicy {
+            jitter: solti_model::JitterPolicy::Equal,
+            first_ms: 100,
+            max_ms: 1000,
+            factor: 2.0,
+        }
+    }
+
+    fn mk_subprocess_spec(slot: &str, command: &str) -> TaskSpec {
+        TaskSpec {
+            slot: slot.into(),
+            kind: TaskKind::Subprocess {
+                command: command.into(),
+                args: vec![],
+                env: Default::default(),
+                cwd: None,
+                fail_on_non_zero: Default::default(),
+            },
+            timeout: 5_000_u64.into(),
+            restart: solti_model::RestartPolicy::Never,
+            backoff: mk_backoff(),
+            admission: solti_model::AdmissionPolicy::DropIfRunning,
+            runner_selector: None,
+            labels: Default::default(),
+        }
+    }
+
+    fn mk_embedded_spec(slot: &str) -> TaskSpec {
+        TaskSpec {
+            slot: slot.into(),
+            kind: TaskKind::Embedded,
+            timeout: 5_000_u64.into(),
+            restart: solti_model::RestartPolicy::Never,
+            backoff: mk_backoff(),
+            admission: solti_model::AdmissionPolicy::DropIfRunning,
+            runner_selector: None,
+            labels: Default::default(),
+        }
+    }
+
     fn make_task_cfg() -> SubprocessTaskConfig {
         SubprocessTaskConfig {
             run_id: Arc::from("test-run-1"),
@@ -527,53 +585,16 @@ mod tests {
     #[test]
     fn build_task_returns_task_ref_for_subprocess() {
         let runner = SubprocessRunner::new("test-runner");
-        let spec = TaskSpec {
-            slot: "test-slot".into(),
-            kind: TaskKind::Subprocess {
-                command: "echo".into(),
-                args: vec!["hi".into()],
-                env: Default::default(),
-                cwd: None,
-                fail_on_non_zero: Default::default(),
-            },
-            timeout: 5_000_u64.into(),
-            restart: solti_model::RestartPolicy::Never,
-            backoff: solti_model::BackoffPolicy {
-                jitter: solti_model::JitterPolicy::Equal,
-                first_ms: 100,
-                max_ms: 1000,
-                factor: 2.0,
-            },
-            admission: solti_model::AdmissionPolicy::DropIfRunning,
-            runner_selector: None,
-            labels: Default::default(),
-        };
-        let ctx = BuildContext::default();
-        let result = runner.build_task(&spec, &ctx);
+        let spec = mk_subprocess_spec("test-slot", "echo");
+        let result = runner.build_task(&spec, &BuildContext::default());
         assert!(result.is_ok());
     }
 
     #[test]
     fn build_task_rejects_non_subprocess_kind() {
         let runner = SubprocessRunner::new("test-runner");
-        let spec = TaskSpec {
-            slot: "test-slot".into(),
-            kind: TaskKind::Embedded,
-            timeout: 5_000_u64.into(),
-            restart: solti_model::RestartPolicy::Never,
-            backoff: solti_model::BackoffPolicy {
-                jitter: solti_model::JitterPolicy::Equal,
-                first_ms: 100,
-                max_ms: 1000,
-                factor: 2.0,
-            },
-            admission: solti_model::AdmissionPolicy::DropIfRunning,
-            runner_selector: None,
-            labels: Default::default(),
-        };
-        let ctx = BuildContext::default();
-        let result = runner.build_task(&spec, &ctx);
-        match result {
+        let spec = mk_embedded_spec("test-slot");
+        match runner.build_task(&spec, &BuildContext::default()) {
             Err(RunnerError::UnsupportedKind { runner, kind }) => {
                 assert_eq!(runner, "test-runner");
                 assert_eq!(kind, "embedded");
@@ -586,48 +607,12 @@ mod tests {
     #[test]
     fn supports_returns_true_for_subprocess() {
         let runner = SubprocessRunner::new("test");
-        let spec = TaskSpec {
-            slot: "s".into(),
-            kind: TaskKind::Subprocess {
-                command: "echo".into(),
-                args: vec![],
-                env: Default::default(),
-                cwd: None,
-                fail_on_non_zero: Default::default(),
-            },
-            timeout: 1000_u64.into(),
-            restart: solti_model::RestartPolicy::Never,
-            backoff: solti_model::BackoffPolicy {
-                jitter: solti_model::JitterPolicy::Equal,
-                first_ms: 100,
-                max_ms: 1000,
-                factor: 2.0,
-            },
-            admission: solti_model::AdmissionPolicy::DropIfRunning,
-            runner_selector: None,
-            labels: Default::default(),
-        };
-        assert!(runner.supports(&spec));
+        assert!(runner.supports(&mk_subprocess_spec("s", "echo")));
     }
 
     #[test]
     fn supports_returns_false_for_embedded() {
         let runner = SubprocessRunner::new("test");
-        let spec = TaskSpec {
-            slot: "s".into(),
-            kind: TaskKind::Embedded,
-            timeout: 1000_u64.into(),
-            restart: solti_model::RestartPolicy::Never,
-            backoff: solti_model::BackoffPolicy {
-                jitter: solti_model::JitterPolicy::Equal,
-                first_ms: 100,
-                max_ms: 1000,
-                factor: 2.0,
-            },
-            admission: solti_model::AdmissionPolicy::DropIfRunning,
-            runner_selector: None,
-            labels: Default::default(),
-        };
-        assert!(!runner.supports(&spec));
+        assert!(!runner.supports(&mk_embedded_spec("s")));
     }
 }

@@ -1,6 +1,6 @@
 mod cgroups;
 pub use cgroups::{CgroupLimits, CpuMax};
-pub(crate) use cgroups::{attach_cgroup, build_cgroup_name, cleanup_cgroup};
+pub(crate) use cgroups::{attach_cgroup, build_cgroup_name, cleanup_cgroup, prepare_cgroup};
 
 mod limits;
 pub use limits::RlimitConfig;

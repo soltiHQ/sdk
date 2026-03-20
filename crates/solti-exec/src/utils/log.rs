@@ -4,10 +4,16 @@
 //! On non-Unix platforms they fall back to simple `eprintln!`.
 
 /// Write a raw byte message to stderr.
+///
+/// Designed for use in `pre_exec` hooks (between `fork` and `execve`).
+/// Uses only `libc::write` which is async-signal-safe per POSIX.
 #[cfg(unix)]
 pub fn pre_exec_log(msg: &[u8]) {
+    // SAFETY: `libc::write` to STDERR_FILENO is async-signal-safe.
+    // `msg.as_ptr()` is valid for `msg.len()` bytes (from a valid `&[u8]` slice).
+    // Return value is intentionally ignored — logging is best-effort in pre_exec context.
     unsafe {
-        libc::write(
+        let _ = libc::write(
             libc::STDERR_FILENO,
             msg.as_ptr() as *const libc::c_void,
             msg.len(),
@@ -54,19 +60,22 @@ pub fn pre_exec_log_errno(errno: i32) {
     }
 
     const PREFIX: &[u8] = b"errno=";
+    // SAFETY: All pointers are derived from valid stack-local byte slices/arrays.
+    // `libc::write` to STDERR_FILENO is async-signal-safe per POSIX.
+    // Return values intentionally ignored — best-effort logging in pre_exec context.
     unsafe {
-        libc::write(
+        let _ = libc::write(
             libc::STDERR_FILENO,
             PREFIX.as_ptr() as *const libc::c_void,
             PREFIX.len(),
         );
-        libc::write(
+        let _ = libc::write(
             libc::STDERR_FILENO,
             buf[idx..].as_ptr() as *const libc::c_void,
             buf.len() - idx,
         );
         let nl = b"\n";
-        libc::write(
+        let _ = libc::write(
             libc::STDERR_FILENO,
             nl.as_ptr() as *const libc::c_void,
             nl.len(),

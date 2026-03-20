@@ -52,19 +52,48 @@ impl CgroupLimits {
     }
 }
 
-/// Attach cgroup v2 limits to a `tokio::process::Command`.
+/// Prepare cgroup v2 limits: create cgroup directory and write limit files.
 ///
-/// Creates a cgroup at `/sys/fs/cgroup/{cgroup_name}/` and places the child process into it.
+/// This phase runs **before** subprocess spawn (in normal async context),
+/// so it can safely use `std::fs` operations.
+///
+/// Returns `Ok(true)` if the cgroup was created and limits applied (the command needs
+/// a `pre_exec` hook to join the cgroup). Returns `Ok(false)` if cgroups are unavailable
+/// or the platform is not Linux.
 ///
 /// # Cgroup lifecycle
 /// - Kernel auto-removes empty cgroups when all processes exit
 /// - Use [`cleanup_cgroup`] to explicitly remove a cgroup (best-effort)
+pub(crate) fn prepare_cgroup(
+    cgroup_name: &str,
+    limits: &CgroupLimits,
+) -> Result<bool, ExecError> {
+    if limits.is_empty() {
+        return Ok(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        linux_impl::prepare(cgroup_name, limits)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        tracing::warn!(
+            "cgroup v2 limits requested for '{}', but OS={} does not support them; limits will be ignored",
+            cgroup_name,
+            std::env::consts::OS
+        );
+        Ok(false)
+    }
+}
+
+/// Attach cgroup v2 join hook to a `tokio::process::Command`.
 ///
-/// # Arguments
-/// - `cmd`: Command to attach cgroup to
-/// - `cgroup_name`: Unique cgroup name (`{runner}-{slot}-{seq}-{timestamp}`)
-/// - `limits`: Resource limits to apply
-pub fn attach_cgroup(
+/// The `pre_exec` hook only writes the child PID to `cgroup.procs` using raw
+/// libc syscalls — fully async-signal-safe.
+///
+/// Must be called after [`prepare_cgroup`] succeeds with `Ok(true)`.
+pub(crate) fn attach_cgroup(
     cmd: &mut Command,
     cgroup_name: &str,
     limits: &CgroupLimits,
@@ -75,16 +104,11 @@ pub fn attach_cgroup(
 
     #[cfg(target_os = "linux")]
     {
-        linux_impl::attach(cmd, cgroup_name, limits);
+        linux_impl::attach_join_hook(cmd, cgroup_name, limits.fail_on_error);
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = &cmd;
-        tracing::warn!(
-            "cgroup v2 limits requested for '{}', but OS={} does not support them; limits will be ignored",
-            cgroup_name,
-            std::env::consts::OS
-        );
+        let _ = (&cmd, cgroup_name, limits);
     }
     Ok(())
 }
@@ -147,52 +171,57 @@ mod linux_impl {
 
     const CONTROLLERS_FILE: &str = "cgroup.controllers";
     const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+    const CGROUP_PROCS_SUFFIX: &str = "/cgroup.procs";
 
-    pub fn attach(cmd: &mut Command, cgroup_name: &str, limits: &CgroupLimits) {
-        let cgroup_name = cgroup_name.to_string();
-        let fail_on_error = limits.fail_on_error;
-        let limits = limits.clone();
+    /// Phase 1: Create cgroup directory and write limit files.
+    /// Runs before spawn in normal async context — safe to use std::fs.
+    pub fn prepare(
+        cgroup_name: &str,
+        limits: &CgroupLimits,
+    ) -> Result<bool, crate::ExecError> {
+        if !is_cgroup_v2(Path::new(CGROUP_ROOT)) {
+            tracing::warn!("cgroup v2 not detected at /sys/fs/cgroup; limits will be ignored");
+            return if limits.fail_on_error {
+                Err(crate::ExecError::InvalidRunnerConfig(
+                    "cgroup v2 not available".into(),
+                ))
+            } else {
+                Ok(false)
+            };
+        }
 
+        let cg_dir = Path::new(CGROUP_ROOT).join(cgroup_name);
+        fs::create_dir_all(&cg_dir).map_err(|e| {
+            crate::ExecError::Io(io::Error::other(format!(
+                "failed to create cgroup directory '{}': {e}",
+                cg_dir.display()
+            )))
+        })?;
+        apply_limits(&cg_dir, limits).map_err(|e| {
+            crate::ExecError::Io(io::Error::other(format!(
+                "failed to apply cgroup limits for '{}': {e}",
+                cg_dir.display()
+            )))
+        })?;
+        Ok(true)
+    }
+
+    /// Phase 2: pre_exec hook that only writes the child PID to cgroup.procs.
+    /// Uses raw libc syscalls — fully async-signal-safe.
+    pub fn attach_join_hook(cmd: &mut Command, cgroup_name: &str, fail_on_error: bool) {
+        let mut procs_path = Vec::with_capacity(CGROUP_ROOT.len() + 1 + cgroup_name.len() + CGROUP_PROCS_SUFFIX.len());
+        procs_path.extend_from_slice(CGROUP_ROOT.as_bytes());
+        procs_path.push(b'/');
+        procs_path.extend_from_slice(cgroup_name.as_bytes());
+        procs_path.extend_from_slice(CGROUP_PROCS_SUFFIX.as_bytes());
+        procs_path.push(0); // null terminator for C
+
+        // SAFETY: The pre_exec closure runs between fork() and execve().
+        // It uses only libc::open, libc::write, libc::close, libc::getpid —
+        // all async-signal-safe per POSIX. No heap allocation occurs.
         unsafe {
             cmd.pre_exec(move || {
-                if !is_cgroup_v2(Path::new(CGROUP_ROOT)) {
-                    pre_exec_log(
-                        b"solti-exec: cgroup v2 not detected at /sys/fs/cgroup; limits will be ignored\n",
-                    );
-                    return if fail_on_error {
-                        Err(io::Error::new(io::ErrorKind::Unsupported, "cgroup v2 not available"))
-                    } else {
-                        Ok(())
-                    };
-                }
-
-                let cg_dir = Path::new(CGROUP_ROOT).join(&cgroup_name);
-                if let Err(e) = fs::create_dir_all(&cg_dir) {
-                    pre_exec_log(b"solti-exec: failed to create cgroup directory\n");
-                    if let Some(code) = e.raw_os_error() {
-                        pre_exec_log_errno(code);
-                    }
-                    return if fail_on_error { Err(e) } else { Ok(()) };
-                }
-                if let Err(e) = apply_limits(&cg_dir, &limits) {
-                    pre_exec_log(b"solti-exec: failed to apply cgroup limits\n");
-                    if let Some(code) = e.raw_os_error() {
-                        pre_exec_log_errno(code);
-                    }
-                    return if fail_on_error { Err(e) } else { Ok(()) };
-                }
-                // CRITICAL: This may fail with `EINVAL` for very short-lived processes
-                // that complete before pre_exec finishes (~1-5ms window).
-                //
-                // Common errno values:
-                // - EINVAL (22): Process state changed (e.g., already exec'd or exited)
-                // - EACCES (13): Permission denied (should have been caught at mkdir)
-                // - ESRCH  ( 3): Process doesn't exist (already terminated)
-                if let Err(e) = add_self_to_cgroup(&cg_dir) {
-                    pre_exec_log(b"solti-exec: failed to attach PID to cgroup\n");
-                    return if fail_on_error { Err(e) } else { Ok(()) };
-                }
-                Ok(())
+                join_cgroup_raw(&procs_path, fail_on_error)
             });
         }
     }
@@ -226,12 +255,72 @@ mod linux_impl {
         fs::write(path, format!("{val}\n"))
     }
 
-    fn add_self_to_cgroup(dir: &Path) -> io::Result<()> {
-        let procs = dir.join("cgroup.procs");
-        let mut f = fs::OpenOptions::new().write(true).open(&procs)?;
+    /// Write PID to cgroup.procs using raw libc syscalls only.
+    /// Fully async-signal-safe — no heap allocation, no mutexes.
+    fn join_cgroup_raw(procs_path_cstr: &[u8], fail_on_error: bool) -> io::Result<()> {
+        // SAFETY: procs_path_cstr is a null-terminated byte string built before fork().
+        // libc::open is async-signal-safe per POSIX.
+        let fd = unsafe {
+            libc::open(
+                procs_path_cstr.as_ptr() as *const libc::c_char,
+                libc::O_WRONLY,
+            )
+        };
+        if fd < 0 {
+            pre_exec_log(b"solti-exec: failed to open cgroup.procs\n");
+            let errno = unsafe { *libc::__errno_location() };
+            pre_exec_log_errno(errno);
+            return if fail_on_error {
+                Err(io::Error::from_raw_os_error(errno))
+            } else {
+                Ok(())
+            };
+        }
+
+        // Format PID into a stack buffer (no allocation).
+        // SAFETY: getpid() is async-signal-safe, always succeeds.
         let pid = unsafe { libc::getpid() };
-        writeln!(f, "{pid}")?;
+        let mut buf = [0u8; 24];
+        let pid_str = format_pid(pid, &mut buf);
+
+        // SAFETY: fd is a valid open file descriptor. pid_str is a valid byte slice.
+        // libc::write is async-signal-safe per POSIX.
+        let written = unsafe {
+            libc::write(fd, pid_str.as_ptr() as *const libc::c_void, pid_str.len())
+        };
+        // SAFETY: libc::close is async-signal-safe.
+        unsafe { libc::close(fd) };
+
+        if written < 0 {
+            pre_exec_log(b"solti-exec: failed to write PID to cgroup.procs\n");
+            let errno = unsafe { *libc::__errno_location() };
+            pre_exec_log_errno(errno);
+            return if fail_on_error {
+                Err(io::Error::from_raw_os_error(errno))
+            } else {
+                Ok(())
+            };
+        }
+
         Ok(())
+    }
+
+    /// Format a PID into a stack buffer as `"<pid>\n"`. Returns the written slice.
+    fn format_pid(pid: libc::pid_t, buf: &mut [u8; 24]) -> &[u8] {
+        let mut n = pid as u32;
+        let mut idx = buf.len() - 1;
+        buf[idx] = b'\n';
+        if n == 0 {
+            idx -= 1;
+            buf[idx] = b'0';
+        } else {
+            while n > 0 {
+                idx -= 1;
+                buf[idx] = b'0' + (n % 10) as u8;
+                n /= 10;
+            }
+        }
+        &buf[idx..]
     }
 }
 

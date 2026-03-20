@@ -85,6 +85,11 @@ mod linux_impl {
         }
 
         let cfg = config.clone();
+        // SAFETY: The pre_exec closure runs between fork() and execve() in the child process.
+        // It calls prctl, capget/capset (async-signal-safe syscalls) and pre_exec_log
+        // (raw libc::write). Error paths use io::Error::last_os_error() which stores errno
+        // inline without heap allocation (Rust >= 1.74). Capability drop failures are non-fatal
+        // (logged and continued); no_new_privs failure is fatal (returns Err, aborting spawn).
         unsafe {
             cmd.pre_exec(move || {
                 if cfg.drop_all_caps
@@ -174,6 +179,9 @@ mod linux_impl {
         };
 
         let mut data = [CapUserData::default(); 2];
+        // SAFETY: header and data are valid stack-local #[repr(C)] structs matching
+        // the kernel's __user_cap_header_struct / __user_cap_data_struct layout.
+        // Version 3 (0x20080522) requires a 2-element data array.
         if unsafe { capget(&mut header, data.as_mut_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -189,6 +197,7 @@ mod linux_impl {
             CapSet::Permitted => data[idx].permitted &= !bit,
             CapSet::Inheritable => data[idx].inheritable &= !bit,
         }
+        // SAFETY: Same structs, modified in-place. capset writes the new capability state.
         if unsafe { capset(&mut header, data.as_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -203,6 +212,7 @@ mod linux_impl {
         };
 
         let mut data = [CapUserData::default(); 2];
+        // SAFETY: Same as drop_cap — valid #[repr(C)] structs for capability v3 syscall.
         if unsafe { capget(&mut header, data.as_mut_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -218,6 +228,7 @@ mod linux_impl {
             CapSet::Permitted => data[idx].permitted |= bit,
             CapSet::Inheritable => data[idx].inheritable |= bit,
         }
+        // SAFETY: Same structs, modified in-place.
         if unsafe { capset(&mut header, data.as_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
