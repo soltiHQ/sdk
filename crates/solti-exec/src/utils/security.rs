@@ -98,9 +98,7 @@ mod linux_impl {
         // The closure captures only Copy types (two bools + [u32; 2]) — zero heap allocation.
         unsafe {
             cmd.pre_exec(move || {
-                if drop_all_caps
-                    && let Err(e) = drop_capabilities_batch(keep_mask)
-                {
+                if drop_all_caps && let Err(e) = drop_capabilities_batch(keep_mask) {
                     pre_exec_log(b"solti-exec: failed to drop capabilities (continuing): ");
                     if let Some(code) = e.raw_os_error() {
                         pre_exec_log_errno(code);

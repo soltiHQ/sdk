@@ -111,6 +111,11 @@ pub(crate) fn attach_cgroup(
 }
 
 /// Attempt to remove a cgroup directory.
+/// Best-effort cgroup cleanup.
+///
+/// Cgroup removal can fail for many reasons (permission denied, busy, not found,
+/// read-only cgroupfs in containers, etc.). All failures are logged and swallowed
+/// because the kernel auto-removes empty cgroups when all member processes exit.
 #[cfg(target_os = "linux")]
 pub fn cleanup_cgroup(cgroup_name: &str) -> Result<(), ExecError> {
     use std::path::Path;
@@ -120,27 +125,20 @@ pub fn cleanup_cgroup(cgroup_name: &str) -> Result<(), ExecError> {
     match std::fs::remove_dir(&full_path) {
         Ok(()) => {
             tracing::debug!("removed cgroup: {}", cgroup_name);
-            Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::trace!("cgroup '{}' not found (already removed)", cgroup_name);
-            Ok(())
-        }
-        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
-            tracing::debug!("cgroup '{}' is busy, skipping cleanup", cgroup_name);
-            Ok(())
-        }
-        Err(e) if e.raw_os_error() == Some(libc::EACCES)
-            || e.raw_os_error() == Some(libc::EPERM) =>
-        {
-            tracing::debug!("cgroup '{}' cleanup: permission denied", cgroup_name);
-            Ok(())
         }
         Err(e) => {
-            tracing::warn!("failed to remove cgroup '{}': {}", cgroup_name, e);
-            Err(ExecError::Io(e))
+            tracing::debug!(
+                "cgroup '{}' cleanup skipped: {} (errno={:?})",
+                cgroup_name,
+                e,
+                e.raw_os_error(),
+            );
         }
     }
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -161,8 +159,7 @@ mod linux_impl {
     use crate::utils::log::{pre_exec_log, pre_exec_log_errno};
 
     use std::{
-        fs,
-        io::self,
+        fs, io,
         path::{Path, PathBuf},
     };
 
