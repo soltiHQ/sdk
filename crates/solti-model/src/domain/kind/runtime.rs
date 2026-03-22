@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 
 /// Script interpreter for subprocess script execution.
 ///
-/// Well-known runtimes resolve to a fixed `(command, flag)` pair.
 /// [`Custom`](Runtime::Custom) allows arbitrary interpreter configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,8 +34,9 @@ impl Runtime {
     pub fn resolve(&self) -> (&str, &str) {
         match self {
             Runtime::Bash => ("bash", "-c"),
-            Runtime::Python => ("python3", "-c"),
             Runtime::Node => ("node", "-e"),
+            Runtime::Python => ("python3", "-c"),
+
             Runtime::Custom { command, flag } => (command.as_str(), flag.as_str()),
         }
     }

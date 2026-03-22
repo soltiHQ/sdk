@@ -10,7 +10,7 @@ use crate::error::{ModelError, ModelResult};
 /// | Variant   | What it does                                                               |
 /// |-----------|----------------------------------------------------------------------------|
 /// | `Command` | Direct binary execution via `execve(command, args)`                        |
-/// | `Script`  | Script passed to an interpreter: `execve(runtime, [flag, body, ...args])` |
+/// | `Script`  | Script passed to an interpreter: `execve(runtime, [flag, body, ...args])`  |
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SubprocessMode {
@@ -86,8 +86,6 @@ mod tests {
         BASE64.encode(s.as_bytes())
     }
 
-    // --- Command mode ---
-
     #[test]
     fn command_valid() {
         let mode = SubprocessMode::Command {
@@ -115,8 +113,6 @@ mod tests {
         };
         assert!(mode.validate().is_err());
     }
-
-    // --- Script mode ---
 
     #[test]
     fn script_valid_bash() {
@@ -208,8 +204,6 @@ mod tests {
                 .contains("custom runtime flag cannot be empty")
         );
     }
-
-    // --- Serde ---
 
     #[test]
     fn serde_roundtrip_command() {

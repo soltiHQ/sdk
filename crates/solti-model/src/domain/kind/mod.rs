@@ -3,12 +3,11 @@
 //! - [`TaskKind`] - enum selecting the runtime backend and its parameters.
 //! - [`Runtime`] - script interpreter for subprocess script execution.
 //! - [`SubprocessMode`] - execution strategy (command or script).
+mod task;
+pub use task::TaskKind;
 
 mod runtime;
 pub use runtime::Runtime;
 
 mod subprocess;
 pub use subprocess::SubprocessMode;
-
-mod task;
-pub use task::TaskKind;
