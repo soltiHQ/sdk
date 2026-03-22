@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Flag, TaskEnv};
+use crate::{Flag, SubprocessMode, TaskEnv};
 
 /// Execution backend for a task.
 ///
@@ -18,13 +18,16 @@ use crate::{Flag, TaskEnv};
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum TaskKind {
-    /// Execute a native process on the host.
+    /// Execute a subprocess on the host.
+    ///
+    /// Supports two execution strategies via [`SubprocessMode`]:
+    /// - **Command** — direct binary execution (`execve(command, args)`)
+    /// - **Script** — script interpreted by a [`Runtime`](crate::Runtime) (`execve(runtime, [flag, body, ...args])`)
+    ///
+    /// Common fields (`env`, `cwd`, `fail_on_non_zero`) apply to both modes.
     Subprocess {
-        /// Command to execute (e.g., `"ls"`, `"/usr/bin/python"`).
-        command: String,
-        /// Command-line arguments.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        args: Vec<String>,
+        /// Execution strategy (command or script).
+        mode: SubprocessMode,
         /// Environment variables for the process.
         #[serde(default, skip_serializing_if = "TaskEnv::is_empty")]
         env: TaskEnv,
@@ -87,6 +90,14 @@ impl TaskKind {
             TaskKind::Container { .. } => "container",
             TaskKind::Embedded => "embedded",
             TaskKind::Wasm { .. } => "wasm",
+        }
+    }
+
+    /// Validate kind-specific constraints.
+    pub fn validate(&self) -> crate::error::ModelResult<()> {
+        match self {
+            TaskKind::Subprocess { mode, .. } => mode.validate(),
+            _ => Ok(()),
         }
     }
 }

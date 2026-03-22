@@ -126,7 +126,7 @@ mod tests {
 
     use solti_model::{
         AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, RunnerSelector,
-        TaskEnv,
+        SubprocessMode, TaskEnv,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -204,8 +204,10 @@ mod tests {
         router.register(Arc::new(SubprocessRunnerDummy));
 
         let spec = mk_spec(TaskKind::Subprocess {
-            command: "echo".to_string(),
-            args: vec!["hello".into()],
+            mode: SubprocessMode::Command {
+                command: "echo".to_string(),
+                args: vec!["hello".into()],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::default(),
@@ -299,8 +301,10 @@ mod tests {
 
         let spec = {
             let base = mk_spec(TaskKind::Subprocess {
-                command: "echo".into(),
-                args: vec!["hi".into()],
+                mode: SubprocessMode::Command {
+                    command: "echo".into(),
+                    args: vec!["hi".into()],
+                },
                 env: TaskEnv::default(),
                 cwd: None,
                 fail_on_non_zero: Flag::enabled(),

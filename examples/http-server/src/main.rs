@@ -7,8 +7,8 @@ use solti_api::{HttpApi, SupervisorApiAdapter};
 use solti_core::{BuildContext, RunnerRouter, SupervisorApi};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, RunnerEnv, TaskEnv,
-    TaskKind, TaskSpec,
+    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, RunnerEnv,
+    SubprocessMode, TaskEnv, TaskKind, TaskSpec,
 };
 use solti_observe::{
     LoggerConfig, LoggerLevel, TracingEventSubscriber, init_logger, timezone_sync,
@@ -102,8 +102,10 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
     let date_spec = TaskSpec {
         slot: "periodic-date".into(),
         kind: TaskKind::Subprocess {
-            command: "date".into(),
-            args: vec!["+%Y-%m-%d %H:%M:%S".into()],
+            mode: SubprocessMode::Command {
+                command: "date".into(),
+                args: vec!["+%Y-%m-%d %H:%M:%S".into()],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
@@ -125,8 +127,10 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
     let uptime_spec = TaskSpec {
         slot: "periodic-uptime".into(),
         kind: TaskKind::Subprocess {
-            command: "uptime".into(),
-            args: vec![],
+            mode: SubprocessMode::Command {
+                command: "uptime".into(),
+                args: vec![],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
@@ -148,8 +152,10 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
     let echo_spec = TaskSpec {
         slot: "periodic-echo".into(),
         kind: TaskKind::Subprocess {
-            command: "echo".into(),
-            args: vec!["Hello from solti periodic task!".into()],
+            mode: SubprocessMode::Command {
+                command: "echo".into(),
+                args: vec!["Hello from solti periodic task!".into()],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),

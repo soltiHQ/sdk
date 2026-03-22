@@ -57,15 +57,17 @@ impl TaskSpec {
     ///
     /// ```rust
     /// # use solti_model::{
-    /// #   TaskSpec, Labels, TaskKind, RestartPolicy, BackoffPolicy,
+    /// #   TaskSpec, Labels, TaskKind, SubprocessMode, RestartPolicy, BackoffPolicy,
     /// #   AdmissionPolicy, JitterPolicy, TaskEnv, Flag, RunnerSelector,
     /// # };
     /// # use std::collections::BTreeMap;
     /// let spec = TaskSpec {
     ///     slot: "demo".into(),
     ///     kind: TaskKind::Subprocess {
-    ///         command: "ls".into(),
-    ///         args: vec!["/tmp".into()],
+    ///         mode: SubprocessMode::Command {
+    ///             command: "ls".into(),
+    ///             args: vec!["/tmp".into()],
+    ///         },
     ///         env: TaskEnv::default(),
     ///         cwd: None,
     ///         fail_on_non_zero: Flag::enabled(),
@@ -117,6 +119,7 @@ impl TaskSpec {
                 "timeout must be greater than zero".into(),
             ));
         }
+        self.kind.validate()?;
         self.backoff.validate()?;
         if let Some(ref sel) = self.runner_selector {
             for req in &sel.match_expressions {
@@ -130,14 +133,16 @@ impl TaskSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Flag, TaskEnv};
+    use crate::{Flag, SubprocessMode, TaskEnv};
 
     fn valid_spec() -> TaskSpec {
         TaskSpec {
             slot: "test".into(),
             kind: TaskKind::Subprocess {
-                command: "echo".into(),
-                args: vec![],
+                mode: SubprocessMode::Command {
+                    command: "echo".into(),
+                    args: vec![],
+                },
                 env: TaskEnv::default(),
                 cwd: None,
                 fail_on_non_zero: Flag::enabled(),

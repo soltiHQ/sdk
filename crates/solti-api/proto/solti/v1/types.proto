@@ -45,10 +45,42 @@ message KeyValue {
   string value = 2;
 }
 
-// Subprocess task configuration
-message SubprocessTask {
+// Subprocess execution mode: direct command
+message CommandMode {
   string command = 1;
   repeated string args = 2;
+}
+
+// Well-known script runtimes
+enum ScriptRuntime {
+  SCRIPT_RUNTIME_UNSPECIFIED = 0;
+  SCRIPT_RUNTIME_BASH = 1;
+  SCRIPT_RUNTIME_PYTHON = 2;
+  SCRIPT_RUNTIME_NODE = 3;
+}
+
+// Custom interpreter configuration
+message CustomRuntime {
+  string command = 1;
+  string flag = 2;
+}
+
+// Script execution mode
+message ScriptMode {
+  oneof runtime {
+    ScriptRuntime well_known = 1;
+    CustomRuntime custom = 2;
+  }
+  string body = 3;           // base64-encoded script
+  repeated string args = 4;
+}
+
+// Subprocess task configuration
+message SubprocessTask {
+  oneof mode {
+    CommandMode command = 1;
+    ScriptMode script = 2;
+  }
   repeated KeyValue env = 3;
   optional string cwd = 4;
   bool fail_on_non_zero = 5;

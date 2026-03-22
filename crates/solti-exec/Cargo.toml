@@ -17,6 +17,7 @@ libc = { workspace = true }
 
 solti-core = { path = "../solti-core" }
 solti-model = { path = "../solti-model" }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

@@ -93,15 +93,17 @@
 //! ```rust
 //! use solti_model::{
 //!     AdmissionPolicy, BackoffPolicy, JitterPolicy, Labels,
-//!     RestartPolicy, Task, TaskKind, TaskPhase, TaskSpec,
+//!     RestartPolicy, SubprocessMode, Task, TaskKind, TaskPhase, TaskSpec,
 //! };
 //!
 //! // 1) Define a task spec
 //! let spec = TaskSpec {
 //!     slot: "my-worker".into(),
 //!     kind: TaskKind::Subprocess {
-//!         command: "echo".into(),
-//!         args: vec!["hello".into()],
+//!         mode: SubprocessMode::Command {
+//!             command: "echo".into(),
+//!             args: vec!["hello".into()],
+//!         },
 //!         env: Default::default(),
 //!         cwd: None,
 //!         fail_on_non_zero: Default::default(),
@@ -132,8 +134,8 @@
 mod domain;
 pub use domain::{
     AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, KeyValue, Labels, LabelsIter,
-    RestartPolicy, RunnerEnv, RunnerSelector, SelectorOperator, SelectorRequirement, Slot, TaskEnv,
-    TaskId, TaskKind, TaskPage, TaskPhase, TaskQuery, Timeout, merge_env,
+    RestartPolicy, RunnerEnv, RunnerSelector, Runtime, SelectorOperator, SelectorRequirement, Slot,
+    SubprocessMode, TaskEnv, TaskId, TaskKind, TaskPage, TaskPhase, TaskQuery, Timeout, merge_env,
 };
 
 mod resource;

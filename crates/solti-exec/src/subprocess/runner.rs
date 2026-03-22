@@ -60,19 +60,21 @@ impl SubprocessRunner {
         let slot = &spec.slot;
         let cfg = match &spec.kind {
             TaskKind::Subprocess {
-                command,
-                args,
+                mode,
                 env,
                 cwd,
                 fail_on_non_zero,
-            } => SubprocessTaskConfig {
-                run_id: Arc::from(self.build_run_id(slot.as_str())),
-                command: command.clone(),
-                args: args.clone(),
-                env: merge_env(env, ctx.env()),
-                cwd: cwd.clone(),
-                fail_on_non_zero: *fail_on_non_zero,
-            },
+            } => {
+                let (command, args) = Self::resolve_mode(mode)?;
+                SubprocessTaskConfig {
+                    run_id: Arc::from(self.build_run_id(slot.as_str())),
+                    command,
+                    args,
+                    env: merge_env(env, ctx.env()),
+                    cwd: cwd.clone(),
+                    fail_on_non_zero: *fail_on_non_zero,
+                }
+            }
             other => {
                 return Err(RunnerError::UnsupportedKind {
                     runner: self.name,
@@ -83,6 +85,37 @@ impl SubprocessRunner {
         cfg.validate()
             .map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
         Ok(cfg)
+    }
+
+    /// Resolve [`SubprocessMode`](solti_model::SubprocessMode) into `(command, args)` for the OS process.
+    fn resolve_mode(
+        mode: &solti_model::SubprocessMode,
+    ) -> Result<(String, Vec<String>), RunnerError> {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        match mode {
+            solti_model::SubprocessMode::Command { command, args } => {
+                Ok((command.clone(), args.clone()))
+            }
+            solti_model::SubprocessMode::Script {
+                runtime,
+                body,
+                args,
+            } => {
+                let bytes = BASE64
+                    .decode(body)
+                    .map_err(|e| RunnerError::InvalidSpec(format!("invalid base64 body: {e}")))?;
+                let script = String::from_utf8(bytes)
+                    .map_err(|e| RunnerError::InvalidSpec(format!("script body not UTF-8: {e}")))?;
+
+                let (cmd, flag) = runtime.resolve();
+                let mut full_args = vec![flag.to_string(), script];
+                full_args.extend(args.iter().cloned());
+
+                Ok((cmd.to_string(), full_args))
+            }
+        }
     }
 }
 
@@ -477,8 +510,10 @@ mod tests {
         TaskSpec {
             slot: slot.into(),
             kind: TaskKind::Subprocess {
-                command: command.into(),
-                args: vec![],
+                mode: solti_model::SubprocessMode::Command {
+                    command: command.into(),
+                    args: vec![],
+                },
                 env: Default::default(),
                 cwd: None,
                 fail_on_non_zero: Default::default(),
@@ -611,5 +646,89 @@ mod tests {
     fn supports_returns_false_for_embedded() {
         let runner = SubprocessRunner::new("test");
         assert!(!runner.supports(&mk_embedded_spec("s")));
+    }
+
+    #[test]
+    fn build_task_returns_task_ref_for_script_mode() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        let runner = SubprocessRunner::new("test-runner");
+        let spec = TaskSpec {
+            slot: "test-slot".into(),
+            kind: TaskKind::Subprocess {
+                mode: solti_model::SubprocessMode::Script {
+                    runtime: solti_model::Runtime::Bash,
+                    body: BASE64.encode(b"echo hello"),
+                    args: vec![],
+                },
+                env: Default::default(),
+                cwd: None,
+                fail_on_non_zero: Default::default(),
+            },
+            timeout: 5_000_u64.into(),
+            restart: solti_model::RestartPolicy::Never,
+            backoff: mk_backoff(),
+            admission: solti_model::AdmissionPolicy::DropIfRunning,
+            runner_selector: None,
+            labels: Default::default(),
+        };
+        let result = runner.build_task(&spec, &BuildContext::default());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn resolve_mode_command() {
+        let mode = solti_model::SubprocessMode::Command {
+            command: "ls".into(),
+            args: vec!["-la".into()],
+        };
+        let (cmd, args) = SubprocessRunner::resolve_mode(&mode).unwrap();
+        assert_eq!(cmd, "ls");
+        assert_eq!(args, vec!["-la"]);
+    }
+
+    #[test]
+    fn resolve_mode_script_bash() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        let mode = solti_model::SubprocessMode::Script {
+            runtime: solti_model::Runtime::Bash,
+            body: BASE64.encode(b"echo hello"),
+            args: vec!["extra".into()],
+        };
+        let (cmd, args) = SubprocessRunner::resolve_mode(&mode).unwrap();
+        assert_eq!(cmd, "bash");
+        assert_eq!(args, vec!["-c", "echo hello", "extra"]);
+    }
+
+    #[test]
+    fn resolve_mode_script_custom() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        let mode = solti_model::SubprocessMode::Script {
+            runtime: solti_model::Runtime::Custom {
+                command: "ruby".into(),
+                flag: "-e".into(),
+            },
+            body: BASE64.encode(b"puts 'hi'"),
+            args: vec![],
+        };
+        let (cmd, args) = SubprocessRunner::resolve_mode(&mode).unwrap();
+        assert_eq!(cmd, "ruby");
+        assert_eq!(args, vec!["-e", "puts 'hi'"]);
+    }
+
+    #[test]
+    fn resolve_mode_invalid_base64() {
+        let mode = solti_model::SubprocessMode::Script {
+            runtime: solti_model::Runtime::Bash,
+            body: "not-valid!!!".into(),
+            args: vec![],
+        };
+        let err = SubprocessRunner::resolve_mode(&mode).unwrap_err();
+        assert!(matches!(err, RunnerError::InvalidSpec(_)));
     }
 }

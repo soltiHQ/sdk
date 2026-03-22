@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, RunnerSelector,
-    TaskEnv, TaskKind, TaskSpec,
+    SubprocessMode, TaskEnv, TaskKind, TaskSpec,
 };
 
 #[tokio::main(flavor = "multi_thread")]
@@ -106,8 +106,10 @@ async fn main() -> anyhow::Result<()> {
     let ls_spec = TaskSpec {
         slot: "dev-ls-tmp".into(),
         kind: TaskKind::Subprocess {
-            command: "ls".into(),
-            args: vec!["-lah".into(), "/tmp".into()],
+            mode: SubprocessMode::Command {
+                command: "ls".into(),
+                args: vec!["-lah".into(), "/tmp".into()],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
@@ -133,8 +135,10 @@ async fn main() -> anyhow::Result<()> {
     let date_spec = TaskSpec {
         slot: "prod-date".into(),
         kind: TaskKind::Subprocess {
-            command: "date".into(),
-            args: vec!["+%Y-%m-%d %H:%M:%S".into()],
+            mode: SubprocessMode::Command {
+                command: "date".into(),
+                args: vec!["+%Y-%m-%d %H:%M:%S".into()],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
@@ -160,8 +164,10 @@ async fn main() -> anyhow::Result<()> {
     let sleep_spec = TaskSpec {
         slot: "untrusted-sleep".into(),
         kind: TaskKind::Subprocess {
-            command: "sleep".into(),
-            args: vec!["2".into()],
+            mode: SubprocessMode::Command {
+                command: "sleep".into(),
+                args: vec!["2".into()],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
@@ -187,11 +193,13 @@ async fn main() -> anyhow::Result<()> {
     let stress_spec = TaskSpec {
         slot: "untrusted-stress".into(),
         kind: TaskKind::Subprocess {
-            command: "sh".into(),
-            args: vec![
-                "-c".into(),
-                "for i in $(seq 1 100); do sleep 1 & done; wait".into(),
-            ],
+            mode: SubprocessMode::Command {
+                command: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "for i in $(seq 1 100); do sleep 1 & done; wait".into(),
+                ],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::disabled(),

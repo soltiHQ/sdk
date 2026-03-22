@@ -9,8 +9,8 @@ use solti_core::{BuildContext, RunnerRouter, SupervisorApi};
 use solti_discover::{DiscoverConfig, DiscoveryTransport};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, RunnerEnv, TaskEnv,
-    TaskKind, TaskSpec,
+    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, RunnerEnv,
+    SubprocessMode, TaskEnv, TaskKind, TaskSpec,
 };
 use solti_observe::{
     LoggerConfig, LoggerLevel, LoggerTimeZone, TracingEventSubscriber, init_local_offset,
@@ -139,8 +139,10 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
     let heartbeat = TaskSpec {
         slot: "agent-heartbeat".into(),
         kind: TaskKind::Subprocess {
-            command: "echo".into(),
-            args: vec!["heartbeat: alive".into()],
+            mode: SubprocessMode::Command {
+                command: "echo".into(),
+                args: vec!["heartbeat: alive".into()],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
@@ -159,8 +161,10 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
     let sysmon = TaskSpec {
         slot: "sys-monitor".into(),
         kind: TaskKind::Subprocess {
-            command: "uptime".into(),
-            args: vec![],
+            mode: SubprocessMode::Command {
+                command: "uptime".into(),
+                args: vec![],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
@@ -179,8 +183,10 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
     let disk_check = TaskSpec {
         slot: "disk-check".into(),
         kind: TaskKind::Subprocess {
-            command: "df".into(),
-            args: vec!["-h".into()],
+            mode: SubprocessMode::Command {
+                command: "df".into(),
+                args: vec!["-h".into()],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
@@ -199,8 +205,10 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
     let oneshot = TaskSpec {
         slot: "oneshot-date".into(),
         kind: TaskKind::Subprocess {
-            command: "date".into(),
-            args: vec!["+%Y-%m-%d %H:%M:%S".into()],
+            mode: SubprocessMode::Command {
+                command: "date".into(),
+                args: vec!["+%Y-%m-%d %H:%M:%S".into()],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
@@ -219,8 +227,10 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
     let flaky = TaskSpec {
         slot: "flaky-job".into(),
         kind: TaskKind::Subprocess {
-            command: "sh".into(),
-            args: vec!["-c".into(), "echo 'attempt running...'; exit 1".into()],
+            mode: SubprocessMode::Command {
+                command: "sh".into(),
+                args: vec!["-c".into(), "echo 'attempt running...'; exit 1".into()],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),

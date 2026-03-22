@@ -38,7 +38,7 @@ mod timeout;
 pub use timeout::Timeout;
 
 mod kind;
-pub use kind::TaskKind;
+pub use kind::{Runtime, SubprocessMode, TaskKind};
 
 mod label;
 pub use label::{Labels, LabelsIter};

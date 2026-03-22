@@ -1,8 +1,8 @@
 use tracing::warn;
 
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, Slot, Task, TaskEnv,
-    TaskKind, TaskPhase, TaskSpec,
+    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, Runtime, Slot,
+    SubprocessMode, Task, TaskEnv, TaskKind, TaskPhase, TaskSpec,
 };
 
 use crate::error::ApiError;
@@ -106,15 +106,72 @@ pub fn convert_create_spec(spec: proto_api::CreateSpec) -> Result<TaskSpec, ApiE
 fn convert_task_kind(kind: proto_api::task_kind::Kind) -> Result<TaskKind, ApiError> {
     match kind {
         proto_api::task_kind::Kind::Subprocess(sub) => {
-            if sub.command.trim().is_empty() {
-                return Err(ApiError::InvalidRequest(
-                    "subprocess command is empty".into(),
-                ));
-            }
+            let mode = sub
+                .mode
+                .ok_or_else(|| ApiError::InvalidRequest("missing subprocess mode".into()))?;
+
+            let subprocess_mode = match mode {
+                proto_api::subprocess_task::Mode::Command(cmd) => {
+                    if cmd.command.trim().is_empty() {
+                        return Err(ApiError::InvalidRequest(
+                            "subprocess command is empty".into(),
+                        ));
+                    }
+                    SubprocessMode::Command {
+                        command: cmd.command,
+                        args: cmd.args,
+                    }
+                }
+                proto_api::subprocess_task::Mode::Script(script) => {
+                    let runtime = script
+                        .runtime
+                        .ok_or_else(|| ApiError::InvalidRequest("missing script runtime".into()))?;
+
+                    let runtime = match runtime {
+                        proto_api::script_mode::Runtime::WellKnown(val) => {
+                            match proto_api::ScriptRuntime::try_from(val) {
+                                Ok(proto_api::ScriptRuntime::Bash) => Runtime::Bash,
+                                Ok(proto_api::ScriptRuntime::Python) => Runtime::Python,
+                                Ok(proto_api::ScriptRuntime::Node) => Runtime::Node,
+                                _ => {
+                                    return Err(ApiError::InvalidRequest(
+                                        "unknown or unspecified script runtime".into(),
+                                    ));
+                                }
+                            }
+                        }
+                        proto_api::script_mode::Runtime::Custom(c) => {
+                            if c.command.trim().is_empty() {
+                                return Err(ApiError::InvalidRequest(
+                                    "custom runtime command is empty".into(),
+                                ));
+                            }
+                            if c.flag.trim().is_empty() {
+                                return Err(ApiError::InvalidRequest(
+                                    "custom runtime flag is empty".into(),
+                                ));
+                            }
+                            Runtime::Custom {
+                                command: c.command,
+                                flag: c.flag,
+                            }
+                        }
+                    };
+
+                    if script.body.is_empty() {
+                        return Err(ApiError::InvalidRequest("script body is empty".into()));
+                    }
+
+                    SubprocessMode::Script {
+                        runtime,
+                        body: script.body,
+                        args: script.args,
+                    }
+                }
+            };
 
             Ok(TaskKind::Subprocess {
-                command: sub.command,
-                args: sub.args,
+                mode: subprocess_mode,
                 env: convert_env(sub.env),
                 cwd: sub.cwd.map(std::path::PathBuf::from),
                 fail_on_non_zero: Flag::from(sub.fail_on_non_zero),
@@ -257,8 +314,12 @@ mod tests {
         proto_api::TaskKind {
             kind: Some(proto_api::task_kind::Kind::Subprocess(
                 proto_api::SubprocessTask {
-                    command: command.to_string(),
-                    args: vec!["-l".to_string()],
+                    mode: Some(proto_api::subprocess_task::Mode::Command(
+                        proto_api::CommandMode {
+                            command: command.to_string(),
+                            args: vec!["-l".to_string()],
+                        },
+                    )),
                     env: vec![proto_api::KeyValue {
                         key: "PATH".to_string(),
                         value: "/usr/bin".to_string(),
@@ -379,7 +440,10 @@ mod tests {
         let cs = result.unwrap();
         assert_eq!(cs.slot, "test-slot");
         assert_eq!(cs.timeout.as_millis(), 5_000);
-        assert!(matches!(cs.kind, TaskKind::Subprocess { ref command, .. } if command == "ls"));
+        assert!(matches!(
+            cs.kind,
+            TaskKind::Subprocess { mode: SubprocessMode::Command { ref command, .. }, .. } if command == "ls"
+        ));
         assert!(matches!(cs.restart, RestartPolicy::OnFailure));
         assert!(matches!(cs.admission, AdmissionPolicy::DropIfRunning));
         assert_eq!(cs.backoff.first_ms, 100);
@@ -500,10 +564,11 @@ mod tests {
         let spec = make_valid_create_spec();
         let cs = convert_create_spec(spec).unwrap();
 
-        if let TaskKind::Subprocess { ref env, .. } = cs.kind {
-            assert_eq!(env.get("PATH"), Some("/usr/bin"));
-        } else {
-            panic!("expected subprocess kind");
+        match &cs.kind {
+            TaskKind::Subprocess { env, .. } => {
+                assert_eq!(env.get("PATH"), Some("/usr/bin"));
+            }
+            _ => panic!("expected subprocess kind"),
         }
     }
 
@@ -550,6 +615,173 @@ mod tests {
         let err = convert_create_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("subprocess command is empty"))
+        );
+    }
+
+    #[test]
+    fn reject_missing_subprocess_mode() {
+        let spec = proto_api::CreateSpec {
+            kind: Some(proto_api::TaskKind {
+                kind: Some(proto_api::task_kind::Kind::Subprocess(
+                    proto_api::SubprocessTask {
+                        mode: None,
+                        env: vec![],
+                        cwd: None,
+                        fail_on_non_zero: false,
+                    },
+                )),
+            }),
+            ..make_valid_create_spec()
+        };
+        let err = convert_create_spec(spec).unwrap_err();
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing subprocess mode"))
+        );
+    }
+
+    #[test]
+    fn create_spec_subprocess_script_bash() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        let spec = proto_api::CreateSpec {
+            kind: Some(proto_api::TaskKind {
+                kind: Some(proto_api::task_kind::Kind::Subprocess(
+                    proto_api::SubprocessTask {
+                        mode: Some(proto_api::subprocess_task::Mode::Script(
+                            proto_api::ScriptMode {
+                                runtime: Some(proto_api::script_mode::Runtime::WellKnown(
+                                    proto_api::ScriptRuntime::Bash as i32,
+                                )),
+                                body: BASE64.encode(b"echo hello"),
+                                args: vec![],
+                            },
+                        )),
+                        env: vec![],
+                        cwd: None,
+                        fail_on_non_zero: true,
+                    },
+                )),
+            }),
+            ..make_valid_create_spec()
+        };
+
+        let cs = convert_create_spec(spec).unwrap();
+        match &cs.kind {
+            TaskKind::Subprocess { mode, .. } => {
+                assert!(matches!(
+                    mode,
+                    SubprocessMode::Script {
+                        runtime: Runtime::Bash,
+                        ..
+                    }
+                ));
+            }
+            _ => panic!("expected subprocess"),
+        }
+    }
+
+    #[test]
+    fn create_spec_subprocess_script_custom_runtime() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        let spec = proto_api::CreateSpec {
+            kind: Some(proto_api::TaskKind {
+                kind: Some(proto_api::task_kind::Kind::Subprocess(
+                    proto_api::SubprocessTask {
+                        mode: Some(proto_api::subprocess_task::Mode::Script(
+                            proto_api::ScriptMode {
+                                runtime: Some(proto_api::script_mode::Runtime::Custom(
+                                    proto_api::CustomRuntime {
+                                        command: "ruby".into(),
+                                        flag: "-e".into(),
+                                    },
+                                )),
+                                body: BASE64.encode(b"puts 'hello'"),
+                                args: vec![],
+                            },
+                        )),
+                        env: vec![],
+                        cwd: None,
+                        fail_on_non_zero: false,
+                    },
+                )),
+            }),
+            ..make_valid_create_spec()
+        };
+
+        let cs = convert_create_spec(spec).unwrap();
+        match &cs.kind {
+            TaskKind::Subprocess { mode, .. } => {
+                assert!(matches!(
+                    mode,
+                    SubprocessMode::Script {
+                        runtime: Runtime::Custom { .. },
+                        ..
+                    }
+                ));
+            }
+            _ => panic!("expected subprocess"),
+        }
+    }
+
+    #[test]
+    fn reject_empty_script_body() {
+        let spec = proto_api::CreateSpec {
+            kind: Some(proto_api::TaskKind {
+                kind: Some(proto_api::task_kind::Kind::Subprocess(
+                    proto_api::SubprocessTask {
+                        mode: Some(proto_api::subprocess_task::Mode::Script(
+                            proto_api::ScriptMode {
+                                runtime: Some(proto_api::script_mode::Runtime::WellKnown(
+                                    proto_api::ScriptRuntime::Bash as i32,
+                                )),
+                                body: "".into(),
+                                args: vec![],
+                            },
+                        )),
+                        env: vec![],
+                        cwd: None,
+                        fail_on_non_zero: false,
+                    },
+                )),
+            }),
+            ..make_valid_create_spec()
+        };
+        let err = convert_create_spec(spec).unwrap_err();
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("script body is empty"))
+        );
+    }
+
+    #[test]
+    fn reject_missing_script_runtime() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        let spec = proto_api::CreateSpec {
+            kind: Some(proto_api::TaskKind {
+                kind: Some(proto_api::task_kind::Kind::Subprocess(
+                    proto_api::SubprocessTask {
+                        mode: Some(proto_api::subprocess_task::Mode::Script(
+                            proto_api::ScriptMode {
+                                runtime: None,
+                                body: BASE64.encode(b"echo hello"),
+                                args: vec![],
+                            },
+                        )),
+                        env: vec![],
+                        cwd: None,
+                        fail_on_non_zero: false,
+                    },
+                )),
+            }),
+            ..make_valid_create_spec()
+        };
+        let err = convert_create_spec(spec).unwrap_err();
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing script runtime"))
         );
     }
 

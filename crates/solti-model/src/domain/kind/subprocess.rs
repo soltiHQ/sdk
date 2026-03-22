@@ -1,0 +1,246 @@
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use serde::{Deserialize, Serialize};
+
+use crate::Runtime;
+use crate::error::{ModelError, ModelResult};
+
+/// Execution strategy for a subprocess task.
+///
+/// | Variant   | What it does                                                               |
+/// |-----------|----------------------------------------------------------------------------|
+/// | `Command` | Direct binary execution via `execve(command, args)`                        |
+/// | `Script`  | Script passed to an interpreter: `execve(runtime, [flag, body, ...args])` |
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SubprocessMode {
+    /// Direct binary execution.
+    Command {
+        /// Binary to execute (e.g. `"ls"`, `"/usr/bin/python"`).
+        command: String,
+        /// Command-line arguments.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+    },
+    /// Script execution via a runtime interpreter.
+    Script {
+        /// Interpreter used to execute the script.
+        runtime: Runtime,
+        /// Base64-encoded (standard alphabet) script body.
+        body: String,
+        /// Additional arguments passed after the script body.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+    },
+}
+
+impl SubprocessMode {
+    /// Validate the mode at the model level.
+    ///
+    /// Checks:
+    /// - `Command`: command must not be empty.
+    /// - `Script`: body must not be empty, must be valid base64, must decode to UTF-8.
+    /// - `Script` + `Custom` runtime: command and flag must not be empty.
+    pub fn validate(&self) -> ModelResult<()> {
+        match self {
+            SubprocessMode::Command { command, .. } => {
+                if command.trim().is_empty() {
+                    return Err(ModelError::Invalid(
+                        "subprocess command cannot be empty".into(),
+                    ));
+                }
+            }
+            SubprocessMode::Script { runtime, body, .. } => {
+                if body.is_empty() {
+                    return Err(ModelError::Invalid("script body cannot be empty".into()));
+                }
+                let bytes = BASE64
+                    .decode(body)
+                    .map_err(|e| ModelError::Invalid(format!("invalid base64 body: {e}").into()))?;
+                std::str::from_utf8(&bytes).map_err(|e| {
+                    ModelError::Invalid(format!("script body is not valid UTF-8: {e}").into())
+                })?;
+                if let Runtime::Custom { command, flag } = runtime {
+                    if command.trim().is_empty() {
+                        return Err(ModelError::Invalid(
+                            "custom runtime command cannot be empty".into(),
+                        ));
+                    }
+                    if flag.trim().is_empty() {
+                        return Err(ModelError::Invalid(
+                            "custom runtime flag cannot be empty".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode(s: &str) -> String {
+        BASE64.encode(s.as_bytes())
+    }
+
+    // --- Command mode ---
+
+    #[test]
+    fn command_valid() {
+        let mode = SubprocessMode::Command {
+            command: "ls".into(),
+            args: vec!["-la".into()],
+        };
+        assert!(mode.validate().is_ok());
+    }
+
+    #[test]
+    fn command_empty_fails() {
+        let mode = SubprocessMode::Command {
+            command: "".into(),
+            args: vec![],
+        };
+        let err = mode.validate().unwrap_err();
+        assert!(err.to_string().contains("command cannot be empty"));
+    }
+
+    #[test]
+    fn command_whitespace_fails() {
+        let mode = SubprocessMode::Command {
+            command: "   ".into(),
+            args: vec![],
+        };
+        assert!(mode.validate().is_err());
+    }
+
+    // --- Script mode ---
+
+    #[test]
+    fn script_valid_bash() {
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Bash,
+            body: encode("echo hello"),
+            args: vec![],
+        };
+        assert!(mode.validate().is_ok());
+    }
+
+    #[test]
+    fn script_empty_body_fails() {
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Bash,
+            body: "".into(),
+            args: vec![],
+        };
+        let err = mode.validate().unwrap_err();
+        assert!(err.to_string().contains("body cannot be empty"));
+    }
+
+    #[test]
+    fn script_invalid_base64_fails() {
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Bash,
+            body: "not-valid-base64!!!".into(),
+            args: vec![],
+        };
+        let err = mode.validate().unwrap_err();
+        assert!(err.to_string().contains("invalid base64"));
+    }
+
+    #[test]
+    fn script_non_utf8_body_fails() {
+        let non_utf8 = BASE64.encode([0xFF, 0xFE, 0x80]);
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Bash,
+            body: non_utf8,
+            args: vec![],
+        };
+        let err = mode.validate().unwrap_err();
+        assert!(err.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn script_custom_runtime_valid() {
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Custom {
+                command: "ruby".into(),
+                flag: "-e".into(),
+            },
+            body: encode("puts 'hello'"),
+            args: vec![],
+        };
+        assert!(mode.validate().is_ok());
+    }
+
+    #[test]
+    fn script_custom_empty_command_fails() {
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Custom {
+                command: "".into(),
+                flag: "-e".into(),
+            },
+            body: encode("puts 'hello'"),
+            args: vec![],
+        };
+        let err = mode.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("custom runtime command cannot be empty")
+        );
+    }
+
+    #[test]
+    fn script_custom_empty_flag_fails() {
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Custom {
+                command: "ruby".into(),
+                flag: "".into(),
+            },
+            body: encode("puts 'hello'"),
+            args: vec![],
+        };
+        let err = mode.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("custom runtime flag cannot be empty")
+        );
+    }
+
+    // --- Serde ---
+
+    #[test]
+    fn serde_roundtrip_command() {
+        let mode = SubprocessMode::Command {
+            command: "echo".into(),
+            args: vec!["hello".into()],
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        let back: SubprocessMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, mode);
+    }
+
+    #[test]
+    fn serde_roundtrip_script() {
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Python,
+            body: encode("print('hello')"),
+            args: vec!["--verbose".into()],
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        let back: SubprocessMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, mode);
+    }
+
+    #[test]
+    fn serde_command_empty_args_skipped() {
+        let mode = SubprocessMode::Command {
+            command: "ls".into(),
+            args: vec![],
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        assert!(!json.contains("args"));
+    }
+}
