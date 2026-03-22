@@ -35,6 +35,28 @@ pub enum SubprocessMode {
 }
 
 impl SubprocessMode {
+    /// Decode base64 script body to a UTF-8 string.
+    ///
+    /// Returns `Ok(body)` for `Script` variant, `Err` for `Command` or invalid body.
+    pub fn decode_body(&self) -> ModelResult<String> {
+        match self {
+            SubprocessMode::Command { .. } => Err(ModelError::Invalid(
+                "decode_body called on Command mode".into(),
+            )),
+            SubprocessMode::Script { body, .. } => {
+                if body.is_empty() {
+                    return Err(ModelError::Invalid("script body cannot be empty".into()));
+                }
+                let bytes = BASE64
+                    .decode(body)
+                    .map_err(|e| ModelError::Invalid(format!("invalid base64 body: {e}").into()))?;
+                String::from_utf8(bytes).map_err(|e| {
+                    ModelError::Invalid(format!("script body is not valid UTF-8: {e}").into())
+                })
+            }
+        }
+    }
+
     /// Validate the mode at the model level.
     ///
     /// Checks:
@@ -50,16 +72,8 @@ impl SubprocessMode {
                     ));
                 }
             }
-            SubprocessMode::Script { runtime, body, .. } => {
-                if body.is_empty() {
-                    return Err(ModelError::Invalid("script body cannot be empty".into()));
-                }
-                let bytes = BASE64
-                    .decode(body)
-                    .map_err(|e| ModelError::Invalid(format!("invalid base64 body: {e}").into()))?;
-                std::str::from_utf8(&bytes).map_err(|e| {
-                    ModelError::Invalid(format!("script body is not valid UTF-8: {e}").into())
-                })?;
+            SubprocessMode::Script { runtime, .. } => {
+                self.decode_body()?;
                 if let Runtime::Custom { command, flag } = runtime {
                     if command.trim().is_empty() {
                         return Err(ModelError::Invalid(
@@ -204,6 +218,29 @@ mod tests {
                 .contains("custom runtime flag cannot be empty")
         );
     }
+
+    // --- decode_body ---
+
+    #[test]
+    fn decode_body_returns_script() {
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Bash,
+            body: encode("echo hello"),
+            args: vec![],
+        };
+        assert_eq!(mode.decode_body().unwrap(), "echo hello");
+    }
+
+    #[test]
+    fn decode_body_errors_on_command_mode() {
+        let mode = SubprocessMode::Command {
+            command: "ls".into(),
+            args: vec![],
+        };
+        assert!(mode.decode_body().is_err());
+    }
+
+    // --- Serde ---
 
     #[test]
     fn serde_roundtrip_command() {

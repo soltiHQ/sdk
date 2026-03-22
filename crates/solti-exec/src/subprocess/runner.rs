@@ -91,23 +91,14 @@ impl SubprocessRunner {
     fn resolve_mode(
         mode: &solti_model::SubprocessMode,
     ) -> Result<(String, Vec<String>), RunnerError> {
-        use base64::Engine;
-        use base64::engine::general_purpose::STANDARD as BASE64;
-
         match mode {
             solti_model::SubprocessMode::Command { command, args } => {
                 Ok((command.clone(), args.clone()))
             }
-            solti_model::SubprocessMode::Script {
-                runtime,
-                body,
-                args,
-            } => {
-                let bytes = BASE64
-                    .decode(body)
-                    .map_err(|e| RunnerError::InvalidSpec(format!("invalid base64 body: {e}")))?;
-                let script = String::from_utf8(bytes)
-                    .map_err(|e| RunnerError::InvalidSpec(format!("script body not UTF-8: {e}")))?;
+            solti_model::SubprocessMode::Script { runtime, args, .. } => {
+                let script = mode
+                    .decode_body()
+                    .map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
 
                 let (cmd, flag) = runtime.resolve();
                 let mut full_args = vec![flag.to_string(), script];

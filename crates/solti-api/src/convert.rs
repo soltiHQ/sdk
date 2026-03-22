@@ -111,17 +111,10 @@ fn convert_task_kind(kind: proto_api::task_kind::Kind) -> Result<TaskKind, ApiEr
                 .ok_or_else(|| ApiError::InvalidRequest("missing subprocess mode".into()))?;
 
             let subprocess_mode = match mode {
-                proto_api::subprocess_task::Mode::Command(cmd) => {
-                    if cmd.command.trim().is_empty() {
-                        return Err(ApiError::InvalidRequest(
-                            "subprocess command is empty".into(),
-                        ));
-                    }
-                    SubprocessMode::Command {
-                        command: cmd.command,
-                        args: cmd.args,
-                    }
-                }
+                proto_api::subprocess_task::Mode::Command(cmd) => SubprocessMode::Command {
+                    command: cmd.command,
+                    args: cmd.args,
+                },
                 proto_api::subprocess_task::Mode::Script(script) => {
                     let runtime = script
                         .runtime
@@ -140,27 +133,11 @@ fn convert_task_kind(kind: proto_api::task_kind::Kind) -> Result<TaskKind, ApiEr
                                 }
                             }
                         }
-                        proto_api::script_mode::Runtime::Custom(c) => {
-                            if c.command.trim().is_empty() {
-                                return Err(ApiError::InvalidRequest(
-                                    "custom runtime command is empty".into(),
-                                ));
-                            }
-                            if c.flag.trim().is_empty() {
-                                return Err(ApiError::InvalidRequest(
-                                    "custom runtime flag is empty".into(),
-                                ));
-                            }
-                            Runtime::Custom {
-                                command: c.command,
-                                flag: c.flag,
-                            }
-                        }
+                        proto_api::script_mode::Runtime::Custom(c) => Runtime::Custom {
+                            command: c.command,
+                            flag: c.flag,
+                        },
                     };
-
-                    if script.body.is_empty() {
-                        return Err(ApiError::InvalidRequest("script body is empty".into()));
-                    }
 
                     SubprocessMode::Script {
                         runtime,
@@ -169,6 +146,11 @@ fn convert_task_kind(kind: proto_api::task_kind::Kind) -> Result<TaskKind, ApiEr
                     }
                 }
             };
+
+            // Single validation point — delegates to model-level checks
+            subprocess_mode
+                .validate()
+                .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
 
             Ok(TaskKind::Subprocess {
                 mode: subprocess_mode,
@@ -602,7 +584,7 @@ mod tests {
         };
         let err = convert_create_spec(spec).unwrap_err();
         assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("subprocess command is empty"))
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("command cannot be empty"))
         );
     }
 
@@ -614,7 +596,7 @@ mod tests {
         };
         let err = convert_create_spec(spec).unwrap_err();
         assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("subprocess command is empty"))
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("command cannot be empty"))
         );
     }
 
@@ -751,7 +733,7 @@ mod tests {
         };
         let err = convert_create_spec(spec).unwrap_err();
         assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("script body is empty"))
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("body cannot be empty"))
         );
     }
 
