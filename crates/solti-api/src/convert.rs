@@ -452,7 +452,9 @@ mod tests {
         };
 
         let cs = convert_create_spec(spec).unwrap();
-        assert!(matches!(cs.kind(), TaskKind::Container(ContainerSpec { image, .. }) if image == "alpine:latest"));
+        assert!(
+            matches!(cs.kind(), TaskKind::Container(ContainerSpec { image, .. }) if image == "alpine:latest")
+        );
     }
 
     #[test]

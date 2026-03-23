@@ -16,7 +16,9 @@ use solti_observe::{
 
 use std::collections::BTreeMap;
 
-use solti_model::{Flag, RunnerSelector, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec};
+use solti_model::{
+    Flag, RunnerSelector, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec,
+};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {

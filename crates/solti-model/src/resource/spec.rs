@@ -20,7 +20,7 @@ use crate::{
 pub struct TaskSpec {
     slot: Slot,
     kind: TaskKind,
-    
+
     timeout: Timeout,
     restart: RestartPolicy,
     backoff: BackoffPolicy,
