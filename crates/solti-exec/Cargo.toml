@@ -5,16 +5,16 @@ edition = "2024"
 
 [features]
 default = []
-subprocess = []
+subprocess = ["dep:base64", "dep:libc", "tokio/process"]
 
 [dependencies]
-tokio = { workspace = true, features = ["process", "io-util"] }
+tokio = { workspace = true, features = ["io-util"] }
 tokio-util = { workspace = true }
 taskvisor = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-base64 = { workspace = true }
-libc = { workspace = true }
+base64 = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 
 solti-model = { path = "../solti-model" }
 solti-core = { path = "../solti-core" }
