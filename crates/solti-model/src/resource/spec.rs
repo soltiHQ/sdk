@@ -20,10 +20,12 @@ use crate::{
 pub struct TaskSpec {
     slot: Slot,
     kind: TaskKind,
+    
     timeout: Timeout,
     restart: RestartPolicy,
     backoff: BackoffPolicy,
     admission: AdmissionPolicy,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runner_selector: Option<RunnerSelector>,
     #[serde(default, skip_serializing_if = "Labels::is_empty")]
