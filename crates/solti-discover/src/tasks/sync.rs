@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 
 use solti_core::{agent_id, arch, os_info, platform, uptime_seconds};
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, JitterPolicy, Labels, RestartPolicy, TaskKind, TaskSpec,
+    AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
 };
 use taskvisor::{TaskError, TaskFn, TaskRef};
 
@@ -27,16 +27,12 @@ pub fn sync(config: DiscoverConfig) -> (TaskRef, TaskSpec) {
         max_ms: delay_ms * 3,
         factor: 2.0,
     };
-    let spec = TaskSpec {
-        slot: SLOT.into(),
-        timeout: delay_ms.into(),
-        restart: RestartPolicy::periodic(delay_ms),
-        backoff,
-        admission: AdmissionPolicy::Replace,
-        kind: TaskKind::Embedded,
-        runner_selector: None,
-        labels: Labels::default(),
-    };
+    let spec = TaskSpec::builder(SLOT, TaskKind::Embedded, delay_ms)
+        .restart(RestartPolicy::periodic(delay_ms))
+        .backoff(backoff)
+        .admission(AdmissionPolicy::Replace)
+        .build()
+        .expect("discover sync spec must be valid");
 
     let base_request = build_base_request(&config);
     let http_client = reqwest::Client::new();

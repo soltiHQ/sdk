@@ -9,8 +9,8 @@ use solti_core::{BuildContext, RunnerRouter, SupervisorApi};
 use solti_discover::{DiscoverConfig, DiscoveryTransport};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, RunnerEnv,
-    SubprocessMode, TaskEnv, TaskKind, TaskSpec,
+    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, RestartPolicy, RunnerEnv, SubprocessMode,
+    TaskEnv, TaskKind, TaskSpec,
 };
 use solti_observe::{
     LoggerConfig, LoggerLevel, LoggerTimeZone, TracingEventSubscriber, init_local_offset,
@@ -136,9 +136,9 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
     };
 
     // ── Task 1: Heartbeat — echo every 5s (periodic, never fails) ───────────
-    let heartbeat = TaskSpec {
-        slot: "agent-heartbeat".into(),
-        kind: TaskKind::Subprocess {
+    let heartbeat = TaskSpec::builder(
+        "agent-heartbeat",
+        TaskKind::Subprocess {
             mode: SubprocessMode::Command {
                 command: "echo".into(),
                 args: vec!["heartbeat: alive".into()],
@@ -147,20 +147,19 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout: 3_000_u64.into(),
-        restart: RestartPolicy::periodic(5_000),
-        backoff: backoff.clone(),
-        admission: AdmissionPolicy::DropIfRunning,
-        runner_selector: None,
-        labels: Labels::default(),
-    };
+        3_000_u64,
+    )
+    .restart(RestartPolicy::periodic(5_000))
+    .backoff(backoff.clone())
+    .build()
+    .unwrap();
     let id = api.submit(&heartbeat).await?;
     info!("[1/5] agent-heartbeat submitted: {}", id);
 
     // ── Task 2: System monitor — uptime every 15s ───────────────────────────
-    let sysmon = TaskSpec {
-        slot: "sys-monitor".into(),
-        kind: TaskKind::Subprocess {
+    let sysmon = TaskSpec::builder(
+        "sys-monitor",
+        TaskKind::Subprocess {
             mode: SubprocessMode::Command {
                 command: "uptime".into(),
                 args: vec![],
@@ -169,20 +168,19 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout: 5_000_u64.into(),
-        restart: RestartPolicy::periodic(15_000),
-        backoff: backoff.clone(),
-        admission: AdmissionPolicy::DropIfRunning,
-        runner_selector: None,
-        labels: Labels::default(),
-    };
+        5_000_u64,
+    )
+    .restart(RestartPolicy::periodic(15_000))
+    .backoff(backoff.clone())
+    .build()
+    .unwrap();
     let id = api.submit(&sysmon).await?;
     info!("[2/5] sys-monitor submitted: {}", id);
 
     // ── Task 3: Disk check — df every 30s ───────────────────────────────────
-    let disk_check = TaskSpec {
-        slot: "disk-check".into(),
-        kind: TaskKind::Subprocess {
+    let disk_check = TaskSpec::builder(
+        "disk-check",
+        TaskKind::Subprocess {
             mode: SubprocessMode::Command {
                 command: "df".into(),
                 args: vec!["-h".into()],
@@ -191,20 +189,19 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout: 5_000_u64.into(),
-        restart: RestartPolicy::periodic(30_000),
-        backoff: backoff.clone(),
-        admission: AdmissionPolicy::DropIfRunning,
-        runner_selector: None,
-        labels: Labels::default(),
-    };
+        5_000_u64,
+    )
+    .restart(RestartPolicy::periodic(30_000))
+    .backoff(backoff.clone())
+    .build()
+    .unwrap();
     let id = api.submit(&disk_check).await?;
     info!("[3/5] disk-check submitted: {}", id);
 
     // ── Task 4: One-shot date — runs once and completes ─────────────────────
-    let oneshot = TaskSpec {
-        slot: "oneshot-date".into(),
-        kind: TaskKind::Subprocess {
+    let oneshot = TaskSpec::builder(
+        "oneshot-date",
+        TaskKind::Subprocess {
             mode: SubprocessMode::Command {
                 command: "date".into(),
                 args: vec!["+%Y-%m-%d %H:%M:%S".into()],
@@ -213,20 +210,18 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout: 3_000_u64.into(),
-        restart: RestartPolicy::Never,
-        backoff: backoff.clone(),
-        admission: AdmissionPolicy::DropIfRunning,
-        runner_selector: None,
-        labels: Labels::default(),
-    };
+        3_000_u64,
+    )
+    .backoff(backoff.clone())
+    .build()
+    .unwrap();
     let id = api.submit(&oneshot).await?;
     info!("[4/5] oneshot-date submitted: {}", id);
 
     // ── Task 5: Flaky job — fails intentionally, retries on failure ─────────
-    let flaky = TaskSpec {
-        slot: "flaky-job".into(),
-        kind: TaskKind::Subprocess {
+    let flaky = TaskSpec::builder(
+        "flaky-job",
+        TaskKind::Subprocess {
             mode: SubprocessMode::Command {
                 command: "sh".into(),
                 args: vec!["-c".into(), "echo 'attempt running...'; exit 1".into()],
@@ -235,18 +230,18 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout: 5_000_u64.into(),
-        restart: RestartPolicy::OnFailure,
-        backoff: BackoffPolicy {
-            jitter: JitterPolicy::Full,
-            first_ms: 2_000,
-            max_ms: 10_000,
-            factor: 2.0,
-        },
-        admission: AdmissionPolicy::Replace,
-        runner_selector: None,
-        labels: Labels::default(),
-    };
+        5_000_u64,
+    )
+    .restart(RestartPolicy::OnFailure)
+    .backoff(BackoffPolicy {
+        jitter: JitterPolicy::Full,
+        first_ms: 2_000,
+        max_ms: 10_000,
+        factor: 2.0,
+    })
+    .admission(AdmissionPolicy::Replace)
+    .build()
+    .unwrap();
     let id = api.submit(&flaky).await?;
     info!("[5/5] flaky-job submitted: {}", id);
 

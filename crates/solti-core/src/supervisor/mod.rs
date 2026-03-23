@@ -107,7 +107,7 @@ impl SupervisorApi {
     /// 2. Delegate to [`SupervisorApi::submit_with_task`].
     ///
     /// This is the primary entrypoint for tasks that are fully described by the public [`solti_model::TaskKind`] model.
-    #[instrument(level = "debug", skip(self, spec), fields(slot = %spec.slot, kind = ?spec.kind))]
+    #[instrument(level = "debug", skip(self, spec), fields(slot = %spec.slot(), kind = ?spec.kind()))]
     pub async fn submit(&self, spec: &TaskSpec) -> Result<TaskId, CoreError> {
         spec.validate()?;
 
@@ -121,7 +121,7 @@ impl SupervisorApi {
     ///
     /// The caller is responsible for constructing the [`TaskRef`];
     /// the spec controls timeout, restart, backoff and admission behavior.
-    #[instrument(level = "debug", skip(self, task, spec), fields(slot = %spec.slot))]
+    #[instrument(level = "debug", skip(self, task, spec), fields(slot = %spec.slot()))]
     pub async fn submit_with_task(
         &self,
         task: TaskRef,
@@ -133,12 +133,12 @@ impl SupervisorApi {
 
         let task_spec = TvTaskSpec::new(
             task,
-            to_restart_policy(spec.restart),
-            to_backoff_policy(&spec.backoff),
-            Some(Duration::from_millis(spec.timeout.as_millis())),
+            to_restart_policy(spec.restart()),
+            to_backoff_policy(spec.backoff()),
+            Some(Duration::from_millis(spec.timeout().as_millis())),
         );
         let controller_spec = ControllerSpec {
-            admission: to_admission_policy(spec.admission),
+            admission: to_admission_policy(spec.admission()),
             task_spec,
         };
 
@@ -197,7 +197,7 @@ mod tests {
     use super::*;
 
     use solti_model::{
-        AdmissionPolicy, BackoffPolicy, JitterPolicy, Labels, RestartPolicy, TaskKind,
+        AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind,
     };
     use taskvisor::{TaskError, TaskFn};
     use tokio_util::sync::CancellationToken;
@@ -227,16 +227,12 @@ mod tests {
             Ok::<(), TaskError>(())
         });
 
-        let spec = TaskSpec {
-            slot: "test-slot".into(),
-            kind: TaskKind::Embedded,
-            timeout: 1_000_u64.into(),
-            restart: RestartPolicy::Never,
-            backoff: mk_backoff(),
-            admission: AdmissionPolicy::DropIfRunning,
-            runner_selector: None,
-            labels: Labels::default(),
-        };
+        let spec = TaskSpec::builder("test-slot", TaskKind::Embedded, 1_000_u64)
+            .restart(RestartPolicy::Never)
+            .backoff(mk_backoff())
+            .admission(AdmissionPolicy::DropIfRunning)
+            .build()
+            .expect("valid spec");
 
         let res = api.submit_with_task(task, &spec).await;
         match res {
@@ -260,16 +256,12 @@ mod tests {
         .await
         .expect("failed to create SupervisorApi");
 
-        let spec = TaskSpec {
-            slot: "test-slot-none".into(),
-            kind: TaskKind::Embedded,
-            timeout: 1_000_u64.into(),
-            restart: RestartPolicy::Never,
-            backoff: mk_backoff(),
-            admission: AdmissionPolicy::DropIfRunning,
-            runner_selector: None,
-            labels: Labels::default(),
-        };
+        let spec = TaskSpec::builder("test-slot-none", TaskKind::Embedded, 1_000_u64)
+            .restart(RestartPolicy::Never)
+            .backoff(mk_backoff())
+            .admission(AdmissionPolicy::DropIfRunning)
+            .build()
+            .expect("valid spec");
         let res = api.submit(&spec).await;
 
         match res {

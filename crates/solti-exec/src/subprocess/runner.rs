@@ -57,8 +57,8 @@ impl SubprocessRunner {
         spec: &TaskSpec,
         ctx: &BuildContext,
     ) -> Result<SubprocessTaskConfig, RunnerError> {
-        let slot = &spec.slot;
-        let cfg = match &spec.kind {
+        let slot = spec.slot();
+        let cfg = match spec.kind() {
             TaskKind::Subprocess {
                 mode,
                 env,
@@ -116,14 +116,14 @@ impl Runner for SubprocessRunner {
     }
 
     fn supports(&self, spec: &TaskSpec) -> bool {
-        matches!(spec.kind, TaskKind::Subprocess { .. })
+        matches!(spec.kind(), TaskKind::Subprocess { .. })
     }
 
     fn build_task(&self, spec: &TaskSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
         let task_cfg = self.build_task_config(spec, ctx)?;
 
         trace!(
-            slot = %spec.slot,
+            slot = %spec.slot(),
             task = %task_cfg.run_id,
             "building subprocess task",
         );
@@ -136,7 +136,7 @@ impl Runner for SubprocessRunner {
                     .as_secs();
                 crate::utils::build_cgroup_name(
                     self.name,
-                    spec.slot.as_str(),
+                    spec.slot().as_str(),
                     extract_seq_from_run_id(&task_cfg.run_id),
                     timestamp,
                 )
@@ -498,9 +498,9 @@ mod tests {
     }
 
     fn mk_subprocess_spec(slot: &str, command: &str) -> TaskSpec {
-        TaskSpec {
-            slot: slot.into(),
-            kind: TaskKind::Subprocess {
+        TaskSpec::builder(
+            slot,
+            TaskKind::Subprocess {
                 mode: solti_model::SubprocessMode::Command {
                     command: command.into(),
                     args: vec![],
@@ -509,26 +509,26 @@ mod tests {
                 cwd: None,
                 fail_on_non_zero: Default::default(),
             },
-            timeout: 5_000_u64.into(),
-            restart: solti_model::RestartPolicy::Never,
-            backoff: mk_backoff(),
-            admission: solti_model::AdmissionPolicy::DropIfRunning,
-            runner_selector: None,
-            labels: Default::default(),
-        }
+            5_000u64,
+        )
+        .restart(solti_model::RestartPolicy::Never)
+        .backoff(mk_backoff())
+        .admission(solti_model::AdmissionPolicy::DropIfRunning)
+        .build()
+        .unwrap()
     }
 
     fn mk_embedded_spec(slot: &str) -> TaskSpec {
-        TaskSpec {
-            slot: slot.into(),
-            kind: TaskKind::Embedded,
-            timeout: 5_000_u64.into(),
-            restart: solti_model::RestartPolicy::Never,
-            backoff: mk_backoff(),
-            admission: solti_model::AdmissionPolicy::DropIfRunning,
-            runner_selector: None,
-            labels: Default::default(),
-        }
+        TaskSpec::builder(
+            slot,
+            TaskKind::Embedded,
+            5_000u64,
+        )
+        .restart(solti_model::RestartPolicy::Never)
+        .backoff(mk_backoff())
+        .admission(solti_model::AdmissionPolicy::DropIfRunning)
+        .build()
+        .unwrap()
     }
 
     fn make_task_cfg() -> SubprocessTaskConfig {
@@ -645,9 +645,9 @@ mod tests {
         use base64::engine::general_purpose::STANDARD as BASE64;
 
         let runner = SubprocessRunner::new("test-runner");
-        let spec = TaskSpec {
-            slot: "test-slot".into(),
-            kind: TaskKind::Subprocess {
+        let spec = TaskSpec::builder(
+            "test-slot",
+            TaskKind::Subprocess {
                 mode: solti_model::SubprocessMode::Script {
                     runtime: solti_model::Runtime::Bash,
                     body: BASE64.encode(b"echo hello"),
@@ -657,13 +657,13 @@ mod tests {
                 cwd: None,
                 fail_on_non_zero: Default::default(),
             },
-            timeout: 5_000_u64.into(),
-            restart: solti_model::RestartPolicy::Never,
-            backoff: mk_backoff(),
-            admission: solti_model::AdmissionPolicy::DropIfRunning,
-            runner_selector: None,
-            labels: Default::default(),
-        };
+            5_000u64,
+        )
+        .restart(solti_model::RestartPolicy::Never)
+        .backoff(mk_backoff())
+        .admission(solti_model::AdmissionPolicy::DropIfRunning)
+        .build()
+        .unwrap();
         let result = runner.build_task(&spec, &BuildContext::default());
         assert!(result.is_ok());
     }

@@ -7,8 +7,8 @@ use solti_api::{SoltiApiServer, SoltiApiService, SupervisorApiAdapter};
 use solti_core::{RunnerRouter, SupervisorApi};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, SubprocessMode,
-    TaskEnv, TaskKind, TaskSpec,
+    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, RestartPolicy, SubprocessMode, TaskEnv,
+    TaskKind, TaskSpec,
 };
 use solti_observe::{
     LoggerConfig, LoggerLevel, TracingEventSubscriber, init_logger, timezone_sync,
@@ -70,9 +70,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Submit demo periodic tasks that run continuously
 async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error::Error>> {
     // Task 1: Print date every 10 seconds
-    let date_spec = TaskSpec {
-        slot: "periodic-date".into(),
-        kind: TaskKind::Subprocess {
+    let date_spec = TaskSpec::builder(
+        "periodic-date",
+        TaskKind::Subprocess {
             mode: SubprocessMode::Command {
                 command: "date".into(),
                 args: vec!["+%Y-%m-%d %H:%M:%S".into()],
@@ -81,23 +81,22 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout: 5_000_u64.into(),
-        restart: RestartPolicy::periodic(10_000), // Every 10 seconds
-        backoff: BackoffPolicy {
-            jitter: JitterPolicy::None,
-            first_ms: 1_000,
-            max_ms: 5_000,
-            factor: 2.0,
-        },
-        admission: AdmissionPolicy::DropIfRunning,
-        runner_selector: None,
-        labels: Labels::default(),
-    };
+        5_000_u64,
+    )
+    .restart(RestartPolicy::periodic(10_000)) // Every 10 seconds
+    .backoff(BackoffPolicy {
+        jitter: JitterPolicy::None,
+        first_ms: 1_000,
+        max_ms: 5_000,
+        factor: 2.0,
+    })
+    .build()
+    .unwrap();
 
     // Task 2: Print uptime every 30 seconds
-    let uptime_spec = TaskSpec {
-        slot: "periodic-uptime".into(),
-        kind: TaskKind::Subprocess {
+    let uptime_spec = TaskSpec::builder(
+        "periodic-uptime",
+        TaskKind::Subprocess {
             mode: SubprocessMode::Command {
                 command: "uptime".into(),
                 args: vec![],
@@ -106,23 +105,22 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout: 5_000_u64.into(),
-        restart: RestartPolicy::periodic(30_000), // Every 30 seconds
-        backoff: BackoffPolicy {
-            jitter: JitterPolicy::Equal,
-            first_ms: 1_000,
-            max_ms: 5_000,
-            factor: 2.0,
-        },
-        admission: AdmissionPolicy::DropIfRunning,
-        runner_selector: None,
-        labels: Labels::default(),
-    };
+        5_000_u64,
+    )
+    .restart(RestartPolicy::periodic(30_000)) // Every 30 seconds
+    .backoff(BackoffPolicy {
+        jitter: JitterPolicy::Equal,
+        first_ms: 1_000,
+        max_ms: 5_000,
+        factor: 2.0,
+    })
+    .build()
+    .unwrap();
 
     // Task 3: Echo message every 5 seconds
-    let echo_spec = TaskSpec {
-        slot: "periodic-echo".into(),
-        kind: TaskKind::Subprocess {
+    let echo_spec = TaskSpec::builder(
+        "periodic-echo",
+        TaskKind::Subprocess {
             mode: SubprocessMode::Command {
                 command: "echo".into(),
                 args: vec!["Hello from solti periodic task!".into()],
@@ -131,18 +129,18 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
         },
-        timeout: 5_000_u64.into(),
-        restart: RestartPolicy::periodic(5_000), // Every 5 seconds
-        backoff: BackoffPolicy {
-            jitter: JitterPolicy::Full,
-            first_ms: 500,
-            max_ms: 2_000,
-            factor: 1.5,
-        },
-        admission: AdmissionPolicy::Replace,
-        runner_selector: None,
-        labels: Labels::default(),
-    };
+        5_000_u64,
+    )
+    .restart(RestartPolicy::periodic(5_000)) // Every 5 seconds
+    .backoff(BackoffPolicy {
+        jitter: JitterPolicy::Full,
+        first_ms: 500,
+        max_ms: 2_000,
+        factor: 1.5,
+    })
+    .admission(AdmissionPolicy::Replace)
+    .build()
+    .unwrap();
 
     let date_id = api.submit(&date_spec).await?;
     info!("submitted periodic date task: {}", date_id);

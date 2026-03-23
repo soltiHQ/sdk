@@ -16,95 +16,121 @@ use crate::{
 /// - lifecycle policies (`timeout`, `restart`, `backoff`)
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(from = "raw::TaskSpecRaw")]
 pub struct TaskSpec {
-    /// Logical slot name for concurrency control.
-    ///
-    /// A slot groups tasks that share a single execution lane.
-    /// The controller enforces admission policies per slot.
-    pub slot: Slot,
-    /// Execution backend used to run the task.
-    ///
-    /// This selects which runner is responsible (subprocess process, wasm, container, etc.).
-    pub kind: TaskKind,
-    /// Hard timeout for the task in milliseconds.
-    ///
-    /// Once this timeout is reached, the task is considered failed with timeout error.
-    pub timeout: Timeout,
-    /// Restart applied after a task completes or fails.
-    ///
-    /// Controls *whether* the task should be scheduled again (e.g. `OnFailure`, `Always`, `Never`).
-    pub restart: RestartPolicy,
-    /// Backoff configuration used between restart attempts.
-    ///
-    /// Defines *how long* to wait before the next run when the restart policy allows another attempt.
-    pub backoff: BackoffPolicy,
-    /// Admission for handling conflicts within the same slot.
-    ///
-    /// Controls what happens when a new task is submitted while a task in the same slot is already running (drop, replace, queue).
-    pub admission: AdmissionPolicy,
-    /// Label selector for runner routing.
-    ///
-    /// If set, the [`RunnerRouter`] will only pick runners whose labels satisfy all `match_labels` and `match_expressions` requirements.
+    slot: Slot,
+    kind: TaskKind,
+    timeout: Timeout,
+    restart: RestartPolicy,
+    backoff: BackoffPolicy,
+    admission: AdmissionPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runner_selector: Option<RunnerSelector>,
-    /// Optional metadata for routing / scheduling / observability.
+    runner_selector: Option<RunnerSelector>,
     #[serde(default, skip_serializing_if = "Labels::is_empty")]
-    pub labels: Labels,
+    labels: Labels,
 }
 
 impl TaskSpec {
-    /// Attach a runner selector used by the router.
-    ///
-    /// ```rust
-    /// # use solti_model::{
-    /// #   TaskSpec, Labels, TaskKind, SubprocessMode, RestartPolicy, BackoffPolicy,
-    /// #   AdmissionPolicy, JitterPolicy, TaskEnv, Flag, RunnerSelector,
-    /// # };
-    /// # use std::collections::BTreeMap;
-    /// let spec = TaskSpec {
-    ///     slot: "demo".into(),
-    ///     kind: TaskKind::Subprocess {
-    ///         mode: SubprocessMode::Command {
-    ///             command: "ls".into(),
-    ///             args: vec!["/tmp".into()],
-    ///         },
-    ///         env: TaskEnv::default(),
-    ///         cwd: None,
-    ///         fail_on_non_zero: Flag::enabled(),
-    ///     },
-    ///     timeout: 5_000_u64.into(),
-    ///     restart: RestartPolicy::Never,
-    ///     backoff: BackoffPolicy::default(),
-    ///     admission: AdmissionPolicy::DropIfRunning,
-    ///     runner_selector: None,
-    ///     labels: Labels::new(),
-    /// }
-    /// .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([
-    ///     ("runner-name".into(), "runner-a".into()),
-    /// ])));
-    /// ```
+    /// Logical slot name for concurrency control.
     #[inline]
-    pub fn with_runner_selector(mut self, sel: RunnerSelector) -> Self {
-        self.runner_selector = Some(sel);
-        self
+    pub fn slot(&self) -> &Slot {
+        &self.slot
     }
 
-    /// Return the runner selector (if present).
+    /// Execution backend used to run the task.
+    #[inline]
+    pub fn kind(&self) -> &TaskKind {
+        &self.kind
+    }
+
+    /// Hard timeout in milliseconds.
+    #[inline]
+    pub fn timeout(&self) -> Timeout {
+        self.timeout
+    }
+
+    /// Restart policy applied after completion or failure.
+    #[inline]
+    pub fn restart(&self) -> RestartPolicy {
+        self.restart
+    }
+
+    /// Backoff configuration between restart attempts.
+    #[inline]
+    pub fn backoff(&self) -> &BackoffPolicy {
+        &self.backoff
+    }
+
+    /// Admission policy for handling slot conflicts.
+    #[inline]
+    pub fn admission(&self) -> AdmissionPolicy {
+        self.admission
+    }
+
+    /// Label selector for runner routing (if present).
     #[inline]
     pub fn runner_selector(&self) -> Option<&RunnerSelector> {
         self.runner_selector.as_ref()
     }
 
-    /// Validate the spec at the model level.
+    /// Metadata labels for routing / scheduling / observability.
+    #[inline]
+    pub fn labels(&self) -> &Labels {
+        &self.labels
+    }
+}
+
+impl TaskSpec {
+    /// Create a [`TaskSpecBuilder`] with the three required fields.
+    ///
+    /// ```rust
+    /// use solti_model::{TaskSpec, TaskKind, SubprocessMode, RestartPolicy};
+    ///
+    /// let spec = TaskSpec::builder(
+    ///     "my-slot",
+    ///     TaskKind::Subprocess {
+    ///         mode: SubprocessMode::Command {
+    ///             command: "echo".into(),
+    ///             args: vec!["hello".into()],
+    ///         },
+    ///         env: Default::default(),
+    ///         cwd: None,
+    ///         fail_on_non_zero: Default::default(),
+    ///     },
+    ///     5_000u64,
+    /// )
+    /// .restart(RestartPolicy::OnFailure)
+    /// .build()
+    /// .expect("valid spec");
+    /// ```
+    pub fn builder(
+        slot: impl Into<Slot>,
+        kind: TaskKind,
+        timeout: impl Into<Timeout>,
+    ) -> TaskSpecBuilder {
+        TaskSpecBuilder::new(slot, kind, timeout)
+    }
+}
+
+impl TaskSpec {
+    /// Attach a runner selector used by the router (consuming builder-style).
+    #[inline]
+    pub fn with_runner_selector(mut self, sel: RunnerSelector) -> Self {
+        self.runner_selector = Some(sel);
+        self
+    }
+}
+
+impl TaskSpec {
+    /// Validate the spec at the **submit boundary**.
     ///
     /// Checks:
     /// - `slot` is not empty
+    /// - `backoff` parameters are sane
     /// - `timeout` is greater than zero
-    /// - `kind` is not [`TaskKind::Embedded`] (internal-only, must use `submit_with_task` instead)
-    ///
-    /// Called automatically by `SupervisorApi::submit()`.
-    /// Does **not** need to be called for specs built by internal tasks
-    /// (timezone sync, discovery) which use `TaskKind::Embedded` + `submit_with_task`.
+    /// - `kind` specific constraints (e.g. non-empty command)
+    /// - `runner_selector` requirements are structurally valid
+    /// - `kind` is not [`TaskKind::Embedded`] (internal-only; use `submit_with_task` instead)
     pub fn validate(&self) -> ModelResult<()> {
         if self.slot.as_str().is_empty() {
             return Err(ModelError::Invalid("slot cannot be empty".into()));
@@ -128,6 +154,170 @@ impl TaskSpec {
         }
         Ok(())
     }
+
+    /// Structural validation (everything except the [`TaskKind::Embedded`] business rule).
+    ///
+    /// Used by [`TaskSpecBuilder::build`].
+    fn validate_structural(&self) -> ModelResult<()> {
+        if self.slot.as_str().is_empty() {
+            return Err(ModelError::Invalid("slot cannot be empty".into()));
+        }
+        if self.timeout.as_millis() == 0 {
+            return Err(ModelError::Invalid(
+                "timeout must be greater than zero".into(),
+            ));
+        }
+        self.kind.validate()?;
+        self.backoff.validate()?;
+        if let Some(ref sel) = self.runner_selector {
+            for req in &sel.match_expressions {
+                req.validate()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Builder for [`TaskSpec`] that validates structural invariants on [`build`](TaskSpecBuilder::build).
+///
+/// Required fields (`slot`, `kind`, `timeout`) are set in the constructor.
+/// Optional fields have sensible defaults:
+/// - `backoff`: [`BackoffPolicy::default`] (full jitter, 1 s → 30 s, factor 2)
+/// - `admission`: [`AdmissionPolicy::DropIfRunning`]
+/// - `restart`: [`RestartPolicy::Never`]
+/// - `runner_selector`: `None`
+/// - `labels`: empty
+pub struct TaskSpecBuilder {
+    runner_selector: Option<RunnerSelector>,
+
+    kind: TaskKind,
+    slot: Slot,
+
+    backoff: BackoffPolicy,
+    restart: RestartPolicy,
+    timeout: Timeout,
+
+    admission: AdmissionPolicy,
+    labels: Labels,
+}
+
+impl TaskSpecBuilder {
+    fn new(slot: impl Into<Slot>, kind: TaskKind, timeout: impl Into<Timeout>) -> Self {
+        Self {
+            runner_selector: None,
+
+            kind,
+            slot: slot.into(),
+
+            restart: RestartPolicy::default(),
+            backoff: BackoffPolicy::default(),
+            timeout: timeout.into(),
+
+            admission: AdmissionPolicy::default(),
+            labels: Labels::new(),
+        }
+    }
+
+    /// Set restart policy.
+    pub fn restart(mut self, restart: RestartPolicy) -> Self {
+        self.restart = restart;
+        self
+    }
+
+    /// Set backoff configuration.
+    pub fn backoff(mut self, backoff: BackoffPolicy) -> Self {
+        self.backoff = backoff;
+        self
+    }
+
+    /// Set admission policy.
+    pub fn admission(mut self, admission: AdmissionPolicy) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    /// Set runner selector.
+    pub fn runner_selector(mut self, sel: RunnerSelector) -> Self {
+        self.runner_selector = Some(sel);
+        self
+    }
+
+    /// Set metadata labels.
+    pub fn labels(mut self, labels: Labels) -> Self {
+        self.labels = labels;
+        self
+    }
+
+    /// Build the [`TaskSpec`], validating structural invariants.
+    ///
+    /// This checks everything **except** the [`TaskKind::Embedded`] business rule
+    /// (which is enforced at the submit boundary by [`TaskSpec::validate`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] if:
+    /// - `slot` is empty
+    /// - `timeout` is zero
+    /// - `kind` fails kind-specific validation
+    /// - `backoff` parameters are invalid
+    /// - `runner_selector` requirements are invalid
+    pub fn build(self) -> ModelResult<TaskSpec> {
+        let spec = TaskSpec {
+            runner_selector: self.runner_selector,
+
+            kind: self.kind,
+            slot: self.slot,
+
+            restart: self.restart,
+            backoff: self.backoff,
+            timeout: self.timeout,
+
+            admission: self.admission,
+            labels: self.labels,
+        };
+        spec.validate_structural()?;
+        Ok(spec)
+    }
+}
+
+/// Permissive deserialization (no validation).
+/// Validation happens at the submit boundary via [`TaskSpec::validate`].
+mod raw {
+    use super::*;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub(super) struct TaskSpecRaw {
+        slot: Slot,
+        kind: TaskKind,
+        timeout: Timeout,
+        restart: RestartPolicy,
+        backoff: BackoffPolicy,
+        admission: AdmissionPolicy,
+
+        #[serde(default)]
+        labels: Labels,
+        #[serde(default)]
+        runner_selector: Option<RunnerSelector>,
+    }
+
+    impl From<TaskSpecRaw> for TaskSpec {
+        fn from(r: TaskSpecRaw) -> Self {
+            Self {
+                runner_selector: r.runner_selector,
+
+                kind: r.kind,
+                slot: r.slot,
+
+                restart: r.restart,
+                backoff: r.backoff,
+                timeout: r.timeout,
+
+                admission: r.admission,
+                labels: r.labels,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -136,9 +326,9 @@ mod tests {
     use crate::{Flag, SubprocessMode, TaskEnv};
 
     fn valid_spec() -> TaskSpec {
-        TaskSpec {
-            slot: "test".into(),
-            kind: TaskKind::Subprocess {
+        TaskSpec::builder(
+            "test",
+            TaskKind::Subprocess {
                 mode: SubprocessMode::Command {
                     command: "echo".into(),
                     args: vec![],
@@ -147,13 +337,10 @@ mod tests {
                 cwd: None,
                 fail_on_non_zero: Flag::enabled(),
             },
-            timeout: 5_000_u64.into(),
-            restart: RestartPolicy::Never,
-            backoff: BackoffPolicy::default(),
-            admission: AdmissionPolicy::DropIfRunning,
-            runner_selector: None,
-            labels: Labels::new(),
-        }
+            5_000u64,
+        )
+        .build()
+        .expect("test spec must be valid")
     }
 
     #[test]
@@ -162,26 +349,69 @@ mod tests {
     }
 
     #[test]
-    fn empty_slot_fails() {
-        let mut spec = valid_spec();
-        spec.slot = "".into();
-        let err = spec.validate().unwrap_err();
+    fn builder_rejects_empty_slot() {
+        let err = TaskSpec::builder(
+            "",
+            TaskKind::Embedded,
+            5_000u64,
+        )
+        .build()
+        .unwrap_err();
         assert!(err.to_string().contains("slot"));
     }
 
     #[test]
-    fn kind_embedded_fails() {
-        let mut spec = valid_spec();
-        spec.kind = TaskKind::Embedded;
+    fn builder_rejects_zero_timeout() {
+        let err = TaskSpec::builder(
+            "test",
+            TaskKind::Embedded,
+            0u64,
+        )
+        .build()
+        .unwrap_err();
+        assert!(err.to_string().contains("timeout"));
+    }
+
+    #[test]
+    fn builder_allows_embedded_kind() {
+        let spec = TaskSpec::builder("test", TaskKind::Embedded, 5_000u64)
+            .build()
+            .expect("Embedded is structurally valid");
+        assert!(matches!(spec.kind(), TaskKind::Embedded));
+    }
+
+    #[test]
+    fn validate_rejects_embedded_kind() {
+        let spec = TaskSpec::builder("test", TaskKind::Embedded, 5_000u64)
+            .build()
+            .unwrap();
         let err = spec.validate().unwrap_err();
         assert!(err.to_string().contains("TaskKind::Embedded"));
     }
 
     #[test]
-    fn zero_timeout_fails() {
-        let mut spec = valid_spec();
-        spec.timeout = 0_u64.into();
-        let err = spec.validate().unwrap_err();
-        assert!(err.to_string().contains("timeout"));
+    fn getters_return_expected_values() {
+        let spec = TaskSpec::builder(
+            "my-slot",
+            TaskKind::Embedded,
+            10_000u64,
+        )
+        .restart(RestartPolicy::OnFailure)
+        .admission(AdmissionPolicy::Replace)
+        .build()
+        .unwrap();
+
+        assert_eq!(spec.slot(), "my-slot");
+        assert_eq!(spec.timeout().as_millis(), 10_000);
+        assert_eq!(spec.restart(), RestartPolicy::OnFailure);
+        assert_eq!(spec.admission(), AdmissionPolicy::Replace);
+    }
+
+    #[test]
+    fn serde_roundtrip() {
+        let spec = valid_spec();
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: TaskSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spec);
     }
 }

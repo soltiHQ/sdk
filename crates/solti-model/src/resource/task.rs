@@ -59,16 +59,16 @@ impl Task {
         &self.metadata.id
     }
 
-    /// Slot (shortcut for `spec.slot`).
+    /// Slot (shortcut for `spec.slot()`).
     #[inline]
     pub fn slot(&self) -> &Slot {
-        &self.spec.slot
+        self.spec.slot()
     }
 
-    /// Labels (shortcut for `spec.labels`).
+    /// Labels (shortcut for `spec.labels()`).
     #[inline]
     pub fn labels(&self) -> &Labels {
-        &self.spec.labels
+        self.spec.labels()
     }
 
     /// Current phase (shortcut for `status.phase`).
@@ -81,21 +81,12 @@ impl Task {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AdmissionPolicy, BackoffPolicy, Labels, RestartPolicy, TaskKind};
+    use crate::TaskKind;
 
     fn test_spec() -> TaskSpec {
-        TaskSpec {
-            timeout: 5_000_u64.into(),
-            slot: "slot-a".into(),
-
-            kind: TaskKind::Embedded,
-            runner_selector: None,
-            labels: Labels::new(),
-
-            restart: RestartPolicy::default(),
-            backoff: BackoffPolicy::default(),
-            admission: AdmissionPolicy::default(),
-        }
+        TaskSpec::builder("slot-a", TaskKind::Embedded, 5_000u64)
+            .build()
+            .expect("test spec must be valid")
     }
 
     #[test]
@@ -142,8 +133,9 @@ mod tests {
 
     #[test]
     fn convenience_accessors() {
-        let mut spec = test_spec();
-        spec.slot = "slot-1".into();
+        let spec = TaskSpec::builder("slot-1", TaskKind::Embedded, 5_000u64)
+            .build()
+            .unwrap();
         let task = Task::new("id-1".into(), spec);
 
         assert_eq!(task.slot(), &Slot::from("slot-1"));
@@ -153,8 +145,9 @@ mod tests {
 
     #[test]
     fn serde_roundtrip() {
-        let mut spec = test_spec();
-        spec.slot = "slot-1".into();
+        let spec = TaskSpec::builder("slot-1", TaskKind::Embedded, 5_000u64)
+            .build()
+            .unwrap();
         let task = Task::new("id-1".into(), spec);
         let json = serde_json::to_string(&task).unwrap();
         let back: Task = serde_json::from_str(&json).unwrap();

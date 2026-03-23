@@ -16,21 +16,22 @@
 //!  └─────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! | Type           | Role                                                |
-//! |----------------|-----------------------------------------------------|
-//! | [`Task`]       | Top-level resource = metadata + spec + status       |
-//! | [`ObjectMeta`] | Identity, versioning, timestamps                    |
-//! | [`TaskSpec`]   | Desired state - what to run, how to supervise       |
-//! | [`TaskStatus`] | Observed state - phase, attempt count, last error   |
+//! | Type                | Role                                                |
+//! |---------------------|-----------------------------------------------------|
+//! | [`Task`]            | Top-level resource = metadata + spec + status       |
+//! | [`ObjectMeta`]      | Identity, versioning, timestamps                    |
+//! | [`TaskSpec`]        | Desired state - what to run, how to supervise       |
+//! | [`TaskSpecBuilder`] | Validated builder for [`TaskSpec`]                  |
+//! | [`TaskStatus`]      | Observed state - phase, attempt count, last error   |
+
+mod spec;
+pub use spec::{TaskSpec, TaskSpecBuilder};
 
 mod metadata;
 pub use metadata::ObjectMeta;
 
 mod status;
 pub use status::TaskStatus;
-
-mod spec;
-pub use spec::TaskSpec;
 
 mod task;
 pub use task::Task;

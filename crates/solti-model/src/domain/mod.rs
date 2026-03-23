@@ -25,8 +25,14 @@ pub use selector::{RunnerSelector, SelectorOperator, SelectorRequirement};
 mod environment;
 pub use environment::{RunnerEnv, TaskEnv, merge as merge_env};
 
+mod kind;
+pub use kind::{Runtime, SubprocessMode, TaskKind};
+
 mod query;
 pub use query::{TaskPage, TaskQuery};
+
+mod label;
+pub use label::{Labels, LabelsIter};
 
 mod identity;
 pub use identity::{Slot, TaskId};
@@ -36,12 +42,6 @@ pub use phase::TaskPhase;
 
 mod timeout;
 pub use timeout::Timeout;
-
-mod kind;
-pub use kind::{Runtime, SubprocessMode, TaskKind};
-
-mod label;
-pub use label::{Labels, LabelsIter};
 
 mod kv;
 pub use kv::KeyValue;

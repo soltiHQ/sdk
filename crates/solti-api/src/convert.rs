@@ -86,19 +86,16 @@ pub fn convert_create_spec(spec: proto_api::CreateSpec) -> Result<TaskSpec, ApiE
         .backoff
         .ok_or_else(|| ApiError::InvalidRequest("missing backoff strategy".into()))?;
 
-    let task_spec = TaskSpec {
-        slot,
-        kind: task_kind,
-        timeout: validate_timeout(spec.timeout_ms)?.into(),
-        restart,
-        backoff: convert_backoff_policy(backoff)?,
-        admission: convert_admission_policy(
+    let task_spec = TaskSpec::builder(slot, task_kind, validate_timeout(spec.timeout_ms)?)
+        .restart(restart)
+        .backoff(convert_backoff_policy(backoff)?)
+        .admission(convert_admission_policy(
             proto_api::AdmissionStrategy::try_from(spec.admission)
                 .map_err(|_| ApiError::InvalidRequest("invalid admission strategy".into()))?,
-        )?,
-        runner_selector: None,
-        labels: convert_labels(spec.labels),
-    };
+        )?)
+        .labels(convert_labels(spec.labels))
+        .build()
+        .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
 
     Ok(task_spec)
 }
@@ -355,16 +352,9 @@ mod tests {
 
     #[test]
     fn task_converts_correctly() {
-        let spec = TaskSpec {
-            slot: "my-slot".into(),
-            kind: TaskKind::Embedded,
-            timeout: 5_000_u64.into(),
-            restart: RestartPolicy::default(),
-            backoff: BackoffPolicy::default(),
-            admission: AdmissionPolicy::default(),
-            runner_selector: None,
-            labels: Labels::new(),
-        };
+        let spec = TaskSpec::builder("my-slot", TaskKind::Embedded, 5_000_u64)
+            .build()
+            .unwrap();
         let mut task = Task::new("task-42".into(), spec);
         // Simulate multiple spec/status changes
         task.metadata.generation = 5;
@@ -395,16 +385,9 @@ mod tests {
 
     #[test]
     fn task_no_error() {
-        let spec = TaskSpec {
-            slot: "slot".into(),
-            kind: TaskKind::Embedded,
-            timeout: 5_000_u64.into(),
-            restart: RestartPolicy::default(),
-            backoff: BackoffPolicy::default(),
-            admission: AdmissionPolicy::default(),
-            runner_selector: None,
-            labels: Labels::new(),
-        };
+        let spec = TaskSpec::builder("slot", TaskKind::Embedded, 5_000_u64)
+            .build()
+            .unwrap();
         let mut task = Task::new("task-1".into(), spec);
         task.status.phase = TaskPhase::Succeeded;
         task.status.attempt = 1;
@@ -420,16 +403,16 @@ mod tests {
         assert!(result.is_ok());
 
         let cs = result.unwrap();
-        assert_eq!(cs.slot, "test-slot");
-        assert_eq!(cs.timeout.as_millis(), 5_000);
+        assert_eq!(cs.slot(), "test-slot");
+        assert_eq!(cs.timeout().as_millis(), 5_000);
         assert!(matches!(
-            cs.kind,
-            TaskKind::Subprocess { mode: SubprocessMode::Command { ref command, .. }, .. } if command == "ls"
+            cs.kind(),
+            TaskKind::Subprocess { mode: SubprocessMode::Command { command, .. }, .. } if command == "ls"
         ));
-        assert!(matches!(cs.restart, RestartPolicy::OnFailure));
-        assert!(matches!(cs.admission, AdmissionPolicy::DropIfRunning));
-        assert_eq!(cs.backoff.first_ms, 100);
-        assert_eq!(cs.backoff.max_ms, 10_000);
+        assert!(matches!(cs.restart(), RestartPolicy::OnFailure));
+        assert!(matches!(cs.admission(), AdmissionPolicy::DropIfRunning));
+        assert_eq!(cs.backoff().first_ms, 100);
+        assert_eq!(cs.backoff().max_ms, 10_000);
     }
 
     #[test]
@@ -447,7 +430,7 @@ mod tests {
 
         let cs = convert_create_spec(spec).unwrap();
         assert!(
-            matches!(cs.kind, TaskKind::Wasm { ref module, .. } if module.to_str() == Some("/app/module.wasm"))
+            matches!(cs.kind(), TaskKind::Wasm { module, .. } if module.to_str() == Some("/app/module.wasm"))
         );
     }
 
@@ -469,7 +452,7 @@ mod tests {
 
         let cs = convert_create_spec(spec).unwrap();
         assert!(
-            matches!(cs.kind, TaskKind::Container { ref image, .. } if image == "alpine:latest")
+            matches!(cs.kind(), TaskKind::Container { image, .. } if image == "alpine:latest")
         );
     }
 
@@ -490,7 +473,7 @@ mod tests {
         };
 
         let cs = convert_create_spec(spec).unwrap();
-        assert!(matches!(cs.kind, TaskKind::Container { command: None, .. }));
+        assert!(matches!(cs.kind(), TaskKind::Container { command: None, .. }));
     }
 
     #[test]
@@ -503,7 +486,7 @@ mod tests {
 
         let cs = convert_create_spec(spec).unwrap();
         assert!(matches!(
-            cs.restart,
+            cs.restart(),
             RestartPolicy::Always {
                 interval_ms: Some(5_000)
             }
@@ -520,7 +503,7 @@ mod tests {
 
         let cs = convert_create_spec(spec).unwrap();
         assert!(matches!(
-            cs.restart,
+            cs.restart(),
             RestartPolicy::Always { interval_ms: None }
         ));
     }
@@ -537,8 +520,8 @@ mod tests {
         };
 
         let cs = convert_create_spec(spec).unwrap();
-        assert_eq!(cs.labels.get("runner-name"), Some("gpu"));
-        assert_eq!(cs.labels.get("env"), Some("prod"));
+        assert_eq!(cs.labels().get("runner-name"), Some("gpu"));
+        assert_eq!(cs.labels().get("env"), Some("prod"));
     }
 
     #[test]
@@ -546,7 +529,7 @@ mod tests {
         let spec = make_valid_create_spec();
         let cs = convert_create_spec(spec).unwrap();
 
-        match &cs.kind {
+        match cs.kind() {
             TaskKind::Subprocess { env, .. } => {
                 assert_eq!(env.get("PATH"), Some("/usr/bin"));
             }
@@ -649,7 +632,7 @@ mod tests {
         };
 
         let cs = convert_create_spec(spec).unwrap();
-        match &cs.kind {
+        match cs.kind() {
             TaskKind::Subprocess { mode, .. } => {
                 assert!(matches!(
                     mode,
@@ -694,7 +677,7 @@ mod tests {
         };
 
         let cs = convert_create_spec(spec).unwrap();
-        match &cs.kind {
+        match cs.kind() {
             TaskKind::Subprocess { mode, .. } => {
                 assert!(matches!(
                     mode,
@@ -946,7 +929,7 @@ mod tests {
                 ..make_valid_create_spec()
             };
             let cs = convert_create_spec(spec).unwrap();
-            assert_eq!(cs.backoff.jitter, expected);
+            assert_eq!(cs.backoff().jitter, expected);
         }
     }
 
@@ -967,7 +950,7 @@ mod tests {
             ..make_valid_create_spec()
         };
         let cs = convert_create_spec(spec).unwrap();
-        assert!(matches!(cs.restart, RestartPolicy::Never));
+        assert!(matches!(cs.restart(), RestartPolicy::Never));
     }
 
     #[test]
@@ -1000,7 +983,7 @@ mod tests {
                 ..make_valid_create_spec()
             };
             let cs = convert_create_spec(spec).unwrap();
-            assert_eq!(cs.admission, expected);
+            assert_eq!(cs.admission(), expected);
         }
     }
 }

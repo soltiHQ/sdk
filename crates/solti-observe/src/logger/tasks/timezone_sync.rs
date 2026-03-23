@@ -1,5 +1,5 @@
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, JitterPolicy, Labels, RestartPolicy, TaskKind, TaskSpec,
+    AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
 };
 use taskvisor::{TaskError, TaskFn, TaskRef};
 use tokio_util::sync::CancellationToken;
@@ -70,19 +70,12 @@ pub fn timezone_sync() -> (TaskRef, TaskSpec) {
         max_ms: BACKOFF_MAX_MS,
         factor: BACKOFF_FACTOR,
     };
-    let spec = TaskSpec {
-        restart: RestartPolicy::periodic(TZ_SYNC_PERIOD_MS),
-        timeout: TZ_SYNC_TIMEOUT_MS.into(),
-
-        slot: TZ_SYNC_SLOT.into(),
-        labels: Labels::default(),
-
-        admission: AdmissionPolicy::Replace,
-        kind: TaskKind::Embedded,
-        runner_selector: None,
-
-        backoff,
-    };
+    let spec = TaskSpec::builder(TZ_SYNC_SLOT, TaskKind::Embedded, TZ_SYNC_TIMEOUT_MS)
+        .restart(RestartPolicy::periodic(TZ_SYNC_PERIOD_MS))
+        .backoff(backoff)
+        .admission(AdmissionPolicy::Replace)
+        .build()
+        .expect("timezone sync spec must be valid");
 
     (task, spec)
 }
