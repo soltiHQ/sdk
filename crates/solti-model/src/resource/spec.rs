@@ -86,11 +86,11 @@ impl TaskSpec {
     /// Create a [`TaskSpecBuilder`] with the three required fields.
     ///
     /// ```rust
-    /// use solti_model::{TaskSpec, TaskKind, SubprocessMode, RestartPolicy};
+    /// use solti_model::{TaskSpec, TaskKind, SubprocessSpec, SubprocessMode, RestartPolicy};
     ///
     /// let spec = TaskSpec::builder(
     ///     "my-slot",
-    ///     TaskKind::Subprocess {
+    ///     TaskKind::Subprocess(SubprocessSpec {
     ///         mode: SubprocessMode::Command {
     ///             command: "echo".into(),
     ///             args: vec!["hello".into()],
@@ -98,7 +98,7 @@ impl TaskSpec {
     ///         env: Default::default(),
     ///         cwd: None,
     ///         fail_on_non_zero: Default::default(),
-    ///     },
+    ///     }),
     ///     5_000u64,
     /// )
     /// .restart(RestartPolicy::OnFailure)
@@ -325,12 +325,12 @@ mod raw {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Flag, SubprocessMode, TaskEnv};
+    use crate::{Flag, SubprocessMode, SubprocessSpec, TaskEnv};
 
     fn valid_spec() -> TaskSpec {
         TaskSpec::builder(
             "test",
-            TaskKind::Subprocess {
+            TaskKind::Subprocess(SubprocessSpec {
                 mode: SubprocessMode::Command {
                     command: "echo".into(),
                     args: vec![],
@@ -338,7 +338,7 @@ mod tests {
                 env: TaskEnv::default(),
                 cwd: None,
                 fail_on_non_zero: Flag::enabled(),
-            },
+            }),
             5_000u64,
         )
         .build()

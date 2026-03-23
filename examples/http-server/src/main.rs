@@ -8,7 +8,7 @@ use solti_core::{BuildContext, RunnerRouter, SupervisorApi};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, RestartPolicy, RunnerEnv, SubprocessMode,
-    TaskEnv, TaskKind, TaskSpec,
+    SubprocessSpec, TaskEnv, TaskKind, TaskSpec,
 };
 use solti_observe::{
     LoggerConfig, LoggerLevel, TracingEventSubscriber, init_logger, timezone_sync,
@@ -101,7 +101,7 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
     // Task 1: Print date every 10 seconds
     let date_spec = TaskSpec::builder(
         "periodic-date",
-        TaskKind::Subprocess {
+        TaskKind::Subprocess(SubprocessSpec {
             mode: SubprocessMode::Command {
                 command: "date".into(),
                 args: vec!["+%Y-%m-%d %H:%M:%S".into()],
@@ -109,7 +109,7 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
-        },
+        }),
         5_000_u64,
     )
     .restart(RestartPolicy::periodic(10_000)) // Every 10 seconds
@@ -125,7 +125,7 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
     // Task 2: Print uptime every 30 seconds
     let uptime_spec = TaskSpec::builder(
         "periodic-uptime",
-        TaskKind::Subprocess {
+        TaskKind::Subprocess(SubprocessSpec {
             mode: SubprocessMode::Command {
                 command: "uptime".into(),
                 args: vec![],
@@ -133,7 +133,7 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
-        },
+        }),
         5_000_u64,
     )
     .restart(RestartPolicy::periodic(30_000)) // Every 30 seconds
@@ -149,7 +149,7 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
     // Task 3: Echo message every 5 seconds
     let echo_spec = TaskSpec::builder(
         "periodic-echo",
-        TaskKind::Subprocess {
+        TaskKind::Subprocess(SubprocessSpec {
             mode: SubprocessMode::Command {
                 command: "echo".into(),
                 args: vec!["Hello from solti periodic task!".into()],
@@ -157,7 +157,7 @@ async fn submit_demo_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std::error
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
-        },
+        }),
         5_000_u64,
     )
     .restart(RestartPolicy::periodic(5_000)) // Every 5 seconds

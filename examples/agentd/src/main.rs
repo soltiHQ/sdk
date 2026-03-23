@@ -16,7 +16,7 @@ use solti_observe::{
 
 use std::collections::BTreeMap;
 
-use solti_model::{Flag, RunnerSelector, SubprocessMode, TaskEnv, TaskKind, TaskSpec};
+use solti_model::{Flag, RunnerSelector, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
     // 6a) Dev runner
     let ls_spec = TaskSpec::builder(
         "dev-ls-tmp",
-        TaskKind::Subprocess {
+        TaskKind::Subprocess(SubprocessSpec {
             mode: SubprocessMode::Command {
                 command: "ls".into(),
                 args: vec!["-lah".into(), "/tmp".into()],
@@ -110,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
-        },
+        }),
         5_000_u64,
     )
     .runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
@@ -123,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
     // 6b) Production runner
     let date_spec = TaskSpec::builder(
         "prod-date",
-        TaskKind::Subprocess {
+        TaskKind::Subprocess(SubprocessSpec {
             mode: SubprocessMode::Command {
                 command: "date".into(),
                 args: vec!["+%Y-%m-%d %H:%M:%S".into()],
@@ -131,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
-        },
+        }),
         5_000_u64,
     )
     .runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
@@ -144,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
     // 6c) Untrusted runner
     let sleep_spec = TaskSpec::builder(
         "untrusted-sleep",
-        TaskKind::Subprocess {
+        TaskKind::Subprocess(SubprocessSpec {
             mode: SubprocessMode::Command {
                 command: "sleep".into(),
                 args: vec!["2".into()],
@@ -152,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
-        },
+        }),
         5_000_u64,
     )
     .runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
@@ -165,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
     // 6d) Untrusted runner
     let stress_spec = TaskSpec::builder(
         "untrusted-stress",
-        TaskKind::Subprocess {
+        TaskKind::Subprocess(SubprocessSpec {
             mode: SubprocessMode::Command {
                 command: "sh".into(),
                 args: vec![
@@ -176,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::disabled(),
-        },
+        }),
         5_000_u64,
     )
     .runner_selector(RunnerSelector::from_labels(BTreeMap::from([(

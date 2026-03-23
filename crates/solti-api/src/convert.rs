@@ -1,8 +1,9 @@
 use tracing::warn;
 
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, Runtime, Slot,
-    SubprocessMode, Task, TaskEnv, TaskKind, TaskPhase, TaskSpec,
+    AdmissionPolicy, BackoffPolicy, ContainerSpec, Flag, JitterPolicy, Labels, RestartPolicy,
+    Runtime, Slot, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskKind, TaskPhase, TaskSpec,
+    WasmSpec,
 };
 
 use crate::error::ApiError;
@@ -149,30 +150,30 @@ fn convert_task_kind(kind: proto_api::task_kind::Kind) -> Result<TaskKind, ApiEr
                 .validate()
                 .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
 
-            Ok(TaskKind::Subprocess {
+            Ok(TaskKind::Subprocess(SubprocessSpec {
                 mode: subprocess_mode,
                 env: convert_env(sub.env),
                 cwd: sub.cwd.map(std::path::PathBuf::from),
                 fail_on_non_zero: Flag::from(sub.fail_on_non_zero),
-            })
+            }))
         }
         proto_api::task_kind::Kind::Wasm(wasm) => {
             if wasm.module.trim().is_empty() {
                 return Err(ApiError::InvalidRequest("wasm module path is empty".into()));
             }
 
-            Ok(TaskKind::Wasm {
+            Ok(TaskKind::Wasm(WasmSpec {
                 module: std::path::PathBuf::from(wasm.module),
                 args: wasm.args,
                 env: convert_env(wasm.env),
-            })
+            }))
         }
         proto_api::task_kind::Kind::Container(cont) => {
             if cont.image.trim().is_empty() {
                 return Err(ApiError::InvalidRequest("container image is empty".into()));
             }
 
-            Ok(TaskKind::Container {
+            Ok(TaskKind::Container(ContainerSpec {
                 image: cont.image,
                 command: if cont.command.is_empty() {
                     None
@@ -181,7 +182,7 @@ fn convert_task_kind(kind: proto_api::task_kind::Kind) -> Result<TaskKind, ApiEr
                 },
                 args: cont.args,
                 env: convert_env(cont.env),
-            })
+            }))
         }
     }
 }
@@ -407,7 +408,7 @@ mod tests {
         assert_eq!(cs.timeout().as_millis(), 5_000);
         assert!(matches!(
             cs.kind(),
-            TaskKind::Subprocess { mode: SubprocessMode::Command { command, .. }, .. } if command == "ls"
+            TaskKind::Subprocess(SubprocessSpec { mode: SubprocessMode::Command { command, .. }, .. }) if command == "ls"
         ));
         assert!(matches!(cs.restart(), RestartPolicy::OnFailure));
         assert!(matches!(cs.admission(), AdmissionPolicy::DropIfRunning));
@@ -430,7 +431,7 @@ mod tests {
 
         let cs = convert_create_spec(spec).unwrap();
         assert!(
-            matches!(cs.kind(), TaskKind::Wasm { module, .. } if module.to_str() == Some("/app/module.wasm"))
+            matches!(cs.kind(), TaskKind::Wasm(WasmSpec { module, .. }) if module.to_str() == Some("/app/module.wasm"))
         );
     }
 
@@ -451,7 +452,7 @@ mod tests {
         };
 
         let cs = convert_create_spec(spec).unwrap();
-        assert!(matches!(cs.kind(), TaskKind::Container { image, .. } if image == "alpine:latest"));
+        assert!(matches!(cs.kind(), TaskKind::Container(ContainerSpec { image, .. }) if image == "alpine:latest"));
     }
 
     #[test]
@@ -473,7 +474,7 @@ mod tests {
         let cs = convert_create_spec(spec).unwrap();
         assert!(matches!(
             cs.kind(),
-            TaskKind::Container { command: None, .. }
+            TaskKind::Container(ContainerSpec { command: None, .. })
         ));
     }
 
@@ -531,7 +532,7 @@ mod tests {
         let cs = convert_create_spec(spec).unwrap();
 
         match cs.kind() {
-            TaskKind::Subprocess { env, .. } => {
+            TaskKind::Subprocess(SubprocessSpec { env, .. }) => {
                 assert_eq!(env.get("PATH"), Some("/usr/bin"));
             }
             _ => panic!("expected subprocess kind"),
@@ -634,7 +635,7 @@ mod tests {
 
         let cs = convert_create_spec(spec).unwrap();
         match cs.kind() {
-            TaskKind::Subprocess { mode, .. } => {
+            TaskKind::Subprocess(SubprocessSpec { mode, .. }) => {
                 assert!(matches!(
                     mode,
                     SubprocessMode::Script {
@@ -679,7 +680,7 @@ mod tests {
 
         let cs = convert_create_spec(spec).unwrap();
         match cs.kind() {
-            TaskKind::Subprocess { mode, .. } => {
+            TaskKind::Subprocess(SubprocessSpec { mode, .. }) => {
                 assert!(matches!(
                     mode,
                     SubprocessMode::Script {

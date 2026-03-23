@@ -126,7 +126,7 @@ mod tests {
 
     use solti_model::{
         AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RunnerSelector, SubprocessMode,
-        TaskEnv,
+        SubprocessSpec, TaskEnv, WasmSpec,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -141,7 +141,7 @@ mod tests {
         }
 
         fn supports(&self, spec: &TaskSpec) -> bool {
-            matches!(spec.kind(), TaskKind::Subprocess { .. })
+            matches!(spec.kind(), TaskKind::Subprocess(_))
         }
 
         fn build_task(
@@ -198,7 +198,7 @@ mod tests {
         let mut router = RunnerRouter::new();
         router.register(Arc::new(SubprocessRunnerDummy));
 
-        let spec = mk_spec(TaskKind::Subprocess {
+        let spec = mk_spec(TaskKind::Subprocess(SubprocessSpec {
             mode: SubprocessMode::Command {
                 command: "echo".to_string(),
                 args: vec!["hello".into()],
@@ -206,7 +206,7 @@ mod tests {
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::default(),
-        });
+        }));
 
         let res = router.build(&spec);
 
@@ -221,11 +221,11 @@ mod tests {
         let mut router = RunnerRouter::new();
         router.register(Arc::new(SubprocessRunnerDummy));
 
-        let spec = mk_spec(TaskKind::Wasm {
+        let spec = mk_spec(TaskKind::Wasm(WasmSpec {
             module: PathBuf::from("mod.wasm"),
             args: Vec::new(),
             env: TaskEnv::default(),
-        });
+        }));
 
         let res = router.build(&spec);
 
@@ -295,7 +295,7 @@ mod tests {
         router.register_with_labels(Arc::new(R2), labels_r2);
 
         let spec = {
-            let base = mk_spec(TaskKind::Subprocess {
+            let base = mk_spec(TaskKind::Subprocess(SubprocessSpec {
                 mode: SubprocessMode::Command {
                     command: "echo".into(),
                     args: vec!["hi".into()],
@@ -303,7 +303,7 @@ mod tests {
                 env: TaskEnv::default(),
                 cwd: None,
                 fail_on_non_zero: Flag::enabled(),
-            });
+            }));
             base.with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
                 "runner-name".into(),
                 "runner-b".into(),

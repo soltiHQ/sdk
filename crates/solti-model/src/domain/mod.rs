@@ -8,13 +8,16 @@
 //! | `selector/`     | [`RunnerSelector`], [`SelectorRequirement`]                  | K8s-style label selector for runner routing |
 //! | `environment/`  | [`TaskEnv`], [`RunnerEnv`], [`merge_env`]                    | Env-var handling with runner-wins merge     |
 //! | `query/`        | [`TaskQuery`], [`TaskPage`]                                  | Filtered, paginated task listing            |
-//! | `identity/`     | [`Slot`], [`TaskId`]                                         | Resource identity (`Arc<str>` newtypes)     |
+//! | `identity/`     | [`Slot`], [`TaskId`]                                         | Resource identity (`Arc<str>`)              |
 //! | `kind/`         | [`TaskKind`]                                                 | Execution backend enum                      |
-//! | `label`         | [`Labels`]                                                   | Key-value metadata (`BTreeMap` newtype)     |
+//! | `label`         | [`Labels`]                                                   | Key-value metadata (`BTreeMap`)             |
 //! | `flag`          | [`Flag`]                                                     | Boolean toggle                              |
 //! | `kv`            | [`KeyValue`]                                                 | Generic key-value pair                      |
 //! | `phase`         | [`TaskPhase`]                                                | Task lifecycle state                        |
-//! | `timeout`       | [`Timeout`]                                                  | Milliseconds newtype                        |
+//! | `timeout`       | [`Timeout`]                                                  | Milliseconds                                |
+
+mod kind;
+pub use kind::{ContainerSpec, Runtime, SubprocessMode, SubprocessSpec, TaskKind, WasmSpec};
 
 mod policy;
 pub use policy::{AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy};
@@ -24,9 +27,6 @@ pub use selector::{RunnerSelector, SelectorOperator, SelectorRequirement};
 
 mod environment;
 pub use environment::{RunnerEnv, TaskEnv, merge as merge_env};
-
-mod kind;
-pub use kind::{Runtime, SubprocessMode, TaskKind};
 
 mod query;
 pub use query::{TaskPage, TaskQuery};

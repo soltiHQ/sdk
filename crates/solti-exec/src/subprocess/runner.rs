@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 use solti_core::{BuildContext, Runner, RunnerError};
-use solti_model::{TaskKind, TaskSpec, merge_env};
+use solti_model::{SubprocessSpec, TaskKind, TaskSpec, merge_env};
 
 use crate::metrics::{RUNNER_TYPE_SUBPROCESS, task_error_to_outcome};
 use crate::subprocess::{
@@ -59,12 +59,12 @@ impl SubprocessRunner {
     ) -> Result<SubprocessTaskConfig, RunnerError> {
         let slot = spec.slot();
         let cfg = match spec.kind() {
-            TaskKind::Subprocess {
+            TaskKind::Subprocess(SubprocessSpec {
                 mode,
                 env,
                 cwd,
                 fail_on_non_zero,
-            } => {
+            }) => {
                 let (command, args) = Self::resolve_mode(mode)?;
                 SubprocessTaskConfig {
                     run_id: Arc::from(self.build_run_id(slot.as_str())),
@@ -116,7 +116,7 @@ impl Runner for SubprocessRunner {
     }
 
     fn supports(&self, spec: &TaskSpec) -> bool {
-        matches!(spec.kind(), TaskKind::Subprocess { .. })
+        matches!(spec.kind(), TaskKind::Subprocess(_))
     }
 
     fn build_task(&self, spec: &TaskSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
@@ -500,7 +500,7 @@ mod tests {
     fn mk_subprocess_spec(slot: &str, command: &str) -> TaskSpec {
         TaskSpec::builder(
             slot,
-            TaskKind::Subprocess {
+            TaskKind::Subprocess(solti_model::SubprocessSpec {
                 mode: solti_model::SubprocessMode::Command {
                     command: command.into(),
                     args: vec![],
@@ -508,7 +508,7 @@ mod tests {
                 env: Default::default(),
                 cwd: None,
                 fail_on_non_zero: Default::default(),
-            },
+            }),
             5_000u64,
         )
         .restart(solti_model::RestartPolicy::Never)
@@ -643,7 +643,7 @@ mod tests {
         let runner = SubprocessRunner::new("test-runner");
         let spec = TaskSpec::builder(
             "test-slot",
-            TaskKind::Subprocess {
+            TaskKind::Subprocess(solti_model::SubprocessSpec {
                 mode: solti_model::SubprocessMode::Script {
                     runtime: solti_model::Runtime::Bash,
                     body: BASE64.encode(b"echo hello"),
@@ -652,7 +652,7 @@ mod tests {
                 env: Default::default(),
                 cwd: None,
                 fail_on_non_zero: Default::default(),
-            },
+            }),
             5_000u64,
         )
         .restart(solti_model::RestartPolicy::Never)

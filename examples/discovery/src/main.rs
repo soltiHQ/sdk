@@ -10,7 +10,7 @@ use solti_discover::{DiscoverConfig, DiscoveryTransport};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, RestartPolicy, RunnerEnv, SubprocessMode,
-    TaskEnv, TaskKind, TaskSpec,
+    SubprocessSpec, TaskEnv, TaskKind, TaskSpec,
 };
 use solti_observe::{
     LoggerConfig, LoggerLevel, LoggerTimeZone, TracingEventSubscriber, init_local_offset,
@@ -138,7 +138,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
     // ── Task 1: Heartbeat — echo every 5s (periodic, never fails) ───────────
     let heartbeat = TaskSpec::builder(
         "agent-heartbeat",
-        TaskKind::Subprocess {
+        TaskKind::Subprocess(SubprocessSpec {
             mode: SubprocessMode::Command {
                 command: "echo".into(),
                 args: vec!["heartbeat: alive".into()],
@@ -146,7 +146,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
-        },
+        }),
         3_000_u64,
     )
     .restart(RestartPolicy::periodic(5_000))
@@ -159,7 +159,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
     // ── Task 2: System monitor — uptime every 15s ───────────────────────────
     let sysmon = TaskSpec::builder(
         "sys-monitor",
-        TaskKind::Subprocess {
+        TaskKind::Subprocess(SubprocessSpec {
             mode: SubprocessMode::Command {
                 command: "uptime".into(),
                 args: vec![],
@@ -167,7 +167,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
-        },
+        }),
         5_000_u64,
     )
     .restart(RestartPolicy::periodic(15_000))
@@ -180,7 +180,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
     // ── Task 3: Disk check — df every 30s ───────────────────────────────────
     let disk_check = TaskSpec::builder(
         "disk-check",
-        TaskKind::Subprocess {
+        TaskKind::Subprocess(SubprocessSpec {
             mode: SubprocessMode::Command {
                 command: "df".into(),
                 args: vec!["-h".into()],
@@ -188,7 +188,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
-        },
+        }),
         5_000_u64,
     )
     .restart(RestartPolicy::periodic(30_000))
@@ -201,7 +201,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
     // ── Task 4: One-shot date — runs once and completes ─────────────────────
     let oneshot = TaskSpec::builder(
         "oneshot-date",
-        TaskKind::Subprocess {
+        TaskKind::Subprocess(SubprocessSpec {
             mode: SubprocessMode::Command {
                 command: "date".into(),
                 args: vec!["+%Y-%m-%d %H:%M:%S".into()],
@@ -209,7 +209,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
-        },
+        }),
         3_000_u64,
     )
     .backoff(backoff.clone())
@@ -221,7 +221,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
     // ── Task 5: Flaky job — fails intentionally, retries on failure ─────────
     let flaky = TaskSpec::builder(
         "flaky-job",
-        TaskKind::Subprocess {
+        TaskKind::Subprocess(SubprocessSpec {
             mode: SubprocessMode::Command {
                 command: "sh".into(),
                 args: vec!["-c".into(), "echo 'attempt running...'; exit 1".into()],
@@ -229,7 +229,7 @@ async fn submit_background_tasks(api: &SupervisorApi) -> Result<(), Box<dyn std:
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
-        },
+        }),
         5_000_u64,
     )
     .restart(RestartPolicy::OnFailure)

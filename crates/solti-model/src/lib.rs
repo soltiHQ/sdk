@@ -106,13 +106,13 @@
 //! ```rust
 //! use solti_model::{
 //!     BackoffPolicy, JitterPolicy,
-//!     RestartPolicy, SubprocessMode, Task, TaskKind, TaskPhase, TaskSpec,
+//!     RestartPolicy, SubprocessMode, SubprocessSpec, Task, TaskKind, TaskPhase, TaskSpec,
 //! };
 //!
 //! // 1) Build a task spec via the builder
 //! let spec = TaskSpec::builder(
 //!     "my-worker",
-//!     TaskKind::Subprocess {
+//!     TaskKind::Subprocess(SubprocessSpec {
 //!         mode: SubprocessMode::Command {
 //!             command: "echo".into(),
 //!             args: vec!["hello".into()],
@@ -120,7 +120,7 @@
 //!         env: Default::default(),
 //!         cwd: None,
 //!         fail_on_non_zero: Default::default(),
-//!     },
+//!     }),
 //!     5_000u64,
 //! )
 //! .restart(RestartPolicy::OnFailure)
@@ -145,9 +145,10 @@
 
 mod domain;
 pub use domain::{
-    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, KeyValue, Labels, LabelsIter,
-    RestartPolicy, RunnerEnv, RunnerSelector, Runtime, SelectorOperator, SelectorRequirement, Slot,
-    SubprocessMode, TaskEnv, TaskId, TaskKind, TaskPage, TaskPhase, TaskQuery, Timeout, merge_env,
+    AdmissionPolicy, BackoffPolicy, ContainerSpec, Flag, JitterPolicy, KeyValue, Labels,
+    LabelsIter, RestartPolicy, RunnerEnv, RunnerSelector, Runtime, SelectorOperator,
+    SelectorRequirement, Slot, SubprocessMode, SubprocessSpec, TaskEnv, TaskId, TaskKind, TaskPage,
+    TaskPhase, TaskQuery, Timeout, WasmSpec, merge_env,
 };
 
 mod resource;
