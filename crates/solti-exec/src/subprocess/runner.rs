@@ -519,16 +519,12 @@ mod tests {
     }
 
     fn mk_embedded_spec(slot: &str) -> TaskSpec {
-        TaskSpec::builder(
-            slot,
-            TaskKind::Embedded,
-            5_000u64,
-        )
-        .restart(solti_model::RestartPolicy::Never)
-        .backoff(mk_backoff())
-        .admission(solti_model::AdmissionPolicy::DropIfRunning)
-        .build()
-        .unwrap()
+        TaskSpec::builder(slot, TaskKind::Embedded, 5_000u64)
+            .restart(solti_model::RestartPolicy::Never)
+            .backoff(mk_backoff())
+            .admission(solti_model::AdmissionPolicy::DropIfRunning)
+            .build()
+            .unwrap()
     }
 
     fn make_task_cfg() -> SubprocessTaskConfig {

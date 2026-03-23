@@ -350,25 +350,17 @@ mod tests {
 
     #[test]
     fn builder_rejects_empty_slot() {
-        let err = TaskSpec::builder(
-            "",
-            TaskKind::Embedded,
-            5_000u64,
-        )
-        .build()
-        .unwrap_err();
+        let err = TaskSpec::builder("", TaskKind::Embedded, 5_000u64)
+            .build()
+            .unwrap_err();
         assert!(err.to_string().contains("slot"));
     }
 
     #[test]
     fn builder_rejects_zero_timeout() {
-        let err = TaskSpec::builder(
-            "test",
-            TaskKind::Embedded,
-            0u64,
-        )
-        .build()
-        .unwrap_err();
+        let err = TaskSpec::builder("test", TaskKind::Embedded, 0u64)
+            .build()
+            .unwrap_err();
         assert!(err.to_string().contains("timeout"));
     }
 
@@ -391,15 +383,11 @@ mod tests {
 
     #[test]
     fn getters_return_expected_values() {
-        let spec = TaskSpec::builder(
-            "my-slot",
-            TaskKind::Embedded,
-            10_000u64,
-        )
-        .restart(RestartPolicy::OnFailure)
-        .admission(AdmissionPolicy::Replace)
-        .build()
-        .unwrap();
+        let spec = TaskSpec::builder("my-slot", TaskKind::Embedded, 10_000u64)
+            .restart(RestartPolicy::OnFailure)
+            .admission(AdmissionPolicy::Replace)
+            .build()
+            .unwrap();
 
         assert_eq!(spec.slot(), "my-slot");
         assert_eq!(spec.timeout().as_millis(), 10_000);

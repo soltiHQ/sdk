@@ -196,9 +196,7 @@ impl SupervisorApi {
 mod tests {
     use super::*;
 
-    use solti_model::{
-        AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind,
-    };
+    use solti_model::{AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind};
     use taskvisor::{TaskError, TaskFn};
     use tokio_util::sync::CancellationToken;
 

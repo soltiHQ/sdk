@@ -125,8 +125,8 @@ mod tests {
     use crate::runner::RunnerError;
 
     use solti_model::{
-        AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RunnerSelector,
-        SubprocessMode, TaskEnv,
+        AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RunnerSelector, SubprocessMode,
+        TaskEnv,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
