@@ -34,12 +34,15 @@ use std::collections::BTreeMap;
 pub fn merge(task: &TaskEnv, runner: &RunnerEnv) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
 
-    for kv in task.iter() {
-        map.insert(kv.key().to_owned(), kv.value().to_owned());
+    for kv in runner.into_iter().rev() {
+        if !map.contains_key(kv.key()) {
+            map.insert(kv.key().to_owned(), kv.value().to_owned());
+        }
     }
-
-    for kv in runner.iter() {
-        map.insert(kv.key().to_owned(), kv.value().to_owned());
+    for kv in task.into_iter().rev() {
+        if !map.contains_key(kv.key()) {
+            map.insert(kv.key().to_owned(), kv.value().to_owned());
+        }
     }
 
     map
