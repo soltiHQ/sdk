@@ -1,24 +1,22 @@
 use std::{
-    borrow::Cow,
     process::Stdio,
     sync::Arc,
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use taskvisor::{TaskError, TaskFn, TaskRef};
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    process::Command,
-};
+use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace};
 
 use solti_core::{BuildContext, Runner, RunnerError, RunnerType};
 use solti_model::{SubprocessSpec, TaskKind, TaskSpec, merge_env};
 
 use crate::metrics::classify_task_error;
 use crate::subprocess::{
-    backend::SubprocessBackendConfig, logger::LogConfig, task::SubprocessTaskConfig,
+    backend::SubprocessBackendConfig,
+    logger::{LogConfig, StreamKind, log_stream},
+    task::SubprocessTaskConfig,
 };
 
 /// Runner that executes `TaskKind::Subprocess` as OS subprocesses.
@@ -101,7 +99,9 @@ impl SubprocessRunner {
                     .map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
 
                 let (cmd, flag) = runtime.resolve();
-                let mut full_args = vec![flag.to_string(), script];
+                let mut full_args = Vec::with_capacity(2 + args.len());
+                full_args.push(flag.to_string());
+                full_args.push(script);
                 full_args.extend(args.iter().cloned());
 
                 Ok((cmd.to_string(), full_args))
@@ -182,9 +182,7 @@ fn build_command(ctx: &TaskExecContext) -> Command {
     if let Some(cwd) = &ctx.task_cfg.cwd {
         cmd.current_dir(cwd);
     }
-    for (k, v) in &ctx.task_cfg.env {
-        cmd.env(k, v);
-    }
+    cmd.envs(&ctx.task_cfg.env);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd
@@ -319,107 +317,6 @@ async fn run_subprocess(
     result
 }
 
-/// Truncate line by Unicode scalar count, safe for UTF-8.
-///
-/// Returns `Cow::Borrowed` when no truncation is needed (zero-alloc for the common case).
-fn truncate_line(line: &str, max_chars: usize) -> Cow<'_, str> {
-    match line.char_indices().nth(max_chars) {
-        None => Cow::Borrowed(line),
-        Some((i, _)) => {
-            let skipped = line[i..].chars().count();
-            Cow::Owned(format!("{}... (truncated {skipped} chars)", &line[..i]))
-        }
-    }
-}
-
-/// Subprocess output stream kind.
-#[derive(Debug, Clone, Copy)]
-enum StreamKind {
-    Stdout,
-    Stderr,
-}
-
-impl StreamKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Stdout => "stdout",
-            Self::Stderr => "stderr",
-        }
-    }
-
-    fn use_elevated_level(self, config: &LogConfig) -> bool {
-        match self {
-            Self::Stdout => config.stdout_info,
-            Self::Stderr => config.stderr_warn,
-        }
-    }
-}
-
-/// Log subprocess output stream with truncation.
-async fn log_stream<R>(reader: R, run_id: &str, stream: StreamKind, config: &LogConfig)
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let stream_name = stream.as_str();
-    let mut lines = BufReader::new(reader).lines();
-    let mut line_count = 0u64;
-
-    while let Some(result) = lines.next_line().await.transpose() {
-        let raw_line = match result {
-            Ok(line) => line,
-            Err(e) => {
-                warn!(
-                    task = %run_id,
-                    stream = %stream_name,
-                    error = %e,
-                    line_num = line_count,
-                    "error while reading subprocess stream"
-                );
-                break;
-            }
-        };
-
-        // max_line_length is guaranteed > 0 by SubprocessBackendConfig::validate().
-        let line = truncate_line(&raw_line, config.max_line_length);
-
-        line_count += 1;
-
-        if stream.use_elevated_level(config) {
-            match stream {
-                StreamKind::Stdout => info!(
-                    task = %run_id,
-                    stream = %stream_name,
-                    line_num = line_count,
-                    "{}",
-                    line
-                ),
-                StreamKind::Stderr => warn!(
-                    task = %run_id,
-                    stream = %stream_name,
-                    line_num = line_count,
-                    "{}",
-                    line
-                ),
-            }
-        } else {
-            debug!(
-                task = %run_id,
-                stream = %stream_name,
-                line_num = line_count,
-                "{}",
-                line
-            );
-        }
-    }
-
-    debug!(
-        task = %run_id,
-        stream = %stream_name,
-        total_lines = line_count,
-        "stream closed"
-    );
-}
-
 /// Extract sequence number from run_id.
 fn extract_seq_from_run_id(run_id: &str) -> u64 {
     run_id
@@ -432,46 +329,6 @@ fn extract_seq_from_run_id(run_id: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn truncate_line_short_line_borrowed() {
-        let result = truncate_line("hello", 10);
-        assert!(matches!(result, Cow::Borrowed(_)));
-        assert_eq!(&*result, "hello");
-    }
-
-    #[test]
-    fn truncate_line_exact_length_borrowed() {
-        let result = truncate_line("hello", 5);
-        assert!(matches!(result, Cow::Borrowed(_)));
-        assert_eq!(&*result, "hello");
-    }
-
-    #[test]
-    fn truncate_line_truncates_long_line() {
-        let result = truncate_line("hello world", 5);
-        assert!(matches!(result, Cow::Owned(_)));
-        assert_eq!(&*result, "hello... (truncated 6 chars)");
-    }
-
-    #[test]
-    fn truncate_line_empty_string_borrowed() {
-        let result = truncate_line("", 10);
-        assert!(matches!(result, Cow::Borrowed(_)));
-        assert_eq!(&*result, "");
-    }
-
-    #[test]
-    fn truncate_line_unicode() {
-        let result = truncate_line("привет", 2);
-        assert_eq!(&*result, "пр... (truncated 4 chars)");
-    }
-
-    #[test]
-    fn truncate_line_single_char_limit() {
-        let result = truncate_line("abc", 1);
-        assert_eq!(&*result, "a... (truncated 2 chars)");
-    }
 
     #[test]
     fn extract_seq_from_run_id_valid() {
