@@ -1,4 +1,33 @@
-//! Subprocess runner for `solti_model::TaskKind::Subprocess`.
+//! # Subprocess: OS process runner for `TaskKind::Subprocess`.
+//!
+//! Executes tasks by spawning child OS processes with optional backend hardening (rlimits, cgroups, security capabilities).
+//!
+//! ## Modules
+//!
+//! | Module      | What it does                                             |
+//! |-------------|----------------------------------------------------------|
+//! | [`runner`]  | [`SubprocessRunner`] — `Runner` trait impl + execution   |
+//! | [`backend`] | [`SubprocessBackendConfig`] — rlimits, cgroups, security |
+//! | [`task`]    | [`SubprocessTaskConfig`] — resolved runtime config       |
+//! | [`logger`]  | [`LogConfig`] + stream capture, truncation, tracing      |
+//!
+//! ## Quick start
+//! ```text
+//! register_subprocess_runner(&mut router, "my-runner")
+//!     ├──► creates SubprocessRunner::new("my-runner")
+//!     ├──► attaches label "runner-name" = "my-runner"
+//!     └──► registers in RunnerRouter
+//!
+//! register_subprocess_runner_with_backend(&mut router, "secure", backend)
+//!     ├──► validates SubprocessBackendConfig
+//!     ├──► creates SubprocessRunner::with_config("secure", backend)
+//!     ├──► attaches label "runner-name" = "secure"
+//!     └──► registers in RunnerRouter
+//! ```
+//!
+//! ## Registration guard
+//! - Duplicate runner names are rejected via `router.contains_label()` check
+//! - Returns `ExecError::DuplicateRunner` if a runner with the same name exists
 mod backend;
 pub use backend::SubprocessBackendConfig;
 
