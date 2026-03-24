@@ -1,17 +1,44 @@
-//! Low-level logging helpers for unsafe contexts (e.g. `pre_exec` hooks).
+//! # Log: async-signal-safe logging for `pre_exec` hooks.
 //!
-//! These functions are designed to be safe to call between `fork()` and `execve` on Unix platforms.
-//! On non-Unix platforms they fall back to simple `eprintln!`.
+//! Provides two helpers that can be called **between `fork()` and `execve()`** where only async-signal-safe functions are allowed.
+//!
+//! ## API
+//!
+//! | Function              | What it writes           | Heap? |
+//! |-----------------------|--------------------------|-------|
+//! | [`pre_exec_log`]      | raw `&[u8]` to stderr    | no    |
+//! | [`pre_exec_log_errno`]| `errno=<N>\n` to stderr  | no    |
+//!
+//! ## How it works
+//! ```text
+//! pre_exec_log(b"solti-exec: capget failed: ")
+//!     │
+//!     ├──► Unix:
+//!     │     └──► libc::write(STDERR_FILENO, ptr, len)
+//!     │          one syscall, no heap, no locks
+//!     │
+//!     └──► non-Unix:
+//!           └──► std::io::stderr().write_all(msg)
+//!
+//! pre_exec_log_errno(errno)
+//!     │
+//!     ├──► format_errno(errno, &mut [u8; 32])
+//!     │     └──► stack-only int→ASCII, handles 0, negative, multi-digit
+//!     │
+//!     └──► write "errno=" + digits + "\n" via 3 × libc::write
+//! ```
+//!
+//! ## Rules
+//! - **Zero heap allocation**: all buffers are stack-local `[u8; N]`
+//! - Return values from `libc::write` are intentionally ignored (best-effort)
+//! - Non-Unix: falls back to `std::io::stderr` (safe, pre_exec doesn't exist there)
 
-/// Write a raw byte message to stderr.
-///
-/// Designed for use in `pre_exec` hooks (between `fork` and `execve`).
-/// Uses only `libc::write` which is async-signal-safe per POSIX.
+/// Write a raw `&[u8]` message to stderr (async-signal-safe on Unix).
 #[cfg(unix)]
-pub fn pre_exec_log(msg: &[u8]) {
-    // SAFETY: `libc::write` to STDERR_FILENO is async-signal-safe.
+pub(crate) fn pre_exec_log(msg: &[u8]) {
+    // SAFETY:
+    // `libc::write` to STDERR_FILENO is async-signal-safe.
     // `msg.as_ptr()` is valid for `msg.len()` bytes (from a valid `&[u8]` slice).
-    // Return value is intentionally ignored — logging is best-effort in pre_exec context.
     unsafe {
         let _ = libc::write(
             libc::STDERR_FILENO,
@@ -21,19 +48,19 @@ pub fn pre_exec_log(msg: &[u8]) {
     }
 }
 
-/// Write a raw byte message to stderr (non-Unix fallback).
+/// Write a raw `&[u8]` message to stderr (non-Unix fallback).
 #[cfg(not(unix))]
-pub fn pre_exec_log(msg: &[u8]) {
+pub(crate) fn pre_exec_log(msg: &[u8]) {
     use std::io::Write;
 
     let _ = std::io::stderr().write_all(msg);
 }
 
-/// Log an errno value as `errno=<n>\n` to stderr.
+/// Write `errno=<N>\n` to stderr (async-signal-safe on Unix).
 ///
-/// On Unix this uses only stack buffers + `libc::write`.
+/// Uses a stack-local `[u8; 32]` buffer for int→ASCII conversion.
 #[cfg(unix)]
-pub fn pre_exec_log_errno(errno: i32) {
+pub(crate) fn pre_exec_log_errno(errno: i32) {
     let mut buf = [0u8; 32];
     let mut idx = buf.len();
     let negative = errno < 0;
@@ -60,9 +87,10 @@ pub fn pre_exec_log_errno(errno: i32) {
     }
 
     const PREFIX: &[u8] = b"errno=";
-    // SAFETY: All pointers are derived from valid stack-local byte slices/arrays.
+
+    // SAFETY:
+    // All pointers are derived from valid stack-local byte slices/arrays.
     // `libc::write` to STDERR_FILENO is async-signal-safe per POSIX.
-    // Return values intentionally ignored — best-effort logging in pre_exec context.
     unsafe {
         let _ = libc::write(
             libc::STDERR_FILENO,
@@ -83,9 +111,9 @@ pub fn pre_exec_log_errno(errno: i32) {
     }
 }
 
-/// Log an errno value as `errno=<n>\n` (non-Unix fallback).
+/// Write `errno=<N>\n` to stderr (non-Unix fallback).
 #[cfg(not(unix))]
-pub fn pre_exec_log_errno(errno: i32) {
+pub(crate) fn pre_exec_log_errno(errno: i32) {
     use std::io::Write;
 
     let mut stderr = std::io::stderr();
