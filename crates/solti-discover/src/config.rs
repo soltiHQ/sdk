@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use solti_model::AgentId;
+
 #[derive(Clone, Debug)]
 pub enum DiscoveryTransport {
     Grpc,
@@ -17,6 +19,8 @@ impl DiscoveryTransport {
 
 #[derive(Debug, Clone)]
 pub struct DiscoverConfig {
+    /// Unique agent identifier (provided by caller).
+    pub agent_id: AgentId,
     pub metadata: HashMap<String, String>,
     pub control_plane_endpoint: String,
     pub transport: DiscoveryTransport,

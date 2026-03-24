@@ -39,6 +39,7 @@ base64 = "0.22"
 axum = "0.8.7"
 hostname = "0.4.2"
 uuid = "1.19.0"
+parking_lot = "0.12"
 
 tonic = "0.12"
 tonic-build = "0.12"

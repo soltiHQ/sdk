@@ -8,7 +8,7 @@
 //! | `selector/`     | [`RunnerSelector`], [`SelectorRequirement`]                  | K8s-style label selector for runner routing |
 //! | `environment/`  | [`TaskEnv`], [`RunnerEnv`], [`merge_env`]                    | Env-var handling with runner-wins merge     |
 //! | `query/`        | [`TaskQuery`], [`TaskPage`]                                  | Filtered, paginated task listing            |
-//! | `identity/`     | [`Slot`], [`TaskId`]                                         | Resource identity (`Arc<str>`)              |
+//! | `identity/`     | [`AgentId`], [`Slot`], [`TaskId`]                            | Resource identity (`Arc<str>`)              |
 //! | `kind/`         | [`TaskKind`]                                                 | Execution backend enum                      |
 //! | `label`         | [`Labels`]                                                   | Key-value metadata (`BTreeMap`)             |
 //! | `flag`          | [`Flag`]                                                     | Boolean toggle                              |
@@ -35,7 +35,7 @@ mod label;
 pub use label::{Labels, LabelsIter};
 
 mod identity;
-pub use identity::{Slot, TaskId};
+pub use identity::{AgentId, Slot, TaskId};
 
 mod phase;
 pub use phase::TaskPhase;

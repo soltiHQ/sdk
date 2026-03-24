@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use solti_core::{agent_id, arch, os_info, platform, uptime_seconds};
+use solti_core::{arch, os_info, platform, uptime_seconds};
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
 };
@@ -113,7 +113,7 @@ async fn invoke_http_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
 
 fn build_base_request(cfg: &DiscoverConfig) -> SyncRequest {
     SyncRequest {
-        id: agent_id().to_string(),
+        id: cfg.agent_id.as_str().to_string(),
         name: cfg.name.clone(),
         endpoint: cfg.agent_endpoint.clone(),
         platform: platform().to_string(),

@@ -1,10 +1,9 @@
 mod subscriber;
 pub use subscriber::StateSubscriber;
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
+use std::{collections::HashMap, sync::Arc};
+
+use parking_lot::RwLock;
 
 use solti_model::{Slot, Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskSpec};
 
@@ -34,7 +33,7 @@ impl TaskState {
 
     /// Register a new task (called on TaskAdded event).
     pub fn add_task(&self, id: TaskId, spec: TaskSpec) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
 
         let slot = spec.slot().clone();
         let task = Task::new(id.clone(), spec);
@@ -51,7 +50,7 @@ impl TaskState {
         error: Option<String>,
         exit_code: Option<i32>,
     ) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
 
         if let Some(task) = inner.tasks.get_mut(id) {
             task.update_phase(phase, error, exit_code);
@@ -60,7 +59,7 @@ impl TaskState {
 
     /// Increment attempt counter (called on TaskStarting event).
     pub fn increment_attempt(&self, id: &TaskId) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
 
         if let Some(task) = inner.tasks.get_mut(id) {
             task.increment_attempt();
@@ -69,7 +68,7 @@ impl TaskState {
 
     /// Remove task from state (called on TaskRemoved event).
     pub fn remove_task(&self, id: &TaskId) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
 
         if let Some(task) = inner.tasks.remove(id)
             && let Some(ids) = inner.by_slot.get_mut(task.slot())
@@ -80,13 +79,13 @@ impl TaskState {
 
     /// Get task by ID.
     pub fn get(&self, id: &TaskId) -> Option<Task> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.tasks.get(id).cloned()
     }
 
     /// List all tasks in a specific slot.
     pub fn list_by_slot(&self, slot: &str) -> Vec<Task> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
 
         inner
             .by_slot
@@ -101,13 +100,13 @@ impl TaskState {
 
     /// List all tasks.
     pub fn list_all(&self) -> Vec<Task> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.tasks.values().cloned().collect()
     }
 
     /// List tasks matching a phase filter.
     pub fn list_by_status(&self, phase: TaskPhase) -> Vec<Task> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner
             .tasks
             .values()
@@ -122,7 +121,7 @@ impl TaskState {
     /// When `slot` is specified, uses the `by_slot` index to narrow the scan.
     /// `total` in the result reflects the count *after* filtering, *before* pagination.
     pub fn query(&self, q: &TaskQuery) -> TaskPage<Task> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
 
         // Choose the iterator source based on whether slot filter is present.
         // When slot is given we use the by_slot index to avoid full scan.

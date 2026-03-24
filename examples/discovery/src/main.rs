@@ -9,8 +9,8 @@ use solti_core::{BuildContext, RunnerRouter, SupervisorApi};
 use solti_discover::{DiscoverConfig, DiscoveryTransport};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, RestartPolicy, RunnerEnv, SubprocessMode,
-    SubprocessSpec, TaskEnv, TaskKind, TaskSpec,
+    AdmissionPolicy, AgentId, BackoffPolicy, Flag, JitterPolicy, RestartPolicy, RunnerEnv,
+    SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec,
 };
 use solti_observe::{
     LoggerConfig, LoggerLevel, LoggerTimeZone, TracingEventSubscriber, init_local_offset,
@@ -71,6 +71,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 6) Discovery — periodic sync with control plane
     let discover_config = DiscoverConfig {
+        agent_id: AgentId::new("demo-agent-001"),
         name: "demo-agent".to_string(),
         control_plane_endpoint: CONTROL_PLANE_ENDPOINT.to_string(),
         agent_endpoint: format!("http://{}", AGENT_HTTP_ADDR),

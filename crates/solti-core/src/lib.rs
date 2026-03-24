@@ -23,6 +23,6 @@ pub use metrics::{
 };
 
 mod system;
-pub use system::{agent_id, arch, os_info, platform, uptime_seconds};
+pub use system::{arch, os_info, platform, uptime_seconds};
 
 mod state;

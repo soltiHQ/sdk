@@ -145,7 +145,7 @@
 
 mod domain;
 pub use domain::{
-    AdmissionPolicy, BackoffPolicy, ContainerSpec, Flag, JitterPolicy, KeyValue, Labels,
+    AdmissionPolicy, AgentId, BackoffPolicy, ContainerSpec, Flag, JitterPolicy, KeyValue, Labels,
     LabelsIter, RestartPolicy, RunnerEnv, RunnerSelector, Runtime, SelectorOperator,
     SelectorRequirement, Slot, SubprocessMode, SubprocessSpec, TaskEnv, TaskId, TaskKind, TaskPage,
     TaskPhase, TaskQuery, Timeout, WasmSpec, merge_env,
