@@ -143,10 +143,10 @@ impl SupervisorApi {
         };
 
         debug!("submitting pre-built task via controller");
-        self.sup
-            .submit(controller_spec)
-            .await
-            .map_err(|e| CoreError::Supervisor(e.to_string()))?;
+        if let Err(e) = self.sup.submit(controller_spec).await {
+            self.state.remove_task(&task_id);
+            return Err(CoreError::Supervisor(e.to_string()));
+        }
         Ok(task_id)
     }
 
@@ -170,10 +170,6 @@ impl SupervisorApi {
     pub async fn cancel_task(&self, id: &TaskId) -> Result<(), CoreError> {
         debug!("cancelling task: {}", id);
 
-        if self.state.get(id).is_none() {
-            return Err(CoreError::Supervisor(format!("task not found: {}", id)));
-        }
-
         let was_cancelled = self
             .sup
             .cancel(id.as_str())
@@ -181,10 +177,7 @@ impl SupervisorApi {
             .map_err(|e| CoreError::Supervisor(format!("cancel failed: {}", e)))?;
 
         if !was_cancelled {
-            return Err(CoreError::Supervisor(format!(
-                "task not found in registry: {}",
-                id
-            )));
+            return Err(CoreError::Supervisor(format!("task not found: {}", id)));
         }
 
         debug!("task cancelled successfully: {}", id);
