@@ -113,7 +113,7 @@ async fn invoke_http_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
 
 fn build_base_request(cfg: &DiscoverConfig) -> SyncRequest {
     SyncRequest {
-        id: cfg.agent_id.as_str().to_string(),
+        id: cfg.agent_id.to_string(),
         name: cfg.name.clone(),
         endpoint: cfg.agent_endpoint.clone(),
         platform: platform().to_string(),
