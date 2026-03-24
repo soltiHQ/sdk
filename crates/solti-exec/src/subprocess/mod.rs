@@ -4,12 +4,12 @@
 //!
 //! ## Modules
 //!
-//! | Module      | What it does                                             |
-//! |-------------|----------------------------------------------------------|
-//! | [`runner`]  | [`SubprocessRunner`] — `Runner` trait impl + execution   |
-//! | [`backend`] | [`SubprocessBackendConfig`] — rlimits, cgroups, security |
-//! | [`task`]    | [`SubprocessTaskConfig`] — resolved runtime config       |
-//! | [`logger`]  | [`LogConfig`] + stream capture, truncation, tracing      |
+//! | Module      | What it does                                            |
+//! |-------------|---------------------------------------------------------|
+//! | [`runner`]  | [`SubprocessRunner`]: `Runner` trait impl + execution   |
+//! | [`backend`] | [`SubprocessBackendConfig`]: rlimits, cgroups, security |
+//! | [`task`]    | [`SubprocessTaskConfig`]: resolved runtime config       |
+//! | [`logger`]  | [`LogConfig`] + stream capture, truncation, tracing     |
 //!
 //! ## Quick start
 //! ```text
