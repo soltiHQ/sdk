@@ -70,10 +70,13 @@ impl TaskState {
     pub fn remove_task(&self, id: &TaskId) {
         let mut inner = self.inner.write();
 
-        if let Some(task) = inner.tasks.remove(id)
-            && let Some(ids) = inner.by_slot.get_mut(task.slot())
-        {
-            ids.retain(|task_id| task_id != id);
+        if let Some(task) = inner.tasks.remove(id) {
+            if let Some(ids) = inner.by_slot.get_mut(task.slot()) {
+                ids.retain(|task_id| task_id != id);
+                if ids.is_empty() {
+                    inner.by_slot.remove(task.slot());
+                }
+            }
         }
     }
 
@@ -155,7 +158,7 @@ impl TaskState {
         filtered.sort_by(|a, b| a.metadata.id.cmp(&b.metadata.id));
         let total = filtered.len();
 
-        // Slice-based paginatior - O(1) index vs O(offset) iterator skip.
+        // Slice-based paginator - O(1) index vs O(offset) iterator skip.
         let start = q.offset().min(total);
         let items = filtered[start..]
             .iter()

@@ -33,7 +33,7 @@ impl BuildContext {
         self
     }
 
-    /// Replace the metrics backend and return unpdated context.
+    /// Replace the metrics backend and return updated context.
     pub fn with_metrics(mut self, metrics: MetricsHandle) -> Self {
         self.metrics = metrics;
         self

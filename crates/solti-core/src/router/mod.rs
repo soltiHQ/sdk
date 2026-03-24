@@ -14,11 +14,11 @@ use crate::{
 };
 
 /// Single runner entry with optional static labels used for routing.
-pub struct RunnerEntry {
+pub(crate) struct RunnerEntry {
     /// Concrete runner implementation.
-    pub runner: Arc<dyn Runner>,
+    pub(crate) runner: Arc<dyn Runner>,
     /// Static labels attached to this runner (e.g. capacity class, backend tag).
-    pub labels: Labels,
+    pub(crate) labels: Labels,
 }
 
 /// Router that selects an appropriate [`Runner`] for a given [`TaskSpec`].

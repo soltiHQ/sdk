@@ -13,12 +13,30 @@ fn next_seq() -> u64 {
 /// Result of [`make_run_id`]: a human-readable run id and the raw sequence number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunId {
+    name: String,
+    seq: u64,
+}
+
+impl RunId {
     /// Human-readable id used as task name for taskvisor.
     ///
     /// Format: `{runner}-{slot}-{seq}`.
-    pub name: String,
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Raw sequence number (monotonically increasing per process).
-    pub seq: u64,
+    #[inline]
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Consume and return the name as an owned `String`.
+    #[inline]
+    pub fn into_name(self) -> String {
+        self.name
+    }
 }
 
 /// Build a human-readable run id used as task name for taskvisor.

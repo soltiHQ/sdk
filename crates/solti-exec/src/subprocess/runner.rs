@@ -114,13 +114,13 @@ impl SubprocessRunner {
                 let (command, args) = Self::resolve_mode(mode)?;
                 let run_id = self.build_run_id(slot.as_str());
                 SubprocessTaskConfig {
-                    run_id: Arc::from(run_id.name),
-                    seq: run_id.seq,
-                    command,
-                    args,
+                    seq: run_id.seq(),
+                    run_id: Arc::from(run_id.into_name()),
+                    fail_on_non_zero: *fail_on_non_zero,
                     env: merge_env(env, ctx.env()),
                     cwd: cwd.clone(),
-                    fail_on_non_zero: *fail_on_non_zero,
+                    command,
+                    args,
                 }
             }
             other => {
