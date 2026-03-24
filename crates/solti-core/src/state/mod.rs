@@ -70,12 +70,12 @@ impl TaskState {
     pub fn remove_task(&self, id: &TaskId) {
         let mut inner = self.inner.write();
 
-        if let Some(task) = inner.tasks.remove(id) {
-            if let Some(ids) = inner.by_slot.get_mut(task.slot()) {
-                ids.retain(|task_id| task_id != id);
-                if ids.is_empty() {
-                    inner.by_slot.remove(task.slot());
-                }
+        if let Some(task) = inner.tasks.remove(id)
+            && let Some(ids) = inner.by_slot.get_mut(task.slot())
+        {
+            ids.retain(|task_id| task_id != id);
+            if ids.is_empty() {
+                inner.by_slot.remove(task.slot());
             }
         }
     }
