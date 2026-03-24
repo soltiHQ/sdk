@@ -526,7 +526,7 @@ mod tests {
         let backend = crate::PrometheusMetrics::new_with_registry(registry.clone()).unwrap();
         let sub = PrometheusSubscriber::new(registry.clone()).unwrap();
 
-        backend.record_task_started("subprocess");
+        backend.record_task_started(solti_core::RunnerType::Subprocess);
         sub.on_event(
             &Event::new(EventKind::TaskStarting)
                 .with_task("t")

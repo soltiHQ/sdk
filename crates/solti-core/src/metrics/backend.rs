@@ -1,5 +1,32 @@
 use std::sync::Arc;
 
+/// Runner implementation type for metrics labeling.
+///
+/// Passed to [`MetricsBackend`] methods so dashboards can slice metrics
+/// by runner backend (subprocess, wasm, container).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RunnerType {
+    /// OS subprocess runner.
+    Subprocess,
+    /// WebAssembly runner.
+    Wasm,
+    /// Container (OCI) runner.
+    Container,
+}
+
+impl RunnerType {
+    /// Return label value for metrics.
+    #[inline]
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Subprocess => "subprocess",
+            Self::Wasm => "wasm",
+            Self::Container => "container",
+        }
+    }
+}
+
 /// Task execution outcome for metrics classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskOutcome {
@@ -37,7 +64,7 @@ pub trait MetricsBackend: Send + Sync + 'static {
     ///
     /// # Arguments
     /// - `runner_type`: Runner implementation
-    fn record_task_started(&self, runner_type: &str);
+    fn record_task_started(&self, runner_type: RunnerType);
     /// Record task completion with outcome and duration.
     ///
     /// Called when task exits (success, failure, timeout, cancel).
@@ -46,7 +73,12 @@ pub trait MetricsBackend: Send + Sync + 'static {
     /// - `runner_type`: Runner implementation
     /// - `outcome`: How the task terminated
     /// - `duration_ms`: Execution time in milliseconds
-    fn record_task_completed(&self, runner_type: &str, outcome: TaskOutcome, duration_ms: u64);
+    fn record_task_completed(
+        &self,
+        runner_type: RunnerType,
+        outcome: TaskOutcome,
+        duration_ms: u64,
+    );
     /// Record runner-specific error during task setup/teardown.
     ///
     /// Called when runner fails to spawn/cleanup a task.
@@ -55,7 +87,7 @@ pub trait MetricsBackend: Send + Sync + 'static {
     /// # Arguments
     /// - `runner_type`: Runner implementation
     /// - `error_kind`: Error category
-    fn record_runner_error(&self, runner_type: &str, error_kind: &str);
+    fn record_runner_error(&self, runner_type: RunnerType, error_kind: &str);
 }
 
 /// Shared handle to metrics backend.

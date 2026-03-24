@@ -3,7 +3,7 @@
 //! This module provides a backend interface for collecting runtime metrics from task execution.
 //! Metrics backends (prometheus, statsd, etc) implement [`MetricsBackend`] and are injected via [`crate::BuildContext`].
 mod backend;
-pub use backend::{MetricsBackend, MetricsHandle, TaskOutcome};
+pub use backend::{MetricsBackend, MetricsHandle, RunnerType, TaskOutcome};
 
 mod noop;
 pub use noop::NoOpMetrics;

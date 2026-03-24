@@ -13,10 +13,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
-use solti_core::{BuildContext, Runner, RunnerError};
+use solti_core::{BuildContext, Runner, RunnerError, RunnerType};
 use solti_model::{SubprocessSpec, TaskKind, TaskSpec, merge_env};
 
-use crate::metrics::{RUNNER_TYPE_SUBPROCESS, task_error_to_outcome};
+use crate::metrics::classify_task_error;
 use crate::subprocess::{
     backend::SubprocessBackendConfig, logger::LogConfig, task::SubprocessTaskConfig,
 };
@@ -196,7 +196,7 @@ fn prepare_backend(ctx: &TaskExecContext) -> Result<(), TaskError> {
         let cgroup_name_ref = ctx.cgroup_name.as_deref().unwrap_or(&ctx.task_cfg.run_id);
         if let Err(e) = backend_cfg.prepare_cgroups(cgroup_name_ref) {
             ctx.metrics
-                .record_runner_error(RUNNER_TYPE_SUBPROCESS, "cgroup_prepare_failed");
+                .record_runner_error(RunnerType::Subprocess, "cgroup_prepare_failed");
             return Err(TaskError::Fatal {
                 reason: format!("failed to prepare cgroup: {e}"),
             });
@@ -211,7 +211,7 @@ fn apply_backend(cmd: &mut Command, ctx: &TaskExecContext) -> Result<(), TaskErr
         let cgroup_name_ref = ctx.cgroup_name.as_deref().unwrap_or(&ctx.task_cfg.run_id);
         if let Err(e) = backend_cfg.apply_to_command(cmd, cgroup_name_ref) {
             ctx.metrics
-                .record_runner_error(RUNNER_TYPE_SUBPROCESS, "backend_config_failed");
+                .record_runner_error(RunnerType::Subprocess, "backend_config_failed");
             return Err(TaskError::Fatal {
                 reason: format!("failed to apply runner config: {e}"),
             });
@@ -242,7 +242,7 @@ async fn run_subprocess(
     ctx: Arc<TaskExecContext>,
     cancel: CancellationToken,
 ) -> Result<(), TaskError> {
-    ctx.metrics.record_task_started(RUNNER_TYPE_SUBPROCESS);
+    ctx.metrics.record_task_started(RunnerType::Subprocess);
     let start = Instant::now();
 
     trace!(
@@ -262,7 +262,7 @@ async fn run_subprocess(
         Ok(child) => child,
         Err(e) => {
             ctx.metrics
-                .record_runner_error(RUNNER_TYPE_SUBPROCESS, "spawn_failed");
+                .record_runner_error(RunnerType::Subprocess, "spawn_failed");
             return Err(TaskError::Fatal {
                 reason: format!("spawn failed: {e}"),
             });
@@ -307,10 +307,10 @@ async fn run_subprocess(
     let duration_ms = start.elapsed().as_millis() as u64;
     let outcome = match &result {
         Ok(()) => solti_core::TaskOutcome::Success,
-        Err(e) => task_error_to_outcome(e),
+        Err(e) => classify_task_error(e),
     };
     ctx.metrics
-        .record_task_completed(RUNNER_TYPE_SUBPROCESS, outcome, duration_ms);
+        .record_task_completed(RunnerType::Subprocess, outcome, duration_ms);
 
     let _ = tokio::join!(stdout_task, stderr_task);
     if let Some(cgroup_name) = &ctx.cgroup_name {

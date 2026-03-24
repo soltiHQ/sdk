@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use prometheus::{CounterVec, HistogramVec, Opts, Registry, proto::MetricFamily};
 
-use solti_core::{MetricsBackend, TaskOutcome};
+use solti_core::{MetricsBackend, RunnerType, TaskOutcome};
 
 /// Prometheus metrics backend for solti runners.
 ///
@@ -119,8 +119,10 @@ impl PrometheusMetrics {
 
 impl MetricsBackend for PrometheusMetrics {
     /// Increments `solti_runner_tasks_started_total{runner=<runner_type>}`.
-    fn record_task_started(&self, runner_type: &str) {
-        self.tasks_started.with_label_values(&[runner_type]).inc();
+    fn record_task_started(&self, runner_type: RunnerType) {
+        self.tasks_started
+            .with_label_values(&[runner_type.as_label()])
+            .inc();
     }
 
     /// Records a task completion event.
@@ -130,16 +132,22 @@ impl MetricsBackend for PrometheusMetrics {
     /// - `solti_runner_task_duration_seconds{runner, outcome}` - observes the duration converted from milliseconds to seconds.
     ///
     /// The `outcome` label is derived from [`TaskOutcome::as_label`]: `success` | `failure` | `canceled` | `timeout`.
-    fn record_task_completed(&self, runner_type: &str, outcome: TaskOutcome, duration_ms: u64) {
+    fn record_task_completed(
+        &self,
+        runner_type: RunnerType,
+        outcome: TaskOutcome,
+        duration_ms: u64,
+    ) {
+        let runner = runner_type.as_label();
         let label = outcome.as_label();
 
         self.tasks_completed
-            .with_label_values(&[runner_type, label])
+            .with_label_values(&[runner, label])
             .inc();
 
         let duration_seconds = duration_ms as f64 / 1000.0;
         self.tasks_duration
-            .with_label_values(&[runner_type, label])
+            .with_label_values(&[runner, label])
             .observe(duration_seconds);
     }
 
@@ -147,9 +155,9 @@ impl MetricsBackend for PrometheusMetrics {
     ///
     /// Called for runner setup/teardown errors (e.g. spawn failures), **not** for task-level failures
     /// which go through [`record_task_completed`](MetricsBackend::record_task_completed).
-    fn record_runner_error(&self, runner_type: &str, error_kind: &str) {
+    fn record_runner_error(&self, runner_type: RunnerType, error_kind: &str) {
         self.runner_errors
-            .with_label_values(&[runner_type, error_kind])
+            .with_label_values(&[runner_type.as_label(), error_kind])
             .inc();
     }
 }
@@ -167,9 +175,9 @@ mod tests {
     fn record_task_started_increments_counter() {
         let metrics = PrometheusMetrics::new().unwrap();
 
-        metrics.record_task_started("subprocess");
-        metrics.record_task_started("subprocess");
-        metrics.record_task_started("wasm");
+        metrics.record_task_started(RunnerType::Subprocess);
+        metrics.record_task_started(RunnerType::Subprocess);
+        metrics.record_task_started(RunnerType::Wasm);
 
         let families = metrics.gather();
         let started = families
@@ -184,8 +192,8 @@ mod tests {
     fn record_task_completed_increments_counter_and_histogram() {
         let metrics = PrometheusMetrics::new().unwrap();
 
-        metrics.record_task_completed("subprocess", TaskOutcome::Success, 150);
-        metrics.record_task_completed("subprocess", TaskOutcome::Failure, 50);
+        metrics.record_task_completed(RunnerType::Subprocess, TaskOutcome::Success, 150);
+        metrics.record_task_completed(RunnerType::Subprocess, TaskOutcome::Failure, 50);
 
         let families = metrics.gather();
 
@@ -206,9 +214,9 @@ mod tests {
     fn record_runner_error_increments_counter() {
         let metrics = PrometheusMetrics::new().unwrap();
 
-        metrics.record_runner_error("subprocess", "spawn_failed");
-        metrics.record_runner_error("subprocess", "spawn_failed");
-        metrics.record_runner_error("wasm", "module_load_failed");
+        metrics.record_runner_error(RunnerType::Subprocess, "spawn_failed");
+        metrics.record_runner_error(RunnerType::Subprocess, "spawn_failed");
+        metrics.record_runner_error(RunnerType::Wasm, "module_load_failed");
 
         let families = metrics.gather();
         let errors = families
@@ -224,7 +232,7 @@ mod tests {
         let registry = Arc::new(Registry::new());
         let metrics = PrometheusMetrics::new_with_registry(registry.clone()).unwrap();
 
-        metrics.record_task_started("test");
+        metrics.record_task_started(RunnerType::Subprocess);
         assert!(!registry.gather().is_empty());
     }
 }
