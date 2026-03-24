@@ -183,11 +183,9 @@ pub fn attach_security(cmd: &mut Command, config: &SecurityConfig) {
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    use super::SecurityConfig;
-    use crate::utils::{
-        LinuxCapability,
-        log::{pre_exec_log, pre_exec_log_errno},
-    };
+    use super::{KeepMask, SecurityConfig};
+
+    use crate::utils::log::{pre_exec_log, pre_exec_log_errno};
     use std::io;
     use tokio::process::Command;
 
@@ -218,12 +216,11 @@ mod linux_impl {
         // The closure captures only Copy types (three bools + [u32; 2]): zero heap allocation.
         unsafe {
             cmd.pre_exec(move || {
-                if drop_all_caps {
-                    if let Err(e) = drop_capabilities_batch(keep_mask) {
-                        if fail_on_cap_error {
-                            return Err(e);
-                        }
-                    }
+                if drop_all_caps
+                    && let Err(e) = drop_capabilities_batch(keep_mask)
+                    && fail_on_cap_error
+                {
+                    return Err(e);
                 }
                 if no_new_privs {
                     apply_no_new_privs()?;
@@ -347,35 +344,40 @@ mod linux_impl {
         fn capset(hdrp: *mut CapUserHeader, datap: *const CapUserData) -> libc::c_int;
         fn capget(hdrp: *mut CapUserHeader, datap: *mut CapUserData) -> libc::c_int;
     }
+}
 
-    #[derive(Clone, Copy)]
-    struct KeepMask {
-        /// bits[0] covers caps 0..31, bits[1] covers caps 32..63.
-        bits: [u32; 2],
+/// Bitmask of Linux capabilities to keep after a bulk drop.
+///
+/// Layout mirrors the kernel v3 capability format: two `u32` words covering caps 0..31 and 32..63 respectively.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct KeepMask {
+    /// `bits[0]` covers caps 0..31, `bits[1]` covers caps 32..63.
+    bits: [u32; 2],
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl KeepMask {
+    /// Build a keep-mask from a slice of capabilities.
+    fn from_caps(caps: &[LinuxCapability]) -> Self {
+        let mut bits = [0u32; 2];
+        for cap in caps {
+            let v = cap.to_cap_value();
+            let idx = (v / 32) as usize;
+            if idx < 2 {
+                bits[idx] |= 1u32 << (v % 32);
+            }
+        }
+        Self { bits }
     }
 
-    impl KeepMask {
-        /// Build a keep-mask from a slice of capabilities.
-        /// Called once before fork — safe to iterate a slice here.
-        fn from_caps(caps: &[LinuxCapability]) -> Self {
-            let mut bits = [0u32; 2];
-            for cap in caps {
-                let v = cap.to_cap_value();
-                let idx = (v / 32) as usize;
-                if idx < 2 {
-                    bits[idx] |= 1u32 << (v % 32);
-                }
-            }
-            Self { bits }
+    /// Returns `true` if the given capability number is set in the mask.
+    fn is_set(self, cap: u32) -> bool {
+        let idx = (cap / 32) as usize;
+        if idx >= 2 {
+            return false;
         }
-
-        fn is_set(self, cap: u32) -> bool {
-            let idx = (cap / 32) as usize;
-            if idx >= 2 {
-                return false;
-            }
-            (self.bits[idx] & (1u32 << (cap % 32))) != 0
-        }
+        (self.bits[idx] & (1u32 << (cap % 32))) != 0
     }
 }
 
@@ -445,5 +447,65 @@ mod tests {
         let result = cmd.status().await;
         assert!(result.is_ok(), "no_new_privs should work without root");
         assert!(result.unwrap().success());
+    }
+
+    #[test]
+    fn keep_mask_empty_caps_all_zero() {
+        let m = KeepMask::from_caps(&[]);
+        assert_eq!(m.bits, [0, 0]);
+        for cap in 0..=63 {
+            assert!(!m.is_set(cap), "cap {cap} should not be set");
+        }
+    }
+
+    #[test]
+    fn keep_mask_single_low_cap() {
+        let m = KeepMask::from_caps(&[LinuxCapability::Chown]);
+        assert!(m.is_set(0));
+        assert!(!m.is_set(1));
+        assert_eq!(m.bits[0], 1);
+        assert_eq!(m.bits[1], 0);
+    }
+
+    #[test]
+    fn keep_mask_cap_in_second_word() {
+        let m = KeepMask::from_caps(&[LinuxCapability::SetFCap, LinuxCapability::SysPtrace]);
+        assert!(m.is_set(31));
+        assert!(m.is_set(19));
+        assert!(!m.is_set(0));
+        assert_eq!(m.bits[1], 0)
+    }
+
+    #[test]
+    fn keep_mask_multiple_caps() {
+        let caps = [
+            LinuxCapability::Chown,          // 0
+            LinuxCapability::NetBindService, // 10
+            LinuxCapability::NetAdmin,       // 12
+            LinuxCapability::SysAdmin,       // 21
+        ];
+        let m = KeepMask::from_caps(&caps);
+        assert!(m.is_set(0));
+        assert!(m.is_set(10));
+        assert!(m.is_set(12));
+        assert!(m.is_set(21));
+        assert!(!m.is_set(1));
+        assert!(!m.is_set(11));
+        assert!(!m.is_set(63));
+    }
+
+    #[test]
+    fn keep_mask_duplicate_caps_idempotent() {
+        let m1 = KeepMask::from_caps(&[LinuxCapability::Kill]);
+        let m2 = KeepMask::from_caps(&[LinuxCapability::Kill, LinuxCapability::Kill]);
+        assert_eq!(m1.bits, m2.bits);
+    }
+
+    #[test]
+    fn keep_mask_out_of_range_returns_false() {
+        let m = KeepMask::from_caps(&[LinuxCapability::Chown]);
+        assert!(!m.is_set(64));
+        assert!(!m.is_set(100));
+        assert!(!m.is_set(u32::MAX));
     }
 }

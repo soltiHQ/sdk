@@ -85,7 +85,9 @@ impl LinuxCapability {
     }
 
     /// Numeric value as in `<linux/capability.h>`.
-    #[cfg(target_os = "linux")]
+    ///
+    /// Platform-independent so that `KeepMask` can be unit-tested on any OS.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn to_cap_value(self) -> u32 {
         match self {
             Self::Chown => 0,           // CAP_CHOWN
