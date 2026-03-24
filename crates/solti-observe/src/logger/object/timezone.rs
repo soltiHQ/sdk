@@ -1,8 +1,6 @@
-use std::{
-    fmt,
-    str::FromStr,
-    sync::{OnceLock, RwLock},
-};
+use std::{fmt, str::FromStr, sync::OnceLock};
+
+use parking_lot::RwLock;
 
 use serde::{Deserialize, Serialize};
 use time::UtcOffset;
@@ -91,7 +89,7 @@ impl fmt::Display for LoggerTimeZone {
 ///
 /// ## Behaviour
 ///
-/// - Caches the detected offset in a global `RwLock<UtcOffset>`.
+/// - Caches the detected offset in a global `parking_lot::RwLock<UtcOffset>`.
 /// - Falls back to UTC silently if detection fails.
 /// - Idempotent - safe to call multiple times; only the first call
 ///   triggers detection.
@@ -115,9 +113,7 @@ impl fmt::Display for LoggerTimeZone {
 /// ```
 pub fn init_local_offset() {
     let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
-    if let Ok(mut guard) = LOCAL_OFFSET.write() {
-        *guard = offset;
-    }
+    *LOCAL_OFFSET.write() = offset;
     let _ = INIT_DONE.set(());
 }
 
@@ -127,10 +123,7 @@ pub fn init_local_offset() {
 pub(crate) fn sync_local_offset() -> Result<(), LoggerError> {
     match UtcOffset::current_local_offset() {
         Ok(new_offset) => {
-            let Ok(mut guard) = LOCAL_OFFSET.write() else {
-                return Ok(());
-            };
-
+            let mut guard = LOCAL_OFFSET.write();
             let old_offset = *guard;
             if old_offset != new_offset {
                 *guard = new_offset;
@@ -156,9 +149,7 @@ pub(crate) fn sync_local_offset() -> Result<(), LoggerError> {
 pub(crate) fn get_or_detect_local_offset() -> UtcOffset {
     INIT_DONE.get_or_init(|| match UtcOffset::current_local_offset() {
         Ok(detected) => {
-            if let Ok(mut guard) = LOCAL_OFFSET.write() {
-                *guard = detected;
-            }
+            *LOCAL_OFFSET.write() = detected;
         }
         Err(_) => {
             eprintln!(
@@ -169,10 +160,7 @@ pub(crate) fn get_or_detect_local_offset() -> UtcOffset {
         }
     });
 
-    LOCAL_OFFSET
-        .read()
-        .map(|guard| *guard)
-        .unwrap_or(UtcOffset::UTC)
+    *LOCAL_OFFSET.read()
 }
 
 /// Formats offset as `UTC±HH` or `UTC±HH:MM`.

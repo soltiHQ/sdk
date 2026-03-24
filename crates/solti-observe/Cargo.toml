@@ -15,6 +15,7 @@ serde = { workspace = true, features = ["derive"] }
 tracing-journald = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+parking_lot = { workspace = true }
 
 taskvisor = { workspace = true, optional = true, features = ["controller"] }
 solti-model = { path = "../solti-model", optional = true }
