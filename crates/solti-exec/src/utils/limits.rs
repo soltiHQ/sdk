@@ -1,10 +1,98 @@
-//! POSIX rlimit-based resource limits for subprocess-based runners.
+//! # Limits: POSIX rlimit-based resource limits for subprocess runners.
 //!
-//! ## Overview
+//! [`RlimitConfig`] applies classic POSIX process limits to child processes spawned by subprocess runners.
 //!
-//! This module provides API for configuring classic POSIX process limits (`rlimit`) to child processes created via `tokio::process::Command`.
-//! - On **Unix platforms** limits are applied inside a `pre_exec` hook, executed in the child process after `fork()` and immediately before `execve()`.
-//! - On **non-Unix platforms**, rlimits are ignored: a warning is emitted and the call returns `Ok(())`.
+//! **Unix:**
+//! - Limits are applied inside a `pre_exec` hook (between `fork()` and `execve()`)
+//! - Each limit uses `getrlimit` → clamp → `setrlimit` (two syscalls)
+//! - Hard limit is never touched — only the soft limit is lowered/raised within bounds
+//! - Zero heap allocation in the child (closure captures only `Copy` types)
+//!
+//! **Other platforms:** `tracing::warn` and no-op.
+//!
+//! ## What happens when a subprocess spawns
+//! ```text
+//!                        parent process
+//!                             │
+//!                           fork()
+//!                             │
+//!          ┌──────────────────┼───────────────────┐
+//!          │            child process             │
+//!          │                                      │
+//!          │  ┌── pre_exec hook ───────────────┐  │
+//!          │  │  for each configured limit:    │  │
+//!          │  │    1. getrlimit(resource)      │  │
+//!          │  │    2. clamp value ≤ hard limit │  │
+//!          │  │    3. setrlimit(soft, hard)    │  │
+//!          │  └────────────────────────────────┘  │
+//!          │                                      │
+//!          │  execve("echo", ["hello"])           │
+//!          │  (runs with restricted limits)       │
+//!          └──────────────────────────────────────┘
+//! ```
+//!
+//! ## How attach_rlimits works
+//! ```text
+//! attach_rlimits(&mut cmd, &config)
+//!     ├──► config.is_empty()? → return early, no hook
+//!     │
+//!     ├──► Unix:
+//!     │     └──► install pre_exec closure on Command
+//!     │           └──► captures: 2 × Option<u64> + 1 × bool (all Copy)
+//!     │
+//!     │           pre_exec:
+//!     │           ├──► max_open_files → apply_rlimit(NOFILE, value)
+//!     │           ├──► max_file_size_bytes → apply_rlimit(FSIZE, value)
+//!     │           └──► disable_core_dumps → apply_rlimit(CORE, 0)
+//!     │
+//!     └──► non-Unix:
+//!           └──► warn!("rlimits ignored on {os}")
+//! ```
+//!
+//! ## apply_rlimit: soft limit clamping
+//! ```text
+//! apply_rlimit(resource, requested_value)
+//!     │
+//!     ├──► getrlimit() → read current { soft, hard }
+//!     │
+//!     ├──► hard == INFINITY?
+//!     │     └──► new_soft = requested (no ceiling)
+//!     │
+//!     ├──► requested > hard?
+//!     │     └──► new_soft = hard (clamp — can't exceed hard without root)
+//!     │
+//!     ├──► requested ≤ hard?
+//!     │     └──► new_soft = requested
+//!     │
+//!     └──► setrlimit(new_soft, hard)  ← hard is NEVER modified
+//! ```
+//!
+//! ## Configuration
+//!
+//! | Field                  | Resource        | If it fails      |
+//! |------------------------|-----------------|------------------|
+//! | `max_open_files`       | `RLIMIT_NOFILE` | **aborts spawn** |
+//! | `max_file_size_bytes`  | `RLIMIT_FSIZE`  | **aborts spawn** |
+//! | `disable_core_dumps`   | `RLIMIT_CORE`   | **aborts spawn** |
+//!
+//! ## Async-signal safety
+//!
+//! Everything inside the `pre_exec` closure runs **between `fork()` and `execve()`**.
+//!
+//! | What we call                 | Why it's safe                              |
+//! |------------------------------|--------------------------------------------|
+//! | `getrlimit()` / `setrlimit()`| direct syscalls                            |
+//! | `libc::write(STDERR)`        | async-signal-safe per POSIX                |
+//! | `io::Error::last_os_error()` | reads `errno`, no heap (Rust ≥ 1.74)       |
+//!
+//! The closure captures **only `Copy` types** (2 × `Option<u64>` + 1 × `bool`).
+//!
+//! ## Rules
+//! - Requested value exceeding hard limit is **silently clamped** (not an error)
+//! - Non-Unix: all knobs are no-op, warning emitted via `tracing::warn`
+//! - All rlimit failures are **fatal** (return `Err`, aborting spawn)
+//! - Hard limit is **never modified** — only the soft limit changes
+//! - `RlimitConfig::is_empty()` → no hook installed, zero overhead
 use tokio::process::Command;
 
 #[cfg(not(unix))]
@@ -70,23 +158,20 @@ mod unix_impl {
 
     use tokio::process::Command;
 
+    /// Caller (`attach_rlimits`) already checked `!config.is_empty()`.
     pub fn attach_rlimits(cmd: &mut Command, config: &RlimitConfig) {
-        if config.is_empty() {
-            return;
-        }
-
         let max_file_size_bytes = config.max_file_size_bytes;
-        let max_open_files = config.max_open_files;
         let disable_core_dumps = config.disable_core_dumps;
+        let max_open_files = config.max_open_files;
 
-        // SAFETY: The pre_exec closure runs between fork() and execve() in the child process.
-        // It only calls setrlimit/getrlimit (async-signal-safe syscalls) and pre_exec_log
-        // (raw libc::write to stderr). Error paths use io::Error::last_os_error() which
-        // stores errno inline without heap allocation (Rust >= 1.74).
+        // SAFETY:
+        // The pre_exec closure runs between fork() and execve() in the child process.
+        // It only calls setrlimit/getrlimit (async-signal-safe syscalls) and pre_exec_log (raw libc::write to stderr).
+        // Error paths use io::Error::last_os_error() which stores errno inline without heap allocation (Rust >= 1.74).
         unsafe {
             cmd.pre_exec(move || {
                 if let Some(nofile) = max_open_files
-                    && let Err(e) = apply_rlimit(rlimit_nofile(), nofile)
+                    && let Err(e) = apply_rlimit(NOFILE, nofile)
                 {
                     pre_exec_log(b"solti-exec: failed to set RLIMIT_NOFILE: ");
                     if let Some(code) = e.raw_os_error() {
@@ -95,7 +180,7 @@ mod unix_impl {
                     return Err(e);
                 }
                 if let Some(fsize) = max_file_size_bytes
-                    && let Err(e) = apply_rlimit(rlimit_fsize(), fsize)
+                    && let Err(e) = apply_rlimit(FSIZE, fsize)
                 {
                     pre_exec_log(b"solti-exec: failed to set RLIMIT_FSIZE: ");
                     if let Some(code) = e.raw_os_error() {
@@ -103,7 +188,7 @@ mod unix_impl {
                     }
                     return Err(e);
                 }
-                if disable_core_dumps && let Err(e) = apply_rlimit(rlimit_core(), 0) {
+                if disable_core_dumps && let Err(e) = apply_rlimit(CORE, 0) {
                     pre_exec_log(b"solti-exec: failed to set RLIMIT_CORE: ");
                     if let Some(code) = e.raw_os_error() {
                         pre_exec_log_errno(code);
@@ -115,86 +200,56 @@ mod unix_impl {
         }
     }
 
-    macro_rules! rlimit_resource {
-        ($fn_name:ident, $constant:ident) => {
-            #[inline]
-            fn $fn_name() -> libc::c_int {
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                {
-                    libc::$constant as libc::c_int
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                {
-                    libc::$constant
-                }
-            }
-        };
-    }
+    /// Resource type accepted by `getrlimit`/`setrlimit`.
+    ///
+    /// On Linux/Android it's `__rlimit_resource_t` (enum), elsewhere `c_int`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    type RlimitResource = libc::__rlimit_resource_t;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    type RlimitResource = libc::c_int;
 
-    rlimit_resource!(rlimit_nofile, RLIMIT_NOFILE);
-    rlimit_resource!(rlimit_fsize, RLIMIT_FSIZE);
-    rlimit_resource!(rlimit_core, RLIMIT_CORE);
+    const NOFILE: RlimitResource = libc::RLIMIT_NOFILE as RlimitResource;
+    const FSIZE: RlimitResource = libc::RLIMIT_FSIZE as RlimitResource;
+    const CORE: RlimitResource = libc::RLIMIT_CORE as RlimitResource;
 
-    /// Apply rlimit, preserving the hard limit if it's already higher.
-    fn apply_rlimit(resource: libc::c_int, value: u64) -> io::Result<()> {
-        let max_rlim = libc::rlim_t::MAX;
-        if value > max_rlim {
-            pre_exec_log(b"solti-exec: rlimit value exceeds platform maximum\n");
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
-        }
+    /// Apply rlimit: set the soft limit to `value`, keep the hard limit unchanged.
+    ///
+    /// If `value` exceeds the current hard limit (and hard != INFINITY), the soft limit is clamped to the hard limit
+    /// an unprivileged process cannot raise its own hard limit.
+    fn apply_rlimit(resource: RlimitResource, value: u64) -> io::Result<()> {
         let mut current = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
         };
-        // SAFETY: `current` is a valid stack-local rlimit struct, passed by pointer.
-        if unsafe { getrlimit_compat(resource, &mut current) } != 0 {
+
+        // SAFETY:
+        // `current` is a valid stack-local rlimit struct, passed by pointer.
+        if unsafe { libc::getrlimit(resource, &mut current) } != 0 {
             return Err(io::Error::last_os_error());
         }
 
-        let new_soft = value as libc::rlim_t;
-        let new_hard = if current.rlim_max == libc::RLIM_INFINITY {
-            libc::RLIM_INFINITY
-        } else if current.rlim_max > new_soft {
+        let requested = value as libc::rlim_t;
+
+        // Clamp to hard limit: unprivileged processes cannot raise it.
+        let new_soft = if current.rlim_max == libc::RLIM_INFINITY {
+            requested
+        } else if requested > current.rlim_max {
             current.rlim_max
         } else {
-            new_soft
-        };
-        let rlim = libc::rlimit {
-            rlim_cur: new_soft,
-            rlim_max: new_hard,
+            requested
         };
 
-        // SAFETY: `rlim` is a valid stack-local rlimit struct, passed by pointer.
-        if unsafe { setrlimit_compat(resource, &rlim) } != 0 {
+        let rlim = libc::rlimit {
+            rlim_cur: new_soft,
+            rlim_max: current.rlim_max,
+        };
+
+        // SAFETY:
+        // `rlim` is a valid stack-local rlimit struct, passed by pointer.
+        if unsafe { libc::setrlimit(resource, &rlim) } != 0 {
             Err(io::Error::last_os_error())
         } else {
             Ok(())
-        }
-    }
-
-    /// Compatibility shim for getrlimit.
-    #[inline]
-    unsafe fn getrlimit_compat(resource: libc::c_int, rlim: *mut libc::rlimit) -> libc::c_int {
-        #[cfg(target_os = "linux")]
-        {
-            unsafe { libc::getrlimit(resource as libc::__rlimit_resource_t, rlim) }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            unsafe { libc::getrlimit(resource, rlim) }
-        }
-    }
-
-    /// Compatibility shim for setrlimit.
-    #[inline]
-    unsafe fn setrlimit_compat(resource: libc::c_int, rlim: *const libc::rlimit) -> libc::c_int {
-        #[cfg(target_os = "linux")]
-        {
-            unsafe { libc::setrlimit(resource as libc::__rlimit_resource_t, rlim) }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            unsafe { libc::setrlimit(resource, rlim) }
         }
     }
 }
