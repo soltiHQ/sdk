@@ -59,16 +59,16 @@ pub fn to_backoff_policy(s: &ModelBackoffPolicy) -> BackoffPolicy {
 pub fn to_task_spec(task: TaskRef, s: &ModelTaskSpec) -> TaskSpec {
     TaskSpec::new(
         task,
-        to_restart_policy(s.restart),
-        to_backoff_policy(&s.backoff),
-        Some(Duration::from_millis(s.timeout.as_millis())),
+        to_restart_policy(s.restart()),
+        to_backoff_policy(s.backoff()),
+        Some(Duration::from_millis(s.timeout().as_millis())),
     )
 }
 
 /// Build a `ControllerSpec` from a public `ModelTaskSpec`.
 pub fn to_controller_spec(task: TaskRef, s: &ModelTaskSpec) -> ControllerSpec {
     ControllerSpec {
-        admission: to_admission_policy(s.admission),
+        admission: to_admission_policy(s.admission()),
         task_spec: to_task_spec(task, s),
     }
 }

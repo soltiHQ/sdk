@@ -93,18 +93,18 @@ impl RunnerRouter {
     /// Build a [`TaskRef`] for the given spec using the selected runner.
     ///
     /// `TaskKind::Embedded` is not routable and must be used with [`SupervisorApi::submit_with_task`](crate::supervisor::SupervisorApi::submit_with_task).
-    #[instrument(level = "debug", skip(self, spec), fields(kind = ?spec.kind))]
+    #[instrument(level = "debug", skip(self, spec), fields(kind = ?spec.kind()))]
     pub fn build(&self, spec: &TaskSpec) -> Result<TaskRef, CoreError> {
         trace!(spec = ?spec, "router received spec");
 
-        if matches!(spec.kind, TaskKind::Embedded) {
+        if matches!(spec.kind(), TaskKind::Embedded) {
             return Err(CoreError::NoRunner(
                 "TaskKind::Embedded requires submit_with_task()".to_string(),
             ));
         }
         let r = self
             .pick(spec)
-            .ok_or_else(|| CoreError::NoRunner(spec.kind.kind().to_string()))?;
+            .ok_or_else(|| CoreError::NoRunner(spec.kind().kind().to_string()))?;
 
         let task = r.build_task(spec, &self.ctx).map_err(CoreError::from)?;
         debug!(runner = r.name(), "runner built task successfully");
@@ -125,8 +125,8 @@ mod tests {
     use crate::runner::RunnerError;
 
     use solti_model::{
-        AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, RunnerSelector,
-        TaskEnv,
+        AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RunnerSelector, SubprocessMode,
+        SubprocessSpec, TaskEnv, WasmSpec,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -141,7 +141,7 @@ mod tests {
         }
 
         fn supports(&self, spec: &TaskSpec) -> bool {
-            matches!(spec.kind, TaskKind::Subprocess { .. })
+            matches!(spec.kind(), TaskKind::Subprocess(_))
         }
 
         fn build_task(
@@ -167,16 +167,11 @@ mod tests {
     }
 
     fn mk_spec(kind: TaskKind) -> TaskSpec {
-        TaskSpec {
-            slot: "test-slot".into(),
-            kind,
-            timeout: 10_000_u64.into(),
-            restart: RestartPolicy::default(),
-            backoff: mk_backoff(),
-            admission: AdmissionPolicy::DropIfRunning,
-            runner_selector: None,
-            labels: Labels::default(),
-        }
+        TaskSpec::builder("test-slot", kind, 10_000_u64)
+            .backoff(mk_backoff())
+            .admission(AdmissionPolicy::DropIfRunning)
+            .build()
+            .expect("valid spec")
     }
 
     #[test]
@@ -203,13 +198,15 @@ mod tests {
         let mut router = RunnerRouter::new();
         router.register(Arc::new(SubprocessRunnerDummy));
 
-        let spec = mk_spec(TaskKind::Subprocess {
-            command: "echo".to_string(),
-            args: vec!["hello".into()],
+        let spec = mk_spec(TaskKind::Subprocess(SubprocessSpec {
+            mode: SubprocessMode::Command {
+                command: "echo".to_string(),
+                args: vec!["hello".into()],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::default(),
-        });
+        }));
 
         let res = router.build(&spec);
 
@@ -224,11 +221,11 @@ mod tests {
         let mut router = RunnerRouter::new();
         router.register(Arc::new(SubprocessRunnerDummy));
 
-        let spec = mk_spec(TaskKind::Wasm {
+        let spec = mk_spec(TaskKind::Wasm(WasmSpec {
             module: PathBuf::from("mod.wasm"),
             args: Vec::new(),
             env: TaskEnv::default(),
-        });
+        }));
 
         let res = router.build(&spec);
 
@@ -298,13 +295,15 @@ mod tests {
         router.register_with_labels(Arc::new(R2), labels_r2);
 
         let spec = {
-            let base = mk_spec(TaskKind::Subprocess {
-                command: "echo".into(),
-                args: vec!["hi".into()],
+            let base = mk_spec(TaskKind::Subprocess(SubprocessSpec {
+                mode: SubprocessMode::Command {
+                    command: "echo".into(),
+                    args: vec!["hi".into()],
+                },
                 env: TaskEnv::default(),
                 cwd: None,
                 fail_on_non_zero: Flag::enabled(),
-            });
+            }));
             base.with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
                 "runner-name".into(),
                 "runner-b".into(),

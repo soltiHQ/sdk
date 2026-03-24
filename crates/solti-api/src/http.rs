@@ -92,7 +92,7 @@ async fn submit_task<H>(
 where
     H: ApiHandler,
 {
-    debug!(slot = %req.spec.slot, kind = ?req.spec.kind, "submitting task");
+    debug!(slot = %req.spec.slot(), kind = ?req.spec.kind(), "submitting task");
     let task_id = handler.submit_task(req.spec).await?;
 
     let response = SubmitTaskResponse {

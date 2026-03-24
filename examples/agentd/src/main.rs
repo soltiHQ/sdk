@@ -17,8 +17,7 @@ use solti_observe::{
 use std::collections::BTreeMap;
 
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RestartPolicy, RunnerSelector,
-    TaskEnv, TaskKind, TaskSpec,
+    Flag, RunnerSelector, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec,
 };
 
 #[tokio::main(flavor = "multi_thread")]
@@ -59,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
             }),
             memory: Some(256 * 1024 * 1024), // 256 MB
             pids: Some(64),                  // max 64 processes
+            ..Default::default()
         });
     register_subprocess_runner_with_backend(&mut router, "prod-runner", prod_backend)?;
     info!("registered prod-runner (moderate restrictions)");
@@ -75,14 +75,15 @@ async fn main() -> anyhow::Result<()> {
                 quota: Some(25_000),
                 period: 100_000,
             }),
-
             memory: Some(64 * 1024 * 1024),
             pids: Some(16),
+            ..Default::default()
         })
         .with_security(SecurityConfig {
             drop_all_caps: true,
             keep_caps: vec![LinuxCapability::NetBindService],
             no_new_privs: true, // CRITICAL  untrusted code
+            ..Default::default()
         });
     register_subprocess_runner_with_backend(&mut router, "untrusted-runner", untrusted_backend)?;
     info!("registered untrusted-runner (MAXIMUM security)");
@@ -102,115 +103,91 @@ async fn main() -> anyhow::Result<()> {
     info!("submitted timezone-sync task: {}", tz_id);
 
     // 6a) Dev runner
-    let ls_spec = TaskSpec {
-        slot: "dev-ls-tmp".into(),
-        kind: TaskKind::Subprocess {
-            command: "ls".into(),
-            args: vec!["-lah".into(), "/tmp".into()],
+    let ls_spec = TaskSpec::builder(
+        "dev-ls-tmp",
+        TaskKind::Subprocess(SubprocessSpec {
+            mode: SubprocessMode::Command {
+                command: "ls".into(),
+                args: vec!["-lah".into(), "/tmp".into()],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
-        },
-        timeout: 5_000_u64.into(),
-        restart: RestartPolicy::Never,
-        backoff: BackoffPolicy {
-            jitter: JitterPolicy::None,
-            first_ms: 0,
-            max_ms: 0,
-            factor: 1.0,
-        },
-        admission: AdmissionPolicy::DropIfRunning,
-        runner_selector: None,
-        labels: Labels::default(),
-    }
-    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
+        }),
+        5_000_u64,
+    )
+    .runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
         "runner-name".into(),
         "dev-runner".into(),
-    )])));
+    )])))
+    .build()
+    .unwrap();
 
     // 6b) Production runner
-    let date_spec = TaskSpec {
-        slot: "prod-date".into(),
-        kind: TaskKind::Subprocess {
-            command: "date".into(),
-            args: vec!["+%Y-%m-%d %H:%M:%S".into()],
+    let date_spec = TaskSpec::builder(
+        "prod-date",
+        TaskKind::Subprocess(SubprocessSpec {
+            mode: SubprocessMode::Command {
+                command: "date".into(),
+                args: vec!["+%Y-%m-%d %H:%M:%S".into()],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
-        },
-        timeout: 5_000_u64.into(),
-        restart: RestartPolicy::Never,
-        backoff: BackoffPolicy {
-            jitter: JitterPolicy::None,
-            first_ms: 0,
-            max_ms: 0,
-            factor: 1.0,
-        },
-        admission: AdmissionPolicy::DropIfRunning,
-        runner_selector: None,
-        labels: Labels::default(),
-    }
-    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
+        }),
+        5_000_u64,
+    )
+    .runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
         "runner-name".into(),
         "prod-runner".into(),
-    )])));
+    )])))
+    .build()
+    .unwrap();
 
     // 6c) Untrusted runner
-    let sleep_spec = TaskSpec {
-        slot: "untrusted-sleep".into(),
-        kind: TaskKind::Subprocess {
-            command: "sleep".into(),
-            args: vec!["2".into()],
+    let sleep_spec = TaskSpec::builder(
+        "untrusted-sleep",
+        TaskKind::Subprocess(SubprocessSpec {
+            mode: SubprocessMode::Command {
+                command: "sleep".into(),
+                args: vec!["2".into()],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::enabled(),
-        },
-        timeout: 5_000_u64.into(),
-        restart: RestartPolicy::Never,
-        backoff: BackoffPolicy {
-            jitter: JitterPolicy::None,
-            first_ms: 0,
-            max_ms: 0,
-            factor: 1.0,
-        },
-        admission: AdmissionPolicy::DropIfRunning,
-        runner_selector: None,
-        labels: Labels::default(),
-    }
-    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
+        }),
+        5_000_u64,
+    )
+    .runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
         "runner-name".into(),
         "untrusted-runner".into(),
-    )])));
+    )])))
+    .build()
+    .unwrap();
 
     // 6d) Untrusted runner
-    let stress_spec = TaskSpec {
-        slot: "untrusted-stress".into(),
-        kind: TaskKind::Subprocess {
-            command: "sh".into(),
-            args: vec![
-                "-c".into(),
-                "for i in $(seq 1 100); do sleep 1 & done; wait".into(),
-            ],
+    let stress_spec = TaskSpec::builder(
+        "untrusted-stress",
+        TaskKind::Subprocess(SubprocessSpec {
+            mode: SubprocessMode::Command {
+                command: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "for i in $(seq 1 100); do sleep 1 & done; wait".into(),
+                ],
+            },
             env: TaskEnv::default(),
             cwd: None,
             fail_on_non_zero: Flag::disabled(),
-        },
-        timeout: 5_000_u64.into(),
-        restart: RestartPolicy::Never,
-        backoff: BackoffPolicy {
-            jitter: JitterPolicy::None,
-            first_ms: 0,
-            max_ms: 0,
-            factor: 1.0,
-        },
-        admission: AdmissionPolicy::DropIfRunning,
-        runner_selector: None,
-        labels: Labels::default(),
-    }
-    .with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
+        }),
+        5_000_u64,
+    )
+    .runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
         "runner-name".into(),
         "untrusted-runner".into(),
-    )])));
+    )])))
+    .build()
+    .unwrap();
 
     // Submit tasks
     info!("submitting tasks...");

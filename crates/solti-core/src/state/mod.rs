@@ -36,7 +36,7 @@ impl TaskState {
     pub fn add_task(&self, id: TaskId, spec: TaskSpec) {
         let mut inner = self.inner.write().unwrap();
 
-        let slot = spec.slot.clone();
+        let slot = spec.slot().clone();
         let task = Task::new(id.clone(), spec);
 
         inner.by_slot.entry(slot).or_default().push(id.clone());
@@ -176,19 +176,12 @@ impl Default for TaskState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solti_model::{AdmissionPolicy, BackoffPolicy, Labels, RestartPolicy, TaskKind};
+    use solti_model::TaskKind;
 
     fn default_spec_with_slot(slot: &str) -> TaskSpec {
-        TaskSpec {
-            slot: slot.into(),
-            kind: TaskKind::Embedded,
-            timeout: 5_000_u64.into(),
-            restart: RestartPolicy::default(),
-            backoff: BackoffPolicy::default(),
-            admission: AdmissionPolicy::default(),
-            runner_selector: None,
-            labels: Labels::new(),
-        }
+        TaskSpec::builder(slot, TaskKind::Embedded, 5_000_u64)
+            .build()
+            .expect("valid spec")
     }
 
     fn default_spec() -> TaskSpec {
