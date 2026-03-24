@@ -1,3 +1,51 @@
+//! # Runner: subprocess execution engine.
+//!
+//! [`SubprocessRunner`] implements the [`Runner`](solti_core::Runner) trait to execute
+//! [`TaskKind::Subprocess`](solti_model::TaskKind::Subprocess) tasks as OS processes.
+//!
+//! ## How it works
+//! ```text
+//! SubprocessRunner::build_task(spec, ctx)
+//!     │
+//!     ├──► build_task_config(spec, ctx)
+//!     │     ├──► match TaskKind::Subprocess(SubprocessSpec { .. })
+//!     │     ├──► resolve_mode(mode) → (command, args)
+//!     │     │     ├──► Command { command, args } → clone
+//!     │     │     └──► Script { runtime, body }  → decode base64 → (runtime, [flag, script, ...])
+//!     │     ├──► merge_env(task_env, runner_env)  → BTreeMap
+//!     │     └──► SubprocessTaskConfig { run_id, command, args, env, cwd, fail_on_non_zero }
+//!     │
+//!     ├──► prepare backend (cgroup dirs, if configured)
+//!     │
+//!     ├──► build Arc<TaskExecContext>
+//!     │     └──► { task_cfg, runner_cfg, cgroup_name, metrics, log_cfg }
+//!     │
+//!     └──► return TaskFn closure → run_subprocess(ctx, cancel)
+//! ```
+//!
+//! ## Subprocess execution lifecycle
+//! ```text
+//! run_subprocess(ctx, cancel)
+//!     │
+//!     ├──► metrics.record_task_started()
+//!     ├──► prepare_backend() → create cgroup dirs
+//!     ├──► build_command() → Command with args, env, cwd, piped stdout/stderr
+//!     ├──► apply_backend() → install pre_exec hooks (rlimits, cgroup join, security)
+//!     ├──► cmd.spawn()
+//!     │
+//!     ├──► tokio::spawn(log_stream(stdout, Stdout))
+//!     ├──► tokio::spawn(log_stream(stderr, Stderr))
+//!     │
+//!     ├──► select!
+//!     │     ├──► child.wait() → evaluate_exit(status)
+//!     │     └──► cancel.cancelled() → child.kill()
+//!     │
+//!     ├──► metrics.record_task_completed(outcome, duration)
+//!     ├──► join!(stdout_task, stderr_task)
+//!     ├──► cleanup_cgroup() (if configured)
+//!     └──► return result
+//! ```
+
 use std::{
     process::Stdio,
     sync::Arc,
@@ -99,6 +147,7 @@ impl SubprocessRunner {
                     .map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
 
                 let (cmd, flag) = runtime.resolve();
+
                 let mut full_args = Vec::with_capacity(2 + args.len());
                 full_args.push(flag.to_string());
                 full_args.push(script);
@@ -192,6 +241,7 @@ fn build_command(ctx: &TaskExecContext) -> Command {
 fn prepare_backend(ctx: &TaskExecContext) -> Result<(), TaskError> {
     if let Some(backend_cfg) = &ctx.runner_cfg {
         let cgroup_name_ref = ctx.cgroup_name.as_deref().unwrap_or(&ctx.task_cfg.run_id);
+
         if let Err(e) = backend_cfg.prepare_cgroups(cgroup_name_ref) {
             ctx.metrics
                 .record_runner_error(RunnerType::Subprocess, "cgroup_prepare_failed");
@@ -207,6 +257,7 @@ fn prepare_backend(ctx: &TaskExecContext) -> Result<(), TaskError> {
 fn apply_backend(cmd: &mut Command, ctx: &TaskExecContext) -> Result<(), TaskError> {
     if let Some(backend_cfg) = &ctx.runner_cfg {
         let cgroup_name_ref = ctx.cgroup_name.as_deref().unwrap_or(&ctx.task_cfg.run_id);
+
         if let Err(e) = backend_cfg.apply_to_command(cmd, cgroup_name_ref) {
             ctx.metrics
                 .record_runner_error(RunnerType::Subprocess, "backend_config_failed");
