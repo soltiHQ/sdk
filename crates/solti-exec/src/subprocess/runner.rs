@@ -386,7 +386,7 @@ mod tests {
     fn mk_subprocess_spec(slot: &str, command: &str) -> TaskSpec {
         TaskSpec::builder(
             slot,
-            TaskKind::Subprocess(solti_model::SubprocessSpec {
+            TaskKind::Subprocess(SubprocessSpec {
                 mode: solti_model::SubprocessMode::Command {
                     command: command.into(),
                     args: vec![],
