@@ -1,10 +1,125 @@
-//! Basic security hardening for subprocess-based runners.
+//! # Security: process-level hardening for subprocess runners.
 //!
-//! ## Overview
+//! [`SecurityConfig`] restricts the privilege set of child processes spawned by subprocess runners.
 //!
-//! This module provides API for configuring process-level security to child processes created via `tokio::process::Command`.
-//! - On **Linux platforms** security settings are applied inside a `pre_exec` hook.
-//! - On **non-Linux platforms**, limits are ignored: a warning is emitted and the call returns `Ok(())`.
+//! **Linux:**
+//! - Drop all process capabilities in one batch (`capget` → mask → `capset`)
+//! - Zero heap allocation in the child (closure captures only `Copy` types)
+//! - Raise kept caps in the ambient set for unprivileged `execve`
+//! - Keep an optional allowlist of caps via [`LinuxCapability`]
+//! - Set `no_new_privs` to block suid/sgid escalation
+//!
+//! **Other platforms:**
+//! - `tracing::warn` and no-op.
+//!
+//! ## What happens when a subprocess spawns
+//! ```text
+//!                        parent process
+//!                             │
+//!                           fork()
+//!                             │
+//!          ┌──────────────────┼───────────────────┐
+//!          │            child process             │
+//!          │                                      │
+//!          │  ┌── pre_exec hook ───────────────┐  │
+//!          │  │  1. clear ambient caps         │  │
+//!          │  │  2. capget current caps        │  │
+//!          │  │  3. mask &= keep_mask          │  │
+//!          │  │  4. capset (one syscall)       │  │
+//!          │  │  5. raise kept in ambient      │  │
+//!          │  │  6. set no_new_privs           │  │
+//!          │  └────────────────────────────────┘  │
+//!          │                                      │
+//!          │  execve("echo", ["hello"])           │
+//!          │  (runs with minimal caps)            │
+//!          └──────────────────────────────────────┘
+//! ```
+//!
+//! ## How attach_security works
+//! ```text
+//! attach_security(&mut cmd, &config)
+//!     ├──► config.is_empty()? → return early, no hook
+//!     │
+//!     ├──► Linux:
+//!     │     ├──► build KeepMask from config.keep_caps
+//!     │     │     └──► Vec<LinuxCapability> → [u32; 2] bitmask (Copy, stack-only)
+//!     │     │
+//!     │     └──► install pre_exec closure on Command
+//!     │           └──► captures: drop_all_caps (bool), no_new_privs (bool), keep_mask ([u32; 2])
+//!     │                zero heap: all Copy types
+//!     │
+//!     └──► non-Linux:
+//!           └──► warn!("security settings ignored on {os}") → Ok(())
+//! ```
+//!
+//! ## Capability drop: step by step
+//! ```text
+//! drop_capabilities_batch(keep_mask)
+//!     │
+//!     ├──► prctl(PR_CAP_AMBIENT, CLEAR_ALL)
+//!     │     └──► EINVAL? kernel < 4.3, no ambient — Ok, continue
+//!     │
+//!     ├──► capget() → read current caps into CapUserData[2]
+//!     │    ┌────────────────────────────────────────────────┐
+//!     │    │  before mask             after mask            │
+//!     │    │  effective:  1111        effective:  0010      │
+//!     │    │  permitted:  1111        permitted:  0010      │
+//!     │    │  inheritable:1111        inheritable:0010      │
+//!     │    │                                                │
+//!     │    │  keep_mask = 0010 (only CAP_NET_BIND_SERVICE)  │
+//!     │    └────────────────────────────────────────────────┘
+//!     │
+//!     ├──► capset() ← one syscall writes all caps
+//!     │
+//!     └──► for each cap set in keep_mask:
+//!           └──► prctl(PR_CAP_AMBIENT, RAISE, cap)
+//!                EINVAL | EPERM → Ok (best-effort, older kernel or no permission)
+//! ```
+//!
+//! ## KeepMask layout
+//! ```text
+//! Linux capability v3 format: CapUserData[2] = 2 × u32 = 64 bits
+//!
+//!   bits[0]                          bits[1]
+//!   ┌─────────────────────────────┐  ┌─────────────────────────────┐
+//!   │ cap 0  cap 1 ... cap 31     │  │ cap 32  cap 33 ... cap 63   │
+//!   └─────────────────────────────┘  └─────────────────────────────┘
+//!
+//!   CAP_LAST_CAP = 63 — this is NOT a guess, it's the v3 ABI limit.
+//!   If kernel ever adds cap > 63, that requires a v4 format with
+//!   new structs and new syscall signatures — this whole module
+//!   would need updating anyway.
+//! ```
+//!
+//! ## Configuration
+//!
+//! | Field           | What it does                          | Needs privileges? | If it fails          |
+//! |-----------------|---------------------------------------|-------------------|----------------------|
+//! | `drop_all_caps` | strip all caps except `keep_caps`     | `CAP_SETPCAP`     | logs warning, go on  |
+//! | `keep_caps`     | allowlist: caps to preserve           | `CAP_SETPCAP`     | logs warning, go on  |
+//! | `no_new_privs`  | block suid/sgid privilege escalation  | none (any user)   | **aborts spawn**     |
+//!
+//! ## Async-signal safety
+//!
+//! Everything inside the `pre_exec` closure runs **between `fork()` and `execve()`**.
+//! POSIX says only async-signal-safe functions are allowed there.
+//!
+//! | What we call                 | Why it's safe                              |
+//! |------------------------------|--------------------------------------------|
+//! | `prctl()`                    | direct syscall                             |
+//! | `capget()` / `capset()`      | direct syscalls                            |
+//! | `libc::write(STDERR)`        | async-signal-safe per POSIX                |
+//! | `io::Error::last_os_error()` | reads `errno`, no heap (Rust ≥ 1.74)       |
+//!
+//! The closure captures **only `Copy` types** (2 bools + `[u32; 2]`).
+//! No `Vec`, no `String`, no `Arc`: zero heap allocation in the child.
+//!
+//! ## Rules
+//! - Capability drop failures are **non-fatal** (logged via `pre_exec_log`, continues)
+//! - Non-Linux: all knobs are no-op, warning emitted via `tracing::warn`
+//! - `KeepMask` is built **before** fork (safe to iterate `Vec<LinuxCapability>`)
+//! - `no_new_privs` failure is **fatal** (returns `Err`, `Command::spawn` fails)
+//! - `SecurityConfig::is_empty()` → no hook installed, zero overhead
 use tokio::process::Command;
 
 use crate::utils::LinuxCapability;
@@ -54,7 +169,7 @@ pub fn attach_security(cmd: &mut Command, config: &SecurityConfig) {
         let _ = &cmd;
         warn!(
             ?config,
-            "security configuration is only enforced on Linux; current OS={} – settings will be ignored",
+            "security configuration is only enforced on Linux; current OS={}: settings will be ignored",
             std::env::consts::OS,
         );
     }
@@ -67,9 +182,7 @@ mod linux_impl {
         LinuxCapability,
         log::{pre_exec_log, pre_exec_log_errno},
     };
-
     use std::io;
-
     use tokio::process::Command;
 
     const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
@@ -77,6 +190,8 @@ mod linux_impl {
     const PR_CAP_AMBIENT_RAISE: libc::c_ulong = 2;
     const PR_CAP_AMBIENT_CLEAR_ALL: libc::c_ulong = 4;
     const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
+    /// Upper bound of capability v3 bitmask: `CapUserData[2]` = 2 × 32 = 64 bits → caps 0..63.
+    /// This is a kernel ABI limit, not a guess. A v4 format would require new structs + syscall signatures.
     const CAP_LAST_CAP: u32 = 63;
 
     pub fn attach(cmd: &mut Command, config: &SecurityConfig) {
@@ -84,18 +199,20 @@ mod linux_impl {
             return;
         }
 
-        // Pre-compute a stack-local bitmask from keep_caps Vec — avoids cloning the Vec
-        // into the closure (which would heap-allocate between closure creation and fork).
+        let keep_mask = KeepMask::from_caps(&config.keep_caps);
         let drop_all_caps = config.drop_all_caps;
         let no_new_privs = config.no_new_privs;
-        let keep_mask = KeepMask::from_caps(&config.keep_caps);
 
-        // SAFETY: The pre_exec closure runs between fork() and execve() in the child process.
-        // It calls prctl, capget/capset (async-signal-safe syscalls) and pre_exec_log
-        // (raw libc::write). Error paths use io::Error::last_os_error() which stores errno
-        // inline without heap allocation (Rust >= 1.74). Capability drop failures are non-fatal
-        // (logged and continued); no_new_privs failure is fatal (returns Err, aborting spawn).
-        // The closure captures only Copy types (two bools + [u32; 2]) — zero heap allocation.
+        // SAFETY:
+        // The pre_exec closure runs between fork() and execve() in the child process.
+        //
+        // It calls prctl, capget/capset (async-signal-safe syscalls) and pre_exec_log (raw libc::write).
+        // Error paths use io::Error::last_os_error() which stores errno inline without heap allocation (Rust >= 1.74).
+        //
+        // Capability drop failures are non-fatal (logged and continued);
+        // no_new_privs failure is fatal (returns Err, aborting spawn).
+        //
+        // The closure captures only Copy types (two bools + [u32; 2]): zero heap allocation.
         unsafe {
             cmd.pre_exec(move || {
                 if drop_all_caps && let Err(e) = drop_capabilities_batch(keep_mask) {
@@ -113,10 +230,6 @@ mod linux_impl {
     }
 
     /// Drop all capabilities except those in `keep_mask`, using batch capget/capset.
-    ///
-    /// This performs exactly 1 capget + 1 capset + 1 prctl (clear ambient),
-    /// plus optional ambient raises for kept caps — instead of the previous
-    /// O(CAP_LAST_CAP × 3) individual syscall pairs.
     fn drop_capabilities_batch(keep_mask: KeepMask) -> io::Result<()> {
         clear_ambient_caps()?;
 
@@ -126,13 +239,13 @@ mod linux_impl {
         };
         let mut data = [CapUserData::default(); 2];
 
-        // SAFETY: header and data are valid stack-local #[repr(C)] structs matching
-        // the kernel's __user_cap_header_struct / __user_cap_data_struct layout.
+        // SAFETY:
+        // Header and data are valid stack-local #[repr(C)] structs matching the kernel's
+        // __user_cap_header_struct / __user_cap_data_struct layout.
         if unsafe { capget(&mut header, data.as_mut_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
 
-        // Apply keep_mask: clear all bits not in the mask for all three sets.
         data[0].effective &= keep_mask.bits[0];
         data[0].permitted &= keep_mask.bits[0];
         data[0].inheritable &= keep_mask.bits[0];
@@ -140,12 +253,13 @@ mod linux_impl {
         data[1].permitted &= keep_mask.bits[1];
         data[1].inheritable &= keep_mask.bits[1];
 
-        // SAFETY: Same structs, modified in-place. Single capset writes the new state.
+        // SAFETY:
+        // Same structs, modified in-place.
+        // Single capset writes the new state.
         if unsafe { capset(&mut header, data.as_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
 
-        // Raise kept caps in ambient set (best-effort, may fail on older kernels).
         for cap_value in 0..=CAP_LAST_CAP {
             if keep_mask.is_set(cap_value) {
                 let _ = raise_ambient_cap(cap_value);
@@ -164,12 +278,12 @@ mod linux_impl {
                 return Err(err);
             }
         }
+
         Ok(())
     }
 
     /// Raise a capability in the ambient set.
     ///
-    /// Returns `Ok(())` even if the operation fails.
     /// Failures can happen on:
     /// - Kernel < 4.3 (no ambient caps support)
     /// - Cap not in permitted+inheritable
@@ -210,12 +324,10 @@ mod linux_impl {
     }
 
     unsafe extern "C" {
-        fn capget(hdrp: *mut CapUserHeader, datap: *mut CapUserData) -> libc::c_int;
         fn capset(hdrp: *mut CapUserHeader, datap: *const CapUserData) -> libc::c_int;
+        fn capget(hdrp: *mut CapUserHeader, datap: *mut CapUserData) -> libc::c_int;
     }
 
-    /// Stack-only bitmask matching the kernel's capability v3 layout ([u32; 2]).
-    /// Captures the keep-list without heap allocation (no Vec clone).
     #[derive(Clone, Copy)]
     struct KeepMask {
         /// bits[0] covers caps 0..31, bits[1] covers caps 32..63.
