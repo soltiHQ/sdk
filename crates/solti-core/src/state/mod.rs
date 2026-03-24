@@ -150,8 +150,9 @@ impl TaskState {
 
         // Collect refs that pass all filters - we need total count
         // and then paginate, so we must know the full filtered set size.
-        // We avoid cloning here by collecting references first.
-        let filtered: Vec<&Task> = iter.collect();
+        // Sort by task ID for deterministic pagination across calls.
+        let mut filtered: Vec<&Task> = iter.collect();
+        filtered.sort_by(|a, b| a.metadata.id.cmp(&b.metadata.id));
         let total = filtered.len();
 
         // Slice-based paginatior - O(1) index vs O(offset) iterator skip.
