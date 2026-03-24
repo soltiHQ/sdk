@@ -82,8 +82,7 @@ impl RunnerRouter {
         self.runners
             .iter()
             .find(|entry| {
-                entry.runner.supports(spec)
-                    && selector.is_none_or(|sel| sel.matches(&entry.labels))
+                entry.runner.supports(spec) && selector.is_none_or(|sel| sel.matches(&entry.labels))
             })
             .map(|entry| &entry.runner)
     }
