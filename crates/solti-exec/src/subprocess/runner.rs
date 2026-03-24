@@ -13,7 +13,7 @@
 //!     │     │     ├──► Command { command, args } → clone
 //!     │     │     └──► Script { runtime, body }  → decode base64 → (runtime, [flag, script, ...])
 //!     │     ├──► merge_env(task_env, runner_env)  → BTreeMap
-//!     │     └──► SubprocessTaskConfig { run_id, command, args, env, cwd, fail_on_non_zero }
+//!     │     └──► SubprocessTaskConfig { run_id, seq, command, args, env, cwd, fail_on_non_zero }
 //!     │
 //!     ├──► prepare backend (cgroup dirs, if configured)
 //!     │
@@ -112,8 +112,10 @@ impl SubprocessRunner {
                 fail_on_non_zero,
             }) => {
                 let (command, args) = Self::resolve_mode(mode)?;
+                let run_id = self.build_run_id(slot.as_str());
                 SubprocessTaskConfig {
-                    run_id: Arc::from(self.build_run_id(slot.as_str())),
+                    run_id: Arc::from(run_id.name),
+                    seq: run_id.seq,
                     command,
                     args,
                     env: merge_env(env, ctx.env()),
@@ -186,7 +188,7 @@ impl Runner for SubprocessRunner {
                 crate::utils::build_cgroup_name(
                     self.name,
                     spec.slot().as_str(),
-                    extract_seq_from_run_id(&task_cfg.run_id),
+                    task_cfg.seq,
                     timestamp,
                 )
             })
@@ -368,33 +370,9 @@ async fn run_subprocess(
     result
 }
 
-/// Extract sequence number from run_id.
-fn extract_seq_from_run_id(run_id: &str) -> u64 {
-    run_id
-        .rsplit('-')
-        .next()
-        .and_then(|s| u64::from_str_radix(s, 16).ok())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extract_seq_from_run_id_valid() {
-        assert_eq!(extract_seq_from_run_id("runner-slot-ff"), 255);
-    }
-
-    #[test]
-    fn extract_seq_from_run_id_no_hex() {
-        assert_eq!(extract_seq_from_run_id("no-hex-zzz"), 0);
-    }
-
-    #[test]
-    fn extract_seq_from_run_id_empty() {
-        assert_eq!(extract_seq_from_run_id(""), 0);
-    }
 
     fn mk_backoff() -> solti_model::BackoffPolicy {
         solti_model::BackoffPolicy {
@@ -438,6 +416,7 @@ mod tests {
     fn make_task_cfg() -> SubprocessTaskConfig {
         SubprocessTaskConfig {
             run_id: Arc::from("test-run-1"),
+            seq: 1,
             command: "echo".into(),
             args: vec!["hello".into()],
             env: Default::default(),

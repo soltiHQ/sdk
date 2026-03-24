@@ -81,13 +81,11 @@ impl RunnerRouter {
 
         self.runners
             .iter()
-            .filter(|entry| entry.runner.supports(spec))
-            .filter(move |entry| match selector {
-                Some(sel) => sel.matches(&entry.labels),
-                None => true,
+            .find(|entry| {
+                entry.runner.supports(spec)
+                    && selector.is_none_or(|sel| sel.matches(&entry.labels))
             })
             .map(|entry| &entry.runner)
-            .next()
     }
 
     /// Build a [`TaskRef`] for the given spec using the selected runner.

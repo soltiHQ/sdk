@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use taskvisor::{Event, EventKind, Subscribe};
-use tracing::{trace, warn};
+use tracing::trace;
 
 use super::TaskState;
 use solti_model::{TaskId, TaskPhase};

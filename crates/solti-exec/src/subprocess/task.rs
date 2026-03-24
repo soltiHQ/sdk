@@ -39,6 +39,8 @@ use crate::ExecError;
 pub struct SubprocessTaskConfig {
     /// End-to-End log identifier.
     pub(crate) run_id: Arc<str>,
+    /// Raw sequence number from run id generation (used for cgroup naming).
+    pub(crate) seq: u64,
     /// Command to execute (e.g. `"ls"`, `"/usr/bin/python"`).
     pub(crate) command: String,
     /// Command-line arguments passed to the command.

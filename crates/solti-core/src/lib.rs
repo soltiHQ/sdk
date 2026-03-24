@@ -11,8 +11,7 @@ mod router;
 pub use router::RunnerRouter;
 
 mod runner;
-pub use runner::make_run_id;
-pub use runner::{BuildContext, Runner, RunnerError};
+pub use runner::{BuildContext, RunId, Runner, RunnerError, make_run_id};
 
 pub mod supervisor;
 pub use supervisor::SupervisorApi;

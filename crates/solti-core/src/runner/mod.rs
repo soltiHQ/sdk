@@ -8,7 +8,7 @@ mod context;
 pub use context::BuildContext;
 
 mod id;
-pub use id::make_run_id;
+pub use id::{RunId, make_run_id};
 
 use solti_model::TaskSpec;
 use taskvisor::TaskRef;
@@ -35,7 +35,7 @@ pub trait Runner: Send + Sync {
     ///
     /// Runners may override this if they need custom id format,
     /// otherwise the core helper is used.
-    fn build_run_id(&self, slot: &str) -> String {
+    fn build_run_id(&self, slot: &str) -> RunId {
         make_run_id(self.name(), slot)
     }
 }
