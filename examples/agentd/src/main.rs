@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
             drop_all_caps: true,
             keep_caps: vec![LinuxCapability::NetBindService],
             no_new_privs: true, // CRITICAL  untrusted code
+            ..Default::default()
         });
     register_subprocess_runner_with_backend(&mut router, "untrusted-runner", untrusted_backend)?;
     info!("registered untrusted-runner (MAXIMUM security)");

@@ -93,11 +93,12 @@
 //!
 //! ## Configuration
 //!
-//! | Field           | What it does                          | Needs privileges? | If it fails          |
-//! |-----------------|---------------------------------------|-------------------|----------------------|
-//! | `drop_all_caps` | strip all caps except `keep_caps`     | `CAP_SETPCAP`     | logs warning, go on  |
-//! | `keep_caps`     | allowlist: caps to preserve           | `CAP_SETPCAP`     | logs warning, go on  |
-//! | `no_new_privs`  | block suid/sgid privilege escalation  | none (any user)   | **aborts spawn**     |
+//! | Field               | What it does                          | Needs privileges? | If it fails                                    |
+//! |---------------------|---------------------------------------|-------------------|------------------------------------------------|
+//! | `drop_all_caps`     | strip all caps except `keep_caps`     | `CAP_SETPCAP`     | logs warning, go on (or abort if strict)       |
+//! | `keep_caps`         | allowlist: caps to preserve           | `CAP_SETPCAP`     | logs warning, go on (or abort if strict)       |
+//! | `fail_on_cap_error` | strict mode: abort spawn on cap error | —                 | —                                              |
+//! | `no_new_privs`      | block suid/sgid privilege escalation  | none (any user)   | **always aborts spawn**                        |
 //!
 //! ## Async-signal safety
 //!
@@ -115,10 +116,11 @@
 //! No `Vec`, no `String`, no `Arc`: zero heap allocation in the child.
 //!
 //! ## Rules
-//! - Capability drop failures are **non-fatal** (logged via `pre_exec_log`, continues)
+//! - Capability drop failures are **non-fatal** by default (logged via `pre_exec_log`, continues)
+//! - Set `fail_on_cap_error = true` to make capability drop failures **fatal** (aborts spawn)
 //! - Non-Linux: all knobs are no-op, warning emitted via `tracing::warn`
+//! - `no_new_privs` failure is **always fatal** (returns `Err`, `Command::spawn` fails)
 //! - `KeepMask` is built **before** fork (safe to iterate `Vec<LinuxCapability>`)
-//! - `no_new_privs` failure is **fatal** (returns `Err`, `Command::spawn` fails)
 //! - `SecurityConfig::is_empty()` → no hook installed, zero overhead
 use tokio::process::Command;
 
@@ -133,7 +135,7 @@ pub struct SecurityConfig {
     /// Drop all capabilities before exec.
     ///
     /// Note: capability operations require CAP_SETPCAP or root.
-    /// If the process lacks these privileges, the operation will log a warning and continue (non-fatal).
+    /// If the process lacks these privileges, the operation will log a warning and continue (unless `fail_on_cap_error` is set).
     pub drop_all_caps: bool,
     /// Optional allowlist of capabilities to keep after `drop_all_caps`.
     ///
@@ -142,8 +144,12 @@ pub struct SecurityConfig {
     /// Enable `no_new_privs` for the child process.
     ///
     /// This flag works without root privileges.
-    /// Failures to set this flag are fatal (spawn will fail).
+    /// Failures to set this flag are always fatal (spawn will fail).
     pub no_new_privs: bool,
+    /// When `true`, capability drop failures abort the spawn instead of logging and continuing.
+    ///
+    /// Default: `false` (best-effort — non-fatal).
+    pub fail_on_cap_error: bool,
 }
 
 impl SecurityConfig {
@@ -194,12 +200,12 @@ mod linux_impl {
     /// This is a kernel ABI limit, not a guess. A v4 format would require new structs + syscall signatures.
     const CAP_LAST_CAP: u32 = 63;
 
+    /// Install the `pre_exec` hook on the command.
+    ///
+    /// Caller (`attach_security`) already checked `!config.is_empty()`.
     pub fn attach(cmd: &mut Command, config: &SecurityConfig) {
-        if config.is_empty() {
-            return;
-        }
-
         let keep_mask = KeepMask::from_caps(&config.keep_caps);
+        let fail_on_cap_error = config.fail_on_cap_error;
         let drop_all_caps = config.drop_all_caps;
         let no_new_privs = config.no_new_privs;
 
@@ -209,16 +215,14 @@ mod linux_impl {
         // It calls prctl, capget/capset (async-signal-safe syscalls) and pre_exec_log (raw libc::write).
         // Error paths use io::Error::last_os_error() which stores errno inline without heap allocation (Rust >= 1.74).
         //
-        // Capability drop failures are non-fatal (logged and continued);
-        // no_new_privs failure is fatal (returns Err, aborting spawn).
-        //
-        // The closure captures only Copy types (two bools + [u32; 2]): zero heap allocation.
+        // The closure captures only Copy types (three bools + [u32; 2]): zero heap allocation.
         unsafe {
             cmd.pre_exec(move || {
-                if drop_all_caps && let Err(e) = drop_capabilities_batch(keep_mask) {
-                    pre_exec_log(b"solti-exec: failed to drop capabilities (continuing): ");
-                    if let Some(code) = e.raw_os_error() {
-                        pre_exec_log_errno(code);
+                if drop_all_caps {
+                    if let Err(e) = drop_capabilities_batch(keep_mask) {
+                        if fail_on_cap_error {
+                            return Err(e);
+                        }
                     }
                 }
                 if no_new_privs {
@@ -230,8 +234,16 @@ mod linux_impl {
     }
 
     /// Drop all capabilities except those in `keep_mask`, using batch capget/capset.
+    ///
+    /// Each step logs a distinct prefix on failure so the operator can tell which syscall failed (clear_ambient / capget / capset).
     fn drop_capabilities_batch(keep_mask: KeepMask) -> io::Result<()> {
-        clear_ambient_caps()?;
+        if let Err(e) = clear_ambient_caps() {
+            pre_exec_log(b"solti-exec: clear_ambient_caps failed: ");
+            if let Some(code) = e.raw_os_error() {
+                pre_exec_log_errno(code);
+            }
+            return Err(e);
+        }
 
         let mut header = CapUserHeader {
             version: LINUX_CAPABILITY_VERSION_3,
@@ -243,7 +255,12 @@ mod linux_impl {
         // Header and data are valid stack-local #[repr(C)] structs matching the kernel's
         // __user_cap_header_struct / __user_cap_data_struct layout.
         if unsafe { capget(&mut header, data.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            pre_exec_log(b"solti-exec: capget failed: ");
+            if let Some(code) = e.raw_os_error() {
+                pre_exec_log_errno(code);
+            }
+            return Err(e);
         }
 
         data[0].effective &= keep_mask.bits[0];
@@ -257,7 +274,12 @@ mod linux_impl {
         // Same structs, modified in-place.
         // Single capset writes the new state.
         if unsafe { capset(&mut header, data.as_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            pre_exec_log(b"solti-exec: capset failed: ");
+            if let Some(code) = e.raw_os_error() {
+                pre_exec_log_errno(code);
+            }
+            return Err(e);
         }
 
         for cap_value in 0..=CAP_LAST_CAP {
@@ -282,12 +304,10 @@ mod linux_impl {
         Ok(())
     }
 
-    /// Raise a capability in the ambient set.
+    /// Raise a capability in the ambient set (best-effort).
     ///
-    /// Failures can happen on:
-    /// - Kernel < 4.3 (no ambient caps support)
-    /// - Cap not in permitted+inheritable
-    /// - EPERM if lacking CAP_SETPCAP
+    /// Returns `Ok(())` for `EINVAL` and `EPERM` (expected on older kernels or when lacking `CAP_SETPCAP`).
+    /// Other errors propagate, but the caller ignores the result with `let _ =`.
     fn raise_ambient_cap(cap: u32) -> io::Result<()> {
         let rc = unsafe { libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, cap, 0, 0) };
         if rc != 0 {
@@ -380,6 +400,7 @@ mod tests {
             drop_all_caps: true,
             keep_caps: vec![LinuxCapability::NetAdmin, LinuxCapability::NetBindService],
             no_new_privs: true,
+            ..Default::default()
         };
 
         assert!(!cfg.is_empty());
@@ -395,6 +416,7 @@ mod tests {
             drop_all_caps: true,
             keep_caps: vec![LinuxCapability::NetAdmin],
             no_new_privs: true,
+            ..Default::default()
         };
 
         assert!(!cfg.is_empty());
@@ -414,9 +436,8 @@ mod tests {
     #[tokio::test]
     async fn no_new_privs_can_be_set_without_root() {
         let cfg = SecurityConfig {
-            drop_all_caps: false,
-            keep_caps: vec![],
             no_new_privs: true,
+            ..Default::default()
         };
         let mut cmd = Command::new("true");
         attach_security(&mut cmd, &cfg);
