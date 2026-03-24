@@ -314,7 +314,7 @@ async fn run_subprocess(
 
     let _ = tokio::join!(stdout_task, stderr_task);
     if let Some(cgroup_name) = &ctx.cgroup_name {
-        let _ = crate::utils::cleanup_cgroup(cgroup_name);
+        crate::utils::cleanup_cgroup(cgroup_name);
     }
     result
 }

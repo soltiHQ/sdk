@@ -110,14 +110,13 @@ pub(crate) fn attach_cgroup(
     Ok(())
 }
 
-/// Attempt to remove a cgroup directory.
-/// Best-effort cgroup cleanup.
+/// Best-effort cgroup cleanup: attempt to remove the cgroup directory.
 ///
 /// Cgroup removal can fail for many reasons (permission denied, busy, not found,
 /// read-only cgroupfs in containers, etc.). All failures are logged and swallowed
 /// because the kernel auto-removes empty cgroups when all member processes exit.
 #[cfg(target_os = "linux")]
-pub fn cleanup_cgroup(cgroup_name: &str) -> Result<(), ExecError> {
+pub fn cleanup_cgroup(cgroup_name: &str) {
     use std::path::Path;
 
     let full_path = Path::new("/sys/fs/cgroup").join(cgroup_name);
@@ -138,13 +137,11 @@ pub fn cleanup_cgroup(cgroup_name: &str) -> Result<(), ExecError> {
             );
         }
     }
-    Ok(())
 }
 
+/// No-op on non-Linux platforms.
 #[cfg(not(target_os = "linux"))]
-pub fn cleanup_cgroup(_cgroup_name: &str) -> Result<(), ExecError> {
-    Ok(())
-}
+pub fn cleanup_cgroup(_cgroup_name: &str) {}
 
 /// Build a unique cgroup name from components.
 ///
@@ -199,23 +196,69 @@ mod linux_impl {
         Ok(true)
     }
 
+    /// Max path length for cgroup.procs:
+    /// `/sys/fs/cgroup/` (15) + cgroup_name + `/cgroup.procs` (13) + NUL (1).
+    const MAX_PROCS_PATH: usize = 256;
+
+    /// Stack-only buffer for the cgroup.procs path.
+    ///
+    /// `Copy` — safe to capture in `pre_exec` closures (no heap, no destructor).
+    #[derive(Clone, Copy)]
+    struct ProcsPath {
+        buf: [u8; MAX_PROCS_PATH],
+        len: usize, // includes NUL terminator
+    }
+
+    impl ProcsPath {
+        /// Build `/sys/fs/cgroup/{name}/cgroup.procs\0` into a stack buffer.
+        ///
+        /// Returns `None` if the path exceeds `MAX_PROCS_PATH`.
+        fn build(cgroup_name: &str) -> Option<Self> {
+            let total = CGROUP_ROOT.len() + 1 + cgroup_name.len() + CGROUP_PROCS_SUFFIX.len() + 1;
+            if total > MAX_PROCS_PATH {
+                return None;
+            }
+            let mut buf = [0u8; MAX_PROCS_PATH];
+            let mut pos = 0;
+            let parts: &[&[u8]] = &[
+                CGROUP_ROOT.as_bytes(),
+                b"/",
+                cgroup_name.as_bytes(),
+                CGROUP_PROCS_SUFFIX.as_bytes(),
+                b"\0",
+            ];
+            for part in parts {
+                buf[pos..pos + part.len()].copy_from_slice(part);
+                pos += part.len();
+            }
+            Some(Self { buf, len: pos })
+        }
+
+        /// Returns the null-terminated path as a byte slice.
+        fn as_bytes(&self) -> &[u8] {
+            &self.buf[..self.len]
+        }
+    }
+
     /// Phase 2: pre_exec hook that only writes the child PID to cgroup.procs.
     /// Uses raw libc syscalls — fully async-signal-safe.
     pub fn attach_join_hook(cmd: &mut Command, cgroup_name: &str, fail_on_error: bool) {
-        let mut procs_path = Vec::with_capacity(
-            CGROUP_ROOT.len() + 1 + cgroup_name.len() + CGROUP_PROCS_SUFFIX.len(),
-        );
-        procs_path.extend_from_slice(CGROUP_ROOT.as_bytes());
-        procs_path.push(b'/');
-        procs_path.extend_from_slice(cgroup_name.as_bytes());
-        procs_path.extend_from_slice(CGROUP_PROCS_SUFFIX.as_bytes());
-        procs_path.push(0); // null terminator for C
+        let procs_path = match ProcsPath::build(cgroup_name) {
+            Some(p) => p,
+            None => {
+                pre_exec_log(b"solti-exec: cgroup path exceeds 256 bytes, skipping join\n");
+                return;
+            }
+        };
 
         // SAFETY: The pre_exec closure runs between fork() and execve().
         // It uses only libc::open, libc::write, libc::close, libc::getpid —
-        // all async-signal-safe per POSIX. No heap allocation occurs.
+        // all async-signal-safe per POSIX.
+        //
+        // The closure captures only Copy types (ProcsPath: [u8; 256] + usize, bool):
+        // zero heap allocation in the child.
         unsafe {
-            cmd.pre_exec(move || join_cgroup_raw(&procs_path, fail_on_error));
+            cmd.pre_exec(move || join_cgroup_raw(procs_path.as_bytes(), fail_on_error));
         }
     }
 
@@ -260,60 +303,67 @@ mod linux_impl {
             )
         };
         if fd < 0 {
-            pre_exec_log(b"solti-exec: failed to open cgroup.procs\n");
-            let errno = unsafe { *libc::__errno_location() };
-            pre_exec_log_errno(errno);
-            return if fail_on_error {
-                Err(io::Error::from_raw_os_error(errno))
-            } else {
-                Ok(())
-            };
+            let e = io::Error::last_os_error();
+            pre_exec_log(b"solti-exec: failed to open cgroup.procs: ");
+            if let Some(code) = e.raw_os_error() {
+                pre_exec_log_errno(code);
+            }
+            return if fail_on_error { Err(e) } else { Ok(()) };
         }
 
         // Format PID into a stack buffer (no allocation).
         // SAFETY: getpid() is async-signal-safe, always succeeds.
         let pid = unsafe { libc::getpid() };
         let mut buf = [0u8; 24];
-        let pid_str = format_pid(pid, &mut buf);
+        let pid_str = super::format_pid(pid, &mut buf);
 
         // SAFETY: fd is a valid open file descriptor. pid_str is a valid byte slice.
         // libc::write is async-signal-safe per POSIX.
         let written =
             unsafe { libc::write(fd, pid_str.as_ptr() as *const libc::c_void, pid_str.len()) };
+
+        // Capture errno BEFORE close (close can clobber it).
+        let write_err = if written < 0 {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        };
+
         // SAFETY: libc::close is async-signal-safe.
         unsafe { libc::close(fd) };
 
-        if written < 0 {
-            pre_exec_log(b"solti-exec: failed to write PID to cgroup.procs\n");
-            let errno = unsafe { *libc::__errno_location() };
-            pre_exec_log_errno(errno);
-            return if fail_on_error {
-                Err(io::Error::from_raw_os_error(errno))
-            } else {
-                Ok(())
-            };
+        if let Some(e) = write_err {
+            pre_exec_log(b"solti-exec: failed to write PID to cgroup.procs: ");
+            if let Some(code) = e.raw_os_error() {
+                pre_exec_log_errno(code);
+            }
+            return if fail_on_error { Err(e) } else { Ok(()) };
         }
 
         Ok(())
     }
 
-    /// Format a PID into a stack buffer as `"<pid>\n"`. Returns the written slice.
-    fn format_pid(pid: libc::pid_t, buf: &mut [u8; 24]) -> &[u8] {
-        let mut n = pid as u32;
-        let mut idx = buf.len() - 1;
-        buf[idx] = b'\n';
-        if n == 0 {
+}
+
+/// Format a PID (positive `i32`) into a stack buffer as `"<pid>\n"`.
+///
+/// Returns the written slice. Pure arithmetic — no platform deps, testable everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn format_pid(pid: i32, buf: &mut [u8; 24]) -> &[u8] {
+    let mut n = pid as u32;
+    let mut idx = buf.len() - 1;
+    buf[idx] = b'\n';
+    if n == 0 {
+        idx -= 1;
+        buf[idx] = b'0';
+    } else {
+        while n > 0 {
             idx -= 1;
-            buf[idx] = b'0';
-        } else {
-            while n > 0 {
-                idx -= 1;
-                buf[idx] = b'0' + (n % 10) as u8;
-                n /= 10;
-            }
+            buf[idx] = b'0' + (n % 10) as u8;
+            n /= 10;
         }
-        &buf[idx..]
     }
+    &buf[idx..]
 }
 
 #[cfg(test)]
@@ -398,9 +448,47 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cleanup_nonexistent_cgroup_succeeds() {
+    fn cleanup_nonexistent_cgroup_does_not_panic() {
         let name = build_cgroup_name("test", "nonexistent", 999, 1733045913);
-        let r = cleanup_cgroup(&name);
-        assert!(r.is_ok(), "cleanup of nonexistent cgroup should succeed");
+        cleanup_cgroup(&name); // best-effort, should not panic
+    }
+
+    // ── format_pid unit tests (platform-independent) ────────────────
+
+    fn fmt_pid(pid: i32) -> String {
+        let mut buf = [0u8; 24];
+        let slice = format_pid(pid, &mut buf);
+        String::from_utf8_lossy(slice).into_owned()
+    }
+
+    #[test]
+    fn format_pid_one() {
+        assert_eq!(fmt_pid(1), "1\n");
+    }
+
+    #[test]
+    fn format_pid_single_digit() {
+        assert_eq!(fmt_pid(9), "9\n");
+    }
+
+    #[test]
+    fn format_pid_two_digits() {
+        assert_eq!(fmt_pid(10), "10\n");
+        assert_eq!(fmt_pid(99), "99\n");
+    }
+
+    #[test]
+    fn format_pid_typical() {
+        assert_eq!(fmt_pid(32768), "32768\n");
+    }
+
+    #[test]
+    fn format_pid_large() {
+        assert_eq!(fmt_pid(4_194_304), "4194304\n");
+    }
+
+    #[test]
+    fn format_pid_zero() {
+        assert_eq!(fmt_pid(0), "0\n");
     }
 }
