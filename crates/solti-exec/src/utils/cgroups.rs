@@ -1,10 +1,106 @@
-//! cgroup v2 resource limits for subprocess-based runners.
+//! # Cgroups: cgroup v2 resource limits for subprocess runners.
 //!
-//! ## Overview
+//! [`CgroupLimits`] applies cgroup v2 resource constraints (CPU, memory, PIDs) to child processes spawned by subprocess runners.
 //!
-//! This module exposes structured API for applying cgroup v2 limits to child processes created via `tokio::process::Command`.
-//! - On **Linux with cgroup v2**, limits are applied by creating a cgroup and placing the child PID via `pre_exec` hook.
-//! - On **non-Linux platforms**, limits are ignored: a warning is emitted and the call returns `Ok(())`.
+//! **Linux (cgroup v2):**
+//! - Zero heap allocation in the child (closure captures only `Copy` types)
+//! - Two-phase lifecycle: `prepare` (before fork) + `attach` (pre_exec hook)
+//! - Phase 1 creates a cgroup directory and writes limit files via `std::fs`
+//! - Phase 2 joins the child PID to the cgroup via raw libc syscalls
+//!
+//! **Other platforms:**
+//! - `tracing::warn` and no-op.
+//!
+//! ## Two-phase lifecycle
+//! ```text
+//!                      parent process (async context)
+//!                               │
+//!                  Phase 1: prepare_cgroup(name, limits)
+//!                               │
+//!                ├──► is_cgroup_v2? (check cgroup.controllers)
+//!                │     └──► no → warn + return Ok(false)
+//!                │
+//!                ├──► mkdir /sys/fs/cgroup/{name}
+//!                │
+//!                ├──► write limit files:
+//!                │     ├──► cpu.max    ← "50000 100000\n"
+//!                │     ├──► memory.max ← "134217728\n"
+//!                │     └──► pids.max   ← "32\n"
+//!                │
+//!                └──► return Ok(true)
+//!                               │
+//!              Phase 2: attach_cgroup(&mut cmd, name, limits)
+//!                               │
+//!                └──► install pre_exec closure
+//!                               │
+//!                             fork()
+//!                               │
+//!          ┌────────────────────┼────────────────────┐
+//!          │              child process              │
+//!          │                                         │
+//!          │  ┌── pre_exec hook ──────────────────┐  │
+//!          │  │  1. open /sys/fs/cgroup/{name}/   │  │
+//!          │  │         cgroup.procs              │  │
+//!          │  │  2. getpid() → format to stack buf│  │
+//!          │  │  3. write PID to fd               │  │
+//!          │  │  4. close fd                      │  │
+//!          │  └───────────────────────────────────┘  │
+//!          │                                         │
+//!          │  execve("echo", ["hello"])              │
+//!          │  (runs inside cgroup with limits)       │
+//!          └─────────────────────────────────────────┘
+//!                               │
+//! Cleanup: process exits → kernel auto-removes empty cgroup or explicit cleanup_cgroup(name)
+//! ```
+//!
+//! ## join_cgroup_raw: step by step
+//! ```text
+//! join_cgroup_raw(procs_path, fail_on_error)
+//!     │
+//!     ├──► libc::open(procs_path, O_WRONLY)
+//!     │     └──► fail? → log + Err if strict, Ok(()) if best-effort
+//!     │
+//!     ├──► libc::getpid() → format_pid(pid, &mut [u8; 24])
+//!     │     └──► stack-only int→ASCII, appends '\n'
+//!     │
+//!     ├──► libc::write(fd, pid_bytes)
+//!     │     └──► save errno BEFORE close (close can clobber it)
+//!     │
+//!     ├──► libc::close(fd)
+//!     │
+//!     └──► write failed? → log + Err if strict, Ok(()) if best-effort
+//! ```
+//!
+//! ## Configuration
+//!
+//! | Field           | cgroup file    | What it does                        | If it fails                     |
+//! |-----------------|----------------|-------------------------------------|---------------------------------|
+//! | `cpu`           | `cpu.max`      | quota/period CPU time window        | depends on `fail_on_error`      |
+//! | `memory`        | `memory.max`   | memory limit in bytes               | depends on `fail_on_error`      |
+//! | `pids`          | `pids.max`     | max number of processes             | depends on `fail_on_error`      |
+//! | `fail_on_error` | —              | strict mode: abort spawn on failure | —                               |
+//!
+//! ## Async-signal safety
+//!
+//! Phase 2 (`pre_exec` hook) runs **between `fork()` and `execve()`**.
+//!
+//! | What we call                 | Why it's safe                        |
+//! |------------------------------|--------------------------------------|
+//! | `libc::open()`               | async-signal-safe per POSIX          |
+//! | `libc::write()`              | async-signal-safe per POSIX          |
+//! | `libc::close()`              | async-signal-safe per POSIX          |
+//! | `libc::getpid()`             | async-signal-safe per POSIX          |
+//! | `io::Error::last_os_error()` | reads `errno`, no heap (Rust ≥ 1.74) |
+//!
+//! The closure captures **only `Copy` types** (`ProcsPath`: `[u8; 256]` + `usize`, + `bool`).
+//!
+//! ## Rules
+//! - Phase 1 (`prepare`) runs in normal async context — `std::fs` is safe
+//! - Phase 2 (`attach`) runs in `pre_exec` — only raw libc syscalls
+//! - Kernel auto-removes empty cgroups; `cleanup_cgroup` is best-effort convenience
+//! - `fail_on_error = false` (default): cgroup failures are **non-fatal** (best-effort)
+//! - `fail_on_error = true`: cgroup failures **abort spawn**
+//! - `CgroupLimits::is_empty()` → no cgroup created, zero overhead
 use tokio::process::Command;
 
 use crate::ExecError;
@@ -54,12 +150,8 @@ impl CgroupLimits {
 
 /// Prepare cgroup v2 limits: create cgroup directory and write limit files.
 ///
-/// This phase runs **before** subprocess spawn (in normal async context),
-/// so it can safely use `std::fs` operations.
-///
-/// Returns `Ok(true)` if the cgroup was created and limits applied (the command needs
-/// a `pre_exec` hook to join the cgroup). Returns `Ok(false)` if cgroups are unavailable
-/// or the platform is not Linux.
+/// Returns `Ok(true)` if the cgroup was created and limits applied (the command needs a `pre_exec` hook to join the cgroup).
+/// Returns `Ok(false)` if cgroups are unavailable or the platform is not Linux.
 ///
 /// # Cgroup lifecycle
 /// - Kernel auto-removes empty cgroups when all processes exit
@@ -86,8 +178,7 @@ pub(crate) fn prepare_cgroup(cgroup_name: &str, limits: &CgroupLimits) -> Result
 
 /// Attach cgroup v2 join hook to a `tokio::process::Command`.
 ///
-/// The `pre_exec` hook only writes the child PID to `cgroup.procs` using raw
-/// libc syscalls — fully async-signal-safe.
+/// The `pre_exec` hook only writes the child PID to `cgroup.procs` using raw libc syscalls — fully async-signal-safe.
 ///
 /// Must be called after [`prepare_cgroup`] succeeds with `Ok(true)`.
 pub(crate) fn attach_cgroup(
@@ -112,9 +203,8 @@ pub(crate) fn attach_cgroup(
 
 /// Best-effort cgroup cleanup: attempt to remove the cgroup directory.
 ///
-/// Cgroup removal can fail for many reasons (permission denied, busy, not found,
-/// read-only cgroupfs in containers, etc.). All failures are logged and swallowed
-/// because the kernel auto-removes empty cgroups when all member processes exit.
+/// Cgroup removal can fail for many reasons (permission denied, busy, not found, read-only cgroupfs in containers, etc.).
+/// All failures are logged and swallowed because the kernel auto-removes empty cgroups when all member processes exit.
 #[cfg(target_os = "linux")]
 pub fn cleanup_cgroup(cgroup_name: &str) {
     use std::path::Path;
@@ -201,12 +291,10 @@ mod linux_impl {
     const MAX_PROCS_PATH: usize = 256;
 
     /// Stack-only buffer for the cgroup.procs path.
-    ///
-    /// `Copy` — safe to capture in `pre_exec` closures (no heap, no destructor).
     #[derive(Clone, Copy)]
     struct ProcsPath {
         buf: [u8; MAX_PROCS_PATH],
-        len: usize, // includes NUL terminator
+        len: usize,
     }
 
     impl ProcsPath {
@@ -251,12 +339,11 @@ mod linux_impl {
             }
         };
 
-        // SAFETY: The pre_exec closure runs between fork() and execve().
-        // It uses only libc::open, libc::write, libc::close, libc::getpid —
-        // all async-signal-safe per POSIX.
+        // SAFETY:
+        // The pre_exec closure runs between fork() and execve().
+        // It uses only libc::open, libc::write, libc::close, libc::getpid: all async-signal-safe per POSIX.
         //
-        // The closure captures only Copy types (ProcsPath: [u8; 256] + usize, bool):
-        // zero heap allocation in the child.
+        // The closure captures only Copy types (ProcsPath: [u8; 256] + usize, bool): zero heap allocation in the child.
         unsafe {
             cmd.pre_exec(move || join_cgroup_raw(procs_path.as_bytes(), fail_on_error));
         }
@@ -294,7 +381,8 @@ mod linux_impl {
     /// Write PID to cgroup.procs using raw libc syscalls only.
     /// Fully async-signal-safe — no heap allocation, no mutexes.
     fn join_cgroup_raw(procs_path_cstr: &[u8], fail_on_error: bool) -> io::Result<()> {
-        // SAFETY: procs_path_cstr is a null-terminated byte string built before fork().
+        // SAFETY:
+        // procs_path_cstr is a null-terminated byte string built before fork().
         // libc::open is async-signal-safe per POSIX.
         let fd = unsafe {
             libc::open(
@@ -312,12 +400,14 @@ mod linux_impl {
         }
 
         // Format PID into a stack buffer (no allocation).
-        // SAFETY: getpid() is async-signal-safe, always succeeds.
+        // SAFETY:
+        // getpid() is async-signal-safe, always succeeds.
         let pid = unsafe { libc::getpid() };
         let mut buf = [0u8; 24];
         let pid_str = super::format_pid(pid, &mut buf);
 
-        // SAFETY: fd is a valid open file descriptor. pid_str is a valid byte slice.
+        // SAFETY:
+        // fd is a valid open file descriptor. pid_str is a valid byte slice.
         // libc::write is async-signal-safe per POSIX.
         let written =
             unsafe { libc::write(fd, pid_str.as_ptr() as *const libc::c_void, pid_str.len()) };
@@ -329,7 +419,8 @@ mod linux_impl {
             None
         };
 
-        // SAFETY: libc::close is async-signal-safe.
+        // SAFETY:
+        // libc::close is async-signal-safe.
         unsafe { libc::close(fd) };
 
         if let Some(e) = write_err {
@@ -342,7 +433,6 @@ mod linux_impl {
 
         Ok(())
     }
-
 }
 
 /// Format a PID (positive `i32`) into a stack buffer as `"<pid>\n"`.
@@ -452,8 +542,6 @@ mod tests {
         let name = build_cgroup_name("test", "nonexistent", 999, 1733045913);
         cleanup_cgroup(&name); // best-effort, should not panic
     }
-
-    // ── format_pid unit tests (platform-independent) ────────────────
 
     fn fmt_pid(pid: i32) -> String {
         let mut buf = [0u8; 24];
