@@ -9,12 +9,12 @@ subprocess = ["dep:base64", "dep:libc", "tokio/process"]
 
 [dependencies]
 tokio = { workspace = true, features = ["io-util"] }
+base64 = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 tokio-util = { workspace = true }
 taskvisor = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-base64 = { workspace = true, optional = true }
-libc = { workspace = true, optional = true }
 
 solti-model = { path = "../solti-model" }
 solti-core = { path = "../solti-core" }
