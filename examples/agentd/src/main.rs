@@ -94,8 +94,7 @@ async fn main() -> anyhow::Result<()> {
         ControllerConfig::default(),
         subscribers,
         router,
-    )
-    .await?;
+    )?;
 
     // 5) internal timezone-sync
     let (tz_task, tz_spec) = timezone_sync();

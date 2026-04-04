@@ -60,8 +60,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         ControllerConfig::default(),
         subscribers,
         router,
-    )
-    .await?;
+    )?;
     info!("supervisor ready");
 
     // 5) Internal tasks: timezone sync

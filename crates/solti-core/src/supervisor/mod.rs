@@ -8,8 +8,8 @@ use std::{sync::Arc, time::Duration};
 
 use solti_model::{Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskSpec};
 use taskvisor::{
-    ControllerConfig, ControllerSpec, Subscribe, Supervisor, SupervisorConfig, TaskRef,
-    TaskSpec as TvTaskSpec,
+    ControllerConfig, ControllerSpec, Subscribe, Supervisor, SupervisorConfig, SupervisorHandle,
+    TaskRef, TaskSpec as TvTaskSpec,
 };
 use tracing::{debug, info, instrument};
 
@@ -28,7 +28,7 @@ use crate::{
 /// - selecting a concrete runner for each [`TaskSpec`];
 /// - mapping model-level specs into controller specs and submitting them.
 pub struct SupervisorApi {
-    sup: Arc<Supervisor>,
+    handle: SupervisorHandle,
     router: RunnerRouter,
     state: TaskState,
 }
@@ -40,9 +40,9 @@ impl SupervisorApi {
     /// - `subscribers` - event subscribers to attach to the supervisor;
     /// - `router`      - runner router [`solti_model::TaskKind`].
     ///
-    /// The supervisor run loop is spawned on the current Tokio runtime.
-    /// This method waits until the supervisor reports readiness before returning.
-    pub async fn new(
+    /// The supervisor event loop is started via [`Supervisor::serve()`] which returns
+    /// a [`SupervisorHandle`] for dynamic task management.
+    pub fn new(
         sup_cfg: SupervisorConfig,
         ctrl_cfg: ControllerConfig,
         mut subscribers: Vec<Arc<dyn Subscribe>>,
@@ -56,18 +56,15 @@ impl SupervisorApi {
             .with_controller(ctrl_cfg)
             .build();
 
-        let runner = Arc::clone(&sup);
-        tokio::spawn(async move {
-            if let Err(e) = runner.run(Vec::new()).await {
-                panic!("supervisor run loop exited with error: {}", e)
-            }
-        });
-
-        sup.wait_ready().await;
+        let handle = sup.serve();
         init_uptime();
 
         info!("supervisor is ready to accept tasks");
-        Ok(Self { sup, router, state })
+        Ok(Self {
+            handle,
+            router,
+            state,
+        })
     }
 
     /// Get task information by ID.
@@ -96,8 +93,8 @@ impl SupervisorApi {
     }
 
     /// Get a clone of the underlying supervisor handle.
-    pub fn supervisor(&self) -> Arc<Supervisor> {
-        Arc::clone(&self.sup)
+    pub fn handle(&self) -> SupervisorHandle {
+        self.handle.clone()
     }
 
     /// Build and submit a task described by [`TaskSpec`].
@@ -137,13 +134,10 @@ impl SupervisorApi {
             to_backoff_policy(spec.backoff()),
             Some(Duration::from_millis(spec.timeout().as_millis())),
         );
-        let controller_spec = ControllerSpec {
-            admission: to_admission_policy(spec.admission()),
-            task_spec,
-        };
+        let controller_spec = ControllerSpec::new(to_admission_policy(spec.admission()), task_spec);
 
         debug!("submitting pre-built task via controller");
-        if let Err(e) = self.sup.submit(controller_spec).await {
+        if let Err(e) = self.handle.submit(controller_spec).await {
             self.state.remove_task(&task_id);
             return Err(CoreError::Supervisor(e.to_string()));
         }
@@ -171,7 +165,7 @@ impl SupervisorApi {
         debug!("cancelling task: {}", id);
 
         let was_cancelled = self
-            .sup
+            .handle
             .cancel(id.as_str())
             .await
             .map_err(|e| CoreError::Supervisor(format!("cancel failed: {}", e)))?;
@@ -211,7 +205,6 @@ mod tests {
             Vec::new(),
             router,
         )
-        .await
         .expect("failed to create SupervisorApi");
 
         let task: TaskRef = TaskFn::arc("test-task", |_ctx: CancellationToken| async move {
@@ -244,7 +237,6 @@ mod tests {
             Vec::new(),
             router,
         )
-        .await
         .expect("failed to create SupervisorApi");
 
         let spec = TaskSpec::builder("test-slot-none", TaskKind::Embedded, 1_000_u64)

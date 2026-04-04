@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use taskvisor::{Event, EventKind, Subscribe};
 use tracing::trace;
 
@@ -24,9 +23,8 @@ impl StateSubscriber {
     }
 }
 
-#[async_trait]
 impl Subscribe for StateSubscriber {
-    async fn on_event(&self, event: &Event) {
+    fn on_event(&self, event: &Event) {
         let Some(task_id) = Self::task_id_from_event(event) else {
             return;
         };

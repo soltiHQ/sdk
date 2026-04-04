@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use prometheus::{Counter, CounterVec, Gauge, Histogram, Opts, Registry};
 use taskvisor::{BackoffSource, Event, EventKind, Subscribe};
 use tracing::debug;
@@ -189,7 +188,6 @@ impl PrometheusSubscriber {
     }
 }
 
-#[async_trait]
 impl Subscribe for PrometheusSubscriber {
     /// Translates a [`taskvisor`] event into prometheus metric updates.
     ///
@@ -204,7 +202,7 @@ impl Subscribe for PrometheusSubscriber {
     ///   [`TaskStarting`](EventKind::TaskStarting) is a no-op on the gauge.
     /// - Backoff duration is converted from milliseconds to seconds before
     ///   being observed in the histogram.
-    async fn on_event(&self, event: &Event) {
+    fn on_event(&self, event: &Event) {
         match event.kind {
             EventKind::TaskStarting => {
                 self.tasks_in_flight.inc();
@@ -299,86 +297,79 @@ mod tests {
         String::from_utf8(buf).unwrap()
     }
 
-    #[tokio::test]
-    async fn task_starting_increments_in_flight() {
+    #[test]
+    fn task_starting_increments_in_flight() {
         let sub = new_subscriber();
 
         sub.on_event(
             &Event::new(EventKind::TaskStarting)
                 .with_task("t")
                 .with_attempt(1),
-        )
-        .await;
+        );
 
         assert_eq!(sub.tasks_in_flight.get(), 1.0);
     }
 
-    #[tokio::test]
-    async fn task_stopped_decrements_in_flight() {
+    #[test]
+    fn task_stopped_decrements_in_flight() {
         let sub = new_subscriber();
 
         sub.on_event(
             &Event::new(EventKind::TaskStarting)
                 .with_task("t")
                 .with_attempt(1),
-        )
-        .await;
-        sub.on_event(&Event::new(EventKind::TaskStopped).with_task("t"))
-            .await;
+        );
+        sub.on_event(&Event::new(EventKind::TaskStopped).with_task("t"));
 
         assert_eq!(sub.tasks_in_flight.get(), 0.0);
     }
 
-    #[tokio::test]
-    async fn task_failed_decrements_in_flight() {
+    #[test]
+    fn task_failed_decrements_in_flight() {
         let sub = new_subscriber();
 
         sub.on_event(
             &Event::new(EventKind::TaskStarting)
                 .with_task("t")
                 .with_attempt(1),
-        )
-        .await;
+        );
         sub.on_event(
             &Event::new(EventKind::TaskFailed)
                 .with_task("t")
                 .with_reason("boom"),
-        )
-        .await;
+        );
 
         assert_eq!(sub.tasks_in_flight.get(), 0.0);
     }
 
-    #[tokio::test]
-    async fn first_attempt_is_not_a_restart() {
+    #[test]
+    fn first_attempt_is_not_a_restart() {
         let sub = new_subscriber();
 
         sub.on_event(
             &Event::new(EventKind::TaskStarting)
                 .with_task("t")
                 .with_attempt(1),
-        )
-        .await;
+        );
 
         assert_eq!(sub.task_restarts.get(), 0.0);
     }
 
-    #[tokio::test]
-    async fn second_attempt_is_a_restart() {
+    #[test]
+    fn second_attempt_is_a_restart() {
         let sub = new_subscriber();
 
         sub.on_event(
             &Event::new(EventKind::TaskStarting)
                 .with_task("t")
                 .with_attempt(2),
-        )
-        .await;
+        );
 
         assert_eq!(sub.task_restarts.get(), 1.0);
     }
 
-    #[tokio::test]
-    async fn backoff_failure_increments_counter() {
+    #[test]
+    fn backoff_failure_increments_counter() {
         let sub = new_subscriber();
 
         sub.on_event(
@@ -386,8 +377,7 @@ mod tests {
                 .with_task("t")
                 .with_delay(Duration::from_secs(5))
                 .with_backoff_failure(),
-        )
-        .await;
+        );
 
         assert_eq!(
             sub.task_backoff_count.with_label_values(&["failure"]).get(),
@@ -395,8 +385,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn backoff_success_increments_counter() {
+    #[test]
+    fn backoff_success_increments_counter() {
         let sub = new_subscriber();
 
         sub.on_event(
@@ -404,8 +394,7 @@ mod tests {
                 .with_task("t")
                 .with_delay(Duration::from_secs(10))
                 .with_backoff_success(),
-        )
-        .await;
+        );
 
         assert_eq!(
             sub.task_backoff_count.with_label_values(&["success"]).get(),
@@ -413,30 +402,28 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn timeout_hit_increments_counter() {
+    #[test]
+    fn timeout_hit_increments_counter() {
         let sub = new_subscriber();
 
         sub.on_event(
             &Event::new(EventKind::TimeoutHit)
                 .with_task("t")
                 .with_timeout(Duration::from_secs(30)),
-        )
-        .await;
+        );
 
         assert_eq!(sub.task_timeouts.get(), 1.0);
     }
 
-    #[tokio::test]
-    async fn actor_exhausted_increments_terminal() {
+    #[test]
+    fn actor_exhausted_increments_terminal() {
         let sub = new_subscriber();
 
         sub.on_event(
             &Event::new(EventKind::ActorExhausted)
                 .with_task("t")
                 .with_reason("policy done"),
-        )
-        .await;
+        );
 
         assert_eq!(
             sub.task_terminal.with_label_values(&["exhausted"]).get(),
@@ -444,83 +431,77 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn actor_dead_increments_terminal() {
+    #[test]
+    fn actor_dead_increments_terminal() {
         let sub = new_subscriber();
 
         sub.on_event(
             &Event::new(EventKind::ActorDead)
                 .with_task("t")
                 .with_reason("fatal error"),
-        )
-        .await;
+        );
 
         assert_eq!(sub.task_terminal.with_label_values(&["fatal"]).get(), 1.0);
     }
 
-    #[tokio::test]
-    async fn in_flight_does_not_go_negative() {
+    #[test]
+    fn in_flight_does_not_go_negative() {
         let sub = new_subscriber();
 
         // TaskStopped without a preceding TaskStarting should not go below zero.
-        sub.on_event(&Event::new(EventKind::TaskStopped).with_task("t"))
-            .await;
+        sub.on_event(&Event::new(EventKind::TaskStopped).with_task("t"));
 
         assert_eq!(sub.tasks_in_flight.get(), 0.0);
     }
 
-    #[tokio::test]
-    async fn subscriber_overflow_increments_counter() {
+    #[test]
+    fn subscriber_overflow_increments_counter() {
         let sub = new_subscriber();
 
         sub.on_event(
             &Event::new(EventKind::SubscriberOverflow)
                 .with_task("t")
                 .with_reason("queue full"),
-        )
-        .await;
+        );
 
         assert_eq!(sub.subscriber_overflow.get(), 1.0);
     }
 
-    #[tokio::test]
-    async fn subscriber_panicked_increments_counter() {
+    #[test]
+    fn subscriber_panicked_increments_counter() {
         let sub = new_subscriber();
 
         sub.on_event(
             &Event::new(EventKind::SubscriberPanicked)
                 .with_task("t")
                 .with_reason("boom"),
-        )
-        .await;
+        );
 
         assert_eq!(sub.subscriber_panicked.get(), 1.0);
     }
 
     #[cfg(feature = "controller")]
-    #[tokio::test]
-    async fn controller_submitted_increments_counter() {
+    #[test]
+    fn controller_submitted_increments_counter() {
         let sub = new_subscriber();
 
-        sub.on_event(&Event::new(EventKind::ControllerSubmitted).with_task("t"))
-            .await;
+        sub.on_event(&Event::new(EventKind::ControllerSubmitted).with_task("t"));
 
         assert_eq!(sub.controller_submissions.get(), 1.0);
     }
 
     #[cfg(feature = "controller")]
-    #[tokio::test]
-    async fn controller_rejected_increments_counter() {
+    #[test]
+    fn controller_rejected_increments_counter() {
         let sub = new_subscriber();
 
-        sub.on_event(&Event::new(EventKind::ControllerRejected).with_task("t"))
-            .await;
+        sub.on_event(&Event::new(EventKind::ControllerRejected).with_task("t"));
 
         assert_eq!(sub.controller_rejections.get(), 1.0);
     }
 
-    #[tokio::test]
-    async fn shared_registry_with_backend() {
+    #[test]
+    fn shared_registry_with_backend() {
         let registry = Arc::new(Registry::new());
 
         let backend = crate::PrometheusMetrics::new_with_registry(registry.clone()).unwrap();
@@ -531,8 +512,7 @@ mod tests {
             &Event::new(EventKind::TaskStarting)
                 .with_task("t")
                 .with_attempt(1),
-        )
-        .await;
+        );
 
         let text = metrics_text(&registry);
         assert!(text.contains("solti_runner_tasks_started_total"));

@@ -67,8 +67,5 @@ pub fn to_task_spec(task: TaskRef, s: &ModelTaskSpec) -> TaskSpec {
 
 /// Build a `ControllerSpec` from a public `ModelTaskSpec`.
 pub fn to_controller_spec(task: TaskRef, s: &ModelTaskSpec) -> ControllerSpec {
-    ControllerSpec {
-        admission: to_admission_policy(s.admission()),
-        task_spec: to_task_spec(task, s),
-    }
+    ControllerSpec::new(to_admission_policy(s.admission()), to_task_spec(task, s))
 }
