@@ -6,11 +6,8 @@ use std::time::Duration;
 use solti_model::{
     AdmissionPolicy as ModelAdmissionPolicy, BackoffPolicy as ModelBackoffPolicy,
     JitterPolicy as ModelJitterPolicy, RestartPolicy as ModelRestartPolicy,
-    TaskSpec as ModelTaskSpec,
 };
-use taskvisor::{
-    AdmissionPolicy, BackoffPolicy, ControllerSpec, JitterPolicy, RestartPolicy, TaskRef, TaskSpec,
-};
+use taskvisor::{AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy};
 
 /// Convert a high-level admission policy from the public model into the controller admission policy used by taskvisor.
 pub(crate) fn to_admission_policy(s: ModelAdmissionPolicy) -> AdmissionPolicy {
@@ -53,19 +50,4 @@ pub(crate) fn to_backoff_policy(s: &ModelBackoffPolicy) -> BackoffPolicy {
         jitter: to_jitter_policy(s.jitter),
         factor: s.factor,
     }
-}
-
-/// Build a `TaskSpec` from a public `ModelTaskSpec`.
-pub(crate) fn to_task_spec(task: TaskRef, s: &ModelTaskSpec) -> TaskSpec {
-    TaskSpec::new(
-        task,
-        to_restart_policy(s.restart()),
-        to_backoff_policy(s.backoff()),
-        Some(Duration::from_millis(s.timeout().as_millis())),
-    )
-}
-
-/// Build a `ControllerSpec` from a public `ModelTaskSpec`.
-pub(crate) fn to_controller_spec(task: TaskRef, s: &ModelTaskSpec) -> ControllerSpec {
-    ControllerSpec::new(to_admission_policy(s.admission()), to_task_spec(task, s))
 }
