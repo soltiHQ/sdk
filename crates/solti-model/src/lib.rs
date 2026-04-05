@@ -64,7 +64,7 @@
 //! | `Container`    | OCI container image                                  |
 //! | `Embedded`     | Code-defined task (in-process `TaskRef`)             |
 //!
-//! `Subprocess` tasks go through [`solti_core::RunnerRouter`]; `Embedded` tasks
+//! `Subprocess` tasks go through [`solti_runner::RunnerRouter`]; `Embedded` tasks
 //! are submitted directly via `SupervisorApi::submit_with_task`.
 //!
 //! ## Policies

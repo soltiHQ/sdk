@@ -4,7 +4,8 @@ use axum::routing::get;
 use tracing::info;
 
 use solti_api::{HttpApi, SupervisorApiAdapter};
-use solti_core::{BuildContext, RunnerRouter, SupervisorApi};
+use solti_core::SupervisorApi;
+use solti_runner::{BuildContext, RunnerRouter};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, RestartPolicy, RunnerEnv, SubprocessMode,

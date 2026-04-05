@@ -4,6 +4,7 @@ members = [
     "crates/solti-discover",
     "crates/solti-observe",
     "crates/solti-model",
+    "crates/solti-runner",
     "crates/solti-core",
     "crates/solti-exec",
     "crates/solti-api",

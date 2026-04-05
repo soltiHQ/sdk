@@ -13,11 +13,12 @@ use taskvisor::{
 };
 use tracing::{debug, info, instrument};
 
+use solti_runner::RunnerRouter;
+
 use crate::system::init_uptime;
 use crate::{
     error::CoreError,
     map::{to_admission_policy, to_backoff_policy, to_restart_policy},
-    router::RunnerRouter,
     state::{StateSubscriber, TaskState},
 };
 

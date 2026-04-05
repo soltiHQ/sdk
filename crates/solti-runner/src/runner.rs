@@ -1,17 +1,13 @@
-//! Runner abstraction used by `solti-core` to build taskvisor tasks from `TaskSpec`.
+//! Runner trait - the plugin interface for task executors.
 //!
-//! Concrete runners implement this trait and are plugged into the router.
-mod error;
-pub use error::RunnerError;
-
-mod context;
-pub use context::BuildContext;
-
-mod id;
-pub use id::{RunId, make_run_id};
+//! Concrete runners implement this trait and are registered in the [`RunnerRouter`](crate::RunnerRouter).
 
 use solti_model::TaskSpec;
 use taskvisor::TaskRef;
+
+use crate::context::BuildContext;
+use crate::error::RunnerError;
+use crate::id::{RunId, make_run_id};
 
 /// Generic task runner used by the core layer.
 ///

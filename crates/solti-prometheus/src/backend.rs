@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use prometheus::{CounterVec, HistogramVec, Opts, Registry, proto::MetricFamily};
 
-use solti_core::{MetricsBackend, RunnerType, TaskOutcome};
+use solti_runner::{MetricsBackend, RunnerType, TaskOutcome};
 
 /// Prometheus metrics backend for solti runners.
 ///

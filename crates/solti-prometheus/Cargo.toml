@@ -12,7 +12,7 @@ prometheus = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 
-solti-core = { path = "../solti-core" }
+solti-runner = { path = "../solti-runner" }
 taskvisor = { workspace = true }
 
 [dev-dependencies]

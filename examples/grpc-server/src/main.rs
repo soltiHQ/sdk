@@ -4,7 +4,8 @@ use tonic::transport::Server;
 use tracing::info;
 
 use solti_api::{SoltiApiServer, SoltiApiService, SupervisorApiAdapter};
-use solti_core::{RunnerRouter, SupervisorApi};
+use solti_core::SupervisorApi;
+use solti_runner::RunnerRouter;
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, RestartPolicy, SubprocessMode,

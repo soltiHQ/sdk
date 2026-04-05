@@ -8,17 +8,16 @@ use solti_model::{Labels, TaskKind, TaskSpec};
 use taskvisor::TaskRef;
 use tracing::{debug, instrument, trace};
 
-use crate::{
-    error::CoreError,
-    runner::{BuildContext, Runner},
-};
+use crate::context::BuildContext;
+use crate::error::RunnerError;
+use crate::runner::Runner;
 
 /// Single runner entry with optional static labels used for routing.
-pub(crate) struct RunnerEntry {
+struct RunnerEntry {
     /// Concrete runner implementation.
-    pub(crate) runner: Arc<dyn Runner>,
+    runner: Arc<dyn Runner>,
     /// Static labels attached to this runner (e.g. capacity class, backend tag).
-    pub(crate) labels: Labels,
+    labels: Labels,
 }
 
 /// Router that selects an appropriate [`Runner`] for a given [`TaskSpec`].
@@ -89,21 +88,22 @@ impl RunnerRouter {
 
     /// Build a [`TaskRef`] for the given spec using the selected runner.
     ///
-    /// `TaskKind::Embedded` is not routable and must be used with [`SupervisorApi::submit_with_task`](crate::supervisor::SupervisorApi::submit_with_task).
+    /// `TaskKind::Embedded` is not routable and must be used with
+    /// `SupervisorApi::submit_with_task`.
     #[instrument(level = "debug", skip(self, spec), fields(kind = ?spec.kind()))]
-    pub fn build(&self, spec: &TaskSpec) -> Result<TaskRef, CoreError> {
+    pub fn build(&self, spec: &TaskSpec) -> Result<TaskRef, RunnerError> {
         trace!(spec = ?spec, "router received spec");
 
         if matches!(spec.kind(), TaskKind::Embedded) {
-            return Err(CoreError::NoRunner(
+            return Err(RunnerError::NoRunner(
                 "TaskKind::Embedded requires submit_with_task()".to_string(),
             ));
         }
         let r = self
             .pick(spec)
-            .ok_or_else(|| CoreError::NoRunner(spec.kind().kind().to_string()))?;
+            .ok_or_else(|| RunnerError::NoRunner(spec.kind().kind().to_string()))?;
 
-        let task = r.build_task(spec, &self.ctx).map_err(CoreError::from)?;
+        let task = r.build_task(spec, &self.ctx)?;
         debug!(runner = r.name(), "runner built task successfully");
         Ok(task)
     }
@@ -119,7 +119,7 @@ impl RunnerRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::RunnerError;
+    use crate::RunnerError;
 
     use solti_model::{
         AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RunnerSelector, SubprocessMode,
@@ -179,14 +179,14 @@ mod tests {
         let res = router.build(&spec);
 
         match res {
-            Err(CoreError::NoRunner(msg)) => {
+            Err(RunnerError::NoRunner(msg)) => {
                 assert!(
                     msg.contains("TaskKind::Embedded"),
                     "unexpected NoRunner message: {msg}"
                 );
             }
-            Ok(_) => panic!("expected CoreError::NoRunner for TaskKind::Embedded, got Ok(..)"),
-            Err(e) => panic!("expected CoreError::NoRunner for TaskKind::Embedded, got {e:?}"),
+            Ok(_) => panic!("expected RunnerError::NoRunner for TaskKind::Embedded, got Ok(..)"),
+            Err(e) => panic!("expected RunnerError::NoRunner for TaskKind::Embedded, got {e:?}"),
         }
     }
 
@@ -227,11 +227,11 @@ mod tests {
         let res = router.build(&spec);
 
         match res {
-            Err(CoreError::NoRunner(kind)) => {
+            Err(RunnerError::NoRunner(kind)) => {
                 assert_eq!(kind, "wasm", "expected NoRunner(\"wasm\")");
             }
-            Ok(_) => panic!("expected CoreError::NoRunner for wasm, got Ok(..)"),
-            Err(e) => panic!("expected CoreError::NoRunner for wasm, got {e:?}"),
+            Ok(_) => panic!("expected RunnerError::NoRunner for wasm, got Ok(..)"),
+            Err(e) => panic!("expected RunnerError::NoRunner for wasm, got {e:?}"),
         }
     }
 

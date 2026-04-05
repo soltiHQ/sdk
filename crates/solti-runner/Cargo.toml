@@ -1,5 +1,5 @@
 [package]
-name = "solti-core"
+name = "solti-runner"
 version = "0.0.1"
 edition = "2024"
 
@@ -7,15 +7,11 @@ edition = "2024"
 default = []
 
 [dependencies]
-taskvisor = { workspace = true, features = ["controller"] }
-
+taskvisor = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true }
 
-parking_lot = { workspace = true }
 solti-model = { path = "../solti-model" }
-solti-runner = { path = "../solti-runner" }
 
 [dev-dependencies]
 tokio-util = { workspace = true }

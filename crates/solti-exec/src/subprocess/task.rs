@@ -1,7 +1,7 @@
 //! # Task: resolved subprocess configuration.
 //!
 //! [`SubprocessTaskConfig`] is the **fully resolved** config passed to the subprocess spawn loop.
-//! It is produced by [`SubprocessRunner::build_task_config`] from a [`TaskSpec`](solti_model::TaskSpec) + [`BuildContext`](solti_core::BuildContext).
+//! It is produced by [`SubprocessRunner::build_task_config`] from a [`TaskSpec`](solti_model::TaskSpec) + [`BuildContext`](solti_runner::BuildContext).
 //!
 //! ## How it fits
 //! ```text

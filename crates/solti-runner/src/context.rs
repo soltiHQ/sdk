@@ -113,7 +113,6 @@ mod tests {
 
         let ctx = BuildContext::new(env, metrics1).with_metrics(metrics2);
 
-        // metrics заменён (проверяем что не паникует)
         ctx.metrics()
             .record_task_started(crate::RunnerType::Subprocess);
     }

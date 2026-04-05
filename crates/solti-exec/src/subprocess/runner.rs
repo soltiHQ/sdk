@@ -1,6 +1,6 @@
 //! # Runner: subprocess execution engine.
 //!
-//! [`SubprocessRunner`] implements the [`Runner`](solti_core::Runner) trait to execute
+//! [`SubprocessRunner`] implements the [`Runner`](solti_runner::Runner) trait to execute
 //! [`TaskKind::Subprocess`](solti_model::TaskKind::Subprocess) tasks as OS processes.
 //!
 //! ## How it works
@@ -57,7 +57,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
-use solti_core::{BuildContext, Runner, RunnerError, RunnerType};
+use solti_runner::{BuildContext, Runner, RunnerError, RunnerType};
 use solti_model::{SubprocessSpec, TaskKind, TaskSpec, merge_env};
 
 use crate::metrics::classify_task_error;
@@ -222,7 +222,7 @@ struct TaskExecContext {
     task_cfg: SubprocessTaskConfig,
     runner_cfg: Option<Arc<SubprocessBackendConfig>>,
     cgroup_name: Option<String>,
-    metrics: solti_core::MetricsHandle,
+    metrics: solti_runner::MetricsHandle,
     log_cfg: LogConfig,
 }
 
@@ -357,7 +357,7 @@ async fn run_subprocess(
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let outcome = match &result {
-        Ok(()) => solti_core::TaskOutcome::Success,
+        Ok(()) => solti_runner::TaskOutcome::Success,
         Err(e) => classify_task_error(e),
     };
     ctx.metrics
@@ -430,7 +430,7 @@ mod tests {
             task_cfg: make_task_cfg(),
             runner_cfg: None,
             cgroup_name: None,
-            metrics: solti_core::noop_metrics(),
+            metrics: solti_runner::noop_metrics(),
             log_cfg: LogConfig::default(),
         }
     }

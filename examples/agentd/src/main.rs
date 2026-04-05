@@ -2,7 +2,8 @@ use std::{sync::Arc, time::Duration};
 
 use tracing::info;
 
-use solti_core::{RunnerRouter, SupervisorApi};
+use solti_core::SupervisorApi;
+use solti_runner::RunnerRouter;
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
 use solti_exec::subprocess::SubprocessBackendConfig;
