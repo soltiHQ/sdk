@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use solti_core::{arch, os_info, platform, uptime_seconds};
+use solti_core::uptime_seconds;
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
 };
@@ -109,6 +109,32 @@ async fn invoke_http_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
     })?;
 
     validate_response(sync_response)
+}
+
+#[inline]
+fn platform() -> &'static str {
+    std::env::consts::OS
+}
+
+#[inline]
+fn arch() -> &'static str {
+    std::env::consts::ARCH
+}
+
+/// Get OS distribution info (Linux only, best effort).
+fn os_info() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
+            for line in content.lines() {
+                if let Some(name) = line.strip_prefix("PRETTY_NAME=") {
+                    return name.trim_matches('"').to_string();
+                }
+            }
+        }
+    }
+
+    platform().to_string()
 }
 
 fn build_base_request(cfg: &DiscoverConfig) -> SyncRequest {

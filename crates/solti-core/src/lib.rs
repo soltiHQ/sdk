@@ -22,6 +22,6 @@ pub use metrics::{
 };
 
 mod system;
-pub use system::{arch, os_info, platform, uptime_seconds};
+pub use system::uptime_seconds;
 
 mod state;
