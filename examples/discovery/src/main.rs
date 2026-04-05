@@ -6,7 +6,6 @@ use tracing::info;
 
 use solti_api::{HttpApi, SupervisorApiAdapter};
 use solti_core::SupervisorApi;
-use solti_runner::{BuildContext, RunnerRouter};
 use solti_discover::{DiscoverConfig, DiscoveryTransport};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
@@ -18,6 +17,7 @@ use solti_observe::{
     init_logger, timezone_sync,
 };
 use solti_prometheus::{PrometheusMetrics, PrometheusSubscriber};
+use solti_runner::{BuildContext, RunnerRouter};
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
 const AGENT_HTTP_ADDR: &str = "0.0.0.0:8085";

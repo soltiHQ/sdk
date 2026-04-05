@@ -5,7 +5,6 @@ use tracing::info;
 
 use solti_api::{HttpApi, SupervisorApiAdapter};
 use solti_core::SupervisorApi;
-use solti_runner::{BuildContext, RunnerRouter};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, RestartPolicy, RunnerEnv, SubprocessMode,
@@ -15,6 +14,7 @@ use solti_observe::{
     LoggerConfig, LoggerLevel, TracingEventSubscriber, init_logger, timezone_sync,
 };
 use solti_prometheus::{PrometheusMetrics, PrometheusSubscriber};
+use solti_runner::{BuildContext, RunnerRouter};
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
 #[tokio::main]

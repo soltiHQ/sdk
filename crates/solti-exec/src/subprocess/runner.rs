@@ -57,8 +57,8 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
-use solti_runner::{BuildContext, Runner, RunnerError, RunnerType};
 use solti_model::{SubprocessSpec, TaskKind, TaskSpec, merge_env};
+use solti_runner::{BuildContext, Runner, RunnerError, RunnerType};
 
 use crate::metrics::classify_task_error;
 use crate::subprocess::{
