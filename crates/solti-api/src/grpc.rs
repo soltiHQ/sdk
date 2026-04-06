@@ -143,10 +143,7 @@ where
             .await
             .map_err(Status::from)?;
 
-        let runs = runs
-            .into_iter()
-            .map(proto_api::TaskRunInfo::from)
-            .collect();
+        let runs = runs.into_iter().map(proto_api::TaskRunInfo::from).collect();
 
         Ok(Response::new(proto_api::ListTaskRunsResponse { runs }))
     }

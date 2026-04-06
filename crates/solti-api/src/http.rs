@@ -174,11 +174,9 @@ impl From<TaskRun> for TaskRunWire {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let finished_at = run.finished_at.map(|t| {
-            t.duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64
-        });
+        let finished_at = run
+            .finished_at
+            .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
 
         Self {
             attempt: run.attempt,
