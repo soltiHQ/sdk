@@ -6,7 +6,7 @@
 //! - maps model-level specs / policies into controller specs and submits them.
 use std::{sync::Arc, time::Duration};
 
-use solti_model::{Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskSpec};
+use solti_model::{Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskRun, TaskSpec};
 use taskvisor::{
     ControllerConfig, ControllerSpec, Subscribe, Supervisor, SupervisorConfig, SupervisorHandle,
     TaskRef, TaskSpec as TvTaskSpec,
@@ -19,7 +19,7 @@ use crate::system::init_uptime;
 use crate::{
     error::CoreError,
     map::{to_admission_policy, to_backoff_policy, to_restart_policy},
-    state::{StateSubscriber, TaskState},
+    state::{StateConfig, StateSubscriber, TaskState, state_gc},
 };
 
 /// Thin wrapper around taskvisor [`Supervisor`] with a runner router.
@@ -91,6 +91,30 @@ impl SupervisorApi {
     /// Query tasks with combined filters and pagination.
     pub fn query_tasks(&self, query: &TaskQuery) -> TaskPage<Task> {
         self.state.query(query)
+    }
+
+    /// List execution history for a specific task (oldest first).
+    pub fn list_task_runs(&self, id: &TaskId) -> Vec<TaskRun> {
+        self.state.list_runs(id)
+    }
+
+    /// Enable automatic garbage collection for in-memory state.
+    ///
+    /// Submits an embedded periodic task that sweeps expired runs and
+    /// terminal tasks according to the provided [`StateConfig`].
+    ///
+    /// This is opt-in: if not called, no GC runs and the state grows
+    /// unboundedly. Recommended for long-running agents.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let api = SupervisorApi::new(sup, ctrl, subs, router)?;
+    /// api.enable_gc(StateConfig::default()).await?;
+    /// ```
+    pub async fn enable_gc(&self, config: StateConfig) -> Result<TaskId, CoreError> {
+        let (task, spec) = state_gc(self.state.clone(), config);
+        self.submit_with_task(task, &spec).await
     }
 
     /// Get a clone of the underlying supervisor handle.

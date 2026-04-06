@@ -153,7 +153,7 @@ pub use domain::{
 };
 
 mod resource;
-pub use resource::{ObjectMeta, Task, TaskSpec, TaskSpecBuilder, TaskStatus};
+pub use resource::{ObjectMeta, Task, TaskRun, TaskSpec, TaskSpecBuilder, TaskStatus};
 
 mod error;
 pub use error::{ModelError, ModelResult};

@@ -35,14 +35,17 @@ impl Subscribe for StateSubscriber {
             }
             EventKind::TaskStarting => {
                 trace!(task = %task_id, "task starting");
-                self.state.increment_attempt(&task_id);
+                let attempt = self.state.increment_attempt(&task_id).unwrap_or(1);
                 self.state
                     .update_phase(&task_id, TaskPhase::Running, None, None);
+                self.state.start_run(&task_id, attempt);
             }
             EventKind::TaskStopped => {
                 trace!(task = %task_id, "task stopped (success)");
                 self.state
                     .update_phase(&task_id, TaskPhase::Succeeded, None, None);
+                self.state
+                    .finish_run(&task_id, TaskPhase::Succeeded, None, None);
             }
             EventKind::TaskFailed => {
                 let reason = event
@@ -52,11 +55,19 @@ impl Subscribe for StateSubscriber {
                     .unwrap_or_else(|| "unknown".to_string());
                 trace!(task = %task_id, reason = %reason, "task failed");
                 self.state
-                    .update_phase(&task_id, TaskPhase::Failed, Some(reason), None);
+                    .update_phase(&task_id, TaskPhase::Failed, Some(reason.clone()), None);
+                self.state
+                    .finish_run(&task_id, TaskPhase::Failed, Some(reason), None);
             }
             EventKind::TimeoutHit => {
                 trace!(task = %task_id, "task timeout");
                 self.state.update_phase(
+                    &task_id,
+                    TaskPhase::Timeout,
+                    Some("timeout".to_string()),
+                    None,
+                );
+                self.state.finish_run(
                     &task_id,
                     TaskPhase::Timeout,
                     Some("timeout".to_string()),
@@ -71,7 +82,9 @@ impl Subscribe for StateSubscriber {
                     .unwrap_or_else(|| "exhausted".to_string());
                 trace!(task = %task_id, "task exhausted");
                 self.state
-                    .update_phase(&task_id, TaskPhase::Exhausted, Some(reason), None);
+                    .update_phase(&task_id, TaskPhase::Exhausted, Some(reason.clone()), None);
+                self.state
+                    .finish_run(&task_id, TaskPhase::Exhausted, Some(reason), None);
             }
             EventKind::TaskRemoved => {
                 trace!(task = %task_id, "task removed from state");

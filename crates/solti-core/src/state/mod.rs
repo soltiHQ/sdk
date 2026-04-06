@@ -1,11 +1,22 @@
+mod gc;
+pub use gc::state_gc;
+
 mod subscriber;
 pub use subscriber::StateSubscriber;
 
-use std::{collections::HashMap, sync::Arc};
+mod config;
+pub use config::StateConfig;
+
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::SystemTime,
+};
 
 use parking_lot::RwLock;
+use tracing::debug;
 
-use solti_model::{Slot, Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskSpec};
+use solti_model::{Slot, Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskRun, TaskSpec};
 
 /// In-memory task state storage.
 #[derive(Clone)]
@@ -18,6 +29,8 @@ struct TaskStateInner {
     tasks: HashMap<TaskId, Task>,
     /// Index: slot -> list of task IDs in that slot.
     by_slot: HashMap<Slot, Vec<TaskId>>,
+    /// Execution history: task_id -> ordered list of runs (oldest first).
+    runs: HashMap<TaskId, VecDeque<TaskRun>>,
 }
 
 impl TaskState {
@@ -27,6 +40,7 @@ impl TaskState {
             inner: Arc::new(RwLock::new(TaskStateInner {
                 tasks: HashMap::new(),
                 by_slot: HashMap::new(),
+                runs: HashMap::new(),
             })),
         }
     }
@@ -58,11 +72,16 @@ impl TaskState {
     }
 
     /// Increment attempt counter (called on TaskStarting event).
-    pub fn increment_attempt(&self, id: &TaskId) {
+    ///
+    /// Returns the new attempt number, or `None` if the task was not found.
+    pub fn increment_attempt(&self, id: &TaskId) -> Option<u32> {
         let mut inner = self.inner.write();
 
         if let Some(task) = inner.tasks.get_mut(id) {
             task.increment_attempt();
+            Some(task.status.attempt)
+        } else {
+            None
         }
     }
 
@@ -78,6 +97,40 @@ impl TaskState {
                 inner.by_slot.remove(task.slot());
             }
         }
+    }
+
+    /// Record the start of a new execution attempt.
+    pub fn start_run(&self, id: &TaskId, attempt: u32) {
+        let mut inner = self.inner.write();
+        let run = TaskRun::starting(attempt);
+        inner.runs.entry(id.clone()).or_default().push_back(run);
+    }
+
+    /// Close the most recent active run for the given task.
+    pub fn finish_run(
+        &self,
+        id: &TaskId,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+    ) {
+        let mut inner = self.inner.write();
+
+        if let Some(runs) = inner.runs.get_mut(id)
+            && let Some(run) = runs.back_mut().filter(|r| r.is_active())
+        {
+            run.finish(phase, error, exit_code);
+        }
+    }
+
+    /// List all runs for a task (oldest first).
+    pub fn list_runs(&self, id: &TaskId) -> Vec<TaskRun> {
+        let inner = self.inner.read();
+        inner
+            .runs
+            .get(id)
+            .map(|runs| runs.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Get task by ID.
@@ -116,6 +169,71 @@ impl TaskState {
             .filter(|task| task.status.phase == phase)
             .cloned()
             .collect()
+    }
+
+    /// Run a garbage collection sweep.
+    ///
+    /// Two passes under a single write lock:
+    /// 1. Remove finished runs older than `run_ttl`.
+    /// 2. Remove terminal tasks that have no remaining runs and whose
+    ///    `updated_at` is older than `task_ttl`.
+    ///
+    /// Returns `(runs_removed, tasks_removed)` for observability.
+    pub fn sweep(&self, config: &StateConfig) -> (usize, usize) {
+        let mut inner = self.inner.write();
+        let now = SystemTime::now();
+        let mut runs_removed = 0usize;
+        let mut tasks_removed = 0usize;
+
+        // Pass 1: remove expired finished runs.
+        for runs in inner.runs.values_mut() {
+            let before = runs.len();
+            runs.retain(|run| {
+                if let Some(finished) = run.finished_at {
+                    now.duration_since(finished)
+                        .map(|age| age < config.run_ttl)
+                        .unwrap_or(true)
+                } else {
+                    true // keep active runs
+                }
+            });
+            runs_removed += before - runs.len();
+        }
+        // Remove empty run entries.
+        inner.runs.retain(|_, runs| !runs.is_empty());
+
+        // Pass 2: remove terminal tasks with no remaining runs past task_ttl.
+        let expired_tasks: Vec<TaskId> = inner
+            .tasks
+            .iter()
+            .filter(|(id, task)| {
+                task.status.phase.is_terminal()
+                    && inner.runs.get(*id).is_none_or(|runs| runs.is_empty())
+                    && now
+                        .duration_since(task.metadata.updated_at)
+                        .map(|age| age >= config.task_ttl)
+                        .unwrap_or(false)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in &expired_tasks {
+            if let Some(task) = inner.tasks.remove(id) {
+                if let Some(ids) = inner.by_slot.get_mut(task.slot()) {
+                    ids.retain(|task_id| task_id != id);
+                    if ids.is_empty() {
+                        inner.by_slot.remove(task.slot());
+                    }
+                }
+                tasks_removed += 1;
+            }
+        }
+
+        if runs_removed > 0 || tasks_removed > 0 {
+            debug!(runs_removed, tasks_removed, "state gc sweep completed");
+        }
+
+        (runs_removed, tasks_removed)
     }
 
     /// Query tasks with combined filters and pagination.
@@ -237,8 +355,8 @@ mod tests {
         let id = TaskId::from("task-1");
 
         state.add_task(id.clone(), default_spec());
-        state.increment_attempt(&id);
-        state.increment_attempt(&id);
+        assert_eq!(state.increment_attempt(&id), Some(1));
+        assert_eq!(state.increment_attempt(&id), Some(2));
 
         let task = state.get(&id).unwrap();
         assert_eq!(task.status.attempt, 2);
@@ -300,6 +418,82 @@ mod tests {
 
         let all_tasks = state.list_all();
         assert_eq!(all_tasks.len(), 3);
+    }
+
+    #[test]
+    fn start_run_creates_active_run() {
+        let state = TaskState::new();
+        let id = TaskId::from("task-1");
+
+        state.add_task(id.clone(), default_spec());
+        state.start_run(&id, 1);
+
+        let runs = state.list_runs(&id);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].attempt, 1);
+        assert!(runs[0].is_active());
+    }
+
+    #[test]
+    fn finish_run_closes_active_run() {
+        let state = TaskState::new();
+        let id = TaskId::from("task-1");
+
+        state.add_task(id.clone(), default_spec());
+        state.start_run(&id, 1);
+        state.finish_run(&id, TaskPhase::Succeeded, None, None);
+
+        let runs = state.list_runs(&id);
+        assert_eq!(runs.len(), 1);
+        assert!(!runs[0].is_active());
+        assert_eq!(runs[0].phase, TaskPhase::Succeeded);
+    }
+
+    #[test]
+    fn multiple_runs_ordered_by_attempt() {
+        let state = TaskState::new();
+        let id = TaskId::from("task-1");
+
+        state.add_task(id.clone(), default_spec());
+
+        // First attempt fails
+        state.start_run(&id, 1);
+        state.finish_run(&id, TaskPhase::Failed, Some("err".into()), None);
+
+        // Second attempt succeeds
+        state.start_run(&id, 2);
+        state.finish_run(&id, TaskPhase::Succeeded, None, None);
+
+        let runs = state.list_runs(&id);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].attempt, 1);
+        assert_eq!(runs[0].phase, TaskPhase::Failed);
+        assert_eq!(runs[1].attempt, 2);
+        assert_eq!(runs[1].phase, TaskPhase::Succeeded);
+    }
+
+    #[test]
+    fn remove_task_does_not_remove_runs() {
+        let state = TaskState::new();
+        let id = TaskId::from("task-1");
+
+        state.add_task(id.clone(), default_spec());
+        state.start_run(&id, 1);
+        state.finish_run(&id, TaskPhase::Succeeded, None, None);
+
+        state.remove_task(&id);
+
+        assert!(state.get(&id).is_none());
+        // Runs survive task removal (cleaned by GC).
+        let runs = state.list_runs(&id);
+        assert_eq!(runs.len(), 1);
+    }
+
+    #[test]
+    fn list_runs_empty_for_unknown_task() {
+        let state = TaskState::new();
+        let runs = state.list_runs(&TaskId::from("nonexistent"));
+        assert!(runs.is_empty());
     }
 
     fn setup_query_state() -> TaskState {
@@ -408,6 +602,87 @@ mod tests {
         let page = state.query(&TaskQuery::new().with_offset(3).with_limit(100));
         assert_eq!(page.total, 5);
         assert_eq!(page.items.len(), 2);
+    }
+
+    #[test]
+    fn sweep_removes_expired_runs() {
+        let state = TaskState::new();
+        let id = TaskId::from("task-1");
+
+        state.add_task(id.clone(), default_spec());
+        state.start_run(&id, 1);
+        state.finish_run(&id, TaskPhase::Succeeded, None, None);
+
+        // With zero TTL, everything is expired.
+        let config = StateConfig {
+            run_ttl: std::time::Duration::ZERO,
+            task_ttl: std::time::Duration::from_secs(3600),
+            gc_interval: std::time::Duration::from_secs(60),
+        };
+
+        let (runs_removed, tasks_removed) = state.sweep(&config);
+        assert_eq!(runs_removed, 1);
+        assert_eq!(tasks_removed, 0); // task still exists (task_ttl is long)
+        assert!(state.list_runs(&id).is_empty());
+    }
+
+    #[test]
+    fn sweep_removes_terminal_tasks_without_runs() {
+        let state = TaskState::new();
+        let id = TaskId::from("task-1");
+
+        state.add_task(id.clone(), default_spec());
+        state.update_phase(&id, TaskPhase::Succeeded, None, None);
+        // No runs at all.
+
+        let config = StateConfig {
+            run_ttl: std::time::Duration::ZERO,
+            task_ttl: std::time::Duration::ZERO,
+            gc_interval: std::time::Duration::from_secs(60),
+        };
+
+        let (_, tasks_removed) = state.sweep(&config);
+        assert_eq!(tasks_removed, 1);
+        assert!(state.get(&id).is_none());
+    }
+
+    #[test]
+    fn sweep_keeps_active_runs() {
+        let state = TaskState::new();
+        let id = TaskId::from("task-1");
+
+        state.add_task(id.clone(), default_spec());
+        state.start_run(&id, 1);
+        // run is still active (not finished)
+
+        let config = StateConfig {
+            run_ttl: std::time::Duration::ZERO,
+            task_ttl: std::time::Duration::ZERO,
+            gc_interval: std::time::Duration::from_secs(60),
+        };
+
+        let (runs_removed, _) = state.sweep(&config);
+        assert_eq!(runs_removed, 0);
+        assert_eq!(state.list_runs(&id).len(), 1);
+    }
+
+    #[test]
+    fn sweep_keeps_non_terminal_tasks() {
+        let state = TaskState::new();
+        let id = TaskId::from("task-1");
+
+        state.add_task(id.clone(), default_spec());
+        state.update_phase(&id, TaskPhase::Running, None, None);
+
+        let config = StateConfig {
+            run_ttl: std::time::Duration::ZERO,
+            task_ttl: std::time::Duration::ZERO,
+            gc_interval: std::time::Duration::from_secs(60),
+        };
+
+        let (_, tasks_removed) = state.sweep(&config);
+        assert_eq!(tasks_removed, 0);
+        assert!(state.get(&id).is_some());
     }
 
     #[test]

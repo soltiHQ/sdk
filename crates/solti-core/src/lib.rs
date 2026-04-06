@@ -10,3 +10,4 @@ mod system;
 pub use system::uptime_seconds;
 
 mod state;
+pub use state::StateConfig;

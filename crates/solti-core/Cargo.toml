@@ -14,8 +14,8 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 
 parking_lot = { workspace = true }
+tokio-util = { workspace = true }
 solti-model = { path = "../solti-model" }
 solti-runner = { path = "../solti-runner" }
 
 [dev-dependencies]
-tokio-util = { workspace = true }
