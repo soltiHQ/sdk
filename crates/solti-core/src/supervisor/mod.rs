@@ -98,6 +98,13 @@ impl SupervisorApi {
         self.state.list_runs(id)
     }
 
+    /// Delete a task and its run history.
+    ///
+    /// Returns `true` if the task existed and was deleted.
+    pub fn delete_task(&self, id: &TaskId) -> bool {
+        self.state.delete_task(id)
+    }
+
     /// Enable automatic garbage collection for in-memory state.
     ///
     /// Submits an embedded periodic task that sweeps expired runs and

@@ -124,59 +124,31 @@ where
         }))
     }
 
-    async fn list_all_tasks(
+    async fn list_task_runs(
         &self,
-        _request: Request<proto_api::ListAllTasksRequest>,
-    ) -> Result<Response<proto_api::ListAllTasksResponse>, Status> {
-        let tasks = self.handler.list_all_tasks().await.map_err(Status::from)?;
-        debug!(count = tasks.len(), "grpc: tasks listed");
-
-        let tasks = tasks.into_iter().map(proto_api::TaskInfo::from).collect();
-
-        Ok(Response::new(proto_api::ListAllTasksResponse { tasks }))
-    }
-
-    async fn list_tasks_by_slot(
-        &self,
-        request: Request<proto_api::ListTasksBySlotRequest>,
-    ) -> Result<Response<proto_api::ListTasksBySlotResponse>, Status> {
+        request: Request<proto_api::ListTaskRunsRequest>,
+    ) -> Result<Response<proto_api::ListTaskRunsResponse>, Status> {
         let req = request.into_inner();
 
-        if req.slot.trim().is_empty() {
-            return Err(Status::invalid_argument("slot cannot be empty"));
+        if req.task_id.trim().is_empty() {
+            return Err(Status::invalid_argument("task_id cannot be empty"));
         }
 
-        debug!(slot = %req.slot, "grpc: listing tasks by slot");
-        let tasks = self
+        let task_id = solti_model::TaskId::from(req.task_id);
+        debug!(%task_id, "grpc: listing task runs");
+
+        let runs = self
             .handler
-            .list_tasks_by_slot(&req.slot)
+            .list_task_runs(&task_id)
             .await
             .map_err(Status::from)?;
 
-        let tasks = tasks.into_iter().map(proto_api::TaskInfo::from).collect();
+        let runs = runs
+            .into_iter()
+            .map(proto_api::TaskRunInfo::from)
+            .collect();
 
-        Ok(Response::new(proto_api::ListTasksBySlotResponse { tasks }))
-    }
-
-    async fn list_tasks_by_status(
-        &self,
-        request: Request<proto_api::ListTasksByStatusRequest>,
-    ) -> Result<Response<proto_api::ListTasksByStatusResponse>, Status> {
-        let req = request.into_inner();
-
-        let domain_status = proto_to_domain_status(req.status)?;
-
-        let tasks = self
-            .handler
-            .list_tasks_by_status(domain_status)
-            .await
-            .map_err(Status::from)?;
-
-        let tasks = tasks.into_iter().map(proto_api::TaskInfo::from).collect();
-
-        Ok(Response::new(proto_api::ListTasksByStatusResponse {
-            tasks,
-        }))
+        Ok(Response::new(proto_api::ListTaskRunsResponse { runs }))
     }
 
     async fn cancel_task(
@@ -198,6 +170,28 @@ where
 
         debug!(%task_id, "grpc: task canceled");
         Ok(Response::new(proto_api::CancelTaskResponse {}))
+    }
+
+    async fn delete_task(
+        &self,
+        request: Request<proto_api::DeleteTaskRequest>,
+    ) -> Result<Response<proto_api::DeleteTaskResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.task_id.trim().is_empty() {
+            return Err(Status::invalid_argument("task_id cannot be empty"));
+        }
+
+        let task_id = solti_model::TaskId::from(req.task_id);
+        debug!(%task_id, "grpc: deleting task");
+
+        self.handler
+            .delete_task(&task_id)
+            .await
+            .map_err(Status::from)?;
+
+        debug!(%task_id, "grpc: task deleted");
+        Ok(Response::new(proto_api::DeleteTaskResponse {}))
     }
 }
 

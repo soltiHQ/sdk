@@ -2,14 +2,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use solti_core::SupervisorApi;
-use solti_model::{Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskSpec};
+use solti_model::{Task, TaskId, TaskPage, TaskQuery, TaskRun, TaskSpec};
 
 use crate::error::ApiError;
 use crate::handler::ApiHandler;
 
-/// Adapter that bridges `SupervisorApi` to `ApiHandler`.
+/// Adapter that bridges [`SupervisorApi`] to [`ApiHandler`].
 ///
-/// This is a ready-to-use implementation that directly delegates to `SupervisorApi`.
+/// Ready-to-use implementation that directly delegates to `SupervisorApi`.
 pub struct SupervisorApiAdapter {
     supervisor: Arc<SupervisorApi>,
 }
@@ -31,20 +31,12 @@ impl ApiHandler for SupervisorApiAdapter {
         Ok(self.supervisor.get_task(id))
     }
 
-    async fn list_all_tasks(&self) -> Result<Vec<Task>, ApiError> {
-        Ok(self.supervisor.list_all_tasks())
-    }
-
-    async fn list_tasks_by_slot(&self, slot: &str) -> Result<Vec<Task>, ApiError> {
-        Ok(self.supervisor.list_tasks_by_slot(slot))
-    }
-
-    async fn list_tasks_by_status(&self, status: TaskPhase) -> Result<Vec<Task>, ApiError> {
-        Ok(self.supervisor.list_tasks_by_status(status))
-    }
-
     async fn query_tasks(&self, query: TaskQuery) -> Result<TaskPage<Task>, ApiError> {
         Ok(self.supervisor.query_tasks(&query))
+    }
+
+    async fn list_task_runs(&self, id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
+        Ok(self.supervisor.list_task_runs(id))
     }
 
     async fn cancel_task(&self, id: &TaskId) -> Result<(), ApiError> {
@@ -52,5 +44,13 @@ impl ApiHandler for SupervisorApiAdapter {
             .cancel_task(id)
             .await
             .map_err(ApiError::from)
+    }
+
+    async fn delete_task(&self, id: &TaskId) -> Result<(), ApiError> {
+        if self.supervisor.delete_task(id) {
+            Ok(())
+        } else {
+            Err(ApiError::TaskNotFound(id.to_string()))
+        }
     }
 }

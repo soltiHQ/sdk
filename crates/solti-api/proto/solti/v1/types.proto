@@ -2,144 +2,156 @@ syntax = "proto3";
 
 package solti.v1;
 
-// Task execution state
+option go_package = "github.com/soltiHQ/control-plane/api/gen/v1;genv1";
+
+// Task execution state.
 enum TaskStatus {
   TASK_STATUS_UNSPECIFIED = 0;
-  TASK_STATUS_PENDING = 1;
-  TASK_STATUS_RUNNING = 2;
-  TASK_STATUS_SUCCEEDED = 3;
-  TASK_STATUS_FAILED = 4;
-  TASK_STATUS_TIMEOUT = 5;
-  TASK_STATUS_CANCELED = 6;
-  TASK_STATUS_EXHAUSTED = 7;
+  TASK_STATUS_PENDING     = 1;
+  TASK_STATUS_RUNNING     = 2;
+  TASK_STATUS_SUCCEEDED   = 3;
+  TASK_STATUS_FAILED      = 4;
+  TASK_STATUS_TIMEOUT     = 5;
+  TASK_STATUS_CANCELED    = 6;
+  TASK_STATUS_EXHAUSTED   = 7;
 }
 
-// Restart strategy
+// Restart strategy.
 enum RestartStrategy {
-  RESTART_STRATEGY_UNSPECIFIED = 0;
-  RESTART_STRATEGY_NEVER = 1;
-  RESTART_STRATEGY_ON_FAILURE = 2;
-  RESTART_STRATEGY_ALWAYS = 3;
+  RESTART_STRATEGY_UNSPECIFIED  = 0;
+  RESTART_STRATEGY_NEVER       = 1;
+  RESTART_STRATEGY_ON_FAILURE  = 2;
+  RESTART_STRATEGY_ALWAYS      = 3;
 }
 
-// Jitter strategy for backoff
+// Jitter strategy for backoff.
 enum JitterStrategy {
-  JITTER_STRATEGY_UNSPECIFIED = 0;
-  JITTER_STRATEGY_NONE = 1;
-  JITTER_STRATEGY_FULL = 2;
-  JITTER_STRATEGY_EQUAL = 3;
+  JITTER_STRATEGY_UNSPECIFIED  = 0;
+  JITTER_STRATEGY_NONE         = 1;
+  JITTER_STRATEGY_FULL         = 2;
+  JITTER_STRATEGY_EQUAL        = 3;
   JITTER_STRATEGY_DECORRELATED = 4;
 }
 
-// Admission strategy for slot conflicts
+// Admission strategy for slot conflicts.
 enum AdmissionStrategy {
-  ADMISSION_STRATEGY_UNSPECIFIED = 0;
-  ADMISSION_STRATEGY_DROP_IF_RUNNING = 1;
-  ADMISSION_STRATEGY_REPLACE = 2;
-  ADMISSION_STRATEGY_QUEUE = 3;
+  ADMISSION_STRATEGY_UNSPECIFIED      = 0;
+  ADMISSION_STRATEGY_DROP_IF_RUNNING  = 1;
+  ADMISSION_STRATEGY_REPLACE          = 2;
+  ADMISSION_STRATEGY_QUEUE            = 3;
 }
 
-// Key-value pair for environment variables
+// Key-value pair for environment variables.
 message KeyValue {
-  string key = 1;
+  string key   = 1;
   string value = 2;
 }
 
-// Subprocess execution mode: direct command
+// Subprocess execution mode: direct command.
 message CommandMode {
-  string command = 1;
-  repeated string args = 2;
+  string command         = 1;
+  repeated string args   = 2;
 }
 
-// Well-known script runtimes
+// Well-known script runtimes.
 enum ScriptRuntime {
   SCRIPT_RUNTIME_UNSPECIFIED = 0;
-  SCRIPT_RUNTIME_BASH = 1;
-  SCRIPT_RUNTIME_PYTHON = 2;
-  SCRIPT_RUNTIME_NODE = 3;
+  SCRIPT_RUNTIME_BASH        = 1;
+  SCRIPT_RUNTIME_PYTHON      = 2;
+  SCRIPT_RUNTIME_NODE        = 3;
 }
 
-// Custom interpreter configuration
+// Custom interpreter configuration.
 message CustomRuntime {
   string command = 1;
-  string flag = 2;
+  string flag    = 2;
 }
 
-// Script execution mode
+// Script execution mode.
 message ScriptMode {
   oneof runtime {
     ScriptRuntime well_known = 1;
-    CustomRuntime custom = 2;
+    CustomRuntime custom     = 2;
   }
-  string body = 3;           // base64-encoded script
-  repeated string args = 4;
+  string body            = 3; // base64-encoded script
+  repeated string args   = 4;
 }
 
-// Subprocess task configuration
+// Subprocess task configuration.
 message SubprocessTask {
   oneof mode {
     CommandMode command = 1;
-    ScriptMode script = 2;
+    ScriptMode  script  = 2;
   }
-  repeated KeyValue env = 3;
-  optional string cwd = 4;
-  bool fail_on_non_zero = 5;
+  repeated KeyValue env     = 3;
+  optional string cwd       = 4;
+  bool fail_on_non_zero     = 5;
 }
 
-// WebAssembly task configuration
+// WebAssembly task configuration.
 message WasmTask {
-  string module = 1;
-  repeated string args = 2;
-  repeated KeyValue env = 3;
+  string module            = 1;
+  repeated string args     = 2;
+  repeated KeyValue env    = 3;
 }
 
-// Container task configuration
+// Container task configuration.
 message ContainerTask {
-  string image = 1;
-  repeated string command = 2;
-  repeated string args = 3;
-  repeated KeyValue env = 4;
+  string image              = 1;
+  repeated string command   = 2;
+  repeated string args      = 3;
+  repeated KeyValue env     = 4;
 }
 
-// Task kind (execution backend)
+// Task kind (execution backend).
 message TaskKind {
   oneof kind {
     SubprocessTask subprocess = 1;
-    WasmTask wasm = 2;
-    ContainerTask container = 3;
+    WasmTask       wasm       = 2;
+    ContainerTask  container  = 3;
   }
 }
 
-// Backoff configuration
+// Backoff configuration.
 message BackoffStrategy {
   JitterStrategy jitter = 1;
-  uint64 first_ms = 2;
-  uint64 max_ms = 3;
-  double factor = 4;
+  uint64 first_ms       = 2;
+  uint64 max_ms         = 3;
+  double factor         = 4;
 }
 
-// Task creation specification
+// Task creation specification.
 message CreateSpec {
-  string slot = 1;
-  TaskKind kind = 2;
-  uint64 timeout_ms = 3;
-  RestartStrategy restart = 4;
-  optional uint64 restart_interval_ms = 5;  // For RestartStrategy::Always
-  BackoffStrategy backoff = 6;
-  AdmissionStrategy admission = 7;
-  map<string, string> labels = 8;
+  string slot                         = 1;
+  TaskKind kind                       = 2;
+  uint64 timeout_ms                   = 3;
+  RestartStrategy restart             = 4;
+  optional uint64 restart_interval_ms = 5; // For RestartStrategy::Always.
+  BackoffStrategy backoff             = 6;
+  AdmissionStrategy admission         = 7;
+  map<string, string> labels          = 8;
 }
 
-// Task information with current state
+// Task information with current state.
 message TaskInfo {
-  string id = 1;
-  string slot = 2;
-  TaskStatus status = 3;
-  uint32 attempt = 4;
-  int64 created_at = 5;     // Unix timestamp
-  int64 updated_at = 6;     // Unix timestamp
-  optional string error = 7;
-  uint64 generation = 8;
-  uint64 resource_version = 9;
-  optional int32 exit_code = 10;
+  string id                    = 1;
+  string slot                  = 2;
+  TaskStatus status            = 3;
+  uint32 attempt               = 4;
+  int64 created_at             = 5; // Unix timestamp (ms).
+  int64 updated_at             = 6; // Unix timestamp (ms).
+  optional string error        = 7;
+  uint64 generation            = 8;
+  uint64 resource_version      = 9;
+  optional int32 exit_code     = 10;
+}
+
+// Record of a single task execution attempt.
+message TaskRunInfo {
+  uint32 attempt               = 1;
+  TaskStatus status            = 2;
+  int64 started_at             = 3; // Unix timestamp (ms).
+  optional int64 finished_at   = 4; // Unix timestamp (ms), absent while running.
+  optional string error        = 5;
+  optional int32 exit_code     = 6;
 }

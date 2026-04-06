@@ -99,6 +99,24 @@ impl TaskState {
         }
     }
 
+    /// Delete a task and its run history. Returns `true` if the task existed.
+    pub fn delete_task(&self, id: &TaskId) -> bool {
+        let mut inner = self.inner.write();
+        inner.runs.remove(id);
+
+        if let Some(task) = inner.tasks.remove(id) {
+            if let Some(ids) = inner.by_slot.get_mut(task.slot()) {
+                ids.retain(|task_id| task_id != id);
+                if ids.is_empty() {
+                    inner.by_slot.remove(task.slot());
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Record the start of a new execution attempt.
     pub fn start_run(&self, id: &TaskId, attempt: u32) {
         let mut inner = self.inner.write();

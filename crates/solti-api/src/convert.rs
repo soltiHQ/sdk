@@ -2,8 +2,8 @@ use tracing::warn;
 
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, ContainerSpec, Flag, JitterPolicy, Labels, RestartPolicy,
-    Runtime, Slot, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskKind, TaskPhase, TaskSpec,
-    WasmSpec,
+    Runtime, Slot, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskKind, TaskPhase, TaskRun,
+    TaskSpec, WasmSpec,
 };
 
 use crate::error::ApiError;
@@ -59,6 +59,39 @@ impl From<Task> for proto_api::TaskInfo {
             generation: task.metadata.generation,
             resource_version: task.metadata.resource_version,
             exit_code: task.status.exit_code,
+        }
+    }
+}
+
+impl From<TaskRun> for proto_api::TaskRunInfo {
+    fn from(run: TaskRun) -> Self {
+        use std::time::UNIX_EPOCH;
+
+        let started_at = run
+            .started_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|e| {
+                warn!(attempt = run.attempt, error = %e, "started_at is before unix epoch, defaulting to 0");
+                std::time::Duration::ZERO
+            })
+            .as_secs() as i64;
+
+        let finished_at = run.finished_at.map(|t| {
+            t.duration_since(UNIX_EPOCH)
+                .unwrap_or_else(|e| {
+                    warn!(attempt = run.attempt, error = %e, "finished_at is before unix epoch, defaulting to 0");
+                    std::time::Duration::ZERO
+                })
+                .as_secs() as i64
+        });
+
+        proto_api::TaskRunInfo {
+            attempt: run.attempt,
+            status: proto_api::TaskStatus::from(run.phase) as i32,
+            started_at,
+            finished_at,
+            error: run.error,
+            exit_code: run.exit_code,
         }
     }
 }

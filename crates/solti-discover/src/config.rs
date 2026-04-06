@@ -27,4 +27,8 @@ pub struct DiscoverConfig {
     pub agent_endpoint: String,
     pub name: String,
     pub delay_ms: u64,
+    /// Agent capabilities — features the agent supports beyond the base API.
+    /// Known values: `"task_runs"`, `"task_delete"`, `"cancel"`.
+    /// The control-plane uses this to decide which RPCs are safe to call.
+    pub capabilities: Vec<String>,
 }

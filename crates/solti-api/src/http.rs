@@ -1,14 +1,15 @@
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
-use solti_model::{Task, TaskId, TaskPhase, TaskQuery, TaskSpec};
-use tracing::debug;
+use solti_model::{Task, TaskId, TaskPhase, TaskQuery, TaskRun, TaskSpec};
+use tracing::{debug, warn};
 
 use crate::{error::ApiError, handler::ApiHandler};
 
@@ -29,15 +30,20 @@ where
     /// Build axum router with mounted endpoints.
     ///
     /// Routes:
-    /// - POST /api/v1/tasks - Submit task
-    /// - GET /api/v1/tasks/:id - Get task status
-    /// - GET /api/v1/tasks - List all tasks (or filter by query params)
+    /// - `POST   /api/v1/tasks`             — Submit task
+    /// - `GET    /api/v1/tasks`             — Query tasks (filters + pagination)
+    /// - `GET    /api/v1/tasks/{id}`        — Get task status
+    /// - `GET    /api/v1/tasks/{id}/runs`   — List task execution history
+    /// - `POST   /api/v1/tasks/{id}/cancel` — Cancel a running task
+    /// - `DELETE /api/v1/tasks/{id}`        — Delete task and its runs
     pub fn router(self) -> Router {
         Router::new()
             .route("/api/v1/tasks", post(submit_task::<H>))
             .route("/api/v1/tasks", get(list_tasks::<H>))
             .route("/api/v1/tasks/{id}", get(get_task_status::<H>))
-            .route("/api/v1/tasks/{id}/cancel", post(cancel_task::<H>)) // НОВОЕ
+            .route("/api/v1/tasks/{id}", delete(delete_task::<H>))
+            .route("/api/v1/tasks/{id}/runs", get(list_task_runs::<H>))
+            .route("/api/v1/tasks/{id}/cancel", post(cancel_task::<H>))
             .with_state(self.handler)
     }
 }
@@ -59,7 +65,7 @@ struct SubmitTaskResponse {
 #[derive(Debug, Serialize, Deserialize)]
 struct GetTaskStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
-    info: Option<Task>,
+    info: Option<TaskInfoWire>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,8 +82,127 @@ struct ListTasksParams {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ListTasksResponse {
-    tasks: Vec<Task>,
+    tasks: Vec<TaskInfoWire>,
     total: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ListTaskRunsResponse {
+    runs: Vec<TaskRunWire>,
+}
+
+// ============================================================================
+// Wire types — flat format compatible with proto TaskInfo/TaskRunInfo.
+//
+// Domain types (Task, TaskRun) are nested; the HTTP API must return a flat
+// JSON shape matching what the control-plane proxy expects.
+// ============================================================================
+
+/// Flat task representation matching proto `TaskInfo`.
+#[derive(Debug, Serialize, Deserialize)]
+struct TaskInfoWire {
+    id: String,
+    slot: String,
+    status: String,
+    attempt: u32,
+    created_at: i64,
+    updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    generation: u64,
+    resource_version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+}
+
+impl From<Task> for TaskInfoWire {
+    fn from(task: Task) -> Self {
+        let created_at = task
+            .metadata
+            .created_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|e| {
+                warn!(task_id = %task.metadata.id, error = %e, "created_at before epoch");
+                std::time::Duration::ZERO
+            })
+            .as_secs() as i64;
+
+        let updated_at = task
+            .metadata
+            .updated_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|e| {
+                warn!(task_id = %task.metadata.id, error = %e, "updated_at before epoch");
+                std::time::Duration::ZERO
+            })
+            .as_secs() as i64;
+
+        Self {
+            id: task.metadata.id.to_string(),
+            slot: task.slot().to_string(),
+            status: phase_to_string(&task.status.phase),
+            attempt: task.status.attempt,
+            created_at,
+            updated_at,
+            error: task.status.error,
+            generation: task.metadata.generation,
+            resource_version: task.metadata.resource_version,
+            exit_code: task.status.exit_code,
+        }
+    }
+}
+
+/// Flat task run representation matching proto `TaskRunInfo`.
+#[derive(Debug, Serialize, Deserialize)]
+struct TaskRunWire {
+    attempt: u32,
+    status: String,
+    started_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finished_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+}
+
+impl From<TaskRun> for TaskRunWire {
+    fn from(run: TaskRun) -> Self {
+        let started_at = run
+            .started_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let finished_at = run.finished_at.map(|t| {
+            t.duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+        });
+
+        Self {
+            attempt: run.attempt,
+            status: phase_to_string(&run.phase),
+            started_at,
+            finished_at,
+            error: run.error,
+            exit_code: run.exit_code,
+        }
+    }
+}
+
+fn phase_to_string(phase: &TaskPhase) -> String {
+    match phase {
+        TaskPhase::Pending => "pending",
+        TaskPhase::Running => "running",
+        TaskPhase::Succeeded => "succeeded",
+        TaskPhase::Failed => "failed",
+        TaskPhase::Timeout => "timeout",
+        TaskPhase::Canceled => "canceled",
+        TaskPhase::Exhausted => "exhausted",
+        _ => "pending",
+    }
+    .to_string()
 }
 
 // ============================================================================
@@ -114,7 +239,9 @@ where
     debug!(%task_id, "getting task status");
     let info = handler.get_task_status(&task_id).await?;
 
-    let response = GetTaskStatusResponse { info };
+    let response = GetTaskStatusResponse {
+        info: info.map(TaskInfoWire::from),
+    };
 
     Ok(Json(response))
 }
@@ -159,7 +286,7 @@ where
     debug!(count = page.items.len(), total = page.total, "tasks listed");
 
     let response = ListTasksResponse {
-        tasks: page.items,
+        tasks: page.items.into_iter().map(TaskInfoWire::from).collect(),
         total: page.total,
     };
     Ok(Json(response))
@@ -180,6 +307,42 @@ fn parse_status(s: &str) -> Result<TaskPhase, ApiError> {
             s
         ))),
     }
+}
+
+/// GET /api/v1/tasks/:id/runs
+async fn list_task_runs<H>(
+    State(handler): State<Arc<H>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError>
+where
+    H: ApiHandler,
+{
+    let task_id = TaskId::from(id);
+    debug!(%task_id, "listing task runs");
+    let runs = handler.list_task_runs(&task_id).await?;
+
+    Ok(Json(ListTaskRunsResponse {
+        runs: runs.into_iter().map(TaskRunWire::from).collect(),
+    }))
+}
+
+/// DELETE /api/v1/tasks/:id
+async fn delete_task<H>(
+    State(handler): State<Arc<H>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError>
+where
+    H: ApiHandler,
+{
+    if id.trim().is_empty() {
+        return Err(ApiError::InvalidRequest("task_id cannot be empty".into()));
+    }
+
+    let task_id = TaskId::from(id);
+    handler.delete_task(&task_id).await?;
+    debug!(%task_id, "task deleted");
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// POST /api/v1/tasks/:id/cancel
