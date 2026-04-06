@@ -27,7 +27,6 @@
 
 use std::borrow::Borrow;
 
-use async_trait::async_trait;
 use taskvisor::{Event, EventKind, Subscribe};
 use tracing::{debug, error, info, trace, warn};
 
@@ -59,11 +58,10 @@ pub struct TracingEventSubscriber;
 /// On overflow events are dropped and a [`EventKind::SubscriberOverflow`] event is emitted by taskvisor (non-blocking).
 const QUEUE_CAPACITY: usize = 2048;
 
-#[async_trait]
 impl Subscribe for TracingEventSubscriber {
     /// Delegates to [`log_event`] which maps the event kind to the
     /// appropriate tracing macro at the correct severity level.
-    async fn on_event(&self, event: &Event) {
+    fn on_event(&self, event: &Event) {
         log_event(event);
     }
 

@@ -22,6 +22,7 @@
 //! | [`ObjectMeta`]      | Identity, versioning, timestamps                    |
 //! | [`TaskSpec`]        | Desired state - what to run, how to supervise       |
 //! | [`TaskSpecBuilder`] | Validated builder for [`TaskSpec`]                  |
+//! | [`TaskRun`]         | Record of a single task execution attempt            |
 //! | [`TaskStatus`]      | Observed state - phase, attempt count, last error   |
 
 mod spec;
@@ -35,3 +36,6 @@ pub use status::TaskStatus;
 
 mod task;
 pub use task::Task;
+
+mod run;
+pub use run::TaskRun;

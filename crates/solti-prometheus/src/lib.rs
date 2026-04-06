@@ -3,7 +3,7 @@
 //! Prometheus metrics for the solti task execution system.
 //!
 //! This crate provides two complementary metric collectors that together give full observability into the task execution pipeline:
-//! - [`PrometheusMetrics`]    - runner-level counters and histograms, injected into runners via [`solti_core::BuildContext`].
+//! - [`PrometheusMetrics`]    - runner-level counters and histograms, injected into runners via [`solti_runner::BuildContext`].
 //! - [`PrometheusSubscriber`] - supervision-level gauges and counters, driven by the [`taskvisor`] event stream.
 //!
 //! Both collectors register into a shared [`prometheus::Registry`] so that a single `metrics` HTTP endpoint can expose the complete picture.
@@ -41,7 +41,7 @@
 //!
 //! | Subsystem                               | Prefix           | Source                         |
 //! |-----------------------------------------|------------------|--------------------------------|
-//! | [`PrometheusMetrics`]                   | `solti_runner_*` | [`solti_core::MetricsBackend`] |
+//! | [`PrometheusMetrics`]                   | `solti_runner_*` | [`solti_runner::MetricsBackend`] |
 //! | [`PrometheusSubscriber`]                | `solti_sv_*`     | [`taskvisor::Subscribe`]       |
 //! | `taskvisor::Controller` (feature-gated) | `solti_ctrl_*`   | [`taskvisor::Subscribe`]       |
 //!

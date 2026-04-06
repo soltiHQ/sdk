@@ -57,7 +57,7 @@ impl ObjectMeta {
     }
 }
 
-mod time_serde {
+pub(crate) mod time_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::{SystemTime, UNIX_EPOCH};
 

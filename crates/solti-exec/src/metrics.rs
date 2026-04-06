@@ -5,7 +5,7 @@
 //! Provides runner-type identifiers and a mapping from [`TaskError`] to [`TaskOutcome`]
 //! used by all runner implementations in this crate.
 
-use solti_core::TaskOutcome;
+use solti_runner::TaskOutcome;
 use taskvisor::TaskError;
 
 /// Classify a [`TaskError`] into a [`TaskOutcome`] metric label.

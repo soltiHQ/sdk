@@ -13,8 +13,11 @@
 //! - [`Slot`]   - logical execution lane, stays the same across submissions.
 //! - [`TaskId`] - unique per run, format `{runner}-{slot}-{seq:x}`.
 
-mod slot;
-pub use slot::Slot;
+mod agent;
+pub use agent::AgentId;
 
 mod task;
 pub use task::TaskId;
+
+mod slot;
+pub use slot::Slot;

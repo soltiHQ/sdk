@@ -6,19 +6,20 @@
 //! - maps model-level specs / policies into controller specs and submits them.
 use std::{sync::Arc, time::Duration};
 
-use solti_model::{Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskSpec};
+use solti_model::{Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskRun, TaskSpec};
 use taskvisor::{
-    ControllerConfig, ControllerSpec, Subscribe, Supervisor, SupervisorConfig, TaskRef,
-    TaskSpec as TvTaskSpec,
+    ControllerConfig, ControllerSpec, Subscribe, Supervisor, SupervisorConfig, SupervisorHandle,
+    TaskRef, TaskSpec as TvTaskSpec,
 };
 use tracing::{debug, info, instrument};
+
+use solti_runner::RunnerRouter;
 
 use crate::system::init_uptime;
 use crate::{
     error::CoreError,
     map::{to_admission_policy, to_backoff_policy, to_restart_policy},
-    router::RunnerRouter,
-    state::{StateSubscriber, TaskState},
+    state::{StateConfig, StateSubscriber, TaskState, state_gc},
 };
 
 /// Thin wrapper around taskvisor [`Supervisor`] with a runner router.
@@ -28,7 +29,7 @@ use crate::{
 /// - selecting a concrete runner for each [`TaskSpec`];
 /// - mapping model-level specs into controller specs and submitting them.
 pub struct SupervisorApi {
-    sup: Arc<Supervisor>,
+    handle: SupervisorHandle,
     router: RunnerRouter,
     state: TaskState,
 }
@@ -40,9 +41,9 @@ impl SupervisorApi {
     /// - `subscribers` - event subscribers to attach to the supervisor;
     /// - `router`      - runner router [`solti_model::TaskKind`].
     ///
-    /// The supervisor run loop is spawned on the current Tokio runtime.
-    /// This method waits until the supervisor reports readiness before returning.
-    pub async fn new(
+    /// The supervisor event loop is started via [`Supervisor::serve()`] which returns
+    /// a [`SupervisorHandle`] for dynamic task management.
+    pub fn new(
         sup_cfg: SupervisorConfig,
         ctrl_cfg: ControllerConfig,
         mut subscribers: Vec<Arc<dyn Subscribe>>,
@@ -56,18 +57,15 @@ impl SupervisorApi {
             .with_controller(ctrl_cfg)
             .build();
 
-        let runner = Arc::clone(&sup);
-        tokio::spawn(async move {
-            if let Err(e) = runner.run(Vec::new()).await {
-                panic!("supervisor run loop exited with error: {}", e)
-            }
-        });
-
-        sup.wait_ready().await;
+        let handle = sup.serve();
         init_uptime();
 
         info!("supervisor is ready to accept tasks");
-        Ok(Self { sup, router, state })
+        Ok(Self {
+            handle,
+            router,
+            state,
+        })
     }
 
     /// Get task information by ID.
@@ -95,9 +93,40 @@ impl SupervisorApi {
         self.state.query(query)
     }
 
+    /// List execution history for a specific task (oldest first).
+    pub fn list_task_runs(&self, id: &TaskId) -> Vec<TaskRun> {
+        self.state.list_runs(id)
+    }
+
+    /// Delete a task and its run history.
+    ///
+    /// Returns `true` if the task existed and was deleted.
+    pub fn delete_task(&self, id: &TaskId) -> bool {
+        self.state.delete_task(id)
+    }
+
+    /// Enable automatic garbage collection for in-memory state.
+    ///
+    /// Submits an embedded periodic task that sweeps expired runs and
+    /// terminal tasks according to the provided [`StateConfig`].
+    ///
+    /// This is opt-in: if not called, no GC runs and the state grows
+    /// unboundedly. Recommended for long-running agents.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let api = SupervisorApi::new(sup, ctrl, subs, router)?;
+    /// api.enable_gc(StateConfig::default()).await?;
+    /// ```
+    pub async fn enable_gc(&self, config: StateConfig) -> Result<TaskId, CoreError> {
+        let (task, spec) = state_gc(self.state.clone(), config);
+        self.submit_with_task(task, &spec).await
+    }
+
     /// Get a clone of the underlying supervisor handle.
-    pub fn supervisor(&self) -> Arc<Supervisor> {
-        Arc::clone(&self.sup)
+    pub fn handle(&self) -> SupervisorHandle {
+        self.handle.clone()
     }
 
     /// Build and submit a task described by [`TaskSpec`].
@@ -137,16 +166,13 @@ impl SupervisorApi {
             to_backoff_policy(spec.backoff()),
             Some(Duration::from_millis(spec.timeout().as_millis())),
         );
-        let controller_spec = ControllerSpec {
-            admission: to_admission_policy(spec.admission()),
-            task_spec,
-        };
+        let controller_spec = ControllerSpec::new(to_admission_policy(spec.admission()), task_spec);
 
         debug!("submitting pre-built task via controller");
-        self.sup
-            .submit(controller_spec)
-            .await
-            .map_err(|e| CoreError::Supervisor(e.to_string()))?;
+        if let Err(e) = self.handle.submit(controller_spec).await {
+            self.state.remove_task(&task_id);
+            return Err(CoreError::Supervisor(e.to_string()));
+        }
         Ok(task_id)
     }
 
@@ -170,21 +196,14 @@ impl SupervisorApi {
     pub async fn cancel_task(&self, id: &TaskId) -> Result<(), CoreError> {
         debug!("cancelling task: {}", id);
 
-        if self.state.get(id).is_none() {
-            return Err(CoreError::Supervisor(format!("task not found: {}", id)));
-        }
-
         let was_cancelled = self
-            .sup
+            .handle
             .cancel(id.as_str())
             .await
             .map_err(|e| CoreError::Supervisor(format!("cancel failed: {}", e)))?;
 
         if !was_cancelled {
-            return Err(CoreError::Supervisor(format!(
-                "task not found in registry: {}",
-                id
-            )));
+            return Err(CoreError::Supervisor(format!("task not found: {}", id)));
         }
 
         debug!("task cancelled successfully: {}", id);
@@ -218,7 +237,6 @@ mod tests {
             Vec::new(),
             router,
         )
-        .await
         .expect("failed to create SupervisorApi");
 
         let task: TaskRef = TaskFn::arc("test-task", |_ctx: CancellationToken| async move {
@@ -251,7 +269,6 @@ mod tests {
             Vec::new(),
             router,
         )
-        .await
         .expect("failed to create SupervisorApi");
 
         let spec = TaskSpec::builder("test-slot-none", TaskKind::Embedded, 1_000_u64)

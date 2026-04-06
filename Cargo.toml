@@ -4,6 +4,7 @@ members = [
     "crates/solti-discover",
     "crates/solti-observe",
     "crates/solti-model",
+    "crates/solti-runner",
     "crates/solti-core",
     "crates/solti-exec",
     "crates/solti-api",
@@ -26,7 +27,7 @@ tokio-util = "0.7.17"
 time = { version = "0.3" }
 serde = { version = "1", features = ["derive"] }
 tracing-journald = "0.3.1"
-taskvisor = { version = "0.1.0" }
+taskvisor = { version = "0.1.1" }
 prometheus = "0.14.0"
 reqwest = "0.13.1"
 async-trait = "0.1"
@@ -39,6 +40,7 @@ base64 = "0.22"
 axum = "0.8.7"
 hostname = "0.4.2"
 uuid = "1.19.0"
+parking_lot = "0.12"
 
 tonic = "0.12"
 tonic-build = "0.12"

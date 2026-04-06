@@ -5,18 +5,19 @@ use axum::routing::get;
 use tracing::info;
 
 use solti_api::{HttpApi, SupervisorApiAdapter};
-use solti_core::{BuildContext, RunnerRouter, SupervisorApi};
+use solti_core::SupervisorApi;
 use solti_discover::{DiscoverConfig, DiscoveryTransport};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, RestartPolicy, RunnerEnv, SubprocessMode,
-    SubprocessSpec, TaskEnv, TaskKind, TaskSpec,
+    AdmissionPolicy, AgentId, BackoffPolicy, Flag, JitterPolicy, RestartPolicy, RunnerEnv,
+    SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec,
 };
 use solti_observe::{
     LoggerConfig, LoggerLevel, LoggerTimeZone, TracingEventSubscriber, init_local_offset,
     init_logger, timezone_sync,
 };
 use solti_prometheus::{PrometheusMetrics, PrometheusSubscriber};
+use solti_runner::{BuildContext, RunnerRouter};
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
 const AGENT_HTTP_ADDR: &str = "0.0.0.0:8085";
@@ -60,8 +61,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         ControllerConfig::default(),
         subscribers,
         router,
-    )
-    .await?;
+    )?;
     info!("supervisor ready");
 
     // 5) Internal tasks: timezone sync
@@ -71,6 +71,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 6) Discovery — periodic sync with control plane
     let discover_config = DiscoverConfig {
+        agent_id: AgentId::new("demo-agent-001"),
         name: "demo-agent".to_string(),
         control_plane_endpoint: CONTROL_PLANE_ENDPOINT.to_string(),
         agent_endpoint: format!("http://{}", AGENT_HTTP_ADDR),
@@ -80,6 +81,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             ("role".into(), "worker".into()),
         ]),
         delay_ms: 10_000,
+        capabilities: vec!["task_runs".into(), "task_delete".into(), "cancel".into()],
     };
     info!(
         "discovery: control_plane={}, agent={}, transport={:?}",

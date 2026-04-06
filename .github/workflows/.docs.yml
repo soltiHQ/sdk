@@ -20,4 +20,4 @@ jobs:
       - name: Run docs gen
         uses: soltiHQ/actions/taskfile@main
         with:
-          command: cargo/docs CRATE=${{ matrix.crate }}
+          command: ci:cargo/docs CRATE=${{ matrix.crate }}

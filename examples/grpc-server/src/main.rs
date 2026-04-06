@@ -4,7 +4,7 @@ use tonic::transport::Server;
 use tracing::info;
 
 use solti_api::{SoltiApiServer, SoltiApiService, SupervisorApiAdapter};
-use solti_core::{RunnerRouter, SupervisorApi};
+use solti_core::SupervisorApi;
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, RestartPolicy, SubprocessMode,
@@ -13,6 +13,7 @@ use solti_model::{
 use solti_observe::{
     LoggerConfig, LoggerLevel, TracingEventSubscriber, init_logger, timezone_sync,
 };
+use solti_runner::RunnerRouter;
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
 #[tokio::main]
@@ -37,8 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ControllerConfig::default(),
         subscribers,
         router,
-    )
-    .await?;
+    )?;
     info!("supervisor ready");
 
     // 4) Submit timezone sync task

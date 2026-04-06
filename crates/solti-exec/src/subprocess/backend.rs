@@ -65,6 +65,27 @@ impl SubprocessBackendConfig {
     /// Validate the configuration.
     pub(crate) fn validate(&self) -> Result<(), crate::ExecError> {
         if let Some(cgroups) = &self.cgroups {
+            if let Some(cpu) = &cgroups.cpu {
+                if cpu.period == 0 {
+                    return Err(InvalidRunnerConfig(
+                        "cgroups.cpu.period cannot be zero".into(),
+                    ));
+                }
+                if let Some(q) = cpu.quota
+                    && q == 0
+                {
+                    return Err(InvalidRunnerConfig(
+                        "cgroups.cpu.quota cannot be zero (process would get no CPU)".into(),
+                    ));
+                }
+                if let Some(q) = cpu.quota
+                    && q > cpu.period
+                {
+                    return Err(InvalidRunnerConfig(
+                        "cgroups.cpu.quota exceeds period (>100% of one core)".into(),
+                    ));
+                }
+            }
             if let Some(mem) = cgroups.memory
                 && mem == 0
             {
@@ -150,5 +171,77 @@ impl SubprocessBackendConfig {
             attach_security(cmd, security);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::CpuMax;
+
+    #[test]
+    fn valid_cpu_config_passes() {
+        let cfg = SubprocessBackendConfig::new().with_cgroups(CgroupLimits {
+            cpu: Some(CpuMax {
+                quota: Some(50_000),
+                period: 100_000,
+            }),
+            ..Default::default()
+        });
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn cpu_period_zero_rejected() {
+        let cfg = SubprocessBackendConfig::new().with_cgroups(CgroupLimits {
+            cpu: Some(CpuMax {
+                quota: Some(50_000),
+                period: 0,
+            }),
+            ..Default::default()
+        });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("period"), "expected period error, got: {err}");
+    }
+
+    #[test]
+    fn cpu_quota_zero_rejected() {
+        let cfg = SubprocessBackendConfig::new().with_cgroups(CgroupLimits {
+            cpu: Some(CpuMax {
+                quota: Some(0),
+                period: 100_000,
+            }),
+            ..Default::default()
+        });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("quota"), "expected quota error, got: {err}");
+    }
+
+    #[test]
+    fn cpu_quota_exceeds_period_rejected() {
+        let cfg = SubprocessBackendConfig::new().with_cgroups(CgroupLimits {
+            cpu: Some(CpuMax {
+                quota: Some(200_000),
+                period: 100_000,
+            }),
+            ..Default::default()
+        });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds period"),
+            "expected exceeds error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cpu_unlimited_quota_passes() {
+        let cfg = SubprocessBackendConfig::new().with_cgroups(CgroupLimits {
+            cpu: Some(CpuMax {
+                quota: None,
+                period: 100_000,
+            }),
+            ..Default::default()
+        });
+        assert!(cfg.validate().is_ok());
     }
 }

@@ -65,6 +65,13 @@ impl From<&str> for Slot {
     }
 }
 
+impl From<Arc<str>> for Slot {
+    #[inline]
+    fn from(s: Arc<str>) -> Self {
+        Self(s)
+    }
+}
+
 impl AsRef<str> for Slot {
     #[inline]
     fn as_ref(&self) -> &str {

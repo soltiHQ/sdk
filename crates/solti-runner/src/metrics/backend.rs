@@ -61,32 +61,22 @@ pub trait MetricsBackend: Send + Sync + 'static {
     /// Record task spawn event.
     ///
     /// Called when a task is submitted and starts executing.
-    ///
-    /// # Arguments
-    /// - `runner_type`: Runner implementation
     fn record_task_started(&self, runner_type: RunnerType);
+
     /// Record task completion with outcome and duration.
     ///
     /// Called when task exits (success, failure, timeout, cancel).
-    ///
-    /// # Arguments
-    /// - `runner_type`: Runner implementation
-    /// - `outcome`: How the task terminated
-    /// - `duration_ms`: Execution time in milliseconds
     fn record_task_completed(
         &self,
         runner_type: RunnerType,
         outcome: TaskOutcome,
         duration_ms: u64,
     );
+
     /// Record runner-specific error during task setup/teardown.
     ///
     /// Called when runner fails to spawn/cleanup a task.
     /// This is separate from task failures (which are `record_task_completed` with `Failure`).
-    ///
-    /// # Arguments
-    /// - `runner_type`: Runner implementation
-    /// - `error_kind`: Error category
     fn record_runner_error(&self, runner_type: RunnerType, error_kind: &str);
 }
 

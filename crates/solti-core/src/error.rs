@@ -1,12 +1,9 @@
 use thiserror::Error;
 
-use crate::runner::RunnerError;
+use solti_runner::RunnerError;
 
 #[derive(Debug, Error)]
 pub enum CoreError {
-    #[error("no suitable runner for task kind: {0}")]
-    NoRunner(String),
-
     #[error("supervisor error: {0}")]
     Supervisor(String),
 

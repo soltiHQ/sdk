@@ -7,18 +7,19 @@
 //! ## Architecture
 //!
 //! ```text
-//!  ┌────────────────────────────────────────────────────────┐
-//!  │                      Task                              │
-//!  │                                                        │
-//!  │  ObjectMeta            TaskSpec            TaskStatus  │
-//!  │  ├─ id: TaskId         ├─ slot: Slot       ├─ phase    │
-//!  │  ├─ generation         ├─ kind: TaskKind   ├─ attempt  │
-//!  │  ├─ resource_version   ├─ timeout          └─ error    │
-//!  │  ├─ created_at         ├─ restart                      │
-//!  │  └─ updated_at         ├─ backoff                      │
-//!  │                        ├─ admission                    │
-//!  │                        └─ labels                       │
-//!  └────────────────────────────────────────────────────────┘
+//!  ┌──────────────────────────────────────────────────────────┐
+//!  │                      Task                                │
+//!  │                                                          │
+//!  │  ObjectMeta            TaskSpec            TaskStatus    │
+//!  │  ├─ id: TaskId         ├─ slot: Slot       ├─ phase      │
+//!  │  ├─ generation         ├─ kind: TaskKind   ├─ attempt    │
+//!  │  ├─ resource_version   ├─ timeout          ├─ exit_code  │
+//!  │  ├─ created_at         ├─ restart          └─ error      │
+//!  │  └─ updated_at         ├─ backoff                        │
+//!  │                        ├─ admission                      │
+//!  │                        ├─ runner_selector                │
+//!  │                        └─ labels                         │
+//!  └──────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! ## Resource model
@@ -26,8 +27,8 @@
 //! | Section         | Type             | Responsibility                                                  |
 //! |-----------------|------------------|-----------------------------------------------------------------|
 //! | **metadata**    | [`ObjectMeta`]   | Identity, versioning, timestamps                                |
+//! | **status**      | [`TaskStatus`]   | Observed state: phase, attempt count, exit code, last error     |
 //! | **spec**        | [`TaskSpec`]     | Desired state (private fields; build via [`TaskSpec::builder`]) |
-//! | **status**      | [`TaskStatus`]   | Observed state: phase, attempt count, last error                |
 //!
 //! Slot and labels live in `spec` as the single source of truth.
 //! [`Task`] provides convenience accessors ([`Task::slot`], [`Task::labels`]) that delegate to `spec`.
@@ -63,7 +64,7 @@
 //! | `Container`    | OCI container image                                  |
 //! | `Embedded`     | Code-defined task (in-process `TaskRef`)             |
 //!
-//! `Subprocess` tasks go through [`solti_core::RunnerRouter`]; `Embedded` tasks
+//! `Subprocess` tasks go through [`solti_runner::RunnerRouter`]; `Embedded` tasks
 //! are submitted directly via `SupervisorApi::submit_with_task`.
 //!
 //! ## Policies
@@ -145,14 +146,14 @@
 
 mod domain;
 pub use domain::{
-    AdmissionPolicy, BackoffPolicy, ContainerSpec, Flag, JitterPolicy, KeyValue, Labels,
+    AdmissionPolicy, AgentId, BackoffPolicy, ContainerSpec, Flag, JitterPolicy, KeyValue, Labels,
     LabelsIter, RestartPolicy, RunnerEnv, RunnerSelector, Runtime, SelectorOperator,
     SelectorRequirement, Slot, SubprocessMode, SubprocessSpec, TaskEnv, TaskId, TaskKind, TaskPage,
     TaskPhase, TaskQuery, Timeout, WasmSpec, merge_env,
 };
 
 mod resource;
-pub use resource::{ObjectMeta, Task, TaskSpec, TaskSpecBuilder, TaskStatus};
+pub use resource::{ObjectMeta, Task, TaskRun, TaskSpec, TaskSpecBuilder, TaskStatus};
 
 mod error;
 pub use error::{ModelError, ModelResult};

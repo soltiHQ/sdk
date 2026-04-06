@@ -1,6 +1,6 @@
 //! # Runner: subprocess execution engine.
 //!
-//! [`SubprocessRunner`] implements the [`Runner`](solti_core::Runner) trait to execute
+//! [`SubprocessRunner`] implements the [`Runner`](solti_runner::Runner) trait to execute
 //! [`TaskKind::Subprocess`](solti_model::TaskKind::Subprocess) tasks as OS processes.
 //!
 //! ## How it works
@@ -13,7 +13,7 @@
 //!     │     │     ├──► Command { command, args } → clone
 //!     │     │     └──► Script { runtime, body }  → decode base64 → (runtime, [flag, script, ...])
 //!     │     ├──► merge_env(task_env, runner_env)  → BTreeMap
-//!     │     └──► SubprocessTaskConfig { run_id, command, args, env, cwd, fail_on_non_zero }
+//!     │     └──► SubprocessTaskConfig { run_id, seq, command, args, env, cwd, fail_on_non_zero }
 //!     │
 //!     ├──► prepare backend (cgroup dirs, if configured)
 //!     │
@@ -57,8 +57,8 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
-use solti_core::{BuildContext, Runner, RunnerError, RunnerType};
 use solti_model::{SubprocessSpec, TaskKind, TaskSpec, merge_env};
+use solti_runner::{BuildContext, Runner, RunnerError, RunnerType};
 
 use crate::metrics::classify_task_error;
 use crate::subprocess::{
@@ -112,13 +112,15 @@ impl SubprocessRunner {
                 fail_on_non_zero,
             }) => {
                 let (command, args) = Self::resolve_mode(mode)?;
+                let run_id = self.build_run_id(slot.as_str());
                 SubprocessTaskConfig {
-                    run_id: Arc::from(self.build_run_id(slot.as_str())),
-                    command,
-                    args,
+                    seq: run_id.seq(),
+                    run_id: Arc::from(run_id.into_name()),
+                    fail_on_non_zero: *fail_on_non_zero,
                     env: merge_env(env, ctx.env()),
                     cwd: cwd.clone(),
-                    fail_on_non_zero: *fail_on_non_zero,
+                    command,
+                    args,
                 }
             }
             other => {
@@ -186,7 +188,7 @@ impl Runner for SubprocessRunner {
                 crate::utils::build_cgroup_name(
                     self.name,
                     spec.slot().as_str(),
-                    extract_seq_from_run_id(&task_cfg.run_id),
+                    task_cfg.seq,
                     timestamp,
                 )
             })
@@ -220,7 +222,7 @@ struct TaskExecContext {
     task_cfg: SubprocessTaskConfig,
     runner_cfg: Option<Arc<SubprocessBackendConfig>>,
     cgroup_name: Option<String>,
-    metrics: solti_core::MetricsHandle,
+    metrics: solti_runner::MetricsHandle,
     log_cfg: LogConfig,
 }
 
@@ -355,7 +357,7 @@ async fn run_subprocess(
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let outcome = match &result {
-        Ok(()) => solti_core::TaskOutcome::Success,
+        Ok(()) => solti_runner::TaskOutcome::Success,
         Err(e) => classify_task_error(e),
     };
     ctx.metrics
@@ -368,33 +370,9 @@ async fn run_subprocess(
     result
 }
 
-/// Extract sequence number from run_id.
-fn extract_seq_from_run_id(run_id: &str) -> u64 {
-    run_id
-        .rsplit('-')
-        .next()
-        .and_then(|s| u64::from_str_radix(s, 16).ok())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extract_seq_from_run_id_valid() {
-        assert_eq!(extract_seq_from_run_id("runner-slot-ff"), 255);
-    }
-
-    #[test]
-    fn extract_seq_from_run_id_no_hex() {
-        assert_eq!(extract_seq_from_run_id("no-hex-zzz"), 0);
-    }
-
-    #[test]
-    fn extract_seq_from_run_id_empty() {
-        assert_eq!(extract_seq_from_run_id(""), 0);
-    }
 
     fn mk_backoff() -> solti_model::BackoffPolicy {
         solti_model::BackoffPolicy {
@@ -408,7 +386,7 @@ mod tests {
     fn mk_subprocess_spec(slot: &str, command: &str) -> TaskSpec {
         TaskSpec::builder(
             slot,
-            TaskKind::Subprocess(solti_model::SubprocessSpec {
+            TaskKind::Subprocess(SubprocessSpec {
                 mode: solti_model::SubprocessMode::Command {
                     command: command.into(),
                     args: vec![],
@@ -438,6 +416,7 @@ mod tests {
     fn make_task_cfg() -> SubprocessTaskConfig {
         SubprocessTaskConfig {
             run_id: Arc::from("test-run-1"),
+            seq: 1,
             command: "echo".into(),
             args: vec!["hello".into()],
             env: Default::default(),
@@ -451,7 +430,7 @@ mod tests {
             task_cfg: make_task_cfg(),
             runner_cfg: None,
             cgroup_name: None,
-            metrics: solti_core::noop_metrics(),
+            metrics: solti_runner::noop_metrics(),
             log_cfg: LogConfig::default(),
         }
     }

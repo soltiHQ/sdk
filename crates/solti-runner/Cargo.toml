@@ -1,0 +1,17 @@
+[package]
+name = "solti-runner"
+version = "0.0.1"
+edition = "2024"
+
+[features]
+default = []
+
+[dependencies]
+taskvisor = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+solti-model = { path = "../solti-model" }
+
+[dev-dependencies]
+tokio-util = { workspace = true }

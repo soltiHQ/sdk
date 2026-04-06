@@ -16,7 +16,7 @@ use crate::{
 /// - lifecycle policies (`timeout`, `restart`, `backoff`)
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[serde(from = "raw::TaskSpecRaw")]
+#[serde(try_from = "raw::TaskSpecRaw")]
 pub struct TaskSpec {
     slot: Slot,
     kind: TaskKind,
@@ -125,41 +125,24 @@ impl TaskSpec {
 
 impl TaskSpec {
     /// Validate the spec at the **submit boundary**.
-    ///
-    /// Checks:
-    /// - `slot` is not empty
-    /// - `backoff` parameters are sane
-    /// - `timeout` is greater than zero
-    /// - `kind` specific constraints (e.g. non-empty command)
-    /// - `runner_selector` requirements are structurally valid
-    /// - `kind` is not [`TaskKind::Embedded`] (internal-only; use `submit_with_task` instead)
     pub fn validate(&self) -> ModelResult<()> {
-        if self.slot.as_str().is_empty() {
-            return Err(ModelError::Invalid("slot cannot be empty".into()));
-        }
+        self.validate_structural()?;
         if matches!(self.kind, TaskKind::Embedded) {
             return Err(ModelError::Invalid(
                 "TaskKind::Embedded cannot be submitted via runner; use submit_with_task".into(),
             ));
         }
-        if self.timeout.as_millis() == 0 {
-            return Err(ModelError::Invalid(
-                "timeout must be greater than zero".into(),
-            ));
-        }
-        self.kind.validate()?;
-        self.backoff.validate()?;
-        if let Some(ref sel) = self.runner_selector {
-            for req in &sel.match_expressions {
-                req.validate()?;
-            }
-        }
         Ok(())
     }
 
-    /// Structural validation (everything except the [`TaskKind::Embedded`] business rule).
+    /// Structural validation of all fields.
     ///
-    /// Used by [`TaskSpecBuilder::build`].
+    /// Checks:
+    /// - `slot` is not empty
+    /// - `timeout` is greater than zero
+    /// - `kind` specific constraints (e.g. non-empty command)
+    /// - `backoff` parameters are sane
+    /// - `runner_selector` requirements are structurally valid
     fn validate_structural(&self) -> ModelResult<()> {
         if self.slot.as_str().is_empty() {
             return Err(ModelError::Invalid("slot cannot be empty".into()));
@@ -282,8 +265,6 @@ impl TaskSpecBuilder {
     }
 }
 
-/// Permissive deserialization (no validation).
-/// Validation happens at the submit boundary via [`TaskSpec::validate`].
 mod raw {
     use super::*;
 
@@ -303,9 +284,11 @@ mod raw {
         runner_selector: Option<RunnerSelector>,
     }
 
-    impl From<TaskSpecRaw> for TaskSpec {
-        fn from(r: TaskSpecRaw) -> Self {
-            Self {
+    impl TryFrom<TaskSpecRaw> for TaskSpec {
+        type Error = ModelError;
+
+        fn try_from(r: TaskSpecRaw) -> Result<Self, Self::Error> {
+            let spec = Self {
                 runner_selector: r.runner_selector,
 
                 kind: r.kind,
@@ -317,7 +300,9 @@ mod raw {
 
                 admission: r.admission,
                 labels: r.labels,
-            }
+            };
+            spec.validate_structural()?;
+            Ok(spec)
         }
     }
 }
@@ -403,5 +388,25 @@ mod tests {
         let json = serde_json::to_string(&spec).unwrap();
         let back: TaskSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn serde_rejects_empty_slot() {
+        let spec = valid_spec();
+        let mut json: serde_json::Value = serde_json::to_value(&spec).unwrap();
+        json["slot"] = serde_json::Value::String(String::new());
+
+        let err = serde_json::from_value::<TaskSpec>(json).unwrap_err();
+        assert!(err.to_string().contains("slot"), "error: {err}");
+    }
+
+    #[test]
+    fn serde_rejects_zero_timeout() {
+        let spec = valid_spec();
+        let mut json: serde_json::Value = serde_json::to_value(&spec).unwrap();
+        json["timeout"] = serde_json::json!(0);
+
+        let err = serde_json::from_value::<TaskSpec>(json).unwrap_err();
+        assert!(err.to_string().contains("timeout"), "error: {err}");
     }
 }

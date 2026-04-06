@@ -42,8 +42,8 @@ pub use runner::SubprocessRunner;
 
 use std::sync::Arc;
 
-use solti_core::RunnerRouter;
 use solti_model::Labels;
+use solti_runner::RunnerRouter;
 
 use crate::ExecError;
 
