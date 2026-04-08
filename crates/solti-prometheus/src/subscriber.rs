@@ -1,3 +1,9 @@
+//! # Supervision-level Prometheus metrics.
+//!
+//! [`PrometheusSubscriber`] implements [`Subscribe`] and translates [`taskvisor`] events into Prometheus counters, gauges, and histograms.
+//!
+//! See the [crate root](crate) for architecture and namespace overview.
+
 use std::sync::Arc;
 
 use prometheus::{Counter, CounterVec, Gauge, Histogram, Opts, Registry};
@@ -60,6 +66,19 @@ use tracing::debug;
 /// |----------|-----------------------|--------------------------------|
 /// | `source` | `failure`, `success`  | [`BackoffSource`] on the event |
 /// | `reason` | `exhausted`, `fatal`  | Terminal event kind            |
+///
+/// ## Notes
+///
+/// - `tasks_in_flight` gauge is guarded against going negative: a [`TaskStopped`](EventKind::TaskStopped) without a preceding
+///   [`TaskStarting`](EventKind::TaskStarting) is a no-op on the gauge.
+/// - Backoff duration is converted from milliseconds to seconds before observation.
+/// - [`queue_capacity`](Subscribe::queue_capacity) is set to `2048` (2x the taskvisor default) to reduce event loss under high throughput.
+///
+/// ## Also
+///
+/// - [`PrometheusMetrics`](crate::PrometheusMetrics) is a runner-level metrics, complementary to this subscriber.
+/// - [`Event`](taskvisor::Event) and [`EventKind`](taskvisor::EventKind): event structure and classification.
+/// - See `examples/http-server` for a complete integration example.
 pub struct PrometheusSubscriber {
     task_backoff_duration: Histogram,
     task_backoff_count: CounterVec,

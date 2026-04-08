@@ -1,3 +1,9 @@
+//! # Runner-level Prometheus metrics.
+//!
+//! [`PrometheusMetrics`] implements [`MetricsBackend`] and exposes counters and histograms for task execution events reported by runners.
+//!
+//! See the [crate root](crate) for architecture and namespace overview.
+
 use std::sync::Arc;
 
 use prometheus::{CounterVec, HistogramVec, Opts, Registry, proto::MetricFamily};
@@ -32,6 +38,11 @@ use solti_runner::{MetricsBackend, RunnerType, TaskOutcome};
 ///
 /// Buckets (seconds): `0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600`.
 /// Covers sub-second scripts up to 1-hour long-running tasks.
+///
+/// ## Also
+///
+/// - [`PrometheusSubscriber`](crate::PrometheusSubscriber) is a supervision-level metrics from the event stream.
+/// - [`Registry`](prometheus::Registry) is a shared registry for unified `/metrics` endpoint.
 #[derive(Clone)]
 pub struct PrometheusMetrics {
     tasks_started: CounterVec,
@@ -96,8 +107,6 @@ impl PrometheusMetrics {
     }
 
     /// Create a new metrics backend with an **isolated** registry.
-    ///
-    /// Tests only.
     pub fn new() -> Result<Self, prometheus::Error> {
         Self::new_with_registry(Arc::new(Registry::new()))
     }
