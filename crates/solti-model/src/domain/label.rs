@@ -1,3 +1,7 @@
+//! # Key-value metadata labels.
+//!
+//! [`Labels`] is an ordered map used for runner routing and task filtering.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

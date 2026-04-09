@@ -1,3 +1,7 @@
+//! # Task lifecycle phases.
+//!
+//! [`TaskPhase`] represents the current state of a task in the supervision lifecycle.
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};

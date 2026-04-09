@@ -1,3 +1,7 @@
+//! # Task specification.
+//!
+//! [`TaskSpec`] defines the desired state; constructed via [`TaskSpecBuilder`].
+
 use serde::{Deserialize, Serialize};
 
 use crate::{

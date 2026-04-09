@@ -1,3 +1,7 @@
+//! # Task run record.
+//!
+//! [`TaskRun`] captures a single execution attempt with start/finish times and outcome.
+
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};

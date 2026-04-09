@@ -1,3 +1,7 @@
+//! # Backoff policy.
+//!
+//! [`BackoffPolicy`] controls retry delay growth: initial delay, max cap, factor, and jitter.
+
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 

@@ -1,3 +1,7 @@
+//! # Agent identifier.
+//!
+//! [`AgentId`] identifies an agent instance in multi-agent deployments.
+
 use std::borrow::Borrow;
 use std::fmt;
 use std::sync::Arc;

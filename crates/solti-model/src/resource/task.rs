@@ -1,3 +1,7 @@
+//! # Task resource.
+//!
+//! [`Task`] is the K8s-style aggregate: metadata + spec + status.
+
 use serde::{Deserialize, Serialize};
 
 use crate::{Labels, ObjectMeta, Slot, TaskId, TaskPhase, TaskSpec, TaskStatus};

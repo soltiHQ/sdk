@@ -1,3 +1,7 @@
+//! # Task query builder.
+//!
+//! [`TaskQuery`] and [`TaskPage`] support filtered, paginated task listing.
+
 use crate::{Slot, TaskPhase};
 
 const DEFAULT_LIMIT: usize = 100;

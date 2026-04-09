@@ -1,3 +1,7 @@
+//! # Subprocess execution specification.
+//!
+//! [`SubprocessSpec`] and [`SubprocessMode`] define how OS subprocess tasks are configured and validated.
+
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};

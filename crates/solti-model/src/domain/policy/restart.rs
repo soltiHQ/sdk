@@ -1,3 +1,7 @@
+//! # Restart policy.
+//!
+//! [`RestartPolicy`] controls when a task is restarted after completion or failure.
+
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 

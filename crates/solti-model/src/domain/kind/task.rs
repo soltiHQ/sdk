@@ -1,3 +1,7 @@
+//! # Task execution backends.
+//!
+//! [`TaskKind`] defines what a task actually runs: subprocess, WASM, container, or embedded code.
+
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};

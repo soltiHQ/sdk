@@ -1,3 +1,7 @@
+//! # Object metadata.
+//!
+//! [`ObjectMeta`] tracks identity, versioning (generation + resource_version), and timestamps.
+
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};

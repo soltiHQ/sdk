@@ -1,3 +1,7 @@
+//! # Task status.
+//!
+//! [`TaskStatus`] tracks observed state: phase, attempt count, exit code, last error.
+
 use serde::{Deserialize, Serialize};
 
 use crate::TaskPhase;

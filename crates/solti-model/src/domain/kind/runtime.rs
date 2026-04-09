@@ -1,3 +1,7 @@
+//! # Script runtime resolution.
+//!
+//! [`Runtime`] maps script languages to interpreter paths for subprocess `Script` mode.
+
 use serde::{Deserialize, Serialize};
 
 /// Script interpreter for subprocess script execution.

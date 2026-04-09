@@ -1,3 +1,7 @@
+//! # Jitter strategy.
+//!
+//! [`JitterPolicy`] adds randomness to backoff delays to prevent thundering-herd effects.
+
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 

@@ -1,3 +1,7 @@
+//! # Per-attempt timeout.
+//!
+//! [`Timeout`] is a validated wrapper over milliseconds, used in [`TaskSpec`](crate::TaskSpec).
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};

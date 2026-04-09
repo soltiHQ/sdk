@@ -1,3 +1,7 @@
+//! # Generic key-value pair.
+//!
+//! [`KeyValue`] is used for environment variables and other ordered pair collections.
+
 use serde::{Deserialize, Serialize};
 
 /// Key–value pair used for environment variables or generic metadata.

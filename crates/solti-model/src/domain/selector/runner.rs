@@ -1,3 +1,7 @@
+//! # Runner selector.
+//!
+//! [`RunnerSelector`] matches runners by label equality and expression-based requirements.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,7 @@
+//! # Task identifier.
+//!
+//! [`TaskId`] is a unique identifier for a task resource (newtype over `Arc<str>`).
+
 use std::borrow::Borrow;
 use std::fmt;
 use std::sync::Arc;
