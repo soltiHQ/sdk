@@ -22,7 +22,7 @@
 //! | [`ObjectMeta`]      | Identity, versioning, timestamps                    |
 //! | [`TaskSpec`]        | Desired state - what to run, how to supervise       |
 //! | [`TaskSpecBuilder`] | Validated builder for [`TaskSpec`]                  |
-//! | [`TaskRun`]         | Record of a single task execution attempt            |
+//! | [`TaskRun`]         | Record of a single task execution attempt           |
 //! | [`TaskStatus`]      | Observed state - phase, attempt count, last error   |
 
 mod spec;

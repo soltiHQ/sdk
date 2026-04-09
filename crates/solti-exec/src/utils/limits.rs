@@ -10,6 +10,11 @@
 //!
 //! **Other platforms:** `tracing::warn` and no-op.
 //!
+//! ## Also
+//!
+//! - [`SubprocessBackendConfig`](crate::subprocess::SubprocessBackendConfig) builder that consumes `RlimitConfig`.
+//! - [`CgroupLimits`](super::CgroupLimits) complementary cgroup v2 limits.
+//!
 //! ## What happens when a subprocess spawns
 //! ```text
 //!                        parent process

@@ -34,6 +34,11 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, info, warn};
 
 /// Configuration for subprocess output logging.
+///
+/// ## Also
+///
+/// - [`SubprocessBackendConfig`](super::SubprocessBackendConfig) carries `LogConfig` as a field.
+/// - `log_stream` async function that reads + truncates + emits lines.
 #[derive(Debug, Clone, Copy)]
 pub struct LogConfig {
     /// Max line length (in Unicode chars) before truncation.

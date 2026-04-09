@@ -67,10 +67,6 @@ impl SubprocessMode {
     /// - `Command`: command must not be empty.
     /// - `Script`: body must not be empty, must be valid base64, must decode to UTF-8.
     /// - `Script` + `Custom` runtime: command and flag must not be empty.
-    ///
-    /// Uses `str::from_utf8` (borrow) instead of `String::from_utf8` (ownership)
-    /// to avoid allocating a `String` that would be immediately discarded.
-    /// The actual decoded body is produced later by [`decode_body`] at execution time.
     pub fn validate(&self) -> ModelResult<()> {
         match self {
             SubprocessMode::Command { command, .. } => {
@@ -90,7 +86,6 @@ impl SubprocessMode {
                 std::str::from_utf8(&bytes).map_err(|e| {
                     ModelError::Invalid(format!("script body is not valid UTF-8: {e}").into())
                 })?;
-                // bytes dropped here — no String allocation
 
                 if let Runtime::Custom { command, flag } = runtime {
                     if command.trim().is_empty() {
@@ -237,8 +232,6 @@ mod tests {
         );
     }
 
-    // --- decode_body ---
-
     #[test]
     fn decode_body_returns_script() {
         let mode = SubprocessMode::Script {
@@ -257,8 +250,6 @@ mod tests {
         };
         assert!(mode.decode_body().is_err());
     }
-
-    // --- Serde ---
 
     #[test]
     fn serde_roundtrip_command() {

@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 /// Current execution phase of a single task attempt.
 ///
 /// Phases describe the state of the **current attempt**.
+///
+/// ## Also
+///
+/// - [`TaskStatus`](crate::TaskStatus) carries the current phase.
+/// - [`TaskPhase::is_terminal`] checks for final states.
+/// - [`RestartPolicy`](crate::RestartPolicy) governs what happens after a terminal phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]

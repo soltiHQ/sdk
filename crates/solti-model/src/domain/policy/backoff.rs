@@ -19,6 +19,12 @@ use crate::error::{ModelError, ModelResult};
 /// | `factor`   | `f64`          | `2.0`     | Exponential growth multiplier         |
 ///
 /// Growth example with `factor = 2.0`: 1 s → 2 s → 4 s → 8 s → … → 30 s (capped).
+///
+/// ## Also
+///
+/// - [`JitterPolicy`](super::JitterPolicy) jitter strategy applied to each delay.
+/// - [`RestartPolicy`](super::RestartPolicy) controls *when* to restart; backoff controls *delay*.
+/// - [`BackoffPolicy::validate`] parameter validation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackoffPolicy {

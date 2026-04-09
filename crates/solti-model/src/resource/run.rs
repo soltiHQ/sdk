@@ -14,8 +14,12 @@ use crate::TaskPhase;
 /// When the attempt finishes (success, failure, timeout, etc.), the run
 /// is closed with the terminal phase and timestamp.
 ///
-/// Runs are associated with a [`Task`](crate::Task) via its [`TaskId`](crate::TaskId)
-/// and ordered by attempt number.
+/// Runs are associated with a [`Task`](crate::Task) via its [`TaskId`](crate::TaskId) and ordered by attempt number.
+///
+/// ## Also
+///
+/// - [`Task`](crate::Task) parent resource.
+/// - [`TaskPhase`] phase values stored in `phase` field.
 ///
 /// # Lifecycle
 ///

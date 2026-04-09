@@ -16,6 +16,11 @@ use crate::TaskId;
 ///
 /// Slot and labels live in [`crate::TaskSpec`]: the single source of truth for user-provided scheduling intent.
 /// The [`crate::Task`] provides convenience accessors that delegate to spec.
+///
+/// ## Also
+///
+/// - [`Task`](crate::Task) aggregate that embeds `ObjectMeta`.
+/// - [`ModelError::Conflict`](crate::ModelError::Conflict) optimistic concurrency error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectMeta {

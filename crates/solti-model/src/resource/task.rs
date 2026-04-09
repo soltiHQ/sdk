@@ -15,6 +15,14 @@ use crate::{Labels, ObjectMeta, Slot, TaskId, TaskPhase, TaskSpec, TaskStatus};
 ///
 /// Slot and labels live in `spec` (single source of truth).
 /// Convenience accessors [`Task::slot`] and [`Task::labels`] delegate to spec.
+///
+/// ## Also
+///
+/// - [`TaskSpec`] desired state (what to run, how to restart).
+/// - [`TaskStatus`] observed state (phase, attempt, exit code).
+/// - [`ObjectMeta`] identity and versioning.
+/// - [`TaskPhase`] lifecycle state machine.
+/// - [`TaskRun`](crate::TaskRun) — per-attempt execution record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {

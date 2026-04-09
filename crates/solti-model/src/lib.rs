@@ -64,7 +64,7 @@
 //! | `Container`    | OCI container image                                  |
 //! | `Embedded`     | Code-defined task (in-process `TaskRef`)             |
 //!
-//! `Subprocess` tasks go through [`solti_runner::RunnerRouter`]; `Embedded` tasks
+//! `Subprocess` tasks go through `solti_runner::RunnerRouter`; `Embedded` tasks
 //! are submitted directly via `SupervisorApi::submit_with_task`.
 //!
 //! ## Policies
@@ -90,9 +90,9 @@
 //!
 //! ## Also
 //!
-//! - `solti-runner` — consumes [`TaskSpec`] and [`TaskKind`] to build executable tasks.
-//! - `solti-core` — manages [`Task`] lifecycle and state transitions.
-//! - `solti-api` — serializes/deserializes model types over gRPC and HTTP.
+//! - `solti-runner` consumes [`TaskSpec`] and [`TaskKind`] to build executable tasks.
+//! - `solti-core` manages [`Task`] lifecycle and state transitions.
+//! - `solti-api` serializes/deserializes model types over gRPC and HTTP.
 //!
 //! ## Domain types
 //!

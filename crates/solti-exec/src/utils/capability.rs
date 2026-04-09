@@ -24,6 +24,10 @@
 //!
 //! ## Rules
 //! - Values match `<linux/capability.h>` from Linux 6.x
+//!
+//! ## Also
+//!
+//! - [`SecurityConfig`](super::SecurityConfig) uses `LinuxCapability` in the keep list.
 
 /// Linux process capability.
 ///

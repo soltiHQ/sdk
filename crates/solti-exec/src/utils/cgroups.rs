@@ -11,6 +11,11 @@
 //! **Other platforms:**
 //! - `tracing::warn` and no-op.
 //!
+//! ## Also
+//!
+//! - [`SubprocessBackendConfig`](crate::subprocess::SubprocessBackendConfig) builder that consumes `CgroupLimits`.
+//! - [`RlimitConfig`](super::RlimitConfig) complementary POSIX rlimits.
+//!
 //! ## Two-phase lifecycle
 //! ```text
 //!                      parent process (async context)
