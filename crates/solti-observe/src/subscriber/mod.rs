@@ -39,7 +39,7 @@ use tracing::{debug, error, info, trace, warn};
 ///
 /// ## Example
 ///
-/// ```rust,ignore
+/// ```text
 /// use std::sync::Arc;
 /// use solti_observe::TracingEventSubscriber;
 /// use solti_prometheus::PrometheusSubscriber;
@@ -50,6 +50,12 @@ use tracing::{debug, error, info, trace, warn};
 ///     Arc::new(prom_subscriber),         // records events as metrics
 /// ];
 /// ```
+///
+/// ## Also
+///
+/// - [`log_event`] is a standalone function usable outside the subscriber pattern.
+/// - [`View`] is a helper trait for extracting event fields with defaults.
+/// - `solti-prometheus::PrometheusSubscriber` - complementary metrics subscriber.
 #[derive(Default)]
 pub struct TracingEventSubscriber;
 

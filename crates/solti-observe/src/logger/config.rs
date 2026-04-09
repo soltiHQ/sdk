@@ -26,6 +26,13 @@ use crate::logger::object::{LoggerFormat, LoggerLevel, LoggerTimeZone};
 /// | `tz`           | `Utc`   | Timestamp timezone                         |
 /// | `with_targets` | `true`  | Include module/target names in output      |
 /// | `use_color`    | `true`  | Colored output (auto-disabled if not TTY)  |
+///
+/// ## Also
+///
+/// - [`init_logger`](crate::init_logger) consumes this config to install the global subscriber.
+/// - [`LoggerTimeZone`] timezone variants and the `init_local_offset` requirement.
+/// - [`LoggerFormat`] output format variants and their backends.
+/// - [`LoggerLevel`] validated filter expression syntax.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoggerConfig {

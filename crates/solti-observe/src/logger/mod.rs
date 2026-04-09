@@ -1,3 +1,9 @@
+//! # Logger initialization and configuration.
+//!
+//! This module contains the backend logger.
+//!
+//! See [`init_logger`] for the entry point.
+
 mod config;
 pub use config::LoggerConfig;
 
@@ -13,8 +19,6 @@ pub use object::{LoggerTimeZone, init_local_offset};
 
 mod tasks;
 
-// Periodic task that re-detects the local UTC offset.
-// Enable with: `--features timezone-sync`
 #[cfg(feature = "timezone-sync")]
 pub use tasks::timezone_sync;
 

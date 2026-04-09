@@ -18,19 +18,19 @@
 //!
 //! ```text
 //!  main()
-//!  ├─ init_local_offset()          // before tokio runtime
-//!  ├─ tokio::Runtime::new()
-//!  │   └─ async_main()
-//!  │       ├─ init_logger(&cfg)    // installs global tracing subscriber
-//!  │       │   ├─ Text  → fmt::Layer (colored, RFC 3339 timestamps)
-//!  │       │   ├─ Json  → fmt::Layer::json()
-//!  │       │   └─ Journald → tracing_journald::layer() (Linux only)
-//!  │       │
-//!  │       ├─ TracingEventSubscriber   // feature: subscriber
-//!  │       │   └─ on_event() → trace!/debug!/info!/warn!/error!
-//!  │       │
-//!  │       └─ timezone_sync()          // feature: timezone-sync
-//!  │           └─ periodic re-detection of local UTC offset
+//!  ├─ init_local_offset()              // before tokio runtime
+//!  └─ tokio::Runtime::new()
+//!      └─ async_main()
+//!          ├─ init_logger(&cfg)        // installs global tracing subscriber
+//!          │   ├─ Text  → fmt::Layer (colored, RFC 3339 timestamps)
+//!          │   ├─ Json  → fmt::Layer::json()
+//!          │   └─ Journald → tracing_journald::layer() (Linux only)
+//!          │
+//!          ├─ TracingEventSubscriber   // feature: subscriber
+//!          │   └─ on_event() → trace!/debug!/info!/warn!/error!
+//!          │
+//!          └─ timezone_sync()          // feature: timezone-sync
+//!              └─ periodic re-detection of local UTC offset
 //!  ```
 //!
 //! ## Public API
@@ -56,7 +56,7 @@
 //!
 //! ## Quick start
 //!
-//! ```rust,ignore
+//! ```text
 //! use solti_observe::{LoggerConfig, LoggerLevel, init_local_offset, init_logger};
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -88,6 +88,13 @@
 //!    the offset (handles DST transitions in long-running daemons).
 //!
 //! If [`init_local_offset`] is not called, timestamps fall back to UTC with a warning printed to stderr on first use.
+//!
+//! ## Also
+//!
+//! - [`tracing`] the underlying structured logging framework.
+//! - [`taskvisor::Subscribe`] trait that [`TracingEventSubscriber`] implements.
+//! - `solti-prometheus` is a complementary metrics subscriber for the same event stream.
+//! - See `examples/http-server` for a complete integration example.
 
 mod logger;
 pub use logger::{
@@ -100,8 +107,6 @@ pub use logger::{
 #[cfg(feature = "timezone-sync")]
 pub use logger::timezone_sync;
 
-// Logs taskvisor supervision events via tracing.
-// Enable with: `--features subscriber`
 #[cfg(feature = "subscriber")]
 mod subscriber;
 #[cfg(feature = "subscriber")]
