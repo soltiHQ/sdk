@@ -1,7 +1,16 @@
-//! Metrics collection abstraction for solti runners.
+//! # Metrics collection abstraction.
 //!
-//! This module provides a backend interface for collecting runtime metrics from task execution.
-//! Metrics backends (prometheus, statsd, etc) implement [`MetricsBackend`] and are injected via [`crate::BuildContext`].
+//! Provides [`MetricsBackend`] trait and a zero-cost [`NoOpMetrics`] default.
+//! Concrete backends (e.g. `solti-prometheus`) implement the trait; the active backend is injected via [`BuildContext`](crate::BuildContext).
+//!
+//! ## Contents
+//!
+//! - [`MetricsBackend`]: trait with `record_task_started`, `record_task_completed`, `record_runner_error`.
+//! - [`MetricsHandle`]: `Arc<dyn MetricsBackend>`, cloneable shared handle.
+//! - [`NoOpMetrics`]: zero-size backend (`#[inline(always)]`, compiles to nothing).
+//! - [`RunnerType`]: metric label enum: `Subprocess`, `Wasm`, `Container`.
+//! - [`TaskOutcome`]: metric label enum: `Success`, `Failure`, `Canceled`, `Timeout`.
+//! - [`noop_metrics`]: convenience constructor for `Arc<NoOpMetrics>`.
 mod backend;
 pub use backend::{MetricsBackend, MetricsHandle, RunnerType, TaskOutcome};
 

@@ -1,14 +1,6 @@
 # solti-prometheus
 Prometheus metrics for the solti task execution system.
 
-## Package map
-```text
-solti-prometheus/
-├── lib.rs           crate root, re-exports, architecture overview
-├── backend.rs       PrometheusMetrics  — runner-level counters and histograms
-└── subscriber.rs    PrometheusSubscriber — supervision-level gauges and counters
-```
-
 ## Architecture
 ```text
   ┌─────────────────────────────────────────────────────────┐

@@ -37,7 +37,7 @@
 //!
 //! A runner must implement [`Runner`] and be registered in a [`RunnerRouter`]:
 //!
-//! ```rust,ignore
+//! ```text
 //! use solti_runner::{Runner, RunnerError, BuildContext, RunId};
 //! use solti_model::TaskSpec;
 //! use taskvisor::TaskRef;
@@ -53,7 +53,7 @@
 //!
 //!     fn build_task(&self, spec: &TaskSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
 //!         // build and return a TaskRef
-//!         # todo!()
+//!         todo!()
 //!     }
 //! }
 //! ```
@@ -64,7 +64,7 @@
 //! 1. returns `true` from [`Runner::supports`] for the given spec, and
 //! 2. satisfies the [`RunnerSelector`](solti_model::RunnerSelector) label constraints (if any).
 //!
-//! ```rust,ignore
+//! ```text
 //! use solti_runner::{RunnerRouter, BuildContext};
 //!
 //! let mut router = RunnerRouter::new();
@@ -78,6 +78,13 @@
 //! Metrics are collected via [`MetricsBackend`], injected through [`BuildContext`].
 //! The default is [`NoOpMetrics`] (zero-cost). Backends like `solti-prometheus`
 //! implement [`MetricsBackend`] for production use.
+//!
+//! ## Also
+//!
+//! - [`solti_model`] — domain types consumed by runners ([`TaskSpec`](solti_model::TaskSpec), [`TaskKind`](solti_model::TaskKind)).
+//! - [`taskvisor::TaskRef`] — the concrete task handle returned by [`Runner::build_task`].
+//! - `solti-exec` — subprocess runner implementation.
+//! - `solti-prometheus` — Prometheus [`MetricsBackend`] implementation.
 
 mod error;
 pub use error::RunnerError;

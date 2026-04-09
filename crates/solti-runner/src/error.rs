@@ -1,6 +1,18 @@
+//! # Runner errors.
+//!
+//! [`RunnerError`] covers failures during runner selection and task construction.
+//!
+//! See [`Runner::build_task`](crate::Runner::build_task) and [`RunnerRouter::build`](crate::RunnerRouter::build)
+//! for the primary error sources.
+
 use thiserror::Error;
 
 /// Errors produced by runner operations.
+///
+/// ## Also
+///
+/// - [`Runner::build_task`](crate::Runner::build_task) — returns `Result<TaskRef, RunnerError>`.
+/// - [`RunnerRouter::build`](crate::RunnerRouter::build) — returns `NoRunner` when no runner matches.
 #[derive(Debug, Error)]
 pub enum RunnerError {
     /// No registered runner can handle the given task kind.

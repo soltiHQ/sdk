@@ -1,18 +1,24 @@
+//! # Metrics backend trait and label types.
+//!
+//! [`MetricsBackend`] is the abstraction for collecting task execution metrics.
+//! Concrete backends (e.g. `solti-prometheus`) implement this trait.
+//!
+//! See the [metrics module](super) for the convenience [`noop_metrics`](super::noop_metrics) constructor.
+
 use std::sync::Arc;
 
 /// Runner implementation type for metrics labeling.
 ///
-/// Passed to [`MetricsBackend`] methods so dashboards can slice metrics
-/// by runner backend (subprocess, wasm, container).
+/// Passed to [`MetricsBackend`] methods so dashboards can slice metrics by runner backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RunnerType {
     /// OS subprocess runner.
     Subprocess,
-    /// WebAssembly runner.
-    Wasm,
     /// Container (OCI) runner.
     Container,
+    /// WebAssembly runner.
+    Wasm,
 }
 
 impl RunnerType {
@@ -21,8 +27,8 @@ impl RunnerType {
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Subprocess => "subprocess",
-            Self::Wasm => "wasm",
             Self::Container => "container",
+            Self::Wasm => "wasm",
         }
     }
 }
@@ -57,6 +63,12 @@ impl TaskOutcome {
 ///
 /// This trait abstracts metrics collection across different backends.
 /// Implementations are injected via [`crate::BuildContext`] and used by all runners.
+///
+/// ## Also
+///
+/// - [`NoOpMetrics`](super::NoOpMetrics): zero-size default backend.
+/// - [`crate::BuildContext::metrics`]: access the handle from within a runner.
+/// - `solti-prometheus::PrometheusMetrics` is a production Prometheus implementation.
 pub trait MetricsBackend: Send + Sync + 'static {
     /// Record task spawn event.
     ///

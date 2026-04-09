@@ -1,7 +1,12 @@
-//! Runner router that selects an appropriate `Runner` implementation for a given `TaskSpec`.
+//! # Runner router.
 //!
-//! The router checks registered runners in order and delegates task construction
-//! to the first one that reports `supports(spec) == true` and matches label constraints (if any).
+//! [`RunnerRouter`] selects the first registered [`Runner`](crate::Runner) that:
+//! 1. returns `true` from [`supports`](crate::Runner::supports) for the given spec, and
+//! 2. satisfies the [`RunnerSelector`](solti_model::RunnerSelector) label constraints (if any).
+//!
+//! Runners are checked in registration order.
+//!
+//! See the [crate root](crate) for architecture overview.
 use std::sync::Arc;
 
 use solti_model::{Labels, TaskKind, TaskSpec};
@@ -23,7 +28,19 @@ struct RunnerEntry {
 /// Router that selects an appropriate [`Runner`] for a given [`TaskSpec`].
 ///
 /// Runners are checked in the order they were registered.
-/// The first runner whose [`Runner::supports`] method returns `true` and satisfies the [`TaskSpec::runner_selector`] (if any) is used to build the task.
+/// The first runner whose [`Runner::supports`] method returns `true` and satisfies
+/// the [`TaskSpec::runner_selector`] (if any) is used to build the task.
+///
+/// ## Notes
+///
+/// - `TaskKind::Embedded` is not routable — use `SupervisorApi::submit_with_task` instead.
+/// - Default [`BuildContext`] uses empty env and [`NoOpMetrics`](crate::NoOpMetrics).
+///
+/// ## Also
+///
+/// - [`Runner`] — trait that concrete executors implement.
+/// - [`BuildContext`] — shared dependencies for all runners.
+/// - [`RunnerError::NoRunner`](crate::RunnerError::NoRunner) — returned when no runner matches.
 #[derive(Default)]
 pub struct RunnerRouter {
     runners: Vec<RunnerEntry>,

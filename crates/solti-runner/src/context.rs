@@ -1,3 +1,9 @@
+//! # Build context.
+//!
+//! [`BuildContext`] carries shared dependencies (environment variables, metrics handle) injected into runners at task-build time.
+//!
+//! See [`Runner::build_task`](crate::Runner::build_task) for usage.
+
 use std::fmt;
 
 use solti_model::RunnerEnv;
@@ -5,10 +11,23 @@ use solti_model::RunnerEnv;
 use crate::metrics::MetricsHandle;
 
 /// Shared build context passed to all runners.
+///
+/// Carries environment variables and a metrics handle that runners use during task construction.
+/// Created once at router setup time and shared (by clone) across all [`Runner::build_task`](crate::Runner::build_task) calls.
+///
+/// ## Defaults
+///
+/// - `env`: empty [`RunnerEnv`]
+/// - `metrics`: [`NoOpMetrics`](crate::NoOpMetrics) (zero-cost)
+///
+/// ## Also
+///
+/// - [`RunnerRouter::with_context`](crate::RunnerRouter::with_context) sets the context for all runners.
+/// - [`MetricsHandle`](crate::MetricsHandle) - `Arc<dyn MetricsBackend>`.
 #[derive(Clone)]
 pub struct BuildContext {
-    env: RunnerEnv,
     metrics: MetricsHandle,
+    env: RunnerEnv,
 }
 
 impl BuildContext {
