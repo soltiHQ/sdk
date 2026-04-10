@@ -80,7 +80,11 @@ fn spec_to_proto(spec: &TaskSpec) -> proto_api::CreateSpec {
         restart_interval_ms,
         backoff: Some(backoff_to_proto(spec.backoff())),
         admission: admission_to_proto(spec.admission()) as i32,
-        labels: spec.labels().iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        labels: spec
+            .labels()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
     }
 }
 
@@ -94,7 +98,11 @@ fn kind_to_proto(kind: &TaskKind) -> proto_api::TaskKind {
                         args: args.clone(),
                     })
                 }
-                SubprocessMode::Script { runtime, body, args } => {
+                SubprocessMode::Script {
+                    runtime,
+                    body,
+                    args,
+                } => {
                     let runtime_proto = match runtime {
                         Runtime::Bash => proto_api::script_mode::Runtime::WellKnown(
                             proto_api::ScriptRuntime::Bash as i32,
@@ -131,14 +139,12 @@ fn kind_to_proto(kind: &TaskKind) -> proto_api::TaskKind {
             args: w.args.clone(),
             env: env_to_proto(&w.env),
         }),
-        TaskKind::Container(c) => {
-            proto_api::task_kind::Kind::Container(proto_api::ContainerTask {
-                image: c.image.clone(),
-                command: c.command.clone().unwrap_or_default(),
-                args: c.args.clone(),
-                env: env_to_proto(&c.env),
-            })
-        }
+        TaskKind::Container(c) => proto_api::task_kind::Kind::Container(proto_api::ContainerTask {
+            image: c.image.clone(),
+            command: c.command.clone().unwrap_or_default(),
+            args: c.args.clone(),
+            env: env_to_proto(&c.env),
+        }),
         TaskKind::Embedded | _ => {
             // Embedded and unknown kinds have no proto equivalent; use empty subprocess as placeholder.
             proto_api::task_kind::Kind::Subprocess(proto_api::SubprocessTask {
@@ -170,9 +176,7 @@ fn restart_to_proto(policy: RestartPolicy) -> (proto_api::RestartStrategy, Optio
     match policy {
         RestartPolicy::Never => (proto_api::RestartStrategy::Never, None),
         RestartPolicy::OnFailure => (proto_api::RestartStrategy::OnFailure, None),
-        RestartPolicy::Always { interval_ms } => {
-            (proto_api::RestartStrategy::Always, interval_ms)
-        }
+        RestartPolicy::Always { interval_ms } => (proto_api::RestartStrategy::Always, interval_ms),
         _ => (proto_api::RestartStrategy::Unspecified, None),
     }
 }
