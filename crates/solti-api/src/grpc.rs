@@ -80,7 +80,7 @@ where
             .map_err(Status::from)?;
 
         Ok(Response::new(proto_api::GetTaskStatusResponse {
-            info: info.map(proto_api::TaskInfo::from),
+            task: info.map(proto_api::TaskData::from),
         }))
     }
 
@@ -127,7 +127,7 @@ where
         let tasks = page
             .items
             .into_iter()
-            .map(proto_api::TaskInfo::from)
+            .map(proto_api::TaskData::from)
             .collect();
 
         Ok(Response::new(proto_api::ListTasksResponse {

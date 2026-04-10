@@ -41,7 +41,7 @@ message GetTaskStatusRequest {
 }
 
 message GetTaskStatusResponse {
-  optional TaskInfo info = 1;
+  optional TaskData task = 1;
 }
 
 message ListTasksRequest {
@@ -52,7 +52,7 @@ message ListTasksRequest {
 }
 
 message ListTasksResponse {
-  repeated TaskInfo tasks = 1;
+  repeated TaskData tasks = 1;
   uint32 total            = 2;
 }
 

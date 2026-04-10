@@ -32,42 +32,173 @@ impl From<TaskPhase> for proto_api::TaskStatus {
     }
 }
 
-impl From<Task> for proto_api::TaskInfo {
+impl From<Task> for proto_api::TaskData {
     fn from(task: Task) -> Self {
-        use std::time::UNIX_EPOCH;
-
-        let created_at = task
-            .metadata
-            .created_at
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_else(|e| {
-                warn!(task_id = %task.metadata.id, error = %e, "created_at is before unix epoch, defaulting to 0");
-                std::time::Duration::ZERO
-            })
-            .as_millis() as i64;
-
-        let updated_at = task
-            .metadata
-            .updated_at
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_else(|e| {
-                warn!(task_id = %task.metadata.id, error = %e, "updated_at is before unix epoch, defaulting to 0");
-                std::time::Duration::ZERO
-            })
-            .as_millis() as i64;
-
-        proto_api::TaskInfo {
-            id: task.metadata.id.to_string(),
-            slot: task.slot().to_string(),
-            status: proto_api::TaskStatus::from(task.status.phase) as i32,
-            attempt: task.status.attempt,
-            created_at,
-            updated_at,
-            error: task.status.error,
-            generation: task.metadata.generation,
-            resource_version: task.metadata.resource_version,
-            exit_code: task.status.exit_code,
+        proto_api::TaskData {
+            metadata: Some(proto_api::ObjectMeta::from(&task.metadata)),
+            spec: Some(spec_to_proto(&task.spec)),
+            status: Some(proto_api::TaskStatusInfo {
+                phase: proto_api::TaskStatus::from(task.status.phase) as i32,
+                attempt: task.status.attempt,
+                error: task.status.error,
+                exit_code: task.status.exit_code,
+            }),
         }
+    }
+}
+
+fn system_time_to_ms(t: std::time::SystemTime) -> i64 {
+    use std::time::UNIX_EPOCH;
+    t.duration_since(UNIX_EPOCH)
+        .unwrap_or(std::time::Duration::ZERO)
+        .as_millis() as i64
+}
+
+impl From<&solti_model::ObjectMeta> for proto_api::ObjectMeta {
+    fn from(m: &solti_model::ObjectMeta) -> Self {
+        proto_api::ObjectMeta {
+            id: m.id.to_string(),
+            created_at: system_time_to_ms(m.created_at),
+            updated_at: system_time_to_ms(m.updated_at),
+            generation: m.generation,
+            resource_version: m.resource_version,
+        }
+    }
+}
+
+// ============================================================================
+// Domain → Proto (spec reverse conversion)
+// ============================================================================
+
+fn spec_to_proto(spec: &TaskSpec) -> proto_api::CreateSpec {
+    let (restart, restart_interval_ms) = restart_to_proto(spec.restart());
+    proto_api::CreateSpec {
+        slot: spec.slot().to_string(),
+        kind: Some(kind_to_proto(spec.kind())),
+        timeout_ms: spec.timeout().as_millis(),
+        restart: restart as i32,
+        restart_interval_ms,
+        backoff: Some(backoff_to_proto(spec.backoff())),
+        admission: admission_to_proto(spec.admission()) as i32,
+        labels: spec.labels().iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+    }
+}
+
+fn kind_to_proto(kind: &TaskKind) -> proto_api::TaskKind {
+    let inner = match kind {
+        TaskKind::Subprocess(sub) => {
+            let mode = match &sub.mode {
+                SubprocessMode::Command { command, args } => {
+                    proto_api::subprocess_task::Mode::Command(proto_api::CommandMode {
+                        command: command.clone(),
+                        args: args.clone(),
+                    })
+                }
+                SubprocessMode::Script { runtime, body, args } => {
+                    let runtime_proto = match runtime {
+                        Runtime::Bash => proto_api::script_mode::Runtime::WellKnown(
+                            proto_api::ScriptRuntime::Bash as i32,
+                        ),
+                        Runtime::Python => proto_api::script_mode::Runtime::WellKnown(
+                            proto_api::ScriptRuntime::Python as i32,
+                        ),
+                        Runtime::Node => proto_api::script_mode::Runtime::WellKnown(
+                            proto_api::ScriptRuntime::Node as i32,
+                        ),
+                        Runtime::Custom { command, flag } => {
+                            proto_api::script_mode::Runtime::Custom(proto_api::CustomRuntime {
+                                command: command.clone(),
+                                flag: flag.clone(),
+                            })
+                        }
+                    };
+                    proto_api::subprocess_task::Mode::Script(proto_api::ScriptMode {
+                        runtime: Some(runtime_proto),
+                        body: body.clone(),
+                        args: args.clone(),
+                    })
+                }
+            };
+            proto_api::task_kind::Kind::Subprocess(proto_api::SubprocessTask {
+                mode: Some(mode),
+                env: env_to_proto(&sub.env),
+                cwd: sub.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
+                fail_on_non_zero: sub.fail_on_non_zero.into(),
+            })
+        }
+        TaskKind::Wasm(w) => proto_api::task_kind::Kind::Wasm(proto_api::WasmTask {
+            module: w.module.to_string_lossy().to_string(),
+            args: w.args.clone(),
+            env: env_to_proto(&w.env),
+        }),
+        TaskKind::Container(c) => {
+            proto_api::task_kind::Kind::Container(proto_api::ContainerTask {
+                image: c.image.clone(),
+                command: c.command.clone().unwrap_or_default(),
+                args: c.args.clone(),
+                env: env_to_proto(&c.env),
+            })
+        }
+        TaskKind::Embedded | _ => {
+            // Embedded and unknown kinds have no proto equivalent; use empty subprocess as placeholder.
+            proto_api::task_kind::Kind::Subprocess(proto_api::SubprocessTask {
+                mode: Some(proto_api::subprocess_task::Mode::Command(
+                    proto_api::CommandMode {
+                        command: "<embedded>".to_string(),
+                        args: vec![],
+                    },
+                )),
+                env: vec![],
+                cwd: None,
+                fail_on_non_zero: false,
+            })
+        }
+    };
+    proto_api::TaskKind { kind: Some(inner) }
+}
+
+fn env_to_proto(env: &TaskEnv) -> Vec<proto_api::KeyValue> {
+    env.iter()
+        .map(|kv| proto_api::KeyValue {
+            key: kv.key().to_string(),
+            value: kv.value().to_string(),
+        })
+        .collect()
+}
+
+fn restart_to_proto(policy: RestartPolicy) -> (proto_api::RestartStrategy, Option<u64>) {
+    match policy {
+        RestartPolicy::Never => (proto_api::RestartStrategy::Never, None),
+        RestartPolicy::OnFailure => (proto_api::RestartStrategy::OnFailure, None),
+        RestartPolicy::Always { interval_ms } => {
+            (proto_api::RestartStrategy::Always, interval_ms)
+        }
+        _ => (proto_api::RestartStrategy::Unspecified, None),
+    }
+}
+
+fn backoff_to_proto(b: &BackoffPolicy) -> proto_api::BackoffStrategy {
+    let jitter = match b.jitter {
+        JitterPolicy::None => proto_api::JitterStrategy::None,
+        JitterPolicy::Full => proto_api::JitterStrategy::Full,
+        JitterPolicy::Equal => proto_api::JitterStrategy::Equal,
+        JitterPolicy::Decorrelated => proto_api::JitterStrategy::Decorrelated,
+        _ => proto_api::JitterStrategy::Unspecified,
+    };
+    proto_api::BackoffStrategy {
+        jitter: jitter as i32,
+        first_ms: b.first_ms,
+        max_ms: b.max_ms,
+        factor: b.factor,
+    }
+}
+
+fn admission_to_proto(policy: AdmissionPolicy) -> proto_api::AdmissionStrategy {
+    match policy {
+        AdmissionPolicy::DropIfRunning => proto_api::AdmissionStrategy::DropIfRunning,
+        AdmissionPolicy::Replace => proto_api::AdmissionStrategy::Replace,
+        AdmissionPolicy::Queue => proto_api::AdmissionStrategy::Queue,
+        _ => proto_api::AdmissionStrategy::Unspecified,
     }
 }
 
@@ -411,17 +542,22 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
 
-        let proto: proto_api::TaskInfo = task.into();
+        let proto: proto_api::TaskData = task.into();
 
-        assert_eq!(proto.id, "task-42");
-        assert_eq!(proto.slot, "my-slot");
-        assert_eq!(proto.status, proto_api::TaskStatus::Running as i32);
-        assert_eq!(proto.attempt, 3);
-        assert_eq!(proto.created_at, now_ms);
-        assert_eq!(proto.updated_at, now_ms);
-        assert_eq!(proto.error, Some("boom".to_string()));
-        assert_eq!(proto.generation, 5);
-        assert_eq!(proto.resource_version, 12);
+        let meta = proto.metadata.unwrap();
+        assert_eq!(meta.id, "task-42");
+        assert_eq!(meta.created_at, now_ms);
+        assert_eq!(meta.updated_at, now_ms);
+        assert_eq!(meta.generation, 5);
+        assert_eq!(meta.resource_version, 12);
+
+        let spec = proto.spec.unwrap();
+        assert_eq!(spec.slot, "my-slot");
+
+        let status = proto.status.unwrap();
+        assert_eq!(status.phase, proto_api::TaskStatus::Running as i32);
+        assert_eq!(status.attempt, 3);
+        assert_eq!(status.error, Some("boom".to_string()));
     }
 
     #[test]
@@ -433,8 +569,9 @@ mod tests {
         task.status.phase = TaskPhase::Succeeded;
         task.status.attempt = 1;
 
-        let proto: proto_api::TaskInfo = task.into();
-        assert_eq!(proto.error, None);
+        let proto: proto_api::TaskData = task.into();
+        let status = proto.status.unwrap();
+        assert_eq!(status.error, None);
     }
 
     #[test]
