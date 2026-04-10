@@ -81,7 +81,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             ("role".into(), "worker".into()),
         ]),
         delay_ms: 10_000,
-        capabilities: vec!["task_runs".into(), "task_delete".into(), "cancel".into()],
+        api_version: solti_api::API_VERSION,
     };
     info!(
         "discovery: control_plane={}, agent={}, transport={:?}",

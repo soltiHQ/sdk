@@ -1,3 +1,7 @@
+//! # Task identifier.
+//!
+//! [`TaskId`] is a unique identifier for a task resource (newtype over `Arc<str>`).
+
 use std::borrow::Borrow;
 use std::fmt;
 use std::sync::Arc;
@@ -22,7 +26,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 ///  TaskId: "subprocess-build-3"
 /// ```
 ///
-/// The [`Slot`] stays the same across submissions.
+/// The [`Slot`](crate::Slot) stays the same across submissions.
 /// The `TaskId` is unique per run: same slot, different execution, different id.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskId(Arc<str>);

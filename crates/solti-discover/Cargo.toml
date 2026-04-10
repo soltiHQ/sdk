@@ -3,6 +3,9 @@ name = "solti-discover"
 version = "0.0.1"
 edition = "2024"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = []
 
@@ -17,6 +20,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
+tokio = { workspace = true }
 
 solti-model = { path = "../solti-model" }
 solti-core = { path = "../solti-core" }

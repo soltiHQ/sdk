@@ -34,7 +34,12 @@ use solti_model::Flag;
 
 use crate::ExecError;
 
-/// Subprocess configuration.
+/// Subprocess configuration - fully resolved per-task parameters.
+///
+/// ## Also
+///
+/// - [`SubprocessRunner`](super::SubprocessRunner) produces this config in `build_task`.
+/// - [`SubprocessBackendConfig`](super::SubprocessBackendConfig) runner-level settings applied at spawn.
 #[derive(Debug, Clone)]
 pub struct SubprocessTaskConfig {
     /// End-to-End log identifier.

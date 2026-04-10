@@ -1,3 +1,7 @@
+//! # Selector requirement.
+//!
+//! [`SelectorRequirement`] is a single label constraint used in [`RunnerSelector`](crate::RunnerSelector).
+
 use serde::{Deserialize, Serialize};
 
 use super::SelectorOperator;

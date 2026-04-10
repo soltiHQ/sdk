@@ -21,3 +21,6 @@ solti-runner = { path = "../solti-runner" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+[package.metadata.docs.rs]
+all-features = true

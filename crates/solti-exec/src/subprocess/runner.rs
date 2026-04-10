@@ -68,6 +68,13 @@ use crate::subprocess::{
 };
 
 /// Runner that executes `TaskKind::Subprocess` as OS subprocesses.
+///
+/// ## Also
+///
+/// - [`SubprocessBackendConfig`] rlimits, cgroups, security applied to spawned processes.
+/// - [`SubprocessTaskConfig`](super::SubprocessTaskConfig) resolved per-task config.
+/// - [`register_subprocess_runner`](super::register_subprocess_runner) registration helper.
+/// - [`solti_runner::Runner`] trait this type implements.
 pub struct SubprocessRunner {
     /// Runner name.
     name: &'static str,

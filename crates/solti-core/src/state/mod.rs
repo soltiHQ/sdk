@@ -1,3 +1,8 @@
+//! # In-memory task state.
+//!
+//! [`TaskState`] stores tasks and execution runs in `Arc<RwLock<_>>`.
+//! Updated from taskvisor events via [`StateSubscriber`], cleaned by the GC task produced by [`state_gc`].
+
 mod gc;
 pub use gc::state_gc;
 
@@ -19,6 +24,12 @@ use tracing::debug;
 use solti_model::{Slot, Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskRun, TaskSpec};
 
 /// In-memory task state storage.
+///
+/// ## Also
+///
+/// - [`StateSubscriber`] wires taskvisor events into mutations.
+/// - [`StateConfig`] TTL settings consumed by [`sweep`](Self::sweep).
+/// - [`state_gc`] builds an embedded periodic sweep task.
 #[derive(Clone)]
 pub struct TaskState {
     inner: Arc<RwLock<TaskStateInner>>,
@@ -38,8 +49,8 @@ impl TaskState {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(TaskStateInner {
-                tasks: HashMap::new(),
                 by_slot: HashMap::new(),
+                tasks: HashMap::new(),
                 runs: HashMap::new(),
             })),
         }
@@ -56,37 +67,11 @@ impl TaskState {
         inner.tasks.insert(id, task);
     }
 
-    /// Update task phase (called on state transition events).
-    pub fn update_phase(
-        &self,
-        id: &TaskId,
-        phase: TaskPhase,
-        error: Option<String>,
-        exit_code: Option<i32>,
-    ) {
-        let mut inner = self.inner.write();
-
-        if let Some(task) = inner.tasks.get_mut(id) {
-            task.update_phase(phase, error, exit_code);
-        }
-    }
-
-    /// Increment attempt counter (called on TaskStarting event).
+    /// Unregister a task from state (called on `TaskRemoved` event).
     ///
-    /// Returns the new attempt number, or `None` if the task was not found.
-    pub fn increment_attempt(&self, id: &TaskId) -> Option<u32> {
-        let mut inner = self.inner.write();
-
-        if let Some(task) = inner.tasks.get_mut(id) {
-            task.increment_attempt();
-            Some(task.status.attempt)
-        } else {
-            None
-        }
-    }
-
-    /// Remove task from state (called on TaskRemoved event).
-    pub fn remove_task(&self, id: &TaskId) {
+    /// Removes the task entry and its slot index, but **preserves run history** (cleaned later by GC).
+    /// Compare with [`delete_task`](Self::delete_task) which removes both.
+    pub fn unregister_task(&self, id: &TaskId) {
         let mut inner = self.inner.write();
 
         if let Some(task) = inner.tasks.remove(id)
@@ -99,7 +84,10 @@ impl TaskState {
         }
     }
 
-    /// Delete a task and its run history. Returns `true` if the task existed.
+    /// Delete a task **and** its run history. Returns `true` if the task existed.
+    ///
+    /// This is the API-driven full removal.
+    /// Compare with [`unregister_task`](Self::unregister_task) which preserves runs.
     pub fn delete_task(&self, id: &TaskId) -> bool {
         let mut inner = self.inner.write();
         inner.runs.remove(id);
@@ -117,28 +105,48 @@ impl TaskState {
         }
     }
 
-    /// Record the start of a new execution attempt.
-    pub fn start_run(&self, id: &TaskId, attempt: u32) {
+    /// Atomically transition a task to `Running`.
+    pub fn transition_starting(&self, id: &TaskId) -> Option<u32> {
         let mut inner = self.inner.write();
+
+        let attempt = if let Some(task) = inner.tasks.get_mut(id) {
+            task.increment_attempt();
+            task.update_phase(TaskPhase::Running, None, None);
+            task.status.attempt
+        } else {
+            return None;
+        };
+
         let run = TaskRun::starting(attempt);
         inner.runs.entry(id.clone()).or_default().push_back(run);
+
+        Some(attempt)
     }
 
-    /// Close the most recent active run for the given task.
-    pub fn finish_run(
+    /// Atomically transition a task to a terminal phase and close the active run.
+    pub fn transition_finished(
         &self,
         id: &TaskId,
         phase: TaskPhase,
         error: Option<String>,
         exit_code: Option<i32>,
-    ) {
+    ) -> bool {
         let mut inner = self.inner.write();
+
+        let found = if let Some(task) = inner.tasks.get_mut(id) {
+            task.update_phase(phase, error.clone(), exit_code);
+            true
+        } else {
+            false
+        };
 
         if let Some(runs) = inner.runs.get_mut(id)
             && let Some(run) = runs.back_mut().filter(|r| r.is_active())
         {
             run.finish(phase, error, exit_code);
         }
+
+        found
     }
 
     /// List all runs for a task (oldest first).
@@ -193,8 +201,7 @@ impl TaskState {
     ///
     /// Two passes under a single write lock:
     /// 1. Remove finished runs older than `run_ttl`.
-    /// 2. Remove terminal tasks that have no remaining runs and whose
-    ///    `updated_at` is older than `task_ttl`.
+    /// 2. Remove terminal tasks that have no remaining runs and whose `updated_at` is older than `task_ttl`.
     ///
     /// Returns `(runs_removed, tasks_removed)` for observability.
     pub fn sweep(&self, config: &StateConfig) -> (usize, usize) {
@@ -203,7 +210,6 @@ impl TaskState {
         let mut runs_removed = 0usize;
         let mut tasks_removed = 0usize;
 
-        // Pass 1: remove expired finished runs.
         for runs in inner.runs.values_mut() {
             let before = runs.len();
             runs.retain(|run| {
@@ -212,15 +218,13 @@ impl TaskState {
                         .map(|age| age < config.run_ttl)
                         .unwrap_or(true)
                 } else {
-                    true // keep active runs
+                    true
                 }
             });
             runs_removed += before - runs.len();
         }
-        // Remove empty run entries.
         inner.runs.retain(|_, runs| !runs.is_empty());
 
-        // Pass 2: remove terminal tasks with no remaining runs past task_ttl.
         let expired_tasks: Vec<TaskId> = inner
             .tasks
             .iter()
@@ -246,7 +250,6 @@ impl TaskState {
                 tasks_removed += 1;
             }
         }
-
         if runs_removed > 0 || tasks_removed > 0 {
             debug!(runs_removed, tasks_removed, "state gc sweep completed");
         }
@@ -262,8 +265,6 @@ impl TaskState {
     pub fn query(&self, q: &TaskQuery) -> TaskPage<Task> {
         let inner = self.inner.read();
 
-        // Choose the iterator source based on whether slot filter is present.
-        // When slot is given we use the by_slot index to avoid full scan.
         let iter: Box<dyn Iterator<Item = &Task>> = match q.slot() {
             Some(slot) => {
                 let ids = inner.by_slot.get(slot.as_str());
@@ -280,21 +281,16 @@ impl TaskState {
             None => Box::new(inner.tasks.values()),
         };
 
-        // Apply status (phase) filter if present.
         let iter: Box<dyn Iterator<Item = &Task>> = if q.status_filters().is_empty() {
             iter
         } else {
             Box::new(iter.filter(|task| q.matches_phase(&task.status.phase)))
         };
 
-        // Collect refs that pass all filters - we need total count
-        // and then paginate, so we must know the full filtered set size.
-        // Sort by task ID for deterministic pagination across calls.
         let mut filtered: Vec<&Task> = iter.collect();
         filtered.sort_by(|a, b| a.metadata.id.cmp(&b.metadata.id));
         let total = filtered.len();
 
-        // Slice-based paginator - O(1) index vs O(offset) iterator skip.
         let start = q.offset().min(total);
         let items = filtered[start..]
             .iter()
@@ -342,25 +338,27 @@ mod tests {
     }
 
     #[test]
-    fn update_phase_changes_task_state() {
+    fn transition_starting_changes_phase_and_attempt() {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
         state.add_task(id.clone(), default_spec());
-        state.update_phase(&id, TaskPhase::Running, None, None);
+        state.transition_starting(&id);
 
         let task = state.get(&id).unwrap();
         assert_eq!(task.status.phase, TaskPhase::Running);
         assert!(task.status.error.is_none());
+        assert_eq!(task.status.attempt, 1);
     }
 
     #[test]
-    fn update_phase_with_error() {
+    fn transition_finished_records_error() {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
         state.add_task(id.clone(), default_spec());
-        state.update_phase(&id, TaskPhase::Failed, Some("timeout".to_string()), None);
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Failed, Some("timeout".to_string()), None);
 
         let task = state.get(&id).unwrap();
         assert_eq!(task.status.phase, TaskPhase::Failed);
@@ -368,27 +366,28 @@ mod tests {
     }
 
     #[test]
-    fn increment_attempt_updates_counter() {
+    fn multiple_starts_increment_attempt() {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
         state.add_task(id.clone(), default_spec());
-        assert_eq!(state.increment_attempt(&id), Some(1));
-        assert_eq!(state.increment_attempt(&id), Some(2));
+        assert_eq!(state.transition_starting(&id), Some(1));
+        state.transition_finished(&id, TaskPhase::Failed, None, None);
+        assert_eq!(state.transition_starting(&id), Some(2));
 
         let task = state.get(&id).unwrap();
         assert_eq!(task.status.attempt, 2);
     }
 
     #[test]
-    fn remove_task_deletes_from_state() {
+    fn unregister_task_removes_from_state() {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
         state.add_task(id.clone(), default_spec());
         assert!(state.get(&id).is_some());
 
-        state.remove_task(&id);
+        state.unregister_task(&id);
         assert!(state.get(&id).is_none());
     }
 
@@ -415,7 +414,7 @@ mod tests {
 
         state.add_task(id1.clone(), default_spec());
         state.add_task(id2.clone(), default_spec());
-        state.update_phase(&id1, TaskPhase::Running, None, None);
+        state.transition_starting(&id1);
 
         let running_tasks = state.list_by_status(TaskPhase::Running);
         assert_eq!(running_tasks.len(), 1);
@@ -439,12 +438,12 @@ mod tests {
     }
 
     #[test]
-    fn start_run_creates_active_run() {
+    fn transition_starting_creates_active_run() {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
         state.add_task(id.clone(), default_spec());
-        state.start_run(&id, 1);
+        state.transition_starting(&id);
 
         let runs = state.list_runs(&id);
         assert_eq!(runs.len(), 1);
@@ -453,13 +452,13 @@ mod tests {
     }
 
     #[test]
-    fn finish_run_closes_active_run() {
+    fn transition_finished_closes_active_run() {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
         state.add_task(id.clone(), default_spec());
-        state.start_run(&id, 1);
-        state.finish_run(&id, TaskPhase::Succeeded, None, None);
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Succeeded, None, None);
 
         let runs = state.list_runs(&id);
         assert_eq!(runs.len(), 1);
@@ -475,12 +474,12 @@ mod tests {
         state.add_task(id.clone(), default_spec());
 
         // First attempt fails
-        state.start_run(&id, 1);
-        state.finish_run(&id, TaskPhase::Failed, Some("err".into()), None);
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Failed, Some("err".into()), None);
 
         // Second attempt succeeds
-        state.start_run(&id, 2);
-        state.finish_run(&id, TaskPhase::Succeeded, None, None);
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Succeeded, None, None);
 
         let runs = state.list_runs(&id);
         assert_eq!(runs.len(), 2);
@@ -491,18 +490,18 @@ mod tests {
     }
 
     #[test]
-    fn remove_task_does_not_remove_runs() {
+    fn unregister_task_preserves_runs() {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
         state.add_task(id.clone(), default_spec());
-        state.start_run(&id, 1);
-        state.finish_run(&id, TaskPhase::Succeeded, None, None);
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Succeeded, None, None);
 
-        state.remove_task(&id);
+        state.unregister_task(&id);
 
         assert!(state.get(&id).is_none());
-        // Runs survive task removal (cleaned by GC).
+        // Runs survive unregister (cleaned by GC).
         let runs = state.list_runs(&id);
         assert_eq!(runs.len(), 1);
     }
@@ -520,13 +519,14 @@ mod tests {
         state.add_task(TaskId::from("a1"), default_spec_with_slot("slot-a"));
         state.add_task(TaskId::from("a2"), default_spec_with_slot("slot-a"));
         state.add_task(TaskId::from("a3"), default_spec_with_slot("slot-a"));
-        state.update_phase(&TaskId::from("a1"), TaskPhase::Running, None, None);
-        state.update_phase(&TaskId::from("a2"), TaskPhase::Running, None, None);
+        state.transition_starting(&TaskId::from("a1"));
+        state.transition_starting(&TaskId::from("a2"));
 
         // slot-b: 2 tasks (1 failed, 1 pending)
         state.add_task(TaskId::from("b1"), default_spec_with_slot("slot-b"));
         state.add_task(TaskId::from("b2"), default_spec_with_slot("slot-b"));
-        state.update_phase(
+        state.transition_starting(&TaskId::from("b1"));
+        state.transition_finished(
             &TaskId::from("b1"),
             TaskPhase::Failed,
             Some("err".into()),
@@ -628,8 +628,8 @@ mod tests {
         let id = TaskId::from("task-1");
 
         state.add_task(id.clone(), default_spec());
-        state.start_run(&id, 1);
-        state.finish_run(&id, TaskPhase::Succeeded, None, None);
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Succeeded, None, None);
 
         // With zero TTL, everything is expired.
         let config = StateConfig {
@@ -650,8 +650,9 @@ mod tests {
         let id = TaskId::from("task-1");
 
         state.add_task(id.clone(), default_spec());
-        state.update_phase(&id, TaskPhase::Succeeded, None, None);
-        // No runs at all.
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Succeeded, None, None);
+        // Run will also be swept since run_ttl is zero.
 
         let config = StateConfig {
             run_ttl: std::time::Duration::ZERO,
@@ -670,7 +671,7 @@ mod tests {
         let id = TaskId::from("task-1");
 
         state.add_task(id.clone(), default_spec());
-        state.start_run(&id, 1);
+        state.transition_starting(&id);
         // run is still active (not finished)
 
         let config = StateConfig {
@@ -690,7 +691,7 @@ mod tests {
         let id = TaskId::from("task-1");
 
         state.add_task(id.clone(), default_spec());
-        state.update_phase(&id, TaskPhase::Running, None, None);
+        state.transition_starting(&id);
 
         let config = StateConfig {
             run_ttl: std::time::Duration::ZERO,
@@ -715,5 +716,96 @@ mod tests {
         );
         assert_eq!(page.total, 3);
         assert_eq!(page.items.len(), 1);
+    }
+
+    #[test]
+    fn transition_starting_atomically_updates_state() {
+        let state = TaskState::new();
+        let id = TaskId::from("task-1");
+
+        state.add_task(id.clone(), default_spec());
+
+        let attempt = state.transition_starting(&id);
+        assert_eq!(attempt, Some(1));
+
+        let task = state.get(&id).unwrap();
+        assert_eq!(task.status.phase, TaskPhase::Running);
+        assert_eq!(task.status.attempt, 1);
+
+        let runs = state.list_runs(&id);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].attempt, 1);
+        assert!(runs[0].is_active());
+    }
+
+    #[test]
+    fn transition_starting_returns_none_for_unknown_task() {
+        let state = TaskState::new();
+        assert_eq!(state.transition_starting(&TaskId::from("nope")), None);
+    }
+
+    #[test]
+    fn transition_finished_atomically_updates_state() {
+        let state = TaskState::new();
+        let id = TaskId::from("task-1");
+
+        state.add_task(id.clone(), default_spec());
+        state.transition_starting(&id);
+
+        state.transition_finished(&id, TaskPhase::Failed, Some("boom".into()), None);
+
+        let task = state.get(&id).unwrap();
+        assert_eq!(task.status.phase, TaskPhase::Failed);
+        assert_eq!(task.status.error.as_deref(), Some("boom"));
+
+        let runs = state.list_runs(&id);
+        assert_eq!(runs.len(), 1);
+        assert!(!runs[0].is_active());
+        assert_eq!(runs[0].phase, TaskPhase::Failed);
+    }
+
+    #[test]
+    fn transition_finished_success_no_error() {
+        let state = TaskState::new();
+        let id = TaskId::from("task-1");
+
+        state.add_task(id.clone(), default_spec());
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Succeeded, None, None);
+
+        let task = state.get(&id).unwrap();
+        assert_eq!(task.status.phase, TaskPhase::Succeeded);
+        assert!(task.status.error.is_none());
+
+        let runs = state.list_runs(&id);
+        assert_eq!(runs[0].phase, TaskPhase::Succeeded);
+        assert!(!runs[0].is_active());
+    }
+
+    #[test]
+    fn transition_starting_multiple_attempts() {
+        let state = TaskState::new();
+        let id = TaskId::from("task-1");
+
+        state.add_task(id.clone(), default_spec());
+
+        // Attempt 1: start → fail
+        assert_eq!(state.transition_starting(&id), Some(1));
+        state.transition_finished(&id, TaskPhase::Failed, Some("err".into()), None);
+
+        // Attempt 2: start → succeed
+        assert_eq!(state.transition_starting(&id), Some(2));
+        state.transition_finished(&id, TaskPhase::Succeeded, None, None);
+
+        let task = state.get(&id).unwrap();
+        assert_eq!(task.status.attempt, 2);
+        assert_eq!(task.status.phase, TaskPhase::Succeeded);
+
+        let runs = state.list_runs(&id);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].attempt, 1);
+        assert_eq!(runs[0].phase, TaskPhase::Failed);
+        assert_eq!(runs[1].attempt, 2);
+        assert_eq!(runs[1].phase, TaskPhase::Succeeded);
     }
 }

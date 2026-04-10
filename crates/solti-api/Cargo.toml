@@ -3,6 +3,9 @@ name = "solti-api"
 version = "0.0.1"
 edition = "2024"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = []
 grpc = ["dep:tonic", "dep:prost"]
@@ -20,7 +23,7 @@ axum = { workspace = true, optional = true }
 
 solti-core = { path = "../solti-core" }
 solti-model = { path = "../solti-model" }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 base64 = { workspace = true }

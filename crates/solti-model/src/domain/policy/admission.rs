@@ -1,3 +1,7 @@
+//! # Admission policy.
+//!
+//! [`AdmissionPolicy`] controls how duplicate task submissions are handled.
+
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 

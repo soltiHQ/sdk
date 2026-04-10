@@ -18,6 +18,11 @@ use crate::logger::object::timezone::{LoggerTimeZone, get_or_detect_local_offset
 ///
 /// In `Local` mode the cached offset is read on **every** call, so DST changes picked up
 /// by [`timezone_sync`](crate::timezone_sync) are reflected without restarting the logger.
+///
+/// ## Also
+///
+/// - [`init_local_offset`](crate::init_local_offset) — must be called before tokio for `Local` mode.
+/// - [`LoggerTimeZone`] — timezone configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct LoggerRfc3339 {
     tz: LoggerTimeZone,

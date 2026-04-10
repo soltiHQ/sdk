@@ -12,6 +12,11 @@
 //! **Other platforms:**
 //! - `tracing::warn` and no-op.
 //!
+//! ## Also
+//!
+//! - [`SubprocessBackendConfig`](crate::subprocess::SubprocessBackendConfig) builder that consumes `SecurityConfig`.
+//! - [`LinuxCapability`](super::LinuxCapability) capability identifiers for the keep list.
+//!
 //! ## What happens when a subprocess spawns
 //! ```text
 //!                        parent process

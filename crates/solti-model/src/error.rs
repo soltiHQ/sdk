@@ -1,7 +1,18 @@
+//! # Model errors.
+//!
+//! [`ModelError`] covers validation and consistency failures in the domain model.
+
 use std::borrow::Cow;
 
 use thiserror::Error;
 
+/// Errors produced by domain model validation and construction.
+///
+/// ## Also
+///
+/// - [`TaskSpec::validate`](crate::TaskSpec::validate) — submit-boundary validation.
+/// - [`TaskSpecBuilder::build`](crate::TaskSpecBuilder::build) — builder-time validation.
+/// - [`BackoffPolicy::validate`](crate::BackoffPolicy::validate) — backoff parameter validation.
 #[derive(Debug, Error)]
 pub enum ModelError {
     #[error("conflict: resource_version mismatch (expected {expected}, got {actual})")]

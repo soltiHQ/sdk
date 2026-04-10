@@ -13,15 +13,18 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 time = { workspace = true, features = ["formatting", "local-offset"] }
 serde = { workspace = true, features = ["derive"] }
 tracing-journald = { workspace = true }
+parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-parking_lot = { workspace = true }
 
 taskvisor = { workspace = true, optional = true, features = ["controller"] }
 solti-model = { path = "../solti-model", optional = true }
-async-trait = { workspace = true, optional = true}
+async-trait = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
 tokio = { workspace = true }
+
+[package.metadata.docs.rs]
+features = ["subscriber", "timezone-sync"]

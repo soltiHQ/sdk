@@ -1,9 +1,19 @@
+//! # Handler trait.
+//!
+//! [`ApiHandler`] defines the transport-agnostic API surface.
+//! Implement this trait to plug custom logic (auth, rate limiting, metrics) between the wire layer and the supervisor.
+
 use async_trait::async_trait;
 use solti_model::{Task, TaskId, TaskPage, TaskQuery, TaskRun, TaskSpec};
 
 use crate::error::ApiError;
 
 /// Task execution API handler.
+///
+/// ## Also
+///
+/// - [`SupervisorApiAdapter`](crate::SupervisorApiAdapter) ready-to-use implementation.
+/// - [`ApiError`](crate::ApiError) error type returned by all methods.
 ///
 /// This trait abstracts the backend implementation, allowing users to:
 /// - Use the provided [`SupervisorApiAdapter`](crate::SupervisorApiAdapter)
@@ -29,8 +39,7 @@ pub trait ApiHandler: Send + Sync + 'static {
 
     /// Query tasks with combined filters and pagination.
     ///
-    /// Supports filtering by slot and/or status simultaneously,
-    /// with offset/limit pagination. Returns a page with total count.
+    /// Supports filtering by slot and/or status simultaneously, with offset/limit pagination. Returns a page with total count.
     async fn query_tasks(&self, query: TaskQuery) -> Result<TaskPage<Task>, ApiError>;
 
     /// List execution history for a specific task (oldest first).
@@ -38,8 +47,7 @@ pub trait ApiHandler: Send + Sync + 'static {
 
     /// Cancel a running task.
     ///
-    /// Sends cancellation signal to the task. The task must cooperate
-    /// by checking its `CancellationToken`.
+    /// Sends cancellation signal to the task. The task must cooperate by checking its `CancellationToken`.
     async fn cancel_task(&self, id: &TaskId) -> Result<(), ApiError>;
 
     /// Delete a task and its associated run history.

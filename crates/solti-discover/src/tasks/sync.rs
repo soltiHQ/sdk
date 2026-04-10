@@ -1,3 +1,16 @@
+//! # Periodic sync (heartbeat) task.
+//!
+//! ```text
+//! Agent                          Control Plane
+//!   |                                  |
+//!   |--- SyncRequest (gRPC / HTTP) --->|
+//!   |<-- SyncResponse (success) -------|
+//!   |         ... delay_ms ...         |
+//!   |--- SyncRequest ----------------> |
+//! ```
+//!
+//! On failure the task returns `TaskError::Fail` and the supervisor applies backoff + restart policy from the spec.
+
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,12 +25,18 @@ use taskvisor::{TaskError, TaskFn, TaskRef};
 
 use crate::config::{DiscoverConfig, DiscoveryTransport};
 use crate::errors::DiscoverError;
-use crate::{
-    ApiVersion, SyncRequest, SyncResponse, discover_service_client::DiscoverServiceClient,
-};
+use crate::proto::{SyncRequest, SyncResponse, discover_service_client::DiscoverServiceClient};
 
 const SLOT: &str = "solti-discover-sync";
 
+/// Build a heartbeat task and its spec from discovery config.
+///
+/// Returns `(TaskRef, TaskSpec)` ready for `SupervisorApi::submit_with_task`.
+///
+/// ## Also
+///
+/// - [`DiscoverConfig`](crate::DiscoverConfig) controls endpoint, transport, interval.
+/// - [`DiscoverError`](crate::DiscoverError) failure modes surfaced via `TaskError::Fail`.
 pub fn sync(config: DiscoverConfig) -> (TaskRef, TaskSpec) {
     let delay_ms = config.delay_ms;
 
@@ -40,28 +59,29 @@ pub fn sync(config: DiscoverConfig) -> (TaskRef, TaskSpec) {
         base_request,
         http_client,
         config,
+        grpc_client: tokio::sync::OnceCell::new(),
     });
 
     let task: TaskRef = TaskFn::arc(SLOT, move |cancel: CancellationToken| {
         let ctx = Arc::clone(&ctx);
 
         async move {
-            if cancel.is_cancelled() {
-                return Err(TaskError::Canceled);
-            }
             debug!("sending sync request to control plane");
 
-            match invoke_sync(&ctx).await {
-                Ok(()) => {
-                    debug!("sync completed successfully");
-                    Ok(())
-                }
-                Err(e) => {
-                    warn!("sync failed: {}", e);
-                    Err(TaskError::Fail {
-                        reason: format!("sync failed: {}", e),
-                    })
-                }
+            tokio::select! {
+                _ = cancel.cancelled() => Err(TaskError::Canceled),
+                result = invoke_sync(&ctx) => match result {
+                    Ok(()) => {
+                        debug!("sync completed successfully");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        warn!("sync failed: {}", e);
+                        Err(TaskError::Fail {
+                            reason: format!("sync failed: {}", e),
+                        })
+                    }
+                },
             }
         }
     });
@@ -72,6 +92,7 @@ struct SyncContext {
     config: DiscoverConfig,
     base_request: SyncRequest,
     http_client: reqwest::Client,
+    grpc_client: tokio::sync::OnceCell<DiscoverServiceClient<tonic::transport::Channel>>,
 }
 
 async fn invoke_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
@@ -82,8 +103,14 @@ async fn invoke_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
 }
 
 async fn invoke_grpc_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
-    let mut client =
-        DiscoverServiceClient::connect(ctx.config.control_plane_endpoint.clone()).await?;
+    let client = ctx
+        .grpc_client
+        .get_or_try_init(|| async {
+            DiscoverServiceClient::connect(ctx.config.control_plane_endpoint.clone()).await
+        })
+        .await?;
+
+    let mut client = client.clone();
     let request = tonic::Request::new(stamp_request(&ctx.base_request));
     let response = client.sync(request).await?.into_inner();
 
@@ -103,6 +130,7 @@ async fn invoke_http_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
         .send()
         .await?;
 
+    let response = response.error_for_status()?;
     let body = response.text().await?;
     let sync_response: SyncResponse = serde_json::from_str(&body).map_err(|e| {
         DiscoverError::InvalidResponse(format!("failed to parse response: {}, body: {}", e, body))
@@ -121,7 +149,7 @@ fn arch() -> &'static str {
     std::env::consts::ARCH
 }
 
-/// Get OS distribution info (Linux only, best effort).
+/// Get OS distribution info (Linux only, the best effort).
 fn os_info() -> String {
     #[cfg(target_os = "linux")]
     {
@@ -149,9 +177,9 @@ fn build_base_request(cfg: &DiscoverConfig) -> SyncRequest {
         ts: 0,
         uptime_seconds: 0,
         endpoint_type: cfg.transport.as_proto(),
-        api_version: ApiVersion::V1.into(),
+        api_version: cfg.api_version as i32,
         heartbeat_interval_s: (cfg.delay_ms / 1000) as i32,
-        capabilities: cfg.capabilities.clone(),
+        capabilities: vec![],
     }
 }
 

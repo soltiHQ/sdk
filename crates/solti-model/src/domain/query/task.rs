@@ -1,3 +1,7 @@
+//! # Task query builder.
+//!
+//! [`TaskQuery`] and [`TaskPage`] support filtered, paginated task listing.
+
 use crate::{Slot, TaskPhase};
 
 const DEFAULT_LIMIT: usize = 100;
@@ -18,6 +22,11 @@ const MAX_LIMIT: usize = 1000;
 ///
 /// An empty `status` filter matches **all** phases (no filtering).
 /// Multiple [`with_status`](Self::with_status) calls accumulate with OR semantics.
+///
+/// ## Also
+///
+/// - [`TaskPage`] paginated result returned by state queries.
+/// - [`TaskPhase`](crate::TaskPhase) phase values used as status filters.
 #[derive(Debug, Clone)]
 pub struct TaskQuery {
     status: Vec<TaskPhase>,

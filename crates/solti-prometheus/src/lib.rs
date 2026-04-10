@@ -53,7 +53,7 @@
 //!
 //! ## Example
 //!
-//! ```rust,ignore
+//! ```text
 //! use std::sync::Arc;
 //! use prometheus::Registry;
 //! use solti_prometheus::{PrometheusMetrics, PrometheusSubscriber};
@@ -76,6 +76,12 @@
 //!     String::from_utf8(buf).unwrap()
 //! }
 //! ```
+//!
+//! ## Also
+//!
+//! - [`solti_runner::MetricsBackend`]: trait that [`PrometheusMetrics`] implements.
+//! - [`taskvisor::Subscribe`]: trait that [`PrometheusSubscriber`] implements.
+//! - See `examples/http-server` for a complete integration example.
 
 mod backend;
 pub use backend::PrometheusMetrics;

@@ -1,3 +1,7 @@
+//! # Boolean toggle.
+//!
+//! [`Flag`] provides `enabled()`/`disabled()` constructors with serde support.
+
 use serde::{Deserialize, Serialize};
 
 /// Universal boolean flag with explicit enable/disable semantics.

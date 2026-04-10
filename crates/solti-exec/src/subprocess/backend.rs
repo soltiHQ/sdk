@@ -1,3 +1,7 @@
+//! # Backend: OS/kernel subprocess hardening.
+//!
+//! [`SubprocessBackendConfig`] collects rlimits, cgroup v2, security, and logging settings applied to every subprocess spawned by a runner.
+
 use tokio::process::Command;
 use tracing::trace;
 
@@ -9,7 +13,15 @@ use crate::utils::{attach_cgroup, attach_rlimits, attach_security};
 /// Low-level OS/kernel configuration for subprocess execution.
 ///
 /// Controls resource limits, security policies, and isolation mechanisms.
-/// All fields are optional - if not specified, the subprocess inherits parent process settings.
+/// All fields are optional — if not specified, the subprocess inherits parent process settings.
+///
+/// ## Also
+///
+/// - [`SubprocessRunner`](super::SubprocessRunner) runner that consumes this config.
+/// - [`RlimitConfig`](crate::utils::RlimitConfig) POSIX rlimit knobs.
+/// - [`CgroupLimits`](crate::utils::CgroupLimits) cgroup v2 knobs.
+/// - [`SecurityConfig`](crate::utils::SecurityConfig) capabilities / seccomp.
+/// - [`LogConfig`](super::LogConfig) stdout/stderr log settings.
 #[derive(Debug, Clone, Default)]
 pub struct SubprocessBackendConfig {
     /// POSIX rlimit-based resource limits.
@@ -120,8 +132,8 @@ impl SubprocessBackendConfig {
 
     /// Prepare cgroup directory and write limit files (before spawn).
     ///
-    /// Must be called before `apply_to_command`. Returns `Ok(true)` if a cgroup
-    /// was created successfully. Runs in normal async context (safe to use std::fs).
+    /// Must be called before `apply_to_command`. Returns `Ok(true)` if a cgroup was created successfully.
+    /// Runs in normal async context (safe to use std::fs).
     pub(crate) fn prepare_cgroups(&self, cgroup_name: &str) -> Result<bool, crate::ExecError> {
         if let Some(cgroups) = &self.cgroups {
             trace!(
@@ -137,9 +149,9 @@ impl SubprocessBackendConfig {
     /// Apply all configured backend features to a `tokio::process::Command`.
     ///
     /// This method mutates the command by attaching pre_exec hooks for:
-    /// - rlimits
     /// - cgroups (join only — directory must be created via [`prepare_cgroups`] first)
     /// - security policies
+    /// - rlimits
     ///
     /// Call this immediately before spawning the subprocess.
     pub(crate) fn apply_to_command(

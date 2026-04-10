@@ -1,3 +1,7 @@
+//! # Restart policy.
+//!
+//! [`RestartPolicy`] controls when a task is restarted after completion or failure.
+
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -15,6 +19,11 @@ use crate::error::{ModelError, ModelResult};
 /// `Always { interval_ms: Some(N) }` waits N ms between runs (periodic task).
 ///
 /// Cancellation (via controller or shutdown) is **not** treated as failure and will not trigger a restart.
+///
+/// ## Also
+///
+/// - [`BackoffPolicy`](super::BackoffPolicy) delay between restart attempts.
+/// - [`TaskSpec`](crate::TaskSpec) carries `restart` as a field.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[non_exhaustive]

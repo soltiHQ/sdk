@@ -1,3 +1,7 @@
+//! # Task specification.
+//!
+//! [`TaskSpec`] defines the desired state; constructed via [`TaskSpecBuilder`].
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -14,6 +18,14 @@ use crate::{
 /// - execution backend (`kind`)
 /// - concurrency control (`admission`)
 /// - lifecycle policies (`timeout`, `restart`, `backoff`)
+///
+/// ## Also
+///
+/// - [`TaskSpecBuilder`] validated builder (via [`TaskSpec::builder`]).
+/// - [`TaskKind`] execution backend variants.
+/// - [`RestartPolicy`] / [`BackoffPolicy`] lifecycle policies.
+/// - [`AdmissionPolicy`] duplicate handling.
+/// - [`RunnerSelector`] label-based runner routing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(try_from = "raw::TaskSpecRaw")]
@@ -172,6 +184,11 @@ impl TaskSpec {
 /// - `restart`: [`RestartPolicy::Never`]
 /// - `runner_selector`: `None`
 /// - `labels`: empty
+///
+/// ## Also
+///
+/// - [`TaskSpec::builder`] entry point.
+/// - [`TaskSpec::validate`] submit-boundary validation (rejects `Embedded`).
 pub struct TaskSpecBuilder {
     runner_selector: Option<RunnerSelector>,
 

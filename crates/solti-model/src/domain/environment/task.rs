@@ -1,3 +1,7 @@
+//! # Task-level environment variables.
+//!
+//! [`TaskEnv`] is an ordered list of key-value pairs attached to a single task spec.
+
 use serde::{Deserialize, Serialize};
 
 use crate::KeyValue;

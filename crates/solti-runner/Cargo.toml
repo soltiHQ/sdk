@@ -15,3 +15,6 @@ solti-model = { path = "../solti-model" }
 
 [dev-dependencies]
 tokio-util = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true

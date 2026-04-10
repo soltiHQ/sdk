@@ -1,3 +1,7 @@
+//! # Runner selector.
+//!
+//! [`RunnerSelector`] matches runners by label equality and expression-based requirements.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +30,12 @@ use crate::Labels;
 ///
 /// Both `match_labels` and `match_expressions` are ANDed together.
 /// An empty selector matches every runner.
+///
+/// ## Also
+///
+/// - [`SelectorRequirement`] individual expression-based requirement.
+/// - [`SelectorOperator`] set operators (`In`, `NotIn`, `Exists`, `DoesNotExist`).
+/// - [`TaskSpec`](crate::TaskSpec) carries optional `runner_selector`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunnerSelector {

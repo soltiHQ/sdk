@@ -40,7 +40,7 @@ const BACKOFF_FACTOR: f64 = 2.0;
 ///
 /// ## Example
 ///
-/// ```rust,ignore
+/// ```text
 /// use solti_observe::timezone_sync;
 ///
 /// let (task, spec) = timezone_sync();

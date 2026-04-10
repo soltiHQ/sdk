@@ -1,3 +1,7 @@
+//! # Runner-level environment variables.
+//!
+//! [`RunnerEnv`] provides base environment variables shared across all tasks on a runner.
+
 use serde::{Deserialize, Serialize};
 
 use crate::KeyValue;

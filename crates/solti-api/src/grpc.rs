@@ -1,3 +1,8 @@
+//! # gRPC transport.
+//!
+//! [`SoltiApiService`] implements the generated `SoltiApi` trait from `proto/solti/v1/api.proto`,
+//! delegating to an [`ApiHandler`](crate::ApiHandler).
+
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
@@ -9,9 +14,12 @@ use crate::error::ApiError;
 use crate::handler::ApiHandler;
 use crate::proto_api::{self, solti_api_server::SoltiApi};
 
-/// gRPC service implementation.
+/// gRPC service wrapping an [`ApiHandler`](crate::ApiHandler).
 ///
-/// This struct wraps an `ApiHandler` and implements the generated `SoltiApi` trait.
+/// ## Also
+///
+/// - `SoltiApiServer` generated tonic server wrapper.
+/// - [`ApiError`](crate::ApiError) mapped to `tonic::Status`.
 pub struct SoltiApiService<H> {
     handler: Arc<H>,
 }
@@ -58,6 +66,10 @@ where
     ) -> Result<Response<proto_api::GetTaskStatusResponse>, Status> {
         let req = request.into_inner();
 
+        if req.task_id.trim().is_empty() {
+            return Err(Status::invalid_argument("task_id cannot be empty"));
+        }
+
         let task_id = solti_model::TaskId::from(req.task_id);
         debug!(%task_id, "grpc: getting task status");
 
@@ -68,7 +80,7 @@ where
             .map_err(Status::from)?;
 
         Ok(Response::new(proto_api::GetTaskStatusResponse {
-            info: info.map(proto_api::TaskInfo::from),
+            task: info.map(proto_api::TaskData::from),
         }))
     }
 
@@ -115,7 +127,7 @@ where
         let tasks = page
             .items
             .into_iter()
-            .map(proto_api::TaskInfo::from)
+            .map(proto_api::TaskData::from)
             .collect();
 
         Ok(Response::new(proto_api::ListTasksResponse {

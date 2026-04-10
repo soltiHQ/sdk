@@ -1,3 +1,7 @@
+//! # Selector operators.
+//!
+//! [`SelectorOperator`] defines comparison operators for label-based runner selection.
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};

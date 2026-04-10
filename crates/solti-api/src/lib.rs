@@ -1,3 +1,35 @@
+//! # Task management API.
+//!
+//! Dual-transport API layer exposing task operations over gRPC and HTTP.
+//! Both transports delegate to an [`ApiHandler`] trait implementation.
+//!
+//! | feature | transport         | module                              |
+//! |---------|-------------------|-------------------------------------|
+//! | `grpc`  | tonic gRPC server | `SoltiApiService`, `SoltiApiServer` |
+//! | `http`  | axum HTTP/JSON    | `HttpApi`                           |
+//!
+//! ## Quick start
+//!
+//! ```text
+//! let adapter = SupervisorApiAdapter::new(supervisor);
+//! // gRPC
+//! let svc = SoltiApiServer::new(SoltiApiService::new(Arc::new(adapter)));
+//! // HTTP
+//! let router = HttpApi::new(Arc::new(adapter)).router();
+//! ```
+//!
+//! ## Also
+//!
+//! - [`ApiHandler`] transport-agnostic trait with 6 operations.
+//! - [`SupervisorApiAdapter`] default adapter bridging to `SupervisorApi`.
+//! - [`ApiError`] unified error type mapped to gRPC Status / HTTP JSON.
+
+/// Current API protocol version.
+///
+/// Bumped when the proto contract changes in a backwards-incompatible way.
+/// Sent to control-plane via `solti_discover::DiscoverConfig`.
+pub const API_VERSION: u32 = 1;
+
 mod error;
 pub use error::ApiError;
 

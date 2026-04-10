@@ -29,8 +29,8 @@ mod tests {
         let metrics = NoOpMetrics;
         for _ in 0..1000 {
             metrics.record_task_started(RunnerType::Subprocess);
-            metrics.record_task_completed(RunnerType::Subprocess, TaskOutcome::Success, 100);
             metrics.record_runner_error(RunnerType::Subprocess, "error");
+            metrics.record_task_completed(RunnerType::Subprocess, TaskOutcome::Success, 100);
         }
     }
 }

@@ -1,8 +1,17 @@
+//! # Task status.
+//!
+//! [`TaskStatus`] tracks observed state: phase, attempt count, exit code, last error.
+
 use serde::{Deserialize, Serialize};
 
 use crate::TaskPhase;
 
 /// Observed runtime state of a task.
+///
+/// ## Also
+///
+/// - [`TaskPhase`] lifecycle phase enum.
+/// - [`Task`](crate::Task) aggregate that embeds `TaskStatus`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskStatus {

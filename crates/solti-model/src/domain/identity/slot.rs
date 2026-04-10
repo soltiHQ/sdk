@@ -1,3 +1,7 @@
+//! # Execution slot.
+//!
+//! [`Slot`] is the logical execution lane name (newtype over `Arc<str>`).
+
 use std::borrow::Borrow;
 use std::fmt;
 use std::sync::Arc;
@@ -19,6 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 ///         one lane                        one lane
 ///     (one at a time)                  (one at a time)
 /// ```
+///
 /// ```rust
 /// use solti_model::Slot;
 ///

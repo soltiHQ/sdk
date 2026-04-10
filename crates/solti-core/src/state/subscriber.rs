@@ -1,12 +1,22 @@
+//! # State event subscriber.
+//!
+//! [`StateSubscriber`] implements [`Subscribe`](taskvisor::Subscribe) to wire
+//! taskvisor lifecycle events into [`TaskState`](super::TaskState) mutations.
+
 use std::sync::Arc;
 
 use taskvisor::{Event, EventKind, Subscribe};
-use tracing::trace;
+use tracing::{trace, warn};
 
 use super::TaskState;
 use solti_model::{TaskId, TaskPhase};
 
 /// Subscriber that updates TaskState from taskvisor events.
+///
+/// ## Also
+///
+/// - [`TaskState`](super::TaskState) storage mutated by this subscriber.
+/// - [`SupervisorApi::new`](crate::SupervisorApi::new) auto-registers this subscriber.
 pub struct StateSubscriber {
     state: TaskState,
 }
@@ -35,17 +45,18 @@ impl Subscribe for StateSubscriber {
             }
             EventKind::TaskStarting => {
                 trace!(task = %task_id, "task starting");
-                let attempt = self.state.increment_attempt(&task_id).unwrap_or(1);
-                self.state
-                    .update_phase(&task_id, TaskPhase::Running, None, None);
-                self.state.start_run(&task_id, attempt);
+                if self.state.transition_starting(&task_id).is_none() {
+                    warn!(task = %task_id, "TaskStarting event for unknown task");
+                }
             }
             EventKind::TaskStopped => {
                 trace!(task = %task_id, "task stopped (success)");
-                self.state
-                    .update_phase(&task_id, TaskPhase::Succeeded, None, None);
-                self.state
-                    .finish_run(&task_id, TaskPhase::Succeeded, None, None);
+                if !self
+                    .state
+                    .transition_finished(&task_id, TaskPhase::Succeeded, None, None)
+                {
+                    warn!(task = %task_id, "TaskStopped event for unknown task");
+                }
             }
             EventKind::TaskFailed => {
                 let reason = event
@@ -54,25 +65,23 @@ impl Subscribe for StateSubscriber {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
                 trace!(task = %task_id, reason = %reason, "task failed");
-                self.state
-                    .update_phase(&task_id, TaskPhase::Failed, Some(reason.clone()), None);
-                self.state
-                    .finish_run(&task_id, TaskPhase::Failed, Some(reason), None);
+                if !self
+                    .state
+                    .transition_finished(&task_id, TaskPhase::Failed, Some(reason), None)
+                {
+                    warn!(task = %task_id, "TaskFailed event for unknown task");
+                }
             }
             EventKind::TimeoutHit => {
                 trace!(task = %task_id, "task timeout");
-                self.state.update_phase(
+                if !self.state.transition_finished(
                     &task_id,
                     TaskPhase::Timeout,
                     Some("timeout".to_string()),
                     None,
-                );
-                self.state.finish_run(
-                    &task_id,
-                    TaskPhase::Timeout,
-                    Some("timeout".to_string()),
-                    None,
-                );
+                ) {
+                    warn!(task = %task_id, "TimeoutHit event for unknown task");
+                }
             }
             EventKind::ActorExhausted => {
                 let reason = event
@@ -81,14 +90,18 @@ impl Subscribe for StateSubscriber {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "exhausted".to_string());
                 trace!(task = %task_id, "task exhausted");
-                self.state
-                    .update_phase(&task_id, TaskPhase::Exhausted, Some(reason.clone()), None);
-                self.state
-                    .finish_run(&task_id, TaskPhase::Exhausted, Some(reason), None);
+                if !self.state.transition_finished(
+                    &task_id,
+                    TaskPhase::Exhausted,
+                    Some(reason),
+                    None,
+                ) {
+                    warn!(task = %task_id, "ActorExhausted event for unknown task");
+                }
             }
             EventKind::TaskRemoved => {
                 trace!(task = %task_id, "task removed from state");
-                self.state.remove_task(&task_id);
+                self.state.unregister_task(&task_id);
             }
             _ => {}
         }

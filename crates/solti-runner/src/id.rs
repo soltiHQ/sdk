@@ -1,3 +1,10 @@
+//! # Run identifier generation.
+//!
+//! [`RunId`] is a human-readable task name for taskvisor, formatted as `{runner}-{slot}-{seq}`.
+//! The sequence is process-global and monotonically increasing (starts at 1).
+//!
+//! See [`Runner::build_run_id`](crate::Runner::build_run_id) for the default id builder.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Global monotonically increasing sequence for run identifiers.

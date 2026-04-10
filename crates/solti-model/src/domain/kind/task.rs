@@ -1,3 +1,7 @@
+//! # Task execution backends.
+//!
+//! [`TaskKind`] defines what a task actually runs: subprocess, WASM, container, or embedded code.
+
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +18,11 @@ use crate::{Flag, SubprocessMode, TaskEnv};
 /// | `Wasm`       | WASI module (`.wasm`)          | yes      |
 ///
 /// Routable variants go through `RunnerRouter::pick()`.
+///
+/// ## Also
+///
+/// - [`TaskSpec`](crate::TaskSpec) — embeds `TaskKind` as its execution backend.
+/// - `solti_runner::RunnerRouter` — picks a runner based on kind and selector.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]

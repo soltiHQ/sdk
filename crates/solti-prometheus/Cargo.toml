@@ -9,11 +9,10 @@ controller = ["taskvisor/controller"]
 
 [dependencies]
 prometheus = { workspace = true }
-async-trait = { workspace = true }
+taskvisor = { workspace = true }
 tracing = { workspace = true }
 
 solti-runner = { path = "../solti-runner" }
-taskvisor = { workspace = true }
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+[package.metadata.docs.rs]
+features = ["controller"]

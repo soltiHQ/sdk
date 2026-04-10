@@ -28,6 +28,12 @@ use crate::{
 /// - constructing and running the supervisor;
 /// - selecting a concrete runner for each [`TaskSpec`];
 /// - mapping model-level specs into controller specs and submitting them.
+///
+/// ## Also
+///
+/// - [`CoreError`] error type returned by all methods.
+/// - [`StateConfig`] passed to [`enable_gc`](Self::enable_gc).
+/// - [`solti_runner::RunnerRouter`] picks a runner for each submitted spec.
 pub struct SupervisorApi {
     handle: SupervisorHandle,
     router: RunnerRouter,
@@ -110,12 +116,11 @@ impl SupervisorApi {
     /// Submits an embedded periodic task that sweeps expired runs and
     /// terminal tasks according to the provided [`StateConfig`].
     ///
-    /// This is opt-in: if not called, no GC runs and the state grows
-    /// unboundedly. Recommended for long-running agents.
+    /// This is opt-in: if not called, no GC runs and the state grows unboundedly.
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```text
     /// let api = SupervisorApi::new(sup, ctrl, subs, router)?;
     /// api.enable_gc(StateConfig::default()).await?;
     /// ```
@@ -162,34 +167,51 @@ impl SupervisorApi {
 
         let task_spec = TvTaskSpec::new(
             task,
-            to_restart_policy(spec.restart()),
-            to_backoff_policy(spec.backoff()),
+            to_restart_policy(spec.restart())?,
+            to_backoff_policy(spec.backoff())?,
             Some(Duration::from_millis(spec.timeout().as_millis())),
         );
-        let controller_spec = ControllerSpec::new(to_admission_policy(spec.admission()), task_spec);
+        let controller_spec =
+            ControllerSpec::new(to_admission_policy(spec.admission())?, task_spec);
 
         debug!("submitting pre-built task via controller");
         if let Err(e) = self.handle.submit(controller_spec).await {
-            self.state.remove_task(&task_id);
+            self.state.unregister_task(&task_id);
             return Err(CoreError::Supervisor(e.to_string()));
         }
         Ok(task_id)
     }
 
+    /// Gracefully shut down the supervisor: cancel all tasks and wait for completion.
+    ///
+    /// Consumes `self` - no further operations are possible after shutdown.
+    /// The grace period is determined by [`SupervisorConfig`] passed to [`new`](Self::new).
+    ///
+    /// # Example
+    /// ```text
+    /// api.shutdown().await?;
+    /// ```
+    #[instrument(level = "info", skip(self))]
+    pub async fn shutdown(self) -> Result<(), CoreError> {
+        info!("initiating graceful shutdown");
+        self.handle
+            .shutdown()
+            .await
+            .map_err(|e| CoreError::Supervisor(e.to_string()))
+    }
+
     /// Cancel a running task by ID.
     ///
-    /// This sends cancellation signal to the task and waits for confirmation
-    /// with the configured grace period (from SupervisorConfig).
+    /// This sends cancellation signal to the task and waits for confirmation with the configured grace period (from SupervisorConfig).
     ///
-    /// The task must be cooperative and respect the `CancellationToken`
-    /// passed during execution.
+    /// The task must be cooperative and respect the `CancellationToken` passed during execution.
     ///
     /// Returns:
     /// - `Ok(())` if task was found and successfully cancelled
     /// - `Err(CoreError::Supervisor)` if task not found or cancellation timed out
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```text
     /// api.cancel_task(&task_id).await?;
     /// ```
     #[instrument(level = "debug", skip(self), fields(task_id = %id))]

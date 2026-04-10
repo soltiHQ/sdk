@@ -1,5 +1,18 @@
+//! # API error types.
+
 use thiserror::Error;
 
+/// Unified error type for all API operations.
+///
+/// Mapped to transport-specific wire formats:
+///
+/// | Variant          | gRPC Status        | HTTP Status                 |
+/// |------------------|--------------------|-----------------------------|
+/// | `InvalidRequest` | `INVALID_ARGUMENT` | `400 Bad Request`           |
+/// | `TaskNotFound`   | `NOT_FOUND`        | `404 Not Found`             |
+/// | `Internal`       | `INTERNAL`         | `500 Internal Server Error` |
+/// | `Core`           | `INTERNAL`         | `500 Internal Server Error` |
+///
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("invalid request: {0}")]
