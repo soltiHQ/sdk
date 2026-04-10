@@ -1,4 +1,4 @@
-//! # solti-exec — task execution backends.
+//! # solti-exec - task execution backends.
 //!
 //! Provides concrete [`Runner`](solti_runner::Runner) implementations that turn [`TaskSpec`](solti_model::TaskSpec)
 //! into running OS processes (and, in the future, WASM / container backends).

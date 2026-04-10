@@ -1,3 +1,7 @@
+//! # State garbage collector.
+//!
+//! [`state_gc`] builds an embedded periodic task that sweeps expired runs and terminal tasks from [`TaskState`](super::TaskState).
+
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
 };
@@ -37,9 +41,7 @@ const BACKOFF_FACTOR: f64 = 2.0;
 ///
 /// ## Example
 ///
-/// ```rust,ignore
-/// use solti_core::state::{state_gc, StateConfig, TaskState};
-///
+/// ```text
 /// let state = TaskState::new();
 /// let config = StateConfig::default();
 /// let (task, spec) = state_gc(state, config);
@@ -51,6 +53,7 @@ pub fn state_gc(state: TaskState, config: StateConfig) -> (TaskRef, TaskSpec) {
     let task: TaskRef = TaskFn::arc(GC_SLOT, move |ctx: CancellationToken| {
         let state = state.clone();
         let config = config.clone();
+
         async move {
             if ctx.is_cancelled() {
                 return Err(TaskError::Canceled);

@@ -1,3 +1,7 @@
+//! # System utilities.
+//!
+//! Agent uptime tracking via [`uptime_seconds`].
+
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -9,9 +13,13 @@ pub(crate) fn init_uptime() {
 }
 
 /// Get agent uptime in seconds.
+///
+/// Returns `0` if called before [`SupervisorApi::new`](crate::SupervisorApi::new)
 pub fn uptime_seconds() -> u64 {
-    let start = START_TIME.get_or_init(Instant::now);
-    start.elapsed().as_secs()
+    START_TIME
+        .get()
+        .map(|start| start.elapsed().as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
