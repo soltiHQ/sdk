@@ -28,8 +28,6 @@ service SoltiApi {
   rpc DeleteTask(DeleteTaskRequest) returns (DeleteTaskResponse);
 }
 
-// --- SubmitTask ---
-
 message SubmitTaskRequest {
   CreateSpec spec = 1;
 }
@@ -38,8 +36,6 @@ message SubmitTaskResponse {
   string task_id = 1;
 }
 
-// --- GetTaskStatus ---
-
 message GetTaskStatusRequest {
   string task_id = 1;
 }
@@ -47,8 +43,6 @@ message GetTaskStatusRequest {
 message GetTaskStatusResponse {
   optional TaskInfo info = 1;
 }
-
-// --- ListTasks ---
 
 message ListTasksRequest {
   optional string slot       = 1;
@@ -62,8 +56,6 @@ message ListTasksResponse {
   uint32 total            = 2;
 }
 
-// --- ListTaskRuns ---
-
 message ListTaskRunsRequest {
   string task_id = 1;
 }
@@ -72,15 +64,11 @@ message ListTaskRunsResponse {
   repeated TaskRunInfo runs = 1;
 }
 
-// --- CancelTask ---
-
 message CancelTaskRequest {
   string task_id = 1;
 }
 
 message CancelTaskResponse {}
-
-// --- DeleteTask ---
 
 message DeleteTaskRequest {
   string task_id = 1;

@@ -1,3 +1,7 @@
+//! # Supervisor adapter.
+//!
+//! [`SupervisorApiAdapter`] bridges [`SupervisorApi`](solti_core::SupervisorApi) to [`ApiHandler`], delegating all operations directly.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,6 +14,11 @@ use crate::handler::ApiHandler;
 /// Adapter that bridges [`SupervisorApi`] to [`ApiHandler`].
 ///
 /// Ready-to-use implementation that directly delegates to `SupervisorApi`.
+///
+/// ## Also
+///
+/// - [`ApiHandler`] the trait this adapter implements.
+/// - [`ApiError::Core`] wraps `CoreError` from the supervisor.
 pub struct SupervisorApiAdapter {
     supervisor: Arc<SupervisorApi>,
 }

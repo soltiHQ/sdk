@@ -1,3 +1,8 @@
+//! # Proto-to-domain conversion.
+//!
+//! Converts protobuf `CreateSpec` into domain [`TaskSpec`](solti_model::TaskSpec)
+//! and domain types (`Task`, `TaskRun`, `TaskPhase`) into proto wire types.
+
 use tracing::warn;
 
 use solti_model::{
@@ -19,7 +24,10 @@ impl From<TaskPhase> for proto_api::TaskStatus {
             TaskPhase::Timeout => proto_api::TaskStatus::Timeout,
             TaskPhase::Canceled => proto_api::TaskStatus::Canceled,
             TaskPhase::Exhausted => proto_api::TaskStatus::Exhausted,
-            _ => proto_api::TaskStatus::Pending,
+            other => {
+                warn!(?other, "unknown TaskPhase variant, mapping to Unspecified");
+                proto_api::TaskStatus::Unspecified
+            }
         }
     }
 }
@@ -36,7 +44,7 @@ impl From<Task> for proto_api::TaskInfo {
                 warn!(task_id = %task.metadata.id, error = %e, "created_at is before unix epoch, defaulting to 0");
                 std::time::Duration::ZERO
             })
-            .as_secs() as i64;
+            .as_millis() as i64;
 
         let updated_at = task
             .metadata
@@ -46,7 +54,7 @@ impl From<Task> for proto_api::TaskInfo {
                 warn!(task_id = %task.metadata.id, error = %e, "updated_at is before unix epoch, defaulting to 0");
                 std::time::Duration::ZERO
             })
-            .as_secs() as i64;
+            .as_millis() as i64;
 
         proto_api::TaskInfo {
             id: task.metadata.id.to_string(),
@@ -74,7 +82,7 @@ impl From<TaskRun> for proto_api::TaskRunInfo {
                 warn!(attempt = run.attempt, error = %e, "started_at is before unix epoch, defaulting to 0");
                 std::time::Duration::ZERO
             })
-            .as_secs() as i64;
+            .as_millis() as i64;
 
         let finished_at = run.finished_at.map(|t| {
             t.duration_since(UNIX_EPOCH)
@@ -82,7 +90,7 @@ impl From<TaskRun> for proto_api::TaskRunInfo {
                     warn!(attempt = run.attempt, error = %e, "finished_at is before unix epoch, defaulting to 0");
                     std::time::Duration::ZERO
                 })
-                .as_secs() as i64
+                .as_millis() as i64
         });
 
         proto_api::TaskRunInfo {
@@ -178,7 +186,6 @@ fn convert_task_kind(kind: proto_api::task_kind::Kind) -> Result<TaskKind, ApiEr
                 }
             };
 
-            // Single validation point — delegates to model-level checks
             subprocess_mode
                 .validate()
                 .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
@@ -268,9 +275,9 @@ fn convert_backoff_policy(backoff: proto_api::BackoffStrategy) -> Result<Backoff
             "backoff max_ms cannot be zero".into(),
         ));
     }
-    if backoff.factor <= 0.0 {
+    if !backoff.factor.is_finite() || backoff.factor <= 0.0 {
         return Err(ApiError::InvalidRequest(
-            "backoff factor must be positive".into(),
+            "backoff factor must be a finite positive number".into(),
         ));
     }
 
@@ -390,19 +397,19 @@ mod tests {
             .build()
             .unwrap();
         let mut task = Task::new("task-42".into(), spec);
-        // Simulate multiple spec/status changes
+        
         task.metadata.generation = 5;
         task.metadata.resource_version = 12;
         task.status.phase = TaskPhase::Running;
         task.status.attempt = 3;
         task.status.error = Some("boom".to_string());
 
-        let now_secs = task
+        let now_ms = task
             .metadata
             .created_at
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs() as i64;
+            .as_millis() as i64;
 
         let proto: proto_api::TaskInfo = task.into();
 
@@ -410,8 +417,8 @@ mod tests {
         assert_eq!(proto.slot, "my-slot");
         assert_eq!(proto.status, proto_api::TaskStatus::Running as i32);
         assert_eq!(proto.attempt, 3);
-        assert_eq!(proto.created_at, now_secs);
-        assert_eq!(proto.updated_at, now_secs);
+        assert_eq!(proto.created_at, now_ms);
+        assert_eq!(proto.updated_at, now_ms);
         assert_eq!(proto.error, Some("boom".to_string()));
         assert_eq!(proto.generation, 5);
         assert_eq!(proto.resource_version, 12);
@@ -913,7 +920,7 @@ mod tests {
         };
         let err = convert_create_spec(spec).unwrap_err();
         assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be positive"))
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be"))
         );
     }
 
@@ -928,7 +935,7 @@ mod tests {
         };
         let err = convert_create_spec(spec).unwrap_err();
         assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be positive"))
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be"))
         );
     }
 

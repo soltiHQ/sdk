@@ -1,3 +1,16 @@
+//! # HTTP/JSON transport.
+//!
+//! [`HttpApi`] builds an axum `Router` with JSON endpoints matching the gRPC API surface.
+//!
+//! | Method | Endpoint                    | Handler             |
+//! |--------|-----------------------------|---------------------|
+//! | POST   | `/api/v1/tasks`             | submit              |
+//! | GET    | `/api/v1/tasks`             | list (query params) |
+//! | GET    | `/api/v1/tasks/{id}`        | get status          |
+//! | GET    | `/api/v1/tasks/{id}/runs`   | list runs           |
+//! | POST   | `/api/v1/tasks/{id}/cancel` | cancel              |
+//! | DELETE | `/api/v1/tasks/{id}`        | delete              |
+
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
@@ -14,6 +27,11 @@ use tracing::{debug, warn};
 use crate::{error::ApiError, handler::ApiHandler};
 
 /// HTTP API service builder.
+///
+/// ## Also
+///
+/// - [`ApiHandler`](crate::ApiHandler) the trait backing all endpoints.
+/// - [`ApiError`](crate::ApiError) mapped to JSON + HTTP status codes.
 pub struct HttpApi<H> {
     handler: Arc<H>,
 }
@@ -47,10 +65,6 @@ where
             .with_state(self.handler)
     }
 }
-
-// ============================================================================
-// Request/Response types
-// ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SubmitTaskRequest {
@@ -91,13 +105,6 @@ struct ListTaskRunsResponse {
     runs: Vec<TaskRunWire>,
 }
 
-// ============================================================================
-// Wire types — flat format compatible with proto TaskInfo/TaskRunInfo.
-//
-// Domain types (Task, TaskRun) are nested; the HTTP API must return a flat
-// JSON shape matching what the control-plane proxy expects.
-// ============================================================================
-
 /// Flat task representation matching proto `TaskInfo`.
 #[derive(Debug, Serialize, Deserialize)]
 struct TaskInfoWire {
@@ -125,7 +132,7 @@ impl From<Task> for TaskInfoWire {
                 warn!(task_id = %task.metadata.id, error = %e, "created_at before epoch");
                 std::time::Duration::ZERO
             })
-            .as_secs() as i64;
+            .as_millis() as i64;
 
         let updated_at = task
             .metadata
@@ -135,7 +142,7 @@ impl From<Task> for TaskInfoWire {
                 warn!(task_id = %task.metadata.id, error = %e, "updated_at before epoch");
                 std::time::Duration::ZERO
             })
-            .as_secs() as i64;
+            .as_millis() as i64;
 
         Self {
             id: task.metadata.id.to_string(),
@@ -172,11 +179,11 @@ impl From<TaskRun> for TaskRunWire {
             .started_at
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64;
+            .as_millis() as i64;
 
         let finished_at = run
             .finished_at
-            .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
+            .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64);
 
         Self {
             attempt: run.attempt,
@@ -198,14 +205,13 @@ fn phase_to_string(phase: &TaskPhase) -> String {
         TaskPhase::Timeout => "timeout",
         TaskPhase::Canceled => "canceled",
         TaskPhase::Exhausted => "exhausted",
-        _ => "pending",
+        other => {
+            warn!(?other, "unknown TaskPhase variant, mapping to unknown");
+            "unknown"
+        }
     }
     .to_string()
 }
-
-// ============================================================================
-// Handlers
-// ============================================================================
 
 /// POST /api/v1/tasks
 async fn submit_task<H>(
@@ -215,6 +221,10 @@ async fn submit_task<H>(
 where
     H: ApiHandler,
 {
+    req.spec
+        .validate()
+        .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
+
     debug!(slot = %req.spec.slot(), kind = ?req.spec.kind(), "submitting task");
     let task_id = handler.submit_task(req.spec).await?;
 
@@ -233,6 +243,10 @@ async fn get_task_status<H>(
 where
     H: ApiHandler,
 {
+    if id.trim().is_empty() {
+        return Err(ApiError::InvalidRequest("task_id cannot be empty".into()));
+    }
+
     let task_id = TaskId::from(id);
     debug!(%task_id, "getting task status");
     let info = handler.get_task_status(&task_id).await?;
@@ -315,6 +329,10 @@ async fn list_task_runs<H>(
 where
     H: ApiHandler,
 {
+    if id.trim().is_empty() {
+        return Err(ApiError::InvalidRequest("task_id cannot be empty".into()));
+    }
+
     let task_id = TaskId::from(id);
     debug!(%task_id, "listing task runs");
     let runs = handler.list_task_runs(&task_id).await?;
