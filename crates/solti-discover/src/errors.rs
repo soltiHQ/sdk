@@ -1,5 +1,13 @@
+//! # Discovery error types.
+
 use thiserror::Error;
 
+/// Errors produced by the sync task.
+///
+/// ## Also
+///
+/// - [`DiscoverConfig`](crate::DiscoverConfig) settings that affect failure modes.
+/// - [`sync`](crate::sync) the task factory that surfaces these errors.
 #[derive(Error, Debug)]
 pub enum DiscoverError {
     #[error("failed to connect to control plane: {0}")]
