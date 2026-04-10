@@ -25,9 +25,7 @@ use taskvisor::{TaskError, TaskFn, TaskRef};
 
 use crate::config::{DiscoverConfig, DiscoveryTransport};
 use crate::errors::DiscoverError;
-use crate::proto::{
-    SyncRequest, SyncResponse, discover_service_client::DiscoverServiceClient,
-};
+use crate::proto::{SyncRequest, SyncResponse, discover_service_client::DiscoverServiceClient};
 
 const SLOT: &str = "solti-discover-sync";
 
