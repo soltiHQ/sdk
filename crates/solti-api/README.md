@@ -24,16 +24,30 @@ Both transports delegate to an `ApiHandler` trait, decoupling wire format from b
  solti_core::SupervisorApi
 ```
 
-## API surface
+## Versioning
 
-| Operation | gRPC RPC | HTTP Endpoint |
-|-----------|----------|---------------|
-| Submit task | `SubmitTask` | `POST /api/v1/tasks` |
-| Get task | `GetTaskStatus` | `GET /api/v1/tasks/{id}` |
-| List tasks | `ListTasks` | `GET /api/v1/tasks` |
-| List runs | `ListTaskRuns` | `GET /api/v1/tasks/{id}/runs` |
-| Cancel task | `CancelTask` | `POST /api/v1/tasks/{id}/cancel` |
-| Delete task | `DeleteTask` | `DELETE /api/v1/tasks/{id}` |
+`solti-api` exports `API_VERSION: u32` - the current protocol version.
+
+Binary passes it to `solti_discover::DiscoverConfig::api_version`, which reports it to the control-plane via `SyncRequest`. One binary = one API version.
+
+```rust
+use solti_api::API_VERSION;
+
+let config = DiscoverConfig {
+    api_version: API_VERSION,
+    // ...
+};
+```
+
+Bump rules:
+- New field in existing message - no bump (proto3 backwards compatible)
+- New RPC - no bump (control-plane does not call unsupported RPCs)
+- Removed/renamed field, changed semantics - bump
+- New proto package (`solti.v2`) - bump
+
+Internal crate compatibility is handled by cargo semver.
+
+Per-version API surface is documented in separate files: [api_v1.md](api_v1.md).
 
 ## Key types
 
@@ -44,14 +58,7 @@ Both transports delegate to an `ApiHandler` trait, decoupling wire format from b
 | `ApiError` | Unified error mapped to gRPC Status / HTTP JSON |
 | `SoltiApiService<H>` | gRPC server impl (feature `grpc`) |
 | `HttpApi<H>` | axum router builder (feature `http`) |
-
-## Protobuf contract
-
-Defined in `proto/solti/v1/`:
-- `api.proto` - service definition with 6 RPCs and request/response messages
-- `types.proto` - shared types: `TaskStatus`, `CreateSpec`, `TaskInfo`, `TaskRunInfo`, policies
-
-The proto carries `go_package` targeting `github.com/soltiHQ/control-plane/api/gen/v1` - the Go control-plane is the primary consumer.
+| `API_VERSION` | Protocol version constant reported via discover |
 
 ## Error model
 
@@ -77,4 +84,4 @@ Neither feature is enabled by default.
 - gRPC path validates input via `convert_create_spec` with slot, timeout, backoff bounds checks.
 - HTTP path accepts `TaskSpec` directly from JSON (validation delegated to model layer).
 - Both transports re-exported: `solti_api::tonic`, `solti_api::axum` for version pinning.
-- `convert.rs` has 60+ unit tests covering all task kinds, policies, and rejection cases.
+- Proto contract defined in `proto/solti/v1/` (`api.proto`, `types.proto`).

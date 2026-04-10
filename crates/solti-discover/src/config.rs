@@ -47,7 +47,7 @@ pub struct DiscoverConfig {
     pub agent_endpoint: String,
     pub name: String,
     pub delay_ms: u64,
-    /// Agent capabilities: features the agent supports beyond the base API.
-    /// Known values: `"task_runs"`, `"task_delete"`, `"cancel"`.
-    pub capabilities: Vec<String>,
+    /// API protocol version reported to the control-plane.
+    /// Use `solti_api::API_VERSION`.
+    pub api_version: u32,
 }

@@ -24,6 +24,12 @@
 //! - [`SupervisorApiAdapter`] default adapter bridging to `SupervisorApi`.
 //! - [`ApiError`] unified error type mapped to gRPC Status / HTTP JSON.
 
+/// Current API protocol version.
+///
+/// Bumped when the proto contract changes in a backwards-incompatible way.
+/// Sent to control-plane via `solti_discover::DiscoverConfig`.
+pub const API_VERSION: u32 = 1;
+
 mod error;
 pub use error::ApiError;
 
