@@ -23,7 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 ///         one lane                        one lane
 ///     (one at a time)                  (one at a time)
 /// ```
-/// 
+///
 /// ```rust
 /// use solti_model::Slot;
 ///

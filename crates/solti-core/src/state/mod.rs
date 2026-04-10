@@ -67,7 +67,6 @@ impl TaskState {
         inner.tasks.insert(id, task);
     }
 
-
     /// Unregister a task from state (called on `TaskRemoved` event).
     ///
     /// Removes the task entry and its slot index, but **preserves run history** (cleaned later by GC).

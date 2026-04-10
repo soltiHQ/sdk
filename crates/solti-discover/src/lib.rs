@@ -27,8 +27,8 @@ pub(crate) mod proto {
 pub use proto::{SyncRequest, SyncResponse};
 
 mod config;
-pub use config::DiscoveryTransport;
 pub use config::DiscoverConfig;
+pub use config::DiscoveryTransport;
 
 mod errors;
 pub use errors::DiscoverError;

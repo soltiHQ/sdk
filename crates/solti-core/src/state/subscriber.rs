@@ -51,7 +51,10 @@ impl Subscribe for StateSubscriber {
             }
             EventKind::TaskStopped => {
                 trace!(task = %task_id, "task stopped (success)");
-                if !self.state.transition_finished(&task_id, TaskPhase::Succeeded, None, None) {
+                if !self
+                    .state
+                    .transition_finished(&task_id, TaskPhase::Succeeded, None, None)
+                {
                     warn!(task = %task_id, "TaskStopped event for unknown task");
                 }
             }
@@ -62,7 +65,10 @@ impl Subscribe for StateSubscriber {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
                 trace!(task = %task_id, reason = %reason, "task failed");
-                if !self.state.transition_finished(&task_id, TaskPhase::Failed, Some(reason), None) {
+                if !self
+                    .state
+                    .transition_finished(&task_id, TaskPhase::Failed, Some(reason), None)
+                {
                     warn!(task = %task_id, "TaskFailed event for unknown task");
                 }
             }
@@ -84,7 +90,12 @@ impl Subscribe for StateSubscriber {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "exhausted".to_string());
                 trace!(task = %task_id, "task exhausted");
-                if !self.state.transition_finished(&task_id, TaskPhase::Exhausted, Some(reason), None) {
+                if !self.state.transition_finished(
+                    &task_id,
+                    TaskPhase::Exhausted,
+                    Some(reason),
+                    None,
+                ) {
                     warn!(task = %task_id, "ActorExhausted event for unknown task");
                 }
             }

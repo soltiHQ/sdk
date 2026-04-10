@@ -397,7 +397,7 @@ mod tests {
             .build()
             .unwrap();
         let mut task = Task::new("task-42".into(), spec);
-        
+
         task.metadata.generation = 5;
         task.metadata.resource_version = 12;
         task.status.phase = TaskPhase::Running;
@@ -919,9 +919,7 @@ mod tests {
             ..make_valid_create_spec()
         };
         let err = convert_create_spec(spec).unwrap_err();
-        assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be"))
-        );
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be")));
     }
 
     #[test]
@@ -934,9 +932,7 @@ mod tests {
             ..make_valid_create_spec()
         };
         let err = convert_create_spec(spec).unwrap_err();
-        assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be"))
-        );
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be")));
     }
 
     #[test]
