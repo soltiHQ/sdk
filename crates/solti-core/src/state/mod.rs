@@ -1,10 +1,10 @@
 //! # In-memory task state.
 //!
 //! [`TaskState`] stores tasks and execution runs in `Arc<RwLock<_>>`.
-//! Updated from taskvisor events via [`StateSubscriber`], cleaned by the GC task produced by [`state_gc`].
+//! Updated from taskvisor events via [`StateSubscriber`], cleaned by the sweep task produced by [`state_sweep`].
 
-mod gc;
-pub use gc::state_gc;
+mod sweep;
+pub use sweep::state_sweep;
 
 mod subscriber;
 pub use subscriber::StateSubscriber;
@@ -29,7 +29,7 @@ use solti_model::{Slot, Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskRun, T
 ///
 /// - [`StateSubscriber`] wires taskvisor events into mutations.
 /// - [`StateConfig`] TTL settings consumed by [`sweep`](Self::sweep).
-/// - [`state_gc`] builds an embedded periodic sweep task.
+/// - [`state_sweep`] builds an embedded periodic sweep task.
 #[derive(Clone)]
 pub struct TaskState {
     inner: Arc<RwLock<TaskStateInner>>,
@@ -69,7 +69,7 @@ impl TaskState {
 
     /// Unregister a task from state (called on `TaskRemoved` event).
     ///
-    /// Removes the task entry and its slot index, but **preserves run history** (cleaned later by GC).
+    /// Removes the task entry and its slot index, but **preserves run history** (cleaned later by sweep).
     /// Compare with [`delete_task`](Self::delete_task) which removes both.
     pub fn unregister_task(&self, id: &TaskId) {
         let mut inner = self.inner.write();
@@ -197,7 +197,7 @@ impl TaskState {
             .collect()
     }
 
-    /// Run a garbage collection sweep.
+    /// Run a sweep pass.
     ///
     /// Two passes under a single write lock:
     /// 1. Remove finished runs older than `run_ttl`.
@@ -251,7 +251,7 @@ impl TaskState {
             }
         }
         if runs_removed > 0 || tasks_removed > 0 {
-            debug!(runs_removed, tasks_removed, "state gc sweep completed");
+            debug!(runs_removed, tasks_removed, "state sweep completed");
         }
 
         (runs_removed, tasks_removed)
@@ -501,7 +501,7 @@ mod tests {
         state.unregister_task(&id);
 
         assert!(state.get(&id).is_none());
-        // Runs survive unregister (cleaned by GC).
+        // Runs survive unregister (cleaned by sweep).
         let runs = state.list_runs(&id);
         assert_eq!(runs.len(), 1);
     }
@@ -635,7 +635,7 @@ mod tests {
         let config = StateConfig {
             run_ttl: std::time::Duration::ZERO,
             task_ttl: std::time::Duration::from_secs(3600),
-            gc_interval: std::time::Duration::from_secs(60),
+            sweep_interval: std::time::Duration::from_secs(60),
         };
 
         let (runs_removed, tasks_removed) = state.sweep(&config);
@@ -657,7 +657,7 @@ mod tests {
         let config = StateConfig {
             run_ttl: std::time::Duration::ZERO,
             task_ttl: std::time::Duration::ZERO,
-            gc_interval: std::time::Duration::from_secs(60),
+            sweep_interval: std::time::Duration::from_secs(60),
         };
 
         let (_, tasks_removed) = state.sweep(&config);
@@ -677,7 +677,7 @@ mod tests {
         let config = StateConfig {
             run_ttl: std::time::Duration::ZERO,
             task_ttl: std::time::Duration::ZERO,
-            gc_interval: std::time::Duration::from_secs(60),
+            sweep_interval: std::time::Duration::from_secs(60),
         };
 
         let (runs_removed, _) = state.sweep(&config);
@@ -696,7 +696,7 @@ mod tests {
         let config = StateConfig {
             run_ttl: std::time::Duration::ZERO,
             task_ttl: std::time::Duration::ZERO,
-            gc_interval: std::time::Duration::from_secs(60),
+            sweep_interval: std::time::Duration::from_secs(60),
         };
 
         let (_, tasks_removed) = state.sweep(&config);
