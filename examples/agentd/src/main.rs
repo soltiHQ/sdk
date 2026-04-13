@@ -64,7 +64,7 @@ use std::sync::Arc;
 
 use tracing::info;
 
-use solti_api::{HttpApi, SupervisorApiAdapter, API_VERSION};
+use solti_api::{API_VERSION, HttpApi, SupervisorApiAdapter};
 use solti_core::{StateConfig, SupervisorApi};
 use solti_discover::{DiscoverConfig, DiscoveryTransport};
 use solti_exec::subprocess::register_subprocess_runner;
@@ -133,9 +133,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (sync_task, sync_spec) = solti_discover::sync(discover_config);
     supervisor.submit_with_task(sync_task, &sync_spec).await?;
-    info!(
-        "discovery heartbeat started (control_plane={CONTROL_PLANE}, api_version={API_VERSION})"
-    );
+    info!("discovery heartbeat started (control_plane={CONTROL_PLANE}, api_version={API_VERSION})");
 
     // 6) HTTP API
     let handler = Arc::new(SupervisorApiAdapter::new(Arc::new(supervisor)));
