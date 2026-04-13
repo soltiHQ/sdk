@@ -5,19 +5,18 @@
 //!
 //! ## Responsibilities
 //!
-//! | Component            | What it does                                       |
-//! |----------------------|----------------------------------------------------|
-//! | [`SupervisorApi`]    | High-level facade: submit, query, cancel, GC       |
-//! | `TaskState`          | In-memory task + run storage (`Arc<RwLock>`)       |
-//! | `StateSubscriber`    | Wires taskvisor events into `TaskState`            |
-//! | `state_gc`           | Embedded periodic task sweeping expired state      |
-//! | `map`                | Policy adapter: `solti-model` → `taskvisor` enums  |
+//! | Component            | What it does                                                 |
+//! |----------------------|--------------------------------------------------------------|
+//! | [`SupervisorApi`]    | High-level facade: submit, query, cancel, sweep              |
+//! | `TaskState`          | In-memory task + run storage (`Arc<RwLock>`)                 |
+//! | `StateSubscriber`    | Wires taskvisor events into `TaskState`                      |
+//! | `state_sweep`        | Embedded periodic task sweeping expired state (auto-started) |
+//! | `map`                | Policy adapter: `solti-model` → `taskvisor` enums            |
 //!
 //! ## Quick start
 //!
 //! ```text
-//! let api = SupervisorApi::new(sup_cfg, ctrl_cfg, subscribers, router)?;
-//! api.enable_gc(StateConfig::default()).await?;
+//! let api = SupervisorApi::new(sup_cfg, ctrl_cfg, subscribers, router, StateConfig::default()).await?;
 //!
 //! let task_id = api.submit(&spec).await?;
 //! let task    = api.get_task(&task_id);

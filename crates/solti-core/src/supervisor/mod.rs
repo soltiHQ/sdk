@@ -19,7 +19,7 @@ use crate::system::init_uptime;
 use crate::{
     error::CoreError,
     map::{to_admission_policy, to_backoff_policy, to_restart_policy},
-    state::{StateConfig, StateSubscriber, TaskState, state_gc},
+    state::{StateConfig, StateSubscriber, TaskState, state_sweep},
 };
 
 /// Thin wrapper around taskvisor [`Supervisor`] with a runner router.
@@ -32,7 +32,7 @@ use crate::{
 /// ## Also
 ///
 /// - [`CoreError`] error type returned by all methods.
-/// - [`StateConfig`] passed to [`enable_gc`](Self::enable_gc).
+/// - [`StateConfig`] configures sweep TTLs and interval (defaults are sane).
 /// - [`solti_runner::RunnerRouter`] picks a runner for each submitted spec.
 pub struct SupervisorApi {
     handle: SupervisorHandle,
@@ -42,18 +42,24 @@ pub struct SupervisorApi {
 
 impl SupervisorApi {
     /// Create a supervisor with explicit configs and start its run loop in the background.
-    /// - `sup_cfg`     - supervisor configuration;
-    /// - `ctrl_cfg`    - controller configuration;
-    /// - `subscribers` - event subscribers to attach to the supervisor;
-    /// - `router`      - runner router [`solti_model::TaskKind`].
+    ///
+    /// - `sup_cfg`      - supervisor configuration;
+    /// - `ctrl_cfg`     - controller configuration;
+    /// - `subscribers`  - event subscribers to attach to the supervisor;
+    /// - `router`       - runner router [`solti_model::TaskKind`];
+    /// - `state_cfg`    - sweep TTLs and interval ([`StateConfig::default()`] is usually fine).
     ///
     /// The supervisor event loop is started via [`Supervisor::serve()`] which returns
     /// a [`SupervisorHandle`] for dynamic task management.
-    pub fn new(
+    ///
+    /// A periodic sweep task is automatically submitted to prevent unbounded memory growth.
+    /// It removes completed runs and terminal tasks that exceed their configured TTLs.
+    pub async fn new(
         sup_cfg: SupervisorConfig,
         ctrl_cfg: ControllerConfig,
         mut subscribers: Vec<Arc<dyn Subscribe>>,
         router: RunnerRouter,
+        state_cfg: StateConfig,
     ) -> Result<Self, CoreError> {
         let state = TaskState::new();
         subscribers.push(Arc::new(StateSubscriber::new(state.clone())));
@@ -66,12 +72,19 @@ impl SupervisorApi {
         let handle = sup.serve();
         init_uptime();
 
-        info!("supervisor is ready to accept tasks");
-        Ok(Self {
+        let api = Self {
             handle,
             router,
             state,
-        })
+        };
+
+        // Sweep is always-on: prevents unbounded memory growth by periodically
+        // removing completed runs and terminal tasks that exceed their TTL.
+        let (task, spec) = state_sweep(api.state.clone(), state_cfg);
+        api.submit_with_task(task, &spec).await?;
+        info!("supervisor is ready (sweep active)");
+
+        Ok(api)
     }
 
     /// Get task information by ID.
@@ -109,24 +122,6 @@ impl SupervisorApi {
     /// Returns `true` if the task existed and was deleted.
     pub fn delete_task(&self, id: &TaskId) -> bool {
         self.state.delete_task(id)
-    }
-
-    /// Enable automatic garbage collection for in-memory state.
-    ///
-    /// Submits an embedded periodic task that sweeps expired runs and
-    /// terminal tasks according to the provided [`StateConfig`].
-    ///
-    /// This is opt-in: if not called, no GC runs and the state grows unboundedly.
-    ///
-    /// # Example
-    ///
-    /// ```text
-    /// let api = SupervisorApi::new(sup, ctrl, subs, router)?;
-    /// api.enable_gc(StateConfig::default()).await?;
-    /// ```
-    pub async fn enable_gc(&self, config: StateConfig) -> Result<TaskId, CoreError> {
-        let (task, spec) = state_gc(self.state.clone(), config);
-        self.submit_with_task(task, &spec).await
     }
 
     /// Get a clone of the underlying supervisor handle.
@@ -258,7 +253,9 @@ mod tests {
             ControllerConfig::default(),
             Vec::new(),
             router,
+            StateConfig::default(),
         )
+        .await
         .expect("failed to create SupervisorApi");
 
         let task: TaskRef = TaskFn::arc("test-task", |_ctx: CancellationToken| async move {
@@ -290,7 +287,9 @@ mod tests {
             ControllerConfig::default(),
             Vec::new(),
             router,
+            StateConfig::default(),
         )
+        .await
         .expect("failed to create SupervisorApi");
 
         let spec = TaskSpec::builder("test-slot-none", TaskKind::Embedded, 1_000_u64)

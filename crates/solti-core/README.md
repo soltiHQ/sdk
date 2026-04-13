@@ -23,8 +23,8 @@ Provides `SupervisorApi` - the main entry point for submitting, querying, and ca
  │  get_task(id)   ──► TaskState ──► Option<Task>               │
  │  list_task_runs ──► TaskState ──► Vec<TaskRun>               │
  │                                                              │
- │  enable_gc(config)                                           │
- │      └──► submit_with_task(state_gc(state, config))          │
+ │  new(..., state_cfg) ──► auto-starts sweep task              │
+ │      └──► submit_with_task(state_sweep(state, state_cfg))    │
  └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -38,17 +38,17 @@ Provides `SupervisorApi` - the main entry point for submitting, querying, and ca
      ├──► TaskFailed     → phase=Failed + finish_run
      ├──► TimeoutHit     → phase=Timeout + finish_run
      ├──► ActorExhausted → phase=Exhausted + finish_run
-     └──► TaskRemoved    → remove_task (runs preserved for GC)
+     └──► TaskRemoved    → remove_task (runs preserved for sweep)
 ```
 
 ## Key types
 
 | Type               | Description                                              |
 |--------------------|----------------------------------------------------------|
-| `SupervisorApi`    | High-level facade: submit, query, cancel, GC             |
+| `SupervisorApi`    | High-level facade: submit, query, cancel, sweep          |
 | `TaskState`        | In-memory storage: tasks + runs (`Arc<RwLock>`)          |
 | `StateSubscriber`  | `Subscribe` impl wiring events into `TaskState`          |
-| `StateConfig`      | TTL settings for runs, tasks, and GC interval            |
+| `StateConfig`      | TTL settings for runs, tasks, and sweep interval         |
 | `CoreError`        | Error enum: Supervisor, Mapping, Runner, InvalidSpec     |
 
 ## State storage
@@ -64,21 +64,21 @@ Provides `SupervisorApi` - the main entry point for submitting, querying, and ca
 Queries use the `by_slot` index when a slot filter is present to avoid full scans.
 Pagination is deterministic (sorted by `TaskId`).
 
-## Garbage collection
+## State sweep
 ```text
- enable_gc(StateConfig)
-     └──► embedded periodic task (slot: "solti-state-gc")
-           ├──► sweep pass 1: remove finished runs older than run_ttl
-           └──► sweep pass 2: remove terminal tasks with no runs past task_ttl
+ SupervisorApi::new(..., StateConfig)
+     └──► auto-starts embedded periodic task (slot: "solti-state-sweep")
+           ├──► pass 1: remove finished runs older than run_ttl
+           └──► pass 2: remove terminal tasks with no runs past task_ttl
 ```
 
-| Parameter     | Default   | Controls                                        |
-|---------------|-----------|-------------------------------------------------|
-| `run_ttl`     | 1 hour    | How long finished runs are retained             |
-| `task_ttl`    | 1 hour    | How long terminal tasks are retained            |
-| `gc_interval` | 5 minutes | Sweep frequency (via `RestartPolicy::periodic`) |
+| Parameter        | Default   | Controls                                        |
+|------------------|-----------|-------------------------------------------------|
+| `run_ttl`        | 1 hour    | How long finished runs are retained             |
+| `task_ttl`       | 1 hour    | How long terminal tasks are retained            |
+| `sweep_interval` | 5 minutes | Sweep frequency (via `RestartPolicy::periodic`) |
 
-GC is opt-in. If not enabled, state grows unboundedly.
+Sweep is always-on. Configure TTLs via `StateConfig` if defaults don't fit.
 
 ## Policy mapping
 ```text

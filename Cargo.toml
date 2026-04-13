@@ -9,9 +9,6 @@ members = [
     "crates/solti-exec",
     "crates/solti-api",
 
-    "examples/grpc-server",
-    "examples/http-server",
-    "examples/discovery",
     "examples/agentd",
 ]
 resolver = "2"

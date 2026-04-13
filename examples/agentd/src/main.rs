@@ -1,224 +1,159 @@
-use std::{sync::Arc, time::Duration};
+//! # agentd - Solti Agent (API v1)
+//!
+//! Reference agent binary that connects to [Podium](https://github.com/soltiHQ/podium) control-plane.
+//!
+//! The agent exposes an HTTP API for task management and periodically sends heartbeats to the control-plane via solti-discover.
+//! Tasks are submitted remotely by the control-plane or directly via the API.
+//!
+//! ## What this shows
+//!
+//! - `SupervisorApi` - task lifecycle management with a runner and state tracking.
+//! - `StateConfig` - sweep is always-on; prevents unbounded memory growth by periodically removing completed runs and terminal tasks that exceed their TTL.
+//! - `solti_discover::sync()` - periodic heartbeat to the control-plane.
+//! - `solti_api::API_VERSION` - protocol version reported to the control-plane.
+//! - `HttpApi` - HTTP/JSON API for submitting, querying, canceling, and deleting tasks.
+//! - `init_local_offset()` + `timezone_sync()` - local timezone in structured logs.
+//! - `TracingEventSubscriber` - logs task lifecycle events.
+//!
+//! ## SDK crates used
+//!
+//! | Crate            | Role                                                   |
+//! |------------------|--------------------------------------------------------|
+//! | `solti-model`    | `AgentId`, domain types                                |
+//! | `solti-runner`   | `RunnerRouter` - runner registration                   |
+//! | `solti-exec`     | `register_subprocess_runner` - subprocess backend      |
+//! | `solti-core`     | `SupervisorApi`, `StateConfig`                         |
+//! | `solti-api`      | `HttpApi`, `SupervisorApiAdapter`, `API_VERSION`       |
+//! | `solti-discover` | `DiscoverConfig`, `sync()` - control-plane heartbeat   |
+//! | `solti-observe`  | Logger, `timezone_sync`, `TracingEventSubscriber`      |
+//!
+//! ## API reference
+//!
+//! See [`api_v1.md`](../../crates/solti-api/api_v1.md) for the full HTTP/gRPC endpoint reference with curl/grpcurl examples.
+//!
+//! ## gRPC transport
+//!
+//! This example uses HTTP by default. To switch to gRPC:
+//!
+//! 1. In `Cargo.toml` change the `solti-api` feature from `http` to `grpc`, and uncomment the `tonic` dependency.
+//! 2. Replace the HTTP server block with:
+//!
+//! ```text
+//! use solti_api::{SoltiApiServer, SoltiApiService};
+//! use tonic::transport::Server;
+//!
+//! let service = SoltiApiService::new(handler);
+//! Server::builder()
+//!     .add_service(SoltiApiServer::new(service))
+//!     .serve("[::1]:50051".parse()?)
+//!     .await?;
+//! ```
+//!
+//! ## Run
+//!
+//! ```bash
+//! cargo run -p agentd
+//! # Endpoints:
+//! #   http://localhost:8085/api/v1/tasks  - task API
+//! # Requires Podium control-plane on localhost:8082 for discovery.
+//! # Without it the agent still works - heartbeat retries with backoff.
+//! ```
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use tracing::info;
 
-use solti_core::SupervisorApi;
+use solti_api::{HttpApi, SupervisorApiAdapter, API_VERSION};
+use solti_core::{StateConfig, SupervisorApi};
+use solti_discover::{DiscoverConfig, DiscoveryTransport};
+use solti_exec::subprocess::register_subprocess_runner;
+use solti_model::AgentId;
+use solti_observe::{
+    LoggerConfig, LoggerLevel, LoggerTimeZone, TracingEventSubscriber, init_local_offset,
+    init_logger, timezone_sync,
+};
 use solti_runner::RunnerRouter;
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
-use solti_exec::subprocess::SubprocessBackendConfig;
-use solti_exec::subprocess::register_subprocess_runner_with_backend;
+const ADDR: &str = "0.0.0.0:8085";
+const CONTROL_PLANE: &str = "http://localhost:8082";
 
-use solti_exec::{CgroupLimits, CpuMax, LinuxCapability, RlimitConfig, SecurityConfig};
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Capture UTC offset before tokio spawns threads.
+    init_local_offset();
 
-use solti_observe::{
-    LoggerConfig, LoggerLevel, TracingEventSubscriber, init_logger, timezone_sync,
-};
+    tokio::runtime::Runtime::new()?.block_on(async_main())
+}
 
-use std::collections::BTreeMap;
-
-use solti_model::{
-    Flag, RunnerSelector, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec,
-};
-
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> anyhow::Result<()> {
-    // 1) logger
-    let cfg = LoggerConfig {
-        level: LoggerLevel::new("trace")?,
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1) Structured logger with local timezone
+    let log_cfg = LoggerConfig {
+        level: LoggerLevel::new("info")?,
+        tz: LoggerTimeZone::Local,
         ..Default::default()
     };
-    init_logger(&cfg)?;
+    init_logger(&log_cfg)?;
     info!("logger initialized");
 
-    // 2) subscribers
-    let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(TracingEventSubscriber)];
-
-    // 3) router + runners with DIFFERENT security profiles
+    // 2) Runner - standard subprocess backend
     let mut router = RunnerRouter::new();
+    register_subprocess_runner(&mut router, "default")?;
+    info!("subprocess runner registered");
 
-    // 3a) Development runner - NO restrictions
-    register_subprocess_runner_with_backend(
-        &mut router,
-        "dev-runner",
-        SubprocessBackendConfig::new(),
-    )?;
-    info!("registered dev-runner (no restrictions)");
-
-    // 3b) Production runner - moderate restrictions
-    let prod_backend = SubprocessBackendConfig::new()
-        .with_rlimits(RlimitConfig {
-            max_open_files: Some(1024),
-            max_file_size_bytes: Some(100 * 1024 * 1024), // 100 MB
-            disable_core_dumps: true,
-        })
-        .with_cgroups(CgroupLimits {
-            cpu: Some(CpuMax {
-                quota: Some(50_000), // 50% CPU (50ms per 100ms)
-                period: 100_000,     // 100ms
-            }),
-            memory: Some(256 * 1024 * 1024), // 256 MB
-            pids: Some(64),                  // max 64 processes
-            ..Default::default()
-        });
-    register_subprocess_runner_with_backend(&mut router, "prod-runner", prod_backend)?;
-    info!("registered prod-runner (moderate restrictions)");
-
-    // 3c) Untrusted runner - MAXIMUM security
-    let untrusted_backend = SubprocessBackendConfig::new()
-        .with_rlimits(RlimitConfig {
-            max_open_files: Some(128),
-            max_file_size_bytes: Some(10 * 1024 * 1024), // 10 MB only
-            disable_core_dumps: true,
-        })
-        .with_cgroups(CgroupLimits {
-            cpu: Some(CpuMax {
-                quota: Some(25_000),
-                period: 100_000,
-            }),
-            memory: Some(64 * 1024 * 1024),
-            pids: Some(16),
-            ..Default::default()
-        })
-        .with_security(SecurityConfig {
-            drop_all_caps: true,
-            keep_caps: vec![LinuxCapability::NetBindService],
-            no_new_privs: true, // CRITICAL  untrusted code
-            ..Default::default()
-        });
-    register_subprocess_runner_with_backend(&mut router, "untrusted-runner", untrusted_backend)?;
-    info!("registered untrusted-runner (MAXIMUM security)");
-
-    // 4) SupervisorApi
-    let api = SupervisorApi::new(
+    // 3) Supervisor
+    let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(TracingEventSubscriber)];
+    let supervisor = SupervisorApi::new(
         SupervisorConfig::default(),
         ControllerConfig::default(),
         subscribers,
         router,
-    )?;
+        StateConfig::default(),
+    )
+    .await?;
 
-    // 5) internal timezone-sync
+    // 4) Timezone sync - refreshes UTC offset for log timestamps
     let (tz_task, tz_spec) = timezone_sync();
-    let tz_id = api.submit_with_task(tz_task, &tz_spec).await?;
-    info!("submitted timezone-sync task: {}", tz_id);
+    supervisor.submit_with_task(tz_task, &tz_spec).await?;
+    info!("timezone sync started");
 
-    // 6a) Dev runner
-    let ls_spec = TaskSpec::builder(
-        "dev-ls-tmp",
-        TaskKind::Subprocess(SubprocessSpec {
-            mode: SubprocessMode::Command {
-                command: "ls".into(),
-                args: vec!["-lah".into(), "/tmp".into()],
-            },
-            env: TaskEnv::default(),
-            cwd: None,
-            fail_on_non_zero: Flag::enabled(),
-        }),
-        5_000_u64,
-    )
-    .runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
-        "runner-name".into(),
-        "dev-runner".into(),
-    )])))
-    .build()
-    .unwrap();
+    // 5) Discovery - periodic heartbeat to Podium control-plane
+    let discover_config = DiscoverConfig {
+        agent_id: AgentId::new("agentd-001"),
+        name: "agentd".to_string(),
+        control_plane_endpoint: CONTROL_PLANE.to_string(),
+        agent_endpoint: format!("http://{ADDR}"),
+        transport: DiscoveryTransport::Http,
+        metadata: HashMap::from([
+            ("region".into(), "us-east-1".into()),
+            ("role".into(), "worker".into()),
+        ]),
+        delay_ms: 10_000,
+        api_version: API_VERSION,
+    };
+    let (sync_task, sync_spec) = solti_discover::sync(discover_config);
+    supervisor.submit_with_task(sync_task, &sync_spec).await?;
+    info!(
+        "discovery heartbeat started (control_plane={CONTROL_PLANE}, api_version={API_VERSION})"
+    );
 
-    // 6b) Production runner
-    let date_spec = TaskSpec::builder(
-        "prod-date",
-        TaskKind::Subprocess(SubprocessSpec {
-            mode: SubprocessMode::Command {
-                command: "date".into(),
-                args: vec!["+%Y-%m-%d %H:%M:%S".into()],
-            },
-            env: TaskEnv::default(),
-            cwd: None,
-            fail_on_non_zero: Flag::enabled(),
-        }),
-        5_000_u64,
-    )
-    .runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
-        "runner-name".into(),
-        "prod-runner".into(),
-    )])))
-    .build()
-    .unwrap();
+    // 6) HTTP API
+    let handler = Arc::new(SupervisorApiAdapter::new(Arc::new(supervisor)));
+    let app = HttpApi::new(handler).router();
 
-    // 6c) Untrusted runner
-    let sleep_spec = TaskSpec::builder(
-        "untrusted-sleep",
-        TaskKind::Subprocess(SubprocessSpec {
-            mode: SubprocessMode::Command {
-                command: "sleep".into(),
-                args: vec!["2".into()],
-            },
-            env: TaskEnv::default(),
-            cwd: None,
-            fail_on_non_zero: Flag::enabled(),
-        }),
-        5_000_u64,
-    )
-    .runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
-        "runner-name".into(),
-        "untrusted-runner".into(),
-    )])))
-    .build()
-    .unwrap();
+    // ── Uncomment for gRPC transport (see doc header for details) ──
+    // use solti_api::{SoltiApiServer, SoltiApiService};
+    // use tonic::transport::Server;
+    // let service = SoltiApiService::new(handler);
+    // Server::builder()
+    //     .add_service(SoltiApiServer::new(service))
+    //     .serve("[::1]:50051".parse()?)
+    //     .await?;
 
-    // 6d) Untrusted runner
-    let stress_spec = TaskSpec::builder(
-        "untrusted-stress",
-        TaskKind::Subprocess(SubprocessSpec {
-            mode: SubprocessMode::Command {
-                command: "sh".into(),
-                args: vec![
-                    "-c".into(),
-                    "for i in $(seq 1 100); do sleep 1 & done; wait".into(),
-                ],
-            },
-            env: TaskEnv::default(),
-            cwd: None,
-            fail_on_non_zero: Flag::disabled(),
-        }),
-        5_000_u64,
-    )
-    .runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
-        "runner-name".into(),
-        "untrusted-runner".into(),
-    )])))
-    .build()
-    .unwrap();
+    let listener = tokio::net::TcpListener::bind(ADDR).await?;
+    info!("HTTP API: http://{ADDR}/api/v1/tasks");
+    info!("press Ctrl+C to stop");
+    axum::serve(listener, app).await?;
 
-    // Submit tasks
-    info!("submitting tasks...");
-    let task_id = api.submit(&ls_spec).await?;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    if let Some(info) = api.get_task(&task_id) {
-        info!("task {} status: {:?}", task_id, info.status.phase);
-    }
-
-    info!("submitted task: {}", task_id);
-    let date_id = api.submit(&date_spec).await?;
-    info!("submitted date: {}", date_id);
-    let sleep_id = api.submit(&sleep_spec).await?;
-    info!("submitted sleep: {}", sleep_id);
-    let stress_id = api.submit(&stress_spec).await?;
-    info!("submitted stress: {}", stress_id);
-
-    info!("all tasks submitted, waiting for completion...");
-    tokio::time::sleep(Duration::from_secs(8)).await;
-
-    info!("=== Task Summary ===");
-    for task in api.list_all_tasks() {
-        info!(
-            "task {}: status={:?}, attempt={}, slot={}",
-            task.id(),
-            task.status.phase,
-            task.status.attempt,
-            task.slot()
-        );
-    }
-
-    info!("demo completed");
     Ok(())
 }
