@@ -107,23 +107,23 @@ Override via `DiscoverConfigBuilder::connect_timeout_ms` / `request_timeout_ms`.
 
 ## Build
 
-`build.rs` runs two codegen passes:
-- `tonic_prost_build::configure()` - message types always, tonic server/client only under `grpc`.
-- `pbjson_build` under `http` - attaches canonical proto-JSON `Serialize`/`Deserialize` to the same message types:
+`build.rs` walks `proto/` recursively, collecting every `*.proto` file (plus
+emitting `rerun-if-changed` for each). Two codegen passes:
 
-  ```rust
-  pbjson_build::Builder::new()
-      .register_descriptors(&descriptor_set)?
-      .build(&[".solti.discover.v1"])?;
-  ```
+- `tonic_prost_build::configure()` — message types always, tonic server/client only under `grpc`.
+- `pbjson_build` under `http` — attaches canonical proto-JSON `Serialize`/`Deserialize` to the same message types.
 
-  `".solti.discover.v1"` is the proto package selector. 
-  If the `package` declaration in `.proto` changes, update this list.
+The proto package selector lives at the top of `build.rs` as
+`const PROTO_PACKAGE = ".solti.discover.v1";`. If the `package` declaration in a
+`.proto` changes, update this constant. Adding new `.proto` files anywhere
+under `proto/` requires **no** changes to `build.rs`.
 
 ## Notes
 
-- gRPC channel is lazily created via `OnceCell` and reused across cycles.
-- Cancellation is cooperative via `tokio::select!` on the cancel token and the network future.
-- `os_info()` reads `/etc/os-release` on Linux for distribution name, falls back to platform.
-- `SyncContext` is wrapped in `Arc` and shared into the async task closure.
-- `tonic-prost` is a regular `[dependencies]` entry - generated gRPC code references `tonic_prost::ProstCodec` at runtime.
+- gRPC channel is lazily created via `OnceCell` and reused across cycles (connection pooling).
+- HTTP `reqwest::Client` is built once with `connect_timeout` + `timeout` + `User-Agent` (`solti-discover/<version>`) and reused for the same effect.
+- HTTP sync path is derived from `api_version`: `/api/v{n}/discovery/sync`. Changing `api_version` automatically changes the endpoint.
+- Cancellation is cooperative via `tokio::select!` on the cancel token and the network future (and, when honoring a server-advised hold, on the sleep).
+- `os_info()` reads `/etc/os-release`, falls back to `/usr/lib/os-release` (freedesktop spec), then to `std::env::consts::OS`. Linux only; other platforms return the platform string.
+- `SyncContext` is wrapped in `Arc` and shared into the async task closure. It carries the base request, both clients, and the `retry_hold_until: AtomicU64` deadline honored on the next attempt.
+- `tonic-prost` is a regular `[dependencies]` entry (feature-gated) — generated gRPC code references `tonic_prost::ProstCodec` at runtime.

@@ -74,7 +74,10 @@ No API server, no discovery, no control-plane — just supervision and execution
 ```rust
 use solti_core::{StateConfig, SupervisorApi};
 use solti_exec::subprocess::register_subprocess_runner;
-use solti_model::{TaskKind, TaskSpec, RestartPolicy, AdmissionPolicy, BackoffPolicy, JitterPolicy};
+use solti_model::{
+    AdmissionPolicy, Flag, RestartPolicy, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind,
+    TaskSpec,
+};
 use solti_runner::RunnerRouter;
 use taskvisor::{ControllerConfig, SupervisorConfig};
 
@@ -95,7 +98,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // 3. Submit a task
-    let spec = TaskSpec::builder("hello", TaskKind::command("echo", &["hello world"]), 30_000u64)
+    let kind = TaskKind::Subprocess(SubprocessSpec {
+        mode: SubprocessMode::Command {
+            command: "echo".into(),
+            args: vec!["hello world".into()],
+        },
+        env: TaskEnv::new(),
+        cwd: None,
+        fail_on_non_zero: Flag::enabled(),
+    });
+    let spec = TaskSpec::builder("hello", kind, 30_000u64)
         .restart(RestartPolicy::Never)
         .admission(AdmissionPolicy::Replace)
         .build()?;
@@ -144,16 +156,22 @@ See [`api_v1.md`](crates/solti-api/api_v1.md) for the full endpoint reference.
 Add `solti-discover` to register with [Podium](https://github.com/soltiHQ/podium) and receive specs remotely:
 
 ```rust
+use solti_api::API_VERSION;
 use solti_discover::{DiscoverConfig, DiscoveryTransport};
+use solti_model::AgentId;
 
-let config = DiscoverConfig {
-    agent_id: AgentId::new("worker-001"),
-    control_plane_endpoint: "http://podium:8082".into(),
-    agent_endpoint: "http://this-host:8085".into(),
-    transport: DiscoveryTransport::Http,
-    // ...
-};
-let (task, spec) = solti_discover::sync(config);
+let config = DiscoverConfig::builder(
+    AgentId::new("worker-001"),
+    "worker",
+    "http://this-host:8085",
+    "http://podium:8082",
+    DiscoveryTransport::Http,
+    10_000, // heartbeat interval (ms)
+    API_VERSION,
+)
+.build()?;
+
+let (task, spec) = solti_discover::sync(config)?;
 supervisor.submit_with_task(task, &spec).await?;
 ```
 
@@ -173,7 +191,7 @@ See [`examples/agentd`](examples/agentd) for a complete reference agent with API
 
 **Dual-transport API**: HTTP/JSON (axum) and gRPC (tonic) behind feature flags. Use one, both, or neither.
 
-**Observability**: structured logging (`tracing` + `zerolog`), local timezone in timestamps, Prometheus metrics, lifecycle event subscribers.
+**Observability**: structured logging (`tracing` + `tracing-subscriber`, JSON / text / journald), local timezone in timestamps, Prometheus metrics, lifecycle event subscribers.
 
 ## Task lifecycle
 

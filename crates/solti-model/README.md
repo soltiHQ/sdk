@@ -24,7 +24,7 @@ Defines core resource types: `Task`, `TaskSpec`, `TaskStatus`, `ObjectMeta`, and
 
 | Section      | Type         | Responsibility                                                |
 |--------------|--------------|---------------------------------------------------------------|
-| **metadata** | `ObjectMeta` | Identity, versioning (`generation` + `resource_version`)      |
+| **metadata** | `ObjectMeta` | Identity, `resource_version`, timestamps                      |
 | **spec**     | `TaskSpec`   | Desired state (private fields; build via `TaskSpec::builder`) |
 | **status**   | `TaskStatus` | Observed state: phase, attempt count, exit code, error        |
 
@@ -123,19 +123,22 @@ spec.validate()?;  // submit-boundary validation (rejects Embedded)
 ```text
  Variant             When
  ───────             ────
- Conflict            resource_version mismatch (optimistic concurrency)
  UnknownAdmission    unknown admission policy string
  UnknownRestart      unknown restart policy string
  UnknownJitter       unknown jitter policy string
  UnknownTaskKind     unknown task kind string
+ UnknownTaskPhase    unknown task phase string
  Invalid             structural validation failure (empty slot, bad backoff, etc.)
 ```
 
 ## Notes
-- `TaskSpec` fields are private use `TaskSpec::builder()` for construction and `serde` for deserialization.
+- `TaskSpec` fields are private — use `TaskSpec::builder()` for construction and `serde` for deserialization.
 - Deserialization goes through `#[serde(try_from = "TaskSpecRaw")]` which validates on parse.
-- Identity newtypes (`Slot`, `TaskId`, `AgentId`) wrap `Arc<str>` for cheap cloning and comparison.
+- `BackoffPolicy` is **also** validated on deserialize via its own `try_from` raw; zero `first_ms`, inverted `max_ms`, or non-finite/`<1.0` `factor` are rejected at parse time.
+- Identity newtypes (`Slot`, `TaskId`, `AgentId`) wrap `Arc<str>` for cheap cloning and comparison; they share one declarative-macro definition.
 - `BackoffPolicy` implements `Eq`/`Hash` via `f64::to_bits()` for the `factor` field.
 - `TaskPhase`, `RestartPolicy`, `AdmissionPolicy`, `JitterPolicy` all implement `FromStr` for CLI/config parsing.
 - `Labels` is backed by `BTreeMap<String, String>` for deterministic iteration order.
-- All types derive `Serialize`/`Deserialize` with `camelCase` field renaming.
+- Most types derive `Serialize`/`Deserialize` with `camelCase` field renaming. The one exception is `SelectorOperator`, which serializes as PascalCase (`In`, `NotIn`, `Exists`, `DoesNotExist`) to match the Kubernetes `LabelSelectorOperator` convention.
+- `TaskKind`, `TaskPhase`, `RestartPolicy`, `AdmissionPolicy`, `JitterPolicy`, `SelectorOperator` are `#[non_exhaustive]` — adding new variants is a non-breaking change.
+- Pagination constants for list endpoints: `DEFAULT_LIMIT = 100`, `MAX_LIMIT = 1000` (re-exported as `pub const` so downstream API layers share one source of truth).

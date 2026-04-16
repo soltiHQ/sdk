@@ -28,15 +28,23 @@ Both transports delegate to an `ApiHandler` trait, decoupling wire format from b
 
 `solti-api` exports `API_VERSION: u32` - the current protocol version.
 
-Binary passes it to `solti_discover::DiscoverConfig::api_version`, which reports it to the control-plane via `SyncRequest`. One binary = one API version.
+Binary passes it to `solti_discover::DiscoverConfig::builder(... , API_VERSION)`, which reports it to the control-plane via `SyncRequest`. One binary = one API version.
 
 ```rust
 use solti_api::API_VERSION;
+use solti_discover::{DiscoverConfig, DiscoveryTransport};
+use solti_model::AgentId;
 
-let config = DiscoverConfig {
-    api_version: API_VERSION,
-    // ...
-};
+let config = DiscoverConfig::builder(
+    AgentId::new("agentd-001"),
+    "agentd",
+    "http://0.0.0.0:8085",
+    "http://podium:8082",
+    DiscoveryTransport::Http,
+    10_000,
+    API_VERSION,
+)
+.build()?;
 ```
 
 Bump rules:
@@ -62,12 +70,21 @@ Per-version API surface is documented in separate files: [api_v1.md](api_v1.md).
 
 ## Error model
 
-| Variant | gRPC Status | HTTP Status |
-|---------|-------------|-------------|
-| `InvalidRequest` | `INVALID_ARGUMENT` | `400 Bad Request` |
-| `TaskNotFound` | `NOT_FOUND` | `404 Not Found` |
-| `Internal` | `INTERNAL` | `500 Internal Server Error` |
-| `Core` | `INTERNAL` | `500 Internal Server Error` |
+| Variant          | gRPC Status                      | HTTP Status                 | `error` label (HTTP body) |
+|------------------|----------------------------------|-----------------------------|---------------------------|
+| `InvalidRequest` | `INVALID_ARGUMENT`               | `400 Bad Request`           | `"InvalidRequest"`        |
+| `TaskNotFound`   | `NOT_FOUND`                      | `404 Not Found`             | `"TaskNotFound"`          |
+| `Internal`       | `INTERNAL`                       | `500 Internal Server Error` | `"Internal"`              |
+| `Core`           | derived from inner `CoreError`   | derived from inner          | flattened to `InvalidRequest` / `Internal` |
+
+`Core` is split by the wrapped [`solti_core::CoreError`]: `InvalidSpec` → `INVALID_ARGUMENT` / `400` / `"InvalidRequest"`; everything else → `INTERNAL` / `500` / `"Internal"`.
+
+HTTP error body:
+```json
+{ "error": "<label>", "message": "<detail>" }
+```
+
+HTTP requests also return `413 Payload Too Large` (no JSON body) when the body exceeds 256 KiB (`RequestBodyLimitLayer`).
 
 ## Feature flags
 
@@ -80,17 +97,13 @@ Neither feature is enabled by default.
 
 ## Build
 
-`build.rs` runs two codegen passes:
-- `tonic_prost_build::configure()` - message types always, tonic server/client only under `grpc`.
-- `pbjson_build` under `http` - attaches canonical proto-JSON `Serialize`/`Deserialize` to the same message types:
+`build.rs` walks `proto/` recursively, collecting every `*.proto` file (plus
+emitting `rerun-if-changed` for each). Two codegen passes:
 
-  ```rust
-  pbjson_build::Builder::new()
-      .register_descriptors(&descriptor_set)?
-      .build(&[".solti.v1"])?;
-  ```
+- `tonic_prost_build::configure()` — message types always, tonic server/client only under `grpc`.
+- `pbjson_build` under `http` — attaches canonical proto-JSON `Serialize`/`Deserialize` to the same message types, with `.emit_fields()` enabled so REST clients see `0` / `false` / `""` / `[]` / `{}` for default scalar/repeated/map values (optional `message` fields still omit on `None`).
 
-  `".solti.v1"` is the proto package selector. If the `package` declaration in `.proto` changes, update this list - otherwise pbjson generates nothing and HTTP compile fails.
+The proto package selector lives at the top of `build.rs` as `const PROTO_PACKAGE = ".solti.v1";`. If the `package` declaration in a `.proto` changes, update this constant — otherwise pbjson generates nothing and HTTP compile fails. Adding new `.proto` files anywhere under `proto/` requires **no** changes to `build.rs`.
 
 ## Notes
 - `ApiHandler` uses `async_trait` for object safety (`Send + Sync + 'static`).
