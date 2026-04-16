@@ -9,7 +9,7 @@ solti-observe  = { path = "../../crates/solti-observe", features = ["timezone-sy
 solti-exec     = { path = "../../crates/solti-exec", features = ["subprocess"] }
 solti-api      = { path = "../../crates/solti-api", features = ["http"] }
 
-solti-discover = { path = "../../crates/solti-discover" }
+solti-discover = { path = "../../crates/solti-discover", features = ["http"] }
 solti-runner   = { path = "../../crates/solti-runner" }
 solti-model    = { path = "../../crates/solti-model" }
 solti-core     = { path = "../../crates/solti-core" }

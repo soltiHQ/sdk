@@ -4,14 +4,14 @@
 
 ## API surface
 
-| Operation   | gRPC RPC       | HTTP Endpoint                  | HTTP Method |
-|-------------|----------------|--------------------------------|-------------|
-| Submit task | `SubmitTask`   | `/api/v1/tasks`                | POST        |
-| Get task    | `GetTaskStatus`| `/api/v1/tasks/{id}`           | GET         |
-| List tasks  | `ListTasks`    | `/api/v1/tasks`                | GET         |
-| List runs   | `ListTaskRuns` | `/api/v1/tasks/{id}/runs`      | GET         |
-| Cancel task | `CancelTask`   | `/api/v1/tasks/{id}/cancel`    | POST        |
-| Delete task | `DeleteTask`   | `/api/v1/tasks/{id}`           | DELETE      |
+| Operation   | gRPC RPC        | HTTP Endpoint                  | HTTP Method |
+|-------------|-----------------|--------------------------------|-------------|
+| Submit task | `SubmitTask`    | `/api/v1/tasks`                | POST        |
+| Get task    | `GetTaskStatus` | `/api/v1/tasks/{id}`           | GET         |
+| List tasks  | `ListTasks`     | `/api/v1/tasks`                | GET         |
+| List runs   | `ListTaskRuns`  | `/api/v1/tasks/{id}/runs`      | GET         |
+| Cancel task | `CancelTask`    | `/api/v1/tasks/{id}/cancel`    | POST        |
+| Delete task | `DeleteTask`    | `/api/v1/tasks/{id}`           | DELETE      |
 
 ---
 
@@ -119,7 +119,6 @@ Response `200 OK`:
   "task": {
     "metadata": {
       "id": "tsk_01JR...",
-      "generation": 1,
       "resourceVersion": 2,
       "createdAt": 1712750400000,
       "updatedAt": 1712750401000
@@ -166,7 +165,7 @@ Response `200 OK`:
 {
   "tasks": [
     {
-      "metadata": { "id": "tsk_01JR...", "generation": 1, "resourceVersion": 1, "createdAt": 1712750400000, "updatedAt": 1712750400000 },
+      "metadata": { "id": "tsk_01JR...", "resourceVersion": 1, "createdAt": 1712750400000, "updatedAt": 1712750400000 },
       "spec": { "slot": "my-job", "..." : "..." },
       "status": { "phase": "running", "attempt": 1 }
     }
@@ -177,12 +176,12 @@ Response `200 OK`:
 
 Query parameters:
 
-| Parameter | Type   | Description                   |
-|-----------|--------|-------------------------------|
-| `slot`    | string | Filter by slot name           |
+| Parameter | Type   | Description                                                                     |
+|-----------|--------|---------------------------------------------------------------------------------|
+| `slot`    | string | Filter by slot name                                                             |
 | `status`  | string | `pending`, `running`, `succeeded`, `failed`, `timeout`, `canceled`, `exhausted` |
-| `limit`   | u32    | Max results (default 100, max 1000) |
-| `offset`  | u32    | Skip first N results          |
+| `limit`   | u32    | Max results (default 100, max 1000)                                             |
+| `offset`  | u32    | Skip first N results                                                            |
 
 ### List task runs
 
@@ -237,11 +236,17 @@ Response `204 No Content`.
 }
 ```
 
-| HTTP Status | ApiError variant | When |
-|-------------|-----------------|------|
-| 400         | `InvalidRequest` | Validation failure (empty slot, bad spec, invalid status) |
-| 404         | `TaskNotFound` | Task ID not found |
-| 500         | `Internal` / `Core` | Supervisor or internal error |
+| HTTP Status | `error` label    | When                                                                                |
+|-------------|------------------|-------------------------------------------------------------------------------------|
+| 400         | `InvalidRequest` | Validation failure (empty slot, bad spec, invalid status), also `Core::InvalidSpec` |
+| 404         | `TaskNotFound`   | Task ID not found                                                                   |
+| 413         | *(no body)*      | Request body exceeds 256 KiB (`RequestBodyLimitLayer`)                              |
+| 500         | `Internal`       | Supervisor/infra error (also `Core::{Supervisor,Mapping,Runner}`)                   |
+
+### JSON field presence
+
+- Scalar defaults (`0`, `false`, `""`), repeated fields and maps are always emitted (`emit_fields` is set in the proto-JSON codec).
+- `optional` message fields are **omitted** when absent (canonical proto3-JSON). For example, `GetTaskStatusResponse` for an unknown task is `{}`, not `{"task": null}`.
 
 ---
 
@@ -340,7 +345,6 @@ Response:
       "id": "tsk_01JR...",
       "createdAt": "1712750400000",
       "updatedAt": "1712750401000",
-      "generation": "1",
       "resourceVersion": "2"
     },
     "spec": {
@@ -421,10 +425,10 @@ Both return `{}`.
 
 ### gRPC errors
 
-| gRPC Status        | ApiError variant | When                         |
-|--------------------|-----------------|------------------------------|
-| `INVALID_ARGUMENT` | `InvalidRequest` | Validation failure           |
-| `NOT_FOUND`        | `TaskNotFound`   | Task ID not found            |
+| gRPC Status        | ApiError variant    | When                         |
+|--------------------|---------------------|------------------------------|
+| `INVALID_ARGUMENT` | `InvalidRequest`    | Validation failure           |
+| `NOT_FOUND`        | `TaskNotFound`      | Task ID not found            |
 | `INTERNAL`         | `Internal` / `Core` | Supervisor or internal error |
 
 ---
@@ -439,13 +443,13 @@ Go package: `github.com/soltiHQ/control-plane/api/gen/v1`
 
 ## Wire type differences
 
-| Aspect     | HTTP (serde JSON)                        | gRPC (protobuf)                          |
-|------------|------------------------------------------|------------------------------------------|
-| Task shape | Domain `Task` (nested metadata/spec/status) | `TaskData` (proto message)            |
-| Timestamps | Unix ms as number (`1712750400000`)      | Unix ms as string (`"1712750400000"`)    |
-| Enums      | camelCase (`"succeeded"`, `"onFailure"`) | SCREAMING_SNAKE (`TASK_STATUS_SUCCEEDED`) |
-| uint64     | JSON number                              | String-encoded                           |
-| Null/absent| `null` or field omitted                  | Default value or field absent            |
-| Field names| camelCase (`firstMs`, `failOnNonZero`)   | camelCase (`firstMs`, `failOnNonZero`)   |
-| Restart    | Tagged: `{ "type": "never" }`            | Enum: `RESTART_STRATEGY_NEVER`           |
-| Admission  | String: `"dropIfRunning"`                | Enum: `ADMISSION_STRATEGY_DROP_IF_RUNNING` |
+| Aspect      | HTTP (serde JSON)                           | gRPC (protobuf)                            |
+|-------------|---------------------------------------------|--------------------------------------------|
+| Task shape  | Domain `Task` (nested metadata/spec/status) | `TaskData` (proto message)                 |
+| Timestamps  | Unix ms as number (`1712750400000`)         | Unix ms as string (`"1712750400000"`)      |
+| Enums       | camelCase (`"succeeded"`, `"onFailure"`)    | SCREAMING_SNAKE (`TASK_STATUS_SUCCEEDED`)  |
+| uint64      | JSON number                                 | String-encoded                             |
+| Null/absent | `null` or field omitted                     | Default value or field absent              |
+| Field names | camelCase (`firstMs`, `failOnNonZero`)      | camelCase (`firstMs`, `failOnNonZero`)     |
+| Restart     | Tagged: `{ "type": "never" }`               | Enum: `RESTART_STRATEGY_NEVER`             |
+| Admission   | String: `"dropIfRunning"`                   | Enum: `ADMISSION_STRATEGY_DROP_IF_RUNNING` |

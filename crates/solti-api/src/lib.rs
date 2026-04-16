@@ -1,7 +1,6 @@
-//! # Task management API.
+//! # solti-api - task management API.
 //!
-//! Dual-transport API layer exposing task operations over gRPC and HTTP.
-//! Both transports delegate to an [`ApiHandler`] trait implementation.
+//! Dual-transport API layer exposing task operations over gRPC and HTTP. Both transports share the same wire types generated from `proto/solti/v1/*.proto` and delegate to an [`ApiHandler`] implementation.
 //!
 //! | feature | transport         | module                              |
 //! |---------|-------------------|-------------------------------------|
@@ -12,10 +11,8 @@
 //!
 //! ```text
 //! let adapter = SupervisorApiAdapter::new(supervisor);
-//! // gRPC
-//! let svc = SoltiApiServer::new(SoltiApiService::new(Arc::new(adapter)));
-//! // HTTP
-//! let router = HttpApi::new(Arc::new(adapter)).router();
+//! let svc     = SoltiApiServer::new(SoltiApiService::new(Arc::new(adapter)));
+//! let router  = HttpApi::new(Arc::new(adapter)).router();
 //! ```
 //!
 //! ## Also
@@ -39,13 +36,22 @@ pub use handler::ApiHandler;
 mod adapter;
 pub use adapter::SupervisorApiAdapter;
 
-#[cfg(feature = "grpc")]
-mod proto_api {
-    tonic::include_proto!("solti.v1");
+#[cfg(any(feature = "grpc", feature = "http"))]
+#[allow(dead_code)] // Generated proto types: request/response messages are exposed for
+// wire completeness but only directly used by one transport at a time (gRPC uses all,
+// HTTP reaches some via path params instead of request-typed bodies).
+pub(crate) mod proto_api {
+    include!(concat!(env!("OUT_DIR"), "/solti.v1.rs"));
+
+    #[cfg(feature = "http")]
+    include!(concat!(env!("OUT_DIR"), "/solti.v1.serde.rs"));
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(any(feature = "grpc", feature = "http"))]
 mod convert;
+
+#[cfg(any(feature = "grpc", feature = "http"))]
+mod validate;
 
 #[cfg(feature = "grpc")]
 mod grpc;

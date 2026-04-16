@@ -1,6 +1,7 @@
 # solti-discover
 
 Periodic heartbeat that registers an agent with the control plane and reports liveness and platform telemetry.
+Dual-transport (gRPC + HTTP).
 
 ## Architecture
 ```text
@@ -17,29 +18,31 @@ Periodic heartbeat that registers an agent with the control plane and reports li
 
 ## Versioning
 
-`DiscoverConfig` accepts `api_version: u32` from the binary. The value is passed into `SyncRequest.api_version` so the control-plane knows which API protocol the agent supports.
+`DiscoverConfig` accepts `api_version: u32` from the binary (passed into `SyncRequest.api_version`).
+The proto field is `int32`: the control-plane interprets `1 = v1`.
 
 ```rust
 use solti_api::API_VERSION;
 
-let config = DiscoverConfig {
-    api_version: API_VERSION,
-    // ...
-};
+let cfg = DiscoverConfig::builder(
+    agent_id, name, agent_endpoint, control_plane_endpoint,
+    DiscoveryTransport::Grpc, 60_000, API_VERSION,
+).build()?;
 ```
 
-The binary is the integration point - solti-discover does not depend on solti-api.
+The binary is the integration point: solti-discover does not depend on solti-api.
 
 ## Key types
 
-| Type                 | Role                                                   |
-|----------------------|--------------------------------------------------------|
-| `DiscoverConfig`     | Agent identity, endpoint, transport, interval, version |
-| `DiscoveryTransport` | Selects gRPC or HTTP path                              |
-| `DiscoverError`      | Transport, parse, and rejection failures               |
-| `sync()`             | Factory - returns `(TaskRef, TaskSpec)` for supervisor  |
-| `SyncRequest`        | Protobuf message sent each cycle                       |
-| `SyncResponse`       | Protobuf ack from control plane                        |
+| Type                    | Role                                                         |
+|-------------------------|--------------------------------------------------------------|
+| `DiscoverConfig`        | Agent identity, endpoint, transport, interval, capabilities  |
+| `DiscoverConfigBuilder` | Validated builder; enforces invariants on `build()`          |
+| `DiscoveryTransport`    | Selects gRPC or HTTP path                                    |
+| `DiscoverError`         | Config, transport, parse, and rejection failures             |
+| `sync()`                | Factory returns `Result<(TaskRef, TaskSpec), DiscoverError>` |
+| `SyncRequest`           | Protobuf message sent each cycle                             |
+| `SyncResponse`          | Protobuf ack: `success`, optional `reason`, `retry_after_s`  |
 
 ## Sync protocol
 
@@ -47,25 +50,80 @@ Per-version protocol details: [sync_v1.md](sync_v1.md).
 
 ## Error model
 
-| Variant           | Cause                                      |
-|-------------------|--------------------------------------------|
-| `GrpcTransport`   | TCP / TLS / HTTP2 connection failure       |
-| `GrpcStatus`      | Server returned non-OK gRPC status         |
-| `HttpRequest`     | HTTP-level failure (connection, timeout)   |
-| `InvalidResponse` | Response body failed JSON deserialization  |
-| `Rejected`        | Control plane returned `success: false`    |
+| Variant           | Feature | Cause                                                                  |
+|-------------------|---------|------------------------------------------------------------------------|
+| `InvalidConfig`   | -       | Builder-stage validation failure                                       |
+| `SpecBuild`       | -       | `TaskSpec::builder(...).build()` rejected the spec                     |
+| `GrpcTransport`   | `grpc`  | TCP / TLS / HTTP2 connection failure                                   |
+| `GrpcStatus`      | `grpc`  | Server returned non-OK gRPC status                                     |
+| `HttpRequest`     | `http`  | HTTP-level failure (connection, timeout, reqwest builder)              |
+| `HttpStatus`      | `http`  | Non-2xx HTTP status (body truncated to 1 KiB)                          |
+| `InvalidResponse` | `http`  | Response body failed JSON deserialization                              |
+| `Rejected`        | -       | Control plane returned `success: false`, with `reason`/`retry_after_s` |
+
+## Feature flags
+
+| Flag   | Enables                                                  | Dependencies                               |
+|--------|----------------------------------------------------------|--------------------------------------------|
+| `grpc` | gRPC transport (tonic client)                            | `tonic`, `tonic-prost`, `prost`            |
+| `http` | HTTP transport (reqwest + canonical proto-JSON)          | `reqwest`, `serde_json`, `prost`, `pbjson` |
+
+Neither feature is enabled by default.
 
 ## Task policy
 
 The sync task is created with:
 - `RestartPolicy::periodic(delay_ms)` - runs on interval
-- `BackoffPolicy` with equal jitter, `first_ms = delay_ms/2`, `max_ms = delay_ms*3`, factor 2.0
-- `AdmissionPolicy::Replace` - new sync replaces a stale one
+- `BackoffPolicy` (default: equal jitter, `first_ms = delay_ms/2`, `max_ms = delay_ms*3`, factor 2.0) - overridable via `DiscoverConfigBuilder::backoff`
+- `AdmissionPolicy::Replace` new sync replaces a stale one
 - Slot: `solti-discover-sync`
+
+## Server-advised backoff (`retry_after_s`)
+
+When the control plane responds with `success = false` and a non-zero `retry_after_s`, the agent stores a Unix deadline in its in-memory sync context. 
+Before sending the next request, the task waits until that deadline has passed.
+
+
+Combined with the client-side backoff from `BackoffPolicy`, the effective wait is:
+
+```text
+next_attempt_wait = max(client_backoff, server_retry_after_s)
+```
+
+- `retry_after_s = 0` (unspecified) - client falls back to its configured backoff only.
+- The deadline is cleared on the next successful sync.
+- The deadline is in-memory; an agent restart drops it.
+
+## Timeouts
+
+Both transports honor the timeouts from `DiscoverConfig`:
+
+| Field                 | Default        | Applies to                                                             |
+|-----------------------|----------------|------------------------------------------------------------------------|
+| `connect_timeout_ms`  | `5_000`        | TCP/TLS handshake (reqwest `connect_timeout`, tonic `connect_timeout`) |
+| `request_timeout_ms`  | `30_000`       | End-to-end request (reqwest `timeout`, tonic `timeout`)                |
+
+Override via `DiscoverConfigBuilder::connect_timeout_ms` / `request_timeout_ms`.
+
+## Build
+
+`build.rs` runs two codegen passes:
+- `tonic_prost_build::configure()` - message types always, tonic server/client only under `grpc`.
+- `pbjson_build` under `http` - attaches canonical proto-JSON `Serialize`/`Deserialize` to the same message types:
+
+  ```rust
+  pbjson_build::Builder::new()
+      .register_descriptors(&descriptor_set)?
+      .build(&[".solti.discover.v1"])?;
+  ```
+
+  `".solti.discover.v1"` is the proto package selector. 
+  If the `package` declaration in `.proto` changes, update this list.
 
 ## Notes
 
-- `SyncContext` is wrapped in `Arc` and shared into the async task closure.
 - gRPC channel is lazily created via `OnceCell` and reused across cycles.
-- `os_info()` reads `/etc/os-release` on Linux for distribution name, falls back to platform.
 - Cancellation is cooperative via `tokio::select!` on the cancel token and the network future.
+- `os_info()` reads `/etc/os-release` on Linux for distribution name, falls back to platform.
+- `SyncContext` is wrapped in `Arc` and shared into the async task closure.
+- `tonic-prost` is a regular `[dependencies]` entry - generated gRPC code references `tonic_prost::ProstCodec` at runtime.

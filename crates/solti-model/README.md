@@ -10,10 +10,10 @@ Defines core resource types: `Task`, `TaskSpec`, `TaskStatus`, `ObjectMeta`, and
  │                                                          │
  │  ObjectMeta            TaskSpec            TaskStatus    │
  │  ├─ id: TaskId         ├─ slot: Slot       ├─ phase      │
- │  ├─ generation         ├─ kind: TaskKind   ├─ attempt    │
- │  ├─ resource_version   ├─ timeout          ├─ exit_code  │
- │  ├─ created_at         ├─ restart          └─ error      │
- │  └─ updated_at         ├─ backoff                        │
+ │  ├─ resource_version   ├─ kind: TaskKind   ├─ attempt    │
+ │  ├─ created_at         ├─ timeout          ├─ exit_code  │
+ │  └─ updated_at         ├─ restart          └─ error      │
+ │                        ├─ backoff                        │
  │                        ├─ admission                      │
  │                        ├─ runner_selector                │
  │                        └─ labels                         │
@@ -106,12 +106,8 @@ Operators: `In`, `NotIn`, `Exists`, `DoesNotExist`.
 
 ## Versioning
 
-`ObjectMeta` tracks two counters inspired by K8s:
-
-| Counter            | Bumped on            | Purpose                           |
-|--------------------|----------------------|-----------------------------------|
-| `generation`       | spec mutations       | User-driven change detection      |
-| `resource_version` | any change           | Optimistic concurrency control    |
+`ObjectMeta.resource_version` is a monotonic counter bumped on every change
+(spec or status) for optimistic concurrency control.
 
 ## Construction
 ```text

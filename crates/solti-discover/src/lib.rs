@@ -1,37 +1,49 @@
-//! # Agent discovery and heartbeat.
+//! # solti-discover - agent heartbeat.
 //!
-//! Periodic sync task that registers an agent with the control plane
-//! and reports liveness, platform telemetry, and capabilities.
+//! Periodic sync task that registers an agent with the control plane and reports liveness and platform telemetry.
 //!
-//! | transport | module                         | protocol                      |
-//! |-----------|--------------------------------|-------------------------------|
-//! | gRPC      | `proto::DiscoverServiceClient` | `proto/v1/sync.proto`         |
-//! | HTTP      | `reqwest::Client`              | `POST /api/v1/discovery/sync` |
+//! | feature | transport         | protocol                      |
+//! |---------|-------------------|-------------------------------|
+//! | `grpc`  | tonic gRPC client | `proto/v1/sync.proto`         |
+//! | `http`  | reqwest HTTP/JSON | `POST /api/v1/discovery/sync` |
 //!
 //! ## Quick start
 //!
 //! ```text
-//! let (task, spec) = solti_discover::sync(config);
+//! let cfg = DiscoverConfig::builder(/* ... */).build()?;
+//! let (task, spec) = solti_discover::sync(cfg)?;
 //! supervisor.submit_with_task(task, &spec).await?;
 //! ```
 //!
 //! ## Also
 //!
-//! - [`DiscoverConfig`] agent identity, endpoint, transport, capabilities.
-//! - [`DiscoverError`] all failure modes (transport, parse, rejection).
-//! - [`sync`] factory that returns `(TaskRef, TaskSpec)` for the supervisor.
-
-pub(crate) mod proto {
-    tonic::include_proto!("solti.discover.v1");
-}
-pub use proto::{SyncRequest, SyncResponse};
-
-mod config;
-pub use config::DiscoverConfig;
-pub use config::DiscoveryTransport;
+//! - [`DiscoverConfig`] / [`DiscoverConfigBuilder`] identity, endpoint, transport, timeouts, capabilities.
+//! - [`DiscoverError`] config, transport, parse, and rejection failures.
+//! - [`sync`] factory returning `Result<(TaskRef, TaskSpec), DiscoverError>`.
 
 mod errors;
 pub use errors::DiscoverError;
 
+#[cfg(any(feature = "grpc", feature = "http"))]
+mod config;
+#[cfg(any(feature = "grpc", feature = "http"))]
+pub use config::{
+    DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS, DiscoverConfig, DiscoverConfigBuilder,
+    DiscoveryTransport,
+};
+
+#[cfg(any(feature = "grpc", feature = "http"))]
 mod tasks;
+#[cfg(any(feature = "grpc", feature = "http"))]
 pub use tasks::sync;
+
+#[cfg(any(feature = "grpc", feature = "http"))]
+pub(crate) mod proto {
+    include!(concat!(env!("OUT_DIR"), "/solti.discover.v1.rs"));
+
+    #[cfg(feature = "http")]
+    include!(concat!(env!("OUT_DIR"), "/solti.discover.v1.serde.rs"));
+}
+
+#[cfg(any(feature = "grpc", feature = "http"))]
+pub use proto::{SyncRequest, SyncResponse};

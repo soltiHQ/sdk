@@ -2,7 +2,7 @@
 
 Dual-transport API layer exposing task operations over gRPC and HTTP.
 
-Both transports delegate to an `ApiHandler` trait, decoupling wire format from business logic.
+Both transports delegate to an `ApiHandler` trait, decoupling wire format from business logic. Both speak the same proto contract defined in `proto/solti/v1/`.
 
 ## Architecture
 ```text
@@ -71,17 +71,29 @@ Per-version API surface is documented in separate files: [api_v1.md](api_v1.md).
 
 ## Feature flags
 
-| Flag | Enables | Dependencies |
-|------|---------|--------------|
-| `grpc` | `SoltiApiService`, `SoltiApiServer`, proto codegen, `convert` | `tonic`, `prost` |
-| `http` | `HttpApi`, axum router | `axum`, `serde_json` |
+| Flag   | Enables                                                   | Dependencies                        |
+|--------|-----------------------------------------------------------|-------------------------------------|
+| `grpc` | `SoltiApiService`, `SoltiApiServer`, proto codegen        | `tonic`, `tonic-prost`, `prost`     |
+| `http` | `HttpApi`, axum router, proto-JSON serde                  | `axum`, `serde_json`, `prost`, `pbjson` |
 
 Neither feature is enabled by default.
 
-## Notes
+## Build
 
+`build.rs` runs two codegen passes:
+- `tonic_prost_build::configure()` - message types always, tonic server/client only under `grpc`.
+- `pbjson_build` under `http` - attaches canonical proto-JSON `Serialize`/`Deserialize` to the same message types:
+
+  ```rust
+  pbjson_build::Builder::new()
+      .register_descriptors(&descriptor_set)?
+      .build(&[".solti.v1"])?;
+  ```
+
+  `".solti.v1"` is the proto package selector. If the `package` declaration in `.proto` changes, update this list - otherwise pbjson generates nothing and HTTP compile fails.
+
+## Notes
 - `ApiHandler` uses `async_trait` for object safety (`Send + Sync + 'static`).
-- gRPC path validates input via `convert_create_spec` with slot, timeout, backoff bounds checks.
-- HTTP path accepts `TaskSpec` directly from JSON (validation delegated to model layer).
-- Both transports re-exported: `solti_api::tonic`, `solti_api::axum` for version pinning.
-- Proto contract defined in `proto/solti/v1/` (`api.proto`, `types.proto`).
+- Both transports feed input through the same `convert_create_spec` validator.
+- Re-exports: `solti_api::tonic`, `solti_api::axum` for version pinning.
+- Proto contract in `proto/solti/v1/` (`api.proto`, `types.proto`).

@@ -118,20 +118,21 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     info!("timezone sync started");
 
     // 5) Discovery - periodic heartbeat to Podium control-plane
-    let discover_config = DiscoverConfig {
-        agent_id: AgentId::new("agentd-001"),
-        name: "agentd".to_string(),
-        control_plane_endpoint: CONTROL_PLANE.to_string(),
-        agent_endpoint: format!("http://{ADDR}"),
-        transport: DiscoveryTransport::Http,
-        metadata: HashMap::from([
-            ("region".into(), "us-east-1".into()),
-            ("role".into(), "worker".into()),
-        ]),
-        delay_ms: 10_000,
-        api_version: API_VERSION,
-    };
-    let (sync_task, sync_spec) = solti_discover::sync(discover_config);
+    let discover_config = DiscoverConfig::builder(
+        AgentId::new("agentd-001"),
+        "agentd",
+        format!("http://{ADDR}"),
+        CONTROL_PLANE,
+        DiscoveryTransport::Http,
+        10_000,
+        API_VERSION,
+    )
+    .metadata(HashMap::from([
+        ("region".into(), "us-east-1".into()),
+        ("role".into(), "worker".into()),
+    ]))
+    .build()?;
+    let (sync_task, sync_spec) = solti_discover::sync(discover_config)?;
     supervisor.submit_with_task(sync_task, &sync_spec).await?;
     info!("discovery heartbeat started (control_plane={CONTROL_PLANE}, api_version={API_VERSION})");
 

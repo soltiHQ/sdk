@@ -107,7 +107,6 @@ mod tests {
 
         assert_eq!(task.status.phase, TaskPhase::Pending);
         assert_eq!(task.metadata.resource_version, 1);
-        assert_eq!(task.metadata.generation, 1);
         assert_eq!(task.metadata.id, "task-1");
         assert!(task.status.error.is_none());
         assert_eq!(task.status.attempt, 0);
@@ -121,7 +120,6 @@ mod tests {
 
         assert_eq!(task.status.phase, TaskPhase::Running);
         assert_eq!(task.metadata.resource_version, 2);
-        assert_eq!(task.metadata.generation, 1);
     }
 
     #[test]
@@ -165,7 +163,7 @@ mod tests {
         let back: Task = serde_json::from_str(&json).unwrap();
 
         assert_eq!(back.status.phase, TaskPhase::Pending);
-        assert_eq!(back.metadata.generation, 1);
+        assert_eq!(back.metadata.resource_version, 1);
         assert_eq!(back.metadata.id, "id-1");
     }
 }

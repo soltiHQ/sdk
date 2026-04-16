@@ -2,8 +2,6 @@
 //!
 //! [`RunnerSelector`] matches runners by label equality and expression-based requirements.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 use super::{SelectorOperator, SelectorRequirement};
@@ -40,8 +38,8 @@ use crate::Labels;
 #[serde(rename_all = "camelCase")]
 pub struct RunnerSelector {
     /// Exact key=value pairs: sugar for `In` with a single value.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub match_labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Labels::is_empty")]
+    pub match_labels: Labels,
 
     /// Set-based requirements, ANDed with `match_labels`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -57,7 +55,7 @@ impl RunnerSelector {
 
     /// Selector from exact key=value pairs only.
     #[inline]
-    pub fn from_labels(labels: BTreeMap<String, String>) -> Self {
+    pub fn from_labels(labels: Labels) -> Self {
         Self {
             match_labels: labels,
             match_expressions: vec![],
@@ -68,7 +66,7 @@ impl RunnerSelector {
     #[inline]
     pub fn from_expressions(expr: Vec<SelectorRequirement>) -> Self {
         Self {
-            match_labels: BTreeMap::new(),
+            match_labels: Labels::new(),
             match_expressions: expr,
         }
     }
@@ -126,6 +124,10 @@ mod tests {
         l
     }
 
+    fn labels_of(pairs: &[(&str, &str)]) -> Labels {
+        labels(pairs)
+    }
+
     #[test]
     fn empty_selector_matches_everything() {
         let sel = RunnerSelector::new();
@@ -135,19 +137,19 @@ mod tests {
 
     #[test]
     fn match_labels_exact_hit() {
-        let sel = RunnerSelector::from_labels(BTreeMap::from([("zone".into(), "eu".into())]));
+        let sel = RunnerSelector::from_labels(labels_of(&[("zone", "eu")]));
         assert!(sel.matches(&labels(&[("zone", "eu"), ("extra", "x")])));
     }
 
     #[test]
     fn match_labels_value_mismatch() {
-        let sel = RunnerSelector::from_labels(BTreeMap::from([("zone".into(), "eu".into())]));
+        let sel = RunnerSelector::from_labels(labels_of(&[("zone", "eu")]));
         assert!(!sel.matches(&labels(&[("zone", "us")])));
     }
 
     #[test]
     fn match_labels_key_missing() {
-        let sel = RunnerSelector::from_labels(BTreeMap::from([("zone".into(), "eu".into())]));
+        let sel = RunnerSelector::from_labels(labels_of(&[("zone", "eu")]));
         assert!(!sel.matches(&labels(&[])));
     }
 
@@ -192,7 +194,7 @@ mod tests {
     #[test]
     fn labels_and_expressions_anded() {
         let sel = RunnerSelector {
-            match_labels: BTreeMap::from([("zone".into(), "eu".into())]),
+            match_labels: labels_of(&[("zone", "eu")]),
             match_expressions: vec![SelectorRequirement::exists("gpu")],
         };
         assert!(sel.matches(&labels(&[("zone", "eu"), ("gpu", "a100")])));
@@ -214,7 +216,7 @@ mod tests {
     #[test]
     fn serde_roundtrip() {
         let sel = RunnerSelector {
-            match_labels: BTreeMap::from([("zone".into(), "eu".into())]),
+            match_labels: labels_of(&[("zone", "eu")]),
             match_expressions: vec![SelectorRequirement::exists("gpu")],
         };
         let json = serde_json::to_string_pretty(&sel).unwrap();
@@ -234,8 +236,6 @@ mod tests {
     #[test]
     fn is_empty() {
         assert!(RunnerSelector::new().is_empty());
-        assert!(
-            !RunnerSelector::from_labels(BTreeMap::from([("k".into(), "v".into()),])).is_empty()
-        );
+        assert!(!RunnerSelector::from_labels(labels_of(&[("k", "v")])).is_empty());
     }
 }

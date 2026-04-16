@@ -13,4 +13,4 @@
 //! ```
 
 mod task;
-pub use task::{TaskPage, TaskQuery};
+pub use task::{DEFAULT_LIMIT, MAX_LIMIT, TaskPage, TaskQuery};

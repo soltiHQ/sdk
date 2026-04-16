@@ -142,7 +142,6 @@ mod tests {
         AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RunnerSelector, SubprocessMode,
         SubprocessSpec, TaskEnv, WasmSpec,
     };
-    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use taskvisor::{TaskError, TaskFn};
     use tokio_util::sync::CancellationToken;
@@ -318,10 +317,9 @@ mod tests {
                 cwd: None,
                 fail_on_non_zero: Flag::enabled(),
             }));
-            base.with_runner_selector(RunnerSelector::from_labels(BTreeMap::from([(
-                "runner-name".into(),
-                "runner-b".into(),
-            )])))
+            let mut match_labels = Labels::new();
+            match_labels.insert("runner-name", "runner-b");
+            base.with_runner_selector(RunnerSelector::from_labels(match_labels))
         };
 
         let picked = router.pick(&spec).expect("runner should be picked");

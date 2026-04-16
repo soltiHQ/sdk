@@ -15,9 +15,6 @@ use thiserror::Error;
 /// - [`BackoffPolicy::validate`](crate::BackoffPolicy::validate) — backoff parameter validation.
 #[derive(Debug, Error)]
 pub enum ModelError {
-    #[error("conflict: resource_version mismatch (expected {expected}, got {actual})")]
-    Conflict { expected: u64, actual: u64 },
-
     #[error("unknown admission policy: {0}")]
     UnknownAdmission(String),
 
@@ -29,6 +26,9 @@ pub enum ModelError {
 
     #[error("unknown task kind: {0}")]
     UnknownTaskKind(String),
+
+    #[error("unknown task phase: {0}")]
+    UnknownTaskPhase(String),
 
     #[error("invalid model: {0}")]
     Invalid(Cow<'static, str>),

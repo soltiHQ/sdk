@@ -29,7 +29,7 @@ mod environment;
 pub use environment::{RunnerEnv, TaskEnv, merge as merge_env};
 
 mod query;
-pub use query::{TaskPage, TaskQuery};
+pub use query::{DEFAULT_LIMIT, MAX_LIMIT, TaskPage, TaskQuery};
 
 mod label;
 pub use label::{Labels, LabelsIter};

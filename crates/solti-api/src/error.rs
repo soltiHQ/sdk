@@ -6,13 +6,15 @@ use thiserror::Error;
 ///
 /// Mapped to transport-specific wire formats:
 ///
-/// | Variant          | gRPC Status        | HTTP Status                 |
-/// |------------------|--------------------|-----------------------------|
-/// | `InvalidRequest` | `INVALID_ARGUMENT` | `400 Bad Request`           |
-/// | `TaskNotFound`   | `NOT_FOUND`        | `404 Not Found`             |
-/// | `Internal`       | `INTERNAL`         | `500 Internal Server Error` |
-/// | `Core`           | `INTERNAL`         | `500 Internal Server Error` |
+/// | Variant          | gRPC Status         | HTTP Status                 |
+/// |------------------|---------------------|-----------------------------|
+/// | `InvalidRequest` | `INVALID_ARGUMENT`  | `400 Bad Request`           |
+/// | `TaskNotFound`   | `NOT_FOUND`         | `404 Not Found`             |
+/// | `Internal`       | `INTERNAL`          | `500 Internal Server Error` |
+/// | `Core`           | derived from variant | derived from variant       |
 ///
+/// `Core` is split further by inspecting the wrapped [`solti_core::CoreError`]:
+/// `InvalidSpec` → `INVALID_ARGUMENT` / `400`, everything else → `INTERNAL` / `500`.
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("invalid request: {0}")]
@@ -28,14 +30,43 @@ pub enum ApiError {
     Core(#[from] solti_core::CoreError),
 }
 
+impl ApiError {
+    /// Short stable label for this variant, surfaced in HTTP error bodies and logs.
+    ///
+    /// `Core` is flattened to the same two buckets used by the wire mappings:
+    /// `InvalidSpec` presents as `InvalidRequest`, anything else as `Internal`.
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            ApiError::InvalidRequest(_) => "InvalidRequest",
+            ApiError::TaskNotFound(_) => "TaskNotFound",
+            ApiError::Internal(_) => "Internal",
+            ApiError::Core(solti_core::CoreError::InvalidSpec(_)) => "InvalidRequest",
+            ApiError::Core(_) => "Internal",
+        }
+    }
+}
+
 #[cfg(feature = "grpc")]
 impl From<ApiError> for tonic::Status {
     fn from(err: ApiError) -> Self {
         match err {
             ApiError::InvalidRequest(msg) => tonic::Status::invalid_argument(msg),
             ApiError::TaskNotFound(msg) => tonic::Status::not_found(msg),
-            ApiError::Internal(msg) => tonic::Status::internal(format!("internal error: {}", msg)),
-            ApiError::Core(e) => tonic::Status::internal(format!("core error: {}", e)),
+            ApiError::Internal(msg) => tonic::Status::internal(msg),
+            ApiError::Core(e) => core_to_status(e),
+        }
+    }
+}
+
+#[cfg(feature = "grpc")]
+fn core_to_status(e: solti_core::CoreError) -> tonic::Status {
+    use solti_core::CoreError;
+    match e {
+        // Client-facing: bad spec supplied by caller.
+        CoreError::InvalidSpec(inner) => tonic::Status::invalid_argument(inner.to_string()),
+        // Internal / infra failures.
+        CoreError::Supervisor(_) | CoreError::Mapping(_) | CoreError::Runner(_) => {
+            tonic::Status::internal(e.to_string())
         }
     }
 }
@@ -45,17 +76,52 @@ impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         use axum::http::StatusCode;
 
+        let label = self.as_label();
         let (status, message) = match self {
             ApiError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::TaskNotFound(msg) => (StatusCode::NOT_FOUND, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            ApiError::Core(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            ApiError::Core(e) => core_to_http_status(e),
         };
 
-        let body = serde_json::json!({
-            "error": message
-        });
-
+        let body = serde_json::json!({ "error": label, "message": message });
         (status, axum::Json(body)).into_response()
+    }
+}
+
+#[cfg(feature = "http")]
+fn core_to_http_status(e: solti_core::CoreError) -> (axum::http::StatusCode, String) {
+    use axum::http::StatusCode;
+    use solti_core::CoreError;
+    match e {
+        CoreError::InvalidSpec(inner) => (StatusCode::BAD_REQUEST, inner.to_string()),
+        CoreError::Supervisor(_) | CoreError::Mapping(_) | CoreError::Runner(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn as_label_covers_all_direct_variants() {
+        assert_eq!(
+            ApiError::InvalidRequest("x".into()).as_label(),
+            "InvalidRequest"
+        );
+        assert_eq!(
+            ApiError::TaskNotFound("x".into()).as_label(),
+            "TaskNotFound"
+        );
+        assert_eq!(ApiError::Internal("x".into()).as_label(), "Internal");
+    }
+
+    #[test]
+    fn as_label_flattens_core_invalid_spec_to_invalid_request() {
+        let inner = solti_model::ModelError::Invalid("bad".into());
+        let e = ApiError::Core(solti_core::CoreError::InvalidSpec(inner));
+        assert_eq!(e.as_label(), "InvalidRequest");
     }
 }
