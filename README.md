@@ -175,7 +175,7 @@ let (task, spec) = solti_discover::sync(config)?;
 supervisor.submit_with_task(task, &spec).await?;
 ```
 
-See [`examples/agentd`](examples/agentd) for a complete reference agent with API + discovery + logging.
+See [`examples/agentd-http`](examples/agentd-http) and [`examples/agentd-grpc`](examples/agentd-grpc) for complete reference agents - one per transport.
 
 ## Key features
 
@@ -238,7 +238,8 @@ sdk/
 │   ├── solti-observe/     # Logging
 │   └── solti-prometheus/  # Metrics backend
 ├── examples/
-│   └── agentd/            # Reference agent: API + discovery + logging
+│   ├── agentd-http/       # Reference agent: HTTP API + discovery
+│   └── agentd-grpc/       # Reference agent: gRPC API + discovery
 ├── LICENSE                # Apache-2.0
 └── CODE_OF_CONDUCT.md
 ```
@@ -251,8 +252,9 @@ Each crate has its own README with detailed documentation.
 cargo build --workspace
 cargo test --workspace
 
-# Run the reference agent
-cargo run -p agentd
+# Run a reference agent
+cargo run -p agentd-http     # HTTP transport, :8085
+cargo run -p agentd-grpc     # gRPC transport, :50052
 
 # Feature-gated builds
 cargo build -p solti-api --features http

@@ -75,6 +75,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let service = build_grpc_server(handler);
 
     info!("gRPC {ADDR}  →  heartbeat {control_plane}");
-    Server::builder().add_service(service).serve(ADDR.parse()?).await?;
+    Server::builder()
+        .add_service(service)
+        .serve(ADDR.parse()?)
+        .await?;
     Ok(())
 }
