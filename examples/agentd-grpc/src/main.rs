@@ -1,11 +1,37 @@
-//! Solti agent with gRPC transport.
+//! Reference Solti agent — gRPC transport.
+//!
+//! A minimal task-execution agent: accepts `TaskSpec` submissions via the `solti.v1.SoltiApi` gRPC service,
+//! runs them as subprocesses, reports status back through the same service.
+//!
+//! Optionally heartbeats to a [Podium](https://github.com/soltiHQ/podium) control-plane so the CP can push specs and collect state remotely.
 //!
 //! ```bash
 //! cargo run -p agentd-grpc
-//! # API:        [::]:50052            (solti.v1.SoltiApi)
-//! # Heartbeat:  localhost:50051       (Podium grpc-discovery)
-//! # Override:   CONTROL_PLANE=host:port
 //! ```
+//!
+//! Defaults:
+//! - API: `[::]:50052` (`solti.v1.SoltiApi`)
+//! - Heartbeat — `localhost:50051` (Podium grpc-discovery)
+//! - Override the CP endpoint via `CONTROL_PLANE=host:port`.
+//!
+//! Running without a reachable Podium is fine:
+//! the heartbeat task retries with backoff, the local API keeps accepting submissions.
+//!
+//! ## Talking to the agent
+//!
+//! ```bash
+//! # List tasks
+//! grpcurl -plaintext localhost:50052 solti.v1.SoltiApi/ListTasks
+//!
+//! # Submit / get / list runs / delete
+//! grpcurl -plaintext -d '{"spec": {...}}' localhost:50052 solti.v1.SoltiApi/SubmitTask
+//! grpcurl -plaintext -d '{"taskId":"<id>"}' localhost:50052 solti.v1.SoltiApi/GetTaskStatus
+//! grpcurl -plaintext -d '{"taskId":"<id>"}' localhost:50052 solti.v1.SoltiApi/ListTaskRuns
+//! grpcurl -plaintext -d '{"taskId":"<id>"}' localhost:50052 solti.v1.SoltiApi/DeleteTask
+//! ```
+//!
+//! Proto contract + full RPC surface: [`api_v1.md`](../../../crates/solti-api/api_v1.md).
+//! gRPC status codes, message-size caps, error envelope — all described there.
 
 use std::sync::Arc;
 

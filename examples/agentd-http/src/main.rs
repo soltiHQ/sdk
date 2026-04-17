@@ -1,11 +1,39 @@
-//! Solti agent with HTTP/JSON transport.
+//! Reference Solti agent — HTTP/JSON transport.
+//!
+//! A minimal task-execution agent: accepts `TaskSpec` submissions over `/api/v1/tasks`,
+//! runs them as subprocesses, reports status back via the same REST surface.
+//!
+//! Optionally heartbeats to a [Podium](https://github.com/soltiHQ/podium) control-plane so the CP can push specs and collect state remotely.
 //!
 //! ```bash
 //! cargo run -p agentd-http
-//! # API:        http://localhost:8085/api/v1/tasks
-//! # Heartbeat:  http://localhost:8082     (Podium http-discovery)
-//! # Override:   CONTROL_PLANE=http://host:port
 //! ```
+//!
+//! Defaults:
+//! - API  — `http://localhost:8085/api/v1/tasks`
+//! - Heartbeat — `http://localhost:8082` (Podium HTTP discovery)
+//! - Override the CP endpoint via `CONTROL_PLANE=http://host:port`.
+//!
+//! Running without a reachable Podium is fine:
+//! the heartbeat task retries with backoff, the local API keeps accepting submissions.
+//!
+//! ## Talking to the agent
+//!
+//! ```bash
+//! # Submit a one-shot subprocess task
+//! curl -X POST http://localhost:8085/api/v1/tasks \
+//!   -H "Content-Type: application/json" \
+//!   -d '{"spec": {"slot":"hello","kind":{"subprocess":{"mode":{"command":{"command":"echo","args":["hi"]}}}},"timeout":5000,"restart":"never","backoff":{"jitter":"equal","firstMs":1000,"maxMs":5000,"factor":2.0},"admission":"dropIfRunning"}}'
+//!
+//! # List tasks / get one / list runs / delete
+//! curl http://localhost:8085/api/v1/tasks
+//! curl http://localhost:8085/api/v1/tasks/{id}
+//! curl http://localhost:8085/api/v1/tasks/{id}/runs
+//! curl -X DELETE http://localhost:8085/api/v1/tasks/{id}
+//! ```
+//!
+//! Full endpoint reference: [`api_v1.md`](../../../crates/solti-api/api_v1.md).
+//! Error envelope, size limits, status codes — all described there.
 
 use std::sync::Arc;
 
