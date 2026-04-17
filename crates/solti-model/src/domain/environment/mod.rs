@@ -19,6 +19,11 @@
 //!         └─ RUNNER=prod-01
 //! ```
 
+// `#[macro_use]` must come before any module that uses the macro
+// (Rust resolves `macro_rules!` top-to-bottom within a module).
+#[macro_use]
+mod macros;
+
 mod runner;
 pub use runner::RunnerEnv;
 
@@ -33,18 +38,10 @@ use std::collections::BTreeMap;
 /// Returns a sorted, deduplicated `BTreeMap` ready for `Command::envs()`.
 pub fn merge(task: &TaskEnv, runner: &RunnerEnv) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
-
-    for kv in runner.into_iter().rev() {
-        if !map.contains_key(kv.key()) {
-            map.insert(kv.key().to_owned(), kv.value().to_owned());
-        }
+    for kv in runner.into_iter().rev().chain(task.into_iter().rev()) {
+        map.entry(kv.key().to_owned())
+            .or_insert_with(|| kv.value().to_owned());
     }
-    for kv in task.into_iter().rev() {
-        if !map.contains_key(kv.key()) {
-            map.insert(kv.key().to_owned(), kv.value().to_owned());
-        }
-    }
-
     map
 }
 
@@ -111,5 +108,32 @@ mod tests {
         let result = merge(&task, &runner);
 
         assert_eq!(result["FOO"], "second");
+    }
+
+    #[test]
+    fn runner_duplicate_keys_last_wins_before_merge() {
+        let task = TaskEnv::new();
+        let mut runner = RunnerEnv::new();
+        runner.push("FOO", "first");
+        runner.push("FOO", "second");
+
+        let result = merge(&task, &runner);
+
+        assert_eq!(result["FOO"], "second");
+    }
+
+    #[test]
+    fn runner_last_value_beats_task_last_value() {
+        let mut task = TaskEnv::new();
+        task.push("FOO", "task-1");
+        task.push("FOO", "task-2");
+
+        let mut runner = RunnerEnv::new();
+        runner.push("FOO", "runner-1");
+        runner.push("FOO", "runner-2");
+
+        let result = merge(&task, &runner);
+
+        assert_eq!(result["FOO"], "runner-2");
     }
 }

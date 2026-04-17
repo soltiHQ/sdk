@@ -15,13 +15,6 @@ use serde::{Deserialize, Serialize};
 /// | `Exists`       | label key is present (values ignored)   |
 /// | `DoesNotExist` | label key is absent  (values ignored)   |
 ///
-/// ## Wire format
-///
-/// Serialized as **PascalCase** (`"In"`, `"NotIn"`, `"Exists"`, `"DoesNotExist"`)
-/// to match the Kubernetes `LabelSelectorOperator` convention, because selector
-/// syntax across the ecosystem (`kubectl`, Helm, controller-runtime) uses these
-/// exact tokens. The rest of the model uses camelCase; this enum is the one
-/// intentional exception.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SelectorOperator {

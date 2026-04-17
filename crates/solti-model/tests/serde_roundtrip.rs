@@ -1,9 +1,3 @@
-//! End-to-end serde roundtrips for `Task` with every non-embedded `TaskKind`
-//! variant plus every optional `TaskSpec` field populated (labels, selector,
-//! non-default policies). Guards against drift between `Serialize` (direct
-//! field-by-field) and `Deserialize` (via `TaskSpecRaw::try_from`) when fields
-//! or renames move under our feet.
-
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, ContainerSpec, Flag, JitterPolicy, Labels, RestartPolicy,
@@ -41,10 +35,6 @@ fn fully_populated_spec(kind: TaskKind) -> TaskSpec {
         .expect("spec must build cleanly")
 }
 
-/// Compare by re-serializing both sides. Direct `Task` equality would fail
-/// because [`std::time::SystemTime`] keeps nanosecond precision, while our
-/// wire format is millisecond-precision — sub-ms digits get dropped on the
-/// first trip. Once both sides go through the codec, they agree.
 fn roundtrip(task: &Task) {
     let json1 = serde_json::to_string(task).expect("serialize");
     let back: Task = serde_json::from_str(&json1).expect("deserialize");
@@ -121,9 +111,6 @@ fn roundtrip_container() {
 
 #[test]
 fn roundtrip_embedded_bypasses_submit_validation() {
-    // TaskKind::Embedded is rejected by submit-boundary validate() but the
-    // resource is still serializable — important for internal tasks stored in
-    // state/exported for debugging.
     let spec = TaskSpec::builder("internal-sync", TaskKind::Embedded, 1_000u64)
         .build()
         .unwrap();
@@ -147,8 +134,6 @@ fn task_run_roundtrip_preserves_all_fields() {
 
 #[test]
 fn backoff_invalid_on_wire_rejected_when_nested_in_spec() {
-    // BackoffPolicy now validates in its own Deserialize path; a spec carrying a
-    // zero first_ms must be rejected at parse time, not silently accepted.
     let valid = fully_populated_spec(TaskKind::Embedded);
     let mut json: serde_json::Value = serde_json::to_value(&valid).unwrap();
     json["backoff"]["firstMs"] = serde_json::json!(0);

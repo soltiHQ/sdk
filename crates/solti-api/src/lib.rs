@@ -27,6 +27,9 @@
 /// Sent to control-plane via `solti_discover::DiscoverConfig`.
 pub const API_VERSION: u32 = 1;
 
+/// Maximum accepted request body / message size for both HTTP and gRPC transports. **4 MiB.**
+pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
 mod error;
 pub use error::ApiError;
 
@@ -37,9 +40,7 @@ mod adapter;
 pub use adapter::SupervisorApiAdapter;
 
 #[cfg(any(feature = "grpc", feature = "http"))]
-#[allow(dead_code)] // Generated proto types: request/response messages are exposed for
-// wire completeness but only directly used by one transport at a time (gRPC uses all,
-// HTTP reaches some via path params instead of request-typed bodies).
+#[cfg_attr(not(feature = "grpc"), allow(dead_code))]
 pub(crate) mod proto_api {
     include!(concat!(env!("OUT_DIR"), "/solti.v1.rs"));
 
@@ -57,7 +58,7 @@ mod validate;
 mod grpc;
 
 #[cfg(feature = "grpc")]
-pub use grpc::SoltiApiService;
+pub use grpc::{SoltiApiService, build_grpc_server};
 
 #[cfg(feature = "grpc")]
 pub use proto_api::solti_api_server::SoltiApiServer;

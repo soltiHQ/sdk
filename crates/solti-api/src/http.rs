@@ -8,23 +8,25 @@
 //! | GET    | `/api/v1/tasks`             | list (query params) |
 //! | GET    | `/api/v1/tasks/{id}`        | get status          |
 //! | GET    | `/api/v1/tasks/{id}/runs`   | list runs           |
-//! | POST   | `/api/v1/tasks/{id}/cancel` | cancel              |
-//! | DELETE | `/api/v1/tasks/{id}`        | delete              |
+//! | DELETE | `/api/v1/tasks/{id}`        | delete (stop+purge) |
 
 use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    response::IntoResponse,
+    extract::{FromRequest, Path, Query, Request, State, rejection::JsonRejection},
+    http::StatusCode,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use solti_model::{TaskId, TaskPhase, TaskQuery};
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::debug;
 
 use crate::{
+    MAX_REQUEST_BYTES,
     convert::{self, clamp_list_limit, tasks_page_to_proto},
     error::ApiError,
     handler::ApiHandler,
@@ -32,8 +34,55 @@ use crate::{
     validate::non_empty_id,
 };
 
-/// Maximum accepted JSON request body size (DoS defense).
-const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
+/// Wrapper around `axum::Json<T>` that maps `JsonRejection` into our [`ApiError::InvalidRequest`] → canonical `{error, message}` envelope.
+pub(crate) struct ApiJson<T>(pub T);
+
+impl<T, S> FromRequest<S> for ApiJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let Json(value) = axum::Json::<T>::from_request(req, state)
+            .await
+            .map_err(map_json_rejection)?;
+        Ok(ApiJson(value))
+    }
+}
+
+fn map_json_rejection(rej: JsonRejection) -> ApiError {
+    if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::PayloadTooLarge(format!(
+            "request body exceeds the maximum of {} bytes",
+            MAX_REQUEST_BYTES
+        ));
+    }
+
+    let msg = rej.body_text();
+    let trimmed = msg
+        .strip_prefix("Failed to deserialize the JSON body into the target type: ")
+        .or_else(|| msg.strip_prefix("Failed to parse the request body as JSON: "))
+        .unwrap_or(&msg)
+        .to_string();
+    ApiError::InvalidRequest(trimmed)
+}
+
+async fn map_413_envelope(req: Request, next: Next) -> Response {
+    let resp = next.run(req).await;
+    if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        let body = serde_json::json!({
+            "error": "PayloadTooLarge",
+            "message": format!(
+                "request body exceeds the maximum of {} bytes",
+                MAX_REQUEST_BYTES
+            ),
+        });
+        return (StatusCode::PAYLOAD_TOO_LARGE, Json(body)).into_response();
+    }
+    resp
+}
 
 /// HTTP API service builder.
 ///
@@ -56,8 +105,7 @@ where
 
     /// Build axum router with mounted endpoints.
     ///
-    /// Applies a [`RequestBodyLimitLayer`] capped at
-    /// [`MAX_REQUEST_BODY_BYTES`] bytes to every request.
+    /// Applies a [`RequestBodyLimitLayer`] capped at [`MAX_REQUEST_BYTES`] bytes to every request.
     pub fn router(self) -> Router {
         Router::new()
             .route("/api/v1/tasks", post(submit_task::<H>))
@@ -65,8 +113,8 @@ where
             .route("/api/v1/tasks/{id}", get(get_task_status::<H>))
             .route("/api/v1/tasks/{id}", delete(delete_task::<H>))
             .route("/api/v1/tasks/{id}/runs", get(list_task_runs::<H>))
-            .route("/api/v1/tasks/{id}/cancel", post(cancel_task::<H>))
-            .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
+            .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
+            .layer(middleware::from_fn(map_413_envelope))
             .with_state(self.handler)
     }
 }
@@ -81,7 +129,7 @@ struct ListTasksParams {
 
 async fn submit_task<H>(
     State(handler): State<Arc<H>>,
-    Json(req): Json<proto_api::SubmitTaskRequest>,
+    ApiJson(req): ApiJson<proto_api::SubmitTaskRequest>,
 ) -> Result<impl IntoResponse, ApiError>
 where
     H: ApiHandler,
@@ -97,7 +145,7 @@ where
     let response = proto_api::SubmitTaskResponse {
         task_id: task_id.to_string(),
     };
-    Ok((axum::http::StatusCode::CREATED, Json(response)))
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn get_task_status<H>(
@@ -181,21 +229,5 @@ where
     handler.delete_task(&task_id).await?;
     debug!(%task_id, "task deleted");
 
-    Ok(axum::http::StatusCode::NO_CONTENT)
-}
-
-async fn cancel_task<H>(
-    State(handler): State<Arc<H>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, ApiError>
-where
-    H: ApiHandler,
-{
-    non_empty_id("task_id", &id)?;
-
-    let task_id = TaskId::from(id);
-    handler.cancel_task(&task_id).await?;
-    debug!(%task_id, "task canceled");
-
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT)
 }

@@ -3,6 +3,11 @@
 //! [`AgentId`] identifies an agent instance in multi-agent deployments.
 
 use super::macros::arc_str_newtype;
+use super::validate_identity;
+use crate::error::ModelError;
+
+/// Maximum length of an `AgentId`.
+pub const AGENT_ID_MAX_LEN: usize = 128;
 
 arc_str_newtype! {
     /// Unique identifier for a solti agent instance.
@@ -22,6 +27,15 @@ arc_str_newtype! {
     /// assert_eq!(format!("{id}"), "worker-pod-7b9f4");
     /// ```
     pub struct AgentId;
+}
+
+impl AgentId {
+    /// Validate that the agent id is safe to use across the SDK and the wire protocol.
+    ///
+    /// See [`validate_identity`] for the exact rules.
+    pub fn validate_format(&self) -> Result<(), ModelError> {
+        validate_identity("agent_id", self.as_str(), AGENT_ID_MAX_LEN)
+    }
 }
 
 #[cfg(test)]
@@ -84,5 +98,23 @@ mod tests {
         let id = AgentId::new("owned");
         let s: Arc<str> = id.into_inner();
         assert_eq!(&*s, "owned");
+    }
+
+    #[test]
+    fn validate_format_accepts_valid() {
+        AgentId::new("550e8400-e29b-41d4-a716-446655440000")
+            .validate_format()
+            .unwrap();
+        AgentId::new("worker-pod-7b9f4").validate_format().unwrap();
+        AgentId::new("agent.eu-west-1.01")
+            .validate_format()
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_format_rejects_invalid() {
+        assert!(AgentId::new("").validate_format().is_err());
+        assert!(AgentId::new("agent with space").validate_format().is_err());
+        assert!(AgentId::new("agent/path").validate_format().is_err());
     }
 }

@@ -156,9 +156,7 @@ impl TaskSpec {
     /// - `backoff` parameters are sane
     /// - `runner_selector` requirements are structurally valid
     fn validate_structural(&self) -> ModelResult<()> {
-        if self.slot.as_str().is_empty() {
-            return Err(ModelError::Invalid("slot cannot be empty".into()));
-        }
+        self.slot.validate_format()?;
         if self.timeout.as_millis() == 0 {
             return Err(ModelError::Invalid(
                 "timeout must be greater than zero".into(),

@@ -2,19 +2,6 @@
 
 use thiserror::Error;
 
-/// Unified error type for all API operations.
-///
-/// Mapped to transport-specific wire formats:
-///
-/// | Variant          | gRPC Status         | HTTP Status                 |
-/// |------------------|---------------------|-----------------------------|
-/// | `InvalidRequest` | `INVALID_ARGUMENT`  | `400 Bad Request`           |
-/// | `TaskNotFound`   | `NOT_FOUND`         | `404 Not Found`             |
-/// | `Internal`       | `INTERNAL`          | `500 Internal Server Error` |
-/// | `Core`           | derived from variant | derived from variant       |
-///
-/// `Core` is split further by inspecting the wrapped [`solti_core::CoreError`]:
-/// `InvalidSpec` → `INVALID_ARGUMENT` / `400`, everything else → `INTERNAL` / `500`.
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("invalid request: {0}")]
@@ -22,6 +9,9 @@ pub enum ApiError {
 
     #[error("task not found: {0}")]
     TaskNotFound(String),
+
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
 
     #[error("internal error: {0}")]
     Internal(String),
@@ -37,10 +27,11 @@ impl ApiError {
     /// `InvalidSpec` presents as `InvalidRequest`, anything else as `Internal`.
     pub fn as_label(&self) -> &'static str {
         match self {
+            ApiError::Core(solti_core::CoreError::InvalidSpec(_)) => "InvalidRequest",
+            ApiError::PayloadTooLarge(_) => "PayloadTooLarge",
             ApiError::InvalidRequest(_) => "InvalidRequest",
             ApiError::TaskNotFound(_) => "TaskNotFound",
             ApiError::Internal(_) => "Internal",
-            ApiError::Core(solti_core::CoreError::InvalidSpec(_)) => "InvalidRequest",
             ApiError::Core(_) => "Internal",
         }
     }
@@ -51,6 +42,7 @@ impl From<ApiError> for tonic::Status {
     fn from(err: ApiError) -> Self {
         match err {
             ApiError::InvalidRequest(msg) => tonic::Status::invalid_argument(msg),
+            ApiError::PayloadTooLarge(msg) => tonic::Status::invalid_argument(msg),
             ApiError::TaskNotFound(msg) => tonic::Status::not_found(msg),
             ApiError::Internal(msg) => tonic::Status::internal(msg),
             ApiError::Core(e) => core_to_status(e),
@@ -62,9 +54,7 @@ impl From<ApiError> for tonic::Status {
 fn core_to_status(e: solti_core::CoreError) -> tonic::Status {
     use solti_core::CoreError;
     match e {
-        // Client-facing: bad spec supplied by caller.
         CoreError::InvalidSpec(inner) => tonic::Status::invalid_argument(inner.to_string()),
-        // Internal / infra failures.
         CoreError::Supervisor(_) | CoreError::Mapping(_) | CoreError::Runner(_) => {
             tonic::Status::internal(e.to_string())
         }
@@ -80,6 +70,7 @@ impl axum::response::IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::TaskNotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            ApiError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             ApiError::Core(e) => core_to_http_status(e),
         };

@@ -62,11 +62,98 @@ impl TaskKind {
     }
 
     /// Validate kind-specific constraints.
+    ///
+    /// Every variant's spec is checked here so the model is self-consistent
+    /// without relying on transport-layer validators. If a new kind is
+    /// added, extend this match — a missing branch is a compile error
+    /// thanks to exhaustive matching.
     pub fn validate(&self) -> crate::error::ModelResult<()> {
         match self {
             TaskKind::Subprocess(spec) => spec.mode.validate(),
-            _ => Ok(()),
+            TaskKind::Wasm(spec) => spec.validate(),
+            TaskKind::Container(spec) => spec.validate(),
+            TaskKind::Embedded => Ok(()),
         }
+    }
+}
+
+impl WasmSpec {
+    /// Validate structural constraints.
+    pub fn validate(&self) -> crate::error::ModelResult<()> {
+        if self.module.as_os_str().is_empty() {
+            return Err(crate::error::ModelError::Invalid(
+                "wasm module path cannot be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ContainerSpec {
+    /// Validate structural constraints.
+    pub fn validate(&self) -> crate::error::ModelResult<()> {
+        if self.image.trim().is_empty() {
+            return Err(crate::error::ModelError::Invalid(
+                "container image cannot be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn task_kind_validate_rejects_empty_container_image() {
+        let kind = TaskKind::Container(ContainerSpec {
+            image: "".into(),
+            command: None,
+            args: vec![],
+            env: Default::default(),
+        });
+        let err = kind.validate().unwrap_err();
+        assert!(err.to_string().contains("container image"));
+    }
+
+    #[test]
+    fn task_kind_validate_rejects_whitespace_container_image() {
+        let kind = TaskKind::Container(ContainerSpec {
+            image: "  \t".into(),
+            command: None,
+            args: vec![],
+            env: Default::default(),
+        });
+        assert!(kind.validate().is_err());
+    }
+
+    #[test]
+    fn task_kind_validate_rejects_empty_wasm_module() {
+        let kind = TaskKind::Wasm(WasmSpec {
+            module: PathBuf::new(),
+            args: vec![],
+            env: Default::default(),
+        });
+        let err = kind.validate().unwrap_err();
+        assert!(err.to_string().contains("wasm module"));
+    }
+
+    #[test]
+    fn task_kind_validate_accepts_valid_container() {
+        let kind = TaskKind::Container(ContainerSpec {
+            image: "nginx:latest".into(),
+            command: None,
+            args: vec![],
+            env: Default::default(),
+        });
+        assert!(kind.validate().is_ok());
+    }
+
+    #[test]
+    fn task_kind_validate_accepts_embedded() {
+        assert!(TaskKind::Embedded.validate().is_ok());
     }
 }
 

@@ -10,8 +10,8 @@ use crate::TaskId;
 
 /// Resource metadata.
 ///
-/// Identity (`id`), optimistic-concurrency counter (`resource_version`), and lifecycle
-/// timestamps. Slot and labels live in [`crate::TaskSpec`] as the single source of truth.
+/// Identity (`id`), optimistic-concurrency counter (`resource_version`), and lifecycle timestamps.
+/// Slot and labels live in [`crate::TaskSpec`] as the single source of truth.
 ///
 /// ## Also
 ///
@@ -59,9 +59,7 @@ pub(crate) mod time_serde {
     where
         S: Serializer,
     {
-        let since_epoch = time
-            .duration_since(UNIX_EPOCH)
-            .map_err(serde::ser::Error::custom)?;
+        let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
         let ms = since_epoch.as_secs() * 1_000 + u64::from(since_epoch.subsec_millis());
         ms.serialize(serializer)
     }
@@ -100,5 +98,17 @@ mod tests {
         let back: ObjectMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, meta.id);
         assert_eq!(back.resource_version, 1);
+    }
+
+    #[test]
+    fn serialize_handles_pre_epoch_timestamp() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let mut meta = ObjectMeta::new("pre-epoch".into());
+        meta.created_at = UNIX_EPOCH - Duration::from_secs(10);
+        meta.updated_at = UNIX_EPOCH - Duration::from_secs(5);
+
+        let json = serde_json::to_string(&meta).expect("must not fail");
+        assert!(json.contains(r#""createdAt":0"#));
+        assert!(json.contains(r#""updatedAt":0"#));
     }
 }

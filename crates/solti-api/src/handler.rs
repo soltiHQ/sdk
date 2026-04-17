@@ -27,7 +27,6 @@ use crate::error::ApiError;
 /// | `get_task_status`  | `GET    /api/v1/tasks/{id}`       | `GetTaskStatus`     |
 /// | `query_tasks`      | `GET    /api/v1/tasks`            | `ListTasks`         |
 /// | `list_task_runs`   | `GET    /api/v1/tasks/{id}/runs`  | `ListTaskRuns`      |
-/// | `cancel_task`      | `POST   /api/v1/tasks/{id}/cancel`| `CancelTask`        |
 /// | `delete_task`      | `DELETE /api/v1/tasks/{id}`       | `DeleteTask`        |
 #[async_trait]
 pub trait ApiHandler: Send + Sync + 'static {
@@ -45,13 +44,10 @@ pub trait ApiHandler: Send + Sync + 'static {
     /// List execution history for a specific task (oldest first).
     async fn list_task_runs(&self, id: &TaskId) -> Result<Vec<TaskRun>, ApiError>;
 
-    /// Cancel a running task.
+    /// Stop a task and purge its run history.
     ///
-    /// Sends cancellation signal to the task. The task must cooperate by checking its `CancellationToken`.
-    async fn cancel_task(&self, id: &TaskId) -> Result<(), ApiError>;
-
-    /// Delete a task and its associated run history.
-    ///
-    /// Returns `TaskNotFound` if the task does not exist.
+    /// Idempotent:
+    /// returns `Ok(())` whether the task is currently registered on the agent.
+    /// Errors only on supervisor cancellation failures (timeout, internal error).
     async fn delete_task(&self, id: &TaskId) -> Result<(), ApiError>;
 }

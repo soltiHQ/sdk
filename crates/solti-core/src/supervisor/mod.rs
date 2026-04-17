@@ -117,11 +117,23 @@ impl SupervisorApi {
         self.state.list_runs(id)
     }
 
-    /// Delete a task and its run history.
-    ///
-    /// Returns `true` if the task existed and was deleted.
-    pub fn delete_task(&self, id: &TaskId) -> bool {
-        self.state.delete_task(id)
+    /// Stop a task and purge its run history.
+    #[instrument(level = "debug", skip(self), fields(task_id = %id))]
+    pub async fn delete_task(&self, id: &TaskId) -> Result<(), CoreError> {
+        debug!("deleting task: {}", id);
+
+        let was_cancelled = self
+            .handle
+            .cancel(id.as_str())
+            .await
+            .map_err(|e| CoreError::Supervisor(format!("cancel failed: {}", e)))?;
+
+        let had_local = self.state.delete_task(id);
+
+        if !was_cancelled && !had_local {
+            debug!("delete_task: no such task in supervisor or state; idempotent no-op");
+        }
+        Ok(())
     }
 
     /// Get a clone of the underlying supervisor handle.
@@ -195,20 +207,7 @@ impl SupervisorApi {
             .map_err(|e| CoreError::Supervisor(e.to_string()))
     }
 
-    /// Cancel a running task by ID.
-    ///
-    /// This sends cancellation signal to the task and waits for confirmation with the configured grace period (from SupervisorConfig).
-    ///
-    /// The task must be cooperative and respect the `CancellationToken` passed during execution.
-    ///
-    /// Returns:
-    /// - `Ok(())` if task was found and successfully cancelled
-    /// - `Err(CoreError::Supervisor)` if task not found or cancellation timed out
-    ///
-    /// # Example
-    /// ```text
-    /// api.cancel_task(&task_id).await?;
-    /// ```
+    /// Cancel a running task by ID (in-process Rust API).
     #[instrument(level = "debug", skip(self), fields(task_id = %id))]
     pub async fn cancel_task(&self, id: &TaskId) -> Result<(), CoreError> {
         debug!("cancelling task: {}", id);
@@ -231,6 +230,8 @@ impl SupervisorApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use solti_model::{AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind};
     use taskvisor::{TaskError, TaskFn};
@@ -277,6 +278,102 @@ mod tests {
             }
             Err(e) => panic!("expected Ok(TaskId), got error: {e:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn delete_task_stops_running_task_and_wipes_state() {
+        let router = RunnerRouter::new();
+        let api = SupervisorApi::new(
+            SupervisorConfig::default(),
+            ControllerConfig::default(),
+            Vec::new(),
+            router,
+            StateConfig::default(),
+        )
+        .await
+        .expect("SupervisorApi::new");
+
+        let cancelled_observed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled_observed);
+        let task: TaskRef = TaskFn::arc("kill-me", move |ctx: CancellationToken| {
+            let flag = Arc::clone(&flag);
+            async move {
+                while !ctx.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                flag.store(true, Ordering::SeqCst);
+                Ok::<(), TaskError>(())
+            }
+        });
+
+        let spec = TaskSpec::builder("slot-delete", TaskKind::Embedded, 60_000_u64)
+            .restart(RestartPolicy::Never)
+            .backoff(mk_backoff())
+            .admission(AdmissionPolicy::Replace)
+            .build()
+            .expect("spec builds");
+
+        let task_id = api
+            .submit_with_task(task, &spec)
+            .await
+            .expect("submit_with_task");
+
+        let handle = api.handle();
+        let mut alive = false;
+        for _ in 0..100 {
+            if handle.is_alive(task_id.as_str()).await {
+                alive = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            alive,
+            "task body must reach Running state before we try to delete"
+        );
+
+        api.delete_task(&task_id)
+            .await
+            .expect("delete_task must Ok");
+
+        assert!(
+            api.get_task(&task_id).is_none(),
+            "state must be wiped after delete"
+        );
+        assert!(
+            api.list_task_runs(&task_id).is_empty(),
+            "run history must be purged by delete"
+        );
+
+        for _ in 0..100 {
+            if cancelled_observed.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cancelled_observed.load(Ordering::SeqCst),
+            "task body must observe the cancel token — delete must cancel, not just wipe state"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_task_is_idempotent_on_missing() {
+        let router = RunnerRouter::new();
+        let api = SupervisorApi::new(
+            SupervisorConfig::default(),
+            ControllerConfig::default(),
+            Vec::new(),
+            router,
+            StateConfig::default(),
+        )
+        .await
+        .expect("SupervisorApi::new");
+
+        let missing = TaskId::from("never-submitted");
+        api.delete_task(&missing)
+            .await
+            .expect("delete on missing id must be Ok");
     }
 
     #[tokio::test]

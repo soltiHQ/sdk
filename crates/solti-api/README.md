@@ -59,22 +59,22 @@ Per-version API surface is documented in separate files: [api_v1.md](api_v1.md).
 
 ## Key types
 
-| Type | Role |
-|------|------|
-| `ApiHandler` | Transport-agnostic trait with 6 operations |
-| `SupervisorApiAdapter` | Default adapter bridging to `SupervisorApi` |
-| `ApiError` | Unified error mapped to gRPC Status / HTTP JSON |
-| `SoltiApiService<H>` | gRPC server impl (feature `grpc`) |
-| `HttpApi<H>` | axum router builder (feature `http`) |
-| `API_VERSION` | Protocol version constant reported via discover |
+| Type                   | Role                                            |
+|------------------------|-------------------------------------------------|
+| `ApiHandler`           | Transport-agnostic trait with 6 operations      |
+| `SupervisorApiAdapter` | Default adapter bridging to `SupervisorApi`     |
+| `ApiError`             | Unified error mapped to gRPC Status / HTTP JSON |
+| `SoltiApiService<H>`   | gRPC server impl (feature `grpc`)               |
+| `HttpApi<H>`           | axum router builder (feature `http`)            |
+| `API_VERSION`          | Protocol version constant reported via discover |
 
 ## Error model
 
-| Variant          | gRPC Status                      | HTTP Status                 | `error` label (HTTP body) |
-|------------------|----------------------------------|-----------------------------|---------------------------|
-| `InvalidRequest` | `INVALID_ARGUMENT`               | `400 Bad Request`           | `"InvalidRequest"`        |
-| `TaskNotFound`   | `NOT_FOUND`                      | `404 Not Found`             | `"TaskNotFound"`          |
-| `Internal`       | `INTERNAL`                       | `500 Internal Server Error` | `"Internal"`              |
+| Variant          | gRPC Status                      | HTTP Status                 | `error` label (HTTP body)                  |
+|------------------|----------------------------------|-----------------------------|--------------------------------------------|
+| `InvalidRequest` | `INVALID_ARGUMENT`               | `400 Bad Request`           | `"InvalidRequest"`                         |
+| `TaskNotFound`   | `NOT_FOUND`                      | `404 Not Found`             | `"TaskNotFound"`                           |
+| `Internal`       | `INTERNAL`                       | `500 Internal Server Error` | `"Internal"`                               |
 | `Core`           | derived from inner `CoreError`   | derived from inner          | flattened to `InvalidRequest` / `Internal` |
 
 `Core` is split by the wrapped [`solti_core::CoreError`]: `InvalidSpec` → `INVALID_ARGUMENT` / `400` / `"InvalidRequest"`; everything else → `INTERNAL` / `500` / `"Internal"`.
@@ -84,26 +84,28 @@ HTTP error body:
 { "error": "<label>", "message": "<detail>" }
 ```
 
-HTTP requests also return `413 Payload Too Large` (no JSON body) when the body exceeds 256 KiB (`RequestBodyLimitLayer`).
+HTTP requests return `413 Payload Too Large` with a JSON envelope (`{"error": "PayloadTooLarge", "message": "…"}`) when the body exceeds [`MAX_REQUEST_BYTES`](crate::MAX_REQUEST_BYTES) (4 MiB). 
+gRPC calls return `RESOURCE_EXHAUSTED` for oversize messages. 
+Script bodies are separately capped in the model at [`solti_model::MAX_SCRIPT_BODY_BYTES`] (2 MiB after base64 decode): oversize bodies are rejected as `InvalidRequest`.
 
 ## Feature flags
 
-| Flag   | Enables                                                   | Dependencies                        |
-|--------|-----------------------------------------------------------|-------------------------------------|
-| `grpc` | `SoltiApiService`, `SoltiApiServer`, proto codegen        | `tonic`, `tonic-prost`, `prost`     |
+| Flag   | Enables                                                   | Dependencies                            |
+|--------|-----------------------------------------------------------|-----------------------------------------|
+| `grpc` | `SoltiApiService`, `SoltiApiServer`, proto codegen        | `tonic`, `tonic-prost`, `prost`         |
 | `http` | `HttpApi`, axum router, proto-JSON serde                  | `axum`, `serde_json`, `prost`, `pbjson` |
 
 Neither feature is enabled by default.
 
 ## Build
 
-`build.rs` walks `proto/` recursively, collecting every `*.proto` file (plus
-emitting `rerun-if-changed` for each). Two codegen passes:
+`build.rs` walks `proto/` recursively, collecting every `*.proto` file (emitting `rerun-if-changed` for each). Two codegen passes:
+- `tonic_prost_build::configure()`: message types always, tonic server/client only under `grpc`.
+- `pbjson_build` under `http`: attaches canonical proto-JSON `Serialize`/`Deserialize` to the same message types, with `.emit_fields()` enabled so REST clients see `0` / `false` / `""` / `[]` / `{}` for default scalar/repeated/map values (optional `message` fields still omit on `None`).
 
-- `tonic_prost_build::configure()` — message types always, tonic server/client only under `grpc`.
-- `pbjson_build` under `http` — attaches canonical proto-JSON `Serialize`/`Deserialize` to the same message types, with `.emit_fields()` enabled so REST clients see `0` / `false` / `""` / `[]` / `{}` for default scalar/repeated/map values (optional `message` fields still omit on `None`).
-
-The proto package selector lives at the top of `build.rs` as `const PROTO_PACKAGE = ".solti.v1";`. If the `package` declaration in a `.proto` changes, update this constant — otherwise pbjson generates nothing and HTTP compile fails. Adding new `.proto` files anywhere under `proto/` requires **no** changes to `build.rs`.
+The proto package selector lives at the top of `build.rs` as `const PROTO_PACKAGE = ".solti.v1";`. 
+If the `package` declaration in a `.proto` changes, update this constant — otherwise pbjson generates nothing and HTTP compile fails. 
+Adding new `.proto` files anywhere under `proto/` requires **no** changes to `build.rs`.
 
 ## Notes
 - `ApiHandler` uses `async_trait` for object safety (`Send + Sync + 'static`).

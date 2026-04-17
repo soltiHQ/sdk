@@ -5,14 +5,12 @@
 use crate::{Slot, TaskPhase};
 
 /// Default page size when the caller does not specify one.
-///
-/// Consumed directly by [`TaskQuery::new`] and re-exported for API callers
-/// so wire-contract documentation and runtime behaviour share one source.
 pub const DEFAULT_LIMIT: usize = 100;
 
-/// Hard cap on page size. [`TaskQuery::with_limit`] clamps values above this
-/// silently; upstream transports should reject oversized limits explicitly
-/// if they expose a wire contract.
+/// Hard cap on page size.
+///
+/// [`TaskQuery::with_limit`] clamps values above this silently;
+/// Upstream transports should reject oversized limits explicitly if they expose a wire contract.
 pub const MAX_LIMIT: usize = 1000;
 
 /// Query parameters for listing tasks with filtering and pagination.

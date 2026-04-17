@@ -22,7 +22,6 @@ pub enum DiscoverError {
     #[error("http request failed: {0}")]
     HttpRequest(#[from] reqwest::Error),
 
-    /// Non-2xx HTTP status. `body` is truncated to ~1 KiB.
     #[cfg(feature = "http")]
     #[error("http status {code}: {body}")]
     HttpStatus { code: u16, body: String },
@@ -34,10 +33,22 @@ pub enum DiscoverError {
     #[error("control plane rejected sync: {reason}")]
     Rejected {
         reason: String,
-        /// Server-suggested minimum delay before next attempt (seconds).
-        /// `None` when the server did not advise a specific delay.
         retry_after_s: Option<i32>,
     },
+
+    #[error("authentication failed: {reason}")]
+    AuthFailed { reason: String },
+}
+
+impl DiscoverError {
+    /// `true` for errors that indicate a misconfiguration, not a transient failure.
+    /// Sync treats these as terminal (Fatal) - the operator must act before the agent can make progress.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            DiscoverError::AuthFailed { .. } | DiscoverError::InvalidConfig(_)
+        )
+    }
 }
 
 #[cfg(feature = "grpc")]

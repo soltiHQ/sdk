@@ -17,7 +17,13 @@
 //! | `timeout`       | [`Timeout`]                                                  | Milliseconds                                |
 
 mod kind;
-pub use kind::{ContainerSpec, Runtime, SubprocessMode, SubprocessSpec, TaskKind, WasmSpec};
+pub use kind::{
+    ContainerSpec, MAX_SCRIPT_BODY_BYTES, Runtime, SubprocessMode, SubprocessSpec, TaskKind,
+    WasmSpec,
+};
+
+mod identity;
+pub use identity::{AGENT_ID_MAX_LEN, AgentId, SLOT_MAX_LEN, Slot, TASK_ID_MAX_LEN, TaskId};
 
 mod policy;
 pub use policy::{AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy};
@@ -33,9 +39,6 @@ pub use query::{DEFAULT_LIMIT, MAX_LIMIT, TaskPage, TaskQuery};
 
 mod label;
 pub use label::{Labels, LabelsIter};
-
-mod identity;
-pub use identity::{AgentId, Slot, TaskId};
 
 mod phase;
 pub use phase::TaskPhase;

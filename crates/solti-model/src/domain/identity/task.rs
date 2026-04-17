@@ -3,6 +3,11 @@
 //! [`TaskId`] is a unique identifier for a task resource (newtype over `Arc<str>`).
 
 use super::macros::arc_str_newtype;
+use super::validate_identity;
+use crate::error::ModelError;
+
+/// Maximum length of a `TaskId`.
+pub const TASK_ID_MAX_LEN: usize = 256;
 
 arc_str_newtype! {
     /// Unique identifier for a task instance.
@@ -26,6 +31,15 @@ arc_str_newtype! {
     /// The [`Slot`](crate::Slot) stays the same across submissions.
     /// The `TaskId` is unique per run: same slot, different execution, different id.
     pub struct TaskId;
+}
+
+impl TaskId {
+    /// Validate that the task id is safe to use across the SDK.
+    ///
+    /// See [`validate_identity`] for the exact rules.
+    pub fn validate_format(&self) -> Result<(), ModelError> {
+        validate_identity("task_id", self.as_str(), TASK_ID_MAX_LEN)
+    }
 }
 
 #[cfg(test)]
@@ -75,5 +89,21 @@ mod tests {
         let a: Arc<str> = id.into_inner();
         let b: Arc<str> = cloned.into_inner();
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn validate_format_accepts_runner_generated() {
+        TaskId::new("subprocess-build-1").validate_format().unwrap();
+        TaskId::new("subprocess-build.frontend-ff")
+            .validate_format()
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_format_rejects_invalid() {
+        assert!(TaskId::new("").validate_format().is_err());
+        assert!(TaskId::new("with/slash").validate_format().is_err());
+        assert!(TaskId::new("with space").validate_format().is_err());
+        assert!(TaskId::new(&"x".repeat(257)).validate_format().is_err());
     }
 }

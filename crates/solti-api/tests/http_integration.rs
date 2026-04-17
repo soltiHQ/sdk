@@ -24,9 +24,10 @@ use solti_model::{Task, TaskId, TaskPage, TaskQuery, TaskRun, TaskSpec};
 #[derive(Default)]
 struct MockHandler {
     submit_calls: AtomicUsize,
-    cancel_calls: AtomicUsize,
     delete_calls: AtomicUsize,
-    /// When true, `delete_task` returns `TaskNotFound`.
+    /// When true, `delete_task` returns `TaskNotFound`. The transport
+    /// still needs to map this error into a 404 — the adapter no
+    /// longer produces it, but custom `ApiHandler` impls may.
     delete_returns_not_found: bool,
 }
 
@@ -50,11 +51,6 @@ impl ApiHandler for MockHandler {
 
     async fn list_task_runs(&self, _id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
         Ok(Vec::new())
-    }
-
-    async fn cancel_task(&self, _id: &TaskId) -> Result<(), ApiError> {
-        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
     }
 
     async fn delete_task(&self, id: &TaskId) -> Result<(), ApiError> {
@@ -103,6 +99,87 @@ async fn submit_task_missing_spec_returns_400_with_structured_error() {
         body["message"].as_str().unwrap().contains("missing spec"),
         "expected message to mention 'missing spec', got {body:?}"
     );
+    assert_eq!(handler.submit_calls.load(Ordering::SeqCst), 0);
+}
+
+/// Malformed JSON must yield our canonical `{error, message}` envelope,
+/// not axum's default `text/plain` rejection body.
+#[tokio::test]
+async fn submit_task_malformed_json_returns_envelope() {
+    let handler = Arc::new(MockHandler::default());
+    let app = router_with(Arc::clone(&handler));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from("{ not json at all"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // Must be JSON, not text/plain.
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("application/json"),
+        "content-type must be JSON, got {ct:?}"
+    );
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "InvalidRequest");
+    assert!(
+        body["message"].is_string(),
+        "message field must be a non-empty string, got {body:?}"
+    );
+    assert_eq!(handler.submit_calls.load(Ordering::SeqCst), 0);
+}
+
+/// Body over [`solti_api::MAX_REQUEST_BYTES`] must reach the client as our
+/// envelope 413, not tower-http's bare `text/plain` default.
+#[tokio::test]
+async fn submit_task_oversize_body_returns_envelope_413() {
+    let handler = Arc::new(MockHandler::default());
+    let app = router_with(Arc::clone(&handler));
+
+    // Build a body just over the limit. The layer intercepts before any
+    // parsing, so the shape doesn't matter — only the size does. Use
+    // `MAX_REQUEST_BYTES + 1 KiB` so the test stays correct if the
+    // constant changes.
+    let huge = "a".repeat(solti_api::MAX_REQUEST_BYTES + 1024);
+    let body = format!(r#"{{"spec": "{huge}"}}"#);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("application/json"),
+        "413 must be JSON, got {ct:?}"
+    );
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "PayloadTooLarge");
+    assert!(body["message"].as_str().unwrap().contains("exceeds"));
     assert_eq!(handler.submit_calls.load(Ordering::SeqCst), 0);
 }
 
@@ -178,26 +255,6 @@ async fn delete_task_success_returns_204_no_content() {
 }
 
 #[tokio::test]
-async fn cancel_task_success_returns_204_no_content() {
-    let handler = Arc::new(MockHandler::default());
-    let app = router_with(Arc::clone(&handler));
-
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/api/v1/tasks/tsk_1/cancel")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    assert_eq!(handler.cancel_calls.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
 async fn list_tasks_invalid_status_returns_400() {
     let app = router_with(Arc::new(MockHandler::default()));
 
@@ -243,8 +300,9 @@ async fn list_tasks_empty_returns_empty_list_and_zero_total() {
 async fn request_body_limit_rejects_oversized_payload() {
     let app = router_with(Arc::new(MockHandler::default()));
 
-    // Router applies RequestBodyLimitLayer = 256 KiB. Send a 300 KiB blob.
-    let oversized = vec![b'x'; 300 * 1024];
+    // Router applies RequestBodyLimitLayer sized to
+    // `solti_api::MAX_REQUEST_BYTES`. Send a blob just over the limit.
+    let oversized = vec![b'x'; solti_api::MAX_REQUEST_BYTES + 1024];
     let resp = app
         .oneshot(
             Request::builder()

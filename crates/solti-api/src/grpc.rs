@@ -1,7 +1,7 @@
 //! # gRPC transport.
 //!
-//! [`SoltiApiService`] implements the generated `SoltiApi` trait from `proto/solti/v1/api.proto`,
-//! delegating to an [`ApiHandler`](crate::ApiHandler).
+//! [`SoltiApiService`] implements the generated `SoltiApi` trait
+//! from `proto/solti/v1/api.proto`, delegating to an [`ApiHandler`](crate::ApiHandler).
 
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use solti_model::TaskQuery;
 use crate::convert::{clamp_list_limit, proto_to_domain_status, tasks_page_to_proto};
 use crate::error::ApiError;
 use crate::handler::ApiHandler;
-use crate::proto_api::{self, solti_api_server::SoltiApi};
+use crate::proto_api::{self, solti_api_server::SoltiApi, solti_api_server::SoltiApiServer};
 use crate::validate::non_empty_id;
 
 /// gRPC service wrapping an [`ApiHandler`](crate::ApiHandler).
@@ -34,6 +34,30 @@ where
     pub fn new(handler: Arc<H>) -> Self {
         Self { handler }
     }
+}
+
+/// Build a configured `SoltiApiServer` ready to mount on a tonic server.
+///
+/// ## Example
+///
+/// ```rust,no_run
+/// # use std::sync::Arc;
+/// # use solti_api::{build_grpc_server, SupervisorApiAdapter};
+/// # async fn example(adapter: Arc<SupervisorApiAdapter>) -> Result<(), Box<dyn std::error::Error>> {
+/// let svc = build_grpc_server(adapter);
+/// tonic::transport::Server::builder()
+///     .add_service(svc)
+///     .serve("0.0.0.0:50052".parse()?)
+///     .await?;
+/// # Ok(()) }
+/// ```
+pub fn build_grpc_server<H>(handler: Arc<H>) -> SoltiApiServer<SoltiApiService<H>>
+where
+    H: ApiHandler,
+{
+    SoltiApiServer::new(SoltiApiService::new(handler))
+        .max_decoding_message_size(crate::MAX_REQUEST_BYTES)
+        .max_encoding_message_size(crate::MAX_REQUEST_BYTES)
 }
 
 #[tonic::async_trait]
@@ -146,25 +170,6 @@ where
         let runs = runs.into_iter().map(proto_api::TaskRunInfo::from).collect();
 
         Ok(Response::new(proto_api::ListTaskRunsResponse { runs }))
-    }
-
-    async fn cancel_task(
-        &self,
-        request: Request<proto_api::CancelTaskRequest>,
-    ) -> Result<Response<proto_api::CancelTaskResponse>, Status> {
-        let req = request.into_inner();
-
-        non_empty_id("task_id", &req.task_id).map_err(Status::from)?;
-
-        let task_id = solti_model::TaskId::from(req.task_id);
-
-        self.handler
-            .cancel_task(&task_id)
-            .await
-            .map_err(Status::from)?;
-
-        debug!(%task_id, "grpc: task canceled");
-        Ok(Response::new(proto_api::CancelTaskResponse {}))
     }
 
     async fn delete_task(

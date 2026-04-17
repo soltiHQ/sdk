@@ -52,6 +52,10 @@ Terminal phases: `Succeeded`, `Failed`, `Timeout`, `Canceled`, `Exhausted`.
 `Embedded` tasks are submitted directly via `SupervisorApi::submit_with_task`.
 Routable variants go through `RunnerRouter::pick()`.
 
+`Subprocess` has two execution strategies (see `SubprocessMode`):
+- **Command**: `execve(command, args)` directly.
+- **Script**: interpreter + script body. The body is **base64-encoded, UTF-8**, capped at `MAX_SCRIPT_BODY_BYTES` (2 MiB after decode). Interpreters: `Bash`, `Python`, `Node`, `Custom { command, flag }`.
+
 ## Policies
 
 | Type              | Controls                                                 |
@@ -104,6 +108,23 @@ Operators: `In`, `NotIn`, `Exists`, `DoesNotExist`.
 | `TaskQuery`        | Builder for filtered, paginated task listing              |
 | `TaskPage`         | Paginated query result                                    |
 
+## Size limits
+
+Exposed as `pub const` so downstream layers (API, CP, UI) share one source of truth.
+
+| Constant                | Value   | Enforced by                         |
+|-------------------------|---------|-------------------------------------|
+| `MAX_SCRIPT_BODY_BYTES` | 2 MiB   | `SubprocessMode::Script::validate`  |
+| `SLOT_MAX_LEN`          | 64      | `Slot::validate_format`             |
+| `TASK_ID_MAX_LEN`       | 256     | `TaskId::validate_format`           |
+| `AGENT_ID_MAX_LEN`      | 128     | `AgentId::validate_format`          |
+
+## Identity rules
+
+`Slot`, `TaskId`, `AgentId` allow `[A-Za-z0-9._-]` only, reject `.` and `..`.
+No whitespace, no path separators, no non-ASCII: these values reach cgroup paths, tempfile names, `execve` argv, and log fields, where anything else misbehaves. 
+Validation runs at `TaskSpec::validate` / submit time.
+
 ## Versioning
 
 `ObjectMeta.resource_version` is a monotonic counter bumped on every change
@@ -135,7 +156,7 @@ spec.validate()?;  // submit-boundary validation (rejects Embedded)
 - `TaskSpec` fields are private — use `TaskSpec::builder()` for construction and `serde` for deserialization.
 - Deserialization goes through `#[serde(try_from = "TaskSpecRaw")]` which validates on parse.
 - `BackoffPolicy` is **also** validated on deserialize via its own `try_from` raw; zero `first_ms`, inverted `max_ms`, or non-finite/`<1.0` `factor` are rejected at parse time.
-- Identity newtypes (`Slot`, `TaskId`, `AgentId`) wrap `Arc<str>` for cheap cloning and comparison; they share one declarative-macro definition.
+- Identity newtypes (`Slot`, `TaskId`, `AgentId`) wrap `Arc<str>` via `arc_str_newtype!`; environment newtypes (`TaskEnv`, `RunnerEnv`) wrap `Vec<KeyValue>` via `env_newtype!`. Both macros keep parallel types in lockstep.
 - `BackoffPolicy` implements `Eq`/`Hash` via `f64::to_bits()` for the `factor` field.
 - `TaskPhase`, `RestartPolicy`, `AdmissionPolicy`, `JitterPolicy` all implement `FromStr` for CLI/config parsing.
 - `Labels` is backed by `BTreeMap<String, String>` for deterministic iteration order.

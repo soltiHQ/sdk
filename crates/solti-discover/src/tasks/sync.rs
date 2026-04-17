@@ -12,11 +12,14 @@
 //! On failure the task returns `TaskError::Fail` and the supervisor applies backoff + restart policy from the spec.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(any(feature = "grpc", feature = "http"))]
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Upper bound on server-advised hold time (seconds).
+const MAX_RETRY_AFTER_S: i32 = 3_600;
 
 #[cfg(feature = "grpc")]
 use crate::proto::discover_service_client::DiscoverServiceClient;
@@ -89,6 +92,7 @@ pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError
         #[cfg(feature = "grpc")]
         grpc_client: tokio::sync::OnceCell::new(),
         retry_hold_until: AtomicU64::new(0),
+        startup_jitter_applied: AtomicBool::new(false),
         config,
     });
 
@@ -96,6 +100,18 @@ pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError
         let ctx = Arc::clone(&ctx);
 
         async move {
+            if !ctx.startup_jitter_applied.swap(true, Ordering::Relaxed) {
+                let jitter = Duration::from_millis(startup_jitter_ms(ctx.config.delay_ms));
+                debug!(
+                    jitter_ms = jitter.as_millis() as u64,
+                    "applying startup jitter before first sync",
+                );
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(TaskError::Canceled),
+                    _ = tokio::time::sleep(jitter) => {}
+                }
+            }
+
             if let Some(wait) = compute_hold_wait(
                 ctx.retry_hold_until.load(Ordering::Relaxed),
                 now_unix_seconds(),
@@ -125,13 +141,30 @@ pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError
                             ..
                         } = &e
                         {
-                            let hold_until = now_unix_seconds().saturating_add(*s as u64);
+                            let clamped = (*s).clamp(0, MAX_RETRY_AFTER_S);
+                            if *s != clamped {
+                                warn!(
+                                    advised_s = *s,
+                                    capped_s = clamped,
+                                    "retry_after_s capped",
+                                );
+                            }
+                            let hold_until =
+                                now_unix_seconds().saturating_add(clamped as u64);
                             ctx.retry_hold_until.store(hold_until, Ordering::Relaxed);
                         }
-                        warn!("sync failed: {}", e);
-                        Err(TaskError::Fail {
-                            reason: format!("sync failed: {}", e),
-                        })
+
+                        if e.is_terminal() {
+                            warn!("sync failed fatally: {}", e);
+                            Err(TaskError::Fatal {
+                                reason: format!("sync fatally failed: {}", e),
+                            })
+                        } else {
+                            warn!("sync failed: {}", e);
+                            Err(TaskError::Fail {
+                                reason: format!("sync failed: {}", e),
+                            })
+                        }
                     }
                 },
             }
@@ -152,6 +185,11 @@ struct SyncContext {
     /// `0` means no active hold. Updated to `now + retry_after_s` when the control plane
     /// returns `Rejected { retry_after_s: Some(_) }`; cleared to `0` on successful sync.
     retry_hold_until: AtomicU64,
+    /// Guard so the first-tick startup jitter runs exactly once per process
+    /// lifetime. Set to `true` after the initial jitter sleep; subsequent
+    /// restarts (e.g. after a transient failure) skip the jitter and stay
+    /// on the periodic schedule.
+    startup_jitter_applied: AtomicBool,
 }
 
 async fn invoke_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
@@ -183,9 +221,17 @@ async fn invoke_grpc_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
 
     let mut client = client.clone();
     let request = tonic::Request::new(stamp_request(&ctx.base_request));
-    let response = client.sync(request).await?.into_inner();
-
-    validate_response(response)
+    match client.sync(request).await {
+        Ok(response) => validate_response(response.into_inner()),
+        Err(status) => match status.code() {
+            tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+                Err(DiscoverError::AuthFailed {
+                    reason: format!("grpc {:?}: {}", status.code(), status.message()),
+                })
+            }
+            _ => Err(DiscoverError::from(status)),
+        },
+    }
 }
 
 #[cfg(feature = "http")]
@@ -203,6 +249,11 @@ async fn invoke_http_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
     let body = response.text().await?;
 
     if !status.is_success() {
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(DiscoverError::AuthFailed {
+                reason: format!("http {}: {}", status.as_u16(), truncate_body(&body)),
+            });
+        }
         return Err(DiscoverError::HttpStatus {
             code: status.as_u16(),
             body: truncate_body(&body),
@@ -283,6 +334,21 @@ fn now_unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn startup_jitter_ms(max_ms: u64) -> u64 {
+    if max_ms == 0 {
+        return 0;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    let pid = std::process::id() as u64;
+    let mixed = nanos
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(pid.rotate_left(32));
+    mixed % max_ms
 }
 
 fn validate_response(response: SyncResponse) -> Result<(), DiscoverError> {
@@ -437,5 +503,69 @@ mod tests {
             }
             other => panic!("expected Rejected, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn retry_after_is_clamped_to_max() {
+        let raw = i32::MAX;
+        let clamped = raw.clamp(0, MAX_RETRY_AFTER_S);
+        assert_eq!(clamped, MAX_RETRY_AFTER_S);
+        assert_eq!(clamped, 3_600);
+        assert_eq!((-10_i32).clamp(0, MAX_RETRY_AFTER_S), 0);
+        assert_eq!((120_i32).clamp(0, MAX_RETRY_AFTER_S), 120);
+    }
+
+    #[test]
+    fn auth_failed_is_terminal() {
+        let e = DiscoverError::AuthFailed {
+            reason: "http 401".into(),
+        };
+        assert!(e.is_terminal(), "auth errors must be escalated to Fatal");
+    }
+
+    #[test]
+    fn transient_errors_are_not_terminal() {
+        #[cfg(feature = "http")]
+        {
+            let e = DiscoverError::HttpStatus {
+                code: 503,
+                body: "overloaded".into(),
+            };
+            assert!(!e.is_terminal(), "5xx is transient; sync must retry");
+        }
+        let e = DiscoverError::Rejected {
+            reason: "overloaded".into(),
+            retry_after_s: Some(60),
+        };
+        assert!(!e.is_terminal());
+    }
+
+    #[test]
+    fn invalid_config_is_terminal() {
+        let e = DiscoverError::InvalidConfig("bad endpoint".into());
+        assert!(e.is_terminal());
+    }
+
+    #[test]
+    fn startup_jitter_is_bounded() {
+        for max in [1u64, 100, 1_000, 30_000, u64::MAX / 2] {
+            let j = startup_jitter_ms(max);
+            assert!(j < max, "jitter {j} must be < max {max}");
+        }
+        assert_eq!(startup_jitter_ms(0), 0);
+    }
+
+    #[test]
+    fn startup_jitter_varies_between_calls() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            seen.insert(startup_jitter_ms(1_000_000));
+            std::thread::sleep(std::time::Duration::from_micros(1));
+        }
+        assert!(
+            seen.len() > 50,
+            "jitter should vary between calls; got only {} distinct values out of 100",
+            seen.len()
+        );
     }
 }

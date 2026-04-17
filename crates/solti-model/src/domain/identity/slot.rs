@@ -3,6 +3,11 @@
 //! [`Slot`] is the logical execution lane name (newtype over `Arc<str>`).
 
 use super::macros::arc_str_newtype;
+use super::validate_identity;
+use crate::error::ModelError;
+
+/// Maximum length of a `Slot` identifier.
+pub const SLOT_MAX_LEN: usize = 64;
 
 arc_str_newtype! {
     /// Logical identifier for a controller slot.
@@ -31,6 +36,15 @@ arc_str_newtype! {
     /// assert_eq!(format!("{slot}"), "deploy");
     /// ```
     pub struct Slot;
+}
+
+impl Slot {
+    /// Validate that the slot name is safe to use across the SDK.
+    ///
+    /// See [`validate_identity`] for the exact rules.
+    pub fn validate_format(&self) -> Result<(), ModelError> {
+        validate_identity("slot", self.as_str(), SLOT_MAX_LEN)
+    }
 }
 
 #[cfg(test)]
@@ -87,5 +101,22 @@ mod tests {
         let a: Arc<str> = slot.into_inner();
         let b: Arc<str> = cloned.into_inner();
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn validate_format_accepts_valid() {
+        Slot::new("build.frontend").validate_format().unwrap();
+        Slot::new("build").validate_format().unwrap();
+        Slot::new("a").validate_format().unwrap();
+    }
+
+    #[test]
+    fn validate_format_rejects_invalid() {
+        assert!(Slot::new("build/frontend").validate_format().is_err());
+        assert!(Slot::new("с кириллицей").validate_format().is_err());
+        assert!(Slot::new("with space").validate_format().is_err());
+        assert!(Slot::new("a\nb").validate_format().is_err());
+        assert!(Slot::new(".").validate_format().is_err());
+        assert!(Slot::new("").validate_format().is_err());
     }
 }

@@ -2,40 +2,26 @@
 //!
 //! [`TaskEnv`] is an ordered list of key-value pairs attached to a single task spec.
 
-use serde::{Deserialize, Serialize};
+use super::macros::env_newtype;
 
-use crate::KeyValue;
-
-/// Environment variables passed to a task at submission time.
-///
-/// ```text
-///  TaskSpec
-///  ┌───────────────────────────────┐
-///  │  kind: Subprocess {           │
-///  │    env: TaskEnv [             │
-///  │      FOO=from-task,           │  ← user-defined
-///  │      BAR=task-only,           │
-///  │    ]                          │
-///  │  }                            │
-///  └───────────────────────────────┘
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct TaskEnv(Vec<KeyValue>);
+env_newtype! {
+    /// Environment variables passed to a task at submission time.
+    ///
+    /// ```text
+    ///  TaskSpec
+    ///  ┌───────────────────────────────┐
+    ///  │  kind: Subprocess {           │
+    ///  │    env: TaskEnv [             │
+    ///  │      FOO=from-task,           │  ← user-defined
+    ///  │      BAR=task-only,           │
+    ///  │    ]                          │
+    ///  │  }                            │
+    ///  └───────────────────────────────┘
+    /// ```
+    pub struct TaskEnv;
+}
 
 impl TaskEnv {
-    /// Create an empty environment.
-    #[inline]
-    pub fn new() -> Self {
-        Self(Vec::new())
-    }
-
-    /// Returns the number of key–value pairs in the environment.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
     /// Create an environment containing a single key–value pair.
     #[inline]
     pub fn single<K, V>(key: K, value: V) -> Self
@@ -43,60 +29,9 @@ impl TaskEnv {
         K: Into<String>,
         V: Into<String>,
     {
-        Self(vec![KeyValue::new(key, value)])
-    }
-
-    /// Check if the environment is empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// Iterate over all key–value pairs.
-    #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = &KeyValue> {
-        self.0.iter()
-    }
-
-    /// Get the value for a key, returning the last matching entry.
-    ///
-    /// This allows simple override semantics when merging environments.
-    #[inline]
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.0
-            .iter()
-            .rev()
-            .find(|kv| kv.key() == key)
-            .map(|kv| kv.value())
-    }
-
-    /// Append a key–value pair to the environment.
-    ///
-    /// Later entries override earlier ones when queried via [`TaskEnv::get`].
-    #[inline]
-    pub fn push<K, V>(&mut self, key: K, value: V)
-    where
-        K: Into<String>,
-        V: Into<String>,
-    {
-        self.0.push(KeyValue::new(key, value));
-    }
-}
-
-impl Default for TaskEnv {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<'a> IntoIterator for &'a TaskEnv {
-    type Item = &'a KeyValue;
-    type IntoIter = std::slice::Iter<'a, KeyValue>;
-
-    #[inline]
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
+        let mut env = Self::new();
+        env.push(key, value);
+        env
     }
 }
 

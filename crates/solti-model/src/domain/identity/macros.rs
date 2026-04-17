@@ -1,10 +1,4 @@
-//! Shared macro for `Arc<str>`-backed identity newtypes.
-//!
-//! [`Slot`](super::Slot), [`TaskId`](super::TaskId), and [`AgentId`](super::AgentId)
-//! all share the same backing (`Arc<str>`) and the same surface (`Display`,
-//! `Hash`, `Ord`, `Borrow<str>`, `AsRef<str>`, `From<&str>/String/Arc<str>`,
-//! transparent serde, `PartialEq<str>` for ergonomics). This macro generates
-//! that surface once so the three types stay in lockstep.
+//! Shared macro for `Arc<str>` backed identity newtypes.
 //!
 //! # Usage
 //!

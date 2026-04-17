@@ -48,18 +48,10 @@ impl ApiHandler for SupervisorApiAdapter {
         Ok(self.supervisor.list_task_runs(id))
     }
 
-    async fn cancel_task(&self, id: &TaskId) -> Result<(), ApiError> {
+    async fn delete_task(&self, id: &TaskId) -> Result<(), ApiError> {
         self.supervisor
-            .cancel_task(id)
+            .delete_task(id)
             .await
             .map_err(ApiError::from)
-    }
-
-    async fn delete_task(&self, id: &TaskId) -> Result<(), ApiError> {
-        if self.supervisor.delete_task(id) {
-            Ok(())
-        } else {
-            Err(ApiError::TaskNotFound(id.to_string()))
-        }
     }
 }
