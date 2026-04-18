@@ -256,8 +256,8 @@ mod tests {
             router,
             StateConfig::default(),
         )
-        .await
-        .expect("failed to create SupervisorApi");
+            .await
+            .expect("failed to create SupervisorApi");
 
         let task: TaskRef = TaskFn::arc("test-task", |_ctx: CancellationToken| async move {
             Ok::<(), TaskError>(())
@@ -290,8 +290,8 @@ mod tests {
             router,
             StateConfig::default(),
         )
-        .await
-        .expect("SupervisorApi::new");
+            .await
+            .expect("SupervisorApi::new");
 
         let cancelled_observed = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancelled_observed);
@@ -367,8 +367,8 @@ mod tests {
             router,
             StateConfig::default(),
         )
-        .await
-        .expect("SupervisorApi::new");
+            .await
+            .expect("SupervisorApi::new");
 
         let missing = TaskId::from("never-submitted");
         api.delete_task(&missing)
@@ -386,8 +386,8 @@ mod tests {
             router,
             StateConfig::default(),
         )
-        .await
-        .expect("failed to create SupervisorApi");
+            .await
+            .expect("failed to create SupervisorApi");
 
         let spec = TaskSpec::builder("test-slot-none", TaskKind::Embedded, 1_000_u64)
             .restart(RestartPolicy::Never)

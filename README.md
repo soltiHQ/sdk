@@ -2,9 +2,9 @@
 
 **Modular Rust toolkit for building task-orchestration agents.**
 
-Solti is a set of composable crates. 
+Solti is a set of composable crates.
 
-Pick what you need: run a subprocess with restart policies, build a headless scheduler, expose an HTTP/gRPC API, or connect to a [Podium](https://github.com/soltiHQ/podium) control-plane. 
+Pick what you need: run a subprocess with restart policies, build a headless scheduler, expose an HTTP/gRPC API, or connect to a [Podium](https://github.com/soltiHQ/podium) control-plane.
 Every layer is optional except `solti-model` (domain types) and `solti-core` (supervision).
 
 Built on top of [taskvisor](https://github.com/soltiHQ/taskvisor) supervision runtime.
@@ -42,8 +42,8 @@ The SDK doesn't prescribe a single topology. Examples of what fits naturally:
 └───────────────────────────────────────────────────────────────┘
 ```
 
-Dependencies flow downward: `model ← runner ← core ← api`. 
-No circular dependencies. 
+Dependencies flow downward: `model ← runner ← core ← api`.
+No circular dependencies.
 The top row is entirely optional - use only what your agent needs.
 
 ## Crates
@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         router,
         StateConfig::default(),
     )
-    .await?;
+        .await?;
 
     // 3. Submit a task
     let kind = TaskKind::Subprocess(SubprocessSpec {
