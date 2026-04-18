@@ -2,8 +2,6 @@
 //!
 //! [`TaskEnv`] is an ordered list of key-value pairs attached to a single task spec.
 
-use super::macros::env_newtype;
-
 env_newtype! {
     /// Environment variables passed to a task at submission time.
     ///

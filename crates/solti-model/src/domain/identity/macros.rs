@@ -115,5 +115,3 @@ macro_rules! arc_str_newtype {
         }
     };
 }
-
-pub(super) use arc_str_newtype;

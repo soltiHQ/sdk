@@ -81,5 +81,3 @@ macro_rules! env_newtype {
         }
     };
 }
-
-pub(super) use env_newtype;

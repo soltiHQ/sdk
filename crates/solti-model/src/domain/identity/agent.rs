@@ -2,7 +2,6 @@
 //!
 //! [`AgentId`] identifies an agent instance in multi-agent deployments.
 
-use super::macros::arc_str_newtype;
 use super::validate_identity;
 use crate::error::ModelError;
 

@@ -2,8 +2,6 @@
 //!
 //! [`RunnerEnv`] provides base environment variables shared across all tasks on a runner.
 
-use super::macros::env_newtype;
-
 env_newtype! {
     /// Environment variables injected by the runner.
     ///

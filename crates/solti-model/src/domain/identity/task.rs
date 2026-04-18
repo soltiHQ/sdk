@@ -2,7 +2,6 @@
 //!
 //! [`TaskId`] is a unique identifier for a task resource (newtype over `Arc<str>`).
 
-use super::macros::arc_str_newtype;
 use super::validate_identity;
 use crate::error::ModelError;
 

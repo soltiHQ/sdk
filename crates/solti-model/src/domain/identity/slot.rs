@@ -2,7 +2,6 @@
 //!
 //! [`Slot`] is the logical execution lane name (newtype over `Arc<str>`).
 
-use super::macros::arc_str_newtype;
 use super::validate_identity;
 use crate::error::ModelError;
 
