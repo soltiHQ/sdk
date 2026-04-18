@@ -21,27 +21,29 @@ Defined in `proto/v1/sync.proto` (package `solti.discover.v1`).
 
 ### SyncRequest fields
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | string | Unique agent identifier |
-| `name` | string | Agent name |
-| `endpoint` | string | Where control plane can reach this agent |
-| `platform` | string | OS name (`linux`, `macos`, `windows`) |
-| `arch` | string | CPU architecture (`x86_64`, `aarch64`) |
-| `os` | string | OS distribution info (Linux `PRETTY_NAME`) |
-| `metadata` | map<string,string> | User-provided key-value pairs |
-| `ts` | int64 | Unix timestamp (seconds) |
-| `uptime_seconds` | int64 | Agent process uptime |
-| `endpoint_type` | EndpointType | `GRPC = 0`, `HTTP = 1` |
-| `api_version` | APIVersion | `V1 = 1` |
-| `heartbeat_interval_s` | int32 | Agent-reported sync interval |
-| `capabilities` | repeated string | Reserved, sent empty in v1 |
+| Field                  | Type               | Description                                |
+|------------------------|--------------------|--------------------------------------------|
+| `id`                   | string             | Unique agent identifier                    |
+| `name`                 | string             | Agent name                                 |
+| `endpoint`             | string             | Where control plane can reach this agent   |
+| `platform`             | string             | OS name (`linux`, `macos`, `windows`)      |
+| `arch`                 | string             | CPU architecture (`x86_64`, `aarch64`)     |
+| `os`                   | string             | OS distribution info (Linux `PRETTY_NAME`) |
+| `metadata`             | map<string,string> | User-provided key-value pairs              |
+| `ts`                   | int64              | Unix timestamp (seconds)                   |
+| `uptime_seconds`       | int64              | Agent process uptime                       |
+| `endpoint_type`        | EndpointType       | `UNSPECIFIED = 0`, `GRPC = 1`, `HTTP = 2`  |
+| `api_version`          | int32              | Agent API protocol version (`1` = v1)      |
+| `heartbeat_interval_s` | int32              | Agent-reported sync interval (min 1)       |
+| `capabilities`         | repeated string    | Agent-declared features (see proto)        |
 
 ### SyncResponse fields
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `success` | bool | Control plane ack |
+| Field           | Type   | Description                                             |
+|-----------------|--------|---------------------------------------------------------|
+| `success`       | bool   | Control plane ack                                       |
+| `reason`        | string | Human-readable reason when `success = false` (optional) |
+| `retry_after_s` | int32  | Server-suggested backoff (seconds); `0` = unspecified   |
 
 ## Transport details
 

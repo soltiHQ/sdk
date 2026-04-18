@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::Runtime;
 use crate::error::{ModelError, ModelResult};
 
+/// Maximum script body size (after base64 decode) accepted by the model.
+pub const MAX_SCRIPT_BODY_BYTES: usize = 2 * 1024 * 1024;
+
 /// Execution strategy for a subprocess task.
 ///
 /// | Variant   | What it does                                                               |
@@ -83,6 +86,16 @@ impl SubprocessMode {
                 let bytes = BASE64
                     .decode(body)
                     .map_err(|e| ModelError::Invalid(format!("invalid base64 body: {e}").into()))?;
+                if bytes.len() > MAX_SCRIPT_BODY_BYTES {
+                    return Err(ModelError::Invalid(
+                        format!(
+                            "script body is {} bytes (decoded), maximum allowed is {} bytes",
+                            bytes.len(),
+                            MAX_SCRIPT_BODY_BYTES
+                        )
+                        .into(),
+                    ));
+                }
                 std::str::from_utf8(&bytes).map_err(|e| {
                     ModelError::Invalid(format!("script body is not valid UTF-8: {e}").into())
                 })?;
@@ -249,6 +262,36 @@ mod tests {
             args: vec![],
         };
         assert!(mode.decode_body().is_err());
+    }
+
+    #[test]
+    fn script_body_within_limit_is_accepted() {
+        let payload = "a".repeat(MAX_SCRIPT_BODY_BYTES);
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Bash,
+            body: BASE64.encode(payload.as_bytes()),
+            args: vec![],
+        };
+        mode.validate()
+            .expect("body at exactly the limit must pass");
+    }
+
+    #[test]
+    fn script_body_over_limit_is_rejected() {
+        let payload = "a".repeat(MAX_SCRIPT_BODY_BYTES + 1);
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Bash,
+            body: BASE64.encode(payload.as_bytes()),
+            args: vec![],
+        };
+        let err = mode
+            .validate()
+            .expect_err("over-limit body must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&MAX_SCRIPT_BODY_BYTES.to_string()),
+            "error should mention the limit, got: {msg}"
+        );
     }
 
     #[test]

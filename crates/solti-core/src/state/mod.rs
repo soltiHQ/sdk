@@ -110,8 +110,7 @@ impl TaskState {
         let mut inner = self.inner.write();
 
         let attempt = if let Some(task) = inner.tasks.get_mut(id) {
-            task.increment_attempt();
-            task.update_phase(TaskPhase::Running, None, None);
+            task.transition_starting();
             task.status.attempt
         } else {
             return None;
@@ -134,8 +133,13 @@ impl TaskState {
         let mut inner = self.inner.write();
 
         let found = if let Some(task) = inner.tasks.get_mut(id) {
-            task.update_phase(phase, error.clone(), exit_code);
-            true
+            match task.transition_finished(phase, error.clone(), exit_code) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(task = %id, error = %e, "ignoring illegal transition");
+                    return false;
+                }
+            }
         } else {
             false
         };

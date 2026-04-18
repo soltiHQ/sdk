@@ -1,7 +1,6 @@
-//! # Task management API.
+//! # solti-api - task management API.
 //!
-//! Dual-transport API layer exposing task operations over gRPC and HTTP.
-//! Both transports delegate to an [`ApiHandler`] trait implementation.
+//! Dual-transport API layer exposing task operations over gRPC and HTTP. Both transports share the same wire types generated from `proto/solti/v1/*.proto` and delegate to an [`ApiHandler`] implementation.
 //!
 //! | feature | transport         | module                              |
 //! |---------|-------------------|-------------------------------------|
@@ -12,10 +11,8 @@
 //!
 //! ```text
 //! let adapter = SupervisorApiAdapter::new(supervisor);
-//! // gRPC
-//! let svc = SoltiApiServer::new(SoltiApiService::new(Arc::new(adapter)));
-//! // HTTP
-//! let router = HttpApi::new(Arc::new(adapter)).router();
+//! let svc     = SoltiApiServer::new(SoltiApiService::new(Arc::new(adapter)));
+//! let router  = HttpApi::new(Arc::new(adapter)).router();
 //! ```
 //!
 //! ## Also
@@ -30,6 +27,9 @@
 /// Sent to control-plane via `solti_discover::DiscoverConfig`.
 pub const API_VERSION: u32 = 1;
 
+/// Maximum accepted request body / message size for both HTTP and gRPC transports. **4 MiB.**
+pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
 mod error;
 pub use error::ApiError;
 
@@ -39,19 +39,26 @@ pub use handler::ApiHandler;
 mod adapter;
 pub use adapter::SupervisorApiAdapter;
 
-#[cfg(feature = "grpc")]
-mod proto_api {
-    tonic::include_proto!("solti.v1");
+#[cfg(any(feature = "grpc", feature = "http"))]
+#[cfg_attr(not(feature = "grpc"), allow(dead_code))]
+pub(crate) mod proto_api {
+    include!(concat!(env!("OUT_DIR"), "/solti.v1.rs"));
+
+    #[cfg(feature = "http")]
+    include!(concat!(env!("OUT_DIR"), "/solti.v1.serde.rs"));
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(any(feature = "grpc", feature = "http"))]
 mod convert;
+
+#[cfg(any(feature = "grpc", feature = "http"))]
+mod validate;
 
 #[cfg(feature = "grpc")]
 mod grpc;
 
 #[cfg(feature = "grpc")]
-pub use grpc::SoltiApiService;
+pub use grpc::{SoltiApiService, build_grpc_server};
 
 #[cfg(feature = "grpc")]
 pub use proto_api::solti_api_server::SoltiApiServer;

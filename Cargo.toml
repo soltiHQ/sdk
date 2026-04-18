@@ -9,12 +9,20 @@ members = [
     "crates/solti-exec",
     "crates/solti-api",
 
-    "examples/agentd",
+    "examples/agentd-http",
+    "examples/agentd-grpc",
 ]
 resolver = "2"
 
 [workspace.package]
+version = "0.0.1"
 edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/soltiHQ/sdk"
+homepage = "https://github.com/soltiHQ/sdk"
+keywords = ["async", "tasks", "supervisor", "orchestration", "solti"]
+categories = ["asynchronous", "concurrency"]
 
 [workspace.dependencies]
 tracing-subscriber = { version = "0.3" }
@@ -35,11 +43,17 @@ anyhow  = "1"
 libc = "0.2.177"
 base64 = "0.22"
 axum = "0.8.7"
+tower-http = "0.6"
 hostname = "0.4.2"
 uuid = "1.19.0"
 parking_lot = "0.12"
+tempfile = "3.14"
 
-tonic = "0.12"
-tonic-build = "0.12"
-prost = "0.13"
-prost-types = "0.13"
+tonic-prost-build = "0.14.5"
+prost-types = "0.14.3"
+tonic-prost = "0.14.5"
+tonic = "0.14.5"
+prost = "0.14.3"
+
+pbjson-build = "0.9.0"
+pbjson = "0.9.0"

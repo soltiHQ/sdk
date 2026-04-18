@@ -10,10 +10,10 @@ Defines core resource types: `Task`, `TaskSpec`, `TaskStatus`, `ObjectMeta`, and
  │                                                          │
  │  ObjectMeta            TaskSpec            TaskStatus    │
  │  ├─ id: TaskId         ├─ slot: Slot       ├─ phase      │
- │  ├─ generation         ├─ kind: TaskKind   ├─ attempt    │
- │  ├─ resource_version   ├─ timeout          ├─ exit_code  │
- │  ├─ created_at         ├─ restart          └─ error      │
- │  └─ updated_at         ├─ backoff                        │
+ │  ├─ resource_version   ├─ kind: TaskKind   ├─ attempt    │
+ │  ├─ created_at         ├─ timeout          ├─ exit_code  │
+ │  └─ updated_at         ├─ restart          └─ error      │
+ │                        ├─ backoff                        │
  │                        ├─ admission                      │
  │                        ├─ runner_selector                │
  │                        └─ labels                         │
@@ -24,7 +24,7 @@ Defines core resource types: `Task`, `TaskSpec`, `TaskStatus`, `ObjectMeta`, and
 
 | Section      | Type         | Responsibility                                                |
 |--------------|--------------|---------------------------------------------------------------|
-| **metadata** | `ObjectMeta` | Identity, versioning (`generation` + `resource_version`)      |
+| **metadata** | `ObjectMeta` | Identity, `resource_version`, timestamps                      |
 | **spec**     | `TaskSpec`   | Desired state (private fields; build via `TaskSpec::builder`) |
 | **status**   | `TaskStatus` | Observed state: phase, attempt count, exit code, error        |
 
@@ -51,6 +51,10 @@ Terminal phases: `Succeeded`, `Failed`, `Timeout`, `Canceled`, `Exhausted`.
 
 `Embedded` tasks are submitted directly via `SupervisorApi::submit_with_task`.
 Routable variants go through `RunnerRouter::pick()`.
+
+`Subprocess` has two execution strategies (see `SubprocessMode`):
+- **Command**: `execve(command, args)` directly.
+- **Script**: interpreter + script body. The body is **base64-encoded, UTF-8**, capped at `MAX_SCRIPT_BODY_BYTES` (2 MiB after decode). Interpreters: `Bash`, `Python`, `Node`, `Custom { command, flag }`.
 
 ## Policies
 
@@ -104,14 +108,27 @@ Operators: `In`, `NotIn`, `Exists`, `DoesNotExist`.
 | `TaskQuery`        | Builder for filtered, paginated task listing              |
 | `TaskPage`         | Paginated query result                                    |
 
+## Size limits
+
+Exposed as `pub const` so downstream layers (API, CP, UI) share one source of truth.
+
+| Constant                | Value   | Enforced by                         |
+|-------------------------|---------|-------------------------------------|
+| `MAX_SCRIPT_BODY_BYTES` | 2 MiB   | `SubprocessMode::Script::validate`  |
+| `SLOT_MAX_LEN`          | 64      | `Slot::validate_format`             |
+| `TASK_ID_MAX_LEN`       | 256     | `TaskId::validate_format`           |
+| `AGENT_ID_MAX_LEN`      | 128     | `AgentId::validate_format`          |
+
+## Identity rules
+
+`Slot`, `TaskId`, `AgentId` allow `[A-Za-z0-9._-]` only, reject `.` and `..`.
+No whitespace, no path separators, no non-ASCII: these values reach cgroup paths, tempfile names, `execve` argv, and log fields, where anything else misbehaves. 
+Validation runs at `TaskSpec::validate` / submit time.
+
 ## Versioning
 
-`ObjectMeta` tracks two counters inspired by K8s:
-
-| Counter            | Bumped on            | Purpose                           |
-|--------------------|----------------------|-----------------------------------|
-| `generation`       | spec mutations       | User-driven change detection      |
-| `resource_version` | any change           | Optimistic concurrency control    |
+`ObjectMeta.resource_version` is a monotonic counter bumped on every change
+(spec or status) for optimistic concurrency control.
 
 ## Construction
 ```text
@@ -127,19 +144,22 @@ spec.validate()?;  // submit-boundary validation (rejects Embedded)
 ```text
  Variant             When
  ───────             ────
- Conflict            resource_version mismatch (optimistic concurrency)
  UnknownAdmission    unknown admission policy string
  UnknownRestart      unknown restart policy string
  UnknownJitter       unknown jitter policy string
  UnknownTaskKind     unknown task kind string
+ UnknownTaskPhase    unknown task phase string
  Invalid             structural validation failure (empty slot, bad backoff, etc.)
 ```
 
 ## Notes
-- `TaskSpec` fields are private use `TaskSpec::builder()` for construction and `serde` for deserialization.
+- `TaskSpec` fields are private — use `TaskSpec::builder()` for construction and `serde` for deserialization.
 - Deserialization goes through `#[serde(try_from = "TaskSpecRaw")]` which validates on parse.
-- Identity newtypes (`Slot`, `TaskId`, `AgentId`) wrap `Arc<str>` for cheap cloning and comparison.
+- `BackoffPolicy` is **also** validated on deserialize via its own `try_from` raw; zero `first_ms`, inverted `max_ms`, or non-finite/`<1.0` `factor` are rejected at parse time.
+- Identity newtypes (`Slot`, `TaskId`, `AgentId`) wrap `Arc<str>` via `arc_str_newtype!`; environment newtypes (`TaskEnv`, `RunnerEnv`) wrap `Vec<KeyValue>` via `env_newtype!`. Both macros keep parallel types in lockstep.
 - `BackoffPolicy` implements `Eq`/`Hash` via `f64::to_bits()` for the `factor` field.
 - `TaskPhase`, `RestartPolicy`, `AdmissionPolicy`, `JitterPolicy` all implement `FromStr` for CLI/config parsing.
 - `Labels` is backed by `BTreeMap<String, String>` for deterministic iteration order.
-- All types derive `Serialize`/`Deserialize` with `camelCase` field renaming.
+- Most types derive `Serialize`/`Deserialize` with `camelCase` field renaming. The one exception is `SelectorOperator`, which serializes as PascalCase (`In`, `NotIn`, `Exists`, `DoesNotExist`) to match the Kubernetes `LabelSelectorOperator` convention.
+- `TaskKind`, `TaskPhase`, `RestartPolicy`, `AdmissionPolicy`, `JitterPolicy`, `SelectorOperator` are `#[non_exhaustive]` — adding new variants is a non-breaking change.
+- Pagination constants for list endpoints: `DEFAULT_LIMIT = 100`, `MAX_LIMIT = 1000` (re-exported as `pub const` so downstream API layers share one source of truth).

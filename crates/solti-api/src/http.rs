@@ -1,6 +1,6 @@
 //! # HTTP/JSON transport.
 //!
-//! [`HttpApi`] builds an axum `Router` with JSON endpoints matching the gRPC API surface.
+//! Axum router exposing [`ApiHandler`] operations as REST-shaped JSON endpoints.
 //!
 //! | Method | Endpoint                    | Handler             |
 //! |--------|-----------------------------|---------------------|
@@ -8,22 +8,81 @@
 //! | GET    | `/api/v1/tasks`             | list (query params) |
 //! | GET    | `/api/v1/tasks/{id}`        | get status          |
 //! | GET    | `/api/v1/tasks/{id}/runs`   | list runs           |
-//! | POST   | `/api/v1/tasks/{id}/cancel` | cancel              |
-//! | DELETE | `/api/v1/tasks/{id}`        | delete              |
+//! | DELETE | `/api/v1/tasks/{id}`        | delete (stop+purge) |
 
 use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    response::IntoResponse,
+    extract::{FromRequest, Path, Query, Request, State, rejection::JsonRejection},
+    http::StatusCode,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use serde::{Deserialize, Serialize};
-use solti_model::{Task, TaskId, TaskPhase, TaskQuery, TaskRun, TaskSpec};
+use serde::{Deserialize, de::DeserializeOwned};
+use solti_model::{TaskId, TaskPhase, TaskQuery};
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::debug;
 
-use crate::{error::ApiError, handler::ApiHandler};
+use crate::{
+    MAX_REQUEST_BYTES,
+    convert::{self, clamp_list_limit, tasks_page_to_proto},
+    error::ApiError,
+    handler::ApiHandler,
+    proto_api,
+    validate::non_empty_id,
+};
+
+/// Wrapper around `axum::Json<T>` that maps `JsonRejection` into our [`ApiError::InvalidRequest`] → canonical `{error, message}` envelope.
+pub(crate) struct ApiJson<T>(pub T);
+
+impl<T, S> FromRequest<S> for ApiJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let Json(value) = axum::Json::<T>::from_request(req, state)
+            .await
+            .map_err(map_json_rejection)?;
+        Ok(ApiJson(value))
+    }
+}
+
+fn map_json_rejection(rej: JsonRejection) -> ApiError {
+    if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::PayloadTooLarge(format!(
+            "request body exceeds the maximum of {} bytes",
+            MAX_REQUEST_BYTES
+        ));
+    }
+
+    let msg = rej.body_text();
+    let trimmed = msg
+        .strip_prefix("Failed to deserialize the JSON body into the target type: ")
+        .or_else(|| msg.strip_prefix("Failed to parse the request body as JSON: "))
+        .unwrap_or(&msg)
+        .to_string();
+    ApiError::InvalidRequest(trimmed)
+}
+
+async fn map_413_envelope(req: Request, next: Next) -> Response {
+    let resp = next.run(req).await;
+    if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        let body = serde_json::json!({
+            "error": "PayloadTooLarge",
+            "message": format!(
+                "request body exceeds the maximum of {} bytes",
+                MAX_REQUEST_BYTES
+            ),
+        });
+        return (StatusCode::PAYLOAD_TOO_LARGE, Json(body)).into_response();
+    }
+    resp
+}
 
 /// HTTP API service builder.
 ///
@@ -46,13 +105,7 @@ where
 
     /// Build axum router with mounted endpoints.
     ///
-    /// Routes:
-    /// - `POST   /api/v1/tasks`             - Submit task
-    /// - `GET    /api/v1/tasks`             - Query tasks (filters + pagination)
-    /// - `GET    /api/v1/tasks/{id}`        - Get task status
-    /// - `GET    /api/v1/tasks/{id}/runs`   - List task execution history
-    /// - `POST   /api/v1/tasks/{id}/cancel` - Cancel a running task
-    /// - `DELETE /api/v1/tasks/{id}`        - Delete task and its runs
+    /// Applies a [`RequestBodyLimitLayer`] capped at [`MAX_REQUEST_BYTES`] bytes to every request.
     pub fn router(self) -> Router {
         Router::new()
             .route("/api/v1/tasks", post(submit_task::<H>))
@@ -60,81 +113,41 @@ where
             .route("/api/v1/tasks/{id}", get(get_task_status::<H>))
             .route("/api/v1/tasks/{id}", delete(delete_task::<H>))
             .route("/api/v1/tasks/{id}/runs", get(list_task_runs::<H>))
-            .route("/api/v1/tasks/{id}/cancel", post(cancel_task::<H>))
+            .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
+            .layer(middleware::from_fn(map_413_envelope))
             .with_state(self.handler)
     }
 }
 
-// ============================================================================
-// Request/Response types
-// ============================================================================
-
-#[derive(Debug, Serialize, Deserialize)]
-struct SubmitTaskRequest {
-    spec: TaskSpec,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct SubmitTaskResponse {
-    task_id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct GetTaskStatusResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    task: Option<Task>,
-}
-
 #[derive(Debug, Deserialize)]
 struct ListTasksParams {
-    /// Filter by slot name
     slot: Option<String>,
-    /// Filter by task status
     status: Option<String>,
-    /// Max items per page (default 100, max 1000)
-    limit: Option<usize>,
-    /// Offset for pagination (default 0)
-    offset: Option<usize>,
+    limit: Option<u32>,
+    offset: Option<u32>,
 }
 
-#[derive(Debug, Serialize)]
-struct ListTasksResponse {
-    tasks: Vec<Task>,
-    total: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct ListTaskRunsResponse {
-    runs: Vec<TaskRun>,
-}
-
-// ============================================================================
-// Handlers
-// ============================================================================
-
-/// POST /api/v1/tasks
 async fn submit_task<H>(
     State(handler): State<Arc<H>>,
-    Json(req): Json<SubmitTaskRequest>,
+    ApiJson(req): ApiJson<proto_api::SubmitTaskRequest>,
 ) -> Result<impl IntoResponse, ApiError>
 where
     H: ApiHandler,
 {
-    req.spec
-        .validate()
-        .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
+    let spec = req
+        .spec
+        .ok_or_else(|| ApiError::InvalidRequest("missing spec".into()))?;
+    let spec = convert::convert_create_spec(spec)?;
 
-    debug!(slot = %req.spec.slot(), kind = ?req.spec.kind(), "submitting task");
-    let task_id = handler.submit_task(req.spec).await?;
+    debug!(slot = %spec.slot(), kind = ?spec.kind(), "submitting task");
+    let task_id = handler.submit_task(spec).await?;
 
-    let response = SubmitTaskResponse {
+    let response = proto_api::SubmitTaskResponse {
         task_id: task_id.to_string(),
     };
-
-    Ok((axum::http::StatusCode::CREATED, Json(response)))
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
-/// GET /api/v1/tasks/:id
 async fn get_task_status<H>(
     State(handler): State<Arc<H>>,
     Path(id): Path<String>,
@@ -142,24 +155,16 @@ async fn get_task_status<H>(
 where
     H: ApiHandler,
 {
-    if id.trim().is_empty() {
-        return Err(ApiError::InvalidRequest("task_id cannot be empty".into()));
-    }
+    non_empty_id("task_id", &id)?;
 
     let task_id = TaskId::from(id);
     debug!(%task_id, "getting task status");
     let task = handler.get_task_status(&task_id).await?;
 
-    Ok(Json(GetTaskStatusResponse { task }))
+    let task = task.map(proto_api::TaskData::try_from).transpose()?;
+    Ok(Json(proto_api::GetTaskStatusResponse { task }))
 }
 
-/// GET /api/v1/tasks
-///
-/// Query params (all optional, combinable):
-/// - ?slot=name    - filter by slot
-/// - ?status=running - filter by status
-/// - ?limit=50     - max items per page (default 100, max 1000)
-/// - ?offset=0     - pagination offset (default 0)
 async fn list_tasks<H>(
     State(handler): State<Arc<H>>,
     Query(params): Query<ListTasksParams>,
@@ -170,53 +175,30 @@ where
     let mut query = TaskQuery::new();
 
     if let Some(slot) = params.slot {
-        if slot.trim().is_empty() {
-            return Err(ApiError::InvalidRequest("slot cannot be empty".into()));
-        }
+        non_empty_id("slot", &slot)?;
         query = query.with_slot(slot);
     }
 
     if let Some(status_str) = params.status {
-        let status = parse_status(&status_str)?;
+        let status = status_str.parse::<TaskPhase>().map_err(|_| {
+            ApiError::InvalidRequest(format!(
+                "invalid status: '{status_str}' (valid: pending, running, succeeded, failed, timeout, canceled, exhausted)"
+            ))
+        })?;
         query = query.with_status(status);
     }
 
-    if let Some(limit) = params.limit {
-        query = query.with_limit(limit);
-    }
-
+    query = query.with_limit(clamp_list_limit(params.limit.unwrap_or(0)));
     if let Some(offset) = params.offset {
-        query = query.with_offset(offset);
+        query = query.with_offset(offset as usize);
     }
 
     let page = handler.query_tasks(query).await?;
     debug!(count = page.items.len(), total = page.total, "tasks listed");
 
-    let response = ListTasksResponse {
-        tasks: page.items,
-        total: page.total,
-    };
-    Ok(Json(response))
+    Ok(Json(tasks_page_to_proto(page)?))
 }
 
-/// Parse TaskPhase from string.
-fn parse_status(s: &str) -> Result<TaskPhase, ApiError> {
-    match s.to_lowercase().as_str() {
-        "pending" => Ok(TaskPhase::Pending),
-        "running" => Ok(TaskPhase::Running),
-        "succeeded" => Ok(TaskPhase::Succeeded),
-        "failed" => Ok(TaskPhase::Failed),
-        "timeout" => Ok(TaskPhase::Timeout),
-        "canceled" => Ok(TaskPhase::Canceled),
-        "exhausted" => Ok(TaskPhase::Exhausted),
-        _ => Err(ApiError::InvalidRequest(format!(
-            "invalid status: '{}' (valid: pending, running, succeeded, failed, timeout, canceled, exhausted)",
-            s
-        ))),
-    }
-}
-
-/// GET /api/v1/tasks/:id/runs
 async fn list_task_runs<H>(
     State(handler): State<Arc<H>>,
     Path(id): Path<String>,
@@ -224,18 +206,16 @@ async fn list_task_runs<H>(
 where
     H: ApiHandler,
 {
-    if id.trim().is_empty() {
-        return Err(ApiError::InvalidRequest("task_id cannot be empty".into()));
-    }
+    non_empty_id("task_id", &id)?;
 
     let task_id = TaskId::from(id);
     debug!(%task_id, "listing task runs");
     let runs = handler.list_task_runs(&task_id).await?;
+    let runs = runs.into_iter().map(proto_api::TaskRunInfo::from).collect();
 
-    Ok(Json(ListTaskRunsResponse { runs }))
+    Ok(Json(proto_api::ListTaskRunsResponse { runs }))
 }
 
-/// DELETE /api/v1/tasks/:id
 async fn delete_task<H>(
     State(handler): State<Arc<H>>,
     Path(id): Path<String>,
@@ -243,32 +223,11 @@ async fn delete_task<H>(
 where
     H: ApiHandler,
 {
-    if id.trim().is_empty() {
-        return Err(ApiError::InvalidRequest("task_id cannot be empty".into()));
-    }
+    non_empty_id("task_id", &id)?;
 
     let task_id = TaskId::from(id);
     handler.delete_task(&task_id).await?;
     debug!(%task_id, "task deleted");
 
-    Ok(axum::http::StatusCode::NO_CONTENT)
-}
-
-/// POST /api/v1/tasks/:id/cancel
-async fn cancel_task<H>(
-    State(handler): State<Arc<H>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, ApiError>
-where
-    H: ApiHandler,
-{
-    if id.trim().is_empty() {
-        return Err(ApiError::InvalidRequest("task_id cannot be empty".into()));
-    }
-
-    let task_id = TaskId::from(id);
-    handler.cancel_task(&task_id).await?;
-    debug!(%task_id, "task canceled");
-
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT)
 }

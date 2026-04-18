@@ -13,7 +13,8 @@ Currently, ships a single backend - `SubprocessRunner` with optional Linux sandb
  SubprocessRunner
      │
      ├──► build_task_config(spec, ctx)
-     │     ├──► resolve SubprocessMode → (command, args)
+     │     ├──► resolve SubprocessMode → (command, args [, script_tempfile])
+     │     │        (Script mode: body → NamedTempFile 0600 → path as argv[0])
      │     ├──► merge_env(task_env, runner_env)
      │     └──► SubprocessTaskConfig { run_id, command, args, env, cwd }
      │
@@ -21,8 +22,9 @@ Currently, ships a single backend - `SubprocessRunner` with optional Linux sandb
      │
      └──► run_subprocess(ctx, cancel)
            ├──► build Command + apply pre_exec hooks
+           │     (process_group(0), kill_on_drop(true))
            ├──► spawn + pipe stdout/stderr
-           ├──► select! { child.wait(), cancel }
+           ├──► select! biased { child.wait(), cancel → killpg }
            ├──► record metrics
            └──► cleanup cgroup (if any)
 ```
@@ -30,13 +32,18 @@ Currently, ships a single backend - `SubprocessRunner` with optional Linux sandb
 ## Subprocess lifecycle
 ```text
  build_task ──► prepare_backend ──► spawn ──► log_stream (stdout/stderr)
+                                   (pgid,
+                                    kill_on_drop)
                                       │
                                       ├──► child.wait() → evaluate exit
-                                      └──► cancel.cancelled() → kill
+                                      └──► cancel.cancelled() → killpg -SIGKILL
+                                                             → wait() to reap
                                       │
                                       ▼
                                   metrics + cleanup
 ```
+
+`biased` select prefers `child.wait()` over `cancel.cancelled()` — a process that has already exited cleanly is never misreported as cancelled, even if the cancel token fired in the same microsecond.
 
 ## Key types
 
@@ -115,8 +122,10 @@ Duplicate names are rejected via `router.contains_label()` → `ExecError::Dupli
 
 ## Notes
 - `SubprocessRunner` implements `Runner` trait from `solti-runner`.
-- Mode resolution: `Command` → direct exec; `Script` → decode base64 body → `runtime.resolve()` → exec.
-- Environment merge: runner env overrides task env (last-writer-wins via `BTreeMap`).
+- Mode resolution: `Command` → direct exec; `Script` → decode base64 body → write to a `NamedTempFile` (mode 0600) → exec interpreter with the path. The tempfile is kept alive for the task's lifetime via `Arc` and unlinked on drop.
+- Script body is capped at `solti_model::MAX_SCRIPT_BODY_BYTES` (2 MiB, decoded) by the model; the tempfile transport avoids Linux's per-arg `MAX_ARG_STRLEN` (128 KiB) limit that `-c <inline>` would hit.
+- Cancel uses **process-group kill** on Unix: `Command::process_group(0)` sets pgid = child pid, then cancel sends `SIGKILL` to `-pgid` so forked helpers (`sleep 1000 &`) die together with the parent. `kill_on_drop(true)` covers the drop-without-wait path.
+- Environment merge: runner env overrides task env (last-writer-wins via `BTreeMap`). Parent env is currently inherited — no automatic `env_clear()`.
 - Cgroup lifecycle is two-phase: `prepare` (mkdir + write limits in parent) → `attach` (join PID in child via pre_exec).
 - Cgroup names are auto-generated: `{runner}-{slot}-{seq:x}-{timestamp:x}`.
 - Line truncation uses `Cow::Borrowed` for the common case (zero-alloc hot path).

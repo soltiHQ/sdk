@@ -12,10 +12,10 @@
 //!  │                                                          │
 //!  │  ObjectMeta            TaskSpec            TaskStatus    │
 //!  │  ├─ id: TaskId         ├─ slot: Slot       ├─ phase      │
-//!  │  ├─ generation         ├─ kind: TaskKind   ├─ attempt    │
-//!  │  ├─ resource_version   ├─ timeout          ├─ exit_code  │
-//!  │  ├─ created_at         ├─ restart          └─ error      │
-//!  │  └─ updated_at         ├─ backoff                        │
+//!  │  ├─ resource_version   ├─ kind: TaskKind   ├─ attempt    │
+//!  │  ├─ created_at         ├─ timeout          ├─ exit_code  │
+//!  │  └─ updated_at         ├─ restart          └─ error      │
+//!  │                        ├─ backoff                        │
 //!  │                        ├─ admission                      │
 //!  │                        ├─ runner_selector                │
 //!  │                        └─ labels                         │
@@ -35,9 +35,8 @@
 //!
 //! ## Versioning
 //!
-//! [`ObjectMeta`] tracks two counters inspired by K8s:
-//! - **`generation`** bumped on spec mutations (user-driven changes)
-//! - **`resource_version`** bumped on any change (spec or status)
+//! [`ObjectMeta::resource_version`] is a monotonic counter bumped on every change
+//! (spec or status) for optimistic concurrency.
 //!
 //! ## Task lifecycle
 //!
@@ -147,14 +146,15 @@
 //! let task = Task::new("task-001".into(), spec);
 //! assert_eq!(task.slot(), "my-worker");
 //! assert_eq!(*task.phase(), TaskPhase::Pending);
-//! assert_eq!(task.metadata.generation, 1);
+//! assert_eq!(task.metadata.resource_version, 1);
 //! ```
 
 mod domain;
 pub use domain::{
-    AdmissionPolicy, AgentId, BackoffPolicy, ContainerSpec, Flag, JitterPolicy, KeyValue, Labels,
-    LabelsIter, RestartPolicy, RunnerEnv, RunnerSelector, Runtime, SelectorOperator,
-    SelectorRequirement, Slot, SubprocessMode, SubprocessSpec, TaskEnv, TaskId, TaskKind, TaskPage,
+    AGENT_ID_MAX_LEN, AdmissionPolicy, AgentId, BackoffPolicy, ContainerSpec, DEFAULT_LIMIT, Flag,
+    JitterPolicy, KeyValue, Labels, LabelsIter, MAX_LIMIT, MAX_SCRIPT_BODY_BYTES, RestartPolicy,
+    RunnerEnv, RunnerSelector, Runtime, SLOT_MAX_LEN, SelectorOperator, SelectorRequirement, Slot,
+    SubprocessMode, SubprocessSpec, TASK_ID_MAX_LEN, TaskEnv, TaskId, TaskKind, TaskPage,
     TaskPhase, TaskQuery, Timeout, WasmSpec, merge_env,
 };
 

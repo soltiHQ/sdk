@@ -6,10 +6,10 @@
 //!  │                                                         │
 //!  │  ObjectMeta            TaskSpec          TaskStatus     │
 //!  │  ├─ id: TaskId         ├─ slot            ├─ phase      │
-//!  │  ├─ generation         ├─ kind            ├─ attempt    │
-//!  │  ├─ resource_version   ├─ timeout         ├─ error      │
-//!  │  ├─ created_at         ├─ restart         └─ exit_code  │
-//!  │  └─ updated_at         ├─ backoff                       │
+//!  │  ├─ resource_version   ├─ kind            ├─ attempt    │
+//!  │  ├─ created_at         ├─ timeout         ├─ error      │
+//!  │  └─ updated_at         ├─ restart         └─ exit_code  │
+//!  │                        ├─ backoff                       │
 //!  │                        ├─ admission                     │
 //!  │                        ├─ runner_selector               │
 //!  │                        └─ labels                        │

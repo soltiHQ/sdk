@@ -32,24 +32,26 @@ Provides `SupervisorApi` - the main entry point for submitting, querying, and ca
 ```text
  taskvisor runtime
      │
-     ├──► TaskAdded      → (logged, task already in state via submit)
-     ├──► TaskStarting   → increment_attempt + phase=Running + start_run
-     ├──► TaskStopped    → phase=Succeeded + finish_run
-     ├──► TaskFailed     → phase=Failed + finish_run
-     ├──► TimeoutHit     → phase=Timeout + finish_run
-     ├──► ActorExhausted → phase=Exhausted + finish_run
-     └──► TaskRemoved    → remove_task (runs preserved for sweep)
+     ├──► TaskAdded      → (traced only; task is already in state from submit)
+     ├──► TaskStarting   → transition_starting: increment_attempt + phase=Running + start_run
+     ├──► TaskStopped    → transition_finished: phase=Succeeded + finish_run
+     ├──► TaskFailed     → transition_finished: phase=Failed + finish_run
+     ├──► TimeoutHit     → transition_finished: phase=Timeout + finish_run
+     ├──► ActorExhausted → transition_finished: phase=Exhausted + finish_run
+     └──► TaskRemoved    → unregister_task (tombstone: runs preserved for sweep)
 ```
 
 ## Key types
 
-| Type               | Description                                              |
-|--------------------|----------------------------------------------------------|
-| `SupervisorApi`    | High-level facade: submit, query, cancel, sweep          |
-| `TaskState`        | In-memory storage: tasks + runs (`Arc<RwLock>`)          |
-| `StateSubscriber`  | `Subscribe` impl wiring events into `TaskState`          |
-| `StateConfig`      | TTL settings for runs, tasks, and sweep interval         |
-| `CoreError`        | Error enum: Supervisor, Mapping, Runner, InvalidSpec     |
+| Type               | Visibility | Description                                              |
+|--------------------|------------|----------------------------------------------------------|
+| `SupervisorApi`    | pub        | High-level facade: submit, query, cancel, sweep          |
+| `StateConfig`      | pub        | TTL settings for runs, tasks, and sweep interval         |
+| `CoreError`        | pub        | Error enum: Supervisor, Mapping, Runner, InvalidSpec     |
+| `uptime_seconds()` | pub        | Agent uptime helper (`OnceLock<Instant>`)                |
+| `TaskState`        | internal   | In-memory storage (`Arc<RwLock>`); wired by `SupervisorApi::new` |
+| `StateSubscriber`  | internal   | `Subscribe` impl; auto-registered by `SupervisorApi::new` |
+| `state_sweep()`    | internal   | Embedded periodic sweeper task; auto-submitted by `SupervisorApi::new` |
 
 ## State storage
 ```text
@@ -105,8 +107,8 @@ Model enums are `#[non_exhaustive]` - unknown variants fall back to safe default
 
 ## Notes
 - `SupervisorApi::new` auto-registers `StateSubscriber` into the subscriber list.
-- `TaskState` is `Clone` via `Arc` - safe to share across threads.
+- `TaskState` is `Clone` via `Arc` — safe to share across threads.
 - `parking_lot::RwLock` is used instead of `std::sync::RwLock` (no poisoning, better perf).
-- `remove_task` (event-driven) preserves runs; `delete_task` (API-driven) removes both.
-- `uptime_seconds()` tracks agent lifetime via `OnceLock<Instant>`.
-- The GC task is self-hosted: it runs as an embedded `TaskKind::Embedded` task inside the same supervisor it manages.
+- `unregister_task` (event-driven on `TaskRemoved`) drops the task entry but keeps runs around until sweep runs; `delete_task` (API-driven) drops both task and runs immediately.
+- `uptime_seconds()` tracks agent lifetime via `OnceLock<Instant>`; initialized by `SupervisorApi::new`.
+- The sweep task is self-hosted: it runs as an embedded `TaskKind::Embedded` task inside the same supervisor it manages.

@@ -40,20 +40,19 @@
 //!                               │
 //!                             fork()
 //!                               │
-//!          ┌────────────────────┼────────────────────┐
-//!          │              child process              │
-//!          │                                         │
-//!          │  ┌── pre_exec hook ──────────────────┐  │
-//!          │  │  1. open /sys/fs/cgroup/{name}/   │  │
-//!          │  │         cgroup.procs              │  │
-//!          │  │  2. getpid() → format to stack buf│  │
-//!          │  │  3. write PID to fd               │  │
-//!          │  │  4. close fd                      │  │
-//!          │  └───────────────────────────────────┘  │
-//!          │                                         │
-//!          │  execve("echo", ["hello"])              │
-//!          │  (runs inside cgroup with limits)       │
-//!          └─────────────────────────────────────────┘
+//!          ┌────────────────────┼───────────────────────────────┐
+//!          │              child process                         │
+//!          │                                                    │
+//!          │  ┌── pre_exec hook ─────────────────────────────┐  │
+//!          │  │  1. open /sys/fs/cgroup/{name}/cgroup.procs  │  │
+//!          │  │  2. getpid() → format to stack buf           │  │
+//!          │  │  3. write PID to fd                          │  │
+//!          │  │  4. close fd                                 │  │
+//!          │  └──────────────────────────────────────────────┘  │
+//!          │                                                    │
+//!          │           execve("echo", ["hello"])                │
+//!          │       (runs inside cgroup with limits)             │
+//!          └────────────────────────────────────────────────────┘
 //!                               │
 //! Cleanup: process exits → kernel auto-removes empty cgroup or explicit cleanup_cgroup(name)
 //! ```

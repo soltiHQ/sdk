@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 /// | `NotIn`        | label value ∉ {values}                  |
 /// | `Exists`       | label key is present (values ignored)   |
 /// | `DoesNotExist` | label key is absent  (values ignored)   |
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SelectorOperator {

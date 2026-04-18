@@ -1,23 +1,32 @@
 [package]
 name = "solti-exec"
-version = "0.0.1"
-edition = "2024"
+description = "Solti SDK jobs execution crate."
+
+rust-version.workspace = true
+repository.workspace = true
+categories.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [features]
 default = []
-subprocess = ["dep:base64", "dep:libc", "tokio/process"]
+subprocess = ["dep:base64", "dep:libc", "dep:tempfile", "tokio/process"]
 
 [dependencies]
-tokio = { workspace = true, features = ["io-util"] }
 base64 = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
-tokio-util = { workspace = true }
-taskvisor = { workspace = true }
+tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
+tokio-util = { workspace = true }
+taskvisor = { workspace = true }
 
-solti-model = { path = "../solti-model" }
-solti-runner = { path = "../solti-runner" }
+solti-model = { path = "../solti-model", version = "0.0.1" }
+solti-runner = { path = "../solti-runner", version = "0.0.1" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

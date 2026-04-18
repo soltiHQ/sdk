@@ -27,6 +27,7 @@ use crate::error::{ModelError, ModelResult};
 /// - [`BackoffPolicy::validate`] parameter validation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(try_from = "raw::BackoffPolicyRaw")]
 pub struct BackoffPolicy {
     /// Jitter policy applied to each computed delay.
     pub jitter: super::JitterPolicy,
@@ -36,6 +37,34 @@ pub struct BackoffPolicy {
     pub max_ms: u64,
     /// Exponential growth multiplier.
     pub factor: f64,
+}
+
+mod raw {
+    use super::*;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub(super) struct BackoffPolicyRaw {
+        pub jitter: super::super::JitterPolicy,
+        pub first_ms: u64,
+        pub max_ms: u64,
+        pub factor: f64,
+    }
+
+    impl TryFrom<BackoffPolicyRaw> for BackoffPolicy {
+        type Error = ModelError;
+
+        fn try_from(r: BackoffPolicyRaw) -> Result<Self, Self::Error> {
+            let p = BackoffPolicy {
+                jitter: r.jitter,
+                first_ms: r.first_ms,
+                max_ms: r.max_ms,
+                factor: r.factor,
+            };
+            p.validate()?;
+            Ok(p)
+        }
+    }
 }
 
 impl BackoffPolicy {
@@ -94,5 +123,81 @@ impl Default for BackoffPolicy {
             max_ms: 30_000,
             factor: 2.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_accepts_defaults() {
+        assert!(BackoffPolicy::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_first_ms() {
+        let p = BackoffPolicy {
+            first_ms: 0,
+            ..BackoffPolicy::default()
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_max_smaller_than_first() {
+        let p = BackoffPolicy {
+            first_ms: 500,
+            max_ms: 100,
+            ..BackoffPolicy::default()
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_factor_below_one() {
+        let p = BackoffPolicy {
+            factor: 0.5,
+            ..BackoffPolicy::default()
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_nan_factor() {
+        let p = BackoffPolicy {
+            factor: f64::NAN,
+            ..BackoffPolicy::default()
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn serde_roundtrip_accepts_valid() {
+        let p = BackoffPolicy::default();
+        let json = serde_json::to_string(&p).unwrap();
+        let back: BackoffPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn serde_rejects_invalid_first_ms_on_deserialize() {
+        let json = r#"{"jitter":"full","firstMs":0,"maxMs":30000,"factor":2.0}"#;
+        let err = serde_json::from_str::<BackoffPolicy>(json).unwrap_err();
+        assert!(err.to_string().contains("first_ms"), "got: {err}");
+    }
+
+    #[test]
+    fn serde_rejects_inverted_max_on_deserialize() {
+        let json = r#"{"jitter":"full","firstMs":1000,"maxMs":500,"factor":2.0}"#;
+        let err = serde_json::from_str::<BackoffPolicy>(json).unwrap_err();
+        assert!(err.to_string().contains("max_ms"), "got: {err}");
+    }
+
+    #[test]
+    fn serde_rejects_factor_below_one_on_deserialize() {
+        let json = r#"{"jitter":"full","firstMs":1000,"maxMs":30000,"factor":0.5}"#;
+        let err = serde_json::from_str::<BackoffPolicy>(json).unwrap_err();
+        assert!(err.to_string().contains("factor"), "got: {err}");
     }
 }

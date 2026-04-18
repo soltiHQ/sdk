@@ -156,9 +156,7 @@ impl TaskSpec {
     /// - `backoff` parameters are sane
     /// - `runner_selector` requirements are structurally valid
     fn validate_structural(&self) -> ModelResult<()> {
-        if self.slot.as_str().is_empty() {
-            return Err(ModelError::Invalid("slot cannot be empty".into()));
-        }
+        self.slot.validate_format()?;
         if self.timeout.as_millis() == 0 {
             return Err(ModelError::Invalid(
                 "timeout must be greater than zero".into(),
@@ -221,30 +219,35 @@ impl TaskSpecBuilder {
     }
 
     /// Set restart policy.
+    #[must_use]
     pub fn restart(mut self, restart: RestartPolicy) -> Self {
         self.restart = restart;
         self
     }
 
     /// Set backoff configuration.
+    #[must_use]
     pub fn backoff(mut self, backoff: BackoffPolicy) -> Self {
         self.backoff = backoff;
         self
     }
 
     /// Set admission policy.
+    #[must_use]
     pub fn admission(mut self, admission: AdmissionPolicy) -> Self {
         self.admission = admission;
         self
     }
 
     /// Set runner selector.
+    #[must_use]
     pub fn runner_selector(mut self, sel: RunnerSelector) -> Self {
         self.runner_selector = Some(sel);
         self
     }
 
     /// Set metadata labels.
+    #[must_use]
     pub fn labels(mut self, labels: Labels) -> Self {
         self.labels = labels;
         self

@@ -4,14 +4,60 @@
 
 ## API surface
 
-| Operation   | gRPC RPC       | HTTP Endpoint                  | HTTP Method |
-|-------------|----------------|--------------------------------|-------------|
-| Submit task | `SubmitTask`   | `/api/v1/tasks`                | POST        |
-| Get task    | `GetTaskStatus`| `/api/v1/tasks/{id}`           | GET         |
-| List tasks  | `ListTasks`    | `/api/v1/tasks`                | GET         |
-| List runs   | `ListTaskRuns` | `/api/v1/tasks/{id}/runs`      | GET         |
-| Cancel task | `CancelTask`   | `/api/v1/tasks/{id}/cancel`    | POST        |
-| Delete task | `DeleteTask`   | `/api/v1/tasks/{id}`           | DELETE      |
+| Operation   | gRPC RPC        | HTTP Endpoint                  | HTTP Method |
+|-------------|-----------------|--------------------------------|-------------|
+| Submit task | `SubmitTask`    | `/api/v1/tasks`                | POST        |
+| Get task    | `GetTaskStatus` | `/api/v1/tasks/{id}`           | GET         |
+| List tasks  | `ListTasks`     | `/api/v1/tasks`                | GET         |
+| List runs   | `ListTaskRuns`  | `/api/v1/tasks/{id}/runs`      | GET         |
+| Delete task | `DeleteTask`    | `/api/v1/tasks/{id}`           | DELETE      |
+
+`DeleteTask` is the single teardown primitive: it stops the task and
+purges its run history. Idempotent — deleting an unknown task is a
+no-op, not an error.
+
+---
+
+## Size limits
+
+These caps apply to every request regardless of transport. Exceeding them
+is a hard rejection at the boundary — the supervisor is never invoked.
+
+| Limit                            | Value   | Rejected with                                               |
+|----------------------------------|---------|-------------------------------------------------------------|
+| Script body (decoded, per task)  | 2 MiB   | HTTP 400 `InvalidRequest` / gRPC `INVALID_ARGUMENT`         |
+| Request body / gRPC message size | 4 MiB   | HTTP 413 `PayloadTooLarge` / gRPC `RESOURCE_EXHAUSTED`      |
+
+### Why 2 MiB on the script body
+
+Real shell/python/ruby scripts rarely exceed 100 KiB. The 2 MiB cap gives
+generous headroom for mega-scripts with inline data while making sure
+specs stay small enough to fit in a single gRPC frame (after base64
+inflation + proto envelope).
+
+Anything larger belongs out-of-band: a container image layer, a volume
+mount, or an object-storage artifact that the script downloads at runtime.
+Do not try to stuff megabytes of data into the spec.
+
+### Why 4 MiB on the wire
+
+- Matches the **tonic** server-side and **grpc-go** client-side defaults
+  (`max_decoding_message_size`, `MaxCallRecvMsgSize`) — no hidden surprise
+  when a client forgets to set explicit options.
+- Accommodates a 2 MiB script body (`×4/3` base64 + proto/JSON overhead)
+  with ~33% headroom.
+
+### Symmetrical clients
+
+Control-plane or SDK consumer libraries calling into the agent over gRPC
+should set **their** `MaxCallRecvMsgSize` / `max_decoding_message_size`
+to 4 MiB as well. Otherwise a large `ListTasks` / `ListTaskRuns` response
+on a busy agent will fail with `ResourceExhausted` on the client.
+
+For Rust: use [`solti_api::build_grpc_server`](#) on the server side — it
+applies both limits in one call. For Go clients: set
+`grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(4 << 20),
+grpc.MaxCallSendMsgSize(4 << 20))` at dial time.
 
 ---
 
@@ -119,7 +165,6 @@ Response `200 OK`:
   "task": {
     "metadata": {
       "id": "tsk_01JR...",
-      "generation": 1,
       "resourceVersion": 2,
       "createdAt": 1712750400000,
       "updatedAt": 1712750401000
@@ -166,7 +211,7 @@ Response `200 OK`:
 {
   "tasks": [
     {
-      "metadata": { "id": "tsk_01JR...", "generation": 1, "resourceVersion": 1, "createdAt": 1712750400000, "updatedAt": 1712750400000 },
+      "metadata": { "id": "tsk_01JR...", "resourceVersion": 1, "createdAt": 1712750400000, "updatedAt": 1712750400000 },
       "spec": { "slot": "my-job", "..." : "..." },
       "status": { "phase": "running", "attempt": 1 }
     }
@@ -177,12 +222,12 @@ Response `200 OK`:
 
 Query parameters:
 
-| Parameter | Type   | Description                   |
-|-----------|--------|-------------------------------|
-| `slot`    | string | Filter by slot name           |
+| Parameter | Type   | Description                                                                     |
+|-----------|--------|---------------------------------------------------------------------------------|
+| `slot`    | string | Filter by slot name                                                             |
 | `status`  | string | `pending`, `running`, `succeeded`, `failed`, `timeout`, `canceled`, `exhausted` |
-| `limit`   | u32    | Max results (default 100, max 1000) |
-| `offset`  | u32    | Skip first N results          |
+| `limit`   | u32    | Max results (default 100, max 1000)                                             |
+| `offset`  | u32    | Skip first N results                                                            |
 
 ### List task runs
 
@@ -212,21 +257,14 @@ Response `200 OK`:
 }
 ```
 
-### Cancel a task
-
-```bash
-curl -X POST http://localhost:8080/api/v1/tasks/tsk_01JR.../cancel
-```
-
-Response `204 No Content`.
-
 ### Delete a task
 
 ```bash
 curl -X DELETE http://localhost:8080/api/v1/tasks/tsk_01JR...
 ```
 
-Response `204 No Content`.
+Response `204 No Content`. Stops the task and purges its run history.
+Safe to retry — deleting an already-gone task is a no-op.
 
 ### Error responses
 
@@ -237,11 +275,17 @@ Response `204 No Content`.
 }
 ```
 
-| HTTP Status | ApiError variant | When |
-|-------------|-----------------|------|
-| 400         | `InvalidRequest` | Validation failure (empty slot, bad spec, invalid status) |
-| 404         | `TaskNotFound` | Task ID not found |
-| 500         | `Internal` / `Core` | Supervisor or internal error |
+| HTTP Status | `error` label    | When                                                                                |
+|-------------|------------------|-------------------------------------------------------------------------------------|
+| 400         | `InvalidRequest` | Validation failure (empty slot, bad spec, invalid status), also `Core::InvalidSpec` |
+| 404         | `TaskNotFound`   | Task ID not found                                                                   |
+| 413         | `PayloadTooLarge`| Request body exceeds 4 MiB (`RequestBodyLimitLayer`) — see "Size limits"            |
+| 500         | `Internal`       | Supervisor/infra error (also `Core::{Supervisor,Mapping,Runner}`)                   |
+
+### JSON field presence
+
+- Scalar defaults (`0`, `false`, `""`), repeated fields and maps are always emitted (`emit_fields` is set in the proto-JSON codec).
+- `optional` message fields are **omitted** when absent (canonical proto3-JSON). For example, `GetTaskStatusResponse` for an unknown task is `{}`, not `{"task": null}`.
 
 ---
 
@@ -340,7 +384,6 @@ Response:
       "id": "tsk_01JR...",
       "createdAt": "1712750400000",
       "updatedAt": "1712750401000",
-      "generation": "1",
       "resourceVersion": "2"
     },
     "spec": {
@@ -407,24 +450,21 @@ Response:
 }
 ```
 
-### Cancel / Delete
+### Delete
 
 ```bash
-grpcurl -plaintext -d '{"taskId": "tsk_01JR..."}' \
-  localhost:50051 solti.v1.SoltiApi/CancelTask
-
 grpcurl -plaintext -d '{"taskId": "tsk_01JR..."}' \
   localhost:50051 solti.v1.SoltiApi/DeleteTask
 ```
 
-Both return `{}`.
+Returns `{}`. Stops the task and purges its run history. Idempotent.
 
 ### gRPC errors
 
-| gRPC Status        | ApiError variant | When                         |
-|--------------------|-----------------|------------------------------|
-| `INVALID_ARGUMENT` | `InvalidRequest` | Validation failure           |
-| `NOT_FOUND`        | `TaskNotFound`   | Task ID not found            |
+| gRPC Status        | ApiError variant    | When                         |
+|--------------------|---------------------|------------------------------|
+| `INVALID_ARGUMENT` | `InvalidRequest`    | Validation failure           |
+| `NOT_FOUND`        | `TaskNotFound`      | Task ID not found            |
 | `INTERNAL`         | `Internal` / `Core` | Supervisor or internal error |
 
 ---
@@ -439,13 +479,13 @@ Go package: `github.com/soltiHQ/control-plane/api/gen/v1`
 
 ## Wire type differences
 
-| Aspect     | HTTP (serde JSON)                        | gRPC (protobuf)                          |
-|------------|------------------------------------------|------------------------------------------|
-| Task shape | Domain `Task` (nested metadata/spec/status) | `TaskData` (proto message)            |
-| Timestamps | Unix ms as number (`1712750400000`)      | Unix ms as string (`"1712750400000"`)    |
-| Enums      | camelCase (`"succeeded"`, `"onFailure"`) | SCREAMING_SNAKE (`TASK_STATUS_SUCCEEDED`) |
-| uint64     | JSON number                              | String-encoded                           |
-| Null/absent| `null` or field omitted                  | Default value or field absent            |
-| Field names| camelCase (`firstMs`, `failOnNonZero`)   | camelCase (`firstMs`, `failOnNonZero`)   |
-| Restart    | Tagged: `{ "type": "never" }`            | Enum: `RESTART_STRATEGY_NEVER`           |
-| Admission  | String: `"dropIfRunning"`                | Enum: `ADMISSION_STRATEGY_DROP_IF_RUNNING` |
+| Aspect      | HTTP (serde JSON)                           | gRPC (protobuf)                            |
+|-------------|---------------------------------------------|--------------------------------------------|
+| Task shape  | Domain `Task` (nested metadata/spec/status) | `TaskData` (proto message)                 |
+| Timestamps  | Unix ms as number (`1712750400000`)         | Unix ms as string (`"1712750400000"`)      |
+| Enums       | camelCase (`"succeeded"`, `"onFailure"`)    | SCREAMING_SNAKE (`TASK_STATUS_SUCCEEDED`)  |
+| uint64      | JSON number                                 | String-encoded                             |
+| Null/absent | `null` or field omitted                     | Default value or field absent              |
+| Field names | camelCase (`firstMs`, `failOnNonZero`)      | camelCase (`firstMs`, `failOnNonZero`)     |
+| Restart     | Tagged: `{ "type": "never" }`               | Enum: `RESTART_STRATEGY_NEVER`             |
+| Admission   | String: `"dropIfRunning"`                   | Enum: `ADMISSION_STRATEGY_DROP_IF_RUNNING` |

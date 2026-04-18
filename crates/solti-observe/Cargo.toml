@@ -1,7 +1,15 @@
 [package]
 name = "solti-observe"
-version = "0.0.1"
-edition = "2024"
+description = "Solti SDK structured logging, timezone sync, and task-lifecycle subscriber."
+
+rust-version.workspace = true
+repository.workspace = true
+categories.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [features]
 default = []
@@ -9,18 +17,18 @@ timezone-sync = ["dep:taskvisor", "dep:tokio-util", "dep:solti-model"]
 subscriber = ["dep:taskvisor", "dep:async-trait"]
 
 [dependencies]
-tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
-time = { workspace = true, features = ["formatting", "local-offset"] }
-serde = { workspace = true, features = ["derive"] }
-tracing-journald = { workspace = true }
-parking_lot = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-
-taskvisor = { workspace = true, optional = true, features = ["controller"] }
-solti-model = { path = "../solti-model", optional = true }
 async-trait = { workspace = true, optional = true }
+parking_lot = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+taskvisor = { workspace = true, optional = true, features = ["controller"] }
+time = { workspace = true, features = ["formatting", "local-offset"] }
+thiserror = { workspace = true }
 tokio-util = { workspace = true, optional = true }
+tracing = { workspace = true }
+tracing-journald = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+
+solti-model = { path = "../solti-model", version = "0.0.1", optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

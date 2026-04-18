@@ -1,33 +1,47 @@
 [package]
 name = "solti-api"
-version = "0.0.1"
-edition = "2024"
+description = "Solti SDK HTTP/JSON and gRPC API layer."
+
+rust-version.workspace = true
+repository.workspace = true
+categories.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true
 
 [features]
 default = []
-grpc = ["dep:tonic", "dep:prost"]
-http = ["dep:axum", "dep:serde_json"]
+grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
+http = ["dep:axum", "dep:pbjson", "dep:prost", "dep:serde_json", "dep:tower-http"]
 
 [dependencies]
 async-trait = { workspace = true }
+axum = { workspace = true, optional = true }
+pbjson = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
 thiserror = { workspace = true }
+tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
+tower-http = { workspace = true, features = ["limit"], optional = true }
 tracing = { workspace = true }
 
-serde_json = { workspace = true, optional = true }
-prost = { workspace = true, optional = true }
-tonic = { workspace = true, optional = true }
-axum = { workspace = true, optional = true }
-
-solti-core = { path = "../solti-core" }
-solti-model = { path = "../solti-model" }
-serde = { workspace = true, features = ["derive"] }
+solti-core = { path = "../solti-core", version = "0.0.1" }
+solti-model = { path = "../solti-model", version = "0.0.1" }
 
 [dev-dependencies]
 base64 = { workspace = true }
+http-body-util = "0.1"
+tokio = { workspace = true, features = ["macros", "rt"] }
+tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
-tonic-build = { workspace = true }
-protoc-bin-vendored = "3"
+pbjson-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
+tonic-prost-build = { workspace = true }

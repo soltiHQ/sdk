@@ -2,9 +2,9 @@
 
 **Modular Rust toolkit for building task-orchestration agents.**
 
-Solti is a set of composable crates. 
+Solti is a set of composable crates.
 
-Pick what you need: run a subprocess with restart policies, build a headless scheduler, expose an HTTP/gRPC API, or connect to a [Podium](https://github.com/soltiHQ/podium) control-plane. 
+Pick what you need: run a subprocess with restart policies, build a headless scheduler, expose an HTTP/gRPC API, or connect to a [Podium](https://github.com/soltiHQ/podium) control-plane.
 Every layer is optional except `solti-model` (domain types) and `solti-core` (supervision).
 
 Built on top of [taskvisor](https://github.com/soltiHQ/taskvisor) supervision runtime.
@@ -42,8 +42,8 @@ The SDK doesn't prescribe a single topology. Examples of what fits naturally:
 └───────────────────────────────────────────────────────────────┘
 ```
 
-Dependencies flow downward: `model ← runner ← core ← api`. 
-No circular dependencies. 
+Dependencies flow downward: `model ← runner ← core ← api`.
+No circular dependencies.
 The top row is entirely optional - use only what your agent needs.
 
 ## Crates
@@ -74,7 +74,10 @@ No API server, no discovery, no control-plane — just supervision and execution
 ```rust
 use solti_core::{StateConfig, SupervisorApi};
 use solti_exec::subprocess::register_subprocess_runner;
-use solti_model::{TaskKind, TaskSpec, RestartPolicy, AdmissionPolicy, BackoffPolicy, JitterPolicy};
+use solti_model::{
+    AdmissionPolicy, Flag, RestartPolicy, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind,
+    TaskSpec,
+};
 use solti_runner::RunnerRouter;
 use taskvisor::{ControllerConfig, SupervisorConfig};
 
@@ -92,10 +95,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         router,
         StateConfig::default(),
     )
-    .await?;
+        .await?;
 
     // 3. Submit a task
-    let spec = TaskSpec::builder("hello", TaskKind::command("echo", &["hello world"]), 30_000u64)
+    let kind = TaskKind::Subprocess(SubprocessSpec {
+        mode: SubprocessMode::Command {
+            command: "echo".into(),
+            args: vec!["hello world".into()],
+        },
+        env: TaskEnv::new(),
+        cwd: None,
+        fail_on_non_zero: Flag::enabled(),
+    });
+    let spec = TaskSpec::builder("hello", kind, 30_000u64)
         .restart(RestartPolicy::Never)
         .admission(AdmissionPolicy::Replace)
         .build()?;
@@ -144,20 +156,26 @@ See [`api_v1.md`](crates/solti-api/api_v1.md) for the full endpoint reference.
 Add `solti-discover` to register with [Podium](https://github.com/soltiHQ/podium) and receive specs remotely:
 
 ```rust
+use solti_api::API_VERSION;
 use solti_discover::{DiscoverConfig, DiscoveryTransport};
+use solti_model::AgentId;
 
-let config = DiscoverConfig {
-    agent_id: AgentId::new("worker-001"),
-    control_plane_endpoint: "http://podium:8082".into(),
-    agent_endpoint: "http://this-host:8085".into(),
-    transport: DiscoveryTransport::Http,
-    // ...
-};
-let (task, spec) = solti_discover::sync(config);
+let config = DiscoverConfig::builder(
+    AgentId::new("worker-001"),
+    "worker",
+    "http://this-host:8085",
+    "http://podium:8082",
+    DiscoveryTransport::Http,
+    10_000, // heartbeat interval (ms)
+    API_VERSION,
+)
+.build()?;
+
+let (task, spec) = solti_discover::sync(config)?;
 supervisor.submit_with_task(task, &spec).await?;
 ```
 
-See [`examples/agentd`](examples/agentd) for a complete reference agent with API + discovery + logging.
+See [`examples/agentd-http`](examples/agentd-http) and [`examples/agentd-grpc`](examples/agentd-grpc) for complete reference agents - one per transport.
 
 ## Key features
 
@@ -173,7 +191,7 @@ See [`examples/agentd`](examples/agentd) for a complete reference agent with API
 
 **Dual-transport API**: HTTP/JSON (axum) and gRPC (tonic) behind feature flags. Use one, both, or neither.
 
-**Observability**: structured logging (`tracing` + `zerolog`), local timezone in timestamps, Prometheus metrics, lifecycle event subscribers.
+**Observability**: structured logging (`tracing` + `tracing-subscriber`, JSON / text / journald), local timezone in timestamps, Prometheus metrics, lifecycle event subscribers.
 
 ## Task lifecycle
 
@@ -220,7 +238,8 @@ sdk/
 │   ├── solti-observe/     # Logging
 │   └── solti-prometheus/  # Metrics backend
 ├── examples/
-│   └── agentd/            # Reference agent: API + discovery + logging
+│   ├── agentd-http/       # Reference agent: HTTP API + discovery
+│   └── agentd-grpc/       # Reference agent: gRPC API + discovery
 ├── LICENSE                # Apache-2.0
 └── CODE_OF_CONDUCT.md
 ```
@@ -233,8 +252,9 @@ Each crate has its own README with detailed documentation.
 cargo build --workspace
 cargo test --workspace
 
-# Run the reference agent
-cargo run -p agentd
+# Run a reference agent
+cargo run -p agentd-http     # HTTP transport, :8085
+cargo run -p agentd-grpc     # gRPC transport, :50052
 
 # Feature-gated builds
 cargo build -p solti-api --features http
@@ -243,7 +263,7 @@ cargo build -p solti-api --features grpc
 
 ## Status
 
-Active development. API is not yet stable: expect breaking changes before `1.0`.
+Active development.
 
 | Runner backend | Status           |
 |----------------|------------------|

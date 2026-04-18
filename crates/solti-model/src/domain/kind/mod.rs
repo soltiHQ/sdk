@@ -11,4 +11,4 @@ mod runtime;
 pub use runtime::Runtime;
 
 mod subprocess;
-pub use subprocess::SubprocessMode;
+pub use subprocess::{MAX_SCRIPT_BODY_BYTES, SubprocessMode};

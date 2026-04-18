@@ -1,7 +1,7 @@
 //! # gRPC transport.
 //!
-//! [`SoltiApiService`] implements the generated `SoltiApi` trait from `proto/solti/v1/api.proto`,
-//! delegating to an [`ApiHandler`](crate::ApiHandler).
+//! [`SoltiApiService`] implements the generated `SoltiApi` trait
+//! from `proto/solti/v1/api.proto`, delegating to an [`ApiHandler`](crate::ApiHandler).
 
 use std::sync::Arc;
 
@@ -10,9 +10,11 @@ use tracing::debug;
 
 use solti_model::TaskQuery;
 
+use crate::convert::{clamp_list_limit, proto_to_domain_status, tasks_page_to_proto};
 use crate::error::ApiError;
 use crate::handler::ApiHandler;
-use crate::proto_api::{self, solti_api_server::SoltiApi};
+use crate::proto_api::{self, solti_api_server::SoltiApi, solti_api_server::SoltiApiServer};
+use crate::validate::non_empty_id;
 
 /// gRPC service wrapping an [`ApiHandler`](crate::ApiHandler).
 ///
@@ -32,6 +34,30 @@ where
     pub fn new(handler: Arc<H>) -> Self {
         Self { handler }
     }
+}
+
+/// Build a configured `SoltiApiServer` ready to mount on a tonic server.
+///
+/// ## Example
+///
+/// ```rust,no_run
+/// # use std::sync::Arc;
+/// # use solti_api::{build_grpc_server, SupervisorApiAdapter};
+/// # async fn example(adapter: Arc<SupervisorApiAdapter>) -> Result<(), Box<dyn std::error::Error>> {
+/// let svc = build_grpc_server(adapter);
+/// tonic::transport::Server::builder()
+///     .add_service(svc)
+///     .serve("0.0.0.0:50052".parse()?)
+///     .await?;
+/// # Ok(()) }
+/// ```
+pub fn build_grpc_server<H>(handler: Arc<H>) -> SoltiApiServer<SoltiApiService<H>>
+where
+    H: ApiHandler,
+{
+    SoltiApiServer::new(SoltiApiService::new(handler))
+        .max_decoding_message_size(crate::MAX_REQUEST_BYTES)
+        .max_encoding_message_size(crate::MAX_REQUEST_BYTES)
 }
 
 #[tonic::async_trait]
@@ -66,9 +92,7 @@ where
     ) -> Result<Response<proto_api::GetTaskStatusResponse>, Status> {
         let req = request.into_inner();
 
-        if req.task_id.trim().is_empty() {
-            return Err(Status::invalid_argument("task_id cannot be empty"));
-        }
+        non_empty_id("task_id", &req.task_id).map_err(Status::from)?;
 
         let task_id = solti_model::TaskId::from(req.task_id);
         debug!(%task_id, "grpc: getting task status");
@@ -79,9 +103,12 @@ where
             .await
             .map_err(Status::from)?;
 
-        Ok(Response::new(proto_api::GetTaskStatusResponse {
-            task: info.map(proto_api::TaskData::from),
-        }))
+        let task = info
+            .map(proto_api::TaskData::try_from)
+            .transpose()
+            .map_err(Status::from)?;
+
+        Ok(Response::new(proto_api::GetTaskStatusResponse { task }))
     }
 
     async fn list_tasks(
@@ -93,21 +120,16 @@ where
         let mut query = TaskQuery::new();
 
         if let Some(slot) = req.slot {
-            if slot.trim().is_empty() {
-                return Err(Status::invalid_argument("slot cannot be empty"));
-            }
+            non_empty_id("slot", &slot).map_err(Status::from)?;
             query = query.with_slot(slot);
         }
 
         if let Some(status_raw) = req.status {
-            let status = proto_to_domain_status(status_raw)?;
+            let status = proto_to_domain_status(status_raw).map_err(Status::from)?;
             query = query.with_status(status);
         }
 
-        if req.limit > 0 {
-            query = query.with_limit(req.limit as usize);
-        }
-
+        query = query.with_limit(clamp_list_limit(req.limit));
         if req.offset > 0 {
             query = query.with_offset(req.offset as usize);
         }
@@ -124,16 +146,8 @@ where
             "grpc: tasks listed"
         );
 
-        let tasks = page
-            .items
-            .into_iter()
-            .map(proto_api::TaskData::from)
-            .collect();
-
-        Ok(Response::new(proto_api::ListTasksResponse {
-            tasks,
-            total: page.total as u32,
-        }))
+        let response = tasks_page_to_proto(page).map_err(Status::from)?;
+        Ok(Response::new(response))
     }
 
     async fn list_task_runs(
@@ -142,9 +156,7 @@ where
     ) -> Result<Response<proto_api::ListTaskRunsResponse>, Status> {
         let req = request.into_inner();
 
-        if req.task_id.trim().is_empty() {
-            return Err(Status::invalid_argument("task_id cannot be empty"));
-        }
+        non_empty_id("task_id", &req.task_id).map_err(Status::from)?;
 
         let task_id = solti_model::TaskId::from(req.task_id);
         debug!(%task_id, "grpc: listing task runs");
@@ -160,36 +172,13 @@ where
         Ok(Response::new(proto_api::ListTaskRunsResponse { runs }))
     }
 
-    async fn cancel_task(
-        &self,
-        request: Request<proto_api::CancelTaskRequest>,
-    ) -> Result<Response<proto_api::CancelTaskResponse>, Status> {
-        let req = request.into_inner();
-
-        if req.task_id.trim().is_empty() {
-            return Err(Status::invalid_argument("task_id cannot be empty"));
-        }
-
-        let task_id = solti_model::TaskId::from(req.task_id);
-
-        self.handler
-            .cancel_task(&task_id)
-            .await
-            .map_err(Status::from)?;
-
-        debug!(%task_id, "grpc: task canceled");
-        Ok(Response::new(proto_api::CancelTaskResponse {}))
-    }
-
     async fn delete_task(
         &self,
         request: Request<proto_api::DeleteTaskRequest>,
     ) -> Result<Response<proto_api::DeleteTaskResponse>, Status> {
         let req = request.into_inner();
 
-        if req.task_id.trim().is_empty() {
-            return Err(Status::invalid_argument("task_id cannot be empty"));
-        }
+        non_empty_id("task_id", &req.task_id).map_err(Status::from)?;
 
         let task_id = solti_model::TaskId::from(req.task_id);
         debug!(%task_id, "grpc: deleting task");
@@ -201,25 +190,5 @@ where
 
         debug!(%task_id, "grpc: task deleted");
         Ok(Response::new(proto_api::DeleteTaskResponse {}))
-    }
-}
-
-/// Convert proto TaskStatus i32 to domain TaskPhase.
-#[allow(clippy::result_large_err)]
-fn proto_to_domain_status(raw: i32) -> Result<solti_model::TaskPhase, Status> {
-    let status = proto_api::TaskStatus::try_from(raw)
-        .map_err(|_| Status::invalid_argument("invalid status"))?;
-
-    match status {
-        proto_api::TaskStatus::Pending => Ok(solti_model::TaskPhase::Pending),
-        proto_api::TaskStatus::Running => Ok(solti_model::TaskPhase::Running),
-        proto_api::TaskStatus::Succeeded => Ok(solti_model::TaskPhase::Succeeded),
-        proto_api::TaskStatus::Failed => Ok(solti_model::TaskPhase::Failed),
-        proto_api::TaskStatus::Timeout => Ok(solti_model::TaskPhase::Timeout),
-        proto_api::TaskStatus::Canceled => Ok(solti_model::TaskPhase::Canceled),
-        proto_api::TaskStatus::Exhausted => Ok(solti_model::TaskPhase::Exhausted),
-        proto_api::TaskStatus::Unspecified => {
-            Err(Status::invalid_argument("status cannot be unspecified"))
-        }
     }
 }

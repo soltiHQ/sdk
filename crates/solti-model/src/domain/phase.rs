@@ -3,8 +3,11 @@
 //! [`TaskPhase`] represents the current state of a task in the supervision lifecycle.
 
 use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+
+use crate::error::{ModelError, ModelResult};
 
 /// Current execution phase of a single task attempt.
 ///
@@ -45,6 +48,26 @@ impl fmt::Display for TaskPhase {
             TaskPhase::Timeout => f.write_str("timeout"),
             TaskPhase::Canceled => f.write_str("canceled"),
             TaskPhase::Exhausted => f.write_str("exhausted"),
+        }
+    }
+}
+
+impl FromStr for TaskPhase {
+    type Err = ModelError;
+
+    /// Parse a phase name (case-insensitive, trimmed). Accepts the same
+    /// camelCase form produced by [`fmt::Display`] / serde.
+    fn from_str(s: &str) -> ModelResult<Self> {
+        let trimmed = s.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "pending" => Ok(TaskPhase::Pending),
+            "running" => Ok(TaskPhase::Running),
+            "succeeded" => Ok(TaskPhase::Succeeded),
+            "failed" => Ok(TaskPhase::Failed),
+            "timeout" => Ok(TaskPhase::Timeout),
+            "canceled" => Ok(TaskPhase::Canceled),
+            "exhausted" => Ok(TaskPhase::Exhausted),
+            _ => Err(ModelError::UnknownTaskPhase(trimmed.to_string())),
         }
     }
 }
@@ -106,5 +129,52 @@ mod tests {
 
         let back: TaskPhase = serde_json::from_str(&json).unwrap();
         assert_eq!(back, status);
+    }
+
+    #[test]
+    fn from_str_all_variants() {
+        let cases = [
+            ("pending", TaskPhase::Pending),
+            ("running", TaskPhase::Running),
+            ("succeeded", TaskPhase::Succeeded),
+            ("failed", TaskPhase::Failed),
+            ("timeout", TaskPhase::Timeout),
+            ("canceled", TaskPhase::Canceled),
+            ("exhausted", TaskPhase::Exhausted),
+        ];
+        for (s, expected) in cases {
+            assert_eq!(s.parse::<TaskPhase>().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn from_str_is_case_insensitive_and_trims() {
+        assert_eq!("RUNNING".parse::<TaskPhase>().unwrap(), TaskPhase::Running);
+        assert_eq!(
+            "  Succeeded  ".parse::<TaskPhase>().unwrap(),
+            TaskPhase::Succeeded
+        );
+    }
+
+    #[test]
+    fn from_str_roundtrips_display() {
+        for phase in [
+            TaskPhase::Pending,
+            TaskPhase::Running,
+            TaskPhase::Succeeded,
+            TaskPhase::Failed,
+            TaskPhase::Timeout,
+            TaskPhase::Canceled,
+            TaskPhase::Exhausted,
+        ] {
+            let rendered = phase.to_string();
+            assert_eq!(rendered.parse::<TaskPhase>().unwrap(), phase);
+        }
+    }
+
+    #[test]
+    fn from_str_unknown_errors() {
+        let err = "bogus".parse::<TaskPhase>().unwrap_err();
+        assert!(matches!(err, ModelError::UnknownTaskPhase(_)));
     }
 }

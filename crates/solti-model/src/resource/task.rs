@@ -4,7 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Labels, ObjectMeta, Slot, TaskId, TaskPhase, TaskSpec, TaskStatus};
+use crate::{
+    Labels, ObjectMeta, Slot, TaskId, TaskPhase, TaskSpec, TaskStatus,
+    error::{ModelError, ModelResult},
+};
 
 /// Unified task resource.
 ///
@@ -20,9 +23,9 @@ use crate::{Labels, ObjectMeta, Slot, TaskId, TaskPhase, TaskSpec, TaskStatus};
 ///
 /// - [`TaskSpec`] desired state (what to run, how to restart).
 /// - [`TaskStatus`] observed state (phase, attempt, exit code).
+/// - [`TaskRun`](crate::TaskRun) per-attempt execution record.
 /// - [`ObjectMeta`] identity and versioning.
 /// - [`TaskPhase`] lifecycle state machine.
-/// - [`TaskRun`](crate::TaskRun) — per-attempt execution record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
@@ -44,10 +47,36 @@ impl Task {
         }
     }
 
-    /// Transition phase with optional error and exit code.
+    /// Transition the task into a new attempt: bumps attempt counter, sets phase to `Running`, clears error/exit_code.
+    pub fn transition_starting(&mut self) {
+        self.increment_attempt();
+        self.update_phase(TaskPhase::Running, None, None);
+    }
+
+    /// Transition the current attempt into a terminal phase with optional error and exit code.
+    ///
+    /// Rejects illegal transitions:
+    /// - target phase must be terminal (see [`TaskPhase::is_terminal`]);
+    ///   finishing into `Pending` or `Running` is a logic bug upstream.
     ///
     /// Bumps `resource_version`.
-    pub fn update_phase(
+    pub fn transition_finished(
+        &mut self,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+    ) -> ModelResult<()> {
+        if !phase.is_terminal() {
+            return Err(ModelError::Invalid(
+                format!("transition_finished requires a terminal phase, got {phase}").into(),
+            ));
+        }
+        self.update_phase(phase, error, exit_code);
+        Ok(())
+    }
+
+    /// Raw phase setter.
+    pub(crate) fn update_phase(
         &mut self,
         phase: TaskPhase,
         error: Option<String>,
@@ -59,8 +88,8 @@ impl Task {
         self.status.exit_code = exit_code;
     }
 
-    /// Increment attempt counter. Bumps `resource_version`.
-    pub fn increment_attempt(&mut self) {
+    /// Raw attempt bump. Crate-private (see [`update_phase`]).
+    pub(crate) fn increment_attempt(&mut self) {
         self.metadata.bump_resource_version();
         self.status.attempt += 1;
     }
@@ -107,7 +136,6 @@ mod tests {
 
         assert_eq!(task.status.phase, TaskPhase::Pending);
         assert_eq!(task.metadata.resource_version, 1);
-        assert_eq!(task.metadata.generation, 1);
         assert_eq!(task.metadata.id, "task-1");
         assert!(task.status.error.is_none());
         assert_eq!(task.status.attempt, 0);
@@ -115,32 +143,34 @@ mod tests {
     }
 
     #[test]
-    fn update_phase_bumps_resource_version() {
+    fn transition_starting_sets_running_and_bumps() {
         let mut task = Task::new("task-1".into(), test_spec());
-        task.update_phase(TaskPhase::Running, None, None);
+        task.transition_starting();
 
         assert_eq!(task.status.phase, TaskPhase::Running);
-        assert_eq!(task.metadata.resource_version, 2);
-        assert_eq!(task.metadata.generation, 1);
+        assert_eq!(task.status.attempt, 1);
+        assert_eq!(task.metadata.resource_version, 3);
     }
 
     #[test]
-    fn update_phase_with_error() {
+    fn transition_finished_accepts_terminal_and_carries_error() {
         let mut task = Task::new("task-1".into(), test_spec());
-        task.update_phase(TaskPhase::Failed, Some("boom".into()), Some(1));
+        task.transition_starting();
+        task.transition_finished(TaskPhase::Failed, Some("boom".into()), Some(1))
+            .unwrap();
 
-        assert_eq!(task.status.error.as_deref(), Some("boom"));
         assert_eq!(task.status.phase, TaskPhase::Failed);
+        assert_eq!(task.status.error.as_deref(), Some("boom"));
         assert_eq!(task.status.exit_code, Some(1));
     }
 
     #[test]
-    fn increment_attempt_bumps_resource_version() {
+    fn transition_finished_rejects_non_terminal_phase() {
         let mut task = Task::new("task-1".into(), test_spec());
-        task.increment_attempt();
-
-        assert_eq!(task.metadata.resource_version, 2);
-        assert_eq!(task.status.attempt, 1);
+        let err = task
+            .transition_finished(TaskPhase::Running, None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("terminal phase"));
     }
 
     #[test]
@@ -165,7 +195,7 @@ mod tests {
         let back: Task = serde_json::from_str(&json).unwrap();
 
         assert_eq!(back.status.phase, TaskPhase::Pending);
-        assert_eq!(back.metadata.generation, 1);
+        assert_eq!(back.metadata.resource_version, 1);
         assert_eq!(back.metadata.id, "id-1");
     }
 }
