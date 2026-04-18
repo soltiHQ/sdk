@@ -12,6 +12,7 @@ jobs:
           - solti-core
           - solti-exec
           - solti-model
+          - solti-runner
           - solti-observe
           - solti-discover
           - solti-prometheus

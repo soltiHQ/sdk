@@ -263,7 +263,7 @@ cargo build -p solti-api --features grpc
 
 ## Status
 
-Active development. API is not yet stable: expect breaking changes before `1.0`.
+Active development.
 
 | Runner backend | Status           |
 |----------------|------------------|

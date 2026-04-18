@@ -1,7 +1,15 @@
 [package]
 name = "solti-prometheus"
-version = "0.0.1"
-edition = "2024"
+description = "Solti SDK Prometheus metrics."
+
+rust-version.workspace = true
+repository.workspace = true
+categories.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [features]
 default = []
@@ -12,7 +20,7 @@ prometheus = { workspace = true }
 taskvisor = { workspace = true }
 tracing = { workspace = true }
 
-solti-runner = { path = "../solti-runner" }
+solti-runner = { path = "../solti-runner", version = "0.0.1" }
 
 [package.metadata.docs.rs]
 features = ["controller"]

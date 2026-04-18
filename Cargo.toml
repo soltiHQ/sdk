@@ -15,7 +15,14 @@ members = [
 resolver = "2"
 
 [workspace.package]
+version = "0.0.1"
 edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/soltiHQ/sdk"
+homepage = "https://github.com/soltiHQ/sdk"
+keywords = ["async", "tasks", "supervisor", "orchestration", "solti"]
+categories = ["asynchronous", "concurrency"]
 
 [workspace.dependencies]
 tracing-subscriber = { version = "0.3" }

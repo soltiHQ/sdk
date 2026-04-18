@@ -1,7 +1,15 @@
 [package]
 name = "solti-runner"
-version = "0.0.1"
-edition = "2024"
+description = "Solti SDK runner plugin trait."
+
+rust-version.workspace = true
+repository.workspace = true
+categories.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [features]
 default = []
@@ -11,7 +19,7 @@ taskvisor = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-solti-model = { path = "../solti-model" }
+solti-model = { path = "../solti-model", version = "0.0.1" }
 
 [dev-dependencies]
 tokio-util = { workspace = true }
