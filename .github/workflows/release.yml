@@ -92,7 +92,6 @@ jobs:
           #   solti-model, solti-runner, solti-observe, solti-exec,
           #   solti-core, solti-prometheus, solti-api, solti-discover
           CRATES=(
-            solti-runner
             solti-api
             solti-discover
           )
