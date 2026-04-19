@@ -16,9 +16,6 @@ use crate::{
 /// - `spec`     - desired state: what to run and how ([`TaskSpec`])
 /// - `metadata` - identity, versioning, timestamps ([`ObjectMeta`])
 ///
-/// Slot and labels live in `spec` (single source of truth).
-/// Convenience accessors [`Task::slot`] and [`Task::labels`] delegate to spec.
-///
 /// ## Also
 ///
 /// - [`TaskSpec`] desired state (what to run, how to restart).
@@ -29,12 +26,9 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
-    /// Resource metadata: identity, versioning, timestamps.
-    pub metadata: ObjectMeta,
-    /// Observed state: current phase, attempts, errors.
-    pub status: TaskStatus,
-    /// Desired state: what to run and how.
-    pub spec: TaskSpec,
+    metadata: ObjectMeta,
+    status: TaskStatus,
+    spec: TaskSpec,
 }
 
 impl Task {
@@ -45,6 +39,31 @@ impl Task {
             status: TaskStatus::pending(),
             spec,
         }
+    }
+
+    /// Resource metadata (identity, `resource_version`, timestamps).
+    #[inline]
+    pub fn metadata(&self) -> &ObjectMeta {
+        &self.metadata
+    }
+
+    /// Observed state (phase, attempt, exit code, error).
+    #[inline]
+    pub fn status(&self) -> &TaskStatus {
+        &self.status
+    }
+
+    /// Desired state (what to run, how to restart).
+    #[inline]
+    pub fn spec(&self) -> &TaskSpec {
+        &self.spec
+    }
+
+    /// Destructure into `(metadata, spec, status)`. Used by transport
+    /// layers that need owned fields for serialization into wire types.
+    #[inline]
+    pub fn into_parts(self) -> (ObjectMeta, TaskSpec, TaskStatus) {
+        (self.metadata, self.spec, self.status)
     }
 
     /// Transition the task into a new attempt: bumps attempt counter, sets phase to `Running`, clears error/exit_code.
@@ -134,11 +153,11 @@ mod tests {
     fn new_creates_pending_task() {
         let task = Task::new("task-1".into(), test_spec());
 
-        assert_eq!(task.status.phase, TaskPhase::Pending);
-        assert_eq!(task.metadata.resource_version, 1);
-        assert_eq!(task.metadata.id, "task-1");
-        assert!(task.status.error.is_none());
-        assert_eq!(task.status.attempt, 0);
+        assert_eq!(task.status().phase, TaskPhase::Pending);
+        assert_eq!(task.metadata().resource_version, 1);
+        assert_eq!(task.metadata().id, "task-1");
+        assert!(task.status().error.is_none());
+        assert_eq!(task.status().attempt, 0);
         assert_eq!(task.slot(), "slot-a");
     }
 
@@ -147,9 +166,9 @@ mod tests {
         let mut task = Task::new("task-1".into(), test_spec());
         task.transition_starting();
 
-        assert_eq!(task.status.phase, TaskPhase::Running);
-        assert_eq!(task.status.attempt, 1);
-        assert_eq!(task.metadata.resource_version, 3);
+        assert_eq!(task.status().phase, TaskPhase::Running);
+        assert_eq!(task.status().attempt, 1);
+        assert_eq!(task.metadata().resource_version, 3);
     }
 
     #[test]
@@ -159,9 +178,9 @@ mod tests {
         task.transition_finished(TaskPhase::Failed, Some("boom".into()), Some(1))
             .unwrap();
 
-        assert_eq!(task.status.phase, TaskPhase::Failed);
-        assert_eq!(task.status.error.as_deref(), Some("boom"));
-        assert_eq!(task.status.exit_code, Some(1));
+        assert_eq!(task.status().phase, TaskPhase::Failed);
+        assert_eq!(task.status().error.as_deref(), Some("boom"));
+        assert_eq!(task.status().exit_code, Some(1));
     }
 
     #[test]
@@ -194,8 +213,8 @@ mod tests {
         let json = serde_json::to_string(&task).unwrap();
         let back: Task = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(back.status.phase, TaskPhase::Pending);
-        assert_eq!(back.metadata.resource_version, 1);
-        assert_eq!(back.metadata.id, "id-1");
+        assert_eq!(back.status().phase, TaskPhase::Pending);
+        assert_eq!(back.metadata().resource_version, 1);
+        assert_eq!(back.metadata().id, "id-1");
     }
 }

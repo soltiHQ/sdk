@@ -30,7 +30,7 @@
 
 use std::borrow::Cow;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tracing::{debug, info, warn};
 
 /// Configuration for subprocess output logging.
@@ -41,8 +41,10 @@ use tracing::{debug, info, warn};
 /// - `log_stream` async function that reads + truncates + emits lines.
 #[derive(Debug, Clone, Copy)]
 pub struct LogConfig {
-    /// Max line length (in Unicode chars) before truncation.
+    /// Max line length (in Unicode chars) before truncation of the emitted line.
     pub max_line_length: usize,
+    /// Hard byte cap per line; bytes past it are drained until next `\n`.
+    pub max_line_bytes: usize,
     /// Log stdout at INFO level (`false` = DEBUG).
     pub stdout_info: bool,
     /// Log stderr at WARN level (`false` = DEBUG).
@@ -52,6 +54,7 @@ pub struct LogConfig {
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
+            max_line_bytes: 64 * 1024,
             max_line_length: 4096,
             stdout_info: true,
             stderr_warn: true,
@@ -90,13 +93,21 @@ pub(crate) async fn log_stream<R>(reader: R, run_id: &str, stream: StreamKind, c
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
     let stream_name = stream.as_str();
     let mut line_count = 0u64;
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
 
-    while let Some(result) = lines.next_line().await.transpose() {
-        let raw_line = match result {
-            Ok(line) => line,
+    loop {
+        buf.clear();
+        let read_result = (&mut reader)
+            .take(config.max_line_bytes as u64)
+            .read_until(b'\n', &mut buf)
+            .await;
+
+        let bytes_read = match read_result {
+            Ok(0) => break,
+            Ok(n) => n,
             Err(e) => {
                 warn!(
                     task = %run_id,
@@ -108,6 +119,39 @@ where
                 break;
             }
         };
+
+        let hit_cap = bytes_read == config.max_line_bytes && !buf.ends_with(b"\n");
+        if buf.ends_with(b"\n") {
+            buf.pop();
+            if buf.ends_with(b"\r") {
+                buf.pop();
+            }
+        }
+        let raw_line = String::from_utf8_lossy(&buf).into_owned();
+        let raw_line = if hit_cap {
+            format!(
+                "{raw_line} ...[line exceeded {} bytes, truncated]",
+                config.max_line_bytes
+            )
+        } else {
+            raw_line
+        };
+
+        if hit_cap {
+            let mut scratch = [0u8; 8 * 1024];
+            loop {
+                let drained = match reader.read(&mut scratch).await {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if let Some(nl) = scratch[..drained].iter().position(|&b| b == b'\n') {
+                    let _ = nl;
+                    break;
+                }
+            }
+        }
+
         let line = truncate_line(&raw_line, config.max_line_length);
         line_count += 1;
 

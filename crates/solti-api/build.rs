@@ -4,17 +4,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// API major version on the build-script side.
+const API_MAJOR: u32 = 1;
+
 const PROTO_ROOT: &str = "proto";
-const PROTO_PACKAGE: &str = ".solti.v1";
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={PROTO_ROOT}");
+    println!("cargo:rustc-env=SOLTI_API_MAJOR={API_MAJOR}");
 
     let protoc_path =
         protoc_bin_vendored::protoc_bin_path().expect("failed to get vendored protoc binary");
-    // SAFETY: build.rs runs single-threaded at compile time before any other
-    // crate code observes the environment; no data race is possible.
+
     unsafe {
         env::set_var("PROTOC", &protoc_path);
     }
@@ -23,6 +25,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let http = env::var_os("CARGO_FEATURE_HTTP").is_some();
     if !grpc && !http {
         return Ok(());
+    }
+
+    let major_dir = Path::new(PROTO_ROOT)
+        .join("solti")
+        .join(format!("v{API_MAJOR}"));
+    if !major_dir.is_dir() {
+        return Err(format!(
+            "expected proto directory '{}' for API major v{API_MAJOR}; \
+             either add the tree or update API_MAJOR in build.rs and \
+             solti_api_major! in lib.rs in lockstep",
+            major_dir.display(),
+        )
+        .into());
     }
 
     let protos = collect_proto_files(Path::new(PROTO_ROOT))?;
@@ -43,15 +58,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .compile_protos(&protos, &[PathBuf::from(PROTO_ROOT)])?;
 
     if http {
+        let proto_package = format!(".solti.v{API_MAJOR}");
         let descriptor_set = std::fs::read(&descriptor_path)?;
         pbjson_build::Builder::new()
-            // Emit default values (empty arrays, 0, false, "") instead of omitting
-            // them: REST clients expect stable field presence, not canonical
-            // proto-JSON sparseness. Optional (proto3 `optional`) fields still
-            // serialize to `null` when absent.
             .emit_fields()
             .register_descriptors(&descriptor_set)?
-            .build(&[PROTO_PACKAGE])?;
+            .build(&[&proto_package])?;
     }
 
     Ok(())

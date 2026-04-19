@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use prometheus::{Counter, CounterVec, Gauge, Histogram, Opts, Registry};
 use taskvisor::{BackoffSource, Event, EventKind, Subscribe};
-use tracing::debug;
 
 /// Prometheus subscriber for supervision-level metrics.
 ///
@@ -279,8 +278,22 @@ impl Subscribe for PrometheusSubscriber {
             EventKind::ControllerRejected => {
                 self.controller_rejections.inc();
             }
-            other => {
-                debug!(kind = ?other, "unhandled event kind");
+            // Lifecycle/management events without a metric of their own.
+            // Listed explicitly (no wildcard) so that adding a new
+            // `EventKind` variant in taskvisor breaks compilation here
+            // rather than silently dropping the event in a `_` arm.
+            EventKind::TaskAdded
+            | EventKind::TaskRemoved
+            | EventKind::TaskAddRequested
+            | EventKind::TaskRemoveRequested
+            | EventKind::ShutdownRequested
+            | EventKind::AllStoppedWithinGrace
+            | EventKind::GraceExceeded => {
+                // no-op: these are ops events observed via tracing, not metrics.
+            }
+            #[cfg(feature = "controller")]
+            EventKind::ControllerSlotTransition => {
+                // no-op: slot transitions are internal state churn, not a metric.
             }
         }
     }

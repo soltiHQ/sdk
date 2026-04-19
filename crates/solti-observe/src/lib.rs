@@ -110,4 +110,4 @@ pub use logger::timezone_sync;
 #[cfg(feature = "subscriber")]
 mod subscriber;
 #[cfg(feature = "subscriber")]
-pub use subscriber::*;
+pub use subscriber::{TracingEventSubscriber, View, log_event};

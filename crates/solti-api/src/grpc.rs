@@ -1,7 +1,7 @@
 //! # gRPC transport.
 //!
-//! [`SoltiApiService`] implements the generated `SoltiApi` trait
-//! from `proto/solti/v1/api.proto`, delegating to an [`ApiHandler`](crate::ApiHandler).
+//! [`SoltiApiService`] implements the generated `SoltiApi` trait from `proto/solti/v1/api.proto`,
+//! delegating to an [`ApiHandler`](crate::ApiHandler).
 
 use std::sync::Arc;
 
@@ -10,11 +10,11 @@ use tracing::debug;
 
 use solti_model::TaskQuery;
 
-use crate::convert::{clamp_list_limit, proto_to_domain_status, tasks_page_to_proto};
+use crate::convert::{proto_to_domain_status, tasks_page_to_proto};
 use crate::error::ApiError;
 use crate::handler::ApiHandler;
 use crate::proto_api::{self, solti_api_server::SoltiApi, solti_api_server::SoltiApiServer};
-use crate::validate::non_empty_id;
+use crate::validate::{clamp_list_limit, non_empty_id};
 
 /// gRPC service wrapping an [`ApiHandler`](crate::ApiHandler).
 ///

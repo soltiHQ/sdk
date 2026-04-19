@@ -24,9 +24,6 @@ pub enum ModelError {
     #[error("unknown jitter policy: {0}")]
     UnknownJitter(String),
 
-    #[error("unknown task kind: {0}")]
-    UnknownTaskKind(String),
-
     #[error("unknown task phase: {0}")]
     UnknownTaskPhase(String),
 

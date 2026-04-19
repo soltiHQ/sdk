@@ -146,7 +146,7 @@
 //! let task = Task::new("task-001".into(), spec);
 //! assert_eq!(task.slot(), "my-worker");
 //! assert_eq!(*task.phase(), TaskPhase::Pending);
-//! assert_eq!(task.metadata.resource_version, 1);
+//! assert_eq!(task.metadata().resource_version, 1);
 //! ```
 
 mod domain;

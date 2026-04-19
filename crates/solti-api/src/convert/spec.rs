@@ -1,92 +1,32 @@
-//! # Proto-to-domain conversion.
+//! # `TaskSpec` ↔ `CreateSpec` conversion.
 //!
-//! Converts protobuf `CreateSpec` into domain [`TaskSpec`](solti_model::TaskSpec)
-//! and domain types (`Task`, `TaskRun`, `TaskPhase`) into proto wire types.
-
-use tracing::warn;
+//! This module covers both directions:
+//!
+//! | Direction     | Entry point              | Shape                                      |
+//! |---------------|--------------------------|--------------------------------------------|
+//! | Domain → wire | [`spec_to_proto`]        | used by `task.rs` when building `TaskData` |
+//! | Wire → domain | [`convert_create_spec`]  | gRPC/HTTP submit path                      |
 
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, ContainerSpec, Flag, JitterPolicy, Labels, RestartPolicy,
-    Runtime, Slot, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskKind, TaskPhase, TaskRun,
-    TaskSpec, WasmSpec,
+    Runtime, Slot, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec, WasmSpec,
 };
 
 use crate::error::ApiError;
 use crate::proto_api;
+use crate::validate::{validate_slot, validate_timeout};
 
-impl From<TaskPhase> for proto_api::TaskStatus {
-    fn from(phase: TaskPhase) -> Self {
-        match phase {
-            TaskPhase::Pending => proto_api::TaskStatus::Pending,
-            TaskPhase::Running => proto_api::TaskStatus::Running,
-            TaskPhase::Succeeded => proto_api::TaskStatus::Succeeded,
-            TaskPhase::Failed => proto_api::TaskStatus::Failed,
-            TaskPhase::Timeout => proto_api::TaskStatus::Timeout,
-            TaskPhase::Canceled => proto_api::TaskStatus::Canceled,
-            TaskPhase::Exhausted => proto_api::TaskStatus::Exhausted,
-            other => {
-                warn!(?other, "unknown TaskPhase variant, mapping to Unspecified");
-                proto_api::TaskStatus::Unspecified
-            }
-        }
-    }
-}
-
-impl TryFrom<Task> for proto_api::TaskData {
-    type Error = ApiError;
-
-    fn try_from(task: Task) -> Result<Self, Self::Error> {
-        Ok(proto_api::TaskData {
-            metadata: Some(proto_api::ObjectMeta::from(&task.metadata)),
-            spec: Some(spec_to_proto(&task.spec)?),
-            status: Some(proto_api::TaskStatusInfo {
-                phase: proto_api::TaskStatus::from(task.status.phase) as i32,
-                attempt: task.status.attempt,
-                error: task.status.error,
-                exit_code: task.status.exit_code,
-            }),
-        })
-    }
-}
-
-/// Convert a `SystemTime` to Unix ms. Returns `0` if the input predates the epoch
-/// (unreachable in practice) — logs a warning instead of panicking so a skewed clock
-/// on one task can't crash the whole API response.
-fn system_time_to_ms(t: std::time::SystemTime) -> i64 {
-    use std::time::UNIX_EPOCH;
-    t.duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|e| {
-            warn!(error = %e, "system time is before unix epoch, defaulting to 0");
-            std::time::Duration::ZERO
-        })
-        .as_millis() as i64
-}
-
-impl From<&solti_model::ObjectMeta> for proto_api::ObjectMeta {
-    fn from(m: &solti_model::ObjectMeta) -> Self {
-        proto_api::ObjectMeta {
-            id: m.id.to_string(),
-            created_at: system_time_to_ms(m.created_at),
-            updated_at: system_time_to_ms(m.updated_at),
-            resource_version: m.resource_version,
-        }
-    }
-}
-
-// ============================================================================
-// Domain → Proto (spec reverse conversion)
-// ============================================================================
-
-fn spec_to_proto(spec: &TaskSpec) -> Result<proto_api::CreateSpec, ApiError> {
+/// Build a proto [`proto_api::CreateSpec`] from a domain [`TaskSpec`].
+pub(super) fn spec_to_proto(spec: &TaskSpec) -> Result<proto_api::CreateSpec, ApiError> {
     let (restart, restart_interval_ms) = restart_to_proto(spec.restart());
     Ok(proto_api::CreateSpec {
-        slot: spec.slot().to_string(),
+        admission: admission_to_proto(spec.admission()) as i32,
+        backoff: Some(backoff_to_proto(spec.backoff())),
         kind: Some(kind_to_proto(spec.kind())?),
         timeout_ms: spec.timeout().as_millis(),
+        slot: spec.slot().to_string(),
         restart: restart as i32,
         restart_interval_ms,
-        backoff: Some(backoff_to_proto(spec.backoff())),
-        admission: admission_to_proto(spec.admission()) as i32,
         labels: spec
             .labels()
             .iter()
@@ -143,14 +83,14 @@ fn kind_to_proto(kind: &TaskKind) -> Result<proto_api::TaskKind, ApiError> {
         }
         TaskKind::Wasm(w) => proto_api::task_kind::Kind::Wasm(proto_api::WasmTask {
             module: w.module.to_string_lossy().to_string(),
-            args: w.args.clone(),
             env: env_to_proto(&w.env),
+            args: w.args.clone(),
         }),
         TaskKind::Container(c) => proto_api::task_kind::Kind::Container(proto_api::ContainerTask {
-            image: c.image.clone(),
             command: c.command.clone().unwrap_or_default(),
-            args: c.args.clone(),
             env: env_to_proto(&c.env),
+            image: c.image.clone(),
+            args: c.args.clone(),
         }),
         TaskKind::Embedded => {
             return Err(ApiError::InvalidRequest(
@@ -158,8 +98,6 @@ fn kind_to_proto(kind: &TaskKind) -> Result<proto_api::TaskKind, ApiError> {
                     .into(),
             ));
         }
-        // TaskKind is #[non_exhaustive]: future variants that have no proto
-        // mapping yet surface as Internal, not as a silent placeholder.
         other => {
             return Err(ApiError::Internal(format!(
                 "unsupported task kind variant: {:?}",
@@ -213,101 +151,7 @@ fn admission_to_proto(policy: AdmissionPolicy) -> proto_api::AdmissionStrategy {
     }
 }
 
-impl From<TaskRun> for proto_api::TaskRunInfo {
-    fn from(run: TaskRun) -> Self {
-        use std::time::UNIX_EPOCH;
-
-        let started_at = run
-            .started_at
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_else(|e| {
-                warn!(attempt = run.attempt, error = %e, "started_at is before unix epoch, defaulting to 0");
-                std::time::Duration::ZERO
-            })
-            .as_millis() as i64;
-
-        let finished_at = run.finished_at.map(|t| {
-            t.duration_since(UNIX_EPOCH)
-                .unwrap_or_else(|e| {
-                    warn!(attempt = run.attempt, error = %e, "finished_at is before unix epoch, defaulting to 0");
-                    std::time::Duration::ZERO
-                })
-                .as_millis() as i64
-        });
-
-        proto_api::TaskRunInfo {
-            attempt: run.attempt,
-            status: proto_api::TaskStatus::from(run.phase) as i32,
-            started_at,
-            finished_at,
-            error: run.error,
-            exit_code: run.exit_code,
-        }
-    }
-}
-
-/// Apply the documented pagination contract for `ListTasksRequest.limit`:
-/// `0` → [`solti_model::DEFAULT_LIMIT`], values above [`solti_model::MAX_LIMIT`]
-/// are clamped to the cap.
-#[cfg(any(feature = "grpc", feature = "http"))]
-pub(crate) fn clamp_list_limit(raw: u32) -> usize {
-    if raw == 0 {
-        return solti_model::DEFAULT_LIMIT;
-    }
-    // `usize::try_from` never fails for u32 on 32-/64-bit targets; fall back to the
-    // cap if we ever hit a smaller-than-u32 platform.
-    let bounded = usize::try_from(raw).unwrap_or(solti_model::MAX_LIMIT);
-    bounded.min(solti_model::MAX_LIMIT)
-}
-
-/// Build a proto `ListTasksResponse` from a domain `TaskPage`.
-///
-/// Embedded tasks (heartbeat, timezone sync, etc.) have no wire representation
-/// (see [`TaskData::try_from`]) and are dropped so external endpoints don't
-/// hard-fail when the supervisor hosts any internal task. `total` is recomputed
-/// from the filtered slice so HTTP and gRPC paginate identically and UIs can
-/// trust `total == tasks.len()` for a single-page fetch.
-#[cfg(any(feature = "grpc", feature = "http"))]
-pub(crate) fn tasks_page_to_proto(
-    page: solti_model::TaskPage<solti_model::Task>,
-) -> Result<proto_api::ListTasksResponse, ApiError> {
-    let tasks: Vec<proto_api::TaskData> = page
-        .items
-        .into_iter()
-        .filter(|t| !matches!(t.spec.kind(), TaskKind::Embedded))
-        .map(proto_api::TaskData::try_from)
-        .collect::<Result<_, _>>()?;
-    Ok(proto_api::ListTasksResponse {
-        total: tasks.len() as u32,
-        tasks,
-    })
-}
-
-/// Convert a proto `TaskStatus` enum value (as i32) into domain [`TaskPhase`].
-///
-/// Used by gRPC (wire field). HTTP parses status by camelCase name instead.
-#[cfg(feature = "grpc")]
-pub(crate) fn proto_to_domain_status(raw: i32) -> Result<TaskPhase, ApiError> {
-    let status = proto_api::TaskStatus::try_from(raw)
-        .map_err(|_| ApiError::InvalidRequest(format!("invalid status value: {raw}")))?;
-
-    match status {
-        proto_api::TaskStatus::Pending => Ok(TaskPhase::Pending),
-        proto_api::TaskStatus::Running => Ok(TaskPhase::Running),
-        proto_api::TaskStatus::Succeeded => Ok(TaskPhase::Succeeded),
-        proto_api::TaskStatus::Failed => Ok(TaskPhase::Failed),
-        proto_api::TaskStatus::Timeout => Ok(TaskPhase::Timeout),
-        proto_api::TaskStatus::Canceled => Ok(TaskPhase::Canceled),
-        proto_api::TaskStatus::Exhausted => Ok(TaskPhase::Exhausted),
-        proto_api::TaskStatus::Unspecified => Err(ApiError::InvalidRequest(
-            "status cannot be unspecified".into(),
-        )),
-    }
-}
-
-/// Convert a proto `CreateSpec` into a [`TaskSpec`].
-///
-/// Slot is extracted from the proto message and placed inside [`TaskSpec`].
+/// Convert a proto [`proto_api::CreateSpec`] into a domain [`TaskSpec`].
 pub fn convert_create_spec(spec: proto_api::CreateSpec) -> Result<TaskSpec, ApiError> {
     let slot: Slot = validate_slot(spec.slot)?.into();
 
@@ -444,6 +288,7 @@ fn convert_restart_policy(
         proto_api::RestartStrategy::Never => Ok(RestartPolicy::Never),
         proto_api::RestartStrategy::OnFailure => Ok(RestartPolicy::OnFailure),
         proto_api::RestartStrategy::Always => Ok(RestartPolicy::Always { interval_ms }),
+
         proto_api::RestartStrategy::Unspecified => Err(ApiError::InvalidRequest(
             "restart strategy not specified".into(),
         )),
@@ -455,10 +300,11 @@ fn convert_backoff_policy(backoff: proto_api::BackoffStrategy) -> Result<Backoff
         .map_err(|_| ApiError::InvalidRequest("invalid jitter strategy".into()))?;
 
     let jitter = match jitter {
+        proto_api::JitterStrategy::Decorrelated => JitterPolicy::Decorrelated,
+        proto_api::JitterStrategy::Equal => JitterPolicy::Equal,
         proto_api::JitterStrategy::None => JitterPolicy::None,
         proto_api::JitterStrategy::Full => JitterPolicy::Full,
-        proto_api::JitterStrategy::Equal => JitterPolicy::Equal,
-        proto_api::JitterStrategy::Decorrelated => JitterPolicy::Decorrelated,
+
         proto_api::JitterStrategy::Unspecified => {
             return Err(ApiError::InvalidRequest(
                 "jitter strategy not specified".into(),
@@ -497,6 +343,7 @@ fn convert_admission_policy(
         proto_api::AdmissionStrategy::DropIfRunning => Ok(AdmissionPolicy::DropIfRunning),
         proto_api::AdmissionStrategy::Replace => Ok(AdmissionPolicy::Replace),
         proto_api::AdmissionStrategy::Queue => Ok(AdmissionPolicy::Queue),
+
         proto_api::AdmissionStrategy::Unspecified => Err(ApiError::InvalidRequest(
             "admission strategy not specified".into(),
         )),
@@ -511,25 +358,10 @@ fn convert_labels(map: std::collections::HashMap<String, String>) -> Labels {
     labels
 }
 
-fn validate_slot(slot: String) -> Result<String, ApiError> {
-    if slot.trim().is_empty() {
-        return Err(ApiError::InvalidRequest("slot cannot be empty".into()));
-    }
-    Ok(slot)
-}
-
-fn validate_timeout(timeout_ms: u64) -> Result<u64, ApiError> {
-    if timeout_ms == 0 {
-        return Err(ApiError::InvalidRequest("timeout_ms cannot be zero".into()));
-    }
-    Ok(timeout_ms)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::time::UNIX_EPOCH;
 
     fn make_subprocess_kind(command: &str) -> proto_api::TaskKind {
         proto_api::TaskKind {
@@ -575,129 +407,8 @@ mod tests {
     }
 
     #[test]
-    fn clamp_list_limit_zero_uses_default() {
-        assert_eq!(clamp_list_limit(0), solti_model::DEFAULT_LIMIT);
-    }
-
-    #[test]
-    fn clamp_list_limit_within_bounds_passes_through() {
-        assert_eq!(clamp_list_limit(1), 1);
-        assert_eq!(clamp_list_limit(50), 50);
-        assert_eq!(
-            clamp_list_limit(solti_model::MAX_LIMIT as u32),
-            solti_model::MAX_LIMIT
-        );
-    }
-
-    #[test]
-    fn clamp_list_limit_above_cap_is_clamped() {
-        assert_eq!(
-            clamp_list_limit(solti_model::MAX_LIMIT as u32 + 1),
-            solti_model::MAX_LIMIT
-        );
-        assert_eq!(clamp_list_limit(u32::MAX), solti_model::MAX_LIMIT);
-    }
-
-    #[test]
-    fn task_phase_all_variants() {
-        let cases = [
-            (TaskPhase::Pending, proto_api::TaskStatus::Pending),
-            (TaskPhase::Running, proto_api::TaskStatus::Running),
-            (TaskPhase::Succeeded, proto_api::TaskStatus::Succeeded),
-            (TaskPhase::Failed, proto_api::TaskStatus::Failed),
-            (TaskPhase::Timeout, proto_api::TaskStatus::Timeout),
-            (TaskPhase::Canceled, proto_api::TaskStatus::Canceled),
-            (TaskPhase::Exhausted, proto_api::TaskStatus::Exhausted),
-        ];
-
-        for (domain, expected_proto) in cases {
-            let proto = proto_api::TaskStatus::from(domain);
-            assert_eq!(proto, expected_proto, "mismatch for {:?}", domain);
-        }
-    }
-
-    fn subprocess_task_kind() -> TaskKind {
-        TaskKind::Subprocess(SubprocessSpec {
-            mode: SubprocessMode::Command {
-                command: "ls".into(),
-                args: vec![],
-            },
-            env: TaskEnv::new(),
-            cwd: None,
-            fail_on_non_zero: Flag::from(true),
-        })
-    }
-
-    #[test]
-    fn task_converts_correctly() {
-        let spec = TaskSpec::builder("my-slot", subprocess_task_kind(), 5_000_u64)
-            .build()
-            .unwrap();
-        let mut task = Task::new("task-42".into(), spec);
-
-        task.metadata.resource_version = 12;
-        task.status.phase = TaskPhase::Running;
-        task.status.attempt = 3;
-        task.status.error = Some("boom".to_string());
-
-        let now_ms = task
-            .metadata
-            .created_at
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-
-        let proto = proto_api::TaskData::try_from(task).expect("conversion must succeed");
-
-        let meta = proto.metadata.unwrap();
-        assert_eq!(meta.id, "task-42");
-        assert_eq!(meta.created_at, now_ms);
-        assert_eq!(meta.updated_at, now_ms);
-        assert_eq!(meta.resource_version, 12);
-
-        let spec = proto.spec.unwrap();
-        assert_eq!(spec.slot, "my-slot");
-
-        let status = proto.status.unwrap();
-        assert_eq!(status.phase, proto_api::TaskStatus::Running as i32);
-        assert_eq!(status.attempt, 3);
-        assert_eq!(status.error, Some("boom".to_string()));
-    }
-
-    #[test]
-    fn task_no_error() {
-        let spec = TaskSpec::builder("slot", subprocess_task_kind(), 5_000_u64)
-            .build()
-            .unwrap();
-        let mut task = Task::new("task-1".into(), spec);
-        task.status.phase = TaskPhase::Succeeded;
-        task.status.attempt = 1;
-
-        let proto = proto_api::TaskData::try_from(task).expect("conversion must succeed");
-        let status = proto.status.unwrap();
-        assert_eq!(status.error, None);
-    }
-
-    #[test]
-    fn task_embedded_rejected() {
-        let spec = TaskSpec::builder("slot", TaskKind::Embedded, 5_000_u64)
-            .build()
-            .unwrap();
-        let task = Task::new("task-1".into(), spec);
-        let err = proto_api::TaskData::try_from(task).unwrap_err();
-        assert!(
-            matches!(&err, ApiError::InvalidRequest(msg) if msg.contains("embedded tasks")),
-            "expected InvalidRequest for Embedded task, got {err:?}"
-        );
-    }
-
-    #[test]
     fn create_spec_subprocess_valid() {
-        let spec = make_valid_create_spec();
-        let result = convert_create_spec(spec);
-        assert!(result.is_ok());
-
-        let cs = result.unwrap();
+        let cs = convert_create_spec(make_valid_create_spec()).unwrap();
         assert_eq!(cs.slot(), "test-slot");
         assert_eq!(cs.timeout().as_millis(), 5_000);
         assert!(matches!(
@@ -781,7 +492,6 @@ mod tests {
             restart_interval_ms: Some(5_000),
             ..make_valid_create_spec()
         };
-
         let cs = convert_create_spec(spec).unwrap();
         assert!(matches!(
             cs.restart(),
@@ -798,7 +508,6 @@ mod tests {
             restart_interval_ms: None,
             ..make_valid_create_spec()
         };
-
         let cs = convert_create_spec(spec).unwrap();
         assert!(matches!(
             cs.restart(),
@@ -824,82 +533,13 @@ mod tests {
 
     #[test]
     fn create_spec_env_conversion() {
-        let spec = make_valid_create_spec();
-        let cs = convert_create_spec(spec).unwrap();
-
+        let cs = convert_create_spec(make_valid_create_spec()).unwrap();
         match cs.kind() {
             TaskKind::Subprocess(SubprocessSpec { env, .. }) => {
                 assert_eq!(env.get("PATH"), Some("/usr/bin"));
             }
             _ => panic!("expected subprocess kind"),
         }
-    }
-
-    #[test]
-    fn reject_missing_kind() {
-        let spec = proto_api::CreateSpec {
-            kind: None,
-            ..make_valid_create_spec()
-        };
-        let err = convert_create_spec(spec).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing task kind")));
-    }
-
-    #[test]
-    fn reject_missing_kind_variant() {
-        let spec = proto_api::CreateSpec {
-            kind: Some(proto_api::TaskKind { kind: None }),
-            ..make_valid_create_spec()
-        };
-        let err = convert_create_spec(spec).unwrap_err();
-        assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing task kind variant"))
-        );
-    }
-
-    #[test]
-    fn reject_empty_subprocess_command() {
-        let spec = proto_api::CreateSpec {
-            kind: Some(make_subprocess_kind("")),
-            ..make_valid_create_spec()
-        };
-        let err = convert_create_spec(spec).unwrap_err();
-        assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("command cannot be empty"))
-        );
-    }
-
-    #[test]
-    fn reject_whitespace_subprocess_command() {
-        let spec = proto_api::CreateSpec {
-            kind: Some(make_subprocess_kind("   ")),
-            ..make_valid_create_spec()
-        };
-        let err = convert_create_spec(spec).unwrap_err();
-        assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("command cannot be empty"))
-        );
-    }
-
-    #[test]
-    fn reject_missing_subprocess_mode() {
-        let spec = proto_api::CreateSpec {
-            kind: Some(proto_api::TaskKind {
-                kind: Some(proto_api::task_kind::Kind::Subprocess(
-                    proto_api::SubprocessTask {
-                        mode: None,
-                        env: vec![],
-                        cwd: None,
-                        fail_on_non_zero: false,
-                    },
-                )),
-            }),
-            ..make_valid_create_spec()
-        };
-        let err = convert_create_spec(spec).unwrap_err();
-        assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing subprocess mode"))
-        );
     }
 
     #[test]
@@ -987,6 +627,134 @@ mod tests {
             }
             _ => panic!("expected subprocess"),
         }
+    }
+
+    #[test]
+    fn restart_never() {
+        let spec = proto_api::CreateSpec {
+            restart: proto_api::RestartStrategy::Never as i32,
+            ..make_valid_create_spec()
+        };
+        let cs = convert_create_spec(spec).unwrap();
+        assert!(matches!(cs.restart(), RestartPolicy::Never));
+    }
+
+    #[test]
+    fn all_jitter_policies_convert() {
+        let cases = [
+            (proto_api::JitterStrategy::None, JitterPolicy::None),
+            (proto_api::JitterStrategy::Full, JitterPolicy::Full),
+            (proto_api::JitterStrategy::Equal, JitterPolicy::Equal),
+            (
+                proto_api::JitterStrategy::Decorrelated,
+                JitterPolicy::Decorrelated,
+            ),
+        ];
+
+        for (proto_jitter, expected) in cases {
+            let spec = proto_api::CreateSpec {
+                backoff: Some(proto_api::BackoffStrategy {
+                    jitter: proto_jitter as i32,
+                    ..make_backoff()
+                }),
+                ..make_valid_create_spec()
+            };
+            let cs = convert_create_spec(spec).unwrap();
+            assert_eq!(cs.backoff().jitter, expected);
+        }
+    }
+
+    #[test]
+    fn all_admission_policies_convert() {
+        let cases = [
+            (
+                proto_api::AdmissionStrategy::DropIfRunning,
+                AdmissionPolicy::DropIfRunning,
+            ),
+            (
+                proto_api::AdmissionStrategy::Replace,
+                AdmissionPolicy::Replace,
+            ),
+            (proto_api::AdmissionStrategy::Queue, AdmissionPolicy::Queue),
+        ];
+
+        for (proto_adm, expected) in cases {
+            let spec = proto_api::CreateSpec {
+                admission: proto_adm as i32,
+                ..make_valid_create_spec()
+            };
+            let cs = convert_create_spec(spec).unwrap();
+            assert_eq!(cs.admission(), expected);
+        }
+    }
+
+    // ----- rejection paths -----
+
+    #[test]
+    fn reject_missing_kind() {
+        let spec = proto_api::CreateSpec {
+            kind: None,
+            ..make_valid_create_spec()
+        };
+        let err = convert_create_spec(spec).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing task kind")));
+    }
+
+    #[test]
+    fn reject_missing_kind_variant() {
+        let spec = proto_api::CreateSpec {
+            kind: Some(proto_api::TaskKind { kind: None }),
+            ..make_valid_create_spec()
+        };
+        let err = convert_create_spec(spec).unwrap_err();
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing task kind variant"))
+        );
+    }
+
+    #[test]
+    fn reject_empty_subprocess_command() {
+        let spec = proto_api::CreateSpec {
+            kind: Some(make_subprocess_kind("")),
+            ..make_valid_create_spec()
+        };
+        let err = convert_create_spec(spec).unwrap_err();
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("command cannot be empty"))
+        );
+    }
+
+    #[test]
+    fn reject_whitespace_subprocess_command() {
+        let spec = proto_api::CreateSpec {
+            kind: Some(make_subprocess_kind("   ")),
+            ..make_valid_create_spec()
+        };
+        let err = convert_create_spec(spec).unwrap_err();
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("command cannot be empty"))
+        );
+    }
+
+    #[test]
+    fn reject_missing_subprocess_mode() {
+        let spec = proto_api::CreateSpec {
+            kind: Some(proto_api::TaskKind {
+                kind: Some(proto_api::task_kind::Kind::Subprocess(
+                    proto_api::SubprocessTask {
+                        mode: None,
+                        env: vec![],
+                        cwd: None,
+                        fail_on_non_zero: false,
+                    },
+                )),
+            }),
+            ..make_valid_create_spec()
+        };
+        let err = convert_create_spec(spec).unwrap_err();
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing subprocess mode"))
+        );
     }
 
     #[test]
@@ -1203,31 +971,6 @@ mod tests {
     }
 
     #[test]
-    fn all_jitter_policies_convert() {
-        let cases = [
-            (proto_api::JitterStrategy::None, JitterPolicy::None),
-            (proto_api::JitterStrategy::Full, JitterPolicy::Full),
-            (proto_api::JitterStrategy::Equal, JitterPolicy::Equal),
-            (
-                proto_api::JitterStrategy::Decorrelated,
-                JitterPolicy::Decorrelated,
-            ),
-        ];
-
-        for (proto_jitter, expected) in cases {
-            let spec = proto_api::CreateSpec {
-                backoff: Some(proto_api::BackoffStrategy {
-                    jitter: proto_jitter as i32,
-                    ..make_backoff()
-                }),
-                ..make_valid_create_spec()
-            };
-            let cs = convert_create_spec(spec).unwrap();
-            assert_eq!(cs.backoff().jitter, expected);
-        }
-    }
-
-    #[test]
     fn reject_unspecified_restart() {
         let spec = proto_api::CreateSpec {
             restart: proto_api::RestartStrategy::Unspecified as i32,
@@ -1238,16 +981,6 @@ mod tests {
     }
 
     #[test]
-    fn restart_never() {
-        let spec = proto_api::CreateSpec {
-            restart: proto_api::RestartStrategy::Never as i32,
-            ..make_valid_create_spec()
-        };
-        let cs = convert_create_spec(spec).unwrap();
-        assert!(matches!(cs.restart(), RestartPolicy::Never));
-    }
-
-    #[test]
     fn reject_unspecified_admission() {
         let spec = proto_api::CreateSpec {
             admission: proto_api::AdmissionStrategy::Unspecified as i32,
@@ -1255,29 +988,5 @@ mod tests {
         };
         let err = convert_create_spec(spec).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("admission")));
-    }
-
-    #[test]
-    fn all_admission_policies_convert() {
-        let cases = [
-            (
-                proto_api::AdmissionStrategy::DropIfRunning,
-                AdmissionPolicy::DropIfRunning,
-            ),
-            (
-                proto_api::AdmissionStrategy::Replace,
-                AdmissionPolicy::Replace,
-            ),
-            (proto_api::AdmissionStrategy::Queue, AdmissionPolicy::Queue),
-        ];
-
-        for (proto_adm, expected) in cases {
-            let spec = proto_api::CreateSpec {
-                admission: proto_adm as i32,
-                ..make_valid_create_spec()
-            };
-            let cs = convert_create_spec(spec).unwrap();
-            assert_eq!(cs.admission(), expected);
-        }
     }
 }

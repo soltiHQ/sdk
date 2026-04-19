@@ -60,6 +60,7 @@ pub fn timezone_sync() -> (TaskRef, TaskSpec) {
             }
             Err(e) => Err(TaskError::Fail {
                 reason: format!("failed to sync timezone offset: {e}"),
+                exit_code: None,
             }),
         }
     });

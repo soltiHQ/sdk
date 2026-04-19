@@ -1,6 +1,6 @@
 //! # Supervisor adapter.
 //!
-//! [`SupervisorApiAdapter`] bridges [`SupervisorApi`](solti_core::SupervisorApi) to [`ApiHandler`], delegating all operations directly.
+//! [`SupervisorApiAdapter`] bridges [`SupervisorApi`](solti_core::SupervisorApi) to [`ApiHandler`].
 
 use std::sync::Arc;
 

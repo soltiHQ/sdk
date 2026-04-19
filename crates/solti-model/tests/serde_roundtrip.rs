@@ -59,8 +59,13 @@ fn roundtrip_subprocess_command() {
         fail_on_non_zero: Flag::enabled(),
     }));
     let mut task = Task::new("task-sub-cmd".into(), spec);
-    task.status.phase = TaskPhase::Running;
-    task.status.attempt = 3;
+    task.transition_starting();
+    task.transition_finished(TaskPhase::Failed, Some("retry".into()), None)
+        .unwrap();
+    task.transition_starting();
+    task.transition_finished(TaskPhase::Failed, Some("retry-2".into()), None)
+        .unwrap();
+    task.transition_starting(); // now attempt=3, phase=Running
     roundtrip(&task);
 }
 
@@ -103,9 +108,9 @@ fn roundtrip_container() {
         env: TaskEnv::new(),
     }));
     let mut task = Task::new("task-ctr".into(), spec);
-    task.status.phase = TaskPhase::Failed;
-    task.status.exit_code = Some(137);
-    task.status.error = Some("SIGKILL".into());
+    task.transition_starting();
+    task.transition_finished(TaskPhase::Failed, Some("SIGKILL".into()), Some(137))
+        .unwrap();
     roundtrip(&task);
 }
 
