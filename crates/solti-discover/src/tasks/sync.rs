@@ -28,6 +28,9 @@ use crate::proto::{SyncRequest, SyncResponse};
 #[cfg(feature = "http")]
 const MAX_BODY_PREVIEW_BYTES: usize = 1024;
 
+#[cfg(feature = "http")]
+const MAX_RESPONSE_BODY_BYTES: u64 = 64 * 1024;
+
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -158,11 +161,13 @@ pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError
                             warn!("sync failed fatally: {}", e);
                             Err(TaskError::Fatal {
                                 reason: format!("sync fatally failed: {}", e),
+                                exit_code: None,
                             })
                         } else {
                             warn!("sync failed: {}", e);
                             Err(TaskError::Fail {
                                 reason: format!("sync failed: {}", e),
+                                exit_code: None,
                             })
                         }
                     }
@@ -246,7 +251,7 @@ async fn invoke_http_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
     let response = ctx.http_client.post(url).json(&request).send().await?;
 
     let status = response.status();
-    let body = response.text().await?;
+    let body = read_body_bounded(response, MAX_RESPONSE_BODY_BYTES).await?;
 
     if !status.is_success() {
         if status.as_u16() == 401 || status.as_u16() == 403 {
@@ -378,6 +383,31 @@ fn validate_response(response: SyncResponse) -> Result<(), DiscoverError> {
 #[cfg(feature = "http")]
 fn http_sync_path(api_version: u32) -> String {
     format!("/api/v{api_version}/discovery/sync")
+}
+
+#[cfg(feature = "http")]
+async fn read_body_bounded(
+    response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<String, DiscoverError> {
+    if let Some(len) = response.content_length()
+        && len > max_bytes
+    {
+        return Err(DiscoverError::InvalidResponse(format!(
+            "response body {len} bytes exceeds cap {max_bytes}"
+        )));
+    }
+
+    let bytes = response.bytes().await?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(DiscoverError::InvalidResponse(format!(
+            "response body {} bytes exceeds cap {max_bytes}",
+            bytes.len()
+        )));
+    }
+
+    String::from_utf8(bytes.to_vec())
+        .map_err(|e| DiscoverError::InvalidResponse(format!("response body is not UTF-8: {e}")))
 }
 
 /// Truncate a response body preview at a char boundary, capping at ~1 KiB.

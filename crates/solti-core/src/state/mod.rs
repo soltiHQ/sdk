@@ -111,7 +111,7 @@ impl TaskState {
 
         let attempt = if let Some(task) = inner.tasks.get_mut(id) {
             task.transition_starting();
-            task.status.attempt
+            task.status().attempt
         } else {
             return None;
         };
@@ -196,7 +196,7 @@ impl TaskState {
         inner
             .tasks
             .values()
-            .filter(|task| task.status.phase == phase)
+            .filter(|task| task.status().phase == phase)
             .cloned()
             .collect()
     }
@@ -233,10 +233,10 @@ impl TaskState {
             .tasks
             .iter()
             .filter(|(id, task)| {
-                task.status.phase.is_terminal()
+                task.status().phase.is_terminal()
                     && inner.runs.get(*id).is_none_or(|runs| runs.is_empty())
                     && now
-                        .duration_since(task.metadata.updated_at)
+                        .duration_since(task.metadata().updated_at)
                         .map(|age| age >= config.task_ttl)
                         .unwrap_or(false)
             })
@@ -288,11 +288,11 @@ impl TaskState {
         let iter: Box<dyn Iterator<Item = &Task>> = if q.status_filters().is_empty() {
             iter
         } else {
-            Box::new(iter.filter(|task| q.matches_phase(&task.status.phase)))
+            Box::new(iter.filter(|task| q.matches_phase(&task.status().phase)))
         };
 
         let mut filtered: Vec<&Task> = iter.collect();
-        filtered.sort_by(|a, b| a.metadata.id.cmp(&b.metadata.id));
+        filtered.sort_by(|a, b| a.metadata().id.cmp(&b.metadata().id));
         let total = filtered.len();
 
         let start = q.offset().min(total);
@@ -335,10 +335,10 @@ mod tests {
         state.add_task(id.clone(), default_spec_with_slot("demo-slot"));
 
         let task = state.get(&id).expect("task should exist");
-        assert_eq!(task.metadata.id, id);
+        assert_eq!(task.metadata().id, id);
         assert_eq!(task.slot(), "demo-slot");
-        assert_eq!(task.status.phase, TaskPhase::Pending);
-        assert_eq!(task.status.attempt, 0);
+        assert_eq!(task.status().phase, TaskPhase::Pending);
+        assert_eq!(task.status().attempt, 0);
     }
 
     #[test]
@@ -350,9 +350,9 @@ mod tests {
         state.transition_starting(&id);
 
         let task = state.get(&id).unwrap();
-        assert_eq!(task.status.phase, TaskPhase::Running);
-        assert!(task.status.error.is_none());
-        assert_eq!(task.status.attempt, 1);
+        assert_eq!(task.status().phase, TaskPhase::Running);
+        assert!(task.status().error.is_none());
+        assert_eq!(task.status().attempt, 1);
     }
 
     #[test]
@@ -365,8 +365,8 @@ mod tests {
         state.transition_finished(&id, TaskPhase::Failed, Some("timeout".to_string()), None);
 
         let task = state.get(&id).unwrap();
-        assert_eq!(task.status.phase, TaskPhase::Failed);
-        assert_eq!(task.status.error.as_deref(), Some("timeout"));
+        assert_eq!(task.status().phase, TaskPhase::Failed);
+        assert_eq!(task.status().error.as_deref(), Some("timeout"));
     }
 
     #[test]
@@ -380,7 +380,7 @@ mod tests {
         assert_eq!(state.transition_starting(&id), Some(2));
 
         let task = state.get(&id).unwrap();
-        assert_eq!(task.status.attempt, 2);
+        assert_eq!(task.status().attempt, 2);
     }
 
     #[test]
@@ -422,11 +422,11 @@ mod tests {
 
         let running_tasks = state.list_by_status(TaskPhase::Running);
         assert_eq!(running_tasks.len(), 1);
-        assert_eq!(running_tasks[0].metadata.id, id1);
+        assert_eq!(running_tasks[0].metadata().id, id1);
 
         let pending_tasks = state.list_by_status(TaskPhase::Pending);
         assert_eq!(pending_tasks.len(), 1);
-        assert_eq!(pending_tasks[0].metadata.id, id2);
+        assert_eq!(pending_tasks[0].metadata().id, id2);
     }
 
     #[test]
@@ -576,7 +576,7 @@ mod tests {
         assert!(
             page.items
                 .iter()
-                .all(|t| t.status.phase == TaskPhase::Running)
+                .all(|t| t.status().phase == TaskPhase::Running)
         );
     }
 
@@ -733,8 +733,8 @@ mod tests {
         assert_eq!(attempt, Some(1));
 
         let task = state.get(&id).unwrap();
-        assert_eq!(task.status.phase, TaskPhase::Running);
-        assert_eq!(task.status.attempt, 1);
+        assert_eq!(task.status().phase, TaskPhase::Running);
+        assert_eq!(task.status().attempt, 1);
 
         let runs = state.list_runs(&id);
         assert_eq!(runs.len(), 1);
@@ -759,8 +759,8 @@ mod tests {
         state.transition_finished(&id, TaskPhase::Failed, Some("boom".into()), None);
 
         let task = state.get(&id).unwrap();
-        assert_eq!(task.status.phase, TaskPhase::Failed);
-        assert_eq!(task.status.error.as_deref(), Some("boom"));
+        assert_eq!(task.status().phase, TaskPhase::Failed);
+        assert_eq!(task.status().error.as_deref(), Some("boom"));
 
         let runs = state.list_runs(&id);
         assert_eq!(runs.len(), 1);
@@ -778,8 +778,8 @@ mod tests {
         state.transition_finished(&id, TaskPhase::Succeeded, None, None);
 
         let task = state.get(&id).unwrap();
-        assert_eq!(task.status.phase, TaskPhase::Succeeded);
-        assert!(task.status.error.is_none());
+        assert_eq!(task.status().phase, TaskPhase::Succeeded);
+        assert!(task.status().error.is_none());
 
         let runs = state.list_runs(&id);
         assert_eq!(runs[0].phase, TaskPhase::Succeeded);
@@ -802,8 +802,8 @@ mod tests {
         state.transition_finished(&id, TaskPhase::Succeeded, None, None);
 
         let task = state.get(&id).unwrap();
-        assert_eq!(task.status.attempt, 2);
-        assert_eq!(task.status.phase, TaskPhase::Succeeded);
+        assert_eq!(task.status().attempt, 2);
+        assert_eq!(task.status().phase, TaskPhase::Succeeded);
 
         let runs = state.list_runs(&id);
         assert_eq!(runs.len(), 2);

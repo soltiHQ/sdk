@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use prometheus::{Counter, CounterVec, Gauge, Histogram, Opts, Registry};
 use taskvisor::{BackoffSource, Event, EventKind, Subscribe};
-use tracing::debug;
 
 /// Prometheus subscriber for supervision-level metrics.
 ///
@@ -89,9 +88,7 @@ pub struct PrometheusSubscriber {
     subscriber_overflow: Counter,
     subscriber_panicked: Counter,
 
-    #[cfg(feature = "controller")]
     controller_submissions: Counter,
-    #[cfg(feature = "controller")]
     controller_rejections: Counter,
 }
 
@@ -168,7 +165,6 @@ impl PrometheusSubscriber {
         )?;
         registry.register(Box::new(subscriber_panicked.clone()))?;
 
-        #[cfg(feature = "controller")]
         let controller_submissions = {
             let c = Counter::with_opts(
                 Opts::new("submissions_total", "Total controller submissions")
@@ -179,7 +175,6 @@ impl PrometheusSubscriber {
             c
         };
 
-        #[cfg(feature = "controller")]
         let controller_rejections = {
             let c = Counter::with_opts(
                 Opts::new("rejections_total", "Total controller rejections")
@@ -199,9 +194,7 @@ impl PrometheusSubscriber {
             task_timeouts,
             subscriber_overflow,
             subscriber_panicked,
-            #[cfg(feature = "controller")]
             controller_submissions,
-            #[cfg(feature = "controller")]
             controller_rejections,
         })
     }
@@ -271,16 +264,25 @@ impl Subscribe for PrometheusSubscriber {
             EventKind::ActorDead => {
                 self.task_terminal.with_label_values(&["fatal"]).inc();
             }
-            #[cfg(feature = "controller")]
             EventKind::ControllerSubmitted => {
                 self.controller_submissions.inc();
             }
-            #[cfg(feature = "controller")]
             EventKind::ControllerRejected => {
                 self.controller_rejections.inc();
             }
-            other => {
-                debug!(kind = ?other, "unhandled event kind");
+            // Lifecycle/management events without a metric of their own.
+            // Listed explicitly (no wildcard) so that adding a new
+            // `EventKind` variant in taskvisor breaks compilation here
+            // rather than silently dropping the event in a `_` arm.
+            EventKind::TaskAdded
+            | EventKind::TaskRemoved
+            | EventKind::TaskAddRequested
+            | EventKind::TaskRemoveRequested
+            | EventKind::ShutdownRequested
+            | EventKind::AllStoppedWithinGrace
+            | EventKind::GraceExceeded
+            | EventKind::ControllerSlotTransition => {
+                // no-op: ops events observed via tracing, not metrics.
             }
         }
     }
@@ -499,7 +501,6 @@ mod tests {
         assert_eq!(sub.subscriber_panicked.get(), 1.0);
     }
 
-    #[cfg(feature = "controller")]
     #[test]
     fn controller_submitted_increments_counter() {
         let sub = new_subscriber();
@@ -509,7 +510,6 @@ mod tests {
         assert_eq!(sub.controller_submissions.get(), 1.0);
     }
 
-    #[cfg(feature = "controller")]
     #[test]
     fn controller_rejected_increments_counter() {
         let sub = new_subscriber();

@@ -41,8 +41,8 @@ impl ApiError {
 impl From<ApiError> for tonic::Status {
     fn from(err: ApiError) -> Self {
         match err {
+            ApiError::PayloadTooLarge(msg) => tonic::Status::resource_exhausted(msg),
             ApiError::InvalidRequest(msg) => tonic::Status::invalid_argument(msg),
-            ApiError::PayloadTooLarge(msg) => tonic::Status::invalid_argument(msg),
             ApiError::TaskNotFound(msg) => tonic::Status::not_found(msg),
             ApiError::Internal(msg) => tonic::Status::internal(msg),
             ApiError::Core(e) => core_to_status(e),

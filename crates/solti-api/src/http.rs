@@ -1,6 +1,9 @@
 //! # HTTP/JSON transport.
 //!
 //! Axum router exposing [`ApiHandler`] operations as REST-shaped JSON endpoints.
+//! All paths share the `/api/v<MAJOR>` prefix where `MAJOR` is [`crate::API_VERSION`];
+//!
+//! _the examples below show the current value (`v1`)_.
 //!
 //! | Method | Endpoint                    | Handler             |
 //! |--------|-----------------------------|---------------------|
@@ -26,15 +29,15 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tracing::debug;
 
 use crate::{
-    MAX_REQUEST_BYTES,
-    convert::{self, clamp_list_limit, tasks_page_to_proto},
+    MAX_REQUEST_BYTES, api_url,
+    convert::{self, tasks_page_to_proto},
     error::ApiError,
     handler::ApiHandler,
     proto_api,
-    validate::non_empty_id,
+    validate::{clamp_list_limit, non_empty_id},
 };
 
-/// Wrapper around `axum::Json<T>` that maps `JsonRejection` into our [`ApiError::InvalidRequest`] → canonical `{error, message}` envelope.
+/// Wrapper around `axum::Json<T>` that maps `JsonRejection` into [`ApiError::InvalidRequest`].
 pub(crate) struct ApiJson<T>(pub T);
 
 impl<T, S> FromRequest<S> for ApiJson<T>
@@ -108,11 +111,11 @@ where
     /// Applies a [`RequestBodyLimitLayer`] capped at [`MAX_REQUEST_BYTES`] bytes to every request.
     pub fn router(self) -> Router {
         Router::new()
-            .route("/api/v1/tasks", post(submit_task::<H>))
-            .route("/api/v1/tasks", get(list_tasks::<H>))
-            .route("/api/v1/tasks/{id}", get(get_task_status::<H>))
-            .route("/api/v1/tasks/{id}", delete(delete_task::<H>))
-            .route("/api/v1/tasks/{id}/runs", get(list_task_runs::<H>))
+            .route(api_url!("/tasks"), post(submit_task::<H>))
+            .route(api_url!("/tasks"), get(list_tasks::<H>))
+            .route(api_url!("/tasks/{id}"), get(get_task_status::<H>))
+            .route(api_url!("/tasks/{id}"), delete(delete_task::<H>))
+            .route(api_url!("/tasks/{id}/runs"), get(list_task_runs::<H>))
             .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
             .layer(middleware::from_fn(map_413_envelope))
             .with_state(self.handler)

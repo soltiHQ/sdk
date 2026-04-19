@@ -342,9 +342,6 @@ async fn kill_process_group(child: &mut tokio::process::Child, run_id: &str) {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
-            // SAFETY:
-            // `kill` with a negative pid targets a process group.
-            // `pid` is non-zero (tokio returns `Some` only while the child has not been reaped), so `-pid` is a valid pgid reference.
             let rc = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
             if rc != 0 {
                 let err = std::io::Error::last_os_error();
@@ -377,6 +374,7 @@ fn prepare_backend(ctx: &TaskExecContext) -> Result<(), TaskError> {
                 .record_runner_error(RunnerType::Subprocess, "cgroup_prepare_failed");
             return Err(TaskError::Fatal {
                 reason: format!("failed to prepare cgroup: {e}"),
+                exit_code: None,
             });
         }
     }
@@ -393,6 +391,7 @@ fn apply_backend(cmd: &mut Command, ctx: &TaskExecContext) -> Result<(), TaskErr
                 .record_runner_error(RunnerType::Subprocess, "backend_config_failed");
             return Err(TaskError::Fatal {
                 reason: format!("failed to apply runner config: {e}"),
+                exit_code: None,
             });
         }
     }
@@ -405,14 +404,26 @@ fn evaluate_exit(
     task_cfg: &SubprocessTaskConfig,
 ) -> Result<(), TaskError> {
     if !status.success() && task_cfg.fail_on_non_zero.is_enabled() {
-        let reason = match status.code() {
+        let exit_code = status.code();
+        let reason = match exit_code {
             Some(code) => format!("process exited with non-zero code: {code}"),
             None => "process terminated by signal".into(),
         };
-        Err(TaskError::Fail { reason })
+        Err(TaskError::Fail { reason, exit_code })
     } else {
         debug!(task = %task_cfg.run_id, "subprocess exited successfully");
         Ok(())
+    }
+}
+
+/// RAII guard that calls `cleanup_cgroup` on drop.
+struct CgroupGuard<'a>(Option<&'a str>);
+
+impl Drop for CgroupGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(name) = self.0 {
+            crate::utils::cleanup_cgroup(name);
+        }
     }
 }
 
@@ -434,6 +445,7 @@ async fn run_subprocess(
 
     prepare_backend(&ctx)?;
 
+    let _cgroup_guard = CgroupGuard(ctx.cgroup_name.as_deref());
     let mut cmd = build_command(&ctx);
     apply_backend(&mut cmd, &ctx)?;
 
@@ -444,6 +456,7 @@ async fn run_subprocess(
                 .record_runner_error(RunnerType::Subprocess, "spawn_failed");
             return Err(TaskError::Fatal {
                 reason: format!("spawn failed: {e}"),
+                exit_code: None,
             });
         }
     };
@@ -452,6 +465,7 @@ async fn run_subprocess(
 
     let stdout = child.stdout.take().ok_or_else(|| TaskError::Fatal {
         reason: "failed to capture stdout".into(),
+        exit_code: None,
     })?;
     let run_id_stdout = Arc::clone(&ctx.task_cfg.run_id);
     let stdout_task = tokio::spawn(async move {
@@ -460,6 +474,7 @@ async fn run_subprocess(
 
     let stderr = child.stderr.take().ok_or_else(|| TaskError::Fatal {
         reason: "failed to capture stderr".into(),
+        exit_code: None,
     })?;
     let run_id_stderr = Arc::clone(&ctx.task_cfg.run_id);
     let stderr_task = tokio::spawn(async move {
@@ -471,6 +486,7 @@ async fn run_subprocess(
         res = child.wait() => {
             let status = res.map_err(|e| TaskError::Fatal {
                 reason: format!("wait failed: {e}"),
+                exit_code: None,
             })?;
             evaluate_exit(status, &ctx.task_cfg)
         }
@@ -494,9 +510,6 @@ async fn run_subprocess(
         .record_task_completed(RunnerType::Subprocess, outcome, duration_ms);
 
     let _ = tokio::join!(stdout_task, stderr_task);
-    if let Some(cgroup_name) = &ctx.cgroup_name {
-        crate::utils::cleanup_cgroup(cgroup_name);
-    }
     result
 }
 
@@ -605,7 +618,10 @@ mod tests {
         let result = evaluate_exit(status, &cfg);
         assert!(result.is_err());
         match result.unwrap_err() {
-            TaskError::Fail { reason } => assert!(reason.contains("non-zero")),
+            TaskError::Fail { reason, exit_code } => {
+                assert!(reason.contains("non-zero"));
+                assert_eq!(exit_code, Some(1));
+            }
             other => panic!("expected TaskError::Fail, got {other:?}"),
         }
     }

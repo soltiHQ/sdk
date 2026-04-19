@@ -147,7 +147,6 @@ spec.validate()?;  // submit-boundary validation (rejects Embedded)
  UnknownAdmission    unknown admission policy string
  UnknownRestart      unknown restart policy string
  UnknownJitter       unknown jitter policy string
- UnknownTaskKind     unknown task kind string
  UnknownTaskPhase    unknown task phase string
  Invalid             structural validation failure (empty slot, bad backoff, etc.)
 ```

@@ -34,6 +34,7 @@ impl RunnerType {
 }
 
 /// Task execution outcome for metrics classification.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskOutcome {
     /// Task completed successfully.
