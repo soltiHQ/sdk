@@ -87,34 +87,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Topological order by intra-workspace dependencies.
-          # Each crate is published sequentially; `sleep 30` between calls
-          # gives crates.io's sparse index time to propagate before the
-          # next crate's build tries to resolve the freshly-published dep.
-          #
-          # If you add a new crate, append it in dep-order (leafs first).
+          # Resume partial release: already-published crates skipped.
+          # Full dep-order (for reference):
+          #   solti-model, solti-runner, solti-observe, solti-exec,
+          #   solti-core, solti-prometheus, solti-api, solti-discover
           CRATES=(
-            solti-model         # level 0
-            solti-runner        # -> model
-            solti-observe       # -> model (optional)
-            solti-exec          # -> model, runner
-            solti-core          # -> model, runner
-            solti-prometheus    # -> runner
-            solti-api           # -> core, model
-            solti-discover      # -> core, model
+            solti-runner
+            solti-api
+            solti-discover
           )
 
           for crate in "${CRATES[@]}"; do
             echo "::group::Publishing $crate"
-            # `--no-verify` skips the in-repo re-build: we already verified
-            # in the Checks job and each crate was just built above.
-            # Keep verify enabled (default) on first release or when the
-            # lockfile diverges from main — trading CI minutes for safety.
             cargo publish -p "$crate" --all-features
             echo "::endgroup::"
-            # Index propagation delay. Bump if you see "version X not found"
-            # on downstream crates — crates.io's sparse index is usually
-            # <10s but occasionally slower.
             sleep 30
           done
 

@@ -29,13 +29,16 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tracing::debug;
 
 use crate::{
-    MAX_REQUEST_BYTES, api_url,
+    MAX_REQUEST_BYTES,
     convert::{self, tasks_page_to_proto},
     error::ApiError,
     handler::ApiHandler,
     proto_api,
     validate::{clamp_list_limit, non_empty_id},
 };
+// `api_url!` is `#[macro_export]`, so it's already accessible in this
+// module by its bare name — `use crate::api_url` would be redundant
+// (and warnings about unused imports broke a `cargo publish` on us).
 
 /// Wrapper around `axum::Json<T>` that maps `JsonRejection` into [`ApiError::InvalidRequest`].
 pub(crate) struct ApiJson<T>(pub T);
