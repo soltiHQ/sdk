@@ -13,14 +13,10 @@ license.workspace = true
 
 [features]
 default = []
-controller = ["taskvisor/controller"]
 
 [dependencies]
 prometheus = { workspace = true }
-taskvisor = { workspace = true }
+taskvisor = { workspace = true, features = ["controller"] }
 tracing = { workspace = true }
 
 solti-runner = { path = "../solti-runner", version = "0.0.1" }
-
-[package.metadata.docs.rs]
-features = ["controller"]
