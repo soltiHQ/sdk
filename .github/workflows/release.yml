@@ -19,8 +19,8 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
 jobs:
-  check-main-branch:
-    name: Verify tag from main branch
+  verify:
+    name: Verify tag and versions
     runs-on: ${{ vars.RUNS_ON }}
     steps:
       - uses: actions/checkout@v4
@@ -42,11 +42,11 @@ jobs:
           git rev-parse --verify origin/main >/dev/null
 
           if ! git merge-base --is-ancestor "$TAG_COMMIT" origin/main; then
-            echo "Tag commit is not an ancestor of origin/main"
+            echo "::error::Tag commit is not an ancestor of origin/main"
             exit 1
           fi
 
-      - name: Verify workspace version matches tag
+      - name: Verify workspace.package.version matches tag
         shell: bash
         env:
           REF_NAME: ${{ github.ref_name }}
@@ -54,8 +54,6 @@ jobs:
           set -euo pipefail
 
           TAG_VERSION="${REF_NAME#v}"
-          # `[workspace.package].version` is the single source of truth;
-          # every crate inherits it via `version.workspace = true`.
           FILE_VERSION=$(awk '
             /^\[workspace.package\]/ { in_section=1; next }
             /^\[/ { in_section=0 }
@@ -65,46 +63,54 @@ jobs:
           ' Cargo.toml)
 
           if [ -z "$FILE_VERSION" ] || [ "$FILE_VERSION" != "$TAG_VERSION" ]; then
-            echo "workspace.package.version ($FILE_VERSION) must equal tag ($TAG_VERSION, from '$REF_NAME')"
+            echo "::error::workspace.package.version ($FILE_VERSION) must equal tag ($TAG_VERSION, from '$REF_NAME')"
             exit 1
           fi
 
-  publish-crates:
-    needs: check-main-branch
-    runs-on: ${{ vars.RUNS_ON }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Publish workspace in dep-order
+      - name: Verify internal path-deps versions
         shell: bash
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
-          # Resume partial release: already-published crates skipped.
-          # Full dep-order (for reference):
-          #   solti-model, solti-runner, solti-observe, solti-exec,
-          #   solti-core, solti-prometheus, solti-api, solti-discover
-          CRATES=(
-            solti-api
-            solti-discover
-          )
+          TAG_VERSION="${REF_NAME#v}"
+          
+          bad=0
+          while IFS= read -r line; do
+            file=${line%%:*}
+            rest=${line#*:}
+            ver=$(printf '%s' "$rest" | grep -oE 'version[[:space:]]*=[[:space:]]*"[^"]*"' | sed -E 's/.*"([^"]*)".*/\1/')
+            if [ -z "$ver" ] || [ "$ver" != "$TAG_VERSION" ]; then
+              echo "::error file=$file::internal path-dep version '$ver' != workspace '$TAG_VERSION' — line: ${rest}"
+              bad=$((bad + 1))
+            fi
+          done < <(grep -n -E '^[[:space:]]*solti-[a-z-]+[[:space:]]*=[[:space:]]*\{.*path[[:space:]]*=' crates/*/Cargo.toml)
 
-          for crate in "${CRATES[@]}"; do
-            echo "::group::Publishing $crate"
-            cargo publish -p "$crate" --all-features
-            echo "::endgroup::"
-            sleep 30
-          done
+          if [ "$bad" -gt 0 ]; then
+            echo "::error::$bad internal path-dep(s) misaligned with workspace version"
+            exit 1
+          fi
 
-  publish-release:
-    needs: publish-crates
+  crates:
+    needs: verify
+    uses: ./.github/workflows/.crates.yml
+
+  publish:
+    name: Publish crates
+    needs: crates
+    runs-on: ${{ vars.RUNS_ON }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: soltiHQ/actions/cargo-publish@main
+        with:
+          token: ${{ secrets.CRATES_IO_TOKEN }}
+          crates: ${{ needs.crates.outputs.list }}
+
+  gh-release:
+    name: GitHub release
+    needs: publish
     runs-on: ${{ vars.RUNS_ON }}
     permissions:
       contents: write

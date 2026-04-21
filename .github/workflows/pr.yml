@@ -22,9 +22,13 @@ jobs:
     name: Audit
     uses: ./.github/workflows/.audit.yml
 
+  preflight:
+    name: Preflight
+    uses: ./.github/workflows/.preflight.yml
+
   pr-check:
     name: Pr Check
-    needs: [docs, audit]
+    needs: [docs, audit, preflight]
     runs-on: ${{ vars.RUNS_ON }}
     steps:
       - name: All checks passed

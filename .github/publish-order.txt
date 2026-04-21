@@ -1,0 +1,24 @@
+# Publishable workspace crates, in dependency (topological) order.
+#
+# Source of truth for:
+#   .github/workflows/release.yml    - sequential publish via soltiHQ/actions/cargo-publish
+#   .github/workflows/.preflight.yml - per-crate `cargo publish --dry-run` matrix
+#   .github/workflows/.docs.yml      - per-crate rustdoc matrix
+#
+# Dependency layout (first crate depends only on external deps):
+#   solti-model, solti-observe               - no internal deps
+#   solti-runner                             - depends on solti-model
+#   solti-exec, solti-core, solti-prometheus - depend on solti-{model,runner}
+#   solti-api, solti-discover                - depend on solti-{model,core}
+#
+# When adding a publishable crate, insert it at its correct topological position.
+# Dry-run / docs matrix consumers don't care about order, but release.yml publishes sequentially and depends on it.
+
+solti-model
+solti-observe
+solti-runner
+solti-exec
+solti-core
+solti-prometheus
+solti-api
+solti-discover
