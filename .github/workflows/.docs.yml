@@ -14,7 +14,7 @@ jobs:
       matrix:
         crate: ${{ fromJSON(needs.crates.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run docs gen
         uses: soltiHQ/actions/taskfile@main
         with:

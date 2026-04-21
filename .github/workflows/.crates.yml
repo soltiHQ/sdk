@@ -17,7 +17,7 @@ jobs:
       matrix: ${{ steps.set.outputs.matrix }}
       list: ${{ steps.set.outputs.list }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - id: set
         shell: bash
         run: |
