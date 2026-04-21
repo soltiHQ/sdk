@@ -110,31 +110,29 @@ jobs:
 
   gh-release:
     name: GitHub release
-    needs: publish
+    needs: [crates, publish]
     runs-on: ${{ vars.RUNS_ON }}
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: Generate changelog
-        id: changelog
+      - name: Build crate/docs links
+        id: body
+        shell: bash
+        env:
+          CRATES: ${{ needs.crates.outputs.list }}
         run: |
           set -euo pipefail
-
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          if [ -n "$PREV_TAG" ]; then
-            CHANGELOG=$(git log --pretty=format:"- %s" "$PREV_TAG"..HEAD)
-          else
-            CHANGELOG=$(git log --pretty=format:"- %s")
-          fi
-
           {
-            echo "changelog<<EOF"
-            echo "$CHANGELOG"
+            echo "body<<EOF"
+            echo "### Crates published"
+            for c in $CRATES; do
+              echo "- https://crates.io/crates/$c"
+            done
+            echo
+            echo "### Docs"
+            for c in $CRATES; do
+              echo "- https://docs.rs/$c"
+            done
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -144,21 +142,6 @@ jobs:
           draft: false
           prerelease: false
           tag_name: ${{ github.ref_name }}
-          name: "${{ github.ref_name }}"
-          body: |
-            ### Changes
-            ${{ steps.changelog.outputs.changelog }}
-
-            ### Crates published
-            - https://crates.io/crates/solti-model
-            - https://crates.io/crates/solti-runner
-            - https://crates.io/crates/solti-observe
-            - https://crates.io/crates/solti-exec
-            - https://crates.io/crates/solti-core
-            - https://crates.io/crates/solti-prometheus
-            - https://crates.io/crates/solti-api
-            - https://crates.io/crates/solti-discover
-
-            ### Docs
-            - https://docs.rs/solti-model
-            - https://docs.rs/solti-api
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          body: ${{ steps.body.outputs.body }}

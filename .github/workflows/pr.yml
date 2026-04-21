@@ -2,7 +2,7 @@ name: Pr
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 concurrency:
   group: pr-${{ github.ref }}
@@ -26,9 +26,13 @@ jobs:
     name: Preflight
     uses: ./.github/workflows/.preflight.yml
 
+  label-check:
+    name: Label check
+    uses: ./.github/workflows/.label-check.yml
+
   pr-check:
     name: Pr Check
-    needs: [docs, audit, preflight]
+    needs: [docs, audit, preflight, label-check]
     runs-on: ${{ vars.RUNS_ON }}
     steps:
       - name: All checks passed

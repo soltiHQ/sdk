@@ -21,7 +21,7 @@ jobs:
       - id: set
         shell: bash
         run: |
-          entries=$(grep -vE '^\s*(#|$)' .github/publish-order.txt)
+          entries=$(grep -vE '^\s*(#|$)' .github/crates.txt)
           matrix=$(printf '%s\n' "$entries" | jq -Rsc 'split("\n") | map(select(length > 0))')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           {
