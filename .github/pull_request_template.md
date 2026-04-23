@@ -8,14 +8,15 @@ Resolves #ISSUE_ID (if applicable)
 Apply **one** of these labels before merge 
 (_required by `label-check`, drives the release-notes section this PR will land in: see `.github/release.yml`_):
 
-| Label                        | Release section      |
-|------------------------------|----------------------|
-| `feature`, `enhancement`     | Features             |
-| `bug`, `fix`                 | Bug fixes            |
-| `docs`, `documentation`      | Documentation        |
-| `dependencies`, `deps`       | Dependencies         |
-| `ci`, `build`                | CI / Build           |
-| `skip-changelog`             | *omitted from notes* |
+| Label     | Release section      |
+|-----------|----------------------|
+| `feature` | Features             |
+| `fix`     | Bug fixes            |
+| `docs`    | Documentation        |
+| `deps`    | Dependencies         |
+| `ci`      | CI / Build           |
+| `other`   | Other changes        |
+| `skip`    | *omitted from notes* |
 
 ## ✅ Checklist
 - [ ] Documentation updated (README, rustdoc, examples)
