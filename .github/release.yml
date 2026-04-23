@@ -10,7 +10,7 @@ changelog:
         - feature
     - title: Bug fixes
       labels:
-        - fix
+        - bug
     - title: Documentation
       labels:
         - docs
