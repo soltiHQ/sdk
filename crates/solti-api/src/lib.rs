@@ -55,6 +55,13 @@ pub use handler::ApiHandler;
 mod adapter;
 pub use adapter::SupervisorApiAdapter;
 
+mod metrics;
+#[cfg(feature = "http")]
+pub use metrics::http_metrics_middleware;
+pub use metrics::{
+    ApiMetricsBackend, ApiMetricsHandle, NoOpApiMetrics, Transport, noop_api_metrics,
+};
+
 #[cfg(any(feature = "grpc", feature = "http"))]
 #[cfg_attr(not(feature = "grpc"), allow(dead_code))]
 pub(crate) mod proto_api {
@@ -84,7 +91,7 @@ mod validate;
 mod grpc;
 
 #[cfg(feature = "grpc")]
-pub use grpc::{SoltiApiService, build_grpc_server};
+pub use grpc::{SoltiApiService, build_grpc_server, build_grpc_server_with_metrics};
 
 #[cfg(feature = "grpc")]
 pub use proto_api::solti_api_server::SoltiApiServer;

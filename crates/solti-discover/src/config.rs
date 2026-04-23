@@ -11,6 +11,7 @@ use solti_model::{AgentId, BackoffPolicy};
 use crate::proto::EndpointType;
 
 use crate::errors::DiscoverError;
+use crate::metrics::{DiscoverMetricsHandle, noop_discover_metrics};
 
 /// Default connect timeout in milliseconds.
 pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
@@ -69,6 +70,7 @@ pub struct DiscoverConfig {
     pub(crate) backoff: Option<BackoffPolicy>,
     pub(crate) connect_timeout_ms: u64,
     pub(crate) request_timeout_ms: u64,
+    pub(crate) metrics: DiscoverMetricsHandle,
 }
 
 impl DiscoverConfig {
@@ -95,6 +97,7 @@ impl DiscoverConfig {
             backoff: None,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
+            metrics: noop_discover_metrics(),
         }
     }
 }
@@ -114,6 +117,7 @@ pub struct DiscoverConfigBuilder {
     backoff: Option<BackoffPolicy>,
     connect_timeout_ms: u64,
     request_timeout_ms: u64,
+    metrics: DiscoverMetricsHandle,
 }
 
 impl DiscoverConfigBuilder {
@@ -146,6 +150,12 @@ impl DiscoverConfigBuilder {
     /// End-to-end request timeout (ms).
     pub fn request_timeout_ms(mut self, ms: u64) -> Self {
         self.request_timeout_ms = ms;
+        self
+    }
+
+    /// Attach a metrics backend. When not set, a zero-cost no-op is used.
+    pub fn with_metrics(mut self, metrics: DiscoverMetricsHandle) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -206,6 +216,7 @@ impl DiscoverConfigBuilder {
             backoff: self.backoff,
             connect_timeout_ms: self.connect_timeout_ms,
             request_timeout_ms: self.request_timeout_ms,
+            metrics: self.metrics,
         })
     }
 }

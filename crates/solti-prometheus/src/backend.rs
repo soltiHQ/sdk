@@ -6,9 +6,11 @@
 
 use std::sync::Arc;
 
-use prometheus::{CounterVec, HistogramVec, Opts, Registry, proto::MetricFamily};
+use prometheus::{CounterVec, HistogramVec, Registry, proto::MetricFamily};
 
 use solti_runner::{MetricsBackend, RunnerType, TaskOutcome};
+
+use crate::register::{Sub, ms_to_secs};
 
 /// Prometheus metrics backend for solti runners.
 ///
@@ -54,48 +56,33 @@ pub struct PrometheusMetrics {
 
 impl PrometheusMetrics {
     /// Create a new metrics backend, registering all counters and histograms into the given [`Registry`].
-    ///
-    /// Use a **shared** registry when you need [`PrometheusMetrics`] and [`PrometheusSubscriber`](crate::PrometheusSubscriber)
-    /// to appear on the same `metrics` endpoint.
     pub fn new_with_registry(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
-        let tasks_started = CounterVec::new(
-            Opts::new("tasks_started_total", "Total number of tasks started")
-                .namespace("solti")
-                .subsystem("runner"),
+        let r = Sub::new(&registry, "runner");
+
+        let tasks_started = r.counter_vec(
+            "tasks_started_total",
+            "Total number of tasks started",
             &["runner"],
         )?;
-        registry.register(Box::new(tasks_started.clone()))?;
-
-        let tasks_completed = CounterVec::new(
-            Opts::new("tasks_completed_total", "Total number of tasks completed")
-                .namespace("solti")
-                .subsystem("runner"),
+        let tasks_completed = r.counter_vec(
+            "tasks_completed_total",
+            "Total number of tasks completed",
             &["runner", "outcome"],
         )?;
-        registry.register(Box::new(tasks_completed.clone()))?;
-
-        let tasks_duration = HistogramVec::new(
-            prometheus::HistogramOpts::new(
-                "task_duration_seconds",
-                "Task execution duration in seconds",
-            )
-            .namespace("solti")
-            .subsystem("runner")
-            .buckets(vec![
+        let tasks_duration = r.histogram_vec(
+            "task_duration_seconds",
+            "Task execution duration in seconds",
+            vec![
                 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
                 3600.0,
-            ]),
+            ],
             &["runner", "outcome"],
         )?;
-        registry.register(Box::new(tasks_duration.clone()))?;
-
-        let runner_errors = CounterVec::new(
-            Opts::new("errors_total", "Total runner-level errors")
-                .namespace("solti")
-                .subsystem("runner"),
+        let runner_errors = r.counter_vec(
+            "errors_total",
+            "Total runner-level errors",
             &["runner", "error"],
         )?;
-        registry.register(Box::new(runner_errors.clone()))?;
 
         Ok(Self {
             tasks_started,
@@ -112,15 +99,11 @@ impl PrometheusMetrics {
     }
 
     /// Gather all metrics for exposition.
-    ///
-    /// Use this to implement `metrics` HTTP endpoint.
     pub fn gather(&self) -> Vec<MetricFamily> {
         self.registry.gather()
     }
 
     /// Get reference to underlying prometheus registry.
-    ///
-    /// Useful for registering custom metrics alongside solti metrics.
     pub fn registry(&self) -> &Arc<Registry> {
         &self.registry
     }
@@ -153,11 +136,9 @@ impl MetricsBackend for PrometheusMetrics {
         self.tasks_completed
             .with_label_values(&[runner, label])
             .inc();
-
-        let duration_seconds = duration_ms as f64 / 1000.0;
         self.tasks_duration
             .with_label_values(&[runner, label])
-            .observe(duration_seconds);
+            .observe(ms_to_secs(duration_ms));
     }
 
     /// Increments `solti_runner_errors_total{runner=<runner_type>, error=<error_kind>}`.
