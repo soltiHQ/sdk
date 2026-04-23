@@ -31,6 +31,8 @@ const MAX_BODY_PREVIEW_BYTES: usize = 1024;
 #[cfg(feature = "http")]
 const MAX_RESPONSE_BODY_BYTES: u64 = 64 * 1024;
 
+use std::time::Instant;
+
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -42,6 +44,7 @@ use taskvisor::{TaskError, TaskFn, TaskRef};
 
 use crate::config::{DiscoverConfig, DiscoveryTransport};
 use crate::errors::DiscoverError;
+use crate::metrics::{self, DiscoverMetricsHandle};
 
 const SLOT: &str = "solti-discover-sync";
 
@@ -88,6 +91,8 @@ pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError
         .user_agent(USER_AGENT)
         .build()?;
 
+    let metrics = config.metrics.clone();
+
     let ctx = Arc::new(SyncContext {
         base_request,
         #[cfg(feature = "http")]
@@ -96,6 +101,7 @@ pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError
         grpc_client: tokio::sync::OnceCell::new(),
         retry_hold_until: AtomicU64::new(0),
         startup_jitter_applied: AtomicBool::new(false),
+        metrics,
         config,
     });
 
@@ -130,45 +136,53 @@ pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError
             }
 
             debug!("sending sync request to control plane");
+            ctx.metrics.record_attempt();
+            let start = Instant::now();
             tokio::select! {
                 _ = cancel.cancelled() => Err(TaskError::Canceled),
-                result = invoke_sync(&ctx) => match result {
-                    Ok(()) => {
-                        ctx.retry_hold_until.store(0, Ordering::Relaxed);
-                        debug!("sync completed successfully");
-                        Ok(())
-                    }
-                    Err(e) => {
-                        if let DiscoverError::Rejected {
-                            retry_after_s: Some(s),
-                            ..
-                        } = &e
-                        {
-                            let clamped = (*s).clamp(0, MAX_RETRY_AFTER_S);
-                            if *s != clamped {
-                                warn!(
-                                    advised_s = *s,
-                                    capped_s = clamped,
-                                    "retry_after_s capped",
-                                );
-                            }
-                            let hold_until =
-                                now_unix_seconds().saturating_add(clamped as u64);
-                            ctx.retry_hold_until.store(hold_until, Ordering::Relaxed);
+                result = invoke_sync(&ctx) => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    match result {
+                        Ok(()) => {
+                            ctx.metrics.record_success(duration_ms);
+                            ctx.retry_hold_until.store(0, Ordering::Relaxed);
+                            debug!("sync completed successfully");
+                            Ok(())
                         }
+                        Err(e) => {
+                            ctx.metrics.record_failure(duration_ms, classify_failure(&e));
+                            if let DiscoverError::Rejected {
+                                retry_after_s: Some(s),
+                                ..
+                            } = &e
+                            {
+                                let clamped = (*s).clamp(0, MAX_RETRY_AFTER_S);
+                                if *s != clamped {
+                                    warn!(
+                                        advised_s = *s,
+                                        capped_s = clamped,
+                                        "retry_after_s capped",
+                                    );
+                                }
+                                let hold_until =
+                                    now_unix_seconds().saturating_add(clamped as u64);
+                                ctx.retry_hold_until.store(hold_until, Ordering::Relaxed);
+                                ctx.metrics.record_hold(clamped as u64);
+                            }
 
-                        if e.is_terminal() {
-                            warn!("sync failed fatally: {}", e);
-                            Err(TaskError::Fatal {
-                                reason: format!("sync fatally failed: {}", e),
-                                exit_code: None,
-                            })
-                        } else {
-                            warn!("sync failed: {}", e);
-                            Err(TaskError::Fail {
-                                reason: format!("sync failed: {}", e),
-                                exit_code: None,
-                            })
+                            if e.is_terminal() {
+                                warn!("sync failed fatally: {}", e);
+                                Err(TaskError::Fatal {
+                                    reason: format!("sync fatally failed: {}", e),
+                                    exit_code: None,
+                                })
+                            } else {
+                                warn!("sync failed: {}", e);
+                                Err(TaskError::Fail {
+                                    reason: format!("sync failed: {}", e),
+                                    exit_code: None,
+                                })
+                            }
                         }
                     }
                 },
@@ -195,6 +209,60 @@ struct SyncContext {
     /// restarts (e.g. after a transient failure) skip the jitter and stay
     /// on the periodic schedule.
     startup_jitter_applied: AtomicBool,
+    metrics: DiscoverMetricsHandle,
+}
+
+/// Map a [`DiscoverError`] to a canonical failure-reason label.
+fn classify_failure(err: &DiscoverError) -> &'static str {
+    match err {
+        DiscoverError::InvalidConfig(_) | DiscoverError::SpecBuild(_) => metrics::FAIL_OTHER,
+        DiscoverError::Rejected { .. } => metrics::FAIL_REJECTED_CLIENT,
+        DiscoverError::AuthFailed { .. } => metrics::FAIL_AUTH,
+        #[cfg(feature = "http")]
+        DiscoverError::HttpRequest(e) => {
+            if e.is_timeout() {
+                metrics::FAIL_TIMEOUT
+            } else if e.is_connect() {
+                metrics::FAIL_CONNECT
+            } else if e.is_decode() || e.is_body() {
+                metrics::FAIL_PARSE
+            } else {
+                metrics::FAIL_OTHER
+            }
+        }
+        #[cfg(feature = "http")]
+        DiscoverError::HttpStatus { code, .. } => {
+            if *code >= 500 {
+                metrics::FAIL_REJECTED_SERVER
+            } else {
+                metrics::FAIL_REJECTED_CLIENT
+            }
+        }
+        #[cfg(feature = "http")]
+        DiscoverError::InvalidResponse(_) => metrics::FAIL_PARSE,
+        #[cfg(feature = "grpc")]
+        DiscoverError::GrpcTransport(_) => metrics::FAIL_CONNECT,
+        #[cfg(feature = "grpc")]
+        DiscoverError::GrpcStatus(s) => {
+            use tonic::Code;
+            match s.code() {
+                Code::DeadlineExceeded => metrics::FAIL_TIMEOUT,
+                Code::Unavailable | Code::Internal | Code::DataLoss => {
+                    metrics::FAIL_REJECTED_SERVER
+                }
+                Code::Unauthenticated => metrics::FAIL_AUTH,
+                Code::PermissionDenied
+                | Code::InvalidArgument
+                | Code::FailedPrecondition
+                | Code::NotFound
+                | Code::AlreadyExists
+                | Code::OutOfRange
+                | Code::Aborted
+                | Code::Cancelled => metrics::FAIL_REJECTED_CLIENT,
+                _ => metrics::FAIL_OTHER,
+            }
+        }
+    }
 }
 
 async fn invoke_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
