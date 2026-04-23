@@ -1,11 +1,12 @@
-//! Build-time identity exposed as `solti_build_info` gauge.
+//! Build-time identity exposed as `solti_build_info` gauge (value always `1`).
 //!
-//! The gauge value is always `1`, labels like:
+//! Labels carry the identity fields — dashboards and alerts use them to pin
+//! observations to a specific build. Typical labels:
+//!
 //!  - `version`
 //!  - `git_sha`
 //!  - `rustc`
 //!  - `built_at`
-//! carry the identity; dashboards and alerts use them to pin observations to a specific build.
 
 use prometheus::{IntGauge, Opts, Registry};
 
