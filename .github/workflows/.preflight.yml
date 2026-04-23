@@ -1,4 +1,4 @@
-name: Docs
+name: Preflight
 
 on: { workflow_call: {} }
 
@@ -6,7 +6,7 @@ jobs:
   crates:
     uses: ./.github/workflows/.crates.yml
 
-  docs:
+  publish-dry-run:
     needs: crates
     runs-on: ${{ vars.RUNS_ON }}
     strategy:
@@ -15,7 +15,7 @@ jobs:
         crate: ${{ fromJSON(needs.crates.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v6
-      - name: Run docs gen
+      - name: Run publish dry-run
         uses: soltiHQ/actions/taskfile@main
         with:
-          command: ci:cargo/docs CRATE=${{ matrix.crate }}
+          command: ci:cargo/publish-dry-run CRATE=${{ matrix.crate }}

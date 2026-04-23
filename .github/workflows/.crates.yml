@@ -1,0 +1,31 @@
+name: Crates
+
+on:
+  workflow_call:
+    outputs:
+      matrix:
+        description: "JSON array of crate names (for `strategy.matrix`)."
+        value: ${{ jobs.list.outputs.matrix }}
+      list:
+        description: "Newline-separated crate names (for `cargo-publish` action)."
+        value: ${{ jobs.list.outputs.list }}
+
+jobs:
+  list:
+    runs-on: ${{ vars.RUNS_ON }}
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      list: ${{ steps.set.outputs.list }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: set
+        shell: bash
+        run: |
+          entries=$(grep -vE '^\s*(#|$)' .github/crates.txt)
+          matrix=$(printf '%s\n' "$entries" | jq -Rsc 'split("\n") | map(select(length > 0))')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          {
+            echo "list<<EOF"
+            printf '%s\n' "$entries"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
