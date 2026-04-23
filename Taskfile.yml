@@ -16,16 +16,3 @@ tasks:
     cmds:
       - echo "Please enter a task or use '-l' or '--list-all' to list all available tasks"
     silent: true
-
-  ci:cargo/docs:
-    desc: Run 'rustdoc' for specific crate.
-    silent: true
-    requires:
-      vars: [ CRATE ]
-    cmds:
-      - task: ci:_cargo/tool
-        vars:
-          CMD: >-
-            +nightly rustdoc --lib --manifest-path crates/{{.CRATE}}/Cargo.toml --all-features
-            -Zrustdoc-map -Zunstable-options -Zrustdoc-scrape-examples
-            --config 'build.rustdocflags=["--cfg","docsrs","-Z","unstable-options","--cap-lints","warn"]'
