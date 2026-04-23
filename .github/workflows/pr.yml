@@ -10,7 +10,8 @@ concurrency:
 
 permissions: {
   contents: read,
-  actions: write
+  actions: write,
+  pull-requests: read
 }
 
 jobs:
