@@ -445,9 +445,7 @@ mod tests {
                 .with_attempt(3),
         );
 
-        let h = sub
-            .attempts_to_finalize
-            .with_label_values(&["exhausted"]);
+        let h = sub.attempts_to_finalize.with_label_values(&["exhausted"]);
         assert_eq!(h.get_sample_count(), 1);
         assert_eq!(h.get_sample_sum(), 3.0);
     }
@@ -474,9 +472,7 @@ mod tests {
 
         sub.on_event(&Event::new(EventKind::ActorExhausted).with_task("t"));
 
-        let h = sub
-            .attempts_to_finalize
-            .with_label_values(&["exhausted"]);
+        let h = sub.attempts_to_finalize.with_label_values(&["exhausted"]);
         assert_eq!(h.get_sample_count(), 1);
         assert_eq!(h.get_sample_sum(), 1.0);
     }
@@ -591,9 +587,7 @@ mod tests {
     #[test]
     fn classify_rejection_reason_recognizes_known_prefixes() {
         assert_eq!(
-            classify_rejection_reason(Some(
-                "slot full at capacity cap=1 depth=1 admission=Queue"
-            )),
+            classify_rejection_reason(Some("slot full at capacity cap=1 depth=1 admission=Queue")),
             "slot_full"
         );
         assert_eq!(
@@ -617,9 +611,7 @@ mod tests {
             "recovery_failed"
         );
         assert_eq!(
-            classify_rejection_reason(Some(
-                "bus_lagged: missed 1 events, recovering slots"
-            )),
+            classify_rejection_reason(Some("bus_lagged: missed 1 events, recovering slots")),
             "bus_lagged"
         );
         assert_eq!(
