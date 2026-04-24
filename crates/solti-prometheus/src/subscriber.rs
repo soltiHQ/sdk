@@ -31,7 +31,7 @@ use crate::register::{Sub, ms_to_secs};
 /// SubscriberOverflow  → subscriber_overflow.inc() + tracing::warn
 /// SubscriberPanicked  → subscriber_panicked.inc() + tracing::warn
 /// ControllerSubmitted → controller_submissions.inc()
-/// ControllerRejected  → controller_rejections.inc()
+/// ControllerRejected  → controller_rejections{reason}.inc()  (reason classified from Event.reason)
 /// ```
 ///
 /// ## Supervision metrics (`solti_sv_*`)
@@ -49,17 +49,18 @@ use crate::register::{Sub, ms_to_secs};
 ///
 /// ## Controller metrics (`solti_ctrl_*`)
 ///
-/// | Metric                         | Type    | Labels | Description            |
-/// |--------------------------------|---------|--------|------------------------|
-/// | `solti_ctrl_submissions_total` | Counter | -      | Controller submissions |
-/// | `solti_ctrl_rejections_total`  | Counter | -      | Controller rejections  |
+/// | Metric                         | Type      | Labels   | Description                             |
+/// |--------------------------------|-----------|----------|-----------------------------------------|
+/// | `solti_ctrl_submissions_total` | Counter   | -        | Controller submissions                  |
+/// | `solti_ctrl_rejections_total`  | CounterVec| `reason` | Controller rejections grouped by cause  |
 ///
 /// ## Labels
 ///
-/// | Label    | Values                | Source                         |
-/// |----------|-----------------------|--------------------------------|
-/// | `source` | `failure`, `success`  | [`BackoffSource`] on the event |
-/// | `reason` | `exhausted`, `fatal`  | Terminal event kind            |
+/// | Label    | Values                                                                                                                           | Source                                                       |
+/// |----------|----------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------|
+/// | `source` | `failure`, `success`                                                                                                             | [`BackoffSource`] on the event                               |
+/// | `reason` (terminal)   | `exhausted`, `fatal`                                                                                                | Terminal event kind                                          |
+/// | `reason` (rejection)  | `slot_full`, `slot_busy`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` | Classified from `Event.reason` by [`classify_rejection_reason`] |
 ///
 /// ## Notes
 ///
@@ -81,7 +82,38 @@ pub struct PrometheusSubscriber {
     subscriber_overflow: Counter,
     subscriber_panicked: Counter,
     controller_submissions: Counter,
-    controller_rejections: Counter,
+    controller_rejections: CounterVec,
+}
+
+/// Map a free-form `ControllerRejected` reason string to a bounded, low-cardinality metric label.
+///
+/// The raw `reason` on [`taskvisor::Event`] can embed error messages, queue depths, and other unbounded content, which would explode Prometheus cardinality if used directly as a label.
+/// This classifier collapses known prefixes produced by taskvisor's controller into a small set:
+///
+/// [`slot_full`, `slot_busy`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` ].
+fn classify_rejection_reason(reason: Option<&str>) -> &'static str {
+    let Some(r) = reason else {
+        return "unknown";
+    };
+    if r.starts_with("slot full") {
+        "slot_full"
+    } else if r.starts_with("dropped: slot busy") {
+        "slot_busy"
+    } else if r.starts_with("add_failed") {
+        "add_failed"
+    } else if r.starts_with("remove_failed") {
+        "remove_failed"
+    } else if r.starts_with("queue_start_failed") {
+        "queue_failed"
+    } else if r.starts_with("recovery_start_failed") {
+        "recovery_failed"
+    } else if r.starts_with("bus_lagged") {
+        "bus_lagged"
+    } else if r.starts_with("controller_loop_exited") {
+        "controller_exited"
+    } else {
+        "other"
+    }
 }
 
 impl PrometheusSubscriber {
@@ -121,8 +153,11 @@ impl PrometheusSubscriber {
 
         let controller_submissions =
             ctrl.counter("submissions_total", "Total controller submissions")?;
-        let controller_rejections =
-            ctrl.counter("rejections_total", "Total controller rejections")?;
+        let controller_rejections = ctrl.counter_vec(
+            "rejections_total",
+            "Total controller rejections grouped by cause",
+            &["reason"],
+        )?;
 
         Ok(Self {
             tasks_in_flight,
@@ -195,7 +230,10 @@ impl Subscribe for PrometheusSubscriber {
                 self.controller_submissions.inc();
             }
             EventKind::ControllerRejected => {
-                self.controller_rejections.inc();
+                let reason = classify_rejection_reason(event.reason.as_deref());
+                self.controller_rejections
+                    .with_label_values(&[reason])
+                    .inc();
             }
             EventKind::TaskAdded
             | EventKind::TaskRemoved
@@ -431,12 +469,104 @@ mod tests {
     }
 
     #[test]
-    fn controller_rejected_increments_counter() {
+    fn controller_rejected_without_reason_labels_as_unknown() {
         let sub = new_subscriber();
 
         sub.on_event(&Event::new(EventKind::ControllerRejected).with_task("t"));
 
-        assert_eq!(sub.controller_rejections.get(), 1.0);
+        assert_eq!(
+            sub.controller_rejections
+                .with_label_values(&["unknown"])
+                .get(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn controller_rejected_slot_full_reason() {
+        let sub = new_subscriber();
+
+        sub.on_event(
+            &Event::new(EventKind::ControllerRejected)
+                .with_task("t")
+                .with_reason("slot full at capacity cap=1 depth=1 admission=Queue"),
+        );
+
+        assert_eq!(
+            sub.controller_rejections
+                .with_label_values(&["slot_full"])
+                .get(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn controller_rejected_slot_busy_reason() {
+        let sub = new_subscriber();
+
+        sub.on_event(
+            &Event::new(EventKind::ControllerRejected)
+                .with_task("t")
+                .with_reason("dropped: slot busy (status=Running)"),
+        );
+
+        assert_eq!(
+            sub.controller_rejections
+                .with_label_values(&["slot_busy"])
+                .get(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn classify_rejection_reason_recognizes_known_prefixes() {
+        assert_eq!(
+            classify_rejection_reason(Some(
+                "slot full at capacity cap=1 depth=1 admission=Queue"
+            )),
+            "slot_full"
+        );
+        assert_eq!(
+            classify_rejection_reason(Some("dropped: slot busy (status=Running)")),
+            "slot_busy"
+        );
+        assert_eq!(
+            classify_rejection_reason(Some("add_failed: something")),
+            "add_failed"
+        );
+        assert_eq!(
+            classify_rejection_reason(Some("remove_failed: boom")),
+            "remove_failed"
+        );
+        assert_eq!(
+            classify_rejection_reason(Some("queue_start_failed: oom")),
+            "queue_failed"
+        );
+        assert_eq!(
+            classify_rejection_reason(Some("recovery_start_failed: net")),
+            "recovery_failed"
+        );
+        assert_eq!(
+            classify_rejection_reason(Some(
+                "bus_lagged: missed 1 events, recovering slots"
+            )),
+            "bus_lagged"
+        );
+        assert_eq!(
+            classify_rejection_reason(Some("controller_loop_exited: channel closed")),
+            "controller_exited"
+        );
+    }
+
+    #[test]
+    fn classify_rejection_reason_none_is_unknown() {
+        assert_eq!(classify_rejection_reason(None), "unknown");
+    }
+
+    #[test]
+    fn classify_rejection_reason_unrecognized_is_other() {
+        assert_eq!(classify_rejection_reason(Some("something weird")), "other");
+        assert_eq!(classify_rejection_reason(Some("")), "other");
     }
 
     #[test]

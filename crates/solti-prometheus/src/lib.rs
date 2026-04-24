@@ -48,7 +48,8 @@
 //! | `solti_runner_task_duration_seconds` | Histogram | `runner`, `outcome` | Per-attempt execution duration |
 //! | `solti_runner_errors_total`          | Counter   | `runner`, `error`   | Runner setup/teardown errors   |
 //!
-//! Duration histogram buckets (seconds): `0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600`.
+//! Duration histogram buckets (seconds): [ `0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 1800, 3600`].
+//! Dense through the `10 ms - 10 s` range, sparser long tail out to one hour.
 //!
 //! ## Supervision metrics (`solti_sv_*`)
 //!
@@ -65,10 +66,13 @@
 //!
 //! ## Controller metrics (`solti_ctrl_*`)
 //!
-//! | Metric                         | Type    | Labels | Description            |
-//! |--------------------------------|---------|--------|------------------------|
-//! | `solti_ctrl_submissions_total` | Counter | —      | Controller submissions |
-//! | `solti_ctrl_rejections_total`  | Counter | —      | Controller rejections  |
+//! | Metric                         | Type      | Labels   | Description                            |
+//! |--------------------------------|-----------|----------|----------------------------------------|
+//! | `solti_ctrl_submissions_total` | Counter   | —        | Controller submissions                 |
+//! | `solti_ctrl_rejections_total`  | CounterVec| `reason` | Controller rejections grouped by cause |
+//!
+//! `reason` values (bounded, classified from `Event.reason`):
+//! [ `slot_full`, `slot_busy`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown`].
 //!
 //! ## API metrics (`solti_api_*`, feature `api`)
 //!
@@ -123,7 +127,7 @@
 //!  SubscriberOverflow  → subscriber_overflow.inc()
 //!  SubscriberPanicked  → subscriber_panicked.inc()
 //!  ControllerSubmitted → controller_submissions.inc()
-//!  ControllerRejected  → controller_rejections.inc()
+//!  ControllerRejected  → controller_rejections{reason}.inc()  (reason classified from Event.reason)
 //! ```
 //!
 //! ## Feature flags

@@ -38,8 +38,7 @@ use crate::register::{Sub, ms_to_secs};
 ///
 /// ## Duration histogram buckets
 ///
-/// Buckets (seconds): `0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600`.
-/// Covers sub-second scripts up to 1-hour long-running tasks.
+/// Buckets (seconds): `0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 1800, 3600`.
 ///
 /// ## Also
 ///
@@ -73,7 +72,7 @@ impl PrometheusMetrics {
             "task_duration_seconds",
             "Task execution duration in seconds",
             vec![
-                0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
+                0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0, 1800.0,
                 3600.0,
             ],
             &["runner", "outcome"],
