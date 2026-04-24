@@ -1,4 +1,4 @@
-use crate::metrics::backend::{MetricsBackend, RunnerType, TaskOutcome};
+use crate::metrics::backend::{MetricsBackend, RunnerErrorKind, RunnerType, TaskOutcome};
 
 /// No-op metrics backend that compiles to nothing.
 #[derive(Debug, Clone, Copy, Default)]
@@ -12,7 +12,7 @@ impl MetricsBackend for NoOpMetrics {
     fn record_task_completed(&self, _: RunnerType, _: TaskOutcome, _: u64) {}
 
     #[inline(always)]
-    fn record_runner_error(&self, _: RunnerType, _: &str) {}
+    fn record_runner_error(&self, _: RunnerType, _: RunnerErrorKind) {}
 }
 
 #[cfg(test)]
@@ -29,7 +29,7 @@ mod tests {
         let metrics = NoOpMetrics;
         for _ in 0..1000 {
             metrics.record_task_started(RunnerType::Subprocess);
-            metrics.record_runner_error(RunnerType::Subprocess, "error");
+            metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
             metrics.record_task_completed(RunnerType::Subprocess, TaskOutcome::Success, 100);
         }
     }

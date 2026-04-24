@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use prometheus::{CounterVec, HistogramVec, Registry, proto::MetricFamily};
 
-use solti_runner::{MetricsBackend, RunnerType, TaskOutcome};
+use solti_runner::{MetricsBackend, RunnerErrorKind, RunnerType, TaskOutcome};
 
 use crate::register::{Sub, ms_to_secs};
 
@@ -30,11 +30,11 @@ use crate::register::{Sub, ms_to_secs};
 ///
 /// All label sets have low, bounded cardinality:
 ///
-/// | Label     | Values                                      | Cardinality |
-/// |-----------|---------------------------------------------|-------------|
-/// | `runner`  | `subprocess`, `wasm`, `container`           | Low         |
-/// | `outcome` | `success`, `failure`, `canceled`, `timeout` | Low         |
-/// | `error`   | `spawn_failed`, `backend_config_failed`, …  | Low         |
+/// | Label     | Values                                                                                                            | Cardinality |
+/// |-----------|-------------------------------------------------------------------------------------------------------------------|-------------|
+/// | `runner`  | `subprocess`, `wasm`, `container`                                                                                 | Low         |
+/// | `outcome` | `success`, `failure`, `canceled`, `timeout`                                                                       | Low         |
+/// | `error`   | `cgroup_prepare_failed`, `backend_config_failed`, `spawn_failed`, `module_load_failed` (from [`RunnerErrorKind`]) | Low         |
 ///
 /// ## Duration histogram buckets
 ///
@@ -149,9 +149,9 @@ impl MetricsBackend for PrometheusMetrics {
     ///
     /// Called for runner setup/teardown errors (e.g. spawn failures), **not** for task-level failures
     /// which go through [`record_task_completed`](MetricsBackend::record_task_completed).
-    fn record_runner_error(&self, runner_type: RunnerType, error_kind: &str) {
+    fn record_runner_error(&self, runner_type: RunnerType, error_kind: RunnerErrorKind) {
         self.runner_errors
-            .with_label_values(&[runner_type.as_label(), error_kind])
+            .with_label_values(&[runner_type.as_label(), error_kind.as_label()])
             .inc();
     }
 }
@@ -208,9 +208,9 @@ mod tests {
     fn record_runner_error_increments_counter() {
         let metrics = PrometheusMetrics::new().unwrap();
 
-        metrics.record_runner_error(RunnerType::Subprocess, "spawn_failed");
-        metrics.record_runner_error(RunnerType::Subprocess, "spawn_failed");
-        metrics.record_runner_error(RunnerType::Wasm, "module_load_failed");
+        metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+        metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+        metrics.record_runner_error(RunnerType::Wasm, RunnerErrorKind::ModuleLoadFailed);
 
         let families = metrics.gather();
         let errors = families
