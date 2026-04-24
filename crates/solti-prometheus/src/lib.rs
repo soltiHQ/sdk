@@ -60,6 +60,7 @@
 //! | `solti_sv_task_backoff_count_total`      | Counter   | `source` | Backoff events               |
 //! | `solti_sv_task_backoff_duration_seconds` | Histogram | —        | Backoff delay duration       |
 //! | `solti_sv_task_terminal_total`           | Counter   | `reason` | Terminal task states         |
+//! | `solti_sv_attempts_to_finalize`          | Histogram | `outcome`| Attempts when task left loop |
 //! | `solti_sv_task_timeouts_total`           | Counter   | —        | Timeout events               |
 //! | `solti_sv_subscriber_overflow_total`     | Counter   | —        | Queue overflow (lost events) |
 //! | `solti_sv_subscriber_panicked_total`     | Counter   | —        | Subscriber panics            |
@@ -122,8 +123,8 @@
 //!  TaskFailed          → tasks_in_flight.dec()
 //!  TimeoutHit          → task_timeouts.inc()
 //!  BackoffScheduled    → task_backoff_count{source}.inc() + task_backoff_duration.observe(delay)
-//!  ActorExhausted      → task_terminal{reason="exhausted"}.inc()
-//!  ActorDead           → task_terminal{reason="fatal"}.inc()
+//!  ActorExhausted      → task_terminal{reason="exhausted"}.inc() + attempts_to_finalize{outcome="exhausted"}.observe(attempt)
+//!  ActorDead           → task_terminal{reason="fatal"}.inc()     + attempts_to_finalize{outcome="fatal"}.observe(attempt)
 //!  SubscriberOverflow  → subscriber_overflow.inc()
 //!  SubscriberPanicked  → subscriber_panicked.inc()
 //!  ControllerSubmitted → controller_submissions.inc()

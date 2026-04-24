@@ -51,16 +51,17 @@ Duration histogram buckets (seconds): `0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5
 
 ## Supervision metrics (`solti_sv_*`)
 
-| Metric                                   | Type      | Labels   | Description                  |
-|------------------------------------------|-----------|----------|------------------------------|
-| `solti_sv_tasks_in_flight`               | Gauge     | —        | Currently executing tasks    |
-| `solti_sv_task_restarts_total`           | Counter   | —        | Restarts (attempt > 1)       |
-| `solti_sv_task_backoff_count_total`      | Counter   | `source` | Backoff events               |
-| `solti_sv_task_backoff_duration_seconds` | Histogram | —        | Backoff delay duration       |
-| `solti_sv_task_terminal_total`           | Counter   | `reason` | Terminal task states         |
-| `solti_sv_task_timeouts_total`           | Counter   | —        | Timeout events               |
-| `solti_sv_subscriber_overflow_total`     | Counter   | —        | Queue overflow (lost events) |
-| `solti_sv_subscriber_panicked_total`     | Counter   | —        | Subscriber panics            |
+| Metric                                   | Type      | Labels    | Description                  |
+|------------------------------------------|-----------|-----------|------------------------------|
+| `solti_sv_tasks_in_flight`               | Gauge     | —         | Currently executing tasks    |
+| `solti_sv_task_restarts_total`           | Counter   | —         | Restarts (attempt > 1)       |
+| `solti_sv_task_backoff_count_total`      | Counter   | `source`  | Backoff events               |
+| `solti_sv_task_backoff_duration_seconds` | Histogram | —         | Backoff delay duration       |
+| `solti_sv_task_terminal_total`           | Counter   | `reason`  | Terminal task states         |
+| `solti_sv_attempts_to_finalize`          | Histogram | `outcome` | Attempts when task left loop |
+| `solti_sv_task_timeouts_total`           | Counter   | —         | Timeout events               |
+| `solti_sv_subscriber_overflow_total`     | Counter   | —         | Queue overflow (lost events) |
+| `solti_sv_subscriber_panicked_total`     | Counter   | —         | Subscriber panics            |
 
 ## Controller metrics (`solti_ctrl_*`)
 
@@ -120,8 +121,8 @@ Its labels (set as Prometheus *constant* labels) carry build-time identity.
   TaskFailed          → tasks_in_flight.dec()
   TimeoutHit          → task_timeouts.inc()
   BackoffScheduled    → task_backoff_count{source}.inc() + task_backoff_duration.observe(delay)
-  ActorExhausted      → task_terminal{reason="exhausted"}.inc()
-  ActorDead           → task_terminal{reason="fatal"}.inc()
+  ActorExhausted      → task_terminal{reason="exhausted"}.inc() + attempts_to_finalize{outcome="exhausted"}.observe(attempt)
+  ActorDead           → task_terminal{reason="fatal"}.inc()     + attempts_to_finalize{outcome="fatal"}.observe(attempt)
   SubscriberOverflow  → subscriber_overflow.inc()
   SubscriberPanicked  → subscriber_panicked.inc()
   ControllerSubmitted → controller_submissions.inc()
@@ -130,17 +131,17 @@ Its labels (set as Prometheus *constant* labels) carry build-time identity.
 
 ## Labels cardinality
 
-| Label       | Values                                                                                                                                    | Cardinality                 |
-|-------------|-------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------|
-| `runner`    | `subprocess`, `wasm`, `container`                                                                                                         | low                         |
-| `outcome`   | `success`, `failure`, `canceled`, `timeout` (runner); `success`, `failure` (discover)                                                     | low                         |
-| `error`     | `spawn_failed`, `backend_config_failed`, …                                                                                                | low                         |
-| `source`    | `failure`, `success`                                                                                                                      | low                         |
+| Label       | Values                                                                                                                                                                                                                                                                                                               | Cardinality                 |
+|-------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------|
+| `runner`    | `subprocess`, `wasm`, `container`                                                                                                                                                                                                                                                                                    | low                         |
+| `outcome`   | `success`, `failure`, `canceled`, `timeout` (runner); `success`, `failure` (discover)                                                                                                                                                                                                                                | low                         |
+| `error`     | `spawn_failed`, `backend_config_failed`, …                                                                                                                                                                                                                                                                           | low                         |
+| `source`    | `failure`, `success`                                                                                                                                                                                                                                                                                                 | low                         |
 | `reason`    | `exhausted`, `fatal` (terminal); `slot_full`, `slot_busy`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` (controller rejections); `connect`, `timeout`, `rejected_client`, `rejected_server`, `parse`, `auth`, `other` (discover failures) | low                         |
-| `transport` | `http`, `grpc`                                                                                                                            | low                         |
-| `method`    | HTTP method for HTTP, RPC method name for gRPC                                                                                            | low                         |
-| `path`      | Templated route (`/api/v1/tasks/{id}`) for HTTP, full RPC path for gRPC                                                                   | low (bounded by route set)  |
-| `status`    | HTTP status code (HTTP), gRPC code number (gRPC)                                                                                          | low                         |
+| `transport` | `http`, `grpc`                                                                                                                                                                                                                                                                                                       | low                         |
+| `method`    | HTTP method for HTTP, RPC method name for gRPC                                                                                                                                                                                                                                                                       | low                         |
+| `path`      | Templated route (`/api/v1/tasks/{id}`) for HTTP, full RPC path for gRPC                                                                                                                                                                                                                                              | low (bounded by route set)  |
+| `status`    | HTTP status code (HTTP), gRPC code number (gRPC)                                                                                                                                                                                                                                                                     | low                         |
 
 All label sets have low, bounded cardinality.
 

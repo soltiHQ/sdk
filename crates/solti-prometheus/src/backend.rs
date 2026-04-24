@@ -44,7 +44,6 @@ use crate::register::{Sub, ms_to_secs};
 ///
 /// - [`PrometheusSubscriber`](crate::PrometheusSubscriber) is a supervision-level metrics from the event stream.
 /// - [`Registry`](prometheus::Registry) is a shared registry for unified `/metrics` endpoint.
-#[derive(Clone)]
 pub struct PrometheusMetrics {
     tasks_started: CounterVec,
     tasks_completed: CounterVec,
@@ -105,6 +104,12 @@ impl PrometheusMetrics {
     /// Get reference to underlying prometheus registry.
     pub fn registry(&self) -> &Arc<Registry> {
         &self.registry
+    }
+}
+
+impl std::fmt::Debug for PrometheusMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrometheusMetrics").finish()
     }
 }
 

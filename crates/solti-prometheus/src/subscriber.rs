@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use prometheus::{Counter, CounterVec, Gauge, Histogram, Registry};
+use prometheus::{Counter, CounterVec, Gauge, Histogram, HistogramVec, Registry};
 use taskvisor::{BackoffSource, Event, EventKind, Subscribe};
 
 use crate::register::{Sub, ms_to_secs};
@@ -27,7 +27,9 @@ use crate::register::{Sub, ms_to_secs};
 /// BackoffScheduled    → task_backoff_count{source}.inc()
 ///                       + task_backoff_duration.observe(delay)
 /// ActorExhausted      → task_terminal{reason="exhausted"}.inc()
+///                       + attempts_to_finalize{outcome="exhausted"}.observe(attempt)
 /// ActorDead           → task_terminal{reason="fatal"}.inc()
+///                       + attempts_to_finalize{outcome="fatal"}.observe(attempt)
 /// SubscriberOverflow  → subscriber_overflow.inc() + tracing::warn
 /// SubscriberPanicked  → subscriber_panicked.inc() + tracing::warn
 /// ControllerSubmitted → controller_submissions.inc()
@@ -43,6 +45,7 @@ use crate::register::{Sub, ms_to_secs};
 /// | `solti_sv_task_backoff_count_total`      | Counter   | `source` | Backoff events               |
 /// | `solti_sv_task_backoff_duration_seconds` | Histogram | -        | Backoff delay duration       |
 /// | `solti_sv_task_terminal_total`           | Counter   | `reason` | Terminal task states         |
+/// | `solti_sv_attempts_to_finalize`          | Histogram | `outcome`| Attempts when task left loop |
 /// | `solti_sv_task_timeouts_total`           | Counter   | -        | Timeout events               |
 /// | `solti_sv_subscriber_overflow_total`     | Counter   | -        | Queue overflow (lost events) |
 /// | `solti_sv_subscriber_panicked_total`     | Counter   | -        | Subscriber panics            |
@@ -60,6 +63,7 @@ use crate::register::{Sub, ms_to_secs};
 /// |----------|----------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------|
 /// | `source` | `failure`, `success`                                                                                                             | [`BackoffSource`] on the event                               |
 /// | `reason` (terminal)   | `exhausted`, `fatal`                                                                                                | Terminal event kind                                          |
+/// | `outcome` (attempts)  | `exhausted`, `fatal`                                                                                                | Attempts-to-finalize histogram                               |
 /// | `reason` (rejection)  | `slot_full`, `slot_busy`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` | Classified from `Event.reason` by [`classify_rejection_reason`] |
 ///
 /// ## Notes
@@ -78,6 +82,7 @@ pub struct PrometheusSubscriber {
     task_backoff_count: CounterVec,
     task_backoff_duration: Histogram,
     task_terminal: CounterVec,
+    attempts_to_finalize: HistogramVec,
     task_timeouts: Counter,
     subscriber_overflow: Counter,
     subscriber_panicked: Counter,
@@ -143,6 +148,12 @@ impl PrometheusSubscriber {
             "Total terminal task states",
             &["reason"],
         )?;
+        let attempts_to_finalize = sv.histogram_vec(
+            "attempts_to_finalize",
+            "Number of attempts observed when a task leaves the supervision loop",
+            vec![1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0],
+            &["outcome"],
+        )?;
         let task_timeouts = sv.counter("task_timeouts_total", "Total task timeout events")?;
         let subscriber_overflow = sv.counter(
             "subscriber_overflow_total",
@@ -165,12 +176,19 @@ impl PrometheusSubscriber {
             task_backoff_count,
             task_backoff_duration,
             task_terminal,
+            attempts_to_finalize,
             task_timeouts,
             subscriber_overflow,
             subscriber_panicked,
             controller_submissions,
             controller_rejections,
         })
+    }
+}
+
+impl std::fmt::Debug for PrometheusSubscriber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrometheusSubscriber").finish()
     }
 }
 
@@ -222,9 +240,15 @@ impl Subscribe for PrometheusSubscriber {
             }
             EventKind::ActorExhausted => {
                 self.task_terminal.with_label_values(&["exhausted"]).inc();
+                self.attempts_to_finalize
+                    .with_label_values(&["exhausted"])
+                    .observe(f64::from(event.attempt.unwrap_or(1)));
             }
             EventKind::ActorDead => {
                 self.task_terminal.with_label_values(&["fatal"]).inc();
+                self.attempts_to_finalize
+                    .with_label_values(&["fatal"])
+                    .observe(f64::from(event.attempt.unwrap_or(1)));
             }
             EventKind::ControllerSubmitted => {
                 self.controller_submissions.inc();
@@ -409,6 +433,52 @@ mod tests {
             sub.task_terminal.with_label_values(&["exhausted"]).get(),
             1.0
         );
+    }
+
+    #[test]
+    fn actor_exhausted_observes_attempts_to_finalize() {
+        let sub = new_subscriber();
+
+        sub.on_event(
+            &Event::new(EventKind::ActorExhausted)
+                .with_task("t")
+                .with_attempt(3),
+        );
+
+        let h = sub
+            .attempts_to_finalize
+            .with_label_values(&["exhausted"]);
+        assert_eq!(h.get_sample_count(), 1);
+        assert_eq!(h.get_sample_sum(), 3.0);
+    }
+
+    #[test]
+    fn actor_dead_observes_attempts_to_finalize() {
+        let sub = new_subscriber();
+
+        sub.on_event(
+            &Event::new(EventKind::ActorDead)
+                .with_task("t")
+                .with_attempt(7)
+                .with_reason("fatal"),
+        );
+
+        let h = sub.attempts_to_finalize.with_label_values(&["fatal"]);
+        assert_eq!(h.get_sample_count(), 1);
+        assert_eq!(h.get_sample_sum(), 7.0);
+    }
+
+    #[test]
+    fn actor_exhausted_without_attempt_observes_one() {
+        let sub = new_subscriber();
+
+        sub.on_event(&Event::new(EventKind::ActorExhausted).with_task("t"));
+
+        let h = sub
+            .attempts_to_finalize
+            .with_label_values(&["exhausted"]);
+        assert_eq!(h.get_sample_count(), 1);
+        assert_eq!(h.get_sample_sum(), 1.0);
     }
 
     #[test]
