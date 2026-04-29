@@ -17,6 +17,7 @@
 //! | [`register_process_collector`]| `process_*`                   | `process`  | Prometheus' default process collector (Linux-only effect) |
 //! | [`register_build_info`]       | `solti_build_info`            | —          | Gauge `= 1` carrying constant labels                      |
 //! | [`server`]                    | —                             | `server`   | Embedded supervised HTTP task exposing `/metrics`         |
+//! | [`PrometheusStateCollector`]  | `solti_sv_tasks_by_phase`     | `state`    | Pull-based collector over `solti_core::TaskState`         |
 //!
 //! ## Architecture
 //!
@@ -64,6 +65,7 @@
 //! | `solti_sv_task_timeouts_total`           | Counter   | —        | Timeout events               |
 //! | `solti_sv_subscriber_overflow_total`     | Counter   | —        | Queue overflow (lost events) |
 //! | `solti_sv_subscriber_panicked_total`     | Counter   | —        | Subscriber panics            |
+//! | `solti_sv_tasks_by_phase`                | Gauge     | `phase`  | Current tasks per phase (feature `state`, pull-based snapshot) |
 //!
 //! ## Controller metrics (`solti_ctrl_*`)
 //!
@@ -139,6 +141,7 @@
 //! | `discover` | off     | Enables [`PrometheusDiscoverMetrics`] (depends on `solti-discover`)                                               |
 //! | `process`  | off     | Makes [`register_process_collector`] register actual `process_*` metrics (Linux); propagates `prometheus/process` |
 //! | `server`   | off     | Enables [`server`] - a supervised embedded HTTP task serving `/metrics`                                           |
+//! | `state`    | off     | Enables [`PrometheusStateCollector`] — pull-based `solti_sv_tasks_by_phase` snapshot (depends on `solti-core`)    |
 //!
 //! ## Quick wire
 //!
@@ -216,5 +219,10 @@ pub use api::PrometheusApiMetrics;
 mod server;
 #[cfg(feature = "server")]
 pub use server::{METRICS_SERVER_SLOT, server};
+
+#[cfg(feature = "state")]
+mod state;
+#[cfg(feature = "state")]
+pub use state::PrometheusStateCollector;
 
 pub use prometheus::Registry;

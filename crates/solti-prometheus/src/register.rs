@@ -79,6 +79,23 @@ impl<'a> Sub<'a> {
         Ok(h)
     }
 
+    /// Build a [`GaugeVec`] **without** registering it into a registry.
+    ///
+    /// Used by composite collectors that expose a `GaugeVec` via [`prometheus::core::Collector::collect`];
+    /// the collector itself is registered by the caller, so the inner metric must not be registered twice.
+    #[inline]
+    pub(crate) fn gauge_vec_unregistered(
+        subsystem: &'static str,
+        name: &str,
+        help: &str,
+        labels: &[&str],
+    ) -> Result<GaugeVec, prometheus::Error> {
+        let opts = Opts::new(name, help)
+            .namespace("solti")
+            .subsystem(subsystem);
+        GaugeVec::new(opts, labels)
+    }
+
     pub(crate) fn histogram_vec(
         &self,
         name: &str,

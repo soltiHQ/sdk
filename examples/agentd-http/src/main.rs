@@ -89,8 +89,9 @@ use solti_observe::{
     init_logger, timezone_sync,
 };
 use solti_prometheus::{
-    PrometheusApiMetrics, PrometheusDiscoverMetrics, PrometheusMetrics, PrometheusSubscriber,
-    Registry, register_build_info, register_process_collector, server as metrics_server,
+    PrometheusApiMetrics, PrometheusDiscoverMetrics, PrometheusMetrics, PrometheusStateCollector,
+    PrometheusSubscriber, Registry, register_build_info, register_process_collector,
+    server as metrics_server,
 };
 use solti_runner::{BuildContext, RunnerRouter};
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
@@ -139,6 +140,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         StateConfig::default(),
     )
     .await?;
+
+    // Pull-based collector: snapshots supervisor state on each /metrics scrape.
+    let state_collector = PrometheusStateCollector::new(supervisor.state())?;
+    registry.register(Box::new(state_collector))?;
 
     // Internal tasks travel the same pipeline as user TaskSpecs: submit → dispatch → run.
     let (tz_task, tz_spec) = timezone_sync();

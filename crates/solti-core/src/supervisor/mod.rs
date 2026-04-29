@@ -141,6 +141,17 @@ impl SupervisorApi {
         self.handle.clone()
     }
 
+    /// Get a clone of the shared [`TaskState`].
+    ///
+    /// The clone is cheap (`Arc<RwLock<_>>` inside) and reflects live state:
+    /// later mutations on the original are visible through the clone.
+    ///
+    /// Intended for read-only consumers like metric collectors
+    /// (e.g. `solti_prometheus::PrometheusStateCollector`).
+    pub fn state(&self) -> TaskState {
+        self.state.clone()
+    }
+
     /// Build and submit a task described by [`TaskSpec`].
     ///
     /// Steps:

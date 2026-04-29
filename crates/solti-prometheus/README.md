@@ -16,6 +16,7 @@ A single `/metrics` endpoint covers runner internals, supervisor events, API req
 | `register_process_collector`  | `process_*`                   | `process`  | Prometheus' default process collector (Linux-only effect) |
 | `register_build_info`         | `solti_build_info`            | —          | Gauge `= 1` carrying constant labels                      |
 | `server`                      | —                             | `server`   | Embedded supervised HTTP task exposing `/metrics`         |
+| `PrometheusStateCollector`    | `solti_sv_tasks_by_phase`     | `state`    | Pull-based collector over `solti_core::TaskState`         |
 
 ## Architecture
 
@@ -62,6 +63,7 @@ Duration histogram buckets (seconds): `0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5
 | `solti_sv_task_timeouts_total`           | Counter   | —         | Timeout events               |
 | `solti_sv_subscriber_overflow_total`     | Counter   | —         | Queue overflow (lost events) |
 | `solti_sv_subscriber_panicked_total`     | Counter   | —         | Subscriber panics            |
+| `solti_sv_tasks_by_phase`                | Gauge     | `phase`   | Current tasks per phase (feature `state`, pull-based snapshot) |
 
 ## Controller metrics (`solti_ctrl_*`)
 
@@ -153,6 +155,7 @@ All label sets have low, bounded cardinality.
 | `discover` | off     | `PrometheusDiscoverMetrics` (depends on `solti-discover`)                                            |
 | `process`  | off     | Makes `register_process_collector` register actual `process_*` metrics on Linux                      |
 | `server`   | off     | `server` — a supervised embedded HTTP task serving `/metrics`                                        |
+| `state`    | off     | `PrometheusStateCollector` — pull-based `solti_sv_tasks_by_phase` snapshot (depends on `solti-core`) |
 
 ## Example
 
