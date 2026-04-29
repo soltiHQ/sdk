@@ -6,9 +6,11 @@
 
 use std::sync::Arc;
 
-use prometheus::{CounterVec, HistogramVec, Opts, Registry, proto::MetricFamily};
+use prometheus::{CounterVec, HistogramVec, Registry, proto::MetricFamily};
 
-use solti_runner::{MetricsBackend, RunnerType, TaskOutcome};
+use solti_runner::{MetricsBackend, RunnerErrorKind, RunnerType, TaskOutcome};
+
+use crate::register::{Sub, ms_to_secs};
 
 /// Prometheus metrics backend for solti runners.
 ///
@@ -28,22 +30,20 @@ use solti_runner::{MetricsBackend, RunnerType, TaskOutcome};
 ///
 /// All label sets have low, bounded cardinality:
 ///
-/// | Label     | Values                                      | Cardinality |
-/// |-----------|---------------------------------------------|-------------|
-/// | `runner`  | `subprocess`, `wasm`, `container`           | Low         |
-/// | `outcome` | `success`, `failure`, `canceled`, `timeout` | Low         |
-/// | `error`   | `spawn_failed`, `backend_config_failed`, …  | Low         |
+/// | Label     | Values                                                                                                            | Cardinality |
+/// |-----------|-------------------------------------------------------------------------------------------------------------------|-------------|
+/// | `runner`  | `subprocess`, `wasm`, `container`                                                                                 | Low         |
+/// | `outcome` | `success`, `failure`, `canceled`, `timeout`                                                                       | Low         |
+/// | `error`   | `cgroup_prepare_failed`, `backend_config_failed`, `spawn_failed`, `module_load_failed` (from [`RunnerErrorKind`]) | Low         |
 ///
 /// ## Duration histogram buckets
 ///
-/// Buckets (seconds): `0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600`.
-/// Covers sub-second scripts up to 1-hour long-running tasks.
+/// Buckets (seconds): `0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 1800, 3600`.
 ///
 /// ## Also
 ///
 /// - [`PrometheusSubscriber`](crate::PrometheusSubscriber) is a supervision-level metrics from the event stream.
 /// - [`Registry`](prometheus::Registry) is a shared registry for unified `/metrics` endpoint.
-#[derive(Clone)]
 pub struct PrometheusMetrics {
     tasks_started: CounterVec,
     tasks_completed: CounterVec,
@@ -55,47 +55,36 @@ pub struct PrometheusMetrics {
 impl PrometheusMetrics {
     /// Create a new metrics backend, registering all counters and histograms into the given [`Registry`].
     ///
-    /// Use a **shared** registry when you need [`PrometheusMetrics`] and [`PrometheusSubscriber`](crate::PrometheusSubscriber)
-    /// to appear on the same `metrics` endpoint.
-    pub fn new_with_registry(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
-        let tasks_started = CounterVec::new(
-            Opts::new("tasks_started_total", "Total number of tasks started")
-                .namespace("solti")
-                .subsystem("runner"),
+    /// Primary constructor — mirrors the shape used by other backends in this
+    /// crate ([`PrometheusSubscriber::new`](crate::PrometheusSubscriber::new),
+    /// `PrometheusApiMetrics::new`, `PrometheusDiscoverMetrics::new`).
+    pub fn new(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
+        let r = Sub::new(&registry, "runner");
+
+        let tasks_started = r.counter_vec(
+            "tasks_started_total",
+            "Total number of tasks started",
             &["runner"],
         )?;
-        registry.register(Box::new(tasks_started.clone()))?;
-
-        let tasks_completed = CounterVec::new(
-            Opts::new("tasks_completed_total", "Total number of tasks completed")
-                .namespace("solti")
-                .subsystem("runner"),
+        let tasks_completed = r.counter_vec(
+            "tasks_completed_total",
+            "Total number of tasks completed",
             &["runner", "outcome"],
         )?;
-        registry.register(Box::new(tasks_completed.clone()))?;
-
-        let tasks_duration = HistogramVec::new(
-            prometheus::HistogramOpts::new(
-                "task_duration_seconds",
-                "Task execution duration in seconds",
-            )
-            .namespace("solti")
-            .subsystem("runner")
-            .buckets(vec![
-                0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
+        let tasks_duration = r.histogram_vec(
+            "task_duration_seconds",
+            "Task execution duration in seconds",
+            vec![
+                0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0, 1800.0,
                 3600.0,
-            ]),
+            ],
             &["runner", "outcome"],
         )?;
-        registry.register(Box::new(tasks_duration.clone()))?;
-
-        let runner_errors = CounterVec::new(
-            Opts::new("errors_total", "Total runner-level errors")
-                .namespace("solti")
-                .subsystem("runner"),
+        let runner_errors = r.counter_vec(
+            "errors_total",
+            "Total runner-level errors",
             &["runner", "error"],
         )?;
-        registry.register(Box::new(runner_errors.clone()))?;
 
         Ok(Self {
             tasks_started,
@@ -107,22 +96,36 @@ impl PrometheusMetrics {
     }
 
     /// Create a new metrics backend with an **isolated** registry.
-    pub fn new() -> Result<Self, prometheus::Error> {
-        Self::new_with_registry(Arc::new(Registry::new()))
+    ///
+    /// Convenience for tests / standalone use. Most agents share a single
+    /// registry across collectors via [`Self::new`].
+    pub fn new_isolated() -> Result<Self, prometheus::Error> {
+        Self::new(Arc::new(Registry::new()))
+    }
+
+    /// Deprecated alias of [`Self::new`].
+    #[deprecated(
+        since = "0.0.2",
+        note = "use `PrometheusMetrics::new(registry)` — same signature, consistent with the other backends"
+    )]
+    pub fn new_with_registry(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
+        Self::new(registry)
     }
 
     /// Gather all metrics for exposition.
-    ///
-    /// Use this to implement `metrics` HTTP endpoint.
     pub fn gather(&self) -> Vec<MetricFamily> {
         self.registry.gather()
     }
 
     /// Get reference to underlying prometheus registry.
-    ///
-    /// Useful for registering custom metrics alongside solti metrics.
     pub fn registry(&self) -> &Arc<Registry> {
         &self.registry
+    }
+}
+
+impl std::fmt::Debug for PrometheusMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrometheusMetrics").finish()
     }
 }
 
@@ -153,20 +156,18 @@ impl MetricsBackend for PrometheusMetrics {
         self.tasks_completed
             .with_label_values(&[runner, label])
             .inc();
-
-        let duration_seconds = duration_ms as f64 / 1000.0;
         self.tasks_duration
             .with_label_values(&[runner, label])
-            .observe(duration_seconds);
+            .observe(ms_to_secs(duration_ms));
     }
 
     /// Increments `solti_runner_errors_total{runner=<runner_type>, error=<error_kind>}`.
     ///
     /// Called for runner setup/teardown errors (e.g. spawn failures), **not** for task-level failures
     /// which go through [`record_task_completed`](MetricsBackend::record_task_completed).
-    fn record_runner_error(&self, runner_type: RunnerType, error_kind: &str) {
+    fn record_runner_error(&self, runner_type: RunnerType, error_kind: RunnerErrorKind) {
         self.runner_errors
-            .with_label_values(&[runner_type.as_label(), error_kind])
+            .with_label_values(&[runner_type.as_label(), error_kind.as_label()])
             .inc();
     }
 }
@@ -177,12 +178,12 @@ mod tests {
 
     #[test]
     fn can_create_prometheus_metrics() {
-        let _metrics = PrometheusMetrics::new().expect("failed to create metrics");
+        let _metrics = PrometheusMetrics::new_isolated().expect("failed to create metrics");
     }
 
     #[test]
     fn record_task_started_increments_counter() {
-        let metrics = PrometheusMetrics::new().unwrap();
+        let metrics = PrometheusMetrics::new_isolated().unwrap();
 
         metrics.record_task_started(RunnerType::Subprocess);
         metrics.record_task_started(RunnerType::Subprocess);
@@ -199,7 +200,7 @@ mod tests {
 
     #[test]
     fn record_task_completed_increments_counter_and_histogram() {
-        let metrics = PrometheusMetrics::new().unwrap();
+        let metrics = PrometheusMetrics::new_isolated().unwrap();
 
         metrics.record_task_completed(RunnerType::Subprocess, TaskOutcome::Success, 150);
         metrics.record_task_completed(RunnerType::Subprocess, TaskOutcome::Failure, 50);
@@ -221,11 +222,11 @@ mod tests {
 
     #[test]
     fn record_runner_error_increments_counter() {
-        let metrics = PrometheusMetrics::new().unwrap();
+        let metrics = PrometheusMetrics::new_isolated().unwrap();
 
-        metrics.record_runner_error(RunnerType::Subprocess, "spawn_failed");
-        metrics.record_runner_error(RunnerType::Subprocess, "spawn_failed");
-        metrics.record_runner_error(RunnerType::Wasm, "module_load_failed");
+        metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+        metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+        metrics.record_runner_error(RunnerType::Wasm, RunnerErrorKind::ModuleLoadFailed);
 
         let families = metrics.gather();
         let errors = families
@@ -239,7 +240,7 @@ mod tests {
     #[test]
     fn can_use_custom_registry() {
         let registry = Arc::new(Registry::new());
-        let metrics = PrometheusMetrics::new_with_registry(registry.clone()).unwrap();
+        let metrics = PrometheusMetrics::new(registry.clone()).unwrap();
 
         metrics.record_task_started(RunnerType::Subprocess);
         assert!(!registry.gather().is_empty());

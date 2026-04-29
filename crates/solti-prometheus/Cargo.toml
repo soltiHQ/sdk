@@ -12,11 +12,28 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default  = []
+api      = ["dep:solti-api"]
+discover = ["dep:solti-discover"]
+process  = ["prometheus/process"]
+server   = ["dep:axum", "dep:tokio", "dep:tokio-util", "dep:solti-model"]
+state    = ["dep:solti-core", "dep:solti-model"]
 
 [dependencies]
 prometheus = { workspace = true }
-taskvisor = { workspace = true, features = ["controller"] }
-tracing = { workspace = true }
+taskvisor  = { workspace = true, features = ["controller"] }
+tracing    = { workspace = true }
+itoa       = { workspace = true }
 
-solti-runner = { path = "../solti-runner", version = "0.0.1" }
+axum       = { workspace = true, optional = true }
+tokio      = { workspace = true, optional = true, features = ["net", "rt"] }
+tokio-util = { workspace = true, optional = true }
+
+solti-runner   = { workspace = true }
+solti-model    = { workspace = true, optional = true }
+solti-discover = { workspace = true, optional = true }
+solti-api      = { workspace = true, optional = true }
+solti-core     = { workspace = true, optional = true }
+
+[package.metadata.docs.rs]
+all-features = true

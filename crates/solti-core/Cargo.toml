@@ -22,8 +22,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 
-solti-model = { path = "../solti-model", version = "0.0.1" }
-solti-runner = { path = "../solti-runner", version = "0.0.1" }
+solti-model = { workspace = true }
+solti-runner = { workspace = true }
 
 [dev-dependencies]
 

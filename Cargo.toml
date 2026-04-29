@@ -15,45 +15,61 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.0.1"
-edition = "2024"
+version      = "0.0.1"
+edition      = "2024"
 rust-version = "1.85"
-license = "Apache-2.0"
-repository = "https://github.com/soltiHQ/sdk"
-homepage = "https://github.com/soltiHQ/sdk"
-keywords = ["async", "tasks", "supervisor", "orchestration", "solti"]
-categories = ["asynchronous", "concurrency"]
+license      = "Apache-2.0"
+
+repository   = "https://github.com/soltiHQ/sdk"
+homepage     = "https://github.com/soltiHQ/sdk"
+
+keywords     = ["async", "tasks", "supervisor", "orchestration", "solti"]
+categories   = ["asynchronous", "concurrency"]
 
 [workspace.dependencies]
-tracing-subscriber = { version = "0.3" }
-protoc-bin-vendored = { version = "3" }
-tokio = { version = "1" }
+tokio      = { version = "1" }
 tokio-util = "0.7.17"
-time = { version = "0.3" }
-serde = { version = "1", features = ["derive"] }
-tracing-journald = "0.3.1"
-taskvisor = { version = "0.1.2" }
-prometheus = "0.14.0"
-reqwest = "0.13.1"
+
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3" }
+tracing-journald   = "0.3.1"
+
+anyhow      = "1"
+thiserror   = "2"
 async-trait = "0.1"
-serde_json = "1"
-thiserror = "2"
-tracing = "0.1"
-anyhow  = "1"
-libc = "0.2.177"
-base64 = "0.22"
-axum = "0.8.7"
-tower-http = "0.6"
-hostname = "0.4.2"
-uuid = "1.19.0"
 parking_lot = "0.12"
-tempfile = "3.14"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+time        = { version = "0.3" }
+base64      = "0.22"
+libc        = "0.2.177"
+hostname    = "0.4.2"
+uuid        = "1.19.0"
+tempfile    = "3.14"
+itoa        = "1"
 
-tonic-prost-build = "0.14.5"
-prost-types = "0.14.3"
-tonic-prost = "0.14.5"
-tonic = "0.14.5"
-prost = "0.14.3"
+axum       = "0.8.7"
+tower-http = "0.6"
+reqwest    = "0.13.1"
 
-pbjson-build = "0.9.0"
-pbjson = "0.9.0"
+tonic               = "0.14.5"
+tonic-prost         = "0.14.5"
+tonic-prost-build   = "0.14.5"
+prost               = "0.14.3"
+prost-types         = "0.14.3"
+protoc-bin-vendored = { version = "3" }
+pbjson              = "0.9.0"
+pbjson-build        = "0.9.0"
+
+prometheus = "0.14.0"
+
+taskvisor = { version = "0.1.2" }
+
+solti-model      = { path = "crates/solti-model",      version = "0.0.1" }
+solti-runner     = { path = "crates/solti-runner",     version = "0.0.1" }
+solti-exec       = { path = "crates/solti-exec",       version = "0.0.1" }
+solti-core       = { path = "crates/solti-core",       version = "0.0.1" }
+solti-api        = { path = "crates/solti-api",        version = "0.0.1" }
+solti-discover   = { path = "crates/solti-discover",   version = "0.0.1" }
+solti-observe    = { path = "crates/solti-observe",    version = "0.0.1" }
+solti-prometheus = { path = "crates/solti-prometheus", version = "0.0.1" }

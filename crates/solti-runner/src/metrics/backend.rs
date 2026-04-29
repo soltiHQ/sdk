@@ -33,6 +33,35 @@ impl RunnerType {
     }
 }
 
+/// Runner setup/teardown error kind for metrics labeling.
+///
+/// Passed to [`MetricsBackend::record_runner_error`] so dashboards can slice errors by a bounded, low-cardinality label rather than free-form strings.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RunnerErrorKind {
+    /// cgroup v2 preparation (creation / attribute write) failed.
+    CgroupPrepareFailed,
+    /// Applying runner-specific configuration to the task command failed (rlimits, capabilities, namespaces, …).
+    BackendConfigFailed,
+    /// Spawning the child process or actor failed.
+    SpawnFailed,
+    /// Loading the runner module (WASM / container image) failed.
+    ModuleLoadFailed,
+}
+
+impl RunnerErrorKind {
+    /// Return label value for metrics.
+    #[inline]
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::CgroupPrepareFailed => "cgroup_prepare_failed",
+            Self::BackendConfigFailed => "backend_config_failed",
+            Self::SpawnFailed => "spawn_failed",
+            Self::ModuleLoadFailed => "module_load_failed",
+        }
+    }
+}
+
 /// Task execution outcome for metrics classification.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,10 +119,32 @@ pub trait MetricsBackend: Send + Sync + 'static {
     ///
     /// Called when runner fails to spawn/cleanup a task.
     /// This is separate from task failures (which are `record_task_completed` with `Failure`).
-    fn record_runner_error(&self, runner_type: RunnerType, error_kind: &str);
+    fn record_runner_error(&self, runner_type: RunnerType, error_kind: RunnerErrorKind);
 }
 
 /// Shared handle to metrics backend.
 ///
 /// Stored in [`crate::BuildContext`] and cloned into each task.
 pub type MetricsHandle = Arc<dyn MetricsBackend>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runner_error_kind_as_label_maps_all_variants() {
+        assert_eq!(
+            RunnerErrorKind::CgroupPrepareFailed.as_label(),
+            "cgroup_prepare_failed"
+        );
+        assert_eq!(
+            RunnerErrorKind::BackendConfigFailed.as_label(),
+            "backend_config_failed"
+        );
+        assert_eq!(RunnerErrorKind::SpawnFailed.as_label(), "spawn_failed");
+        assert_eq!(
+            RunnerErrorKind::ModuleLoadFailed.as_label(),
+            "module_load_failed"
+        );
+    }
+}

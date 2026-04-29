@@ -103,5 +103,6 @@ pub use router::RunnerRouter;
 
 pub mod metrics;
 pub use metrics::{
-    MetricsBackend, MetricsHandle, NoOpMetrics, RunnerType, TaskOutcome, noop_metrics,
+    MetricsBackend, MetricsHandle, NoOpMetrics, RunnerErrorKind, RunnerType, TaskOutcome,
+    noop_metrics,
 };
