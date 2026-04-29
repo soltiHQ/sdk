@@ -113,7 +113,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     let registry = Arc::new(Registry::new());
-    let metrics = PrometheusMetrics::new_with_registry(registry.clone())?;
+    let metrics = PrometheusMetrics::new(registry.clone())?;
     let prom_subscriber = PrometheusSubscriber::new(registry.clone())?;
     register_process_collector(&registry)?;
     register_build_info(

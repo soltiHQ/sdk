@@ -155,7 +155,7 @@
 //! let registry = Arc::new(Registry::new());
 //!
 //! // Core collectors.
-//! let metrics = PrometheusMetrics::new_with_registry(registry.clone())?;
+//! let metrics = PrometheusMetrics::new(registry.clone())?;
 //! let subscriber = PrometheusSubscriber::new(registry.clone())?;
 //!
 //! // Standard extras.
@@ -193,17 +193,17 @@
 
 mod register;
 
-mod backend;
-pub use backend::PrometheusMetrics;
-
 mod subscriber;
-pub use subscriber::PrometheusSubscriber;
-
-mod info;
-pub use info::register_build_info;
+pub use subscriber::{DEFAULT_QUEUE_CAPACITY, PrometheusSubscriber};
 
 mod process;
 pub use process::register_process_collector;
+
+mod backend;
+pub use backend::PrometheusMetrics;
+
+mod info;
+pub use info::register_build_info;
 
 #[cfg(feature = "discover")]
 mod discover;

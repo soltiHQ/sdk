@@ -11,6 +11,9 @@ use taskvisor::{BackoffSource, Event, EventKind, Subscribe};
 
 use crate::register::{Sub, ms_to_secs};
 
+/// Default subscriber queue capacity.
+pub const DEFAULT_QUEUE_CAPACITY: usize = 2048;
+
 /// Prometheus subscriber for supervision-level metrics.
 ///
 /// Implements [`Subscribe`] and captures metrics from the [`taskvisor`] event stream.
@@ -64,12 +67,12 @@ use crate::register::{Sub, ms_to_secs};
 /// | `source` | `failure`, `success`                                                                                                             | [`BackoffSource`] on the event                               |
 /// | `reason` (terminal)   | `exhausted`, `fatal`                                                                                                | Terminal event kind                                          |
 /// | `outcome` (attempts)  | `exhausted`, `fatal`                                                                                                | Attempts-to-finalize histogram                               |
-/// | `reason` (rejection)  | `slot_full`, `slot_busy`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` | Classified from `Event.reason` by [`classify_rejection_reason`] |
+/// | `reason` (rejection)  | `slot_full`, `slot_busy`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` | Classified from `Event.reason` by `classify_rejection_reason` (private)         |
 ///
 /// ## Notes
 ///
 /// - `tasks_in_flight` gauge is guarded against going negative: a [`TaskStopped`](EventKind::TaskStopped) without a preceding [`TaskStarting`](EventKind::TaskStarting) is a no-op on the gauge.
-/// - [`queue_capacity`](Subscribe::queue_capacity) is set to `2048` (2x the taskvisor default) to reduce event loss under high throughput.
+/// - [`queue_capacity`](Subscribe::queue_capacity) defaults to [`DEFAULT_QUEUE_CAPACITY`].
 /// - Backoff duration is converted from milliseconds to seconds before observation.
 ///
 /// ## Also
@@ -88,6 +91,7 @@ pub struct PrometheusSubscriber {
     subscriber_panicked: Counter,
     controller_submissions: Counter,
     controller_rejections: CounterVec,
+    queue_capacity: usize,
 }
 
 /// Map a free-form `ControllerRejected` reason string to a bounded, low-cardinality metric label.
@@ -122,8 +126,16 @@ fn classify_rejection_reason(reason: Option<&str>) -> &'static str {
 }
 
 impl PrometheusSubscriber {
-    /// Create a new subscriber, registering all supervision and controller metrics into the given [`Registry`].
+    /// Create a new subscriber with the default event-bus queue capacity ([`DEFAULT_QUEUE_CAPACITY`]).
     pub fn new(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
+        Self::with_queue_capacity(registry, DEFAULT_QUEUE_CAPACITY)
+    }
+
+    /// Create a new subscriber with a specific event-bus queue capacity.
+    pub fn with_queue_capacity(
+        registry: Arc<Registry>,
+        queue_capacity: usize,
+    ) -> Result<Self, prometheus::Error> {
         let sv = Sub::new(&registry, "sv");
         let ctrl = Sub::new(&registry, "ctrl");
 
@@ -182,6 +194,7 @@ impl PrometheusSubscriber {
             subscriber_panicked,
             controller_submissions,
             controller_rejections,
+            queue_capacity,
         })
     }
 }
@@ -275,9 +288,9 @@ impl Subscribe for PrometheusSubscriber {
         "prometheus"
     }
 
-    /// Returns `2048`.
+    /// Returns the per-subscriber queue capacity configured via [`PrometheusSubscriber::new`] or [`PrometheusSubscriber::with_queue_capacity`].
     fn queue_capacity(&self) -> usize {
-        2048
+        self.queue_capacity
     }
 }
 
@@ -632,10 +645,24 @@ mod tests {
     }
 
     #[test]
+    fn queue_capacity_defaults_to_2048() {
+        let sub = new_subscriber();
+        assert_eq!(sub.queue_capacity(), DEFAULT_QUEUE_CAPACITY);
+        assert_eq!(sub.queue_capacity(), 2048);
+    }
+
+    #[test]
+    fn queue_capacity_is_overridable_via_constructor() {
+        let registry = Arc::new(Registry::new());
+        let sub = PrometheusSubscriber::with_queue_capacity(registry, 4096).unwrap();
+        assert_eq!(sub.queue_capacity(), 4096);
+    }
+
+    #[test]
     fn shared_registry_with_backend() {
         let registry = Arc::new(Registry::new());
 
-        let backend = crate::PrometheusMetrics::new_with_registry(registry.clone()).unwrap();
+        let backend = crate::PrometheusMetrics::new(registry.clone()).unwrap();
         let sub = PrometheusSubscriber::new(registry.clone()).unwrap();
 
         backend.record_task_started(solti_runner::RunnerType::Subprocess);

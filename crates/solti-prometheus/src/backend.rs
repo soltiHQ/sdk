@@ -54,7 +54,11 @@ pub struct PrometheusMetrics {
 
 impl PrometheusMetrics {
     /// Create a new metrics backend, registering all counters and histograms into the given [`Registry`].
-    pub fn new_with_registry(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
+    ///
+    /// Primary constructor — mirrors the shape used by other backends in this
+    /// crate ([`PrometheusSubscriber::new`](crate::PrometheusSubscriber::new),
+    /// `PrometheusApiMetrics::new`, `PrometheusDiscoverMetrics::new`).
+    pub fn new(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
         let r = Sub::new(&registry, "runner");
 
         let tasks_started = r.counter_vec(
@@ -92,8 +96,20 @@ impl PrometheusMetrics {
     }
 
     /// Create a new metrics backend with an **isolated** registry.
-    pub fn new() -> Result<Self, prometheus::Error> {
-        Self::new_with_registry(Arc::new(Registry::new()))
+    ///
+    /// Convenience for tests / standalone use. Most agents share a single
+    /// registry across collectors via [`Self::new`].
+    pub fn new_isolated() -> Result<Self, prometheus::Error> {
+        Self::new(Arc::new(Registry::new()))
+    }
+
+    /// Deprecated alias of [`Self::new`].
+    #[deprecated(
+        since = "0.0.2",
+        note = "use `PrometheusMetrics::new(registry)` — same signature, consistent with the other backends"
+    )]
+    pub fn new_with_registry(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
+        Self::new(registry)
     }
 
     /// Gather all metrics for exposition.
@@ -162,12 +178,12 @@ mod tests {
 
     #[test]
     fn can_create_prometheus_metrics() {
-        let _metrics = PrometheusMetrics::new().expect("failed to create metrics");
+        let _metrics = PrometheusMetrics::new_isolated().expect("failed to create metrics");
     }
 
     #[test]
     fn record_task_started_increments_counter() {
-        let metrics = PrometheusMetrics::new().unwrap();
+        let metrics = PrometheusMetrics::new_isolated().unwrap();
 
         metrics.record_task_started(RunnerType::Subprocess);
         metrics.record_task_started(RunnerType::Subprocess);
@@ -184,7 +200,7 @@ mod tests {
 
     #[test]
     fn record_task_completed_increments_counter_and_histogram() {
-        let metrics = PrometheusMetrics::new().unwrap();
+        let metrics = PrometheusMetrics::new_isolated().unwrap();
 
         metrics.record_task_completed(RunnerType::Subprocess, TaskOutcome::Success, 150);
         metrics.record_task_completed(RunnerType::Subprocess, TaskOutcome::Failure, 50);
@@ -206,7 +222,7 @@ mod tests {
 
     #[test]
     fn record_runner_error_increments_counter() {
-        let metrics = PrometheusMetrics::new().unwrap();
+        let metrics = PrometheusMetrics::new_isolated().unwrap();
 
         metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
         metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
@@ -224,7 +240,7 @@ mod tests {
     #[test]
     fn can_use_custom_registry() {
         let registry = Arc::new(Registry::new());
-        let metrics = PrometheusMetrics::new_with_registry(registry.clone()).unwrap();
+        let metrics = PrometheusMetrics::new(registry.clone()).unwrap();
 
         metrics.record_task_started(RunnerType::Subprocess);
         assert!(!registry.gather().is_empty());
