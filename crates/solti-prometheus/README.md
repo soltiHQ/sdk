@@ -167,5 +167,5 @@ For a full agent wiring: shared registry, runner metrics, subscriber, supervised
 
 - `tasks_in_flight` gauge is guarded against going negative: a `TaskStopped` without a preceding `TaskStarting` is a no-op.
 - Backoff / discover / API durations are converted from ms → seconds before histogram observation.
-- `PrometheusSubscriber` uses `queue_capacity = 2048` (2× taskvisor default) to reduce event loss under high throughput.
+- `PrometheusSubscriber` defaults `queue_capacity` to `DEFAULT_QUEUE_CAPACITY`.
 - All collectors must share one `prometheus::Registry` for a unified `/metrics` endpoint.
