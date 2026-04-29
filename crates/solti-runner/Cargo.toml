@@ -19,7 +19,7 @@ taskvisor = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-solti-model = { path = "../solti-model", version = "0.0.1" }
+solti-model = { workspace = true }
 
 [dev-dependencies]
 tokio-util = { workspace = true }

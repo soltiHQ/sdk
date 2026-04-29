@@ -64,3 +64,12 @@ pbjson-build        = "0.9.0"
 prometheus = "0.14.0"
 
 taskvisor = { version = "0.1.2" }
+
+solti-model      = { path = "crates/solti-model",      version = "0.0.1" }
+solti-runner     = { path = "crates/solti-runner",     version = "0.0.1" }
+solti-exec       = { path = "crates/solti-exec",       version = "0.0.1" }
+solti-core       = { path = "crates/solti-core",       version = "0.0.1" }
+solti-api        = { path = "crates/solti-api",        version = "0.0.1" }
+solti-discover   = { path = "crates/solti-discover",   version = "0.0.1" }
+solti-observe    = { path = "crates/solti-observe",    version = "0.0.1" }
+solti-prometheus = { path = "crates/solti-prometheus", version = "0.0.1" }
