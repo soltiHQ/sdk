@@ -285,4 +285,11 @@ Active development.
 
 ## Contributing
 
-Found a bug? Have an idea? [Open an issue](https://github.com/soltiHQ/taskvisor/issues) or send a pull request.
+Found a bug? Have an idea? [Open an issue](https://github.com/soltiHQ/sdk/issues) or send a pull request.
+
+<div>
+  <a href="https://docs.rs/solti-core/latest/solti_core/"><img alt="API Docs" src="https://img.shields.io/badge/API%20Docs-4d76ae?style=for-the-badge&logo=rust&logoColor=white"></a>
+  <a href="./examples/"><img alt="Examples" src="https://img.shields.io/badge/Examples-2ea44f?style=for-the-badge&logo=github&logoColor=white"></a>
+  <a href="https://github.com/soltiHQ/dashboards"><img alt="Dashboards" src="https://img.shields.io/badge/Dashboards-f46800?style=for-the-badge&logo=grafana&logoColor=white"></a>
+  <a href="https://github.com/soltiHQ/taskvisor"><img alt="Taskvisor" src="https://img.shields.io/badge/Taskvisor-2c3e50?style=for-the-badge&logo=rust&logoColor=white"></a>
+</div>
