@@ -177,6 +177,14 @@ supervisor.submit_with_task(task, &spec).await?;
 
 See [`examples/agentd-http`](examples/agentd-http) and [`examples/agentd-grpc`](examples/agentd-grpc) for complete reference agents - one per transport.
 
+## Dashboards
+
+Pre-built Grafana dashboards live in [`soltiHQ/dashboards`](https://github.com/soltiHQ/dashboards).
+
+Setup options:
+- **Import via Grafana UI**: paste the dashboard ID once it's listed on `grafana.com`, or upload the JSON from the dashboards repo.
+- **Local provisioning**: clone the repo and mount `solti/` into Grafana. See the [dashboards README](https://github.com/soltiHQ/dashboards#usage) for `docker-compose` snippets.
+
 ## Key features
 
 **Supervision**: tasks are supervised by [taskvisor](https://github.com/soltiHQ/taskvisor): automatic restarts, configurable backoff (full/equal/decorrelated jitter), per-attempt timeouts, and graceful cancellation via `CancellationToken`.
