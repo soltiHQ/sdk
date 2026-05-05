@@ -18,6 +18,10 @@ all-features = true
 default = []
 grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
 http = ["dep:axum", "dep:pbjson", "dep:prost", "dep:serde_json", "dep:tower-http"]
+tls = [
+    "dep:solti-tls",
+    "tonic?/tls-ring",
+]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -34,10 +38,12 @@ tracing = { workspace = true }
 
 solti-core = { workspace = true }
 solti-model = { workspace = true }
+solti-tls = { workspace = true, optional = true }
 
 [dev-dependencies]
 base64 = { workspace = true }
 http-body-util = "0.1"
+rcgen = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 tower = { version = "0.5", features = ["util"] }
 

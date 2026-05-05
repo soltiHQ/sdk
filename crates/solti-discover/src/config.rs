@@ -71,6 +71,9 @@ pub struct DiscoverConfig {
     pub(crate) connect_timeout_ms: u64,
     pub(crate) request_timeout_ms: u64,
     pub(crate) metrics: DiscoverMetricsHandle,
+    /// Optional TLS / mTLS configuration. When `None`, plaintext.
+    #[cfg(feature = "tls")]
+    pub(crate) tls: Option<solti_tls::ClientTlsConfig>,
 }
 
 impl DiscoverConfig {
@@ -98,6 +101,8 @@ impl DiscoverConfig {
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
             metrics: noop_discover_metrics(),
+            #[cfg(feature = "tls")]
+            tls: None,
         }
     }
 }
@@ -118,6 +123,8 @@ pub struct DiscoverConfigBuilder {
     connect_timeout_ms: u64,
     request_timeout_ms: u64,
     metrics: DiscoverMetricsHandle,
+    #[cfg(feature = "tls")]
+    tls: Option<solti_tls::ClientTlsConfig>,
 }
 
 impl DiscoverConfigBuilder {
@@ -156,6 +163,18 @@ impl DiscoverConfigBuilder {
     /// Attach a metrics backend. When not set, a zero-cost no-op is used.
     pub fn with_metrics(mut self, metrics: DiscoverMetricsHandle) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    /// Enable TLS / mTLS for the sync transport.
+    ///
+    /// Both gRPC and HTTP transports honour this configuration:
+    /// the control-plane endpoint must be reachable over `https://` (HTTP) or use `https://`/`tls://` semantics in `tonic` (gRPC).
+    ///
+    /// Available with the `tls` feature.
+    #[cfg(feature = "tls")]
+    pub fn with_tls(mut self, tls: solti_tls::ClientTlsConfig) -> Self {
+        self.tls = Some(tls);
         self
     }
 
@@ -217,6 +236,8 @@ impl DiscoverConfigBuilder {
             connect_timeout_ms: self.connect_timeout_ms,
             request_timeout_ms: self.request_timeout_ms,
             metrics: self.metrics,
+            #[cfg(feature = "tls")]
+            tls: self.tls,
         })
     }
 }

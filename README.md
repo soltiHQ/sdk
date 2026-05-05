@@ -16,6 +16,7 @@ The SDK doesn't prescribe a single topology. Examples of what fits naturally:
 - **Standalone scheduler** `solti-core` + `solti-exec`. No network, no API. Submit tasks from code, let the supervisor handle retries, timeouts, and backoff.
 - **HTTP/gRPC service** add `solti-api` to expose task management over the network. Feature-gated: pick HTTP (axum), gRPC (tonic), or both.
 - **Managed agent** add `solti-discover` to register with a Podium control-plane. The control-plane pushes specs, the agent executes.
+- **TLS / mTLS everywhere** `solti-tls` provides a single config shape for `solti-api` (server) and `solti-discover` (client). Same builder, paths or in-memory PEM, mTLS as a one-line knob.
 - **Custom runner** implement the `Runner` trait to execute tasks your way (WASM, containers, in-process functions). The router dispatches by label selectors.
 - **Embedded tasks** `TaskKind::Embedded` lets you run async Rust closures under the same supervision tree as subprocesses. Sweep, timezone sync, and discovery heartbeat all work this way internally.
 
@@ -28,6 +29,8 @@ The SDK doesn't prescribe a single topology. Examples of what fits naturally:
 │ solti-api │ solti-discover │ solti-prometheus │ solti-observe │
 │ HTTP/gRPC │  heartbeat     │     metrics      │    logging    │
 ├───────────┴────────────────┴──────────────────┴───────────────┤
+│        solti-tls - shared TLS / mTLS config (optional)        │
+├───────────────────────────────────────────────────────────────┤
 │                          solti-core                           │
 │                  SupervisorApi · state · sweep                │
 ├───────────────────────────────────────────────────────────────┤
@@ -45,19 +48,21 @@ The SDK doesn't prescribe a single topology. Examples of what fits naturally:
 Dependencies flow downward: `model ← runner ← core ← api`.
 No circular dependencies.
 The top row is entirely optional - use only what your agent needs.
+`solti-tls` is also optional and only pulled in when `solti-api`/`solti-discover` are built with the `tls` feature.
 
 ## Crates
 
-| Crate                                         | What it does                                                 | Required?                 |
-|-----------------------------------------------|--------------------------------------------------------------|---------------------------|
-| [`solti-model`](crates/solti-model)           | Domain types: task specs, policies, selectors, identifiers   | yes                       |
-| [`solti-runner`](crates/solti-runner)         | Runner plugin trait, label-based routing, metrics interface  | yes                       |
-| [`solti-exec`](crates/solti-exec)             | Subprocess runner: cgroups v2, capabilities, rlimits (Linux) | if you run subprocesses   |
-| [`solti-core`](crates/solti-core)             | Supervisor orchestration, in-memory state, sweep             | yes                       |
-| [`solti-api`](crates/solti-api)               | HTTP/JSON and gRPC API layer (feature-gated)                 | if you need a network API |
-| [`solti-discover`](crates/solti-discover)     | Agent registration and heartbeat to Podium control-plane     | if managed by Podium      |
-| [`solti-observe`](crates/solti-observe)       | Structured logging with timezone sync                        | recommended               |
-| [`solti-prometheus`](crates/solti-prometheus) | Prometheus metrics backend                                   | if you need metrics       |
+| Crate                                         | What it does                                                 | Required?                       |
+|-----------------------------------------------|--------------------------------------------------------------|---------------------------------|
+| [`solti-model`](crates/solti-model)           | Domain types: task specs, policies, selectors, identifiers   | yes                             |
+| [`solti-runner`](crates/solti-runner)         | Runner plugin trait, label-based routing, metrics interface  | yes                             |
+| [`solti-exec`](crates/solti-exec)             | Subprocess runner: cgroups v2, capabilities, rlimits (Linux) | if you run subprocesses         |
+| [`solti-core`](crates/solti-core)             | Supervisor orchestration, in-memory state, sweep             | yes                             |
+| [`solti-api`](crates/solti-api)               | HTTP/JSON and gRPC API layer (feature-gated)                 | if you need a network API       |
+| [`solti-discover`](crates/solti-discover)     | Agent registration and heartbeat to Podium control-plane     | if managed by Podium            |
+| [`solti-tls`](crates/solti-tls)               | Shared TLS / mTLS config (paths or in-memory PEM)            | if you enable `tls` on api/disc |
+| [`solti-observe`](crates/solti-observe)       | Structured logging with timezone sync                        | recommended                     |
+| [`solti-prometheus`](crates/solti-prometheus) | Prometheus metrics backend                                   | if you need metrics             |
 
 ## Quick start
 
@@ -177,6 +182,31 @@ supervisor.submit_with_task(task, &spec).await?;
 
 See [`examples/agentd-http`](examples/agentd-http) and [`examples/agentd-grpc`](examples/agentd-grpc) for complete reference agents - one per transport.
 
+### With TLS / mTLS
+
+Enable the `tls` feature on `solti-api` (server) and/or `solti-discover` (client). One config shape feeds both transports:
+
+```rust
+use solti_tls::{ClientTlsConfig, ServerTlsConfig};
+
+// Server side: cert + key + optional client-CA for mTLS.
+let server = ServerTlsConfig::builder()
+    .cert_pem_file("/etc/solti/tls/server.crt")
+    .key_pem_file("/etc/solti/tls/server.key")
+    .require_client_ca_pem_file("/etc/solti/tls/clients-ca.crt")  // omit for plain TLS
+    .with_alpn(["h2"])
+    .build()?;
+
+// Client side: trust roots + optional client cert for mTLS.
+let client = ClientTlsConfig::builder()
+    .ca_pem_file("/etc/solti/tls/control-plane-ca.crt")
+    .client_cert_pem_file("/etc/solti/tls/agent.crt")
+    .client_key_pem_file("/etc/solti/tls/agent.key")
+    .build()?;
+```
+
+Plug `server` into the binary's `tonic`/`axum-server` setup (see `solti-tls` README), or pass `client` to `DiscoverConfigBuilder::with_tls(...)`. Runnable end-to-end demo: [`examples/tls-roundtrip`](examples/tls-roundtrip) (`cargo run -p tls-roundtrip` → `mTLS round-trip OK`).
+
 ## Dashboards
 
 Pre-built Grafana dashboards live in [`soltiHQ/dashboards`](https://github.com/soltiHQ/dashboards).
@@ -243,11 +273,13 @@ sdk/
 │   ├── solti-core/        # Supervisor orchestration
 │   ├── solti-api/         # HTTP & gRPC API (feature-gated)
 │   ├── solti-discover/    # Agent discovery (optional)
+│   ├── solti-tls/         # Shared TLS / mTLS config (optional)
 │   ├── solti-observe/     # Logging
 │   └── solti-prometheus/  # Metrics backend
 ├── examples/
 │   ├── agentd-http/       # Reference agent: HTTP API + discovery
-│   └── agentd-grpc/       # Reference agent: gRPC API + discovery
+│   ├── agentd-grpc/       # Reference agent: gRPC API + discovery
+│   └── tls-roundtrip/     # mTLS demo (axum-server + tonic + reqwest)
 ├── LICENSE                # Apache-2.0
 └── CODE_OF_CONDUCT.md
 ```
@@ -263,10 +295,13 @@ cargo test --workspace
 # Run a reference agent
 cargo run -p agentd-http     # HTTP transport, :8085
 cargo run -p agentd-grpc     # gRPC transport, :50052
+cargo run -p tls-roundtrip   # mTLS demo (HTTPS :18443 + gRPC :18444)
 
 # Feature-gated builds
 cargo build -p solti-api --features http
 cargo build -p solti-api --features grpc
+cargo build -p solti-api --features grpc,tls           # gRPC + TLS adapter
+cargo build -p solti-discover --features http,tls      # HTTP client + TLS
 ```
 
 ## Status

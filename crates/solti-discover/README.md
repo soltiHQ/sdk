@@ -63,12 +63,34 @@ Per-version protocol details: [sync_v1.md](sync_v1.md).
 
 ## Feature flags
 
-| Flag   | Enables                                                  | Dependencies                               |
-|--------|----------------------------------------------------------|--------------------------------------------|
-| `grpc` | gRPC transport (tonic client)                            | `tonic`, `tonic-prost`, `prost`            |
-| `http` | HTTP transport (reqwest + canonical proto-JSON)          | `reqwest`, `serde_json`, `prost`, `pbjson` |
+| Flag   | Enables                                                        | Dependencies                                                             |
+|--------|----------------------------------------------------------------|--------------------------------------------------------------------------|
+| `grpc` | gRPC transport (tonic client)                                  | `tonic`, `tonic-prost`, `prost`                                          |
+| `http` | HTTP transport (reqwest + canonical proto-JSON)                | `reqwest`, `serde_json`, `prost`, `pbjson`                               |
+| `tls`  | Adds `with_tls(...)` builder method (TLS / mTLS for transport) | `solti-tls`; activates `tonic/tls-ring` and `reqwest/rustls-no-provider` |
 
-Neither feature is enabled by default.
+No feature is enabled by default. `tls` is additive on top of `grpc`/`http`.
+
+### Enabling TLS
+
+```rust
+use solti_discover::DiscoverConfig;
+use solti_tls::ClientTlsConfig;
+
+let client_tls = ClientTlsConfig::builder()
+    .ca_pem_file("/etc/solti/tls/control-plane-ca.crt")
+    .client_cert_pem_file("/etc/solti/tls/agent.crt")  // optional, for mTLS
+    .client_key_pem_file("/etc/solti/tls/agent.key")
+    .build()?;
+
+let cfg = DiscoverConfig::builder(/* ... */)
+    .with_tls(client_tls)
+    .build()?;
+```
+
+For HTTP (reqwest), the built `rustls::ClientConfig` is plugged in via `use_preconfigured_tls`. 
+For gRPC (tonic), PEM bytes are re-shaped into `tonic::transport::ClientTlsConfig` (tonic builds its own internal rustls config). 
+See the `solti-tls` README for the full integration story.
 
 ## Task policy
 
