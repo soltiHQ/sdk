@@ -7,18 +7,20 @@
 #
 # Dependency layout — required + optional (because publish runs with `--all-features`):
 #   solti-model       - no internal deps
+#   solti-tls         - no internal deps
 #   solti-observe     - optional: solti-model
 #   solti-runner      - solti-model
 #   solti-exec        - solti-model, solti-runner
 #   solti-core        - solti-model, solti-runner
-#   solti-api         - solti-model, solti-core
-#   solti-discover    - solti-model, solti-core
+#   solti-api         - solti-model, solti-core; optional: solti-tls (`tls` feature)
+#   solti-discover    - solti-model, solti-core; optional: solti-tls (`tls` feature)
 #   solti-prometheus  - solti-runner; optional: solti-model, solti-core, solti-api, solti-discover
 #
 # When adding a publishable crate, insert it at its correct topological position.
 # Dry-run / docs matrix consumers don't care about order, but release.yml publishes sequentially and depends on it.
 
 solti-model
+solti-tls
 solti-observe
 solti-runner
 solti-exec

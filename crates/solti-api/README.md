@@ -90,12 +90,38 @@ Script bodies are separately capped in the model at [`solti_model::MAX_SCRIPT_BO
 
 ## Feature flags
 
-| Flag   | Enables                                                   | Dependencies                            |
-|--------|-----------------------------------------------------------|-----------------------------------------|
-| `grpc` | `SoltiApiService`, `SoltiApiServer`, proto codegen        | `tonic`, `tonic-prost`, `prost`         |
-| `http` | `HttpApi`, axum router, proto-JSON serde                  | `axum`, `serde_json`, `prost`, `pbjson` |
+| Flag   | Enables                                                                           | Dependencies                            |
+|--------|-----------------------------------------------------------------------------------|-----------------------------------------|
+| `grpc` | `SoltiApiService`, `SoltiApiServer`, proto codegen                                | `tonic`, `tonic-prost`, `prost`         |
+| `http` | `HttpApi`, axum router, proto-JSON serde                                          | `axum`, `serde_json`, `prost`, `pbjson` |
+| `tls`  | `to_tonic_server_tls(&ServerTlsConfig)` adapter (under `grpc`); pulls `solti-tls` | `solti-tls`; activates `tonic/tls-ring` |
 
-Neither feature is enabled by default.
+No feature is enabled by default. `tls` is additive on top of `grpc` (the adapter targets tonic; HTTP TLS is terminated by the binary via `axum-server`, see below).
+
+### Enabling TLS
+
+For gRPC:
+
+```rust
+use solti_api::{build_grpc_server, to_tonic_server_tls};
+use solti_tls::ServerTlsConfig;
+
+let server_tls = ServerTlsConfig::builder()
+    .cert_pem_file("/etc/solti/tls/server.crt")
+    .key_pem_file("/etc/solti/tls/server.key")
+    .require_client_ca_pem_file("/etc/solti/tls/clients-ca.crt")  // optional
+    .build()?;
+
+let tls_cfg = to_tonic_server_tls(&server_tls)?;
+tonic::transport::Server::builder()
+    .tls_config(tls_cfg)?
+    .add_service(build_grpc_server(adapter))
+    .serve("0.0.0.0:50443".parse()?)
+    .await?;
+```
+
+For HTTP, terminate TLS in your binary via `axum-server` using the `rustls::ServerConfig` produced by `solti_tls::ServerTlsConfig::into_rustls_config()`.
+See the `solti-tls` README for the full pattern.
 
 ## Build
 

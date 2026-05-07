@@ -16,16 +16,16 @@ default = []
 subprocess = ["dep:base64", "dep:libc", "dep:tempfile", "tokio/process"]
 
 [dependencies]
-base64 = { workspace = true, optional = true }
-libc = { workspace = true, optional = true }
-tempfile = { workspace = true, optional = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-tokio = { workspace = true, features = ["io-util"] }
+base64     = { workspace = true, optional = true }
+libc       = { workspace = true, optional = true }
+tempfile   = { workspace = true, optional = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+tokio      = { workspace = true, features = ["io-util"] }
 tokio-util = { workspace = true }
-taskvisor = { workspace = true }
+taskvisor  = { workspace = true }
 
-solti-model = { workspace = true }
+solti-model  = { workspace = true }
 solti-runner = { workspace = true }
 
 [dev-dependencies]

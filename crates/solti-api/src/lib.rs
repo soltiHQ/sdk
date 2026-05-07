@@ -108,6 +108,12 @@ pub use http::HttpApi;
 #[cfg(feature = "http")]
 pub use axum;
 
+#[cfg(all(feature = "grpc", feature = "tls"))]
+mod tls;
+
+#[cfg(all(feature = "grpc", feature = "tls"))]
+pub use tls::to_tonic_server_tls;
+
 #[cfg(all(test, any(feature = "grpc", feature = "http")))]
 mod api_major_guard {
     #[test]

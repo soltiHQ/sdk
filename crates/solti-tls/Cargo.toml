@@ -1,0 +1,29 @@
+[package]
+name = "solti-tls"
+description = "Solti SDK shared TLS / mTLS configuration."
+
+rust-version.workspace = true
+repository.workspace = true
+categories.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+rustls         = { workspace = true }
+rustls-pemfile = { workspace = true }
+thiserror      = { workspace = true }
+
+[dev-dependencies]
+rcgen        = { workspace = true }
+tempfile     = { workspace = true }
+tokio        = { workspace = true, features = ["rt", "macros", "net", "io-util"] }
+tokio-rustls = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true

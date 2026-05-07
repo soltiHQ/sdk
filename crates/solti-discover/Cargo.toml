@@ -18,6 +18,11 @@ all-features = true
 default = []
 grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
 http = ["dep:reqwest", "dep:serde_json", "dep:prost", "dep:pbjson"]
+tls = [
+    "dep:solti-tls",
+    "tonic?/tls-ring",
+    "reqwest?/rustls-no-provider",
+]
 
 [dependencies]
 pbjson = { workspace = true, optional = true }
@@ -35,6 +40,7 @@ tracing = { workspace = true }
 
 solti-core = { workspace = true }
 solti-model = { workspace = true }
+solti-tls = { workspace = true, optional = true }
 
 [build-dependencies]
 pbjson-build = { workspace = true }

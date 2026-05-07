@@ -85,11 +85,24 @@ pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError
     let base_request = build_base_request(&config);
 
     #[cfg(feature = "http")]
-    let http_client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
-        .timeout(Duration::from_millis(config.request_timeout_ms))
-        .user_agent(USER_AGENT)
-        .build()?;
+    let http_client = {
+        #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
+            .timeout(Duration::from_millis(config.request_timeout_ms))
+            .user_agent(USER_AGENT);
+
+        #[cfg(feature = "tls")]
+        if let Some(tls) = &config.tls {
+            // `into_rustls_config` consumes the value; clone to keep the original on `config` (gRPC path also uses it).
+            let rustls_cfg = tls.clone().into_rustls_config().map_err(|e| {
+                DiscoverError::InvalidConfig(format!("tls into_rustls_config: {e}"))
+            })?;
+            builder = builder.use_preconfigured_tls(rustls_cfg);
+        }
+
+        builder.build()?
+    };
 
     let metrics = config.metrics.clone();
 
@@ -274,12 +287,43 @@ async fn invoke_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
     }
 }
 
+/// Convert [`solti_tls::ClientTlsConfig`] into [`tonic::transport::ClientTlsConfig`].
+///
+/// Reads PEM bytes via [`solti_tls::PemSource`] and re-shapes them into the PEM-blob types that tonic expects (`Certificate::from_pem`, `Identity::from_pem`).
+/// tonic builds its own internal `rustls::ClientConfig`: we cannot pass a pre-built one through.
+#[cfg(all(feature = "grpc", feature = "tls"))]
+fn build_tonic_client_tls(
+    cfg: &solti_tls::ClientTlsConfig,
+) -> Result<tonic::transport::ClientTlsConfig, DiscoverError> {
+    use tonic::transport::{Certificate, ClientTlsConfig as TonicTls, Identity};
+
+    let ca_bytes = cfg
+        .ca
+        .read()
+        .map_err(|e| DiscoverError::InvalidConfig(format!("read ca pem: {e}")))?;
+
+    let mut tls = TonicTls::new().ca_certificate(Certificate::from_pem(ca_bytes));
+
+    if let (Some(cert_src), Some(key_src)) = (&cfg.client_cert, &cfg.client_key) {
+        let cert_bytes = cert_src
+            .read()
+            .map_err(|e| DiscoverError::InvalidConfig(format!("read client cert pem: {e}")))?;
+        let key_bytes = key_src
+            .read()
+            .map_err(|e| DiscoverError::InvalidConfig(format!("read client key pem: {e}")))?;
+        tls = tls.identity(Identity::from_pem(cert_bytes, key_bytes));
+    }
+
+    Ok(tls)
+}
+
 #[cfg(feature = "grpc")]
 async fn invoke_grpc_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
     let client =
         ctx.grpc_client
             .get_or_try_init(|| async {
-                let endpoint = tonic::transport::Endpoint::from_shared(
+                #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
+                let mut endpoint = tonic::transport::Endpoint::from_shared(
                     ctx.config.control_plane_endpoint.clone(),
                 )
                 .map_err(|e| {
@@ -287,6 +331,15 @@ async fn invoke_grpc_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
                 })?
                 .connect_timeout(Duration::from_millis(ctx.config.connect_timeout_ms))
                 .timeout(Duration::from_millis(ctx.config.request_timeout_ms));
+
+                #[cfg(feature = "tls")]
+                if let Some(tls) = &ctx.config.tls {
+                    let tonic_tls = build_tonic_client_tls(tls)?;
+                    endpoint = endpoint
+                        .tls_config(tonic_tls)
+                        .map_err(|e| DiscoverError::InvalidConfig(format!("tls_config: {e}")))?;
+                }
+
                 let channel = endpoint.connect().await?;
                 Ok::<_, DiscoverError>(DiscoverServiceClient::new(channel))
             })
