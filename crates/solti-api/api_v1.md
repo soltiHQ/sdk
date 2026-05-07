@@ -10,6 +10,7 @@
 | Get task    | `GetTaskStatus` | `/api/v1/tasks/{id}`           | GET         |
 | List tasks  | `ListTasks`     | `/api/v1/tasks`                | GET         |
 | List runs   | `ListTaskRuns`  | `/api/v1/tasks/{id}/runs`      | GET         |
+| Stream logs | _not yet wired_ | `/api/v1/tasks/{id}/logs`      | GET (SSE)   |
 | Delete task | `DeleteTask`    | `/api/v1/tasks/{id}`           | DELETE      |
 
 `DeleteTask` is the single teardown primitive: it stops the task and
@@ -257,6 +258,39 @@ Response `200 OK`:
 }
 ```
 
+### Stream task logs (Server-Sent Events)
+
+Live tail of stdout/stderr for one task. The stream covers all attempts of that task: clients see run boundary markers between them.
+
+```bash
+curl -N http://localhost:8080/api/v1/tasks/tsk_01JR.../logs
+```
+
+Response `200 OK` with `Content-Type: text/event-stream`. Each SSE block
+has an `event:` name + a JSON `data:` payload (the same shape direct
+in-process subscribers see):
+
+```text
+event: run-started
+data: {"type":"runStarted","attempt":1,"startedAt":1712750400000}
+
+event: chunk
+data: {"type":"chunk","attempt":1,"stream":"stdout","seq":0,"ts":1712750400123,"line":"hello world"}
+
+event: run-finished
+data: {"type":"runFinished","attempt":1,"exitCode":0,"finishedAt":1712750400500}
+
+event: lagged
+data: {"type":"lagged","skipped":1500}
+```
+
+Event types (mapped 1:1 from `solti_model::OutputEvent`):
+- `chunk`: one stdout/stderr line.
+- `run-started` / `run-finished`: boundary markers between retries.
+- `lagged`: subscriber fell behind the per-task ring buffer; the gap is reported and streaming continues from the freshest event.
+
+Returns `404 TaskNotFound` if no broadcast channel exists for the task.
+
 ### Delete a task
 
 ```bash
@@ -275,12 +309,12 @@ Safe to retry — deleting an already-gone task is a no-op.
 }
 ```
 
-| HTTP Status | `error` label    | When                                                                                |
-|-------------|------------------|-------------------------------------------------------------------------------------|
-| 400         | `InvalidRequest` | Validation failure (empty slot, bad spec, invalid status), also `Core::InvalidSpec` |
-| 404         | `TaskNotFound`   | Task ID not found                                                                   |
-| 413         | `PayloadTooLarge`| Request body exceeds 4 MiB (`RequestBodyLimitLayer`) — see "Size limits"            |
-| 500         | `Internal`       | Supervisor/infra error (also `Core::{Supervisor,Mapping,Runner}`)                   |
+| HTTP Status | `error` label     | When                                                                                |
+|-------------|-------------------|-------------------------------------------------------------------------------------|
+| 400         | `InvalidRequest`  | Validation failure (empty slot, bad spec, invalid status), also `Core::InvalidSpec` |
+| 404         | `TaskNotFound`    | Task ID not found                                                                   |
+| 413         | `PayloadTooLarge` | Request body exceeds 4 MiB (`RequestBodyLimitLayer`) — see "Size limits"            |
+| 500         | `Internal`        | Supervisor/infra error (also `Core::{Supervisor,Mapping,Runner}`)                   |
 
 ### JSON field presence
 
@@ -458,6 +492,10 @@ grpcurl -plaintext -d '{"taskId": "tsk_01JR..."}' \
 ```
 
 Returns `{}`. Stops the task and purges its run history. Idempotent.
+
+### Stream logs
+
+Not exposed over gRPC yet. 
 
 ### gRPC errors
 

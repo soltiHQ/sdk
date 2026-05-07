@@ -5,13 +5,14 @@
 //!
 //! _the examples below show the current value (`v1`)_.
 //!
-//! | Method | Endpoint                    | Handler             |
-//! |--------|-----------------------------|---------------------|
-//! | POST   | `/api/v1/tasks`             | submit              |
-//! | GET    | `/api/v1/tasks`             | list (query params) |
-//! | GET    | `/api/v1/tasks/{id}`        | get status          |
-//! | GET    | `/api/v1/tasks/{id}/runs`   | list runs           |
-//! | DELETE | `/api/v1/tasks/{id}`        | delete (stop+purge) |
+//! | Method | Endpoint                    | Handler              |
+//! |--------|-----------------------------|----------------------|
+//! | POST   | `/api/v1/tasks`             | submit               |
+//! | GET    | `/api/v1/tasks`             | list (query params)  |
+//! | GET    | `/api/v1/tasks/{id}`        | get status           |
+//! | GET    | `/api/v1/tasks/{id}/runs`   | list runs            |
+//! | GET    | `/api/v1/tasks/{id}/logs`   | live-tail SSE stream |
+//! | DELETE | `/api/v1/tasks/{id}`        | delete (stop+purge)  |
 
 use std::sync::Arc;
 

@@ -6,11 +6,24 @@ Sits between the domain model (`solti-model`) and the orchestration layer (`solt
 ```text
   TaskSpec ──► RunnerRouter ──► Runner::build_task() ──► TaskRef
                    │                    ▲
-                   │  label matching    │  BuildContext
-                   │  + supports()      │  (env + metrics)
+                   │  label matching    │  BuildContext (env + metrics + output_registry)
+                   │  + supports()      │  
                    ▼                    │
-               RunnerEntry          MetricsHandle
-               (runner + labels)    (Arc<dyn MetricsBackend>)
+               RunnerEntry          MetricsHandle / OutputRegistry
+               (runner + labels)    (Arc-shared with the supervisor)
+```
+
+`BuildContext` carries an `Arc<OutputRegistry>` alongside metrics. 
+Runners that produce per-line output (e.g. subprocess) ask the registry for an `OutputSink` per attempt and push lines into it; 
+subscribers (HTTP SSE, gRPC stream) read them out the other side.
+
+```text
+  per-task broadcast channel (lag-skip, capacity = N)
+         ▲                                      │
+   sink_for(task_id, attempt)             subscribe(task_id)
+         │                                      ▼
+  Runner produces lines              SSE / gRPC handler reads
+  (per attempt: monotonic seq)       (sees Chunk + RunStarted / Finished across all attempts of one task)
 ```
 
 ## Routing flow
@@ -34,7 +47,9 @@ Sits between the domain model (`solti-model`) and the orchestration layer (`solt
 |-------------------|-----------------------------------------------------------------------------------------------|
 | `Runner`          | Trait: `name()`, `supports()`, `build_task()`, `build_run_id()`                               |
 | `RunnerRouter`    | Selects runner by supports() + label matching                                                 |
-| `BuildContext`    | Shared dependencies: `RunnerEnv` + `MetricsHandle`                                            |
+| `BuildContext`    | Shared dependencies: `RunnerEnv` + `MetricsHandle` + `Arc<OutputRegistry>`                    |
+| `OutputSink`      | Per-attempt writer (`stdout_line` / `stderr_line`); thin newtype over `broadcast::Sender`     |
+| `OutputRegistry`  | One broadcast channel per `TaskId`, reused across attempts; supports `subscribe` / `evict`    |
 | `RunId`           | Human-readable id: `{runner}-{slot}-{seq}`                                                    |
 | `RunnerError`     | Error enum: `NoRunner`, `UnsupportedKind`, `InvalidSpec`, `Internal`, `MissingField`, `Io`    |
 | `MetricsBackend`  | Trait: `record_task_started`, `record_task_completed`, `record_runner_error`                  |
@@ -83,4 +98,5 @@ Production backend: `solti-prometheus::PrometheusMetrics`.
 - Runners are checked in registration order; the first match wins.
 - `TaskKind::Embedded` is not routable: use `SupervisorApi::submit_with_task` directly.
 - `RunId` sequence is process-global, monotonically increasing, starts at 1.
-- `BuildContext` defaults: empty `RunnerEnv` + `NoOpMetrics`.
+- `BuildContext` defaults: empty `RunnerEnv` + `NoOpMetrics` + an empty `OutputRegistry` (no live subscribers).
+- `OutputRegistry` channels are `tokio::sync::broadcast`: slow subscribers don't block the runner; they receive a `Lagged` signal and continue from the freshest event in the ring window.
