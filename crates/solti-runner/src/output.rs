@@ -83,7 +83,23 @@ impl OutputRegistry {
         }
     }
 
-    /// Get an [`OutputSink`] for `(task_id, attempt)`.
+    /// Pre-create the broadcast channel for `task_id` without producing a
+    /// sink. Useful when a subscriber may race with the first runner attempt:
+    /// call `ensure_channel` at task-build time, then `subscribe` is safe to
+    /// invoke before the runner has started writing.
+    ///
+    /// No-op if the channel already exists.
+    pub fn ensure_channel(&self, task_id: TaskId) {
+        let mut channels = self.channels.write();
+        channels
+            .entry(task_id)
+            .or_insert_with(|| broadcast::channel::<OutputEvent>(self.capacity).0);
+    }
+
+    /// Get an [`OutputSink`] for `(task_id, attempt)`. The first call for a
+    /// given `task_id` creates the broadcast channel; subsequent calls reuse
+    /// it (multi-run merge). The returned sink has fresh per-stream `seq`
+    /// counters scoped to this attempt.
     pub fn sink_for(&self, task_id: TaskId, attempt: u32) -> OutputSink {
         let mut channels = self.channels.write();
         let sender = channels
@@ -357,6 +373,33 @@ mod tests {
 
         reg.evict(&TaskId::from("a"));
         assert_eq!(reg.active_channels(), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_ensure_channel_creates_subscribable_channel() {
+        let reg = OutputRegistry::new(16);
+        let task = TaskId::from("t-ensure");
+        assert!(reg.subscribe(&task).is_none());
+
+        reg.ensure_channel(task.clone());
+        assert!(reg.subscribe(&task).is_some());
+    }
+
+    #[tokio::test]
+    async fn registry_ensure_channel_is_idempotent() {
+        let reg = OutputRegistry::new(16);
+        let task = TaskId::from("t-idem");
+
+        reg.ensure_channel(task.clone());
+        let mut rx = reg.subscribe(&task).unwrap();
+
+        // Calling again must not replace the channel; existing subscriber stays alive.
+        reg.ensure_channel(task.clone());
+
+        let _ = reg.sink_for(task.clone(), 1);
+        // After sink_for the same channel still works — receiver was not invalidated.
+        let _ = reg.subscribe(&task).unwrap();
+        assert!(rx.try_recv().is_err()); // no events yet, but channel is alive
     }
 
     #[tokio::test]

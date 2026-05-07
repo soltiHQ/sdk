@@ -10,6 +10,7 @@ use tracing::{trace, warn};
 
 use super::TaskState;
 use solti_model::{TaskId, TaskPhase};
+use solti_runner::OutputRegistry;
 
 /// Subscriber that updates TaskState from taskvisor events.
 ///
@@ -19,12 +20,16 @@ use solti_model::{TaskId, TaskPhase};
 /// - [`SupervisorApi::new`](crate::SupervisorApi::new) auto-registers this subscriber.
 pub struct StateSubscriber {
     state: TaskState,
+    output_registry: Arc<OutputRegistry>,
 }
 
 impl StateSubscriber {
-    /// Create a new state subscriber.
-    pub fn new(state: TaskState) -> Self {
-        Self { state }
+    /// Create a state subscriber.
+    pub fn with_output_registry(state: TaskState, output_registry: Arc<OutputRegistry>) -> Self {
+        Self {
+            state,
+            output_registry,
+        }
     }
 
     /// Extract TaskId from event, reusing the existing `Arc<str>` allocation.
@@ -39,6 +44,8 @@ impl Subscribe for StateSubscriber {
             return;
         };
 
+        let attempt = event.attempt.unwrap_or(0);
+
         match event.kind {
             EventKind::TaskAdded => {
                 trace!(task = %task_id, "task added event received (already in state)");
@@ -48,6 +55,7 @@ impl Subscribe for StateSubscriber {
                 if self.state.transition_starting(&task_id).is_none() {
                     warn!(task = %task_id, "TaskStarting event for unknown task");
                 }
+                self.output_registry.announce_run_started(&task_id, attempt);
             }
             EventKind::TaskStopped => {
                 trace!(task = %task_id, "task stopped (success)");
@@ -57,6 +65,8 @@ impl Subscribe for StateSubscriber {
                 {
                     warn!(task = %task_id, "TaskStopped event for unknown task");
                 }
+                self.output_registry
+                    .announce_run_finished(&task_id, attempt, None);
             }
             EventKind::TaskFailed => {
                 let reason = event
@@ -78,10 +88,10 @@ impl Subscribe for StateSubscriber {
                 ) {
                     warn!(task = %task_id, "TaskFailed event for unknown task");
                 }
+                self.output_registry
+                    .announce_run_finished(&task_id, attempt, event.exit_code);
             }
             EventKind::TimeoutHit => {
-                // Timeouts have no process exit code by definition — the
-                // child was killed by us before it could exit.
                 trace!(task = %task_id, "task timeout");
                 if !self.state.transition_finished(
                     &task_id,
@@ -91,6 +101,8 @@ impl Subscribe for StateSubscriber {
                 ) {
                     warn!(task = %task_id, "TimeoutHit event for unknown task");
                 }
+                self.output_registry
+                    .announce_run_finished(&task_id, attempt, None);
             }
             EventKind::ActorExhausted => {
                 let reason = event
@@ -111,18 +123,10 @@ impl Subscribe for StateSubscriber {
                 ) {
                     warn!(task = %task_id, "ActorExhausted event for unknown task");
                 }
+                self.output_registry
+                    .announce_run_finished(&task_id, attempt, event.exit_code);
+                self.output_registry.evict(&task_id);
             }
-            // `ActorDead` is published by taskvisor when a task returns
-            // `TaskError::Fatal` — the actor is gone and will not be
-            // restarted. taskvisor also emits `TaskFailed` just before
-            // `ActorDead`, so by this point the phase is already
-            // `Failed`. Re-applying the terminal transition here is
-            // intentional: it keeps the final `reason`/`exit_code`
-            // aligned with the fatal event (subsequent `TaskFailed`
-            // wording is per-attempt, while `ActorDead` carries the
-            // sealed state), and it guarantees correctness if upstream
-            // ever publishes `ActorDead` without a preceding
-            // `TaskFailed`.
             EventKind::ActorDead => {
                 let reason = event
                     .reason
@@ -142,10 +146,14 @@ impl Subscribe for StateSubscriber {
                 ) {
                     warn!(task = %task_id, "ActorDead event for unknown task");
                 }
+                self.output_registry
+                    .announce_run_finished(&task_id, attempt, event.exit_code);
+                self.output_registry.evict(&task_id);
             }
             EventKind::TaskRemoved => {
                 trace!(task = %task_id, "task removed from state");
                 self.state.unregister_task(&task_id);
+                self.output_registry.evict(&task_id);
             }
             _ => {}
         }
@@ -163,7 +171,9 @@ impl Subscribe for StateSubscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solti_model::{TaskKind, TaskSpec};
+
+    use solti_model::{OutputEvent, TaskKind, TaskSpec};
+    use solti_runner::OutputRegistry;
     use taskvisor::Event;
 
     fn test_spec() -> TaskSpec {
@@ -177,7 +187,10 @@ mod tests {
         let id = TaskId::from(task_name);
         state.add_task(id.clone(), test_spec());
         state.transition_starting(&id);
-        let sub = StateSubscriber::new(state.clone());
+        let sub = StateSubscriber::with_output_registry(
+            state.clone(),
+            Arc::new(solti_runner::OutputRegistry::default()),
+        );
         (sub, state, id)
     }
 
@@ -221,7 +234,10 @@ mod tests {
     #[test]
     fn actor_dead_for_unknown_task_is_noop() {
         let state = TaskState::new();
-        let sub = StateSubscriber::new(state.clone());
+        let sub = StateSubscriber::with_output_registry(
+            state.clone(),
+            Arc::new(solti_runner::OutputRegistry::default()),
+        );
 
         let ev = Event::new(EventKind::ActorDead)
             .with_task("ghost")
@@ -264,5 +280,132 @@ mod tests {
         let task = state.get(&id).expect("task exists");
         assert_eq!(task.status().phase, TaskPhase::Exhausted);
         assert_eq!(task.status().exit_code, Some(1));
+    }
+
+    fn setup_with_registry(
+        task_name: &str,
+    ) -> (StateSubscriber, TaskState, Arc<OutputRegistry>, TaskId) {
+        let state = TaskState::new();
+        let id = TaskId::from(task_name);
+        state.add_task(id.clone(), test_spec());
+        state.transition_starting(&id);
+        let registry = Arc::new(OutputRegistry::new(16));
+        registry.ensure_channel(id.clone());
+        let sub = StateSubscriber::with_output_registry(state.clone(), Arc::clone(&registry));
+        (sub, state, registry, id)
+    }
+
+    #[test]
+    fn task_starting_announces_run_started_into_registry() {
+        let (sub, _state, registry, id) = setup_with_registry("started-1");
+        let mut rx = registry.subscribe(&id).unwrap();
+
+        let ev = Event::new(EventKind::TaskStarting)
+            .with_task("started-1")
+            .with_attempt(1);
+        sub.on_event(&ev);
+
+        match rx.try_recv().unwrap() {
+            OutputEvent::RunStarted { attempt, .. } => assert_eq!(attempt, 1),
+            other => panic!("expected RunStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_stopped_announces_run_finished_with_no_exit_code() {
+        let (sub, _state, registry, id) = setup_with_registry("stopped-1");
+        let mut rx = registry.subscribe(&id).unwrap();
+
+        let ev = Event::new(EventKind::TaskStopped)
+            .with_task("stopped-1")
+            .with_attempt(2);
+        sub.on_event(&ev);
+
+        match rx.try_recv().unwrap() {
+            OutputEvent::RunFinished {
+                attempt, exit_code, ..
+            } => {
+                assert_eq!(attempt, 2);
+                assert_eq!(exit_code, None);
+            }
+            other => panic!("expected RunFinished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_failed_announces_run_finished_with_exit_code() {
+        let (sub, _state, registry, id) = setup_with_registry("failed-1");
+        let mut rx = registry.subscribe(&id).unwrap();
+
+        let ev = Event::new(EventKind::TaskFailed)
+            .with_task("failed-1")
+            .with_attempt(3)
+            .with_exit_code(17);
+        sub.on_event(&ev);
+
+        match rx.try_recv().unwrap() {
+            OutputEvent::RunFinished {
+                attempt, exit_code, ..
+            } => {
+                assert_eq!(attempt, 3);
+                assert_eq!(exit_code, Some(17));
+            }
+            other => panic!("expected RunFinished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn actor_exhausted_announces_run_finished_and_evicts_channel() {
+        let (sub, _state, registry, id) = setup_with_registry("exh-evict");
+        let mut rx = registry.subscribe(&id).unwrap();
+
+        let ev = Event::new(EventKind::ActorExhausted)
+            .with_task("exh-evict")
+            .with_attempt(5)
+            .with_exit_code(1);
+        sub.on_event(&ev);
+
+        match rx.try_recv().unwrap() {
+            OutputEvent::RunFinished {
+                attempt, exit_code, ..
+            } => {
+                assert_eq!(attempt, 5);
+                assert_eq!(exit_code, Some(1));
+            }
+            other => panic!("expected RunFinished, got {other:?}"),
+        }
+        assert!(
+            registry.subscribe(&id).is_none(),
+            "channel must be evicted on Exhausted"
+        );
+    }
+
+    #[test]
+    fn actor_dead_announces_run_finished_and_evicts_channel() {
+        let (sub, _state, registry, id) = setup_with_registry("dead-evict");
+
+        let ev = Event::new(EventKind::ActorDead)
+            .with_task("dead-evict")
+            .with_attempt(2)
+            .with_exit_code(137);
+        sub.on_event(&ev);
+
+        assert!(
+            registry.subscribe(&id).is_none(),
+            "channel must be evicted on ActorDead"
+        );
+    }
+
+    #[test]
+    fn task_removed_evicts_channel() {
+        let (sub, _state, registry, id) = setup_with_registry("remove");
+
+        let ev = Event::new(EventKind::TaskRemoved).with_task("remove");
+        sub.on_event(&ev);
+
+        assert!(
+            registry.subscribe(&id).is_none(),
+            "channel must be evicted on TaskRemoved"
+        );
     }
 }

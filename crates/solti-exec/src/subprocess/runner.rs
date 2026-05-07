@@ -57,7 +57,10 @@
 use std::{
     io::Write as _,
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -67,8 +70,10 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
-use solti_model::{SubprocessSpec, TaskKind, TaskSpec, merge_env};
-use solti_runner::{BuildContext, Runner, RunnerError, RunnerErrorKind, RunnerType};
+use solti_model::{SubprocessSpec, TaskId, TaskKind, TaskSpec, merge_env};
+use solti_runner::{
+    BuildContext, OutputRegistry, Runner, RunnerError, RunnerErrorKind, RunnerType,
+};
 
 use crate::metrics::classify_task_error;
 use crate::subprocess::{
@@ -272,12 +277,17 @@ impl Runner for SubprocessRunner {
             .map(|c| *c.log_config())
             .unwrap_or_default();
 
+        let task_id = TaskId::from(Arc::clone(&task_cfg.run_id));
+        ctx.output_registry().ensure_channel(task_id);
+
         let exec_ctx = Arc::new(TaskExecContext {
             task_cfg,
             runner_cfg: self.config.clone(),
             cgroup_name,
             metrics: ctx.metrics().clone(),
             log_cfg,
+            output_registry: Arc::clone(ctx.output_registry()),
+            attempt: AtomicU32::new(0),
 
             _script_tempfile: script_tempfile.map(Arc::new),
         });
@@ -293,11 +303,13 @@ impl Runner for SubprocessRunner {
 
 /// Shared context for subprocess task execution.
 struct TaskExecContext {
-    task_cfg: SubprocessTaskConfig,
     runner_cfg: Option<Arc<SubprocessBackendConfig>>,
-    cgroup_name: Option<String>,
     metrics: solti_runner::MetricsHandle,
+    output_registry: Arc<OutputRegistry>,
+    task_cfg: SubprocessTaskConfig,
+    cgroup_name: Option<String>,
     log_cfg: LogConfig,
+    attempt: AtomicU32,
 
     _script_tempfile: Option<Arc<NamedTempFile>>,
 }
@@ -463,13 +475,25 @@ async fn run_subprocess(
 
     let log_cfg = ctx.log_cfg;
 
+    let attempt = ctx.attempt.fetch_add(1, Ordering::Relaxed) + 1;
+    let task_id = TaskId::from(Arc::clone(&ctx.task_cfg.run_id));
+    let sink = ctx.output_registry.sink_for(task_id, attempt);
+
     let stdout = child.stdout.take().ok_or_else(|| TaskError::Fatal {
         reason: "failed to capture stdout".into(),
         exit_code: None,
     })?;
     let run_id_stdout = Arc::clone(&ctx.task_cfg.run_id);
+    let sink_stdout = sink.clone();
     let stdout_task = tokio::spawn(async move {
-        log_stream(stdout, &run_id_stdout, StreamKind::Stdout, &log_cfg).await;
+        log_stream(
+            stdout,
+            &run_id_stdout,
+            StreamKind::Stdout,
+            &log_cfg,
+            Some(&sink_stdout),
+        )
+        .await;
     });
 
     let stderr = child.stderr.take().ok_or_else(|| TaskError::Fatal {
@@ -477,8 +501,16 @@ async fn run_subprocess(
         exit_code: None,
     })?;
     let run_id_stderr = Arc::clone(&ctx.task_cfg.run_id);
+    let sink_stderr = sink.clone();
     let stderr_task = tokio::spawn(async move {
-        log_stream(stderr, &run_id_stderr, StreamKind::Stderr, &log_cfg).await;
+        log_stream(
+            stderr,
+            &run_id_stderr,
+            StreamKind::Stderr,
+            &log_cfg,
+            Some(&sink_stderr),
+        )
+        .await;
     });
 
     let result = tokio::select! {
@@ -527,12 +559,16 @@ mod tests {
     }
 
     fn mk_subprocess_spec(slot: &str, command: &str) -> TaskSpec {
+        mk_subprocess_spec_with_args(slot, command, &[])
+    }
+
+    fn mk_subprocess_spec_with_args(slot: &str, command: &str, args: &[&str]) -> TaskSpec {
         TaskSpec::builder(
             slot,
             TaskKind::Subprocess(SubprocessSpec {
                 mode: solti_model::SubprocessMode::Command {
                     command: command.into(),
-                    args: vec![],
+                    args: args.iter().map(|s| s.to_string()).collect(),
                 },
                 env: Default::default(),
                 cwd: None,
@@ -575,6 +611,8 @@ mod tests {
             cgroup_name: None,
             metrics: solti_runner::noop_metrics(),
             log_cfg: LogConfig::default(),
+            output_registry: Arc::new(OutputRegistry::default()),
+            attempt: AtomicU32::new(0),
             _script_tempfile: None,
         }
     }
@@ -855,6 +893,79 @@ mod tests {
         };
         let err = SubprocessRunner::resolve_mode(&mode).unwrap_err();
         assert!(matches!(err, RunnerError::InvalidSpec(_)));
+    }
+
+    #[tokio::test]
+    async fn subprocess_streams_stdout_into_output_registry() {
+        use solti_model::{OutputEvent, TaskId};
+        use solti_runner::OutputRegistry;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let registry = Arc::new(OutputRegistry::new(64));
+        let ctx = BuildContext::default().with_output_registry(registry.clone());
+
+        let runner = SubprocessRunner::new("test-runner");
+        let spec = mk_subprocess_spec_with_args("echo-slot", "echo", &["hello-stream"]);
+        let task_ref = runner.build_task(&spec, &ctx).unwrap();
+        let task_id = TaskId::from(task_ref.name());
+
+        let mut rx = registry
+            .subscribe(&task_id)
+            .expect("registry must have channel after build_task");
+
+        let cancel = CancellationToken::new();
+        task_ref.spawn(cancel).await.expect("echo must succeed");
+
+        let mut found_line = None;
+        for _ in 0..100 {
+            if let Ok(OutputEvent::Chunk(c)) = rx.try_recv() {
+                if c.line.contains("hello-stream") {
+                    found_line = Some(c);
+                    break;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        let chunk = found_line.expect("expected to receive 'hello-stream' line");
+        assert_eq!(chunk.attempt, 1);
+        assert_eq!(chunk.stream, solti_model::StreamKind::Stdout);
+    }
+
+    #[tokio::test]
+    async fn subprocess_attempt_counter_increments_on_each_spawn() {
+        use solti_model::{OutputEvent, TaskId};
+        use solti_runner::OutputRegistry;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let registry = Arc::new(OutputRegistry::new(64));
+        let ctx = BuildContext::default().with_output_registry(registry.clone());
+        let runner = SubprocessRunner::new("test-runner");
+        let spec = mk_subprocess_spec_with_args("attempts-slot", "echo", &["x"]);
+        let task_ref = runner.build_task(&spec, &ctx).unwrap();
+        let task_id = TaskId::from(task_ref.name());
+        let mut rx = registry.subscribe(&task_id).unwrap();
+
+        task_ref.spawn(CancellationToken::new()).await.unwrap();
+        task_ref.spawn(CancellationToken::new()).await.unwrap();
+
+        let mut attempts = std::collections::BTreeSet::new();
+        for _ in 0..200 {
+            match rx.try_recv() {
+                Ok(OutputEvent::Chunk(c)) => {
+                    attempts.insert(c.attempt);
+                }
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        assert!(attempts.contains(&1), "attempt 1 missing: {attempts:?}");
+        assert!(attempts.contains(&2), "attempt 2 missing: {attempts:?}");
     }
 
     #[test]

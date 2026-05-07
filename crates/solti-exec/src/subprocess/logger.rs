@@ -29,7 +29,9 @@
 //! | `stderr_warn`     | true    | log stderr at WARN (else DEBUG)    |
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
+use solti_runner::OutputSink;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tracing::{debug, info, warn};
 
@@ -86,11 +88,13 @@ impl StreamKind {
 }
 
 /// Log subprocess output stream line-by-line with truncation.
-///
-/// Spawned as a tokio task per stream (stdout / stderr).
-/// Reads lines until EOF or error, emitting each via `tracing`.
-pub(crate) async fn log_stream<R>(reader: R, run_id: &str, stream: StreamKind, config: &LogConfig)
-where
+pub(crate) async fn log_stream<R>(
+    reader: R,
+    run_id: &str,
+    stream: StreamKind,
+    config: &LogConfig,
+    output_sink: Option<&OutputSink>,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut reader = BufReader::new(reader);
@@ -155,6 +159,14 @@ where
         let line = truncate_line(&raw_line, config.max_line_length);
         line_count += 1;
 
+        if let Some(sink) = output_sink {
+            let arc_line: Arc<str> = Arc::from(line.as_ref());
+            match stream {
+                StreamKind::Stdout => sink.stdout_line(arc_line),
+                StreamKind::Stderr => sink.stderr_line(arc_line),
+            }
+        }
+
         if stream.use_elevated_level(config) {
             match stream {
                 StreamKind::Stdout => info!(
@@ -212,6 +224,10 @@ pub(crate) fn truncate_line(line: &str, max_chars: usize) -> Cow<'_, str> {
 mod tests {
     use super::*;
 
+    use solti_model::OutputEvent;
+    use solti_runner::OutputSink;
+    use tokio::sync::broadcast;
+
     #[test]
     fn truncate_line_short_line_borrowed() {
         let result = truncate_line("hello", 10);
@@ -256,5 +272,96 @@ mod tests {
     fn truncate_line_single_char_limit() {
         let result = truncate_line("abc", 1);
         assert_eq!(&*result, "a... (truncated 2 bytes)");
+    }
+
+    #[tokio::test]
+    async fn log_stream_pushes_each_stdout_line_to_sink() {
+        let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
+        let sink = OutputSink::new(tx, 1);
+
+        let reader = "alpha\nbeta\ngamma\n".as_bytes();
+        log_stream(
+            reader,
+            "task-1",
+            StreamKind::Stdout,
+            &LogConfig::default(),
+            Some(&sink),
+        )
+        .await;
+
+        let mut lines = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let OutputEvent::Chunk(c) = ev {
+                assert_eq!(c.stream, solti_model::StreamKind::Stdout);
+                lines.push(c.line.to_string());
+            }
+        }
+        assert_eq!(lines, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[tokio::test]
+    async fn log_stream_pushes_stderr_line_with_stderr_kind() {
+        let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
+        let sink = OutputSink::new(tx, 1);
+
+        log_stream(
+            "boom\n".as_bytes(),
+            "task-2",
+            StreamKind::Stderr,
+            &LogConfig::default(),
+            Some(&sink),
+        )
+        .await;
+
+        match rx.recv().await.unwrap() {
+            OutputEvent::Chunk(c) => {
+                assert_eq!(c.stream, solti_model::StreamKind::Stderr);
+                assert_eq!(&*c.line, "boom");
+            }
+            other => panic!("expected Chunk, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn log_stream_pushes_truncated_line_not_raw() {
+        let cfg = LogConfig {
+            max_line_length: 5,
+            ..LogConfig::default()
+        };
+        let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
+        let sink = OutputSink::new(tx, 1);
+
+        log_stream(
+            "hello world\n".as_bytes(),
+            "task-3",
+            StreamKind::Stdout,
+            &cfg,
+            Some(&sink),
+        )
+        .await;
+
+        match rx.recv().await.unwrap() {
+            OutputEvent::Chunk(c) => {
+                assert!(
+                    c.line.starts_with("hello"),
+                    "expected truncated, got {:?}",
+                    c.line
+                );
+                assert!(c.line.contains("truncated"));
+            }
+            other => panic!("expected Chunk, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn log_stream_with_none_sink_is_a_noop_for_subscribers() {
+        log_stream(
+            "noisy\n".as_bytes(),
+            "task-4",
+            StreamKind::Stdout,
+            &LogConfig::default(),
+            None,
+        )
+        .await;
     }
 }
