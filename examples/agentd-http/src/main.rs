@@ -48,6 +48,10 @@
 //! curl http://localhost:8085/api/v1/tasks/{id}
 //! curl http://localhost:8085/api/v1/tasks/{id}/runs
 //! curl -X DELETE http://localhost:8085/api/v1/tasks/{id}
+//!
+//! # Live-tail stdout/stderr (Server-Sent Events; -N disables buffering)
+//! # One subscription covers all retries of the task with run boundary markers.
+//! curl -N http://localhost:8085/api/v1/tasks/{id}/logs
 //! ```
 //!
 //! Full endpoint reference: [`api_v1.md`](../../../crates/solti-api/api_v1.md).
