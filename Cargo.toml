@@ -29,8 +29,9 @@ keywords     = ["async", "tasks", "supervisor", "orchestration", "solti"]
 categories   = ["asynchronous", "concurrency"]
 
 [workspace.dependencies]
-tokio      = { version = "1" }
-tokio-util = "0.7.17"
+tokio        = { version = "1" }
+tokio-util   = "0.7.17"
+tokio-stream = "0.1"
 
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3" }

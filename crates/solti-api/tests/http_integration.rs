@@ -61,6 +61,38 @@ impl ApiHandler for MockHandler {
             Ok(())
         }
     }
+
+    async fn stream_task_logs(
+        &self,
+        id: &TaskId,
+    ) -> Result<solti_api::OutputEventStream, ApiError> {
+        // Mock surface: return a fixed two-event stream so the SSE handler
+        // has something deterministic to render. Real adapter feeds this
+        // from a `tokio::sync::broadcast::Receiver` via BroadcastStream.
+        use std::sync::Arc as StdArc;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        use solti_model::{OutputChunk, OutputEvent, StreamKind};
+
+        if id.as_str() == "stream-missing" {
+            return Err(ApiError::TaskNotFound(id.to_string()));
+        }
+
+        let events = vec![
+            OutputEvent::RunStarted {
+                attempt: 1,
+                started_at: UNIX_EPOCH + Duration::from_millis(1000),
+            },
+            OutputEvent::Chunk(OutputChunk {
+                attempt: 1,
+                stream: StreamKind::Stdout,
+                seq: 0,
+                ts: UNIX_EPOCH + Duration::from_millis(1100),
+                line: StdArc::from("hello-from-mock"),
+            }),
+        ];
+        Ok(Box::pin(tokio_stream::iter(events)))
+    }
 }
 
 fn router_with(handler: Arc<MockHandler>) -> axum::Router {
@@ -344,4 +376,92 @@ async fn get_task_status_empty_id_trimmed_returns_400() {
             .unwrap()
             .contains("task_id cannot be empty")
     );
+}
+
+// ----- Live-tail SSE endpoint -----
+
+#[tokio::test]
+async fn stream_task_logs_returns_sse_with_chunk_and_run_started_events() {
+    let handler = Arc::new(MockHandler::default());
+    let app = router_with(handler);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/tasks/some-task/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "expected SSE content-type, got {ct}"
+    );
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = std::str::from_utf8(&bytes).unwrap();
+    // Each SSE block must contain its event-name line + a JSON data line.
+    assert!(
+        body.contains("event: run-started"),
+        "missing run-started in SSE body: {body}"
+    );
+    assert!(
+        body.contains("event: chunk"),
+        "missing chunk in SSE body: {body}"
+    );
+    assert!(
+        body.contains("\"line\":\"hello-from-mock\""),
+        "missing inlined chunk fields in SSE body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn stream_task_logs_missing_task_returns_404() {
+    let handler = Arc::new(MockHandler::default());
+    let app = router_with(handler);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/tasks/stream-missing/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "TaskNotFound");
+}
+
+#[tokio::test]
+async fn stream_task_logs_empty_id_returns_400() {
+    let app = router_with(Arc::new(MockHandler::default()));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/tasks/%20%20/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "InvalidRequest");
 }

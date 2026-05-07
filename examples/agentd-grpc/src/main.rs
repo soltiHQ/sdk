@@ -72,7 +72,7 @@ use solti_prometheus::{
     PrometheusSubscriber, Registry, register_build_info, register_process_collector,
     server as metrics_server,
 };
-use solti_runner::{BuildContext, RunnerRouter};
+use solti_runner::{BuildContext, OutputRegistry, RunnerRouter};
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
 const ADDR: &str = "[::]:50052";
@@ -104,20 +104,25 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         ],
     )?;
 
+    // Output registry: live-tail broadcast channels per task.
+    let output_registry = Arc::new(OutputRegistry::default());
+
     // Runner: executes TaskSpec bodies (subprocess here).
-    let ctx = BuildContext::new(RunnerEnv::default(), Arc::new(metrics));
+    let ctx = BuildContext::new(RunnerEnv::default(), Arc::new(metrics))
+        .with_output_registry(Arc::clone(&output_registry));
     let mut router = RunnerRouter::new().with_context(ctx);
     register_subprocess_runner(&mut router, "default")?;
 
     // Supervisor: owns every task, applies restart / backoff, fans lifecycle events to subscribers.
     let subscribers: Vec<Arc<dyn Subscribe>> =
         vec![Arc::new(TracingEventSubscriber), Arc::new(subscriber)];
-    let supervisor = SupervisorApi::new(
+    let supervisor = SupervisorApi::new_with_output_registry(
         SupervisorConfig::default(),
         ControllerConfig::default(),
         subscribers,
         router,
         StateConfig::default(),
+        Arc::clone(&output_registry),
     )
     .await?;
 

@@ -16,38 +16,36 @@ all-features = true
 
 [features]
 default = []
-grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
-http = ["dep:axum", "dep:pbjson", "dep:prost", "dep:serde_json", "dep:tower-http"]
-tls = [
-    "dep:solti-tls",
-    "tonic?/tls-ring",
-]
+grpc    = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
+http    = ["dep:axum", "dep:pbjson", "dep:prost", "dep:serde_json", "dep:tower-http"]
+tls     = ["dep:solti-tls", "tonic?/tls-ring"]
 
 [dependencies]
-async-trait = { workspace = true }
-axum = { workspace = true, optional = true }
-pbjson = { workspace = true, optional = true }
-prost = { workspace = true, optional = true }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, optional = true }
-thiserror = { workspace = true }
-tonic = { workspace = true, optional = true }
-tonic-prost = { workspace = true, optional = true }
-tower-http = { workspace = true, features = ["limit"], optional = true }
-tracing = { workspace = true }
+async-trait  = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+axum         = { workspace = true, optional = true }
+pbjson       = { workspace = true, optional = true }
+prost        = { workspace = true, optional = true }
+serde        = { workspace = true, features = ["derive"] }
+serde_json   = { workspace = true, optional = true }
+thiserror    = { workspace = true }
+tonic        = { workspace = true, optional = true }
+tonic-prost  = { workspace = true, optional = true }
+tower-http   = { workspace = true, features = ["limit"], optional = true }
+tracing      = { workspace = true }
 
-solti-core = { workspace = true }
+solti-core  = { workspace = true }
 solti-model = { workspace = true }
-solti-tls = { workspace = true, optional = true }
+solti-tls  = { workspace = true, optional = true }
 
 [dev-dependencies]
-base64 = { workspace = true }
+base64         = { workspace = true }
 http-body-util = "0.1"
-rcgen = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
-tower = { version = "0.5", features = ["util"] }
+rcgen          = { workspace = true }
+tokio          = { workspace = true, features = ["macros", "rt"] }
+tower          = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
-pbjson-build = { workspace = true }
+pbjson-build        = { workspace = true }
 protoc-bin-vendored = { workspace = true }
-tonic-prost-build = { workspace = true }
+tonic-prost-build   = { workspace = true }
