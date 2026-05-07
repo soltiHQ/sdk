@@ -64,7 +64,11 @@ impl ApiHandler for SupervisorApiAdapter {
             .subscribe(id)
             .ok_or_else(|| ApiError::TaskNotFound(id.to_string()))?;
 
-        let stream = BroadcastStream::new(receiver).map(|res| res.unwrap_or_else(|BroadcastStreamRecvError::Lagged(skipped)| OutputEvent::Lagged { skipped }));
+        let stream = BroadcastStream::new(receiver).map(|res| {
+            res.unwrap_or_else(
+                |BroadcastStreamRecvError::Lagged(skipped)| OutputEvent::Lagged { skipped },
+            )
+        });
         Ok(Box::pin(stream))
     }
 }
