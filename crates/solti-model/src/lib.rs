@@ -152,10 +152,10 @@
 mod domain;
 pub use domain::{
     AGENT_ID_MAX_LEN, AdmissionPolicy, AgentId, BackoffPolicy, ContainerSpec, DEFAULT_LIMIT, Flag,
-    JitterPolicy, KeyValue, Labels, LabelsIter, MAX_LIMIT, MAX_SCRIPT_BODY_BYTES, RestartPolicy,
-    RunnerEnv, RunnerSelector, Runtime, SLOT_MAX_LEN, SelectorOperator, SelectorRequirement, Slot,
-    SubprocessMode, SubprocessSpec, TASK_ID_MAX_LEN, TaskEnv, TaskId, TaskKind, TaskPage,
-    TaskPhase, TaskQuery, Timeout, WasmSpec, merge_env,
+    JitterPolicy, KeyValue, Labels, LabelsIter, MAX_LIMIT, MAX_SCRIPT_BODY_BYTES, OutputChunk,
+    OutputEvent, RestartPolicy, RunnerEnv, RunnerSelector, Runtime, SLOT_MAX_LEN, SelectorOperator,
+    SelectorRequirement, Slot, StreamKind, SubprocessMode, SubprocessSpec, TASK_ID_MAX_LEN,
+    TaskEnv, TaskId, TaskKind, TaskPage, TaskPhase, TaskQuery, Timeout, WasmSpec, merge_env,
 };
 
 mod resource;

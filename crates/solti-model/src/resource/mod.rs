@@ -28,7 +28,7 @@
 mod spec;
 pub use spec::{TaskSpec, TaskSpecBuilder};
 
-mod metadata;
+pub(crate) mod metadata;
 pub use metadata::ObjectMeta;
 
 mod status;
