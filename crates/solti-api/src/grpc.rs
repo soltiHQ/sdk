@@ -2,20 +2,18 @@
 //!
 //! [`SoltiApiService`] implements the generated `SoltiApi` trait from `proto/solti/v1/api.proto`,
 //! delegating to an [`ApiHandler`](crate::ApiHandler).
-//!
-//! Per-request metrics are recorded via [`ApiMetricsHandle`](crate::ApiMetricsHandle); pass a
-//! real backend through [`SoltiApiService::new_with_metrics`] or
-//! [`build_grpc_server_with_metrics`] to observe requests.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
+use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
 use solti_model::TaskQuery;
 
-use crate::convert::{proto_to_domain_status, tasks_page_to_proto};
+use crate::convert::{output_event_to_proto, proto_to_domain_status, tasks_page_to_proto};
 use crate::error::ApiError;
 use crate::handler::ApiHandler;
 use crate::metrics::{ApiMetricsHandle, Transport, noop_api_metrics};
@@ -247,5 +245,165 @@ where
             Ok(Response::new(proto_api::DeleteTaskResponse {}))
         })
         .await
+    }
+
+    /// Server-streaming RPC.
+    type StreamTaskLogsStream = Pin<
+        Box<
+            dyn tokio_stream::Stream<Item = Result<proto_api::OutputEventProto, Status>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    async fn stream_task_logs(
+        &self,
+        request: Request<proto_api::StreamTaskLogsRequest>,
+    ) -> Result<Response<Self::StreamTaskLogsStream>, Status> {
+        let req = request.into_inner();
+        non_empty_id("task_id", &req.task_id).map_err(Status::from)?;
+
+        let task_id = solti_model::TaskId::from(req.task_id);
+        debug!(%task_id, "grpc: subscribing to task log stream");
+
+        let domain_stream = self
+            .handler
+            .stream_task_logs(&task_id)
+            .await
+            .map_err(Status::from)?;
+
+        let proto_stream = domain_stream.map(|ev| Ok(output_event_to_proto(ev)));
+        Ok(Response::new(Box::pin(proto_stream)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc as StdArc;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use async_trait::async_trait;
+    use solti_model::{
+        OutputChunk, OutputEvent, StreamKind as ModelStreamKind, Task, TaskId, TaskPage, TaskQuery,
+        TaskRun, TaskSpec,
+    };
+
+    use crate::error::ApiError;
+    use crate::handler::{ApiHandler, OutputEventStream};
+
+    struct StreamMock;
+
+    #[async_trait]
+    impl ApiHandler for StreamMock {
+        async fn submit_task(&self, _spec: TaskSpec) -> Result<TaskId, ApiError> {
+            unreachable!()
+        }
+        async fn get_task_status(&self, _id: &TaskId) -> Result<Option<Task>, ApiError> {
+            unreachable!()
+        }
+        async fn query_tasks(&self, _q: TaskQuery) -> Result<TaskPage<Task>, ApiError> {
+            unreachable!()
+        }
+        async fn list_task_runs(&self, _id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
+            unreachable!()
+        }
+        async fn delete_task(&self, _id: &TaskId) -> Result<(), ApiError> {
+            unreachable!()
+        }
+        async fn stream_task_logs(&self, id: &TaskId) -> Result<OutputEventStream, ApiError> {
+            if id.as_str() == "missing" {
+                return Err(ApiError::TaskNotFound(id.to_string()));
+            }
+            let events = vec![
+                OutputEvent::RunStarted {
+                    attempt: 1,
+                    started_at: UNIX_EPOCH + Duration::from_millis(1000),
+                },
+                OutputEvent::Chunk(OutputChunk {
+                    attempt: 1,
+                    stream: ModelStreamKind::Stdout,
+                    seq: 0,
+                    ts: UNIX_EPOCH + Duration::from_millis(1100),
+                    line: StdArc::from("hello-grpc"),
+                }),
+                OutputEvent::RunFinished {
+                    attempt: 1,
+                    exit_code: Some(0),
+                    finished_at: UNIX_EPOCH + Duration::from_millis(1500),
+                },
+            ];
+            Ok(Box::pin(tokio_stream::iter(events)))
+        }
+    }
+
+    fn service() -> SoltiApiService<StreamMock> {
+        SoltiApiService::new(Arc::new(StreamMock))
+    }
+
+    #[tokio::test]
+    async fn stream_task_logs_returns_three_proto_events_in_order() {
+        let svc = service();
+        let req = Request::new(proto_api::StreamTaskLogsRequest {
+            task_id: "tsk_1".into(),
+        });
+
+        let response = svc.stream_task_logs(req).await.expect("stream Ok");
+        let mut stream = response.into_inner();
+
+        match stream.next().await.unwrap().unwrap().kind.unwrap() {
+            proto_api::output_event_proto::Kind::RunStarted(r) => {
+                assert_eq!(r.attempt, 1);
+                assert_eq!(r.started_at, 1000);
+            }
+            other => panic!("expected RunStarted, got {other:?}"),
+        }
+
+        match stream.next().await.unwrap().unwrap().kind.unwrap() {
+            proto_api::output_event_proto::Kind::Chunk(c) => {
+                assert_eq!(c.attempt, 1);
+                assert_eq!(c.stream, proto_api::OutputStreamKind::Stdout as i32);
+                assert_eq!(c.seq, 0);
+                assert_eq!(c.line, "hello-grpc");
+            }
+            other => panic!("expected Chunk, got {other:?}"),
+        }
+
+        match stream.next().await.unwrap().unwrap().kind.unwrap() {
+            proto_api::output_event_proto::Kind::RunFinished(r) => {
+                assert_eq!(r.attempt, 1);
+                assert_eq!(r.exit_code, Some(0));
+                assert_eq!(r.finished_at, 1500);
+            }
+            other => panic!("expected RunFinished, got {other:?}"),
+        }
+        assert!(stream.next().await.is_none(), "stream must terminate");
+    }
+
+    #[tokio::test]
+    async fn stream_task_logs_rejects_empty_task_id() {
+        let svc = service();
+        let req = Request::new(proto_api::StreamTaskLogsRequest {
+            task_id: "  ".into(),
+        });
+        let status = match svc.stream_task_logs(req).await {
+            Err(s) => s,
+            Ok(_) => panic!("expected error status"),
+        };
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn stream_task_logs_maps_task_not_found_to_not_found_status() {
+        let svc = service();
+        let req = Request::new(proto_api::StreamTaskLogsRequest {
+            task_id: "missing".into(),
+        });
+        let status = match svc.stream_task_logs(req).await {
+            Err(s) => s,
+            Ok(_) => panic!("expected error status"),
+        };
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 }

@@ -4,18 +4,16 @@
 
 ## API surface
 
-| Operation   | gRPC RPC        | HTTP Endpoint                  | HTTP Method |
-|-------------|-----------------|--------------------------------|-------------|
-| Submit task | `SubmitTask`    | `/api/v1/tasks`                | POST        |
-| Get task    | `GetTaskStatus` | `/api/v1/tasks/{id}`           | GET         |
-| List tasks  | `ListTasks`     | `/api/v1/tasks`                | GET         |
-| List runs   | `ListTaskRuns`  | `/api/v1/tasks/{id}/runs`      | GET         |
-| Stream logs | _not yet wired_ | `/api/v1/tasks/{id}/logs`      | GET (SSE)   |
-| Delete task | `DeleteTask`    | `/api/v1/tasks/{id}`           | DELETE      |
+| Operation   | gRPC RPC         | HTTP Endpoint                   | HTTP Method |
+|-------------|------------------|---------------------------------|-------------|
+| Submit task | `SubmitTask`     | `/api/v1/tasks`                 | POST        |
+| Get task    | `GetTaskStatus`  | `/api/v1/tasks/{id}`            | GET         |
+| List tasks  | `ListTasks`      | `/api/v1/tasks`                 | GET         |
+| List runs   | `ListTaskRuns`   | `/api/v1/tasks/{id}/runs`       | GET         |
+| Stream logs | `StreamTaskLogs` | `/api/v1/tasks/{id}/logs`       | GET (SSE)   |
+| Delete task | `DeleteTask`     | `/api/v1/tasks/{id}`            | DELETE      |
 
-`DeleteTask` is the single teardown primitive: it stops the task and
-purges its run history. Idempotent — deleting an unknown task is a
-no-op, not an error.
+`DeleteTask` is the single teardown primitive: it stops the task and purges its run history. 
 
 ---
 
@@ -260,36 +258,15 @@ Response `200 OK`:
 
 ### Stream task logs (Server-Sent Events)
 
-Live tail of stdout/stderr for one task. The stream covers all attempts of that task: clients see run boundary markers between them.
+Live tail of stdout/stderr. One subscription covers all retries of the task with run-boundary markers between them. 
+`404` if the task has no live channel.
 
 ```bash
 curl -N http://localhost:8080/api/v1/tasks/tsk_01JR.../logs
 ```
 
-Response `200 OK` with `Content-Type: text/event-stream`. Each SSE block
-has an `event:` name + a JSON `data:` payload (the same shape direct
-in-process subscribers see):
-
-```text
-event: run-started
-data: {"type":"runStarted","attempt":1,"startedAt":1712750400000}
-
-event: chunk
-data: {"type":"chunk","attempt":1,"stream":"stdout","seq":0,"ts":1712750400123,"line":"hello world"}
-
-event: run-finished
-data: {"type":"runFinished","attempt":1,"exitCode":0,"finishedAt":1712750400500}
-
-event: lagged
-data: {"type":"lagged","skipped":1500}
-```
-
-Event types (mapped 1:1 from `solti_model::OutputEvent`):
-- `chunk`: one stdout/stderr line.
-- `run-started` / `run-finished`: boundary markers between retries.
-- `lagged`: subscriber fell behind the per-task ring buffer; the gap is reported and streaming continues from the freshest event.
-
-Returns `404 TaskNotFound` if no broadcast channel exists for the task.
+Wire shape (event types map 1:1 to gRPC `OutputEventProto` variants): `chunk`, `run-started`, `run-finished`, `lagged`. 
+Same JSON payload as direct in-process subscribers see.
 
 ### Delete a task
 
@@ -495,7 +472,13 @@ Returns `{}`. Stops the task and purges its run history. Idempotent.
 
 ### Stream logs
 
-Not exposed over gRPC yet. 
+Server-streaming RPC, same semantics as the HTTP/SSE variant: different wire (`OutputEventProto` with `oneof kind`). 
+Closes with `NOT_FOUND` if no live channel exists.
+
+```bash
+grpcurl -plaintext -d '{"taskId": "tsk_01JR..."}' \
+  localhost:50051 solti.v1.SoltiApi/StreamTaskLogs
+```
 
 ### gRPC errors
 

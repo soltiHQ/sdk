@@ -28,6 +28,10 @@
 //! grpcurl -plaintext -d '{"taskId":"<id>"}' localhost:50052 solti.v1.SoltiApi/GetTaskStatus
 //! grpcurl -plaintext -d '{"taskId":"<id>"}' localhost:50052 solti.v1.SoltiApi/ListTaskRuns
 //! grpcurl -plaintext -d '{"taskId":"<id>"}' localhost:50052 solti.v1.SoltiApi/DeleteTask
+//!
+//! # Live-tail stdout/stderr (server-streaming RPC).
+//! # One subscription covers all retries of the task with run boundary markers.
+//! grpcurl -plaintext -d '{"taskId":"<id>"}' localhost:50052 solti.v1.SoltiApi/StreamTaskLogs
 //! ```
 //!
 //! Proto contract + full RPC surface: [`api_v1.md`](../../../crates/solti-api/api_v1.md).

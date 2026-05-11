@@ -23,6 +23,10 @@ mod task;
 mod time;
 
 #[cfg(feature = "grpc")]
+mod output;
+#[cfg(feature = "grpc")]
+pub(crate) use output::output_event_to_proto;
+#[cfg(feature = "grpc")]
 pub(crate) use phase::proto_to_domain_status;
 pub use spec::convert_create_spec;
 #[cfg(any(feature = "grpc", feature = "http"))]
