@@ -85,7 +85,7 @@ message OutputChunkProto {
   OutputStreamKind stream   = 2; // stdout or stderr
   uint64 seq                = 3; // monotonic, per-stream, resets each attempt
   int64  ts                 = 4; // unix milliseconds when the agent read it
-  string line               = 5; // truncated/cleaned line content
+  bytes  line               = 5; // truncated/cleaned line content
 }
 
 message RunStartedProto {

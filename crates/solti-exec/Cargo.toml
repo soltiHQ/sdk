@@ -17,6 +17,7 @@ subprocess = ["dep:base64", "dep:libc", "dep:tempfile", "tokio/process"]
 
 [dependencies]
 base64     = { workspace = true, optional = true }
+bytes      = { workspace = true }
 libc       = { workspace = true, optional = true }
 tempfile   = { workspace = true, optional = true }
 thiserror  = { workspace = true }

@@ -1,8 +1,8 @@
 //! Output streaming types for live tail of task stdout/stderr.
 
-use std::sync::Arc;
 use std::time::SystemTime;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 /// StreamKind.
@@ -70,15 +70,37 @@ pub struct OutputChunk {
     /// Wall-clock time the line was read by the agent (unix milliseconds on the wire).
     #[serde(with = "crate::resource::metadata::time_serde")]
     pub ts: SystemTime,
-    /// One line, already truncated/cleaned by the runner. Borrow-able across subscribers.
-    pub line: Arc<str>,
+    /// One line, already truncated/cleaned by the runner.
+    #[serde(with = "bytes_as_utf8_string")]
+    pub line: Bytes,
+}
+
+/// Serde adapter: serialize `Bytes` as a UTF-8 string in JSON, deserialize from a JSON string back into `Bytes`.
+mod bytes_as_utf8_string {
+    use bytes::Bytes;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S>(b: &Bytes, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let txt = std::str::from_utf8(b).map_err(serde::ser::Error::custom)?;
+        s.serialize_str(txt)
+    }
+
+    pub(super) fn deserialize<'de, D>(d: D) -> Result<Bytes, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(d)?;
+        Ok(Bytes::from(s))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -94,7 +116,7 @@ mod tests {
             stream: StreamKind::Stderr,
             seq: 42,
             ts: UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
-            line: Arc::from("compiling foo..."),
+            line: Bytes::from_static(b"compiling foo..."),
         };
 
         let json = serde_json::to_string(&chunk).unwrap();
@@ -110,7 +132,7 @@ mod tests {
             stream: StreamKind::Stdout,
             seq: 0,
             ts: UNIX_EPOCH + Duration::from_millis(1234),
-            line: Arc::from("x"),
+            line: Bytes::from_static(b"x"),
         };
 
         let json = serde_json::to_string(&chunk).unwrap();
@@ -121,13 +143,29 @@ mod tests {
     }
 
     #[test]
+    fn output_chunk_serializes_line_as_utf8_string_not_array() {
+        let chunk = OutputChunk {
+            attempt: 1,
+            stream: StreamKind::Stdout,
+            seq: 0,
+            ts: UNIX_EPOCH,
+            line: Bytes::from_static(b"hello"),
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(
+            json.contains(r#""line":"hello""#),
+            "line must serialize as JSON string, not byte array; got {json}"
+        );
+    }
+
+    #[test]
     fn output_event_chunk_inlines_chunk_fields() {
         let event = OutputEvent::Chunk(OutputChunk {
             attempt: 3,
             stream: StreamKind::Stdout,
             seq: 5,
             ts: UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
-            line: Arc::from("hello"),
+            line: Bytes::from_static(b"hello"),
         });
         let json = serde_json::to_string(&event).unwrap();
 
@@ -181,7 +219,7 @@ mod tests {
                 stream: StreamKind::Stderr,
                 seq: 0,
                 ts: UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
-                line: Arc::from("warning"),
+                line: Bytes::from_static(b"warning"),
             }),
             OutputEvent::RunStarted {
                 attempt: 1,
@@ -209,7 +247,7 @@ mod tests {
             stream: StreamKind::Stdout,
             seq: 9,
             ts: UNIX_EPOCH,
-            line: Arc::from("hi"),
+            line: Bytes::from_static(b"hi"),
         };
 
         let json = serde_json::to_string(&chunk).unwrap();
@@ -222,5 +260,18 @@ mod tests {
         ] {
             assert!(json.contains(key), "missing key {key} in {json}");
         }
+    }
+
+    #[test]
+    fn output_chunk_clone_is_refcount_bump() {
+        let original = OutputChunk {
+            attempt: 1,
+            stream: StreamKind::Stdout,
+            seq: 0,
+            ts: UNIX_EPOCH,
+            line: Bytes::from_static(b"shared-line"),
+        };
+        let cloned = original.clone();
+        assert_eq!(original.line.as_ptr(), cloned.line.as_ptr());
     }
 }

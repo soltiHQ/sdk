@@ -15,6 +15,7 @@ license.workspace = true
 default = []
 
 [dependencies]
+bytes       = { workspace = true }
 parking_lot = { workspace = true }
 taskvisor   = { workspace = true }
 thiserror   = { workspace = true }

@@ -2,6 +2,10 @@
 //!
 //! Maps [`solti_model::OutputEvent`] (in-process broadcast carrier) to the
 //! generated [`proto_api::OutputEventProto`] for the `StreamTaskLogs` RPC.
+//!
+//! The line payload is carried as [`bytes::Bytes`] on both sides, so the
+//! per-event line is forwarded by an `Arc`-style refcount bump rather than
+//! a byte-copy on every subscriber.
 
 use solti_model::{OutputChunk, OutputEvent, StreamKind};
 
@@ -43,7 +47,9 @@ fn output_chunk_to_proto(c: OutputChunk) -> proto_api::OutputChunkProto {
         stream: stream_kind_to_proto(c.stream) as i32,
         seq: c.seq,
         ts: system_time_to_ms(c.ts),
-        line: c.line.to_string(),
+        // Zero-copy: `c.line` is `bytes::Bytes`, the proto field is also
+        // `bytes::Bytes` (configured via `.bytes([...])` in build.rs).
+        line: c.line,
     }
 }
 
@@ -58,8 +64,9 @@ fn stream_kind_to_proto(k: StreamKind) -> proto_api::OutputStreamKind {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
+
+    use bytes::Bytes;
 
     #[test]
     fn chunk_maps_all_fields() {
@@ -68,7 +75,7 @@ mod tests {
             stream: StreamKind::Stderr,
             seq: 42,
             ts: UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
-            line: Arc::from("error: boom"),
+            line: Bytes::from_static(b"error: boom"),
         });
 
         let proto = output_event_to_proto(ev);
@@ -81,7 +88,32 @@ mod tests {
         assert_eq!(chunk.stream, proto_api::OutputStreamKind::Stderr as i32);
         assert_eq!(chunk.seq, 42);
         assert_eq!(chunk.ts, 1_700_000_000_000);
-        assert_eq!(chunk.line, "error: boom");
+        assert_eq!(&chunk.line[..], b"error: boom");
+    }
+
+    #[test]
+    fn chunk_forwards_line_without_byte_copy() {
+        let original = Bytes::from_static(b"shared-line");
+        let original_ptr = original.as_ptr();
+
+        let ev = OutputEvent::Chunk(OutputChunk {
+            attempt: 1,
+            stream: StreamKind::Stdout,
+            seq: 0,
+            ts: UNIX_EPOCH,
+            line: original,
+        });
+
+        let proto = output_event_to_proto(ev);
+        let chunk = match proto.kind.unwrap() {
+            proto_api::output_event_proto::Kind::Chunk(c) => c,
+            other => panic!("expected Chunk, got {other:?}"),
+        };
+        assert_eq!(
+            chunk.line.as_ptr(),
+            original_ptr,
+            "line bytes must be forwarded zero-copy"
+        );
     }
 
     #[test]

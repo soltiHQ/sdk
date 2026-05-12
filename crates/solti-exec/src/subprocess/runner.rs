@@ -921,7 +921,8 @@ mod tests {
         let mut found_line = None;
         for _ in 0..100 {
             if let Ok(OutputEvent::Chunk(c)) = rx.try_recv() {
-                if c.line.contains("hello-stream") {
+                let line_text = std::str::from_utf8(&c.line).unwrap_or_default();
+                if line_text.contains("hello-stream") {
                     found_line = Some(c);
                     break;
                 }

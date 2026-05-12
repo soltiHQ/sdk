@@ -29,8 +29,8 @@
 //! | `stderr_warn`     | true    | log stderr at WARN (else DEBUG)    |
 
 use std::borrow::Cow;
-use std::sync::Arc;
 
+use bytes::Bytes;
 use solti_runner::OutputSink;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tracing::{debug, info, warn};
@@ -159,14 +159,6 @@ pub(crate) async fn log_stream<R>(
         let line = truncate_line(&raw_line, config.max_line_length);
         line_count += 1;
 
-        if let Some(sink) = output_sink {
-            let arc_line: Arc<str> = Arc::from(line.as_ref());
-            match stream {
-                StreamKind::Stdout => sink.stdout_line(arc_line),
-                StreamKind::Stderr => sink.stderr_line(arc_line),
-            }
-        }
-
         if stream.use_elevated_level(config) {
             match stream {
                 StreamKind::Stdout => info!(
@@ -192,6 +184,17 @@ pub(crate) async fn log_stream<R>(
                 "{}",
                 line
             );
+        }
+
+        if let Some(sink) = output_sink {
+            let bytes_line: Bytes = match line {
+                Cow::Borrowed(s) => Bytes::copy_from_slice(s.as_bytes()),
+                Cow::Owned(s) => Bytes::from(s),
+            };
+            match stream {
+                StreamKind::Stdout => sink.stdout_line(bytes_line),
+                StreamKind::Stderr => sink.stderr_line(bytes_line),
+            }
         }
     }
 
@@ -293,7 +296,7 @@ mod tests {
         while let Ok(ev) = rx.try_recv() {
             if let OutputEvent::Chunk(c) = ev {
                 assert_eq!(c.stream, solti_model::StreamKind::Stdout);
-                lines.push(c.line.to_string());
+                lines.push(std::str::from_utf8(&c.line).unwrap().to_string());
             }
         }
         assert_eq!(lines, vec!["alpha", "beta", "gamma"]);
@@ -316,7 +319,7 @@ mod tests {
         match rx.recv().await.unwrap() {
             OutputEvent::Chunk(c) => {
                 assert_eq!(c.stream, solti_model::StreamKind::Stderr);
-                assert_eq!(&*c.line, "boom");
+                assert_eq!(&c.line[..], b"boom");
             }
             other => panic!("expected Chunk, got {other:?}"),
         }
@@ -342,12 +345,12 @@ mod tests {
 
         match rx.recv().await.unwrap() {
             OutputEvent::Chunk(c) => {
+                let line_text = std::str::from_utf8(&c.line).expect("line must be UTF-8");
                 assert!(
-                    c.line.starts_with("hello"),
-                    "expected truncated, got {:?}",
-                    c.line
+                    line_text.starts_with("hello"),
+                    "expected truncated, got {line_text:?}"
                 );
-                assert!(c.line.contains("truncated"));
+                assert!(line_text.contains("truncated"));
             }
             other => panic!("expected Chunk, got {other:?}"),
         }

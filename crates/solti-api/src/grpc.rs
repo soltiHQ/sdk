@@ -281,10 +281,10 @@ where
 mod tests {
     use super::*;
 
-    use std::sync::Arc as StdArc;
     use std::time::{Duration, UNIX_EPOCH};
 
     use async_trait::async_trait;
+    use bytes::Bytes;
     use solti_model::{
         OutputChunk, OutputEvent, StreamKind as ModelStreamKind, Task, TaskId, TaskPage, TaskQuery,
         TaskRun, TaskSpec,
@@ -326,7 +326,7 @@ mod tests {
                     stream: ModelStreamKind::Stdout,
                     seq: 0,
                     ts: UNIX_EPOCH + Duration::from_millis(1100),
-                    line: StdArc::from("hello-grpc"),
+                    line: Bytes::from_static(b"hello-grpc"),
                 }),
                 OutputEvent::RunFinished {
                     attempt: 1,
@@ -365,7 +365,7 @@ mod tests {
                 assert_eq!(c.attempt, 1);
                 assert_eq!(c.stream, proto_api::OutputStreamKind::Stdout as i32);
                 assert_eq!(c.seq, 0);
-                assert_eq!(c.line, "hello-grpc");
+                assert_eq!(&c.line[..], b"hello-grpc");
             }
             other => panic!("expected Chunk, got {other:?}"),
         }

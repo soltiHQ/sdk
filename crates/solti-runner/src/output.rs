@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use bytes::Bytes;
 use parking_lot::RwLock;
 use solti_model::{OutputChunk, OutputEvent, StreamKind, TaskId};
 use tokio::sync::broadcast;
@@ -33,13 +34,17 @@ impl OutputSink {
     }
 
     /// Push one stdout line. No-op if no subscribers are attached.
-    pub fn stdout_line(&self, line: Arc<str>) {
+    ///
+    /// `line` is `bytes::Bytes` (UTF-8): cloning is a refcount bump, so the
+    /// same buffer is shared across every subscriber and all the way through
+    /// to the gRPC `bytes line` wire field without an extra byte-copy.
+    pub fn stdout_line(&self, line: Bytes) {
         let seq = self.seq_stdout.fetch_add(1, Ordering::Relaxed);
         self.push(StreamKind::Stdout, seq, line);
     }
 
     /// Push one stderr line. No-op if no subscribers are attached.
-    pub fn stderr_line(&self, line: Arc<str>) {
+    pub fn stderr_line(&self, line: Bytes) {
         let seq = self.seq_stderr.fetch_add(1, Ordering::Relaxed);
         self.push(StreamKind::Stderr, seq, line);
     }
@@ -49,7 +54,7 @@ impl OutputSink {
         self.attempt
     }
 
-    fn push(&self, stream: StreamKind, seq: u64, line: Arc<str>) {
+    fn push(&self, stream: StreamKind, seq: u64, line: Bytes) {
         let chunk = OutputChunk {
             attempt: self.attempt,
             stream,
@@ -163,8 +168,7 @@ impl Default for OutputRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
+    use bytes::Bytes;
     use solti_model::{OutputEvent, StreamKind, TaskId};
     use tokio::sync::broadcast;
 
@@ -175,14 +179,14 @@ mod tests {
         let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
         let sink = OutputSink::new(tx, 1);
 
-        sink.stdout_line(Arc::from("hello"));
+        sink.stdout_line(Bytes::from_static(b"hello"));
 
         match rx.recv().await.unwrap() {
             OutputEvent::Chunk(chunk) => {
                 assert_eq!(chunk.attempt, 1);
                 assert_eq!(chunk.stream, StreamKind::Stdout);
                 assert_eq!(chunk.seq, 0);
-                assert_eq!(&*chunk.line, "hello");
+                assert_eq!(&chunk.line[..], b"hello");
             }
             other => panic!("expected Chunk, got {other:?}"),
         }
@@ -193,13 +197,13 @@ mod tests {
         let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
         let sink = OutputSink::new(tx, 5);
 
-        sink.stderr_line(Arc::from("oops"));
+        sink.stderr_line(Bytes::from_static(b"oops"));
 
         match rx.recv().await.unwrap() {
             OutputEvent::Chunk(chunk) => {
                 assert_eq!(chunk.attempt, 5);
                 assert_eq!(chunk.stream, StreamKind::Stderr);
-                assert_eq!(&*chunk.line, "oops");
+                assert_eq!(&chunk.line[..], b"oops");
             }
             other => panic!("expected Chunk, got {other:?}"),
         }
@@ -210,9 +214,9 @@ mod tests {
         let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
         let sink = OutputSink::new(tx, 1);
 
-        sink.stdout_line(Arc::from("a"));
-        sink.stdout_line(Arc::from("b"));
-        sink.stdout_line(Arc::from("c"));
+        sink.stdout_line(Bytes::from_static(b"a"));
+        sink.stdout_line(Bytes::from_static(b"b"));
+        sink.stdout_line(Bytes::from_static(b"c"));
 
         let mut seqs = Vec::new();
         for _ in 0..3 {
@@ -228,10 +232,10 @@ mod tests {
         let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
         let sink = OutputSink::new(tx, 1);
 
-        sink.stdout_line(Arc::from("o1"));
-        sink.stderr_line(Arc::from("e1"));
-        sink.stdout_line(Arc::from("o2"));
-        sink.stderr_line(Arc::from("e2"));
+        sink.stdout_line(Bytes::from_static(b"o1"));
+        sink.stderr_line(Bytes::from_static(b"e1"));
+        sink.stdout_line(Bytes::from_static(b"o2"));
+        sink.stderr_line(Bytes::from_static(b"e2"));
 
         let mut stdout_seqs = Vec::new();
         let mut stderr_seqs = Vec::new();
@@ -252,8 +256,8 @@ mod tests {
         let (tx, _) = broadcast::channel::<OutputEvent>(16);
         let sink = OutputSink::new(tx, 1);
 
-        sink.stdout_line(Arc::from("nobody-listens"));
-        sink.stderr_line(Arc::from("still-no-one"));
+        sink.stdout_line(Bytes::from_static(b"nobody-listens"));
+        sink.stderr_line(Bytes::from_static(b"still-no-one"));
     }
 
     #[tokio::test]
@@ -262,11 +266,34 @@ mod tests {
         let mut rx2 = tx.subscribe();
         let sink = OutputSink::new(tx, 2);
 
-        sink.stdout_line(Arc::from("hello"));
+        sink.stdout_line(Bytes::from_static(b"hello"));
 
         for rx in [&mut rx1, &mut rx2] {
             if let OutputEvent::Chunk(c) = rx.recv().await.unwrap() {
-                assert_eq!(&*c.line, "hello");
+                assert_eq!(&c.line[..], b"hello");
+            } else {
+                panic!("expected Chunk");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn output_sink_forwards_line_to_subscribers_without_byte_copy() {
+        let (tx, mut rx1) = broadcast::channel::<OutputEvent>(16);
+        let mut rx2 = tx.subscribe();
+        let sink = OutputSink::new(tx, 1);
+
+        let payload = Bytes::from_static(b"shared-line");
+        let payload_ptr = payload.as_ptr();
+        sink.stdout_line(payload);
+
+        for rx in [&mut rx1, &mut rx2] {
+            if let OutputEvent::Chunk(c) = rx.recv().await.unwrap() {
+                assert_eq!(
+                    c.line.as_ptr(),
+                    payload_ptr,
+                    "line bytes must be shared across subscribers"
+                );
             } else {
                 panic!("expected Chunk");
             }
@@ -296,15 +323,15 @@ mod tests {
         let sink_a1 = reg.sink_for(task.clone(), 1);
         let mut rx = reg.subscribe(&task).unwrap();
 
-        sink_a1.stdout_line(Arc::from("from-attempt-1"));
+        sink_a1.stdout_line(Bytes::from_static(b"from-attempt-1"));
 
         let sink_a2 = reg.sink_for(task.clone(), 2);
-        sink_a2.stdout_line(Arc::from("from-attempt-2"));
+        sink_a2.stdout_line(Bytes::from_static(b"from-attempt-2"));
 
         let mut seen = Vec::new();
         for _ in 0..2 {
             if let OutputEvent::Chunk(c) = rx.recv().await.unwrap() {
-                seen.push((c.attempt, c.line.to_string()));
+                seen.push((c.attempt, std::str::from_utf8(&c.line).unwrap().to_string()));
             }
         }
         assert_eq!(

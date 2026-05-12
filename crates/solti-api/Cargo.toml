@@ -40,10 +40,11 @@ solti-tls  = { workspace = true, optional = true }
 
 [dev-dependencies]
 base64         = { workspace = true }
-http-body-util = "0.1"
+bytes          = { workspace = true }
+http-body-util = { workspace = true }
 rcgen          = { workspace = true }
 tokio          = { workspace = true, features = ["macros", "rt"] }
-tower          = { version = "0.5", features = ["util"] }
+tower          = { workspace = true, features = ["util"] }
 
 [build-dependencies]
 pbjson-build        = { workspace = true }
