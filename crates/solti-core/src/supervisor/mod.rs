@@ -221,10 +221,16 @@ impl SupervisorApi {
 
         debug!("submitting pre-built task via controller");
         if let Err(e) = self.handle.submit(controller_spec).await {
-            self.state.unregister_task(&task_id);
+            self.unwind_provisional_submit(&task_id);
             return Err(CoreError::Supervisor(e.to_string()));
         }
         Ok(task_id)
+    }
+
+    /// Roll back resources reserved by [`submit_with_task`] before `handle.submit`.
+    fn unwind_provisional_submit(&self, task_id: &TaskId) {
+        self.state.unregister_task(task_id);
+        self.output_registry.evict(task_id);
     }
 
     /// Gracefully shut down the supervisor: cancel all tasks and wait for completion.
@@ -480,5 +486,47 @@ mod tests {
 
         assert!(Arc::ptr_eq(api.output_registry(), &registry));
         assert_eq!(api.output_registry().active_channels(), 1);
+    }
+
+    #[tokio::test]
+    async fn unwind_provisional_submit_drops_state_entry_and_output_channel() {
+        let registry = Arc::new(OutputRegistry::default());
+        let router = RunnerRouter::new();
+        let api = SupervisorApi::new_with_output_registry(
+            SupervisorConfig::default(),
+            ControllerConfig::default(),
+            Vec::new(),
+            router,
+            StateConfig::default(),
+            Arc::clone(&registry),
+        )
+        .await
+        .expect("SupervisorApi::new_with_output_registry");
+
+        let ghost = TaskId::from("orphan-on-submit-fail");
+
+        registry.ensure_channel(ghost.clone());
+        let spec = TaskSpec::builder("ghost-slot", TaskKind::Embedded, 1_000_u64)
+            .restart(RestartPolicy::Never)
+            .backoff(mk_backoff())
+            .admission(AdmissionPolicy::DropIfRunning)
+            .build()
+            .expect("valid spec");
+        api.state.add_task(ghost.clone(), spec);
+
+        let channels_before = registry.active_channels();
+        assert!(channels_before >= 1, "channel must exist before unwind");
+        assert!(api.get_task(&ghost).is_some(), "state entry must exist");
+
+        api.unwind_provisional_submit(&ghost);
+        assert_eq!(
+            registry.active_channels(),
+            channels_before - 1,
+            "unwind must drop exactly the ghost task's channel"
+        );
+        assert!(
+            api.get_task(&ghost).is_none(),
+            "state entry must be gone after unwind"
+        );
     }
 }
