@@ -1,8 +1,6 @@
 //! Metrics interface for the discovery heartbeat task.
 //!
 //! Implement [`DiscoverMetricsBackend`] to record discovery lifecycle events.
-//! The default is [`NoOpDiscoverMetrics`] — zero-cost, used when no handle is
-//! wired via [`DiscoverConfigBuilder::with_metrics`](crate::DiscoverConfigBuilder::with_metrics).
 
 use std::sync::Arc;
 
@@ -31,8 +29,7 @@ pub const FAIL_OTHER: &str = "other";
 
 /// Metrics backend for the discovery heartbeat task.
 ///
-/// All methods have empty default bodies so integrators can override only the
-/// hooks they care about.
+/// All methods have empty default bodies so integrators can override only the hooks they care about.
 pub trait DiscoverMetricsBackend: Send + Sync + std::fmt::Debug {
     /// Called once per sync attempt before the network call starts.
     fn record_attempt(&self) {}
@@ -56,7 +53,7 @@ impl DiscoverMetricsBackend for NoOpDiscoverMetrics {}
 /// Shareable handle used throughout this crate.
 pub type DiscoverMetricsHandle = Arc<dyn DiscoverMetricsBackend>;
 
-/// Construct a no-op handle — convenient default for [`DiscoverConfig`](crate::DiscoverConfig).
+/// Construct a no-op handle - convenient default for [`DiscoverConfig`](crate::DiscoverConfig).
 pub fn noop_discover_metrics() -> DiscoverMetricsHandle {
     Arc::new(NoOpDiscoverMetrics)
 }

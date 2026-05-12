@@ -27,8 +27,8 @@ use solti_model::{Slot, Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskRun, T
 ///
 /// ## Also
 ///
-/// - [`StateSubscriber`] wires taskvisor events into mutations.
 /// - [`StateConfig`] TTL settings consumed by [`sweep`](Self::sweep).
+/// - [`StateSubscriber`] wires taskvisor events into mutations.
 /// - [`state_sweep`] builds an embedded periodic sweep task.
 #[derive(Clone)]
 pub struct TaskState {

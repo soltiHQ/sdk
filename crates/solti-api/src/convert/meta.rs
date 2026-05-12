@@ -1,4 +1,4 @@
-//! # `ObjectMeta` domain → wire conversion.
+//! # `ObjectMeta` domain to wire conversion.
 
 use solti_model::ObjectMeta;
 

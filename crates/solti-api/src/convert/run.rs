@@ -1,4 +1,4 @@
-//! # `TaskRun` → `TaskRunInfo` conversion.
+//! # `TaskRun` to `TaskRunInfo` conversion.
 
 use solti_model::TaskRun;
 

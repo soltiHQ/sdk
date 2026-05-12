@@ -132,13 +132,11 @@ Override via `DiscoverConfigBuilder::connect_timeout_ms` / `request_timeout_ms`.
 `build.rs` walks `proto/` recursively, collecting every `*.proto` file (plus
 emitting `rerun-if-changed` for each). Two codegen passes:
 
-- `tonic_prost_build::configure()` — message types always, tonic server/client only under `grpc`.
-- `pbjson_build` under `http` — attaches canonical proto-JSON `Serialize`/`Deserialize` to the same message types.
+- `tonic_prost_build::configure()` - message types always, tonic server/client only under `grpc`.
+- `pbjson_build` under `http` - attaches canonical proto-JSON `Serialize`/`Deserialize` to the same message types.
 
-The proto package selector lives at the top of `build.rs` as
-`const PROTO_PACKAGE = ".solti.discover.v1";`. If the `package` declaration in a
-`.proto` changes, update this constant. Adding new `.proto` files anywhere
-under `proto/` requires **no** changes to `build.rs`.
+The proto package selector lives at the top of `build.rs` as `const PROTO_PACKAGE = ".solti.discover.v1";`. 
+If the `package` declaration in a `.proto` changes, update this constant. Adding new `.proto` files anywhere under `proto/` requires **no** changes to `build.rs`.
 
 ## Notes
 
@@ -148,4 +146,4 @@ under `proto/` requires **no** changes to `build.rs`.
 - Cancellation is cooperative via `tokio::select!` on the cancel token and the network future (and, when honoring a server-advised hold, on the sleep).
 - `os_info()` reads `/etc/os-release`, falls back to `/usr/lib/os-release` (freedesktop spec), then to `std::env::consts::OS`. Linux only; other platforms return the platform string.
 - `SyncContext` is wrapped in `Arc` and shared into the async task closure. It carries the base request, both clients, and the `retry_hold_until: AtomicU64` deadline honored on the next attempt.
-- `tonic-prost` is a regular `[dependencies]` entry (feature-gated) — generated gRPC code references `tonic_prost::ProstCodec` at runtime.
+- `tonic-prost` is a regular `[dependencies]` entry (feature-gated) - generated gRPC code references `tonic_prost::ProstCodec` at runtime.

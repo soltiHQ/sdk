@@ -62,7 +62,7 @@
 //! drop_capabilities_batch(keep_mask)
 //!     │
 //!     ├──► prctl(PR_CAP_AMBIENT, CLEAR_ALL)
-//!     │     └──► EINVAL? kernel < 4.3, no ambient — Ok, continue
+//!     │     └──► EINVAL? kernel < 4.3, no ambient - Ok, continue
 //!     │
 //!     ├──► capget() → read current caps into CapUserData[2]
 //!     │    ┌────────────────────────────────────────────────┐
@@ -90,10 +90,8 @@
 //!   │ cap 0  cap 1 ... cap 31     │  │ cap 32  cap 33 ... cap 63   │
 //!   └─────────────────────────────┘  └─────────────────────────────┘
 //!
-//!   CAP_LAST_CAP = 63 — this is NOT a guess, it's the v3 ABI limit.
-//!   If kernel ever adds cap > 63, that requires a v4 format with
-//!   new structs and new syscall signatures — this whole module
-//!   would need updating anyway.
+//!   CAP_LAST_CAP = 63 - this is NOT a guess, it's the v3 ABI limit.
+//!   If kernel ever adds cap > 63, that requires a v4 format with new structs and new syscall signatures - this whole module would need updating anyway.
 //! ```
 //!
 //! ## Configuration
@@ -153,7 +151,7 @@ pub struct SecurityConfig {
     pub no_new_privs: bool,
     /// When `true`, capability drop failures abort the spawn instead of logging and continuing.
     ///
-    /// Default: `false` (best-effort — non-fatal).
+    /// Default: `false` (best-effort - non-fatal).
     pub fail_on_cap_error: bool,
 }
 

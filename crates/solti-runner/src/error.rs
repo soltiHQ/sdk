@@ -2,8 +2,7 @@
 //!
 //! [`RunnerError`] covers failures during runner selection and task construction.
 //!
-//! See [`Runner::build_task`](crate::Runner::build_task) and [`RunnerRouter::build`](crate::RunnerRouter::build)
-//! for the primary error sources.
+//! See [`Runner::build_task`](crate::Runner::build_task) and [`RunnerRouter::build`](crate::RunnerRouter::build) for the primary error sources.
 
 use thiserror::Error;
 

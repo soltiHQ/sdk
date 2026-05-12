@@ -1,4 +1,4 @@
-//! # `TaskSpec` ↔ `CreateSpec` conversion.
+//! # `TaskSpec` && `CreateSpec` conversion.
 //!
 //! This module covers both directions:
 //!

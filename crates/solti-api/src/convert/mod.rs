@@ -1,4 +1,4 @@
-//! # Proto ↔ domain conversion.
+//! # Proto to domain conversion.
 //!
 //! Two-way translation layer between [`solti_model`] domain types and generated protobuf wire types.
 //! Split by target type to keep each module short and focused.

@@ -2,10 +2,6 @@
 //!
 //! Maps [`solti_model::OutputEvent`] (in-process broadcast carrier) to the
 //! generated [`proto_api::OutputEventProto`] for the `StreamTaskLogs` RPC.
-//!
-//! The line payload is carried as [`bytes::Bytes`] on both sides, so the
-//! per-event line is forwarded by an `Arc`-style refcount bump rather than
-//! a byte-copy on every subscriber.
 
 use solti_model::{OutputChunk, OutputEvent, StreamKind};
 
@@ -43,13 +39,11 @@ pub(crate) fn output_event_to_proto(ev: OutputEvent) -> proto_api::OutputEventPr
 
 fn output_chunk_to_proto(c: OutputChunk) -> proto_api::OutputChunkProto {
     proto_api::OutputChunkProto {
-        attempt: c.attempt,
         stream: stream_kind_to_proto(c.stream) as i32,
-        seq: c.seq,
         ts: system_time_to_ms(c.ts),
-        // Zero-copy: `c.line` is `bytes::Bytes`, the proto field is also
-        // `bytes::Bytes` (configured via `.bytes([...])` in build.rs).
+        attempt: c.attempt,
         line: c.line,
+        seq: c.seq,
     }
 }
 

@@ -15,9 +15,9 @@ use crate::error::{ModelError, ModelResult};
 ///
 /// ## Also
 ///
+/// - [`RestartPolicy`](crate::RestartPolicy) governs what happens after a terminal phase.
 /// - [`TaskStatus`](crate::TaskStatus) carries the current phase.
 /// - [`TaskPhase::is_terminal`] checks for final states.
-/// - [`RestartPolicy`](crate::RestartPolicy) governs what happens after a terminal phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -55,8 +55,7 @@ impl fmt::Display for TaskPhase {
 impl FromStr for TaskPhase {
     type Err = ModelError;
 
-    /// Parse a phase name (case-insensitive, trimmed). Accepts the same
-    /// camelCase form produced by [`fmt::Display`] / serde.
+    /// Parse a phase name (case-insensitive, trimmed). Accepts the same camelCase form produced by [`fmt::Display`] / serde.
     fn from_str(s: &str) -> ModelResult<Self> {
         let trimmed = s.trim();
         match trimmed.to_ascii_lowercase().as_str() {

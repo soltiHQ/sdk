@@ -105,7 +105,7 @@ message LaggedProto {
   uint64 skipped = 1; // number of events the subscriber missed
 }
 
-// Tagged wrapper — one of the four variants is set per stream item.
+// Tagged wrapper - one of the four variants is set per stream item.
 message OutputEventProto {
   oneof kind {
     OutputChunkProto chunk        = 1;

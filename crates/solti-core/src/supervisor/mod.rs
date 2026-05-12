@@ -50,8 +50,7 @@ impl SupervisorApi {
     /// - `router`       - runner router [`solti_model::TaskKind`];
     /// - `state_cfg`    - sweep TTLs and interval ([`StateConfig::default()`] is usually fine).
     ///
-    /// The supervisor event loop is started via [`Supervisor::serve()`] which returns
-    /// a [`SupervisorHandle`] for dynamic task management.
+    /// The supervisor event loop is started via [`Supervisor::serve()`] which returns a [`SupervisorHandle`] for dynamic task management.
     ///
     /// A periodic sweep task is automatically submitted to prevent unbounded memory growth.
     /// It removes completed runs and terminal tasks that exceed their configured TTLs.

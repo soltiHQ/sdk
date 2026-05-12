@@ -21,8 +21,8 @@ use crate::{Flag, SubprocessMode, TaskEnv};
 ///
 /// ## Also
 ///
-/// - [`TaskSpec`](crate::TaskSpec) — embeds `TaskKind` as its execution backend.
-/// - `solti_runner::RunnerRouter` — picks a runner based on kind and selector.
+/// - [`TaskSpec`](crate::TaskSpec) - embeds `TaskKind` as its execution backend.
+/// - `solti_runner::RunnerRouter`  - picks a runner based on kind and selector.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -62,11 +62,6 @@ impl TaskKind {
     }
 
     /// Validate kind-specific constraints.
-    ///
-    /// Every variant's spec is checked here so the model is self-consistent
-    /// without relying on transport-layer validators. If a new kind is
-    /// added, extend this match — a missing branch is a compile error
-    /// thanks to exhaustive matching.
     pub fn validate(&self) -> crate::error::ModelResult<()> {
         match self {
             TaskKind::Subprocess(spec) => spec.mode.validate(),

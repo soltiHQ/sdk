@@ -1,8 +1,4 @@
 //! Integration tests for the HTTP transport.
-//!
-//! Exercise the axum `Router` end-to-end through `tower::ServiceExt::oneshot`:
-//! real request parsing, route matching, validators, handler trait, error
-//! conversion, status codes and JSON body shape. No TCP, no network.
 
 #![cfg(feature = "http")]
 

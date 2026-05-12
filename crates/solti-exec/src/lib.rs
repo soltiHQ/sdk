@@ -7,7 +7,7 @@
 //!
 //! | Flag          | What it enables                                             |
 //! |---------------|-------------------------------------------------------------|
-//! | `subprocess`  | [`subprocess`] module — OS process runner with sandboxing   |
+//! | `subprocess`  | [`subprocess`] module - OS process runner with sandboxing   |
 //!
 //! ## Quick start
 //!

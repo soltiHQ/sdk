@@ -47,7 +47,7 @@ where
 
     async fn instrument<F, T>(&self, method: &'static str, fut: F) -> Result<Response<T>, Status>
     where
-        F: std::future::Future<Output = Result<Response<T>, Status>>,
+        F: Future<Output = Result<Response<T>, Status>>,
     {
         self.metrics.record_in_flight_delta(Transport::Grpc, 1);
         let start = Instant::now();

@@ -99,8 +99,8 @@
 //! The closure captures **only `Copy` types** (`ProcsPath`: `[u8; 256]` + `usize`, + `bool`).
 //!
 //! ## Rules
-//! - Phase 1 (`prepare`) runs in normal async context — `std::fs` is safe
-//! - Phase 2 (`attach`) runs in `pre_exec` — only raw libc syscalls
+//! - Phase 1 (`prepare`) runs in normal async context - `std::fs` is safe
+//! - Phase 2 (`attach`) runs in `pre_exec` - only raw libc syscalls
 //! - Kernel auto-removes empty cgroups; `cleanup_cgroup` is best-effort convenience
 //! - `fail_on_error = false` (default): cgroup failures are **non-fatal** (best-effort)
 //! - `fail_on_error = true`: cgroup failures **abort spawn**

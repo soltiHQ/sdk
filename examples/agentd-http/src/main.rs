@@ -20,18 +20,17 @@
 //!
 //! ## Observability
 //!
-//! A dedicated HTTP server runs **under supervisor control** (embedded task with
-//! restart-on-failure + backoff) and exposes Prometheus metrics at `/metrics` on
-//! port `9090`.
+//! A dedicated HTTP server runs **under supervisor control** (embedded task with restart-on-failure + backoff)
+//! and exposes Prometheus metrics at `/metrics` on port `9090`.
 //!
 //! ```bash
 //! curl http://localhost:9090/metrics
 //! ```
 //!
 //! Metric families:
-//! - `solti_runner_*` — runner-level (tasks started/completed, duration histogram, errors).
-//! - `solti_sv_*`     — supervision-level (in-flight gauge, restarts, backoff, terminal states, timeouts).
-//! - `solti_ctrl_*`   — controller-level (submissions, rejections).
+//! - `solti_runner_*` - runner-level (tasks started/completed, duration histogram, errors).
+//! - `solti_sv_*`     - supervision-level (in-flight gauge, restarts, backoff, terminal states, timeouts).
+//! - `solti_ctrl_*`   - controller-level (submissions, rejections).
 //!
 //! See [`solti-prometheus`](../../../crates/solti-prometheus) for the full metric list.
 //!
@@ -61,7 +60,6 @@
 //!
 //! ```text
 //!   Client ── submit TaskSpec ─▶ API
-//!                                 │
 //!                                 ▼
 //!                             Supervisor ── owns lifecycle, restart / backoff
 //!                                 │
