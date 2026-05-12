@@ -5,10 +5,12 @@
 //! See [`Runner::build_task`](crate::Runner::build_task) for usage.
 
 use std::fmt;
+use std::sync::Arc;
 
 use solti_model::RunnerEnv;
 
 use crate::metrics::MetricsHandle;
+use crate::output::OutputRegistry;
 
 /// Shared build context passed to all runners.
 ///
@@ -26,6 +28,7 @@ use crate::metrics::MetricsHandle;
 /// - [`MetricsHandle`](crate::MetricsHandle) - `Arc<dyn MetricsBackend>`.
 #[derive(Clone)]
 pub struct BuildContext {
+    output_registry: Arc<OutputRegistry>,
     metrics: MetricsHandle,
     env: RunnerEnv,
 }
@@ -33,7 +36,11 @@ pub struct BuildContext {
 impl BuildContext {
     /// Create a new build context with the given params.
     pub fn new(env: RunnerEnv, metrics: MetricsHandle) -> Self {
-        Self { env, metrics }
+        Self {
+            env,
+            metrics,
+            output_registry: Arc::new(OutputRegistry::default()),
+        }
     }
 
     /// Get a reference to the shared environment.
@@ -44,6 +51,11 @@ impl BuildContext {
     /// Get a clonable handle to the metrics backend.
     pub fn metrics(&self) -> &MetricsHandle {
         &self.metrics
+    }
+
+    /// Get a shared handle to the output registry.
+    pub fn output_registry(&self) -> &Arc<OutputRegistry> {
+        &self.output_registry
     }
 
     /// Replace the environment and return updated context.
@@ -57,6 +69,12 @@ impl BuildContext {
         self.metrics = metrics;
         self
     }
+
+    /// Replace the output registry and return updated context.
+    pub fn with_output_registry(mut self, registry: Arc<OutputRegistry>) -> Self {
+        self.output_registry = registry;
+        self
+    }
 }
 
 impl Default for BuildContext {
@@ -64,6 +82,7 @@ impl Default for BuildContext {
         Self {
             env: RunnerEnv::default(),
             metrics: crate::metrics::noop_metrics(),
+            output_registry: Arc::new(OutputRegistry::default()),
         }
     }
 }
@@ -85,8 +104,12 @@ impl fmt::Display for BuildContext {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::BuildContext;
-    use solti_model::RunnerEnv;
+    use crate::OutputRegistry;
+
+    use solti_model::{RunnerEnv, TaskId};
 
     #[test]
     fn default_build_context_has_empty_env_and_noop_metrics() {
@@ -159,5 +182,31 @@ mod tests {
             crate::TaskOutcome::Success,
             100,
         );
+    }
+    #[test]
+    fn default_build_context_has_an_empty_output_registry() {
+        let ctx = BuildContext::default();
+        assert_eq!(ctx.output_registry().active_channels(), 0);
+    }
+
+    #[test]
+    fn with_output_registry_replaces_registry() {
+        let custom = Arc::new(OutputRegistry::new(2048));
+        let _ = custom.sink_for(TaskId::from("seed"), 1);
+
+        let ctx = BuildContext::default().with_output_registry(custom.clone());
+
+        assert_eq!(ctx.output_registry().active_channels(), 1);
+        assert!(Arc::ptr_eq(ctx.output_registry(), &custom));
+    }
+
+    #[test]
+    fn output_registry_handle_is_shared_via_arc() {
+        let ctx = BuildContext::default();
+        let task = TaskId::from("shared");
+        let _sink = ctx.output_registry().sink_for(task.clone(), 1);
+
+        let handle = Arc::clone(ctx.output_registry());
+        assert!(handle.subscribe(&task).is_some());
     }
 }

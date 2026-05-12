@@ -59,14 +59,15 @@ Per-version API surface is documented in separate files: [api_v1.md](api_v1.md).
 
 ## Key types
 
-| Type                   | Role                                            |
-|------------------------|-------------------------------------------------|
-| `ApiHandler`           | Transport-agnostic trait with 6 operations      |
-| `SupervisorApiAdapter` | Default adapter bridging to `SupervisorApi`     |
-| `ApiError`             | Unified error mapped to gRPC Status / HTTP JSON |
-| `SoltiApiService<H>`   | gRPC server impl (feature `grpc`)               |
-| `HttpApi<H>`           | axum router builder (feature `http`)            |
-| `API_VERSION`          | Protocol version constant reported via discover |
+| Type                   | Role                                                                             |
+|------------------------|----------------------------------------------------------------------------------|
+| `ApiHandler`           | Transport-agnostic trait with 6 operations (CRUD + log stream)                   |
+| `OutputEventStream`    | `Pin<Box<dyn Stream<Item = OutputEvent> + Send>>` returned by `stream_task_logs` |
+| `SupervisorApiAdapter` | Default adapter bridging to `SupervisorApi`                                      |
+| `ApiError`             | Unified error mapped to gRPC Status / HTTP JSON                                  |
+| `SoltiApiService<H>`   | gRPC server impl (feature `grpc`)                                                |
+| `HttpApi<H>`           | axum router builder (feature `http`)                                             |
+| `API_VERSION`          | Protocol version constant reported via discover                                  |
 
 ## Error model
 

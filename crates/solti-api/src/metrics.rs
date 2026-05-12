@@ -1,14 +1,12 @@
 //! Metrics interface for the API layer (HTTP + gRPC).
 //!
-//! Implement [`ApiMetricsBackend`] to record per-request metrics. The default
-//! is [`NoOpApiMetrics`] — zero-cost when no handle is wired in.
+//! Implement [`ApiMetricsBackend`] to record per-request metrics.
+//! The default is [`NoOpApiMetrics`] - zero-cost when no handle is wired in.
 //!
 //! Wiring:
-//! - HTTP: apply [`http_metrics_middleware`] via
-//!   [`axum::middleware::from_fn_with_state`] on the router returned by
-//!   [`HttpApi::router`](crate::HttpApi::router).
-//! - gRPC: construct the service with
-//!   [`SoltiApiService::new_with_metrics`](crate::SoltiApiService::new_with_metrics)
+//! - HTTP: apply [`http_metrics_middleware`] via [`axum::middleware::from_fn_with_state`]
+//!   on the router returned by [`HttpApi::router`](crate::HttpApi::router).
+//! - gRPC: construct the service with [`SoltiApiService::new_with_metrics`](crate::SoltiApiService::new_with_metrics)
 //!   or call [`build_grpc_server_with_metrics`](crate::build_grpc_server_with_metrics).
 
 use std::sync::Arc;
@@ -35,12 +33,10 @@ impl Transport {
 ///
 /// - `transport`: `http` | `grpc`
 /// - `method`: HTTP method (`GET`, `POST`, ...) for HTTP, RPC method name (`SubmitTask`, ...) for gRPC
-/// - `path`: templated route (`/api/v1/tasks/{id}`) for HTTP via `MatchedPath`,
-///   full RPC path (`/solti.v1.SoltiApi/SubmitTask`) for gRPC
+/// - `path`: templated route (`/api/v1/tasks/{id}`) for HTTP via `MatchedPath`, full RPC path (`/solti.v1.SoltiApi/SubmitTask`) for gRPC
 /// - `status`: HTTP status code (200/404/500/...) for HTTP, gRPC code number for gRPC
 ///
-/// Cardinality stays bounded because routes are a closed set per version and
-/// templated paths avoid per-resource-id explosion.
+/// Cardinality stays bounded because routes are a closed set per version and templated paths avoid per-resource-id explosion.
 pub trait ApiMetricsBackend: Send + Sync + std::fmt::Debug {
     /// Record a completed request.
     fn record_request(
@@ -66,7 +62,7 @@ impl ApiMetricsBackend for NoOpApiMetrics {}
 /// Shareable handle used throughout this crate.
 pub type ApiMetricsHandle = Arc<dyn ApiMetricsBackend>;
 
-/// Construct a no-op handle — convenient default.
+/// Construct a no-op handle: convenient default.
 pub fn noop_api_metrics() -> ApiMetricsHandle {
     Arc::new(NoOpApiMetrics)
 }

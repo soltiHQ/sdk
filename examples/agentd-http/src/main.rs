@@ -10,9 +10,9 @@
 //! ```
 //!
 //! Defaults:
-//! - API       — `http://localhost:8085/api/v1/tasks`
-//! - Metrics   — `http://localhost:9090/metrics`
-//! - Heartbeat — `http://localhost:8082` (Podium HTTP discovery)
+//! - API       - `http://localhost:8085/api/v1/tasks`
+//! - Metrics   - `http://localhost:9090/metrics`
+//! - Heartbeat - `http://localhost:8082` (Podium HTTP discovery)
 //! - Override the CP endpoint via `CONTROL_PLANE=http://host:port`.
 //!
 //! Running without a reachable Podium is fine:
@@ -20,18 +20,17 @@
 //!
 //! ## Observability
 //!
-//! A dedicated HTTP server runs **under supervisor control** (embedded task with
-//! restart-on-failure + backoff) and exposes Prometheus metrics at `/metrics` on
-//! port `9090`.
+//! A dedicated HTTP server runs **under supervisor control** (embedded task with restart-on-failure + backoff)
+//! and exposes Prometheus metrics at `/metrics` on port `9090`.
 //!
 //! ```bash
 //! curl http://localhost:9090/metrics
 //! ```
 //!
 //! Metric families:
-//! - `solti_runner_*` — runner-level (tasks started/completed, duration histogram, errors).
-//! - `solti_sv_*`     — supervision-level (in-flight gauge, restarts, backoff, terminal states, timeouts).
-//! - `solti_ctrl_*`   — controller-level (submissions, rejections).
+//! - `solti_runner_*` - runner-level (tasks started/completed, duration histogram, errors).
+//! - `solti_sv_*`     - supervision-level (in-flight gauge, restarts, backoff, terminal states, timeouts).
+//! - `solti_ctrl_*`   - controller-level (submissions, rejections).
 //!
 //! See [`solti-prometheus`](../../../crates/solti-prometheus) for the full metric list.
 //!
@@ -48,6 +47,10 @@
 //! curl http://localhost:8085/api/v1/tasks/{id}
 //! curl http://localhost:8085/api/v1/tasks/{id}/runs
 //! curl -X DELETE http://localhost:8085/api/v1/tasks/{id}
+//!
+//! # Live-tail stdout/stderr (Server-Sent Events; -N disables buffering)
+//! # One subscription covers all retries of the task with run boundary markers.
+//! curl -N http://localhost:8085/api/v1/tasks/{id}/logs
 //! ```
 //!
 //! Full endpoint reference: [`api_v1.md`](../../../crates/solti-api/api_v1.md).
@@ -57,7 +60,6 @@
 //!
 //! ```text
 //!   Client ── submit TaskSpec ─▶ API
-//!                                 │
 //!                                 ▼
 //!                             Supervisor ── owns lifecycle, restart / backoff
 //!                                 │
@@ -93,7 +95,7 @@ use solti_prometheus::{
     PrometheusSubscriber, Registry, register_build_info, register_process_collector,
     server as metrics_server,
 };
-use solti_runner::{BuildContext, RunnerRouter};
+use solti_runner::{BuildContext, OutputRegistry, RunnerRouter};
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
 const ADDR: &str = "0.0.0.0:8085";
@@ -124,20 +126,25 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         ],
     )?;
 
+    // Output registry: live-tail broadcast channels per task.
+    let output_registry = Arc::new(OutputRegistry::default());
+
     // Runner: executes TaskSpec bodies (subprocess here).
-    let ctx = BuildContext::new(RunnerEnv::default(), Arc::new(metrics));
+    let ctx = BuildContext::new(RunnerEnv::default(), Arc::new(metrics))
+        .with_output_registry(Arc::clone(&output_registry));
     let mut router = RunnerRouter::new().with_context(ctx);
     register_subprocess_runner(&mut router, "default")?;
 
     // Supervisor: owns every task, applies restart / backoff, fans lifecycle events to subscribers.
     let subscribers: Vec<Arc<dyn Subscribe>> =
         vec![Arc::new(TracingEventSubscriber), Arc::new(prom_subscriber)];
-    let supervisor = SupervisorApi::new(
+    let supervisor = SupervisorApi::new_with_output_registry(
         SupervisorConfig::default(),
         ControllerConfig::default(),
         subscribers,
         router,
         StateConfig::default(),
+        Arc::clone(&output_registry),
     )
     .await?;
 

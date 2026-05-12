@@ -1,4 +1,4 @@
-//! # `Task` / `TaskPage` domain → wire conversion.
+//! # `Task` / `TaskPage` domain to wire conversion.
 
 use solti_model::{Task, TaskKind};
 

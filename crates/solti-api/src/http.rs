@@ -5,26 +5,33 @@
 //!
 //! _the examples below show the current value (`v1`)_.
 //!
-//! | Method | Endpoint                    | Handler             |
-//! |--------|-----------------------------|---------------------|
-//! | POST   | `/api/v1/tasks`             | submit              |
-//! | GET    | `/api/v1/tasks`             | list (query params) |
-//! | GET    | `/api/v1/tasks/{id}`        | get status          |
-//! | GET    | `/api/v1/tasks/{id}/runs`   | list runs           |
-//! | DELETE | `/api/v1/tasks/{id}`        | delete (stop+purge) |
+//! | Method | Endpoint                    | Handler              |
+//! |--------|-----------------------------|----------------------|
+//! | POST   | `/api/v1/tasks`             | submit               |
+//! | GET    | `/api/v1/tasks`             | list (query params)  |
+//! | GET    | `/api/v1/tasks/{id}`        | get status           |
+//! | GET    | `/api/v1/tasks/{id}/runs`   | list runs            |
+//! | GET    | `/api/v1/tasks/{id}/logs`   | live-tail SSE stream |
+//! | DELETE | `/api/v1/tasks/{id}`        | delete (stop+purge)  |
 
 use std::sync::Arc;
+
+use std::convert::Infallible;
 
 use axum::{
     Json, Router,
     extract::{FromRequest, Path, Query, Request, State, rejection::JsonRejection},
     http::StatusCode,
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{delete, get, post},
 };
 use serde::{Deserialize, de::DeserializeOwned};
-use solti_model::{TaskId, TaskPhase, TaskQuery};
+use solti_model::{OutputEvent, TaskId, TaskPhase, TaskQuery};
+use tokio_stream::StreamExt;
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::debug;
 
@@ -119,6 +126,7 @@ where
             .route(api_url!("/tasks/{id}"), get(get_task_status::<H>))
             .route(api_url!("/tasks/{id}"), delete(delete_task::<H>))
             .route(api_url!("/tasks/{id}/runs"), get(list_task_runs::<H>))
+            .route(api_url!("/tasks/{id}/logs"), get(stream_task_logs::<H>))
             .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
             .layer(middleware::from_fn(map_413_envelope))
             .with_state(self.handler)
@@ -236,4 +244,31 @@ where
     debug!(%task_id, "task deleted");
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /tasks/{id}/logs` - Server-Sent Events stream of [`OutputEvent`]s (live tail of stdout/stderr + run boundary markers + lag signals).
+async fn stream_task_logs<H>(
+    State(handler): State<Arc<H>>,
+    Path(id): Path<String>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError>
+where
+    H: ApiHandler,
+{
+    non_empty_id("task_id", &id)?;
+
+    let task_id = TaskId::from(id);
+    debug!(%task_id, "subscribing to task log stream");
+    let stream = handler.stream_task_logs(&task_id).await?;
+
+    let sse_stream = stream.map(|ev| {
+        let name = match &ev {
+            OutputEvent::Chunk(_) => "chunk",
+            OutputEvent::RunStarted { .. } => "run-started",
+            OutputEvent::RunFinished { .. } => "run-finished",
+            OutputEvent::Lagged { .. } => "lagged",
+        };
+        let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
+        Ok(Event::default().event(name).data(data))
+    });
+    Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
 }

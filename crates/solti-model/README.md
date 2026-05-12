@@ -86,27 +86,30 @@ Operators: `In`, `NotIn`, `Exists`, `DoesNotExist`.
 
 ## Key types
 
-| Type               | Description                                               |
-|--------------------|-----------------------------------------------------------|
-| `Task`             | K8s-style aggregate: metadata + spec + status             |
-| `TaskSpec`         | Desired state (private fields, build via builder)         |
-| `TaskSpecBuilder`  | Validated builder for `TaskSpec`                          |
-| `TaskStatus`       | Observed state: phase, attempt, exit code, error          |
-| `ObjectMeta`       | Identity, versioning, timestamps                          |
-| `TaskRun`          | Per-attempt execution record with start/finish times      |
-| `TaskPhase`        | Lifecycle phase enum (7 variants)                         |
-| `TaskKind`         | Execution backend: Subprocess, Wasm, Container, Embedded  |
-| `Slot`             | Logical execution lane (newtype over `Arc<str>`)          |
-| `TaskId`           | Unique task identifier (newtype over `Arc<str>`)          |
-| `AgentId`          | Agent identifier (newtype over `Arc<str>`)                |
-| `Timeout`          | Per-attempt timeout in milliseconds                       |
-| `Labels`           | Key-value metadata for routing and filtering              |
-| `TaskEnv`          | Ordered environment variables for task execution          |
-| `RunnerEnv`        | Ordered environment variables for runner injection        |
-| `Flag`             | Boolean toggle with `enabled()`/`disabled()` constructors |
-| `RunnerSelector`   | Label selector for runner routing                         |
-| `TaskQuery`        | Builder for filtered, paginated task listing              |
-| `TaskPage`         | Paginated query result                                    |
+| Type               | Description                                                    |
+|--------------------|----------------------------------------------------------------|
+| `Task`             | K8s-style aggregate: metadata + spec + status                  |
+| `TaskSpec`         | Desired state (private fields, build via builder)              |
+| `TaskSpecBuilder`  | Validated builder for `TaskSpec`                               |
+| `TaskStatus`       | Observed state: phase, attempt, exit code, error               |
+| `ObjectMeta`       | Identity, versioning, timestamps                               |
+| `TaskRun`          | Per-attempt execution record with start/finish times           |
+| `TaskPhase`        | Lifecycle phase enum (7 variants)                              |
+| `TaskKind`         | Execution backend: Subprocess, Wasm, Container, Embedded       |
+| `Slot`             | Logical execution lane (newtype over `Arc<str>`)               |
+| `TaskId`           | Unique task identifier (newtype over `Arc<str>`)               |
+| `AgentId`          | Agent identifier (newtype over `Arc<str>`)                     |
+| `Timeout`          | Per-attempt timeout in milliseconds                            |
+| `Labels`           | Key-value metadata for routing and filtering                   |
+| `TaskEnv`          | Ordered environment variables for task execution               |
+| `RunnerEnv`        | Ordered environment variables for runner injection             |
+| `Flag`             | Boolean toggle with `enabled()`/`disabled()` constructors      |
+| `RunnerSelector`   | Label selector for runner routing                              |
+| `TaskQuery`        | Builder for filtered, paginated task listing                   |
+| `TaskPage`         | Paginated query result                                         |
+| `OutputChunk`      | One stdout/stderr line from a task attempt                     |
+| `OutputEvent`      | Tagged enum: `Chunk` / `RunStarted` / `RunFinished` / `Lagged` |
+| `StreamKind`       | `Stdout` or `Stderr` discriminator carried by `OutputChunk`    |
 
 ## Size limits
 

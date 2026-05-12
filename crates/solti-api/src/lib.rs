@@ -50,7 +50,7 @@ mod error;
 pub use error::ApiError;
 
 mod handler;
-pub use handler::ApiHandler;
+pub use handler::{ApiHandler, OutputEventStream};
 
 mod adapter;
 pub use adapter::SupervisorApiAdapter;

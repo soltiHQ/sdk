@@ -32,13 +32,12 @@ Currently, ships a single backend - `SubprocessRunner` with optional Linux sandb
 ## Subprocess lifecycle
 ```text
  build_task ──► prepare_backend ──► spawn ──► log_stream (stdout/stderr)
-                                   (pgid,
-                                    kill_on_drop)
+                                   (pgid,                  ├──► tracing::info/warn
+                                    kill_on_drop)          └──► OutputSink (if registry wired)
                                       │
                                       ├──► child.wait() → evaluate exit
-                                      └──► cancel.cancelled() → killpg -SIGKILL
-                                                             → wait() to reap
-                                      │
+                                      ├──► cancel.cancelled() → killpg -SIGKILL
+                                      │                       → wait() to reap
                                       ▼
                                   metrics + cleanup
 ```
@@ -129,5 +128,6 @@ Duplicate names are rejected via `router.contains_label()` → `ExecError::Dupli
 - Cgroup lifecycle is two-phase: `prepare` (mkdir + write limits in parent) → `attach` (join PID in child via pre_exec).
 - Cgroup names are auto-generated: `{runner}-{slot}-{seq:x}-{timestamp:x}`.
 - Line truncation uses `Cow::Borrowed` for the common case (zero-alloc hot path).
+- `log_stream` is double-headed: every line goes to `tracing` (existing path) and, if the supervisor wired an `OutputRegistry` into `BuildContext`, also to a `solti_runner::OutputSink` (live-tail subscribers). When no registry is attached, the sink push is a no-op cost (one Arc clone, one `broadcast::send` that returns `Err` and is ignored).
 - `LinuxCapability` values match `<linux/capability.h>` from Linux 6.x.
 - On non-Linux platforms, all sandboxing is no-op with `tracing::warn`.

@@ -13,7 +13,7 @@ use taskvisor::{
 };
 use tracing::{debug, info, instrument};
 
-use solti_runner::RunnerRouter;
+use solti_runner::{OutputRegistry, RunnerRouter};
 
 use crate::system::init_uptime;
 use crate::{
@@ -35,6 +35,7 @@ use crate::{
 /// - [`StateConfig`] configures sweep TTLs and interval (defaults are sane).
 /// - [`solti_runner::RunnerRouter`] picks a runner for each submitted spec.
 pub struct SupervisorApi {
+    output_registry: Arc<OutputRegistry>,
     handle: SupervisorHandle,
     router: RunnerRouter,
     state: TaskState,
@@ -49,20 +50,42 @@ impl SupervisorApi {
     /// - `router`       - runner router [`solti_model::TaskKind`];
     /// - `state_cfg`    - sweep TTLs and interval ([`StateConfig::default()`] is usually fine).
     ///
-    /// The supervisor event loop is started via [`Supervisor::serve()`] which returns
-    /// a [`SupervisorHandle`] for dynamic task management.
+    /// The supervisor event loop is started via [`Supervisor::serve()`] which returns a [`SupervisorHandle`] for dynamic task management.
     ///
     /// A periodic sweep task is automatically submitted to prevent unbounded memory growth.
     /// It removes completed runs and terminal tasks that exceed their configured TTLs.
     pub async fn new(
         sup_cfg: SupervisorConfig,
         ctrl_cfg: ControllerConfig,
-        mut subscribers: Vec<Arc<dyn Subscribe>>,
+        subscribers: Vec<Arc<dyn Subscribe>>,
         router: RunnerRouter,
         state_cfg: StateConfig,
     ) -> Result<Self, CoreError> {
+        Self::new_with_output_registry(
+            sup_cfg,
+            ctrl_cfg,
+            subscribers,
+            router,
+            state_cfg,
+            Arc::new(OutputRegistry::default()),
+        )
+        .await
+    }
+
+    /// Same as [`SupervisorApi::new`], but lets the caller pass a shared [`OutputRegistry`].
+    pub async fn new_with_output_registry(
+        sup_cfg: SupervisorConfig,
+        ctrl_cfg: ControllerConfig,
+        mut subscribers: Vec<Arc<dyn Subscribe>>,
+        router: RunnerRouter,
+        state_cfg: StateConfig,
+        output_registry: Arc<OutputRegistry>,
+    ) -> Result<Self, CoreError> {
         let state = TaskState::new();
-        subscribers.push(Arc::new(StateSubscriber::new(state.clone())));
+        subscribers.push(Arc::new(StateSubscriber::with_output_registry(
+            state.clone(),
+            Arc::clone(&output_registry),
+        )));
 
         let sup = Supervisor::builder(sup_cfg)
             .with_subscribers(subscribers)
@@ -76,15 +99,19 @@ impl SupervisorApi {
             handle,
             router,
             state,
+            output_registry,
         };
 
-        // Sweep is always-on: prevents unbounded memory growth by periodically
-        // removing completed runs and terminal tasks that exceed their TTL.
         let (task, spec) = state_sweep(api.state.clone(), state_cfg);
         api.submit_with_task(task, &spec).await?;
         info!("supervisor is ready (sweep active)");
 
         Ok(api)
+    }
+
+    /// Get a shared handle to the output registry for live-tail subscriptions.
+    pub fn output_registry(&self) -> &Arc<OutputRegistry> {
+        &self.output_registry
     }
 
     /// Get task information by ID.
@@ -245,6 +272,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use solti_model::{AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind};
+    use solti_runner::OutputRegistry;
     use taskvisor::{TaskError, TaskFn};
     use tokio_util::sync::CancellationToken;
 
@@ -415,5 +443,42 @@ mod tests {
             Ok(_) => panic!("expected error for TaskKind::Embedded, got Ok(TaskId)"),
             Err(e) => panic!("expected CoreError::InvalidSpec, got {e:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn supervisor_api_default_new_creates_empty_output_registry() {
+        let router = RunnerRouter::new();
+        let api = SupervisorApi::new(
+            SupervisorConfig::default(),
+            ControllerConfig::default(),
+            Vec::new(),
+            router,
+            StateConfig::default(),
+        )
+        .await
+        .expect("SupervisorApi::new");
+
+        assert_eq!(api.output_registry().active_channels(), 0);
+    }
+
+    #[tokio::test]
+    async fn supervisor_api_with_provided_registry_shares_arc() {
+        let router = RunnerRouter::new();
+        let registry = Arc::new(OutputRegistry::new(64));
+        registry.ensure_channel(TaskId::from("seeded"));
+
+        let api = SupervisorApi::new_with_output_registry(
+            SupervisorConfig::default(),
+            ControllerConfig::default(),
+            Vec::new(),
+            router,
+            StateConfig::default(),
+            Arc::clone(&registry),
+        )
+        .await
+        .expect("SupervisorApi::new_with_output_registry");
+
+        assert!(Arc::ptr_eq(api.output_registry(), &registry));
+        assert_eq!(api.output_registry().active_channels(), 1);
     }
 }

@@ -5,7 +5,7 @@
 //! **Unix:**
 //! - Limits are applied inside a `pre_exec` hook (between `fork()` and `execve()`)
 //! - Each limit uses `getrlimit` → clamp → `setrlimit` (two syscalls)
-//! - Hard limit is never touched — only the soft limit is lowered/raised within bounds
+//! - Hard limit is never touched: only the soft limit is lowered/raised within bounds
 //! - Zero heap allocation in the child (closure captures only `Copy` types)
 //!
 //! **Other platforms:** `tracing::warn` and no-op.
@@ -96,7 +96,7 @@
 //! - Requested value exceeding hard limit is **silently clamped** (not an error)
 //! - Non-Unix: all knobs are no-op, warning emitted via `tracing::warn`
 //! - All rlimit failures are **fatal** (return `Err`, aborting spawn)
-//! - Hard limit is **never modified** — only the soft limit changes
+//! - Hard limit is **never modified** - only the soft limit changes
 //! - `RlimitConfig::is_empty()` → no hook installed, zero overhead
 use tokio::process::Command;
 

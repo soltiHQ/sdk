@@ -51,3 +51,6 @@ pub use kv::KeyValue;
 
 mod flag;
 pub use flag::Flag;
+
+mod output;
+pub use output::{OutputChunk, OutputEvent, StreamKind};

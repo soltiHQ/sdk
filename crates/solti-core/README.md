@@ -7,25 +7,25 @@ Provides `SupervisorApi` - the main entry point for submitting, querying, and ca
 ## Architecture
 ```text
  SupervisorApi
- ┌──────────────────────────────────────────────────────────────┐
- │                                                              │
- │  submit(spec)                                                │
- │      ├──► spec.validate()                                    │
- │      ├──► RunnerRouter::build(spec) → TaskRef                │
- │      └──► submit_with_task(task, spec)                       │
- │              ├──► state.add_task(id, spec)                   │
- │              ├──► map policies → ControllerSpec              │
- │              └──► handle.submit(controller_spec)             │
- │                                                              │
- │  taskvisor events ──► StateSubscriber ──► TaskState          │
- │                                                              │
- │  query_tasks(q) ──► TaskState ──► TaskPage<Task>             │
- │  get_task(id)   ──► TaskState ──► Option<Task>               │
- │  list_task_runs ──► TaskState ──► Vec<TaskRun>               │
- │                                                              │
- │  new(..., state_cfg) ──► auto-starts sweep task              │
- │      └──► submit_with_task(state_sweep(state, state_cfg))    │
- └──────────────────────────────────────────────────────────────┘
+   submit(spec)
+       ├──► spec.validate()                                    
+       ├──► RunnerRouter::build(spec) → TaskRef
+       └──► submit_with_task(task, spec)                                       
+               ├──► state.add_task(id, spec)                                   
+               ├──► map policies → ControllerSpec                              
+               └──► handle.submit(controller_spec
+ 
+   taskvisor events ──► StateSubscriber ──► TaskState                          
+                                        └─► OutputRegistry
+                                            (RunStarted / RunFinished / evict)
+ 
+   query_tasks(q)    ──► TaskState ──► TaskPage<Task>
+   get_task(id)      ──► TaskState ──► Option<Task>
+   list_task_runs    ──► TaskState ──► Vec<TaskRun>
+   output_registry() ──► Arc<OutputRegistry>  (live-tail subs) 
+ 
+   new(..., state_cfg) ──► auto-starts sweep task              
+       └──► submit_with_task(state_sweep(state, state_cfg))
 ```
 
 ## Event flow
@@ -33,25 +33,29 @@ Provides `SupervisorApi` - the main entry point for submitting, querying, and ca
  taskvisor runtime
      │
      ├──► TaskAdded      → (traced only; task is already in state from submit)
-     ├──► TaskStarting   → transition_starting: increment_attempt + phase=Running + start_run
-     ├──► TaskStopped    → transition_finished: phase=Succeeded + finish_run
-     ├──► TaskFailed     → transition_finished: phase=Failed + finish_run
-     ├──► TimeoutHit     → transition_finished: phase=Timeout + finish_run
-     ├──► ActorExhausted → transition_finished: phase=Exhausted + finish_run
-     └──► TaskRemoved    → unregister_task (tombstone: runs preserved for sweep)
+     ├──► TaskStarting   → transition_starting + announce_run_started
+     ├──► TaskStopped    → transition_finished(Succeeded)  + announce_run_finished
+     ├──► TaskFailed     → transition_finished(Failed)     + announce_run_finished
+     ├──► TimeoutHit     → transition_finished(Timeout)    + announce_run_finished
+     ├──► ActorExhausted → transition_finished(Exhausted)  + announce_run_finished + evict
+     ├──► ActorDead      → transition_finished(Failed)     + announce_run_finished + evict
+     └──► TaskRemoved    → unregister_task                 + evict
 ```
+
+`announce_*` and `evict` reach an `Arc<OutputRegistry>` shared with the runner side; 
+this is what bridges supervisor lifecycle into the live-tail broadcast channel that subscribers (HTTP SSE, gRPC stream) read from.
 
 ## Key types
 
-| Type               | Visibility | Description                                              |
-|--------------------|------------|----------------------------------------------------------|
-| `SupervisorApi`    | pub        | High-level facade: submit, query, cancel, sweep          |
-| `StateConfig`      | pub        | TTL settings for runs, tasks, and sweep interval         |
-| `CoreError`        | pub        | Error enum: Supervisor, Mapping, Runner, InvalidSpec     |
-| `uptime_seconds()` | pub        | Agent uptime helper (`OnceLock<Instant>`)                |
-| `TaskState`        | internal   | In-memory storage (`Arc<RwLock>`); wired by `SupervisorApi::new` |
-| `StateSubscriber`  | internal   | `Subscribe` impl; auto-registered by `SupervisorApi::new` |
-| `state_sweep()`    | internal   | Embedded periodic sweeper task; auto-submitted by `SupervisorApi::new` |
+| Type               | Visibility | Description                                                                   |
+|--------------------|------------|-------------------------------------------------------------------------------|
+| `SupervisorApi`    | pub        | High-level facade: submit, query, cancel, sweep, `output_registry()` accessor |
+| `StateConfig`      | pub        | TTL settings for runs, tasks, and sweep interval                              |
+| `CoreError`        | pub        | Error enum: Supervisor, Mapping, Runner, InvalidSpec                          |
+| `uptime_seconds()` | pub        | Agent uptime helper (`OnceLock<Instant>`)                                     |
+| `TaskState`        | internal   | In-memory storage (`Arc<RwLock>`); wired by `SupervisorApi::new`              |
+| `StateSubscriber`  | internal   | `Subscribe` impl; auto-registered by `SupervisorApi::new`                     |
+| `state_sweep()`    | internal   | Embedded periodic sweeper task; auto-submitted by `SupervisorApi::new`        |
 
 ## State storage
 ```text
@@ -107,6 +111,7 @@ Model enums are `#[non_exhaustive]` - unknown variants fall back to safe default
 
 ## Notes
 - `SupervisorApi::new` auto-registers `StateSubscriber` into the subscriber list.
+- `SupervisorApi::new` creates a fresh empty `OutputRegistry`; use `new_with_output_registry(...)` to share one with the runner side.
 - `TaskState` is `Clone` via `Arc` — safe to share across threads.
 - `parking_lot::RwLock` is used instead of `std::sync::RwLock` (no poisoning, better perf).
 - `unregister_task` (event-driven on `TaskRemoved`) drops the task entry but keeps runs around until sweep runs; `delete_task` (API-driven) drops both task and runs immediately.

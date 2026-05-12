@@ -3,10 +3,16 @@
 //! [`ApiHandler`] defines the transport-agnostic API surface.
 //! Implement this trait to plug custom logic (auth, rate limiting, metrics) between the wire layer and the supervisor.
 
+use std::pin::Pin;
+
 use async_trait::async_trait;
-use solti_model::{Task, TaskId, TaskPage, TaskQuery, TaskRun, TaskSpec};
+use solti_model::{OutputEvent, Task, TaskId, TaskPage, TaskQuery, TaskRun, TaskSpec};
+use tokio_stream::Stream;
 
 use crate::error::ApiError;
+
+/// Boxed stream of [`OutputEvent`]s — the wire-side surface of live task logs.
+pub type OutputEventStream = Pin<Box<dyn Stream<Item = OutputEvent> + Send + 'static>>;
 
 /// Task execution API handler.
 ///
@@ -28,6 +34,7 @@ use crate::error::ApiError;
 /// | `query_tasks`      | `GET    /api/v1/tasks`            | `ListTasks`         |
 /// | `list_task_runs`   | `GET    /api/v1/tasks/{id}/runs`  | `ListTaskRuns`      |
 /// | `delete_task`      | `DELETE /api/v1/tasks/{id}`       | `DeleteTask`        |
+/// | `stream_task_logs` | `GET    /api/v1/tasks/{id}/logs`  | `StreamTaskLogs`    |
 #[async_trait]
 pub trait ApiHandler: Send + Sync + 'static {
     /// Submit a new task for execution.
@@ -50,4 +57,12 @@ pub trait ApiHandler: Send + Sync + 'static {
     /// returns `Ok(())` whether the task is currently registered on the agent.
     /// Errors only on supervisor cancellation failures (timeout, internal error).
     async fn delete_task(&self, id: &TaskId) -> Result<(), ApiError>;
+
+    /// Subscribe to the live-tail stream of stdout/stderr lines for a task.
+    ///
+    /// Returns an [`OutputEventStream`] that yields [`OutputEvent`]s in real time.
+    /// The stream covers all subsequent runs of the task (multi-run merge) and ends when the task is fully terminal and evicted.
+    async fn stream_task_logs(&self, _id: &TaskId) -> Result<OutputEventStream, ApiError> {
+        Ok(Box::pin(tokio_stream::empty()))
+    }
 }

@@ -54,6 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     tonic_prost_build::configure()
         .build_server(grpc)
         .build_client(grpc)
+        .bytes(".solti.v1.OutputChunkProto.line")
         .file_descriptor_set_path(&descriptor_path)
         .compile_protos(&protos, &[PathBuf::from(PROTO_ROOT)])?;
 

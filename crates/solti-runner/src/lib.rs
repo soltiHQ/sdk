@@ -95,6 +95,9 @@ pub use runner::Runner;
 mod context;
 pub use context::BuildContext;
 
+mod output;
+pub use output::{OutputRegistry, OutputSink};
+
 mod id;
 pub use id::{RunId, make_run_id};
 

@@ -6,10 +6,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use solti_core::SupervisorApi;
-use solti_model::{Task, TaskId, TaskPage, TaskQuery, TaskRun, TaskSpec};
+use solti_model::{OutputEvent, Task, TaskId, TaskPage, TaskQuery, TaskRun, TaskSpec};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
 use crate::error::ApiError;
-use crate::handler::ApiHandler;
+use crate::handler::{ApiHandler, OutputEventStream};
 
 /// Adapter that bridges [`SupervisorApi`] to [`ApiHandler`].
 ///
@@ -53,5 +55,20 @@ impl ApiHandler for SupervisorApiAdapter {
             .delete_task(id)
             .await
             .map_err(ApiError::from)
+    }
+
+    async fn stream_task_logs(&self, id: &TaskId) -> Result<OutputEventStream, ApiError> {
+        let receiver = self
+            .supervisor
+            .output_registry()
+            .subscribe(id)
+            .ok_or_else(|| ApiError::TaskNotFound(id.to_string()))?;
+
+        let stream = BroadcastStream::new(receiver).map(|res| {
+            res.unwrap_or_else(
+                |BroadcastStreamRecvError::Lagged(skipped)| OutputEvent::Lagged { skipped },
+            )
+        });
+        Ok(Box::pin(stream))
     }
 }

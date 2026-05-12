@@ -11,8 +11,7 @@ use crate::TaskPhase;
 /// Record of a single task execution attempt.
 ///
 /// Each time the supervisor starts a task, a new `TaskRun` is created.
-/// When the attempt finishes (success, failure, timeout, etc.), the run
-/// is closed with the terminal phase and timestamp.
+/// When the attempt finishes (success, failure, timeout, etc.), the run is closed with the terminal phase and timestamp.
 ///
 /// Runs are associated with a [`Task`](crate::Task) via its [`TaskId`](crate::TaskId) and ordered by attempt number.
 ///
@@ -26,9 +25,9 @@ use crate::TaskPhase;
 /// ```text
 ///   TaskStarting  ──►  TaskRun { phase: Running, finished_at: None }
 ///        │
-///        ├──► TaskStopped   ──►  phase = Succeeded, finished_at = Some(now)
-///        ├──► TaskFailed    ──►  phase = Failed,    finished_at = Some(now)
-///        ├──► TimeoutHit    ──►  phase = Timeout,   finished_at = Some(now)
+///        ├──► TaskStopped    ──► phase = Succeeded, finished_at = Some(now)
+///        ├──► TaskFailed     ──► phase = Failed,    finished_at = Some(now)
+///        ├──► TimeoutHit     ──► phase = Timeout,   finished_at = Some(now)
 ///        └──► ActorExhausted ──► phase = Exhausted, finished_at = Some(now)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

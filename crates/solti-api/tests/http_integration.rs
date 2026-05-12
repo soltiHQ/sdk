@@ -1,8 +1,4 @@
 //! Integration tests for the HTTP transport.
-//!
-//! Exercise the axum `Router` end-to-end through `tower::ServiceExt::oneshot`:
-//! real request parsing, route matching, validators, handler trait, error
-//! conversion, status codes and JSON body shape. No TCP, no network.
 
 #![cfg(feature = "http")]
 
@@ -25,9 +21,6 @@ use solti_model::{Task, TaskId, TaskPage, TaskQuery, TaskRun, TaskSpec};
 struct MockHandler {
     submit_calls: AtomicUsize,
     delete_calls: AtomicUsize,
-    /// When true, `delete_task` returns `TaskNotFound`. The transport
-    /// still needs to map this error into a 404 — the adapter no
-    /// longer produces it, but custom `ApiHandler` impls may.
     delete_returns_not_found: bool,
 }
 
@@ -60,6 +53,38 @@ impl ApiHandler for MockHandler {
         } else {
             Ok(())
         }
+    }
+
+    async fn stream_task_logs(
+        &self,
+        id: &TaskId,
+    ) -> Result<solti_api::OutputEventStream, ApiError> {
+        // Mock surface: return a fixed two-event stream so the SSE handler
+        // has something deterministic to render. Real adapter feeds this
+        // from a `tokio::sync::broadcast::Receiver` via BroadcastStream.
+        use std::time::{Duration, UNIX_EPOCH};
+
+        use bytes::Bytes;
+        use solti_model::{OutputChunk, OutputEvent, StreamKind};
+
+        if id.as_str() == "stream-missing" {
+            return Err(ApiError::TaskNotFound(id.to_string()));
+        }
+
+        let events = vec![
+            OutputEvent::RunStarted {
+                attempt: 1,
+                started_at: UNIX_EPOCH + Duration::from_millis(1000),
+            },
+            OutputEvent::Chunk(OutputChunk {
+                attempt: 1,
+                stream: StreamKind::Stdout,
+                seq: 0,
+                ts: UNIX_EPOCH + Duration::from_millis(1100),
+                line: Bytes::from_static(b"hello-from-mock"),
+            }),
+        ];
+        Ok(Box::pin(tokio_stream::iter(events)))
     }
 }
 
@@ -102,8 +127,6 @@ async fn submit_task_missing_spec_returns_400_with_structured_error() {
     assert_eq!(handler.submit_calls.load(Ordering::SeqCst), 0);
 }
 
-/// Malformed JSON must yield our canonical `{error, message}` envelope,
-/// not axum's default `text/plain` rejection body.
 #[tokio::test]
 async fn submit_task_malformed_json_returns_envelope() {
     let handler = Arc::new(MockHandler::default());
@@ -122,7 +145,6 @@ async fn submit_task_malformed_json_returns_envelope() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    // Must be JSON, not text/plain.
     let ct = resp
         .headers()
         .get("content-type")
@@ -141,17 +163,11 @@ async fn submit_task_malformed_json_returns_envelope() {
     assert_eq!(handler.submit_calls.load(Ordering::SeqCst), 0);
 }
 
-/// Body over [`solti_api::MAX_REQUEST_BYTES`] must reach the client as our
-/// envelope 413, not tower-http's bare `text/plain` default.
 #[tokio::test]
 async fn submit_task_oversize_body_returns_envelope_413() {
     let handler = Arc::new(MockHandler::default());
     let app = router_with(Arc::clone(&handler));
 
-    // Build a body just over the limit. The layer intercepts before any
-    // parsing, so the shape doesn't matter — only the size does. Use
-    // `MAX_REQUEST_BYTES + 1 KiB` so the test stays correct if the
-    // constant changes.
     let huge = "a".repeat(solti_api::MAX_REQUEST_BYTES + 1024);
     let body = format!(r#"{{"spec": "{huge}"}}"#);
 
@@ -200,8 +216,6 @@ async fn get_task_status_omits_task_field_when_absent() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
-    // canonical proto3-JSON: `optional message` fields are OMITTED when None
-    // (not `null`). `.emit_fields()` only toggles scalar/repeated defaults.
     assert!(
         body.get("task").is_none(),
         "expected `task` field absent, got {body:?}"
@@ -300,8 +314,6 @@ async fn list_tasks_empty_returns_empty_list_and_zero_total() {
 async fn request_body_limit_rejects_oversized_payload() {
     let app = router_with(Arc::new(MockHandler::default()));
 
-    // Router applies RequestBodyLimitLayer sized to
-    // `solti_api::MAX_REQUEST_BYTES`. Send a blob just over the limit.
     let oversized = vec![b'x'; solti_api::MAX_REQUEST_BYTES + 1024];
     let resp = app
         .oneshot(
@@ -320,8 +332,6 @@ async fn request_body_limit_rejects_oversized_payload() {
 
 #[tokio::test]
 async fn get_task_status_empty_id_trimmed_returns_400() {
-    // `/api/v1/tasks/   ` after url-decoding is whitespace-only; our
-    // non_empty_id validator should catch it.
     let app = router_with(Arc::new(MockHandler::default()));
 
     let resp = app
@@ -344,4 +354,89 @@ async fn get_task_status_empty_id_trimmed_returns_400() {
             .unwrap()
             .contains("task_id cannot be empty")
     );
+}
+
+#[tokio::test]
+async fn stream_task_logs_returns_sse_with_chunk_and_run_started_events() {
+    let handler = Arc::new(MockHandler::default());
+    let app = router_with(handler);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/tasks/some-task/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "expected SSE content-type, got {ct}"
+    );
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        body.contains("event: run-started"),
+        "missing run-started in SSE body: {body}"
+    );
+    assert!(
+        body.contains("event: chunk"),
+        "missing chunk in SSE body: {body}"
+    );
+    assert!(
+        body.contains("\"line\":\"hello-from-mock\""),
+        "missing inlined chunk fields in SSE body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn stream_task_logs_missing_task_returns_404() {
+    let handler = Arc::new(MockHandler::default());
+    let app = router_with(handler);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/tasks/stream-missing/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "TaskNotFound");
+}
+
+#[tokio::test]
+async fn stream_task_logs_empty_id_returns_400() {
+    let app = router_with(Arc::new(MockHandler::default()));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/tasks/%20%20/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "InvalidRequest");
 }

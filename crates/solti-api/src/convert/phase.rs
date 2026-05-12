@@ -1,4 +1,4 @@
-//! # `TaskPhase` ↔ `TaskStatus` conversion.
+//! # `TaskPhase` && `TaskStatus` conversion.
 //!
 //! Domain `TaskPhase` is `#[non_exhaustive]`.
 //! The outgoing `From` impl logs and maps unknown variants to `Unspecified` instead of panicking.

@@ -214,13 +214,12 @@ struct SyncContext {
     grpc_client: tokio::sync::OnceCell<DiscoverServiceClient<tonic::transport::Channel>>,
     /// Unix timestamp (seconds) before which the next sync attempt must wait.
     ///
-    /// `0` means no active hold. Updated to `now + retry_after_s` when the control plane
-    /// returns `Rejected { retry_after_s: Some(_) }`; cleared to `0` on successful sync.
+    /// `0` means no active hold. Updated to `now + retry_after_s` when the control plane returns `Rejected { retry_after_s: Some(_) }`;
+    /// cleared to `0` on successful sync.
     retry_hold_until: AtomicU64,
-    /// Guard so the first-tick startup jitter runs exactly once per process
-    /// lifetime. Set to `true` after the initial jitter sleep; subsequent
-    /// restarts (e.g. after a transient failure) skip the jitter and stay
-    /// on the periodic schedule.
+    /// Guard so the first-tick startup jitter runs exactly once per process lifetime.
+    /// Set to `true` after the initial jitter sleep;
+    /// subsequent restarts (e.g. after a transient failure) skip the jitter and stay on the periodic schedule.
     startup_jitter_applied: AtomicBool,
     metrics: DiscoverMetricsHandle,
 }

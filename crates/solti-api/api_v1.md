@@ -4,17 +4,16 @@
 
 ## API surface
 
-| Operation   | gRPC RPC        | HTTP Endpoint                  | HTTP Method |
-|-------------|-----------------|--------------------------------|-------------|
-| Submit task | `SubmitTask`    | `/api/v1/tasks`                | POST        |
-| Get task    | `GetTaskStatus` | `/api/v1/tasks/{id}`           | GET         |
-| List tasks  | `ListTasks`     | `/api/v1/tasks`                | GET         |
-| List runs   | `ListTaskRuns`  | `/api/v1/tasks/{id}/runs`      | GET         |
-| Delete task | `DeleteTask`    | `/api/v1/tasks/{id}`           | DELETE      |
+| Operation   | gRPC RPC         | HTTP Endpoint                   | HTTP Method |
+|-------------|------------------|---------------------------------|-------------|
+| Submit task | `SubmitTask`     | `/api/v1/tasks`                 | POST        |
+| Get task    | `GetTaskStatus`  | `/api/v1/tasks/{id}`            | GET         |
+| List tasks  | `ListTasks`      | `/api/v1/tasks`                 | GET         |
+| List runs   | `ListTaskRuns`   | `/api/v1/tasks/{id}/runs`       | GET         |
+| Stream logs | `StreamTaskLogs` | `/api/v1/tasks/{id}/logs`       | GET (SSE)   |
+| Delete task | `DeleteTask`     | `/api/v1/tasks/{id}`            | DELETE      |
 
-`DeleteTask` is the single teardown primitive: it stops the task and
-purges its run history. Idempotent — deleting an unknown task is a
-no-op, not an error.
+`DeleteTask` is the single teardown primitive: it stops the task and purges its run history. 
 
 ---
 
@@ -257,6 +256,18 @@ Response `200 OK`:
 }
 ```
 
+### Stream task logs (Server-Sent Events)
+
+Live tail of stdout/stderr. One subscription covers all retries of the task with run-boundary markers between them. 
+`404` if the task has no live channel.
+
+```bash
+curl -N http://localhost:8080/api/v1/tasks/tsk_01JR.../logs
+```
+
+Wire shape (event types map 1:1 to gRPC `OutputEventProto` variants): `chunk`, `run-started`, `run-finished`, `lagged`. 
+Same JSON payload as direct in-process subscribers see.
+
 ### Delete a task
 
 ```bash
@@ -275,12 +286,12 @@ Safe to retry — deleting an already-gone task is a no-op.
 }
 ```
 
-| HTTP Status | `error` label    | When                                                                                |
-|-------------|------------------|-------------------------------------------------------------------------------------|
-| 400         | `InvalidRequest` | Validation failure (empty slot, bad spec, invalid status), also `Core::InvalidSpec` |
-| 404         | `TaskNotFound`   | Task ID not found                                                                   |
-| 413         | `PayloadTooLarge`| Request body exceeds 4 MiB (`RequestBodyLimitLayer`) — see "Size limits"            |
-| 500         | `Internal`       | Supervisor/infra error (also `Core::{Supervisor,Mapping,Runner}`)                   |
+| HTTP Status | `error` label     | When                                                                                |
+|-------------|-------------------|-------------------------------------------------------------------------------------|
+| 400         | `InvalidRequest`  | Validation failure (empty slot, bad spec, invalid status), also `Core::InvalidSpec` |
+| 404         | `TaskNotFound`    | Task ID not found                                                                   |
+| 413         | `PayloadTooLarge` | Request body exceeds 4 MiB (`RequestBodyLimitLayer`) — see "Size limits"            |
+| 500         | `Internal`        | Supervisor/infra error (also `Core::{Supervisor,Mapping,Runner}`)                   |
 
 ### JSON field presence
 
@@ -458,6 +469,16 @@ grpcurl -plaintext -d '{"taskId": "tsk_01JR..."}' \
 ```
 
 Returns `{}`. Stops the task and purges its run history. Idempotent.
+
+### Stream logs
+
+Server-streaming RPC, same semantics as the HTTP/SSE variant: different wire (`OutputEventProto` with `oneof kind`). 
+Closes with `NOT_FOUND` if no live channel exists.
+
+```bash
+grpcurl -plaintext -d '{"taskId": "tsk_01JR..."}' \
+  localhost:50051 solti.v1.SoltiApi/StreamTaskLogs
+```
 
 ### gRPC errors
 

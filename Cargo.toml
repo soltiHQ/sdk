@@ -29,37 +29,43 @@ keywords     = ["async", "tasks", "supervisor", "orchestration", "solti"]
 categories   = ["asynchronous", "concurrency"]
 
 [workspace.dependencies]
-tokio      = { version = "1" }
-tokio-util = "0.7.17"
+tokio        = { version = "1.52.3" }
+tokio-util   = "0.7.18"
+tokio-stream = "0.1.18"
+bytes        = "1.11.1"
 
-tracing            = "0.1"
-tracing-subscriber = { version = "0.3" }
-tracing-journald   = "0.3.1"
+tracing            = "0.1.44"
+tracing-subscriber = { version = "0.3.23" }
+tracing-journald   = "0.3.2"
 
-anyhow      = "1"
-thiserror   = "2"
-async-trait = "0.1"
-parking_lot = "0.12"
-serde       = { version = "1", features = ["derive"] }
-serde_json  = "1"
-time        = { version = "0.3" }
-base64      = "0.22"
+serde      = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+anyhow    = "1.0.102"
+thiserror = "2.0.18"
+
+async-trait = "0.1.89"
+parking_lot = "0.12.5"
+time        = { version = "0.3.47" }
+base64      = "0.22.1"
 libc        = "0.2.177"
 hostname    = "0.4.2"
-uuid        = "1.19.0"
-tempfile    = "3.14"
-itoa        = "1"
+uuid        = "1.23.1"
+tempfile    = "3.27.0"
+itoa        = "1.0.18"
 
-axum       = "0.8.7"
-tower-http = "0.6"
-reqwest    = "0.13.1"
+axum           = "0.8.9"
+tower          = "0.5.3"
+tower-http     = "0.6.10"
+http-body-util = "0.1.3"
+reqwest        = "0.13.3"
 
-tonic               = "0.14.5"
-tonic-prost         = "0.14.5"
-tonic-prost-build   = "0.14.5"
+tonic               = "0.14.6"
+tonic-prost         = "0.14.6"
+tonic-prost-build   = "0.14.6"
 prost               = "0.14.3"
 prost-types         = "0.14.3"
-protoc-bin-vendored = { version = "3" }
+protoc-bin-vendored = { version = "3.2.0" }
 pbjson              = "0.9.0"
 pbjson-build        = "0.9.0"
 
@@ -67,8 +73,8 @@ prometheus = "0.14.0"
 
 rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
-rcgen          = "0.14.7"
-tokio-rustls   = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen          = "0.14.8"
+tokio-rustls   = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 
 taskvisor = { version = "0.1.2" }
 
