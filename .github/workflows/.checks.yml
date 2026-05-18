@@ -9,7 +9,7 @@ jobs:
       - uses: actions/checkout@v6
       - name: Run fmt
         uses: soltiHQ/actions/taskfile@main
-        with: { command: ci:cargo/fmt }
+        with: { command: ci/fmt }
 
   check:
     runs-on: ${{ vars.RUNS_ON }}
@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v6
       - name: Run check
         uses: soltiHQ/actions/taskfile@main
-        with: { command: ci:cargo/check }
+        with: { command: ci/check }
 
   test:
     runs-on: ${{ vars.RUNS_ON }}
@@ -35,7 +35,7 @@ jobs:
 
       - name: Run Job
         uses: soltiHQ/actions/taskfile@main
-        with: { command: ci:cargo/test }
+        with: { command: ci/test }
 
       - name: Put Cache
         if: steps.cache_get.outputs.cache-hit != 'true'
@@ -62,7 +62,7 @@ jobs:
 
       - name: Run Job
         uses: soltiHQ/actions/taskfile@main
-        with: { command: ci:cargo/clippy }
+        with: { command: ci/clippy }
 
       - name: Put Cache
         if: steps.cache_get.outputs.cache-hit != 'true'
