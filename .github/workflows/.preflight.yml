@@ -18,4 +18,4 @@ jobs:
       - name: Run publish dry-run
         uses: soltiHQ/actions/taskfile@main
         with:
-          command: ci:cargo/publish-dry-run CRATE=${{ matrix.crate }}
+          command: ci/publish-dry-run CRATE=${{ matrix.crate }}

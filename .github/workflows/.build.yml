@@ -28,4 +28,4 @@ jobs:
       - name: Build example
         uses: soltiHQ/actions/taskfile@main
         with:
-          command: ci:cargo/build CRATE=${{ matrix.example }}
+          command: ci/build CRATE=${{ matrix.example }}
