@@ -16,7 +16,9 @@ use crate::convert::{output_event_to_proto, proto_to_domain_status, tasks_page_t
 use crate::error::ApiError;
 use crate::handler::ApiHandler;
 use crate::metrics::{ApiMetricsHandle, Transport, noop_api_metrics};
-use crate::proto_api::{self, task_service_server::TaskService, task_service_server::TaskServiceServer};
+use crate::proto_api::{
+    self, task_service_server::TaskService, task_service_server::TaskServiceServer,
+};
 use crate::validate::{clamp_list_limit, non_empty_id};
 
 /// gRPC service wrapping an [`ApiHandler`](crate::ApiHandler).
