@@ -111,6 +111,7 @@ jobs:
         with:
           token: ${{ secrets.CRATES_IO_TOKEN }}
           crates: ${{ needs.crates.outputs.list }}
+          allow-dirty: "true"
 
   gh-release:
     name: GitHub release

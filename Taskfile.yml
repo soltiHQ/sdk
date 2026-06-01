@@ -67,6 +67,7 @@ tasks:
       - task: rust:publish-dry-run
         vars:
           CRATE: '{{.CRATE}}'
+          PUBLISH_ARGS: "--all-features --allow-dirty"
 
   ci/docs:
     desc: Run 'rustdoc' for a crate. Pass CRATE.

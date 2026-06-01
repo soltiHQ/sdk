@@ -63,7 +63,7 @@ Each crate has its own README with a detailed reference.
 
 ### Prerequisites
 
-- Rust 2024 edition (1.85+)
+- Rust 2024 edition (1.90+)
 - Subprocess runner is Linux-only (cgroups v2, capabilities). The rest of the SDK is cross-platform.
 
 ### Minimal: run a task from code
