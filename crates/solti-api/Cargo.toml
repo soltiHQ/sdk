@@ -11,6 +11,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+include = [
+    "proto/**/*.proto",
+    "src/**/*.rs",
+    "Cargo.toml",
+    "README.md",
+    "build.rs",
+]
+
 [package.metadata.docs.rs]
 all-features = true
 

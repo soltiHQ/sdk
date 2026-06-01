@@ -1,18 +1,18 @@
 //! # solti-api - task management API.
 //!
 //! Dual-transport API layer exposing task operations over gRPC and HTTP.
-//! Both transports share the same wire types generated from `proto/solti/v1/*.proto` and delegate to an [`ApiHandler`] implementation.
+//! Both transports share the same wire types generated from `proto/solti/task/v1/*.proto` and delegate to an [`ApiHandler`] implementation.
 //!
-//! | feature | transport         | module                              |
-//! |---------|-------------------|-------------------------------------|
-//! | `grpc`  | tonic gRPC server | `SoltiApiService`, `SoltiApiServer` |
-//! | `http`  | axum HTTP/JSON    | `HttpApi`                           |
+//! | feature | transport         | module                                |
+//! |---------|-------------------|---------------------------------------|
+//! | `grpc`  | tonic gRPC server | `TaskApiService`, `TaskServiceServer` |
+//! | `http`  | axum HTTP/JSON    | `HttpApi`                             |
 //!
 //! ## Quick start
 //!
 //! ```text
 //! let adapter = SupervisorApiAdapter::new(supervisor);
-//! let svc     = SoltiApiServer::new(SoltiApiService::new(Arc::new(adapter)));
+//! let svc     = TaskServiceServer::new(TaskApiService::new(Arc::new(adapter)));
 //! let router  = HttpApi::new(Arc::new(adapter)).router();
 //! ```
 //!
@@ -67,7 +67,7 @@ pub use metrics::{
 pub(crate) mod proto_api {
     include!(concat!(
         env!("OUT_DIR"),
-        "/solti.v",
+        "/solti.task.v",
         solti_api_major!(),
         ".rs"
     ));
@@ -75,7 +75,7 @@ pub(crate) mod proto_api {
     #[cfg(feature = "http")]
     include!(concat!(
         env!("OUT_DIR"),
-        "/solti.v",
+        "/solti.task.v",
         solti_api_major!(),
         ".serde.rs"
     ));
@@ -91,10 +91,10 @@ mod validate;
 mod grpc;
 
 #[cfg(feature = "grpc")]
-pub use grpc::{SoltiApiService, build_grpc_server, build_grpc_server_with_metrics};
+pub use grpc::{TaskApiService, build_grpc_server, build_grpc_server_with_metrics};
 
 #[cfg(feature = "grpc")]
-pub use proto_api::solti_api_server::SoltiApiServer;
+pub use proto_api::task_service_server::TaskServiceServer;
 
 #[cfg(feature = "grpc")]
 pub use tonic;

@@ -1,7 +1,7 @@
 //! # `OutputEvent` domain → proto.
 //!
 //! Maps [`solti_model::OutputEvent`] (in-process broadcast carrier) to the
-//! generated [`proto_api::OutputEventProto`] for the `StreamTaskLogs` RPC.
+//! generated [`proto_api::StreamTaskLogsResponse`] for the `StreamTaskLogs` RPC.
 
 use solti_model::{OutputChunk, OutputEvent, StreamKind};
 
@@ -10,15 +10,15 @@ use crate::proto_api;
 use super::time::system_time_to_ms;
 
 /// Convert one [`OutputEvent`] into its protobuf representation.
-pub(crate) fn output_event_to_proto(ev: OutputEvent) -> proto_api::OutputEventProto {
-    use proto_api::output_event_proto::Kind;
+pub(crate) fn output_event_to_proto(ev: OutputEvent) -> proto_api::StreamTaskLogsResponse {
+    use proto_api::stream_task_logs_response::Kind;
 
     let kind = match ev {
         OutputEvent::Chunk(c) => Kind::Chunk(output_chunk_to_proto(c)),
         OutputEvent::RunStarted {
             attempt,
             started_at,
-        } => Kind::RunStarted(proto_api::RunStartedProto {
+        } => Kind::RunStarted(proto_api::RunStarted {
             attempt,
             started_at: system_time_to_ms(started_at),
         }),
@@ -26,19 +26,19 @@ pub(crate) fn output_event_to_proto(ev: OutputEvent) -> proto_api::OutputEventPr
             attempt,
             exit_code,
             finished_at,
-        } => Kind::RunFinished(proto_api::RunFinishedProto {
+        } => Kind::RunFinished(proto_api::RunFinished {
             attempt,
             exit_code,
             finished_at: system_time_to_ms(finished_at),
         }),
-        OutputEvent::Lagged { skipped } => Kind::Lagged(proto_api::LaggedProto { skipped }),
+        OutputEvent::Lagged { skipped } => Kind::Lagged(proto_api::Lagged { skipped }),
     };
 
-    proto_api::OutputEventProto { kind: Some(kind) }
+    proto_api::StreamTaskLogsResponse { kind: Some(kind) }
 }
 
-fn output_chunk_to_proto(c: OutputChunk) -> proto_api::OutputChunkProto {
-    proto_api::OutputChunkProto {
+fn output_chunk_to_proto(c: OutputChunk) -> proto_api::OutputChunk {
+    proto_api::OutputChunk {
         stream: stream_kind_to_proto(c.stream) as i32,
         ts: system_time_to_ms(c.ts),
         attempt: c.attempt,
@@ -75,7 +75,7 @@ mod tests {
         let proto = output_event_to_proto(ev);
         let kind = proto.kind.expect("kind must be set");
         let chunk = match kind {
-            proto_api::output_event_proto::Kind::Chunk(c) => c,
+            proto_api::stream_task_logs_response::Kind::Chunk(c) => c,
             other => panic!("expected Chunk, got {other:?}"),
         };
         assert_eq!(chunk.attempt, 7);
@@ -100,7 +100,7 @@ mod tests {
 
         let proto = output_event_to_proto(ev);
         let chunk = match proto.kind.unwrap() {
-            proto_api::output_event_proto::Kind::Chunk(c) => c,
+            proto_api::stream_task_logs_response::Kind::Chunk(c) => c,
             other => panic!("expected Chunk, got {other:?}"),
         };
         assert_eq!(
@@ -117,7 +117,7 @@ mod tests {
             started_at: UNIX_EPOCH + Duration::from_millis(1234),
         };
         match output_event_to_proto(ev).kind.unwrap() {
-            proto_api::output_event_proto::Kind::RunStarted(r) => {
+            proto_api::stream_task_logs_response::Kind::RunStarted(r) => {
                 assert_eq!(r.attempt, 3);
                 assert_eq!(r.started_at, 1234);
             }
@@ -133,7 +133,7 @@ mod tests {
             finished_at: UNIX_EPOCH + Duration::from_millis(2222),
         };
         match output_event_to_proto(ev).kind.unwrap() {
-            proto_api::output_event_proto::Kind::RunFinished(r) => {
+            proto_api::stream_task_logs_response::Kind::RunFinished(r) => {
                 assert_eq!(r.attempt, 2);
                 assert_eq!(r.exit_code, Some(0));
                 assert_eq!(r.finished_at, 2222);
@@ -146,7 +146,7 @@ mod tests {
     fn lagged_carries_skipped_count() {
         let ev = OutputEvent::Lagged { skipped: 1500 };
         match output_event_to_proto(ev).kind.unwrap() {
-            proto_api::output_event_proto::Kind::Lagged(l) => {
+            proto_api::stream_task_logs_response::Kind::Lagged(l) => {
                 assert_eq!(l.skipped, 1500);
             }
             other => panic!("expected Lagged, got {other:?}"),

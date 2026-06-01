@@ -6,7 +6,7 @@
 //! Wiring:
 //! - HTTP: apply [`http_metrics_middleware`] via [`axum::middleware::from_fn_with_state`]
 //!   on the router returned by [`HttpApi::router`](crate::HttpApi::router).
-//! - gRPC: construct the service with [`SoltiApiService::new_with_metrics`](crate::SoltiApiService::new_with_metrics)
+//! - gRPC: construct the service with [`TaskApiService::new_with_metrics`](crate::TaskApiService::new_with_metrics)
 //!   or call [`build_grpc_server_with_metrics`](crate::build_grpc_server_with_metrics).
 
 use std::sync::Arc;
@@ -33,7 +33,7 @@ impl Transport {
 ///
 /// - `transport`: `http` | `grpc`
 /// - `method`: HTTP method (`GET`, `POST`, ...) for HTTP, RPC method name (`SubmitTask`, ...) for gRPC
-/// - `path`: templated route (`/api/v1/tasks/{id}`) for HTTP via `MatchedPath`, full RPC path (`/solti.v1.SoltiApi/SubmitTask`) for gRPC
+/// - `path`: templated route (`/api/v1/tasks/{id}`) for HTTP via `MatchedPath`, full RPC path (`/solti.task.v1.TaskService/SubmitTask`) for gRPC
 /// - `status`: HTTP status code (200/404/500/...) for HTTP, gRPC code number for gRPC
 ///
 /// Cardinality stays bounded because routes are a closed set per version and templated paths avoid per-resource-id explosion.

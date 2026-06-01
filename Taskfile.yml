@@ -6,7 +6,32 @@ includes:
     vars:
       image_patch: "-1"
 
+vars:
+  proto_repo: '{{.proto_repo | default "https://github.com/soltiHQ/proto.git"}}'
+  proto_ref: '{{.proto_ref | default "main"}}'
+
 tasks:
+  proto/vendor:
+    desc: Re-vendor .proto from soltiHQ/proto at {{.proto_ref}} into the crates.
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+        tmp="$(mktemp -d)"
+        trap 'rm -rf "$tmp"' EXIT
+        git clone --quiet "{{.proto_repo}}" "$tmp"
+        git -C "$tmp" checkout --quiet "{{.proto_ref}}"
+
+        rm -rf crates/solti-api/proto/solti/task
+        mkdir -p crates/solti-api/proto/solti/task
+        cp -R "$tmp/solti/task/." crates/solti-api/proto/solti/task/
+
+        rm -rf crates/solti-discover/proto/solti/discover
+        mkdir -p crates/solti-discover/proto/solti/discover
+        cp -R "$tmp/solti/discover/." crates/solti-discover/proto/solti/discover/
+
+        echo "vendored proto from {{.proto_ref}}"
+
   ci/fmt:
     desc: Run 'cargo fmt --check'.
     cmds:
@@ -14,16 +39,19 @@ tasks:
 
   ci/check:
     desc: Run 'cargo check'.
+    deps: [proto/vendor]
     cmds:
       - task: rust:check
 
   ci/clippy:
     desc: Run 'cargo clippy'.
+    deps: [proto/vendor]
     cmds:
       - task: rust:clippy
 
   ci/test:
     desc: Run 'cargo test'.
+    deps: [proto/vendor]
     cmds:
       - task: rust:test
 
@@ -34,6 +62,7 @@ tasks:
 
   ci/build:
     desc: Build a crate. Pass CRATE.
+    deps: [proto/vendor]
     requires:
       vars: [ CRATE ]
     cmds:
@@ -43,6 +72,7 @@ tasks:
 
   ci/publish-dry-run:
     desc: Simulate 'cargo publish' for a crate. Pass CRATE.
+    deps: [proto/vendor]
     requires:
       vars: [ CRATE ]
     cmds:
@@ -52,6 +82,7 @@ tasks:
 
   ci/docs:
     desc: Run 'rustdoc' for a crate. Pass CRATE.
+    deps: [proto/vendor]
     requires:
       vars: [ CRATE ]
     cmds:

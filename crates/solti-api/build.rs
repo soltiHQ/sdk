@@ -29,6 +29,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let major_dir = Path::new(PROTO_ROOT)
         .join("solti")
+        .join("task")
         .join(format!("v{API_MAJOR}"));
     if !major_dir.is_dir() {
         return Err(format!(
@@ -54,12 +55,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     tonic_prost_build::configure()
         .build_server(grpc)
         .build_client(grpc)
-        .bytes(".solti.v1.OutputChunkProto.line")
+        .bytes(".solti.task.v1.OutputChunk.line")
         .file_descriptor_set_path(&descriptor_path)
         .compile_protos(&protos, &[PathBuf::from(PROTO_ROOT)])?;
 
     if http {
-        let proto_package = format!(".solti.v{API_MAJOR}");
+        let proto_package = format!(".solti.task.v{API_MAJOR}");
         let descriptor_set = std::fs::read(&descriptor_path)?;
         pbjson_build::Builder::new()
             .emit_fields()

@@ -1,7 +1,7 @@
 //! Reference Solti agent: gRPC transport.
 //!
 //! A minimal task-execution agent:
-//! - Accepts `TaskSpec` submissions via the `solti.v1.SoltiApi` gRPC service
+//! - Accepts `TaskSpec` submissions via the `solti.task.v1.TaskService` gRPC service
 //! - Runs them as subprocesses, reports status back through the same service.
 //!
 //! Optionally heartbeats to a [Podium](https://github.com/soltiHQ/podium) control-plane so the CP can push specs and collect state remotely.
@@ -12,7 +12,7 @@
 //! ```
 //!
 //! Defaults:
-//! - API       - `[::]:50052` (`solti.v1.SoltiApi`)
+//! - API       - `[::]:50052` (`solti.task.v1.TaskService`)
 //! - Metrics   - `http://localhost:9090/metrics` (HTTP, Prometheus scrape target)
 //! - Heartbeat - `localhost:50051` (Podium grpc-discovery)
 //! - Override the CP endpoint via `CONTROL_PLANE=host:port`.
@@ -21,17 +21,17 @@
 //!
 //! ```bash
 //! # List tasks
-//! grpcurl -plaintext localhost:50052 solti.v1.SoltiApi/ListTasks
+//! grpcurl -plaintext localhost:50052 solti.task.v1.TaskService/ListTasks
 //!
 //! # Submit / get / list runs / delete
-//! grpcurl -plaintext -d '{"spec": {...}}' localhost:50052 solti.v1.SoltiApi/SubmitTask
-//! grpcurl -plaintext -d '{"taskId":"<id>"}' localhost:50052 solti.v1.SoltiApi/GetTaskStatus
-//! grpcurl -plaintext -d '{"taskId":"<id>"}' localhost:50052 solti.v1.SoltiApi/ListTaskRuns
-//! grpcurl -plaintext -d '{"taskId":"<id>"}' localhost:50052 solti.v1.SoltiApi/DeleteTask
+//! grpcurl -plaintext -d '{"spec": {...}}' localhost:50052 solti.task.v1.TaskService/SubmitTask
+//! grpcurl -plaintext -d '{"taskId":"<id>"}' localhost:50052 solti.task.v1.TaskService/GetTaskStatus
+//! grpcurl -plaintext -d '{"taskId":"<id>"}' localhost:50052 solti.task.v1.TaskService/ListTaskRuns
+//! grpcurl -plaintext -d '{"taskId":"<id>"}' localhost:50052 solti.task.v1.TaskService/DeleteTask
 //!
 //! # Live-tail stdout/stderr (server-streaming RPC).
 //! # One subscription covers all retries of the task with run boundary markers.
-//! grpcurl -plaintext -d '{"taskId":"<id>"}' localhost:50052 solti.v1.SoltiApi/StreamTaskLogs
+//! grpcurl -plaintext -d '{"taskId":"<id>"}' localhost:50052 solti.task.v1.TaskService/StreamTaskLogs
 //! ```
 //!
 //! Proto contract + full RPC surface: [`api_v1.md`](../../../crates/solti-api/api_v1.md).
