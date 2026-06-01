@@ -10,7 +10,7 @@ includes:
 
 tasks:
   proto/vendor:
-    desc: Re-vendor .proto from soltiHQ/proto (pinned ref) into the crates.
+    desc: Re-vendor .proto from soltiHQ/proto.
     silent: true
     cmds:
       - task: helpers:proto/vendor
