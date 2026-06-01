@@ -5,32 +5,19 @@ includes:
     taskfile: https://raw.githubusercontent.com/soltiHQ/actions/main/taskfiles/rust/Taskfile.yml
     vars:
       image_patch: "-1"
-
-vars:
-  proto_repo: '{{.proto_repo | default "https://github.com/soltiHQ/proto.git"}}'
-  proto_ref: '{{.proto_ref | default "main"}}'
+  helpers:
+    taskfile: https://raw.githubusercontent.com/soltiHQ/actions/main/taskfiles/helpers/Taskfile.yml
 
 tasks:
   proto/vendor:
-    desc: Re-vendor .proto from soltiHQ/proto at {{.proto_ref}} into the crates.
+    desc: Re-vendor .proto from soltiHQ/proto into the crates.
     silent: true
     cmds:
-      - |
-        set -euo pipefail
-        tmp="$(mktemp -d)"
-        trap 'rm -rf "$tmp"' EXIT
-        git clone --quiet "{{.proto_repo}}" "$tmp"
-        git -C "$tmp" checkout --quiet "{{.proto_ref}}"
-
-        rm -rf crates/solti-api/proto/solti/task
-        mkdir -p crates/solti-api/proto/solti/task
-        cp -R "$tmp/solti/task/." crates/solti-api/proto/solti/task/
-
-        rm -rf crates/solti-discover/proto/solti/discover
-        mkdir -p crates/solti-discover/proto/solti/discover
-        cp -R "$tmp/solti/discover/." crates/solti-discover/proto/solti/discover/
-
-        echo "vendored proto from {{.proto_ref}}"
+      - task: helpers:proto/vendor
+        vars:
+          MAPPINGS: |
+            solti/task crates/solti-api/proto/solti/task
+            solti/discover crates/solti-discover/proto/solti/discover
 
   ci/fmt:
     desc: Run 'cargo fmt --check'.
