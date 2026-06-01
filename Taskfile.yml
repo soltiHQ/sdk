@@ -10,11 +10,12 @@ includes:
 
 tasks:
   proto/vendor:
-    desc: Re-vendor .proto from soltiHQ/proto into the crates.
+    desc: Re-vendor .proto from soltiHQ/proto (pinned ref) into the crates.
     silent: true
     cmds:
       - task: helpers:proto/vendor
         vars:
+          proto_ref: "v0.0.1"
           MAPPINGS: |
             solti/task crates/solti-api/proto/solti/task
             solti/discover crates/solti-discover/proto/solti/discover
