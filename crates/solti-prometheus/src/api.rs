@@ -19,7 +19,7 @@ use crate::register::{Sub, ms_to_secs};
 ///
 /// ## Cardinality
 ///
-/// `path` is a **templated** route (e.g. `/api/v1/tasks/{id}`) for HTTP thanks to`axum::extract::MatchedPath`, and a full method path (`/solti.v1.SoltiApi/SubmitTask`) for gRPC.
+/// `path` is a **templated** route (e.g. `/api/v1/tasks/{id}`) for HTTP thanks to`axum::extract::MatchedPath`, and a full method path (`/solti.task.v1.TaskService/SubmitTask`) for gRPC.
 /// In both cases the set is bounded by the proto/api definition.
 pub struct PrometheusApiMetrics {
     requests_total: CounterVec,

@@ -5,8 +5,21 @@ includes:
     taskfile: https://raw.githubusercontent.com/soltiHQ/actions/main/taskfiles/rust/Taskfile.yml
     vars:
       image_patch: "-1"
+  helpers:
+    taskfile: https://raw.githubusercontent.com/soltiHQ/actions/main/taskfiles/helpers/Taskfile.yml
 
 tasks:
+  proto/vendor:
+    desc: Re-vendor .proto from soltiHQ/proto.
+    silent: true
+    cmds:
+      - task: helpers:proto/vendor
+        vars:
+          proto_ref: "v0.0.1"
+          MAPPINGS: |
+            solti/task crates/solti-api/proto/solti/task
+            solti/discover crates/solti-discover/proto/solti/discover
+
   ci/fmt:
     desc: Run 'cargo fmt --check'.
     cmds:
@@ -14,16 +27,19 @@ tasks:
 
   ci/check:
     desc: Run 'cargo check'.
+    deps: [proto/vendor]
     cmds:
       - task: rust:check
 
   ci/clippy:
     desc: Run 'cargo clippy'.
+    deps: [proto/vendor]
     cmds:
       - task: rust:clippy
 
   ci/test:
     desc: Run 'cargo test'.
+    deps: [proto/vendor]
     cmds:
       - task: rust:test
 
@@ -34,6 +50,7 @@ tasks:
 
   ci/build:
     desc: Build a crate. Pass CRATE.
+    deps: [proto/vendor]
     requires:
       vars: [ CRATE ]
     cmds:
@@ -43,15 +60,18 @@ tasks:
 
   ci/publish-dry-run:
     desc: Simulate 'cargo publish' for a crate. Pass CRATE.
+    deps: [proto/vendor]
     requires:
       vars: [ CRATE ]
     cmds:
       - task: rust:publish-dry-run
         vars:
           CRATE: '{{.CRATE}}'
+          PUBLISH_ARGS: "--all-features --allow-dirty"
 
   ci/docs:
     desc: Run 'rustdoc' for a crate. Pass CRATE.
+    deps: [proto/vendor]
     requires:
       vars: [ CRATE ]
     cmds:

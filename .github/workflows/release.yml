@@ -103,10 +103,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - name: Vendor proto
+        uses: soltiHQ/actions/taskfile@main
+        with:
+          command: proto/vendor
       - uses: soltiHQ/actions/cargo-publish@main
         with:
           token: ${{ secrets.CRATES_IO_TOKEN }}
           crates: ${{ needs.crates.outputs.list }}
+          allow-dirty: "true"
 
   gh-release:
     name: GitHub release

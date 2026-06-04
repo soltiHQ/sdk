@@ -1,7 +1,6 @@
 //! # gRPC transport.
 //!
-//! [`SoltiApiService`] implements the generated `SoltiApi` trait from `proto/solti/v1/api.proto`,
-//! delegating to an [`ApiHandler`](crate::ApiHandler).
+//! [`TaskApiService`] implements the generated `TaskService` trait from `proto/solti/task/v1/api.proto`, delegating to an [`ApiHandler`](crate::ApiHandler).
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -17,21 +16,23 @@ use crate::convert::{output_event_to_proto, proto_to_domain_status, tasks_page_t
 use crate::error::ApiError;
 use crate::handler::ApiHandler;
 use crate::metrics::{ApiMetricsHandle, Transport, noop_api_metrics};
-use crate::proto_api::{self, solti_api_server::SoltiApi, solti_api_server::SoltiApiServer};
+use crate::proto_api::{
+    self, task_service_server::TaskService, task_service_server::TaskServiceServer,
+};
 use crate::validate::{clamp_list_limit, non_empty_id};
 
 /// gRPC service wrapping an [`ApiHandler`](crate::ApiHandler).
 ///
 /// ## Also
 ///
-/// - `SoltiApiServer` generated tonic server wrapper.
+/// - `TaskServiceServer` generated tonic server wrapper.
 /// - [`ApiError`](crate::ApiError) mapped to `tonic::Status`.
-pub struct SoltiApiService<H> {
+pub struct TaskApiService<H> {
     handler: Arc<H>,
     metrics: ApiMetricsHandle,
 }
 
-impl<H> SoltiApiService<H>
+impl<H> TaskApiService<H>
 where
     H: ApiHandler,
 {
@@ -57,7 +58,7 @@ where
             Ok(_) => 0u16,
             Err(s) => s.code() as u16,
         };
-        let path = format!("/solti.v1.SoltiApi/{}", method);
+        let path = format!("/solti.task.v1.TaskService/{}", method);
         self.metrics
             .record_request(Transport::Grpc, method, &path, status, duration_ms);
         self.metrics.record_in_flight_delta(Transport::Grpc, -1);
@@ -65,7 +66,7 @@ where
     }
 }
 
-/// Build a configured `SoltiApiServer` with no-op metrics.
+/// Build a configured `TaskServiceServer` with no-op metrics.
 ///
 /// ## Example
 ///
@@ -80,28 +81,28 @@ where
 ///     .await?;
 /// # Ok(()) }
 /// ```
-pub fn build_grpc_server<H>(handler: Arc<H>) -> SoltiApiServer<SoltiApiService<H>>
+pub fn build_grpc_server<H>(handler: Arc<H>) -> TaskServiceServer<TaskApiService<H>>
 where
     H: ApiHandler,
 {
     build_grpc_server_with_metrics(handler, noop_api_metrics())
 }
 
-/// Build a configured `SoltiApiServer` with an explicit metrics backend.
+/// Build a configured `TaskServiceServer` with an explicit metrics backend.
 pub fn build_grpc_server_with_metrics<H>(
     handler: Arc<H>,
     metrics: ApiMetricsHandle,
-) -> SoltiApiServer<SoltiApiService<H>>
+) -> TaskServiceServer<TaskApiService<H>>
 where
     H: ApiHandler,
 {
-    SoltiApiServer::new(SoltiApiService::new_with_metrics(handler, metrics))
+    TaskServiceServer::new(TaskApiService::new_with_metrics(handler, metrics))
         .max_decoding_message_size(crate::MAX_REQUEST_BYTES)
         .max_encoding_message_size(crate::MAX_REQUEST_BYTES)
 }
 
 #[tonic::async_trait]
-impl<H> SoltiApi for SoltiApiService<H>
+impl<H> TaskService for TaskApiService<H>
 where
     H: ApiHandler,
 {
@@ -250,7 +251,7 @@ where
     /// Server-streaming RPC.
     type StreamTaskLogsStream = Pin<
         Box<
-            dyn tokio_stream::Stream<Item = Result<proto_api::OutputEventProto, Status>>
+            dyn tokio_stream::Stream<Item = Result<proto_api::StreamTaskLogsResponse, Status>>
                 + Send
                 + 'static,
         >,
@@ -338,8 +339,8 @@ mod tests {
         }
     }
 
-    fn service() -> SoltiApiService<StreamMock> {
-        SoltiApiService::new(Arc::new(StreamMock))
+    fn service() -> TaskApiService<StreamMock> {
+        TaskApiService::new(Arc::new(StreamMock))
     }
 
     #[tokio::test]
@@ -353,7 +354,7 @@ mod tests {
         let mut stream = response.into_inner();
 
         match stream.next().await.unwrap().unwrap().kind.unwrap() {
-            proto_api::output_event_proto::Kind::RunStarted(r) => {
+            proto_api::stream_task_logs_response::Kind::RunStarted(r) => {
                 assert_eq!(r.attempt, 1);
                 assert_eq!(r.started_at, 1000);
             }
@@ -361,7 +362,7 @@ mod tests {
         }
 
         match stream.next().await.unwrap().unwrap().kind.unwrap() {
-            proto_api::output_event_proto::Kind::Chunk(c) => {
+            proto_api::stream_task_logs_response::Kind::Chunk(c) => {
                 assert_eq!(c.attempt, 1);
                 assert_eq!(c.stream, proto_api::OutputStreamKind::Stdout as i32);
                 assert_eq!(c.seq, 0);
@@ -371,7 +372,7 @@ mod tests {
         }
 
         match stream.next().await.unwrap().unwrap().kind.unwrap() {
-            proto_api::output_event_proto::Kind::RunFinished(r) => {
+            proto_api::stream_task_logs_response::Kind::RunFinished(r) => {
                 assert_eq!(r.attempt, 1);
                 assert_eq!(r.exit_code, Some(0));
                 assert_eq!(r.finished_at, 1500);
