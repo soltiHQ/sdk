@@ -130,6 +130,30 @@ where
         .await
     }
 
+    async fn apply_task(
+        &self,
+        request: Request<proto_api::ApplyTaskRequest>,
+    ) -> Result<Response<proto_api::ApplyTaskResponse>, Status> {
+        self.instrument("ApplyTask", async move {
+            let req = request.into_inner();
+
+            let spec = req
+                .spec
+                .ok_or_else(|| Status::invalid_argument("missing spec"))?;
+
+            let spec =
+                crate::convert::convert_create_spec(spec).map_err(|e: ApiError| Status::from(e))?;
+
+            debug!(slot = %spec.slot(), kind = ?spec.kind(), "grpc: applying task");
+            let task_id = self.handler.apply_task(spec).await.map_err(Status::from)?;
+
+            Ok(Response::new(proto_api::ApplyTaskResponse {
+                task_id: task_id.to_string(),
+            }))
+        })
+        .await
+    }
+
     async fn get_task_status(
         &self,
         request: Request<proto_api::GetTaskStatusRequest>,

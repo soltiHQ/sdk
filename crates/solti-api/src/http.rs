@@ -5,14 +5,15 @@
 //!
 //! _the examples below show the current value (`v1`)_.
 //!
-//! | Method | Endpoint                    | Handler              |
-//! |--------|-----------------------------|----------------------|
-//! | POST   | `/api/v1/tasks`             | submit               |
-//! | GET    | `/api/v1/tasks`             | list (query params)  |
-//! | GET    | `/api/v1/tasks/{id}`        | get status           |
-//! | GET    | `/api/v1/tasks/{id}/runs`   | list runs            |
-//! | GET    | `/api/v1/tasks/{id}/logs`   | live-tail SSE stream |
-//! | DELETE | `/api/v1/tasks/{id}`        | delete (stop+purge)  |
+//! | Method | Endpoint                    | Handler                   |
+//! |--------|-----------------------------|---------------------------|
+//! | POST   | `/api/v1/tasks`             | submit                    |
+//! | PUT    | `/api/v1/tasks`             | apply (supersede/install) |
+//! | GET    | `/api/v1/tasks`             | list (query params)       |
+//! | GET    | `/api/v1/tasks/{id}`        | get status                |
+//! | GET    | `/api/v1/tasks/{id}/runs`   | list runs                 |
+//! | GET    | `/api/v1/tasks/{id}/logs`   | live-tail SSE stream      |
+//! | DELETE | `/api/v1/tasks/{id}`        | delete (stop+purge)       |
 
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use solti_model::{OutputEvent, TaskId, TaskPhase, TaskQuery};
@@ -122,6 +123,7 @@ where
     pub fn router(self) -> Router {
         Router::new()
             .route(api_url!("/tasks"), post(submit_task::<H>))
+            .route(api_url!("/tasks"), put(apply_task::<H>))
             .route(api_url!("/tasks"), get(list_tasks::<H>))
             .route(api_url!("/tasks/{id}"), get(get_task_status::<H>))
             .route(api_url!("/tasks/{id}"), delete(delete_task::<H>))
@@ -160,6 +162,27 @@ where
         task_id: task_id.to_string(),
     };
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn apply_task<H>(
+    State(handler): State<Arc<H>>,
+    ApiJson(req): ApiJson<proto_api::ApplyTaskRequest>,
+) -> Result<impl IntoResponse, ApiError>
+where
+    H: ApiHandler,
+{
+    let spec = req
+        .spec
+        .ok_or_else(|| ApiError::InvalidRequest("missing spec".into()))?;
+    let spec = convert::convert_create_spec(spec)?;
+
+    debug!(slot = %spec.slot(), kind = ?spec.kind(), "applying task");
+    let task_id = handler.apply_task(spec).await?;
+
+    let response = proto_api::ApplyTaskResponse {
+        task_id: task_id.to_string(),
+    };
+    Ok((StatusCode::OK, Json(response)))
 }
 
 async fn get_task_status<H>(
