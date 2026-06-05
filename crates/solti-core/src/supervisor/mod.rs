@@ -215,7 +215,8 @@ impl SupervisorApi {
             to_restart_policy(spec.restart())?,
             to_backoff_policy(spec.backoff())?,
             Some(Duration::from_millis(spec.timeout().as_millis())),
-        );
+        )
+        .with_slot(spec.slot().as_str());
         let controller_spec =
             ControllerSpec::new(to_admission_policy(spec.admission())?, task_spec);
 

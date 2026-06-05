@@ -1,7 +1,12 @@
 //! # Run identifier generation.
 //!
-//! [`RunId`] is a human-readable task name for taskvisor, formatted as `{runner}-{slot}-{seq}`.
-//! The sequence is process-global and monotonically increasing (starts at 1).
+//! [`RunId`] is the per-execution task name for taskvisor, formatted as `{runner}-{slot}-{seq}` and **unique per submission**
+//! (the sequence is a process-global counter).
+//!
+//! Uniqueness is intentional: the name identifies one *run instance* (used for events, logs, cgroup naming and per-task state tracking).
+//!
+//! It is NOT the admission slot.
+//! The stable slot is set separately via [`TaskSpec::with_slot`](taskvisor::TaskSpec::with_slot).
 //!
 //! See [`Runner::build_run_id`](crate::Runner::build_run_id) for the default id builder.
 
@@ -25,9 +30,8 @@ pub struct RunId {
 }
 
 impl RunId {
-    /// Human-readable id used as task name for taskvisor.
-    ///
-    /// Format: `{runner}-{slot}-{seq}`.
+    /// Per-execution task name for taskvisor.
+    /// Format: `{runner}-{slot}-{seq}`, unique per submission.
     #[inline]
     pub fn name(&self) -> &str {
         &self.name
@@ -46,16 +50,12 @@ impl RunId {
     }
 }
 
-/// Build a human-readable run id used as task name for taskvisor.
+/// Build the per-execution run id.
 ///
-/// Format: `{runner}-{slot}-{seq}`.
+/// The taskvisor task name is `{runner}-{slot}-{seq}` and **unique per call** — it identifies one run instance.
 /// - `runner` - Runner::name()
-/// - `slot`   - TaskSpec.slot
-/// - `seq`    - per-process decimal sequence
-///
-/// Returns both the formatted name and the raw sequence number,
-/// so callers that need the seq (e.g. for cgroup naming) don't
-/// have to parse it back out of the string.
+/// - `slot`   - TaskSpec.slot (logical)
+/// - `seq`    - per-process counter (also used verbatim for cgroup naming)
 pub fn make_run_id(runner_name: &str, slot: &str) -> RunId {
     let seq = next_seq();
     RunId {
