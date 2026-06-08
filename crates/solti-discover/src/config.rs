@@ -5,12 +5,11 @@
 
 use std::collections::HashMap;
 
-use solti_model::{AgentId, BackoffPolicy};
+use solti_model::{AgentId, BackoffPolicy, Token};
 
 #[cfg(any(feature = "grpc", feature = "http"))]
 use crate::proto::EndpointType;
 
-use crate::auth::Token;
 use crate::errors::DiscoverError;
 use crate::metrics::{DiscoverMetricsHandle, noop_discover_metrics};
 

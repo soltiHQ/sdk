@@ -12,6 +12,7 @@ Built on [taskvisor](https://github.com/soltiHQ/taskvisor).
 - **HTTP/gRPC service**: add `solti-api` to expose task management over the network. Pick HTTP (axum), gRPC (tonic), or both.
 - **Managed agent**: add `solti-discover` to register with a Podium control-plane. The control-plane pushes specs, the agent executes.
 - **TLS / mTLS everywhere**: `solti-tls` provides a single config shape for `solti-api` (server) and `solti-discover` (client). Same builder, paths or in-memory PEM, mTLS as a one-line knob.
+- **Bearer-token auth**: one shared secret (`solti_model::Token`) authenticates both directions — `solti-discover` presents it to the control-plane, `solti-api` verifies inbound calls against it. Constant-time check, redacted in logs, orthogonal to TLS, enabled from a single config value.
 - **Live-tail task output**: subscribe to a task's stdout/stderr over HTTP Server-Sent Events (`GET /api/v1/tasks/{id}/logs`) or gRPC server-streaming (`StreamTaskLogs`). One subscription covers all retries with explicit run-boundary markers; the agent never persists output.
 - **Custom runner**: implement the `Runner` trait to execute tasks your way (WASM, containers, in-process functions). The router dispatches by label selectors.
 - **Embedded tasks**: `TaskKind::Embedded` runs async Rust closures under the same supervision tree as subprocesses. Sweep, timezone sync, and discovery heartbeat use it internally.

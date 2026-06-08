@@ -34,15 +34,16 @@ The binary is the integration point: solti-discover does not depend on solti-api
 
 ## Key types
 
-| Type                    | Role                                                         |
-|-------------------------|--------------------------------------------------------------|
-| `DiscoverConfig`        | Agent identity, endpoint, transport, interval, capabilities  |
-| `DiscoverConfigBuilder` | Validated builder; enforces invariants on `build()`          |
-| `DiscoveryTransport`    | Selects gRPC or HTTP path                                    |
-| `DiscoverError`         | Config, transport, parse, and rejection failures             |
-| `sync()`                | Factory returns `Result<(TaskRef, TaskSpec), DiscoverError>` |
-| `SyncRequest`           | Protobuf message sent each cycle                             |
-| `SyncResponse`          | Protobuf ack: `success`, optional `reason`, `retry_after_s`  |
+| Type                    | Role                                                                  |
+|-------------------------|-----------------------------------------------------------------------|
+| `DiscoverConfig`        | Agent identity, endpoint, transport, interval, capabilities           |
+| `DiscoverConfigBuilder` | Validated builder; enforces invariants on `build()`                   |
+| `DiscoveryTransport`    | Selects gRPC or HTTP path                                             |
+| `Token`                 | Bearer secret presented to the CP (re-export of `solti_model::Token`) |
+| `DiscoverError`         | Config, transport, parse, and rejection failures                      |
+| `sync()`                | Factory returns `Result<(TaskRef, TaskSpec), DiscoverError>`          |
+| `SyncRequest`           | Protobuf message sent each cycle                                      |
+| `SyncResponse`          | Protobuf ack: `success`, optional `reason`, `retry_after_s`           |
 
 ## Sync protocol
 
@@ -50,16 +51,17 @@ Per-version protocol details: [sync_v1.md](sync_v1.md).
 
 ## Error model
 
-| Variant           | Feature | Cause                                                                  |
-|-------------------|---------|------------------------------------------------------------------------|
-| `InvalidConfig`   | -       | Builder-stage validation failure                                       |
-| `SpecBuild`       | -       | `TaskSpec::builder(...).build()` rejected the spec                     |
-| `GrpcTransport`   | `grpc`  | TCP / TLS / HTTP2 connection failure                                   |
-| `GrpcStatus`      | `grpc`  | Server returned non-OK gRPC status                                     |
-| `HttpRequest`     | `http`  | HTTP-level failure (connection, timeout, reqwest builder)              |
-| `HttpStatus`      | `http`  | Non-2xx HTTP status (body truncated to 1 KiB)                          |
-| `InvalidResponse` | `http`  | Response body failed JSON deserialization                              |
-| `Rejected`        | -       | Control plane returned `success: false`, with `reason`/`retry_after_s` |
+| Variant           | Feature | Cause                                                                                      |
+|-------------------|---------|--------------------------------------------------------------------------------------------|
+| `InvalidConfig`   | -       | Builder-stage validation failure                                                           |
+| `SpecBuild`       | -       | `TaskSpec::builder(...).build()` rejected the spec                                         |
+| `GrpcTransport`   | `grpc`  | TCP / TLS / HTTP2 connection failure                                                       |
+| `GrpcStatus`      | `grpc`  | Server returned non-OK gRPC status                                                         |
+| `HttpRequest`     | `http`  | HTTP-level failure (connection, timeout, reqwest builder)                                  |
+| `HttpStatus`      | `http`  | Non-2xx HTTP status (body truncated to 1 KiB)                                              |
+| `InvalidResponse` | `http`  | Response body failed JSON deserialization                                                  |
+| `Rejected`        | -       | Control plane returned `success: false`, with `reason`/`retry_after_s`                     |
+| `AuthFailed`      | -       | CP rejected the credential (HTTP 401/403, gRPC Unauthenticated/PermissionDenied); terminal |
 
 ## Feature flags
 
@@ -91,6 +93,20 @@ let cfg = DiscoverConfig::builder(/* ... */)
 For HTTP (reqwest), the built `rustls::ClientConfig` is plugged in via `use_preconfigured_tls`. 
 For gRPC (tonic), PEM bytes are re-shaped into `tonic::transport::ClientTlsConfig` (tonic builds its own internal rustls config). 
 See the `solti-tls` README for the full integration story.
+
+### Enabling token auth
+
+```rust
+use solti_discover::{DiscoverConfig, Token};
+
+let cfg = DiscoverConfig::builder(/* ... */)
+    .with_token(Token::from_env("SOLTI_AGENT_TOKEN")?)
+    .build()?;
+```
+
+The token is sent as `Authorization: Bearer <token>` (HTTP) / `authorization` metadata (gRPC) on every sync - never in the request body.
+It stays out of the wire schema. Orthogonal to TLS: all four modes (±token, ±tls) work, but the sync task logs a warning if a token is set without TLS (the credential would travel in plaintext). 
+The same secret is what the agent's inbound API (`solti-api`) verifies, one config value enables auth in both directions.
 
 ## Task policy
 

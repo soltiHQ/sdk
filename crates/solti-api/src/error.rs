@@ -7,6 +7,9 @@ pub enum ApiError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    #[error("unauthenticated: {0}")]
+    Unauthenticated(String),
+
     #[error("task not found: {0}")]
     TaskNotFound(String),
 
@@ -30,6 +33,7 @@ impl ApiError {
             ApiError::Core(solti_core::CoreError::InvalidSpec(_)) => "InvalidRequest",
             ApiError::PayloadTooLarge(_) => "PayloadTooLarge",
             ApiError::InvalidRequest(_) => "InvalidRequest",
+            ApiError::Unauthenticated(_) => "Unauthenticated",
             ApiError::TaskNotFound(_) => "TaskNotFound",
             ApiError::Internal(_) => "Internal",
             ApiError::Core(_) => "Internal",
@@ -43,6 +47,7 @@ impl From<ApiError> for tonic::Status {
         match err {
             ApiError::PayloadTooLarge(msg) => tonic::Status::resource_exhausted(msg),
             ApiError::InvalidRequest(msg) => tonic::Status::invalid_argument(msg),
+            ApiError::Unauthenticated(msg) => tonic::Status::unauthenticated(msg),
             ApiError::TaskNotFound(msg) => tonic::Status::not_found(msg),
             ApiError::Internal(msg) => tonic::Status::internal(msg),
             ApiError::Core(e) => core_to_status(e),
@@ -69,6 +74,7 @@ impl axum::response::IntoResponse for ApiError {
         let label = self.as_label();
         let (status, message) = match self {
             ApiError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            ApiError::Unauthenticated(msg) => (StatusCode::UNAUTHORIZED, msg),
             ApiError::TaskNotFound(msg) => (StatusCode::NOT_FOUND, msg),
             ApiError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
