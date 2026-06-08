@@ -32,6 +32,11 @@ pub use metrics::{
 };
 
 #[cfg(any(feature = "grpc", feature = "http"))]
+mod auth;
+#[cfg(any(feature = "grpc", feature = "http"))]
+pub use auth::Token;
+
+#[cfg(any(feature = "grpc", feature = "http"))]
 mod config;
 #[cfg(any(feature = "grpc", feature = "http"))]
 pub use config::{
