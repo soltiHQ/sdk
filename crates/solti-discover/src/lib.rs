@@ -32,6 +32,9 @@ pub use metrics::{
 };
 
 #[cfg(any(feature = "grpc", feature = "http"))]
+pub use solti_model::Token;
+
+#[cfg(any(feature = "grpc", feature = "http"))]
 mod config;
 #[cfg(any(feature = "grpc", feature = "http"))]
 pub use config::{

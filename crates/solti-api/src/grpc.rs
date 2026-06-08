@@ -7,10 +7,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio_stream::StreamExt;
+use tonic::service::Interceptor;
+use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
-use solti_model::TaskQuery;
+use solti_model::{TaskQuery, Token};
 
 use crate::convert::{output_event_to_proto, proto_to_domain_status, tasks_page_to_proto};
 use crate::error::ApiError;
@@ -99,6 +101,70 @@ where
     TaskServiceServer::new(TaskApiService::new_with_metrics(handler, metrics))
         .max_decoding_message_size(crate::MAX_REQUEST_BYTES)
         .max_encoding_message_size(crate::MAX_REQUEST_BYTES)
+}
+
+/// gRPC interceptor enforcing a bearer token on every call.
+///
+/// Verifies `authorization: Bearer <token>` metadata in constant time and rejects with `Unauthenticated` otherwise.
+///
+/// This is the same shared secret the agent presents to the control plane in discovery, one config value enables both directions.
+/// Orthogonal to TLS. Install via [`build_grpc_server_with_auth`] / [`build_grpc_server_with_metrics_auth`].
+#[derive(Clone)]
+pub struct BearerAuth {
+    expected: Token,
+}
+
+impl Interceptor for BearerAuth {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        let ok = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(bearer_value)
+            .map(|presented| self.expected.verify(presented))
+            .unwrap_or(false);
+
+        if ok {
+            Ok(request)
+        } else {
+            Err(Status::unauthenticated("missing or invalid bearer token"))
+        }
+    }
+}
+
+/// Extract the credential from an `authorization` value, accepting the scheme case-insensitively (`Bearer` / `bearer`).
+fn bearer_value(header: &str) -> Option<&str> {
+    header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))
+}
+
+/// Like [`build_grpc_server`] but enforcing a bearer token on every call.
+pub fn build_grpc_server_with_auth<H>(
+    handler: Arc<H>,
+    token: Token,
+) -> InterceptedService<TaskServiceServer<TaskApiService<H>>, BearerAuth>
+where
+    H: ApiHandler,
+{
+    build_grpc_server_with_metrics_auth(handler, noop_api_metrics(), token)
+}
+
+/// Like [`build_grpc_server_with_metrics`] but enforcing a bearer token.
+///
+/// Wraps the configured server (message-size limits preserved) in an [`InterceptedService`] that gates every call on the token.
+pub fn build_grpc_server_with_metrics_auth<H>(
+    handler: Arc<H>,
+    metrics: ApiMetricsHandle,
+    token: Token,
+) -> InterceptedService<TaskServiceServer<TaskApiService<H>>, BearerAuth>
+where
+    H: ApiHandler,
+{
+    InterceptedService::new(
+        build_grpc_server_with_metrics(handler, metrics),
+        BearerAuth { expected: token },
+    )
 }
 
 #[tonic::async_trait]

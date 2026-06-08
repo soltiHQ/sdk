@@ -84,6 +84,13 @@ pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError
 
     let base_request = build_base_request(&config);
 
+    if config.token.is_some() && !tls_enabled(&config) {
+        warn!(
+            "discovery: presenting a bearer token over a plaintext channel; \
+             enable TLS to protect the credential in transit"
+        );
+    }
+
     #[cfg(feature = "http")]
     let http_client = {
         #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
@@ -277,6 +284,19 @@ fn classify_failure(err: &DiscoverError) -> &'static str {
     }
 }
 
+/// Whether outbound TLS is configured.
+#[inline]
+fn tls_enabled(_config: &DiscoverConfig) -> bool {
+    #[cfg(feature = "tls")]
+    {
+        _config.tls.is_some()
+    }
+    #[cfg(not(feature = "tls"))]
+    {
+        false
+    }
+}
+
 async fn invoke_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
     match ctx.config.transport {
         #[cfg(feature = "grpc")]
@@ -345,7 +365,16 @@ async fn invoke_grpc_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
             .await?;
 
     let mut client = client.clone();
-    let request = tonic::Request::new(stamp_request(&ctx.base_request));
+    let mut request = tonic::Request::new(stamp_request(&ctx.base_request));
+    if let Some(token) = &ctx.config.token {
+        let value: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
+            format!("Bearer {}", token.expose()).parse().map_err(|_| {
+                DiscoverError::InvalidConfig(
+                    "token contains characters invalid for an Authorization header".into(),
+                )
+            })?;
+        request.metadata_mut().insert("authorization", value);
+    }
     match client.sync(request).await {
         Ok(response) => validate_response(response.into_inner()),
         Err(status) => match status.code() {
@@ -368,7 +397,11 @@ async fn invoke_http_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
         ctx.config.control_plane_endpoint,
         http_sync_path(ctx.config.api_version),
     );
-    let response = ctx.http_client.post(url).json(&request).send().await?;
+    let mut http_req = ctx.http_client.post(url).json(&request);
+    if let Some(token) = &ctx.config.token {
+        http_req = http_req.bearer_auth(token.expose());
+    }
+    let response = http_req.send().await?;
 
     let status = response.status();
     let body = read_body_bounded(response, MAX_RESPONSE_BODY_BYTES).await?;

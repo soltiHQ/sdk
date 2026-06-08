@@ -17,7 +17,9 @@ default = []
 [dependencies]
 base64    = { workspace = true }
 bytes     = { workspace = true }
+getrandom = { workspace = true }
 serde     = { workspace = true, features = ["rc"] }
+subtle    = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

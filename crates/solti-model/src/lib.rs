@@ -162,3 +162,6 @@ pub use resource::{ObjectMeta, Task, TaskRun, TaskSpec, TaskSpecBuilder, TaskSta
 
 mod error;
 pub use error::{ModelError, ModelResult};
+
+mod auth;
+pub use auth::Token;

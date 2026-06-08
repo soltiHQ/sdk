@@ -91,7 +91,10 @@ mod validate;
 mod grpc;
 
 #[cfg(feature = "grpc")]
-pub use grpc::{TaskApiService, build_grpc_server, build_grpc_server_with_metrics};
+pub use grpc::{
+    BearerAuth, TaskApiService, build_grpc_server, build_grpc_server_with_auth,
+    build_grpc_server_with_metrics, build_grpc_server_with_metrics_auth,
+};
 
 #[cfg(feature = "grpc")]
 pub use proto_api::task_service_server::TaskServiceServer;

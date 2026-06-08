@@ -86,30 +86,31 @@ Operators: `In`, `NotIn`, `Exists`, `DoesNotExist`.
 
 ## Key types
 
-| Type               | Description                                                    |
-|--------------------|----------------------------------------------------------------|
-| `Task`             | K8s-style aggregate: metadata + spec + status                  |
-| `TaskSpec`         | Desired state (private fields, build via builder)              |
-| `TaskSpecBuilder`  | Validated builder for `TaskSpec`                               |
-| `TaskStatus`       | Observed state: phase, attempt, exit code, error               |
-| `ObjectMeta`       | Identity, versioning, timestamps                               |
-| `TaskRun`          | Per-attempt execution record with start/finish times           |
-| `TaskPhase`        | Lifecycle phase enum (7 variants)                              |
-| `TaskKind`         | Execution backend: Subprocess, Wasm, Container, Embedded       |
-| `Slot`             | Logical execution lane (newtype over `Arc<str>`)               |
-| `TaskId`           | Unique task identifier (newtype over `Arc<str>`)               |
-| `AgentId`          | Agent identifier (newtype over `Arc<str>`)                     |
-| `Timeout`          | Per-attempt timeout in milliseconds                            |
-| `Labels`           | Key-value metadata for routing and filtering                   |
-| `TaskEnv`          | Ordered environment variables for task execution               |
-| `RunnerEnv`        | Ordered environment variables for runner injection             |
-| `Flag`             | Boolean toggle with `enabled()`/`disabled()` constructors      |
-| `RunnerSelector`   | Label selector for runner routing                              |
-| `TaskQuery`        | Builder for filtered, paginated task listing                   |
-| `TaskPage`         | Paginated query result                                         |
-| `OutputChunk`      | One stdout/stderr line from a task attempt                     |
-| `OutputEvent`      | Tagged enum: `Chunk` / `RunStarted` / `RunFinished` / `Lagged` |
-| `StreamKind`       | `Stdout` or `Stderr` discriminator carried by `OutputChunk`    |
+| Type               | Description                                                              |
+|--------------------|--------------------------------------------------------------------------|
+| `Task`             | K8s-style aggregate: metadata + spec + status                            |
+| `TaskSpec`         | Desired state (private fields, build via builder)                        |
+| `TaskSpecBuilder`  | Validated builder for `TaskSpec`                                         |
+| `TaskStatus`       | Observed state: phase, attempt, exit code, error                         |
+| `ObjectMeta`       | Identity, versioning, timestamps                                         |
+| `TaskRun`          | Per-attempt execution record with start/finish times                     |
+| `TaskPhase`        | Lifecycle phase enum (7 variants)                                        |
+| `TaskKind`         | Execution backend: Subprocess, Wasm, Container, Embedded                 |
+| `Slot`             | Logical execution lane (newtype over `Arc<str>`)                         |
+| `TaskId`           | Unique task identifier (newtype over `Arc<str>`)                         |
+| `AgentId`          | Agent identifier (newtype over `Arc<str>`)                               |
+| `Token`            | Shared agent↔CP bearer secret (redacted `Debug`, constant-time `verify`) |
+| `Timeout`          | Per-attempt timeout in milliseconds                                      |
+| `Labels`           | Key-value metadata for routing and filtering                             |
+| `TaskEnv`          | Ordered environment variables for task execution                         |
+| `RunnerEnv`        | Ordered environment variables for runner injection                       |
+| `Flag`             | Boolean toggle with `enabled()`/`disabled()` constructors                |
+| `RunnerSelector`   | Label selector for runner routing                                        |
+| `TaskQuery`        | Builder for filtered, paginated task listing                             |
+| `TaskPage`         | Paginated query result                                                   |
+| `OutputChunk`      | One stdout/stderr line from a task attempt                               |
+| `OutputEvent`      | Tagged enum: `Chunk` / `RunStarted` / `RunFinished` / `Lagged`           |
+| `StreamKind`       | `Stdout` or `Stderr` discriminator carried by `OutputChunk`              |
 
 ## Size limits
 
@@ -127,6 +128,21 @@ Exposed as `pub const` so downstream layers (API, CP, UI) share one source of tr
 `Slot`, `TaskId`, `AgentId` allow `[A-Za-z0-9._-]` only, reject `.` and `..`.
 No whitespace, no path separators, no non-ASCII: these values reach cgroup paths, tempfile names, `execve` argv, and log fields, where anything else misbehaves. 
 Validation runs at `TaskSpec::validate` / submit time.
+
+## Authentication
+
+`Token` is the shared bearer secret used in **both** directions of agent ⇄ control-plane communication:
+- agent → CP discovery: the agent presents it (`solti-discover`);
+- CP → agent API: the agent verifies inbound calls against it (`solti-api`).
+
+One secret per agent enables auth symmetrically from a single config value. 
+It rides in the transport (`Authorization: Bearer <token>` / gRPC `authorization` metadata), never in a message body. 
+`Debug` is redacted; `verify()` compares in constant time. 
+Orthogonal to TLS - both can be enabled independently.
+
+Construct via `Token::new` (literal), `Token::from_env` / `Token::from_file` (readers), or `Token::generate()` (fresh 256-bit OS-random, prefixed `solti_agt_`). 
+`generate()` performs **no** persistence - the SDK is a library and does not decide where the secret lives; the agent binary owns that (file, vault, k8s secret). 
+The zero-ops flow lives in the agent: "read from my store; if absent, `generate()` then persist".
 
 ## Versioning
 

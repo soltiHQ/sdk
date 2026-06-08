@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use solti_model::{AgentId, BackoffPolicy};
+use solti_model::{AgentId, BackoffPolicy, Token};
 
 #[cfg(any(feature = "grpc", feature = "http"))]
 use crate::proto::EndpointType;
@@ -67,11 +67,11 @@ pub struct DiscoverConfig {
     pub(crate) api_version: u32,
     pub(crate) metadata: HashMap<String, String>,
     pub(crate) capabilities: Vec<String>,
+    pub(crate) token: Option<Token>,
     pub(crate) backoff: Option<BackoffPolicy>,
     pub(crate) connect_timeout_ms: u64,
     pub(crate) request_timeout_ms: u64,
     pub(crate) metrics: DiscoverMetricsHandle,
-    /// Optional TLS / mTLS configuration. When `None`, plaintext.
     #[cfg(feature = "tls")]
     pub(crate) tls: Option<solti_tls::ClientTlsConfig>,
 }
@@ -97,6 +97,7 @@ impl DiscoverConfig {
             api_version,
             metadata: HashMap::new(),
             capabilities: Vec::new(),
+            token: None,
             backoff: None,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
@@ -119,6 +120,7 @@ pub struct DiscoverConfigBuilder {
     api_version: u32,
     metadata: HashMap<String, String>,
     capabilities: Vec<String>,
+    token: Option<Token>,
     backoff: Option<BackoffPolicy>,
     connect_timeout_ms: u64,
     request_timeout_ms: u64,
@@ -163,6 +165,16 @@ impl DiscoverConfigBuilder {
     /// Attach a metrics backend. When not set, a zero-cost no-op is used.
     pub fn with_metrics(mut self, metrics: DiscoverMetricsHandle) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    /// Attach a bearer token presented to the control plane on every sync.
+    ///
+    /// Transport-agnostic:
+    ///  - HTTP sends it as `Authorization: Bearer <token>`,
+    ///  - gRPC sends the same value as `authorization` metadata.
+    pub fn with_token(mut self, token: Token) -> Self {
+        self.token = Some(token);
         self
     }
 
@@ -216,6 +228,13 @@ impl DiscoverConfigBuilder {
                 "request_timeout_ms must be > 0".into(),
             ));
         }
+        if let Some(token) = &self.token
+            && token.is_empty()
+        {
+            return Err(DiscoverError::InvalidConfig(
+                "token must not be empty".into(),
+            ));
+        }
 
         let control_plane_endpoint = self
             .control_plane_endpoint
@@ -232,6 +251,7 @@ impl DiscoverConfigBuilder {
             api_version: self.api_version,
             metadata: self.metadata,
             capabilities: self.capabilities,
+            token: self.token,
             backoff: self.backoff,
             connect_timeout_ms: self.connect_timeout_ms,
             request_timeout_ms: self.request_timeout_ms,

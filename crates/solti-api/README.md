@@ -67,16 +67,18 @@ Per-version API surface is documented in separate files: [api_v1.md](api_v1.md).
 | `ApiError`             | Unified error mapped to gRPC Status / HTTP JSON                                  |
 | `SoltiApiService<H>`   | gRPC server impl (feature `grpc`)                                                |
 | `HttpApi<H>`           | axum router builder (feature `http`)                                             |
+| `BearerAuth`           | gRPC interceptor verifying the inbound bearer token (feature `grpc`)             |
 | `API_VERSION`          | Protocol version constant reported via discover                                  |
 
 ## Error model
 
-| Variant          | gRPC Status                      | HTTP Status                 | `error` label (HTTP body)                  |
-|------------------|----------------------------------|-----------------------------|--------------------------------------------|
-| `InvalidRequest` | `INVALID_ARGUMENT`               | `400 Bad Request`           | `"InvalidRequest"`                         |
-| `TaskNotFound`   | `NOT_FOUND`                      | `404 Not Found`             | `"TaskNotFound"`                           |
-| `Internal`       | `INTERNAL`                       | `500 Internal Server Error` | `"Internal"`                               |
-| `Core`           | derived from inner `CoreError`   | derived from inner          | flattened to `InvalidRequest` / `Internal` |
+| Variant           | gRPC Status                      | HTTP Status                 | `error` label (HTTP body)                  |
+|-------------------|----------------------------------|-----------------------------|--------------------------------------------|
+| `InvalidRequest`  | `INVALID_ARGUMENT`               | `400 Bad Request`           | `"InvalidRequest"`                         |
+| `Unauthenticated` | `UNAUTHENTICATED`                | `401 Unauthorized`          | `"Unauthenticated"`                        |
+| `TaskNotFound`    | `NOT_FOUND`                      | `404 Not Found`             | `"TaskNotFound"`                           |
+| `Internal`        | `INTERNAL`                       | `500 Internal Server Error` | `"Internal"`                               |
+| `Core`            | derived from inner `CoreError`   | derived from inner          | flattened to `InvalidRequest` / `Internal` |
 
 `Core` is split by the wrapped [`solti_core::CoreError`]: `InvalidSpec` → `INVALID_ARGUMENT` / `400` / `"InvalidRequest"`; everything else → `INTERNAL` / `500` / `"Internal"`.
 
@@ -124,6 +126,38 @@ tonic::transport::Server::builder()
 For HTTP, terminate TLS in your binary via `axum-server` using the `rustls::ServerConfig` produced by `solti_tls::ServerTlsConfig::into_rustls_config()`.
 See the `solti-tls` README for the full pattern.
 
+### Enabling token auth
+
+Require a bearer token on every inbound call. 
+The token is the same shared secret the agent presents to the control plane in discovery (`solti_model::Token`), one config value gates both directions. 
+Orthogonal to TLS; comparison is constant-time; a missing/invalid token is rejected with `401` (HTTP) / `Unauthenticated` (gRPC) before reaching any handler.
+
+HTTP:
+
+```rust
+use solti_api::HttpApi;
+use solti_model::Token;
+
+let router = HttpApi::new(adapter)
+    .with_auth(Token::from_env("SOLTI_AGENT_TOKEN")?)
+    .router();
+```
+
+gRPC:
+
+```rust
+use solti_api::build_grpc_server_with_auth;
+use solti_model::Token;
+
+let svc = build_grpc_server_with_auth(adapter, Token::from_env("SOLTI_AGENT_TOKEN")?);
+tonic::transport::Server::builder()
+    .add_service(svc)
+    .serve("0.0.0.0:50051".parse()?)
+    .await?;
+```
+
+When no token is configured (plain `HttpApi::new(...).router()` / `build_grpc_server(...)`), no auth is enforced.
+
 ## Build
 
 `build.rs` walks `proto/` recursively, collecting every `*.proto` file (emitting `rerun-if-changed` for each). Two codegen passes:
@@ -131,7 +165,7 @@ See the `solti-tls` README for the full pattern.
 - `pbjson_build` under `http`: attaches canonical proto-JSON `Serialize`/`Deserialize` to the same message types, with `.emit_fields()` enabled so REST clients see `0` / `false` / `""` / `[]` / `{}` for default scalar/repeated/map values (optional `message` fields still omit on `None`).
 
 The proto package selector lives at the top of `build.rs` as `const PROTO_PACKAGE = ".solti.v1";`. 
-If the `package` declaration in a `.proto` changes, update this constant — otherwise pbjson generates nothing and HTTP compile fails. 
+If the `package` declaration in a `.proto` changes, update this constant - otherwise pbjson generates nothing and HTTP compile fails. 
 Adding new `.proto` files anywhere under `proto/` requires **no** changes to `build.rs`.
 
 ## Notes

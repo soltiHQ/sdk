@@ -31,7 +31,7 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use serde::{Deserialize, de::DeserializeOwned};
-use solti_model::{OutputEvent, TaskId, TaskPhase, TaskQuery};
+use solti_model::{OutputEvent, TaskId, TaskPhase, TaskQuery, Token};
 use tokio_stream::StreamExt;
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::debug;
@@ -106,6 +106,7 @@ async fn map_413_envelope(req: Request, next: Next) -> Response {
 /// - [`ApiError`](crate::ApiError) mapped to JSON + HTTP status codes.
 pub struct HttpApi<H> {
     handler: Arc<H>,
+    auth: Option<Token>,
 }
 
 impl<H> HttpApi<H>
@@ -114,14 +115,28 @@ where
 {
     /// Create new HTTP API with the given handler.
     pub fn new(handler: Arc<H>) -> Self {
-        Self { handler }
+        Self {
+            handler,
+            auth: None,
+        }
+    }
+
+    /// Require a bearer token on every request.
+    ///
+    /// When set, requests without a valid `Authorization: Bearer <token>` header are rejected with `401 Unauthorized` before reaching any handler .
+    /// This is the same shared secret the agent presents to the control plane in discovery, one config value enables both directions.
+    /// Orthogonal to TLS. When unset, no auth is enforced.
+    pub fn with_auth(mut self, token: Token) -> Self {
+        self.auth = Some(token);
+        self
     }
 
     /// Build axum router with mounted endpoints.
     ///
-    /// Applies a [`RequestBodyLimitLayer`] capped at [`MAX_REQUEST_BYTES`] bytes to every request.
+    /// Applies a [`RequestBodyLimitLayer`] capped at [`MAX_REQUEST_BYTES`] bytes to every request,
+    /// and when [`with_auth`](Self::with_auth) is set a bearer-token gate that runs before any handler.
     pub fn router(self) -> Router {
-        Router::new()
+        let mut router = Router::new()
             .route(api_url!("/tasks"), post(submit_task::<H>))
             .route(api_url!("/tasks"), put(apply_task::<H>))
             .route(api_url!("/tasks"), get(list_tasks::<H>))
@@ -130,9 +145,40 @@ where
             .route(api_url!("/tasks/{id}/runs"), get(list_task_runs::<H>))
             .route(api_url!("/tasks/{id}/logs"), get(stream_task_logs::<H>))
             .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
-            .layer(middleware::from_fn(map_413_envelope))
-            .with_state(self.handler)
+            .layer(middleware::from_fn(map_413_envelope));
+
+        // Added last → outermost → runs first: reject unauthenticated requests before any work happens.
+        if let Some(token) = self.auth {
+            router = router.layer(middleware::from_fn_with_state(token, require_bearer));
+        }
+
+        router.with_state(self.handler)
     }
+}
+
+/// Axum middleware: reject requests lacking a valid `Authorization: Bearer` token.
+/// Installed only when [`HttpApi::with_auth`] is set.
+async fn require_bearer(State(expected): State<Token>, req: Request, next: Next) -> Response {
+    let ok = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(bearer_value)
+        .map(|presented| expected.verify(presented))
+        .unwrap_or(false);
+
+    if ok {
+        next.run(req).await
+    } else {
+        ApiError::Unauthenticated("missing or invalid bearer token".into()).into_response()
+    }
+}
+
+/// Extract the credential from an `Authorization` header value, accepting the scheme case-insensitively (`Bearer` / `bearer`).
+fn bearer_value(header: &str) -> Option<&str> {
+    header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))
 }
 
 #[derive(Debug, Deserialize)]

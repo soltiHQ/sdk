@@ -1,91 +1,54 @@
-//! Reference Solti agent - HTTP/JSON transport.
+//! Reference Solti agent — HTTP/JSON transport.
 //!
-//! A minimal task-execution agent: accepts `TaskSpec` submissions over `/api/v1/tasks`,
-//! runs them as subprocesses, reports status back via the same REST surface.
+//! Accepts `TaskSpec` submissions over `/api/v1/tasks`, runs them as subprocesses,
+//! reports status back over the same REST surface, exposes Prometheus metrics on
+//! `:9090`, and heartbeats to a [Podium](https://github.com/soltiHQ/podium)
+//! control plane. Running without a reachable CP is fine — the heartbeat retries
+//! with backoff while the local API keeps serving.
 //!
-//! Optionally heartbeats to a [Podium](https://github.com/soltiHQ/podium) control-plane so the CP can push specs and collect state remotely.
+//! ## Run modes
+//!
+//! Authentication and TLS are **independent**, each selected by environment
+//! variables — giving the four combinations:
 //!
 //! ```bash
+//! # 1) no auth, no TLS (plain dev)
 //! cargo run -p agentd-http
+//!
+//! # 2) auth only — bearer token, both directions
+//! SOLTI_AGENT_TOKEN=s3cret cargo run -p agentd-http
+//!
+//! # 3) TLS only — serve the API over TLS, dial the CP over TLS
+//! SOLTI_TLS_CERT=server.crt SOLTI_TLS_KEY=server.key SOLTI_CP_CA=ca.crt \
+//!   cargo run -p agentd-http
+//!
+//! # 4) auth + TLS
+//! SOLTI_AGENT_TOKEN=s3cret SOLTI_TLS_CERT=server.crt SOLTI_TLS_KEY=server.key \
+//!   SOLTI_CP_CA=ca.crt cargo run -p agentd-http
 //! ```
 //!
-//! Defaults:
-//! - API       - `http://localhost:8085/api/v1/tasks`
-//! - Metrics   - `http://localhost:9090/metrics`
-//! - Heartbeat - `http://localhost:8082` (Podium HTTP discovery)
-//! - Override the CP endpoint via `CONTROL_PLANE=http://host:port`.
+//! Environment:
+//! - `SOLTI_AGENT_TOKEN` — bearer token; presented to the CP in discovery and
+//!   required on this agent's API. Unset → no authentication.
+//! - `SOLTI_TLS_CERT` + `SOLTI_TLS_KEY` — serve the API over TLS.
+//!   `SOLTI_TLS_CLIENT_CA` (optional) requires client certificates (mTLS).
+//! - `SOLTI_CP_CA` — CA that signs the control plane's cert (dial the CP over TLS).
+//!   `SOLTI_CP_CLIENT_CERT` + `SOLTI_CP_CLIENT_KEY` (optional) present a client cert (mTLS).
+//! - `CONTROL_PLANE` — CP discovery endpoint (default `http://localhost:8082`).
 //!
-//! Running without a reachable Podium is fine:
-//! the heartbeat task retries with backoff, the local API keeps accepting submissions.
-//!
-//! ## Observability
-//!
-//! A dedicated HTTP server runs **under supervisor control** (embedded task with restart-on-failure + backoff)
-//! and exposes Prometheus metrics at `/metrics` on port `9090`.
-//!
-//! ```bash
-//! curl http://localhost:9090/metrics
-//! ```
-//!
-//! Metric families:
-//! - `solti_runner_*` - runner-level (tasks started/completed, duration histogram, errors).
-//! - `solti_sv_*`     - supervision-level (in-flight gauge, restarts, backoff, terminal states, timeouts).
-//! - `solti_ctrl_*`   - controller-level (submissions, rejections).
-//!
-//! See [`solti-prometheus`](../../../crates/solti-prometheus) for the full metric list.
-//!
-//! ## Talking to the agent
-//!
-//! ```bash
-//! # Submit a one-shot subprocess task
-//! curl -X POST http://localhost:8085/api/v1/tasks \
-//!   -H "Content-Type: application/json" \
-//!   -d '{"spec": {"slot":"hello","kind":{"subprocess":{"mode":{"command":{"command":"echo","args":["hi"]}}}},"timeout":5000,"restart":"never","backoff":{"jitter":"equal","firstMs":1000,"maxMs":5000,"factor":2.0},"admission":"dropIfRunning"}}'
-//!
-//! # List tasks / get one / list runs / delete
-//! curl http://localhost:8085/api/v1/tasks
-//! curl http://localhost:8085/api/v1/tasks/{id}
-//! curl http://localhost:8085/api/v1/tasks/{id}/runs
-//! curl -X DELETE http://localhost:8085/api/v1/tasks/{id}
-//!
-//! # Live-tail stdout/stderr (Server-Sent Events; -N disables buffering)
-//! # One subscription covers all retries of the task with run boundary markers.
-//! curl -N http://localhost:8085/api/v1/tasks/{id}/logs
-//! ```
-//!
-//! Full endpoint reference: [`api_v1.md`](../../../crates/solti-api/api_v1.md).
-//! Error envelope, size limits, status codes — all described there.
-//!
-//! ## Task flow
-//!
-//! ```text
-//!   Client ── submit TaskSpec ─▶ API
-//!                                 ▼
-//!                             Supervisor ── owns lifecycle, restart / backoff
-//!                                 │
-//!                                 │ dispatch by kind + label selectors
-//!                                 ▼
-//!                             RunnerRouter
-//!                                 │
-//!                                 ▼
-//!                             Runner  (subprocess, wasm, …)
-//!                                 │
-//!                                 │ lifecycle events
-//!                                 ▼
-//!                             Subscribers (logs, metrics)
-//!
-//!   Client ◀── status / runs ── API
-//! ```
+//! Talking to the agent and the full endpoint reference live in
+//! [`api_v1.md`](../../../crates/solti-api/api_v1.md).
 
 use std::sync::Arc;
 
+use axum_server::tls_rustls::RustlsConfig;
 use tracing::info;
 
 use solti_api::{API_VERSION, HttpApi, SupervisorApiAdapter, http_metrics_middleware};
 use solti_core::{StateConfig, SupervisorApi};
 use solti_discover::{DiscoverConfig, DiscoveryTransport};
 use solti_exec::subprocess::register_subprocess_runner;
-use solti_model::{AgentId, RunnerEnv};
+use solti_model::{AgentId, RunnerEnv, Token};
 use solti_observe::{
     LoggerConfig, LoggerLevel, LoggerTimeZone, TracingEventSubscriber, init_local_offset,
     init_logger, timezone_sync,
@@ -96,6 +59,7 @@ use solti_prometheus::{
     server as metrics_server,
 };
 use solti_runner::{BuildContext, OutputRegistry, RunnerRouter};
+use solti_tls::{ClientTlsConfig, ServerTlsConfig};
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
 const ADDR: &str = "0.0.0.0:8085";
@@ -135,7 +99,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut router = RunnerRouter::new().with_context(ctx);
     register_subprocess_runner(&mut router, "default")?;
 
-    // Supervisor: owns every task, applies restart / backoff, fans lifecycle events to subscribers.
+    // Supervisor: owns every task, applies restart / backoff, fans events to subscribers.
     let subscribers: Vec<Arc<dyn Subscribe>> =
         vec![Arc::new(TracingEventSubscriber), Arc::new(prom_subscriber)];
     let supervisor = SupervisorApi::new_with_output_registry(
@@ -148,7 +112,6 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    // Pull-based collector: snapshots supervisor state on each /metrics scrape.
     let state_collector = PrometheusStateCollector::new(supervisor.state())?;
     registry.register(Box::new(state_collector))?;
 
@@ -159,10 +122,16 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let (m_task, m_spec) = metrics_server(registry.clone(), METRICS_ADDR);
     supervisor.submit_with_task(m_task, &m_spec).await?;
 
+    // --- Optional auth & TLS, selected by the environment ---
+    let token = std::env::var("SOLTI_AGENT_TOKEN").ok().map(Token::new);
+    let server_tls = server_tls_from_env()?; // agent API server TLS (CP → agent)
+    let client_tls = client_tls_from_env()?; // discovery client TLS (agent → CP)
+
+    // --- Discovery: agent → control plane ---
     let control_plane =
         std::env::var("CONTROL_PLANE").unwrap_or_else(|_| CONTROL_PLANE_DEFAULT.to_string());
     let discover_metrics = Arc::new(PrometheusDiscoverMetrics::new(registry.clone())?);
-    let discover_config = DiscoverConfig::builder(
+    let mut discover = DiscoverConfig::builder(
         AgentId::new("agentd-http-001"),
         "agentd-http",
         format!("http://{ADDR}"),
@@ -171,24 +140,88 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         10_000,
         API_VERSION,
     )
-    .with_metrics(discover_metrics)
-    .build()?;
-    let (sync_task, sync_spec) = solti_discover::sync(discover_config)?;
+    .with_metrics(discover_metrics);
+    if let Some(t) = &token {
+        discover = discover.with_token(t.clone());
+    }
+    if let Some(tls) = client_tls {
+        discover = discover.with_tls(tls);
+    }
+    let (sync_task, sync_spec) = solti_discover::sync(discover.build()?)?;
     supervisor.submit_with_task(sync_task, &sync_spec).await?;
 
-    // API: client entry point. External TaskSpecs arrive here and flow into the supervisor.
+    // --- API: control plane → agent ---
     let api_metrics: Arc<dyn solti_api::ApiMetricsBackend> =
         Arc::new(PrometheusApiMetrics::new(registry.clone())?);
     let handler = Arc::new(SupervisorApiAdapter::new(Arc::new(supervisor)));
-    let app = HttpApi::new(handler)
-        .router()
-        .layer(axum::middleware::from_fn_with_state(
-            api_metrics,
-            http_metrics_middleware,
-        ));
 
-    let listener = tokio::net::TcpListener::bind(ADDR).await?;
-    info!("HTTP http://{ADDR}  →  heartbeat {control_plane}");
-    axum::serve(listener, app).await?;
+    let mut api = HttpApi::new(handler);
+    if let Some(t) = token {
+        api = api.with_auth(t);
+    }
+    let app = api.router().layer(axum::middleware::from_fn_with_state(
+        api_metrics,
+        http_metrics_middleware,
+    ));
+
+    let scheme = if server_tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    info!("{scheme} {ADDR}  →  heartbeat {control_plane}");
+
+    match server_tls {
+        Some(tls) => {
+            let rustls = Arc::new(tls.into_rustls_config()?);
+            axum_server::bind_rustls(ADDR.parse()?, RustlsConfig::from_config(rustls))
+                .serve(app.into_make_service())
+                .await?;
+        }
+        None => {
+            let listener = tokio::net::TcpListener::bind(ADDR).await?;
+            axum::serve(listener, app).await?;
+        }
+    }
     Ok(())
+}
+
+/// Reads a non-empty environment variable as a path.
+fn env_path(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.is_empty())
+}
+
+/// Agent API server TLS (the control plane connects to this).
+///
+/// Enabled when `SOLTI_TLS_CERT` and `SOLTI_TLS_KEY` are both set;
+/// `SOLTI_TLS_CLIENT_CA` (optional) turns on mTLS (require a client cert).
+fn server_tls_from_env() -> Result<Option<ServerTlsConfig>, Box<dyn std::error::Error>> {
+    let (Some(cert), Some(key)) = (env_path("SOLTI_TLS_CERT"), env_path("SOLTI_TLS_KEY")) else {
+        return Ok(None);
+    };
+    let mut b = ServerTlsConfig::builder()
+        .cert_pem_file(cert)
+        .key_pem_file(key);
+    if let Some(ca) = env_path("SOLTI_TLS_CLIENT_CA") {
+        b = b.require_client_ca_pem_file(ca);
+    }
+    Ok(Some(b.build()?))
+}
+
+/// Discovery client TLS (the agent dials the control plane over TLS).
+///
+/// Enabled when `SOLTI_CP_CA` is set; `SOLTI_CP_CLIENT_CERT` + `SOLTI_CP_CLIENT_KEY`
+/// (optional) present a client cert for mTLS.
+fn client_tls_from_env() -> Result<Option<ClientTlsConfig>, Box<dyn std::error::Error>> {
+    let Some(ca) = env_path("SOLTI_CP_CA") else {
+        return Ok(None);
+    };
+    let mut b = ClientTlsConfig::builder().ca_pem_file(ca);
+    if let (Some(cert), Some(key)) = (
+        env_path("SOLTI_CP_CLIENT_CERT"),
+        env_path("SOLTI_CP_CLIENT_KEY"),
+    ) {
+        b = b.client_cert_pem_file(cert).client_key_pem_file(key);
+    }
+    Ok(Some(b.build()?))
 }
