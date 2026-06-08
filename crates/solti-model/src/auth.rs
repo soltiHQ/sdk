@@ -39,8 +39,9 @@ impl Token {
     /// Returns [`ModelError::Invalid`] if the file cannot be read or is empty.
     pub fn from_file(path: impl AsRef<Path>) -> ModelResult<Self> {
         let path = path.as_ref();
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| ModelError::Invalid(format!("read token file `{}`: {e}", path.display()).into()))?;
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            ModelError::Invalid(format!("read token file `{}`: {e}", path.display()).into())
+        })?;
         Self::checked(raw)
     }
 
