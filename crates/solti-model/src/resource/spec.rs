@@ -133,6 +133,15 @@ impl TaskSpec {
         self.runner_selector = Some(sel);
         self
     }
+
+    /// Override the admission policy (consuming builder-style).
+    ///
+    /// Used by the apply/upgrade path to force [`AdmissionPolicy::Replace`] regardless of the spec's declared admission.
+    #[inline]
+    pub fn with_admission(mut self, admission: AdmissionPolicy) -> Self {
+        self.admission = admission;
+        self
+    }
 }
 
 impl TaskSpec {
@@ -399,6 +408,12 @@ mod tests {
         assert_eq!(spec.slot(), "my-slot");
         assert_eq!(spec.timeout().as_millis(), 10_000);
         assert_eq!(spec.restart(), RestartPolicy::OnFailure);
+        assert_eq!(spec.admission(), AdmissionPolicy::Replace);
+    }
+
+    #[test]
+    fn with_admission_overrides_policy() {
+        let spec = valid_spec().with_admission(AdmissionPolicy::Replace);
         assert_eq!(spec.admission(), AdmissionPolicy::Replace);
     }
 

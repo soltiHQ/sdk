@@ -6,7 +6,9 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use solti_model::{OutputEvent, Task, TaskId, TaskPage, TaskQuery, TaskRun, TaskSpec};
+use solti_model::{
+    AdmissionPolicy, OutputEvent, Task, TaskId, TaskPage, TaskQuery, TaskRun, TaskSpec,
+};
 use tokio_stream::Stream;
 
 use crate::error::ApiError;
@@ -30,6 +32,7 @@ pub type OutputEventStream = Pin<Box<dyn Stream<Item = OutputEvent> + Send + 'st
 /// | Method             | HTTP                              | gRPC                |
 /// |--------------------|-----------------------------------|---------------------|
 /// | `submit_task`      | `POST   /api/v1/tasks`            | `SubmitTask`        |
+/// | `apply_task`       | `PUT    /api/v1/tasks`            | `ApplyTask`         |
 /// | `get_task_status`  | `GET    /api/v1/tasks/{id}`       | `GetTaskStatus`     |
 /// | `query_tasks`      | `GET    /api/v1/tasks`            | `ListTasks`         |
 /// | `list_task_runs`   | `GET    /api/v1/tasks/{id}/runs`  | `ListTaskRuns`      |
@@ -39,6 +42,13 @@ pub type OutputEventStream = Pin<Box<dyn Stream<Item = OutputEvent> + Send + 'st
 pub trait ApiHandler: Send + Sync + 'static {
     /// Submit a new task for execution.
     async fn submit_task(&self, spec: TaskSpec) -> Result<TaskId, ApiError>;
+
+    /// Apply a spec to its slot.
+    /// Returns the id of the task running in the slot after apply.
+    async fn apply_task(&self, spec: TaskSpec) -> Result<TaskId, ApiError> {
+        self.submit_task(spec.with_admission(AdmissionPolicy::Replace))
+            .await
+    }
 
     /// Get current status of a task by ID.
     async fn get_task_status(&self, id: &TaskId) -> Result<Option<Task>, ApiError>;
