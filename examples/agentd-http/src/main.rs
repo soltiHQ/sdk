@@ -84,7 +84,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     register_process_collector(&registry)?;
     register_build_info(
         &registry,
-        &[("agent", "agentd-http"), ("version", env!("CARGO_PKG_VERSION"))],
+        &[
+            ("agent", "agentd-http"),
+            ("version", env!("CARGO_PKG_VERSION")),
+        ],
     )?;
 
     // Output registry: live-tail broadcast channels per task.
@@ -161,7 +164,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         http_metrics_middleware,
     ));
 
-    let scheme = if server_tls.is_some() { "https" } else { "http" };
+    let scheme = if server_tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     info!("{scheme} {ADDR}  →  heartbeat {control_plane}");
 
     match server_tls {
@@ -192,7 +199,9 @@ fn server_tls_from_env() -> Result<Option<ServerTlsConfig>, Box<dyn std::error::
     let (Some(cert), Some(key)) = (env_path("SOLTI_TLS_CERT"), env_path("SOLTI_TLS_KEY")) else {
         return Ok(None);
     };
-    let mut b = ServerTlsConfig::builder().cert_pem_file(cert).key_pem_file(key);
+    let mut b = ServerTlsConfig::builder()
+        .cert_pem_file(cert)
+        .key_pem_file(key);
     if let Some(ca) = env_path("SOLTI_TLS_CLIENT_CA") {
         b = b.require_client_ca_pem_file(ca);
     }
@@ -208,9 +217,10 @@ fn client_tls_from_env() -> Result<Option<ClientTlsConfig>, Box<dyn std::error::
         return Ok(None);
     };
     let mut b = ClientTlsConfig::builder().ca_pem_file(ca);
-    if let (Some(cert), Some(key)) =
-        (env_path("SOLTI_CP_CLIENT_CERT"), env_path("SOLTI_CP_CLIENT_KEY"))
-    {
+    if let (Some(cert), Some(key)) = (
+        env_path("SOLTI_CP_CLIENT_CERT"),
+        env_path("SOLTI_CP_CLIENT_KEY"),
+    ) {
         b = b.client_cert_pem_file(cert).client_key_pem_file(key);
     }
     Ok(Some(b.build()?))
