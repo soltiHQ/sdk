@@ -138,8 +138,11 @@ Validation runs at `TaskSpec::validate` / submit time.
 One secret per agent enables auth symmetrically from a single config value. 
 It rides in the transport (`Authorization: Bearer <token>` / gRPC `authorization` metadata), never in a message body. 
 `Debug` is redacted; `verify()` compares in constant time. 
-Construct via `Token::new` / `Token::from_env` / `Token::from_file`. 
 Orthogonal to TLS - both can be enabled independently.
+
+Construct via `Token::new` (literal), `Token::from_env` / `Token::from_file` (readers), or `Token::generate()` (fresh 256-bit OS-random, prefixed `solti_agt_`). 
+`generate()` performs **no** persistence - the SDK is a library and does not decide where the secret lives; the agent binary owns that (file, vault, k8s secret). 
+The zero-ops flow lives in the agent: "read from my store; if absent, `generate()` then persist".
 
 ## Versioning
 

@@ -9,9 +9,18 @@
 use std::fmt;
 use std::path::Path;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use subtle::ConstantTimeEq;
 
 use crate::error::{ModelError, ModelResult};
+
+/// Prefix on generated tokens:
+/// aids secret-scanners and log redaction, and makes an auto-generated token visually distinguishable from a user-supplied one.
+const GENERATED_PREFIX: &str = "solti_agt_";
+
+/// Entropy of a generated token, in bytes (256 bits).
+const GENERATED_ENTROPY_BYTES: usize = 32;
 
 /// A bearer token shared between an agent and the control plane.
 #[derive(Clone)]
@@ -23,6 +32,16 @@ impl Token {
     /// Prefer [`Token::from_env`] / [`Token::from_file`] in production so the secret is not baked into the binary or argv.
     pub fn new(token: impl Into<String>) -> Self {
         Self(token.into().trim().to_string())
+    }
+
+    /// Generate a fresh random token (256 bits of OS entropy, base64url-encoded, prefixed `solti_agt_`).
+    ///
+    /// This is a pure value: it performs **no** persistence.
+    /// The SDK is a library and does not decide *where* the secret lives: the agent binary owns that (file, vault, k8s secret, …).
+    pub fn generate() -> Self {
+        let mut buf = [0u8; GENERATED_ENTROPY_BYTES];
+        getrandom::fill(&mut buf).expect("getrandom: OS entropy source unavailable");
+        Self(format!("{GENERATED_PREFIX}{}", URL_SAFE_NO_PAD.encode(buf)))
     }
 
     /// Read the token from an environment variable.
@@ -108,5 +127,16 @@ mod tests {
         let t = Token::new("super-secret");
         assert_eq!(format!("{t:?}"), "Token(***redacted***)");
         assert!(!format!("{t:?}").contains("super-secret"));
+    }
+
+    #[test]
+    fn generate_is_prefixed_unique_and_self_verifying() {
+        let a = Token::generate();
+        let b = Token::generate();
+        assert!(a.expose().starts_with("solti_agt_"));
+        assert_ne!(a.expose(), b.expose(), "two generated tokens must differ");
+        assert!(a.verify(a.expose()));
+        assert!(!a.verify(b.expose()));
+        assert_eq!(a.expose().len(), "solti_agt_".len() + 43);
     }
 }
