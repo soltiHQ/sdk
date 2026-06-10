@@ -151,7 +151,7 @@ impl SupervisorApi {
 
         let was_cancelled = self
             .handle
-            .cancel(id.as_str())
+            .cancel_by_label(id.as_str())
             .await
             .map_err(|e| CoreError::Supervisor(format!("cancel failed: {}", e)))?;
 
@@ -259,7 +259,7 @@ impl SupervisorApi {
 
         let was_cancelled = self
             .handle
-            .cancel(id.as_str())
+            .cancel_by_label(id.as_str())
             .await
             .map_err(|e| CoreError::Supervisor(format!("cancel failed: {}", e)))?;
 

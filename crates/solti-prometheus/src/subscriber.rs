@@ -273,6 +273,7 @@ impl Subscribe for PrometheusSubscriber {
                     .inc();
             }
             EventKind::TaskAdded
+            | EventKind::TaskAddFailed
             | EventKind::TaskRemoved
             | EventKind::TaskAddRequested
             | EventKind::TaskRemoveRequested
@@ -280,6 +281,9 @@ impl Subscribe for PrometheusSubscriber {
             | EventKind::AllStoppedWithinGrace
             | EventKind::GraceExceeded
             | EventKind::ControllerSlotTransition => {}
+
+            // `EventKind` is #[non_exhaustive]: ignore variants added in future taskvisor releases.
+            _ => {}
         }
     }
 

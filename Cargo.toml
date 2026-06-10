@@ -89,3 +89,8 @@ solti-api        = { path = "crates/solti-api",        version = "0.0.2" }
 solti-discover   = { path = "crates/solti-discover",   version = "0.0.2" }
 solti-observe    = { path = "crates/solti-observe",    version = "0.0.2" }
 solti-prometheus = { path = "crates/solti-prometheus", version = "0.0.2" }
+
+# TEMP (local dev): build against the unpublished taskvisor in the sibling repo.
+# Remove / replace with the published version once taskvisor's TaskId API is released.
+[patch.crates-io]
+taskvisor = { path = "../taskvisor" }
