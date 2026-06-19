@@ -1,4 +1,4 @@
-//! PEM cert/key parsing helpers.
+//! # PEM → DER parsing helpers.
 
 use std::io::BufRead;
 
@@ -6,7 +6,23 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::TlsError;
 
-/// Parse all `CERTIFICATE` sections out of a PEM-encoded byte stream.
+/// Parse **all** `CERTIFICATE` blocks out of a PEM byte stream, in file order (leaf-first by convention for a chain).
+///
+/// Errors with [`TlsError::NoCertificates`] if the stream holds no certificate blocks.
+///
+/// ## Also
+///
+/// - [`PemSource::read`](crate::PemSource::read) - produces the bytes fed here.
+/// - [`load_key_from_pem`] - the private-key counterpart.
+///
+/// ## Example
+///
+/// ```
+/// use solti_tls::{load_certs_from_pem, TlsError};
+///
+/// let err = load_certs_from_pem(&b"not a pem"[..]).unwrap_err();
+/// assert!(matches!(err, TlsError::NoCertificates));
+/// ```
 pub fn load_certs_from_pem<R: BufRead>(
     reader: R,
 ) -> Result<Vec<CertificateDer<'static>>, TlsError> {
@@ -20,7 +36,16 @@ pub fn load_certs_from_pem<R: BufRead>(
     Ok(certs)
 }
 
-/// Parse the first private key (`PKCS#8`, `PKCS#1`, or `SEC1`) out of a PEM-encoded byte stream.
+/// Parse the **first** private key (`PKCS#8`, `PKCS#1`, or `SEC1`) out of a PEM byte stream.
+///
+/// If the stream contains more than one key, only the first is returned and the rest are **silently ignored**.
+/// Pass a PEM that holds exactly the intended key.
+///
+/// Errors with [`TlsError::NoPrivateKey`] if no key is present.
+///
+/// ## Also
+///
+/// - [`load_certs_from_pem`] — the certificate counterpart (which, unlike this function, returns *all* blocks).
 pub fn load_key_from_pem<R: BufRead>(reader: R) -> Result<PrivateKeyDer<'static>, TlsError> {
     let mut reader = reader;
     let key = rustls_pemfile::private_key(&mut reader)?;

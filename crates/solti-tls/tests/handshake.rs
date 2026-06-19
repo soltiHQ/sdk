@@ -146,6 +146,84 @@ async fn mtls_round_trip_via_solti_configs() {
 }
 
 #[tokio::test]
+async fn client_rejects_server_cert_from_untrusted_ca() {
+    let server_pki = make_pki();
+    let other_pki = make_pki();
+
+    let server_cfg = ServerTlsConfig::builder()
+        .cert_pem_bytes(server_pki.server_cert_pem)
+        .key_pem_bytes(server_pki.server_key_pem)
+        .build()
+        .unwrap()
+        .into_rustls_config()
+        .unwrap();
+
+    let client_cfg = ClientTlsConfig::builder()
+        .ca_pem_bytes(other_pki.ca_cert_pem)
+        .build()
+        .unwrap()
+        .into_rustls_config()
+        .unwrap();
+
+    let port = run_echo_server(server_cfg).await;
+    let connector = TlsConnector::from(Arc::new(client_cfg));
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let server_name = ServerName::try_from("127.0.0.1").unwrap();
+
+    let result = connector.connect(server_name, stream).await;
+    assert!(
+        result.is_err(),
+        "client must reject a server cert that does not chain to its trusted CA"
+    );
+}
+
+#[tokio::test]
+async fn mtls_server_rejects_client_cert_from_untrusted_ca() {
+    let server_pki = make_pki();
+    let other_pki = make_pki();
+
+    let server_cfg = ServerTlsConfig::builder()
+        .cert_pem_bytes(server_pki.server_cert_pem)
+        .key_pem_bytes(server_pki.server_key_pem)
+        .require_client_ca_pem_bytes(server_pki.ca_cert_pem.clone())
+        .build()
+        .unwrap()
+        .into_rustls_config()
+        .unwrap();
+
+    let client_cfg = ClientTlsConfig::builder()
+        .ca_pem_bytes(server_pki.ca_cert_pem) // trusts server's CA (server cert ok)
+        .client_cert_pem_bytes(other_pki.client_cert_pem) // but client cert is from another CA
+        .client_key_pem_bytes(other_pki.client_key_pem)
+        .build()
+        .unwrap()
+        .into_rustls_config()
+        .unwrap();
+
+    let port = run_echo_server(server_cfg).await;
+    let connector = TlsConnector::from(Arc::new(client_cfg));
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let server_name = ServerName::try_from("127.0.0.1").unwrap();
+
+    let connect_result = connector.connect(server_name, stream).await;
+    let mut tls = match connect_result {
+        Ok(tls) => tls,
+        Err(_) => return,
+    };
+    let write_res = tls.write_all(b"hello").await;
+    let mut buf = [0u8; 5];
+    let read_res = tls.read_exact(&mut buf).await;
+    assert!(
+        write_res.is_err() || read_res.is_err(),
+        "mTLS server must reject a client cert from an untrusted CA (write={write_res:?}, read={read_res:?})"
+    );
+}
+
+#[tokio::test]
 async fn mtls_server_rejects_client_without_cert() {
     let pki = make_pki();
 

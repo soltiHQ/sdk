@@ -1,4 +1,8 @@
-//! Server-side TLS configuration.
+//! # Server-side TLS configuration.
+//!
+//! [`ServerTlsConfig`] (built via [`ServerTlsConfigBuilder`]) describes a TLS listener:
+//! the server's own cert/key, an optional client-CA bundle that turns on **mandatory** mTLS, and ALPN.
+//! [`ServerTlsConfig::into_rustls_config`] performs the I/O + parsing and yields a [`rustls::ServerConfig`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,7 +11,18 @@ use crate::{PemSource, TlsError};
 
 /// Server-side TLS configuration.
 ///
-/// _Construct via [`ServerTlsConfig::builder`]_.
+/// Construct via [`ServerTlsConfig::builder`].
+///
+/// ## Security
+///
+/// `key` (and `cert`/`client_ca`) are held as [`PemSource`]; the `Bytes` variant keeps the raw private key.
+/// The derived `Debug` redacts those bytes (see [`PemSource`]), so logging this struct will not leak the key, but the key is **not** zeroed while the config is alive.
+///
+/// ## Also
+///
+/// - [`ClientTlsConfig`](crate::ClientTlsConfig) - the peer side.
+/// - [`ServerTlsConfigBuilder`] - the builder.
+/// - [`PemSource`], [`TlsError`].
 #[derive(Debug, Clone)]
 pub struct ServerTlsConfig {
     /// Server certificate chain (leaf first).
@@ -30,10 +45,23 @@ impl ServerTlsConfig {
 
     /// Build a [`rustls::ServerConfig`] from this configuration.
     ///
-    /// Reads PEM sources from disk (or memory), parses certs and key, optionally constructs a `WebPkiClientVerifier` for mTLS, and applies ALPN settings.
-    /// All I/O and parse errors surface here.
+    /// Reads the PEM sources (disk or memory), parses the cert chain and key, optionally constructs a `WebPkiClientVerifier` for mTLS, and applies ALPN.
+    /// Auto-installs the `ring` [`CryptoProvider`](crate::ensure_default_provider) if none is set process-wide.
     ///
-    /// Auto-installs the `ring` `CryptoProvider` if no provider is set process-wide.
+    /// ## Security
+    ///
+    /// The server always presents `cert` + `key`.
+    /// If `client_ca` is set, client authentication is **mandatory**:
+    /// the server demands a client certificate chaining to that CA and rejects unauthenticated clients at the handshake (`WebPkiClientVerifier` defaults to deny-anonymous).
+    ///
+    /// Server *hostname* is not this method's concern: it is the client that verifies the server's identity.
+    ///
+    /// ## Errors
+    ///
+    /// - [`TlsError::Io`]: PEM read
+    /// - [`TlsError::NoCertificates`] / [`TlsError::NoPrivateKey`]: parse
+    /// - [`TlsError::ClientVerifier`]: mTLS trust-anchor build
+    /// - [`TlsError::Rustls`]: e.g. cert/key mismatch
     pub fn into_rustls_config(self) -> Result<rustls::ServerConfig, TlsError> {
         crate::ensure_default_provider();
 
@@ -52,9 +80,8 @@ impl ServerTlsConfig {
                 for ca in ca_certs {
                     roots.add(ca)?;
                 }
-                let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-                    .build()
-                    .map_err(|e| TlsError::ClientVerifier(e.to_string()))?;
+                let verifier =
+                    rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
                 builder.with_client_cert_verifier(verifier)
             }
             None => builder.with_no_client_auth(),
@@ -137,7 +164,24 @@ impl ServerTlsConfigBuilder {
         self
     }
 
-    /// Build.
+    /// Finalize the configuration.
+    ///
+    /// Validates that `cert` and `key` are present (else [`TlsError::MissingField`]).
+    /// Does no I/O - the PEM sources are read later by [`ServerTlsConfig::into_rustls_config`].
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_tls::ServerTlsConfig;
+    ///
+    /// let cfg = ServerTlsConfig::builder()
+    ///     .cert_pem_bytes(b"-----BEGIN CERTIFICATE-----\n...".to_vec())
+    ///     .key_pem_bytes(b"-----BEGIN PRIVATE KEY-----\n...".to_vec())
+    ///     .with_alpn(["h2"])
+    ///     .build()
+    ///     .unwrap();
+    /// assert!(cfg.client_ca.is_none()); // standard TLS until require_client_ca
+    /// ```
     pub fn build(self) -> Result<ServerTlsConfig, TlsError> {
         let cert = self.cert.ok_or(TlsError::MissingField("cert"))?;
         let key = self.key.ok_or(TlsError::MissingField("key"))?;
@@ -154,6 +198,24 @@ impl ServerTlsConfigBuilder {
 mod tests {
     use super::*;
     use crate::PemSource;
+
+    #[test]
+    fn debug_of_config_does_not_leak_key_bytes() {
+        let cfg = ServerTlsConfig::builder()
+            .cert_pem_bytes(vec![10, 20, 30])
+            .key_pem_bytes(vec![201, 202, 203])
+            .build()
+            .unwrap();
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("201") && !rendered.contains("202"),
+            "config Debug must not leak key bytes: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "expected redaction marker: {rendered}"
+        );
+    }
 
     #[test]
     fn builder_returns_config_when_cert_and_key_provided() {
@@ -293,5 +355,38 @@ mod tests {
 
         let rustls = cfg.into_rustls_config().unwrap();
         assert_eq!(rustls.alpn_protocols, vec![b"h2".to_vec()]);
+    }
+
+    #[test]
+    fn into_rustls_config_rejects_cert_key_mismatch() {
+        let (cert, _) = rcgen_self_signed();
+        let (_, other_key) = rcgen_self_signed();
+        let cfg = ServerTlsConfig::builder()
+            .cert_pem_bytes(cert)
+            .key_pem_bytes(other_key)
+            .build()
+            .unwrap();
+
+        let err = cfg.into_rustls_config().unwrap_err();
+        assert!(
+            matches!(err, TlsError::Rustls(_)),
+            "cert/key mismatch must surface as TlsError::Rustls, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn into_rustls_config_errors_on_malformed_cert_pem() {
+        let (_, key) = rcgen_self_signed();
+        let cfg = ServerTlsConfig::builder()
+            .cert_pem_bytes(b"not a pem".to_vec())
+            .key_pem_bytes(key)
+            .build()
+            .unwrap();
+
+        let err = cfg.into_rustls_config().unwrap_err();
+        assert!(
+            matches!(err, TlsError::NoCertificates),
+            "malformed cert PEM must surface as NoCertificates, got {err:?}"
+        );
     }
 }
