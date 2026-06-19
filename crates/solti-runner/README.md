@@ -14,8 +14,7 @@ Sits between the domain model (`solti-model`) and the orchestration layer (`solt
 ```
 
 `BuildContext` carries an `Arc<OutputRegistry>` alongside metrics. 
-Runners that produce per-line output (e.g. subprocess) ask the registry for an `OutputSink` per attempt and push lines into it; 
-subscribers (HTTP SSE, gRPC stream) read them out the other side.
+Runners that produce per-line output (e.g. subprocess) ask the registry for an `OutputSink` per attempt and push lines into it; subscribers (HTTP SSE, gRPC stream) read them out the other side.
 
 ```text
   per-task broadcast channel (lag-skip, capacity = N)
@@ -43,21 +42,21 @@ subscribers (HTTP SSE, gRPC stream) read them out the other side.
 
 ## Key types
 
-| Type              | Purpose                                                                                       |
-|-------------------|-----------------------------------------------------------------------------------------------|
-| `Runner`          | Trait: `name()`, `supports()`, `build_task()`, `build_run_id()`                               |
-| `RunnerRouter`    | Selects runner by supports() + label matching                                                 |
-| `BuildContext`    | Shared dependencies: `RunnerEnv` + `MetricsHandle` + `Arc<OutputRegistry>`                    |
-| `OutputSink`      | Per-attempt writer (`stdout_line` / `stderr_line`); thin newtype over `broadcast::Sender`     |
-| `OutputRegistry`  | One broadcast channel per `TaskId`, reused across attempts; supports `subscribe` / `evict`    |
-| `RunId`           | Human-readable id: `{runner}-{slot}-{seq}`                                                    |
-| `RunnerError`     | Error enum: `NoRunner`, `UnsupportedKind`, `InvalidSpec`, `Internal`, `MissingField`, `Io`    |
-| `MetricsBackend`  | Trait: `record_task_started`, `record_task_completed`, `record_runner_error`                  |
-| `MetricsHandle`   | `Arc<dyn MetricsBackend>` - cloneable shared handle                                           |
-| `NoOpMetrics`     | Zero-size backend (`#[inline(always)]`)                                                       |
-| `RunnerType`      | Metric label: `Subprocess`, `Wasm`, `Container`                                               |
-| `TaskOutcome`     | Metric label: `Success`, `Failure`, `Canceled`, `Timeout`                                     |
-| `RunnerErrorKind` | Metric label: `CgroupPrepareFailed`, `BackendConfigFailed`, `SpawnFailed`, `ModuleLoadFailed` |
+| Type              | Purpose                                                                                              |
+|-------------------|------------------------------------------------------------------------------------------------------|
+| `Runner`          | Trait: `name()`, `supports()`, `build_task()`, `build_run_id()`                                      |
+| `RunnerRouter`    | Selects runner by supports() + label matching                                                        |
+| `BuildContext`    | Shared dependencies: `RunnerEnv` + `MetricsHandle` + `Arc<OutputRegistry>`                           |
+| `OutputSink`      | Per-attempt writer (`stdout_line` / `stderr_line`); thin new type over `broadcast::Sender`           |
+| `OutputRegistry`  | One broadcast channel per `TaskId`, reused across attempts; `ensure_channel` / `subscribe` / `evict` |
+| `RunId`           | Human-readable id: `{runner}-{slot}-{seq}`                                                           |
+| `RunnerError`     | Error enum: `NoRunner`, `UnsupportedKind`, `InvalidSpec`, `Internal`, `MissingField`, `Io`           |
+| `MetricsBackend`  | Trait: `record_task_started`, `record_task_completed`, `record_runner_error`                         |
+| `MetricsHandle`   | `Arc<dyn MetricsBackend>` - cloneable shared handle                                                  |
+| `NoOpMetrics`     | Zero-size backend (`#[inline(always)]`)                                                              |
+| `RunnerType`      | Metric label: `Subprocess`, `Container`, `Wasm`                                                      |
+| `MetricOutcome`   | Metric label: `Success`, `Failure`, `Canceled`, `Timeout`                                            |
+| `RunnerErrorKind` | Metric label: `CgroupPrepareFailed`, `BackendConfigFailed`, `SpawnFailed`, `ModuleLoadFailed`        |
 
 ## Runner trait
 ```text
@@ -85,7 +84,7 @@ subscribers (HTTP SSE, gRPC stream) read them out the other side.
 ```text
   trait MetricsBackend: Send + Sync + 'static {
       fn record_task_started(&self, runner_type: RunnerType);
-      fn record_task_completed(&self, runner_type: RunnerType, outcome: TaskOutcome, duration_ms: u64);
+      fn record_task_completed(&self, runner_type: RunnerType, outcome: MetricOutcome, duration_ms: u64);
       fn record_runner_error(&self, runner_type: RunnerType, error_kind: RunnerErrorKind);
   }
 ```
@@ -96,7 +95,7 @@ Production backend: `solti-prometheus::PrometheusMetrics`.
 
 ## Notes
 - Runners are checked in registration order; the first match wins.
-- `TaskKind::Embedded` is not routable: use `SupervisorApi::submit_with_task` directly.
 - `RunId` sequence is process-global, monotonically increasing, starts at 1.
+- `TaskKind::Embedded` is not routable: use `SupervisorApi::submit_with_task` directly.
 - `BuildContext` defaults: empty `RunnerEnv` + `NoOpMetrics` + an empty `OutputRegistry` (no live subscribers).
 - `OutputRegistry` channels are `tokio::sync::broadcast`: slow subscribers don't block the runner; they receive a `Lagged` signal and continue from the freshest event in the ring window.

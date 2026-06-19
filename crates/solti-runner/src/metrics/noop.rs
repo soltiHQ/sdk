@@ -1,6 +1,11 @@
+//! # No-op metrics backend.
+
 use crate::metrics::backend::{MetricOutcome, MetricsBackend, RunnerErrorKind, RunnerType};
 
-/// No-op metrics backend that compiles to nothing.
+/// Zero-cost [`MetricsBackend`](super::MetricsBackend) that discards everything.
+///
+/// Zero-sized (`size_of::<NoOpMetrics>() == 0`) and the default backend of [`BuildContext`](crate::BuildContext);
+/// every method is an `#[inline(always)]` empty body that compiles to nothing.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoOpMetrics;
 

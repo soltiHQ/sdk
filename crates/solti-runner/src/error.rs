@@ -1,18 +1,9 @@
 //! # Runner errors.
-//!
-//! [`RunnerError`] covers failures during runner selection and task construction.
-//!
-//! See [`Runner::build_task`](crate::Runner::build_task) and [`RunnerRouter::build`](crate::RunnerRouter::build) for the primary error sources.
 
 use thiserror::Error;
 
-/// Errors produced by runner operations.
-///
-/// ## Also
-///
-/// - [`Runner::build_task`](crate::Runner::build_task) — returns `Result<TaskRef, RunnerError>`.
-/// - [`RunnerRouter::build`](crate::RunnerRouter::build) — returns `NoRunner` when no runner matches.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum RunnerError {
     /// No registered runner can handle the given task kind.
     #[error("no suitable runner for task kind: {0}")]
@@ -34,13 +25,8 @@ pub enum RunnerError {
     #[error("missing field: {0}")]
     MissingField(&'static str),
 
-    /// I/O error during task setup.
+    /// I/O error during task setup (spawn, cgroup, module read, …).
+    /// The underlying [`std::io::Error`] is preserved as the source, so callers can inspect its [`ErrorKind`](std::io::ErrorKind).
     #[error("io error: {0}")]
-    Io(String),
-}
-
-impl From<std::io::Error> for RunnerError {
-    fn from(e: std::io::Error) -> Self {
-        RunnerError::Io(e.to_string())
-    }
+    Io(#[from] std::io::Error),
 }
