@@ -40,7 +40,7 @@ arc_str_newtype! {
 impl Slot {
     /// Validate that the slot name is safe to use across the SDK.
     ///
-    /// See [`validate_identity`] for the exact rules.
+    /// See `validate_identity` (module-private) for the exact rules.
     pub fn validate_format(&self) -> Result<(), ModelError> {
         validate_identity("slot", self.as_str(), SLOT_MAX_LEN)
     }

@@ -157,6 +157,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // --- API: control plane → agent ---
     let api_metrics: Arc<dyn solti_api::ApiMetricsBackend> =
         Arc::new(PrometheusApiMetrics::new(registry.clone())?);
+    // Keep a supervisor handle for graceful shutdown after the server stops.
+    let sup_handle = supervisor.handle();
     let handler = Arc::new(SupervisorApiAdapter::new(Arc::new(supervisor)));
 
     let mut builder = Server::builder();
@@ -174,17 +176,45 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         Some(t) => {
             builder
                 .add_service(build_grpc_server_with_metrics_auth(handler, api_metrics, t))
-                .serve(addr)
+                .serve_with_shutdown(addr, shutdown_signal())
                 .await?;
         }
         None => {
             builder
                 .add_service(build_grpc_server_with_metrics(handler, api_metrics))
-                .serve(addr)
+                .serve_with_shutdown(addr, shutdown_signal())
                 .await?;
         }
     }
+
+    // Drain the supervision tree: cancels tasks cooperatively (grace period),
+    // then force-aborts stragglers. Without this, SIGINT/SIGTERM would kill
+    // the process and orphan task subprocesses.
+    info!("server stopped; shutting down supervisor");
+    sup_handle.shutdown().await?;
     Ok(())
+}
+
+/// Resolves on SIGINT (Ctrl-C) or SIGTERM: the trigger for graceful shutdown.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl-C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 /// Reads a non-empty environment variable as a path.

@@ -28,8 +28,8 @@ use solti_model::{Slot, Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskRun, T
 /// ## Also
 ///
 /// - [`StateConfig`] TTL settings consumed by [`sweep`](Self::sweep).
-/// - [`StateSubscriber`] wires taskvisor events into mutations.
-/// - [`state_sweep`] builds an embedded periodic sweep task.
+/// - `StateSubscriber` (crate-internal) wires taskvisor events into mutations.
+/// - `state_sweep` (crate-internal) builds an embedded periodic sweep task.
 #[derive(Clone)]
 pub struct TaskState {
     inner: Arc<RwLock<TaskStateInner>>,
@@ -42,6 +42,11 @@ struct TaskStateInner {
     by_slot: HashMap<Slot, Vec<TaskId>>,
     /// Execution history: task_id -> ordered list of runs (oldest first).
     runs: HashMap<TaskId, VecDeque<TaskRun>>,
+    /// taskvisor run identity (raw) -> task entry. The canonical correlation
+    /// key for incoming events: labels are reusable, identities are not.
+    by_tv: HashMap<u64, TaskId>,
+    /// Task entry -> its current taskvisor run identity (raw).
+    tv_of: HashMap<TaskId, u64>,
 }
 
 impl TaskState {
@@ -52,6 +57,8 @@ impl TaskState {
                 by_slot: HashMap::new(),
                 tasks: HashMap::new(),
                 runs: HashMap::new(),
+                by_tv: HashMap::new(),
+                tv_of: HashMap::new(),
             })),
         }
     }
@@ -67,13 +74,44 @@ impl TaskState {
         inner.tasks.insert(id, task);
     }
 
+    /// Bind a task entry to its current taskvisor run identity.
+    ///
+    /// Called at submission time (the id is pre-minted by `submit()`). Rebinding
+    /// the same entry to a new identity drops the previous binding, so late
+    /// events from the previous incarnation no longer resolve to this entry.
+    pub fn bind_tv(&self, id: &TaskId, tv: u64) {
+        let mut inner = self.inner.write();
+        if let Some(old) = inner.tv_of.insert(id.clone(), tv) {
+            inner.by_tv.remove(&old);
+        }
+        inner.by_tv.insert(tv, id.clone());
+    }
+
+    /// Resolve a taskvisor run identity to its task entry (if currently bound).
+    pub fn resolve_tv(&self, tv: u64) -> Option<TaskId> {
+        self.inner.read().by_tv.get(&tv).cloned()
+    }
+
+    /// The taskvisor run identity currently bound to a task entry (if any).
+    pub fn tv_for(&self, id: &TaskId) -> Option<u64> {
+        self.inner.read().tv_of.get(id).copied()
+    }
+
+    fn unbind_locked(inner: &mut TaskStateInner, id: &TaskId) {
+        if let Some(tv) = inner.tv_of.remove(id) {
+            inner.by_tv.remove(&tv);
+        }
+    }
+
     /// Unregister a task from state (called on `TaskRemoved` event).
     ///
-    /// Removes the task entry and its slot index, but **preserves run history** (cleaned later by sweep).
+    /// Removes the task entry, its slot index, and its identity binding,
+    /// but **preserves run history** (cleaned later by sweep).
     /// Compare with [`delete_task`](Self::delete_task) which removes both.
     pub fn unregister_task(&self, id: &TaskId) {
         let mut inner = self.inner.write();
 
+        Self::unbind_locked(&mut inner, id);
         if let Some(task) = inner.tasks.remove(id)
             && let Some(ids) = inner.by_slot.get_mut(task.slot())
         {
@@ -92,6 +130,7 @@ impl TaskState {
         let mut inner = self.inner.write();
         inner.runs.remove(id);
 
+        Self::unbind_locked(&mut inner, id);
         if let Some(task) = inner.tasks.remove(id) {
             if let Some(ids) = inner.by_slot.get_mut(task.slot()) {
                 ids.retain(|task_id| task_id != id);
@@ -233,7 +272,12 @@ impl TaskState {
             .tasks
             .iter()
             .filter(|(id, task)| {
-                task.status().phase.is_terminal()
+                // A terminal phase only means the last *attempt* finished: a
+                // periodic task sits in Succeeded between runs. While the entry
+                // is bound to a live run identity, its actor has not been
+                // removed (no TaskRemoved observed) - never sweep it.
+                !inner.tv_of.contains_key(*id)
+                    && task.status().phase.is_terminal()
                     && inner.runs.get(*id).is_none_or(|runs| runs.is_empty())
                     && now
                         .duration_since(task.metadata().updated_at)
@@ -244,6 +288,7 @@ impl TaskState {
             .collect();
 
         for id in &expired_tasks {
+            Self::unbind_locked(&mut inner, id);
             if let Some(task) = inner.tasks.remove(id) {
                 if let Some(ids) = inner.by_slot.get_mut(task.slot()) {
                     ids.retain(|task_id| task_id != id);
@@ -646,6 +691,32 @@ mod tests {
         assert_eq!(runs_removed, 1);
         assert_eq!(tasks_removed, 0); // task still exists (task_ttl is long)
         assert!(state.list_runs(&id).is_empty());
+    }
+
+    #[test]
+    fn sweep_keeps_terminal_tasks_with_live_binding() {
+        // A periodic task sits in a terminal phase *between* runs while its
+        // actor is alive (binding present): the sweep must not delete it.
+        let state = TaskState::new();
+        let id = TaskId::from("periodic");
+
+        state.add_task(id.clone(), default_spec());
+        state.bind_tv(&id, 42);
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Succeeded, None, None);
+
+        let config = StateConfig {
+            run_ttl: std::time::Duration::ZERO,
+            task_ttl: std::time::Duration::ZERO,
+            sweep_interval: std::time::Duration::from_secs(60),
+        };
+
+        let (_, tasks_removed) = state.sweep(&config);
+        assert_eq!(
+            tasks_removed, 0,
+            "a task whose actor is still alive (bound) must survive the sweep"
+        );
+        assert!(state.get(&id).is_some());
     }
 
     #[test]

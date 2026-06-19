@@ -104,10 +104,16 @@ fn classify_rejection_reason(reason: Option<&str>) -> &'static str {
     let Some(r) = reason else {
         return "unknown";
     };
-    if r.starts_with("slot full") {
+    if r.starts_with("slot full") || r.starts_with("queue_full") {
         "slot_full"
     } else if r.starts_with("dropped: slot busy") {
         "slot_busy"
+    } else if r.starts_with("superseded_by_replace") {
+        "superseded"
+    } else if r.starts_with("removed_from_queue") {
+        "removed"
+    } else if r.starts_with("controller_shutting_down") {
+        "shutting_down"
     } else if r.starts_with("add_failed") {
         "add_failed"
     } else if r.starts_with("remove_failed") {
@@ -215,7 +221,7 @@ impl Subscribe for PrometheusSubscriber {
                     self.task_restarts.inc();
                 }
             }
-            EventKind::TaskStopped | EventKind::TaskFailed => {
+            EventKind::TaskStopped | EventKind::TaskCanceled | EventKind::TaskFailed => {
                 if self.tasks_in_flight.get() > 0.0 {
                     self.tasks_in_flight.dec();
                 }
@@ -252,9 +258,16 @@ impl Subscribe for PrometheusSubscriber {
                 }
             }
             EventKind::ActorExhausted => {
-                self.task_terminal.with_label_values(&["exhausted"]).inc();
+                // Success under OnFailure/Never is the normal way a task ends,
+                // not retry exhaustion: keep the two distinguishable.
+                let label = if event.reason.as_deref() == Some("policy_exhausted_success") {
+                    "completed"
+                } else {
+                    "exhausted"
+                };
+                self.task_terminal.with_label_values(&[label]).inc();
                 self.attempts_to_finalize
-                    .with_label_values(&["exhausted"])
+                    .with_label_values(&[label])
                     .observe(f64::from(event.attempt.unwrap_or(1)));
             }
             EventKind::ActorDead => {
@@ -272,9 +285,17 @@ impl Subscribe for PrometheusSubscriber {
                     .with_label_values(&[reason])
                     .inc();
             }
+            // A force-aborted attempt never publishes its own terminal event:
+            // compensate the in-flight gauge from the removal notification.
+            EventKind::TaskRemoved => {
+                if event.reason.as_deref() == Some("force_terminated_after_grace")
+                    && self.tasks_in_flight.get() > 0.0
+                {
+                    self.tasks_in_flight.dec();
+                }
+            }
             EventKind::TaskAdded
             | EventKind::TaskAddFailed
-            | EventKind::TaskRemoved
             | EventKind::TaskAddRequested
             | EventKind::TaskRemoveRequested
             | EventKind::ShutdownRequested
@@ -343,6 +364,88 @@ mod tests {
         sub.on_event(&Event::new(EventKind::TaskStopped).with_task("t"));
 
         assert_eq!(sub.tasks_in_flight.get(), 0.0);
+    }
+
+    #[test]
+    fn task_canceled_decrements_in_flight() {
+        let sub = new_subscriber();
+
+        sub.on_event(
+            &Event::new(EventKind::TaskStarting)
+                .with_task("t")
+                .with_attempt(1),
+        );
+        sub.on_event(&Event::new(EventKind::TaskCanceled).with_task("t"));
+
+        assert_eq!(sub.tasks_in_flight.get(), 0.0);
+    }
+
+    #[test]
+    fn force_terminated_removal_decrements_in_flight() {
+        let sub = new_subscriber();
+
+        // A force-aborted attempt never publishes its own terminal event:
+        // the only signal is TaskRemoved("force_terminated_after_grace").
+        sub.on_event(
+            &Event::new(EventKind::TaskStarting)
+                .with_task("t")
+                .with_attempt(1),
+        );
+        sub.on_event(
+            &Event::new(EventKind::TaskRemoved)
+                .with_task("t")
+                .with_reason("force_terminated_after_grace"),
+        );
+
+        assert_eq!(
+            sub.tasks_in_flight.get(),
+            0.0,
+            "force-terminated tasks must not leak the in-flight gauge"
+        );
+    }
+
+    #[test]
+    fn exhausted_after_success_is_labelled_completed() {
+        let sub = new_subscriber();
+
+        sub.on_event(
+            &Event::new(EventKind::ActorExhausted)
+                .with_task("t")
+                .with_attempt(1)
+                .with_reason("policy_exhausted_success"),
+        );
+        sub.on_event(
+            &Event::new(EventKind::ActorExhausted)
+                .with_task("t2")
+                .with_attempt(5)
+                .with_reason("max_retries_exceeded(5/5): boom"),
+        );
+
+        assert_eq!(
+            sub.task_terminal.with_label_values(&["completed"]).get(),
+            1.0,
+            "normal one-shot completion must not be counted as exhaustion"
+        );
+        assert_eq!(
+            sub.task_terminal.with_label_values(&["exhausted"]).get(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn classifier_recognizes_taskvisor_03_reasons() {
+        assert_eq!(
+            classify_rejection_reason(Some("superseded_by_replace")),
+            "superseded"
+        );
+        assert_eq!(
+            classify_rejection_reason(Some("removed_from_queue")),
+            "removed"
+        );
+        assert_eq!(
+            classify_rejection_reason(Some("controller_shutting_down")),
+            "shutting_down"
+        );
     }
 
     #[test]

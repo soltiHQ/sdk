@@ -60,13 +60,13 @@ async fn run_echo_server(server_cfg: rustls::ServerConfig) -> u16 {
 
     tokio::spawn(async move {
         let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
-        if let Ok((stream, _)) = listener.accept().await {
-            if let Ok(mut tls) = acceptor.accept(stream).await {
-                let mut buf = [0u8; 5];
-                if tls.read_exact(&mut buf).await.is_ok() {
-                    let _ = tls.write_all(&buf).await;
-                    let _ = tls.shutdown().await;
-                }
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(mut tls) = acceptor.accept(stream).await
+        {
+            let mut buf = [0u8; 5];
+            if tls.read_exact(&mut buf).await.is_ok() {
+                let _ = tls.write_all(&buf).await;
+                let _ = tls.shutdown().await;
             }
         }
     });

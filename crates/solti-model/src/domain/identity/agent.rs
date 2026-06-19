@@ -31,7 +31,7 @@ arc_str_newtype! {
 impl AgentId {
     /// Validate that the agent id is safe to use across the SDK and the wire protocol.
     ///
-    /// See [`validate_identity`] for the exact rules.
+    /// See `validate_identity` (module-private) for the exact rules.
     pub fn validate_format(&self) -> Result<(), ModelError> {
         validate_identity("agent_id", self.as_str(), AGENT_ID_MAX_LEN)
     }

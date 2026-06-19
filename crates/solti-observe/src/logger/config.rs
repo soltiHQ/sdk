@@ -97,8 +97,8 @@ mod tests {
         assert_eq!(config.format, LoggerFormat::Text);
         assert_eq!(config.tz, LoggerTimeZone::Utc);
         assert_eq!(config.level.as_str(), "info");
-        assert_eq!(config.with_targets, true);
-        assert_eq!(config.use_color, true);
+        assert!(config.with_targets);
+        assert!(config.use_color);
     }
 
     #[test]
@@ -129,8 +129,8 @@ mod tests {
         assert_eq!(config.level.as_str(), LoggerLevel::default().as_str());
         assert_eq!(config.format, LoggerFormat::default());
         assert_eq!(config.tz, LoggerTimeZone::default());
-        assert_eq!(config.with_targets, true);
-        assert_eq!(config.use_color, true);
+        assert!(config.with_targets);
+        assert!(config.use_color);
     }
 
     #[test]
@@ -140,7 +140,7 @@ mod tests {
 
         assert_eq!(config.format, LoggerFormat::Json);
         assert_eq!(config.level.as_str(), "debug");
-        assert_eq!(config.with_targets, true);
-        assert_eq!(config.use_color, true);
+        assert!(config.with_targets);
+        assert!(config.use_color);
     }
 }
