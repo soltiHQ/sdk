@@ -179,7 +179,7 @@ mod tests {
         handle.record_task_started(crate::RunnerType::Subprocess);
         handle.record_task_completed(
             crate::RunnerType::Subprocess,
-            crate::TaskOutcome::Success,
+            crate::MetricOutcome::Success,
             100,
         );
     }

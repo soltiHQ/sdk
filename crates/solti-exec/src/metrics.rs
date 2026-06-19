@@ -2,24 +2,24 @@
 //!
 //! ## Overview
 //!
-//! Provides runner-type identifiers and a mapping from [`TaskError`] to [`TaskOutcome`]
+//! Provides runner-type identifiers and a mapping from [`TaskError`] to [`MetricOutcome`]
 //! used by all runner implementations in this crate.
 
-use solti_runner::TaskOutcome;
+use solti_runner::MetricOutcome;
 use taskvisor::TaskError;
 
-/// Classify a [`TaskError`] into a [`TaskOutcome`] metric label.
+/// Classify a [`TaskError`] into a [`MetricOutcome`] metric label.
 ///
 /// Strips operational details (reason strings, durations) and returns only the category for dashboards:
-/// - `Fail` / `Fatal` → [`TaskOutcome::Failure`]
-/// - `Canceled` → [`TaskOutcome::Canceled`]
-/// - `Timeout`  → [`TaskOutcome::Timeout`]
-pub(crate) fn classify_task_error(error: &TaskError) -> TaskOutcome {
+/// - `Fail` / `Fatal` → [`MetricOutcome::Failure`]
+/// - `Canceled` → [`MetricOutcome::Canceled`]
+/// - `Timeout`  → [`MetricOutcome::Timeout`]
+pub(crate) fn classify_task_error(error: &TaskError) -> MetricOutcome {
     match error {
-        TaskError::Fail { .. } | TaskError::Fatal { .. } => TaskOutcome::Failure,
-        TaskError::Timeout { .. } => TaskOutcome::Timeout,
+        TaskError::Fail { .. } | TaskError::Fatal { .. } => MetricOutcome::Failure,
+        TaskError::Timeout { .. } => MetricOutcome::Timeout,
 
-        TaskError::Canceled => TaskOutcome::Canceled,
-        _ => TaskOutcome::Failure,
+        TaskError::Canceled => MetricOutcome::Canceled,
+        _ => MetricOutcome::Failure,
     }
 }

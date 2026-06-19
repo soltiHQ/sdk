@@ -95,12 +95,22 @@ impl RunnerRouter {
     pub fn pick(&self, spec: &TaskSpec) -> Option<&Arc<dyn Runner>> {
         let selector = spec.runner_selector();
 
-        self.runners
-            .iter()
-            .find(|entry| {
-                entry.runner.supports(spec) && selector.is_none_or(|sel| sel.matches(&entry.labels))
-            })
-            .map(|entry| &entry.runner)
+        let mut matching = self.runners.iter().filter(|entry| {
+            entry.runner.supports(spec) && selector.is_none_or(|sel| sel.matches(&entry.labels))
+        });
+
+        let first = matching.next()?;
+        if matching.next().is_some() {
+            // First-match-wins is silent by default; surface ambiguity so a
+            // misconfigured registration order (a general runner shadowing a
+            // specialized one) is diagnosable rather than invisible.
+            tracing::debug!(
+                slot = %spec.slot(),
+                runner = first.runner.name(),
+                "multiple runners match this spec; using the first registered (registration order is significant)"
+            );
+        }
+        Some(&first.runner)
     }
 
     /// Build a [`TaskRef`] for the given spec using the selected runner.

@@ -71,7 +71,13 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 2048;
 ///
 /// ## Notes
 ///
-/// - `tasks_in_flight` gauge is guarded against going negative: a [`TaskStopped`](EventKind::TaskStopped) without a preceding [`TaskStarting`](EventKind::TaskStarting) is a no-op on the gauge.
+/// - `tasks_in_flight` is **best-effort**. It is derived from taskvisor's lossy
+///   broadcast bus (inc on `TaskStarting`, dec on the per-attempt terminal), so a
+///   dropped event under sustained bus lag makes it drift and it does not
+///   self-heal. It is guarded against going negative (a terminal without a
+///   preceding start is a no-op). For an **authoritative**, self-correcting count
+///   that is recomputed from `TaskState` on every scrape, use the pull-based
+///   `PrometheusStateCollector` (`state` feature): `solti_sv_tasks_by_phase{phase="running"}`.
 /// - [`queue_capacity`](Subscribe::queue_capacity) defaults to [`DEFAULT_QUEUE_CAPACITY`].
 /// - Backoff duration is converted from milliseconds to seconds before observation.
 ///
@@ -104,7 +110,7 @@ fn classify_rejection_reason(reason: Option<&str>) -> &'static str {
     let Some(r) = reason else {
         return "unknown";
     };
-    if r.starts_with("slot full") || r.starts_with("queue_full") {
+    if r.starts_with("queue_full") {
         "slot_full"
     } else if r.starts_with("dropped: slot busy") {
         "slot_busy"
@@ -260,6 +266,9 @@ impl Subscribe for PrometheusSubscriber {
             EventKind::ActorExhausted => {
                 // Success under OnFailure/Never is the normal way a task ends,
                 // not retry exhaustion: keep the two distinguishable.
+                // NB: the literal mirrors `solti_core::reasons::POLICY_EXHAUSTED_SUCCESS`
+                // (the canonical, CI-pinned list); solti-prometheus does not depend
+                // on solti-core unconditionally, so it is duplicated here.
                 let label = if event.reason.as_deref() == Some("policy_exhausted_success") {
                     "completed"
                 } else {
@@ -675,7 +684,8 @@ mod tests {
         sub.on_event(
             &Event::new(EventKind::ControllerRejected)
                 .with_task("t")
-                .with_reason("slot full at capacity cap=1 depth=1 admission=Queue"),
+                // taskvisor emits `queue_full: {len}/{max}` (controller/core.rs).
+                .with_reason("queue_full: 1/1"),
         );
 
         assert_eq!(
@@ -707,7 +717,8 @@ mod tests {
     #[test]
     fn classify_rejection_reason_recognizes_known_prefixes() {
         assert_eq!(
-            classify_rejection_reason(Some("slot full at capacity cap=1 depth=1 admission=Queue")),
+            // taskvisor emits `queue_full: {len}/{max}` (controller/core.rs).
+            classify_rejection_reason(Some("queue_full: 1/1")),
             "slot_full"
         );
         assert_eq!(

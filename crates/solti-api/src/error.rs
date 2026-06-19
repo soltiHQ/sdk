@@ -31,6 +31,8 @@ impl ApiError {
     pub fn as_label(&self) -> &'static str {
         match self {
             ApiError::Core(solti_core::CoreError::InvalidSpec(_)) => "InvalidRequest",
+            ApiError::Core(solti_core::CoreError::AlreadyExists(_)) => "AlreadyExists",
+            ApiError::Core(solti_core::CoreError::NotFound(_)) => "TaskNotFound",
             ApiError::PayloadTooLarge(_) => "PayloadTooLarge",
             ApiError::InvalidRequest(_) => "InvalidRequest",
             ApiError::Unauthenticated(_) => "Unauthenticated",
@@ -60,6 +62,8 @@ fn core_to_status(e: solti_core::CoreError) -> tonic::Status {
     use solti_core::CoreError;
     match e {
         CoreError::InvalidSpec(inner) => tonic::Status::invalid_argument(inner.to_string()),
+        CoreError::AlreadyExists(msg) => tonic::Status::already_exists(msg),
+        CoreError::NotFound(msg) => tonic::Status::not_found(msg),
         CoreError::Supervisor(_) | CoreError::Mapping(_) | CoreError::Runner(_) => {
             tonic::Status::internal(e.to_string())
         }
@@ -92,6 +96,8 @@ fn core_to_http_status(e: solti_core::CoreError) -> (axum::http::StatusCode, Str
     use solti_core::CoreError;
     match e {
         CoreError::InvalidSpec(inner) => (StatusCode::BAD_REQUEST, inner.to_string()),
+        CoreError::AlreadyExists(msg) => (StatusCode::CONFLICT, msg),
+        CoreError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
         CoreError::Supervisor(_) | CoreError::Mapping(_) | CoreError::Runner(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
@@ -120,5 +126,24 @@ mod tests {
         let inner = solti_model::ModelError::Invalid("bad".into());
         let e = ApiError::Core(solti_core::CoreError::InvalidSpec(inner));
         assert_eq!(e.as_label(), "InvalidRequest");
+    }
+
+    #[test]
+    fn as_label_maps_core_already_exists_and_not_found() {
+        let dup = ApiError::Core(solti_core::CoreError::AlreadyExists("t".into()));
+        assert_eq!(dup.as_label(), "AlreadyExists");
+
+        let missing = ApiError::Core(solti_core::CoreError::NotFound("t".into()));
+        assert_eq!(missing.as_label(), "TaskNotFound");
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn core_already_exists_is_conflict_and_not_found_is_404() {
+        use axum::http::StatusCode;
+        let (status, _) = core_to_http_status(solti_core::CoreError::AlreadyExists("t".into()));
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = core_to_http_status(solti_core::CoreError::NotFound("t".into()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

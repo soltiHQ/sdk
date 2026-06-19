@@ -46,6 +46,13 @@ fn phase_label(phase: TaskPhase) -> &'static str {
 /// collectors. On each scrape, all phases from [`TaskPhase`] are emitted; empty
 /// phases return `0` so dashboards can rely on a stable label set.
 ///
+/// Counts are recomputed from [`TaskState`] every scrape, so unlike the
+/// event-gauge `solti_sv_tasks_in_flight` this self-corrects and never accrues
+/// drift. The residual limitation is upstream: a `Running` count reflects the
+/// `TaskStarting` events `TaskState` has observed, so a start dropped under bus
+/// lag is undercounted until the entry's phase next changes (bounded, not
+/// cumulative).
+///
 /// ## Cost
 ///
 /// `O(N)` per scrape where `N` is the current number of tasks in state.

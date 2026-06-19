@@ -9,11 +9,11 @@
 //! - [`MetricsHandle`]: `Arc<dyn MetricsBackend>`, cloneable shared handle.
 //! - [`NoOpMetrics`]: zero-size backend (`#[inline(always)]`, compiles to nothing).
 //! - [`RunnerType`]: metric label enum: `Subprocess`, `Wasm`, `Container`.
-//! - [`TaskOutcome`]: metric label enum: `Success`, `Failure`, `Canceled`, `Timeout`.
+//! - [`MetricOutcome`]: metric label enum: `Success`, `Failure`, `Canceled`, `Timeout`.
 //! - [`RunnerErrorKind`]: metric label enum: `CgroupPrepareFailed`, `BackendConfigFailed`, `SpawnFailed`, `ModuleLoadFailed`.
 //! - [`noop_metrics`]: convenience constructor for `Arc<NoOpMetrics>`.
 mod backend;
-pub use backend::{MetricsBackend, MetricsHandle, RunnerErrorKind, RunnerType, TaskOutcome};
+pub use backend::{MetricOutcome, MetricsBackend, MetricsHandle, RunnerErrorKind, RunnerType};
 
 mod noop;
 pub use noop::NoOpMetrics;

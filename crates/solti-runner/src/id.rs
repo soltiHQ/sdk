@@ -58,8 +58,15 @@ impl RunId {
 /// - `seq`    - per-process counter (also used verbatim for cgroup naming)
 pub fn make_run_id(runner_name: &str, slot: &str) -> RunId {
     let seq = next_seq();
-    RunId {
-        name: format!("{runner_name}-{slot}-{seq}"),
-        seq,
-    }
+    let name = format!("{runner_name}-{slot}-{seq}");
+    // The name is used verbatim as a taskvisor label and a solti-model TaskId.
+    // A bad `runner_name` (spaces/slashes) or an over-long combination would
+    // produce a broken identity; catch it in debug builds at the source.
+    debug_assert!(
+        solti_model::TaskId::from(name.as_str())
+            .validate_format()
+            .is_ok(),
+        "make_run_id produced an invalid identity {name:?}: runner/slot has illegal chars or is too long"
+    );
+    RunId { name, seq }
 }

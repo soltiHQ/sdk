@@ -31,7 +31,7 @@
 //! | [`MetricsHandle`]     | `Arc<dyn MetricsBackend>` — cloneable shared handle          |
 //! | [`NoOpMetrics`]       | Zero-size backend that compiles to nothing                   |
 //! | [`RunnerType`]        | Metric label: `Subprocess`, `Wasm`, `Container`              |
-//! | [`TaskOutcome`]       | Metric label: `Success`, `Failure`, `Canceled`, `Timeout`    |
+//! | [`MetricOutcome`]       | Metric label: `Success`, `Failure`, `Canceled`, `Timeout`    |
 //!
 //! ## Runner implementation
 //!
@@ -106,6 +106,6 @@ pub use router::RunnerRouter;
 
 pub mod metrics;
 pub use metrics::{
-    MetricsBackend, MetricsHandle, NoOpMetrics, RunnerErrorKind, RunnerType, TaskOutcome,
+    MetricOutcome, MetricsBackend, MetricsHandle, NoOpMetrics, RunnerErrorKind, RunnerType,
     noop_metrics,
 };

@@ -381,7 +381,10 @@ impl Drop for ProcessGroupGuard {
         #[cfg(unix)]
         if let Some(pgid) = self.pgid {
             // Non-blocking and async-free: just signal the group, do not wait/reap
-            // (we are in Drop, possibly during future cancellation).
+            // (we are in Drop, possibly during future cancellation). The leader is
+            // reaped by tokio's `kill_on_drop`; grandchildren are SIGKILLed here
+            // and then reaped by the OS (reparented to PID 1 / a subreaper), not
+            // by this code — so this path frees the subtree without a wait.
             let rc = unsafe { libc::kill(-pgid, libc::SIGKILL) };
             if rc != 0 {
                 let err = std::io::Error::last_os_error();
@@ -415,6 +418,10 @@ async fn kill_process_group(child: &mut tokio::process::Child, run_id: &str) {
                         error = %err,
                         "killpg failed; falling back to single-pid kill",
                     );
+                    // Note: the single-pid fallback reaps only the leader, not
+                    // grandchildren. It is reached on a non-ESRCH killpg error
+                    // (e.g. EPERM after a privilege drop), where the subtree may
+                    // survive; the leader is still terminated.
                     let _ = child.kill().await;
                 }
             }
@@ -496,7 +503,6 @@ async fn run_subprocess(
     ctx: Arc<TaskExecContext>,
     cancel: CancellationToken,
 ) -> Result<(), TaskError> {
-    ctx.metrics.record_task_started(RunnerType::Subprocess);
     let start = Instant::now();
 
     trace!(
@@ -524,6 +530,12 @@ async fn run_subprocess(
             });
         }
     };
+
+    // The task has actually started now that the child spawned. Counting it here
+    // (rather than before prepare/spawn) keeps `record_task_started` symmetric
+    // with `record_task_completed`: infra failures before this point are counted
+    // via `record_runner_error`, not as started-but-never-completed.
+    ctx.metrics.record_task_started(RunnerType::Subprocess);
 
     // Arm the drop-safe subtree reaper immediately: from here, any early return or a
     // dropped future (taskvisor timeout / force-abort) kills the whole process group,
@@ -599,7 +611,7 @@ async fn run_subprocess(
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let outcome = match &result {
-        Ok(()) => solti_runner::TaskOutcome::Success,
+        Ok(()) => solti_runner::MetricOutcome::Success,
         Err(e) => classify_task_error(e),
     };
     ctx.metrics

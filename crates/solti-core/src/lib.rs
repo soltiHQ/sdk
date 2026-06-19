@@ -32,6 +32,8 @@
 mod error;
 pub use error::CoreError;
 
+pub mod reasons;
+
 mod map;
 
 mod system;

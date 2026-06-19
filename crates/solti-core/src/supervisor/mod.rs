@@ -4,7 +4,31 @@
 //! - owns a [`Supervisor`] instance and runs its event loop in the background;
 //! - uses [`RunnerRouter`] to build concrete tasks from [`TaskSpec`];
 //! - maps model-level specs / policies into controller specs and submits them.
-use std::{sync::Arc, time::Duration};
+//!
+//! ## Two-plane state reconstruction (invariant)
+//!
+//! Task state is rebuilt from two planes with **disjoint authority**:
+//!
+//! - The **event plane** (`StateSubscriber`, fed by taskvisor's *lossy* broadcast
+//!   bus) is authoritative for per-attempt detail: phase transitions, `TaskRun`
+//!   records, and output announcements.
+//! - The **completion plane** (`finalize_from_outcome`, fed by the *guaranteed*
+//!   per-submission `TaskWaiter` oneshot) is authoritative **only** for terminal
+//!   liveness — it ensures a run still reaches a terminal phase when its terminal
+//!   event was dropped under bus lag.
+//!
+//! The backstop must therefore stay a **no-op on already-terminal entries**
+//! (enforced here and by `Task::transition_finished`'s sticky-terminal guard), so
+//! it can never demote a richer event-derived phase. Both planes classify a
+//! rejection the same way (see [`reasons`](crate::reasons)) so they never
+//! disagree on the final phase.
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use solti_model::{Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskRun, TaskSpec};
 use taskvisor::{
@@ -19,6 +43,7 @@ use crate::system::init_uptime;
 use crate::{
     error::CoreError,
     map::{to_admission_policy, to_backoff_policy, to_restart_policy},
+    reasons,
     state::{StateConfig, StateSubscriber, TaskState, state_sweep},
 };
 
@@ -34,6 +59,15 @@ use crate::{
 /// - [`CoreError`] error type returned by all methods.
 /// - [`StateConfig`] configures sweep TTLs and interval (defaults are sane).
 /// - [`solti_runner::RunnerRouter`] picks a runner for each submitted spec.
+///
+/// ## Lifecycle
+///
+/// [`SupervisorApi::shutdown`] is the graceful drain path and should be awaited
+/// before the value goes away. Dropping the value **without** calling it is a
+/// best-effort fallback: if a Tokio runtime is active, `Drop` schedules the same
+/// drain so the taskvisor runtime (actors, listeners, controller loop) is not
+/// leaked; if there is no runtime, it can only log a warning. Prefer the
+/// explicit `shutdown().await`.
 pub struct SupervisorApi {
     output_registry: Arc<OutputRegistry>,
     handle: SupervisorHandle,
@@ -42,6 +76,33 @@ pub struct SupervisorApi {
     /// Supervisor grace period: cancellation confirmation must wait slightly
     /// longer, because the registry force-aborts stragglers only *after* it.
     grace: Duration,
+    /// Set once a graceful `shutdown()` (or the `Drop` fallback) has been
+    /// initiated, so the two paths do not double-drain.
+    shutdown_started: AtomicBool,
+}
+
+impl Drop for SupervisorApi {
+    fn drop(&mut self) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return; // explicit shutdown() already initiated the drain
+        }
+        // Best-effort: Drop cannot be async, so schedule the graceful drain on
+        // the current runtime. Without a runtime there is nothing safe to do.
+        let handle = self.handle.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    let _ = handle.shutdown().await;
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "SupervisorApi dropped without shutdown() and outside a Tokio runtime; \
+                     the taskvisor runtime may leak — call SupervisorApi::shutdown().await",
+                );
+            }
+        }
+    }
 }
 
 impl SupervisorApi {
@@ -105,6 +166,7 @@ impl SupervisorApi {
             state,
             output_registry,
             grace,
+            shutdown_started: AtomicBool::new(false),
         };
 
         let (task, spec) = state_sweep(api.state.clone(), state_cfg);
@@ -242,6 +304,11 @@ impl SupervisorApi {
         spec: &TaskSpec,
     ) -> Result<TaskId, CoreError> {
         let task_id = TaskId::from(task.name());
+        // The task name becomes the runtime identity and the taskvisor label;
+        // reject a malformed one at the boundary instead of shipping a broken
+        // identity (the routed `submit` path gets safe names from `make_run_id`,
+        // but `submit_with_task` accepts a caller-chosen name).
+        task_id.validate_format()?;
 
         // A live (non-terminal) entry under this name means the previous
         // incarnation is still active: registering provisionally would clobber
@@ -249,7 +316,7 @@ impl SupervisorApi {
         if let Some(existing) = self.state.get(&task_id)
             && !existing.status().phase.is_terminal()
         {
-            return Err(CoreError::Supervisor(format!(
+            return Err(CoreError::AlreadyExists(format!(
                 "task '{task_id}' is already active (phase {})",
                 existing.status().phase
             )));
@@ -275,6 +342,16 @@ impl SupervisorApi {
             Ok((tv_id, waiter)) => {
                 // Bind the entry to its run identity: from here on, lossy events
                 // (including async rejections) resolve through this binding.
+                //
+                // Ordering is race-free even on a multi-thread runtime:
+                // `submit_and_watch` only mints `tv_id` and enqueues the Add
+                // command onto the controller's mpsc channel — it publishes no
+                // events before returning. Every `TaskAdded`/`TaskStarting` for
+                // this id is emitted later, from the controller loop, only after
+                // it dequeues that command. `bind_tv` is a synchronous lock
+                // taken before the next `.await`, so it always wins the race.
+                // (Do NOT move `bind_tv` before `submit` — `tv_id` does not exist
+                // until the await returns.)
                 self.state.bind_tv(&task_id, tv_id.get());
 
                 // Guaranteed-outcome backstop: taskvisor delivers the *final*
@@ -319,9 +396,20 @@ impl SupervisorApi {
             return; // events already cleaned the entry up, or it was never bound
         };
 
-        if matches!(outcome, TaskOutcome::Rejected { .. }) {
-            // Never admitted: drop the provisional entry (idempotent with the event path).
-            state.unregister_task(&model_id);
+        if let TaskOutcome::Rejected { reason } = outcome {
+            // Match the event path (StateSubscriber): a rejected submission stays
+            // as a terminal, observable entry (Canceled for user/shutdown drops,
+            // Failed otherwise) and releases its output channel; it is reaped
+            // later by `TaskRemoved`/sweep. `transition_finished` is sticky-
+            // guarded, so this is a no-op when the event path already finalized
+            // the entry — the two planes never disagree on a rejection.
+            let phase = match reason.as_ref() {
+                reasons::REMOVED_FROM_QUEUE
+                | reasons::SUPERSEDED_BY_REPLACE
+                | reasons::CONTROLLER_SHUTTING_DOWN => TaskPhase::Canceled,
+                _ => TaskPhase::Failed,
+            };
+            state.transition_finished(&model_id, phase, Some(reason.to_string()), None);
             output_registry.evict(&model_id);
             return;
         }
@@ -358,6 +446,11 @@ impl SupervisorApi {
             ),
         };
         state.transition_finished(&model_id, phase, error, exit_code);
+        // The completion plane is lag-proof, so release the output channel here
+        // too. Eviction otherwise rides the lossy event path; this is the precise
+        // lag-dropped-terminal case the backstop exists for, and `evict` is an
+        // idempotent map remove (harmless if the event path already ran it).
+        output_registry.evict(&model_id);
     }
 
     /// Roll back resources reserved by [`submit_with_task`] before `handle.submit`.
@@ -377,8 +470,12 @@ impl SupervisorApi {
     /// ```
     #[instrument(level = "info", skip(self))]
     pub async fn shutdown(self) -> Result<(), CoreError> {
+        // Mark before draining so the `Drop` fallback (which runs when `self`
+        // goes out of scope at the end of this method) does not drain again.
+        self.shutdown_started.store(true, Ordering::Release);
         info!("initiating graceful shutdown");
         self.handle
+            .clone()
             .shutdown()
             .await
             .map_err(|e| CoreError::Supervisor(e.to_string()))
@@ -391,7 +488,7 @@ impl SupervisorApi {
 
         let was_running = self.cancel_bound(id).await?;
         if !was_running && self.state.get(id).is_none() {
-            return Err(CoreError::Supervisor(format!("task not found: {}", id)));
+            return Err(CoreError::NotFound(id.to_string()));
         }
 
         debug!("task cancellation issued: {}", id);
@@ -589,6 +686,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_api_without_shutdown_cancels_running_tasks() {
+        let api = SupervisorApi::new(
+            SupervisorConfig::default(),
+            ControllerConfig::default(),
+            Vec::new(),
+            RunnerRouter::new(),
+            StateConfig::default(),
+        )
+        .await
+        .expect("SupervisorApi::new");
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let task: TaskRef = TaskFn::arc("drop-cancel", move |ctx: CancellationToken| {
+            let flag = Arc::clone(&flag);
+            async move {
+                while !ctx.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                flag.store(true, Ordering::SeqCst);
+                Ok::<(), TaskError>(())
+            }
+        });
+        let spec = TaskSpec::builder("drop-slot", TaskKind::Embedded, 60_000_u64)
+            .restart(RestartPolicy::Never)
+            .backoff(mk_backoff())
+            .admission(AdmissionPolicy::Replace)
+            .build()
+            .expect("spec builds");
+
+        api.submit_with_task(task, &spec)
+            .await
+            .expect("submit_with_task");
+
+        // Keep the runtime alive past the api drop so we can observe the cancel.
+        let handle = api.handle();
+        for _ in 0..200 {
+            if handle.is_alive("drop-cancel").await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Drop WITHOUT calling shutdown(): the runtime must still be cancelled.
+        drop(api);
+
+        let mut observed = false;
+        for _ in 0..200 {
+            if cancelled.load(Ordering::SeqCst) {
+                observed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            observed,
+            "dropping SupervisorApi without shutdown() must cancel running tasks (best-effort), not leak them"
+        );
+    }
+
+    #[tokio::test]
+    async fn submitting_an_active_duplicate_name_returns_already_exists() {
+        let api = SupervisorApi::new(
+            SupervisorConfig::default(),
+            ControllerConfig::default(),
+            Vec::new(),
+            RunnerRouter::new(),
+            StateConfig::default(),
+        )
+        .await
+        .expect("SupervisorApi::new");
+
+        let long = |name: &'static str| -> TaskRef {
+            TaskFn::arc(name, |ctx: CancellationToken| async move {
+                ctx.cancelled().await;
+                Ok::<(), TaskError>(())
+            })
+        };
+        let spec = TaskSpec::builder("dup-slot", TaskKind::Embedded, 60_000_u64)
+            .restart(RestartPolicy::Never)
+            .backoff(mk_backoff())
+            .admission(AdmissionPolicy::Replace)
+            .build()
+            .expect("spec builds");
+
+        let id = api
+            .submit_with_task(long("dup-name"), &spec)
+            .await
+            .expect("first submit ok");
+
+        // Wait until the first incarnation is non-terminal (Running).
+        let handle = api.handle();
+        for _ in 0..200 {
+            if handle.is_alive(id.as_str()).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let err = api
+            .submit_with_task(long("dup-name"), &spec)
+            .await
+            .expect_err("duplicate active name must be rejected");
+        assert!(
+            matches!(err, CoreError::AlreadyExists(_)),
+            "expected AlreadyExists, got {err:?}"
+        );
+
+        let _ = api.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn submit_with_task_rejects_malformed_task_name() {
+        let api = SupervisorApi::new(
+            SupervisorConfig::default(),
+            ControllerConfig::default(),
+            Vec::new(),
+            RunnerRouter::new(),
+            StateConfig::default(),
+        )
+        .await
+        .expect("SupervisorApi::new");
+
+        // A space makes an invalid TaskId / taskvisor label; it must be caught at
+        // the submit boundary rather than producing a broken runtime identity.
+        let task: TaskRef = TaskFn::arc(
+            "bad name with spaces",
+            |_ctx: CancellationToken| async move { Ok::<(), TaskError>(()) },
+        );
+        let spec = TaskSpec::builder("ok-slot", TaskKind::Embedded, 1_000_u64)
+            .restart(RestartPolicy::Never)
+            .backoff(mk_backoff())
+            .admission(AdmissionPolicy::DropIfRunning)
+            .build()
+            .expect("spec builds");
+
+        let err = api
+            .submit_with_task(task, &spec)
+            .await
+            .expect_err("malformed task name must be rejected");
+        assert!(
+            matches!(err, CoreError::InvalidSpec(_)),
+            "expected InvalidSpec, got {err:?}"
+        );
+
+        let _ = api.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_missing_task_returns_not_found() {
+        let api = SupervisorApi::new(
+            SupervisorConfig::default(),
+            ControllerConfig::default(),
+            Vec::new(),
+            RunnerRouter::new(),
+            StateConfig::default(),
+        )
+        .await
+        .expect("SupervisorApi::new");
+
+        let err = api
+            .cancel_task(&TaskId::from("never-existed"))
+            .await
+            .expect_err("cancel on missing must error");
+        assert!(
+            matches!(err, CoreError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+
+        let _ = api.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn delete_task_is_idempotent_on_missing() {
         let router = RunnerRouter::new();
         let api = SupervisorApi::new(
@@ -745,6 +1015,25 @@ mod tests {
     }
 
     #[test]
+    fn backstop_evicts_output_channel_on_terminal_outcome() {
+        // The backstop exists for the lag-dropped-terminal case: when it
+        // finalizes the phase it must ALSO release the output channel, otherwise
+        // the broadcast channel leaks for exactly the events the backstop covers.
+        let (state, id) = bound_running_state("leak-1", 201);
+        let registry = OutputRegistry::default();
+        registry.ensure_channel(id.clone());
+        assert!(registry.subscribe(&id).is_some(), "channel exists before");
+
+        SupervisorApi::finalize_from_outcome(&state, &registry, 201, &TaskOutcome::Completed);
+
+        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Succeeded);
+        assert!(
+            registry.subscribe(&id).is_none(),
+            "the backstop must evict the output channel on a terminal outcome"
+        );
+    }
+
+    #[test]
     fn backstop_is_noop_when_events_already_finalized() {
         // Common case: events finalized first; the backstop must not fight them.
         let (state, id) = bound_running_state("done-1", 102);
@@ -761,9 +1050,13 @@ mod tests {
     }
 
     #[test]
-    fn backstop_rejected_drops_the_provisional_entry() {
+    fn backstop_rejected_finalizes_entry_consistently_with_event_path() {
+        // A non-user rejection (slot busy / queue full) is a Failed terminal;
+        // the entry stays observable (event path keeps it too) and the output
+        // channel is released. The backstop must NOT hard-drop it.
         let (state, id) = bound_running_state("rej-1", 103);
         let registry = OutputRegistry::default();
+        registry.ensure_channel(id.clone());
 
         SupervisorApi::finalize_from_outcome(
             &state,
@@ -774,10 +1067,28 @@ mod tests {
             },
         );
 
-        assert!(
-            state.get(&id).is_none(),
-            "a rejected submission never ran; its provisional entry must be removed"
+        let task = state.get(&id).expect("rejected entry stays observable");
+        assert_eq!(task.status().phase, TaskPhase::Failed);
+        assert!(registry.subscribe(&id).is_none(), "output channel evicted");
+    }
+
+    #[test]
+    fn backstop_rejected_user_drop_is_canceled() {
+        // A user/shutdown-driven drop (removed_from_queue / superseded / shutting
+        // down) is a cancellation, matching the StateSubscriber classification.
+        let (state, id) = bound_running_state("rej-2", 104);
+        let registry = OutputRegistry::default();
+
+        SupervisorApi::finalize_from_outcome(
+            &state,
+            &registry,
+            104,
+            &TaskOutcome::Rejected {
+                reason: "removed_from_queue".into(),
+            },
         );
+
+        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Canceled);
     }
 
     #[test]

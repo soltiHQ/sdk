@@ -3,12 +3,14 @@
 //! [`StateSubscriber`] implements [`Subscribe`](taskvisor::Subscribe) to wire
 //! taskvisor lifecycle events into [`TaskState`](super::TaskState) mutations.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
+use parking_lot::Mutex;
 use taskvisor::{Event, EventKind, Subscribe};
 use tracing::{trace, warn};
 
 use super::TaskState;
+use crate::reasons;
 use solti_model::{TaskId, TaskPhase};
 use solti_runner::OutputRegistry;
 
@@ -21,6 +23,12 @@ use solti_runner::OutputRegistry;
 pub struct StateSubscriber {
     state: TaskState,
     output_registry: Arc<OutputRegistry>,
+    /// Attempts that emitted a `TimeoutHit` and are awaiting their `TaskFailed`,
+    /// keyed by task id -> attempt. taskvisor publishes `TimeoutHit` immediately
+    /// before the `TaskFailed` carrying the timeout error, so this lets the
+    /// failing attempt land in [`TaskPhase::Timeout`] instead of a generic
+    /// `Failed`. Entries are cleared on consumption and on task removal.
+    timed_out: Mutex<HashMap<TaskId, u32>>,
 }
 
 impl StateSubscriber {
@@ -29,6 +37,7 @@ impl StateSubscriber {
         Self {
             state,
             output_registry,
+            timed_out: Mutex::new(HashMap::new()),
         }
     }
 
@@ -93,45 +102,61 @@ impl Subscribe for StateSubscriber {
                     .as_ref()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
+                // If taskvisor flagged this exact attempt as timed out (a
+                // TimeoutHit preceding this TaskFailed), finalize it as Timeout
+                // rather than a generic Failed, so state agrees with the metrics
+                // plane (which counts timeouts separately).
+                let phase = {
+                    let mut timed_out = self.timed_out.lock();
+                    if timed_out.get(&task_id).is_some_and(|a| *a == attempt) {
+                        timed_out.remove(&task_id);
+                        TaskPhase::Timeout
+                    } else {
+                        TaskPhase::Failed
+                    }
+                };
                 trace!(
                     task = %task_id,
                     reason = %reason,
                     exit_code = ?event.exit_code,
+                    phase = %phase,
                     "task failed",
                 );
-                if !self.state.transition_finished(
-                    &task_id,
-                    TaskPhase::Failed,
-                    Some(reason),
-                    event.exit_code,
-                ) {
+                if !self
+                    .state
+                    .transition_finished(&task_id, phase, Some(reason), event.exit_code)
+                {
                     warn!(task = %task_id, "TaskFailed event for unknown task");
                 }
                 self.output_registry
                     .announce_run_finished(&task_id, attempt, event.exit_code);
             }
-            // Informational: always followed by TaskFailed for the same attempt,
-            // which performs the actual transition and announcement.
+            // Informational: always followed by TaskFailed for the same attempt.
+            // Record the timed-out attempt so that TaskFailed lands in Timeout.
             EventKind::TimeoutHit => {
                 trace!(task = %task_id, "task attempt timed out");
+                self.timed_out.lock().insert(task_id.clone(), attempt);
             }
             EventKind::ActorExhausted => {
-                // The normal way a task ends: success under OnFailure/Never, or
-                // retry budget exhaustion. Success is not an error.
+                // The normal way a task ends: success under OnFailure/Never,
+                // cooperative self-cancel, or retry-budget exhaustion. Success
+                // and cancel are not errors. The `Canceled`/`Succeeded` mappings
+                // are also protected by `Task::transition_finished`'s sticky
+                // terminal guard, so a trailing `ActorExhausted` cannot overwrite
+                // the phase a per-attempt terminal event already set.
                 let reason = event.reason.as_ref().map(|s| s.to_string());
-                let is_success = reason.as_deref() == Some("policy_exhausted_success");
                 trace!(
                     task = %task_id,
                     exit_code = ?event.exit_code,
                     "actor exhausted",
                 );
-                let (phase, error) = if is_success {
-                    (TaskPhase::Succeeded, None)
-                } else {
-                    (
+                let (phase, error) = match reason.as_deref() {
+                    Some(reasons::POLICY_EXHAUSTED_SUCCESS) => (TaskPhase::Succeeded, None),
+                    Some(reasons::TASK_RETURNED_CANCELED) => (TaskPhase::Canceled, None),
+                    _ => (
                         TaskPhase::Exhausted,
                         Some(reason.unwrap_or_else(|| "exhausted".to_string())),
-                    )
+                    ),
                 };
                 if !self
                     .state
@@ -173,9 +198,9 @@ impl Subscribe for StateSubscriber {
                     .unwrap_or_else(|| "rejected".to_string());
                 // User-initiated or shutdown-driven drops are cancellations.
                 let phase = match reason.as_str() {
-                    "removed_from_queue" | "superseded_by_replace" | "controller_shutting_down" => {
-                        TaskPhase::Canceled
-                    }
+                    reasons::REMOVED_FROM_QUEUE
+                    | reasons::SUPERSEDED_BY_REPLACE
+                    | reasons::CONTROLLER_SHUTTING_DOWN => TaskPhase::Canceled,
                     _ => TaskPhase::Failed,
                 };
                 if !self
@@ -188,6 +213,7 @@ impl Subscribe for StateSubscriber {
             }
             EventKind::TaskRemoved => {
                 trace!(task = %task_id, "task removed from state");
+                self.timed_out.lock().remove(&task_id);
                 self.state.unregister_task(&task_id);
                 self.output_registry.evict(&task_id);
             }
@@ -522,6 +548,66 @@ mod tests {
             registry.subscribe(&id).is_none(),
             "channel must be evicted on Exhausted"
         );
+    }
+
+    #[test]
+    fn timeout_hit_then_task_failed_for_same_attempt_maps_to_timeout_phase() {
+        // taskvisor emits TimeoutHit (informational) immediately before the
+        // TaskFailed that carries the Timeout error. The pairing must land the
+        // attempt in the Timeout phase, not a generic Failed.
+        let (sub, state, id) = setup("slow-task");
+
+        sub.on_event(
+            &Event::new(EventKind::TimeoutHit)
+                .with_task("slow-task")
+                .with_attempt(1),
+        );
+        sub.on_event(
+            &Event::new(EventKind::TaskFailed)
+                .with_task("slow-task")
+                .with_attempt(1)
+                .with_reason("deadline exceeded"),
+        );
+
+        let task = state.get(&id).expect("task exists");
+        assert_eq!(task.status().phase, TaskPhase::Timeout);
+    }
+
+    #[test]
+    fn task_failed_without_timeout_hit_stays_failed() {
+        let (sub, state, id) = setup("plain-fail");
+
+        sub.on_event(
+            &Event::new(EventKind::TaskFailed)
+                .with_task("plain-fail")
+                .with_attempt(1)
+                .with_reason("boom"),
+        );
+
+        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Failed);
+    }
+
+    #[test]
+    fn actor_exhausted_task_returned_canceled_maps_to_canceled() {
+        // A task body returning TaskError::Canceled (without a runtime-token
+        // cancel) makes taskvisor emit ActorExhausted{reason:"task_returned_canceled"}.
+        // That is a cooperative stop, not a retry-budget exhaustion.
+        let (sub, state, id) = setup("self-cancel");
+
+        sub.on_event(
+            &Event::new(EventKind::ActorExhausted)
+                .with_task("self-cancel")
+                .with_attempt(1)
+                .with_reason("task_returned_canceled"),
+        );
+
+        let task = state.get(&id).expect("task exists");
+        assert_eq!(
+            task.status().phase,
+            TaskPhase::Canceled,
+            "task_returned_canceled is a cancellation, not an exhaustion"
+        );
+        assert!(task.status().error.is_none());
     }
 
     #[test]

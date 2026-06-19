@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use prometheus::{CounterVec, HistogramVec, Registry, proto::MetricFamily};
 
-use solti_runner::{MetricsBackend, RunnerErrorKind, RunnerType, TaskOutcome};
+use solti_runner::{MetricOutcome, MetricsBackend, RunnerErrorKind, RunnerType};
 
 use crate::register::{Sub, ms_to_secs};
 
@@ -143,11 +143,11 @@ impl MetricsBackend for PrometheusMetrics {
     /// - `solti_runner_tasks_completed_total{runner, outcome}` - incremented by 1.
     /// - `solti_runner_task_duration_seconds{runner, outcome}` - observes the duration converted from milliseconds to seconds.
     ///
-    /// The `outcome` label is derived from [`TaskOutcome::as_label`]: `success` | `failure` | `canceled` | `timeout`.
+    /// The `outcome` label is derived from [`MetricOutcome::as_label`]: `success` | `failure` | `canceled` | `timeout`.
     fn record_task_completed(
         &self,
         runner_type: RunnerType,
-        outcome: TaskOutcome,
+        outcome: MetricOutcome,
         duration_ms: u64,
     ) {
         let runner = runner_type.as_label();
@@ -202,8 +202,8 @@ mod tests {
     fn record_task_completed_increments_counter_and_histogram() {
         let metrics = PrometheusMetrics::new_isolated().unwrap();
 
-        metrics.record_task_completed(RunnerType::Subprocess, TaskOutcome::Success, 150);
-        metrics.record_task_completed(RunnerType::Subprocess, TaskOutcome::Failure, 50);
+        metrics.record_task_completed(RunnerType::Subprocess, MetricOutcome::Success, 150);
+        metrics.record_task_completed(RunnerType::Subprocess, MetricOutcome::Failure, 50);
 
         let families = metrics.gather();
 

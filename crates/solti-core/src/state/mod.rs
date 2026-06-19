@@ -70,7 +70,10 @@ impl TaskState {
         let slot = spec.slot().clone();
         let task = Task::new(id.clone(), spec);
 
-        inner.by_slot.entry(slot).or_default().push(id.clone());
+        let ids = inner.by_slot.entry(slot).or_default();
+        if !ids.contains(&id) {
+            ids.push(id.clone());
+        }
         inner.tasks.insert(id, task);
     }
 
@@ -426,6 +429,23 @@ mod tests {
 
         let task = state.get(&id).unwrap();
         assert_eq!(task.status().attempt, 2);
+    }
+
+    #[test]
+    fn add_task_twice_with_same_id_does_not_duplicate_in_slot() {
+        // Resubmit of a terminal-but-not-yet-removed embedded task reuses the
+        // same TaskId; the slot index must not list it twice.
+        let state = TaskState::new();
+        let id = TaskId::from("dup");
+
+        state.add_task(id.clone(), default_spec_with_slot("slot-x"));
+        state.add_task(id.clone(), default_spec_with_slot("slot-x"));
+
+        assert_eq!(
+            state.list_by_slot("slot-x").len(),
+            1,
+            "re-adding the same id must not duplicate it in the slot index"
+        );
     }
 
     #[test]
