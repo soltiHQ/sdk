@@ -1,9 +1,12 @@
+//! # Local-timezone offset cache ([`LoggerTimeZone`]).
+
 use std::{fmt, str::FromStr, sync::OnceLock};
 
 use parking_lot::RwLock;
 
 use serde::{Deserialize, Serialize};
 use time::UtcOffset;
+#[cfg(feature = "timezone-sync")]
 use tracing::debug;
 
 use crate::logger::error::LoggerError;
@@ -31,7 +34,7 @@ static INIT_DONE: OnceLock<()> = OnceLock::new();
 ///
 /// ## Default
 ///
-/// Defaults to `Utc.
+/// Defaults to `Utc`.
 ///
 /// ## Parsing
 ///
@@ -120,6 +123,7 @@ pub fn init_local_offset() {
 /// Re-detects the system UTC offset and updates the global cache.
 ///
 /// Called periodically by the [`crate::timezone_sync`] task.
+#[cfg(feature = "timezone-sync")]
 pub(crate) fn sync_local_offset() -> Result<(), LoggerError> {
     match UtcOffset::current_local_offset() {
         Ok(new_offset) => {
@@ -166,6 +170,7 @@ pub(crate) fn get_or_detect_local_offset() -> UtcOffset {
 /// Formats offset as `UTC±HH` or `UTC±HH:MM`.
 ///
 /// Examples: `"UTC+00"`, `"UTC+03:30"`, `"UTC-05"`
+#[cfg(feature = "timezone-sync")]
 fn format_offset(offset: UtcOffset) -> String {
     let hours = offset.whole_hours();
     let minutes = offset.minutes_past_hour();
@@ -217,17 +222,20 @@ mod tests {
         assert_eq!(LoggerTimeZone::Local.to_string(), "local");
     }
 
+    #[cfg(feature = "timezone-sync")]
     #[test]
     fn format_offset_handles_utc() {
         assert_eq!(format_offset(UtcOffset::UTC), "UTC+00");
     }
 
+    #[cfg(feature = "timezone-sync")]
     #[test]
     fn format_offset_handles_positive() {
         let offset = UtcOffset::from_hms(3, 30, 0).unwrap();
         assert_eq!(format_offset(offset), "UTC+03:30");
     }
 
+    #[cfg(feature = "timezone-sync")]
     #[test]
     fn format_offset_handles_negative() {
         let offset = UtcOffset::from_hms(-5, 0, 0).unwrap();

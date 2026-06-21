@@ -1,3 +1,8 @@
+//! # Timezone-sync supervised task ([`timezone_sync`](crate::timezone_sync)).
+//!
+//! Returns a `(TaskRef, TaskSpec)` for a periodic task that re-detects the local UTC offset.
+//! Runs under`Replace` admission in the `tz-sync` slot: ~1h period on success, backoff on failure.
+
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
 };

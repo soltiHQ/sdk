@@ -1,3 +1,9 @@
+//! # Logger backend dispatch (internal).
+//!
+//! Builds and installs the global tracing subscriber per [`LoggerFormat`](crate::LoggerFormat):
+//! `Text` → `fmt::Layer` (RFC 3339 timer), `Json` → `fmt::Layer::json()`, `Journald` → `tracing_journald` (Linux; a stub returning [`LoggerError::JournaldNotSupported`](crate::LoggerError) elsewhere).
+//! All install via `try_init`, mapping a second call to [`LoggerError::AlreadyInitialized`](crate::LoggerError).
+
 use tracing::Subscriber;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 

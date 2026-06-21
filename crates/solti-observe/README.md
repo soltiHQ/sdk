@@ -119,7 +119,6 @@ Supports serde deserialization with missing-field defaults:
   JournaldInitFailed     journald layer init error (Linux)
   AlreadyInitialized     init_logger() called twice
   InvalidTimeZone        unknown timezone string (not utc/local)
-  LocalTimezoneInitFailed timezone detection failed
   InvalidLevel           invalid EnvFilter expression
 ```
 
@@ -127,5 +126,5 @@ Supports serde deserialization with missing-field defaults:
 - `init_logger` can only be called **once** per process - subsequent calls return `AlreadyInitialized`.
 - `init_local_offset` is idempotent: safe to call multiple times, only the first triggers detection.
 - `TracingEventSubscriber` uses `queue_capacity = 2048`.
-- All `EventKind` variants are explicitly matched (no wildcard) compiler catches new variants.
+- `EventKind` is `#[non_exhaustive]`; a `_` arm tolerates future taskvisor variants (logged at `debug`).
 - `BackoffScheduled` differentiates retry-after-failure vs scheduled-next-run by checking `reason` field presence.
