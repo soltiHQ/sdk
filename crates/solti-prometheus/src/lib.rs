@@ -2,9 +2,8 @@
 //!
 //! Prometheus metrics for the Solti task-orchestration SDK.
 //!
-//! Collectors and helpers share one [`prometheus::Registry`]. A single
-//! `/metrics` endpoint covers runner internals, supervisor events, API
-//! requests, discovery heartbeat, process stats, and build identity.
+//! Collectors and helpers share one [`prometheus::Registry`].
+//! A single `/metrics` endpoint covers runner internals, supervisor events, API requests, discovery heartbeat, process stats, and build identity.
 //!
 //! ## Collectors and helpers
 //!
@@ -75,7 +74,7 @@
 //! | `solti_ctrl_rejections_total`  | CounterVec| `reason` | Controller rejections grouped by cause |
 //!
 //! `reason` values (bounded, classified from `Event.reason`):
-//! [ `slot_full`, `slot_busy`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown`].
+//! [ `slot_full`, `slot_busy`, `superseded`, `removed`, `shutting_down`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown`].
 //!
 //! ## API metrics (`solti_api_*`, feature `api`)
 //!
@@ -125,7 +124,8 @@
 //!  TaskFailed          → tasks_in_flight.dec()
 //!  TimeoutHit          → task_timeouts.inc()
 //!  BackoffScheduled    → task_backoff_count{source}.inc() + task_backoff_duration.observe(delay)
-//!  ActorExhausted      → task_terminal{reason="exhausted"}.inc() + attempts_to_finalize{outcome="exhausted"}.observe(attempt)
+//!  ActorExhausted      → task_terminal{reason}.inc() + attempts_to_finalize{outcome}.observe(attempt)
+//!                        (reason/outcome = "completed" if policy_exhausted_success, else "exhausted")
 //!  ActorDead           → task_terminal{reason="fatal"}.inc()     + attempts_to_finalize{outcome="fatal"}.observe(attempt)
 //!  SubscriberOverflow  → subscriber_overflow.inc()
 //!  SubscriberPanicked  → subscriber_panicked.inc()
@@ -190,6 +190,13 @@
 //! - [`taskvisor::Subscribe`] - trait backing [`PrometheusSubscriber`].
 //! - `solti_api::ApiMetricsBackend` - trait backing [`PrometheusApiMetrics`] (feature `api`).
 //! - `solti_discover::DiscoverMetricsBackend` - trait backing [`PrometheusDiscoverMetrics`] (feature `discover`).
+
+#![forbid(unsafe_code)]
+
+/// Compiles the runnable Rust code blocks in `README.md` as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 mod register;
 

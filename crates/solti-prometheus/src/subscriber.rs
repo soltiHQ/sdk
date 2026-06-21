@@ -29,8 +29,8 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 2048;
 /// TimeoutHit          → task_timeouts.inc()
 /// BackoffScheduled    → task_backoff_count{source}.inc()
 ///                       + task_backoff_duration.observe(delay)
-/// ActorExhausted      → task_terminal{reason="exhausted"}.inc()
-///                       + attempts_to_finalize{outcome="exhausted"}.observe(attempt)
+/// ActorExhausted      → task_terminal{reason}.inc()   (reason="completed" if the reason is policy_exhausted_success, else "exhausted")
+///                       + attempts_to_finalize{outcome}.observe(attempt)
 /// ActorDead           → task_terminal{reason="fatal"}.inc()
 ///                       + attempts_to_finalize{outcome="fatal"}.observe(attempt)
 /// SubscriberOverflow  → subscriber_overflow.inc() + tracing::warn
@@ -65,9 +65,9 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 2048;
 /// | Label    | Values                                                                                                                           | Source                                                       |
 /// |----------|----------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------|
 /// | `source` | `failure`, `success`                                                                                                             | [`BackoffSource`] on the event                               |
-/// | `reason` (terminal)   | `exhausted`, `fatal`                                                                                                | Terminal event kind                                          |
-/// | `outcome` (attempts)  | `exhausted`, `fatal`                                                                                                | Attempts-to-finalize histogram                               |
-/// | `reason` (rejection)  | `slot_full`, `slot_busy`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` | Classified from `Event.reason` by `classify_rejection_reason` (private)         |
+/// | `reason` (terminal)   | `completed`, `exhausted`, `fatal`                                                                                   | Terminal event kind (`completed` = policy_exhausted_success) |
+/// | `outcome` (attempts)  | `completed`, `exhausted`, `fatal`                                                                                   | Attempts-to-finalize histogram                               |
+/// | `reason` (rejection)  | `slot_full`, `slot_busy`, `superseded`, `removed`, `shutting_down`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` | Classified from `Event.reason` by `classify_rejection_reason` (private)         |
 ///
 /// ## Notes
 ///
@@ -105,7 +105,7 @@ pub struct PrometheusSubscriber {
 /// The raw `reason` on [`taskvisor::Event`] can embed error messages, queue depths, and other unbounded content, which would explode Prometheus cardinality if used directly as a label.
 /// This classifier collapses known prefixes produced by taskvisor's controller into a small set:
 ///
-/// [`slot_full`, `slot_busy`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` ].
+/// [`slot_full`, `slot_busy`, `superseded`, `removed`, `shutting_down`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` ].
 fn classify_rejection_reason(reason: Option<&str>) -> &'static str {
     let Some(r) = reason else {
         return "unknown";
@@ -126,7 +126,7 @@ fn classify_rejection_reason(reason: Option<&str>) -> &'static str {
         "remove_failed"
     } else if r.starts_with("queue_start_failed") {
         "queue_failed"
-    } else if r.starts_with("recovery_start_failed") {
+    } else if r.starts_with("recovery_remove_failed") {
         "recovery_failed"
     } else if r.starts_with("bus_lagged") {
         "bus_lagged"
@@ -738,7 +738,8 @@ mod tests {
             "queue_failed"
         );
         assert_eq!(
-            classify_rejection_reason(Some("recovery_start_failed: net")),
+            // taskvisor 0.3 emits `recovery_remove_failed: {e}` (controller/core.rs).
+            classify_rejection_reason(Some("recovery_remove_failed: net")),
             "recovery_failed"
         );
         assert_eq!(

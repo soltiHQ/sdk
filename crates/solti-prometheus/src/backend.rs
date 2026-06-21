@@ -40,6 +40,19 @@ use crate::register::{Sub, ms_to_secs};
 ///
 /// Buckets (seconds): `0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 1800, 3600`.
 ///
+/// ## Example
+///
+/// ```rust
+/// use solti_prometheus::PrometheusMetrics;
+/// use solti_runner::{MetricsBackend, RunnerType};
+///
+/// // `new_isolated` owns a private registry — no shared wiring needed.
+/// let metrics = PrometheusMetrics::new_isolated().unwrap();
+/// metrics.record_task_started(RunnerType::Subprocess);
+///
+/// assert!(!metrics.gather().is_empty());
+/// ```
+///
 /// ## Also
 ///
 /// - [`PrometheusSubscriber`](crate::PrometheusSubscriber) is a supervision-level metrics from the event stream.

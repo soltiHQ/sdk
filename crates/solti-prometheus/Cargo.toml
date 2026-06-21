@@ -1,6 +1,7 @@
 [package]
 name = "solti-prometheus"
 description = "Solti SDK Prometheus metrics."
+documentation = "https://docs.rs/solti-prometheus"
 
 rust-version.workspace = true
 repository.workspace = true

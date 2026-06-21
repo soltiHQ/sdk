@@ -1,3 +1,11 @@
+//! # Embedded metrics HTTP server (feature `server`).
+//!
+//! [`server`] builds a supervised axum task that serves `/metrics` (Prometheus text exposition, `text/plain; version=0.0.4`) from a shared [`Registry`].
+//! Bind/serve failures are retried under supervisor backoff; shutdown is cooperative via the task's `CancellationToken`.
+//! The task runs under [`AdmissionPolicy::Replace`] in the [`METRICS_SERVER_SLOT`] slot.
+//!
+//! See the [crate root](crate) for the namespace/architecture overview.
+
 use std::sync::Arc;
 
 use axum::{

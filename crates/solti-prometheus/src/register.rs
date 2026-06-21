@@ -4,8 +4,11 @@
 //! [`Sub`] binds a [`Registry`] and a subsystem name together so constructors collapse to one line per metric.
 
 use prometheus::{
-    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, Opts, Registry,
+    Counter, CounterVec, Gauge, Histogram, HistogramOpts, HistogramVec, Opts, Registry,
 };
+// `GaugeVec` is only used by the feature-gated `gauge_vec` (api) / `gauge_vec_unregistered` (state).
+#[cfg(any(feature = "api", feature = "state"))]
+use prometheus::GaugeVec;
 
 /// Scoped registrar bound to a `solti` subsystem (e.g. `runner`, `sv`, `api`).
 pub(crate) struct Sub<'a> {
@@ -57,6 +60,7 @@ impl<'a> Sub<'a> {
         Ok(g)
     }
 
+    #[cfg(feature = "api")]
     pub(crate) fn gauge_vec(
         &self,
         name: &str,
@@ -83,6 +87,7 @@ impl<'a> Sub<'a> {
     ///
     /// Used by composite collectors that expose a `GaugeVec` via [`prometheus::core::Collector::collect`];
     /// the collector itself is registered by the caller, so the inner metric must not be registered twice.
+    #[cfg(feature = "state")]
     #[inline]
     pub(crate) fn gauge_vec_unregistered(
         subsystem: &'static str,
