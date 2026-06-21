@@ -69,7 +69,9 @@ pub(crate) mod time_serde {
         D: Deserializer<'de>,
     {
         let ms = u64::deserialize(deserializer)?;
-        Ok(UNIX_EPOCH + std::time::Duration::from_millis(ms))
+        UNIX_EPOCH
+            .checked_add(std::time::Duration::from_millis(ms))
+            .ok_or_else(|| <D::Error as serde::de::Error>::custom("timestamp out of range"))
     }
 }
 

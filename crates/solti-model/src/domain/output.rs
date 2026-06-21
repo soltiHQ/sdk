@@ -5,11 +5,13 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-/// StreamKind.
+/// Which standard stream a chunk came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamKind {
+    /// Standard output (`stdout`).
     Stdout,
+    /// Standard error (`stderr`).
     Stderr,
 }
 
