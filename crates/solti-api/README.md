@@ -2,14 +2,14 @@
 
 Dual-transport API layer exposing task operations over gRPC and HTTP.
 
-Both transports delegate to an `ApiHandler` trait, decoupling wire format from business logic. Both speak the same proto contract defined in `proto/solti/v1/`.
+Both transports delegate to an `ApiHandler` trait, decoupling wire format from business logic. Both speak the same proto contract defined in `proto/solti/task/v1/`.
 
 ## Architecture
 ```text
  Control Plane / Client
      │
      ├──► gRPC (feature = "grpc")
-     │        └──► SoltiApiService<H>
+     │        └──► TaskApiService<H>
      │                  │
      ├──► HTTP (feature = "http")
      │        └──► HttpApi<H> (axum Router)
@@ -30,7 +30,7 @@ Both transports delegate to an `ApiHandler` trait, decoupling wire format from b
 
 Binary passes it to `solti_discover::DiscoverConfig::builder(... , API_VERSION)`, which reports it to the control-plane via `SyncRequest`. One binary = one API version.
 
-```rust
+```rust,ignore
 use solti_api::API_VERSION;
 use solti_discover::{DiscoverConfig, DiscoveryTransport};
 use solti_model::AgentId;
@@ -65,22 +65,27 @@ Per-version API surface is documented in separate files: [api_v1.md](api_v1.md).
 | `OutputEventStream`    | `Pin<Box<dyn Stream<Item = OutputEvent> + Send>>` returned by `stream_task_logs` |
 | `SupervisorApiAdapter` | Default adapter bridging to `SupervisorApi`                                      |
 | `ApiError`             | Unified error mapped to gRPC Status / HTTP JSON                                  |
-| `SoltiApiService<H>`   | gRPC server impl (feature `grpc`)                                                |
+| `TaskApiService<H>`    | gRPC server impl (feature `grpc`)                                                |
 | `HttpApi<H>`           | axum router builder (feature `http`)                                             |
 | `BearerAuth`           | gRPC interceptor verifying the inbound bearer token (feature `grpc`)             |
 | `API_VERSION`          | Protocol version constant reported via discover                                  |
 
 ## Error model
 
-| Variant           | gRPC Status                      | HTTP Status                 | `error` label (HTTP body)                  |
-|-------------------|----------------------------------|-----------------------------|--------------------------------------------|
-| `InvalidRequest`  | `INVALID_ARGUMENT`               | `400 Bad Request`           | `"InvalidRequest"`                         |
-| `Unauthenticated` | `UNAUTHENTICATED`                | `401 Unauthorized`          | `"Unauthenticated"`                        |
-| `TaskNotFound`    | `NOT_FOUND`                      | `404 Not Found`             | `"TaskNotFound"`                           |
-| `Internal`        | `INTERNAL`                       | `500 Internal Server Error` | `"Internal"`                               |
-| `Core`            | derived from inner `CoreError`   | derived from inner          | flattened to `InvalidRequest` / `Internal` |
+| Variant           | gRPC Status                    | HTTP Status                 | `error` label (HTTP body) |
+|-------------------|--------------------------------|-----------------------------|---------------------------|
+| `InvalidRequest`  | `INVALID_ARGUMENT`             | `400 Bad Request`           | `"InvalidRequest"`        |
+| `Unauthenticated` | `UNAUTHENTICATED`              | `401 Unauthorized`          | `"Unauthenticated"`       |
+| `TaskNotFound`    | `NOT_FOUND`                    | `404 Not Found`             | `"TaskNotFound"`          |
+| `PayloadTooLarge` | `RESOURCE_EXHAUSTED`           | `413 Payload Too Large`     | `"PayloadTooLarge"`       |
+| `Internal`        | `INTERNAL`                     | `500 Internal Server Error` | `"Internal"`              |
+| `Core`            | derived from inner `CoreError` | derived from inner          | derived from inner        |
 
-`Core` is split by the wrapped [`solti_core::CoreError`]: `InvalidSpec` → `INVALID_ARGUMENT` / `400` / `"InvalidRequest"`; everything else → `INTERNAL` / `500` / `"Internal"`.
+`Core` is split by the wrapped [`solti_core::CoreError`]:
+- `InvalidSpec` → `INVALID_ARGUMENT` / `400 Bad Request` / `"InvalidRequest"`
+- `AlreadyExists` → `ALREADY_EXISTS` / `409 Conflict` / `"AlreadyExists"`
+- `NotFound` → `NOT_FOUND` / `404 Not Found` / `"TaskNotFound"`
+- everything else (`Supervisor`, `Mapping`, `Runner`) → `INTERNAL` / `500 Internal Server Error` / `"Internal"`
 
 HTTP error body:
 ```json
@@ -95,17 +100,17 @@ Script bodies are separately capped in the model at [`solti_model::MAX_SCRIPT_BO
 
 | Flag   | Enables                                                                           | Dependencies                            |
 |--------|-----------------------------------------------------------------------------------|-----------------------------------------|
-| `grpc` | `SoltiApiService`, `SoltiApiServer`, proto codegen                                | `tonic`, `tonic-prost`, `prost`         |
+| `grpc` | `TaskApiService`, `TaskServiceServer`, proto codegen                              | `tonic`, `tonic-prost`, `prost`         |
 | `http` | `HttpApi`, axum router, proto-JSON serde                                          | `axum`, `serde_json`, `prost`, `pbjson` |
 | `tls`  | `to_tonic_server_tls(&ServerTlsConfig)` adapter (under `grpc`); pulls `solti-tls` | `solti-tls`; activates `tonic/tls-ring` |
 
-No feature is enabled by default. `tls` is additive on top of `grpc` (the adapter targets tonic; HTTP TLS is terminated by the binary via `axum-server`, see below).
+No feature is enabled by default. `tls` **implies `grpc`** — the adapter targets tonic, so enabling `tls` alone would pull `solti-tls` in without compiling anything. HTTP TLS is terminated by the binary via `axum-server` (see below), not by this feature.
 
 ### Enabling TLS
 
 For gRPC:
 
-```rust
+```rust,ignore
 use solti_api::{build_grpc_server, to_tonic_server_tls};
 use solti_tls::ServerTlsConfig;
 
@@ -134,7 +139,7 @@ Orthogonal to TLS; comparison is constant-time; a missing/invalid token is rejec
 
 HTTP:
 
-```rust
+```rust,ignore
 use solti_api::HttpApi;
 use solti_model::Token;
 
@@ -145,7 +150,7 @@ let router = HttpApi::new(adapter)
 
 gRPC:
 
-```rust
+```rust,ignore
 use solti_api::build_grpc_server_with_auth;
 use solti_model::Token;
 
@@ -164,12 +169,12 @@ When no token is configured (plain `HttpApi::new(...).router()` / `build_grpc_se
 - `tonic_prost_build::configure()`: message types always, tonic server/client only under `grpc`.
 - `pbjson_build` under `http`: attaches canonical proto-JSON `Serialize`/`Deserialize` to the same message types, with `.emit_fields()` enabled so REST clients see `0` / `false` / `""` / `[]` / `{}` for default scalar/repeated/map values (optional `message` fields still omit on `None`).
 
-The proto package selector lives at the top of `build.rs` as `const PROTO_PACKAGE = ".solti.v1";`. 
-If the `package` declaration in a `.proto` changes, update this constant - otherwise pbjson generates nothing and HTTP compile fails. 
+The proto package selector is derived in `build.rs` as `format!(".solti.task.v{API_MAJOR}")`. 
+If the `package` declaration in a `.proto` changes, keep it in lockstep with `API_MAJOR` - otherwise pbjson generates nothing and HTTP compile fails. 
 Adding new `.proto` files anywhere under `proto/` requires **no** changes to `build.rs`.
 
 ## Notes
 - `ApiHandler` uses `async_trait` for object safety (`Send + Sync + 'static`).
 - Both transports feed input through the same `convert_create_spec` validator.
 - Re-exports: `solti_api::tonic`, `solti_api::axum` for version pinning.
-- Proto contract in `proto/solti/v1/` (`api.proto`, `types.proto`).
+- Proto contract in `proto/solti/task/v1/` (`api.proto`, `types.proto`).

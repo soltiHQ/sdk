@@ -3,22 +3,29 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ApiError {
+    /// Request was syntactically or semantically invalid (bad field, malformed body, missing required value). → `400` / `InvalidArgument`.
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    /// Credential missing, malformed, or rejected.
     #[error("unauthenticated: {0}")]
     Unauthenticated(String),
 
+    /// No task matched the requested name/id. → `404` / `NotFound`.
     #[error("task not found: {0}")]
     TaskNotFound(String),
 
+    /// Request body exceeded the configured limit. → `413` / `ResourceExhausted`.
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
 
+    /// Unexpected server-side failure with no more specific mapping.
     #[error("internal error: {0}")]
     Internal(String),
 
+    /// A failure from the [`solti_core`] layer, mapped variant-by-variant
     #[error("core error: {0}")]
     Core(#[from] solti_core::CoreError),
 }

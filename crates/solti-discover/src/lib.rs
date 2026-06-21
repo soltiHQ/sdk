@@ -17,9 +17,16 @@
 //!
 //! ## Also
 //!
-//! - [`DiscoverConfig`] / [`DiscoverConfigBuilder`] identity, endpoint, transport, timeouts, capabilities.
-//! - [`DiscoverError`] config, transport, parse, and rejection failures.
-//! - [`sync`] factory returning `Result<(TaskRef, TaskSpec), DiscoverError>`.
+//! - `DiscoverConfig` / `DiscoverConfigBuilder` (feature `grpc`/`http`): identity, endpoint, transport, timeouts, capabilities.
+//! - `sync` (feature `grpc`/`http`): factory returning `Result<(TaskRef, TaskSpec), DiscoverError>`.
+//! - [`DiscoverError`]: config, transport, parse, and rejection failures.
+
+#![forbid(unsafe_code)]
+
+/// Compiles the runnable Rust code blocks in `README.md` as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 mod errors;
 pub use errors::DiscoverError;

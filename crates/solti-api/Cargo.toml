@@ -26,7 +26,10 @@ all-features = true
 default = []
 grpc    = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
 http    = ["dep:axum", "dep:pbjson", "dep:prost", "dep:serde_json", "dep:tower-http"]
-tls     = ["dep:solti-tls", "tonic?/tls-ring"]
+# `tls` only has effect on the gRPC transport (the `tls` module is gated on
+# `grpc`), so it implies `grpc` — enabling it alone would otherwise pull
+# `solti-tls` in without compiling anything that uses it.
+tls     = ["grpc", "dep:solti-tls", "tonic/tls-ring"]
 
 [dependencies]
 async-trait  = { workspace = true }

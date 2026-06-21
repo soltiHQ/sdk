@@ -519,6 +519,10 @@ fn startup_jitter_ms(max_ms: u64) -> u64 {
     mixed % max_ms
 }
 
+/// Turn a `success=false` response into [`DiscoverError::Rejected`].
+///
+/// `reason` is propagated **verbatim** from the control plane:
+/// treat it as untrusted server text (do not interpolate it into anything trust-sensitive).
 fn validate_response(response: SyncResponse) -> Result<(), DiscoverError> {
     if !response.success {
         let reason = if response.reason.is_empty() {

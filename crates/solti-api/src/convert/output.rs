@@ -1,7 +1,6 @@
 //! # `OutputEvent` domain → proto.
 //!
-//! Maps [`solti_model::OutputEvent`] (in-process broadcast carrier) to the
-//! generated [`proto_api::StreamTaskLogsResponse`] for the `StreamTaskLogs` RPC.
+//! Maps [`solti_model::OutputEvent`] (in-process broadcast carrier) to the generated [`proto_api::StreamTaskLogsResponse`] for the `StreamTaskLogs` RPC.
 
 use solti_model::{OutputChunk, OutputEvent, StreamKind};
 

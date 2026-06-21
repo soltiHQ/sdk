@@ -132,11 +132,12 @@ impl Interceptor for BearerAuth {
     }
 }
 
-/// Extract the credential from an `authorization` value, accepting the scheme case-insensitively (`Bearer` / `bearer`).
+/// Extract the credential from an `authorization` metadata value, accepting the scheme case-insensitively.
+///
+/// The credential is returned verbatim after the first space; it is never trimmed, so it is matched byte-for-byte by [`Token::verify`].
 fn bearer_value(header: &str) -> Option<&str> {
-    header
-        .strip_prefix("Bearer ")
-        .or_else(|| header.strip_prefix("bearer "))
+    let (scheme, token) = header.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(token)
 }
 
 /// Like [`build_grpc_server`] but enforcing a bearer token on every call.
@@ -496,5 +497,17 @@ mod tests {
             Ok(_) => panic!("expected error status"),
         };
         assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[test]
+    fn bearer_value_accepts_scheme_case_insensitively() {
+        assert_eq!(bearer_value("Bearer tok"), Some("tok"));
+        assert_eq!(bearer_value("bearer tok"), Some("tok"));
+        assert_eq!(bearer_value("BEARER tok"), Some("tok"));
+        assert_eq!(bearer_value("BeArEr tok"), Some("tok"));
+        assert_eq!(bearer_value("Bearer a b"), Some("a b"));
+        assert_eq!(bearer_value("Basic tok"), None);
+        assert_eq!(bearer_value("tok"), None);
+        assert_eq!(bearer_value(""), None);
     }
 }
