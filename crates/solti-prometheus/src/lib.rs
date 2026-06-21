@@ -53,17 +53,17 @@
 //!
 //! ## Supervision metrics (`solti_sv_*`)
 //!
-//! | Metric                                   | Type      | Labels   | Description                  |
-//! |------------------------------------------|-----------|----------|------------------------------|
-//! | `solti_sv_tasks_in_flight`               | Gauge     | —        | Currently executing tasks    |
-//! | `solti_sv_task_restarts_total`           | Counter   | —        | Restarts (attempt > 1)       |
-//! | `solti_sv_task_backoff_count_total`      | Counter   | `source` | Backoff events               |
-//! | `solti_sv_task_backoff_duration_seconds` | Histogram | —        | Backoff delay duration       |
-//! | `solti_sv_task_terminal_total`           | Counter   | `reason` | Terminal task states         |
-//! | `solti_sv_attempts_to_finalize`          | Histogram | `outcome`| Attempts when task left loop |
-//! | `solti_sv_task_timeouts_total`           | Counter   | —        | Timeout events               |
-//! | `solti_sv_subscriber_overflow_total`     | Counter   | —        | Queue overflow (lost events) |
-//! | `solti_sv_subscriber_panicked_total`     | Counter   | —        | Subscriber panics            |
+//! | Metric                                   | Type      | Labels   | Description                                                    |
+//! |------------------------------------------|-----------|----------|----------------------------------------------------------------|
+//! | `solti_sv_tasks_in_flight`               | Gauge     | —        | Currently executing tasks                                      |
+//! | `solti_sv_task_restarts_total`           | Counter   | —        | Restarts (attempt > 1)                                         |
+//! | `solti_sv_task_backoff_count_total`      | Counter   | `source` | Backoff events                                                 |
+//! | `solti_sv_task_backoff_duration_seconds` | Histogram | —        | Backoff delay duration                                         |
+//! | `solti_sv_task_terminal_total`           | Counter   | `reason` | Terminal task states                                           |
+//! | `solti_sv_attempts_to_finalize`          | Histogram | `outcome`| Attempts when task left loop                                   |
+//! | `solti_sv_task_timeouts_total`           | Counter   | —        | Timeout events                                                 |
+//! | `solti_sv_subscriber_overflow_total`     | Counter   | —        | Queue overflow (lost events)                                   |
+//! | `solti_sv_subscriber_panicked_total`     | Counter   | —        | Subscriber panics                                              |
 //! | `solti_sv_tasks_by_phase`                | Gauge     | `phase`  | Current tasks per phase (feature `state`, pull-based snapshot) |
 //!
 //! ## Controller metrics (`solti_ctrl_*`)
