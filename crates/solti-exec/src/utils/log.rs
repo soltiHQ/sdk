@@ -22,8 +22,8 @@
 //!
 //! pre_exec_log_errno(errno)
 //!     │
-//!     ├──► format_errno(errno, &mut [u8; 32])
-//!     │     └──► stack-only int→ASCII, handles 0, negative, multi-digit
+//!     ├──► inline stack-only int→ASCII into a `[u8; 32]` buffer
+//!     │     └──► handles 0, negative (via `unsigned_abs`), multi-digit
 //!     │
 //!     └──► write "errno=" + digits + "\n" via 3 × libc::write
 //! ```
@@ -64,11 +64,7 @@ pub(crate) fn pre_exec_log_errno(errno: i32) {
     let mut buf = [0u8; 32];
     let mut idx = buf.len();
     let negative = errno < 0;
-    let mut n = if negative {
-        (-errno) as u32
-    } else {
-        errno as u32
-    };
+    let mut n = errno.unsigned_abs();
 
     if n == 0 {
         idx -= 1;

@@ -141,6 +141,11 @@ pub struct CgroupLimits {
     pub pids: Option<u64>,
     /// If `true`, cgroup setup failures abort the subprocess spawn.
     /// If `false` (default), failures are logged and the process runs without cgroup isolation.
+    ///
+    /// Honored **only on Linux**: on non-Linux platforms cgroups are unsupported,
+    /// so `prepare_cgroup` always returns `Ok(false)` (child runs unconfined)
+    /// regardless of this flag. Use `SubprocessBackendConfig::require_enforcement`
+    /// to fail closed when confinement cannot be applied at all.
     pub fail_on_error: bool,
 }
 
@@ -275,23 +280,47 @@ mod linux_impl {
         }
 
         let cg_dir = Path::new(CGROUP_ROOT).join(cgroup_name);
-        fs::create_dir_all(&cg_dir).map_err(|e| {
-            crate::ExecError::Io(io::Error::other(format!(
-                "failed to create cgroup directory '{}': {e}",
-                cg_dir.display()
-            )))
-        })?;
-        apply_limits(&cg_dir, limits).map_err(|e| {
-            crate::ExecError::Io(io::Error::other(format!(
-                "failed to apply cgroup limits for '{}': {e}",
-                cg_dir.display()
-            )))
-        })?;
+        if let Err(e) = fs::create_dir_all(&cg_dir) {
+            return setup_outcome("create cgroup directory", &cg_dir, e, limits.fail_on_error);
+        }
+        if let Err(e) = apply_limits(&cg_dir, limits) {
+            return setup_outcome("apply cgroup limits", &cg_dir, e, limits.fail_on_error);
+        }
         Ok(true)
     }
 
+    /// Resolve a Phase-1 cgroup setup failure against `fail_on_error`, matching
+    /// the v2-detection branch: strict mode aborts the spawn, best-effort mode
+    /// (the documented default) warns and runs the child **unconfined**
+    /// (`Ok(false)`) rather than hard-failing.
+    ///
+    /// NOTE: writing `cpu.max`/`memory.max`/`pids.max` requires the matching
+    /// controller to be enabled in the **parent's** `cgroup.subtree_control`;
+    /// on a systemd-delegated host where it is not, `apply_limits` fails with
+    /// `ENOENT` and is surfaced here (best-effort warn or strict error). Enabling
+    /// controllers in the delegated subtree is left to the operator/unit config.
+    fn setup_outcome(
+        what: &str,
+        dir: &Path,
+        e: io::Error,
+        fail_on_error: bool,
+    ) -> Result<bool, crate::ExecError> {
+        if fail_on_error {
+            Err(crate::ExecError::Io(io::Error::other(format!(
+                "failed to {what} '{}': {e}",
+                dir.display()
+            ))))
+        } else {
+            tracing::warn!(
+                "failed to {what} '{}': {e}; running without cgroup confinement (best-effort)",
+                dir.display()
+            );
+            Ok(false)
+        }
+    }
+
     /// Max path length for cgroup.procs:
-    /// `/sys/fs/cgroup/` (15) + cgroup_name + `/cgroup.procs` (13) + NUL (1).
+    /// `/sys/fs/cgroup` (14) + `/` (1) + cgroup_name + `/cgroup.procs` (13) + NUL (1).
     const MAX_PROCS_PATH: usize = 256;
 
     /// Stack-only buffer for the cgroup.procs path.

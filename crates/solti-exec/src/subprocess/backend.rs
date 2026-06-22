@@ -32,6 +32,9 @@ pub struct SubprocessBackendConfig {
     security: Option<SecurityConfig>,
     /// Subprocess output logging configuration.
     logger: LogConfig,
+    /// When `true`, confinement that cannot be applied is a hard error rather
+    /// than a best-effort warning. See [`with_require_enforcement`](Self::with_require_enforcement).
+    require_enforcement: bool,
 }
 
 impl SubprocessBackendConfig {
@@ -62,6 +65,28 @@ impl SubprocessBackendConfig {
     pub fn with_logger(mut self, config: LogConfig) -> Self {
         self.logger = config;
         self
+    }
+
+    /// Require that the configured confinement actually applies (default `false`).
+    ///
+    /// With the default best-effort policy a sandbox that cannot be applied only warns and runs the child **unconfined**.
+    /// When this is `true` and a security/cgroup config is present, confinement fails **closed**:
+    /// - on non-Linux it is rejected at config-validation time;
+    /// - on Linux the cgroup join and capability drop are forced into fail-on-error mode.
+    ///
+    /// Use it for security-critical deployments that must never run a job outside its sandbox.
+    pub fn with_require_enforcement(mut self, require: bool) -> Self {
+        self.require_enforcement = require;
+        self
+    }
+
+    /// Cgroup limits with `fail_on_error` forced on when enforcement is required.
+    fn effective_cgroups(&self, cgroups: &CgroupLimits) -> CgroupLimits {
+        let mut c = cgroups.clone();
+        if self.require_enforcement {
+            c.fail_on_error = true;
+        }
+        c
     }
 
     /// Get log configuration.
@@ -122,6 +147,21 @@ impl SubprocessBackendConfig {
                 "log_config.max_line_length cannot be zero".into(),
             ));
         }
+        if self.logger.max_line_bytes == 0 {
+            return Err(InvalidRunnerConfig(
+                "log_config.max_line_bytes cannot be zero (all output would be swallowed)".into(),
+            ));
+        }
+        if let Some(security) = &self.security {
+            security.validate()?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        if self.require_enforcement && !self.is_empty() {
+            return Err(InvalidRunnerConfig(format!(
+                "require_enforcement is set but OS={} cannot enforce cgroup/security confinement",
+                std::env::consts::OS
+            )));
+        }
         Ok(())
     }
 
@@ -140,7 +180,7 @@ impl SubprocessBackendConfig {
                 "subprocess backend: preparing cgroup: {:?} (group={})",
                 cgroups, cgroup_name
             );
-            crate::utils::prepare_cgroup(cgroup_name, cgroups)
+            crate::utils::prepare_cgroup(cgroup_name, &self.effective_cgroups(cgroups))
         } else {
             Ok(false)
         }
@@ -173,14 +213,21 @@ impl SubprocessBackendConfig {
                 "subprocess backend: attaching cgroup join hook (group={})",
                 cgroup_name
             );
-            attach_cgroup(cmd, cgroup_name, cgroups)?;
+            attach_cgroup(cmd, cgroup_name, &self.effective_cgroups(cgroups))?;
         }
         if let Some(security) = &self.security {
             trace!(
                 "subprocess backend: attaching security config: {:?}",
                 security
             );
-            attach_security(cmd, security);
+            let security = if self.require_enforcement {
+                let mut s = security.clone();
+                s.fail_on_cap_error = true;
+                s
+            } else {
+                security.clone()
+            };
+            attach_security(cmd, &security);
         }
         Ok(())
     }
@@ -254,6 +301,62 @@ mod tests {
             }),
             ..Default::default()
         });
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn max_line_bytes_zero_rejected() {
+        let cfg = SubprocessBackendConfig::new().with_logger(LogConfig {
+            max_line_bytes: 0,
+            ..LogConfig::default()
+        });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_line_bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn keep_caps_without_drop_all_caps_rejected() {
+        use crate::utils::{LinuxCapability, SecurityConfig};
+        let cfg = SubprocessBackendConfig::new().with_security(SecurityConfig {
+            drop_all_caps: false,
+            keep_caps: vec![LinuxCapability::NetBindService],
+            ..Default::default()
+        });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("keep_caps") && err.contains("drop_all_caps"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn keep_caps_with_drop_all_caps_passes() {
+        use crate::utils::{LinuxCapability, SecurityConfig};
+        let cfg = SubprocessBackendConfig::new().with_security(SecurityConfig {
+            drop_all_caps: true,
+            keep_caps: vec![LinuxCapability::NetBindService],
+            ..Default::default()
+        });
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn require_enforcement_fails_closed_on_non_linux() {
+        use crate::utils::SecurityConfig;
+        let cfg = SubprocessBackendConfig::new()
+            .with_security(SecurityConfig {
+                no_new_privs: true,
+                ..Default::default()
+            })
+            .with_require_enforcement(true);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("require_enforcement"), "got: {err}");
+    }
+
+    #[test]
+    fn require_enforcement_with_empty_config_is_ok() {
+        let cfg = SubprocessBackendConfig::new().with_require_enforcement(true);
         assert!(cfg.validate().is_ok());
     }
 }

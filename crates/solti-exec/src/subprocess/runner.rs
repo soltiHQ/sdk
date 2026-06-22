@@ -380,11 +380,6 @@ impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Some(pgid) = self.pgid {
-            // Non-blocking and async-free: just signal the group, do not wait/reap
-            // (we are in Drop, possibly during future cancellation). The leader is
-            // reaped by tokio's `kill_on_drop`; grandchildren are SIGKILLed here
-            // and then reaped by the OS (reparented to PID 1 / a subreaper), not
-            // by this code — so this path frees the subtree without a wait.
             let rc = unsafe { libc::kill(-pgid, libc::SIGKILL) };
             if rc != 0 {
                 let err = std::io::Error::last_os_error();
@@ -409,6 +404,11 @@ async fn kill_process_group(child: &mut tokio::process::Child, run_id: &str) {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
+            // SAFETY:
+            // `libc::kill` has no memory preconditions.
+            // The negative pid is the killpg idiom (targets the whole group, not a single process);
+            // `pid` is the live child's id (group leader via `process_group(0)`).
+            // On a non-ESRCH error we fall back to the single-pid `child.kill()`.
             let rc = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
             if rc != 0 {
                 let err = std::io::Error::last_os_error();
@@ -418,15 +418,10 @@ async fn kill_process_group(child: &mut tokio::process::Child, run_id: &str) {
                         error = %err,
                         "killpg failed; falling back to single-pid kill",
                     );
-                    // Note: the single-pid fallback reaps only the leader, not
-                    // grandchildren. It is reached on a non-ESRCH killpg error
-                    // (e.g. EPERM after a privilege drop), where the subtree may
-                    // survive; the leader is still terminated.
                     let _ = child.kill().await;
                 }
             }
         } else {
-            // No pid means the child was already reaped - nothing to kill.
         }
     }
     #[cfg(not(unix))]
@@ -498,6 +493,8 @@ impl Drop for CgroupGuard<'_> {
     }
 }
 
+const LOG_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Execute a subprocess task with cancellation support, metrics, and cleanup.
 async fn run_subprocess(
     ctx: Arc<TaskExecContext>,
@@ -530,16 +527,8 @@ async fn run_subprocess(
             });
         }
     };
-
-    // The task has actually started now that the child spawned. Counting it here
-    // (rather than before prepare/spawn) keeps `record_task_started` symmetric
-    // with `record_task_completed`: infra failures before this point are counted
-    // via `record_runner_error`, not as started-but-never-completed.
     ctx.metrics.record_task_started(RunnerType::Subprocess);
 
-    // Arm the drop-safe subtree reaper immediately: from here, any early return or a
-    // dropped future (taskvisor timeout / force-abort) kills the whole process group,
-    // not just the leader pid. Disarmed after the child is reaped below.
     let mut pg_guard = ProcessGroupGuard::new(
         child.id().map(|pid| pid as i32),
         Arc::clone(&ctx.task_cfg.run_id),
@@ -557,7 +546,7 @@ async fn run_subprocess(
     })?;
     let run_id_stdout = Arc::clone(&ctx.task_cfg.run_id);
     let sink_stdout = sink.clone();
-    let stdout_task = tokio::spawn(async move {
+    let mut stdout_task = tokio::spawn(async move {
         log_stream(
             stdout,
             &run_id_stdout,
@@ -574,7 +563,7 @@ async fn run_subprocess(
     })?;
     let run_id_stderr = Arc::clone(&ctx.task_cfg.run_id);
     let sink_stderr = sink.clone();
-    let stderr_task = tokio::spawn(async move {
+    let mut stderr_task = tokio::spawn(async move {
         log_stream(
             stderr,
             &run_id_stderr,
@@ -605,8 +594,9 @@ async fn run_subprocess(
         }
     };
 
-    // The child has been reaped on both branches (normal exit, or killpg + wait):
-    // disarm so the guard does not target a recycled pgid.
+    #[cfg(unix)]
+    let pgid = pg_guard.pgid;
+
     pg_guard.disarm();
 
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -617,7 +607,37 @@ async fn run_subprocess(
     ctx.metrics
         .record_task_completed(RunnerType::Subprocess, outcome, duration_ms);
 
-    let _ = tokio::join!(stdout_task, stderr_task);
+    let drained = tokio::time::timeout(LOG_DRAIN_GRACE, async {
+        let _ = tokio::join!(&mut stdout_task, &mut stderr_task);
+    })
+    .await;
+    if drained.is_err() {
+        #[cfg(unix)]
+        if let Some(pgid) = pgid {
+            // SAFETY:
+            // `libc::kill` has no memory preconditions.
+            // The negative pid is the killpg idiom (targets the whole group, not a single pid);
+            // `pgid` was captured at spawn from `process_group(0)`, and the leader is already reaped, this reaches only still-living grandchildren.
+            // `ESRCH` (group already gone) is benign.
+            let rc = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    warn!(
+                        task = %ctx.task_cfg.run_id,
+                        error = %err,
+                        "killpg of lingering subtree failed",
+                    );
+                }
+            }
+        }
+        stdout_task.abort();
+        stderr_task.abort();
+        warn!(
+            task = %ctx.task_cfg.run_id,
+            "subprocess output drain timed out after leader exit; killed lingering process group",
+        );
+    }
     result
 }
 
@@ -1110,6 +1130,34 @@ mod tests {
         }
         assert!(attempts.contains(&1), "attempt 1 missing: {attempts:?}");
         assert!(attempts.contains(&2), "attempt 2 missing: {attempts:?}");
+    }
+
+    #[tokio::test]
+    async fn run_subprocess_does_not_hang_on_daemonized_grandchild_holding_pipe() {
+        use std::time::{Duration, Instant};
+        use tokio_util::sync::CancellationToken;
+
+        let runner = SubprocessRunner::new("hang-runner");
+        let spec = mk_subprocess_spec_with_args("hang-slot", "sh", &["-c", "sleep 30 & exit 0"]);
+        let task_ref = runner.build_task(&spec, &BuildContext::default()).unwrap();
+
+        let started = Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(20),
+            task_ref.spawn(CancellationToken::new()),
+        )
+        .await;
+
+        assert!(
+            res.is_ok(),
+            "run_subprocess hung past the bounded log-drain grace (daemonized grandchild)"
+        );
+        res.unwrap().expect("leader exited 0; task should succeed");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "run_subprocess took too long: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

@@ -14,7 +14,12 @@ pub(crate) fn init_uptime() {
 
 /// Get agent uptime in seconds.
 ///
-/// Returns `0` if called before [`SupervisorApi::new`](crate::SupervisorApi::new)
+/// Returns `0` if called before [`SupervisorApi::new`](crate::SupervisorApi::new).
+///
+/// The start instant is **process-global, first-init-wins**:
+/// it is captured once on the first `SupervisorApi::new()` and never reset,
+/// a process that creates (or recreates) several `SupervisorApi` instances still measures from the first.
+/// This is intentional: the value is *agent process uptime* (what the discover heartbeat reports), not per-supervisor uptime.
 pub fn uptime_seconds() -> u64 {
     START_TIME
         .get()

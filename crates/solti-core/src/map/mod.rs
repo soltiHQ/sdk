@@ -2,8 +2,6 @@
 //!
 //! Adapter layer between `solti-model` (public specs) and the taskvisor runtime.
 //! Maps high-level API types into taskvisor's internal execution structures.
-//!
-//! All model enums are `#[non_exhaustive]` unknown variants produce [`CoreError::Mapping`](crate::CoreError::Mapping) instead of a silent fallback.
 
 use std::time::Duration;
 
@@ -66,10 +64,6 @@ pub(crate) fn to_backoff_policy(s: &ModelBackoffPolicy) -> Result<BackoffPolicy,
 
 #[cfg(test)]
 mod tests {
-    //! Drift guard: the solti-model policy enums MIRROR `taskvisor`'s, and these
-    //! mappings keep them in sync. If a variant is added/renamed/re-semantic'd on
-    //! either side, the exhaustive matches above stop compiling and these tests
-    //! pin the variant-for-variant correspondence.
     use super::*;
 
     #[test]

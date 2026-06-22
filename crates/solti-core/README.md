@@ -10,10 +10,12 @@ Provides `SupervisorApi` - the main entry point for submitting, querying, and ca
    submit(spec)
        ├──► spec.validate()                                    
        ├──► RunnerRouter::build(spec) → TaskRef
-       └──► submit_with_task(task, spec)                                       
-               ├──► state.add_task(id, spec)                                   
-               ├──► map policies → ControllerSpec                              
-               └──► handle.submit(controller_spec
+       └──► submit_with_task(task, spec)
+               ├──► state.reserve(id, spec)            (atomic provisional entry)
+               ├──► map policies → ControllerSpec
+               └──► handle.submit_and_watch → (tv_id, TaskWaiter)
+                       ├──► state.bind_tv(id, tv_id)
+                       └──► spawn backstop: TaskWaiter → finalize_from_outcome
  
    taskvisor events ──► StateSubscriber ──► TaskState                          
                                         └─► OutputRegistry
@@ -47,15 +49,15 @@ this is what bridges supervisor lifecycle into the live-tail broadcast channel t
 
 ## Key types
 
-| Type               | Visibility | Description                                                                   |
-|--------------------|------------|-------------------------------------------------------------------------------|
-| `SupervisorApi`    | pub        | High-level facade: submit, query, cancel, sweep, `output_registry()` accessor |
-| `StateConfig`      | pub        | TTL settings for runs, tasks, and sweep interval                              |
-| `CoreError`        | pub        | Error enum: Supervisor, Mapping, Runner, InvalidSpec                          |
-| `uptime_seconds()` | pub        | Agent uptime helper (`OnceLock<Instant>`)                                     |
-| `TaskState`        | internal   | In-memory storage (`Arc<RwLock>`); wired by `SupervisorApi::new`              |
-| `StateSubscriber`  | internal   | `Subscribe` impl; auto-registered by `SupervisorApi::new`                     |
-| `state_sweep()`    | internal   | Embedded periodic sweeper task; auto-submitted by `SupervisorApi::new`        |
+| Type               | Visibility | Description                                                                                         |
+|--------------------|------------|-----------------------------------------------------------------------------------------------------|
+| `SupervisorApi`    | pub        | High-level facade: submit, query, cancel, sweep, `output_registry()` accessor                       |
+| `StateConfig`      | pub        | TTL settings for runs, tasks, and sweep interval                                                    |
+| `CoreError`        | pub        | Error enum (`#[non_exhaustive]`): Supervisor, AlreadyExists, NotFound, Mapping, Runner, InvalidSpec |
+| `uptime_seconds()` | pub        | Agent uptime helper (`OnceLock<Instant>`)                                                           |
+| `TaskState`        | internal   | In-memory storage (`Arc<RwLock>`); wired by `SupervisorApi::new`                                    |
+| `StateSubscriber`  | internal   | `Subscribe` impl; auto-registered by `SupervisorApi::new`                                           |
+| `state_sweep()`    | internal   | Embedded periodic sweeper task; auto-submitted by `SupervisorApi::new`                              |
 
 ## State storage
 ```text
@@ -84,6 +86,10 @@ Pagination is deterministic (sorted by `TaskId`).
 | `task_ttl`       | 1 hour    | How long terminal tasks are retained            |
 | `sweep_interval` | 5 minutes | Sweep frequency (via `RestartPolicy::periodic`) |
 
+In addition to the TTLs, `StateConfig::max_runs_per_task` (default `256`) caps the retained run history per task: 
+when a new attempt starts, the oldest *finished* runs beyond the cap are evicted (the in-flight run is never dropped). 
+This bounds memory for fast-restarting tasks *between* sweeps.
+
 Sweep is always-on. Configure TTLs via `StateConfig` if defaults don't fit.
 
 ## Policy mapping
@@ -96,18 +102,22 @@ Sweep is always-on. Configure TTLs via `StateConfig` if defaults don't fit.
  BackoffPolicy { first_ms } →  BackoffPolicy { first: Duration }
 ```
 
-Model enums are `#[non_exhaustive]` - unknown variants fall back to safe defaults
-(`DropIfRunning`, `Never`, `Full`).
+The model enums are `#[non_exhaustive]`, so the mappers carry a wildcard arm: 
+an unknown variant produces a `CoreError::Mapping` (surfaced as `500` by solti-api), never a silent fallback to a default policy.
 
 ## Error model
 ```text
- Variant       Source                       When
- ───────       ──────                       ────
- Supervisor    taskvisor runtime            submit/cancel failure
- Mapping       policy conversion            unknown policy variant
- Runner        solti_runner::RunnerError    build_task failure
- InvalidSpec   solti_model::ModelError      spec validation failure
+ Variant       Source                       When                              HTTP
+ ───────       ──────                       ────                              ────
+ Supervisor    taskvisor runtime            submit/cancel/remove failure      500
+ AlreadyExists name already active          duplicate non-terminal submit     409
+ NotFound      no such task                 cancel/delete of a missing task   404
+ Mapping       policy conversion            unknown model policy variant      500
+ Runner        solti_runner::RunnerError    build_task failure                500
+ InvalidSpec   solti_model::ModelError      spec validation failure           400
 ```
+
+`CoreError` is `#[non_exhaustive]`; solti-api maps every variant above and falls through to `500` for any future one.
 
 ## Notes
 - `SupervisorApi::new` auto-registers `StateSubscriber` into the subscriber list.

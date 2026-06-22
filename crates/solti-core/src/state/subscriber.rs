@@ -1,7 +1,10 @@
 //! # State event subscriber.
 //!
-//! [`StateSubscriber`] implements [`Subscribe`](taskvisor::Subscribe) to wire
-//! taskvisor lifecycle events into [`TaskState`](super::TaskState) mutations.
+//! [`StateSubscriber`] implements [`Subscribe`](taskvisor::Subscribe) and owns two responsibilities driven off taskvisor's lifecycle events:
+//! - project events into [`TaskState`](super::TaskState) transitions (phases and`TaskRun` records, including the `TimeoutHit`→`TaskFailed` pairing);
+//! - drive the per-run [`OutputRegistry`] lifecycle (announce `RunStarted` / `RunFinished`, evict on terminal).
+//!
+//! This is the **event plane** - fed by taskvisor's *lossy* broadcast bus, a dropped terminal event is repaired by the completion-plane backstop (`finalize_from_outcome`) on [`SupervisorApi`](crate::SupervisorApi).
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -23,16 +26,11 @@ use solti_runner::OutputRegistry;
 pub struct StateSubscriber {
     state: TaskState,
     output_registry: Arc<OutputRegistry>,
-    /// Attempts that emitted a `TimeoutHit` and are awaiting their `TaskFailed`,
-    /// keyed by task id -> attempt. taskvisor publishes `TimeoutHit` immediately
-    /// before the `TaskFailed` carrying the timeout error, so this lets the
-    /// failing attempt land in [`TaskPhase::Timeout`] instead of a generic
-    /// `Failed`. Entries are cleared on consumption and on task removal.
     timed_out: Mutex<HashMap<TaskId, u32>>,
 }
 
 impl StateSubscriber {
-    /// Create a state subscriber.
+    /// Create a state subscriber over a shared [`TaskState`] and [`OutputRegistry`].
     pub fn with_output_registry(state: TaskState, output_registry: Arc<OutputRegistry>) -> Self {
         Self {
             state,
@@ -42,11 +40,6 @@ impl StateSubscriber {
     }
 
     /// Resolve the task entry an event belongs to.
-    ///
-    /// Events carrying a taskvisor run identity resolve **only** through the
-    /// identity binding (labels are reusable; a late event from a previous
-    /// incarnation must not touch the current entry). Id-less events fall back
-    /// to the label (synthetic/test events).
     fn resolve(&self, event: &Event) -> Option<TaskId> {
         match event.id {
             Some(tv) => self.state.resolve_tv(tv.get()),
@@ -102,17 +95,11 @@ impl Subscribe for StateSubscriber {
                     .as_ref()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
-                // If taskvisor flagged this exact attempt as timed out (a
-                // TimeoutHit preceding this TaskFailed), finalize it as Timeout
-                // rather than a generic Failed, so state agrees with the metrics
-                // plane (which counts timeouts separately).
                 let phase = {
                     let mut timed_out = self.timed_out.lock();
-                    if timed_out.get(&task_id).is_some_and(|a| *a == attempt) {
-                        timed_out.remove(&task_id);
-                        TaskPhase::Timeout
-                    } else {
-                        TaskPhase::Failed
+                    match timed_out.remove(&task_id) {
+                        Some(a) if a == attempt => TaskPhase::Timeout,
+                        _ => TaskPhase::Failed,
                     }
                 };
                 trace!(
@@ -131,19 +118,13 @@ impl Subscribe for StateSubscriber {
                 self.output_registry
                     .announce_run_finished(&task_id, attempt, event.exit_code);
             }
-            // Informational: always followed by TaskFailed for the same attempt.
-            // Record the timed-out attempt so that TaskFailed lands in Timeout.
             EventKind::TimeoutHit => {
                 trace!(task = %task_id, "task attempt timed out");
-                self.timed_out.lock().insert(task_id.clone(), attempt);
+                let mut timed_out = self.timed_out.lock();
+                timed_out.insert(task_id.clone(), attempt);
+                timed_out.retain(|id, _| self.state.contains_task(id));
             }
             EventKind::ActorExhausted => {
-                // The normal way a task ends: success under OnFailure/Never,
-                // cooperative self-cancel, or retry-budget exhaustion. Success
-                // and cancel are not errors. The `Canceled`/`Succeeded` mappings
-                // are also protected by `Task::transition_finished`'s sticky
-                // terminal guard, so a trailing `ActorExhausted` cannot overwrite
-                // the phase a per-attempt terminal event already set.
                 let reason = event.reason.as_ref().map(|s| s.to_string());
                 trace!(
                     task = %task_id,
@@ -165,6 +146,7 @@ impl Subscribe for StateSubscriber {
                     warn!(task = %task_id, "ActorExhausted event for unknown task");
                 }
                 self.output_registry.evict(&task_id);
+                self.timed_out.lock().remove(&task_id);
             }
             EventKind::ActorDead => {
                 let reason = event
@@ -186,17 +168,14 @@ impl Subscribe for StateSubscriber {
                     warn!(task = %task_id, "ActorDead event for unknown task");
                 }
                 self.output_registry.evict(&task_id);
+                self.timed_out.lock().remove(&task_id);
             }
-            // Admission rejected: the run will never start. Finalize the
-            // provisional entry and release its output channel (the submit()
-            // path pre-creates both).
             EventKind::ControllerRejected | EventKind::TaskAddFailed => {
                 let reason = event
                     .reason
                     .as_ref()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "rejected".to_string());
-                // User-initiated or shutdown-driven drops are cancellations.
                 let phase = match reason.as_str() {
                     reasons::REMOVED_FROM_QUEUE
                     | reasons::SUPERSEDED_BY_REPLACE
@@ -210,6 +189,8 @@ impl Subscribe for StateSubscriber {
                     warn!(task = %task_id, "rejection event for unknown task");
                 }
                 self.output_registry.evict(&task_id);
+                self.state.unbind(&task_id);
+                self.timed_out.lock().remove(&task_id);
             }
             EventKind::TaskRemoved => {
                 trace!(task = %task_id, "task removed from state");
@@ -225,8 +206,17 @@ impl Subscribe for StateSubscriber {
         "state-subscriber"
     }
 
+    /// Per-subscriber event-queue depth: `2048`, a deliberate 2× of taskvisor's `1024` default.
     fn queue_capacity(&self) -> usize {
         2048
+    }
+}
+
+#[cfg(test)]
+impl StateSubscriber {
+    /// Number of pending timeout markers (test-only observability).
+    fn timed_out_len(&self) -> usize {
+        self.timed_out.lock().len()
     }
 }
 
@@ -262,7 +252,6 @@ mod tests {
     fn late_events_from_previous_incarnation_are_ignored() {
         let (sub, state, id) = setup("reuse-x");
         state.bind_tv(&id, 1);
-        // The label was resubmitted: a new incarnation now owns the entry.
         state.bind_tv(&id, 2);
 
         let stale = Event::new(EventKind::TaskRemoved)
@@ -288,13 +277,12 @@ mod tests {
     fn controller_rejection_finalizes_entry_and_evicts_channel() {
         let state = TaskState::new();
         let id = TaskId::from("rejected-task");
-        state.add_task(id.clone(), test_spec()); // provisional Pending entry
+        state.add_task(id.clone(), test_spec());
         state.bind_tv(&id, 7);
         let registry = Arc::new(OutputRegistry::new(16));
         registry.ensure_channel(id.clone());
         let sub = StateSubscriber::with_output_registry(state.clone(), Arc::clone(&registry));
 
-        // Rejections carry the SLOT name, not the task name: resolution is id-only.
         let ev = Event::new(EventKind::ControllerRejected)
             .with_task("some-slot")
             .with_id(TvId::from_raw(7))
@@ -314,6 +302,41 @@ mod tests {
             registry.subscribe(&id).is_none(),
             "output channel must be evicted on rejection"
         );
+        assert!(
+            state.tv_for(&id).is_none(),
+            "rejection must release the identity binding so the sweep can reap it"
+        );
+    }
+
+    #[test]
+    fn controller_rejection_unbinds_so_sweep_reaps_the_entry() {
+        use crate::state::StateConfig;
+        use std::time::Duration;
+
+        let state = TaskState::new();
+        let id = TaskId::from("rej-reap");
+        state.add_task(id.clone(), test_spec());
+        state.bind_tv(&id, 11);
+        let sub = StateSubscriber::with_output_registry(
+            state.clone(),
+            Arc::new(OutputRegistry::default()),
+        );
+
+        sub.on_event(
+            &Event::new(EventKind::ControllerRejected)
+                .with_task("slot")
+                .with_id(TvId::from_raw(11))
+                .with_reason("queue_full: 3/3"),
+        );
+
+        let config = StateConfig {
+            run_ttl: Duration::ZERO,
+            task_ttl: Duration::ZERO,
+            ..StateConfig::default()
+        };
+        let (_, removed) = state.sweep(&config);
+        assert_eq!(removed, 1, "unbound terminal rejection entry must be swept");
+        assert!(state.get(&id).is_none());
     }
 
     #[test]
@@ -521,14 +544,12 @@ mod tests {
         let (sub, _state, registry, id) = setup_with_registry("exh-evict");
         let mut rx = registry.subscribe(&id).unwrap();
 
-        // The attempt's own terminal event (TaskFailed) announces RunFinished...
         sub.on_event(
             &Event::new(EventKind::TaskFailed)
                 .with_task("exh-evict")
                 .with_attempt(5)
                 .with_exit_code(1),
         );
-        // ...so the actor-terminal event must only evict, not announce again.
         sub.on_event(
             &Event::new(EventKind::ActorExhausted)
                 .with_task("exh-evict")
@@ -552,9 +573,6 @@ mod tests {
 
     #[test]
     fn timeout_hit_then_task_failed_for_same_attempt_maps_to_timeout_phase() {
-        // taskvisor emits TimeoutHit (informational) immediately before the
-        // TaskFailed that carries the Timeout error. The pairing must land the
-        // attempt in the Timeout phase, not a generic Failed.
         let (sub, state, id) = setup("slow-task");
 
         sub.on_event(
@@ -574,6 +592,63 @@ mod tests {
     }
 
     #[test]
+    fn pending_timeout_is_cleared_when_actor_terminates_without_paired_failed() {
+        let (sub, _state, _id) = setup("timeout-orphan");
+
+        sub.on_event(
+            &Event::new(EventKind::TimeoutHit)
+                .with_task("timeout-orphan")
+                .with_attempt(1),
+        );
+        assert_eq!(sub.timed_out_len(), 1);
+
+        sub.on_event(
+            &Event::new(EventKind::ActorExhausted)
+                .with_task("timeout-orphan")
+                .with_attempt(1)
+                .with_reason("max_retries_exceeded"),
+        );
+        assert_eq!(
+            sub.timed_out_len(),
+            0,
+            "a pending timeout marker must be cleared when the actor terminates"
+        );
+    }
+
+    #[test]
+    fn timeout_hit_prunes_markers_for_tasks_no_longer_in_state() {
+        let state = TaskState::new();
+        let sub = StateSubscriber::with_output_registry(
+            state.clone(),
+            Arc::new(OutputRegistry::default()),
+        );
+        let gone = TaskId::from("gone");
+        let live = TaskId::from("live");
+        state.add_task(gone.clone(), test_spec());
+        state.add_task(live.clone(), test_spec());
+
+        sub.on_event(
+            &Event::new(EventKind::TimeoutHit)
+                .with_task("gone")
+                .with_attempt(1),
+        );
+        assert_eq!(sub.timed_out_len(), 1);
+
+        state.unregister_task(&gone);
+
+        sub.on_event(
+            &Event::new(EventKind::TimeoutHit)
+                .with_task("live")
+                .with_attempt(1),
+        );
+        assert_eq!(
+            sub.timed_out_len(),
+            1,
+            "the dead task's marker is pruned; only the live task's remains"
+        );
+    }
+
+    #[test]
     fn task_failed_without_timeout_hit_stays_failed() {
         let (sub, state, id) = setup("plain-fail");
 
@@ -589,9 +664,6 @@ mod tests {
 
     #[test]
     fn actor_exhausted_task_returned_canceled_maps_to_canceled() {
-        // A task body returning TaskError::Canceled (without a runtime-token
-        // cancel) makes taskvisor emit ActorExhausted{reason:"task_returned_canceled"}.
-        // That is a cooperative stop, not a retry-budget exhaustion.
         let (sub, state, id) = setup("self-cancel");
 
         sub.on_event(

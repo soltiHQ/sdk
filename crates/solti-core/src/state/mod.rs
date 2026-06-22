@@ -23,13 +23,33 @@ use tracing::debug;
 
 use solti_model::{Slot, Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskRun, TaskSpec};
 
+use crate::error::CoreError;
+
 /// In-memory task state storage.
+///
+/// # Examples
+///
+/// ```
+/// use solti_core::TaskState;
+/// use solti_model::{TaskId, TaskKind, TaskQuery, TaskSpec};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let state = TaskState::new();
+/// let id = TaskId::from("task-1");
+/// let spec = TaskSpec::builder("my-slot", TaskKind::Embedded, 5_000u64).build()?;
+///
+/// state.add_task(id.clone(), spec);
+/// assert!(state.get(&id).is_some());
+/// assert_eq!(state.query(&TaskQuery::new()).total, 1);
+/// # Ok(())
+/// # }
+/// ```
 ///
 /// ## Also
 ///
 /// - [`StateConfig`] TTL settings consumed by [`sweep`](Self::sweep).
-/// - `StateSubscriber` (crate-internal) wires taskvisor events into mutations.
 /// - `state_sweep` (crate-internal) builds an embedded periodic sweep task.
+/// - `StateSubscriber` (crate-internal) wires taskvisor events into mutations.
 #[derive(Clone)]
 pub struct TaskState {
     inner: Arc<RwLock<TaskStateInner>>,
@@ -47,10 +67,14 @@ struct TaskStateInner {
     by_tv: HashMap<u64, TaskId>,
     /// Task entry -> its current taskvisor run identity (raw).
     tv_of: HashMap<TaskId, u64>,
+    /// Per-task run-history cap (oldest finished runs evicted past this).
+    max_runs_per_task: usize,
 }
 
 impl TaskState {
-    /// Create empty task state.
+    /// Create empty task state with the default per-task run-history cap.
+    ///
+    /// Use [`set_max_runs_per_task`](Self::set_max_runs_per_task) to override it from a [`StateConfig`] before the state sees traffic.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(TaskStateInner {
@@ -59,8 +83,16 @@ impl TaskState {
                 runs: HashMap::new(),
                 by_tv: HashMap::new(),
                 tv_of: HashMap::new(),
+                max_runs_per_task: config::DEFAULT_MAX_RUNS_PER_TASK,
             })),
         }
+    }
+
+    /// Override the per-task run-history cap (see [`StateConfig::max_runs_per_task`]).
+    ///
+    /// Intended to be called once at wiring time, before any events arrive.
+    pub fn set_max_runs_per_task(&self, max: usize) {
+        self.inner.write().max_runs_per_task = max;
     }
 
     /// Register a new task (called on TaskAdded event).
@@ -77,11 +109,36 @@ impl TaskState {
         inner.tasks.insert(id, task);
     }
 
+    /// Atomically reserve a task name with a provisional entry.
+    ///
+    /// Returns [`CoreError::AlreadyExists`] if a **non-terminal** entry already holds this name (the previous incarnation is still active).
+    /// Otherwise, it inserts the provisional entry: idempotent on the slot index, exactly like [`add_task`](Self::add_task) and returns `Ok(())`.
+    pub fn reserve(&self, id: TaskId, spec: TaskSpec) -> Result<(), CoreError> {
+        let mut inner = self.inner.write();
+
+        if let Some(existing) = inner.tasks.get(&id)
+            && !existing.status().phase.is_terminal()
+        {
+            return Err(CoreError::AlreadyExists(format!(
+                "task '{id}' is already active (phase {})",
+                existing.status().phase
+            )));
+        }
+
+        let slot = spec.slot().clone();
+        let task = Task::new(id.clone(), spec);
+        let ids = inner.by_slot.entry(slot).or_default();
+        if !ids.contains(&id) {
+            ids.push(id.clone());
+        }
+        inner.tasks.insert(id, task);
+        Ok(())
+    }
+
     /// Bind a task entry to its current taskvisor run identity.
     ///
-    /// Called at submission time (the id is pre-minted by `submit()`). Rebinding
-    /// the same entry to a new identity drops the previous binding, so late
-    /// events from the previous incarnation no longer resolve to this entry.
+    /// Called at submission time (the id is pre-minted by `submit()`).
+    /// Rebinding the same entry to a new identity drops the previous binding, late events from the previous incarnation no longer resolve to this entry.
     pub fn bind_tv(&self, id: &TaskId, tv: u64) {
         let mut inner = self.inner.write();
         if let Some(old) = inner.tv_of.insert(id.clone(), tv) {
@@ -106,10 +163,19 @@ impl TaskState {
         }
     }
 
+    /// Release the taskvisor identity binding for a task entry, if any.
+    ///
+    /// The sweep deliberately spares any entry that is still **bound**: a periodic task sits in a terminal phase between runs while its actor is alive (see [`sweep`](Self::sweep)).
+    /// Terminal finalizations that do *not* flow through `TaskRemoved`, admission rejections and lag-dropped terminals reconstructed by the completion-plane backstop - must therefore
+    /// call this to drop the binding, otherwise the entry is mistaken for a live periodic task and is never reaped.
+    pub fn unbind(&self, id: &TaskId) {
+        let mut inner = self.inner.write();
+        Self::unbind_locked(&mut inner, id);
+    }
+
     /// Unregister a task from state (called on `TaskRemoved` event).
     ///
-    /// Removes the task entry, its slot index, and its identity binding,
-    /// but **preserves run history** (cleaned later by sweep).
+    /// Removes the task entry, its slot index, and its identity binding, but **preserves run history** (cleaned later by sweep).
     /// Compare with [`delete_task`](Self::delete_task) which removes both.
     pub fn unregister_task(&self, id: &TaskId) {
         let mut inner = self.inner.write();
@@ -158,8 +224,20 @@ impl TaskState {
             return None;
         };
 
-        let run = TaskRun::starting(attempt);
-        inner.runs.entry(id.clone()).or_default().push_back(run);
+        let max_runs = inner.max_runs_per_task;
+        let runs = inner.runs.entry(id.clone()).or_default();
+        for run in runs.iter_mut().filter(|r| r.is_active()) {
+            run.finish(
+                TaskPhase::Failed,
+                Some("run outcome not observed (a later attempt started first)".to_string()),
+                None,
+            );
+        }
+        runs.push_back(TaskRun::starting(attempt));
+
+        while runs.len() > max_runs && runs.front().is_some_and(|r| !r.is_active()) {
+            runs.pop_front();
+        }
 
         Some(attempt)
     }
@@ -211,6 +289,11 @@ impl TaskState {
         inner.tasks.get(id).cloned()
     }
 
+    /// `true` if a task entry currently exists for `id` (cheap: no clone).
+    pub fn contains_task(&self, id: &TaskId) -> bool {
+        self.inner.read().tasks.contains_key(id)
+    }
+
     /// List all tasks in a specific slot.
     pub fn list_by_slot(&self, slot: &str) -> Vec<Task> {
         let inner = self.inner.read();
@@ -226,19 +309,24 @@ impl TaskState {
             .unwrap_or_default()
     }
 
-    /// List all tasks.
+    /// List all tasks (excluding solti-core's internal embedded tasks).
     pub fn list_all(&self) -> Vec<Task> {
         let inner = self.inner.read();
-        inner.tasks.values().cloned().collect()
+        inner
+            .tasks
+            .values()
+            .filter(|task| !is_internal_slot(task.slot().as_str()))
+            .cloned()
+            .collect()
     }
 
-    /// List tasks matching a phase filter.
+    /// List tasks matching a phase filter (excluding internal embedded tasks).
     pub fn list_by_status(&self, phase: TaskPhase) -> Vec<Task> {
         let inner = self.inner.read();
         inner
             .tasks
             .values()
-            .filter(|task| task.status().phase == phase)
+            .filter(|task| !is_internal_slot(task.slot().as_str()) && task.status().phase == phase)
             .cloned()
             .collect()
     }
@@ -256,15 +344,21 @@ impl TaskState {
         let mut runs_removed = 0usize;
         let mut tasks_removed = 0usize;
 
-        for runs in inner.runs.values_mut() {
+        let bound: std::collections::HashSet<TaskId> = inner.tv_of.keys().cloned().collect();
+        for (id, runs) in inner.runs.iter_mut() {
             let before = runs.len();
-            runs.retain(|run| {
-                if let Some(finished) = run.finished_at {
-                    now.duration_since(finished)
-                        .map(|age| age < config.run_ttl)
-                        .unwrap_or(true)
-                } else {
-                    true
+            let task_bound = bound.contains(id);
+            runs.retain(|run| match run.finished_at {
+                Some(finished) => now
+                    .duration_since(finished)
+                    .map(|age| age < config.run_ttl)
+                    .unwrap_or(true),
+                None => {
+                    task_bound
+                        || now
+                            .duration_since(run.started_at)
+                            .map(|age| age < config.run_ttl)
+                            .unwrap_or(true)
                 }
             });
             runs_removed += before - runs.len();
@@ -275,10 +369,6 @@ impl TaskState {
             .tasks
             .iter()
             .filter(|(id, task)| {
-                // A terminal phase only means the last *attempt* finished: a
-                // periodic task sits in Succeeded between runs. While the entry
-                // is bound to a live run identity, its actor has not been
-                // removed (no TaskRemoved observed) - never sweep it.
                 !inner.tv_of.contains_key(*id)
                     && task.status().phase.is_terminal()
                     && inner.runs.get(*id).is_none_or(|runs| runs.is_empty())
@@ -330,7 +420,12 @@ impl TaskState {
                     }
                 }
             }
-            None => Box::new(inner.tasks.values()),
+            None => Box::new(
+                inner
+                    .tasks
+                    .values()
+                    .filter(|task| !is_internal_slot(task.slot().as_str())),
+            ),
         };
 
         let iter: Box<dyn Iterator<Item = &Task>> = if q.status_filters().is_empty() {
@@ -358,6 +453,11 @@ impl Default for TaskState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `true` for slots owned by solti-core's own embedded machinery.
+fn is_internal_slot(slot: &str) -> bool {
+    slot == sweep::SWEEP_SLOT
 }
 
 #[cfg(test)]
@@ -433,8 +533,6 @@ mod tests {
 
     #[test]
     fn add_task_twice_with_same_id_does_not_duplicate_in_slot() {
-        // Resubmit of a terminal-but-not-yet-removed embedded task reuses the
-        // same TaskId; the slot index must not list it twice.
         let state = TaskState::new();
         let id = TaskId::from("dup");
 
@@ -445,6 +543,34 @@ mod tests {
             state.list_by_slot("slot-x").len(),
             1,
             "re-adding the same id must not duplicate it in the slot index"
+        );
+    }
+
+    #[test]
+    fn reserve_rejects_a_second_active_name() {
+        let state = TaskState::new();
+        let id = TaskId::from("dup");
+
+        assert!(state.reserve(id.clone(), default_spec()).is_ok());
+        let err = state
+            .reserve(id.clone(), default_spec())
+            .expect_err("second reservation of an active name must fail");
+        assert!(matches!(err, CoreError::AlreadyExists(_)));
+        assert_eq!(state.list_by_slot("slot").len(), 1);
+    }
+
+    #[test]
+    fn reserve_allows_reusing_a_terminal_name() {
+        let state = TaskState::new();
+        let id = TaskId::from("reuse");
+
+        state.reserve(id.clone(), default_spec()).unwrap();
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Succeeded, None, None);
+
+        assert!(
+            state.reserve(id.clone(), default_spec()).is_ok(),
+            "a terminal name must be reusable"
         );
     }
 
@@ -495,6 +621,37 @@ mod tests {
     }
 
     #[test]
+    fn internal_sweep_slot_is_hidden_from_general_listings() {
+        let state = TaskState::new();
+        state.add_task(
+            TaskId::from("user-task"),
+            default_spec_with_slot("user-slot"),
+        );
+        state.add_task(
+            TaskId::from(super::sweep::SWEEP_SLOT),
+            default_spec_with_slot(super::sweep::SWEEP_SLOT),
+        );
+
+        assert_eq!(state.list_all().len(), 1);
+        assert_eq!(state.list_all()[0].slot(), "user-slot");
+        assert_eq!(
+            state.list_by_status(TaskPhase::Pending).len(),
+            1,
+            "by-status listing also omits the internal sweep task"
+        );
+        let page = state.query(&TaskQuery::new().with_limit(100));
+        assert_eq!(
+            page.total, 1,
+            "slot-less query omits the internal sweep task"
+        );
+        assert_eq!(page.items.len(), 1);
+
+        let page = state.query(&TaskQuery::new().with_slot(super::sweep::SWEEP_SLOT));
+        assert_eq!(page.total, 1);
+        assert_eq!(state.list_by_slot(super::sweep::SWEEP_SLOT).len(), 1);
+    }
+
+    #[test]
     fn list_all_returns_all_tasks() {
         let state = TaskState::new();
 
@@ -542,11 +699,9 @@ mod tests {
 
         state.add_task(id.clone(), default_spec());
 
-        // First attempt fails
         state.transition_starting(&id);
         state.transition_finished(&id, TaskPhase::Failed, Some("err".into()), None);
 
-        // Second attempt succeeds
         state.transition_starting(&id);
         state.transition_finished(&id, TaskPhase::Succeeded, None, None);
 
@@ -570,7 +725,6 @@ mod tests {
         state.unregister_task(&id);
 
         assert!(state.get(&id).is_none());
-        // Runs survive unregister (cleaned by sweep).
         let runs = state.list_runs(&id);
         assert_eq!(runs.len(), 1);
     }
@@ -584,14 +738,12 @@ mod tests {
 
     fn setup_query_state() -> TaskState {
         let state = TaskState::new();
-        // slot-a: 3 tasks (2 running, 1 pending)
         state.add_task(TaskId::from("a1"), default_spec_with_slot("slot-a"));
         state.add_task(TaskId::from("a2"), default_spec_with_slot("slot-a"));
         state.add_task(TaskId::from("a3"), default_spec_with_slot("slot-a"));
         state.transition_starting(&TaskId::from("a1"));
         state.transition_starting(&TaskId::from("a2"));
 
-        // slot-b: 2 tasks (1 failed, 1 pending)
         state.add_task(TaskId::from("b1"), default_spec_with_slot("slot-b"));
         state.add_task(TaskId::from("b2"), default_spec_with_slot("slot-b"));
         state.transition_starting(&TaskId::from("b1"));
@@ -668,7 +820,6 @@ mod tests {
     #[test]
     fn query_pagination_offset_and_limit() {
         let state = setup_query_state();
-        // 5 total tasks, offset 2 limit 2 => items 2, total 5
         let page = state.query(&TaskQuery::new().with_limit(2).with_offset(2));
         assert_eq!(page.total, 5);
         assert_eq!(page.items.len(), 2);
@@ -685,7 +836,6 @@ mod tests {
     #[test]
     fn query_limit_larger_than_remaining() {
         let state = setup_query_state();
-        // offset 3, limit 100 => only 2 remaining
         let page = state.query(&TaskQuery::new().with_offset(3).with_limit(100));
         assert_eq!(page.total, 5);
         assert_eq!(page.items.len(), 2);
@@ -700,23 +850,21 @@ mod tests {
         state.transition_starting(&id);
         state.transition_finished(&id, TaskPhase::Succeeded, None, None);
 
-        // With zero TTL, everything is expired.
         let config = StateConfig {
             run_ttl: std::time::Duration::ZERO,
             task_ttl: std::time::Duration::from_secs(3600),
             sweep_interval: std::time::Duration::from_secs(60),
+            ..StateConfig::default()
         };
 
         let (runs_removed, tasks_removed) = state.sweep(&config);
         assert_eq!(runs_removed, 1);
-        assert_eq!(tasks_removed, 0); // task still exists (task_ttl is long)
+        assert_eq!(tasks_removed, 0);
         assert!(state.list_runs(&id).is_empty());
     }
 
     #[test]
     fn sweep_keeps_terminal_tasks_with_live_binding() {
-        // A periodic task sits in a terminal phase *between* runs while its
-        // actor is alive (binding present): the sweep must not delete it.
         let state = TaskState::new();
         let id = TaskId::from("periodic");
 
@@ -729,6 +877,7 @@ mod tests {
             run_ttl: std::time::Duration::ZERO,
             task_ttl: std::time::Duration::ZERO,
             sweep_interval: std::time::Duration::from_secs(60),
+            ..StateConfig::default()
         };
 
         let (_, tasks_removed) = state.sweep(&config);
@@ -740,6 +889,33 @@ mod tests {
     }
 
     #[test]
+    fn unbind_lets_sweep_reap_a_terminal_bound_entry() {
+        let state = TaskState::new();
+        let id = TaskId::from("leaked");
+
+        state.add_task(id.clone(), default_spec());
+        state.bind_tv(&id, 99);
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Failed, Some("rejected".into()), None);
+
+        let config = StateConfig {
+            run_ttl: std::time::Duration::ZERO,
+            task_ttl: std::time::Duration::ZERO,
+            ..StateConfig::default()
+        };
+
+        let (_, removed) = state.sweep(&config);
+        assert_eq!(removed, 0, "a bound terminal entry must NOT be swept");
+        assert!(state.get(&id).is_some());
+
+        state.unbind(&id);
+        let (_, removed) = state.sweep(&config);
+        assert_eq!(removed, 1, "an unbound terminal entry must be reaped");
+        assert!(state.get(&id).is_none());
+        assert!(state.resolve_tv(99).is_none());
+    }
+
+    #[test]
     fn sweep_removes_terminal_tasks_without_runs() {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
@@ -747,12 +923,12 @@ mod tests {
         state.add_task(id.clone(), default_spec());
         state.transition_starting(&id);
         state.transition_finished(&id, TaskPhase::Succeeded, None, None);
-        // Run will also be swept since run_ttl is zero.
 
         let config = StateConfig {
             run_ttl: std::time::Duration::ZERO,
             task_ttl: std::time::Duration::ZERO,
             sweep_interval: std::time::Duration::from_secs(60),
+            ..StateConfig::default()
         };
 
         let (_, tasks_removed) = state.sweep(&config);
@@ -761,23 +937,115 @@ mod tests {
     }
 
     #[test]
-    fn sweep_keeps_active_runs() {
+    fn sweep_keeps_active_runs_of_a_live_task() {
         let state = TaskState::new();
         let id = TaskId::from("task-1");
 
         state.add_task(id.clone(), default_spec());
+        state.bind_tv(&id, 1);
         state.transition_starting(&id);
-        // run is still active (not finished)
 
         let config = StateConfig {
             run_ttl: std::time::Duration::ZERO,
             task_ttl: std::time::Duration::ZERO,
-            sweep_interval: std::time::Duration::from_secs(60),
+            ..StateConfig::default()
         };
 
         let (runs_removed, _) = state.sweep(&config);
         assert_eq!(runs_removed, 0);
         assert_eq!(state.list_runs(&id).len(), 1);
+    }
+
+    #[test]
+    fn sweep_ages_out_active_run_on_an_unbound_task() {
+        let state = TaskState::new();
+        let id = TaskId::from("orphan-run");
+
+        state.add_task(id.clone(), default_spec());
+        state.transition_starting(&id); // active run, task never bound
+
+        let config = StateConfig {
+            run_ttl: std::time::Duration::ZERO,
+            task_ttl: std::time::Duration::from_secs(3600),
+            ..StateConfig::default()
+        };
+
+        let (runs_removed, _) = state.sweep(&config);
+        assert_eq!(
+            runs_removed, 1,
+            "an active run on an unbound (dead) task is aged out"
+        );
+        assert!(state.list_runs(&id).is_empty());
+    }
+
+    #[test]
+    fn run_history_is_capped_per_task() {
+        let state = TaskState::new();
+        state.set_max_runs_per_task(3);
+        let id = TaskId::from("chatty");
+        state.add_task(id.clone(), default_spec());
+
+        for _ in 0..5 {
+            state.transition_starting(&id);
+            state.transition_finished(&id, TaskPhase::Failed, None, None);
+        }
+
+        let runs = state.list_runs(&id);
+        assert_eq!(
+            runs.len(),
+            3,
+            "run history must be capped at max_runs_per_task"
+        );
+        assert_eq!(
+            runs.first().unwrap().attempt,
+            3,
+            "oldest retained is attempt 3"
+        );
+        assert_eq!(
+            runs.last().unwrap().attempt,
+            5,
+            "newest retained is attempt 5"
+        );
+    }
+
+    #[test]
+    fn run_history_cap_never_evicts_the_active_tail() {
+        let state = TaskState::new();
+        state.set_max_runs_per_task(2);
+        let id = TaskId::from("tail");
+        state.add_task(id.clone(), default_spec());
+
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Failed, None, None);
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Failed, None, None);
+        state.transition_starting(&id);
+
+        let runs = state.list_runs(&id);
+        assert_eq!(runs.len(), 2);
+        assert!(
+            runs.last().unwrap().is_active(),
+            "the in-flight run is preserved"
+        );
+        assert_eq!(runs.last().unwrap().attempt, 3);
+    }
+
+    #[test]
+    fn new_start_closes_a_prior_orphaned_active_run() {
+        let state = TaskState::new();
+        let id = TaskId::from("retry");
+
+        state.add_task(id.clone(), default_spec());
+        state.transition_starting(&id);
+        state.transition_starting(&id);
+
+        let runs = state.list_runs(&id);
+        assert_eq!(runs.len(), 2);
+        assert!(
+            !runs[0].is_active(),
+            "the prior attempt's orphaned run must be closed when a new attempt starts"
+        );
+        assert!(runs[1].is_active(), "the newest attempt's run stays active");
     }
 
     #[test]
@@ -792,6 +1060,7 @@ mod tests {
             run_ttl: std::time::Duration::ZERO,
             task_ttl: std::time::Duration::ZERO,
             sweep_interval: std::time::Duration::from_secs(60),
+            ..StateConfig::default()
         };
 
         let (_, tasks_removed) = state.sweep(&config);
@@ -802,7 +1071,6 @@ mod tests {
     #[test]
     fn query_slot_with_pagination() {
         let state = setup_query_state();
-        // slot-a has 3 tasks, offset 1 limit 1 => 1 item, total 3
         let page = state.query(
             &TaskQuery::new()
                 .with_slot("slot-a")
@@ -884,11 +1152,9 @@ mod tests {
 
         state.add_task(id.clone(), default_spec());
 
-        // Attempt 1: start → fail
         assert_eq!(state.transition_starting(&id), Some(1));
         state.transition_finished(&id, TaskPhase::Failed, Some("err".into()), None);
 
-        // Attempt 2: start → succeed
         assert_eq!(state.transition_starting(&id), Some(2));
         state.transition_finished(&id, TaskPhase::Succeeded, None, None);
 

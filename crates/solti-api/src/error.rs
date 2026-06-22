@@ -74,6 +74,9 @@ fn core_to_status(e: solti_core::CoreError) -> tonic::Status {
         CoreError::Supervisor(_) | CoreError::Mapping(_) | CoreError::Runner(_) => {
             tonic::Status::internal(e.to_string())
         }
+        // `CoreError` is `#[non_exhaustive]`: any future variant is conservatively
+        // surfaced as `Internal` rather than silently dropped.
+        _ => tonic::Status::internal(e.to_string()),
     }
 }
 
@@ -108,6 +111,9 @@ fn core_to_http_status(e: solti_core::CoreError) -> (axum::http::StatusCode, Str
         CoreError::Supervisor(_) | CoreError::Mapping(_) | CoreError::Runner(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
+        // `CoreError` is `#[non_exhaustive]`: any future variant is conservatively
+        // surfaced as `500 Internal Server Error` rather than silently dropped.
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -152,5 +158,56 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         let (status, _) = core_to_http_status(solti_core::CoreError::NotFound("t".into()));
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // `CoreError` is `#[non_exhaustive]`, so the compiler no longer forces these
+    // mappers to cover every variant. These tests pin the known mappings instead:
+    // a maintainer adding a variant should extend the mappers (and this test).
+    #[cfg(feature = "http")]
+    #[test]
+    fn core_to_http_status_maps_every_known_variant() {
+        use axum::http::StatusCode;
+        use solti_core::CoreError;
+
+        let cases = [
+            (
+                CoreError::InvalidSpec(solti_model::ModelError::Invalid("x".into())),
+                StatusCode::BAD_REQUEST,
+            ),
+            (CoreError::AlreadyExists("x".into()), StatusCode::CONFLICT),
+            (CoreError::NotFound("x".into()), StatusCode::NOT_FOUND),
+            (
+                CoreError::Supervisor("x".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                CoreError::Mapping("x".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(core_to_http_status(err).0, expected);
+        }
+    }
+
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn core_to_status_maps_every_known_variant() {
+        use solti_core::CoreError;
+        use tonic::Code;
+
+        let cases = [
+            (
+                CoreError::InvalidSpec(solti_model::ModelError::Invalid("x".into())),
+                Code::InvalidArgument,
+            ),
+            (CoreError::AlreadyExists("x".into()), Code::AlreadyExists),
+            (CoreError::NotFound("x".into()), Code::NotFound),
+            (CoreError::Supervisor("x".into()), Code::Internal),
+            (CoreError::Mapping("x".into()), Code::Internal),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(core_to_status(err).code(), expected);
+        }
     }
 }

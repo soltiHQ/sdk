@@ -124,13 +124,39 @@ pub(crate) async fn log_stream<R>(
             }
         };
 
-        let hit_cap = bytes_read == config.max_line_bytes && !buf.ends_with(b"\n");
+        let mut hit_cap = bytes_read == config.max_line_bytes && !buf.ends_with(b"\n");
         if buf.ends_with(b"\n") {
             buf.pop();
             if buf.ends_with(b"\r") {
                 buf.pop();
             }
         }
+
+        if hit_cap {
+            let mut drained_any = false;
+            let mut junk: Vec<u8> = Vec::with_capacity(256);
+            loop {
+                junk.clear();
+                match (&mut reader)
+                    .take(config.max_line_bytes as u64)
+                    .read_until(b'\n', &mut junk)
+                    .await
+                {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        drained_any = true;
+                        if junk.last() == Some(&b'\n') {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if !drained_any {
+                hit_cap = false;
+            }
+        }
+
         let raw_line = String::from_utf8_lossy(&buf).into_owned();
         let raw_line = if hit_cap {
             format!(
@@ -140,21 +166,6 @@ pub(crate) async fn log_stream<R>(
         } else {
             raw_line
         };
-
-        if hit_cap {
-            let mut scratch = [0u8; 8 * 1024];
-            loop {
-                let drained = match reader.read(&mut scratch).await {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-                if let Some(nl) = scratch[..drained].iter().position(|&b| b == b'\n') {
-                    let _ = nl;
-                    break;
-                }
-            }
-        }
 
         let line = truncate_line(&raw_line, config.max_line_length);
         line_count += 1;
@@ -351,6 +362,66 @@ mod tests {
                     "expected truncated, got {line_text:?}"
                 );
                 assert!(line_text.contains("truncated"));
+            }
+            other => panic!("expected Chunk, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn log_stream_over_cap_line_does_not_eat_the_following_line() {
+        let cfg = LogConfig {
+            max_line_bytes: 8,
+            ..LogConfig::default()
+        };
+        let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
+        let sink = OutputSink::new(tx, 1);
+
+        log_stream(
+            b"AAAAAAAA\nKEEPME\n".as_slice(),
+            "task-cap",
+            StreamKind::Stdout,
+            &cfg,
+            Some(&sink),
+        )
+        .await;
+
+        let mut lines = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let OutputEvent::Chunk(c) = ev {
+                lines.push(String::from_utf8_lossy(&c.line).into_owned());
+            }
+        }
+        assert!(
+            lines.iter().any(|l| l == "KEEPME"),
+            "the line after an over-cap line must survive intact, got {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_stream_exact_cap_final_line_at_eof_is_not_marked_truncated() {
+        let cfg = LogConfig {
+            max_line_bytes: 8,
+            ..LogConfig::default()
+        };
+        let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
+        let sink = OutputSink::new(tx, 1);
+
+        log_stream(
+            b"AAAAAAAA".as_slice(),
+            "task-exact",
+            StreamKind::Stdout,
+            &cfg,
+            Some(&sink),
+        )
+        .await;
+
+        match rx.recv().await.unwrap() {
+            OutputEvent::Chunk(c) => {
+                let s = String::from_utf8_lossy(&c.line);
+                assert_eq!(
+                    s, "AAAAAAAA",
+                    "a complete exact-cap line must not be marked truncated"
+                );
             }
             other => panic!("expected Chunk, got {other:?}"),
         }
