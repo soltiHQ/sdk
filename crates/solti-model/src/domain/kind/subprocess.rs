@@ -20,6 +20,7 @@ pub const MAX_SCRIPT_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// | `Script`  | Script passed to an interpreter: `execve(runtime, [flag, body, ...args])`  |
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum SubprocessMode {
     /// Direct binary execution.
     Command {

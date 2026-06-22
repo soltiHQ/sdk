@@ -36,5 +36,8 @@ solti-discover = { workspace = true, optional = true }
 solti-api      = { workspace = true, optional = true }
 solti-core     = { workspace = true, optional = true }
 
+[dev-dependencies]
+solti-core = { workspace = true, features = ["test-util"] }
+
 [package.metadata.docs.rs]
 all-features = true

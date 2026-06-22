@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 /// [`Custom`](Runtime::Custom) allows arbitrary interpreter configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum Runtime {
     /// Bash shell: resolves to `("bash", "-c")`.
     Bash,

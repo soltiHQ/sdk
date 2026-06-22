@@ -1,7 +1,6 @@
 //! # Supervisor state collector.
 //!
-//! [`PrometheusStateCollector`] is a `prometheus::core::Collector` that exposes
-//! the current number of tasks per [`TaskPhase`] as `solti_sv_tasks_by_phase{phase}`.
+//! [`PrometheusStateCollector`] is a `prometheus::core::Collector` that exposes the current number of tasks per [`TaskPhase`] as `solti_sv_tasks_by_phase{phase}`.
 
 use prometheus::GaugeVec;
 use prometheus::core::{Collector, Desc};
@@ -14,8 +13,7 @@ use crate::register::Sub;
 
 /// All phases we want to be represented as gauges, even at zero.
 ///
-/// Kept in code (not derived) because [`TaskPhase`] is `#[non_exhaustive]`:
-/// adding a variant upstream should be a conscious decision here too.
+/// Kept in code (not derived) because [`TaskPhase`] is `#[non_exhaustive]`: adding a variant upstream should be a conscious decision here too.
 const ALL_PHASES: &[TaskPhase] = &[
     TaskPhase::Pending,
     TaskPhase::Running,
@@ -173,9 +171,9 @@ mod tests {
     #[test]
     fn collector_counts_pending_tasks() {
         let state = TaskState::new();
-        state.add_task(TaskId::from("t1"), spec());
-        state.add_task(TaskId::from("t2"), spec());
-        state.add_task(TaskId::from("t3"), spec());
+        state.seed_task(TaskId::from("t1"), spec());
+        state.seed_task(TaskId::from("t2"), spec());
+        state.seed_task(TaskId::from("t3"), spec());
 
         let collector = PrometheusStateCollector::new(state).unwrap();
         let families = collector.collect();
@@ -193,9 +191,9 @@ mod tests {
     #[test]
     fn collector_reflects_transitions() {
         let state = TaskState::new();
-        state.add_task(TaskId::from("t1"), spec());
-        state.add_task(TaskId::from("t2"), spec());
-        state.transition_starting(&TaskId::from("t1"));
+        state.seed_task(TaskId::from("t1"), spec());
+        state.seed_task(TaskId::from("t2"), spec());
+        state.seed_starting(&TaskId::from("t1"));
 
         let collector = PrometheusStateCollector::new(state.clone()).unwrap();
         let families = collector.collect();
@@ -210,7 +208,7 @@ mod tests {
         );
 
         // Finish the running task, rescrape — expected phase counts move.
-        state.transition_finished(&TaskId::from("t1"), TaskPhase::Succeeded, None, None);
+        state.seed_finished(&TaskId::from("t1"), TaskPhase::Succeeded, None, None);
         let families = collector.collect();
         assert_eq!(
             gauge_value(&families, "solti_sv_tasks_by_phase", "running"),
@@ -226,8 +224,8 @@ mod tests {
     fn collector_registers_into_registry_and_scrapes() {
         let registry = Arc::new(Registry::new());
         let state = TaskState::new();
-        state.add_task(TaskId::from("alpha"), spec());
-        state.transition_starting(&TaskId::from("alpha"));
+        state.seed_task(TaskId::from("alpha"), spec());
+        state.seed_starting(&TaskId::from("alpha"));
 
         let collector = PrometheusStateCollector::new(state).unwrap();
         registry.register(Box::new(collector)).unwrap();

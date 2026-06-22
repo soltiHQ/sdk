@@ -31,6 +31,7 @@ pub(crate) fn output_event_to_proto(ev: OutputEvent) -> proto_api::StreamTaskLog
             finished_at: system_time_to_ms(finished_at),
         }),
         OutputEvent::Lagged { skipped } => Kind::Lagged(proto_api::Lagged { skipped }),
+        _ => return proto_api::StreamTaskLogsResponse { kind: None },
     };
 
     proto_api::StreamTaskLogsResponse { kind: Some(kind) }

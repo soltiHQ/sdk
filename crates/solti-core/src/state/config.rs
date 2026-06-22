@@ -18,7 +18,7 @@ pub(crate) const DEFAULT_MAX_RUNS_PER_TASK: usize = 256;
 ///
 /// ## Also
 ///
-/// - [`TaskState::sweep`](crate::TaskState::sweep) consumes the TTL settings.
+/// - [`TaskState`](crate::TaskState)'s crate-internal sweep consumes the TTL settings.
 /// - [`SupervisorApi::new`](crate::SupervisorApi::new) accepts this config and auto-starts the sweep task.
 #[derive(Debug, Clone)]
 pub struct StateConfig {

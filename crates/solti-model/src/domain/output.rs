@@ -28,6 +28,7 @@ pub enum StreamKind {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum OutputEvent {
     /// One line of stdout/stderr from the currently active run.
     Chunk(OutputChunk),

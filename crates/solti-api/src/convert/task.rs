@@ -30,6 +30,9 @@ impl TryFrom<Task> for proto_api::TaskData {
 pub(crate) fn tasks_page_to_proto(
     page: solti_model::TaskPage<solti_model::Task>,
 ) -> Result<proto_api::ListTasksResponse, ApiError> {
+    // `total` is the count of all matching tasks across pages, not the size of this
+    // page — preserve it from the domain page (saturating into the proto's u32).
+    let total = u32::try_from(page.total).unwrap_or(u32::MAX);
     let tasks: Vec<proto_api::TaskData> = page
         .items
         .into_iter()
@@ -37,10 +40,7 @@ pub(crate) fn tasks_page_to_proto(
         .map(proto_api::TaskData::try_from)
         .collect::<Result<_, _>>()?;
 
-    Ok(proto_api::ListTasksResponse {
-        total: tasks.len() as u32,
-        tasks,
-    })
+    Ok(proto_api::ListTasksResponse { total, tasks })
 }
 
 #[cfg(test)]
@@ -52,15 +52,15 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     fn subprocess_task_kind() -> TaskKind {
-        TaskKind::Subprocess(SubprocessSpec {
-            mode: SubprocessMode::Command {
+        TaskKind::Subprocess(SubprocessSpec::new(
+            SubprocessMode::Command {
                 command: "ls".into(),
                 args: vec![],
             },
-            env: TaskEnv::new(),
-            cwd: None,
-            fail_on_non_zero: Flag::from(true),
-        })
+            TaskEnv::new(),
+            None,
+            Flag::from(true),
+        ))
     }
 
     #[test]
@@ -122,6 +122,29 @@ mod tests {
         let status = proto.status.unwrap();
         assert_eq!(status.error, None);
         assert_eq!(status.exit_code, Some(0));
+    }
+
+    #[test]
+    fn list_response_total_reflects_full_match_count_not_page_size() {
+        // Simulate a paginated query: 5 total matches, but this page carries only 2 items.
+        let mk = |id: &str| {
+            let spec = TaskSpec::builder("slot", subprocess_task_kind(), 5_000_u64)
+                .build()
+                .unwrap();
+            Task::new(id.into(), spec)
+        };
+        let page = solti_model::TaskPage {
+            items: vec![mk("task-1"), mk("task-2")],
+            total: 5,
+        };
+
+        let resp = tasks_page_to_proto(page).expect("conversion must succeed");
+
+        assert_eq!(resp.tasks.len(), 2, "this page carries exactly 2 items");
+        assert_eq!(
+            resp.total, 5,
+            "total must report all matching tasks across pages, not the current page size"
+        );
     }
 
     #[test]

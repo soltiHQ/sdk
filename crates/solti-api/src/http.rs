@@ -334,6 +334,7 @@ where
             OutputEvent::RunStarted { .. } => "run-started",
             OutputEvent::RunFinished { .. } => "run-finished",
             OutputEvent::Lagged { .. } => "lagged",
+            _ => "unknown",
         };
         let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
         Ok(Event::default().event(name).data(data))

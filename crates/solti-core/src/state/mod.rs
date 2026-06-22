@@ -29,25 +29,21 @@ use crate::error::CoreError;
 ///
 /// # Examples
 ///
+/// `TaskState` is populated internally by the supervisor (via its event subscriber);
+/// from outside the crate it is a **read-only snapshot**. A fresh state is empty:
+///
 /// ```
 /// use solti_core::TaskState;
-/// use solti_model::{TaskId, TaskKind, TaskQuery, TaskSpec};
+/// use solti_model::TaskQuery;
 ///
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let state = TaskState::new();
-/// let id = TaskId::from("task-1");
-/// let spec = TaskSpec::builder("my-slot", TaskKind::Embedded, 5_000u64).build()?;
-///
-/// state.add_task(id.clone(), spec);
-/// assert!(state.get(&id).is_some());
-/// assert_eq!(state.query(&TaskQuery::new()).total, 1);
-/// # Ok(())
-/// # }
+/// assert!(state.list_all().is_empty());
+/// assert_eq!(state.query(&TaskQuery::new()).total, 0);
 /// ```
 ///
 /// ## Also
 ///
-/// - [`StateConfig`] TTL settings consumed by [`sweep`](Self::sweep).
+/// - [`StateConfig`] TTL settings consumed by `sweep` (crate-internal).
 /// - `state_sweep` (crate-internal) builds an embedded periodic sweep task.
 /// - `StateSubscriber` (crate-internal) wires taskvisor events into mutations.
 #[derive(Clone)]
@@ -74,7 +70,7 @@ struct TaskStateInner {
 impl TaskState {
     /// Create empty task state with the default per-task run-history cap.
     ///
-    /// Use [`set_max_runs_per_task`](Self::set_max_runs_per_task) to override it from a [`StateConfig`] before the state sees traffic.
+    /// Use `set_max_runs_per_task` (crate-internal) to override it from a [`StateConfig`] before the state sees traffic.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(TaskStateInner {
@@ -91,12 +87,12 @@ impl TaskState {
     /// Override the per-task run-history cap (see [`StateConfig::max_runs_per_task`]).
     ///
     /// Intended to be called once at wiring time, before any events arrive.
-    pub fn set_max_runs_per_task(&self, max: usize) {
+    pub(crate) fn set_max_runs_per_task(&self, max: usize) {
         self.inner.write().max_runs_per_task = max;
     }
 
     /// Register a new task (called on TaskAdded event).
-    pub fn add_task(&self, id: TaskId, spec: TaskSpec) {
+    pub(crate) fn add_task(&self, id: TaskId, spec: TaskSpec) {
         let mut inner = self.inner.write();
 
         let slot = spec.slot().clone();
@@ -113,7 +109,7 @@ impl TaskState {
     ///
     /// Returns [`CoreError::AlreadyExists`] if a **non-terminal** entry already holds this name (the previous incarnation is still active).
     /// Otherwise, it inserts the provisional entry: idempotent on the slot index, exactly like [`add_task`](Self::add_task) and returns `Ok(())`.
-    pub fn reserve(&self, id: TaskId, spec: TaskSpec) -> Result<(), CoreError> {
+    pub(crate) fn reserve(&self, id: TaskId, spec: TaskSpec) -> Result<(), CoreError> {
         let mut inner = self.inner.write();
 
         if let Some(existing) = inner.tasks.get(&id)
@@ -139,7 +135,7 @@ impl TaskState {
     ///
     /// Called at submission time (the id is pre-minted by `submit()`).
     /// Rebinding the same entry to a new identity drops the previous binding, late events from the previous incarnation no longer resolve to this entry.
-    pub fn bind_tv(&self, id: &TaskId, tv: u64) {
+    pub(crate) fn bind_tv(&self, id: &TaskId, tv: u64) {
         let mut inner = self.inner.write();
         if let Some(old) = inner.tv_of.insert(id.clone(), tv) {
             inner.by_tv.remove(&old);
@@ -148,12 +144,12 @@ impl TaskState {
     }
 
     /// Resolve a taskvisor run identity to its task entry (if currently bound).
-    pub fn resolve_tv(&self, tv: u64) -> Option<TaskId> {
+    pub(crate) fn resolve_tv(&self, tv: u64) -> Option<TaskId> {
         self.inner.read().by_tv.get(&tv).cloned()
     }
 
     /// The taskvisor run identity currently bound to a task entry (if any).
-    pub fn tv_for(&self, id: &TaskId) -> Option<u64> {
+    pub(crate) fn tv_for(&self, id: &TaskId) -> Option<u64> {
         self.inner.read().tv_of.get(id).copied()
     }
 
@@ -168,7 +164,7 @@ impl TaskState {
     /// The sweep deliberately spares any entry that is still **bound**: a periodic task sits in a terminal phase between runs while its actor is alive (see [`sweep`](Self::sweep)).
     /// Terminal finalizations that do *not* flow through `TaskRemoved`, admission rejections and lag-dropped terminals reconstructed by the completion-plane backstop - must therefore
     /// call this to drop the binding, otherwise the entry is mistaken for a live periodic task and is never reaped.
-    pub fn unbind(&self, id: &TaskId) {
+    pub(crate) fn unbind(&self, id: &TaskId) {
         let mut inner = self.inner.write();
         Self::unbind_locked(&mut inner, id);
     }
@@ -177,7 +173,7 @@ impl TaskState {
     ///
     /// Removes the task entry, its slot index, and its identity binding, but **preserves run history** (cleaned later by sweep).
     /// Compare with [`delete_task`](Self::delete_task) which removes both.
-    pub fn unregister_task(&self, id: &TaskId) {
+    pub(crate) fn unregister_task(&self, id: &TaskId) {
         let mut inner = self.inner.write();
 
         Self::unbind_locked(&mut inner, id);
@@ -195,7 +191,7 @@ impl TaskState {
     ///
     /// This is the API-driven full removal.
     /// Compare with [`unregister_task`](Self::unregister_task) which preserves runs.
-    pub fn delete_task(&self, id: &TaskId) -> bool {
+    pub(crate) fn delete_task(&self, id: &TaskId) -> bool {
         let mut inner = self.inner.write();
         inner.runs.remove(id);
 
@@ -214,7 +210,7 @@ impl TaskState {
     }
 
     /// Atomically transition a task to `Running`.
-    pub fn transition_starting(&self, id: &TaskId) -> Option<u32> {
+    pub(crate) fn transition_starting(&self, id: &TaskId) -> Option<u32> {
         let mut inner = self.inner.write();
 
         let attempt = if let Some(task) = inner.tasks.get_mut(id) {
@@ -243,7 +239,7 @@ impl TaskState {
     }
 
     /// Atomically transition a task to a terminal phase and close the active run.
-    pub fn transition_finished(
+    pub(crate) fn transition_finished(
         &self,
         id: &TaskId,
         phase: TaskPhase,
@@ -338,7 +334,7 @@ impl TaskState {
     /// 2. Remove terminal tasks that have no remaining runs and whose `updated_at` is older than `task_ttl`.
     ///
     /// Returns `(runs_removed, tasks_removed)` for observability.
-    pub fn sweep(&self, config: &StateConfig) -> (usize, usize) {
+    pub(crate) fn sweep(&self, config: &StateConfig) -> (usize, usize) {
         let mut inner = self.inner.write();
         let now = SystemTime::now();
         let mut runs_removed = 0usize;
@@ -452,6 +448,31 @@ impl TaskState {
 impl Default for TaskState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Test-only fixtures for populating state from outside the crate.
+#[cfg(feature = "test-util")]
+impl TaskState {
+    /// Seed a task entry directly (test fixtures only).
+    pub fn seed_task(&self, id: TaskId, spec: TaskSpec) {
+        self.add_task(id, spec);
+    }
+
+    /// Transition a seeded task to `Running` (test fixtures only).
+    pub fn seed_starting(&self, id: &TaskId) {
+        self.transition_starting(id);
+    }
+
+    /// Transition a seeded task to a terminal phase (test fixtures only).
+    pub fn seed_finished(
+        &self,
+        id: &TaskId,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+    ) {
+        self.transition_finished(id, phase, error, exit_code);
     }
 }
 

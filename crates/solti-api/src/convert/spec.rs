@@ -66,12 +66,22 @@ fn kind_to_proto(kind: &TaskKind) -> Result<proto_api::TaskKind, ApiError> {
                                 flag: flag.clone(),
                             })
                         }
+                        _ => {
+                            return Err(ApiError::Internal(
+                                "unsupported script runtime variant".into(),
+                            ));
+                        }
                     };
                     proto_api::subprocess_task::Mode::Script(proto_api::ScriptMode {
                         runtime: Some(runtime_proto),
                         body: body.clone(),
                         args: args.clone(),
                     })
+                }
+                _ => {
+                    return Err(ApiError::Internal(
+                        "unsupported subprocess mode variant".into(),
+                    ));
                 }
             };
             proto_api::task_kind::Kind::Subprocess(proto_api::SubprocessTask {
@@ -235,39 +245,39 @@ fn convert_task_kind(kind: proto_api::task_kind::Kind) -> Result<TaskKind, ApiEr
                 .validate()
                 .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
 
-            Ok(TaskKind::Subprocess(SubprocessSpec {
-                mode: subprocess_mode,
-                env: convert_env(sub.env),
-                cwd: sub.cwd.map(std::path::PathBuf::from),
-                fail_on_non_zero: Flag::from(sub.fail_on_non_zero),
-            }))
+            Ok(TaskKind::Subprocess(SubprocessSpec::new(
+                subprocess_mode,
+                convert_env(sub.env),
+                sub.cwd.map(std::path::PathBuf::from),
+                Flag::from(sub.fail_on_non_zero),
+            )))
         }
         proto_api::task_kind::Kind::Wasm(wasm) => {
             if wasm.module.trim().is_empty() {
                 return Err(ApiError::InvalidRequest("wasm module path is empty".into()));
             }
 
-            Ok(TaskKind::Wasm(WasmSpec {
-                module: std::path::PathBuf::from(wasm.module),
-                args: wasm.args,
-                env: convert_env(wasm.env),
-            }))
+            Ok(TaskKind::Wasm(WasmSpec::new(
+                std::path::PathBuf::from(wasm.module),
+                wasm.args,
+                convert_env(wasm.env),
+            )))
         }
         proto_api::task_kind::Kind::Container(cont) => {
             if cont.image.trim().is_empty() {
                 return Err(ApiError::InvalidRequest("container image is empty".into()));
             }
 
-            Ok(TaskKind::Container(ContainerSpec {
-                image: cont.image,
-                command: if cont.command.is_empty() {
+            Ok(TaskKind::Container(ContainerSpec::new(
+                cont.image,
+                if cont.command.is_empty() {
                     None
                 } else {
                     Some(cont.command)
                 },
-                args: cont.args,
-                env: convert_env(cont.env),
-            }))
+                cont.args,
+                convert_env(cont.env),
+            )))
         }
     }
 }

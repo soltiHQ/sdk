@@ -95,15 +95,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let kind = TaskKind::Subprocess(SubprocessSpec {
-        mode: SubprocessMode::Command {
+    let kind = TaskKind::Subprocess(SubprocessSpec::new(
+        SubprocessMode::Command {
             command: "echo".into(),
             args: vec!["hello world".into()],
         },
-        env: TaskEnv::new(),
-        cwd: None,
-        fail_on_non_zero: Flag::enabled(),
-    });
+        TaskEnv::new(),
+        None,
+        Flag::enabled(),
+    ));
     let spec = TaskSpec::builder("hello", kind, 30_000u64)
         .restart(RestartPolicy::Never)
         .admission(AdmissionPolicy::Replace)

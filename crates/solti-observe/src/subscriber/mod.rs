@@ -8,7 +8,7 @@
 //! | Level   | Events                                                                               |
 //! |---------|--------------------------------------------------------------------------------------|
 //! | `trace` | TaskAddRequested, TaskRemoveRequested, TaskRemoved, TaskStopped, ControllerSubmitted |
-//! | `debug` | TaskAdded, ActorExhausted, BackoffScheduled, ControllerSlotTransition                |
+//! | `debug` | TaskAdded, TaskCanceled, ActorExhausted, BackoffScheduled, ControllerSlotTransition   |
 //! | `info`  | TaskStarting, ShutdownRequested, AllStoppedWithinGrace                               |
 //! | `warn`  | GraceExceeded, TimeoutHit, ControllerRejected                                        |
 //! | `error` | TaskFailed, ActorDead, SubscriberPanicked, SubscriberOverflow                        |
@@ -122,6 +122,9 @@ pub fn log_event<E: View>(e: E) {
         }
         EventKind::TaskStarting => {
             info!(task = e.as_task(), attempt = e.attempt(), "{msg}")
+        }
+        EventKind::TaskCanceled => {
+            debug!(task = e.as_task(), "{msg}")
         }
         EventKind::TaskStopped => {
             trace!(task = e.as_task(), "{msg}")
@@ -263,6 +266,7 @@ fn message_for(kind: EventKind) -> &'static str {
         EventKind::ActorDead => "actor terminated permanently (fatal)",
 
         // Lifecycle
+        EventKind::TaskCanceled => "task canceled (graceful cancellation)",
         EventKind::TaskStopped => "task stopped (success or graceful cancel)",
         EventKind::TaskFailed => "task failed (non-fatal for this attempt)",
         EventKind::TimeoutHit => "task exceeded its configured timeout",
@@ -279,5 +283,23 @@ fn message_for(kind: EventKind) -> &'static str {
 
         // `EventKind` is #[non_exhaustive]
         _ => "unknown event",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_canceled_has_a_dedicated_message_not_the_unknown_fallback() {
+        let msg = message_for(EventKind::TaskCanceled);
+        assert_ne!(
+            msg, "unknown event",
+            "graceful TaskCanceled must not fall through to the unknown-event fallback",
+        );
+        assert!(
+            msg.contains("cancel"),
+            "message should describe cancellation, got: {msg}",
+        );
     }
 }

@@ -136,6 +136,7 @@ impl SubprocessRunner {
                 env,
                 cwd,
                 fail_on_non_zero,
+                ..
             }) => {
                 let Resolved {
                     command,
@@ -226,6 +227,9 @@ impl SubprocessRunner {
                     script_tempfile: Some(tmp),
                 })
             }
+            _ => Err(RunnerError::InvalidSpec(
+                "unsupported subprocess mode variant".into(),
+            )),
         }
     }
 }
@@ -662,15 +666,15 @@ mod tests {
     fn mk_subprocess_spec_with_args(slot: &str, command: &str, args: &[&str]) -> TaskSpec {
         TaskSpec::builder(
             slot,
-            TaskKind::Subprocess(SubprocessSpec {
-                mode: solti_model::SubprocessMode::Command {
+            TaskKind::Subprocess(SubprocessSpec::new(
+                solti_model::SubprocessMode::Command {
                     command: command.into(),
                     args: args.iter().map(|s| s.to_string()).collect(),
                 },
-                env: Default::default(),
-                cwd: None,
-                fail_on_non_zero: Default::default(),
-            }),
+                Default::default(),
+                None,
+                Default::default(),
+            )),
             5_000u64,
         )
         .restart(solti_model::RestartPolicy::Never)
@@ -812,16 +816,16 @@ mod tests {
         let runner = SubprocessRunner::new("test-runner");
         let spec = TaskSpec::builder(
             "test-slot",
-            TaskKind::Subprocess(solti_model::SubprocessSpec {
-                mode: solti_model::SubprocessMode::Script {
+            TaskKind::Subprocess(solti_model::SubprocessSpec::new(
+                solti_model::SubprocessMode::Script {
                     runtime: solti_model::Runtime::Bash,
                     body: BASE64.encode(b"echo hello"),
                     args: vec![],
                 },
-                env: Default::default(),
-                cwd: None,
-                fail_on_non_zero: Default::default(),
-            }),
+                Default::default(),
+                None,
+                Default::default(),
+            )),
             5_000u64,
         )
         .restart(solti_model::RestartPolicy::Never)

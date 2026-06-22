@@ -117,15 +117,15 @@
 //! // 1) Build a task spec via the builder
 //! let spec = TaskSpec::builder(
 //!     "my-worker",
-//!     TaskKind::Subprocess(SubprocessSpec {
-//!         mode: SubprocessMode::Command {
+//!     TaskKind::Subprocess(SubprocessSpec::new(
+//!         SubprocessMode::Command {
 //!             command: "echo".into(),
 //!             args: vec!["hello".into()],
 //!         },
-//!         env: Default::default(),
-//!         cwd: None,
-//!         fail_on_non_zero: Default::default(),
-//!     }),
+//!         Default::default(),
+//!         None,
+//!         Default::default(),
+//!     )),
 //!     5_000u64,
 //! )
 //! .restart(RestartPolicy::OnFailure)

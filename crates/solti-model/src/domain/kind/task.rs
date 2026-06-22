@@ -73,6 +73,13 @@ impl TaskKind {
 }
 
 impl WasmSpec {
+    /// Construct a WASM spec from its module path and options.
+    ///
+    /// `WasmSpec` is `#[non_exhaustive]`; use this constructor instead of a struct literal.
+    pub fn new(module: PathBuf, args: Vec<String>, env: TaskEnv) -> Self {
+        Self { module, args, env }
+    }
+
     /// Validate structural constraints.
     pub fn validate(&self) -> crate::error::ModelResult<()> {
         if self.module.as_os_str().is_empty() {
@@ -85,6 +92,23 @@ impl WasmSpec {
 }
 
 impl ContainerSpec {
+    /// Construct a container spec from its image and options.
+    ///
+    /// `ContainerSpec` is `#[non_exhaustive]`; use this constructor instead of a struct literal.
+    pub fn new(
+        image: String,
+        command: Option<Vec<String>>,
+        args: Vec<String>,
+        env: TaskEnv,
+    ) -> Self {
+        Self {
+            image,
+            command,
+            args,
+            env,
+        }
+    }
+
     /// Validate structural constraints.
     pub fn validate(&self) -> crate::error::ModelResult<()> {
         if self.image.trim().is_empty() {
@@ -150,6 +174,40 @@ mod tests {
     fn task_kind_validate_accepts_embedded() {
         assert!(TaskKind::Embedded.validate().is_ok());
     }
+
+    #[test]
+    fn constructors_build_specs_with_expected_fields() {
+        use crate::{Flag, SubprocessMode, TaskEnv};
+
+        let sub = SubprocessSpec::new(
+            SubprocessMode::Command {
+                command: "ls".into(),
+                args: vec!["-l".into()],
+            },
+            TaskEnv::default(),
+            Some(PathBuf::from("/tmp")),
+            Flag::enabled(),
+        );
+        assert!(matches!(sub.mode, SubprocessMode::Command { .. }));
+        assert_eq!(sub.cwd, Some(PathBuf::from("/tmp")));
+
+        let wasm = WasmSpec::new(
+            PathBuf::from("/m.wasm"),
+            vec!["--x".into()],
+            TaskEnv::default(),
+        );
+        assert_eq!(wasm.module, PathBuf::from("/m.wasm"));
+        assert_eq!(wasm.args, vec!["--x".to_string()]);
+
+        let cont = ContainerSpec::new(
+            "img:1".into(),
+            Some(vec!["sh".into()]),
+            vec!["-c".into()],
+            TaskEnv::default(),
+        );
+        assert_eq!(cont.image, "img:1");
+        assert_eq!(cont.command, Some(vec!["sh".to_string()]));
+    }
 }
 
 /// Specification for subprocess execution on the host.
@@ -161,6 +219,7 @@ mod tests {
 /// Common fields (`env`, `cwd`, `fail_on_non_zero`) apply to both modes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct SubprocessSpec {
     /// Execution strategy (command or script).
     pub mode: SubprocessMode,
@@ -177,9 +236,29 @@ pub struct SubprocessSpec {
     pub fail_on_non_zero: Flag,
 }
 
+impl SubprocessSpec {
+    /// Construct a subprocess spec from its execution mode and common options.
+    ///
+    /// `SubprocessSpec` is `#[non_exhaustive]`; use this constructor instead of a struct literal.
+    pub fn new(
+        mode: SubprocessMode,
+        env: TaskEnv,
+        cwd: Option<PathBuf>,
+        fail_on_non_zero: Flag,
+    ) -> Self {
+        Self {
+            mode,
+            env,
+            cwd,
+            fail_on_non_zero,
+        }
+    }
+}
+
 /// Specification for WebAssembly module execution via a WASI-compatible runtime.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct WasmSpec {
     /// Path to the `.wasm` module.
     pub module: PathBuf,
@@ -194,6 +273,7 @@ pub struct WasmSpec {
 /// Specification for OCI-compatible container execution.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ContainerSpec {
     /// Container image (e.g. `"nginx:latest"`, `"docker.io/library/redis:7"`).
     pub image: String,

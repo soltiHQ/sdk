@@ -1,12 +1,3 @@
-//! Tripwire for the taskvisor `reason`-string coupling.
-//!
-//! solti-core's [`StateSubscriber`] maps taskvisor terminal/rejection events to
-//! a [`TaskPhase`] **only** by the event's free-form `reason` string (taskvisor
-//! exposes no typed discriminator). These tests drive a real taskvisor runtime
-//! and assert that the strings in [`solti_core::reasons`] are still the ones
-//! taskvisor emits — so a taskvisor rename fails CI here instead of silently
-//! mis-classifying a run in production.
-
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -22,7 +13,6 @@ use tokio_util::sync::CancellationToken;
 
 type Captured = Arc<Mutex<Vec<(EventKind, Option<String>)>>>;
 
-/// Captures `(kind, reason)` for every event the supervisor publishes.
 #[derive(Default)]
 struct Capture {
     events: Captured,
@@ -50,7 +40,6 @@ fn backoff() -> BackoffPolicy {
     }
 }
 
-/// Polls the captured events until one carries `reason`, or fails after ~3s.
 async fn wait_for_reason(events: &Captured, reason: &str) {
     for _ in 0..300 {
         if events
@@ -102,7 +91,6 @@ async fn taskvisor_emits_task_returned_canceled() {
         .build();
     let handle = sup.serve();
 
-    // A body returning TaskError::Canceled *without* a runtime-token cancel.
     let task: TaskRef = TaskFn::arc("self-cancel", |_ctx: CancellationToken| async move {
         Err::<(), TaskError>(TaskError::Canceled)
     });
@@ -128,9 +116,6 @@ async fn taskvisor_emits_superseded_by_replace() {
         .build();
     let handle = sup.serve();
 
-    // The head task ignores cancellation for a while, so the slot stays in
-    // `Terminating` after the first Replace — long enough for a queued head to
-    // exist and then be displaced by a third submission.
     let stubborn: TaskRef = TaskFn::arc("head", |_ctx: CancellationToken| async move {
         tokio::time::sleep(Duration::from_millis(300)).await;
         Ok::<(), TaskError>(())
@@ -154,18 +139,15 @@ async fn taskvisor_emits_superseded_by_replace() {
         )
     };
 
-    // A: occupies the slot and resists cancellation (keeps the slot Terminating).
     let (_a, _aw) = handle
         .submit_and_watch(mk_spec(stubborn))
         .await
         .expect("submit A");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    // B: Replace -> A goes Terminating, B becomes the queued head.
     let (_b, _bw) = handle
         .submit_and_watch(mk_spec(cooperative("queued")))
         .await
         .expect("submit B");
-    // C: Replace -> displaces the queued head B with `superseded_by_replace`.
     let (_c, _cw) = handle
         .submit_and_watch(mk_spec(cooperative("winner")))
         .await

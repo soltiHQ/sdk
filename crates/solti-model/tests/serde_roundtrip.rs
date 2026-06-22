@@ -44,20 +44,20 @@ fn roundtrip(task: &Task) {
 
 #[test]
 fn roundtrip_subprocess_command() {
-    let spec = fully_populated_spec(TaskKind::Subprocess(SubprocessSpec {
-        mode: SubprocessMode::Command {
+    let spec = fully_populated_spec(TaskKind::Subprocess(SubprocessSpec::new(
+        SubprocessMode::Command {
             command: "/usr/bin/make".into(),
             args: vec!["-j4".into(), "test".into()],
         },
-        env: {
+        {
             let mut e = TaskEnv::new();
             e.push("LANG", "C.UTF-8");
             e.push("BUILD_ID", "42");
             e
         },
-        cwd: Some(std::path::PathBuf::from("/workspace")),
-        fail_on_non_zero: Flag::enabled(),
-    }));
+        Some(std::path::PathBuf::from("/workspace")),
+        Flag::enabled(),
+    )));
     let mut task = Task::new("task-sub-cmd".into(), spec);
     task.transition_starting();
     task.transition_finished(TaskPhase::Failed, Some("retry".into()), None)
@@ -71,8 +71,8 @@ fn roundtrip_subprocess_command() {
 
 #[test]
 fn roundtrip_subprocess_script_custom() {
-    let spec = fully_populated_spec(TaskKind::Subprocess(SubprocessSpec {
-        mode: SubprocessMode::Script {
+    let spec = fully_populated_spec(TaskKind::Subprocess(SubprocessSpec::new(
+        SubprocessMode::Script {
             runtime: Runtime::Custom {
                 command: "ruby".into(),
                 flag: "-e".into(),
@@ -80,33 +80,33 @@ fn roundtrip_subprocess_script_custom() {
             body: BASE64.encode(b"puts 'ok'"),
             args: vec![],
         },
-        env: TaskEnv::new(),
-        cwd: None,
-        fail_on_non_zero: Flag::disabled(),
-    }));
+        TaskEnv::new(),
+        None,
+        Flag::disabled(),
+    )));
     let task = Task::new("task-script".into(), spec);
     roundtrip(&task);
 }
 
 #[test]
 fn roundtrip_wasm() {
-    let spec = fully_populated_spec(TaskKind::Wasm(WasmSpec {
-        module: std::path::PathBuf::from("/modules/report.wasm"),
-        args: vec!["--format=json".into()],
-        env: TaskEnv::new(),
-    }));
+    let spec = fully_populated_spec(TaskKind::Wasm(WasmSpec::new(
+        std::path::PathBuf::from("/modules/report.wasm"),
+        vec!["--format=json".into()],
+        TaskEnv::new(),
+    )));
     let task = Task::new("task-wasm".into(), spec);
     roundtrip(&task);
 }
 
 #[test]
 fn roundtrip_container() {
-    let spec = fully_populated_spec(TaskKind::Container(ContainerSpec {
-        image: "registry.example.com/build:v1.2.3".into(),
-        command: Some(vec!["sh".into(), "-c".into()]),
-        args: vec!["echo hi".into()],
-        env: TaskEnv::new(),
-    }));
+    let spec = fully_populated_spec(TaskKind::Container(ContainerSpec::new(
+        "registry.example.com/build:v1.2.3".into(),
+        Some(vec!["sh".into(), "-c".into()]),
+        vec!["echo hi".into()],
+        TaskEnv::new(),
+    )));
     let mut task = Task::new("task-ctr".into(), spec);
     task.transition_starting();
     task.transition_finished(TaskPhase::Failed, Some("SIGKILL".into()), Some(137))

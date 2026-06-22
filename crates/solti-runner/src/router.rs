@@ -1,7 +1,7 @@
 //! # Runner router.
 //!
 //! [`RunnerRouter`] selects the first registered [`Runner`](crate::Runner) that:
-//! 1. returns `true` from [`supports`](crate::Runner::supports) for the given spec, and
+//! 1. returns `true` from [`supports`](crate::Runner::supports) for the given spec
 //! 2. satisfies the [`RunnerSelector`](solti_model::RunnerSelector) label constraints (if any).
 //!
 //! Runners are checked in registration order.
@@ -245,15 +245,15 @@ mod tests {
         let mut router = RunnerRouter::new();
         router.register(Arc::new(SubprocessRunnerDummy));
 
-        let spec = mk_spec(TaskKind::Subprocess(SubprocessSpec {
-            mode: SubprocessMode::Command {
+        let spec = mk_spec(TaskKind::Subprocess(SubprocessSpec::new(
+            SubprocessMode::Command {
                 command: "echo".to_string(),
                 args: vec!["hello".into()],
             },
-            env: TaskEnv::default(),
-            cwd: None,
-            fail_on_non_zero: Flag::default(),
-        }));
+            TaskEnv::default(),
+            None,
+            Flag::default(),
+        )));
 
         let res = router.build(&spec);
 
@@ -268,11 +268,11 @@ mod tests {
         let mut router = RunnerRouter::new();
         router.register(Arc::new(SubprocessRunnerDummy));
 
-        let spec = mk_spec(TaskKind::Wasm(WasmSpec {
-            module: PathBuf::from("mod.wasm"),
-            args: Vec::new(),
-            env: TaskEnv::default(),
-        }));
+        let spec = mk_spec(TaskKind::Wasm(WasmSpec::new(
+            PathBuf::from("mod.wasm"),
+            Vec::new(),
+            TaskEnv::default(),
+        )));
 
         let res = router.build(&spec);
 
@@ -342,15 +342,15 @@ mod tests {
         router.register_with_labels(Arc::new(R2), labels_r2);
 
         let spec = {
-            let base = mk_spec(TaskKind::Subprocess(SubprocessSpec {
-                mode: SubprocessMode::Command {
+            let base = mk_spec(TaskKind::Subprocess(SubprocessSpec::new(
+                SubprocessMode::Command {
                     command: "echo".into(),
                     args: vec!["hi".into()],
                 },
-                env: TaskEnv::default(),
-                cwd: None,
-                fail_on_non_zero: Flag::enabled(),
-            }));
+                TaskEnv::default(),
+                None,
+                Flag::enabled(),
+            )));
             let mut match_labels = Labels::new();
             match_labels.insert("runner-name", "runner-b");
             base.with_runner_selector(RunnerSelector::from_labels(match_labels))

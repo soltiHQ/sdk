@@ -12,7 +12,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default   = []
+test-util = []
 
 [dependencies]
 taskvisor   = { workspace = true, features = ["controller"] }
