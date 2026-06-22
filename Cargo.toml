@@ -17,7 +17,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version      = "0.0.2"
+version      = "0.0.3"
 edition      = "2024"
 rust-version = "1.90.0"
 license      = "Apache-2.0"
@@ -71,12 +71,12 @@ tracing-journald    = "0.3.2"
 tracing-subscriber  = { version = "0.3.23" }
 uuid                = "1.23.1"
 
-solti-tls        = { path = "crates/solti-tls",        version = "0.0.2" }
-solti-model      = { path = "crates/solti-model",      version = "0.0.2" }
-solti-runner     = { path = "crates/solti-runner",     version = "0.0.2" }
-solti-exec       = { path = "crates/solti-exec",       version = "0.0.2" }
-solti-core       = { path = "crates/solti-core",       version = "0.0.2" }
-solti-api        = { path = "crates/solti-api",        version = "0.0.2" }
-solti-discover   = { path = "crates/solti-discover",   version = "0.0.2" }
-solti-observe    = { path = "crates/solti-observe",    version = "0.0.2" }
-solti-prometheus = { path = "crates/solti-prometheus", version = "0.0.2" }
+solti-tls        = { path = "crates/solti-tls",        version = "0.0.3" }
+solti-model      = { path = "crates/solti-model",      version = "0.0.3" }
+solti-runner     = { path = "crates/solti-runner",     version = "0.0.3" }
+solti-exec       = { path = "crates/solti-exec",       version = "0.0.3" }
+solti-core       = { path = "crates/solti-core",       version = "0.0.3" }
+solti-api        = { path = "crates/solti-api",        version = "0.0.3" }
+solti-discover   = { path = "crates/solti-discover",   version = "0.0.3" }
+solti-observe    = { path = "crates/solti-observe",    version = "0.0.3" }
+solti-prometheus = { path = "crates/solti-prometheus", version = "0.0.3" }
