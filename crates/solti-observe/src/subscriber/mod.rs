@@ -163,6 +163,14 @@ pub fn log_event<E: View>(e: E) {
         EventKind::ControllerSlotTransition => {
             debug!(task = e.as_task(), reason = e.as_reason(), "{msg}")
         }
+
+        // Add failure (e.g. duplicate name) — no actor spawned.
+        EventKind::TaskAddFailed => {
+            warn!(task = e.as_task(), reason = e.as_reason(), "{msg}")
+        }
+
+        // `EventKind` is #[non_exhaustive]: tolerate variants added in future taskvisor releases.
+        _ => debug!(task = e.as_task(), "{msg}"),
     }
 }
 
@@ -265,5 +273,11 @@ fn message_for(kind: EventKind) -> &'static str {
         EventKind::ControllerRejected => "queue rejected",
         EventKind::ControllerSubmitted => "task submitted by controller",
         EventKind::ControllerSlotTransition => "controller slot transition",
+
+        // Add failure (e.g. duplicate name)
+        EventKind::TaskAddFailed => "task add failed (name already registered)",
+
+        // `EventKind` is #[non_exhaustive]
+        _ => "unknown event",
     }
 }

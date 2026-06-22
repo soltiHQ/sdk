@@ -37,6 +37,8 @@ pub struct TaskSpec {
     restart: RestartPolicy,
     backoff: BackoffPolicy,
     admission: AdmissionPolicy,
+    #[serde(default)]
+    max_retries: u32,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runner_selector: Option<RunnerSelector>,
@@ -79,6 +81,15 @@ impl TaskSpec {
     #[inline]
     pub fn admission(&self) -> AdmissionPolicy {
         self.admission
+    }
+
+    /// Maximum failure-driven retries per run (`0` = unlimited, the default).
+    ///
+    /// Counts only failure retries (the counter resets on success); when the
+    /// budget is exhausted the supervisor stops restarting the task.
+    #[inline]
+    pub fn max_retries(&self) -> u32 {
+        self.max_retries
     }
 
     /// Label selector for runner routing (if present).
@@ -205,6 +216,7 @@ pub struct TaskSpecBuilder {
     backoff: BackoffPolicy,
     restart: RestartPolicy,
     timeout: Timeout,
+    max_retries: u32,
 
     admission: AdmissionPolicy,
     labels: Labels,
@@ -223,6 +235,7 @@ impl TaskSpecBuilder {
             timeout: timeout.into(),
 
             admission: AdmissionPolicy::default(),
+            max_retries: 0,
             labels: Labels::new(),
         }
     }
@@ -231,6 +244,13 @@ impl TaskSpecBuilder {
     #[must_use]
     pub fn restart(mut self, restart: RestartPolicy) -> Self {
         self.restart = restart;
+        self
+    }
+
+    /// Set the failure-retry budget (`0` = unlimited, the default).
+    #[must_use]
+    pub fn max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
         self
     }
 
@@ -287,6 +307,7 @@ impl TaskSpecBuilder {
             timeout: self.timeout,
 
             admission: self.admission,
+            max_retries: self.max_retries,
             labels: self.labels,
         };
         spec.validate_structural()?;
@@ -306,6 +327,8 @@ mod raw {
         restart: RestartPolicy,
         backoff: BackoffPolicy,
         admission: AdmissionPolicy,
+        #[serde(default)]
+        max_retries: u32,
 
         #[serde(default)]
         labels: Labels,
@@ -328,6 +351,7 @@ mod raw {
                 timeout: r.timeout,
 
                 admission: r.admission,
+                max_retries: r.max_retries,
                 labels: r.labels,
             };
             spec.validate_structural()?;

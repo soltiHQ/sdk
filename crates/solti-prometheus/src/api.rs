@@ -1,4 +1,9 @@
-//! API-layer metrics: Prometheus implementation of [`solti_api::ApiMetricsBackend`].
+//! # API-layer Prometheus metrics (feature `api`).
+//!
+//! [`PrometheusApiMetrics`] implements [`solti_api::ApiMetricsBackend`], exposing `solti_api_*`
+//! request counters, duration histograms, and an in-flight gauge for both the HTTP and gRPC transports.
+//!
+//! See the [crate root](crate) for architecture and namespace overview.
 
 use std::sync::Arc;
 

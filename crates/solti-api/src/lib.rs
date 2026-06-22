@@ -10,10 +10,12 @@
 //!
 //! ## Quick start
 //!
+//! Build one [`ApiHandler`] and share it across both transports (the handler is `Arc`-wrapped once, then cloned into each server):
+//!
 //! ```text
-//! let adapter = SupervisorApiAdapter::new(supervisor);
-//! let svc     = TaskServiceServer::new(TaskApiService::new(Arc::new(adapter)));
-//! let router  = HttpApi::new(Arc::new(adapter)).router();
+//! let handler = Arc::new(SupervisorApiAdapter::new(supervisor));
+//! let grpc    = TaskServiceServer::new(TaskApiService::new(handler.clone()));
+//! let http    = HttpApi::new(handler).router();
 //! ```
 //!
 //! ## Also
@@ -21,6 +23,13 @@
 //! - [`ApiHandler`] transport-agnostic trait with 6 operations.
 //! - [`ApiError`] unified error type mapped to gRPC Status / HTTP JSON.
 //! - [`SupervisorApiAdapter`] default adapter bridging to `SupervisorApi`.
+
+#![forbid(unsafe_code)]
+
+/// Compiles the runnable Rust code blocks in `README.md` as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 #[doc(hidden)]
 #[macro_export]

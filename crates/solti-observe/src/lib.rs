@@ -7,10 +7,10 @@
 //! 1. **Logger initialization** - [`init_logger`] installs a global tracing
 //!    subscriber configured via [`LoggerConfig`] (format, level filter,
 //!    timezone, color).
-//! 2. **Event logging** - [`TracingEventSubscriber`] (feature `subscriber`)
-//!    maps every [`taskvisor`] supervision event to a structured tracing call
+//! 2. **Event logging** - `TracingEventSubscriber` (feature `subscriber`)
+//!    maps every `taskvisor` supervision event to a structured tracing call
 //!    at the appropriate severity level.
-//! 3. **Timezone sync** - [`timezone_sync`] (feature `timezone-sync`) is a
+//! 3. **Timezone sync** - `timezone_sync` (feature `timezone-sync`) is a
 //!    periodic task that re-detects the local UTC offset so log timestamps
 //!    stay correct across DST transitions.
 //!
@@ -44,19 +44,19 @@
 //! | [`LoggerLevel`]                          | -               | Validated `EnvFilter` expression wrapper                 |
 //! | [`LoggerTimeZone`]                       | -               | Timestamp timezone: `Utc` / `Local`                      |
 //! | [`LoggerError`]                          | -               | Error type for logger initialization                     |
-//! | [`TracingEventSubscriber`]               | `subscriber`    | Logs [`taskvisor`] events via tracing                    |
-//! | [`timezone_sync`]                        | `timezone-sync` | Periodic task that re-detects the local UTC offset       |
+//! | `TracingEventSubscriber`               | `subscriber`    | Logs `taskvisor` events via tracing                    |
+//! | `timezone_sync`                        | `timezone-sync` | Periodic task that re-detects the local UTC offset       |
 //!
 //! ## Feature flags
 //!
 //! | Flag            | Default | Dependencies                        | Effect                                        |
 //! |-----------------|---------|-------------------------------------|-----------------------------------------------|
-//! | `subscriber`    | off     | `taskvisor`, `async-trait`          | Enables [`TracingEventSubscriber`]            |
-//! | `timezone-sync` | off     | `taskvisor`, `tokio-util`, `solti-model` | Enables [`timezone_sync`] periodic task  |
+//! | `subscriber`    | off     | `taskvisor`, `async-trait`          | Enables `TracingEventSubscriber`            |
+//! | `timezone-sync` | off     | `taskvisor`, `tokio-util`, `solti-model` | Enables `timezone_sync` periodic task  |
 //!
 //! ## Quick start
 //!
-//! ```text
+//! ```rust,no_run
 //! use solti_observe::{LoggerConfig, LoggerLevel, init_local_offset, init_logger};
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -84,7 +84,7 @@
 //!
 //! To workaround this:
 //! 1. Call [`init_local_offset`] in `main()` **before** `tokio::runtime::Runtime::new()`.
-//! 2. Optionally submit the [`timezone_sync`] task to periodically re-detect
+//! 2. Optionally submit the `timezone_sync` task to periodically re-detect
 //!    the offset (handles DST transitions in long-running daemons).
 //!
 //! If [`init_local_offset`] is not called, timestamps fall back to UTC with a warning printed to stderr on first use.
@@ -92,9 +92,16 @@
 //! ## Also
 //!
 //! - [`tracing`] the underlying structured logging framework.
-//! - [`taskvisor::Subscribe`] trait that [`TracingEventSubscriber`] implements.
+//! - `taskvisor::Subscribe` trait that `TracingEventSubscriber` implements.
 //! - `solti-prometheus` is a complementary metrics subscriber for the same event stream.
 //! - See `examples/http-server` for a complete integration example.
+
+#![forbid(unsafe_code)]
+
+/// Compiles the runnable Rust code blocks in `README.md` as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 mod logger;
 pub use logger::{

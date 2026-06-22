@@ -21,7 +21,7 @@ Dual-transport (gRPC + HTTP).
 `DiscoverConfig` accepts `api_version: u32` from the binary (passed into `SyncRequest.api_version`).
 The proto field is `int32`: the control-plane interprets `1 = v1`.
 
-```rust
+```rust,ignore
 use solti_api::API_VERSION;
 
 let cfg = DiscoverConfig::builder(
@@ -75,7 +75,7 @@ No feature is enabled by default. `tls` is additive on top of `grpc`/`http`.
 
 ### Enabling TLS
 
-```rust
+```rust,ignore
 use solti_discover::DiscoverConfig;
 use solti_tls::ClientTlsConfig;
 
@@ -96,7 +96,7 @@ See the `solti-tls` README for the full integration story.
 
 ### Enabling token auth
 
-```rust
+```rust,ignore
 use solti_discover::{DiscoverConfig, Token};
 
 let cfg = DiscoverConfig::builder(/* ... */)
@@ -121,11 +121,11 @@ The sync task is created with:
 When the control plane responds with `success = false` and a non-zero `retry_after_s`, the agent stores a Unix deadline in its in-memory sync context. 
 Before sending the next request, the task waits until that deadline has passed.
 
-
-Combined with the client-side backoff from `BackoffPolicy`, the effective wait is:
+The wait is *sequential*, not a max: the supervisor's `BackoffPolicy` first spaces the task *restart*, and then the next attempt body waits out any *remaining* server hold before sending. 
+Effective gap is:
 
 ```text
-next_attempt_wait = max(client_backoff, server_retry_after_s)
+next_attempt_wait ≈ client_backoff + remaining(server_retry_after_s)
 ```
 
 - `retry_after_s = 0` (unspecified) - client falls back to its configured backoff only.

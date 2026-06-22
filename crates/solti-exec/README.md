@@ -52,7 +52,7 @@ Currently, ships a single backend - `SubprocessRunner` with optional Linux sandb
 | `SubprocessBackendConfig` | Builder for rlimits + cgroups + security + logger settings  |
 | `SubprocessTaskConfig`    | Fully resolved per-task config (command, args, env, cwd)    |
 | `LogConfig`               | Stdout/stderr logging: truncation length, log levels        |
-| `RlimitConfig`            | POSIX rlimits (nofile, fsize, core, nproc, as)              |
+| `RlimitConfig`            | POSIX rlimits (nofile, fsize, core)                         |
 | `CgroupLimits`            | cgroup v2: CPU quota/period, memory, PIDs                   |
 | `CpuMax`                  | CPU quota + period for `cpu.max`                            |
 | `SecurityConfig`          | Capability drop + `no_new_privs`                            |
@@ -64,11 +64,13 @@ Currently, ships a single backend - `SubprocessRunner` with optional Linux sandb
  SubprocessBackendConfig::new()
      .with_rlimits(RlimitConfig { max_open_files: Some(1024), .. })
      .with_cgroups(CgroupLimits { cpu: Some(CpuMax { quota: Some(50_000), period: 100_000 }), memory: Some(128 MB), pids: Some(32) })
-     .with_security(SecurityConfig { keep_capabilities: vec![NetBindService], no_new_privs: true })
+     .with_security(SecurityConfig { drop_all_caps: true, keep_caps: vec![LinuxCapability::NetBindService], no_new_privs: true, ..Default::default() })
      .with_logger(LogConfig { max_line_length: 4096, stdout_info: true, stderr_warn: true })
 ```
 
 All settings are optional — without a backend config the subprocess inherits parent process settings.
+
+By default, confinement is **best-effort**: if the sandbox cannot be applied (non-Linux host, missing `CAP_SETPCAP`, cgroup join failure) the child runs *unconfined* with a warning. Call `.with_require_enforcement(true)` to fail **closed** instead — a non-Linux host is rejected at config time, and on Linux a cgroup-join or capability-drop failure aborts the spawn. `keep_caps` is only meaningful with `drop_all_caps = true` (validated at config time).
 
 ## Sandboxing (pre_exec hooks)
 ```text

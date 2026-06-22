@@ -21,6 +21,7 @@ use crate::output::OutputRegistry;
 ///
 /// - `env`: empty [`RunnerEnv`]
 /// - `metrics`: [`NoOpMetrics`](crate::NoOpMetrics) (zero-cost)
+/// - `output_registry`: a fresh, empty [`OutputRegistry`](crate::OutputRegistry) (no live subscribers)
 ///
 /// ## Also
 ///
@@ -34,7 +35,9 @@ pub struct BuildContext {
 }
 
 impl BuildContext {
-    /// Create a new build context with the given params.
+    /// Create a new build context with the given env and metrics.
+    ///
+    /// Starts with a fresh, empty [`OutputRegistry`]; to share a live registry with the supervisor, chain [`with_output_registry`](Self::with_output_registry).
     pub fn new(env: RunnerEnv, metrics: MetricsHandle) -> Self {
         Self {
             env,
@@ -179,7 +182,7 @@ mod tests {
         handle.record_task_started(crate::RunnerType::Subprocess);
         handle.record_task_completed(
             crate::RunnerType::Subprocess,
-            crate::TaskOutcome::Success,
+            crate::MetricOutcome::Success,
             100,
         );
     }

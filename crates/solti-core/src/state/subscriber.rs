@@ -1,14 +1,19 @@
 //! # State event subscriber.
 //!
-//! [`StateSubscriber`] implements [`Subscribe`](taskvisor::Subscribe) to wire
-//! taskvisor lifecycle events into [`TaskState`](super::TaskState) mutations.
+//! [`StateSubscriber`] implements [`Subscribe`](taskvisor::Subscribe) and owns two responsibilities driven off taskvisor's lifecycle events:
+//! - project events into [`TaskState`](super::TaskState) transitions (phases and`TaskRun` records, including the `TimeoutHit`→`TaskFailed` pairing);
+//! - drive the per-run [`OutputRegistry`] lifecycle (announce `RunStarted` / `RunFinished`, evict on terminal).
+//!
+//! This is the **event plane** - fed by taskvisor's *lossy* broadcast bus, a dropped terminal event is repaired by the completion-plane backstop (`finalize_from_outcome`) on [`SupervisorApi`](crate::SupervisorApi).
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
+use parking_lot::Mutex;
 use taskvisor::{Event, EventKind, Subscribe};
 use tracing::{trace, warn};
 
 use super::TaskState;
+use crate::reasons;
 use solti_model::{TaskId, TaskPhase};
 use solti_runner::OutputRegistry;
 
@@ -21,26 +26,31 @@ use solti_runner::OutputRegistry;
 pub struct StateSubscriber {
     state: TaskState,
     output_registry: Arc<OutputRegistry>,
+    timed_out: Mutex<HashMap<TaskId, u32>>,
 }
 
 impl StateSubscriber {
-    /// Create a state subscriber.
+    /// Create a state subscriber over a shared [`TaskState`] and [`OutputRegistry`].
     pub fn with_output_registry(state: TaskState, output_registry: Arc<OutputRegistry>) -> Self {
         Self {
             state,
             output_registry,
+            timed_out: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Extract TaskId from event, reusing the existing `Arc<str>` allocation.
-    fn task_id_from_event(event: &Event) -> Option<TaskId> {
-        event.task.as_ref().map(|s| TaskId::from(Arc::clone(s)))
+    /// Resolve the task entry an event belongs to.
+    fn resolve(&self, event: &Event) -> Option<TaskId> {
+        match event.id {
+            Some(tv) => self.state.resolve_tv(tv.get()),
+            None => event.task.as_ref().map(|s| TaskId::from(Arc::clone(s))),
+        }
     }
 }
 
 impl Subscribe for StateSubscriber {
     fn on_event(&self, event: &Event) {
-        let Some(task_id) = Self::task_id_from_event(event) else {
+        let Some(task_id) = self.resolve(event) else {
             return;
         };
 
@@ -68,64 +78,75 @@ impl Subscribe for StateSubscriber {
                 self.output_registry
                     .announce_run_finished(&task_id, attempt, None);
             }
+            EventKind::TaskCanceled => {
+                trace!(task = %task_id, "task canceled (graceful)");
+                if !self
+                    .state
+                    .transition_finished(&task_id, TaskPhase::Canceled, None, None)
+                {
+                    warn!(task = %task_id, "TaskCanceled event for unknown task");
+                }
+                self.output_registry
+                    .announce_run_finished(&task_id, attempt, None);
+            }
             EventKind::TaskFailed => {
                 let reason = event
                     .reason
                     .as_ref()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
+                let phase = {
+                    let mut timed_out = self.timed_out.lock();
+                    match timed_out.remove(&task_id) {
+                        Some(a) if a == attempt => TaskPhase::Timeout,
+                        _ => TaskPhase::Failed,
+                    }
+                };
                 trace!(
                     task = %task_id,
                     reason = %reason,
                     exit_code = ?event.exit_code,
+                    phase = %phase,
                     "task failed",
                 );
-                if !self.state.transition_finished(
-                    &task_id,
-                    TaskPhase::Failed,
-                    Some(reason),
-                    event.exit_code,
-                ) {
+                if !self
+                    .state
+                    .transition_finished(&task_id, phase, Some(reason), event.exit_code)
+                {
                     warn!(task = %task_id, "TaskFailed event for unknown task");
                 }
                 self.output_registry
                     .announce_run_finished(&task_id, attempt, event.exit_code);
             }
             EventKind::TimeoutHit => {
-                trace!(task = %task_id, "task timeout");
-                if !self.state.transition_finished(
-                    &task_id,
-                    TaskPhase::Timeout,
-                    Some("timeout".to_string()),
-                    None,
-                ) {
-                    warn!(task = %task_id, "TimeoutHit event for unknown task");
-                }
-                self.output_registry
-                    .announce_run_finished(&task_id, attempt, None);
+                trace!(task = %task_id, "task attempt timed out");
+                let mut timed_out = self.timed_out.lock();
+                timed_out.insert(task_id.clone(), attempt);
+                timed_out.retain(|id, _| self.state.contains_task(id));
             }
             EventKind::ActorExhausted => {
-                let reason = event
-                    .reason
-                    .as_ref()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "exhausted".to_string());
+                let reason = event.reason.as_ref().map(|s| s.to_string());
                 trace!(
                     task = %task_id,
                     exit_code = ?event.exit_code,
-                    "task exhausted",
+                    "actor exhausted",
                 );
-                if !self.state.transition_finished(
-                    &task_id,
-                    TaskPhase::Exhausted,
-                    Some(reason),
-                    event.exit_code,
-                ) {
+                let (phase, error) = match reason.as_deref() {
+                    Some(reasons::POLICY_EXHAUSTED_SUCCESS) => (TaskPhase::Succeeded, None),
+                    Some(reasons::TASK_RETURNED_CANCELED) => (TaskPhase::Canceled, None),
+                    _ => (
+                        TaskPhase::Exhausted,
+                        Some(reason.unwrap_or_else(|| "exhausted".to_string())),
+                    ),
+                };
+                if !self
+                    .state
+                    .transition_finished(&task_id, phase, error, event.exit_code)
+                {
                     warn!(task = %task_id, "ActorExhausted event for unknown task");
                 }
-                self.output_registry
-                    .announce_run_finished(&task_id, attempt, event.exit_code);
                 self.output_registry.evict(&task_id);
+                self.timed_out.lock().remove(&task_id);
             }
             EventKind::ActorDead => {
                 let reason = event
@@ -146,12 +167,34 @@ impl Subscribe for StateSubscriber {
                 ) {
                     warn!(task = %task_id, "ActorDead event for unknown task");
                 }
-                self.output_registry
-                    .announce_run_finished(&task_id, attempt, event.exit_code);
                 self.output_registry.evict(&task_id);
+                self.timed_out.lock().remove(&task_id);
+            }
+            EventKind::ControllerRejected | EventKind::TaskAddFailed => {
+                let reason = event
+                    .reason
+                    .as_ref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "rejected".to_string());
+                let phase = match reason.as_str() {
+                    reasons::REMOVED_FROM_QUEUE
+                    | reasons::SUPERSEDED_BY_REPLACE
+                    | reasons::CONTROLLER_SHUTTING_DOWN => TaskPhase::Canceled,
+                    _ => TaskPhase::Failed,
+                };
+                if !self
+                    .state
+                    .transition_finished(&task_id, phase, Some(reason), None)
+                {
+                    warn!(task = %task_id, "rejection event for unknown task");
+                }
+                self.output_registry.evict(&task_id);
+                self.state.unbind(&task_id);
+                self.timed_out.lock().remove(&task_id);
             }
             EventKind::TaskRemoved => {
                 trace!(task = %task_id, "task removed from state");
+                self.timed_out.lock().remove(&task_id);
                 self.state.unregister_task(&task_id);
                 self.output_registry.evict(&task_id);
             }
@@ -163,8 +206,17 @@ impl Subscribe for StateSubscriber {
         "state-subscriber"
     }
 
+    /// Per-subscriber event-queue depth: `2048`, a deliberate 2× of taskvisor's `1024` default.
     fn queue_capacity(&self) -> usize {
         2048
+    }
+}
+
+#[cfg(test)]
+impl StateSubscriber {
+    /// Number of pending timeout markers (test-only observability).
+    fn timed_out_len(&self) -> usize {
+        self.timed_out.lock().len()
     }
 }
 
@@ -192,6 +244,139 @@ mod tests {
             Arc::new(solti_runner::OutputRegistry::default()),
         );
         (sub, state, id)
+    }
+
+    use taskvisor::TaskId as TvId;
+
+    #[test]
+    fn late_events_from_previous_incarnation_are_ignored() {
+        let (sub, state, id) = setup("reuse-x");
+        state.bind_tv(&id, 1);
+        state.bind_tv(&id, 2);
+
+        let stale = Event::new(EventKind::TaskRemoved)
+            .with_task("reuse-x")
+            .with_id(TvId::from_raw(1));
+        sub.on_event(&stale);
+        assert!(
+            state.get(&id).is_some(),
+            "late TaskRemoved from the previous incarnation must be ignored"
+        );
+
+        let current = Event::new(EventKind::TaskRemoved)
+            .with_task("reuse-x")
+            .with_id(TvId::from_raw(2));
+        sub.on_event(&current);
+        assert!(
+            state.get(&id).is_none(),
+            "current incarnation's TaskRemoved must unregister"
+        );
+    }
+
+    #[test]
+    fn controller_rejection_finalizes_entry_and_evicts_channel() {
+        let state = TaskState::new();
+        let id = TaskId::from("rejected-task");
+        state.add_task(id.clone(), test_spec());
+        state.bind_tv(&id, 7);
+        let registry = Arc::new(OutputRegistry::new(16));
+        registry.ensure_channel(id.clone());
+        let sub = StateSubscriber::with_output_registry(state.clone(), Arc::clone(&registry));
+
+        let ev = Event::new(EventKind::ControllerRejected)
+            .with_task("some-slot")
+            .with_id(TvId::from_raw(7))
+            .with_reason("queue_full: 3/3");
+        sub.on_event(&ev);
+
+        let task = state.get(&id).expect("entry kept for observability");
+        assert_eq!(task.status().phase, TaskPhase::Failed);
+        assert!(
+            task.status()
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("queue_full")),
+            "rejection reason must be recorded"
+        );
+        assert!(
+            registry.subscribe(&id).is_none(),
+            "output channel must be evicted on rejection"
+        );
+        assert!(
+            state.tv_for(&id).is_none(),
+            "rejection must release the identity binding so the sweep can reap it"
+        );
+    }
+
+    #[test]
+    fn controller_rejection_unbinds_so_sweep_reaps_the_entry() {
+        use crate::state::StateConfig;
+        use std::time::Duration;
+
+        let state = TaskState::new();
+        let id = TaskId::from("rej-reap");
+        state.add_task(id.clone(), test_spec());
+        state.bind_tv(&id, 11);
+        let sub = StateSubscriber::with_output_registry(
+            state.clone(),
+            Arc::new(OutputRegistry::default()),
+        );
+
+        sub.on_event(
+            &Event::new(EventKind::ControllerRejected)
+                .with_task("slot")
+                .with_id(TvId::from_raw(11))
+                .with_reason("queue_full: 3/3"),
+        );
+
+        let config = StateConfig {
+            run_ttl: Duration::ZERO,
+            task_ttl: Duration::ZERO,
+            ..StateConfig::default()
+        };
+        let (_, removed) = state.sweep(&config);
+        assert_eq!(removed, 1, "unbound terminal rejection entry must be swept");
+        assert!(state.get(&id).is_none());
+    }
+
+    #[test]
+    fn user_initiated_queue_removal_is_canceled_phase() {
+        let state = TaskState::new();
+        let id = TaskId::from("victim");
+        state.add_task(id.clone(), test_spec());
+        state.bind_tv(&id, 9);
+        let sub = StateSubscriber::with_output_registry(
+            state.clone(),
+            Arc::new(OutputRegistry::default()),
+        );
+
+        let ev = Event::new(EventKind::ControllerRejected)
+            .with_task("s")
+            .with_id(TvId::from_raw(9))
+            .with_reason("removed_from_queue");
+        sub.on_event(&ev);
+
+        let task = state.get(&id).expect("entry kept");
+        assert_eq!(
+            task.status().phase,
+            TaskPhase::Canceled,
+            "user-initiated removal is a cancellation, not a failure"
+        );
+    }
+
+    #[test]
+    fn task_canceled_event_maps_to_canceled_phase() {
+        let (sub, state, id) = setup("graceful");
+        state.bind_tv(&id, 3);
+
+        let ev = Event::new(EventKind::TaskCanceled)
+            .with_task("graceful")
+            .with_id(TvId::from_raw(3))
+            .with_attempt(1);
+        sub.on_event(&ev);
+
+        let task = state.get(&id).expect("task exists");
+        assert_eq!(task.status().phase, TaskPhase::Canceled);
     }
 
     #[test]
@@ -355,28 +540,173 @@ mod tests {
     }
 
     #[test]
-    fn actor_exhausted_announces_run_finished_and_evicts_channel() {
+    fn actor_exhausted_evicts_channel_without_duplicate_run_finished() {
         let (sub, _state, registry, id) = setup_with_registry("exh-evict");
         let mut rx = registry.subscribe(&id).unwrap();
 
-        let ev = Event::new(EventKind::ActorExhausted)
-            .with_task("exh-evict")
-            .with_attempt(5)
-            .with_exit_code(1);
-        sub.on_event(&ev);
+        sub.on_event(
+            &Event::new(EventKind::TaskFailed)
+                .with_task("exh-evict")
+                .with_attempt(5)
+                .with_exit_code(1),
+        );
+        sub.on_event(
+            &Event::new(EventKind::ActorExhausted)
+                .with_task("exh-evict")
+                .with_attempt(5)
+                .with_exit_code(1),
+        );
 
         match rx.try_recv().unwrap() {
-            OutputEvent::RunFinished {
-                attempt, exit_code, ..
-            } => {
-                assert_eq!(attempt, 5);
-                assert_eq!(exit_code, Some(1));
-            }
+            OutputEvent::RunFinished { attempt, .. } => assert_eq!(attempt, 5),
             other => panic!("expected RunFinished, got {other:?}"),
         }
         assert!(
+            rx.try_recv().is_err(),
+            "ActorExhausted must not announce a second RunFinished for the same attempt"
+        );
+        assert!(
             registry.subscribe(&id).is_none(),
             "channel must be evicted on Exhausted"
+        );
+    }
+
+    #[test]
+    fn timeout_hit_then_task_failed_for_same_attempt_maps_to_timeout_phase() {
+        let (sub, state, id) = setup("slow-task");
+
+        sub.on_event(
+            &Event::new(EventKind::TimeoutHit)
+                .with_task("slow-task")
+                .with_attempt(1),
+        );
+        sub.on_event(
+            &Event::new(EventKind::TaskFailed)
+                .with_task("slow-task")
+                .with_attempt(1)
+                .with_reason("deadline exceeded"),
+        );
+
+        let task = state.get(&id).expect("task exists");
+        assert_eq!(task.status().phase, TaskPhase::Timeout);
+    }
+
+    #[test]
+    fn pending_timeout_is_cleared_when_actor_terminates_without_paired_failed() {
+        let (sub, _state, _id) = setup("timeout-orphan");
+
+        sub.on_event(
+            &Event::new(EventKind::TimeoutHit)
+                .with_task("timeout-orphan")
+                .with_attempt(1),
+        );
+        assert_eq!(sub.timed_out_len(), 1);
+
+        sub.on_event(
+            &Event::new(EventKind::ActorExhausted)
+                .with_task("timeout-orphan")
+                .with_attempt(1)
+                .with_reason("max_retries_exceeded"),
+        );
+        assert_eq!(
+            sub.timed_out_len(),
+            0,
+            "a pending timeout marker must be cleared when the actor terminates"
+        );
+    }
+
+    #[test]
+    fn timeout_hit_prunes_markers_for_tasks_no_longer_in_state() {
+        let state = TaskState::new();
+        let sub = StateSubscriber::with_output_registry(
+            state.clone(),
+            Arc::new(OutputRegistry::default()),
+        );
+        let gone = TaskId::from("gone");
+        let live = TaskId::from("live");
+        state.add_task(gone.clone(), test_spec());
+        state.add_task(live.clone(), test_spec());
+
+        sub.on_event(
+            &Event::new(EventKind::TimeoutHit)
+                .with_task("gone")
+                .with_attempt(1),
+        );
+        assert_eq!(sub.timed_out_len(), 1);
+
+        state.unregister_task(&gone);
+
+        sub.on_event(
+            &Event::new(EventKind::TimeoutHit)
+                .with_task("live")
+                .with_attempt(1),
+        );
+        assert_eq!(
+            sub.timed_out_len(),
+            1,
+            "the dead task's marker is pruned; only the live task's remains"
+        );
+    }
+
+    #[test]
+    fn task_failed_without_timeout_hit_stays_failed() {
+        let (sub, state, id) = setup("plain-fail");
+
+        sub.on_event(
+            &Event::new(EventKind::TaskFailed)
+                .with_task("plain-fail")
+                .with_attempt(1)
+                .with_reason("boom"),
+        );
+
+        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Failed);
+    }
+
+    #[test]
+    fn actor_exhausted_task_returned_canceled_maps_to_canceled() {
+        let (sub, state, id) = setup("self-cancel");
+
+        sub.on_event(
+            &Event::new(EventKind::ActorExhausted)
+                .with_task("self-cancel")
+                .with_attempt(1)
+                .with_reason("task_returned_canceled"),
+        );
+
+        let task = state.get(&id).expect("task exists");
+        assert_eq!(
+            task.status().phase,
+            TaskPhase::Canceled,
+            "task_returned_canceled is a cancellation, not an exhaustion"
+        );
+        assert!(task.status().error.is_none());
+    }
+
+    #[test]
+    fn actor_exhausted_after_success_is_not_an_error() {
+        let (sub, state, id) = setup("oneshot");
+
+        sub.on_event(
+            &Event::new(EventKind::TaskStopped)
+                .with_task("oneshot")
+                .with_attempt(1),
+        );
+        sub.on_event(
+            &Event::new(EventKind::ActorExhausted)
+                .with_task("oneshot")
+                .with_attempt(1)
+                .with_reason("policy_exhausted_success"),
+        );
+
+        let task = state.get(&id).expect("task exists");
+        assert_eq!(
+            task.status().phase,
+            TaskPhase::Succeeded,
+            "normal one-shot completion must stay Succeeded"
+        );
+        assert!(
+            task.status().error.is_none(),
+            "policy_exhausted_success is not an error"
         );
     }
 

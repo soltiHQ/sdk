@@ -25,14 +25,14 @@ all-features = true
 [features]
 default = []
 grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
-http = ["dep:reqwest", "dep:serde_json", "dep:prost", "dep:pbjson"]
+http = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:prost", "dep:pbjson"]
 tls  = ["dep:solti-tls", "tonic?/tls-ring", "reqwest?/rustls-no-provider", ]
 
 [dependencies]
 pbjson      = { workspace = true, optional = true }
 prost       = { workspace = true, optional = true }
 reqwest     = { workspace = true, features = ["json"], optional = true }
-serde       = { workspace = true }
+serde       = { workspace = true, optional = true }
 serde_json  = { workspace = true, optional = true }
 taskvisor   = { workspace = true }
 thiserror   = { workspace = true }

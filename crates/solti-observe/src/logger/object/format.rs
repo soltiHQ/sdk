@@ -1,3 +1,7 @@
+//! # Output format value object ([`LoggerFormat`]).
+//!
+//! Parses and represents the log output backend: `text`, `json`, or `journald`.
+
 use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize, Serializer};

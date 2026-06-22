@@ -174,11 +174,10 @@ async fn require_bearer(State(expected): State<Token>, req: Request, next: Next)
     }
 }
 
-/// Extract the credential from an `Authorization` header value, accepting the scheme case-insensitively (`Bearer` / `bearer`).
+/// Extract the credential from an `Authorization` header value, accepting the scheme case-insensitively.
 fn bearer_value(header: &str) -> Option<&str> {
-    header
-        .strip_prefix("Bearer ")
-        .or_else(|| header.strip_prefix("bearer "))
+    let (scheme, token) = header.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(token)
 }
 
 #[derive(Debug, Deserialize)]
@@ -340,4 +339,21 @@ where
         Ok(Event::default().event(name).data(data))
     });
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bearer_value;
+
+    #[test]
+    fn bearer_value_accepts_scheme_case_insensitively() {
+        assert_eq!(bearer_value("Bearer tok"), Some("tok"));
+        assert_eq!(bearer_value("bearer tok"), Some("tok"));
+        assert_eq!(bearer_value("BEARER tok"), Some("tok"));
+        assert_eq!(bearer_value("BeArEr tok"), Some("tok"));
+        assert_eq!(bearer_value("Bearer a b"), Some("a b"));
+        assert_eq!(bearer_value("Basic tok"), None);
+        assert_eq!(bearer_value("tok"), None);
+        assert_eq!(bearer_value(""), None);
+    }
 }

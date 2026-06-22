@@ -65,7 +65,7 @@ impl RunnerErrorKind {
 /// Task execution outcome for metrics classification.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskOutcome {
+pub enum MetricOutcome {
     /// Task completed successfully.
     Success,
     /// Task failed.
@@ -76,15 +76,15 @@ pub enum TaskOutcome {
     Timeout,
 }
 
-impl TaskOutcome {
+impl MetricOutcome {
     /// Return label value for metrics.
     #[inline]
     pub fn as_label(&self) -> &'static str {
         match self {
-            TaskOutcome::Success => "success",
-            TaskOutcome::Failure => "failure",
-            TaskOutcome::Canceled => "canceled",
-            TaskOutcome::Timeout => "timeout",
+            MetricOutcome::Success => "success",
+            MetricOutcome::Failure => "failure",
+            MetricOutcome::Canceled => "canceled",
+            MetricOutcome::Timeout => "timeout",
         }
     }
 }
@@ -111,7 +111,7 @@ pub trait MetricsBackend: Send + Sync + 'static {
     fn record_task_completed(
         &self,
         runner_type: RunnerType,
-        outcome: TaskOutcome,
+        outcome: MetricOutcome,
         duration_ms: u64,
     );
 

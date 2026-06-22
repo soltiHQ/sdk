@@ -148,6 +148,13 @@
 //! assert_eq!(task.metadata().resource_version, 1);
 //! ```
 
+#![forbid(unsafe_code)]
+
+/// Compiles the runnable Rust code blocks in `README.md` as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 mod domain;
 pub use domain::{
     AGENT_ID_MAX_LEN, AdmissionPolicy, AgentId, BackoffPolicy, ContainerSpec, DEFAULT_LIMIT, Flag,

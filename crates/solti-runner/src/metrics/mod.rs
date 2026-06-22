@@ -5,15 +5,15 @@
 //!
 //! ## Contents
 //!
-//! - [`MetricsBackend`]: trait with `record_task_started`, `record_task_completed`, `record_runner_error`.
-//! - [`MetricsHandle`]: `Arc<dyn MetricsBackend>`, cloneable shared handle.
-//! - [`NoOpMetrics`]: zero-size backend (`#[inline(always)]`, compiles to nothing).
-//! - [`RunnerType`]: metric label enum: `Subprocess`, `Wasm`, `Container`.
-//! - [`TaskOutcome`]: metric label enum: `Success`, `Failure`, `Canceled`, `Timeout`.
 //! - [`RunnerErrorKind`]: metric label enum: `CgroupPrepareFailed`, `BackendConfigFailed`, `SpawnFailed`, `ModuleLoadFailed`.
+//! - [`MetricsBackend`]: trait with `record_task_started`, `record_task_completed`, `record_runner_error`.
+//! - [`MetricOutcome`]: metric label enum: `Success`, `Failure`, `Canceled`, `Timeout`.
+//! - [`NoOpMetrics`]: zero-size backend (`#[inline(always)]`, compiles to nothing).
+//! - [`MetricsHandle`]: `Arc<dyn MetricsBackend>`, cloneable shared handle.
+//! - [`RunnerType`]: metric label enum: `Subprocess`, `Wasm`, `Container`.
 //! - [`noop_metrics`]: convenience constructor for `Arc<NoOpMetrics>`.
 mod backend;
-pub use backend::{MetricsBackend, MetricsHandle, RunnerErrorKind, RunnerType, TaskOutcome};
+pub use backend::{MetricOutcome, MetricsBackend, MetricsHandle, RunnerErrorKind, RunnerType};
 
 mod noop;
 pub use noop::NoOpMetrics;

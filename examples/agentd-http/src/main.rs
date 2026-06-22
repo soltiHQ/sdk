@@ -153,6 +153,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // --- API: control plane → agent ---
     let api_metrics: Arc<dyn solti_api::ApiMetricsBackend> =
         Arc::new(PrometheusApiMetrics::new(registry.clone())?);
+    // Keep a supervisor handle for graceful shutdown after the server stops.
+    let sup_handle = supervisor.handle();
     let handler = Arc::new(SupervisorApiAdapter::new(Arc::new(supervisor)));
 
     let mut api = HttpApi::new(handler);
@@ -174,16 +176,53 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     match server_tls {
         Some(tls) => {
             let rustls = Arc::new(tls.into_rustls_config()?);
+            let srv = axum_server::Handle::new();
+            let srv2 = srv.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                srv2.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+            });
             axum_server::bind_rustls(ADDR.parse()?, RustlsConfig::from_config(rustls))
+                .handle(srv)
                 .serve(app.into_make_service())
                 .await?;
         }
         None => {
             let listener = tokio::net::TcpListener::bind(ADDR).await?;
-            axum::serve(listener, app).await?;
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
         }
     }
+
+    // Drain the supervision tree: cancels tasks cooperatively (grace period),
+    // then force-aborts stragglers. Without this, SIGINT/SIGTERM would kill
+    // the process and orphan task subprocesses.
+    info!("server stopped; shutting down supervisor");
+    sup_handle.shutdown().await?;
     Ok(())
+}
+
+/// Resolves on SIGINT (Ctrl-C) or SIGTERM: the trigger for graceful shutdown.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl-C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 /// Reads a non-empty environment variable as a path.

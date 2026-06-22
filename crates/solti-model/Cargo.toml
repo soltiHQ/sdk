@@ -1,6 +1,7 @@
 [package]
 name = "solti-model"
 description = "Solti SDK domain model."
+documentation = "https://docs.rs/solti-model"
 
 rust-version.workspace = true
 repository.workspace = true

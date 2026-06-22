@@ -78,7 +78,17 @@ impl Task {
     /// - target phase must be terminal (see [`TaskPhase::is_terminal`]);
     ///   finishing into `Pending` or `Running` is a logic bug upstream.
     ///
-    /// Bumps `resource_version`.
+    /// Sticky terminals: once an attempt has reached a specific final state
+    /// (`Succeeded`, `Canceled`, or `Timeout`), a later, conflicting terminal
+    /// event must not overwrite it. taskvisor emits two terminal events per run (the
+    /// per-attempt `TaskStopped`/`TaskCanceled`/`TaskFailed` followed by the
+    /// actor-level `ActorExhausted`/`ActorDead`); without this guard a trailing
+    /// `ActorExhausted` would flip a `Canceled` run into `Exhausted`. A
+    /// failure-class phase (`Failed`) is still allowed to be refined into a more
+    /// specific disposition (`Exhausted`/`Timeout`), and re-applying the same
+    /// phase is a harmless no-op.
+    ///
+    /// Bumps `resource_version` only when the phase actually changes.
     pub fn transition_finished(
         &mut self,
         phase: TaskPhase,
@@ -89,6 +99,15 @@ impl Task {
             return Err(ModelError::Invalid(
                 format!("transition_finished requires a terminal phase, got {phase}").into(),
             ));
+        }
+        if matches!(
+            self.status.phase,
+            TaskPhase::Succeeded | TaskPhase::Canceled | TaskPhase::Timeout
+        ) && self.status.phase != phase
+        {
+            // Keep the intentional/specific terminal; ignore the conflicting
+            // overwrite (e.g. a trailing ActorExhausted after a Timeout/Cancel).
+            return Ok(());
         }
         self.update_phase(phase, error, exit_code);
         Ok(())
@@ -190,6 +209,69 @@ mod tests {
             .transition_finished(TaskPhase::Running, None, None)
             .unwrap_err();
         assert!(err.to_string().contains("terminal phase"));
+    }
+
+    #[test]
+    fn canceled_is_not_overwritten_by_a_later_terminal_event() {
+        // A self-canceling task emits TaskCanceled (-> Canceled) and then an
+        // actor-level ActorExhausted: that trailing terminal must not flip the
+        // intentional Canceled into Exhausted/Failed.
+        let mut task = Task::new("task-1".into(), test_spec());
+        task.transition_starting();
+        task.transition_finished(TaskPhase::Canceled, None, None)
+            .unwrap();
+
+        task.transition_finished(TaskPhase::Exhausted, Some("budget".into()), Some(1))
+            .unwrap();
+
+        assert_eq!(task.status().phase, TaskPhase::Canceled);
+        assert!(task.status().error.is_none());
+        assert_eq!(task.status().exit_code, None);
+    }
+
+    #[test]
+    fn succeeded_is_not_overwritten_by_a_later_terminal_event() {
+        let mut task = Task::new("task-1".into(), test_spec());
+        task.transition_starting();
+        task.transition_finished(TaskPhase::Succeeded, None, None)
+            .unwrap();
+
+        task.transition_finished(TaskPhase::Failed, Some("late".into()), Some(2))
+            .unwrap();
+
+        assert_eq!(task.status().phase, TaskPhase::Succeeded);
+        assert!(task.status().error.is_none());
+    }
+
+    #[test]
+    fn timeout_is_not_overwritten_by_a_later_terminal_event() {
+        // A timed-out attempt is finalized as Timeout by the TimeoutHit/TaskFailed
+        // pairing; the trailing actor-level ActorExhausted must not erase it.
+        let mut task = Task::new("task-1".into(), test_spec());
+        task.transition_starting();
+        task.transition_finished(TaskPhase::Timeout, Some("deadline".into()), None)
+            .unwrap();
+
+        task.transition_finished(TaskPhase::Exhausted, Some("budget".into()), None)
+            .unwrap();
+
+        assert_eq!(task.status().phase, TaskPhase::Timeout);
+    }
+
+    #[test]
+    fn failed_can_be_refined_to_exhausted() {
+        // The per-attempt TaskFailed lands as Failed; the actor-level
+        // ActorExhausted refines it to Exhausted. This refinement must survive.
+        let mut task = Task::new("task-1".into(), test_spec());
+        task.transition_starting();
+        task.transition_finished(TaskPhase::Failed, Some("attempt".into()), None)
+            .unwrap();
+
+        task.transition_finished(TaskPhase::Exhausted, Some("max_retries".into()), None)
+            .unwrap();
+
+        assert_eq!(task.status().phase, TaskPhase::Exhausted);
+        assert_eq!(task.status().error.as_deref(), Some("max_retries"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 [package]
 name = "solti-tls"
 description = "Solti SDK shared TLS / mTLS configuration."
+documentation = "https://docs.rs/solti-tls"
 
 rust-version.workspace = true
 repository.workspace = true

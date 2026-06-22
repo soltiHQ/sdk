@@ -29,8 +29,8 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 2048;
 /// TimeoutHit          → task_timeouts.inc()
 /// BackoffScheduled    → task_backoff_count{source}.inc()
 ///                       + task_backoff_duration.observe(delay)
-/// ActorExhausted      → task_terminal{reason="exhausted"}.inc()
-///                       + attempts_to_finalize{outcome="exhausted"}.observe(attempt)
+/// ActorExhausted      → task_terminal{reason}.inc()   (reason="completed" if the reason is policy_exhausted_success, else "exhausted")
+///                       + attempts_to_finalize{outcome}.observe(attempt)
 /// ActorDead           → task_terminal{reason="fatal"}.inc()
 ///                       + attempts_to_finalize{outcome="fatal"}.observe(attempt)
 /// SubscriberOverflow  → subscriber_overflow.inc() + tracing::warn
@@ -65,13 +65,19 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 2048;
 /// | Label    | Values                                                                                                                           | Source                                                       |
 /// |----------|----------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------|
 /// | `source` | `failure`, `success`                                                                                                             | [`BackoffSource`] on the event                               |
-/// | `reason` (terminal)   | `exhausted`, `fatal`                                                                                                | Terminal event kind                                          |
-/// | `outcome` (attempts)  | `exhausted`, `fatal`                                                                                                | Attempts-to-finalize histogram                               |
-/// | `reason` (rejection)  | `slot_full`, `slot_busy`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` | Classified from `Event.reason` by `classify_rejection_reason` (private)         |
+/// | `reason` (terminal)   | `completed`, `exhausted`, `fatal`                                                                                   | Terminal event kind (`completed` = policy_exhausted_success) |
+/// | `outcome` (attempts)  | `completed`, `exhausted`, `fatal`                                                                                   | Attempts-to-finalize histogram                               |
+/// | `reason` (rejection)  | `slot_full`, `slot_busy`, `superseded`, `removed`, `shutting_down`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` | Classified from `Event.reason` by `classify_rejection_reason` (private)         |
 ///
 /// ## Notes
 ///
-/// - `tasks_in_flight` gauge is guarded against going negative: a [`TaskStopped`](EventKind::TaskStopped) without a preceding [`TaskStarting`](EventKind::TaskStarting) is a no-op on the gauge.
+/// - `tasks_in_flight` is **best-effort**. It is derived from taskvisor's lossy
+///   broadcast bus (inc on `TaskStarting`, dec on the per-attempt terminal), so a
+///   dropped event under sustained bus lag makes it drift and it does not
+///   self-heal. It is guarded against going negative (a terminal without a
+///   preceding start is a no-op). For an **authoritative**, self-correcting count
+///   that is recomputed from `TaskState` on every scrape, use the pull-based
+///   `PrometheusStateCollector` (`state` feature): `solti_sv_tasks_by_phase{phase="running"}`.
 /// - [`queue_capacity`](Subscribe::queue_capacity) defaults to [`DEFAULT_QUEUE_CAPACITY`].
 /// - Backoff duration is converted from milliseconds to seconds before observation.
 ///
@@ -99,22 +105,28 @@ pub struct PrometheusSubscriber {
 /// The raw `reason` on [`taskvisor::Event`] can embed error messages, queue depths, and other unbounded content, which would explode Prometheus cardinality if used directly as a label.
 /// This classifier collapses known prefixes produced by taskvisor's controller into a small set:
 ///
-/// [`slot_full`, `slot_busy`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` ].
+/// [`slot_full`, `slot_busy`, `superseded`, `removed`, `shutting_down`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` ].
 fn classify_rejection_reason(reason: Option<&str>) -> &'static str {
     let Some(r) = reason else {
         return "unknown";
     };
-    if r.starts_with("slot full") {
+    if r.starts_with("queue_full") {
         "slot_full"
     } else if r.starts_with("dropped: slot busy") {
         "slot_busy"
+    } else if r.starts_with("superseded_by_replace") {
+        "superseded"
+    } else if r.starts_with("removed_from_queue") {
+        "removed"
+    } else if r.starts_with("controller_shutting_down") {
+        "shutting_down"
     } else if r.starts_with("add_failed") {
         "add_failed"
     } else if r.starts_with("remove_failed") {
         "remove_failed"
     } else if r.starts_with("queue_start_failed") {
         "queue_failed"
-    } else if r.starts_with("recovery_start_failed") {
+    } else if r.starts_with("recovery_remove_failed") {
         "recovery_failed"
     } else if r.starts_with("bus_lagged") {
         "bus_lagged"
@@ -215,7 +227,7 @@ impl Subscribe for PrometheusSubscriber {
                     self.task_restarts.inc();
                 }
             }
-            EventKind::TaskStopped | EventKind::TaskFailed => {
+            EventKind::TaskStopped | EventKind::TaskCanceled | EventKind::TaskFailed => {
                 if self.tasks_in_flight.get() > 0.0 {
                     self.tasks_in_flight.dec();
                 }
@@ -252,9 +264,19 @@ impl Subscribe for PrometheusSubscriber {
                 }
             }
             EventKind::ActorExhausted => {
-                self.task_terminal.with_label_values(&["exhausted"]).inc();
+                // Success under OnFailure/Never is the normal way a task ends,
+                // not retry exhaustion: keep the two distinguishable.
+                // NB: the literal mirrors `solti_core::reasons::POLICY_EXHAUSTED_SUCCESS`
+                // (the canonical, CI-pinned list); solti-prometheus does not depend
+                // on solti-core unconditionally, so it is duplicated here.
+                let label = if event.reason.as_deref() == Some("policy_exhausted_success") {
+                    "completed"
+                } else {
+                    "exhausted"
+                };
+                self.task_terminal.with_label_values(&[label]).inc();
                 self.attempts_to_finalize
-                    .with_label_values(&["exhausted"])
+                    .with_label_values(&[label])
                     .observe(f64::from(event.attempt.unwrap_or(1)));
             }
             EventKind::ActorDead => {
@@ -272,14 +294,26 @@ impl Subscribe for PrometheusSubscriber {
                     .with_label_values(&[reason])
                     .inc();
             }
+            // A force-aborted attempt never publishes its own terminal event:
+            // compensate the in-flight gauge from the removal notification.
+            EventKind::TaskRemoved => {
+                if event.reason.as_deref() == Some("force_terminated_after_grace")
+                    && self.tasks_in_flight.get() > 0.0
+                {
+                    self.tasks_in_flight.dec();
+                }
+            }
             EventKind::TaskAdded
-            | EventKind::TaskRemoved
+            | EventKind::TaskAddFailed
             | EventKind::TaskAddRequested
             | EventKind::TaskRemoveRequested
             | EventKind::ShutdownRequested
             | EventKind::AllStoppedWithinGrace
             | EventKind::GraceExceeded
             | EventKind::ControllerSlotTransition => {}
+
+            // `EventKind` is #[non_exhaustive]: ignore variants added in future taskvisor releases.
+            _ => {}
         }
     }
 
@@ -339,6 +373,88 @@ mod tests {
         sub.on_event(&Event::new(EventKind::TaskStopped).with_task("t"));
 
         assert_eq!(sub.tasks_in_flight.get(), 0.0);
+    }
+
+    #[test]
+    fn task_canceled_decrements_in_flight() {
+        let sub = new_subscriber();
+
+        sub.on_event(
+            &Event::new(EventKind::TaskStarting)
+                .with_task("t")
+                .with_attempt(1),
+        );
+        sub.on_event(&Event::new(EventKind::TaskCanceled).with_task("t"));
+
+        assert_eq!(sub.tasks_in_flight.get(), 0.0);
+    }
+
+    #[test]
+    fn force_terminated_removal_decrements_in_flight() {
+        let sub = new_subscriber();
+
+        // A force-aborted attempt never publishes its own terminal event:
+        // the only signal is TaskRemoved("force_terminated_after_grace").
+        sub.on_event(
+            &Event::new(EventKind::TaskStarting)
+                .with_task("t")
+                .with_attempt(1),
+        );
+        sub.on_event(
+            &Event::new(EventKind::TaskRemoved)
+                .with_task("t")
+                .with_reason("force_terminated_after_grace"),
+        );
+
+        assert_eq!(
+            sub.tasks_in_flight.get(),
+            0.0,
+            "force-terminated tasks must not leak the in-flight gauge"
+        );
+    }
+
+    #[test]
+    fn exhausted_after_success_is_labelled_completed() {
+        let sub = new_subscriber();
+
+        sub.on_event(
+            &Event::new(EventKind::ActorExhausted)
+                .with_task("t")
+                .with_attempt(1)
+                .with_reason("policy_exhausted_success"),
+        );
+        sub.on_event(
+            &Event::new(EventKind::ActorExhausted)
+                .with_task("t2")
+                .with_attempt(5)
+                .with_reason("max_retries_exceeded(5/5): boom"),
+        );
+
+        assert_eq!(
+            sub.task_terminal.with_label_values(&["completed"]).get(),
+            1.0,
+            "normal one-shot completion must not be counted as exhaustion"
+        );
+        assert_eq!(
+            sub.task_terminal.with_label_values(&["exhausted"]).get(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn classifier_recognizes_taskvisor_03_reasons() {
+        assert_eq!(
+            classify_rejection_reason(Some("superseded_by_replace")),
+            "superseded"
+        );
+        assert_eq!(
+            classify_rejection_reason(Some("removed_from_queue")),
+            "removed"
+        );
+        assert_eq!(
+            classify_rejection_reason(Some("controller_shutting_down")),
+            "shutting_down"
+        );
     }
 
     #[test]
@@ -568,7 +684,8 @@ mod tests {
         sub.on_event(
             &Event::new(EventKind::ControllerRejected)
                 .with_task("t")
-                .with_reason("slot full at capacity cap=1 depth=1 admission=Queue"),
+                // taskvisor emits `queue_full: {len}/{max}` (controller/core.rs).
+                .with_reason("queue_full: 1/1"),
         );
 
         assert_eq!(
@@ -600,7 +717,8 @@ mod tests {
     #[test]
     fn classify_rejection_reason_recognizes_known_prefixes() {
         assert_eq!(
-            classify_rejection_reason(Some("slot full at capacity cap=1 depth=1 admission=Queue")),
+            // taskvisor emits `queue_full: {len}/{max}` (controller/core.rs).
+            classify_rejection_reason(Some("queue_full: 1/1")),
             "slot_full"
         );
         assert_eq!(
@@ -620,7 +738,8 @@ mod tests {
             "queue_failed"
         );
         assert_eq!(
-            classify_rejection_reason(Some("recovery_start_failed: net")),
+            // taskvisor 0.3 emits `recovery_remove_failed: {e}` (controller/core.rs).
+            classify_rejection_reason(Some("recovery_remove_failed: net")),
             "recovery_failed"
         );
         assert_eq!(

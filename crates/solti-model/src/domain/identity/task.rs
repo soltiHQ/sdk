@@ -35,7 +35,7 @@ arc_str_newtype! {
 impl TaskId {
     /// Validate that the task id is safe to use across the SDK.
     ///
-    /// See [`validate_identity`] for the exact rules.
+    /// See `validate_identity` (module-private) for the exact rules.
     pub fn validate_format(&self) -> Result<(), ModelError> {
         validate_identity("task_id", self.as_str(), TASK_ID_MAX_LEN)
     }

@@ -29,56 +29,47 @@ keywords     = ["async", "tasks", "supervisor", "orchestration", "solti"]
 categories   = ["asynchronous", "concurrency"]
 
 [workspace.dependencies]
-tokio        = { version = "1.52.3" }
-tokio-util   = "0.7.18"
-tokio-stream = "0.1.18"
-bytes        = "1.11.1"
-
-tracing            = "0.1.44"
-tracing-subscriber = { version = "0.3.23" }
-tracing-journald   = "0.3.2"
-
-serde      = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-
-anyhow    = "1.0.102"
-thiserror = "2.0.18"
-subtle    = "2.6.1"
-getrandom = "0.4.2"
-
-async-trait = "0.1.89"
-parking_lot = "0.12.5"
-time        = { version = "0.3.47" }
-base64      = "0.22.1"
-libc        = "0.2.177"
-hostname    = "0.4.2"
-uuid        = "1.23.1"
-tempfile    = "3.27.0"
-itoa        = "1.0.18"
-
-axum           = "0.8.9"
-tower          = "0.5.3"
-tower-http     = "0.6.10"
-http-body-util = "0.1.3"
-reqwest        = "0.13.3"
-
+anyhow              = "1.0.102"
+async-trait         = "0.1.89"
+axum                = "0.8.9"
+base64              = "0.22.1"
+bytes               = "1.12.0"
+getrandom           = "0.4.3"
+hostname            = "0.4.2"
+http-body-util      = "0.1.3"
+itoa                = "1.0.18"
+libc                = "0.2.177"
+parking_lot         = "0.12.5"
+pbjson              = "0.9.0"
+pbjson-build        = "0.9.0"
+prometheus          = "0.14.0"
+prost               = "0.14.4"
+prost-types         = "0.14.4"
+protoc-bin-vendored = { version = "3.2.0" }
+rcgen               = "0.14.8"
+reqwest             = "0.13.4"
+rustls              = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile      = "2.2.0"
+serde               = { version = "1.0.228", features = ["derive"] }
+serde_json          = "1.0.150"
+subtle              = "2.6.1"
+taskvisor           = { version = "0.3.0" }
+tempfile            = "3.27.0"
+thiserror           = "2.0.18"
+time                = { version = "0.3.49" }
+tokio               = { version = "1.52.3" }
+tokio-rustls        = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+tokio-stream        = "0.1.18"
+tokio-util          = "0.7.18"
 tonic               = "0.14.6"
 tonic-prost         = "0.14.6"
 tonic-prost-build   = "0.14.6"
-prost               = "0.14.3"
-prost-types         = "0.14.3"
-protoc-bin-vendored = { version = "3.2.0" }
-pbjson              = "0.9.0"
-pbjson-build        = "0.9.0"
-
-prometheus = "0.14.0"
-
-rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
-rcgen          = "0.14.8"
-tokio-rustls   = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
-
-taskvisor = { version = "0.1.3" }
+tower               = "0.5.3"
+tower-http          = "0.7.0"
+tracing             = "0.1.44"
+tracing-journald    = "0.3.2"
+tracing-subscriber  = { version = "0.3.23" }
+uuid                = "1.23.1"
 
 solti-tls        = { path = "crates/solti-tls",        version = "0.0.2" }
 solti-model      = { path = "crates/solti-model",      version = "0.0.2" }

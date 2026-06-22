@@ -107,7 +107,12 @@ mod option_time_serde {
         D: Deserializer<'de>,
     {
         let opt: Option<u64> = Option::deserialize(deserializer)?;
-        Ok(opt.map(|ms| UNIX_EPOCH + std::time::Duration::from_millis(ms)))
+        opt.map(|ms| {
+            UNIX_EPOCH
+                .checked_add(std::time::Duration::from_millis(ms))
+                .ok_or_else(|| <D::Error as serde::de::Error>::custom("timestamp out of range"))
+        })
+        .transpose()
     }
 }
 

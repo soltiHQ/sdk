@@ -5,7 +5,7 @@
 #   .github/workflows/.preflight.yml - per-crate `cargo publish --dry-run` matrix
 #   .github/workflows/.docs.yml      - per-crate rustdoc matrix
 #
-# Dependency layout — required + optional (because publish runs with `--all-features`):
+# Dependency layout - required + optional (because publish runs with `--all-features`):
 #   solti-model       - no internal deps
 #   solti-tls         - no internal deps
 #   solti-observe     - optional: solti-model

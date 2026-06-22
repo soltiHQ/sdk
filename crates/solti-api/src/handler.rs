@@ -43,8 +43,13 @@ pub trait ApiHandler: Send + Sync + 'static {
     /// Submit a new task for execution.
     async fn submit_task(&self, spec: TaskSpec) -> Result<TaskId, ApiError>;
 
-    /// Apply a spec to its slot.
+    /// Apply a spec to its slot (declarative upsert).
     /// Returns the id of the task running in the slot after apply.
+    ///
+    /// Note: this **forces** [`AdmissionPolicy::Replace`], overriding any admission
+    /// policy on the supplied `spec` — that is the point of "apply" (latest spec
+    /// wins the slot). Use [`submit_task`](Self::submit_task) to honor the spec's
+    /// own admission policy.
     async fn apply_task(&self, spec: TaskSpec) -> Result<TaskId, ApiError> {
         self.submit_task(spec.with_admission(AdmissionPolicy::Replace))
             .await

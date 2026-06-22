@@ -115,7 +115,7 @@
 //! | `libc::write(STDERR)`        | async-signal-safe per POSIX                |
 //! | `io::Error::last_os_error()` | reads `errno`, no heap (Rust ≥ 1.74)       |
 //!
-//! The closure captures **only `Copy` types** (2 bools + `[u32; 2]`).
+//! The closure captures **only `Copy` types** (3 bools + `[u32; 2]`).
 //! No `Vec`, no `String`, no `Arc`: zero heap allocation in the child.
 //!
 //! ## Rules
@@ -160,6 +160,22 @@ impl SecurityConfig {
     #[inline]
     pub fn is_empty(&self) -> bool {
         !self.drop_all_caps && self.keep_caps.is_empty() && !self.no_new_privs
+    }
+
+    /// Validate the security policy at config time.
+    ///
+    /// Rejects a `keep_caps` allowlist with `drop_all_caps = false`:
+    /// the keep list is only applied *while* dropping, so without `drop_all_caps`
+    /// the hook would drop nothing and the child would keep **all** parent capabilities - a silent fail-open.
+    pub(crate) fn validate(&self) -> Result<(), crate::ExecError> {
+        if !self.keep_caps.is_empty() && !self.drop_all_caps {
+            return Err(crate::ExecError::InvalidRunnerConfig(
+                "security.keep_caps is set but drop_all_caps is false: the allowlist would have \
+                 nothing to drop from, so the child would keep ALL capabilities"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -293,6 +309,8 @@ mod linux_impl {
 
     /// Clear all ambient capabilities.
     fn clear_ambient_caps() -> io::Result<()> {
+        // SAFETY:
+        // direct async-signal-safe `prctl` syscall with scalar/constant arguments only (no pointer is dereferenced), safe to call post-fork.
         let rc = unsafe { libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) };
         if rc != 0 {
             let err = io::Error::last_os_error();
@@ -309,6 +327,8 @@ mod linux_impl {
     /// Returns `Ok(())` for `EINVAL` and `EPERM` (expected on older kernels or when lacking `CAP_SETPCAP`).
     /// Other errors propagate, but the caller ignores the result with `let _ =`.
     fn raise_ambient_cap(cap: u32) -> io::Result<()> {
+        // SAFETY:
+        // direct async-signal-safe `prctl` syscall with scalar arguments only (no pointer is dereferenced), safe to call post-fork.
         let rc = unsafe { libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, cap, 0, 0) };
         if rc != 0 {
             let err = io::Error::last_os_error();
@@ -321,6 +341,8 @@ mod linux_impl {
     }
 
     fn apply_no_new_privs() -> io::Result<()> {
+        // SAFETY: direct async-signal-safe `prctl` syscall with scalar/constant
+        // arguments only (no pointer is dereferenced), safe to call post-fork.
         let rc = unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
         if rc != 0 {
             Err(io::Error::last_os_error())

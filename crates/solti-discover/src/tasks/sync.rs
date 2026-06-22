@@ -75,7 +75,17 @@ pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError
         factor: 2.0,
     });
 
-    let spec = TaskSpec::builder(SLOT, TaskKind::Embedded, delay_ms)
+    // The per-attempt timeout must cover everything the attempt body may
+    // legitimately wait through: one-time startup jitter (up to delay_ms),
+    // a server-advised retry hold (up to MAX_RETRY_AFTER_S), and the request
+    // itself. Tying it to the heartbeat period would kill healthy attempts.
+    let attempt_timeout_ms = delay_ms
+        .saturating_add((MAX_RETRY_AFTER_S as u64).saturating_mul(1_000))
+        .saturating_add(config.connect_timeout_ms)
+        .saturating_add(config.request_timeout_ms)
+        .saturating_add(1_000);
+
+    let spec = TaskSpec::builder(SLOT, TaskKind::Embedded, attempt_timeout_ms)
         .restart(RestartPolicy::periodic(delay_ms))
         .backoff(backoff)
         .admission(AdmissionPolicy::Replace)
@@ -509,6 +519,10 @@ fn startup_jitter_ms(max_ms: u64) -> u64 {
     mixed % max_ms
 }
 
+/// Turn a `success=false` response into [`DiscoverError::Rejected`].
+///
+/// `reason` is propagated **verbatim** from the control plane:
+/// treat it as untrusted server text (do not interpolate it into anything trust-sensitive).
 fn validate_response(response: SyncResponse) -> Result<(), DiscoverError> {
     if !response.success {
         let reason = if response.reason.is_empty() {
@@ -592,6 +606,40 @@ fn compute_hold_wait(hold_until_unix_s: u64, now_unix_s: u64) -> Option<Duration
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn attempt_timeout_covers_jitter_hold_and_request() {
+        // The attempt body may legitimately sleep through startup jitter (up to
+        // delay_ms) plus a server-advised retry hold (up to MAX_RETRY_AFTER_S)
+        // before even sending the request. The per-attempt timeout must cover
+        // that, or taskvisor kills healthy heartbeats with TimeoutHit cycles.
+        let delay_ms = 30_000u64;
+        let config = crate::DiscoverConfig::builder(
+            solti_model::AgentId::from("agent-1"),
+            "agent-1",
+            "http://127.0.0.1:8085",
+            "http://127.0.0.1:9000",
+            crate::DiscoveryTransport::Http,
+            delay_ms,
+            1,
+        )
+        .build()
+        .expect("config builds");
+
+        let worst_case_ms = delay_ms
+            + (MAX_RETRY_AFTER_S as u64) * 1_000
+            + config.connect_timeout_ms
+            + config.request_timeout_ms;
+
+        let (_task, spec) = sync(config).expect("sync builds");
+        assert!(
+            spec.timeout().as_millis() >= worst_case_ms,
+            "attempt timeout {}ms must cover the worst case {}ms",
+            spec.timeout().as_millis(),
+            worst_case_ms
+        );
+    }
 
     #[test]
     fn compute_hold_wait_zero_means_no_hold() {

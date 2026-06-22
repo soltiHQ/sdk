@@ -36,7 +36,7 @@ Builders that hold *intent* (paths or in-memory PEM bytes) and produce `rustls::
 
 ### TLS-terminated server
 
-```rust
+```rust,ignore
 use solti_tls::ServerTlsConfig;
 
 let server_cfg = ServerTlsConfig::builder()
@@ -53,7 +53,7 @@ let server_cfg = ServerTlsConfig::builder()
 
 ### TLS-validating client
 
-```rust
+```rust,ignore
 use solti_tls::ClientTlsConfig;
 
 let client_cfg = ClientTlsConfig::builder()
@@ -70,7 +70,7 @@ let client_cfg = ClientTlsConfig::builder()
 
 Server requires a client certificate signed by `clients-ca.crt`:
 
-```rust
+```rust,ignore
 use solti_tls::ServerTlsConfig;
 
 let server_cfg = ServerTlsConfig::builder()
@@ -83,7 +83,7 @@ let server_cfg = ServerTlsConfig::builder()
 
 Client presents its own certificate:
 
-```rust
+```rust,ignore
 use solti_tls::ClientTlsConfig;
 
 let client_cfg = ClientTlsConfig::builder()
@@ -113,7 +113,7 @@ one returns `TlsError::MissingField("client_key")` / `MissingField("client_cert"
 
 ## PemSource: paths vs bytes
 
-```rust
+```rust,ignore
 use solti_tls::PemSource;
 
 // File on disk: read at into_rustls_config() time
@@ -148,7 +148,7 @@ ALPN protocols are stored in preference order and copied verbatim into `rustls::
 
 ### `solti-api` server (gRPC + tonic)
 
-```rust
+```rust,ignore
 use solti_api::{build_grpc_server, to_tonic_server_tls};
 use solti_tls::ServerTlsConfig;
 
@@ -171,7 +171,7 @@ Requires `solti-api` features `grpc + tls`.
 
 axum does not terminate TLS itself; bind through `axum-server`:
 
-```rust
+```rust,ignore
 use axum_server::tls_rustls::RustlsConfig;
 use solti_api::HttpApi;
 use solti_tls::ServerTlsConfig;
@@ -194,7 +194,7 @@ axum_server::bind_rustls(addr, RustlsConfig::from_config(Arc::new(rustls_cfg)))
 
 `with_tls` accepts a `solti_tls::ClientTlsConfig` directly:
 
-```rust
+```rust,ignore
 use solti_discover::DiscoverConfig;
 use solti_tls::ClientTlsConfig;
 
@@ -222,6 +222,21 @@ Requires `solti-discover` features `tls + (http or grpc)`.
   This is intentional: for service-to-service TLS in a controlled environment, the trust set is tightly defined.
 - **Auto-install**: `into_rustls_config()` calls `ensure_default_provider()` which installs `ring` if no provider is set process-wide. 
 
+## Security model
+
+**Verified:** the server certificate chains to the CA you supply (`ClientTlsConfig`); under mTLS the client certificate chains to `require_client_ca(..)` and client auth is **mandatory** (`ServerTlsConfig`).
+
+**Not verified here (caller's responsibility):**
+- *Hostname / SAN* - matched by `rustls` at connect time against the `ServerName` you pass to `TlsConnector::connect(..)` / tonic / reqwest. 
+  Pass the real server name; a wrong one silently weakens identity checking. 
+  Do not install a `dangerous()` verifier.
+- *Revocation* - no OCSP / CRL; rely on short cert lifetimes.
+- *TLS versions / suites* - `rustls` safe defaults (TLS 1.2 + 1.3); no min-version policy. 
+  Provider is `ring` (not configurable here).
+
+**Secrets:** `PemSource::Bytes` may hold a private key; its `Debug` is redacted so
+logging a config does not leak the key. Key bytes are not zeroized on drop.
+
 ## Error model
 
 | Variant            | Cause                                                                     |
@@ -244,6 +259,3 @@ Consumers of `solti-tls` (e.g. `solti-api`, `solti-discover`) gate their integra
 
 - `into_rustls_config()` consumes `self`. Clone the config first if you need to keep the builder-side struct around (e.g. for diagnostics).
 - `solti-tls` __does not configure session resumption, ticket keys, or OCSP stapling__: defaults from `rustls` apply.
-- The runnable demo lives at `examples/tls-roundtrip`: generates an in-memory PKI, 
-  brings up an HTTPS server (`axum-server`) and a gRPC server (`tonic` + `tonic-health`) with mTLS, 
-  then makes a client round trip through each.

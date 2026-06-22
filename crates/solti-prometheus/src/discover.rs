@@ -1,4 +1,9 @@
-//! Discovery heartbeat metrics: Prometheus implementation of [`solti_discover::DiscoverMetricsBackend`].
+//! # Discovery-heartbeat Prometheus metrics (feature `discover`).
+//!
+//! [`PrometheusDiscoverMetrics`] implements [`solti_discover::DiscoverMetricsBackend`], exposing `solti_discover_*`
+//! attempt / outcome / duration / failure / hold metrics for the control-plane discovery heartbeat.
+//!
+//! See the [crate root](crate) for architecture and namespace overview.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

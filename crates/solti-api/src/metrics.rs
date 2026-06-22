@@ -1,4 +1,4 @@
-//! Metrics interface for the API layer (HTTP + gRPC).
+//! # API metrics — HTTP + gRPC.
 //!
 //! Implement [`ApiMetricsBackend`] to record per-request metrics.
 //! The default is [`NoOpApiMetrics`] - zero-cost when no handle is wired in.
@@ -11,14 +11,19 @@
 
 use std::sync::Arc;
 
-/// Transport label value — bounded cardinality by construction.
+/// Transport that served a request - the `transport` metric label.
+///
+/// A closed two-value set, so it keeps label cardinality bounded by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
+    /// The axum HTTP/JSON transport (feature `http`).
     Http,
+    /// The tonic gRPC transport (feature `grpc`).
     Grpc,
 }
 
 impl Transport {
+    /// Stable lowercase label value (`"http"` / `"grpc"`) for the metric series.
     pub fn as_label(&self) -> &'static str {
         match self {
             Transport::Http => "http",

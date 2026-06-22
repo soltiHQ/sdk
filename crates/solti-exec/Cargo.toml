@@ -12,8 +12,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
-subprocess = ["dep:base64", "dep:libc", "dep:tempfile", "tokio/process"]
+default    = []
+subprocess = ["dep:base64", "dep:libc", "dep:tempfile", "tokio/process", "tokio/time", "tokio/macros"]
 
 [dependencies]
 base64     = { workspace = true, optional = true }

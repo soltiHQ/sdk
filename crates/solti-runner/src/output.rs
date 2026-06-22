@@ -1,4 +1,27 @@
-//! Per-run output sink: runners push lines, subscribers receive `OutputEvent`s.
+//! # Task output broadcast hub.
+//!
+//! Carries a running task's stdout/stderr (and run-boundary markers) from the runner to any number of live subscribers (a gRPC/SSE log tail, a recorder).
+//!
+//! ```text
+//!   runner attempt ──► OutputSink::stdout_line / stderr_line
+//!                            │  (OutputEvent::Chunk)
+//!                            ▼
+//!                   broadcast::Sender  (one per TaskId, capacity N)
+//!                       │        │        │
+//!                       ▼        ▼        ▼
+//!                    sub #1    sub #2    sub #N      (OutputRegistry::subscribe)
+//! ```
+//!
+//! ## Per-task channel lifecycle (owned by `solti-core`)
+//!
+//! 1. `ensure_channel` / `sink_for` create the channel - **one [`broadcast::Sender`] per [`TaskId`], reused across every attempt** of that task (so a retried task's runs merge into one stream).
+//! 2. `subscribe` attaches a receiver; `announce_run_started` / `announce_run_finished` emit the run-boundary markers.
+//! 3. `evict` drops the channel once the task is fully terminal (`Exhausted` / `Removed`). The supervisor drives this; the registry never self-reaps.
+//!
+//! ## Also
+//!
+//! - [`BuildContext::output_registry`](crate::BuildContext::output_registry) - how a runner obtains the registry.
+//! - [`OutputEvent`](solti_model::OutputEvent) / [`OutputChunk`](solti_model::OutputChunk) - the wire payloads.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,8 +35,13 @@ use tokio::sync::broadcast;
 
 /// Sink for one task-run attempt.
 ///
-/// Created by `OutputRegistry` when a runner starts an attempt;
-/// the runner pushes lines into it, subscribers (obtained via the registry) receive `OutputEvent`s on the other end.
+/// Created by [`OutputRegistry::sink_for`] when a runner starts an attempt;
+/// the runner pushes lines into it, subscribers (via [`OutputRegistry::subscribe`]) receive [`OutputEvent`]s on the other end.
+/// Writes are **lossy** - see the module-level "Lossy by design".
+///
+/// ## Also
+///
+/// - [`OutputRegistry`] - owns the channel this sink writes to.
 #[derive(Clone)]
 pub struct OutputSink {
     attempt: u32,
@@ -33,17 +61,13 @@ impl OutputSink {
         }
     }
 
-    /// Push one stdout line. No-op if no subscribers are attached.
-    ///
-    /// `line` is `bytes::Bytes` (UTF-8): cloning is a refcount bump, so the
-    /// same buffer is shared across every subscriber and all the way through
-    /// to the gRPC `bytes line` wire field without an extra byte-copy.
+    /// Push one stdout line.
     pub fn stdout_line(&self, line: Bytes) {
         let seq = self.seq_stdout.fetch_add(1, Ordering::Relaxed);
         self.push(StreamKind::Stdout, seq, line);
     }
 
-    /// Push one stderr line. No-op if no subscribers are attached.
+    /// Push one stderr line.
     pub fn stderr_line(&self, line: Bytes) {
         let seq = self.seq_stderr.fetch_add(1, Ordering::Relaxed);
         self.push(StreamKind::Stderr, seq, line);
@@ -68,12 +92,31 @@ impl OutputSink {
 
 /// Per-task broadcast registry.
 ///
-/// One [`broadcast::Sender`] per [`TaskId`], reused across all attempts of that task.
+/// One [`broadcast::Sender`] per [`TaskId`], reused across all attempts of that task, with a fixed ring capacity (see [`OutputRegistry::new`]; [`Default`] uses `1024`).
+/// Lifecycle is owned by the supervisor (`solti-core`), see the module-level docs.
+/// The registry never self-reaps; the supervisor must call [`evict`](Self::evict).
 ///
-/// Lifecycle is owned by the supervisor (`solti-core`):
-/// - `sink_for` is called by the runner factory at the start of every attempt.
-/// - `announce_run_started` / `announce_run_finished` are called from the supervisor's lifecycle transitions.
-/// - `evict` removes the channel when the task is fully terminal (`Exhausted` / `Removed`).
+/// ## Also
+///
+/// - [`OutputSink`] - the write end handed to a runner attempt.
+/// - [`BuildContext::output_registry`](crate::BuildContext::output_registry).
+///
+/// ## Example
+///
+/// ```rust
+/// use solti_runner::OutputRegistry;
+/// use solti_model::TaskId;
+///
+/// let registry = OutputRegistry::new(64);
+/// let task = TaskId::from("build-1");
+///
+/// let _sink = registry.sink_for(task.clone(), 1); // attempt 1 creates the channel
+/// assert!(registry.subscribe(&task).is_some());
+/// assert_eq!(registry.active_channels(), 1);
+///
+/// registry.evict(&task);
+/// assert!(registry.subscribe(&task).is_none());
+/// ```
 pub struct OutputRegistry {
     channels: RwLock<HashMap<TaskId, broadcast::Sender<OutputEvent>>>,
     capacity: usize,
@@ -88,10 +131,7 @@ impl OutputRegistry {
         }
     }
 
-    /// Pre-create the broadcast channel for `task_id` without producing a
-    /// sink. Useful when a subscriber may race with the first runner attempt:
-    /// call `ensure_channel` at task-build time, then `subscribe` is safe to
-    /// invoke before the runner has started writing.
+    /// Pre-create the broadcast channel for `task_id` without producing a sink.
     ///
     /// No-op if the channel already exists.
     pub fn ensure_channel(&self, task_id: TaskId) {
@@ -101,10 +141,9 @@ impl OutputRegistry {
             .or_insert_with(|| broadcast::channel::<OutputEvent>(self.capacity).0);
     }
 
-    /// Get an [`OutputSink`] for `(task_id, attempt)`. The first call for a
-    /// given `task_id` creates the broadcast channel; subsequent calls reuse
-    /// it (multi-run merge). The returned sink has fresh per-stream `seq`
-    /// counters scoped to this attempt.
+    /// Get an [`OutputSink`] for `(task_id, attempt)`.
+    /// The first call for a given `task_id` creates the broadcast channel; subsequent calls reuse it (multi-run merge).
+    /// The returned sink has fresh per-stream `seq` counters scoped to this attempt.
     pub fn sink_for(&self, task_id: TaskId, attempt: u32) -> OutputSink {
         let mut channels = self.channels.write();
         let sender = channels
@@ -420,13 +459,11 @@ mod tests {
         reg.ensure_channel(task.clone());
         let mut rx = reg.subscribe(&task).unwrap();
 
-        // Calling again must not replace the channel; existing subscriber stays alive.
         reg.ensure_channel(task.clone());
 
         let _ = reg.sink_for(task.clone(), 1);
-        // After sink_for the same channel still works — receiver was not invalidated.
         let _ = reg.subscribe(&task).unwrap();
-        assert!(rx.try_recv().is_err()); // no events yet, but channel is alive
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@
 //!
 //! | Flag          | What it enables                                             |
 //! |---------------|-------------------------------------------------------------|
-//! | `subprocess`  | [`subprocess`] module - OS process runner with sandboxing   |
+//! | `subprocess`  | `subprocess` module - OS process runner with sandboxing     |
 //!
 //! ## Quick start
 //!
@@ -31,9 +31,17 @@
 //! - [`solti_model::TaskKind`] determines which backend handles the task.
 //! - [`solti_runner::RunnerRouter`] routes tasks to registered runners.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
+/// Compiles the runnable Rust code blocks in `README.md` as doctests.
+#[cfg(all(doctest, feature = "subprocess"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 mod error;
 pub use error::ExecError;
 
+#[cfg(feature = "subprocess")]
 mod metrics;
 
 #[cfg(feature = "subprocess")]

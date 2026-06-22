@@ -21,8 +21,8 @@ use crate::id::{RunId, make_run_id};
 /// ## Also
 ///
 /// - [`RunnerRouter`](crate::RunnerRouter) selects a runner for a given spec.
-/// - [`BuildContext`](crate::BuildContext) shared dependencies passed to [`build_task`](Self::build_task).
 /// - [`RunId`](crate::RunId) is a default id format produced by [`build_run_id`](Self::build_run_id).
+/// - [`BuildContext`](crate::BuildContext) shared dependencies passed to [`build_task`](Self::build_task).
 pub trait Runner: Send + Sync {
     /// Runner name used in logs and diagnostics.
     fn name(&self) -> &'static str;

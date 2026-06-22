@@ -1,8 +1,6 @@
 //! # Run identifier generation.
 //!
-//! [`RunId`] is the per-execution task name for taskvisor, formatted as `{runner}-{slot}-{seq}` and **unique per submission**
-//! (the sequence is a process-global counter).
-//!
+//! [`RunId`] is the per-execution task name for taskvisor, formatted as `{runner}-{slot}-{seq}` and **unique per submission** (the sequence is a process-global counter).
 //! Uniqueness is intentional: the name identifies one *run instance* (used for events, logs, cgroup naming and per-task state tracking).
 //!
 //! It is NOT the admission slot.
@@ -56,10 +54,24 @@ impl RunId {
 /// - `runner` - Runner::name()
 /// - `slot`   - TaskSpec.slot (logical)
 /// - `seq`    - per-process counter (also used verbatim for cgroup naming)
+///
+/// ## Example
+///
+/// ```rust
+/// use solti_runner::make_run_id;
+///
+/// let id = make_run_id("subprocess", "my-slot");
+/// assert!(id.name().starts_with("subprocess-my-slot-"));
+/// assert!(id.seq() >= 1); // process-global counter starts at 1
+/// ```
 pub fn make_run_id(runner_name: &str, slot: &str) -> RunId {
     let seq = next_seq();
-    RunId {
-        name: format!("{runner_name}-{slot}-{seq}"),
-        seq,
-    }
+    let name = format!("{runner_name}-{slot}-{seq}");
+    debug_assert!(
+        solti_model::TaskId::from(name.as_str())
+            .validate_format()
+            .is_ok(),
+        "make_run_id produced an invalid identity {name:?}: runner/slot has illegal chars or is too long"
+    );
+    RunId { name, seq }
 }

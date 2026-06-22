@@ -2,8 +2,6 @@
 //!
 //! Adapter layer between `solti-model` (public specs) and the taskvisor runtime.
 //! Maps high-level API types into taskvisor's internal execution structures.
-//!
-//! All model enums are `#[non_exhaustive]` unknown variants produce [`CoreError::Mapping`](crate::CoreError::Mapping) instead of a silent fallback.
 
 use std::time::Duration;
 
@@ -62,4 +60,84 @@ pub(crate) fn to_backoff_policy(s: &ModelBackoffPolicy) -> Result<BackoffPolicy,
         jitter: to_jitter_policy(s.jitter)?,
         factor: s.factor,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admission_policy_maps_every_variant() {
+        assert_eq!(
+            to_admission_policy(ModelAdmissionPolicy::DropIfRunning).unwrap(),
+            AdmissionPolicy::DropIfRunning
+        );
+        assert_eq!(
+            to_admission_policy(ModelAdmissionPolicy::Replace).unwrap(),
+            AdmissionPolicy::Replace
+        );
+        assert_eq!(
+            to_admission_policy(ModelAdmissionPolicy::Queue).unwrap(),
+            AdmissionPolicy::Queue
+        );
+    }
+
+    #[test]
+    fn jitter_policy_maps_every_variant() {
+        assert_eq!(
+            to_jitter_policy(ModelJitterPolicy::Decorrelated).unwrap(),
+            JitterPolicy::Decorrelated
+        );
+        assert_eq!(
+            to_jitter_policy(ModelJitterPolicy::Equal).unwrap(),
+            JitterPolicy::Equal
+        );
+        assert_eq!(
+            to_jitter_policy(ModelJitterPolicy::Full).unwrap(),
+            JitterPolicy::Full
+        );
+        assert_eq!(
+            to_jitter_policy(ModelJitterPolicy::None).unwrap(),
+            JitterPolicy::None
+        );
+    }
+
+    #[test]
+    fn restart_policy_maps_every_variant() {
+        // taskvisor::RestartPolicy is not PartialEq, so match structurally.
+        assert!(matches!(
+            to_restart_policy(ModelRestartPolicy::Never).unwrap(),
+            RestartPolicy::Never
+        ));
+        assert!(matches!(
+            to_restart_policy(ModelRestartPolicy::OnFailure).unwrap(),
+            RestartPolicy::OnFailure
+        ));
+        assert!(matches!(
+            to_restart_policy(ModelRestartPolicy::Always { interval_ms: None }).unwrap(),
+            RestartPolicy::Always { interval: None }
+        ));
+        assert!(matches!(
+            to_restart_policy(ModelRestartPolicy::Always {
+                interval_ms: Some(2_500)
+            })
+            .unwrap(),
+            RestartPolicy::Always { interval: Some(d) } if d == Duration::from_millis(2_500)
+        ));
+    }
+
+    #[test]
+    fn backoff_policy_maps_all_fields() {
+        let model = ModelBackoffPolicy {
+            jitter: ModelJitterPolicy::Equal,
+            first_ms: 100,
+            max_ms: 5_000,
+            factor: 2.0,
+        };
+        let tv = to_backoff_policy(&model).unwrap();
+        assert_eq!(tv.first, Duration::from_millis(100));
+        assert_eq!(tv.max, Duration::from_millis(5_000));
+        assert_eq!(tv.jitter, JitterPolicy::Equal);
+        assert_eq!(tv.factor, 2.0);
+    }
 }

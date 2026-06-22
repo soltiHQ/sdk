@@ -1,4 +1,10 @@
-//! Client-side TLS configuration.
+//! # Client-side TLS configuration.
+//!
+//! [`ClientTlsConfig`] (built via [`ClientTlsConfigBuilder`]) describes a TLS client:
+//! the trust roots (CA) used to verify the server, an optional client cert/key pair for mTLS, and ALPN.
+//! [`ClientTlsConfig::into_rustls_config`] yields a [`rustls::ClientConfig`].
+//!
+//! **Hostname verification is performed by `rustls` at connect time**, not here - see [`ClientTlsConfig::into_rustls_config`].
 
 use std::path::PathBuf;
 
@@ -6,7 +12,19 @@ use crate::{PemSource, TlsError};
 
 /// Client-side TLS configuration.
 ///
-/// _Construct via [`ClientTlsConfig::builder`]_.
+/// Construct via [`ClientTlsConfig::builder`].
+/// `client_cert` and `client_key` are paired: supply both (mTLS) or neither - the builder rejects one without the other.
+///
+/// ## Security
+///
+/// `client_key` is held as a [`PemSource`] whose `Bytes` variant keeps the raw key; the derived `Debug` redacts it (see [`PemSource`]).
+/// The key is not zeroized while the config is alive.
+///
+/// ## Also
+///
+/// - [`ServerTlsConfig`](crate::ServerTlsConfig) - the peer side.
+/// - [`ClientTlsConfigBuilder`] - the builder.
+/// - [`PemSource`], [`TlsError`].
 #[derive(Debug, Clone)]
 pub struct ClientTlsConfig {
     /// Trusted CA bundle for verifying the server's certificate.
@@ -27,10 +45,24 @@ impl ClientTlsConfig {
 
     /// Build a [`rustls::ClientConfig`].
     ///
-    /// Reads PEM sources, builds a `RootCertStore` from CA, optionally adds the client cert+key for mTLS, and applies ALPN.
-    /// All I/O surfaces here.
+    /// Reads the PEM sources, builds a `RootCertStore` from `ca`, optionally adds the client cert+key for mTLS, and applies ALPN.
+    /// Auto-installs the `ring` [`CryptoProvider`](crate::ensure_default_provider) if none is set.
     ///
-    /// Auto-installs the `ring` `CryptoProvider` if no provider is set process-wide.
+    /// ## Security: read this!
+    ///
+    /// The resulting config verifies that the server's certificate **chains to the `ca` bundle** you supplied (`rustls`' `WebPkiServerVerifier`; trust roots come only from your PEM, not the OS store).
+    /// It does **not** itself check the server *hostname*: SAN/identity matching is done by `rustls` when you connect, against the [`ServerName`](rustls::pki_types::ServerName)
+    /// you pass to `TlsConnector::connect(server_name, ..)` (or the tonic/reqwest equivalent).
+    ///
+    /// **Pass the real server name** - a wrong or placeholder name silently defeats identity checking even though the chain still validates.
+    /// Do not install a `dangerous()` certificate verifier on the returned config.
+    /// Revocation (OCSP/CRL) is not checked.
+    ///
+    /// If `client_cert` + `client_key` are set, they are presented for mTLS.
+    ///
+    /// ## Errors
+    ///
+    /// [`TlsError::Io`] (PEM read), [`TlsError::NoCertificates`] / [`TlsError::NoPrivateKey`] (parse), [`TlsError::Rustls`].
     pub fn into_rustls_config(self) -> Result<rustls::ClientConfig, TlsError> {
         crate::ensure_default_provider();
 
@@ -129,7 +161,25 @@ impl ClientTlsConfigBuilder {
         self.client_key(PemSource::Bytes(bytes.into()))
     }
 
-    /// Build.
+    /// Finalize the configuration.
+    ///
+    /// Requires `ca`.
+    /// Rejects an unpaired client cert/key with [`TlsError::MissingField`] (`"client_cert"` or `"client_key"`).
+    /// Does no I/O: the PEM sources are read by [`ClientTlsConfig::into_rustls_config`].
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_tls::{ClientTlsConfig, TlsError};
+    ///
+    /// // A client cert without its key is rejected.
+    /// let err = ClientTlsConfig::builder()
+    ///     .ca_pem_bytes(b"-----BEGIN CERTIFICATE-----\n...".to_vec())
+    ///     .client_cert_pem_bytes(b"cert".to_vec())
+    ///     .build()
+    ///     .unwrap_err();
+    /// assert!(matches!(err, TlsError::MissingField("client_key")));
+    /// ```
     pub fn build(self) -> Result<ClientTlsConfig, TlsError> {
         let ca = self.ca.ok_or(TlsError::MissingField("ca"))?;
         match (&self.client_cert, &self.client_key) {

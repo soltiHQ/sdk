@@ -1,3 +1,7 @@
+//! # Validated `EnvFilter` expression value object ([`LoggerLevel`]).
+//!
+//! Wraps a `tracing_subscriber` `EnvFilter` directive string, validated at construction so it cannot fail later at subscriber-install time.
+
 use std::{convert::TryFrom, str::FromStr};
 
 use serde::{Deserialize, Serialize};

@@ -41,6 +41,30 @@ struct RunnerEntry {
 /// - [`Runner`] — trait that concrete executors implement.
 /// - [`BuildContext`] — shared dependencies for all runners.
 /// - [`RunnerError::NoRunner`](crate::RunnerError::NoRunner) — returned when no runner matches.
+///
+/// ## Example
+///
+/// ```rust,no_run
+/// use std::sync::Arc;
+/// use solti_runner::RunnerRouter;
+/// # use solti_runner::{BuildContext, Runner, RunnerError};
+/// # use solti_model::{TaskKind, TaskSpec};
+/// # use taskvisor::TaskRef;
+/// # struct MyRunner;
+/// # impl Runner for MyRunner {
+/// #     fn name(&self) -> &'static str { "my-runner" }
+/// #     fn supports(&self, spec: &TaskSpec) -> bool { matches!(spec.kind(), TaskKind::Subprocess(_)) }
+/// #     fn build_task(&self, _s: &TaskSpec, _c: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
+/// # }
+/// # fn demo(spec: &TaskSpec) -> Result<(), RunnerError> {
+/// let mut router = RunnerRouter::new();
+/// router.register(Arc::new(MyRunner));
+///
+/// let task_ref = router.build(spec)?; // picks the first runner that supports `spec`
+/// # let _ = task_ref;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Default)]
 pub struct RunnerRouter {
     runners: Vec<RunnerEntry>,
@@ -95,12 +119,22 @@ impl RunnerRouter {
     pub fn pick(&self, spec: &TaskSpec) -> Option<&Arc<dyn Runner>> {
         let selector = spec.runner_selector();
 
-        self.runners
-            .iter()
-            .find(|entry| {
-                entry.runner.supports(spec) && selector.is_none_or(|sel| sel.matches(&entry.labels))
-            })
-            .map(|entry| &entry.runner)
+        let mut matching = self.runners.iter().filter(|entry| {
+            entry.runner.supports(spec) && selector.is_none_or(|sel| sel.matches(&entry.labels))
+        });
+
+        let first = matching.next()?;
+        if matching.next().is_some() {
+            // First-match-wins is silent by default; surface ambiguity so a
+            // misconfigured registration order (a general runner shadowing a
+            // specialized one) is diagnosable rather than invisible.
+            tracing::debug!(
+                slot = %spec.slot(),
+                runner = first.runner.name(),
+                "multiple runners match this spec; using the first registered (registration order is significant)"
+            );
+        }
+        Some(&first.runner)
     }
 
     /// Build a [`TaskRef`] for the given spec using the selected runner.

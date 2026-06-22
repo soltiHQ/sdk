@@ -3,41 +3,61 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum DiscoverError {
+    /// Builder validation failed (missing/invalid identity, endpoint, …).
     #[error("invalid config: {0}")]
     InvalidConfig(String),
 
+    /// The taskvisor `TaskSpec` for the heartbeat task could not be built.
     #[error("failed to build task spec: {0}")]
     SpecBuild(String),
 
+    /// gRPC transport (TCP/TLS/HTTP2) connect failure (feature `grpc`).
     #[cfg(feature = "grpc")]
     #[error("failed to connect to control plane: {0}")]
     GrpcTransport(#[from] tonic::transport::Error),
 
+    /// A non-OK gRPC status from the control plane (feature `grpc`).
     #[cfg(feature = "grpc")]
     #[error("grpc call failed: {0}")]
     GrpcStatus(#[source] Box<tonic::Status>),
 
+    /// HTTP-level request failure — connect/TLS/timeout (feature `http`).
     #[cfg(feature = "http")]
     #[error("http request failed: {0}")]
     HttpRequest(#[from] reqwest::Error),
 
+    /// A non-2xx HTTP response (feature `http`). `body` is truncated (~1 KiB).
     #[cfg(feature = "http")]
     #[error("http status {code}: {body}")]
-    HttpStatus { code: u16, body: String },
+    HttpStatus {
+        /// HTTP status code.
+        code: u16,
+        /// Response body, truncated for logging.
+        body: String,
+    },
 
+    /// The response body could not be deserialized (feature `http`).
     #[cfg(feature = "http")]
     #[error("invalid response: {0}")]
     InvalidResponse(String),
 
+    /// The control plane returned `success: false`.
     #[error("control plane rejected sync: {reason}")]
     Rejected {
+        /// Rejection reason: surfaced **verbatim** from the control plane (untrusted server text).
         reason: String,
+        /// Server-advised hold before the next attempt, if any.
         retry_after_s: Option<i32>,
     },
 
+    /// Authentication was rejected (`401`/`403`, or gRPC `Unauthenticated`/ `PermissionDenied`).
     #[error("authentication failed: {reason}")]
-    AuthFailed { reason: String },
+    AuthFailed {
+        /// Why authentication failed (server-provided).
+        reason: String,
+    },
 }
 
 impl DiscoverError {

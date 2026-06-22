@@ -1,3 +1,7 @@
+//! # RFC 3339 timestamp formatter ([`LoggerRfc3339`]) for `tracing-subscriber`.
+//!
+//! Injected by [`init_logger`](crate::init_logger). On each log line it reads the cached local offset and degrades to `<invalid-time>` rather than erroring.
+
 use std::fmt;
 
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
@@ -21,8 +25,8 @@ use crate::logger::object::timezone::{LoggerTimeZone, get_or_detect_local_offset
 ///
 /// ## Also
 ///
-/// - [`init_local_offset`](crate::init_local_offset) — must be called before tokio for `Local` mode.
-/// - [`LoggerTimeZone`] — timezone configuration.
+/// - [`init_local_offset`](crate::init_local_offset) - must be called before tokio for `Local` mode.
+/// - [`LoggerTimeZone`] - timezone configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct LoggerRfc3339 {
     tz: LoggerTimeZone,

@@ -2,9 +2,8 @@
 //!
 //! Prometheus metrics for the Solti task-orchestration SDK.
 //!
-//! Collectors and helpers share one [`prometheus::Registry`]. A single
-//! `/metrics` endpoint covers runner internals, supervisor events, API
-//! requests, discovery heartbeat, process stats, and build identity.
+//! Collectors and helpers share one [`prometheus::Registry`].
+//! A single `/metrics` endpoint covers runner internals, supervisor events, API requests, discovery heartbeat, process stats, and build identity.
 //!
 //! ## Collectors and helpers
 //!
@@ -54,17 +53,17 @@
 //!
 //! ## Supervision metrics (`solti_sv_*`)
 //!
-//! | Metric                                   | Type      | Labels   | Description                  |
-//! |------------------------------------------|-----------|----------|------------------------------|
-//! | `solti_sv_tasks_in_flight`               | Gauge     | —        | Currently executing tasks    |
-//! | `solti_sv_task_restarts_total`           | Counter   | —        | Restarts (attempt > 1)       |
-//! | `solti_sv_task_backoff_count_total`      | Counter   | `source` | Backoff events               |
-//! | `solti_sv_task_backoff_duration_seconds` | Histogram | —        | Backoff delay duration       |
-//! | `solti_sv_task_terminal_total`           | Counter   | `reason` | Terminal task states         |
-//! | `solti_sv_attempts_to_finalize`          | Histogram | `outcome`| Attempts when task left loop |
-//! | `solti_sv_task_timeouts_total`           | Counter   | —        | Timeout events               |
-//! | `solti_sv_subscriber_overflow_total`     | Counter   | —        | Queue overflow (lost events) |
-//! | `solti_sv_subscriber_panicked_total`     | Counter   | —        | Subscriber panics            |
+//! | Metric                                   | Type      | Labels   | Description                                                    |
+//! |------------------------------------------|-----------|----------|----------------------------------------------------------------|
+//! | `solti_sv_tasks_in_flight`               | Gauge     | —        | Currently executing tasks                                      |
+//! | `solti_sv_task_restarts_total`           | Counter   | —        | Restarts (attempt > 1)                                         |
+//! | `solti_sv_task_backoff_count_total`      | Counter   | `source` | Backoff events                                                 |
+//! | `solti_sv_task_backoff_duration_seconds` | Histogram | —        | Backoff delay duration                                         |
+//! | `solti_sv_task_terminal_total`           | Counter   | `reason` | Terminal task states                                           |
+//! | `solti_sv_attempts_to_finalize`          | Histogram | `outcome`| Attempts when task left loop                                   |
+//! | `solti_sv_task_timeouts_total`           | Counter   | —        | Timeout events                                                 |
+//! | `solti_sv_subscriber_overflow_total`     | Counter   | —        | Queue overflow (lost events)                                   |
+//! | `solti_sv_subscriber_panicked_total`     | Counter   | —        | Subscriber panics                                              |
 //! | `solti_sv_tasks_by_phase`                | Gauge     | `phase`  | Current tasks per phase (feature `state`, pull-based snapshot) |
 //!
 //! ## Controller metrics (`solti_ctrl_*`)
@@ -75,7 +74,7 @@
 //! | `solti_ctrl_rejections_total`  | CounterVec| `reason` | Controller rejections grouped by cause |
 //!
 //! `reason` values (bounded, classified from `Event.reason`):
-//! [ `slot_full`, `slot_busy`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown`].
+//! [ `slot_full`, `slot_busy`, `superseded`, `removed`, `shutting_down`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown`].
 //!
 //! ## API metrics (`solti_api_*`, feature `api`)
 //!
@@ -125,7 +124,8 @@
 //!  TaskFailed          → tasks_in_flight.dec()
 //!  TimeoutHit          → task_timeouts.inc()
 //!  BackoffScheduled    → task_backoff_count{source}.inc() + task_backoff_duration.observe(delay)
-//!  ActorExhausted      → task_terminal{reason="exhausted"}.inc() + attempts_to_finalize{outcome="exhausted"}.observe(attempt)
+//!  ActorExhausted      → task_terminal{reason}.inc() + attempts_to_finalize{outcome}.observe(attempt)
+//!                        (reason/outcome = "completed" if policy_exhausted_success, else "exhausted")
 //!  ActorDead           → task_terminal{reason="fatal"}.inc()     + attempts_to_finalize{outcome="fatal"}.observe(attempt)
 //!  SubscriberOverflow  → subscriber_overflow.inc()
 //!  SubscriberPanicked  → subscriber_panicked.inc()
@@ -190,6 +190,13 @@
 //! - [`taskvisor::Subscribe`] - trait backing [`PrometheusSubscriber`].
 //! - `solti_api::ApiMetricsBackend` - trait backing [`PrometheusApiMetrics`] (feature `api`).
 //! - `solti_discover::DiscoverMetricsBackend` - trait backing [`PrometheusDiscoverMetrics`] (feature `discover`).
+
+#![forbid(unsafe_code)]
+
+/// Compiles the runnable Rust code blocks in `README.md` as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 mod register;
 

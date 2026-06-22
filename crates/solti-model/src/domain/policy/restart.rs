@@ -35,9 +35,15 @@ pub enum RestartPolicy {
     OnFailure,
     /// Always restart after completion.
     ///
-    /// - `interval_ms: None` - restart immediately after the previous run completes (tight loop tempered only by [`BackoffPolicy`] on failure).
+    /// - `interval_ms: None` - restart immediately after the previous run completes (tight loop tempered only by [`BackoffPolicy`](super::BackoffPolicy) on failure).
     /// - `interval_ms: Some(n)` - wait `n` milliseconds between runs (periodic task).
     /// - `Some(0)` is treated as immediate and is semantically identical to `None`; prefer `None` for clarity.
+    ///
+    /// **Caution:** `interval_ms: None` (or `Some(0)`) is appropriate for a task
+    /// that *blocks* (a long-running service that should respawn immediately if it
+    /// ever exits). For a task that returns *quickly* on success it produces a hot
+    /// restart loop with no delay floor — use `interval_ms: Some(n)` for anything
+    /// that completes fast and is meant to repeat.
     #[serde(rename_all = "camelCase")]
     Always {
         #[serde(skip_serializing_if = "Option::is_none")]

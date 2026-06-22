@@ -53,7 +53,7 @@ impl DiscoverMetricsBackend for NoOpDiscoverMetrics {}
 /// Shareable handle used throughout this crate.
 pub type DiscoverMetricsHandle = Arc<dyn DiscoverMetricsBackend>;
 
-/// Construct a no-op handle - convenient default for [`DiscoverConfig`](crate::DiscoverConfig).
+/// Construct a no-op handle - convenient default for `DiscoverConfig` (feature `grpc`/`http`).
 pub fn noop_discover_metrics() -> DiscoverMetricsHandle {
     Arc::new(NoOpDiscoverMetrics)
 }
