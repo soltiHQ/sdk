@@ -113,8 +113,7 @@ impl RunnerRouter {
     ///
     /// Routing rules:
     /// - filter runners by `Runner::supports(spec)`;
-    /// - if `spec.runner_selector()` is set, keep only runners whose `labels`
-    ///   satisfy all `match_labels` and `match_expressions` requirements;
+    /// - if `spec.runner_selector()` is set, keep only runners whose `labels` satisfy all `match_labels` and `match_expressions` requirements;
     /// - pick the first matching entry.
     pub fn pick(&self, spec: &TaskSpec) -> Option<&Arc<dyn Runner>> {
         let selector = spec.runner_selector();
@@ -125,10 +124,7 @@ impl RunnerRouter {
 
         let first = matching.next()?;
         if matching.next().is_some() {
-            // First-match-wins is silent by default; surface ambiguity so a
-            // misconfigured registration order (a general runner shadowing a
-            // specialized one) is diagnosable rather than invisible.
-            tracing::debug!(
+            debug!(
                 slot = %spec.slot(),
                 runner = first.runner.name(),
                 "multiple runners match this spec; using the first registered (registration order is significant)"
@@ -139,8 +135,7 @@ impl RunnerRouter {
 
     /// Build a [`TaskRef`] for the given spec using the selected runner.
     ///
-    /// `TaskKind::Embedded` is not routable and must be used with
-    /// `SupervisorApi::submit_with_task`.
+    /// `TaskKind::Embedded` is not routable and must be used with `SupervisorApi::submit_with_task`.
     #[instrument(level = "debug", skip(self, spec), fields(kind = ?spec.kind()))]
     pub fn build(&self, spec: &TaskSpec) -> Result<TaskRef, RunnerError> {
         trace!(spec = ?spec, "router received spec");

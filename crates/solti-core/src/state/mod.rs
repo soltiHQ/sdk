@@ -91,7 +91,12 @@ impl TaskState {
         self.inner.write().max_runs_per_task = max;
     }
 
-    /// Register a new task (called on TaskAdded event).
+    /// Register a task entry unconditionally.
+    ///
+    /// Production registration goes through [`reserve`](Self::reserve) at submit time;
+    /// this unconditional insert exists only for in-crate tests and the `test-util`
+    /// fixtures, so it is compiled only under those configurations.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn add_task(&self, id: TaskId, spec: TaskSpec) {
         let mut inner = self.inner.write();
 
