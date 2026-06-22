@@ -87,8 +87,10 @@ mod bytes_as_utf8_string {
     where
         S: Serializer,
     {
-        let txt = std::str::from_utf8(b).map_err(serde::ser::Error::custom)?;
-        s.serialize_str(txt)
+        match std::str::from_utf8(b) {
+            Ok(txt) => s.serialize_str(txt),
+            Err(_) => s.serialize_str(&String::from_utf8_lossy(b)),
+        }
     }
 
     pub(super) fn deserialize<'de, D>(d: D) -> Result<Bytes, D::Error>
@@ -276,5 +278,25 @@ mod tests {
         };
         let cloned = original.clone();
         assert_eq!(original.line.as_ptr(), cloned.line.as_ptr());
+    }
+
+    #[test]
+    fn output_chunk_with_non_utf8_line_serializes_lossily_instead_of_failing() {
+        let chunk = OutputChunk {
+            attempt: 1,
+            stream: StreamKind::Stdout,
+            seq: 0,
+            ts: UNIX_EPOCH,
+            line: Bytes::from_static(&[b'h', b'i', 0xFF, 0xFE]),
+        };
+
+        let json = serde_json::to_string(&chunk)
+            .expect("non-UTF8 line must serialize lossily, not error out");
+
+        assert!(json.contains("hi"), "valid prefix must survive: {json}");
+        assert!(
+            json.contains('\u{FFFD}'),
+            "invalid bytes must be replaced with U+FFFD, not dropped: {json}"
+        );
     }
 }

@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use prometheus::{Counter, CounterVec, Gauge, Histogram, HistogramVec, Registry};
-use solti_discover::{DiscoverMetricsBackend, OUTCOME_FAILURE, OUTCOME_SUCCESS};
+use solti_discover::{
+    DiscoverFailReason, DiscoverMetricsBackend, OUTCOME_FAILURE, OUTCOME_SUCCESS,
+};
 
 use crate::register::{Sub, ms_to_secs};
 
@@ -106,14 +108,16 @@ impl DiscoverMetricsBackend for PrometheusDiscoverMetrics {
         self.last_success_ts.set(ts);
     }
 
-    fn record_failure(&self, duration_ms: u64, reason: &'static str) {
+    fn record_failure(&self, duration_ms: u64, reason: DiscoverFailReason) {
         self.outcomes_total
             .with_label_values(&[OUTCOME_FAILURE])
             .inc();
         self.duration_seconds
             .with_label_values(&[OUTCOME_FAILURE])
             .observe(ms_to_secs(duration_ms));
-        self.failures_total.with_label_values(&[reason]).inc();
+        self.failures_total
+            .with_label_values(&[reason.as_label()])
+            .inc();
     }
 
     fn record_hold(&self, duration_s: u64) {

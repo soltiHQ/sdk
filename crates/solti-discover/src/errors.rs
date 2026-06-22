@@ -23,7 +23,7 @@ pub enum DiscoverError {
     #[error("grpc call failed: {0}")]
     GrpcStatus(#[source] Box<tonic::Status>),
 
-    /// HTTP-level request failure — connect/TLS/timeout (feature `http`).
+    /// HTTP-level request failure - connect/TLS/timeout (feature `http`).
     #[cfg(feature = "http")]
     #[error("http request failed: {0}")]
     HttpRequest(#[from] reqwest::Error),

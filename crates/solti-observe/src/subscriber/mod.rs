@@ -27,7 +27,7 @@
 
 use std::borrow::Borrow;
 
-use taskvisor::{Event, EventKind, Subscribe};
+use taskvisor::{BackoffSource, Event, EventKind, Subscribe};
 use tracing::{debug, error, info, trace, warn};
 
 /// Taskvisor event subscriber that logs every event via [`tracing`].
@@ -135,23 +135,23 @@ pub fn log_event<E: View>(e: E) {
             reason = e.as_reason(),
             "{msg}"
         ),
-
-        // Backoff: differentiate retry vs scheduled next run
         EventKind::BackoffScheduled => {
-            if e.has_reason() {
+            let source = e.backoff_source();
+            let msg = backoff_message(source);
+            if matches!(source, Some(BackoffSource::Failure)) {
                 debug!(
                     task = e.as_task(),
                     attempt = e.attempt(),
                     delay_ms = e.delay_ms(),
                     reason = e.as_reason(),
-                    "retry scheduled after failure",
+                    "{msg}",
                 );
             } else {
                 debug!(
                     task = e.as_task(),
                     attempt = e.attempt(),
                     delay_ms = e.delay_ms(),
-                    "next run scheduled after success",
+                    "{msg}",
                 );
             }
         }
@@ -196,6 +196,8 @@ pub trait View {
     fn kind(&self) -> EventKind;
     /// Whether the event carries a reason field.
     fn has_reason(&self) -> bool;
+    /// Canonical backoff source (success vs failure), if the event carries one.
+    fn backoff_source(&self) -> Option<BackoffSource>;
 }
 
 impl<T> View for T
@@ -235,6 +237,21 @@ where
     #[inline]
     fn has_reason(&self) -> bool {
         self.borrow().reason.is_some()
+    }
+
+    #[inline]
+    fn backoff_source(&self) -> Option<BackoffSource> {
+        self.borrow().backoff_source
+    }
+}
+
+/// Message for a `BackoffScheduled` event, chosen by the canonical [`BackoffSource`] instead of the fragile presence of a `reason` field.
+#[inline]
+fn backoff_message(source: Option<BackoffSource>) -> &'static str {
+    match source {
+        Some(BackoffSource::Failure) => "retry scheduled after failure",
+        Some(BackoffSource::Success) => "next run scheduled after success",
+        None => "next attempt scheduled",
     }
 }
 
@@ -300,6 +317,24 @@ mod tests {
         assert!(
             msg.contains("cancel"),
             "message should describe cancellation, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn backoff_message_uses_canonical_source_not_reason_presence() {
+        use taskvisor::BackoffSource;
+        assert_eq!(
+            backoff_message(Some(BackoffSource::Failure)),
+            "retry scheduled after failure",
+        );
+        assert_eq!(
+            backoff_message(Some(BackoffSource::Success)),
+            "next run scheduled after success",
+        );
+        assert_eq!(
+            backoff_message(None),
+            "next attempt scheduled",
+            "absent backoff source must not be misclassified as success or failure",
         );
     }
 }

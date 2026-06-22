@@ -16,6 +16,7 @@ include = [
     "src/**/*.rs",
     "Cargo.toml",
     "README.md",
+    "api_v1.md",
     "build.rs",
 ]
 

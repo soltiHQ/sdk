@@ -28,19 +28,18 @@ struct RunnerEntry {
 /// Router that selects an appropriate [`Runner`] for a given [`TaskSpec`].
 ///
 /// Runners are checked in the order they were registered.
-/// The first runner whose [`Runner::supports`] method returns `true` and satisfies
-/// the [`TaskSpec::runner_selector`] (if any) is used to build the task.
+/// The first runner whose [`Runner::supports`] method returns `true` and satisfies the [`TaskSpec::runner_selector`] (if any) is used to build the task.
 ///
 /// ## Notes
 ///
-/// - `TaskKind::Embedded` is not routable — use `SupervisorApi::submit_with_task` instead.
+/// - `TaskKind::Embedded` is not routable - use `SupervisorApi::submit_with_task` instead.
 /// - Default [`BuildContext`] uses empty env and [`NoOpMetrics`](crate::NoOpMetrics).
 ///
 /// ## Also
 ///
-/// - [`Runner`] — trait that concrete executors implement.
-/// - [`BuildContext`] — shared dependencies for all runners.
-/// - [`RunnerError::NoRunner`](crate::RunnerError::NoRunner) — returned when no runner matches.
+/// - [`Runner`] - trait that concrete executors implement.
+/// - [`BuildContext`] - shared dependencies for all runners.
+/// - [`RunnerError::NoRunner`](crate::RunnerError::NoRunner) - returned when no runner matches.
 ///
 /// ## Example
 ///

@@ -33,9 +33,8 @@ pub use errors::DiscoverError;
 
 mod metrics;
 pub use metrics::{
-    DiscoverMetricsBackend, DiscoverMetricsHandle, FAIL_AUTH, FAIL_CONNECT, FAIL_OTHER, FAIL_PARSE,
-    FAIL_REJECTED_CLIENT, FAIL_REJECTED_SERVER, FAIL_TIMEOUT, NoOpDiscoverMetrics, OUTCOME_FAILURE,
-    OUTCOME_SUCCESS, noop_discover_metrics,
+    DiscoverFailReason, DiscoverMetricsBackend, DiscoverMetricsHandle, NoOpDiscoverMetrics,
+    OUTCOME_FAILURE, OUTCOME_SUCCESS, noop_discover_metrics,
 };
 
 #[cfg(any(feature = "grpc", feature = "http"))]

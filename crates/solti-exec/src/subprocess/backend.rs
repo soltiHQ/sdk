@@ -5,6 +5,8 @@
 use tokio::process::Command;
 use tracing::trace;
 
+use solti_model::MAX_SCRIPT_BODY_BYTES;
+
 use crate::ExecError::InvalidRunnerConfig;
 use crate::subprocess::logger::LogConfig;
 use crate::utils::{CgroupLimits, RlimitConfig, SecurityConfig};
@@ -35,6 +37,9 @@ pub struct SubprocessBackendConfig {
     /// When `true`, confinement that cannot be applied is a hard error rather
     /// than a best-effort warning. See [`with_require_enforcement`](Self::with_require_enforcement).
     require_enforcement: bool,
+    /// Maximum decoded script-body size for `Script`-mode subprocesses.
+    /// `None` uses the model default [`MAX_SCRIPT_BODY_BYTES`].
+    max_script_body_bytes: Option<usize>,
 }
 
 impl SubprocessBackendConfig {
@@ -78,6 +83,20 @@ impl SubprocessBackendConfig {
     pub fn with_require_enforcement(mut self, require: bool) -> Self {
         self.require_enforcement = require;
         self
+    }
+
+    /// Override the maximum decoded script-body size (default [`MAX_SCRIPT_BODY_BYTES`]).
+    ///
+    /// Applies to `Script`-mode subprocesses: a body whose decoded size exceeds this is rejected at build time.
+    /// A value of `0` is rejected when the runner config is validated.
+    pub fn with_max_script_body_bytes(mut self, max: usize) -> Self {
+        self.max_script_body_bytes = Some(max);
+        self
+    }
+
+    /// Effective maximum decoded script-body size (falls back to [`MAX_SCRIPT_BODY_BYTES`]).
+    pub(crate) fn max_script_body_bytes(&self) -> usize {
+        self.max_script_body_bytes.unwrap_or(MAX_SCRIPT_BODY_BYTES)
     }
 
     /// Cgroup limits with `fail_on_error` forced on when enforcement is required.
@@ -150,6 +169,11 @@ impl SubprocessBackendConfig {
         if self.logger.max_line_bytes == 0 {
             return Err(InvalidRunnerConfig(
                 "log_config.max_line_bytes cannot be zero (all output would be swallowed)".into(),
+            ));
+        }
+        if self.max_script_body_bytes == Some(0) {
+            return Err(InvalidRunnerConfig(
+                "max_script_body_bytes cannot be zero (all scripts would be rejected)".into(),
             ));
         }
         if let Some(security) = &self.security {
@@ -358,5 +382,23 @@ mod tests {
     fn require_enforcement_with_empty_config_is_ok() {
         let cfg = SubprocessBackendConfig::new().with_require_enforcement(true);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn max_script_body_bytes_defaults_to_model_const_and_is_configurable() {
+        use solti_model::MAX_SCRIPT_BODY_BYTES;
+
+        let default_cfg = SubprocessBackendConfig::new();
+        assert_eq!(default_cfg.max_script_body_bytes(), MAX_SCRIPT_BODY_BYTES);
+
+        let custom = SubprocessBackendConfig::new().with_max_script_body_bytes(4096);
+        assert_eq!(custom.max_script_body_bytes(), 4096);
+    }
+
+    #[test]
+    fn max_script_body_bytes_zero_rejected() {
+        let cfg = SubprocessBackendConfig::new().with_max_script_body_bytes(0);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_script_body_bytes"), "got: {err}");
     }
 }

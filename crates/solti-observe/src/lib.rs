@@ -51,7 +51,7 @@
 //!
 //! | Flag            | Default | Dependencies                        | Effect                                        |
 //! |-----------------|---------|-------------------------------------|-----------------------------------------------|
-//! | `subscriber`    | off     | `taskvisor`, `async-trait`          | Enables `TracingEventSubscriber`            |
+//! | `subscriber`    | off     | `taskvisor`                         | Enables `TracingEventSubscriber`            |
 //! | `timezone-sync` | off     | `taskvisor`, `tokio-util`, `solti-model` | Enables `timezone_sync` periodic task  |
 //!
 //! ## Quick start

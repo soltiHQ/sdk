@@ -138,11 +138,16 @@ impl SubprocessRunner {
                 fail_on_non_zero,
                 ..
             }) => {
+                let max_body = self
+                    .config
+                    .as_ref()
+                    .map(|c| c.max_script_body_bytes())
+                    .unwrap_or(solti_model::MAX_SCRIPT_BODY_BYTES);
                 let Resolved {
                     command,
                     args,
                     script_tempfile,
-                } = Self::resolve_mode(mode)?;
+                } = Self::resolve_mode(mode, max_body)?;
                 let run_id = self.build_run_id(slot.as_str());
                 let cfg = SubprocessTaskConfig {
                     seq: run_id.seq(),
@@ -177,7 +182,10 @@ impl SubprocessRunner {
     ///
     /// - The inline form is limited to `MAX_ARG_STRLEN` (128 KiB on Linux);
     /// - The tempfile form supports scripts up to [`MAX_SCRIPT_BODY_BYTES`](solti_model::MAX_SCRIPT_BODY_BYTES) (2 MiB).
-    fn resolve_mode(mode: &solti_model::SubprocessMode) -> Result<Resolved, RunnerError> {
+    fn resolve_mode(
+        mode: &solti_model::SubprocessMode,
+        max_script_body_bytes: usize,
+    ) -> Result<Resolved, RunnerError> {
         match mode {
             solti_model::SubprocessMode::Command { command, args } => Ok(Resolved {
                 command: command.clone(),
@@ -186,7 +194,7 @@ impl SubprocessRunner {
             }),
             solti_model::SubprocessMode::Script { runtime, args, .. } => {
                 let script = mode
-                    .decode_body()
+                    .decode_body_with_limit(max_script_body_bytes)
                     .map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
 
                 let mut tmp = NamedTempFile::with_prefix("solti-script-").map_err(|e| {
@@ -843,7 +851,7 @@ mod tests {
             command: "ls".into(),
             args: vec!["-la".into()],
         };
-        let r = SubprocessRunner::resolve_mode(&mode).unwrap();
+        let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap();
         assert_eq!(r.command, "ls");
         assert_eq!(r.args, vec!["-la"]);
         assert!(
@@ -862,7 +870,7 @@ mod tests {
             body: BASE64.encode(b"echo hello"),
             args: vec!["extra".into()],
         };
-        let r = SubprocessRunner::resolve_mode(&mode).unwrap();
+        let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap();
         assert_eq!(r.command, "bash");
         assert_eq!(r.args.len(), 2, "args: {:?}", r.args);
         assert_eq!(r.args[1], "extra");
@@ -899,7 +907,7 @@ mod tests {
             body: BASE64.encode(b"puts 'hi'"),
             args: vec![],
         };
-        let r = SubprocessRunner::resolve_mode(&mode).unwrap();
+        let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap();
         assert_eq!(r.command, "ruby");
         assert_eq!(r.args.len(), 1, "only the tempfile path, no flag");
         assert!(!r.args[0].contains("-e"), "flag must not leak into args");
@@ -1059,7 +1067,8 @@ mod tests {
             body: "not-valid!!!".into(),
             args: vec![],
         };
-        let err = SubprocessRunner::resolve_mode(&mode).unwrap_err();
+        let err =
+            SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap_err();
         assert!(matches!(err, RunnerError::InvalidSpec(_)));
     }
 
@@ -1180,7 +1189,7 @@ mod tests {
             body: BASE64.encode(&payload),
             args: vec![],
         };
-        let r = SubprocessRunner::resolve_mode(&mode)
+        let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES)
             .expect("200 KiB script must resolve via tempfile");
         assert_eq!(r.command, "bash");
         assert_eq!(r.args.len(), 1);
@@ -1189,5 +1198,23 @@ mod tests {
             .expect("large Script must allocate a tempfile");
         let written = std::fs::read(tmp.path()).unwrap();
         assert_eq!(written.len(), payload.len());
+    }
+
+    #[test]
+    fn resolve_mode_rejects_body_over_configured_limit() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        let mode = solti_model::SubprocessMode::Script {
+            runtime: solti_model::Runtime::Bash,
+            body: BASE64.encode("a".repeat(100).as_bytes()),
+            args: vec![],
+        };
+        let err = SubprocessRunner::resolve_mode(&mode, 10)
+            .expect_err("body over the configured limit must be rejected");
+        assert!(
+            matches!(err, RunnerError::InvalidSpec(_)),
+            "expected InvalidSpec, got {err:?}"
+        );
     }
 }

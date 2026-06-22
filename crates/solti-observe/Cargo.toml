@@ -13,11 +13,10 @@ license.workspace = true
 
 [features]
 default       = []
-subscriber    = ["dep:taskvisor", "dep:async-trait"]
+subscriber    = ["dep:taskvisor"]
 timezone-sync = ["dep:taskvisor", "dep:tokio-util", "dep:solti-model"]
 
 [dependencies]
-async-trait        = { workspace = true, optional = true }
 parking_lot        = { workspace = true }
 serde              = { workspace = true, features = ["derive"] }
 taskvisor          = { workspace = true, optional = true, features = ["controller"] }

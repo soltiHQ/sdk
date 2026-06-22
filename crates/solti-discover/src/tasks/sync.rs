@@ -242,44 +242,46 @@ struct SyncContext {
 }
 
 /// Map a [`DiscoverError`] to a canonical failure-reason label.
-fn classify_failure(err: &DiscoverError) -> &'static str {
+fn classify_failure(err: &DiscoverError) -> metrics::DiscoverFailReason {
     match err {
-        DiscoverError::InvalidConfig(_) | DiscoverError::SpecBuild(_) => metrics::FAIL_OTHER,
-        DiscoverError::Rejected { .. } => metrics::FAIL_REJECTED_CLIENT,
-        DiscoverError::AuthFailed { .. } => metrics::FAIL_AUTH,
+        DiscoverError::InvalidConfig(_) | DiscoverError::SpecBuild(_) => {
+            metrics::DiscoverFailReason::Other
+        }
+        DiscoverError::Rejected { .. } => metrics::DiscoverFailReason::RejectedClient,
+        DiscoverError::AuthFailed { .. } => metrics::DiscoverFailReason::Auth,
         #[cfg(feature = "http")]
         DiscoverError::HttpRequest(e) => {
             if e.is_timeout() {
-                metrics::FAIL_TIMEOUT
+                metrics::DiscoverFailReason::Timeout
             } else if e.is_connect() {
-                metrics::FAIL_CONNECT
+                metrics::DiscoverFailReason::Connect
             } else if e.is_decode() || e.is_body() {
-                metrics::FAIL_PARSE
+                metrics::DiscoverFailReason::Parse
             } else {
-                metrics::FAIL_OTHER
+                metrics::DiscoverFailReason::Other
             }
         }
         #[cfg(feature = "http")]
         DiscoverError::HttpStatus { code, .. } => {
             if *code >= 500 {
-                metrics::FAIL_REJECTED_SERVER
+                metrics::DiscoverFailReason::RejectedServer
             } else {
-                metrics::FAIL_REJECTED_CLIENT
+                metrics::DiscoverFailReason::RejectedClient
             }
         }
         #[cfg(feature = "http")]
-        DiscoverError::InvalidResponse(_) => metrics::FAIL_PARSE,
+        DiscoverError::InvalidResponse(_) => metrics::DiscoverFailReason::Parse,
         #[cfg(feature = "grpc")]
-        DiscoverError::GrpcTransport(_) => metrics::FAIL_CONNECT,
+        DiscoverError::GrpcTransport(_) => metrics::DiscoverFailReason::Connect,
         #[cfg(feature = "grpc")]
         DiscoverError::GrpcStatus(s) => {
             use tonic::Code;
             match s.code() {
-                Code::DeadlineExceeded => metrics::FAIL_TIMEOUT,
+                Code::DeadlineExceeded => metrics::DiscoverFailReason::Timeout,
                 Code::Unavailable | Code::Internal | Code::DataLoss => {
-                    metrics::FAIL_REJECTED_SERVER
+                    metrics::DiscoverFailReason::RejectedServer
                 }
-                Code::Unauthenticated => metrics::FAIL_AUTH,
+                Code::Unauthenticated => metrics::DiscoverFailReason::Auth,
                 Code::PermissionDenied
                 | Code::InvalidArgument
                 | Code::FailedPrecondition
@@ -287,8 +289,8 @@ fn classify_failure(err: &DiscoverError) -> &'static str {
                 | Code::AlreadyExists
                 | Code::OutOfRange
                 | Code::Aborted
-                | Code::Cancelled => metrics::FAIL_REJECTED_CLIENT,
-                _ => metrics::FAIL_OTHER,
+                | Code::Cancelled => metrics::DiscoverFailReason::RejectedClient,
+                _ => metrics::DiscoverFailReason::Other,
             }
         }
     }

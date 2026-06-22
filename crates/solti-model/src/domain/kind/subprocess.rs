@@ -43,10 +43,19 @@ pub enum SubprocessMode {
 }
 
 impl SubprocessMode {
-    /// Decode base64 script body to a UTF-8 string.
+    /// Decode the base64 script body to a UTF-8 string, capped at the default [`MAX_SCRIPT_BODY_BYTES`].
     ///
-    /// Returns `Ok(body)` for `Script` variant, `Err` for `Command` or invalid body.
+    /// Returns `Ok(body)` for the `Script` variant; `Err` for `Command`, an invalid body, or a decoded body larger than the default cap.
+    /// To use a different cap, call [`decode_body_with_limit`](Self::decode_body_with_limit).
     pub fn decode_body(&self) -> ModelResult<String> {
+        self.decode_body_with_limit(MAX_SCRIPT_BODY_BYTES)
+    }
+
+    /// Decode the base64 script body to a UTF-8 string, rejecting anybody whose decoded size exceeds `max_bytes`.
+    ///
+    /// [`decode_body`](Self::decode_body) applies the default [`MAX_SCRIPT_BODY_BYTES`];
+    /// pass an explicit `max_bytes` to tighten or relax the cap where needed.
+    pub fn decode_body_with_limit(&self, max_bytes: usize) -> ModelResult<String> {
         match self {
             SubprocessMode::Command { .. } => Err(ModelError::Invalid(
                 "decode_body called on Command mode".into(),
@@ -58,6 +67,16 @@ impl SubprocessMode {
                 let bytes = BASE64
                     .decode(body)
                     .map_err(|e| ModelError::Invalid(format!("invalid base64 body: {e}").into()))?;
+                if bytes.len() > max_bytes {
+                    return Err(ModelError::Invalid(
+                        format!(
+                            "script body is {} bytes (decoded), maximum allowed is {} bytes",
+                            bytes.len(),
+                            max_bytes
+                        )
+                        .into(),
+                    ));
+                }
                 String::from_utf8(bytes).map_err(|e| {
                     ModelError::Invalid(format!("script body is not valid UTF-8: {e}").into())
                 })
@@ -254,6 +273,50 @@ mod tests {
             args: vec![],
         };
         assert_eq!(mode.decode_body().unwrap(), "echo hello");
+    }
+
+    #[test]
+    fn decode_body_with_limit_rejects_over_limit() {
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Bash,
+            body: encode("aaaaaaaaaa"),
+            args: vec![],
+        };
+        let err = mode
+            .decode_body_with_limit(5)
+            .expect_err("decoded body over the configured limit must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains('5') || msg.contains("maximum"),
+            "error should mention the limit, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn decode_body_with_limit_accepts_within_limit() {
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Bash,
+            body: encode("echo hi"),
+            args: vec![],
+        };
+        assert_eq!(mode.decode_body_with_limit(64).unwrap(), "echo hi");
+    }
+
+    #[test]
+    fn decode_body_enforces_the_default_cap() {
+        let payload = "a".repeat(MAX_SCRIPT_BODY_BYTES + 1);
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Bash,
+            body: BASE64.encode(payload.as_bytes()),
+            args: vec![],
+        };
+        let err = mode
+            .decode_body()
+            .expect_err("decode_body must enforce MAX_SCRIPT_BODY_BYTES by default");
+        assert!(
+            err.to_string().contains(&MAX_SCRIPT_BODY_BYTES.to_string()),
+            "error should mention the default limit"
+        );
     }
 
     #[test]
