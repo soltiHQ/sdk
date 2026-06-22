@@ -403,6 +403,8 @@ impl Drop for ProcessGroupGuard {
 async fn kill_process_group(child: &mut tokio::process::Child, run_id: &str) {
     #[cfg(unix)]
     {
+        // `child.id()` is `None` only once the child has already been reaped —
+        // nothing to kill in that case.
         if let Some(pid) = child.id() {
             // SAFETY:
             // `libc::kill` has no memory preconditions.
@@ -421,7 +423,6 @@ async fn kill_process_group(child: &mut tokio::process::Child, run_id: &str) {
                     let _ = child.kill().await;
                 }
             }
-        } else {
         }
     }
     #[cfg(not(unix))]
