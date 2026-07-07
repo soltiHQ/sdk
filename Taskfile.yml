@@ -8,6 +8,10 @@ includes:
   helpers:
     taskfile: https://raw.githubusercontent.com/soltiHQ/actions/main/taskfiles/helpers/Taskfile.yml
 
+vars:
+  publish_crates:
+    sh: grep -vE '^\s*(#|$)' .github/crates.txt
+
 tasks:
   proto/vendor:
     desc: Re-vendor .proto from soltiHQ/proto.
@@ -85,24 +89,15 @@ tasks:
           CRATE: '{{.CRATE}}'
 
   ci/publish-dry-run:
-    desc: Simulate 'cargo publish'. Pass CRATE to check one crate; defaults to .github/crates.txt.
+    desc: Simulate 'cargo publish' for publishable workspace crates.
     deps: [proto/vendor]
     cmds:
-      - |
-        set -euo pipefail
-
-        crate='{{.CRATE | default ""}}'
-        if [ -n "$crate" ]; then
-          task rust:publish-dry-run CRATE="$crate" PUBLISH_ARGS="--all-features --allow-dirty"
-          exit 0
-        fi
-
-        while IFS= read -r crate; do
-          case "$crate" in
-            ''|\#*) continue ;;
-          esac
-          task rust:publish-dry-run CRATE="$crate" PUBLISH_ARGS="--all-features --allow-dirty"
-        done < .github/crates.txt
+      - for:
+          var: publish_crates
+        task: rust:publish-dry-run
+        vars:
+          CRATE: '{{.ITEM}}'
+          PUBLISH_ARGS: "--all-features --allow-dirty"
 
   ci/docs:
     desc: Run 'rustdoc' for the SDK workspace. Fails on broken doc links in any feature config.
