@@ -7,12 +7,12 @@
 //! 1. **Logger initialization** - [`init_logger`] installs a global tracing
 //!    subscriber configured via [`LoggerConfig`] (format, level filter,
 //!    timezone, color).
-//! 2. **Event logging** - `TracingEventSubscriber` (feature `subscriber`)
-//!    maps every `taskvisor` supervision event to a structured tracing call
-//!    at the appropriate severity level.
+//! 2. **Event logging** - `TracingBridge` (feature `subscriber`, re-exported
+//!    from `taskvisor`) forwards every supervision event to tracing with
+//!    structured fields and stable `event` labels.
 //! 3. **Timezone sync** - `timezone_sync` (feature `timezone-sync`) is a
-//!    periodic task that re-detects the local UTC offset so log timestamps
-//!    stay correct across DST transitions.
+//!    periodic task that re-detects the local UTC offset. This keeps log
+//!    timestamps correct across DST transitions.
 //!
 //! ## Architecture
 //!
@@ -26,8 +26,8 @@
 //!          │   ├─ Json  → fmt::Layer::json()
 //!          │   └─ Journald → tracing_journald::layer() (Linux only)
 //!          │
-//!          ├─ TracingEventSubscriber   // feature: subscriber
-//!          │   └─ on_event() → trace!/debug!/info!/warn!/error!
+//!          ├─ TracingBridge            // feature: subscriber
+//!          │   └─ on_event() → tracing events, target "taskvisor"
 //!          │
 //!          └─ timezone_sync()          // feature: timezone-sync
 //!              └─ periodic re-detection of local UTC offset
@@ -44,15 +44,15 @@
 //! | [`LoggerLevel`]                          | -               | Validated `EnvFilter` expression wrapper                 |
 //! | [`LoggerTimeZone`]                       | -               | Timestamp timezone: `Utc` / `Local`                      |
 //! | [`LoggerError`]                          | -               | Error type for logger initialization                     |
-//! | `TracingEventSubscriber`               | `subscriber`    | Logs `taskvisor` events via tracing                    |
+//! | `TracingBridge`                        | `subscriber`    | Logs `taskvisor` events via tracing                    |
 //! | `timezone_sync`                        | `timezone-sync` | Periodic task that re-detects the local UTC offset       |
 //!
 //! ## Feature flags
 //!
 //! | Flag            | Default | Dependencies                        | Effect                                        |
 //! |-----------------|---------|-------------------------------------|-----------------------------------------------|
-//! | `subscriber`    | off     | `taskvisor`                         | Enables `TracingEventSubscriber`            |
-//! | `timezone-sync` | off     | `taskvisor`, `tokio-util`, `solti-model` | Enables `timezone_sync` periodic task  |
+//! | `subscriber`    | off     | `taskvisor` (+ its `tracing` feature) | Enables the `TracingBridge` re-export       |
+//! | `timezone-sync` | off     | `taskvisor`, `solti-model`          | Enables `timezone_sync` periodic task         |
 //!
 //! ## Quick start
 //!
@@ -82,7 +82,7 @@
 //! On most Unix platforms, detecting the local UTC offset requires reading `/etc/localtime`,
 //! which is unsafe in multi-threaded processes.
 //!
-//! To workaround this:
+//! To work around this:
 //! 1. Call [`init_local_offset`] in `main()` **before** `tokio::runtime::Runtime::new()`.
 //! 2. Optionally submit the `timezone_sync` task to periodically re-detect
 //!    the offset (handles DST transitions in long-running daemons).
@@ -92,11 +92,12 @@
 //! ## Also
 //!
 //! - [`tracing`] the underlying structured logging framework.
-//! - `taskvisor::Subscribe` trait that `TracingEventSubscriber` implements.
+//! - `taskvisor::Subscribe` the subscriber contract `TracingBridge` implements.
 //! - `solti-prometheus` is a complementary metrics subscriber for the same event stream.
 //! - See `examples/http-server` for a complete integration example.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 /// Compiles the runnable Rust code blocks in `README.md` as doctests.
 #[cfg(doctest)]
@@ -114,7 +115,9 @@ pub use logger::{
 #[cfg(feature = "timezone-sync")]
 pub use logger::timezone_sync;
 
+// Taskvisor's own tracing bridge, re-exported as the event-logging subscriber.
+// It emits structured fields (stable `event` label, `seq`, `id`, `attempt`,
+// `reason`, timings) under target "taskvisor" and raises permanent retry
+// give-ups to WARN.
 #[cfg(feature = "subscriber")]
-mod subscriber;
-#[cfg(feature = "subscriber")]
-pub use subscriber::{TracingEventSubscriber, View, log_event};
+pub use taskvisor::TracingBridge;

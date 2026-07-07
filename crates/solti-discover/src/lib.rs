@@ -9,10 +9,29 @@
 //!
 //! ## Quick start
 //!
-//! ```text
-//! let cfg = DiscoverConfig::builder(/* ... */).build()?;
+//! ```rust,no_run
+//! # #[cfg(feature = "http")]
+//! # fn wire() -> Result<(), Box<dyn std::error::Error>> {
+//! use solti_discover::{DiscoverConfig, DiscoveryTransport};
+//! use solti_model::AgentId;
+//!
+//! let cfg = DiscoverConfig::builder(
+//!     AgentId::from("agent-1"),
+//!     "agent-1",               // display name
+//!     "http://127.0.0.1:8085", // this agent's endpoint
+//!     "http://127.0.0.1:9000", // control-plane endpoint
+//!     DiscoveryTransport::Http,
+//!     30_000, // sync interval (ms)
+//!     1,      // api_version
+//! )
+//! .build()?;
+//!
 //! let (task, spec) = solti_discover::sync(cfg)?;
-//! supervisor.submit_with_task(task, &spec).await?;
+//! // Submit to a running taskvisor supervisor:
+//! // supervisor.submit_with_task(task, &spec).await?;
+//! # let _ = (task, spec);
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Also
@@ -22,9 +41,13 @@
 //! - [`DiscoverError`]: config, transport, parse, and rejection failures.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 /// Compiles the runnable Rust code blocks in `README.md` as doctests.
-#[cfg(doctest)]
+///
+/// Gated on `http` + `tls`: the README examples use the full API surface
+/// (docs.rs and CI build with `--all-features`).
+#[cfg(all(doctest, feature = "http", feature = "tls"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 

@@ -4,6 +4,43 @@ Orchestration layer for the solti task system.
 Bridges `solti-model` (public API types) with the `taskvisor` runtime.
 Provides `SupervisorApi` - the main entry point for submitting, querying, and cancelling tasks.
 
+## Quick start
+```rust,no_run
+use solti_core::{CoreError, StateConfig, SupervisorApi};
+use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec};
+use solti_runner::RunnerRouter;
+use taskvisor::{ControllerConfig, SupervisorConfig};
+
+async fn demo() -> Result<(), CoreError> {
+    let api = SupervisorApi::new(
+        SupervisorConfig::default(),
+        ControllerConfig::default(),
+        Vec::new(),          // extra event subscribers
+        RunnerRouter::new(), // register runners for Subprocess/Wasm/Container here
+        StateConfig::default(),
+    )
+    .await?;
+
+    let kind = TaskKind::Subprocess(SubprocessSpec::new(
+        SubprocessMode::Command {
+            command: "echo".into(),
+            args: vec!["hello".into()],
+        },
+        TaskEnv::default(),
+        None,
+        Flag::enabled(),
+    ));
+    let spec = TaskSpec::builder("demo-slot", kind, 5_000_u64).build()?;
+
+    let task_id = api.submit(&spec).await?;
+    let _task = api.get_task(&task_id);
+    let _runs = api.list_task_runs(&task_id);
+
+    api.shutdown().await?;
+    Ok(())
+}
+```
+
 ## Architecture
 ```text
  SupervisorApi
@@ -102,7 +139,7 @@ Sweep is always-on. Configure TTLs via `StateConfig` if defaults don't fit.
  BackoffPolicy { first_ms } →  BackoffPolicy { first: Duration }
 ```
 
-The model enums are `#[non_exhaustive]`, so the mappers carry a wildcard arm: 
+The model enums are `#[non_exhaustive]`. The mappers therefore carry a wildcard arm: 
 an unknown variant produces a `CoreError::Mapping` (surfaced as `500` by solti-api), never a silent fallback to a default policy.
 
 ## Error model

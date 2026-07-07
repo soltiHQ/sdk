@@ -1,9 +1,11 @@
 //! # tls-roundtrip
 //!
-//! Self-contained mTLS demo of `solti-tls` in action.
+//! Self-contained mTLS demo of `solti-tls` in action. It generates an
+//! in-memory PKI (CA + server cert with `SAN=127.0.0.1` + client cert) via
+//! `rcgen`, then runs both transports side by side. Both servers require a
+//! client certificate signed by the same CA.
 //!
-//! Generates an in-memory PKI (CA + server cert with `SAN=127.0.0.1` + client
-//! cert) via `rcgen`, then runs both transports side by side:
+//! ## What this shows
 //!
 //! - **HTTPS**: `axum` router behind `axum-server` with the `rustls::ServerConfig`
 //!   produced by [`solti_tls::ServerTlsConfig::into_rustls_config`].
@@ -11,10 +13,10 @@
 //!   [`tonic::transport::ServerTlsConfig`] returned by
 //!   [`solti_api::to_tonic_server_tls`], serving the standard
 //!   `grpc.health.v1.Health` service from `tonic-health`.
+//! - A `reqwest` client and a `tonic` client connect with their cert presented,
+//!   exchange one round trip each, and the program exits when both succeed.
 //!
-//! Both servers require a client certificate signed by the same CA. A
-//! `reqwest` client and a `tonic` client connect with their cert presented,
-//! exchange one round trip each, and the program exits when both succeed.
+//! ## Run
 //!
 //! ```bash
 //! cargo run -p tls-roundtrip
@@ -32,6 +34,14 @@
 //! No supervisor, no discovery, no metrics — just `solti-tls` end-to-end.
 //! For the production cert-delivery patterns (certbot, cert-manager,
 //! rustls-acme) see `crates/solti-tls/README.md`.
+//!
+//! ## Next
+//!
+//! | Example                          | What it adds                                        |
+//! |----------------------------------|-----------------------------------------------------|
+//! | [`agentd-http`](../../agentd-http) | Full agent over HTTP/JSON with optional TLS + auth |
+//! | [`agentd-grpc`](../../agentd-grpc) | Full agent over gRPC with optional TLS + auth      |
+//! | [`podium`](../../podium)         | Config-driven agent: runtime transport switch, TOML |
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -191,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
     anyhow::ensure!(body == "hello, mTLS!", "unexpected HTTPS body: {body:?}");
 
     // ---- Client: gRPC round trip (tonic Channel with mTLS) ----
-    // tonic does not accept a pre-built rustls::ClientConfig, so we hand it
+    // tonic does not accept a pre-built rustls::ClientConfig; we hand it
     // PEM bytes directly through tonic::transport::ClientTlsConfig — same
     // pattern as solti_discover's internal converter.
     let tonic_client_tls = TonicClientTls::new()

@@ -10,12 +10,22 @@
 //!
 //! ## Quick start
 //!
-//! Build one [`ApiHandler`] and share it across both transports (the handler is `Arc`-wrapped once, then cloned into each server):
+//! Build one [`ApiHandler`] and share it across both transports.
+//! The handler is `Arc`-wrapped once, then cloned into each server:
 //!
-//! ```text
+#![cfg_attr(all(feature = "grpc", feature = "http"), doc = "```rust,no_run")]
+#![cfg_attr(
+    not(all(feature = "grpc", feature = "http")),
+    doc = "```rust,no_run,ignore"
+)]
+//! # use std::sync::Arc;
+//! # use solti_api::{HttpApi, SupervisorApiAdapter, TaskApiService, TaskServiceServer};
+//! # fn wire(supervisor: Arc<solti_core::SupervisorApi>) {
 //! let handler = Arc::new(SupervisorApiAdapter::new(supervisor));
 //! let grpc    = TaskServiceServer::new(TaskApiService::new(handler.clone()));
 //! let http    = HttpApi::new(handler).router();
+//! # let _ = (grpc, http);
+//! # }
 //! ```
 //!
 //! ## Also
@@ -25,9 +35,12 @@
 //! - [`SupervisorApiAdapter`] default adapter bridging to `SupervisorApi`.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 /// Compiles the runnable Rust code blocks in `README.md` as doctests.
-#[cfg(doctest)]
+///
+/// Gated on every feature: the README examples cover both transports and TLS.
+#[cfg(all(doctest, feature = "grpc", feature = "http", feature = "tls"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
@@ -71,8 +84,12 @@ pub use metrics::{
     ApiMetricsBackend, ApiMetricsHandle, NoOpApiMetrics, Transport, noop_api_metrics,
 };
 
+// Generated prost/pbjson output carries no doc comments; suppress the doc
+// lints on this module only. Never suppress them crate-wide.
 #[cfg(any(feature = "grpc", feature = "http"))]
 #[cfg_attr(not(feature = "grpc"), allow(dead_code))]
+#[allow(missing_docs)]
+#[allow(rustdoc::all)]
 pub(crate) mod proto_api {
     include!(concat!(
         env!("OUT_DIR"),

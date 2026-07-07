@@ -269,14 +269,14 @@ async fn delete_task_success_returns_204_no_content() {
 }
 
 #[tokio::test]
-async fn list_tasks_invalid_status_returns_400() {
+async fn list_tasks_invalid_phase_returns_400() {
     let app = router_with(Arc::new(MockHandler::default()));
 
     let resp = app
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/api/v1/tasks?status=totally_bogus")
+                .uri("/api/v1/tasks?phase=totally_bogus")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -286,7 +286,7 @@ async fn list_tasks_invalid_status_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_json(resp).await;
     assert_eq!(body["error"], "InvalidRequest");
-    assert!(body["message"].as_str().unwrap().contains("invalid status"));
+    assert!(body["message"].as_str().unwrap().contains("invalid phase"));
 }
 
 #[tokio::test]

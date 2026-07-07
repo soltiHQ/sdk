@@ -4,15 +4,15 @@
 
 use std::sync::Arc;
 
-/// Canonical `outcome` label values (success / failure categorization).
+/// Canonical `outcome` label value for a successful sync attempt.
 pub const OUTCOME_SUCCESS: &str = "success";
-/// See [`OUTCOME_SUCCESS`].
+/// Canonical `outcome` label value for a failed sync attempt.
 pub const OUTCOME_FAILURE: &str = "failure";
 
 /// Canonical `reason` label for heartbeat failures.
 ///
-/// A bounded, typed set (mirroring the `as_label()` enums in the other crates) so the
-/// failure-metric label cardinality stays fixed regardless of the underlying error text.
+/// A bounded, typed set that mirrors the `as_label()` enums in the other crates.
+/// The failure-metric label cardinality stays fixed regardless of the underlying error text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DiscoverFailReason {
@@ -49,7 +49,7 @@ impl DiscoverFailReason {
 
 /// Metrics backend for the discovery heartbeat task.
 ///
-/// All methods have empty default bodies so integrators can override only the hooks they care about.
+/// All methods have empty default bodies. Integrators override only the hooks they care about.
 pub trait DiscoverMetricsBackend: Send + Sync + std::fmt::Debug {
     /// Called once per sync attempt before the network call starts.
     fn record_attempt(&self) {}

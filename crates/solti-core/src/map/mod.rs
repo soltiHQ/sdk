@@ -1,7 +1,13 @@
-//! # Policy mapping.
+//! # Model ↔ taskvisor mapping.
 //!
 //! Adapter layer between `solti-model` (public specs) and the taskvisor runtime.
-//! Maps high-level API types into taskvisor's internal execution structures.
+//!
+//! Two directions, one module tree:
+//! - this file maps model policies **into** taskvisor structures (submit path);
+//! - [`phase`] maps taskvisor outcomes and reasons **back** into model phases
+//!   (state-reconstruction path, shared by both planes).
+
+pub(crate) mod phase;
 
 use std::time::Duration;
 
@@ -28,7 +34,7 @@ pub(crate) fn to_admission_policy(s: ModelAdmissionPolicy) -> Result<AdmissionPo
 /// Convert a high-level jitter policy into the jitter policy used by taskvisor.
 pub(crate) fn to_jitter_policy(s: ModelJitterPolicy) -> Result<JitterPolicy, CoreError> {
     match s {
-        ModelJitterPolicy::Decorrelated => Ok(JitterPolicy::Decorrelated),
+        ModelJitterPolicy::Decorrelated => Ok(JitterPolicy::RandomizedBand),
         ModelJitterPolicy::Equal => Ok(JitterPolicy::Equal),
         ModelJitterPolicy::Full => Ok(JitterPolicy::Full),
         ModelJitterPolicy::None => Ok(JitterPolicy::None),
@@ -54,12 +60,13 @@ pub(crate) fn to_restart_policy(s: ModelRestartPolicy) -> Result<RestartPolicy, 
 
 /// Convert a high-level backoff policy into a backoff policy used by taskvisor.
 pub(crate) fn to_backoff_policy(s: &ModelBackoffPolicy) -> Result<BackoffPolicy, CoreError> {
-    Ok(BackoffPolicy {
-        first: Duration::from_millis(s.first_ms),
-        max: Duration::from_millis(s.max_ms),
-        jitter: to_jitter_policy(s.jitter)?,
-        factor: s.factor,
-    })
+    BackoffPolicy::new(
+        Duration::from_millis(s.first_ms),
+        Duration::from_millis(s.max_ms),
+        s.factor,
+        to_jitter_policy(s.jitter)?,
+    )
+    .map_err(|e| CoreError::Mapping(format!("invalid backoff policy: {e}")))
 }
 
 #[cfg(test)]
@@ -86,7 +93,7 @@ mod tests {
     fn jitter_policy_maps_every_variant() {
         assert_eq!(
             to_jitter_policy(ModelJitterPolicy::Decorrelated).unwrap(),
-            JitterPolicy::Decorrelated
+            JitterPolicy::RandomizedBand
         );
         assert_eq!(
             to_jitter_policy(ModelJitterPolicy::Equal).unwrap(),
@@ -104,7 +111,7 @@ mod tests {
 
     #[test]
     fn restart_policy_maps_every_variant() {
-        // taskvisor::RestartPolicy is not PartialEq, so match structurally.
+        // taskvisor::RestartPolicy is not PartialEq; match structurally.
         assert!(matches!(
             to_restart_policy(ModelRestartPolicy::Never).unwrap(),
             RestartPolicy::Never
@@ -135,9 +142,9 @@ mod tests {
             factor: 2.0,
         };
         let tv = to_backoff_policy(&model).unwrap();
-        assert_eq!(tv.first, Duration::from_millis(100));
-        assert_eq!(tv.max, Duration::from_millis(5_000));
-        assert_eq!(tv.jitter, JitterPolicy::Equal);
-        assert_eq!(tv.factor, 2.0);
+        assert_eq!(tv.first(), Duration::from_millis(100));
+        assert_eq!(tv.max(), Duration::from_millis(5_000));
+        assert_eq!(tv.jitter(), JitterPolicy::Equal);
+        assert_eq!(tv.factor(), 2.0);
     }
 }

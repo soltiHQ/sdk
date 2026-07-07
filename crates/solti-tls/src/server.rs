@@ -16,7 +16,8 @@ use crate::{PemSource, TlsError};
 /// ## Security
 ///
 /// `key` (and `cert`/`client_ca`) are held as [`PemSource`]; the `Bytes` variant keeps the raw private key.
-/// The derived `Debug` redacts those bytes (see [`PemSource`]), so logging this struct will not leak the key, but the key is **not** zeroed while the config is alive.
+/// The derived `Debug` redacts those bytes (see [`PemSource`]) and logging this struct will not leak the key.
+/// The key is **not** zeroed while the config is alive.
 ///
 /// ## Also
 ///
@@ -58,10 +59,11 @@ impl ServerTlsConfig {
     ///
     /// ## Errors
     ///
-    /// - [`TlsError::Io`]: PEM read
-    /// - [`TlsError::NoCertificates`] / [`TlsError::NoPrivateKey`]: parse
-    /// - [`TlsError::ClientVerifier`]: mTLS trust-anchor build
-    /// - [`TlsError::Rustls`]: e.g. cert/key mismatch
+    /// - [`TlsError::Io`]: reading a [`PemSource::Path`] from disk failed, or a PEM block is structurally malformed.
+    /// - [`TlsError::NoCertificates`]: the `cert` (or `client_ca`) PEM held no `CERTIFICATE` blocks.
+    /// - [`TlsError::NoPrivateKey`]: the `key` PEM held no private key.
+    /// - [`TlsError::ClientVerifier`]: building the mTLS client verifier failed (e.g. no usable trust anchors in `client_ca`).
+    /// - [`TlsError::Rustls`]: `rustls` rejected the config - most commonly a cert/key mismatch, or a CA cert that `RootCertStore::add` refused.
     pub fn into_rustls_config(self) -> Result<rustls::ServerConfig, TlsError> {
         crate::ensure_default_provider();
 
@@ -166,8 +168,12 @@ impl ServerTlsConfigBuilder {
 
     /// Finalize the configuration.
     ///
-    /// Validates that `cert` and `key` are present (else [`TlsError::MissingField`]).
+    /// Validates that `cert` and `key` are present.
     /// Does no I/O - the PEM sources are read later by [`ServerTlsConfig::into_rustls_config`].
+    ///
+    /// ## Errors
+    ///
+    /// - [`TlsError::MissingField`]: `cert` or `key` was never set (carries `"cert"` / `"key"`).
     ///
     /// ## Example
     ///

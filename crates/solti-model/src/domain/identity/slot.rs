@@ -41,6 +41,11 @@ impl Slot {
     /// Validate that the slot name is safe to use across the SDK.
     ///
     /// See `validate_identity` (module-private) for the exact rules.
+    ///
+    /// ## Errors
+    ///
+    /// - [`ModelError::Invalid`]: the name is empty, longer than [`SLOT_MAX_LEN`],
+    ///   equal to `"."` or `".."`, or contains a byte outside `[A-Za-z0-9._-]`.
     pub fn validate_format(&self) -> Result<(), ModelError> {
         validate_identity("slot", self.as_str(), SLOT_MAX_LEN)
     }

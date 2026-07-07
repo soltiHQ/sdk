@@ -1,13 +1,12 @@
 //! # Timezone-sync supervised task ([`timezone_sync`](crate::timezone_sync)).
 //!
 //! Returns a `(TaskRef, TaskSpec)` for a periodic task that re-detects the local UTC offset.
-//! Runs under`Replace` admission in the `tz-sync` slot: ~1h period on success, backoff on failure.
+//! Runs under `Replace` admission in the `solti-logger-tz-sync` slot: ~1h period on success, backoff on failure.
 
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
 };
-use taskvisor::{TaskError, TaskFn, TaskRef};
-use tokio_util::sync::CancellationToken;
+use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tracing::debug;
 
 use crate::logger::object::timezone::sync_local_offset;
@@ -52,7 +51,7 @@ const BACKOFF_FACTOR: f64 = 2.0;
 /// supervisor.submit_with_task(task, &spec).await?;
 /// ```
 pub fn timezone_sync() -> (TaskRef, TaskSpec) {
-    let task: TaskRef = TaskFn::arc(TZ_SYNC_SLOT, |ctx: CancellationToken| async move {
+    let task: TaskRef = TaskFn::arc(TZ_SYNC_SLOT, |ctx: TaskContext| async move {
         debug!("timezone sync started");
 
         if ctx.is_cancelled() {
@@ -63,10 +62,9 @@ pub fn timezone_sync() -> (TaskRef, TaskSpec) {
                 debug!("timezone offset sync success");
                 Ok(())
             }
-            Err(e) => Err(TaskError::Fail {
-                reason: format!("failed to sync timezone offset: {e}"),
-                exit_code: None,
-            }),
+            Err(e) => Err(TaskError::fail(format!(
+                "failed to sync timezone offset: {e}"
+            ))),
         }
     });
 

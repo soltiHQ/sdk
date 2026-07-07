@@ -1,12 +1,12 @@
 [package]
 name = "solti-exec"
-description = "Solti SDK jobs execution crate."
+description = "Task execution backends for the Solti SDK. Runs task specs as OS subprocesses."
 
 rust-version.workspace = true
 repository.workspace = true
-categories.workspace = true
+categories = ["os", "asynchronous"]
 homepage.workspace = true
-keywords.workspace = true
+keywords = ["subprocess", "exec", "runner", "tasks", "process"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,6 +14,8 @@ license.workspace = true
 [features]
 default    = []
 subprocess = ["dep:base64", "dep:libc", "dep:tempfile", "tokio/process", "tokio/time", "tokio/macros"]
+# seccomp-bpf syscall filtering (Linux only; no-op elsewhere). Requires `subprocess`.
+seccomp    = ["subprocess", "dep:seccompiler"]
 
 [dependencies]
 base64     = { workspace = true, optional = true }
@@ -23,14 +25,19 @@ tempfile   = { workspace = true, optional = true }
 thiserror  = { workspace = true }
 tracing    = { workspace = true }
 tokio      = { workspace = true, features = ["io-util"] }
-tokio-util = { workspace = true }
 taskvisor  = { workspace = true }
 
 solti-model  = { workspace = true }
 solti-runner = { workspace = true }
 
+# seccompiler is Linux-only; keep it off the dependency tree on other platforms.
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = { workspace = true, optional = true }
+
 [dev-dependencies]
+taskvisor = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

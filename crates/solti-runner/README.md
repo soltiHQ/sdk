@@ -2,6 +2,40 @@
 Runner plugin interface, routing, and execution metrics for the solti task system.
 Sits between the domain model (`solti-model`) and the orchestration layer (`solti-core`), providing a stable plugin boundary.
 
+## Quick start
+Implement `Runner`, register it in a `RunnerRouter`, and let the router build tasks:
+
+```rust,no_run
+use std::sync::Arc;
+
+use solti_model::{TaskKind, TaskSpec};
+use solti_runner::{BuildContext, Runner, RunnerError, RunnerRouter};
+use taskvisor::TaskRef;
+
+struct MyRunner;
+
+impl Runner for MyRunner {
+    fn name(&self) -> &'static str {
+        "my-runner"
+    }
+
+    fn supports(&self, spec: &TaskSpec) -> bool {
+        matches!(spec.kind(), TaskKind::Subprocess(_))
+    }
+
+    fn build_task(&self, _spec: &TaskSpec, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
+        // build and return a TaskRef
+        todo!()
+    }
+}
+
+fn route(spec: &TaskSpec) -> Result<TaskRef, RunnerError> {
+    let mut router = RunnerRouter::new();
+    router.register(Arc::new(MyRunner));
+    router.build(spec) // picks the first runner that supports `spec`
+}
+```
+
 ## Architecture
 ```text
   TaskSpec ──► RunnerRouter ──► Runner::build_task() ──► TaskRef
@@ -47,7 +81,7 @@ Runners that produce per-line output (e.g. subprocess) ask the registry for an `
 | `Runner`          | Trait: `name()`, `supports()`, `build_task()`, `build_run_id()`                                      |
 | `RunnerRouter`    | Selects runner by supports() + label matching                                                        |
 | `BuildContext`    | Shared dependencies: `RunnerEnv` + `MetricsHandle` + `Arc<OutputRegistry>`                           |
-| `OutputSink`      | Per-attempt writer (`stdout_line` / `stderr_line`); thin new type over `broadcast::Sender`           |
+| `OutputSink`      | Per-attempt writer (`stdout_line` / `stderr_line`); thin wrapper over `broadcast::Sender`            |
 | `OutputRegistry`  | One broadcast channel per `TaskId`, reused across attempts; `ensure_channel` / `subscribe` / `evict` |
 | `RunId`           | Human-readable id: `{runner}-{slot}-{seq}`                                                           |
 | `RunnerError`     | Error enum: `NoRunner`, `UnsupportedKind`, `InvalidSpec`, `Internal`, `MissingField`, `Io`           |

@@ -123,7 +123,8 @@ Its labels (set as Prometheus *constant* labels) carry build-time identity.
   TaskFailed          → tasks_in_flight.dec()
   TimeoutHit          → task_timeouts.inc()
   BackoffScheduled    → task_backoff_count{source}.inc() + task_backoff_duration.observe(delay)
-  ActorExhausted      → task_terminal{reason="exhausted"}.inc() + attempts_to_finalize{outcome="exhausted"}.observe(attempt)
+  ActorExhausted      → task_terminal{reason}.inc() + attempts_to_finalize{outcome}.observe(attempt)
+                        (reason/outcome = "completed" if policy_exhausted_success, else "exhausted")
   ActorDead           → task_terminal{reason="fatal"}.inc()     + attempts_to_finalize{outcome="fatal"}.observe(attempt)
   SubscriberOverflow  → subscriber_overflow.inc()
   SubscriberPanicked  → subscriber_panicked.inc()
@@ -157,9 +158,44 @@ All label sets have low, bounded cardinality.
 | `server`   | off     | `server` — a supervised embedded HTTP task serving `/metrics`                                        |
 | `state`    | off     | `PrometheusStateCollector` — pull-based `solti_sv_tasks_by_phase` snapshot (depends on `solti-core`) |
 
+## Quick wire
+
+```rust,no_run
+use std::sync::Arc;
+
+use solti_prometheus::{
+    PrometheusMetrics, PrometheusSubscriber, Registry, register_build_info,
+    register_process_collector,
+};
+use solti_runner::{BuildContext, RunnerRouter};
+use taskvisor::Subscribe;
+
+fn main() -> Result<(), prometheus::Error> {
+    let registry = Arc::new(Registry::new());
+
+    // Core collectors.
+    let metrics = PrometheusMetrics::new(registry.clone())?;
+    let subscriber = PrometheusSubscriber::new(registry.clone())?;
+
+    // Standard extras.
+    register_process_collector(&registry)?;
+    register_build_info(&registry, &[("version", env!("CARGO_PKG_VERSION"))])?;
+
+    // Wire into solti-runner.
+    let ctx = BuildContext::default().with_metrics(Arc::new(metrics));
+    let router = RunnerRouter::new().with_context(ctx);
+
+    // Wire into the supervisor event bus.
+    let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(subscriber)];
+
+    let _ = (router, subscribers);
+    Ok(())
+}
+```
+
 ## Example
 
-For a full agent wiring: shared registry, runner metrics, subscriber, supervised`/metrics` HTTP task, HTTP/gRPC `ApiMetricsBackend`, and `DiscoverMetricsBackend` see the reference agents:
+For a full agent wiring: shared registry, runner metrics, subscriber, supervised `/metrics` HTTP task, HTTP/gRPC `ApiMetricsBackend`, and `DiscoverMetricsBackend` see the reference agents:
 - [`examples/agentd-http`](../../examples/agentd-http)
 - [`examples/agentd-grpc`](../../examples/agentd-grpc)
 

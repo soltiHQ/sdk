@@ -62,6 +62,14 @@ impl TaskKind {
     }
 
     /// Validate kind-specific constraints.
+    ///
+    /// Delegates to the inner spec: [`SubprocessMode::validate`], [`WasmSpec::validate`],
+    /// [`ContainerSpec::validate`]. `Embedded` always passes.
+    ///
+    /// ## Errors
+    ///
+    /// - [`ModelError::Invalid`](crate::ModelError::Invalid): the inner spec failed its
+    ///   validation (empty command, malformed script body, empty module path, empty image).
     pub fn validate(&self) -> crate::error::ModelResult<()> {
         match self {
             TaskKind::Subprocess(spec) => spec.mode.validate(),
@@ -81,6 +89,10 @@ impl WasmSpec {
     }
 
     /// Validate structural constraints.
+    ///
+    /// ## Errors
+    ///
+    /// - [`ModelError::Invalid`](crate::ModelError::Invalid): `module` path is empty.
     pub fn validate(&self) -> crate::error::ModelResult<()> {
         if self.module.as_os_str().is_empty() {
             return Err(crate::error::ModelError::Invalid(
@@ -110,6 +122,10 @@ impl ContainerSpec {
     }
 
     /// Validate structural constraints.
+    ///
+    /// ## Errors
+    ///
+    /// - [`ModelError::Invalid`](crate::ModelError::Invalid): `image` is empty or whitespace-only.
     pub fn validate(&self) -> crate::error::ModelResult<()> {
         if self.image.trim().is_empty() {
             return Err(crate::error::ModelError::Invalid(

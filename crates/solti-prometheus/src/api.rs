@@ -24,7 +24,7 @@ use crate::register::{Sub, ms_to_secs};
 ///
 /// ## Cardinality
 ///
-/// `path` is a **templated** route (e.g. `/api/v1/tasks/{id}`) for HTTP thanks to`axum::extract::MatchedPath`, and a full method path (`/solti.task.v1.TaskService/SubmitTask`) for gRPC.
+/// `path` is a **templated** route (e.g. `/api/v1/tasks/{id}`) for HTTP thanks to `axum::extract::MatchedPath`, and a full method path (`/solti.task.v1.TaskService/SubmitTask`) for gRPC.
 /// In both cases the set is bounded by the proto/api definition.
 pub struct PrometheusApiMetrics {
     requests_total: CounterVec,
@@ -34,6 +34,11 @@ pub struct PrometheusApiMetrics {
 
 impl PrometheusApiMetrics {
     /// Register all API metrics into `registry`.
+    ///
+    /// ## Errors
+    ///
+    /// - [`prometheus::Error::AlreadyReg`]: one of the `solti_api_*` metrics is already
+    ///   registered in `registry` (e.g. another instance was built against the same registry).
     pub fn new(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
         let r = Sub::new(&registry, "api");
 

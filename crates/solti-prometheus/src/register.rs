@@ -85,8 +85,8 @@ impl<'a> Sub<'a> {
 
     /// Build a [`GaugeVec`] **without** registering it into a registry.
     ///
-    /// Used by composite collectors that expose a `GaugeVec` via [`prometheus::core::Collector::collect`];
-    /// the collector itself is registered by the caller, so the inner metric must not be registered twice.
+    /// Used by composite collectors that expose a `GaugeVec` via [`prometheus::core::Collector::collect`].
+    /// The caller registers the collector itself. Registering the inner metric here would register it twice.
     #[cfg(feature = "state")]
     #[inline]
     pub(crate) fn gauge_vec_unregistered(

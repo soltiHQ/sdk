@@ -14,13 +14,24 @@ use prometheus::{IntGauge, Opts, Registry};
 ///
 /// Labels are set as *constant* labels: they live on the metric descriptor and never change during process lifetime.
 ///
+/// ## Errors
+///
+/// - [`prometheus::Error::Msg`]: a key in `labels` is not a valid Prometheus label name.
+/// - [`prometheus::Error::AlreadyReg`]: a `solti_build_info` gauge is already registered in `registry`.
+///
 /// ## Example
 ///
-/// ```text
-/// solti_prometheus::register_build_info(&registry, &[
+/// ```rust
+/// use solti_prometheus::{Registry, register_build_info};
+///
+/// # fn main() -> Result<(), prometheus::Error> {
+/// let registry = Registry::new();
+/// register_build_info(&registry, &[
 ///     ("version", env!("CARGO_PKG_VERSION")),
-///     ("rustc",   "1.90.0"),
+///     ("rustc", "1.90.0"),
 /// ])?;
+/// # Ok(())
+/// # }
 /// ```
 pub fn register_build_info(
     registry: &Registry,

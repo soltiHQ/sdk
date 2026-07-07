@@ -46,6 +46,7 @@ pub enum RestartPolicy {
     /// that completes fast and is meant to repeat.
     #[serde(rename_all = "camelCase")]
     Always {
+        /// Delay in milliseconds between runs. `None` (or `Some(0)`) restarts immediately.
         #[serde(skip_serializing_if = "Option::is_none")]
         interval_ms: Option<u64>,
     },

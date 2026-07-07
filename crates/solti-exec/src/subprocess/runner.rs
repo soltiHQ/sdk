@@ -66,10 +66,9 @@ use std::{
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use taskvisor::{TaskError, TaskFn, TaskRef};
+use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tempfile::NamedTempFile;
 use tokio::process::Command;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
 use solti_model::{SubprocessSpec, TaskId, TaskKind, TaskSpec, merge_env};
@@ -99,21 +98,58 @@ pub struct SubprocessRunner {
     config: Option<Arc<SubprocessBackendConfig>>,
 }
 
+/// Validate a runner name before it is embedded into run IDs and cgroup paths.
+///
+/// The name reaches the filesystem via `build_cgroup_name`, so it must not carry
+/// path separators, `.`/`..`, or non-portable characters. The rule matches the
+/// model's identity charset: non-empty, ASCII alphanumeric plus `-`, `_`, `.`,
+/// and no lone `.`/`..`, capped at 64 bytes.
+fn validate_runner_name(name: &str) -> Result<(), crate::ExecError> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(crate::ExecError::InvalidRunnerConfig(format!(
+            "invalid runner name {name:?}: must be 1..=64 chars of [A-Za-z0-9._-] and not '.'/'..'"
+        )))
+    }
+}
+
 impl SubprocessRunner {
     /// Create a new subprocess runner without backend configuration.
+    ///
+    /// `name` must be a valid runner identity (see [`with_config`](Self::with_config)
+    /// for the rule); it is embedded into run IDs and cgroup paths. Because this
+    /// constructor is infallible, an invalid name is a debug assertion here and
+    /// is rejected outright by [`with_config`](Self::with_config).
     pub fn new(name: &'static str) -> Self {
+        debug_assert!(
+            validate_runner_name(name).is_ok(),
+            "invalid runner name {name:?}",
+        );
         Self { name, config: None }
     }
 
     /// Create a subprocess runner with explicit backend configuration.
     ///
-    /// # Errors
+    /// ## Errors
     ///
-    /// Returns `ExecError` if the configuration is invalid.
+    /// - [`ExecError::InvalidRunnerConfig`](crate::ExecError::InvalidRunnerConfig): the
+    ///   `name` is not a valid runner identity (non-empty, `[A-Za-z0-9._-]`, ≤ 64 bytes,
+    ///   not `.`/`..`), or `config` failed validation. Config examples: a zero
+    ///   cgroup/rlimit/log limit, `keep_caps` without `drop_all_caps`, or
+    ///   `require_enforcement` on a non-Linux host.
     pub fn with_config(
         name: &'static str,
         config: SubprocessBackendConfig,
     ) -> Result<Self, crate::ExecError> {
+        validate_runner_name(name)?;
         config.validate()?;
         Ok(Self {
             name,
@@ -169,6 +205,11 @@ impl SubprocessRunner {
         };
         cfg.validate()
             .map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
+        if let Some(backend) = self.config.as_ref() {
+            backend
+                .check_cwd(cfg.cwd.as_deref())
+                .map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
+        }
         Ok((cfg, script_tempfile))
     }
 
@@ -261,6 +302,17 @@ impl Runner for SubprocessRunner {
         matches!(spec.kind(), TaskKind::Subprocess(_))
     }
 
+    /// Turn a `TaskKind::Subprocess` spec into a runnable [`TaskRef`].
+    ///
+    /// Resolves the subprocess mode, merges the environment, and captures the
+    /// resolved config in a closure that spawns the OS process when the task runs.
+    ///
+    /// ## Errors
+    ///
+    /// - [`RunnerError::UnsupportedKind`]: `spec.kind()` is not `TaskKind::Subprocess`.
+    /// - [`RunnerError::InvalidSpec`]: the command is empty, the script body is not
+    ///   valid base64 or exceeds the configured size limit, or the script tempfile
+    ///   could not be created or written.
     fn build_task(&self, spec: &TaskSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
         let (task_cfg, script_tempfile) = self.build_task_config(spec, ctx)?;
 
@@ -307,7 +359,7 @@ impl Runner for SubprocessRunner {
         });
 
         let run_id = exec_ctx.task_cfg.run_id.to_string();
-        let task: TaskRef = TaskFn::arc(run_id, move |cancel: CancellationToken| {
+        let task: TaskRef = TaskFn::arc(run_id, move |cancel: TaskContext| {
             let ctx = Arc::clone(&exec_ctx);
             async move { run_subprocess(ctx, cancel).await }
         });
@@ -335,7 +387,7 @@ fn build_command(ctx: &TaskExecContext) -> Command {
     if let Some(cwd) = &ctx.task_cfg.cwd {
         cmd.current_dir(cwd);
     }
-    cmd.envs(&ctx.task_cfg.env);
+    apply_env_policy(&mut cmd, ctx);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -359,6 +411,50 @@ fn build_command(ctx: &TaskExecContext) -> Command {
     cmd
 }
 
+/// Build the child's environment per the backend [`EnvPolicy`].
+///
+/// The task's own vars are always applied last, so they win over inherited or
+/// allowlisted values. Under `Clear`/`Allowlist` a [safe `PATH`] is injected
+/// when the task set none, so a bare command name still resolves.
+///
+/// [safe `PATH`]: crate::subprocess::backend::SAFE_DEFAULT_PATH
+fn apply_env_policy(cmd: &mut Command, ctx: &TaskExecContext) {
+    use crate::subprocess::backend::{EnvPolicy, SAFE_DEFAULT_PATH};
+
+    let policy = ctx
+        .runner_cfg
+        .as_ref()
+        .map(|c| c.effective_env_policy())
+        .unwrap_or_default();
+
+    let task_sets_path = ctx.task_cfg.env.contains_key("PATH");
+
+    match policy {
+        EnvPolicy::Inherit => {
+            cmd.envs(&ctx.task_cfg.env);
+        }
+        EnvPolicy::Clear => {
+            cmd.env_clear();
+            if !task_sets_path {
+                cmd.env("PATH", SAFE_DEFAULT_PATH);
+            }
+            cmd.envs(&ctx.task_cfg.env);
+        }
+        EnvPolicy::Allowlist(keys) => {
+            cmd.env_clear();
+            for key in &keys {
+                if let Some(val) = std::env::var_os(key) {
+                    cmd.env(key, val);
+                }
+            }
+            if !task_sets_path && !keys.iter().any(|k| k.as_str() == "PATH") {
+                cmd.env("PATH", SAFE_DEFAULT_PATH);
+            }
+            cmd.envs(&ctx.task_cfg.env);
+        }
+    }
+}
+
 /// Drop-safe reaper for the child's process group.
 ///
 /// taskvisor enforces the per-attempt timeout via `tokio::time::timeout` and force-abort
@@ -368,8 +464,8 @@ fn build_command(ctx: &TaskExecContext) -> Command {
 ///
 /// This guard captures the child's pgid right after spawn and, on `Drop`, sends
 /// `kill(-pgid, SIGKILL)` to the whole group. It is [`disarm`](Self::disarm)ed once the
-/// child has been reaped on a normal/explicit-kill path, so it never targets a recycled
-/// pgid — it fires **only** when the future is dropped mid-flight.
+/// child has been reaped on a normal/explicit-kill path. It therefore never targets a
+/// recycled pgid — it fires **only** when the future is dropped mid-flight.
 struct ProcessGroupGuard {
     /// `Some(pgid)` while armed; `None` once the group is reaped. On Unix `pgid == child pid`
     /// because the child is spawned with `process_group(0)`.
@@ -451,10 +547,7 @@ fn prepare_backend(ctx: &TaskExecContext) -> Result<(), TaskError> {
         if let Err(e) = backend_cfg.prepare_cgroups(cgroup_name_ref) {
             ctx.metrics
                 .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::CgroupPrepareFailed);
-            return Err(TaskError::Fatal {
-                reason: format!("failed to prepare cgroup: {e}"),
-                exit_code: None,
-            });
+            return Err(TaskError::fatal(format!("failed to prepare cgroup: {e}")));
         }
     }
     Ok(())
@@ -468,10 +561,9 @@ fn apply_backend(cmd: &mut Command, ctx: &TaskExecContext) -> Result<(), TaskErr
         if let Err(e) = backend_cfg.apply_to_command(cmd, cgroup_name_ref) {
             ctx.metrics
                 .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::BackendConfigFailed);
-            return Err(TaskError::Fatal {
-                reason: format!("failed to apply runner config: {e}"),
-                exit_code: None,
-            });
+            return Err(TaskError::fatal(format!(
+                "failed to apply runner config: {e}"
+            )));
         }
     }
     Ok(())
@@ -488,7 +580,7 @@ fn evaluate_exit(
             Some(code) => format!("process exited with non-zero code: {code}"),
             None => "process terminated by signal".into(),
         };
-        Err(TaskError::Fail { reason, exit_code })
+        Err(TaskError::fail(reason).with_exit_code(exit_code))
     } else {
         debug!(task = %task_cfg.run_id, "subprocess exited successfully");
         Ok(())
@@ -509,17 +601,15 @@ impl Drop for CgroupGuard<'_> {
 const LOG_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Execute a subprocess task with cancellation support, metrics, and cleanup.
-async fn run_subprocess(
-    ctx: Arc<TaskExecContext>,
-    cancel: CancellationToken,
-) -> Result<(), TaskError> {
+async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Result<(), TaskError> {
     let start = Instant::now();
 
+    // Args and cwd are not logged: task arguments routinely carry tokens and
+    // other secrets. Only the command name and the argument count are recorded.
     trace!(
         task = %ctx.task_cfg.run_id,
         command = %ctx.task_cfg.command,
-        args = ?ctx.task_cfg.args,
-        cwd = ?ctx.task_cfg.cwd,
+        arg_count = ctx.task_cfg.args.len(),
         "spawning subprocess",
     );
 
@@ -534,10 +624,7 @@ async fn run_subprocess(
         Err(e) => {
             ctx.metrics
                 .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
-            return Err(TaskError::Fatal {
-                reason: format!("spawn failed: {e}"),
-                exit_code: None,
-            });
+            return Err(TaskError::fatal(format!("spawn failed: {e}")));
         }
     };
     ctx.metrics.record_task_started(RunnerType::Subprocess);
@@ -553,10 +640,10 @@ async fn run_subprocess(
     let task_id = TaskId::from(Arc::clone(&ctx.task_cfg.run_id));
     let sink = ctx.output_registry.sink_for(task_id, attempt);
 
-    let stdout = child.stdout.take().ok_or_else(|| TaskError::Fatal {
-        reason: "failed to capture stdout".into(),
-        exit_code: None,
-    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| TaskError::fatal("failed to capture stdout"))?;
     let run_id_stdout = Arc::clone(&ctx.task_cfg.run_id);
     let sink_stdout = sink.clone();
     let mut stdout_task = tokio::spawn(async move {
@@ -570,10 +657,10 @@ async fn run_subprocess(
         .await;
     });
 
-    let stderr = child.stderr.take().ok_or_else(|| TaskError::Fatal {
-        reason: "failed to capture stderr".into(),
-        exit_code: None,
-    })?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| TaskError::fatal("failed to capture stderr"))?;
     let run_id_stderr = Arc::clone(&ctx.task_cfg.run_id);
     let sink_stderr = sink.clone();
     let mut stderr_task = tokio::spawn(async move {
@@ -590,10 +677,7 @@ async fn run_subprocess(
     let result = tokio::select! {
         biased;
         res = child.wait() => {
-            let status = res.map_err(|e| TaskError::Fatal {
-                reason: format!("wait failed: {e}"),
-                exit_code: None,
-            })?;
+            let status = res.map_err(|e| TaskError::fatal(format!("wait failed: {e}")))?;
             evaluate_exit(status, &ctx.task_cfg)
         }
         _ = cancel.cancelled() => {
@@ -737,6 +821,23 @@ mod tests {
     }
 
     #[test]
+    fn runner_name_validation_accepts_and_rejects() {
+        for good in ["subprocess", "runner-1", "a.b_c", "x"] {
+            assert!(validate_runner_name(good).is_ok(), "should accept {good:?}");
+        }
+        for bad in ["", ".", "..", "a/b", "a b", "runner\0", &"n".repeat(65)] {
+            assert!(validate_runner_name(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn with_config_rejects_bad_runner_name() {
+        let result = SubprocessRunner::with_config("bad/name", SubprocessBackendConfig::new());
+        let err = result.err().expect("bad name must be rejected").to_string();
+        assert!(err.contains("invalid runner name"), "got: {err}");
+    }
+
+    #[test]
     fn build_command_sets_env() {
         let mut ctx = make_exec_ctx();
         ctx.task_cfg.env.insert("FOO".into(), "bar".into());
@@ -745,6 +846,83 @@ mod tests {
         assert!(
             envs.iter()
                 .any(|(k, v)| *k == "FOO" && *v == Some(std::ffi::OsStr::new("bar")))
+        );
+    }
+
+    fn env_of(cmd: &Command) -> std::collections::HashMap<String, Option<String>> {
+        cmd.as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    fn ctx_with_backend(cfg: SubprocessBackendConfig) -> TaskExecContext {
+        let mut ctx = make_exec_ctx();
+        ctx.runner_cfg = Some(Arc::new(cfg));
+        ctx
+    }
+
+    #[test]
+    fn env_inherit_injects_no_path() {
+        // Default (Inherit): no env_clear, no synthetic PATH — the child inherits
+        // the agent's PATH as before.
+        let ctx = ctx_with_backend(SubprocessBackendConfig::new());
+        let cmd = build_command(&ctx);
+        assert!(!env_of(&cmd).contains_key("PATH"));
+    }
+
+    #[test]
+    fn env_clear_injects_safe_path() {
+        use crate::subprocess::backend::{EnvPolicy, SAFE_DEFAULT_PATH};
+        let ctx =
+            ctx_with_backend(SubprocessBackendConfig::new().with_env_policy(EnvPolicy::Clear));
+        let cmd = build_command(&ctx);
+        let env = env_of(&cmd);
+        assert_eq!(env.get("PATH"), Some(&Some(SAFE_DEFAULT_PATH.to_string())));
+    }
+
+    #[test]
+    fn env_clear_respects_task_provided_path() {
+        use crate::subprocess::backend::EnvPolicy;
+        let mut ctx =
+            ctx_with_backend(SubprocessBackendConfig::new().with_env_policy(EnvPolicy::Clear));
+        ctx.task_cfg
+            .env
+            .insert("PATH".into(), "/opt/custom/bin".into());
+        let cmd = build_command(&ctx);
+        assert_eq!(
+            env_of(&cmd).get("PATH"),
+            Some(&Some("/opt/custom/bin".to_string()))
+        );
+    }
+
+    #[test]
+    fn env_clear_keeps_task_vars() {
+        use crate::subprocess::backend::EnvPolicy;
+        let mut ctx =
+            ctx_with_backend(SubprocessBackendConfig::new().with_env_policy(EnvPolicy::Clear));
+        ctx.task_cfg.env.insert("FOO".into(), "bar".into());
+        let cmd = build_command(&ctx);
+        assert_eq!(env_of(&cmd).get("FOO"), Some(&Some("bar".to_string())));
+    }
+
+    #[test]
+    fn env_allowlist_skips_absent_key_and_still_injects_path() {
+        use crate::subprocess::backend::{EnvPolicy, SAFE_DEFAULT_PATH};
+        // An allowlisted var that is not in the parent env is simply skipped;
+        // PATH is still injected because neither the task nor the allowlist set it.
+        let ctx = ctx_with_backend(SubprocessBackendConfig::new().with_env_policy(
+            EnvPolicy::Allowlist(vec!["SOLTI_DEFINITELY_ABSENT_VAR_XYZ".into()]),
+        ));
+        let cmd = build_command(&ctx);
+        assert_eq!(
+            env_of(&cmd).get("PATH"),
+            Some(&Some(SAFE_DEFAULT_PATH.to_string()))
         );
     }
 
@@ -765,7 +943,9 @@ mod tests {
         let result = evaluate_exit(status, &cfg);
         assert!(result.is_err());
         match result.unwrap_err() {
-            TaskError::Fail { reason, exit_code } => {
+            TaskError::Fail {
+                reason, exit_code, ..
+            } => {
                 assert!(reason.contains("non-zero"));
                 assert_eq!(exit_code, Some(1));
             }
@@ -997,12 +1177,11 @@ mod tests {
         // taskvisor enforces a per-attempt timeout via `tokio::time::timeout` and
         // force-abort via `JoinHandle::abort` — both DROP the task future without ever
         // polling the cooperative `cancel.cancelled()` branch. `kill_on_drop(true)`
-        // only SIGKILLs the leader pid, so forked grandchildren would be orphaned.
+        // only SIGKILLs the leader pid; forked grandchildren would be orphaned.
         // The subtree must still be reaped on drop.
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::time::Duration;
         use tokio::time::timeout;
-        use tokio_util::sync::CancellationToken;
 
         static N: AtomicU32 = AtomicU32::new(0);
         let marker = std::env::temp_dir().join(format!(
@@ -1020,7 +1199,7 @@ mod tests {
         let task_ref = runner.build_task(&spec, &BuildContext::default()).unwrap();
 
         // Run, then DROP the future via timeout — exactly what taskvisor does.
-        let cancel = CancellationToken::new();
+        let cancel = TaskContext::detached();
         let _ = timeout(Duration::from_millis(500), task_ref.spawn(cancel)).await;
 
         let grandchild_pid: i32 = {
@@ -1078,7 +1257,6 @@ mod tests {
         use solti_runner::OutputRegistry;
         use std::sync::Arc;
         use std::time::Duration;
-        use tokio_util::sync::CancellationToken;
 
         let registry = Arc::new(OutputRegistry::new(64));
         let ctx = BuildContext::default().with_output_registry(registry.clone());
@@ -1092,7 +1270,7 @@ mod tests {
             .subscribe(&task_id)
             .expect("registry must have channel after build_task");
 
-        let cancel = CancellationToken::new();
+        let cancel = TaskContext::detached();
         task_ref.spawn(cancel).await.expect("echo must succeed");
 
         let mut found_line = None;
@@ -1119,7 +1297,6 @@ mod tests {
         use solti_runner::OutputRegistry;
         use std::sync::Arc;
         use std::time::Duration;
-        use tokio_util::sync::CancellationToken;
 
         let registry = Arc::new(OutputRegistry::new(64));
         let ctx = BuildContext::default().with_output_registry(registry.clone());
@@ -1129,8 +1306,9 @@ mod tests {
         let task_id = TaskId::from(task_ref.name());
         let mut rx = registry.subscribe(&task_id).unwrap();
 
-        task_ref.spawn(CancellationToken::new()).await.unwrap();
-        task_ref.spawn(CancellationToken::new()).await.unwrap();
+        let ctx = TaskContext::detached();
+        task_ref.spawn(ctx.clone()).await.unwrap();
+        task_ref.spawn(ctx).await.unwrap();
 
         let mut attempts = std::collections::BTreeSet::new();
         for _ in 0..200 {
@@ -1149,18 +1327,14 @@ mod tests {
     #[tokio::test]
     async fn run_subprocess_does_not_hang_on_daemonized_grandchild_holding_pipe() {
         use std::time::{Duration, Instant};
-        use tokio_util::sync::CancellationToken;
 
         let runner = SubprocessRunner::new("hang-runner");
         let spec = mk_subprocess_spec_with_args("hang-slot", "sh", &["-c", "sleep 30 & exit 0"]);
         let task_ref = runner.build_task(&spec, &BuildContext::default()).unwrap();
 
         let started = Instant::now();
-        let res = tokio::time::timeout(
-            Duration::from_secs(20),
-            task_ref.spawn(CancellationToken::new()),
-        )
-        .await;
+        let ctx = TaskContext::detached();
+        let res = tokio::time::timeout(Duration::from_secs(20), task_ref.spawn(ctx)).await;
 
         assert!(
             res.is_ok(),

@@ -1,12 +1,20 @@
-//! Reference Solti agent — HTTP/JSON transport.
+//! # agentd-http
 //!
-//! Accepts `TaskSpec` submissions over `/api/v1/tasks`, runs them as subprocesses,
-//! reports status back over the same REST surface, exposes Prometheus metrics on
-//! `:9090`, and heartbeats to a [Podium](https://github.com/soltiHQ/podium)
-//! control plane. Running without a reachable CP is fine — the heartbeat retries
-//! with backoff while the local API keeps serving.
+//! Reference Solti agent with the HTTP/JSON transport. It accepts `TaskSpec`
+//! submissions over `/api/v1/tasks` and runs them as subprocesses. Running
+//! without a reachable control plane (CP) is fine — the heartbeat retries with
+//! backoff while the local API keeps serving.
 //!
-//! ## Run modes
+//! ## What this shows
+//!
+//! - Accepts `TaskSpec` submissions over `/api/v1/tasks` and reports status
+//!   back over the same REST surface.
+//! - Runs submitted tasks as subprocesses.
+//! - Exposes Prometheus metrics on `:9090`.
+//! - Heartbeats to a [Podium](https://github.com/soltiHQ/podium) control plane.
+//! - Toggles auth and TLS independently via environment variables.
+//!
+//! ## Run
 //!
 //! Authentication and TLS are **independent**, each selected by environment
 //! variables — giving the four combinations:
@@ -38,6 +46,14 @@
 //!
 //! Talking to the agent and the full endpoint reference live in
 //! [`api_v1.md`](../../../crates/solti-api/api_v1.md).
+//!
+//! ## Next
+//!
+//! | Example                          | What it adds                                        |
+//! |----------------------------------|-----------------------------------------------------|
+//! | [`agentd-grpc`](../../agentd-grpc) | The same agent over gRPC instead of HTTP/JSON      |
+//! | [`podium`](../../podium)         | Config-driven agent: runtime transport switch, TOML |
+//! | [`tls-roundtrip`](../../tls-roundtrip) | Minimal mTLS demo of `solti-tls` alone         |
 
 use std::sync::Arc;
 
@@ -50,8 +66,8 @@ use solti_discover::{DiscoverConfig, DiscoveryTransport};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{AgentId, RunnerEnv, Token};
 use solti_observe::{
-    LoggerConfig, LoggerLevel, LoggerTimeZone, TracingEventSubscriber, init_local_offset,
-    init_logger, timezone_sync,
+    LoggerConfig, LoggerLevel, LoggerTimeZone, TracingBridge, init_local_offset, init_logger,
+    timezone_sync,
 };
 use solti_prometheus::{
     PrometheusApiMetrics, PrometheusDiscoverMetrics, PrometheusMetrics, PrometheusStateCollector,
@@ -101,7 +117,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Supervisor: owns every task, applies restart / backoff, fans events to subscribers.
     let subscribers: Vec<Arc<dyn Subscribe>> =
-        vec![Arc::new(TracingEventSubscriber), Arc::new(prom_subscriber)];
+        vec![Arc::new(TracingBridge), Arc::new(prom_subscriber)];
     let supervisor = SupervisorApi::new_with_output_registry(
         SupervisorConfig::default(),
         ControllerConfig::default(),

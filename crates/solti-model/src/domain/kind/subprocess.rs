@@ -45,16 +45,28 @@ pub enum SubprocessMode {
 impl SubprocessMode {
     /// Decode the base64 script body to a UTF-8 string, capped at the default [`MAX_SCRIPT_BODY_BYTES`].
     ///
-    /// Returns `Ok(body)` for the `Script` variant; `Err` for `Command`, an invalid body, or a decoded body larger than the default cap.
+    /// Returns `Ok(body)` for the `Script` variant.
     /// To use a different cap, call [`decode_body_with_limit`](Self::decode_body_with_limit).
+    ///
+    /// ## Errors
+    ///
+    /// - [`ModelError::Invalid`]: called on the `Command` variant, the body is empty,
+    ///   the body is not valid base64, the decoded body exceeds [`MAX_SCRIPT_BODY_BYTES`],
+    ///   or the decoded bytes are not valid UTF-8.
     pub fn decode_body(&self) -> ModelResult<String> {
         self.decode_body_with_limit(MAX_SCRIPT_BODY_BYTES)
     }
 
-    /// Decode the base64 script body to a UTF-8 string, rejecting anybody whose decoded size exceeds `max_bytes`.
+    /// Decode the base64 script body to a UTF-8 string, rejecting any body whose decoded size exceeds `max_bytes`.
     ///
     /// [`decode_body`](Self::decode_body) applies the default [`MAX_SCRIPT_BODY_BYTES`];
     /// pass an explicit `max_bytes` to tighten or relax the cap where needed.
+    ///
+    /// ## Errors
+    ///
+    /// - [`ModelError::Invalid`]: called on the `Command` variant, the body is empty,
+    ///   the body is not valid base64, the decoded body exceeds `max_bytes`,
+    ///   or the decoded bytes are not valid UTF-8.
     pub fn decode_body_with_limit(&self, max_bytes: usize) -> ModelResult<String> {
         match self {
             SubprocessMode::Command { .. } => Err(ModelError::Invalid(
@@ -90,6 +102,12 @@ impl SubprocessMode {
     /// - `Command`: command must not be empty.
     /// - `Script`: body must not be empty, must be valid base64, must decode to UTF-8.
     /// - `Script` + `Custom` runtime: command and flag must not be empty.
+    ///
+    /// ## Errors
+    ///
+    /// - [`ModelError::Invalid`]: `Command` has an empty command; `Script` has an empty,
+    ///   non-base64, oversized (over [`MAX_SCRIPT_BODY_BYTES`]), or non-UTF-8 body;
+    ///   or a `Custom` runtime has an empty command or flag.
     pub fn validate(&self) -> ModelResult<()> {
         match self {
             SubprocessMode::Command { command, .. } => {

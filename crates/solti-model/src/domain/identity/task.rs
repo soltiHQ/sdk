@@ -36,6 +36,11 @@ impl TaskId {
     /// Validate that the task id is safe to use across the SDK.
     ///
     /// See `validate_identity` (module-private) for the exact rules.
+    ///
+    /// ## Errors
+    ///
+    /// - [`ModelError::Invalid`]: the id is empty, longer than [`TASK_ID_MAX_LEN`],
+    ///   equal to `"."` or `".."`, or contains a byte outside `[A-Za-z0-9._-]`.
     pub fn validate_format(&self) -> Result<(), ModelError> {
         validate_identity("task_id", self.as_str(), TASK_ID_MAX_LEN)
     }
@@ -66,6 +71,18 @@ mod tests {
 
         let back: TaskId = serde_json::from_str(&json).unwrap();
         assert_eq!(back, id);
+    }
+
+    #[test]
+    fn task_id_deserialization_validates_format() {
+        // Ids leak into filesystem and cgroup paths; untrusted JSON must not
+        // smuggle a path separator past the charset rules.
+        for bad in [r#""a/b""#, r#""""#, r#"".""#, r#""a b""#] {
+            assert!(
+                serde_json::from_str::<TaskId>(bad).is_err(),
+                "must reject {bad}"
+            );
+        }
     }
 
     #[test]

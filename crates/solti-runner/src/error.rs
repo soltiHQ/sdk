@@ -1,7 +1,13 @@
 //! # Runner errors.
+//!
+//! [`RunnerError`] covers both routing failures ([`RunnerRouter::build`](crate::RunnerRouter::build)) and task-build failures ([`Runner::build_task`](crate::Runner::build_task)).
 
 use thiserror::Error;
 
+/// Error type for runner selection and task construction.
+///
+/// Returned by [`RunnerRouter::build`](crate::RunnerRouter::build) and [`Runner::build_task`](crate::Runner::build_task).
+/// The enum is `#[non_exhaustive]`: match with a wildcard arm.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RunnerError {
@@ -11,7 +17,12 @@ pub enum RunnerError {
 
     /// Runner does not support the requested task kind.
     #[error("unsupported task kind for runner '{runner}': {kind}")]
-    UnsupportedKind { runner: &'static str, kind: String },
+    UnsupportedKind {
+        /// Name of the runner that rejected the spec (see [`Runner::name`](crate::Runner::name)).
+        runner: &'static str,
+        /// Label of the rejected task kind (e.g. `"wasm"`).
+        kind: String,
+    },
 
     /// Task specification is invalid for this runner.
     #[error("invalid specification: {0}")]
@@ -26,7 +37,7 @@ pub enum RunnerError {
     MissingField(&'static str),
 
     /// I/O error during task setup (spawn, cgroup, module read, …).
-    /// The underlying [`std::io::Error`] is preserved as the source, so callers can inspect its [`ErrorKind`](std::io::ErrorKind).
+    /// The underlying [`std::io::Error`] is preserved as the source. Callers can inspect its [`ErrorKind`](std::io::ErrorKind).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

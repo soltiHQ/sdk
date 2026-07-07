@@ -2,6 +2,8 @@
 //!
 //! [`TaskSpec`] defines the desired state; constructed via [`TaskSpecBuilder`].
 
+use std::num::NonZeroU32;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -37,8 +39,8 @@ pub struct TaskSpec {
     restart: RestartPolicy,
     backoff: BackoffPolicy,
     admission: AdmissionPolicy,
-    #[serde(default)]
-    max_retries: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_retries: Option<NonZeroU32>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runner_selector: Option<RunnerSelector>,
@@ -83,12 +85,14 @@ impl TaskSpec {
         self.admission
     }
 
-    /// Maximum failure-driven retries per run (`0` = unlimited, the default).
+    /// Maximum failure-driven retries per run.
     ///
+    /// `None` means unlimited, the default. The invariant lives in the type:
+    /// a zero budget is not representable.
     /// Counts only failure retries (the counter resets on success); when the
     /// budget is exhausted the supervisor stops restarting the task.
     #[inline]
-    pub fn max_retries(&self) -> u32 {
+    pub fn max_retries(&self) -> Option<NonZeroU32> {
         self.max_retries
     }
 
@@ -157,6 +161,14 @@ impl TaskSpec {
 
 impl TaskSpec {
     /// Validate the spec at the **submit boundary**.
+    ///
+    /// Runs the full structural validation and then rejects [`TaskKind::Embedded`].
+    ///
+    /// ## Errors
+    ///
+    /// - [`ModelError::Invalid`]: a structural check failed (empty or malformed `slot`,
+    ///   zero `timeout`, invalid `kind`, `backoff`, or `runner_selector`), or `kind` is
+    ///   [`TaskKind::Embedded`] (submit that via `submit_with_task` instead).
     pub fn validate(&self) -> ModelResult<()> {
         self.validate_structural()?;
         if matches!(self.kind, TaskKind::Embedded) {
@@ -216,7 +228,7 @@ pub struct TaskSpecBuilder {
     backoff: BackoffPolicy,
     restart: RestartPolicy,
     timeout: Timeout,
-    max_retries: u32,
+    max_retries: Option<NonZeroU32>,
 
     admission: AdmissionPolicy,
     labels: Labels,
@@ -235,7 +247,7 @@ impl TaskSpecBuilder {
             timeout: timeout.into(),
 
             admission: AdmissionPolicy::default(),
-            max_retries: 0,
+            max_retries: None,
             labels: Labels::new(),
         }
     }
@@ -247,10 +259,22 @@ impl TaskSpecBuilder {
         self
     }
 
-    /// Set the failure-retry budget (`0` = unlimited, the default).
+    /// Set the failure-retry budget. `None` means unlimited, the default.
+    ///
+    /// Mirrors taskvisor's signature: pass `NonZeroU32::new(n)` directly.
+    ///
+    /// ```rust
+    /// # use solti_model::{TaskSpec, TaskKind};
+    /// # use std::num::NonZeroU32;
+    /// let spec = TaskSpec::builder("s", TaskKind::Embedded, 1_000u64)
+    ///     .max_retries(NonZeroU32::new(3))
+    ///     .build()
+    ///     .expect("valid spec");
+    /// assert_eq!(spec.max_retries().map(NonZeroU32::get), Some(3));
+    /// ```
     #[must_use]
-    pub fn max_retries(mut self, max_retries: u32) -> Self {
-        self.max_retries = max_retries;
+    pub fn max_retries(mut self, max_retries: impl Into<Option<NonZeroU32>>) -> Self {
+        self.max_retries = max_retries.into();
         self
     }
 
@@ -287,14 +311,11 @@ impl TaskSpecBuilder {
     /// This checks everything **except** the [`TaskKind::Embedded`] business rule
     /// (which is enforced at the submit boundary by [`TaskSpec::validate`]).
     ///
-    /// # Errors
+    /// ## Errors
     ///
-    /// Returns [`ModelError::Invalid`] if:
-    /// - `slot` is empty
-    /// - `timeout` is zero
-    /// - `kind` fails kind-specific validation
-    /// - `backoff` parameters are invalid
-    /// - `runner_selector` requirements are invalid
+    /// - [`ModelError::Invalid`]: `slot` is empty or malformed, `timeout` is zero,
+    ///   `kind` fails kind-specific validation, `backoff` parameters are invalid,
+    ///   or a `runner_selector` requirement is invalid.
     pub fn build(self) -> ModelResult<TaskSpec> {
         let spec = TaskSpec {
             runner_selector: self.runner_selector,
@@ -328,7 +349,7 @@ mod raw {
         backoff: BackoffPolicy,
         admission: AdmissionPolicy,
         #[serde(default)]
-        max_retries: u32,
+        max_retries: Option<u32>,
 
         #[serde(default)]
         labels: Labels,
@@ -340,6 +361,17 @@ mod raw {
         type Error = ModelError;
 
         fn try_from(r: TaskSpecRaw) -> Result<Self, Self::Error> {
+            let max_retries = match r.max_retries {
+                None => None,
+                Some(0) => {
+                    return Err(ModelError::Invalid(
+                        "maxRetries: 0 is not allowed; omit the field for an unlimited budget"
+                            .into(),
+                    ));
+                }
+                Some(n) => NonZeroU32::new(n),
+            };
+
             let spec = Self {
                 runner_selector: r.runner_selector,
 
@@ -351,7 +383,7 @@ mod raw {
                 timeout: r.timeout,
 
                 admission: r.admission,
-                max_retries: r.max_retries,
+                max_retries,
                 labels: r.labels,
             };
             spec.validate_structural()?;
@@ -467,5 +499,34 @@ mod tests {
 
         let err = serde_json::from_value::<TaskSpec>(json).unwrap_err();
         assert!(err.to_string().contains("timeout"), "error: {err}");
+    }
+
+    #[test]
+    fn serde_rejects_zero_max_retries() {
+        let spec = valid_spec();
+        let mut json: serde_json::Value = serde_json::to_value(&spec).unwrap();
+        json["maxRetries"] = serde_json::json!(0);
+
+        let err = serde_json::from_value::<TaskSpec>(json).unwrap_err();
+        assert!(err.to_string().contains("maxRetries"), "error: {err}");
+    }
+
+    #[test]
+    fn unlimited_max_retries_is_omitted_from_json() {
+        let json = serde_json::to_value(valid_spec()).unwrap();
+        assert!(
+            json.get("maxRetries").is_none(),
+            "unlimited budget must serialize as an absent field"
+        );
+    }
+
+    #[test]
+    fn max_retries_roundtrips_through_json() {
+        let spec = valid_spec();
+        let mut json: serde_json::Value = serde_json::to_value(&spec).unwrap();
+        json["maxRetries"] = serde_json::json!(3);
+
+        let back: TaskSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(back.max_retries().map(NonZeroU32::get), Some(3));
     }
 }

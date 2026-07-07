@@ -3,13 +3,12 @@ use std::{
     time::Duration,
 };
 
-use solti_core::reasons;
+use taskvisor::reasons;
 use taskvisor::{
     AdmissionPolicy, BackoffPolicy, ControllerConfig, ControllerSpec, Event, EventKind,
-    JitterPolicy, RestartPolicy, Subscribe, Supervisor, SupervisorConfig, TaskError, TaskFn,
-    TaskRef, TaskSpec,
+    JitterPolicy, RestartPolicy, Subscribe, Supervisor, SupervisorConfig, TaskContext, TaskError,
+    TaskFn, TaskRef, TaskSpec,
 };
-use tokio_util::sync::CancellationToken;
 
 type Captured = Arc<Mutex<Vec<(EventKind, Option<String>)>>>;
 
@@ -32,12 +31,13 @@ impl Subscribe for Capture {
 }
 
 fn backoff() -> BackoffPolicy {
-    BackoffPolicy {
-        first: Duration::from_millis(1),
-        max: Duration::from_millis(1),
-        jitter: JitterPolicy::None,
-        factor: 1.0,
-    }
+    BackoffPolicy::new(
+        Duration::from_millis(1),
+        Duration::from_millis(1),
+        1.0,
+        JitterPolicy::None,
+    )
+    .expect("valid backoff")
 }
 
 async fn wait_for_reason(events: &Captured, reason: &str) {
@@ -67,7 +67,7 @@ async fn taskvisor_emits_policy_exhausted_success() {
         .build();
     let handle = sup.serve();
 
-    let task: TaskRef = TaskFn::arc("ok-once", |_ctx: CancellationToken| async move {
+    let task: TaskRef = TaskFn::arc("ok-once", |_ctx: TaskContext| async move {
         Ok::<(), TaskError>(())
     });
     let spec = TaskSpec::new(
@@ -91,7 +91,7 @@ async fn taskvisor_emits_task_returned_canceled() {
         .build();
     let handle = sup.serve();
 
-    let task: TaskRef = TaskFn::arc("self-cancel", |_ctx: CancellationToken| async move {
+    let task: TaskRef = TaskFn::arc("self-cancel", |_ctx: TaskContext| async move {
         Err::<(), TaskError>(TaskError::Canceled)
     });
     let spec = TaskSpec::new(
@@ -116,12 +116,12 @@ async fn taskvisor_emits_superseded_by_replace() {
         .build();
     let handle = sup.serve();
 
-    let stubborn: TaskRef = TaskFn::arc("head", |_ctx: CancellationToken| async move {
+    let stubborn: TaskRef = TaskFn::arc("head", |_ctx: TaskContext| async move {
         tokio::time::sleep(Duration::from_millis(300)).await;
         Ok::<(), TaskError>(())
     });
     let cooperative = |name: &'static str| -> TaskRef {
-        TaskFn::arc(name, |ctx: CancellationToken| async move {
+        TaskFn::arc(name, |ctx: TaskContext| async move {
             ctx.cancelled().await;
             Ok::<(), TaskError>(())
         })
@@ -134,9 +134,9 @@ async fn taskvisor_emits_superseded_by_replace() {
                 RestartPolicy::Never,
                 backoff(),
                 Some(Duration::from_secs(30)),
-            )
-            .with_slot("replace-slot"),
+            ),
         )
+        .with_slot("replace-slot")
     };
 
     let (_a, _aw) = handle

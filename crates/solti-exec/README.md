@@ -3,7 +3,28 @@ Task execution backends for the solti task system.
 
 Provides concrete `Runner` implementations that turn `TaskSpec` into running OS processes.
 
-Currently, ships a single backend - `SubprocessRunner` with optional Linux sandboxing (rlimits, cgroup v2, capabilities).
+It currently ships a single backend - `SubprocessRunner` with optional Linux sandboxing (rlimits, cgroup v2, capabilities).
+
+## Quick start
+```rust,no_run
+use solti_exec::subprocess::{
+    SubprocessBackendConfig, register_subprocess_runner, register_subprocess_runner_with_backend,
+};
+use solti_exec::{RlimitConfig, SecurityConfig};
+use solti_runner::RunnerRouter;
+
+fn main() -> Result<(), solti_exec::ExecError> {
+    let mut router = RunnerRouter::new();
+    register_subprocess_runner(&mut router, "default")?;
+
+    // With sandboxing:
+    let backend = SubprocessBackendConfig::new()
+        .with_rlimits(RlimitConfig { max_open_files: Some(1024), ..Default::default() })
+        .with_security(SecurityConfig { no_new_privs: true, ..Default::default() });
+    register_subprocess_runner_with_backend(&mut router, "secure", backend)?;
+    Ok(())
+}
+```
 
 ## Architecture
 ```text
@@ -60,12 +81,33 @@ Currently, ships a single backend - `SubprocessRunner` with optional Linux sandb
 | `ExecError`               | Configuration and spawn-time errors                         |
 
 ## Backend config
-```text
- SubprocessBackendConfig::new()
-     .with_rlimits(RlimitConfig { max_open_files: Some(1024), .. })
-     .with_cgroups(CgroupLimits { cpu: Some(CpuMax { quota: Some(50_000), period: 100_000 }), memory: Some(128 MB), pids: Some(32) })
-     .with_security(SecurityConfig { drop_all_caps: true, keep_caps: vec![LinuxCapability::NetBindService], no_new_privs: true, ..Default::default() })
-     .with_logger(LogConfig { max_line_length: 4096, stdout_info: true, stderr_warn: true })
+```rust,no_run
+use solti_exec::subprocess::{LogConfig, SubprocessBackendConfig};
+use solti_exec::{CgroupLimits, CpuMax, LinuxCapability, RlimitConfig, SecurityConfig};
+
+let backend = SubprocessBackendConfig::new()
+    .with_rlimits(RlimitConfig {
+        max_open_files: Some(1024),
+        ..Default::default()
+    })
+    .with_cgroups(CgroupLimits {
+        cpu: Some(CpuMax { quota: Some(50_000), period: 100_000 }),
+        memory: Some(128 * 1024 * 1024),
+        pids: Some(32),
+        ..Default::default()
+    })
+    .with_security(SecurityConfig {
+        drop_all_caps: true,
+        keep_caps: vec![LinuxCapability::NetBindService],
+        no_new_privs: true,
+        ..Default::default()
+    })
+    .with_logger(LogConfig {
+        max_line_length: 4096,
+        stdout_info: true,
+        stderr_warn: true,
+        ..Default::default()
+    });
 ```
 
 All settings are optional — without a backend config the subprocess inherits parent process settings.

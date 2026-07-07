@@ -14,9 +14,15 @@
 //!
 //! ## Per-task channel lifecycle (owned by `solti-core`)
 //!
-//! 1. `ensure_channel` / `sink_for` create the channel - **one [`broadcast::Sender`] per [`TaskId`], reused across every attempt** of that task (so a retried task's runs merge into one stream).
+//! 1. `ensure_channel` / `sink_for` create the channel - **one [`broadcast::Sender`] per [`TaskId`], reused across every attempt** of that task. A retried task's runs merge into one stream.
 //! 2. `subscribe` attaches a receiver; `announce_run_started` / `announce_run_finished` emit the run-boundary markers.
 //! 3. `evict` drops the channel once the task is fully terminal (`Exhausted` / `Removed`). The supervisor drives this; the registry never self-reaps.
+//!
+//! ## Lossy by design
+//!
+//! Channels are [`tokio::sync::broadcast`] with a fixed ring capacity (see [`OutputRegistry::new`]).
+//! A slow subscriber never blocks the runner: it receives a `Lagged` signal and continues from the freshest events still in the ring window.
+//! Writes without any live subscriber are dropped silently.
 //!
 //! ## Also
 //!

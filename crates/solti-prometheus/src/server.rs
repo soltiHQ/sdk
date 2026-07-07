@@ -1,7 +1,7 @@
 //! # Embedded metrics HTTP server (feature `server`).
 //!
 //! [`server`] builds a supervised axum task that serves `/metrics` (Prometheus text exposition, `text/plain; version=0.0.4`) from a shared [`Registry`].
-//! Bind/serve failures are retried under supervisor backoff; shutdown is cooperative via the task's `CancellationToken`.
+//! Bind/serve failures are retried under supervisor backoff; shutdown is cooperative via the task's [`TaskContext`](taskvisor::TaskContext).
 //! The task runs under [`AdmissionPolicy::Replace`] in the [`METRICS_SERVER_SLOT`] slot.
 //!
 //! See the [crate root](crate) for the namespace/architecture overview.
@@ -19,8 +19,7 @@ use prometheus::{Encoder, Registry, TextEncoder};
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
 };
-use taskvisor::{TaskError, TaskFn, TaskRef};
-use tokio_util::sync::CancellationToken;
+use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tracing::{debug, error, info};
 
 /// Logical slot name for the metrics server task.
@@ -45,7 +44,7 @@ const BACKOFF_FACTOR: f64 = 2.0;
 ///
 /// Serves `/metrics` (Prometheus text exposition format) from the given shared [`Registry`].
 /// The task runs under supervisor control so bind and serve errors are retried with backoff;
-/// graceful shutdown is propagated via [`CancellationToken`].
+/// graceful shutdown is propagated via the task's [`TaskContext`](taskvisor::TaskContext).
 ///
 /// ## Scheduling
 ///
@@ -57,7 +56,7 @@ const BACKOFF_FACTOR: f64 = 2.0;
 ///
 /// ## Example
 ///
-/// ```text
+/// ```rust,no_run
 /// use std::sync::Arc;
 /// use solti_prometheus::{Registry, server};
 ///
@@ -65,12 +64,14 @@ const BACKOFF_FACTOR: f64 = 2.0;
 /// // ... register collectors into `registry` ...
 ///
 /// let (task, spec) = server(registry.clone(), "0.0.0.0:9090");
-/// supervisor.submit_with_task(task, &spec).await?;
+/// // Submit to a running supervisor:
+/// // supervisor.submit_with_task(task, &spec).await?;
+/// # let _ = (task, spec);
 /// ```
 pub fn server(registry: Arc<Registry>, addr: impl Into<String>) -> (TaskRef, TaskSpec) {
     let addr: String = addr.into();
 
-    let task: TaskRef = TaskFn::arc(METRICS_SERVER_SLOT, move |ctx: CancellationToken| {
+    let task: TaskRef = TaskFn::arc(METRICS_SERVER_SLOT, move |ctx: TaskContext| {
         let addr = addr.clone();
         let registry = registry.clone();
         async move {
@@ -82,13 +83,9 @@ pub fn server(registry: Arc<Registry>, addr: impl Into<String>) -> (TaskRef, Tas
                 .route("/metrics", get(metrics_handler))
                 .with_state(registry);
 
-            let listener =
-                tokio::net::TcpListener::bind(&addr)
-                    .await
-                    .map_err(|e| TaskError::Fail {
-                        reason: format!("metrics listener bind failed on {addr}: {e}"),
-                        exit_code: None,
-                    })?;
+            let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+                TaskError::fail(format!("metrics listener bind failed on {addr}: {e}"))
+            })?;
             debug!(addr = %addr, "metrics server started");
             info!("metrics http://{addr}/metrics");
 
@@ -102,13 +99,10 @@ pub fn server(registry: Arc<Registry>, addr: impl Into<String>) -> (TaskRef, Tas
                 return Err(TaskError::Canceled);
             }
 
-            Err(TaskError::Fail {
-                reason: match serve_result {
-                    Ok(()) => "metrics server exited unexpectedly".to_string(),
-                    Err(e) => format!("metrics server error: {e}"),
-                },
-                exit_code: None,
-            })
+            Err(TaskError::fail(match serve_result {
+                Ok(()) => "metrics server exited unexpectedly".to_string(),
+                Err(e) => format!("metrics server error: {e}"),
+            }))
         }
     });
 

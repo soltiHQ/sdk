@@ -11,18 +11,36 @@
 //!
 //! ## Quick start
 //!
-//! ```text
-//! use solti_exec::subprocess::*;
+//! ```rust,no_run
+//! # #[cfg(feature = "subprocess")]
+//! # {
+//! use solti_exec::subprocess::{SubprocessRunner, register_subprocess_runner};
+//! use solti_model::{SubprocessMode, SubprocessSpec, TaskKind, TaskSpec};
+//! use solti_runner::{BuildContext, Runner, RunnerRouter};
 //!
+//! // The usual path: register the runner in a router.
 //! let mut router = RunnerRouter::new();
 //! register_subprocess_runner(&mut router, "default")?;
 //!
-//! // with sandboxing
-//! let backend = SubprocessBackendConfig::new()
-//!     .with_rlimits(RlimitConfig { .. })
-//!     .with_cgroups(CgroupLimits { .. })
-//!     .with_security(SecurityConfig { .. });
-//! register_subprocess_runner_with_backend(&mut router, "secure", backend)?;
+//! // Or drive the runner directly: TaskSpec -> runnable task.
+//! let runner = SubprocessRunner::new("direct");
+//! let spec = TaskSpec::builder(
+//!     "hello",
+//!     TaskKind::Subprocess(SubprocessSpec::new(
+//!         SubprocessMode::Command {
+//!             command: "echo".into(),
+//!             args: vec!["hi".into()],
+//!         },
+//!         Default::default(),
+//!         None,
+//!         Default::default(),
+//!     )),
+//!     5_000u64,
+//! )
+//! .build()?;
+//! let task = runner.build_task(&spec, &BuildContext::default())?;
+//! # }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
 //! ## Also
@@ -32,6 +50,7 @@
 //! - [`solti_runner::RunnerRouter`] routes tasks to registered runners.
 
 #![deny(unsafe_op_in_unsafe_fn)]
+#![warn(missing_docs)]
 
 /// Compiles the runnable Rust code blocks in `README.md` as doctests.
 #[cfg(all(doctest, feature = "subprocess"))]
@@ -45,7 +64,9 @@ pub use error::ExecError;
 mod metrics;
 
 #[cfg(feature = "subprocess")]
-pub use utils::{CgroupLimits, CpuMax, LinuxCapability, RlimitConfig, SecurityConfig};
+pub use utils::{
+    CgroupLimits, CpuMax, LinuxCapability, Namespaces, RlimitConfig, SeccompPolicy, SecurityConfig,
+};
 #[cfg(feature = "subprocess")]
 pub mod subprocess;
 #[cfg(feature = "subprocess")]

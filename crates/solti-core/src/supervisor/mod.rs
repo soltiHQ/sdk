@@ -17,7 +17,7 @@
 //!
 //! The backstop must therefore stay a **no-op on already-terminal entries** (enforced here and by `Task::transition_finished`'s sticky-terminal guard).
 //! It can never demote a richer event-derived phase.
-//! Both planes classify a rejection the same way (see [`reasons`]) so they never disagree on the final phase.
+//! Both planes classify outcomes and rejections through one crosswalk (`map::phase`). They can never disagree on the final phase.
 use std::{
     sync::{
         Arc,
@@ -38,8 +38,7 @@ use solti_runner::{OutputRegistry, RunnerRouter};
 use crate::system::init_uptime;
 use crate::{
     error::CoreError,
-    map::{to_admission_policy, to_backoff_policy, to_restart_policy},
-    reasons,
+    map::{phase, to_admission_policy, to_backoff_policy, to_restart_policy},
     state::{StateConfig, StateSubscriber, TaskState, state_sweep},
 };
 
@@ -99,6 +98,11 @@ impl SupervisorApi {
     ///
     /// A periodic sweep task is automatically submitted to prevent unbounded memory growth.
     /// It removes completed runs and terminal tasks that exceed their configured TTLs.
+    ///
+    /// ## Errors
+    ///
+    /// - [`CoreError::Supervisor`] (`op = "submit"`): the runtime refused the embedded sweep task submission.
+    ///   The sweep spec itself is built internally and always valid; no other variant is reachable.
     pub async fn new(
         sup_cfg: SupervisorConfig,
         ctrl_cfg: ControllerConfig,
@@ -118,6 +122,11 @@ impl SupervisorApi {
     }
 
     /// Same as [`SupervisorApi::new`], but lets the caller pass a shared [`OutputRegistry`].
+    ///
+    /// ## Errors
+    ///
+    /// - [`CoreError::Supervisor`] (`op = "submit"`): the runtime refused the embedded sweep task submission.
+    ///   The sweep spec itself is built internally and always valid; no other variant is reachable.
     pub async fn new_with_output_registry(
         sup_cfg: SupervisorConfig,
         ctrl_cfg: ControllerConfig,
@@ -194,6 +203,13 @@ impl SupervisorApi {
     }
 
     /// Stop a task (running **or** still queued in its slot) and purge its run history.
+    ///
+    /// Deleting a missing task is not an error: the call is an idempotent no-op.
+    ///
+    /// ## Errors
+    ///
+    /// - [`CoreError::Supervisor`] (`op = "cancel"`): the runtime failed to cancel the bound run.
+    /// - [`CoreError::Supervisor`] (`op = "remove"`): the run did not confirm the cancel in time and the follow-up queue purge failed.
     #[instrument(level = "debug", skip(self), fields(task_id = %id))]
     pub async fn delete_task(&self, id: &TaskId) -> Result<(), CoreError> {
         debug!("deleting task: {}", id);
@@ -217,22 +233,21 @@ impl SupervisorApi {
                 .handle
                 .cancel_by_label(id.as_str())
                 .await
-                .map_err(|e| CoreError::Supervisor(format!("cancel failed: {}", e)));
+                .map_err(|e| CoreError::supervisor("cancel", e));
         };
-        let tv = taskvisor::TaskId::from_raw(tv);
 
         let cancelled = self
             .handle
             .cancel_with_timeout(tv, self.grace + Duration::from_secs(1))
             .await
-            .map_err(|e| CoreError::Supervisor(format!("cancel failed: {}", e)))?;
+            .map_err(|e| CoreError::supervisor("cancel", e))?;
         if cancelled {
             return Ok(true);
         }
 
         self.handle
             .remove(tv)
-            .map_err(|e| CoreError::Supervisor(format!("remove failed: {}", e)))?;
+            .map_err(|e| CoreError::supervisor("remove", e))?;
         Ok(false)
     }
 
@@ -256,6 +271,14 @@ impl SupervisorApi {
     /// 2. Delegate to [`SupervisorApi::submit_with_task`].
     ///
     /// This is the primary entrypoint for tasks that are fully described by the public [`solti_model::TaskKind`] model.
+    ///
+    /// ## Errors
+    ///
+    /// - [`CoreError::InvalidSpec`]: the spec failed validation. This covers structural problems and `TaskKind::Embedded`, which cannot go through runners (use [`SupervisorApi::submit_with_task`]).
+    /// - [`CoreError::Runner`]: no registered runner matches the spec's kind/selector, or the runner failed to build the task.
+    /// - [`CoreError::Mapping`]: a spec policy has no taskvisor equivalent (unknown `#[non_exhaustive]` variant), or the backoff parameters are invalid.
+    /// - [`CoreError::AlreadyExists`]: a non-terminal task with the same name is still active.
+    /// - [`CoreError::Supervisor`] (`op = "submit"`): the runtime rejected the submission.
     #[instrument(level = "debug", skip(self, spec), fields(slot = %spec.slot(), kind = ?spec.kind()))]
     pub async fn submit(&self, spec: &TaskSpec) -> Result<TaskId, CoreError> {
         spec.validate()?;
@@ -270,6 +293,13 @@ impl SupervisorApi {
     ///
     /// The caller is responsible for constructing the [`TaskRef`];
     /// the spec controls timeout, restart, backoff and admission behavior.
+    ///
+    /// ## Errors
+    ///
+    /// - [`CoreError::InvalidSpec`]: the task name fails `TaskId` format validation.
+    /// - [`CoreError::Mapping`]: a spec policy has no taskvisor equivalent (unknown `#[non_exhaustive]` variant), or the backoff parameters are invalid.
+    /// - [`CoreError::AlreadyExists`]: a non-terminal task with the same name is still active.
+    /// - [`CoreError::Supervisor`] (`op = "submit"`): the runtime rejected the submission; the provisional state entry is rolled back.
     #[instrument(level = "debug", skip(self, task, spec), fields(slot = %spec.slot()))]
     pub async fn submit_with_task(
         &self,
@@ -285,17 +315,17 @@ impl SupervisorApi {
             to_backoff_policy(spec.backoff())?,
             Some(Duration::from_millis(spec.timeout().as_millis())),
         )
-        .with_max_retries(spec.max_retries())
-        .with_slot(spec.slot().as_str());
+        .with_max_retries(spec.max_retries());
         let controller_spec =
-            ControllerSpec::new(to_admission_policy(spec.admission())?, task_spec);
+            ControllerSpec::new(to_admission_policy(spec.admission())?, task_spec)
+                .with_slot(spec.slot().as_str());
 
         self.state.reserve(task_id.clone(), spec.clone())?;
 
         debug!("submitting pre-built task via controller");
         match self.handle.submit_and_watch(controller_spec).await {
             Ok((tv_id, waiter)) => {
-                self.state.bind_tv(&task_id, tv_id.get());
+                self.state.bind_tv(&task_id, tv_id);
 
                 let state = self.state.clone();
                 let output_registry = Arc::clone(&self.output_registry);
@@ -310,7 +340,7 @@ impl SupervisorApi {
             }
             Err(e) => {
                 self.unwind_provisional_submit(&task_id);
-                Err(CoreError::Supervisor(e.to_string()))
+                Err(CoreError::supervisor("submit", e))
             }
         }
     }
@@ -331,47 +361,18 @@ impl SupervisorApi {
             return;
         };
 
-        if let TaskOutcome::Rejected { reason } = outcome {
-            let phase = match reason.as_ref() {
-                reasons::REMOVED_FROM_QUEUE
-                | reasons::SUPERSEDED_BY_REPLACE
-                | reasons::CONTROLLER_SHUTTING_DOWN => TaskPhase::Canceled,
-                _ => TaskPhase::Failed,
-            };
-            state.transition_finished(&model_id, phase, Some(reason.to_string()), None);
-            output_registry.evict(&model_id);
-            state.unbind(&model_id);
-            return;
-        }
-
-        if state
-            .get(&model_id)
-            .is_none_or(|t| t.status().phase.is_terminal())
+        // A rejection finalizes unconditionally: the submission never ran, the
+        // provisional entry must reach a terminal phase even if the event plane
+        // already touched it (transition_finished stays sticky-terminal).
+        if !matches!(outcome, TaskOutcome::Rejected { .. })
+            && state
+                .get(&model_id)
+                .is_none_or(|t| t.status().phase.is_terminal())
         {
             return;
         }
 
-        let (phase, error, exit_code) = match outcome {
-            TaskOutcome::Completed => (TaskPhase::Succeeded, None, None),
-            TaskOutcome::Failed { reason, exit_code } => {
-                (TaskPhase::Exhausted, Some(reason.to_string()), *exit_code)
-            }
-            TaskOutcome::Fatal { reason, exit_code } => {
-                (TaskPhase::Failed, Some(reason.to_string()), *exit_code)
-            }
-            TaskOutcome::Canceled => (TaskPhase::Canceled, None, None),
-            TaskOutcome::ForceAborted => (
-                TaskPhase::Canceled,
-                Some("force_terminated_after_grace".to_string()),
-                None,
-            ),
-            TaskOutcome::Panicked => (TaskPhase::Failed, Some("actor panicked".to_string()), None),
-            _ => (
-                TaskPhase::Failed,
-                Some("unknown task outcome".to_string()),
-                None,
-            ),
-        };
+        let (phase, error, exit_code) = phase::phase_for_outcome(outcome);
         state.transition_finished(&model_id, phase, error, exit_code);
         output_registry.evict(&model_id);
         state.unbind(&model_id);
@@ -384,6 +385,10 @@ impl SupervisorApi {
     }
 
     /// Gracefully shut down the supervisor: cancel all tasks and wait for completion.
+    ///
+    /// ## Errors
+    ///
+    /// - [`CoreError::Supervisor`] (`op = "shutdown"`): the runtime failed to stop cleanly (for example, tasks had to be force-aborted after the grace period).
     #[instrument(level = "info", skip(self))]
     pub async fn shutdown(self) -> Result<(), CoreError> {
         info!("initiating graceful shutdown");
@@ -392,12 +397,18 @@ impl SupervisorApi {
             .clone()
             .shutdown()
             .await
-            .map_err(|e| CoreError::Supervisor(e.to_string()));
+            .map_err(|e| CoreError::supervisor("shutdown", e));
         self.shutdown_started.store(true, Ordering::Release);
         res
     }
 
     /// Cancel a task by ID (in-process Rust API), running or still queued.
+    ///
+    /// ## Errors
+    ///
+    /// - [`CoreError::NotFound`]: nothing was cancelled and no state entry exists for `id`.
+    /// - [`CoreError::Supervisor`] (`op = "cancel"`): the runtime failed to cancel the bound run.
+    /// - [`CoreError::Supervisor`] (`op = "remove"`): the run did not confirm the cancel in time and the follow-up queue purge failed.
     #[instrument(level = "debug", skip(self), fields(task_id = %id))]
     pub async fn cancel_task(&self, id: &TaskId) -> Result<(), CoreError> {
         debug!("cancelling task: {}", id);
@@ -420,8 +431,7 @@ mod tests {
 
     use solti_model::{AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind};
     use solti_runner::OutputRegistry;
-    use taskvisor::{TaskError, TaskFn};
-    use tokio_util::sync::CancellationToken;
+    use taskvisor::{TaskContext, TaskError, TaskFn};
 
     fn mk_backoff() -> BackoffPolicy {
         BackoffPolicy {
@@ -444,11 +454,8 @@ mod tests {
         .await
         .expect("SupervisorApi::new");
 
-        let task: TaskRef = TaskFn::arc("budget-task", |_ctx: CancellationToken| async move {
-            Err::<(), TaskError>(TaskError::Fail {
-                reason: "always fails".into(),
-                exit_code: None,
-            })
+        let task: TaskRef = TaskFn::arc("budget-task", |_ctx: TaskContext| async move {
+            Err::<(), TaskError>(TaskError::fail("always fails"))
         });
 
         let spec = TaskSpec::builder("budget-slot", TaskKind::Embedded, 5_000_u64)
@@ -459,7 +466,7 @@ mod tests {
                 max_ms: 1,
                 factor: 1.0,
             })
-            .max_retries(2)
+            .max_retries(std::num::NonZeroU32::new(2))
             .admission(AdmissionPolicy::DropIfRunning)
             .build()
             .expect("valid spec");
@@ -526,7 +533,7 @@ mod tests {
         );
 
         fn long_task() -> TaskRef {
-            TaskFn::arc("dup-name", |ctx: CancellationToken| async move {
+            TaskFn::arc("dup-name", |ctx: TaskContext| async move {
                 while !ctx.is_cancelled() {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
@@ -581,7 +588,7 @@ mod tests {
         .await
         .expect("failed to create SupervisorApi");
 
-        let task: TaskRef = TaskFn::arc("test-task", |_ctx: CancellationToken| async move {
+        let task: TaskRef = TaskFn::arc("test-task", |_ctx: TaskContext| async move {
             Ok::<(), TaskError>(())
         });
 
@@ -617,7 +624,7 @@ mod tests {
 
         let cancelled_observed = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancelled_observed);
-        let task: TaskRef = TaskFn::arc("kill-me", move |ctx: CancellationToken| {
+        let task: TaskRef = TaskFn::arc("kill-me", move |ctx: TaskContext| {
             let flag = Arc::clone(&flag);
             async move {
                 while !ctx.is_cancelled() {
@@ -693,7 +700,7 @@ mod tests {
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancelled);
-        let task: TaskRef = TaskFn::arc("drop-cancel", move |ctx: CancellationToken| {
+        let task: TaskRef = TaskFn::arc("drop-cancel", move |ctx: TaskContext| {
             let flag = Arc::clone(&flag);
             async move {
                 while !ctx.is_cancelled() {
@@ -751,7 +758,7 @@ mod tests {
         .expect("SupervisorApi::new");
 
         let long = |name: &'static str| -> TaskRef {
-            TaskFn::arc(name, |ctx: CancellationToken| async move {
+            TaskFn::arc(name, |ctx: TaskContext| async move {
                 ctx.cancelled().await;
                 Ok::<(), TaskError>(())
             })
@@ -800,10 +807,9 @@ mod tests {
         .await
         .expect("SupervisorApi::new");
 
-        let task: TaskRef = TaskFn::arc(
-            "bad name with spaces",
-            |_ctx: CancellationToken| async move { Ok::<(), TaskError>(()) },
-        );
+        let task: TaskRef = TaskFn::arc("bad name with spaces", |_ctx: TaskContext| async move {
+            Ok::<(), TaskError>(())
+        });
         let spec = TaskSpec::builder("ok-slot", TaskKind::Embedded, 1_000_u64)
             .restart(RestartPolicy::Never)
             .backoff(mk_backoff())
@@ -977,36 +983,37 @@ mod tests {
 
     use taskvisor::TaskOutcome;
 
-    fn bound_running_state(name: &str, tv: u64) -> (TaskState, TaskId) {
+    fn bound_running_state(name: &str) -> (TaskState, TaskId, u64) {
         let state = TaskState::new();
         let id = TaskId::from(name);
         let spec = TaskSpec::builder(name, TaskKind::Embedded, 5_000_u64)
             .build()
             .expect("valid spec");
         state.add_task(id.clone(), spec);
+        let tv = taskvisor::TaskId::for_tests();
         state.bind_tv(&id, tv);
         state.transition_starting(&id);
-        (state, id)
+        (state, id, tv.get())
     }
 
     #[test]
     fn backstop_finalizes_a_lost_terminal_outcome() {
-        let (state, id) = bound_running_state("lost-1", 101);
+        let (state, id, tv_raw) = bound_running_state("lost-1");
         let registry = OutputRegistry::default();
 
-        SupervisorApi::finalize_from_outcome(&state, &registry, 101, &TaskOutcome::Completed);
+        SupervisorApi::finalize_from_outcome(&state, &registry, tv_raw, &TaskOutcome::Completed);
 
         assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Succeeded);
     }
 
     #[test]
     fn backstop_evicts_output_channel_on_terminal_outcome() {
-        let (state, id) = bound_running_state("leak-1", 201);
+        let (state, id, tv_raw) = bound_running_state("leak-1");
         let registry = OutputRegistry::default();
         registry.ensure_channel(id.clone());
         assert!(registry.subscribe(&id).is_some(), "channel exists before");
 
-        SupervisorApi::finalize_from_outcome(&state, &registry, 201, &TaskOutcome::Completed);
+        SupervisorApi::finalize_from_outcome(&state, &registry, tv_raw, &TaskOutcome::Completed);
 
         assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Succeeded);
         assert!(
@@ -1017,11 +1024,11 @@ mod tests {
 
     #[test]
     fn backstop_is_noop_when_events_already_finalized() {
-        let (state, id) = bound_running_state("done-1", 102);
+        let (state, id, tv_raw) = bound_running_state("done-1");
         let registry = OutputRegistry::default();
         state.transition_finished(&id, TaskPhase::Failed, Some("boom".into()), Some(1));
 
-        SupervisorApi::finalize_from_outcome(&state, &registry, 102, &TaskOutcome::Completed);
+        SupervisorApi::finalize_from_outcome(&state, &registry, tv_raw, &TaskOutcome::Completed);
 
         assert_eq!(
             state.get(&id).unwrap().status().phase,
@@ -1032,14 +1039,14 @@ mod tests {
 
     #[test]
     fn backstop_rejected_finalizes_entry_consistently_with_event_path() {
-        let (state, id) = bound_running_state("rej-1", 103);
+        let (state, id, tv_raw) = bound_running_state("rej-1");
         let registry = OutputRegistry::default();
         registry.ensure_channel(id.clone());
 
         SupervisorApi::finalize_from_outcome(
             &state,
             &registry,
-            103,
+            tv_raw,
             &TaskOutcome::Rejected {
                 reason: "dropped: slot busy (running)".into(),
             },
@@ -1052,13 +1059,13 @@ mod tests {
 
     #[test]
     fn backstop_rejected_user_drop_is_canceled() {
-        let (state, id) = bound_running_state("rej-2", 104);
+        let (state, id, tv_raw) = bound_running_state("rej-2");
         let registry = OutputRegistry::default();
 
         SupervisorApi::finalize_from_outcome(
             &state,
             &registry,
-            104,
+            tv_raw,
             &TaskOutcome::Rejected {
                 reason: "removed_from_queue".into(),
             },

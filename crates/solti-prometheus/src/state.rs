@@ -44,12 +44,12 @@ fn phase_label(phase: TaskPhase) -> &'static str {
 /// collectors. On each scrape, all phases from [`TaskPhase`] are emitted; empty
 /// phases return `0` so dashboards can rely on a stable label set.
 ///
-/// Counts are recomputed from [`TaskState`] every scrape, so unlike the
-/// event-gauge `solti_sv_tasks_in_flight` this self-corrects and never accrues
-/// drift. The residual limitation is upstream: a `Running` count reflects the
-/// `TaskStarting` events `TaskState` has observed, so a start dropped under bus
-/// lag is undercounted until the entry's phase next changes (bounded, not
-/// cumulative).
+/// Counts are recomputed from [`TaskState`] on every scrape. Unlike the
+/// event-gauge `solti_sv_tasks_in_flight`, this collector self-corrects and
+/// never accrues drift. The residual limitation is upstream: a `Running` count
+/// reflects the `TaskStarting` events `TaskState` has observed. A start dropped
+/// under bus lag is undercounted until the entry's phase next changes (bounded,
+/// not cumulative).
 ///
 /// ## Cost
 ///
@@ -60,13 +60,18 @@ fn phase_label(phase: TaskPhase) -> &'static str {
 ///
 /// ## Example
 ///
-/// ```text
-/// use std::sync::Arc;
+/// ```rust
+/// use solti_core::TaskState;
 /// use solti_prometheus::{PrometheusStateCollector, Registry};
 ///
-/// let registry = Arc::new(Registry::new());
-/// let collector = PrometheusStateCollector::new(supervisor_api.state())?;
+/// # fn main() -> Result<(), prometheus::Error> {
+/// let registry = Registry::new();
+/// // In an agent, take the supervisor's shared state instead of a fresh one.
+/// let state = TaskState::new();
+/// let collector = PrometheusStateCollector::new(state)?;
 /// registry.register(Box::new(collector))?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct PrometheusStateCollector {
     state: TaskState,
@@ -77,6 +82,11 @@ impl PrometheusStateCollector {
     /// Create a new collector wired to `state`. The collector holds a cheap
     /// `Arc` clone of [`TaskState`] and will always observe the most recent
     /// mutations made by the supervisor's state subscriber.
+    ///
+    /// ## Errors
+    ///
+    /// - [`prometheus::Error::Msg`]: the metric descriptor failed validation.
+    ///   The names used here are fixed and valid, and this does not happen in practice.
     pub fn new(state: TaskState) -> Result<Self, prometheus::Error> {
         // We piggy-back on the existing `Sub` helper only for namespace/subsystem —
         // the gauge is *not* registered into a registry here, the caller does that

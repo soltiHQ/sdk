@@ -1,12 +1,12 @@
 [package]
 name = "solti-core"
-description = "Solti SDK supervisor orchestration."
+description = "Supervisor layer of the Solti SDK. It bridges the task model to the taskvisor runtime."
 
 rust-version.workspace = true
 repository.workspace = true
-categories.workspace = true
+categories = ["asynchronous", "concurrency"]
 homepage.workspace = true
-keywords.workspace = true
+keywords = ["supervisor", "tasks", "async", "runtime", "tokio"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -18,7 +18,6 @@ test-util = []
 [dependencies]
 taskvisor   = { workspace = true, features = ["controller"] }
 parking_lot = { workspace = true }
-tokio-util  = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 tokio       = { workspace = true }
@@ -27,6 +26,8 @@ solti-model  = { workspace = true }
 solti-runner = { workspace = true }
 
 [dev-dependencies]
+taskvisor = { workspace = true, features = ["test-util"] }
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

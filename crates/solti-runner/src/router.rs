@@ -135,6 +135,11 @@ impl RunnerRouter {
     /// Build a [`TaskRef`] for the given spec using the selected runner.
     ///
     /// `TaskKind::Embedded` is not routable and must be used with `SupervisorApi::submit_with_task`.
+    ///
+    /// ## Errors
+    ///
+    /// - [`RunnerError::NoRunner`]: the spec kind is `TaskKind::Embedded`, or no registered runner passes both [`Runner::supports`] and the [`TaskSpec::runner_selector`] label check.
+    /// - Any error from the selected runner's [`Runner::build_task`]: [`RunnerError::UnsupportedKind`], [`RunnerError::InvalidSpec`], [`RunnerError::MissingField`], [`RunnerError::Io`], or [`RunnerError::Internal`].
     #[instrument(level = "debug", skip(self, spec), fields(kind = ?spec.kind()))]
     pub fn build(&self, spec: &TaskSpec) -> Result<TaskRef, RunnerError> {
         trace!(spec = ?spec, "router received spec");
@@ -171,8 +176,7 @@ mod tests {
         SubprocessSpec, TaskEnv, WasmSpec,
     };
     use std::path::PathBuf;
-    use taskvisor::{TaskError, TaskFn};
-    use tokio_util::sync::CancellationToken;
+    use taskvisor::{TaskContext, TaskError, TaskFn};
 
     struct SubprocessRunnerDummy;
 
@@ -190,10 +194,9 @@ mod tests {
             _spec: &TaskSpec,
             _ctx: &BuildContext,
         ) -> Result<TaskRef, RunnerError> {
-            let task = TaskFn::arc(
-                "test-subprocess-runner",
-                |_ctx: CancellationToken| async move { Ok::<(), TaskError>(()) },
-            );
+            let task = TaskFn::arc("test-subprocess-runner", |_ctx: TaskContext| async move {
+                Ok::<(), TaskError>(())
+            });
             Ok(task)
         }
     }
@@ -298,10 +301,9 @@ mod tests {
                 _spec: &TaskSpec,
                 _ctx: &BuildContext,
             ) -> Result<TaskRef, RunnerError> {
-                Ok(TaskFn::arc(
-                    "r1-task",
-                    |_ctx: CancellationToken| async move { Ok::<(), TaskError>(()) },
-                ))
+                Ok(TaskFn::arc("r1-task", |_ctx: TaskContext| async move {
+                    Ok::<(), TaskError>(())
+                }))
             }
         }
 
@@ -319,10 +321,9 @@ mod tests {
                 _spec: &TaskSpec,
                 _ctx: &BuildContext,
             ) -> Result<TaskRef, RunnerError> {
-                Ok(TaskFn::arc(
-                    "r2-task",
-                    |_ctx: CancellationToken| async move { Ok::<(), TaskError>(()) },
-                ))
+                Ok(TaskFn::arc("r2-task", |_ctx: TaskContext| async move {
+                    Ok::<(), TaskError>(())
+                }))
             }
         }
 

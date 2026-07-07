@@ -74,6 +74,11 @@ impl BackoffPolicy {
     /// - `first_ms > 0`
     /// - `max_ms >= first_ms`
     /// - `factor >= 1.0` and finite
+    ///
+    /// ## Errors
+    ///
+    /// - [`ModelError::Invalid`]: `first_ms` is zero, `max_ms` is less than `first_ms`,
+    ///   or `factor` is not finite or below `1.0`.
     pub fn validate(&self) -> ModelResult<()> {
         if self.first_ms == 0 {
             return Err(ModelError::Invalid(Cow::Borrowed(

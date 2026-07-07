@@ -2,6 +2,11 @@
 
 use thiserror::Error;
 
+/// Errors returned by logger setup and by config value-object parsing.
+///
+/// The parsing variants (`InvalidFormat`, `InvalidTimeZone`, `InvalidLevel`) come from
+/// `FromStr` and serde construction of [`LoggerConfig`](crate::LoggerConfig) fields.
+/// The remaining variants come from [`init_logger`](crate::init_logger).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LoggerError {
@@ -17,7 +22,9 @@ pub enum LoggerError {
     #[error("Failed to initialize journald: {0}")]
     JournaldInitFailed(String),
 
-    /// A global tracing subscriber was already installed — [`init_logger`](crate::init_logger) is idempotent-by-error and may be called at most once per process.
+    /// A global tracing subscriber is already installed.
+    ///
+    /// [`init_logger`](crate::init_logger) can succeed at most once per process.
     #[error("Logger already initialized")]
     AlreadyInitialized,
 

@@ -32,6 +32,11 @@ impl AgentId {
     /// Validate that the agent id is safe to use across the SDK and the wire protocol.
     ///
     /// See `validate_identity` (module-private) for the exact rules.
+    ///
+    /// ## Errors
+    ///
+    /// - [`ModelError::Invalid`]: the id is empty, longer than [`AGENT_ID_MAX_LEN`],
+    ///   equal to `"."` or `".."`, or contains a byte outside `[A-Za-z0-9._-]`.
     pub fn validate_format(&self) -> Result<(), ModelError> {
         validate_identity("agent_id", self.as_str(), AGENT_ID_MAX_LEN)
     }

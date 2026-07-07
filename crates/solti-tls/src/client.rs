@@ -62,7 +62,10 @@ impl ClientTlsConfig {
     ///
     /// ## Errors
     ///
-    /// [`TlsError::Io`] (PEM read), [`TlsError::NoCertificates`] / [`TlsError::NoPrivateKey`] (parse), [`TlsError::Rustls`].
+    /// - [`TlsError::Io`]: reading a [`PemSource::Path`] from disk failed, or a PEM block is structurally malformed.
+    /// - [`TlsError::NoCertificates`]: the `ca` (or `client_cert`) PEM held no `CERTIFICATE` blocks.
+    /// - [`TlsError::NoPrivateKey`]: the `client_key` PEM held no private key.
+    /// - [`TlsError::Rustls`]: `rustls` rejected the config - e.g. a CA cert that `RootCertStore::add` refused, or a client cert/key mismatch.
     pub fn into_rustls_config(self) -> Result<rustls::ClientConfig, TlsError> {
         crate::ensure_default_provider();
 
@@ -163,9 +166,12 @@ impl ClientTlsConfigBuilder {
 
     /// Finalize the configuration.
     ///
-    /// Requires `ca`.
-    /// Rejects an unpaired client cert/key with [`TlsError::MissingField`] (`"client_cert"` or `"client_key"`).
+    /// Requires `ca`; the client cert/key must be paired.
     /// Does no I/O: the PEM sources are read by [`ClientTlsConfig::into_rustls_config`].
+    ///
+    /// ## Errors
+    ///
+    /// - [`TlsError::MissingField`]: `ca` was never set (carries `"ca"`), or a client cert/key was supplied without its pair (carries `"client_key"` / `"client_cert"`).
     ///
     /// ## Example
     ///

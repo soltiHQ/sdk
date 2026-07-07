@@ -1,11 +1,11 @@
 [package]
 name = "solti-discover"
-description = "Solti SDK agent-registration and heartbeat client for the Podium control-plane."
+description = "Agent registration and heartbeat client for the Podium control plane."
 
 rust-version.workspace = true
 repository.workspace = true
-categories.workspace = true
-keywords.workspace = true
+categories = ["network-programming", "asynchronous"]
+keywords = ["discovery", "heartbeat", "agent", "grpc", "http"]
 homepage.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -21,6 +21,7 @@ include = [
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []
@@ -37,7 +38,6 @@ serde_json  = { workspace = true, optional = true }
 taskvisor   = { workspace = true }
 thiserror   = { workspace = true }
 tokio       = { workspace = true }
-tokio-util  = { workspace = true }
 tonic       = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
 tracing     = { workspace = true }

@@ -51,7 +51,9 @@ impl Default for TaskQuery {
 /// Result of a paginated task query.
 #[derive(Debug, Clone)]
 pub struct TaskPage<T> {
+    /// Items on this page, at most [`TaskQuery::limit`] entries.
     pub items: Vec<T>,
+    /// Total number of items that match the query across all pages.
     pub total: usize,
 }
 

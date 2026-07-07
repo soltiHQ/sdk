@@ -1,6 +1,7 @@
 //! # Validated `EnvFilter` expression value object ([`LoggerLevel`]).
 //!
-//! Wraps a `tracing_subscriber` `EnvFilter` directive string, validated at construction so it cannot fail later at subscriber-install time.
+//! Wraps a `tracing_subscriber` `EnvFilter` directive string. The string is validated at
+//! construction. It cannot fail later at subscriber-install time.
 
 use std::{convert::TryFrom, str::FromStr};
 
@@ -58,6 +59,11 @@ impl LoggerLevel {
     /// Creates a new `LoggerLevel` from a string-like value.
     ///
     /// This is a convenience wrapper around [`TryFrom<String>`].
+    ///
+    /// ## Errors
+    ///
+    /// - [`LoggerError::InvalidLevel`]: the value is not a valid `EnvFilter` directive
+    ///   string (carries the input and the parse error).
     ///
     /// # Examples
     /// ```

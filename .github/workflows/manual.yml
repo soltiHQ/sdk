@@ -1,0 +1,19 @@
+name: Manual
+
+on: workflow_dispatch
+
+concurrency:
+  group: manual-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {
+  contents: read,
+  actions: write
+}
+
+jobs:
+  ci:
+    name: ci
+    uses: soltiHQ/actions/.github/workflows/rust-ci.yml@v1
+    with:
+      preflight-required: false

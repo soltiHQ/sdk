@@ -1,6 +1,9 @@
 //! # Backend: OS/kernel subprocess hardening.
 //!
-//! [`SubprocessBackendConfig`] collects rlimits, cgroup v2, security, and logging settings applied to every subprocess spawned by a runner.
+//! [`SubprocessBackendConfig`] collects rlimits, cgroup v2, security, logging,
+//! and environment settings applied to every subprocess spawned by a runner.
+
+use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
 use tracing::trace;
@@ -12,6 +15,100 @@ use crate::subprocess::logger::LogConfig;
 use crate::utils::{CgroupLimits, RlimitConfig, SecurityConfig};
 use crate::utils::{attach_cgroup, attach_rlimits, attach_security};
 
+/// Minimal `PATH` injected when the environment is cleared and the task did not
+/// set its own. Without it, a bare command name (`echo`) would fail to resolve.
+pub(crate) const SAFE_DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+/// How the child process's environment is built.
+///
+/// A subprocess started from an untrusted spec inherits the agent's environment
+/// by default, which commonly holds secrets (tokens, connection strings). This
+/// policy controls that boundary.
+#[derive(Debug, Clone, Default)]
+pub enum EnvPolicy {
+    /// Inherit the agent's full environment, then apply the task's own vars on
+    /// top. The historical behavior. Convenient, but the child sees every
+    /// secret in the agent's environment. Use it only for trusted specs.
+    #[default]
+    Inherit,
+    /// Start from an empty environment: the child sees only the task's own vars
+    /// plus a safe default `PATH` when the task set none.
+    /// No agent secret can leak through the environment.
+    Clear,
+    /// Start from an empty environment, then pass through the named variables
+    /// from the agent's environment (plus the task's own vars). Use it to hand
+    /// a task exactly the variables it needs and nothing else.
+    Allowlist(Vec<String>),
+}
+
+/// Where a task is allowed to set its working directory.
+///
+/// A spec from an untrusted control plane carries a free-form `cwd`. Left
+/// unchecked, a task can run in any directory the agent can reach.
+///
+/// ## This is a build-time check, not a filesystem sandbox
+///
+/// [`Roots`](Self::Roots) validates the `cwd` when the task is built, then the
+/// process is spawned later. A writable path component can be swapped between
+/// the two (a TOCTOU race), and the check constrains only *where the process
+/// starts*, not what it can reach afterwards. For hostile workloads confine the
+/// filesystem itself with a mount namespace
+/// ([`Namespaces`](crate::Namespaces)) or run the agent inside a container.
+#[derive(Debug, Clone, Default)]
+pub enum CwdPolicy {
+    /// Allow any `cwd` the spec provides. The historical behavior.
+    #[default]
+    Unrestricted,
+    /// The task's `cwd` must be set and must resolve (after following symlinks
+    /// and `..`) to a path inside one of these roots. A `cwd` that is omitted,
+    /// escapes, does not exist, or is not a directory is rejected at build time.
+    ///
+    /// Omitting `cwd` is rejected on purpose: inheriting the agent's working
+    /// directory would let a task sidestep the restriction entirely.
+    Roots(Vec<PathBuf>),
+}
+
+impl CwdPolicy {
+    /// Check a task-provided `cwd` against the policy.
+    ///
+    /// Under [`Unrestricted`](Self::Unrestricted) anything is allowed. Under
+    /// [`Roots`](Self::Roots) the `cwd` is required and is canonicalized first,
+    /// which resolves symlinks and `..` so a crafted path cannot traverse out
+    /// of an allowed root at validation time.
+    fn check(&self, cwd: Option<&Path>) -> Result<(), crate::ExecError> {
+        let CwdPolicy::Roots(roots) = self else {
+            return Ok(());
+        };
+        let Some(cwd) = cwd else {
+            return Err(InvalidRunnerConfig(
+                "cwd is required under a Roots policy; a task may not inherit the agent's cwd"
+                    .into(),
+            ));
+        };
+
+        let real = cwd.canonicalize().map_err(|e| {
+            InvalidRunnerConfig(format!("cwd {} cannot be resolved: {e}", cwd.display()))
+        })?;
+        if !real.is_dir() {
+            return Err(InvalidRunnerConfig(format!(
+                "cwd {} is not a directory",
+                real.display()
+            )));
+        }
+        let allowed = roots.iter().any(|root| match root.canonicalize() {
+            Ok(root) => real.starts_with(&root),
+            Err(_) => false,
+        });
+        if !allowed {
+            return Err(InvalidRunnerConfig(format!(
+                "cwd {} is outside the allowed roots",
+                real.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Low-level OS/kernel configuration for subprocess execution.
 ///
 /// Controls resource limits, security policies, and isolation mechanisms.
@@ -22,7 +119,9 @@ use crate::utils::{attach_cgroup, attach_rlimits, attach_security};
 /// - [`SubprocessRunner`](super::SubprocessRunner) runner that consumes this config.
 /// - [`RlimitConfig`](crate::utils::RlimitConfig) POSIX rlimit knobs.
 /// - [`CgroupLimits`](crate::utils::CgroupLimits) cgroup v2 knobs.
-/// - [`SecurityConfig`](crate::utils::SecurityConfig) capabilities / seccomp.
+/// - [`SecurityConfig`](crate::utils::SecurityConfig) Linux capability drop and `no_new_privs`.
+/// - [`EnvPolicy`] how the child environment is built.
+/// - [`CwdPolicy`] where a task may set its working directory.
 /// - [`LogConfig`](super::LogConfig) stdout/stderr log settings.
 #[derive(Debug, Clone, Default)]
 pub struct SubprocessBackendConfig {
@@ -32,6 +131,10 @@ pub struct SubprocessBackendConfig {
     cgroups: Option<CgroupLimits>,
     /// Security hardening.
     security: Option<SecurityConfig>,
+    /// How the child environment is built. Default [`EnvPolicy::Inherit`].
+    env_policy: EnvPolicy,
+    /// Where a task may set its working directory. Default [`CwdPolicy::Unrestricted`].
+    cwd_policy: CwdPolicy,
     /// Subprocess output logging configuration.
     logger: LogConfig,
     /// When `true`, confinement that cannot be applied is a hard error rather
@@ -66,6 +169,32 @@ impl SubprocessBackendConfig {
         self
     }
 
+    /// Set the environment policy for spawned children (default [`EnvPolicy::Inherit`]).
+    ///
+    /// For untrusted specs prefer [`EnvPolicy::Clear`] or [`EnvPolicy::Allowlist`]
+    /// so the child cannot read the agent's secrets from the environment.
+    /// [`with_require_enforcement(true)`](Self::with_require_enforcement) upgrades
+    /// an `Inherit` policy to `Clear` automatically.
+    pub fn with_env_policy(mut self, policy: EnvPolicy) -> Self {
+        self.env_policy = policy;
+        self
+    }
+
+    /// Restrict where a task may set its working directory (default
+    /// [`CwdPolicy::Unrestricted`]).
+    ///
+    /// Use [`CwdPolicy::Roots`] to confine tasks to a set of directories; a spec
+    /// whose `cwd` escapes them is rejected at build time.
+    pub fn with_cwd_policy(mut self, policy: CwdPolicy) -> Self {
+        self.cwd_policy = policy;
+        self
+    }
+
+    /// Validate a task-provided `cwd` against the configured [`CwdPolicy`].
+    pub(crate) fn check_cwd(&self, cwd: Option<&Path>) -> Result<(), crate::ExecError> {
+        self.cwd_policy.check(cwd)
+    }
+
     /// Set logger configuration.
     pub fn with_logger(mut self, config: LogConfig) -> Self {
         self.logger = config;
@@ -78,6 +207,8 @@ impl SubprocessBackendConfig {
     /// When this is `true` and a security/cgroup config is present, confinement fails **closed**:
     /// - on non-Linux it is rejected at config-validation time;
     /// - on Linux the cgroup join and capability drop are forced into fail-on-error mode.
+    /// - an [`EnvPolicy::Inherit`] environment is upgraded to [`EnvPolicy::Clear`],
+    ///   so the agent's secrets never reach the child.
     ///
     /// Use it for security-critical deployments that must never run a job outside its sandbox.
     pub fn with_require_enforcement(mut self, require: bool) -> Self {
@@ -106,6 +237,19 @@ impl SubprocessBackendConfig {
             c.fail_on_error = true;
         }
         c
+    }
+
+    /// Environment policy actually applied to a child.
+    ///
+    /// Under [`require_enforcement`](Self::with_require_enforcement) an
+    /// `Inherit` policy is upgraded to [`EnvPolicy::Clear`]: a deployment that
+    /// asked to fail closed must not leak the agent environment either.
+    /// An explicit `Allowlist` is respected as-is.
+    pub(crate) fn effective_env_policy(&self) -> EnvPolicy {
+        match (&self.env_policy, self.require_enforcement) {
+            (EnvPolicy::Inherit, true) => EnvPolicy::Clear,
+            (policy, _) => policy.clone(),
+        }
     }
 
     /// Get log configuration.
@@ -400,5 +544,111 @@ mod tests {
         let cfg = SubprocessBackendConfig::new().with_max_script_body_bytes(0);
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("max_script_body_bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn env_policy_defaults_to_inherit() {
+        let cfg = SubprocessBackendConfig::new();
+        assert!(matches!(cfg.effective_env_policy(), EnvPolicy::Inherit));
+    }
+
+    #[test]
+    fn require_enforcement_upgrades_inherit_to_clear() {
+        let cfg = SubprocessBackendConfig::new().with_require_enforcement(true);
+        assert!(
+            matches!(cfg.effective_env_policy(), EnvPolicy::Clear),
+            "a fail-closed deployment must not leak the agent environment"
+        );
+    }
+
+    #[test]
+    fn require_enforcement_leaves_explicit_allowlist_untouched() {
+        let cfg = SubprocessBackendConfig::new()
+            .with_env_policy(EnvPolicy::Allowlist(vec!["HOME".into()]))
+            .with_require_enforcement(true);
+        assert!(matches!(
+            cfg.effective_env_policy(),
+            EnvPolicy::Allowlist(keys) if keys == vec!["HOME".to_string()]
+        ));
+    }
+
+    #[test]
+    fn explicit_clear_without_enforcement_is_respected() {
+        let cfg = SubprocessBackendConfig::new().with_env_policy(EnvPolicy::Clear);
+        assert!(matches!(cfg.effective_env_policy(), EnvPolicy::Clear));
+    }
+
+    #[test]
+    fn cwd_unrestricted_allows_anything() {
+        let cfg = SubprocessBackendConfig::new();
+        assert!(cfg.check_cwd(None).is_ok());
+        assert!(
+            cfg.check_cwd(Some(Path::new("/nonexistent/anywhere")))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn cwd_roots_allows_paths_inside() {
+        let root = tempfile::TempDir::new().unwrap();
+        let sub = root.path().join("work");
+        std::fs::create_dir(&sub).unwrap();
+
+        let cfg = SubprocessBackendConfig::new()
+            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]));
+
+        assert!(cfg.check_cwd(Some(&sub)).is_ok());
+        assert!(cfg.check_cwd(Some(root.path())).is_ok());
+    }
+
+    #[test]
+    fn cwd_roots_requires_explicit_cwd() {
+        let root = tempfile::TempDir::new().unwrap();
+        let cfg = SubprocessBackendConfig::new()
+            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]));
+
+        let err = cfg.check_cwd(None).unwrap_err().to_string();
+        assert!(err.contains("cwd is required"), "got: {err}");
+    }
+
+    #[test]
+    fn cwd_roots_rejects_paths_outside() {
+        let root = tempfile::TempDir::new().unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+
+        let cfg = SubprocessBackendConfig::new()
+            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]));
+
+        let err = cfg.check_cwd(Some(other.path())).unwrap_err().to_string();
+        assert!(err.contains("outside the allowed roots"), "got: {err}");
+    }
+
+    #[test]
+    fn cwd_roots_rejects_nonexistent() {
+        let root = tempfile::TempDir::new().unwrap();
+        let cfg = SubprocessBackendConfig::new()
+            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]));
+
+        let missing = root.path().join("does-not-exist");
+        let err = cfg.check_cwd(Some(&missing)).unwrap_err().to_string();
+        assert!(err.contains("cannot be resolved"), "got: {err}");
+    }
+
+    #[test]
+    fn cwd_roots_rejects_traversal_escape() {
+        // A cwd built to look like it is under the root but that resolves out of
+        // it via `..` must be rejected: canonicalize collapses the traversal.
+        let base = tempfile::TempDir::new().unwrap();
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+
+        let cfg =
+            SubprocessBackendConfig::new().with_cwd_policy(CwdPolicy::Roots(vec![root.clone()]));
+
+        let escape = root.join("..").join("outside");
+        let err = cfg.check_cwd(Some(&escape)).unwrap_err().to_string();
+        assert!(err.contains("outside the allowed roots"), "got: {err}");
     }
 }

@@ -3,6 +3,28 @@ Observability primitives for the solti task execution system.
 
 Wires [`tracing`](https://docs.rs/tracing) into solti: logger initialization, supervision event logging, and timezone sync.
 
+## Quick start
+```rust,no_run
+use solti_observe::{LoggerConfig, LoggerLevel, init_local_offset, init_logger};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1) Must run before the tokio runtime spawns threads.
+    init_local_offset();
+
+    tokio::runtime::Runtime::new()?.block_on(async {
+        // 2) Install the global tracing subscriber.
+        let cfg = LoggerConfig {
+            level: LoggerLevel::new("info")?,
+            ..Default::default()
+        };
+        init_logger(&cfg)?;
+
+        tracing::info!("ready");
+        Ok(())
+    })
+}
+```
+
 ## Architecture
 ```text
   main()
@@ -14,7 +36,7 @@ Wires [`tracing`](https://docs.rs/tracing) into solti: logger initialization, su
           │   ├─ Json  → fmt::Layer::json()
           │   └─ Journald → tracing_journald::layer() (Linux only)
           │
-          ├─ TracingEventSubscriber     (feature: subscriber)
+          ├─ TracingBridge              (feature: subscriber)
           │   └─ on_event() → trace!/debug!/info!/warn!/error!
           │
           └─ timezone_sync()            (feature: timezone-sync)
@@ -46,29 +68,12 @@ Supports serde deserialization with missing-field defaults:
 {"format": "json", "tz": "local"} → JSON with local timestamps
 ```
 
-## Event → log level mapping (feature `subscriber`)
-```text
-  Level     Events
-  ─────     ──────
-  trace     TaskAddRequested, TaskRemoveRequested, TaskRemoved,
-            TaskStopped, ControllerSubmitted
-  debug     TaskAdded, ActorExhausted, BackoffScheduled,
-            ControllerSlotTransition
-  info      TaskStarting, ShutdownRequested, AllStoppedWithinGrace
-  warn      GraceExceeded, TimeoutHit, ControllerRejected
-  error     TaskFailed, ActorDead, SubscriberPanicked,
-            SubscriberOverflow
-```
+## Event logging (feature `subscriber`)
 
-## Structured fields
-
-| Field        | Type  | Present when                                 |
-|--------------|-------|----------------------------------------------|
-| `task`       | `str` | Most events (task name)                      |
-| `attempt`    | `u32` | TaskStarting, TaskFailed, BackoffScheduled   |
-| `reason`     | `str` | TaskFailed, ActorDead, SubscriberPanicked    |
-| `delay_ms`   | `u32` | BackoffScheduled                             |
-| `timeout_ms` | `u32` | TimeoutHit                                   |
+The feature re-exports `TracingBridge` from taskvisor.
+It forwards every supervision event to tracing under target `taskvisor`, with a stable `event` label and structured fields (`seq`, `id`, `task`, `attempt`, `reason`, `delay_ms`, `timeout_ms`, `duration_ms`, `exit_code`, `backoff_source`).
+Failures arrive as ERROR, timeouts and permanent retry give-ups as WARN, milestones as INFO, chatty events as DEBUG.
+See the [taskvisor docs](https://docs.rs/taskvisor) for the full level mapping.
 
 ## Local timezone support
 ```text
@@ -94,8 +99,8 @@ Supports serde deserialization with missing-field defaults:
 
 | Flag            | Default | Dependencies                             | Effect                          |
 |-----------------|---------|------------------------------------------|---------------------------------|
-| `subscriber`    | off     | `taskvisor`, `async-trait`               | TracingEventSubscriber          |
-| `timezone-sync` | off     | `taskvisor`, `tokio-util`, `solti-model` | timezone_sync() periodic task   |
+| `subscriber`    | off     | `taskvisor` (+ its `tracing` feature)    | `TracingBridge` re-export       |
+| `timezone-sync` | off     | `taskvisor`, `solti-model`               | timezone_sync() periodic task   |
 
 ## Key types
 
@@ -107,8 +112,7 @@ Supports serde deserialization with missing-field defaults:
 | `LoggerTimeZone`         | Timestamp timezone: `Utc`, `Local`                        |
 | `LoggerRfc3339`          | RFC 3339 formatter implementing `FormatTime`              |
 | `LoggerError`            | Error type for initialization and parsing                 |
-| `TracingEventSubscriber` | Logs taskvisor events via tracing (feature: `subscriber`) |
-| `View`                   | Helper trait for extracting event fields with defaults    |
+| `TracingBridge`          | Logs taskvisor events via tracing (feature: `subscriber`) |
 
 ## Error model
 ```text
@@ -125,6 +129,4 @@ Supports serde deserialization with missing-field defaults:
 ## Notes
 - `init_logger` can only be called **once** per process - subsequent calls return `AlreadyInitialized`.
 - `init_local_offset` is idempotent: safe to call multiple times, only the first triggers detection.
-- `TracingEventSubscriber` uses `queue_capacity = 2048`.
-- `EventKind` is `#[non_exhaustive]`; a `_` arm tolerates future taskvisor variants (logged at `debug`).
-- `BackoffScheduled` differentiates retry-after-failure vs scheduled-next-run by checking `reason` field presence.
+- `TracingBridge` lives in taskvisor; this crate only re-exports it. Level policy and fields evolve upstream.

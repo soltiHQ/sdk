@@ -2,7 +2,7 @@
 //!
 //! Shared TLS / mTLS configuration for Solti network-facing crates.
 //!
-//! Builders hold *intent*, a [`PemSource`] - filesystem path or in-memory PEM bytes for each cert/key.
+//! Builders hold *intent*: a [`PemSource`] (filesystem path or in-memory PEM bytes) for each cert/key.
 //! Defer all I/O and parsing to [`ServerTlsConfig::into_rustls_config`] / [`ClientTlsConfig::into_rustls_config`], which produce a ready [`rustls::ServerConfig`] / [`rustls::ClientConfig`].
 //!
 //! ## Architecture
@@ -85,6 +85,7 @@
 //! - [`TlsError`] - every failure mode of `build` / `into_rustls_config`.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 /// Compiles the runnable Rust code blocks in `README.md` as doctests.
 #[cfg(doctest)]

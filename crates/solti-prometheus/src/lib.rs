@@ -48,7 +48,7 @@
 //! | `solti_runner_task_duration_seconds` | Histogram | `runner`, `outcome` | Per-attempt execution duration |
 //! | `solti_runner_errors_total`          | Counter   | `runner`, `error`   | Runner setup/teardown errors   |
 //!
-//! Duration histogram buckets (seconds): [ `0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 1800, 3600`].
+//! Duration histogram buckets (seconds): `0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 1800, 3600`.
 //! Dense through the `10 ms - 10 s` range, sparser long tail out to one hour.
 //!
 //! ## Supervision metrics (`solti_sv_*`)
@@ -74,7 +74,7 @@
 //! | `solti_ctrl_rejections_total`  | CounterVec| `reason` | Controller rejections grouped by cause |
 //!
 //! `reason` values (bounded, classified from `Event.reason`):
-//! [ `slot_full`, `slot_busy`, `superseded`, `removed`, `shutting_down`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown`].
+//! `slot_full`, `slot_busy`, `superseded`, `removed`, `shutting_down`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown`.
 //!
 //! ## API metrics (`solti_api_*`, feature `api`)
 //!
@@ -108,8 +108,7 @@
 //!  - `process_max_fds`
 //!  - `process_start_time_seconds`.
 //!
-//! On other targets the function is a no-op.
-//! (compiles cleanly, registers nothing).
+//! On other targets the function is a no-op: it compiles cleanly and registers nothing.
 //!
 //! ## Build info
 //!
@@ -145,35 +144,41 @@
 //!
 //! ## Quick wire
 //!
-//! ```text
+//! ```rust,no_run
 //! use std::sync::Arc;
+//!
 //! use solti_prometheus::{
-//!     PrometheusMetrics, PrometheusSubscriber, Registry,
-//!     register_build_info, register_process_collector,
+//!     PrometheusMetrics, PrometheusSubscriber, Registry, register_build_info,
+//!     register_process_collector,
 //! };
+//! use solti_runner::{BuildContext, RunnerRouter};
+//! use taskvisor::Subscribe;
 //!
-//! let registry = Arc::new(Registry::new());
+//! fn main() -> Result<(), prometheus::Error> {
+//!     let registry = Arc::new(Registry::new());
 //!
-//! // Core collectors.
-//! let metrics = PrometheusMetrics::new(registry.clone())?;
-//! let subscriber = PrometheusSubscriber::new(registry.clone())?;
+//!     // Core collectors.
+//!     let metrics = PrometheusMetrics::new(registry.clone())?;
+//!     let subscriber = PrometheusSubscriber::new(registry.clone())?;
 //!
-//! // Standard extras.
-//! register_process_collector(&registry)?;
-//! register_build_info(&registry, &[
-//!     ("version", env!("CARGO_PKG_VERSION")),
-//! ])?;
+//!     // Standard extras.
+//!     register_process_collector(&registry)?;
+//!     register_build_info(&registry, &[("version", env!("CARGO_PKG_VERSION"))])?;
 //!
-//! // Wire into solti-runner:
-//! let ctx = BuildContext::new(RunnerEnv::default(), Arc::new(metrics));
-//! let router = RunnerRouter::new().with_context(ctx);
+//!     // Wire into solti-runner.
+//!     let ctx = BuildContext::default().with_metrics(Arc::new(metrics));
+//!     let router = RunnerRouter::new().with_context(ctx);
 //!
-//! // Wire into solti-core supervisor:
-//! let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(subscriber)];
+//!     // Wire into the supervisor event bus.
+//!     let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(subscriber)];
+//!
+//!     let _ = (router, subscribers);
+//!     Ok(())
+//! }
 //! ```
 //!
-//! For a full agent wiring — including the supervised `/metrics` HTTP task, `ApiMetricsBackend` (HTTP + gRPC), and `DiscoverMetricsBackend`
-//! _see the reference agents under `examples/agentd-http` and `examples/agentd-grpc`_ .
+//! For a full agent wiring — including the supervised `/metrics` HTTP task, `ApiMetricsBackend` (HTTP + gRPC), and `DiscoverMetricsBackend` —
+//! see the reference agents under `examples/agentd-http` and `examples/agentd-grpc`.
 //!
 //! ## Notes
 //!
@@ -192,6 +197,7 @@
 //! - `solti_discover::DiscoverMetricsBackend` - trait backing [`PrometheusDiscoverMetrics`] (feature `discover`).
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 /// Compiles the runnable Rust code blocks in `README.md` as doctests.
 #[cfg(doctest)]

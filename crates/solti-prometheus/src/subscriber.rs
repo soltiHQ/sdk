@@ -72,9 +72,9 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 2048;
 /// ## Notes
 ///
 /// - `tasks_in_flight` is **best-effort**. It is derived from taskvisor's lossy
-///   broadcast bus (inc on `TaskStarting`, dec on the per-attempt terminal), so a
-///   dropped event under sustained bus lag makes it drift and it does not
-///   self-heal. It is guarded against going negative (a terminal without a
+///   broadcast bus (inc on `TaskStarting`, dec on the per-attempt terminal). A
+///   dropped event under sustained bus lag makes it drift, and the gauge does
+///   not self-heal. It is guarded against going negative (a terminal without a
 ///   preceding start is a no-op). For an **authoritative**, self-correcting count
 ///   that is recomputed from `TaskState` on every scrape, use the pull-based
 ///   `PrometheusStateCollector` (`state` feature): `solti_sv_tasks_by_phase{phase="running"}`.
@@ -83,7 +83,7 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 2048;
 ///
 /// ## Also
 ///
-/// - [`PrometheusMetrics`](crate::PrometheusMetrics) is a runner-level metrics, complementary to this subscriber.
+/// - [`PrometheusMetrics`](crate::PrometheusMetrics): runner-level metrics, complementary to this subscriber.
 /// - [`Event`](taskvisor::Event) and [`EventKind`](taskvisor::EventKind): event structure and classification.
 pub struct PrometheusSubscriber {
     tasks_in_flight: Gauge,
@@ -104,8 +104,7 @@ pub struct PrometheusSubscriber {
 ///
 /// The raw `reason` on [`taskvisor::Event`] can embed error messages, queue depths, and other unbounded content, which would explode Prometheus cardinality if used directly as a label.
 /// This classifier collapses known prefixes produced by taskvisor's controller into a small set:
-///
-/// [`slot_full`, `slot_busy`, `superseded`, `removed`, `shutting_down`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` ].
+/// `slot_full`, `slot_busy`, `superseded`, `removed`, `shutting_down`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown`.
 fn classify_rejection_reason(reason: Option<&str>) -> &'static str {
     let Some(r) = reason else {
         return "unknown";
@@ -139,11 +138,21 @@ fn classify_rejection_reason(reason: Option<&str>) -> &'static str {
 
 impl PrometheusSubscriber {
     /// Create a new subscriber with the default event-bus queue capacity ([`DEFAULT_QUEUE_CAPACITY`]).
+    ///
+    /// ## Errors
+    ///
+    /// - [`prometheus::Error::AlreadyReg`]: one of the `solti_sv_*` / `solti_ctrl_*` metrics is
+    ///   already registered in `registry` (e.g. another subscriber was built against the same registry).
     pub fn new(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
         Self::with_queue_capacity(registry, DEFAULT_QUEUE_CAPACITY)
     }
 
     /// Create a new subscriber with a specific event-bus queue capacity.
+    ///
+    /// ## Errors
+    ///
+    /// - [`prometheus::Error::AlreadyReg`]: one of the `solti_sv_*` / `solti_ctrl_*` metrics is
+    ///   already registered in `registry` (e.g. another subscriber was built against the same registry).
     pub fn with_queue_capacity(
         registry: Arc<Registry>,
         queue_capacity: usize,
@@ -266,9 +275,9 @@ impl Subscribe for PrometheusSubscriber {
             EventKind::ActorExhausted => {
                 // Success under OnFailure/Never is the normal way a task ends,
                 // not retry exhaustion: keep the two distinguishable.
-                // NB: the literal mirrors `solti_core::reasons::POLICY_EXHAUSTED_SUCCESS`
+                // NB: the literal mirrors `taskvisor::reasons::POLICY_EXHAUSTED_SUCCESS`
                 // (the canonical, CI-pinned list); solti-prometheus does not depend
-                // on solti-core unconditionally, so it is duplicated here.
+                // on solti-core unconditionally, hence the duplicate here.
                 let label = if event.reason.as_deref() == Some("policy_exhausted_success") {
                     "completed"
                 } else {
@@ -317,7 +326,7 @@ impl Subscribe for PrometheusSubscriber {
         }
     }
 
-    /// Returns `"prometheus"`
+    /// Returns `"prometheus"`.
     fn name(&self) -> &'static str {
         "prometheus"
     }

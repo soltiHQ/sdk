@@ -17,12 +17,12 @@ changelog:
     - title: Dependencies
       labels:
         - deps
-    - title: CI/CD
+    - title: Tooling
       labels:
-        - ci
+        - tooling
     - title: Other
       labels:
         - other
-    - title: Exclude
+    - title: Uncategorized
       labels:
         - "*"

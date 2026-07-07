@@ -33,14 +33,13 @@ const MAX_RESPONSE_BODY_BYTES: u64 = 64 * 1024;
 
 use std::time::Instant;
 
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use solti_core::uptime_seconds;
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
 };
-use taskvisor::{TaskError, TaskFn, TaskRef};
+use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 
 use crate::config::{DiscoverConfig, DiscoveryTransport};
 use crate::errors::DiscoverError;
@@ -59,7 +58,8 @@ const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VE
 /// ## Errors
 ///
 /// - [`DiscoverError::SpecBuild`]: `TaskSpec` validation failed.
-/// - [`DiscoverError::HttpRequest`] `reqwest::Client` builder failed (rare; e.g. invalid default timeouts or TLS backend init).
+/// - [`DiscoverError::HttpRequest`]: the `reqwest::Client` builder failed (feature `http`; rare - e.g. TLS backend init).
+/// - [`DiscoverError::InvalidConfig`]: the TLS config could not be converted into a `rustls` client config (features `http` + `tls`).
 ///
 /// ## Also
 ///
@@ -135,7 +135,7 @@ pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError
         config,
     });
 
-    let task: TaskRef = TaskFn::arc(SLOT, move |cancel: CancellationToken| {
+    let task: TaskRef = TaskFn::arc(SLOT, move |cancel: TaskContext| {
         let ctx = Arc::clone(&ctx);
 
         async move {
@@ -145,10 +145,9 @@ pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError
                     jitter_ms = jitter.as_millis() as u64,
                     "applying startup jitter before first sync",
                 );
-                tokio::select! {
-                    _ = cancel.cancelled() => return Err(TaskError::Canceled),
-                    _ = tokio::time::sleep(jitter) => {}
-                }
+                cancel
+                    .run_until_cancelled(tokio::time::sleep(jitter))
+                    .await?;
             }
 
             if let Some(wait) = compute_hold_wait(
@@ -159,63 +158,46 @@ pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError
                     wait_s = wait.as_secs(),
                     "waiting for server-advised retry hold"
                 );
-                tokio::select! {
-                    _ = cancel.cancelled() => return Err(TaskError::Canceled),
-                    _ = tokio::time::sleep(wait) => {}
-                }
+                cancel.run_until_cancelled(tokio::time::sleep(wait)).await?;
             }
 
             debug!("sending sync request to control plane");
             ctx.metrics.record_attempt();
             let start = Instant::now();
-            tokio::select! {
-                _ = cancel.cancelled() => Err(TaskError::Canceled),
-                result = invoke_sync(&ctx) => {
-                    let duration_ms = start.elapsed().as_millis() as u64;
-                    match result {
-                        Ok(()) => {
-                            ctx.metrics.record_success(duration_ms);
-                            ctx.retry_hold_until.store(0, Ordering::Relaxed);
-                            debug!("sync completed successfully");
-                            Ok(())
+            let result = cancel.run_until_cancelled(invoke_sync(&ctx)).await?;
+            let duration_ms = start.elapsed().as_millis() as u64;
+            match result {
+                Ok(()) => {
+                    ctx.metrics.record_success(duration_ms);
+                    ctx.retry_hold_until.store(0, Ordering::Relaxed);
+                    debug!("sync completed successfully");
+                    Ok(())
+                }
+                Err(e) => {
+                    ctx.metrics
+                        .record_failure(duration_ms, classify_failure(&e));
+                    if let DiscoverError::Rejected {
+                        retry_after_s: Some(s),
+                        ..
+                    } = &e
+                    {
+                        let clamped = (*s).clamp(0, MAX_RETRY_AFTER_S);
+                        if *s != clamped {
+                            warn!(advised_s = *s, capped_s = clamped, "retry_after_s capped",);
                         }
-                        Err(e) => {
-                            ctx.metrics.record_failure(duration_ms, classify_failure(&e));
-                            if let DiscoverError::Rejected {
-                                retry_after_s: Some(s),
-                                ..
-                            } = &e
-                            {
-                                let clamped = (*s).clamp(0, MAX_RETRY_AFTER_S);
-                                if *s != clamped {
-                                    warn!(
-                                        advised_s = *s,
-                                        capped_s = clamped,
-                                        "retry_after_s capped",
-                                    );
-                                }
-                                let hold_until =
-                                    now_unix_seconds().saturating_add(clamped as u64);
-                                ctx.retry_hold_until.store(hold_until, Ordering::Relaxed);
-                                ctx.metrics.record_hold(clamped as u64);
-                            }
-
-                            if e.is_terminal() {
-                                warn!("sync failed fatally: {}", e);
-                                Err(TaskError::Fatal {
-                                    reason: format!("sync fatally failed: {}", e),
-                                    exit_code: None,
-                                })
-                            } else {
-                                warn!("sync failed: {}", e);
-                                Err(TaskError::Fail {
-                                    reason: format!("sync failed: {}", e),
-                                    exit_code: None,
-                                })
-                            }
-                        }
+                        let hold_until = now_unix_seconds().saturating_add(clamped as u64);
+                        ctx.retry_hold_until.store(hold_until, Ordering::Relaxed);
+                        ctx.metrics.record_hold(clamped as u64);
                     }
-                },
+
+                    if e.is_terminal() {
+                        warn!("sync failed fatally: {}", e);
+                        Err(TaskError::fatal(format!("sync fatally failed: {}", e)))
+                    } else {
+                        warn!("sync failed: {}", e);
+                        Err(TaskError::fail(format!("sync failed: {}", e)))
+                    }
+                }
             }
         }
     });
@@ -234,7 +216,7 @@ struct SyncContext {
     /// `0` means no active hold. Updated to `now + retry_after_s` when the control plane returns `Rejected { retry_after_s: Some(_) }`;
     /// cleared to `0` on successful sync.
     retry_hold_until: AtomicU64,
-    /// Guard so the first-tick startup jitter runs exactly once per process lifetime.
+    /// Guard that makes the first-tick startup jitter run exactly once per process lifetime.
     /// Set to `true` after the initial jitter sleep;
     /// subsequent restarts (e.g. after a transient failure) skip the jitter and stay on the periodic schedule.
     startup_jitter_applied: AtomicBool,

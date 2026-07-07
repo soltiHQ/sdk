@@ -32,16 +32,43 @@ tasks:
       - task: rust:check
 
   ci/clippy:
-    desc: Run 'cargo clippy'.
+    desc: "Run 'cargo clippy' for one feature set. FEATURE = none|all|default (default: all)."
     deps: [proto/vendor]
+    vars:
+      FEATURE: '{{.FEATURE | default "all"}}'
+      FEATURE_FLAGS:
+        sh: |
+          case "{{.FEATURE}}" in
+            none)    echo '--no-default-features' ;;
+            all)     echo '--all-features' ;;
+            default) echo '' ;;
+            *)       echo "--no-default-features --features {{.FEATURE}}" ;;
+          esac
     cmds:
       - task: rust:clippy
+        vars: { CLIPPY_ARGS: '--workspace --all-targets {{.FEATURE_FLAGS}} -- -D warnings' }
 
   ci/test:
-    desc: Run 'cargo test'.
+    desc: Run 'cargo test' (all targets, all features).
     deps: [proto/vendor]
     cmds:
       - task: rust:test
+
+  ci/test-unit:
+    desc: Run unit tests ('cargo test --lib') and doctests ('cargo test --doc').
+    deps: [proto/vendor]
+    cmds:
+      - task: rust:test
+        vars: { TEST_ARGS: '--workspace --lib --all-features' }
+      - task: rust:test
+        vars: { TEST_ARGS: '--workspace --doc --all-features' }
+
+  ci/test-integration:
+    desc: Run integration tests ('cargo test --test "*"').
+    deps: [proto/vendor]
+    cmds:
+      - task: rust:test
+        vars: { TEST_ARGS: '--workspace --test "*" --all-features' }
 
   ci/audit:
     desc: Run 'cargo audit'.
@@ -70,11 +97,13 @@ tasks:
           PUBLISH_ARGS: "--all-features --allow-dirty"
 
   ci/docs:
-    desc: Run 'rustdoc' for a crate. Pass CRATE.
+    desc: Rustdoc gate. Whole workspace in two feature configs; pass CRATE to document one crate.
     deps: [proto/vendor]
-    requires:
-      vars: [ CRATE ]
     cmds:
-      - task: rust:docs
-        vars:
-          CRATE: '{{.CRATE}}'
+      - |
+        if [ -n "{{.CRATE}}" ]; then
+          RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p {{.CRATE}} --all-features
+        else
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+        fi

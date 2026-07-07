@@ -75,19 +75,31 @@ No feature is enabled by default. `tls` is additive on top of `grpc`/`http`.
 
 ### Enabling TLS
 
-```rust,ignore
-use solti_discover::DiscoverConfig;
+```rust,no_run
+use solti_discover::{DiscoverConfig, DiscoveryTransport};
+use solti_model::AgentId;
 use solti_tls::ClientTlsConfig;
 
-let client_tls = ClientTlsConfig::builder()
-    .ca_pem_file("/etc/solti/tls/control-plane-ca.crt")
-    .client_cert_pem_file("/etc/solti/tls/agent.crt")  // optional, for mTLS
-    .client_key_pem_file("/etc/solti/tls/agent.key")
-    .build()?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client_tls = ClientTlsConfig::builder()
+        .ca_pem_file("/etc/solti/tls/control-plane-ca.crt")
+        .client_cert_pem_file("/etc/solti/tls/agent.crt") // optional, for mTLS
+        .client_key_pem_file("/etc/solti/tls/agent.key")
+        .build()?;
 
-let cfg = DiscoverConfig::builder(/* ... */)
+    let _cfg = DiscoverConfig::builder(
+        AgentId::from("agent-1"),
+        "agent-1",
+        "https://127.0.0.1:8085",
+        "https://control-plane:9000",
+        DiscoveryTransport::Http,
+        30_000, // sync interval (ms)
+        1,      // api_version
+    )
     .with_tls(client_tls)
     .build()?;
+    Ok(())
+}
 ```
 
 For HTTP (reqwest), the built `rustls::ClientConfig` is plugged in via `use_preconfigured_tls`. 
@@ -96,17 +108,29 @@ See the `solti-tls` README for the full integration story.
 
 ### Enabling token auth
 
-```rust,ignore
-use solti_discover::{DiscoverConfig, Token};
+```rust,no_run
+use solti_discover::{DiscoverConfig, DiscoveryTransport, Token};
+use solti_model::AgentId;
 
-let cfg = DiscoverConfig::builder(/* ... */)
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _cfg = DiscoverConfig::builder(
+        AgentId::from("agent-1"),
+        "agent-1",
+        "https://127.0.0.1:8085",
+        "https://control-plane:9000",
+        DiscoveryTransport::Http,
+        30_000, // sync interval (ms)
+        1,      // api_version
+    )
     .with_token(Token::from_env("SOLTI_AGENT_TOKEN")?)
     .build()?;
+    Ok(())
+}
 ```
 
 The token is sent as `Authorization: Bearer <token>` (HTTP) / `authorization` metadata (gRPC) on every sync - never in the request body.
 It stays out of the wire schema. Orthogonal to TLS: all four modes (±token, ±tls) work, but the sync task logs a warning if a token is set without TLS (the credential would travel in plaintext). 
-The same secret is what the agent's inbound API (`solti-api`) verifies, one config value enables auth in both directions.
+The agent's inbound API (`solti-api`) verifies the same secret: one config value enables auth in both directions.
 
 ## Task policy
 

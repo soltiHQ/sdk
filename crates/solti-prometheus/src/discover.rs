@@ -40,6 +40,11 @@ pub struct PrometheusDiscoverMetrics {
 
 impl PrometheusDiscoverMetrics {
     /// Register all discovery metrics into `registry`.
+    ///
+    /// ## Errors
+    ///
+    /// - [`prometheus::Error::AlreadyReg`]: one of the `solti_discover_*` metrics is already
+    ///   registered in `registry` (e.g. another instance was built against the same registry).
     pub fn new(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
         let r = Sub::new(&registry, "discover");
 

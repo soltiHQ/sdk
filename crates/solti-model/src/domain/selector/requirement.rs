@@ -34,6 +34,11 @@ impl SelectorRequirement {
     /// - `key` must not be empty
     /// - `In`/`NotIn` must have non-empty `values`
     /// - `Exists`/`DoesNotExist` must have empty `values`
+    ///
+    /// ## Errors
+    ///
+    /// - [`ModelError::Invalid`](crate::ModelError::Invalid): `key` is empty, `In`/`NotIn`
+    ///   has empty `values`, or `Exists`/`DoesNotExist` has non-empty `values`.
     pub fn validate(&self) -> crate::error::ModelResult<()> {
         use std::borrow::Cow;
 

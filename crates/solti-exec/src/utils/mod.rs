@@ -26,8 +26,8 @@ pub use limits::RlimitConfig;
 pub(crate) use limits::attach_rlimits;
 
 mod security;
-pub use security::SecurityConfig;
 pub(crate) use security::attach_security;
+pub use security::{Namespaces, SeccompPolicy, SecurityConfig};
 
 mod capability;
 pub use capability::LinuxCapability;

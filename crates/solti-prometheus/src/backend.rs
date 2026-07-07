@@ -55,8 +55,8 @@ use crate::register::{Sub, ms_to_secs};
 ///
 /// ## Also
 ///
-/// - [`PrometheusSubscriber`](crate::PrometheusSubscriber) is a supervision-level metrics from the event stream.
-/// - [`Registry`](prometheus::Registry) is a shared registry for unified `/metrics` endpoint.
+/// - [`PrometheusSubscriber`](crate::PrometheusSubscriber): supervision-level metrics from the event stream.
+/// - [`Registry`](prometheus::Registry): shared registry for a unified `/metrics` endpoint.
 pub struct PrometheusMetrics {
     tasks_started: CounterVec,
     tasks_completed: CounterVec,
@@ -71,6 +71,11 @@ impl PrometheusMetrics {
     /// Primary constructor — mirrors the shape used by other backends in this
     /// crate ([`PrometheusSubscriber::new`](crate::PrometheusSubscriber::new),
     /// `PrometheusApiMetrics::new`, `PrometheusDiscoverMetrics::new`).
+    ///
+    /// ## Errors
+    ///
+    /// - [`prometheus::Error::AlreadyReg`]: one of the `solti_runner_*` metrics is already
+    ///   registered in `registry` (e.g. another backend was built against the same registry).
     pub fn new(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
         let r = Sub::new(&registry, "runner");
 
@@ -112,11 +117,20 @@ impl PrometheusMetrics {
     ///
     /// Convenience for tests / standalone use. Most agents share a single
     /// registry across collectors via [`Self::new`].
+    ///
+    /// ## Errors
+    ///
+    /// Same as [`Self::new`]. The registry is fresh and private here, and
+    /// registration into it does not collide in practice.
     pub fn new_isolated() -> Result<Self, prometheus::Error> {
         Self::new(Arc::new(Registry::new()))
     }
 
     /// Deprecated alias of [`Self::new`].
+    ///
+    /// ## Errors
+    ///
+    /// See [`Self::new`].
     #[deprecated(
         since = "0.0.2",
         note = "use `PrometheusMetrics::new(registry)` — same signature, consistent with the other backends"

@@ -2,6 +2,13 @@
 
 use thiserror::Error;
 
+/// Unified error type for both API transports.
+///
+/// Every handler and conversion failure becomes one of these variants.
+/// The transport layers map each variant to a wire response:
+/// gRPC via `From<ApiError> for tonic::Status`, HTTP via `axum::response::IntoResponse`
+/// (JSON body `{ "error": <label>, "message": <detail> }`).
+/// The stable `error` label comes from [`ApiError::as_label`].
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ApiError {
@@ -9,7 +16,7 @@ pub enum ApiError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
-    /// Credential missing, malformed, or rejected.
+    /// Credential missing, malformed, or rejected. → `401` / `Unauthenticated`.
     #[error("unauthenticated: {0}")]
     Unauthenticated(String),
 
@@ -21,11 +28,12 @@ pub enum ApiError {
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
 
-    /// Unexpected server-side failure with no more specific mapping.
+    /// Unexpected server-side failure with no more specific mapping. → `500` / `Internal`.
     #[error("internal error: {0}")]
     Internal(String),
 
-    /// A failure from the [`solti_core`] layer, mapped variant-by-variant
+    /// A failure from the [`solti_core`] layer, mapped variant-by-variant.
+    /// `InvalidSpec` → `400`, `AlreadyExists` → `409`, `NotFound` → `404`, everything else → `500`.
     #[error("core error: {0}")]
     Core(#[from] solti_core::CoreError),
 }
@@ -71,7 +79,7 @@ fn core_to_status(e: solti_core::CoreError) -> tonic::Status {
         CoreError::InvalidSpec(inner) => tonic::Status::invalid_argument(inner.to_string()),
         CoreError::AlreadyExists(msg) => tonic::Status::already_exists(msg),
         CoreError::NotFound(msg) => tonic::Status::not_found(msg),
-        CoreError::Supervisor(_) | CoreError::Mapping(_) | CoreError::Runner(_) => {
+        CoreError::Supervisor { .. } | CoreError::Mapping(_) | CoreError::Runner(_) => {
             tonic::Status::internal(e.to_string())
         }
         // `CoreError` is `#[non_exhaustive]`: any future variant is conservatively
@@ -108,7 +116,7 @@ fn core_to_http_status(e: solti_core::CoreError) -> (axum::http::StatusCode, Str
         CoreError::InvalidSpec(inner) => (StatusCode::BAD_REQUEST, inner.to_string()),
         CoreError::AlreadyExists(msg) => (StatusCode::CONFLICT, msg),
         CoreError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-        CoreError::Supervisor(_) | CoreError::Mapping(_) | CoreError::Runner(_) => {
+        CoreError::Supervisor { .. } | CoreError::Mapping(_) | CoreError::Runner(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
         // `CoreError` is `#[non_exhaustive]`: any future variant is conservatively
@@ -160,9 +168,9 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
-    // `CoreError` is `#[non_exhaustive]`, so the compiler no longer forces these
-    // mappers to cover every variant. These tests pin the known mappings instead:
-    // a maintainer adding a variant should extend the mappers (and this test).
+    // `CoreError` is `#[non_exhaustive]`. The compiler therefore no longer forces
+    // these mappers to cover every variant. These tests pin the known mappings
+    // instead: a maintainer adding a variant should extend the mappers (and this test).
     #[cfg(feature = "http")]
     #[test]
     fn core_to_http_status_maps_every_known_variant() {
@@ -177,7 +185,10 @@ mod tests {
             (CoreError::AlreadyExists("x".into()), StatusCode::CONFLICT),
             (CoreError::NotFound("x".into()), StatusCode::NOT_FOUND),
             (
-                CoreError::Supervisor("x".into()),
+                CoreError::Supervisor {
+                    op: "cancel",
+                    source: taskvisor::RuntimeError::TaskAlreadyExists { name: "x".into() }.into(),
+                },
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (
@@ -203,7 +214,13 @@ mod tests {
             ),
             (CoreError::AlreadyExists("x".into()), Code::AlreadyExists),
             (CoreError::NotFound("x".into()), Code::NotFound),
-            (CoreError::Supervisor("x".into()), Code::Internal),
+            (
+                CoreError::Supervisor {
+                    op: "cancel",
+                    source: taskvisor::RuntimeError::TaskAlreadyExists { name: "x".into() }.into(),
+                },
+                Code::Internal,
+            ),
             (CoreError::Mapping("x".into()), Code::Internal),
         ];
         for (err, expected) in cases {

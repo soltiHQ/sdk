@@ -1,10 +1,10 @@
 //! # State event subscriber.
 //!
 //! [`StateSubscriber`] implements [`Subscribe`](taskvisor::Subscribe) and owns two responsibilities driven off taskvisor's lifecycle events:
-//! - project events into [`TaskState`](super::TaskState) transitions (phases and`TaskRun` records, including the `TimeoutHit`→`TaskFailed` pairing);
+//! - project events into [`TaskState`](super::TaskState) transitions (phases and `TaskRun` records, including the `TimeoutHit`→`TaskFailed` pairing);
 //! - drive the per-run [`OutputRegistry`] lifecycle (announce `RunStarted` / `RunFinished`, evict on terminal).
 //!
-//! This is the **event plane** - fed by taskvisor's *lossy* broadcast bus, a dropped terminal event is repaired by the completion-plane backstop (`finalize_from_outcome`) on [`SupervisorApi`](crate::SupervisorApi).
+//! This is the **event plane** - fed by taskvisor's *lossy* broadcast bus. A dropped terminal event is repaired by the completion-plane backstop (`finalize_from_outcome`) on [`SupervisorApi`](crate::SupervisorApi).
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -13,7 +13,7 @@ use taskvisor::{Event, EventKind, Subscribe};
 use tracing::{trace, warn};
 
 use super::TaskState;
-use crate::reasons;
+use crate::map::phase::{phase_for_exhausted, phase_for_rejection};
 use solti_model::{TaskId, TaskPhase};
 use solti_runner::OutputRegistry;
 
@@ -125,20 +125,12 @@ impl Subscribe for StateSubscriber {
                 timed_out.retain(|id, _| self.state.contains_task(id));
             }
             EventKind::ActorExhausted => {
-                let reason = event.reason.as_ref().map(|s| s.to_string());
                 trace!(
                     task = %task_id,
                     exit_code = ?event.exit_code,
                     "actor exhausted",
                 );
-                let (phase, error) = match reason.as_deref() {
-                    Some(reasons::POLICY_EXHAUSTED_SUCCESS) => (TaskPhase::Succeeded, None),
-                    Some(reasons::TASK_RETURNED_CANCELED) => (TaskPhase::Canceled, None),
-                    _ => (
-                        TaskPhase::Exhausted,
-                        Some(reason.unwrap_or_else(|| "exhausted".to_string())),
-                    ),
-                };
+                let (phase, error) = phase_for_exhausted(event.reason.as_deref());
                 if !self
                     .state
                     .transition_finished(&task_id, phase, error, event.exit_code)
@@ -176,12 +168,7 @@ impl Subscribe for StateSubscriber {
                     .as_ref()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "rejected".to_string());
-                let phase = match reason.as_str() {
-                    reasons::REMOVED_FROM_QUEUE
-                    | reasons::SUPERSEDED_BY_REPLACE
-                    | reasons::CONTROLLER_SHUTTING_DOWN => TaskPhase::Canceled,
-                    _ => TaskPhase::Failed,
-                };
+                let phase = phase_for_rejection(&reason);
                 if !self
                     .state
                     .transition_finished(&task_id, phase, Some(reason), None)
@@ -246,17 +233,19 @@ mod tests {
         (sub, state, id)
     }
 
-    use taskvisor::TaskId as TvId;
-
     #[test]
     fn late_events_from_previous_incarnation_are_ignored() {
         let (sub, state, id) = setup("reuse-x");
-        state.bind_tv(&id, 1);
-        state.bind_tv(&id, 2);
+        let tvs = [
+            taskvisor::TaskId::for_tests(),
+            taskvisor::TaskId::for_tests(),
+        ];
+        state.bind_tv(&id, tvs[0]);
+        state.bind_tv(&id, tvs[1]);
 
         let stale = Event::new(EventKind::TaskRemoved)
             .with_task("reuse-x")
-            .with_id(TvId::from_raw(1));
+            .with_id(tvs[0]);
         sub.on_event(&stale);
         assert!(
             state.get(&id).is_some(),
@@ -265,7 +254,7 @@ mod tests {
 
         let current = Event::new(EventKind::TaskRemoved)
             .with_task("reuse-x")
-            .with_id(TvId::from_raw(2));
+            .with_id(tvs[1]);
         sub.on_event(&current);
         assert!(
             state.get(&id).is_none(),
@@ -278,14 +267,15 @@ mod tests {
         let state = TaskState::new();
         let id = TaskId::from("rejected-task");
         state.add_task(id.clone(), test_spec());
-        state.bind_tv(&id, 7);
+        let tv = taskvisor::TaskId::for_tests();
+        state.bind_tv(&id, tv);
         let registry = Arc::new(OutputRegistry::new(16));
         registry.ensure_channel(id.clone());
         let sub = StateSubscriber::with_output_registry(state.clone(), Arc::clone(&registry));
 
         let ev = Event::new(EventKind::ControllerRejected)
             .with_task("some-slot")
-            .with_id(TvId::from_raw(7))
+            .with_id(tv)
             .with_reason("queue_full: 3/3");
         sub.on_event(&ev);
 
@@ -316,7 +306,8 @@ mod tests {
         let state = TaskState::new();
         let id = TaskId::from("rej-reap");
         state.add_task(id.clone(), test_spec());
-        state.bind_tv(&id, 11);
+        let tv = taskvisor::TaskId::for_tests();
+        state.bind_tv(&id, tv);
         let sub = StateSubscriber::with_output_registry(
             state.clone(),
             Arc::new(OutputRegistry::default()),
@@ -325,7 +316,7 @@ mod tests {
         sub.on_event(
             &Event::new(EventKind::ControllerRejected)
                 .with_task("slot")
-                .with_id(TvId::from_raw(11))
+                .with_id(tv)
                 .with_reason("queue_full: 3/3"),
         );
 
@@ -344,7 +335,8 @@ mod tests {
         let state = TaskState::new();
         let id = TaskId::from("victim");
         state.add_task(id.clone(), test_spec());
-        state.bind_tv(&id, 9);
+        let tv = taskvisor::TaskId::for_tests();
+        state.bind_tv(&id, tv);
         let sub = StateSubscriber::with_output_registry(
             state.clone(),
             Arc::new(OutputRegistry::default()),
@@ -352,7 +344,7 @@ mod tests {
 
         let ev = Event::new(EventKind::ControllerRejected)
             .with_task("s")
-            .with_id(TvId::from_raw(9))
+            .with_id(tv)
             .with_reason("removed_from_queue");
         sub.on_event(&ev);
 
@@ -367,11 +359,12 @@ mod tests {
     #[test]
     fn task_canceled_event_maps_to_canceled_phase() {
         let (sub, state, id) = setup("graceful");
-        state.bind_tv(&id, 3);
+        let tv = taskvisor::TaskId::for_tests();
+        state.bind_tv(&id, tv);
 
         let ev = Event::new(EventKind::TaskCanceled)
             .with_task("graceful")
-            .with_id(TvId::from_raw(3))
+            .with_id(tv)
             .with_attempt(1);
         sub.on_event(&ev);
 

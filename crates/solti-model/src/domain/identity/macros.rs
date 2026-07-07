@@ -109,8 +109,14 @@ macro_rules! arc_str_newtype {
         }
 
         impl<'de> serde::Deserialize<'de> for $ty {
+            /// Deserialization validates: every identity type must define
+            /// `validate_format`, and untrusted input cannot smuggle an id
+            /// past the charset rules (ids leak into filesystem and cgroup paths).
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                String::deserialize(deserializer).map(|s| Self(std::sync::Arc::from(s)))
+                let s = String::deserialize(deserializer)?;
+                let id = Self(std::sync::Arc::from(s));
+                id.validate_format().map_err(serde::de::Error::custom)?;
+                Ok(id)
             }
         }
     };

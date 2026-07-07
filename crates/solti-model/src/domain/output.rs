@@ -1,4 +1,18 @@
 //! Output streaming types for live tail of task stdout/stderr.
+//!
+//! ## Wire encodings (contract)
+//!
+//! The same events cross the API boundary in two encodings, and they are
+//! **different by design**:
+//!
+//! | Transport | Encoding | Source of truth |
+//! |-----------|----------|-----------------|
+//! | HTTP SSE  | this module's serde (`type`-tagged camelCase JSON, ms timestamps) | [`OutputEvent`] derives |
+//! | gRPC      | proto `StreamTaskLogsResponse` (binary protobuf) | `solti-api/proto/solti/task/v1/api.proto` |
+//!
+//! Do not switch the SSE path to pbjson-generated JSON: the shapes differ
+//! (`oneof` nesting vs flat `type` tag) and existing SSE consumers parse this
+//! module's shape. A pinning test below locks the SSE encoding.
 
 use std::time::SystemTime;
 
@@ -36,7 +50,9 @@ pub enum OutputEvent {
     /// A new run attempt has started; sequence numbers reset from this point on.
     #[serde(rename_all = "camelCase")]
     RunStarted {
+        /// Attempt number of the run that just started.
         attempt: u32,
+        /// Wall-clock start time (unix milliseconds on the wire).
         #[serde(with = "crate::resource::metadata::time_serde")]
         started_at: SystemTime,
     },
@@ -44,15 +60,21 @@ pub enum OutputEvent {
     /// The current run finished. Consumers can stop accumulating chunks for this attempt.
     #[serde(rename_all = "camelCase")]
     RunFinished {
+        /// Attempt number of the run that finished.
         attempt: u32,
+        /// Process exit code. `None` when the run ended without one (killed, canceled).
         #[serde(skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
+        /// Wall-clock finish time (unix milliseconds on the wire).
         #[serde(with = "crate::resource::metadata::time_serde")]
         finished_at: SystemTime,
     },
 
     /// Subscriber fell behind the broadcast ring window.
-    Lagged { skipped: u64 },
+    Lagged {
+        /// Number of events dropped before the subscriber caught up.
+        skipped: u64,
+    },
 }
 
 /// One line of output from a single task-run attempt.
@@ -112,6 +134,29 @@ mod tests {
     fn stream_kind_stdout_serializes_to_lowercase() {
         let json = serde_json::to_string(&StreamKind::Stdout).unwrap();
         assert_eq!(json, "\"stdout\"");
+    }
+
+    #[test]
+    fn sse_wire_shape_is_pinned() {
+        // The SSE encoding is a public contract (see the module doc).
+        // If this test fails, an SSE consumer somewhere just broke.
+        let chunk = OutputEvent::Chunk(OutputChunk {
+            attempt: 1,
+            stream: StreamKind::Stdout,
+            seq: 0,
+            ts: UNIX_EPOCH + Duration::from_millis(1_700),
+            line: Bytes::from_static(b"hi"),
+        });
+        assert_eq!(
+            serde_json::to_string(&chunk).unwrap(),
+            r#"{"type":"chunk","attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"hi"}"#
+        );
+
+        let lagged = OutputEvent::Lagged { skipped: 42 };
+        assert_eq!(
+            serde_json::to_string(&lagged).unwrap(),
+            r#"{"type":"lagged","skipped":42}"#
+        );
     }
 
     #[test]

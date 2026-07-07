@@ -14,7 +14,7 @@ use tracing::debug;
 
 use solti_model::{TaskQuery, Token};
 
-use crate::convert::{output_event_to_proto, proto_to_domain_status, tasks_page_to_proto};
+use crate::convert::{output_event_to_proto, proto_to_domain_phase, tasks_page_to_proto};
 use crate::error::ApiError;
 use crate::handler::ApiHandler;
 use crate::metrics::{ApiMetricsHandle, Transport, noop_api_metrics};
@@ -107,7 +107,8 @@ where
 ///
 /// Verifies `authorization: Bearer <token>` metadata in constant time and rejects with `Unauthenticated` otherwise.
 ///
-/// This is the same shared secret the agent presents to the control plane in discovery, one config value enables both directions.
+/// This is the same shared secret the agent presents to the control plane in discovery.
+/// One config value enables both directions.
 /// Orthogonal to TLS. Install via [`build_grpc_server_with_auth`] / [`build_grpc_server_with_metrics_auth`].
 #[derive(Clone)]
 pub struct BearerAuth {
@@ -134,7 +135,7 @@ impl Interceptor for BearerAuth {
 
 /// Extract the credential from an `authorization` metadata value, accepting the scheme case-insensitively.
 ///
-/// The credential is returned verbatim after the first space; it is never trimmed, so it is matched byte-for-byte by [`Token::verify`].
+/// The credential is returned verbatim after the first space. It is never trimmed and is matched byte-for-byte by [`Token::verify`].
 fn bearer_value(header: &str) -> Option<&str> {
     let (scheme, token) = header.split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then_some(token)
@@ -263,9 +264,9 @@ where
                 query = query.with_slot(slot);
             }
 
-            if let Some(status_raw) = req.status {
-                let status = proto_to_domain_status(status_raw).map_err(Status::from)?;
-                query = query.with_status(status);
+            if let Some(phase_raw) = req.phase {
+                let phase = proto_to_domain_phase(phase_raw).map_err(Status::from)?;
+                query = query.with_status(phase);
             }
 
             query = query.with_limit(clamp_list_limit(req.limit));

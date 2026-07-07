@@ -5,8 +5,7 @@
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
 };
-use taskvisor::{TaskError, TaskFn, TaskRef};
-use tokio_util::sync::CancellationToken;
+use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tracing::debug;
 
 use super::{StateConfig, TaskState};
@@ -50,7 +49,7 @@ const BACKOFF_FACTOR: f64 = 2.0;
 pub fn state_sweep(state: TaskState, config: StateConfig) -> (TaskRef, TaskSpec) {
     let sweep_interval_ms = config.sweep_interval.as_millis() as u64;
 
-    let task: TaskRef = TaskFn::arc(SWEEP_SLOT, move |ctx: CancellationToken| {
+    let task: TaskRef = TaskFn::arc(SWEEP_SLOT, move |ctx: TaskContext| {
         let state = state.clone();
         let config = config.clone();
 

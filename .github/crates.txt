@@ -1,9 +1,8 @@
 # Publishable workspace crates, in dependency (topological) order.
 #
-# Source of truth for:
-#   .github/workflows/release.yml    - sequential publish via soltiHQ/actions/cargo-publish
-#   .github/workflows/.preflight.yml - per-crate `cargo publish --dry-run` matrix
-#   .github/workflows/.docs.yml      - per-crate rustdoc matrix
+# Source of truth for release crate order:
+#   .github/workflows/.crates.yml - exposes the crate list to release jobs
+#   .github/workflows/release.yml - publishes crates sequentially via soltiHQ/actions/cargo-publish
 #
 # Dependency layout - required + optional (because publish runs with `--all-features`):
 #   solti-model       - no internal deps

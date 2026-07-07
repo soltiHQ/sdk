@@ -1,13 +1,13 @@
 [package]
 name = "solti-tls"
-description = "Solti SDK shared TLS / mTLS configuration."
+description = "Shared TLS and mTLS configuration builders for Solti network crates, based on rustls."
 documentation = "https://docs.rs/solti-tls"
 
 rust-version.workspace = true
 repository.workspace = true
-categories.workspace = true
+categories = ["network-programming", "cryptography"]
 homepage.workspace = true
-keywords.workspace = true
+keywords = ["tls", "rustls", "mtls", "certificate", "pem"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -28,3 +28,4 @@ tokio-rustls = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

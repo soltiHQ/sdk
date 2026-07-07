@@ -2,6 +2,12 @@
 
 use thiserror::Error;
 
+/// Errors returned by runner registration and backend configuration.
+///
+/// This enum covers the setup path: registering runners in a router,
+/// validating backend configs, and preparing OS resources (cgroups, tempfiles).
+/// Failures inside a running task are reported through `taskvisor::TaskError`,
+/// not through this enum.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ExecError {

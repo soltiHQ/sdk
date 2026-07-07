@@ -1,12 +1,12 @@
 [package]
 name = "solti-api"
-description = "Solti SDK HTTP/JSON and gRPC API layer."
+description = "HTTP/JSON and gRPC API layer for the Solti task supervisor SDK."
 
 rust-version.workspace = true
 repository.workspace = true
-categories.workspace = true
+categories = ["network-programming", "web-programming"]
 homepage.workspace = true
-keywords.workspace = true
+keywords = ["grpc", "http", "api", "tonic", "tasks"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -22,6 +22,7 @@ include = [
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []
@@ -55,6 +56,7 @@ base64         = { workspace = true }
 bytes          = { workspace = true }
 http-body-util = { workspace = true }
 rcgen          = { workspace = true }
+taskvisor      = { workspace = true }
 tokio          = { workspace = true, features = ["macros", "rt"] }
 tower          = { workspace = true, features = ["util"] }
 

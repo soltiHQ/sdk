@@ -1,13 +1,13 @@
 [package]
 name = "solti-model"
-description = "Solti SDK domain model."
+description = "Domain model types for the Solti task execution SDK: task specs, states, and identifiers."
 documentation = "https://docs.rs/solti-model"
 
 rust-version.workspace = true
 repository.workspace = true
-categories.workspace = true
+categories = ["data-structures"]
 homepage.workspace = true
-keywords.workspace = true
+keywords = ["task", "model", "spec", "types", "domain"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -28,3 +28,4 @@ serde_json = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

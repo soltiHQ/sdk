@@ -44,12 +44,15 @@
 //!  Pending ──► Running ──► Succeeded
 //!                │
 //!                ├──► Failed ──► (restart) ──► Running
+//!                │      └──► Exhausted / Timeout  (refined by a later, more specific signal)
 //!                ├──► Timeout
 //!                ├──► Canceled
-//!                └──► Exhausted (max retries reached)
+//!                └──► Exhausted (retry budget spent)
 //! ```
 //!
 //! Terminal phases: `Succeeded`, `Failed`, `Timeout`, `Canceled`, `Exhausted`.
+//! `Succeeded`, `Canceled`, and `Timeout` are sticky: a conflicting late signal cannot overwrite them.
+//! `Failed` may be refined into `Exhausted` or `Timeout` (see `Task::transition_finished`).
 //! See [`TaskPhase::is_terminal`].
 //!
 //! ## Task kinds
@@ -78,10 +81,16 @@
 //!
 //! [`TaskSpec`] fields are private; construct via [`TaskSpec::builder`]:
 //!
-//! ```text
+//! ```rust
+//! # use solti_model::{ModelError, RestartPolicy, TaskKind, TaskSpec};
+//! # fn demo() -> Result<(), ModelError> {
+//! # let kind = TaskKind::Embedded;
 //! let spec = TaskSpec::builder("my-slot", kind, 5_000u64)
 //!     .restart(RestartPolicy::OnFailure)
 //!     .build()?;
+//! # Ok(())
+//! # }
+//! # demo().unwrap();
 //! ```
 //!
 //! See [`TaskSpecBuilder`] for the full API.
@@ -149,6 +158,7 @@
 //! ```
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 /// Compiles the runnable Rust code blocks in `README.md` as doctests.
 #[cfg(doctest)]

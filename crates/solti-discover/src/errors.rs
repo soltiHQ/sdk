@@ -2,6 +2,11 @@
 
 use thiserror::Error;
 
+/// Failure modes of the discovery heartbeat.
+///
+/// Covers config validation, transport failures, response parsing, and control-plane rejections.
+/// The sync task maps terminal variants (see [`DiscoverError::is_terminal`]) to `TaskError::Fatal`;
+/// all other variants surface as `TaskError::Fail` and the supervisor retries with backoff.
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum DiscoverError {
@@ -52,7 +57,7 @@ pub enum DiscoverError {
         retry_after_s: Option<i32>,
     },
 
-    /// Authentication was rejected (`401`/`403`, or gRPC `Unauthenticated`/ `PermissionDenied`).
+    /// Authentication was rejected (`401`/`403`, or gRPC `Unauthenticated`/`PermissionDenied`).
     #[error("authentication failed: {reason}")]
     AuthFailed {
         /// Why authentication failed (server-provided).

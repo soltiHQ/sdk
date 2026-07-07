@@ -7,9 +7,12 @@
 //! | Domain → wire | [`spec_to_proto`]        | used by `task.rs` when building `TaskData` |
 //! | Wire → domain | [`convert_create_spec`]  | gRPC/HTTP submit path                      |
 
+use std::num::NonZeroU32;
+
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, ContainerSpec, Flag, JitterPolicy, Labels, RestartPolicy,
-    Runtime, Slot, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec, WasmSpec,
+    RunnerSelector, Runtime, SelectorOperator, SelectorRequirement, Slot, SubprocessMode,
+    SubprocessSpec, TaskEnv, TaskKind, TaskSpec, WasmSpec,
 };
 
 use crate::error::ApiError;
@@ -32,7 +35,38 @@ pub(super) fn spec_to_proto(spec: &TaskSpec) -> Result<proto_api::CreateSpec, Ap
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
+        max_retries: spec.max_retries().map(NonZeroU32::get),
+        runner_selector: spec.runner_selector().map(selector_to_proto),
     })
+}
+
+fn selector_to_proto(sel: &RunnerSelector) -> proto_api::RunnerSelector {
+    proto_api::RunnerSelector {
+        match_labels: sel
+            .match_labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        match_expressions: sel
+            .match_expressions
+            .iter()
+            .map(|req| proto_api::SelectorRequirement {
+                key: req.key.clone(),
+                operator: operator_to_proto(req.operator) as i32,
+                values: req.values.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn operator_to_proto(op: SelectorOperator) -> proto_api::SelectorOperator {
+    match op {
+        SelectorOperator::In => proto_api::SelectorOperator::In,
+        SelectorOperator::NotIn => proto_api::SelectorOperator::NotIn,
+        SelectorOperator::Exists => proto_api::SelectorOperator::Exists,
+        SelectorOperator::DoesNotExist => proto_api::SelectorOperator::DoesNotExist,
+        _ => proto_api::SelectorOperator::Unspecified,
+    }
 }
 
 fn kind_to_proto(kind: &TaskKind) -> Result<proto_api::TaskKind, ApiError> {
@@ -127,24 +161,24 @@ fn env_to_proto(env: &TaskEnv) -> Vec<proto_api::KeyValue> {
         .collect()
 }
 
-fn restart_to_proto(policy: RestartPolicy) -> (proto_api::RestartStrategy, Option<u64>) {
+fn restart_to_proto(policy: RestartPolicy) -> (proto_api::RestartPolicy, Option<u64>) {
     match policy {
-        RestartPolicy::Never => (proto_api::RestartStrategy::Never, None),
-        RestartPolicy::OnFailure => (proto_api::RestartStrategy::OnFailure, None),
-        RestartPolicy::Always { interval_ms } => (proto_api::RestartStrategy::Always, interval_ms),
-        _ => (proto_api::RestartStrategy::Unspecified, None),
+        RestartPolicy::Never => (proto_api::RestartPolicy::Never, None),
+        RestartPolicy::OnFailure => (proto_api::RestartPolicy::OnFailure, None),
+        RestartPolicy::Always { interval_ms } => (proto_api::RestartPolicy::Always, interval_ms),
+        _ => (proto_api::RestartPolicy::Unspecified, None),
     }
 }
 
-fn backoff_to_proto(b: &BackoffPolicy) -> proto_api::BackoffStrategy {
+fn backoff_to_proto(b: &BackoffPolicy) -> proto_api::BackoffPolicy {
     let jitter = match b.jitter {
-        JitterPolicy::None => proto_api::JitterStrategy::None,
-        JitterPolicy::Full => proto_api::JitterStrategy::Full,
-        JitterPolicy::Equal => proto_api::JitterStrategy::Equal,
-        JitterPolicy::Decorrelated => proto_api::JitterStrategy::Decorrelated,
-        _ => proto_api::JitterStrategy::Unspecified,
+        JitterPolicy::None => proto_api::JitterPolicy::None,
+        JitterPolicy::Full => proto_api::JitterPolicy::Full,
+        JitterPolicy::Equal => proto_api::JitterPolicy::Equal,
+        JitterPolicy::Decorrelated => proto_api::JitterPolicy::Decorrelated,
+        _ => proto_api::JitterPolicy::Unspecified,
     };
-    proto_api::BackoffStrategy {
+    proto_api::BackoffPolicy {
         jitter: jitter as i32,
         first_ms: b.first_ms,
         max_ms: b.max_ms,
@@ -152,16 +186,27 @@ fn backoff_to_proto(b: &BackoffPolicy) -> proto_api::BackoffStrategy {
     }
 }
 
-fn admission_to_proto(policy: AdmissionPolicy) -> proto_api::AdmissionStrategy {
+fn admission_to_proto(policy: AdmissionPolicy) -> proto_api::AdmissionPolicy {
     match policy {
-        AdmissionPolicy::DropIfRunning => proto_api::AdmissionStrategy::DropIfRunning,
-        AdmissionPolicy::Replace => proto_api::AdmissionStrategy::Replace,
-        AdmissionPolicy::Queue => proto_api::AdmissionStrategy::Queue,
-        _ => proto_api::AdmissionStrategy::Unspecified,
+        AdmissionPolicy::DropIfRunning => proto_api::AdmissionPolicy::DropIfRunning,
+        AdmissionPolicy::Replace => proto_api::AdmissionPolicy::Replace,
+        AdmissionPolicy::Queue => proto_api::AdmissionPolicy::Queue,
+        _ => proto_api::AdmissionPolicy::Unspecified,
     }
 }
 
 /// Convert a proto [`proto_api::CreateSpec`] into a domain [`TaskSpec`].
+///
+/// Single validation gate for both transports: every submit/apply request passes through here.
+///
+/// ## Errors
+///
+/// - [`ApiError::InvalidRequest`]: the wire spec is not a valid [`TaskSpec`]. Causes:
+///   - empty `slot`, `timeout_ms == 0`, or `max_retries == 0` (omit the field instead);
+///   - missing `kind`, kind variant, subprocess mode, script runtime, or `backoff`;
+///   - `UNSPECIFIED` / out-of-range enum value (restart, admission, jitter, selector operator);
+///   - kind-specific field rejected (empty command, empty script body, empty wasm module path, empty container image);
+///   - the final `TaskSpec::build` validation failed (e.g. backoff `factor < 1.0`).
 pub fn convert_create_spec(spec: proto_api::CreateSpec) -> Result<TaskSpec, ApiError> {
     let slot: Slot = validate_slot(spec.slot)?.into();
 
@@ -174,7 +219,7 @@ pub fn convert_create_spec(spec: proto_api::CreateSpec) -> Result<TaskSpec, ApiE
     let task_kind = convert_task_kind(kind)?;
 
     let restart = convert_restart_policy(
-        proto_api::RestartStrategy::try_from(spec.restart)
+        proto_api::RestartPolicy::try_from(spec.restart)
             .map_err(|_| ApiError::InvalidRequest("invalid restart strategy".into()))?,
         spec.restart_interval_ms,
     )?;
@@ -183,18 +228,66 @@ pub fn convert_create_spec(spec: proto_api::CreateSpec) -> Result<TaskSpec, ApiE
         .backoff
         .ok_or_else(|| ApiError::InvalidRequest("missing backoff strategy".into()))?;
 
-    let task_spec = TaskSpec::builder(slot, task_kind, validate_timeout(spec.timeout_ms)?)
+    let max_retries = match spec.max_retries {
+        None => None,
+        Some(0) => {
+            return Err(ApiError::InvalidRequest(
+                "max_retries: 0 is not allowed; omit the field for an unlimited budget".into(),
+            ));
+        }
+        Some(n) => NonZeroU32::new(n),
+    };
+
+    let mut builder = TaskSpec::builder(slot, task_kind, validate_timeout(spec.timeout_ms)?)
         .restart(restart)
         .backoff(convert_backoff_policy(backoff)?)
         .admission(convert_admission_policy(
-            proto_api::AdmissionStrategy::try_from(spec.admission)
+            proto_api::AdmissionPolicy::try_from(spec.admission)
                 .map_err(|_| ApiError::InvalidRequest("invalid admission strategy".into()))?,
         )?)
         .labels(convert_labels(spec.labels))
+        .max_retries(max_retries);
+
+    if let Some(sel) = spec.runner_selector {
+        builder = builder.runner_selector(convert_runner_selector(sel)?);
+    }
+
+    let task_spec = builder
         .build()
         .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
 
     Ok(task_spec)
+}
+
+fn convert_runner_selector(sel: proto_api::RunnerSelector) -> Result<RunnerSelector, ApiError> {
+    let match_expressions = sel
+        .match_expressions
+        .into_iter()
+        .map(|req| {
+            let operator = match proto_api::SelectorOperator::try_from(req.operator) {
+                Ok(proto_api::SelectorOperator::In) => SelectorOperator::In,
+                Ok(proto_api::SelectorOperator::NotIn) => SelectorOperator::NotIn,
+                Ok(proto_api::SelectorOperator::Exists) => SelectorOperator::Exists,
+                Ok(proto_api::SelectorOperator::DoesNotExist) => SelectorOperator::DoesNotExist,
+                _ => {
+                    return Err(ApiError::InvalidRequest(format!(
+                        "invalid selector operator for key '{}'",
+                        req.key
+                    )));
+                }
+            };
+            Ok(SelectorRequirement {
+                key: req.key,
+                operator,
+                values: req.values,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    Ok(RunnerSelector {
+        match_labels: convert_labels(sel.match_labels),
+        match_expressions,
+    })
 }
 
 fn convert_task_kind(kind: proto_api::task_kind::Kind) -> Result<TaskKind, ApiError> {
@@ -291,53 +384,41 @@ fn convert_env(kvs: Vec<proto_api::KeyValue>) -> TaskEnv {
 }
 
 fn convert_restart_policy(
-    strategy: proto_api::RestartStrategy,
+    strategy: proto_api::RestartPolicy,
     interval_ms: Option<u64>,
 ) -> Result<RestartPolicy, ApiError> {
     match strategy {
-        proto_api::RestartStrategy::Never => Ok(RestartPolicy::Never),
-        proto_api::RestartStrategy::OnFailure => Ok(RestartPolicy::OnFailure),
-        proto_api::RestartStrategy::Always => Ok(RestartPolicy::Always { interval_ms }),
+        proto_api::RestartPolicy::Never => Ok(RestartPolicy::Never),
+        proto_api::RestartPolicy::OnFailure => Ok(RestartPolicy::OnFailure),
+        proto_api::RestartPolicy::Always => Ok(RestartPolicy::Always { interval_ms }),
 
-        proto_api::RestartStrategy::Unspecified => Err(ApiError::InvalidRequest(
+        proto_api::RestartPolicy::Unspecified => Err(ApiError::InvalidRequest(
             "restart strategy not specified".into(),
         )),
     }
 }
 
-fn convert_backoff_policy(backoff: proto_api::BackoffStrategy) -> Result<BackoffPolicy, ApiError> {
-    let jitter = proto_api::JitterStrategy::try_from(backoff.jitter)
+fn convert_backoff_policy(backoff: proto_api::BackoffPolicy) -> Result<BackoffPolicy, ApiError> {
+    let jitter = proto_api::JitterPolicy::try_from(backoff.jitter)
         .map_err(|_| ApiError::InvalidRequest("invalid jitter strategy".into()))?;
 
     let jitter = match jitter {
-        proto_api::JitterStrategy::Decorrelated => JitterPolicy::Decorrelated,
-        proto_api::JitterStrategy::Equal => JitterPolicy::Equal,
-        proto_api::JitterStrategy::None => JitterPolicy::None,
-        proto_api::JitterStrategy::Full => JitterPolicy::Full,
+        proto_api::JitterPolicy::Decorrelated => JitterPolicy::Decorrelated,
+        proto_api::JitterPolicy::Equal => JitterPolicy::Equal,
+        proto_api::JitterPolicy::None => JitterPolicy::None,
+        proto_api::JitterPolicy::Full => JitterPolicy::Full,
 
-        proto_api::JitterStrategy::Unspecified => {
+        proto_api::JitterPolicy::Unspecified => {
             return Err(ApiError::InvalidRequest(
                 "jitter strategy not specified".into(),
             ));
         }
     };
 
-    if backoff.first_ms == 0 {
-        return Err(ApiError::InvalidRequest(
-            "backoff first_ms cannot be zero".into(),
-        ));
-    }
-    if backoff.max_ms == 0 {
-        return Err(ApiError::InvalidRequest(
-            "backoff max_ms cannot be zero".into(),
-        ));
-    }
-    if !backoff.factor.is_finite() || backoff.factor <= 0.0 {
-        return Err(ApiError::InvalidRequest(
-            "backoff factor must be a finite positive number".into(),
-        ));
-    }
-
+    // No business validation here: the model's BackoffPolicy::validate is the
+    // single source of the rules and runs inside TaskSpec::build. Duplicating
+    // it once produced drifted rules (the API accepted factor < 1.0 that the
+    // model rejected later).
     Ok(BackoffPolicy {
         jitter,
         first_ms: backoff.first_ms,
@@ -347,14 +428,14 @@ fn convert_backoff_policy(backoff: proto_api::BackoffStrategy) -> Result<Backoff
 }
 
 fn convert_admission_policy(
-    strategy: proto_api::AdmissionStrategy,
+    strategy: proto_api::AdmissionPolicy,
 ) -> Result<AdmissionPolicy, ApiError> {
     match strategy {
-        proto_api::AdmissionStrategy::DropIfRunning => Ok(AdmissionPolicy::DropIfRunning),
-        proto_api::AdmissionStrategy::Replace => Ok(AdmissionPolicy::Replace),
-        proto_api::AdmissionStrategy::Queue => Ok(AdmissionPolicy::Queue),
+        proto_api::AdmissionPolicy::DropIfRunning => Ok(AdmissionPolicy::DropIfRunning),
+        proto_api::AdmissionPolicy::Replace => Ok(AdmissionPolicy::Replace),
+        proto_api::AdmissionPolicy::Queue => Ok(AdmissionPolicy::Queue),
 
-        proto_api::AdmissionStrategy::Unspecified => Err(ApiError::InvalidRequest(
+        proto_api::AdmissionPolicy::Unspecified => Err(ApiError::InvalidRequest(
             "admission strategy not specified".into(),
         )),
     }
@@ -394,9 +475,9 @@ mod tests {
         }
     }
 
-    fn make_backoff() -> proto_api::BackoffStrategy {
-        proto_api::BackoffStrategy {
-            jitter: proto_api::JitterStrategy::Full as i32,
+    fn make_backoff() -> proto_api::BackoffPolicy {
+        proto_api::BackoffPolicy {
+            jitter: proto_api::JitterPolicy::Full as i32,
             first_ms: 100,
             max_ms: 10_000,
             factor: 2.0,
@@ -408,12 +489,82 @@ mod tests {
             slot: "test-slot".to_string(),
             kind: Some(make_subprocess_kind("ls")),
             timeout_ms: 5_000,
-            restart: proto_api::RestartStrategy::OnFailure as i32,
+            restart: proto_api::RestartPolicy::OnFailure as i32,
             restart_interval_ms: None,
             backoff: Some(make_backoff()),
-            admission: proto_api::AdmissionStrategy::DropIfRunning as i32,
+            admission: proto_api::AdmissionPolicy::DropIfRunning as i32,
             labels: HashMap::new(),
+            max_retries: None,
+            runner_selector: None,
         }
+    }
+
+    #[test]
+    fn create_spec_max_retries_round_trips() {
+        let mut proto = make_valid_create_spec();
+        proto.max_retries = Some(3);
+
+        let spec = convert_create_spec(proto).unwrap();
+        assert_eq!(spec.max_retries().map(NonZeroU32::get), Some(3));
+
+        let back = spec_to_proto(&spec).unwrap();
+        assert_eq!(back.max_retries, Some(3));
+    }
+
+    #[test]
+    fn create_spec_zero_max_retries_is_rejected() {
+        let mut proto = make_valid_create_spec();
+        proto.max_retries = Some(0);
+
+        let err = convert_create_spec(proto).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("max_retries")));
+    }
+
+    #[test]
+    fn create_spec_runner_selector_round_trips() {
+        let mut proto = make_valid_create_spec();
+        proto.runner_selector = Some(proto_api::RunnerSelector {
+            match_labels: HashMap::from([("zone".to_string(), "eu".to_string())]),
+            match_expressions: vec![proto_api::SelectorRequirement {
+                key: "arch".to_string(),
+                operator: proto_api::SelectorOperator::In as i32,
+                values: vec!["arm64".to_string()],
+            }],
+        });
+
+        let spec = convert_create_spec(proto).unwrap();
+        let sel = spec
+            .runner_selector()
+            .expect("selector must survive convert");
+        assert_eq!(sel.match_expressions.len(), 1);
+        assert_eq!(sel.match_expressions[0].operator, SelectorOperator::In);
+        assert_eq!(sel.match_expressions[0].values, vec!["arm64".to_string()]);
+
+        let back = spec_to_proto(&spec).unwrap();
+        let back_sel = back
+            .runner_selector
+            .expect("selector must survive round-trip");
+        assert_eq!(
+            back_sel.match_labels.get("zone").map(String::as_str),
+            Some("eu")
+        );
+        assert_eq!(back_sel.match_expressions.len(), 1);
+    }
+
+    #[test]
+    fn create_spec_invalid_selector_operator_is_rejected() {
+        let mut proto = make_valid_create_spec();
+        proto.runner_selector = Some(proto_api::RunnerSelector {
+            match_labels: HashMap::new(),
+            match_expressions: vec![proto_api::SelectorRequirement {
+                key: "arch".to_string(),
+                operator: 999,
+                values: vec![],
+            }],
+        });
+
+        let err = convert_create_spec(proto).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("arch")));
     }
 
     #[test]
@@ -498,7 +649,7 @@ mod tests {
     #[test]
     fn create_spec_always_with_interval() {
         let spec = proto_api::CreateSpec {
-            restart: proto_api::RestartStrategy::Always as i32,
+            restart: proto_api::RestartPolicy::Always as i32,
             restart_interval_ms: Some(5_000),
             ..make_valid_create_spec()
         };
@@ -514,7 +665,7 @@ mod tests {
     #[test]
     fn create_spec_always_without_interval() {
         let spec = proto_api::CreateSpec {
-            restart: proto_api::RestartStrategy::Always as i32,
+            restart: proto_api::RestartPolicy::Always as i32,
             restart_interval_ms: None,
             ..make_valid_create_spec()
         };
@@ -642,7 +793,7 @@ mod tests {
     #[test]
     fn restart_never() {
         let spec = proto_api::CreateSpec {
-            restart: proto_api::RestartStrategy::Never as i32,
+            restart: proto_api::RestartPolicy::Never as i32,
             ..make_valid_create_spec()
         };
         let cs = convert_create_spec(spec).unwrap();
@@ -652,18 +803,18 @@ mod tests {
     #[test]
     fn all_jitter_policies_convert() {
         let cases = [
-            (proto_api::JitterStrategy::None, JitterPolicy::None),
-            (proto_api::JitterStrategy::Full, JitterPolicy::Full),
-            (proto_api::JitterStrategy::Equal, JitterPolicy::Equal),
+            (proto_api::JitterPolicy::None, JitterPolicy::None),
+            (proto_api::JitterPolicy::Full, JitterPolicy::Full),
+            (proto_api::JitterPolicy::Equal, JitterPolicy::Equal),
             (
-                proto_api::JitterStrategy::Decorrelated,
+                proto_api::JitterPolicy::Decorrelated,
                 JitterPolicy::Decorrelated,
             ),
         ];
 
         for (proto_jitter, expected) in cases {
             let spec = proto_api::CreateSpec {
-                backoff: Some(proto_api::BackoffStrategy {
+                backoff: Some(proto_api::BackoffPolicy {
                     jitter: proto_jitter as i32,
                     ..make_backoff()
                 }),
@@ -678,14 +829,14 @@ mod tests {
     fn all_admission_policies_convert() {
         let cases = [
             (
-                proto_api::AdmissionStrategy::DropIfRunning,
+                proto_api::AdmissionPolicy::DropIfRunning,
                 AdmissionPolicy::DropIfRunning,
             ),
             (
-                proto_api::AdmissionStrategy::Replace,
+                proto_api::AdmissionPolicy::Replace,
                 AdmissionPolicy::Replace,
             ),
-            (proto_api::AdmissionStrategy::Queue, AdmissionPolicy::Queue),
+            (proto_api::AdmissionPolicy::Queue, AdmissionPolicy::Queue),
         ];
 
         for (proto_adm, expected) in cases {
@@ -914,7 +1065,7 @@ mod tests {
     #[test]
     fn reject_zero_backoff_first_ms() {
         let spec = proto_api::CreateSpec {
-            backoff: Some(proto_api::BackoffStrategy {
+            backoff: Some(proto_api::BackoffPolicy {
                 first_ms: 0,
                 ..make_backoff()
             }),
@@ -922,14 +1073,14 @@ mod tests {
         };
         let err = convert_create_spec(spec).unwrap_err();
         assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("first_ms cannot be zero"))
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("first_ms must be greater than zero"))
         );
     }
 
     #[test]
     fn reject_zero_backoff_max_ms() {
         let spec = proto_api::CreateSpec {
-            backoff: Some(proto_api::BackoffStrategy {
+            backoff: Some(proto_api::BackoffPolicy {
                 max_ms: 0,
                 ..make_backoff()
             }),
@@ -937,14 +1088,30 @@ mod tests {
         };
         let err = convert_create_spec(spec).unwrap_err();
         assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("max_ms cannot be zero"))
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("max_ms must be >= first_ms"))
         );
+    }
+
+    #[test]
+    fn reject_sub_one_backoff_factor() {
+        // Regression: factor 0.5 used to pass the API precheck (factor > 0.0)
+        // and fail later inside build with a confusing error. The model rule
+        // (factor >= 1.0) is now the only rule.
+        let spec = proto_api::CreateSpec {
+            backoff: Some(proto_api::BackoffPolicy {
+                factor: 0.5,
+                ..make_backoff()
+            }),
+            ..make_valid_create_spec()
+        };
+        let err = convert_create_spec(spec).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains(">= 1.0")));
     }
 
     #[test]
     fn reject_negative_backoff_factor() {
         let spec = proto_api::CreateSpec {
-            backoff: Some(proto_api::BackoffStrategy {
+            backoff: Some(proto_api::BackoffPolicy {
                 factor: -1.0,
                 ..make_backoff()
             }),
@@ -957,7 +1124,7 @@ mod tests {
     #[test]
     fn reject_zero_backoff_factor() {
         let spec = proto_api::CreateSpec {
-            backoff: Some(proto_api::BackoffStrategy {
+            backoff: Some(proto_api::BackoffPolicy {
                 factor: 0.0,
                 ..make_backoff()
             }),
@@ -970,8 +1137,8 @@ mod tests {
     #[test]
     fn reject_unspecified_jitter() {
         let spec = proto_api::CreateSpec {
-            backoff: Some(proto_api::BackoffStrategy {
-                jitter: proto_api::JitterStrategy::Unspecified as i32,
+            backoff: Some(proto_api::BackoffPolicy {
+                jitter: proto_api::JitterPolicy::Unspecified as i32,
                 ..make_backoff()
             }),
             ..make_valid_create_spec()
@@ -983,7 +1150,7 @@ mod tests {
     #[test]
     fn reject_unspecified_restart() {
         let spec = proto_api::CreateSpec {
-            restart: proto_api::RestartStrategy::Unspecified as i32,
+            restart: proto_api::RestartPolicy::Unspecified as i32,
             ..make_valid_create_spec()
         };
         let err = convert_create_spec(spec).unwrap_err();
@@ -993,7 +1160,7 @@ mod tests {
     #[test]
     fn reject_unspecified_admission() {
         let spec = proto_api::CreateSpec {
-            admission: proto_api::AdmissionStrategy::Unspecified as i32,
+            admission: proto_api::AdmissionPolicy::Unspecified as i32,
             ..make_valid_create_spec()
         };
         let err = convert_create_spec(spec).unwrap_err();

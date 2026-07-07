@@ -104,28 +104,33 @@ Script bodies are separately capped in the model at [`solti_model::MAX_SCRIPT_BO
 | `http` | `HttpApi`, axum router, proto-JSON serde                                          | `axum`, `serde_json`, `prost`, `pbjson` |
 | `tls`  | `to_tonic_server_tls(&ServerTlsConfig)` adapter (under `grpc`); pulls `solti-tls` | `solti-tls`; activates `tonic/tls-ring` |
 
-No feature is enabled by default. `tls` **implies `grpc`** — the adapter targets tonic, so enabling `tls` alone would pull `solti-tls` in without compiling anything. HTTP TLS is terminated by the binary via `axum-server` (see below), not by this feature.
+No feature is enabled by default. `tls` **implies `grpc`** — the adapter targets tonic, and enabling `tls` alone would pull `solti-tls` in without compiling anything. HTTP TLS is terminated by the binary via `axum-server` (see below), not by this feature.
 
 ### Enabling TLS
 
 For gRPC:
 
-```rust,ignore
-use solti_api::{build_grpc_server, to_tonic_server_tls};
+```rust,no_run
+use std::sync::Arc;
+
+use solti_api::{SupervisorApiAdapter, build_grpc_server, to_tonic_server_tls};
 use solti_tls::ServerTlsConfig;
 
-let server_tls = ServerTlsConfig::builder()
-    .cert_pem_file("/etc/solti/tls/server.crt")
-    .key_pem_file("/etc/solti/tls/server.key")
-    .require_client_ca_pem_file("/etc/solti/tls/clients-ca.crt")  // optional
-    .build()?;
+async fn serve_tls(adapter: Arc<SupervisorApiAdapter>) -> Result<(), Box<dyn std::error::Error>> {
+    let server_tls = ServerTlsConfig::builder()
+        .cert_pem_file("/etc/solti/tls/server.crt")
+        .key_pem_file("/etc/solti/tls/server.key")
+        .require_client_ca_pem_file("/etc/solti/tls/clients-ca.crt") // optional
+        .build()?;
 
-let tls_cfg = to_tonic_server_tls(&server_tls)?;
-tonic::transport::Server::builder()
-    .tls_config(tls_cfg)?
-    .add_service(build_grpc_server(adapter))
-    .serve("0.0.0.0:50443".parse()?)
-    .await?;
+    let tls_cfg = to_tonic_server_tls(&server_tls)?;
+    tonic::transport::Server::builder()
+        .tls_config(tls_cfg)?
+        .add_service(build_grpc_server(adapter))
+        .serve("0.0.0.0:50443".parse()?)
+        .await?;
+    Ok(())
+}
 ```
 
 For HTTP, terminate TLS in your binary via `axum-server` using the `rustls::ServerConfig` produced by `solti_tls::ServerTlsConfig::into_rustls_config()`.
@@ -134,31 +139,42 @@ See the `solti-tls` README for the full pattern.
 ### Enabling token auth
 
 Require a bearer token on every inbound call. 
-The token is the same shared secret the agent presents to the control plane in discovery (`solti_model::Token`), one config value gates both directions. 
+The token is the same shared secret the agent presents to the control plane in discovery (`solti_model::Token`). One config value gates both directions. 
 Orthogonal to TLS; comparison is constant-time; a missing/invalid token is rejected with `401` (HTTP) / `Unauthenticated` (gRPC) before reaching any handler.
 
 HTTP:
 
-```rust,ignore
-use solti_api::HttpApi;
+```rust,no_run
+use std::sync::Arc;
+
+use axum::Router;
+use solti_api::{HttpApi, SupervisorApiAdapter};
 use solti_model::Token;
 
-let router = HttpApi::new(adapter)
-    .with_auth(Token::from_env("SOLTI_AGENT_TOKEN")?)
-    .router();
+fn secured_router(adapter: Arc<SupervisorApiAdapter>) -> Result<Router, Box<dyn std::error::Error>> {
+    let router = HttpApi::new(adapter)
+        .with_auth(Token::from_env("SOLTI_AGENT_TOKEN")?)
+        .router();
+    Ok(router)
+}
 ```
 
 gRPC:
 
-```rust,ignore
-use solti_api::build_grpc_server_with_auth;
+```rust,no_run
+use std::sync::Arc;
+
+use solti_api::{SupervisorApiAdapter, build_grpc_server_with_auth};
 use solti_model::Token;
 
-let svc = build_grpc_server_with_auth(adapter, Token::from_env("SOLTI_AGENT_TOKEN")?);
-tonic::transport::Server::builder()
-    .add_service(svc)
-    .serve("0.0.0.0:50051".parse()?)
-    .await?;
+async fn serve_grpc(adapter: Arc<SupervisorApiAdapter>) -> Result<(), Box<dyn std::error::Error>> {
+    let svc = build_grpc_server_with_auth(adapter, Token::from_env("SOLTI_AGENT_TOKEN")?);
+    tonic::transport::Server::builder()
+        .add_service(svc)
+        .serve("0.0.0.0:50051".parse()?)
+        .await?;
+    Ok(())
+}
 ```
 
 When no token is configured (plain `HttpApi::new(...).router()` / `build_grpc_server(...)`), no auth is enforced.

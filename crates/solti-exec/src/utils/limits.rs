@@ -219,8 +219,8 @@ mod unix_impl {
 
     /// Apply rlimit: set the soft limit to `value`, keep the hard limit unchanged.
     ///
-    /// If `value` exceeds the current hard limit (and hard != INFINITY), the soft limit is clamped to the hard limit
-    /// an unprivileged process cannot raise its own hard limit.
+    /// If `value` exceeds the current hard limit (and hard != INFINITY), the soft limit
+    /// is clamped to the hard limit. An unprivileged process cannot raise its own hard limit.
     fn apply_rlimit(resource: RlimitResource, value: u64) -> io::Result<()> {
         let mut current = libc::rlimit {
             rlim_cur: 0,

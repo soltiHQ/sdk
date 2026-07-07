@@ -46,7 +46,9 @@ impl Token {
 
     /// Read the token from an environment variable.
     ///
-    /// Returns [`ModelError::Invalid`] if the variable is unset or empty.
+    /// ## Errors
+    ///
+    /// - [`ModelError::Invalid`]: the variable is unset, or its value is empty after trimming.
     pub fn from_env(var: &str) -> ModelResult<Self> {
         let raw = std::env::var(var)
             .map_err(|_| ModelError::Invalid(format!("token env var `{var}` is not set").into()))?;
@@ -55,7 +57,9 @@ impl Token {
 
     /// Read the token from a file (trailing newline / whitespace trimmed).
     ///
-    /// Returns [`ModelError::Invalid`] if the file cannot be read or is empty.
+    /// ## Errors
+    ///
+    /// - [`ModelError::Invalid`]: the file cannot be read, or its content is empty after trimming.
     pub fn from_file(path: impl AsRef<Path>) -> ModelResult<Self> {
         let path = path.as_ref();
         let raw = std::fs::read_to_string(path).map_err(|e| {

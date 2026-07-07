@@ -8,7 +8,10 @@ use crate::TlsError;
 
 /// Parse **all** `CERTIFICATE` blocks out of a PEM byte stream, in file order (leaf-first by convention for a chain).
 ///
-/// Errors with [`TlsError::NoCertificates`] if the stream holds no certificate blocks.
+/// ## Errors
+///
+/// - [`TlsError::Io`]: the reader failed, or a PEM block is structurally malformed (`rustls-pemfile` reports both as [`std::io::Error`]).
+/// - [`TlsError::NoCertificates`]: the input parsed cleanly but held no `CERTIFICATE` blocks.
 ///
 /// ## Also
 ///
@@ -41,7 +44,10 @@ pub fn load_certs_from_pem<R: BufRead>(
 /// If the stream contains more than one key, only the first is returned and the rest are **silently ignored**.
 /// Pass a PEM that holds exactly the intended key.
 ///
-/// Errors with [`TlsError::NoPrivateKey`] if no key is present.
+/// ## Errors
+///
+/// - [`TlsError::Io`]: the reader failed, or a PEM block is structurally malformed.
+/// - [`TlsError::NoPrivateKey`]: no private-key block was found in the input.
 ///
 /// ## Also
 ///

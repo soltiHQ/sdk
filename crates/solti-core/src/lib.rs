@@ -31,12 +31,40 @@
 //!
 //! ## Quick start
 //!
-//! ```text
-//! let api = SupervisorApi::new(sup_cfg, ctrl_cfg, subscribers, router, StateConfig::default()).await?;
+//! ```rust,no_run
+//! use solti_core::{CoreError, StateConfig, SupervisorApi};
+//! use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec};
+//! use solti_runner::RunnerRouter;
+//! use taskvisor::{ControllerConfig, SupervisorConfig};
 //!
-//! let task_id = api.submit(&spec).await?;
-//! let task    = api.get_task(&task_id);
-//! let runs    = api.list_task_runs(&task_id);
+//! async fn demo() -> Result<(), CoreError> {
+//!     let api = SupervisorApi::new(
+//!         SupervisorConfig::default(),
+//!         ControllerConfig::default(),
+//!         Vec::new(),          // extra event subscribers
+//!         RunnerRouter::new(), // register runners for Subprocess/Wasm/Container here
+//!         StateConfig::default(),
+//!     )
+//!     .await?;
+//!
+//!     let kind = TaskKind::Subprocess(SubprocessSpec::new(
+//!         SubprocessMode::Command {
+//!             command: "echo".into(),
+//!             args: vec!["hello".into()],
+//!         },
+//!         TaskEnv::default(),
+//!         None,
+//!         Flag::enabled(),
+//!     ));
+//!     let spec = TaskSpec::builder("demo-slot", kind, 5_000_u64).build()?;
+//!
+//!     let task_id = api.submit(&spec).await?;
+//!     let _task = api.get_task(&task_id);
+//!     let _runs = api.list_task_runs(&task_id);
+//!
+//!     api.shutdown().await?;
+//!     Ok(())
+//! }
 //! ```
 //!
 //! ## Also
@@ -46,6 +74,7 @@
 //! - [`solti_runner::RunnerRouter`] picks a runner for each `TaskKind`.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 /// Compiles the runnable Rust code blocks in `README.md` as doctests.
 #[cfg(doctest)]
@@ -54,8 +83,6 @@ struct ReadmeDoctests;
 
 mod error;
 pub use error::CoreError;
-
-pub mod reasons;
 
 mod map;
 

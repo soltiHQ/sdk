@@ -25,8 +25,12 @@ impl std::fmt::Debug for PemSource {
 impl PemSource {
     /// Read the PEM bytes from the source.
     ///
-    /// - [`PemSource::Path`] performs file I/O (errors surface as [`TlsError::Io`]).
-    /// - [`PemSource::Bytes`] returns a fresh **clone** of the buffer.
+    /// - [`PemSource::Path`] performs file I/O.
+    /// - [`PemSource::Bytes`] returns a fresh **clone** of the buffer and never fails.
+    ///
+    /// ## Errors
+    ///
+    /// - [`TlsError::Io`]: reading a [`PemSource::Path`] from disk failed (missing file, permissions, ...).
     ///
     /// ## Also
     ///

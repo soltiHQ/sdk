@@ -21,7 +21,7 @@ env:
 jobs:
   verify:
     name: Verify tag and versions
-    runs-on: ${{ vars.RUNS_ON }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
         with:
@@ -57,8 +57,11 @@ jobs:
           FILE_VERSION=$(awk '
             /^\[workspace.package\]/ { in_section=1; next }
             /^\[/ { in_section=0 }
-            in_section && /^\s*version\s*=/ {
-              match($0, /"([^"]+)"/, m); print m[1]; exit
+            in_section && /^[[:space:]]*version[[:space:]]*=/ {
+              sub(/^[^"]*"/, "")
+              sub(/".*$/, "")
+              print
+              exit
             }
           ' Cargo.toml)
 
@@ -99,7 +102,7 @@ jobs:
   publish:
     name: Publish crates
     needs: crates
-    runs-on: ${{ vars.RUNS_ON }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -116,7 +119,7 @@ jobs:
   gh-release:
     name: GitHub release
     needs: [crates, publish]
-    runs-on: ${{ vars.RUNS_ON }}
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:

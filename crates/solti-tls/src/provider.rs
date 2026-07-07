@@ -14,7 +14,7 @@
 ///
 /// This installs **`ring`** specifically.
 /// The default is not configurable: a caller who needs `aws-lc-rs` must install their own provider **before** the first `solti-tls` builder runs (since this becomes a no-op once any provider exists).
-/// Protocol versions and cipher suites use `rustls` - safe defaults (the workspace enables TLS 1.2 + 1.3); there is no min-version policy here.
+/// Protocol versions and cipher suites use the `rustls` safe defaults (the workspace enables TLS 1.2 + 1.3); there is no min-version policy here.
 pub fn ensure_default_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         // Ignore Err: that just means a concurrent caller installed a provider first.

@@ -150,13 +150,34 @@ The zero-ops flow lives in the agent: "read from my store; if absent, `generate(
 (spec or status) for optimistic concurrency control.
 
 ## Construction
-```text
+```rust,no_run
+use solti_model::{
+    BackoffPolicy, JitterPolicy, RestartPolicy, SubprocessMode, SubprocessSpec, TaskKind, TaskSpec,
+};
+
+let kind = TaskKind::Subprocess(SubprocessSpec::new(
+    SubprocessMode::Command {
+        command: "echo".into(),
+        args: vec!["hello".into()],
+    },
+    Default::default(),
+    None,
+    Default::default(),
+));
+
 let spec = TaskSpec::builder("my-slot", kind, 5_000u64)
     .restart(RestartPolicy::OnFailure)
-    .backoff(BackoffPolicy { jitter: JitterPolicy::Equal, first_ms: 1_000, max_ms: 30_000, factor: 2.0 })
-    .build()?;
+    .backoff(BackoffPolicy {
+        jitter: JitterPolicy::Equal,
+        first_ms: 1_000,
+        max_ms: 30_000,
+        factor: 2.0,
+    })
+    .build()
+    .expect("spec should be valid");
 
-spec.validate()?;  // submit-boundary validation (rejects Embedded)
+// Submit-boundary validation (rejects Embedded).
+spec.validate().expect("spec should pass submit validation");
 ```
 
 ## Error model

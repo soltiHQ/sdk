@@ -4,14 +4,29 @@ use thiserror::Error;
 
 use solti_runner::RunnerError;
 
+/// Error type returned by every fallible operation in solti-core.
+///
+/// Each variant notes the HTTP status that solti-api maps it to.
+/// The enum is `#[non_exhaustive]`: match with a wildcard arm and treat
+/// unknown variants as an internal error (`500`).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CoreError {
     /// A taskvisor runtime failure (submit / cancel / remove / shutdown). → `500`.
-    #[error("supervisor error: {0}")]
-    Supervisor(String),
+    ///
+    /// Carries the typed [`taskvisor::Error`] as the source; `op` is a stable
+    /// label for the failed operation: `"submit"`, `"cancel"`, `"remove"`, or `"shutdown"`.
+    #[error("supervisor {op} failed: {source}")]
+    Supervisor {
+        /// The operation that failed.
+        op: &'static str,
+        /// The underlying taskvisor error.
+        #[source]
+        source: taskvisor::Error,
+    },
 
-    /// A task with this name is already active (non-terminal). Distinct from a generic supervisor error so callers can map it to `409 Conflict`.
+    /// A task with this name is already active (non-terminal).
+    /// Kept distinct from a generic supervisor error; callers map it to `409 Conflict`.
     #[error("task already exists: {0}")]
     AlreadyExists(String),
 
@@ -33,4 +48,17 @@ pub enum CoreError {
     /// Wraps [`solti_model::ModelError`]. → `400 Bad Request`.
     #[error("invalid spec: {0}")]
     InvalidSpec(#[from] solti_model::ModelError),
+}
+
+impl CoreError {
+    /// Wrap a taskvisor failure with the operation label.
+    ///
+    /// Accepts both [`taskvisor::RuntimeError`] and [`taskvisor::ControllerError`]
+    /// through the umbrella [`taskvisor::Error`].
+    pub(crate) fn supervisor(op: &'static str, e: impl Into<taskvisor::Error>) -> Self {
+        Self::Supervisor {
+            op,
+            source: e.into(),
+        }
+    }
 }

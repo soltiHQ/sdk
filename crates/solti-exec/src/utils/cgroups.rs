@@ -201,7 +201,7 @@ pub(crate) fn attach_cgroup(
 
     #[cfg(target_os = "linux")]
     {
-        linux_impl::attach_join_hook(cmd, cgroup_name, limits.fail_on_error);
+        linux_impl::attach_join_hook(cmd, cgroup_name, limits.fail_on_error)?;
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -363,12 +363,29 @@ mod linux_impl {
 
     /// Phase 2: pre_exec hook that only writes the child PID to cgroup.procs.
     /// Uses raw libc syscalls — fully async-signal-safe.
-    pub fn attach_join_hook(cmd: &mut Command, cgroup_name: &str, fail_on_error: bool) {
+    ///
+    /// Runs in the parent (it installs the hook). If the `cgroup.procs` path is
+    /// too long to fit the fixed buffer, strict mode (`fail_on_error`) aborts;
+    /// best-effort mode warns and runs the child unconfined.
+    pub fn attach_join_hook(
+        cmd: &mut Command,
+        cgroup_name: &str,
+        fail_on_error: bool,
+    ) -> Result<(), crate::ExecError> {
         let procs_path = match ProcsPath::build(cgroup_name) {
             Some(p) => p,
             None => {
-                pre_exec_log(b"solti-exec: cgroup path exceeds 256 bytes, skipping join\n");
-                return;
+                if fail_on_error {
+                    return Err(crate::ExecError::InvalidRunnerConfig(format!(
+                        "cgroup.procs path for '{cgroup_name}' exceeds {MAX_PROCS_PATH} bytes; \
+                         cannot join the child to its cgroup under strict enforcement"
+                    )));
+                }
+                tracing::warn!(
+                    cgroup = cgroup_name,
+                    "cgroup.procs path exceeds {MAX_PROCS_PATH} bytes; running without cgroup join (best-effort)"
+                );
+                return Ok(());
             }
         };
 
@@ -380,6 +397,7 @@ mod linux_impl {
         unsafe {
             cmd.pre_exec(move || join_cgroup_raw(procs_path.as_bytes(), fail_on_error));
         }
+        Ok(())
     }
 
     fn is_cgroup_v2(root: &Path) -> bool {
@@ -501,6 +519,19 @@ mod tests {
         let mut cmd = Command::new("sh");
         let r = attach_cgroup(&mut cmd, "test-cgroup", &limits);
         assert!(r.is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn attach_join_hook_strict_mode_rejects_overlong_path() {
+        let long_name = "n".repeat(300);
+        let mut cmd = Command::new("true");
+        // Strict: an unbuildable path must abort rather than silently skip.
+        let err = linux_impl::attach_join_hook(&mut cmd, &long_name, true).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "got: {err}");
+        // Best-effort: the same input warns and proceeds.
+        let mut cmd2 = Command::new("true");
+        assert!(linux_impl::attach_join_hook(&mut cmd2, &long_name, false).is_ok());
     }
 
     #[test]

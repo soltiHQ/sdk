@@ -34,6 +34,15 @@ pub trait Runner: Send + Sync {
     ///
     /// The provided [`BuildContext`] carries shared dependencies injected at router setup time.
     /// Slot is extracted from `spec.slot`.
+    ///
+    /// ## Errors
+    ///
+    /// Implementations return:
+    /// - [`RunnerError::UnsupportedKind`]: the spec kind does not match this runner. Callers avoid this by checking [`supports`](Self::supports) first.
+    /// - [`RunnerError::InvalidSpec`]: a spec field is malformed for this runner.
+    /// - [`RunnerError::MissingField`]: a required spec field is absent.
+    /// - [`RunnerError::Io`]: task setup I/O failed (spawn, cgroup, module read).
+    /// - [`RunnerError::Internal`]: any other runner-specific failure.
     fn build_task(&self, spec: &TaskSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError>;
 
     /// Builds a default run id for a given slot.

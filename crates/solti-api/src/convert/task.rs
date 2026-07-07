@@ -15,8 +15,8 @@ impl TryFrom<Task> for proto_api::TaskData {
         Ok(proto_api::TaskData {
             metadata: Some(proto_api::ObjectMeta::from(&metadata)),
             spec: Some(spec_to_proto(&spec)?),
-            status: Some(proto_api::TaskStatusInfo {
-                phase: proto_api::TaskStatus::from(status.phase) as i32,
+            status: Some(proto_api::TaskStatus {
+                phase: proto_api::TaskPhase::from(status.phase) as i32,
                 exit_code: status.exit_code,
                 attempt: status.attempt,
                 error: status.error,
@@ -103,7 +103,7 @@ mod tests {
         assert_eq!(spec.slot, "my-slot");
 
         let status = proto.status.unwrap();
-        assert_eq!(status.phase, proto_api::TaskStatus::Failed as i32);
+        assert_eq!(status.phase, proto_api::TaskPhase::Failed as i32);
         assert_eq!(status.attempt, 3);
         assert_eq!(status.error, Some("boom".to_string()));
     }

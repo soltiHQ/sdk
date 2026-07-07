@@ -40,6 +40,12 @@ pub use tasks::timezone_sync;
 /// When using [`LoggerTimeZone::Local`], call [`init_local_offset`] in `main()` **before** spawning the tokio runtime.
 /// See the [crate-level docs](crate#local-timezone-support) for details.
 ///
+/// ## Errors
+///
+/// - [`LoggerError::AlreadyInitialized`]: a global tracing subscriber is already installed (any format).
+/// - [`LoggerError::JournaldNotSupported`]: `cfg.format` is [`LoggerFormat::Journald`] on a non-Linux target.
+/// - [`LoggerError::JournaldInitFailed`]: connecting to the systemd journal failed (Linux only).
+///
 /// ## Examples
 ///
 /// ```rust

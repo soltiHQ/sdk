@@ -44,7 +44,7 @@ use crate::{
     proto_api,
     validate::{clamp_list_limit, non_empty_id},
 };
-// `api_url!` is `#[macro_export]`, so it's already accessible in this
+// `api_url!` is `#[macro_export]` and therefore already accessible in this
 // module by its bare name — `use crate::api_url` would be redundant
 // (and warnings about unused imports broke a `cargo publish` on us).
 
@@ -123,8 +123,9 @@ where
 
     /// Require a bearer token on every request.
     ///
-    /// When set, requests without a valid `Authorization: Bearer <token>` header are rejected with `401 Unauthorized` before reaching any handler .
-    /// This is the same shared secret the agent presents to the control plane in discovery, one config value enables both directions.
+    /// When set, requests without a valid `Authorization: Bearer <token>` header are rejected with `401 Unauthorized` before reaching any handler.
+    /// This is the same shared secret the agent presents to the control plane in discovery.
+    /// One config value enables both directions.
     /// Orthogonal to TLS. When unset, no auth is enforced.
     pub fn with_auth(mut self, token: Token) -> Self {
         self.auth = Some(token);
@@ -183,7 +184,7 @@ fn bearer_value(header: &str) -> Option<&str> {
 #[derive(Debug, Deserialize)]
 struct ListTasksParams {
     slot: Option<String>,
-    status: Option<String>,
+    phase: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
 }
@@ -261,13 +262,13 @@ where
         query = query.with_slot(slot);
     }
 
-    if let Some(status_str) = params.status {
-        let status = status_str.parse::<TaskPhase>().map_err(|_| {
+    if let Some(phase_str) = params.phase {
+        let phase = phase_str.parse::<TaskPhase>().map_err(|_| {
             ApiError::InvalidRequest(format!(
-                "invalid status: '{status_str}' (valid: pending, running, succeeded, failed, timeout, canceled, exhausted)"
+                "invalid phase: '{phase_str}' (valid: pending, running, succeeded, failed, timeout, canceled, exhausted)"
             ))
         })?;
-        query = query.with_status(status);
+        query = query.with_status(phase);
     }
 
     query = query.with_limit(clamp_list_limit(params.limit.unwrap_or(0)));

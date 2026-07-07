@@ -65,6 +65,10 @@ impl SubprocessTaskConfig {
     ///
     /// Rules:
     /// - `command` is not empty or whitespace-only.
+    ///
+    /// ## Errors
+    ///
+    /// - [`ExecError::InvalidSpec`]: `command` is empty or contains only whitespace.
     pub fn validate(&self) -> Result<(), ExecError> {
         if self.command.trim().is_empty() {
             return Err(ExecError::InvalidSpec("Subprocess command is empty".into()));

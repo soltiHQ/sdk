@@ -5,10 +5,12 @@
 //!
 //! ## Example
 //!
-//! ```rust,ignore
-//! use solti_api::{build_grpc_server, to_tonic_server_tls};
+//! ```rust,no_run
+//! # use std::sync::Arc;
+//! use solti_api::{SupervisorApiAdapter, build_grpc_server, to_tonic_server_tls};
 //! use solti_tls::ServerTlsConfig;
 //!
+//! # async fn serve(adapter: Arc<SupervisorApiAdapter>) -> Result<(), Box<dyn std::error::Error>> {
 //! let server_tls = ServerTlsConfig::builder()
 //!     .cert_pem_file("/etc/solti/tls/server.crt")
 //!     .key_pem_file("/etc/solti/tls/server.key")
@@ -21,6 +23,7 @@
 //!     .add_service(build_grpc_server(adapter))
 //!     .serve("0.0.0.0:50443".parse()?)
 //!     .await?;
+//! # Ok(()) }
 //! ```
 
 use solti_tls::{ServerTlsConfig, TlsError};
@@ -33,7 +36,7 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig as TonicServerTls}
 ///
 /// ## Errors
 ///
-/// Returns [`TlsError::Io`] if any [`PemSource::Path`] cannot be read.
+/// - [`TlsError::Io`]: a [`PemSource::Path`] (cert, key, or client CA) could not be read.
 ///
 /// ## Notes on mTLS
 ///

@@ -1,12 +1,12 @@
 [package]
 name = "solti-runner"
-description = "Solti SDK runner plugin trait."
+description = "Runner plugin trait, routing, and execution metrics for the Solti task SDK."
 
 rust-version.workspace = true
 repository.workspace = true
-categories.workspace = true
+categories = ["asynchronous", "concurrency"]
 homepage.workspace = true
-keywords.workspace = true
+keywords = ["runner", "plugin", "tasks", "async", "executor"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -26,7 +26,7 @@ solti-model = { workspace = true }
 
 [dev-dependencies]
 tokio      = { workspace = true, features = ["macros", "rt", "sync"] }
-tokio-util = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

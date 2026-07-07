@@ -1,13 +1,13 @@
 [package]
 name = "solti-prometheus"
-description = "Solti SDK Prometheus metrics."
+description = "Prometheus metrics and exporter endpoint for the Solti task supervisor SDK."
 documentation = "https://docs.rs/solti-prometheus"
 
 rust-version.workspace = true
 repository.workspace = true
-categories.workspace = true
+categories = ["development-tools::profiling"]
 homepage.workspace = true
-keywords.workspace = true
+keywords = ["prometheus", "metrics", "monitoring", "exporter", "tasks"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,7 +17,7 @@ default  = []
 api      = ["dep:solti-api"]
 discover = ["dep:solti-discover"]
 process  = ["prometheus/process"]
-server   = ["dep:axum", "dep:tokio", "dep:tokio-util", "dep:solti-model"]
+server   = ["dep:axum", "dep:tokio", "dep:solti-model"]
 state    = ["dep:solti-core", "dep:solti-model"]
 
 [dependencies]
@@ -28,7 +28,6 @@ itoa       = { workspace = true }
 
 axum       = { workspace = true, optional = true }
 tokio      = { workspace = true, optional = true, features = ["net", "rt"] }
-tokio-util = { workspace = true, optional = true }
 
 solti-runner   = { workspace = true }
 solti-model    = { workspace = true, optional = true }
@@ -41,3 +40,4 @@ solti-core = { workspace = true, features = ["test-util"] }
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 /// Transport that served a request - the `transport` metric label.
 ///
-/// A closed two-value set, so it keeps label cardinality bounded by construction.
+/// A closed two-value set. This keeps label cardinality bounded by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     /// The axum HTTP/JSON transport (feature `http`).

@@ -98,6 +98,7 @@
 //! - `solti-exec` - subprocess runner implementation.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 /// Compiles the runnable Rust code blocks in `README.md` as doctests.
 #[cfg(doctest)]

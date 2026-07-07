@@ -12,7 +12,7 @@ on:
 
 jobs:
   list:
-    runs-on: ${{ vars.RUNS_ON }}
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
       list: ${{ steps.set.outputs.list }}

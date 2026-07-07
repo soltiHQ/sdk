@@ -9,7 +9,11 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::logger::{config::LoggerConfig, error::LoggerError, object::LoggerRfc3339};
 
-/// Initializes text logger.
+/// Initializes the text logger.
+///
+/// ## Errors
+///
+/// - [`LoggerError::AlreadyInitialized`]: a global subscriber is already installed.
 pub fn logger_text(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     let filter = cfg.level.to_env_filter();
     let timer = LoggerRfc3339::new(cfg.tz);
@@ -22,7 +26,11 @@ pub fn logger_text(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     init_subscriber(subscriber)
 }
 
-/// Initializes JSON (structured) logger.
+/// Initializes the JSON (structured) logger.
+///
+/// ## Errors
+///
+/// - [`LoggerError::AlreadyInitialized`]: a global subscriber is already installed.
 pub fn logger_json(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     let filter = cfg.level.to_env_filter();
     let timer = LoggerRfc3339::new(cfg.tz);
@@ -36,7 +44,12 @@ pub fn logger_json(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     init_subscriber(subscriber)
 }
 
-/// Initializes journald logger (Linux only).
+/// Initializes the journald logger (Linux only).
+///
+/// ## Errors
+///
+/// - [`LoggerError::JournaldInitFailed`]: connecting to the systemd journal failed.
+/// - [`LoggerError::AlreadyInitialized`]: a global subscriber is already installed.
 #[cfg(target_os = "linux")]
 pub fn logger_journald(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     let filter = cfg.level.to_env_filter();
@@ -48,12 +61,20 @@ pub fn logger_journald(cfg: &LoggerConfig) -> Result<(), LoggerError> {
 }
 
 /// Stub for journald on non-Linux platforms.
+///
+/// ## Errors
+///
+/// Always returns [`LoggerError::JournaldNotSupported`].
 #[cfg(not(all(target_os = "linux")))]
 pub fn logger_journald(_cfg: &LoggerConfig) -> Result<(), LoggerError> {
     Err(LoggerError::JournaldNotSupported)
 }
 
 /// Installs the subscriber as the global default.
+///
+/// ## Errors
+///
+/// - [`LoggerError::AlreadyInitialized`]: `try_init` failed because a global subscriber exists.
 fn init_subscriber<S>(subscriber: S) -> Result<(), LoggerError>
 where
     S: Subscriber + Send + Sync + 'static,

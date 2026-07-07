@@ -8,7 +8,7 @@
 //! | Module  | Content                                                    |
 //! |---------|------------------------------------------------------------|
 //! | `spec`  | `TaskSpec` domain ↔ wire, plus all nested policy helpers   |
-//! | `phase` | `TaskPhase` ↔ `TaskStatus`                                 |
+//! | `phase` | `TaskPhase` domain enum ↔ wire enum                        |
 //! | `time`  | `SystemTime` → Unix-ms helper                              |
 //! | `meta`  | `ObjectMeta` domain → wire                                 |
 //! | `run`   | `TaskRun` domain → wire                                    |
@@ -27,7 +27,7 @@ mod output;
 #[cfg(feature = "grpc")]
 pub(crate) use output::output_event_to_proto;
 #[cfg(feature = "grpc")]
-pub(crate) use phase::proto_to_domain_status;
+pub(crate) use phase::proto_to_domain_phase;
 pub use spec::convert_create_spec;
 #[cfg(any(feature = "grpc", feature = "http"))]
 pub(crate) use task::tasks_page_to_proto;

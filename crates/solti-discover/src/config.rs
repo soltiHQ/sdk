@@ -28,8 +28,10 @@ pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// - `proto::EndpointType` is the wire-level equivalent.
 #[derive(Clone, Debug)]
 pub enum DiscoveryTransport {
+    /// Sync over gRPC (`DiscoverService.Sync`, tonic channel).
     #[cfg(feature = "grpc")]
     Grpc,
+    /// Sync over HTTP/JSON (`POST /api/v{n}/discovery/sync`, reqwest client).
     #[cfg(feature = "http")]
     Http,
 }
@@ -192,8 +194,13 @@ impl DiscoverConfigBuilder {
 
     /// Validate and produce a [`DiscoverConfig`].
     ///
-    /// Rejects empty strings, zero intervals and zero timeouts.
     /// Trims trailing `/` from `control_plane_endpoint`.
+    ///
+    /// ## Errors
+    ///
+    /// - [`DiscoverError::InvalidConfig`]: `name`, `agent_endpoint`, or `control_plane_endpoint` is empty;
+    ///   `delay_ms`, `api_version`, `connect_timeout_ms`, or `request_timeout_ms` is zero;
+    ///   a token is set but empty.
     pub fn build(self) -> Result<DiscoverConfig, DiscoverError> {
         if self.name.is_empty() {
             return Err(DiscoverError::InvalidConfig(

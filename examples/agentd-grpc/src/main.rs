@@ -1,13 +1,20 @@
-//! Reference Solti agent — gRPC transport.
+//! # agentd-grpc
 //!
-//! Accepts `TaskSpec` submissions via `solti.task.v1.TaskService`, runs them as
-//! subprocesses, reports status back over the same service, exposes Prometheus
-//! metrics on `:9090` (HTTP), and heartbeats to a
-//! [Podium](https://github.com/soltiHQ/podium) control plane. Running without a
-//! reachable CP is fine — the heartbeat retries with backoff while the local API
-//! keeps serving.
+//! Reference Solti agent with the gRPC transport. It accepts `TaskSpec`
+//! submissions via `solti.task.v1.TaskService` and runs them as subprocesses.
+//! Running without a reachable control plane (CP) is fine — the heartbeat
+//! retries with backoff while the local API keeps serving.
 //!
-//! ## Run modes
+//! ## What this shows
+//!
+//! - Accepts `TaskSpec` submissions via `solti.task.v1.TaskService` and reports
+//!   status back over the same service.
+//! - Runs submitted tasks as subprocesses.
+//! - Exposes Prometheus metrics on `:9090` (HTTP).
+//! - Heartbeats to a [Podium](https://github.com/soltiHQ/podium) control plane.
+//! - Toggles auth and TLS independently via environment variables.
+//!
+//! ## Run
 //!
 //! Authentication and TLS are **independent**, each selected by environment
 //! variables — giving the four combinations:
@@ -38,6 +45,14 @@
 //! - `CONTROL_PLANE` — CP discovery endpoint (default `http://localhost:50051`).
 //!
 //! Proto contract + full RPC surface: [`api_v1.md`](../../../crates/solti-api/api_v1.md).
+//!
+//! ## Next
+//!
+//! | Example                          | What it adds                                        |
+//! |----------------------------------|-----------------------------------------------------|
+//! | [`agentd-http`](../../agentd-http) | The same agent over HTTP/JSON instead of gRPC      |
+//! | [`podium`](../../podium)         | Config-driven agent: runtime transport switch, TOML |
+//! | [`tls-roundtrip`](../../tls-roundtrip) | Minimal mTLS demo of `solti-tls` alone         |
 
 use std::sync::Arc;
 
@@ -53,8 +68,8 @@ use solti_discover::{DiscoverConfig, DiscoveryTransport};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{AgentId, RunnerEnv, Token};
 use solti_observe::{
-    LoggerConfig, LoggerLevel, LoggerTimeZone, TracingEventSubscriber, init_local_offset,
-    init_logger, timezone_sync,
+    LoggerConfig, LoggerLevel, LoggerTimeZone, TracingBridge, init_local_offset, init_logger,
+    timezone_sync,
 };
 use solti_prometheus::{
     PrometheusApiMetrics, PrometheusDiscoverMetrics, PrometheusMetrics, PrometheusStateCollector,
@@ -104,8 +119,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     register_subprocess_runner(&mut router, "default")?;
 
     // Supervisor: owns every task, applies restart / backoff, fans events to subscribers.
-    let subscribers: Vec<Arc<dyn Subscribe>> =
-        vec![Arc::new(TracingEventSubscriber), Arc::new(subscriber)];
+    let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(TracingBridge), Arc::new(subscriber)];
     let supervisor = SupervisorApi::new_with_output_registry(
         SupervisorConfig::default(),
         ControllerConfig::default(),
@@ -171,7 +185,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let scheme = if tls_on { "grpcs" } else { "grpc" };
     info!("{scheme} {ADDR}  →  heartbeat {control_plane}");
 
-    // The auth interceptor changes the concrete service type, so branch the serve.
+    // The auth interceptor changes the concrete service type; branch the serve.
     match token {
         Some(t) => {
             builder

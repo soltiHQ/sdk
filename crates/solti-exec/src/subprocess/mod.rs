@@ -29,7 +29,7 @@
 //! - Duplicate runner names are rejected via `router.contains_label()` check
 //! - Returns `ExecError::DuplicateRunner` if a runner with the same name exists
 mod backend;
-pub use backend::SubprocessBackendConfig;
+pub use backend::{CwdPolicy, EnvPolicy, SubprocessBackendConfig};
 
 mod task;
 pub use task::SubprocessTaskConfig;
@@ -51,6 +51,13 @@ use crate::ExecError;
 pub const LABEL_RUNNER_NAME: &str = "runner-name";
 
 /// Register a subprocess runner with default settings.
+///
+/// Creates a [`SubprocessRunner`] without backend hardening, labels it with
+/// [`LABEL_RUNNER_NAME`]` = name`, and adds it to the router.
+///
+/// ## Errors
+///
+/// - [`ExecError::DuplicateRunner`]: a runner with this `name` is already registered in the router.
 pub fn register_subprocess_runner(
     router: &mut RunnerRouter,
     name: &'static str,
@@ -59,6 +66,15 @@ pub fn register_subprocess_runner(
 }
 
 /// Register a subprocess runner with explicit runner configuration.
+///
+/// Validates `backend` first, then registers the runner under
+/// [`LABEL_RUNNER_NAME`]` = name`.
+///
+/// ## Errors
+///
+/// - [`ExecError::InvalidRunnerConfig`]: `backend` failed validation (zero limits,
+///   fail-open security policy, unenforceable confinement).
+/// - [`ExecError::DuplicateRunner`]: a runner with this `name` is already registered in the router.
 pub fn register_subprocess_runner_with_backend(
     router: &mut RunnerRouter,
     name: &'static str,

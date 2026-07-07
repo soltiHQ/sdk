@@ -61,8 +61,12 @@ struct TaskStateInner {
     /// taskvisor run identity (raw) -> task entry. The canonical correlation
     /// key for incoming events: labels are reusable, identities are not.
     by_tv: HashMap<u64, TaskId>,
-    /// Task entry -> its current taskvisor run identity (raw).
-    tv_of: HashMap<TaskId, u64>,
+    /// Task entry -> its current taskvisor run identity.
+    ///
+    /// Stores the opaque [`taskvisor::TaskId`] itself: taskvisor 0.4 removed
+    /// `TaskId::from_raw`. The id captured at submit time is the only handle
+    /// for cancel/remove calls.
+    tv_of: HashMap<TaskId, taskvisor::TaskId>,
     /// Per-task run-history cap (oldest finished runs evicted past this).
     max_runs_per_task: usize,
 }
@@ -95,7 +99,7 @@ impl TaskState {
     ///
     /// Production registration goes through [`reserve`](Self::reserve) at submit time;
     /// this unconditional insert exists only for in-crate tests and the `test-util`
-    /// fixtures, so it is compiled only under those configurations.
+    /// fixtures. It is compiled only under those configurations.
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn add_task(&self, id: TaskId, spec: TaskSpec) {
         let mut inner = self.inner.write();
@@ -139,13 +143,13 @@ impl TaskState {
     /// Bind a task entry to its current taskvisor run identity.
     ///
     /// Called at submission time (the id is pre-minted by `submit()`).
-    /// Rebinding the same entry to a new identity drops the previous binding, late events from the previous incarnation no longer resolve to this entry.
-    pub(crate) fn bind_tv(&self, id: &TaskId, tv: u64) {
+    /// Rebinding the same entry to a new identity drops the previous binding. Late events from the previous incarnation no longer resolve to this entry.
+    pub(crate) fn bind_tv(&self, id: &TaskId, tv: taskvisor::TaskId) {
         let mut inner = self.inner.write();
         if let Some(old) = inner.tv_of.insert(id.clone(), tv) {
-            inner.by_tv.remove(&old);
+            inner.by_tv.remove(&old.get());
         }
-        inner.by_tv.insert(tv, id.clone());
+        inner.by_tv.insert(tv.get(), id.clone());
     }
 
     /// Resolve a taskvisor run identity to its task entry (if currently bound).
@@ -154,21 +158,21 @@ impl TaskState {
     }
 
     /// The taskvisor run identity currently bound to a task entry (if any).
-    pub(crate) fn tv_for(&self, id: &TaskId) -> Option<u64> {
+    pub(crate) fn tv_for(&self, id: &TaskId) -> Option<taskvisor::TaskId> {
         self.inner.read().tv_of.get(id).copied()
     }
 
     fn unbind_locked(inner: &mut TaskStateInner, id: &TaskId) {
         if let Some(tv) = inner.tv_of.remove(id) {
-            inner.by_tv.remove(&tv);
+            inner.by_tv.remove(&tv.get());
         }
     }
 
     /// Release the taskvisor identity binding for a task entry, if any.
     ///
     /// The sweep deliberately spares any entry that is still **bound**: a periodic task sits in a terminal phase between runs while its actor is alive (see [`sweep`](Self::sweep)).
-    /// Terminal finalizations that do *not* flow through `TaskRemoved`, admission rejections and lag-dropped terminals reconstructed by the completion-plane backstop - must therefore
-    /// call this to drop the binding, otherwise the entry is mistaken for a live periodic task and is never reaped.
+    /// Terminal finalizations that do *not* flow through `TaskRemoved` (admission rejections, lag-dropped terminals reconstructed by the completion-plane backstop)
+    /// must therefore call this to drop the binding. Otherwise the entry is mistaken for a live periodic task and is never reaped.
     pub(crate) fn unbind(&self, id: &TaskId) {
         let mut inner = self.inner.write();
         Self::unbind_locked(&mut inner, id);
@@ -895,7 +899,7 @@ mod tests {
         let id = TaskId::from("periodic");
 
         state.add_task(id.clone(), default_spec());
-        state.bind_tv(&id, 42);
+        state.bind_tv(&id, taskvisor::TaskId::for_tests());
         state.transition_starting(&id);
         state.transition_finished(&id, TaskPhase::Succeeded, None, None);
 
@@ -920,7 +924,8 @@ mod tests {
         let id = TaskId::from("leaked");
 
         state.add_task(id.clone(), default_spec());
-        state.bind_tv(&id, 99);
+        let tv = taskvisor::TaskId::for_tests();
+        state.bind_tv(&id, tv);
         state.transition_starting(&id);
         state.transition_finished(&id, TaskPhase::Failed, Some("rejected".into()), None);
 
@@ -938,7 +943,7 @@ mod tests {
         let (_, removed) = state.sweep(&config);
         assert_eq!(removed, 1, "an unbound terminal entry must be reaped");
         assert!(state.get(&id).is_none());
-        assert!(state.resolve_tv(99).is_none());
+        assert!(state.resolve_tv(tv.get()).is_none());
     }
 
     #[test]
@@ -968,7 +973,7 @@ mod tests {
         let id = TaskId::from("task-1");
 
         state.add_task(id.clone(), default_spec());
-        state.bind_tv(&id, 1);
+        state.bind_tv(&id, taskvisor::TaskId::for_tests());
         state.transition_starting(&id);
 
         let config = StateConfig {

@@ -88,7 +88,7 @@ impl fmt::Display for LoggerTimeZone {
 ///
 /// On most Unix platforms, reading `/etc/localtime` is only safe in a single-threaded process.
 /// Once tokio spawns its worker threads, the `time` crate's `UtcOffset::current_local_offset()`
-/// will return `Err` and timestamps would silently fall back to UTC.
+/// returns `Err`. Timestamps then silently fall back to UTC.
 ///
 /// ## Behaviour
 ///
@@ -123,6 +123,11 @@ pub fn init_local_offset() {
 /// Re-detects the system UTC offset and updates the global cache.
 ///
 /// Called periodically by the [`crate::timezone_sync`] task.
+///
+/// ## Errors
+///
+/// Currently always returns `Ok`. A failed detection (multi-threaded context)
+/// is logged at debug level and skipped.
 #[cfg(feature = "timezone-sync")]
 pub(crate) fn sync_local_offset() -> Result<(), LoggerError> {
     match UtcOffset::current_local_offset() {
