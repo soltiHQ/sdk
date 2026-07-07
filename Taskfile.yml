@@ -85,15 +85,24 @@ tasks:
           CRATE: '{{.CRATE}}'
 
   ci/publish-dry-run:
-    desc: Simulate 'cargo publish' for a crate. Pass CRATE.
+    desc: Simulate 'cargo publish'. Pass CRATE to check one crate; defaults to .github/crates.txt.
     deps: [proto/vendor]
-    requires:
-      vars: [ CRATE ]
     cmds:
-      - task: rust:publish-dry-run
-        vars:
-          CRATE: '{{.CRATE}}'
-          PUBLISH_ARGS: "--all-features --allow-dirty"
+      - |
+        set -euo pipefail
+
+        crate='{{.CRATE | default ""}}'
+        if [ -n "$crate" ]; then
+          task rust:publish-dry-run CRATE="$crate" PUBLISH_ARGS="--all-features --allow-dirty"
+          exit 0
+        fi
+
+        while IFS= read -r crate; do
+          case "$crate" in
+            ''|\#*) continue ;;
+          esac
+          task rust:publish-dry-run CRATE="$crate" PUBLISH_ARGS="--all-features --allow-dirty"
+        done < .github/crates.txt
 
   ci/docs:
     desc: Run 'rustdoc' for the SDK workspace. Fails on broken doc links in any feature config.
@@ -101,6 +110,3 @@ tasks:
     cmds:
       - RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
       - RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
-      - task: rust:docs
-        vars:
-          DOCS_ARGS: '--workspace --all-features'
