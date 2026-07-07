@@ -32,17 +32,16 @@ tasks:
       - task: rust:check
 
   ci/clippy:
-    desc: "Run 'cargo clippy' for one feature set. FEATURE = none|all|default (default: all)."
+    desc: "Run 'cargo clippy' for one feature set. FEATURE = none|all|<feature-name> (default: all)."
     deps: [proto/vendor]
     vars:
       FEATURE: '{{.FEATURE | default "all"}}'
       FEATURE_FLAGS:
         sh: |
           case "{{.FEATURE}}" in
-            none)    echo '--no-default-features' ;;
-            all)     echo '--all-features' ;;
-            default) echo '' ;;
-            *)       echo "--no-default-features --features {{.FEATURE}}" ;;
+            none) echo '--no-default-features' ;;
+            all)  echo '--all-features' ;;
+            *)    echo "--no-default-features --features {{.FEATURE}}" ;;
           esac
     cmds:
       - task: rust:clippy
@@ -97,13 +96,11 @@ tasks:
           PUBLISH_ARGS: "--all-features --allow-dirty"
 
   ci/docs:
-    desc: Rustdoc gate. Whole workspace in two feature configs; pass CRATE to document one crate.
+    desc: Run 'rustdoc' for the SDK workspace. Fails on broken doc links in any feature config.
     deps: [proto/vendor]
     cmds:
-      - |
-        if [ -n "{{.CRATE}}" ]; then
-          RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p {{.CRATE}} --all-features
-        else
-          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
-        fi
+      - RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+      - RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+      - task: rust:docs
+        vars:
+          DOCS_ARGS: '--workspace --all-features'
