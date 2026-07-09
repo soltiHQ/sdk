@@ -4,16 +4,55 @@
 
 ## API surface
 
-| Operation   | gRPC RPC         | HTTP Endpoint                   | HTTP Method |
-|-------------|------------------|---------------------------------|-------------|
-| Submit task | `SubmitTask`     | `/api/v1/tasks`                 | POST        |
-| Get task    | `GetTaskStatus`  | `/api/v1/tasks/{id}`            | GET         |
-| List tasks  | `ListTasks`      | `/api/v1/tasks`                 | GET         |
-| List runs   | `ListTaskRuns`   | `/api/v1/tasks/{id}/runs`       | GET         |
-| Stream logs | `StreamTaskLogs` | `/api/v1/tasks/{id}/logs`       | GET (SSE)   |
-| Delete task | `DeleteTask`     | `/api/v1/tasks/{id}`            | DELETE      |
+| Operation   | gRPC RPC         | HTTP Endpoint                   | HTTP Method | Success          |
+|-------------|------------------|---------------------------------|-------------|------------------|
+| Submit task | `SubmitTask`     | `/api/v1/tasks`                 | POST        | `201 Created`    |
+| Apply task  | `ApplyTask`      | `/api/v1/tasks`                 | PUT         | `200 OK`         |
+| Get task    | `GetTaskStatus`  | `/api/v1/tasks/{id}`            | GET         | `200 OK`         |
+| List tasks  | `ListTasks`      | `/api/v1/tasks`                 | GET         | `200 OK`         |
+| List runs   | `ListTaskRuns`   | `/api/v1/tasks/{id}/runs`       | GET         | `200 OK`         |
+| Stream logs | `StreamTaskLogs` | `/api/v1/tasks/{id}/logs`       | GET (SSE)   | `200 OK`         |
+| Delete task | `DeleteTask`     | `/api/v1/tasks/{id}`            | DELETE      | `204 No Content` |
 
-`DeleteTask` is the single teardown primitive: it stops the task and purges its run history. 
+`SubmitTask` honors the admission policy declared in the spec. `ApplyTask` is the
+declarative upsert: it **forces `ADMISSION_POLICY_REPLACE`**, overriding whatever
+admission the spec declares — the latest applied spec wins the slot — and returns
+the id of the task running in the slot after apply.
+
+`DeleteTask` is the single teardown primitive: it stops the task and purges its run history.
+
+---
+
+## One contract, two transports
+
+Both transports carry the **same protobuf messages** defined in
+`proto/solti/task/v1/` (package `solti.task.v1`):
+
+- **gRPC** sends them as binary protobuf (`solti.task.v1.TaskService`).
+- **HTTP** sends them as canonical proto3-JSON (pbjson): camelCase field names,
+  64-bit integers encoded as strings, enums as `SCREAMING_SNAKE` names, `oneof`
+  fields flattened into the parent object.
+
+The single exception is the HTTP SSE log stream, whose payload is the domain JSON
+encoding of `OutputEvent` — see
+[Stream task logs](#stream-task-logs-server-sent-events) and
+[Wire encodings](#wire-encodings).
+
+## Authentication
+
+Both transports are unauthenticated by default. To require a shared bearer token:
+
+- **HTTP**: `HttpApi::new(handler).with_auth(token)` — every request must carry an
+  `Authorization: Bearer <token>` header, otherwise it is rejected with
+  `401 Unauthorized` before reaching any handler.
+- **gRPC**: `build_grpc_server_with_auth(handler, token)` (or
+  `build_grpc_server_with_metrics_auth`) — every call must carry
+  `authorization: Bearer <token>` metadata, otherwise it fails with
+  `UNAUTHENTICATED`.
+
+The `Bearer` scheme is matched case-insensitively and the token is compared in
+constant time. This is the same shared secret the agent presents to the control
+plane in discovery — one config value enables both directions. Orthogonal to TLS.
 
 ---
 
@@ -62,6 +101,11 @@ grpc.MaxCallSendMsgSize(4 << 20))` at dial time.
 
 ## HTTP examples
 
+Every request/response body is canonical proto3-JSON of the messages in
+`proto/solti/task/v1/api.proto`. Watch for three conventions throughout:
+64-bit integers are strings, enums are `SCREAMING_SNAKE` names, `oneof`s are
+flattened.
+
 ### Submit a task (command)
 
 ```bash
@@ -72,39 +116,44 @@ curl -X POST http://localhost:8080/api/v1/tasks \
       "slot": "my-job",
       "kind": {
         "subprocess": {
-          "mode": {
-            "command": {
-              "command": "echo",
-              "args": ["hello world"]
-            }
+          "command": {
+            "command": "echo",
+            "args": ["hello world"]
           },
           "env": [],
           "failOnNonZero": true
         }
       },
-      "timeout": 30000,
-      "restart": { "type": "never" },
+      "timeoutMs": "30000",
+      "restart": "RESTART_POLICY_NEVER",
       "backoff": {
-        "jitter": "full",
-        "firstMs": 1000,
-        "maxMs": 10000,
+        "jitter": "JITTER_POLICY_FULL",
+        "firstMs": "1000",
+        "maxMs": "10000",
         "factor": 2.0
       },
-      "admission": "dropIfRunning"
+      "admission": "ADMISSION_POLICY_DROP_IF_RUNNING"
     }
   }'
 ```
 
+`kind` and the subprocess `mode` are proto `oneof`s and arrive **flattened**:
+the subprocess object carries `command` *or* `script` directly — there is no
+`"mode"` wrapper key. 64-bit integers (`timeoutMs`, `firstMs`, `maxMs`) are
+canonically strings; plain JSON numbers are also accepted on input.
+
 Response `201 Created`:
 ```json
 {
-  "task_id": "tsk_01JR..."
+  "taskId": "tsk_01JR..."
 }
 ```
 
 ### Submit a task (script)
 
-Script body is base64-encoded. `runtime` is one of `bash`, `python`, `node`, or a custom object.
+Script body is base64-encoded. The script `runtime` oneof is either `wellKnown`
+(`SCRIPT_RUNTIME_BASH`, `SCRIPT_RUNTIME_PYTHON`, `SCRIPT_RUNTIME_NODE`) or a
+`custom` interpreter object.
 
 ```bash
 # echo 'echo "hello from script"' | base64
@@ -117,12 +166,10 @@ curl -X POST http://localhost:8080/api/v1/tasks \
       "slot": "my-script",
       "kind": {
         "subprocess": {
-          "mode": {
-            "script": {
-              "runtime": "bash",
-              "body": "ZWNobyAiaGVsbG8gZnJvbSBzY3JpcHQiCg==",
-              "args": []
-            }
+          "script": {
+            "wellKnown": "SCRIPT_RUNTIME_BASH",
+            "body": "ZWNobyAiaGVsbG8gZnJvbSBzY3JpcHQiCg==",
+            "args": []
           },
           "env": [
             { "key": "ENV", "value": "production" }
@@ -130,15 +177,15 @@ curl -X POST http://localhost:8080/api/v1/tasks \
           "failOnNonZero": true
         }
       },
-      "timeout": 60000,
-      "restart": { "type": "onFailure" },
+      "timeoutMs": "60000",
+      "restart": "RESTART_POLICY_ON_FAILURE",
       "backoff": {
-        "jitter": "equal",
-        "firstMs": 2000,
-        "maxMs": 30000,
+        "jitter": "JITTER_POLICY_EQUAL",
+        "firstMs": "2000",
+        "maxMs": "30000",
         "factor": 2.0
       },
-      "admission": "replace"
+      "admission": "ADMISSION_POLICY_REPLACE"
     }
   }'
 ```
@@ -146,9 +193,48 @@ curl -X POST http://localhost:8080/api/v1/tasks \
 Custom runtime example:
 ```json
 {
-  "runtime": { "custom": { "command": "ruby", "flag": "-e" } },
-  "body": "cHV0cyAnaGVsbG8n",
-  "args": []
+  "script": {
+    "custom": { "command": "ruby", "flag": "-e" },
+    "body": "cHV0cyAnaGVsbG8n",
+    "args": []
+  }
+}
+```
+
+### Apply a task (declarative upsert)
+
+Same body shape as submit. The `admission` in the spec is **ignored**: apply
+always force-replaces whatever occupies the slot.
+
+```bash
+curl -X PUT http://localhost:8080/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "spec": {
+      "slot": "my-job",
+      "kind": {
+        "subprocess": {
+          "command": { "command": "echo", "args": ["v2"] },
+          "failOnNonZero": true
+        }
+      },
+      "timeoutMs": "30000",
+      "restart": "RESTART_POLICY_NEVER",
+      "backoff": {
+        "jitter": "JITTER_POLICY_FULL",
+        "firstMs": "1000",
+        "maxMs": "10000",
+        "factor": 2.0
+      },
+      "admission": "ADMISSION_POLICY_DROP_IF_RUNNING"
+    }
+  }'
+```
+
+Response `200 OK` — the id of the task running in the slot after apply:
+```json
+{
+  "taskId": "tsk_01JR..."
 }
 ```
 
@@ -164,33 +250,36 @@ Response `200 OK`:
   "task": {
     "metadata": {
       "id": "tsk_01JR...",
-      "resourceVersion": 2,
-      "createdAt": 1712750400000,
-      "updatedAt": 1712750401000
+      "createdAt": "1712750400000",
+      "updatedAt": "1712750401000",
+      "resourceVersion": "2"
     },
     "spec": {
       "slot": "my-job",
       "kind": {
         "subprocess": {
-          "mode": {
-            "command": { "command": "echo", "args": ["hello world"] }
-          },
-          "failOnNonZero": true
+          "env": [],
+          "failOnNonZero": true,
+          "command": { "command": "echo", "args": ["hello world"] }
         }
       },
-      "timeout": 30000,
-      "restart": { "type": "never" },
-      "backoff": { "jitter": "full", "firstMs": 1000, "maxMs": 10000, "factor": 2.0 },
-      "admission": "dropIfRunning"
+      "timeoutMs": "30000",
+      "restart": "RESTART_POLICY_NEVER",
+      "backoff": { "jitter": "JITTER_POLICY_FULL", "firstMs": "1000", "maxMs": "10000", "factor": 2.0 },
+      "admission": "ADMISSION_POLICY_DROP_IF_RUNNING",
+      "labels": {}
     },
     "status": {
-      "phase": "succeeded",
+      "phase": "TASK_PHASE_SUCCEEDED",
       "attempt": 1,
       "exitCode": 0
     }
   }
 }
 ```
+
+Unknown id → `200 OK` with `{}`: the optional `task` field is omitted, not
+`null` (see [JSON field presence](#json-field-presence)).
 
 ### List tasks
 
@@ -201,18 +290,20 @@ curl http://localhost:8080/api/v1/tasks
 # Filter by slot
 curl "http://localhost:8080/api/v1/tasks?slot=my-job"
 
-# Filter by status + pagination
-curl "http://localhost:8080/api/v1/tasks?status=running&limit=10&offset=0"
+# Filter by phase + pagination
+curl "http://localhost:8080/api/v1/tasks?phase=running&limit=10&offset=0"
 ```
 
-Response `200 OK`:
+Response `200 OK` — each entry has the same shape as `task` in
+[Get task status](#get-task-status); `total` counts all tasks matching the
+filters across pages, not the page size:
 ```json
 {
   "tasks": [
     {
-      "metadata": { "id": "tsk_01JR...", "resourceVersion": 1, "createdAt": 1712750400000, "updatedAt": 1712750400000 },
+      "metadata": { "id": "tsk_01JR...", "createdAt": "1712750400000", "updatedAt": "1712750400000", "resourceVersion": "1" },
       "spec": { "slot": "my-job", "..." : "..." },
-      "status": { "phase": "running", "attempt": 1 }
+      "status": { "phase": "TASK_PHASE_RUNNING", "attempt": 1 }
     }
   ],
   "total": 1
@@ -224,9 +315,12 @@ Query parameters:
 | Parameter | Type   | Description                                                                     |
 |-----------|--------|---------------------------------------------------------------------------------|
 | `slot`    | string | Filter by slot name                                                             |
-| `status`  | string | `pending`, `running`, `succeeded`, `failed`, `timeout`, `canceled`, `exhausted` |
+| `phase`   | string | `pending`, `running`, `succeeded`, `failed`, `timeout`, `canceled`, `exhausted` |
 | `limit`   | u32    | Max results (default 100, max 1000)                                             |
 | `offset`  | u32    | Skip first N results                                                            |
+
+Note the asymmetry: the `phase` query parameter takes the short lowercase name,
+while phases inside JSON bodies are proto enum names (`TASK_PHASE_RUNNING`).
 
 ### List task runs
 
@@ -240,33 +334,59 @@ Response `200 OK`:
   "runs": [
     {
       "attempt": 1,
-      "phase": "failed",
-      "startedAt": 1712750400000,
-      "finishedAt": 1712750402000,
+      "phase": "TASK_PHASE_FAILED",
+      "startedAt": "1712750400000",
+      "finishedAt": "1712750402000",
       "error": "exit code 1",
       "exitCode": 1
     },
     {
       "attempt": 2,
-      "phase": "succeeded",
-      "startedAt": 1712750405000,
-      "finishedAt": 1712750406000
+      "phase": "TASK_PHASE_SUCCEEDED",
+      "startedAt": "1712750405000",
+      "finishedAt": "1712750406000",
+      "exitCode": 0
     }
   ]
 }
 ```
 
+`finishedAt` is omitted while the attempt is still running; `exitCode` is
+omitted when the process was killed or timed out.
+
 ### Stream task logs (Server-Sent Events)
 
-Live tail of stdout/stderr. One subscription covers all retries of the task with run-boundary markers between them. 
-`404` if the task has no live channel.
+Live tail of stdout/stderr. One subscription covers all retries of the task with
+run-boundary markers between them. `404` if the task has no live channel.
 
 ```bash
 curl -N http://localhost:8080/api/v1/tasks/tsk_01JR.../logs
 ```
 
-Wire shape (event types map 1:1 to gRPC `OutputEventProto` variants): `chunk`, `run-started`, `run-finished`, `lagged`. 
-Same JSON payload as direct in-process subscribers see.
+**This is the one endpoint that does not speak proto-JSON.** Each SSE frame's
+event name is one of `chunk`, `run-started`, `run-finished`, `lagged`, and its
+`data` payload is the domain JSON encoding of `OutputEvent` from `solti-model`:
+`type`-tagged camelCase JSON with millisecond timestamps as plain numbers — the
+same JSON direct in-process subscribers see. The shape is pinned by the
+`sse_wire_shape_is_pinned` test in `solti-model/src/domain/output.rs`.
+
+```text
+event: run-started
+data: {"type":"runStarted","attempt":1,"startedAt":1712750400000}
+
+event: chunk
+data: {"type":"chunk","attempt":1,"stream":"stdout","seq":0,"ts":1712750400123,"line":"hello world"}
+
+event: run-finished
+data: {"type":"runFinished","attempt":1,"exitCode":0,"finishedAt":1712750400456}
+
+event: lagged
+data: {"type":"lagged","skipped":42}
+```
+
+- `run-started` / `run-finished` bracket each attempt; `seq` resets to 0 on every new run.
+- `exitCode` in `runFinished` is omitted when the process was killed or timed out.
+- `lagged` means the subscriber fell behind and `skipped` events were dropped.
 
 ### Delete a task
 
@@ -274,7 +394,7 @@ Same JSON payload as direct in-process subscribers see.
 curl -X DELETE http://localhost:8080/api/v1/tasks/tsk_01JR...
 ```
 
-Response `204 No Content`. Stops the task and purges its run history.
+Response `204 No Content` (empty body). Stops the task and purges its run history.
 Safe to retry — deleting an already-gone task is a no-op.
 
 ### Error responses
@@ -288,8 +408,10 @@ Safe to retry — deleting an already-gone task is a no-op.
 
 | HTTP Status | `error` label     | When                                                                                |
 |-------------|-------------------|-------------------------------------------------------------------------------------|
-| 400         | `InvalidRequest`  | Validation failure (empty slot, bad spec, invalid status), also `Core::InvalidSpec` |
-| 404         | `TaskNotFound`    | Task ID not found                                                                   |
+| 400         | `InvalidRequest`  | Validation failure (empty slot, bad spec, invalid phase), also `Core::InvalidSpec`  |
+| 401         | `Unauthenticated` | Bearer token missing or invalid (only when [auth](#authentication) is enabled)      |
+| 404         | `TaskNotFound`    | Task ID not found or no live log channel, also `Core::NotFound`                     |
+| 409         | `AlreadyExists`   | `Core::AlreadyExists` — a non-terminal task with the same name occupies the slot    |
 | 413         | `PayloadTooLarge` | Request body exceeds 4 MiB (`RequestBodyLimitLayer`) — see "Size limits"            |
 | 500         | `Internal`        | Supervisor/infra error (also `Core::{Supervisor,Mapping,Runner}`)                   |
 
@@ -302,12 +424,19 @@ Safe to retry — deleting an already-gone task is a no-op.
 
 ## gRPC examples
 
-Proto package: `solti.v1`, service: `SoltiApi`.
+Proto package: `solti.task.v1`, service: `TaskService`. The server does not
+expose reflection, so point `grpcurl` at the proto sources with
+`-import-path`/`-proto`; the paths below are relative to the `solti-api` crate
+root. `grpcurl` encodes requests and responses as the same canonical proto-JSON
+the HTTP transport uses, so all bodies match the HTTP examples.
 
 ### Submit a task (command)
 
 ```bash
-grpcurl -plaintext -d '{
+grpcurl -plaintext \
+  -import-path proto \
+  -proto solti/task/v1/api.proto \
+  -d '{
   "spec": {
     "slot": "my-job",
     "kind": {
@@ -320,16 +449,16 @@ grpcurl -plaintext -d '{
       }
     },
     "timeoutMs": "30000",
-    "restart": "RESTART_STRATEGY_NEVER",
+    "restart": "RESTART_POLICY_NEVER",
     "backoff": {
-      "jitter": "JITTER_STRATEGY_FULL",
+      "jitter": "JITTER_POLICY_FULL",
       "firstMs": "1000",
       "maxMs": "10000",
       "factor": 2.0
     },
-    "admission": "ADMISSION_STRATEGY_DROP_IF_RUNNING"
+    "admission": "ADMISSION_POLICY_DROP_IF_RUNNING"
   }
-}' localhost:50051 solti.v1.SoltiApi/SubmitTask
+}' localhost:50051 solti.task.v1.TaskService/SubmitTask
 ```
 
 Response:
@@ -342,7 +471,10 @@ Response:
 ### Submit a task (script)
 
 ```bash
-grpcurl -plaintext -d '{
+grpcurl -plaintext \
+  -import-path proto \
+  -proto solti/task/v1/api.proto \
+  -d '{
   "spec": {
     "slot": "my-script",
     "kind": {
@@ -357,16 +489,16 @@ grpcurl -plaintext -d '{
       }
     },
     "timeoutMs": "60000",
-    "restart": "RESTART_STRATEGY_ON_FAILURE",
+    "restart": "RESTART_POLICY_ON_FAILURE",
     "backoff": {
-      "jitter": "JITTER_STRATEGY_EQUAL",
+      "jitter": "JITTER_POLICY_EQUAL",
       "firstMs": "2000",
       "maxMs": "30000",
       "factor": 2.0
     },
-    "admission": "ADMISSION_STRATEGY_REPLACE"
+    "admission": "ADMISSION_POLICY_REPLACE"
   }
-}' localhost:50051 solti.v1.SoltiApi/SubmitTask
+}' localhost:50051 solti.task.v1.TaskService/SubmitTask
 ```
 
 Custom runtime:
@@ -380,57 +512,53 @@ Custom runtime:
 }
 ```
 
+### Apply a task
+
+Same request shape as `SubmitTask`; the spec's `admission` is ignored and the
+slot is always force-replaced. Returns the id of the task running in the slot
+after apply.
+
+```bash
+grpcurl -plaintext \
+  -import-path proto \
+  -proto solti/task/v1/api.proto \
+  -d '{"spec": { ... }}' \
+  localhost:50051 solti.task.v1.TaskService/ApplyTask
+```
+
 ### Get task status
 
 ```bash
-grpcurl -plaintext -d '{"taskId": "tsk_01JR..."}' \
-  localhost:50051 solti.v1.SoltiApi/GetTaskStatus
+grpcurl -plaintext \
+  -import-path proto \
+  -proto solti/task/v1/api.proto \
+  -d '{"taskId": "tsk_01JR..."}' \
+  localhost:50051 solti.task.v1.TaskService/GetTaskStatus
 ```
 
-Response:
-```json
-{
-  "task": {
-    "metadata": {
-      "id": "tsk_01JR...",
-      "createdAt": "1712750400000",
-      "updatedAt": "1712750401000",
-      "resourceVersion": "2"
-    },
-    "spec": {
-      "slot": "my-job",
-      "kind": {
-        "subprocess": {
-          "command": { "command": "echo", "args": ["hello world"] },
-          "failOnNonZero": true
-        }
-      },
-      "timeoutMs": "30000",
-      "restart": "RESTART_STRATEGY_NEVER",
-      "backoff": { "jitter": "JITTER_STRATEGY_FULL", "firstMs": "1000", "maxMs": "10000", "factor": 2 },
-      "admission": "ADMISSION_STRATEGY_DROP_IF_RUNNING"
-    },
-    "status": {
-      "phase": "TASK_STATUS_SUCCEEDED",
-      "attempt": 1,
-      "exitCode": 0
-    }
-  }
-}
-```
+Response — identical to the HTTP [Get task status](#get-task-status) body
+(`grpcurl` prints canonical proto-JSON): `metadata` timestamps and
+`resourceVersion` as strings, `timeoutMs` as a string, phases as
+`TASK_PHASE_*` names.
 
 ### List tasks
 
 ```bash
 # All tasks
-grpcurl -plaintext localhost:50051 solti.v1.SoltiApi/ListTasks
+grpcurl -plaintext \
+  -import-path proto \
+  -proto solti/task/v1/api.proto \
+  localhost:50051 solti.task.v1.TaskService/ListTasks
 
 # With filters
-grpcurl -plaintext -d '{"slot": "my-job", "status": "TASK_STATUS_RUNNING", "limit": 10}' \
-  localhost:50051 solti.v1.SoltiApi/ListTasks
+grpcurl -plaintext \
+  -import-path proto \
+  -proto solti/task/v1/api.proto \
+  -d '{"slot": "my-job", "phase": "TASK_PHASE_RUNNING", "limit": 10}' \
+  localhost:50051 solti.task.v1.TaskService/ListTasks
 ```
 
-Response:
+Response — same shape as the HTTP [List tasks](#list-tasks) body:
 ```json
 {
   "tasks": [ { "metadata": {}, "spec": {}, "status": {} } ],
@@ -441,72 +569,83 @@ Response:
 ### List task runs
 
 ```bash
-grpcurl -plaintext -d '{"taskId": "tsk_01JR..."}' \
-  localhost:50051 solti.v1.SoltiApi/ListTaskRuns
+grpcurl -plaintext \
+  -import-path proto \
+  -proto solti/task/v1/api.proto \
+  -d '{"taskId": "tsk_01JR..."}' \
+  localhost:50051 solti.task.v1.TaskService/ListTaskRuns
 ```
 
-Response:
-```json
-{
-  "runs": [
-    {
-      "attempt": 1,
-      "status": "TASK_STATUS_FAILED",
-      "startedAt": "1712750400000",
-      "finishedAt": "1712750402000",
-      "error": "exit code 1",
-      "exitCode": 1
-    }
-  ]
-}
-```
+Response — same shape as the HTTP [List task runs](#list-task-runs) body:
+`phase` as `TASK_PHASE_*`, `startedAt`/`finishedAt` as strings.
 
 ### Delete
 
 ```bash
-grpcurl -plaintext -d '{"taskId": "tsk_01JR..."}' \
-  localhost:50051 solti.v1.SoltiApi/DeleteTask
+grpcurl -plaintext \
+  -import-path proto \
+  -proto solti/task/v1/api.proto \
+  -d '{"taskId": "tsk_01JR..."}' \
+  localhost:50051 solti.task.v1.TaskService/DeleteTask
 ```
 
 Returns `{}`. Stops the task and purges its run history. Idempotent.
 
 ### Stream logs
 
-Server-streaming RPC, same semantics as the HTTP/SSE variant: different wire (`OutputEventProto` with `oneof kind`). 
+Server-streaming RPC with the same semantics as the HTTP/SSE variant but a
+different wire shape: each message is a proto `StreamTaskLogsResponse` whose
+`oneof kind` carries `chunk`, `runStarted`, `runFinished`, or `lagged`.
 Closes with `NOT_FOUND` if no live channel exists.
 
 ```bash
-grpcurl -plaintext -d '{"taskId": "tsk_01JR..."}' \
-  localhost:50051 solti.v1.SoltiApi/StreamTaskLogs
+grpcurl -plaintext \
+  -import-path proto \
+  -proto solti/task/v1/api.proto \
+  -d '{"taskId": "tsk_01JR..."}' \
+  localhost:50051 solti.task.v1.TaskService/StreamTaskLogs
 ```
 
 ### gRPC errors
 
-| gRPC Status        | ApiError variant    | When                         |
-|--------------------|---------------------|------------------------------|
-| `INVALID_ARGUMENT` | `InvalidRequest`    | Validation failure           |
-| `NOT_FOUND`        | `TaskNotFound`      | Task ID not found            |
-| `INTERNAL`         | `Internal` / `Core` | Supervisor or internal error |
+| gRPC Status          | ApiError variant      | When                                                                |
+|----------------------|-----------------------|---------------------------------------------------------------------|
+| `INVALID_ARGUMENT`   | `InvalidRequest`      | Validation failure, also `Core::InvalidSpec`                        |
+| `UNAUTHENTICATED`    | `Unauthenticated`     | Bearer token missing or invalid (only when [auth](#authentication) is enabled) |
+| `NOT_FOUND`          | `TaskNotFound`        | Task ID not found or no live log channel, also `Core::NotFound`     |
+| `ALREADY_EXISTS`     | `Core::AlreadyExists` | A non-terminal task with the same name occupies the slot            |
+| `RESOURCE_EXHAUSTED` | `PayloadTooLarge`     | Message exceeds the 4 MiB cap — see "Size limits"                   |
+| `INTERNAL`           | `Internal` / `Core`   | Supervisor or internal error (also `Core::{Supervisor,Mapping,Runner}`) |
 
 ---
 
 ## Protobuf contract
 
-Defined in `proto/solti/v1/`:
-- `api.proto` - service definition, request/response messages
-- `types.proto` - shared types: `TaskStatus`, `CreateSpec`, `TaskData`, `TaskRunInfo`, policies
+Defined in `proto/solti/task/v1/` (package `solti.task.v1`):
+- `api.proto` - `TaskService` definition, request/response messages, log-stream events
+- `types.proto` - shared types: `TaskPhase`, `CreateSpec`, `TaskData`, `TaskRunInfo`, policies
 
-Go package: `github.com/soltiHQ/control-plane/api/gen/v1`
+## Wire encodings
 
-## Wire type differences
+Both transports carry the same proto messages — one contract, two encodings.
+There is no separate "HTTP shape": the HTTP transport (de)serializes the
+generated proto types through pbjson, which implements canonical proto3-JSON.
 
-| Aspect      | HTTP (serde JSON)                           | gRPC (protobuf)                            |
-|-------------|---------------------------------------------|--------------------------------------------|
-| Task shape  | Domain `Task` (nested metadata/spec/status) | `TaskData` (proto message)                 |
-| Timestamps  | Unix ms as number (`1712750400000`)         | Unix ms as string (`"1712750400000"`)      |
-| Enums       | camelCase (`"succeeded"`, `"onFailure"`)    | SCREAMING_SNAKE (`TASK_STATUS_SUCCEEDED`)  |
-| uint64      | JSON number                                 | String-encoded                             |
-| Null/absent | `null` or field omitted                     | Default value or field absent              |
-| Field names | camelCase (`firstMs`, `failOnNonZero`)      | camelCase (`firstMs`, `failOnNonZero`)     |
-| Restart     | Tagged: `{ "type": "never" }`               | Enum: `RESTART_STRATEGY_NEVER`             |
-| Admission   | String: `"dropIfRunning"`                   | Enum: `ADMISSION_STRATEGY_DROP_IF_RUNNING` |
+| Aspect         | HTTP (proto-JSON)                                              | gRPC (binary protobuf) |
+|----------------|-----------------------------------------------------------------|------------------------|
+| Messages       | `SubmitTaskRequest`, `TaskData`, ... from `proto/solti/task/v1/` | the same               |
+| Field names    | camelCase (`timeoutMs`, `failOnNonZero`)                         | field numbers          |
+| 64-bit ints    | strings (`"30000"`); plain numbers accepted on input             | varint                 |
+| Enums          | `SCREAMING_SNAKE` names (`RESTART_POLICY_NEVER`)                 | integers               |
+| `oneof` fields | flattened into the parent object (no wrapper key)                | tagged field           |
+| `optional`     | omitted when absent                                              | field absent           |
+
+The one exception: the SSE payload on `GET /api/v1/tasks/{id}/logs` is the
+domain serde encoding of `OutputEvent` (`type`-tagged camelCase JSON, numeric ms
+timestamps), not proto-JSON — see
+[Stream task logs](#stream-task-logs-server-sent-events). The equivalent gRPC
+stream (`StreamTaskLogs`) carries proto `StreamTaskLogsResponse` messages
+instead; the two log encodings differ by design.
+
+The HTTP request/response shapes documented above are pinned by
+`tests/wire_shape.rs`; the SSE payload is pinned in `solti-model`.

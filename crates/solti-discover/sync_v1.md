@@ -17,7 +17,7 @@ Each cycle stamps the base request with fresh `ts` and `uptime_seconds`, then se
 
 ## Protobuf contract
 
-Defined in `proto/v1/sync.proto` (package `solti.discover.v1`).
+Defined in `proto/solti/discover/v1/discovery.proto` (package `solti.discover.v1`).
 
 ### SyncRequest fields
 
