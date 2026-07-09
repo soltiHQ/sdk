@@ -1,4 +1,4 @@
-//! # Error types.
+//! Error types.
 
 use thiserror::Error;
 
@@ -9,10 +9,25 @@ use solti_runner::RunnerError;
 /// Each variant notes the HTTP status that solti-api maps it to.
 /// The enum is `#[non_exhaustive]`: match with a wildcard arm and treat
 /// unknown variants as an internal error (`500`).
+///
+/// ## Example
+///
+/// ```
+/// use solti_core::CoreError;
+///
+/// fn http_status(err: &CoreError) -> u16 {
+///     match err {
+///         CoreError::AlreadyExists(_) => 409,
+///         CoreError::NotFound(_) => 404,
+///         CoreError::InvalidSpec(_) => 400,
+///         _ => 500,
+///     }
+/// }
+/// ```
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CoreError {
-    /// A taskvisor runtime failure (submit / cancel / remove / shutdown). → `500`.
+    /// A taskvisor runtime failure (submit / cancel / remove / shutdown). Maps to `500`.
     ///
     /// Carries the typed [`taskvisor::Error`] as the source; `op` is a stable
     /// label for the failed operation: `"submit"`, `"cancel"`, `"remove"`, or `"shutdown"`.
@@ -34,18 +49,18 @@ pub enum CoreError {
     #[error("task not found: {0}")]
     NotFound(String),
 
-    /// A model→taskvisor policy mapping failure:
-    /// a `#[non_exhaustive]` model enum carried a variant with no taskvisor equivalent. → `500`.
+    /// A model-to-taskvisor policy mapping failure:
+    /// a `#[non_exhaustive]` model enum carried a variant with no taskvisor equivalent. Maps to `500`.
     #[error("mapping error: {0}")]
     Mapping(String),
 
     /// A runner failed to build the concrete task.
-    /// Wraps [`solti_runner::RunnerError`]. → `500`.
+    /// Wraps [`solti_runner::RunnerError`]. Maps to `500`.
     #[error("runner error: {0}")]
     Runner(#[from] RunnerError),
 
     /// The submitted spec failed validation.
-    /// Wraps [`solti_model::ModelError`]. → `400 Bad Request`.
+    /// Wraps [`solti_model::ModelError`]. Maps to `400 Bad Request`.
     #[error("invalid spec: {0}")]
     InvalidSpec(#[from] solti_model::ModelError),
 }

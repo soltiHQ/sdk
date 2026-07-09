@@ -1,25 +1,22 @@
-//! # taskvisor → model phase crosswalk.
+//! taskvisor to model phase crosswalk.
 //!
-//! The single home for the semantic mapping from taskvisor vocabulary
-//! (outcomes, event `reason` strings) into [`TaskPhase`].
+//! The single home for the semantic mapping from taskvisor vocabulary (outcomes, event `reason` strings) into [`TaskPhase`].
 //!
-//! Both state-reconstruction planes call these classifiers:
+//! Both state-reconstruction paths call these classifiers:
 //!
-//! - the **event plane** ([`StateSubscriber`](crate::state::StateSubscriber))
-//!   for `ActorExhausted` and rejection events;
-//! - the **completion plane** (`SupervisorApi::finalize_from_outcome`)
-//!   for the guaranteed [`taskvisor::TaskOutcome`].
+//! - the event path ([`StateSubscriber`](crate::state::StateSubscriber)) for `ActorExhausted` and rejection events;
+//! - the completion path (`SupervisorApi::finalize_from_outcome`) for the guaranteed [`taskvisor::TaskOutcome`].
 //!
-//! One implementation guarantees the planes never disagree on a final phase.
+//! One implementation keeps both paths on the same final phase.
 //!
 //! ## The subtle rows
 //!
-//! | taskvisor says | model phase | Why |
-//! |----------------|-------------|-----|
-//! | `TaskOutcome::Failed` | [`TaskPhase::Exhausted`] | The retry budget ran out; the task kept failing. |
-//! | `TaskOutcome::Fatal` | [`TaskPhase::Failed`] | A permanent error stopped the task at once. |
-//! | rejection with a cancel-like reason | [`TaskPhase::Canceled`] | User- or shutdown-initiated, not an error. |
-//! | rejection reason `dropped: ...` | [`TaskPhase::Canceled`] | The task's own `DropIfRunning` admission policy skipped the run: a routine skip, not an error. |
+//! | taskvisor says                      | model phase              | Why                                                                                            |
+//! |-------------------------------------|--------------------------|------------------------------------------------------------------------------------------------|
+//! | `TaskOutcome::Failed`               | [`TaskPhase::Exhausted`] | The retry budget ran out; the task kept failing.                                               |
+//! | `TaskOutcome::Fatal`                | [`TaskPhase::Failed`]    | A permanent error stopped the task at once.                                                    |
+//! | rejection with a cancel-like reason | [`TaskPhase::Canceled`]  | User- or shutdown-initiated, not an error.                                                     |
+//! | rejection reason `dropped: ...`     | [`TaskPhase::Canceled`]  | The task's own `DropIfRunning` admission policy skipped the run: a routine skip, not an error. |
 
 use solti_model::TaskPhase;
 
@@ -27,17 +24,11 @@ use taskvisor::reasons;
 
 /// Classify a rejection reason into a terminal phase.
 ///
-/// Applies to `ControllerRejected` / `TaskAddFailed` events and to
-/// [`taskvisor::TaskOutcome::Rejected`]. User- or shutdown-initiated removals
-/// ([`reasons::REMOVED_FROM_QUEUE`], [`reasons::SUPERSEDED_BY_REPLACE`],
-/// [`reasons::CONTROLLER_SHUTTING_DOWN`]) and admission-policy drops
-/// (`AdmissionPolicy::DropIfRunning` on a busy slot) are a clean
-/// [`TaskPhase::Canceled`]. Everything else (queue full, duplicate name, ...)
-/// is [`TaskPhase::Failed`].
+/// Applies to `ControllerRejected` / `TaskAddFailed` events and to [`taskvisor::TaskOutcome::Rejected`].
+/// User- or shutdown-initiated removals ([`reasons::REMOVED_FROM_QUEUE`], [`reasons::SUPERSEDED_BY_REPLACE`], [`reasons::CONTROLLER_SHUTTING_DOWN`])
+/// and admission-policy drops (`AdmissionPolicy::DropIfRunning` on a busy slot) are a clean [`TaskPhase::Canceled`].
+/// Everything else (queue full, duplicate name, ...) is [`TaskPhase::Failed`].
 pub(crate) fn phase_for_rejection(reason: &str) -> TaskPhase {
-    // taskvisor 0.4 has no constant for the DropIfRunning rejection: it emits
-    // the free-form "dropped: slot busy (...)". The stable part is the prefix,
-    // pinned by `tests/reason_contract.rs`.
     if reason.starts_with("dropped:") {
         return TaskPhase::Canceled;
     }
@@ -51,9 +42,9 @@ pub(crate) fn phase_for_rejection(reason: &str) -> TaskPhase {
 
 /// Classify an `ActorExhausted` reason into `(phase, error)`.
 ///
-/// - [`reasons::POLICY_EXHAUSTED_SUCCESS`]: a normal one-shot completion → [`TaskPhase::Succeeded`], no error.
-/// - [`reasons::TASK_RETURNED_CANCELED`]: a cooperative self-stop → [`TaskPhase::Canceled`], no error.
-/// - Anything else (`max_retries_exceeded(...)`, ...) → [`TaskPhase::Exhausted`] with the reason as the error text.
+/// - [`reasons::POLICY_EXHAUSTED_SUCCESS`]: a normal one-shot completion maps to [`TaskPhase::Succeeded`], no error.
+/// - [`reasons::TASK_RETURNED_CANCELED`]: a cooperative self-stop maps to [`TaskPhase::Canceled`], no error.
+/// - Anything else (`max_retries_exceeded(...)`, ...) maps to [`TaskPhase::Exhausted`] with the reason as the error text.
 pub(crate) fn phase_for_exhausted(reason: Option<&str>) -> (TaskPhase, Option<String>) {
     match reason {
         Some(reasons::POLICY_EXHAUSTED_SUCCESS) => (TaskPhase::Succeeded, None),
@@ -65,9 +56,8 @@ pub(crate) fn phase_for_exhausted(reason: Option<&str>) -> (TaskPhase, Option<St
 
 /// Crosswalk a guaranteed [`taskvisor::TaskOutcome`] into `(phase, error, exit_code)`.
 ///
-/// `Rejected` delegates to [`phase_for_rejection`], keeping both planes on one
-/// classifier. Unknown future variants degrade to [`TaskPhase::Failed`] with a
-/// diagnostic error text.
+/// `Rejected` delegates to [`phase_for_rejection`], keeping both paths on one classifier.
+/// Unknown future variants degrade to [`TaskPhase::Failed`] with a diagnostic error text.
 pub(crate) fn phase_for_outcome(
     outcome: &taskvisor::TaskOutcome,
 ) -> (TaskPhase, Option<String>, Option<i32>) {
@@ -124,8 +114,6 @@ mod tests {
 
     #[test]
     fn rejection_admission_drop_maps_to_canceled() {
-        // AdmissionPolicy::DropIfRunning on a busy slot: a routine skip by the
-        // task's own admission policy, keyed on the "dropped:" prefix.
         for reason in [
             "dropped: slot busy (running)",
             "dropped: slot busy (admitting)",
@@ -160,7 +148,6 @@ mod tests {
 
     #[test]
     fn outcome_failed_is_exhausted_and_fatal_is_failed() {
-        // The two subtle rows of the crosswalk (see the module doc table).
         let failed = TaskOutcome::failed_for_tests("boom", Some(3));
         let (phase, error, exit_code) = phase_for_outcome(&failed);
         assert_eq!(phase, TaskPhase::Exhausted);

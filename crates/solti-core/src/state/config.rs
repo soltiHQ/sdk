@@ -1,13 +1,14 @@
-//! # State configuration.
+//! State retention configuration.
 //!
-//! [`StateConfig`] controls TTLs and sweep interval for [`TaskState`](super::TaskState).
+//! [`StateConfig`] controls how long [`TaskState`](super::TaskState) keeps
+//! finished runs and terminal tasks.
 
 use std::time::Duration;
 
 /// Default per-task run-history cap (see [`StateConfig::max_runs_per_task`]).
 pub(crate) const DEFAULT_MAX_RUNS_PER_TASK: usize = 256;
 
-/// Configuration for in-memory state retention and periodic sweep.
+/// Configuration for in-memory state retention.
 ///
 /// | Parameter           | Controls                                                      | Default    |
 /// |---------------------|---------------------------------------------------------------|------------|
@@ -16,10 +17,24 @@ pub(crate) const DEFAULT_MAX_RUNS_PER_TASK: usize = 256;
 /// | `sweep_interval`    | How often the sweep runs                                      | 5 minutes  |
 /// | `max_runs_per_task` | Hard cap on retained runs per task (oldest finished evicted)  | 256        |
 ///
-/// ## Also
+/// ## Example
 ///
-/// - [`TaskState`](crate::TaskState)'s crate-internal sweep consumes the TTL settings.
-/// - [`SupervisorApi::new`](crate::SupervisorApi::new) accepts this config and auto-starts the sweep task.
+/// ```
+/// use solti_core::StateConfig;
+/// use std::time::Duration;
+///
+/// let config = StateConfig {
+///     run_ttl: Duration::from_secs(10 * 60),
+///     task_ttl: Duration::from_secs(30 * 60),
+///     max_runs_per_task: 128,
+///     ..StateConfig::default()
+/// };
+///
+/// assert_eq!(config.max_runs_per_task, 128);
+/// ```
+///
+/// [`SupervisorApi::new`](crate::SupervisorApi::new) accepts this config and
+/// starts the sweep task automatically.
 #[derive(Debug, Clone)]
 pub struct StateConfig {
     /// How long to keep completed runs before sweep removes them.

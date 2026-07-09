@@ -1,4 +1,4 @@
-//! # System utilities.
+//! System utilities.
 //!
 //! Agent uptime tracking via [`uptime_seconds`].
 
@@ -20,6 +20,15 @@ pub(crate) fn init_uptime() {
 /// it is captured once on the first `SupervisorApi::new()` and never reset.
 /// A process that creates (or recreates) several `SupervisorApi` instances still measures from the first.
 /// This is intentional: the value is *agent process uptime* (what the discover heartbeat reports), not per-supervisor uptime.
+///
+/// ## Example
+///
+/// ```
+/// use solti_core::uptime_seconds;
+///
+/// let uptime = uptime_seconds();
+/// assert!(uptime < u64::MAX);
+/// ```
 pub fn uptime_seconds() -> u64 {
     START_TIME
         .get()

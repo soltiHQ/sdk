@@ -1,10 +1,12 @@
 //! # State event subscriber.
 //!
 //! [`StateSubscriber`] implements [`Subscribe`](taskvisor::Subscribe) and owns two responsibilities driven off taskvisor's lifecycle events:
-//! - project events into [`TaskState`](super::TaskState) transitions (phases and `TaskRun` records, including the `TimeoutHit`→`TaskFailed` pairing);
+//! - project events into [`TaskState`](super::TaskState) transitions (phases and `TaskRun` records, including the `TimeoutHit` + `TaskFailed` pairing);
 //! - drive the per-run [`OutputRegistry`] lifecycle (announce `RunStarted` / `RunFinished`, evict on terminal).
 //!
-//! This is the **event plane** - fed by taskvisor's *lossy* broadcast bus. A dropped terminal event is repaired by the completion-plane backstop (`finalize_from_outcome`) on [`SupervisorApi`](crate::SupervisorApi).
+//! This is the event path. It is fed by taskvisor's best-effort broadcast bus.
+//! A dropped terminal event is repaired by the completion path
+//! (`finalize_from_outcome`) on [`SupervisorApi`](crate::SupervisorApi).
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -200,7 +202,7 @@ impl Subscribe for StateSubscriber {
         "state-subscriber"
     }
 
-    /// Per-subscriber event-queue depth: `2048`, a deliberate 2× of taskvisor's `1024` default.
+    /// Per-subscriber event-queue depth: `2048`, a deliberate 2x of taskvisor's `1024` default.
     fn queue_capacity(&self) -> usize {
         2048
     }

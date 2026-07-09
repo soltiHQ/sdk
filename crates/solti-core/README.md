@@ -1,22 +1,29 @@
 # solti-core
-Orchestration layer for the solti task system.
 
-Bridges `solti-model` (public API types) with the `taskvisor` runtime.
-Provides `SupervisorApi` - the main entry point for submitting, querying, and cancelling tasks.
+`solti-core` is the supervisor layer of the Solti SDK.
 
-## Quick start
+It connects three parts:
+
+- `solti-model` - public task specs, phases, policies, and query types.
+- `solti-runner` - builds runnable tasks from `TaskKind`.
+- `taskvisor` - runs tasks, restarts them, and emits lifecycle events.
+
+Use this crate when you want to submit tasks, query their state, cancel them,
+and read their run history from one Rust API.
+
+## Quick Start
+
 ```rust,no_run
-use solti_core::{CoreError, StateConfig, SupervisorApi};
+use solti_core::taskvisor::{ControllerConfig, SupervisorConfig};
+use solti_core::{CoreError, RunnerRouter, StateConfig, SupervisorApi};
 use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec};
-use solti_runner::RunnerRouter;
-use taskvisor::{ControllerConfig, SupervisorConfig};
 
 async fn demo() -> Result<(), CoreError> {
     let api = SupervisorApi::new(
         SupervisorConfig::default(),
         ControllerConfig::default(),
-        Vec::new(),          // extra event subscribers
-        RunnerRouter::new(), // register runners for Subprocess/Wasm/Container here
+        Vec::new(),          // extra taskvisor subscribers
+        RunnerRouter::new(), // add concrete runners in the host application
         StateConfig::default(),
     )
     .await?;
@@ -41,126 +48,161 @@ async fn demo() -> Result<(), CoreError> {
 }
 ```
 
-## Architecture
-```text
- SupervisorApi
-   submit(spec)
-       ├──► spec.validate()                                    
-       ├──► RunnerRouter::build(spec) → TaskRef
-       └──► submit_with_task(task, spec)
-               ├──► state.reserve(id, spec)            (atomic provisional entry)
-               ├──► map policies → ControllerSpec
-               └──► handle.submit_and_watch → (tv_id, TaskWaiter)
-                       ├──► state.bind_tv(id, tv_id)
-                       └──► spawn backstop: TaskWaiter → finalize_from_outcome
- 
-   taskvisor events ──► StateSubscriber ──► TaskState                          
-                                        └─► OutputRegistry
-                                            (RunStarted / RunFinished / evict)
- 
-   query_tasks(q)    ──► TaskState ──► TaskPage<Task>
-   get_task(id)      ──► TaskState ──► Option<Task>
-   list_task_runs    ──► TaskState ──► Vec<TaskRun>
-   output_registry() ──► Arc<OutputRegistry>  (live-tail subs) 
- 
-   new(..., state_cfg) ──► auto-starts sweep task              
-       └──► submit_with_task(state_sweep(state, state_cfg))
+`submit()` is for model tasks that a `RunnerRouter` can build.
+For in-process tasks, use `submit_with_task()`.
+
+```rust,no_run
+use solti_core::taskvisor::{
+    ControllerConfig, SupervisorConfig, TaskContext, TaskError, TaskFn,
+};
+use solti_core::{CoreError, RunnerRouter, StateConfig, SupervisorApi};
+use solti_model::{RestartPolicy, TaskKind, TaskSpec};
+
+async fn demo() -> Result<(), CoreError> {
+    let api = SupervisorApi::new(
+        SupervisorConfig::default(),
+        ControllerConfig::default(),
+        Vec::new(),
+        RunnerRouter::new(),
+        StateConfig::default(),
+    )
+    .await?;
+
+    let task = TaskFn::arc("embedded-demo", |_ctx: TaskContext| async move {
+        Ok::<(), TaskError>(())
+    });
+    let spec = TaskSpec::builder("embedded", TaskKind::Embedded, 1_000_u64)
+        .restart(RestartPolicy::Never)
+        .build()?;
+
+    let task_id = api.submit_with_task(task, &spec).await?;
+    let _task = api.get_task(&task_id);
+
+    api.shutdown().await?;
+    Ok(())
+}
 ```
 
-## Event flow
+## Core Model
+
 ```text
- taskvisor runtime
-     │
-     ├──► TaskAdded      → (traced only; task is already in state from submit)
-     ├──► TaskStarting   → transition_starting + announce_run_started
-     ├──► TaskStopped    → transition_finished(Succeeded)  + announce_run_finished
-     ├──► TaskFailed     → transition_finished(Failed)     + announce_run_finished
-     ├──► TimeoutHit     → transition_finished(Timeout)    + announce_run_finished
-     ├──► ActorExhausted → transition_finished(Exhausted)  + announce_run_finished + evict
-     ├──► ActorDead      → transition_finished(Failed)     + announce_run_finished + evict
-     └──► TaskRemoved    → unregister_task                 + evict
+TaskSpec
+  -> RunnerRouter builds a task
+  -> taskvisor runs the task
+  -> StateSubscriber updates TaskState
+  -> OutputRegistry announces live-tail events
 ```
 
-`announce_*` and `evict` reach an `Arc<OutputRegistry>` shared with the runner side; 
-this is what bridges supervisor lifecycle into the live-tail broadcast channel that subscribers (HTTP SSE, gRPC stream) read from.
+`SupervisorApi` is the main public entry point. It owns the taskvisor runtime, the runner
+router, shared in-memory state, and the output registry.
 
-## Key types
+## Submit Path
 
-| Type               | Visibility | Description                                                                                         |
-|--------------------|------------|-----------------------------------------------------------------------------------------------------|
-| `SupervisorApi`    | pub        | High-level facade: submit, query, cancel, sweep, `output_registry()` accessor                       |
-| `StateConfig`      | pub        | TTL settings for runs, tasks, and sweep interval                                                    |
-| `CoreError`        | pub        | Error enum (`#[non_exhaustive]`): Supervisor, AlreadyExists, NotFound, Mapping, Runner, InvalidSpec |
-| `uptime_seconds()` | pub        | Agent uptime helper (`OnceLock<Instant>`)                                                           |
-| `TaskState`        | internal   | In-memory storage (`Arc<RwLock>`); wired by `SupervisorApi::new`                                    |
-| `StateSubscriber`  | internal   | `Subscribe` impl; auto-registered by `SupervisorApi::new`                                           |
-| `state_sweep()`    | internal   | Embedded periodic sweeper task; auto-submitted by `SupervisorApi::new`                              |
-
-## State storage
 ```text
- TaskState (Arc<RwLock<TaskStateInner>>)
- ┌──────────────────────────────────────────────┐
- │  tasks:   HashMap<TaskId, Task>              │
- │  by_slot: HashMap<Slot, Vec<TaskId>>         │ ← index for slot queries
- │  runs:    HashMap<TaskId, VecDeque<TaskRun>> │
- └──────────────────────────────────────────────┘
+submit(spec)
+  -> spec.validate()
+  -> RunnerRouter::build(spec)
+  -> submit_with_task(task, spec)
+      -> reserve a TaskState entry
+      -> map Solti policies to taskvisor policies
+      -> submit to taskvisor
+      -> bind the Solti TaskId to the taskvisor run id
 ```
 
-Queries use the `by_slot` index when a slot filter is present to avoid full scans.
-Pagination is deterministic (sorted by `TaskId`).
+`submit_with_task()` skips the router. It is the right API for embedded Rust
+tasks that already have a `taskvisor::TaskRef`.
 
-## State sweep
-```text
- SupervisorApi::new(..., StateConfig)
-     └──► auto-starts embedded periodic task (slot: "solti-state-sweep")
-           ├──► pass 1: remove finished runs older than run_ttl
-           └──► pass 2: remove terminal tasks with no runs past task_ttl
+## State Path
+
+`solti-core` rebuilds task state from two paths:
+
+- Event path: taskvisor lifecycle events update phases, attempts, run history,
+  and live-tail announcements.
+- Completion path: taskvisor `TaskWaiter` gives a guaranteed final outcome if
+  a terminal event was missed by the event bus.
+
+The event bus is best-effort, so the completion path is a safety path. It must not
+replace a more specific event-derived phase. For example, a task that timed out
+should stay `Timeout`; a later actor-level `ActorExhausted` must not turn it
+into `Exhausted`.
+
+## TaskState
+
+`TaskState` is an in-memory read handle. It stores current tasks and recent
+`TaskRun` records.
+
+Common reads:
+
+- `get_task(id)` - one task by id.
+- `list_all_tasks()` - visible tasks, excluding internal Solti tasks.
+- `query_tasks(query)` - combined filters and pagination.
+- `list_task_runs(id)` - run history for one task.
+- `state().count_by_phase()` - cheap counts for metrics.
+
+`TaskState` clones are cheap. They share one internal `Arc<RwLock<_>>`.
+
+## Output Registry
+
+`SupervisorApi::output_registry()` returns the shared `OutputRegistry`.
+
+Runners write output chunks into it. API layers subscribe to it for live logs,
+for example HTTP SSE and gRPC server streams.
+
+## Retention
+
+`StateConfig` controls memory retention:
+
+| Field | Default | Meaning |
+|------|---------|---------|
+| `run_ttl` | 1 hour | How long finished runs stay in memory. |
+| `task_ttl` | 1 hour | How long terminal tasks stay after their runs are gone. |
+| `sweep_interval` | 5 minutes | How often the embedded sweep task runs. |
+| `max_runs_per_task` | 256 | Hard cap for retained run records per task. |
+
+The sweep task starts automatically in `SupervisorApi::new()`.
+
+Example:
+
+```rust
+use solti_core::StateConfig;
+use std::time::Duration;
+
+let config = StateConfig {
+    run_ttl: Duration::from_secs(10 * 60),
+    task_ttl: Duration::from_secs(30 * 60),
+    ..StateConfig::default()
+};
 ```
 
-| Parameter        | Default   | Controls                                        |
-|------------------|-----------|-------------------------------------------------|
-| `run_ttl`        | 1 hour    | How long finished runs are retained             |
-| `task_ttl`       | 1 hour    | How long terminal tasks are retained            |
-| `sweep_interval` | 5 minutes | Sweep frequency (via `RestartPolicy::periodic`) |
+## Error Model
 
-In addition to the TTLs, `StateConfig::max_runs_per_task` (default `256`) caps the retained run history per task: 
-when a new attempt starts, the oldest *finished* runs beyond the cap are evicted (the in-flight run is never dropped). 
-This bounds memory for fast-restarting tasks *between* sweeps.
+All fallible APIs return `CoreError`.
 
-Sweep is always-on. Configure TTLs via `StateConfig` if defaults don't fit.
+| Variant | Meaning |
+|---------|---------|
+| `Supervisor` | taskvisor submit, cancel, remove, or shutdown failed. |
+| `AlreadyExists` | a non-terminal task with the same id is already active. |
+| `NotFound` | the requested task does not exist. |
+| `Mapping` | a Solti policy could not be mapped to taskvisor. |
+| `Runner` | the runner router could not build a task. |
+| `InvalidSpec` | the submitted `TaskSpec` failed validation. |
 
-## Policy mapping
-```text
- solti-model                    taskvisor
- ───────────                    ────────
- AdmissionPolicy::Replace   →  AdmissionPolicy::Replace
- RestartPolicy::OnFailure   →  RestartPolicy::OnFailure
- JitterPolicy::Equal        →  JitterPolicy::Equal
- BackoffPolicy { first_ms } →  BackoffPolicy { first: Duration }
-```
+`CoreError` is `#[non_exhaustive]`, so downstream code should keep a wildcard
+match arm.
 
-The model enums are `#[non_exhaustive]`. The mappers therefore carry a wildcard arm: 
-an unknown variant produces a `CoreError::Mapping` (surfaced as `500` by solti-api), never a silent fallback to a default policy.
+## Re-exports
 
-## Error model
-```text
- Variant       Source                       When                              HTTP
- ───────       ──────                       ────                              ────
- Supervisor    taskvisor runtime            submit/cancel/remove failure      500
- AlreadyExists name already active          duplicate non-terminal submit     409
- NotFound      no such task                 cancel/delete of a missing task   404
- Mapping       policy conversion            unknown model policy variant      500
- Runner        solti_runner::RunnerError    build_task failure                500
- InvalidSpec   solti_model::ModelError      spec validation failure           400
-```
+`solti-core` re-exports:
 
-`CoreError` is `#[non_exhaustive]`; solti-api maps every variant above and falls through to `500` for any future one.
+- `taskvisor` - so applications use the same runtime version.
+- `RunnerRouter` and `OutputRegistry` - the runner-facing pieces used with the
+  supervisor.
 
 ## Notes
-- `SupervisorApi::new` auto-registers `StateSubscriber` into the subscriber list.
-- `SupervisorApi::new` creates a fresh empty `OutputRegistry`; use `new_with_output_registry(...)` to share one with the runner side.
-- `TaskState` is `Clone` via `Arc` — safe to share across threads.
-- `parking_lot::RwLock` is used instead of `std::sync::RwLock` (no poisoning, better perf).
-- `unregister_task` (event-driven on `TaskRemoved`) drops the task entry but keeps runs around until sweep runs; `delete_task` (API-driven) drops both task and runs immediately.
-- `uptime_seconds()` tracks agent lifetime via `OnceLock<Instant>`; initialized by `SupervisorApi::new`.
-- The sweep task is self-hosted: it runs as an embedded `TaskKind::Embedded` task inside the same supervisor it manages.
+
+- `SupervisorApi::new()` registers the state subscriber automatically.
+- `new_with_output_registry()` lets the runner side and API side share one
+  output registry.
+- `delete_task()` is idempotent and removes both task state and run history.
+- `cancel_task()` returns `NotFound` when no task exists.
+- `uptime_seconds()` reports process uptime from the first `SupervisorApi::new()`.

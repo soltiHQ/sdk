@@ -1,7 +1,7 @@
-//! # In-memory task state.
+//! In-memory task state.
 //!
 //! [`TaskState`] stores tasks and execution runs in `Arc<RwLock<_>>`.
-//! Updated from taskvisor events via [`StateSubscriber`], cleaned by the sweep task produced by [`state_sweep`].
+//! It is updated from taskvisor events and cleaned by the periodic sweep task.
 
 mod sweep;
 pub use sweep::state_sweep;
@@ -27,12 +27,12 @@ use solti_model::{
 
 use crate::error::CoreError;
 
-/// In-memory task state storage.
+/// Shared in-memory task state.
 ///
-/// # Examples
+/// `TaskState` is usually obtained from [`SupervisorApi::state`](crate::SupervisorApi::state).
+/// Outside this crate it is a read handle: the supervisor owns the writes.
 ///
-/// `TaskState` is populated internally by the supervisor (via its event subscriber);
-/// from outside the crate it is a **read-only snapshot**. A fresh state is empty:
+/// ## Example
 ///
 /// ```
 /// use solti_core::TaskState;
@@ -42,12 +42,6 @@ use crate::error::CoreError;
 /// assert!(state.list_all().is_empty());
 /// assert_eq!(state.query(&TaskQuery::new()).total, 0);
 /// ```
-///
-/// ## Also
-///
-/// - [`StateConfig`] TTL settings consumed by `sweep` (crate-internal).
-/// - `state_sweep` (crate-internal) builds an embedded periodic sweep task.
-/// - `StateSubscriber` (crate-internal) wires taskvisor events into mutations.
 #[derive(Clone)]
 pub struct TaskState {
     inner: Arc<RwLock<TaskStateInner>>,
@@ -60,14 +54,10 @@ struct TaskStateInner {
     by_slot: HashMap<Slot, Vec<TaskId>>,
     /// Execution history: task_id -> ordered list of runs (oldest first).
     runs: HashMap<TaskId, VecDeque<TaskRun>>,
-    /// taskvisor run identity (raw) -> task entry. The canonical correlation
-    /// key for incoming events: labels are reusable, identities are not.
+    /// taskvisor run identity (raw) -> task entry.
+    /// The canonical correlation key for incoming events: labels are reusable, identities are not.
     by_tv: HashMap<u64, TaskId>,
     /// Task entry -> its current taskvisor run identity.
-    ///
-    /// Stores the opaque [`taskvisor::TaskId`] itself: taskvisor 0.4 removed
-    /// `TaskId::from_raw`. The id captured at submit time is the only handle
-    /// for cancel/remove calls.
     tv_of: HashMap<TaskId, taskvisor::TaskId>,
     /// Per-task run-history cap (oldest finished runs evicted past this).
     max_runs_per_task: usize,
@@ -76,7 +66,16 @@ struct TaskStateInner {
 impl TaskState {
     /// Create empty task state with the default per-task run-history cap.
     ///
-    /// Use `set_max_runs_per_task` (crate-internal) to override it from a [`StateConfig`] before the state sees traffic.
+    /// Most applications use [`SupervisorApi::state`](crate::SupervisorApi::state) instead of constructing this directly.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_core::TaskState;
+    ///
+    /// let state = TaskState::new();
+    /// assert!(state.list_all().is_empty());
+    /// ```
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(TaskStateInner {
@@ -100,8 +99,8 @@ impl TaskState {
     /// Register a task entry unconditionally.
     ///
     /// Production registration goes through [`reserve`](Self::reserve) at submit time;
-    /// this unconditional insert exists only for in-crate tests and the `test-util`
-    /// fixtures. It is compiled only under those configurations.
+    /// this unconditional insert exists only for in-crate tests and the `test-util` fixtures.
+    /// It is compiled only under those configurations.
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn add_task(&self, id: TaskId, spec: TaskSpec) {
         let mut inner = self.inner.write();
@@ -131,10 +130,6 @@ impl TaskState {
                 existing.status().phase
             )));
         }
-
-        // Replacing a terminal previous incarnation: sever its identity binding
-        // so a stale completion waiter can no longer resolve into the fresh entry
-        // during the reserve -> bind_tv window (see `finalize_if_bound`).
         Self::unbind_locked(&mut inner, &id);
 
         let slot = spec.slot().clone();
@@ -150,7 +145,8 @@ impl TaskState {
     /// Bind a task entry to its current taskvisor run identity.
     ///
     /// Called at submission time (the id is pre-minted by `submit()`).
-    /// Rebinding the same entry to a new identity drops the previous binding. Late events from the previous incarnation no longer resolve to this entry.
+    /// Rebinding the same entry to a new identity drops the previous binding.
+    /// Late events from the previous incarnation no longer resolve to this entry.
     pub(crate) fn bind_tv(&self, id: &TaskId, tv: taskvisor::TaskId) {
         let mut inner = self.inner.write();
         if let Some(old) = inner.tv_of.insert(id.clone(), tv) {
@@ -178,7 +174,7 @@ impl TaskState {
     /// Release the taskvisor identity binding for a task entry, if any.
     ///
     /// The sweep deliberately spares any entry that is still **bound**: a periodic task sits in a terminal phase between runs while its actor is alive (see [`sweep`](Self::sweep)).
-    /// Terminal finalizations that do *not* flow through `TaskRemoved` (admission rejections, lag-dropped terminals reconstructed by the completion-plane backstop)
+    /// Terminal finalizations that do *not* flow through `TaskRemoved` (admission rejections, lag-dropped terminals reconstructed by the completion path)
     /// must therefore call this to drop the binding. Otherwise the entry is mistaken for a live periodic task and is never reaped.
     pub(crate) fn unbind(&self, id: &TaskId) {
         let mut inner = self.inner.write();
@@ -301,8 +297,8 @@ impl TaskState {
     /// 1. The binding must still be bidirectionally current: `by_tv[tv_raw]` resolves to an entry whose `tv_of` points back at `tv_raw`.
     ///    A stale completion waiter can therefore never touch a newer incarnation that already re-reserved the name (see [`reserve`](Self::reserve)).
     /// 2. The binding is released unconditionally: the waiter fires only once the actor has fully terminated (see [`unbind`](Self::unbind)).
-    /// 3. The phase transition is applied unless the entry is already terminal - the completion plane must never demote an event-derived phase.
-    ///    `force` overrides that guard for rejected submissions, which must reach a terminal phase even if the event plane already touched the
+    /// 3. The phase transition is applied unless the entry is already terminal - the completion path must never demote an event-derived phase.
+    ///    `force` overrides that guard for rejected submissions, which must reach a terminal phase even if the event path already touched the
     ///    entry (`Task::transition_finished` stays sticky-terminal).
     ///
     /// Returns the bound entry's id so the caller can evict per-task resources (e.g. output channels) outside the lock; `None` for a stale binding.
@@ -332,7 +328,21 @@ impl TaskState {
         Some(id)
     }
 
-    /// List all runs for a task (oldest first).
+    /// List all retained runs for a task, oldest first.
+    ///
+    /// Returns an empty list when the task is unknown or its run history has
+    /// already been swept.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_core::TaskState;
+    /// use solti_model::TaskId;
+    ///
+    /// let state = TaskState::new();
+    /// let runs = state.list_runs(&TaskId::from("task-1"));
+    /// assert!(runs.is_empty());
+    /// ```
     pub fn list_runs(&self, id: &TaskId) -> Vec<TaskRun> {
         let inner = self.inner.read();
         inner
@@ -342,18 +352,50 @@ impl TaskState {
             .unwrap_or_default()
     }
 
-    /// Get task by ID.
+    /// Return one task by id.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_core::TaskState;
+    /// use solti_model::TaskId;
+    ///
+    /// let state = TaskState::new();
+    /// assert!(state.get(&TaskId::from("task-1")).is_none());
+    /// ```
     pub fn get(&self, id: &TaskId) -> Option<Task> {
         let inner = self.inner.read();
         inner.tasks.get(id).cloned()
     }
 
-    /// `true` if a task entry currently exists for `id` (cheap: no clone).
+    /// Return `true` if a task entry currently exists for `id`.
+    ///
+    /// This is cheaper than [`get`](Self::get) because it does not clone the
+    /// task.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_core::TaskState;
+    /// use solti_model::TaskId;
+    ///
+    /// let state = TaskState::new();
+    /// assert!(!state.contains_task(&TaskId::from("task-1")));
+    /// ```
     pub fn contains_task(&self, id: &TaskId) -> bool {
         self.inner.read().tasks.contains_key(id)
     }
 
-    /// List all tasks in a specific slot.
+    /// List tasks in a specific slot.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_core::TaskState;
+    ///
+    /// let state = TaskState::new();
+    /// assert!(state.list_by_slot("workers").is_empty());
+    /// ```
     pub fn list_by_slot(&self, slot: &str) -> Vec<Task> {
         let inner = self.inner.read();
 
@@ -368,7 +410,18 @@ impl TaskState {
             .unwrap_or_default()
     }
 
-    /// List all tasks (excluding solti-core's internal embedded tasks).
+    /// List all visible tasks.
+    ///
+    /// Solti internal maintenance tasks are excluded.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_core::TaskState;
+    ///
+    /// let state = TaskState::new();
+    /// assert!(state.list_all().is_empty());
+    /// ```
     pub fn list_all(&self) -> Vec<Task> {
         let inner = self.inner.read();
         inner
@@ -379,7 +432,17 @@ impl TaskState {
             .collect()
     }
 
-    /// List tasks matching a phase filter (excluding internal embedded tasks).
+    /// List visible tasks that match one phase.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_core::TaskState;
+    /// use solti_model::TaskPhase;
+    ///
+    /// let state = TaskState::new();
+    /// assert!(state.list_by_status(TaskPhase::Running).is_empty());
+    /// ```
     pub fn list_by_status(&self, phase: TaskPhase) -> Vec<Task> {
         let inner = self.inner.read();
         inner
@@ -390,13 +453,20 @@ impl TaskState {
             .collect()
     }
 
-    /// Count tasks per phase (excluding solti-core's internal embedded tasks).
+    /// Count visible tasks per phase.
     ///
-    /// Same visibility as [`list_all`](Self::list_all), but a single read-lock
-    /// pass with no `Task` clones (a clone drags the whole spec along,
-    /// including script bodies). Built for scrape-style consumers like the
-    /// Prometheus phase collector that only need the totals; phases with no
-    /// tasks are absent from the map.
+    /// This makes one read-lock pass and does not clone full [`Task`] values.
+    /// It is built for metrics collectors. Phases with no tasks are absent from
+    /// the map.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_core::TaskState;
+    ///
+    /// let state = TaskState::new();
+    /// assert!(state.count_by_phase().is_empty());
+    /// ```
     pub fn count_by_phase(&self) -> HashMap<TaskPhase, usize> {
         let inner = self.inner.read();
         let mut counts: HashMap<TaskPhase, usize> = HashMap::new();
@@ -478,16 +548,29 @@ impl TaskState {
         (runs_removed, tasks_removed)
     }
 
-    /// Query tasks with combined filters and pagination.
+    /// Query visible tasks with combined filters and pagination.
     ///
     /// Filters are applied inside a single read lock.
     /// When `slot` is specified, uses the `by_slot` index to narrow the scan.
     /// `total` in the result reflects the count *after* filtering, *before* pagination.
     ///
     /// This is the API-facing listing: [`TaskKind::Embedded`] entries (in-process
-    /// machinery such as discovery sync or metric servers) are excluded in both
-    /// branches **before** `total` is computed and the page is cut, so `total`
-    /// always agrees with the items a client can actually see.
+    /// machinery such as discovery sync or metric servers) are excluded before
+    /// `total` is computed, so `total` matches the visible API result.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_core::TaskState;
+    /// use solti_model::{TaskPhase, TaskQuery};
+    ///
+    /// let state = TaskState::new();
+    /// let query = TaskQuery::new().with_status(TaskPhase::Running).with_limit(10);
+    /// let page = state.query(&query);
+    ///
+    /// assert_eq!(page.total, 0);
+    /// assert!(page.items.is_empty());
+    /// ```
     pub fn query(&self, q: &TaskQuery) -> TaskPage<Task> {
         let inner = self.inner.read();
 

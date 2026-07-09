@@ -1,24 +1,25 @@
-//! # Supervisor API.
+//! Supervisor API.
 //!
-//! High-level API over taskvisor `Supervisor` used by solti-core.
+//! [`SupervisorApi`] is the main entry point of `solti-core`.
+//! It owns the taskvisor runtime, a runner router, in-memory state, and the
+//! output registry used for live logs.
 //!
-//! Responsibilities:
-//! - owns a [`Supervisor`] instance and runs its event loop in the background;
-//! - uses [`RunnerRouter`] to build concrete tasks from [`TaskSpec`];
-//! - maps model-level specs / policies into controller specs and submits them.
+//! ## State Reconstruction
 //!
-//! ## Two-plane state reconstruction (invariant)
+//! Task state is rebuilt from two paths with separate roles:
 //!
-//! Task state is rebuilt from two planes with **disjoint authority**:
+//! - The event path (`StateSubscriber`, fed by taskvisor's best-effort event
+//!   bus) owns per-attempt detail: phase transitions, `TaskRun` records, and
+//!   output announcements.
+//! - The completion path (`finalize_from_outcome`, fed by the guaranteed
+//!   per-submission `TaskWaiter`) is only a terminal-state safety path. It makes
+//!   sure a task still reaches a final phase when a terminal event was dropped.
 //!
-//! - The **event plane** (`StateSubscriber`, fed by taskvisor's *lossy* broadcast bus) is authoritative for per-attempt detail: phase transitions, `TaskRun` records, and output announcements.
-//! - The **completion plane** (`finalize_from_outcome`, fed by the *guaranteed* per-submission `TaskWaiter` oneshot) is authoritative **only** for terminal
-//!   liveness - it ensures a run still reaches a terminal phase when its terminal event was dropped under bus lag.
-//!
-//! The backstop must therefore stay a **phase no-op on already-terminal entries** (enforced by `TaskState::finalize_if_bound` and by
-//! `Task::transition_finished`'s sticky-terminal guard); it still releases the identity binding, because the waiter fires only once the
-//! actor has fully terminated. It can never demote a richer event-derived phase.
-//! Both planes classify outcomes and rejections through one crosswalk (`map::phase`). They can never disagree on the final phase.
+//! The safety path must not rewrite an already-terminal task. A richer
+//! event-derived phase such as `Timeout` or `Canceled` must survive a later
+//! actor-level event.
+//! Both paths use the same phase crosswalk (`map::phase`) so they agree on the
+//! final meaning.
 use std::{
     sync::{
         Arc,
@@ -43,18 +44,33 @@ use crate::{
     state::{StateConfig, StateSubscriber, TaskState, state_sweep},
 };
 
-/// Thin wrapper around taskvisor [`Supervisor`] with a runner router.
+/// High-level supervisor API.
 ///
-/// This type is responsible for:
-/// - constructing and running the supervisor;
-/// - selecting a concrete runner for each [`TaskSpec`];
-/// - mapping model-level specs into controller specs and submitting them.
+/// `SupervisorApi` is the main entry point for host applications. It starts the
+/// taskvisor runtime, submits tasks, exposes in-memory state, and shuts the
+/// runtime down.
 ///
-/// ## Also
+/// ## Example
 ///
-/// - [`CoreError`] error type returned by all methods.
-/// - [`StateConfig`] configures sweep TTLs and interval (defaults are sane).
-/// - [`solti_runner::RunnerRouter`] picks a runner for each submitted spec.
+/// ```rust,no_run
+/// use solti_core::taskvisor::{ControllerConfig, SupervisorConfig};
+/// use solti_core::{CoreError, RunnerRouter, StateConfig, SupervisorApi};
+///
+/// async fn demo() -> Result<(), CoreError> {
+///     let api = SupervisorApi::new(
+///         SupervisorConfig::default(),
+///         ControllerConfig::default(),
+///         Vec::new(),
+///         RunnerRouter::new(),
+///         StateConfig::default(),
+///     )
+///     .await?;
+///
+///     assert!(api.list_all_tasks().is_empty());
+///     api.shutdown().await?;
+///     Ok(())
+/// }
+/// ```
 pub struct SupervisorApi {
     output_registry: Arc<OutputRegistry>,
     handle: SupervisorHandle,
@@ -79,7 +95,7 @@ impl Drop for SupervisorApi {
             Err(_) => {
                 tracing::warn!(
                     "SupervisorApi dropped without shutdown() and outside a Tokio runtime; \
-                     the taskvisor runtime may leak — call SupervisorApi::shutdown().await",
+                     the taskvisor runtime may leak - call SupervisorApi::shutdown().await",
                 );
             }
         }
@@ -87,23 +103,36 @@ impl Drop for SupervisorApi {
 }
 
 impl SupervisorApi {
-    /// Create a supervisor with explicit configs and start its run loop in the background.
+    /// Create a supervisor and start its run loop in the background.
     ///
-    /// - `sup_cfg`      - supervisor configuration;
-    /// - `ctrl_cfg`     - controller configuration;
-    /// - `subscribers`  - event subscribers to attach to the supervisor;
-    /// - `router`       - runner router [`solti_model::TaskKind`];
-    /// - `state_cfg`    - sweep TTLs and interval ([`StateConfig::default()`] is usually fine).
+    /// `StateSubscriber` and the periodic state sweep task are registered
+    /// automatically.
     ///
-    /// The supervisor event loop is started via [`Supervisor::serve()`] which returns a [`SupervisorHandle`] for dynamic task management.
+    /// ## Example
     ///
-    /// A periodic sweep task is automatically submitted to prevent unbounded memory growth.
-    /// It removes completed runs and terminal tasks that exceed their configured TTLs.
+    /// ```rust,no_run
+    /// use solti_core::taskvisor::{ControllerConfig, SupervisorConfig};
+    /// use solti_core::{CoreError, RunnerRouter, StateConfig, SupervisorApi};
+    ///
+    /// async fn demo() -> Result<(), CoreError> {
+    ///     let api = SupervisorApi::new(
+    ///         SupervisorConfig::default(),
+    ///         ControllerConfig::default(),
+    ///         Vec::new(),
+    ///         RunnerRouter::new(),
+    ///         StateConfig::default(),
+    ///     )
+    ///     .await?;
+    ///
+    ///     api.shutdown().await?;
+    ///     Ok(())
+    /// }
+    /// ```
     ///
     /// ## Errors
     ///
-    /// - [`CoreError::Supervisor`] (`op = "submit"`): the runtime refused the embedded sweep task submission.
-    ///   The sweep spec itself is built internally and always valid; no other variant is reachable.
+    /// Returns [`CoreError::Supervisor`] if taskvisor rejects the embedded sweep
+    /// task during startup.
     pub async fn new(
         sup_cfg: SupervisorConfig,
         ctrl_cfg: ControllerConfig,
@@ -122,12 +151,39 @@ impl SupervisorApi {
         .await
     }
 
-    /// Same as [`SupervisorApi::new`], but lets the caller pass a shared [`OutputRegistry`].
+    /// Create a supervisor with a caller-provided [`OutputRegistry`].
+    ///
+    /// Use this when the runner side and the API side must share the same live
+    /// output registry.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use solti_core::taskvisor::{ControllerConfig, SupervisorConfig};
+    /// use solti_core::{CoreError, OutputRegistry, RunnerRouter, StateConfig, SupervisorApi};
+    /// use std::sync::Arc;
+    ///
+    /// async fn demo() -> Result<(), CoreError> {
+    ///     let output_registry = Arc::new(OutputRegistry::default());
+    ///     let api = SupervisorApi::new_with_output_registry(
+    ///         SupervisorConfig::default(),
+    ///         ControllerConfig::default(),
+    ///         Vec::new(),
+    ///         RunnerRouter::new(),
+    ///         StateConfig::default(),
+    ///         output_registry,
+    ///     )
+    ///     .await?;
+    ///
+    ///     api.shutdown().await?;
+    ///     Ok(())
+    /// }
+    /// ```
     ///
     /// ## Errors
     ///
-    /// - [`CoreError::Supervisor`] (`op = "submit"`): the runtime refused the embedded sweep task submission.
-    ///   The sweep spec itself is built internally and always valid; no other variant is reachable.
+    /// Returns [`CoreError::Supervisor`] if taskvisor rejects the embedded sweep
+    /// task during startup.
     pub async fn new_with_output_registry(
         sup_cfg: SupervisorConfig,
         ctrl_cfg: ControllerConfig,
@@ -168,37 +224,129 @@ impl SupervisorApi {
         Ok(api)
     }
 
-    /// Get a shared handle to the output registry for live-tail subscriptions.
+    /// Return the shared output registry for live-tail subscriptions.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use solti_core::SupervisorApi;
+    /// use solti_model::TaskId;
+    /// use std::sync::Arc;
+    ///
+    /// fn demo(api: &SupervisorApi, task_id: &TaskId) {
+    ///     let registry = Arc::clone(api.output_registry());
+    ///     let _maybe_stream = registry.subscribe(task_id);
+    /// }
+    /// ```
     pub fn output_registry(&self) -> &Arc<OutputRegistry> {
         &self.output_registry
     }
 
-    /// Get task information by ID.
+    /// Return one task by id.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use solti_core::SupervisorApi;
+    /// use solti_model::TaskId;
+    ///
+    /// fn demo(api: &SupervisorApi, id: &TaskId) {
+    ///     if let Some(task) = api.get_task(id) {
+    ///         assert_eq!(task.id(), id);
+    ///     }
+    /// }
+    /// ```
     pub fn get_task(&self, id: &TaskId) -> Option<Task> {
         self.state.get(id)
     }
 
-    /// List all tasks in a specific slot.
+    /// List visible tasks in one slot.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use solti_core::SupervisorApi;
+    ///
+    /// fn demo(api: &SupervisorApi) {
+    ///     let tasks = api.list_tasks_by_slot("daily-jobs");
+    ///     for task in tasks {
+    ///         assert_eq!(task.slot().as_str(), "daily-jobs");
+    ///     }
+    /// }
+    /// ```
     pub fn list_tasks_by_slot(&self, slot: &str) -> Vec<Task> {
         self.state.list_by_slot(slot)
     }
 
-    /// List all tasks.
+    /// List all visible tasks.
+    ///
+    /// Internal Solti maintenance tasks are excluded.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use solti_core::SupervisorApi;
+    ///
+    /// fn demo(api: &SupervisorApi) {
+    ///     let tasks = api.list_all_tasks();
+    ///     assert!(tasks.iter().all(|task| task.slot().as_str() != "solti-state-sweep"));
+    /// }
+    /// ```
     pub fn list_all_tasks(&self) -> Vec<Task> {
         self.state.list_all()
     }
 
-    /// List tasks by phase.
+    /// List visible tasks by phase.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use solti_core::SupervisorApi;
+    /// use solti_model::TaskPhase;
+    ///
+    /// fn demo(api: &SupervisorApi) {
+    ///     let running = api.list_tasks_by_status(TaskPhase::Running);
+    ///     assert!(running.iter().all(|task| *task.phase() == TaskPhase::Running));
+    /// }
+    /// ```
     pub fn list_tasks_by_status(&self, phase: TaskPhase) -> Vec<Task> {
         self.state.list_by_status(phase)
     }
 
-    /// Query tasks with combined filters and pagination.
+    /// Query visible tasks with combined filters and pagination.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use solti_core::SupervisorApi;
+    /// use solti_model::{TaskPhase, TaskQuery};
+    ///
+    /// fn demo(api: &SupervisorApi) {
+    ///     let query = TaskQuery::new()
+    ///         .with_status(TaskPhase::Running)
+    ///         .with_limit(20);
+    ///     let page = api.query_tasks(&query);
+    ///
+    ///     assert!(page.items.len() <= 20);
+    /// }
+    /// ```
     pub fn query_tasks(&self, query: &TaskQuery) -> TaskPage<Task> {
         self.state.query(query)
     }
 
-    /// List execution history for a specific task (oldest first).
+    /// List execution history for one task, oldest first.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use solti_core::SupervisorApi;
+    /// use solti_model::TaskId;
+    ///
+    /// fn demo(api: &SupervisorApi, id: &TaskId) {
+    ///     let runs = api.list_task_runs(id);
+    ///     assert!(runs.windows(2).all(|pair| pair[0].attempt <= pair[1].attempt));
+    /// }
+    /// ```
     pub fn list_task_runs(&self, id: &TaskId) -> Vec<TaskRun> {
         self.state.list_runs(id)
     }
@@ -206,6 +354,20 @@ impl SupervisorApi {
     /// Stop a task (running **or** still queued in its slot) and purge its run history.
     ///
     /// Deleting a missing task is not an error: the call is an idempotent no-op.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use solti_core::{CoreError, SupervisorApi};
+    /// use solti_model::TaskId;
+    ///
+    /// async fn demo(api: &SupervisorApi, id: &TaskId) -> Result<(), CoreError> {
+    ///     api.delete_task(id).await?;
+    ///     assert!(api.get_task(id).is_none());
+    ///     assert!(api.list_task_runs(id).is_empty());
+    ///     Ok(())
+    /// }
+    /// ```
     ///
     /// ## Errors
     ///
@@ -252,15 +414,42 @@ impl SupervisorApi {
         Ok(false)
     }
 
-    /// Get a clone of the underlying supervisor handle.
+    /// Return a clone of the underlying taskvisor supervisor handle.
+    ///
+    /// Use this only when you need a taskvisor-specific operation that
+    /// `SupervisorApi` does not wrap.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use solti_core::SupervisorApi;
+    ///
+    /// fn demo(api: &SupervisorApi) {
+    ///     let _handle = api.handle();
+    /// }
+    /// ```
     pub fn handle(&self) -> SupervisorHandle {
         self.handle.clone()
     }
 
-    /// Get a clone of the shared [`TaskState`].
+    /// Return a cheap clone of the shared [`TaskState`].
     ///
-    /// The clone is cheap (`Arc<RwLock<_>>` inside) and reflects live state: later mutations on the original are visible through the clone.
-    /// Intended for read-only consumers like metric collectors (e.g. `solti_prometheus::PrometheusStateCollector`).
+    /// Later supervisor updates are visible through the clone. This is useful
+    /// for read-only consumers such as metrics collectors.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use solti_core::SupervisorApi;
+    /// use solti_model::TaskPhase;
+    ///
+    /// fn demo(api: &SupervisorApi) {
+    ///     let state = api.state();
+    ///     let counts = state.count_by_phase();
+    ///     let running = counts.get(&TaskPhase::Running).copied().unwrap_or(0);
+    ///     assert_eq!(running, state.list_by_status(TaskPhase::Running).len());
+    /// }
+    /// ```
     pub fn state(&self) -> TaskState {
         self.state.clone()
     }
@@ -272,6 +461,30 @@ impl SupervisorApi {
     /// 2. Delegate to [`SupervisorApi::submit_with_task`].
     ///
     /// This is the primary entrypoint for tasks that are fully described by the public [`solti_model::TaskKind`] model.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use solti_core::{CoreError, SupervisorApi};
+    /// use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec};
+    ///
+    /// async fn demo(api: &SupervisorApi) -> Result<(), CoreError> {
+    ///     let kind = TaskKind::Subprocess(SubprocessSpec::new(
+    ///         SubprocessMode::Command {
+    ///             command: "true".into(),
+    ///             args: vec![],
+    ///         },
+    ///         TaskEnv::default(),
+    ///         None,
+    ///         Flag::enabled(),
+    ///     ));
+    ///     let spec = TaskSpec::builder("checks", kind, 5_000_u64).build()?;
+    ///
+    ///     let task_id = api.submit(&spec).await?;
+    ///     assert!(api.get_task(&task_id).is_some());
+    ///     Ok(())
+    /// }
+    /// ```
     ///
     /// ## Errors
     ///
@@ -294,6 +507,27 @@ impl SupervisorApi {
     ///
     /// The caller is responsible for constructing the [`TaskRef`];
     /// the spec controls timeout, restart, backoff and admission behavior.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use solti_core::taskvisor::{TaskContext, TaskError, TaskFn};
+    /// use solti_core::{CoreError, SupervisorApi};
+    /// use solti_model::{RestartPolicy, TaskKind, TaskSpec};
+    ///
+    /// async fn demo(api: &SupervisorApi) -> Result<(), CoreError> {
+    ///     let task = TaskFn::arc("embedded-once", |_ctx: TaskContext| async move {
+    ///         Ok::<(), TaskError>(())
+    ///     });
+    ///     let spec = TaskSpec::builder("embedded", TaskKind::Embedded, 1_000_u64)
+    ///         .restart(RestartPolicy::Never)
+    ///         .build()?;
+    ///
+    ///     let task_id = api.submit_with_task(task, &spec).await?;
+    ///     assert!(api.get_task(&task_id).is_some());
+    ///     Ok(())
+    /// }
+    /// ```
     ///
     /// ## Errors
     ///
@@ -346,7 +580,7 @@ impl SupervisorApi {
         }
     }
 
-    /// Backstop finalization of a state entry from taskvisor's guaranteed [`TaskOutcome`].
+    /// Safety finalization of a state entry from taskvisor's guaranteed [`TaskOutcome`].
     ///
     /// Idempotent and event-friendly. The whole check-and-finalize step is one
     /// atomic [`TaskState::finalize_if_bound`] call: the binding must still be
@@ -376,7 +610,21 @@ impl SupervisorApi {
         self.output_registry.evict(task_id);
     }
 
-    /// Gracefully shut down the supervisor: cancel all tasks and wait for completion.
+    /// Gracefully shut down the supervisor.
+    ///
+    /// This consumes the API, asks taskvisor to stop all tasks, and waits for
+    /// shutdown to finish.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use solti_core::{CoreError, SupervisorApi};
+    ///
+    /// async fn demo(api: SupervisorApi) -> Result<(), CoreError> {
+    ///     api.shutdown().await?;
+    ///     Ok(())
+    /// }
+    /// ```
     ///
     /// ## Errors
     ///
@@ -394,7 +642,22 @@ impl SupervisorApi {
         res
     }
 
-    /// Cancel a task by ID (in-process Rust API), running or still queued.
+    /// Cancel a task by ID, whether it is running or still queued.
+    ///
+    /// Unlike [`delete_task`](Self::delete_task), this keeps already recorded
+    /// run history until normal retention cleanup.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use solti_core::{CoreError, SupervisorApi};
+    /// use solti_model::TaskId;
+    ///
+    /// async fn demo(api: &SupervisorApi, id: &TaskId) -> Result<(), CoreError> {
+    ///     api.cancel_task(id).await?;
+    ///     Ok(())
+    /// }
+    /// ```
     ///
     /// ## Errors
     ///
@@ -674,7 +937,7 @@ mod tests {
         }
         assert!(
             cancelled_observed.load(Ordering::SeqCst),
-            "task body must observe the cancel token — delete must cancel, not just wipe state"
+            "task body must observe the cancel token - delete must cancel, not just wipe state"
         );
     }
 

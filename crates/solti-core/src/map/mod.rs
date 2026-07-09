@@ -1,11 +1,10 @@
-//! # Model ↔ taskvisor mapping.
+//! Model to taskvisor mapping.
 //!
 //! Adapter layer between `solti-model` (public specs) and the taskvisor runtime.
 //!
 //! Two directions, one module tree:
 //! - this file maps model policies **into** taskvisor structures (submit path);
-//! - [`phase`] maps taskvisor outcomes and reasons **back** into model phases
-//!   (state-reconstruction path, shared by both planes).
+//! - [`phase`] maps taskvisor outcomes and reasons **back** into model phases (state-reconstruction path, shared by both state paths).
 
 pub(crate) mod phase;
 
@@ -111,7 +110,6 @@ mod tests {
 
     #[test]
     fn restart_policy_maps_every_variant() {
-        // taskvisor::RestartPolicy is not PartialEq; match structurally.
         assert!(matches!(
             to_restart_policy(ModelRestartPolicy::Never).unwrap(),
             RestartPolicy::Never

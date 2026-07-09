@@ -74,18 +74,18 @@ assert_eq!(task.id().as_str(), "embedded-cleanup-1");
 
 ## What Ships
 
-| Area | Main Types |
-|------|------------|
-| Resource | `Task`, `TaskSpec`, `TaskStatus`, `ObjectMeta`, `TaskRun` |
-| Identity | `Slot`, `TaskId`, `AgentId` |
-| Execution | `TaskKind`, `SubprocessSpec`, `SubprocessMode`, `WasmSpec`, `ContainerSpec`, `Runtime` |
-| Policies | `RestartPolicy`, `BackoffPolicy`, `JitterPolicy`, `AdmissionPolicy`, `Timeout` |
-| Routing | `Labels`, `RunnerSelector`, `SelectorRequirement`, `SelectorOperator` |
-| Environment | `TaskEnv`, `RunnerEnv`, `KeyValue`, `merge_env` |
-| Query | `TaskQuery`, `TaskPage` |
-| Output | `OutputEvent`, `OutputChunk`, `StreamKind` |
-| Auth | `Token` |
-| Errors | `ModelError`, `ModelResult` |
+| Area        | Main Types                                                                             |
+|-------------|----------------------------------------------------------------------------------------|
+| Resource    | `Task`, `TaskSpec`, `TaskStatus`, `ObjectMeta`, `TaskRun`                              |
+| Identity    | `Slot`, `TaskId`, `AgentId`                                                            |
+| Execution   | `TaskKind`, `SubprocessSpec`, `SubprocessMode`, `WasmSpec`, `ContainerSpec`, `Runtime` |
+| Policies    | `RestartPolicy`, `BackoffPolicy`, `JitterPolicy`, `AdmissionPolicy`, `Timeout`         |
+| Routing     | `Labels`, `RunnerSelector`, `SelectorRequirement`, `SelectorOperator`                  |
+| Environment | `TaskEnv`, `RunnerEnv`, `KeyValue`, `merge_env`                                        |
+| Query       | `TaskQuery`, `TaskPage`                                                                |
+| Output      | `OutputEvent`, `OutputChunk`, `StreamKind`                                             |
+| Auth        | `Token`                                                                                |
+| Errors      | `ModelError`, `ModelResult`                                                            |
 
 ## Core Model
 
@@ -134,12 +134,12 @@ Terminal phases are `Succeeded`, `Failed`, `Timeout`, `Canceled`, and `Exhausted
 
 ## Task Kinds
 
-| Kind | Meaning | Routed by runner |
-|------|---------|------------------|
-| `Subprocess` | Host command or script | yes |
-| `Container` | OCI image | yes |
-| `Wasm` | WASI module | yes |
-| `Embedded` | In-process task | no |
+| Kind         | Meaning                | Routed by runner  |
+|--------------|------------------------|-------------------|
+| `Subprocess` | Host command or script | yes               |
+| `Container`  | OCI image              | yes               |
+| `Wasm`       | WASI module            | yes               |
+| `Embedded`   | In-process task        | no                |
 
 Subprocess command example:
 
@@ -239,11 +239,11 @@ assert_eq!(env.get("APP_MODE").map(String::as_str), Some("batch"));
 `Slot`, `TaskId`, and `AgentId` are cheap `Arc<str>` wrappers.
 They allow only `[A-Za-z0-9._-]`, reject empty strings, reject `"."` and `".."`, and have length limits:
 
-| Type | Limit |
-|------|-------|
-| `Slot` | 64 bytes |
+| Type      | Limit     |
+|-----------|-----------|
+| `Slot`    | 64 bytes  |
 | `AgentId` | 128 bytes |
-| `TaskId` | 256 bytes |
+| `TaskId`  | 256 bytes |
 
 These values can reach cgroup names, temp paths, logs, and wire protocols, so the model keeps them boring on purpose.
 

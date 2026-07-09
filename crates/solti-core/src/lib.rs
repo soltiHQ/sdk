@@ -1,35 +1,12 @@
-//! # solti-core - orchestration layer.
+//! Supervisor layer for the Solti SDK.
 //!
-//! Bridges [`solti-model`](solti_model) (public API types) with the [`taskvisor`] runtime.
-//! Provides [`SupervisorApi`]: the main entry point for submitting, querying, and cancelling tasks.
+//! `solti-core` connects [`solti_model`] task specs, [`solti_runner`] runners,
+//! and the [`taskvisor`] runtime.
 //!
-//! ## Architecture
+//! The main type is [`SupervisorApi`]. It lets an application submit tasks,
+//! query their state, read run history, cancel tasks, and shut the runtime down.
 //!
-//! ```text
-//!  submit(spec) ─► spec.validate() ─► RunnerRouter::build(spec) ─► TaskRef
-//!                                                                     │
-//!                                       submit_with_task(task, spec) ◄┘
-//!                                         ├─ reserve(id, spec)            (provisional state entry)
-//!                                         ├─ map policies ─► ControllerSpec
-//!                                         └─ handle.submit_and_watch ─► (tv_id, TaskWaiter)
-//!                                              ├─ bind_tv(id, tv_id)
-//!                                              └─ spawn backstop: TaskWaiter ─► finalize_from_outcome
-//!
-//!  taskvisor events (lossy bus) ─► StateSubscriber ─► TaskState      (phases + runs)
-//!                                                  └─► OutputRegistry (live-tail)
-//! ```
-//!
-//! ## Responsibilities
-//!
-//! | Component            | What it does                                                 |
-//! |----------------------|--------------------------------------------------------------|
-//! | [`SupervisorApi`]    | High-level facade: submit, query, cancel, sweep              |
-//! | `TaskState`          | In-memory task + run storage (`Arc<RwLock>`)                 |
-//! | `StateSubscriber`    | Wires taskvisor events into `TaskState`                      |
-//! | `state_sweep`        | Embedded periodic task sweeping expired state (auto-started) |
-//! | `map`                | Policy adapter: `solti-model` → `taskvisor` enums            |
-//!
-//! ## Quick start
+//! ## Quick Start
 //!
 //! ```rust,no_run
 //! use solti_core::taskvisor::{ControllerConfig, SupervisorConfig};
@@ -66,13 +43,43 @@
 //! }
 //! ```
 //!
-//! ## Also
+//! ## Main Flow
 //!
-//! - [`solti_model::TaskSpec`] input spec submitted via [`SupervisorApi::submit`].
-//! - [`taskvisor::Supervisor`] underlying runtime that manages actor lifecycle.
-//! - [`RunnerRouter`] picks a runner for each `TaskKind`.
-//! - [`taskvisor`], [`RunnerRouter`] and [`OutputRegistry`] are re-exported so
-//!   consumers build against the same runtime versions as this crate.
+//! ```text
+//! TaskSpec
+//!   -> RunnerRouter builds a task
+//!   -> taskvisor runs the task
+//!   -> TaskState stores phase and run history
+//!   -> OutputRegistry streams live output
+//! ```
+//!
+//! `submit()` is the normal path for model tasks. `submit_with_task()` is the
+//! path for embedded Rust tasks that already have a `taskvisor::TaskRef`.
+//!
+//! ## State
+//!
+//! Task state is rebuilt from two sources:
+//!
+//! - taskvisor events, which carry attempt-level detail;
+//! - taskvisor completion waiters, which repair terminal state if a final event
+//!   was dropped by the best-effort event bus.
+//!
+//! Terminal phases are sticky. A later actor-level event must not replace a more
+//! specific phase such as `Timeout` or `Canceled`.
+//!
+//! ## Common Types
+//!
+//! | Type | Role |
+//! |------|------|
+//! | [`SupervisorApi`] | Main public entry point over the supervisor runtime. |
+//! | [`StateConfig`] | Retention settings for tasks and run history. |
+//! | [`TaskState`] | Shared in-memory read handle. |
+//! | [`CoreError`] | Error type returned by fallible APIs. |
+//! | [`RunnerRouter`] | Builds concrete runner tasks from model specs. |
+//! | [`OutputRegistry`] | Live-tail output registry used by API streams. |
+//!
+//! [`taskvisor`], [`RunnerRouter`], and [`OutputRegistry`] are re-exported so
+//! host applications use the same runtime versions as this crate.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
