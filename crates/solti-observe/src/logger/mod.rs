@@ -1,8 +1,6 @@
-//! # Logger initialization and configuration.
+//! Logger initialization and configuration.
 //!
-//! This module contains the backend logger.
-//!
-//! See [`init_logger`] for the entry point.
+//! The public entry point is [`init_logger`]. It installs one global tracing subscriber for the process.
 
 mod config;
 pub use config::LoggerConfig;
@@ -22,9 +20,9 @@ mod tasks;
 #[cfg(feature = "timezone-sync")]
 pub use tasks::timezone_sync;
 
-/// Initializes the global tracing subscriber based on the given [`LoggerConfig`].
+/// Install the global tracing subscriber.
 ///
-/// Dispatches to the appropriate backend based on [`LoggerConfig::format`]:
+/// The selected backend comes from [`LoggerConfig::format`]:
 ///
 /// | Format                    | Backend                         | Notes                        |
 /// |---------------------------|---------------------------------|------------------------------|
@@ -32,29 +30,29 @@ pub use tasks::timezone_sync;
 /// | [`LoggerFormat::Json`]    | `tracing_subscriber::fmt::json` | Structured, machine-readable |
 /// | [`LoggerFormat::Journald`]| `tracing_journald`              | Linux only                   |
 ///
-/// Once initialized, all `tracing` macros (`info!`, `debug!`, etc.) will use this configuration.
-/// Can only be called **once** per process - subsequent calls return [`LoggerError::AlreadyInitialized`].
+/// After this call, all `tracing` macros use this config.
+/// The function can succeed only once per process.
+/// A later call returns [`LoggerError::AlreadyInitialized`].
 ///
 /// ## Local timezone
 ///
-/// When using [`LoggerTimeZone::Local`], call [`init_local_offset`] in `main()` **before** spawning the tokio runtime.
-/// See the [crate-level docs](crate#local-timezone-support) for details.
+/// When using [`LoggerTimeZone::Local`], call [`init_local_offset`] in `main()` before spawning the Tokio runtime.
+/// See the [crate-level docs](crate#local-time) for details.
 ///
-/// ## Errors
+/// ## Example
 ///
-/// - [`LoggerError::AlreadyInitialized`]: a global tracing subscriber is already installed (any format).
-/// - [`LoggerError::JournaldNotSupported`]: `cfg.format` is [`LoggerFormat::Journald`] on a non-Linux target.
-/// - [`LoggerError::JournaldInitFailed`]: connecting to the systemd journal failed (Linux only).
+/// ```rust,no_run
+/// use solti_observe::{LoggerConfig, LoggerLevel, init_logger};
 ///
-/// ## Examples
+/// # fn main() -> Result<(), solti_observe::LoggerError> {
+/// let config = LoggerConfig {
+///     level: LoggerLevel::new("taskvisor=debug,info")?,
+///     ..Default::default()
+/// };
 ///
-/// ```rust
-/// use solti_observe::{LoggerConfig, init_logger};
-///
-/// let config = LoggerConfig::default();
-/// init_logger(&config).expect("Failed to initialize logger");
-///
-/// tracing::info!("Logger initialized successfully");
+/// init_logger(&config)?;
+/// tracing::info!("logger ready");
+/// # Ok(()) }
 /// ```
 pub fn init_logger(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     match cfg.format {

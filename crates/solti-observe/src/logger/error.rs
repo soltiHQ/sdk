@@ -1,12 +1,7 @@
-//! # Logger error type.
+//! Logger error type.
 
 use thiserror::Error;
 
-/// Errors returned by logger setup and by config value-object parsing.
-///
-/// The parsing variants (`InvalidFormat`, `InvalidTimeZone`, `InvalidLevel`) come from
-/// `FromStr` and serde construction of [`LoggerConfig`](crate::LoggerConfig) fields.
-/// The remaining variants come from [`init_logger`](crate::init_logger).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LoggerError {

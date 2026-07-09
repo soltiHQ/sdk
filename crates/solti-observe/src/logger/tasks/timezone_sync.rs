@@ -1,7 +1,7 @@
-//! # Timezone-sync supervised task ([`timezone_sync`](crate::timezone_sync)).
+//! Timezone-sync supervised task.
 //!
-//! Returns a `(TaskRef, TaskSpec)` for a periodic task that re-detects the local UTC offset.
-//! Runs under `Replace` admission in the `solti-logger-tz-sync` slot: ~1h period on success, backoff on failure.
+//! [`timezone_sync`](crate::timezone_sync) returns a `(TaskRef, TaskSpec)`
+//! pair for a periodic task that tries to refresh the local UTC offset.
 
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
@@ -29,26 +29,28 @@ const BACKOFF_MAX_MS: u64 = 300_000;
 /// Backoff multiplier per consecutive failure.
 const BACKOFF_FACTOR: f64 = 2.0;
 
-/// Builds the timezone sync task and its supervision specification.
+/// Build the timezone sync task and its supervision specification.
 ///
-/// The task re-detects the local UTC offset by calling `UtcOffset::current_local_offset()` and updating the global cache.
-/// This keeps log timestamps correct across DST transitions in long-running daemons.
+/// The task calls `UtcOffset::current_local_offset()` and updates the global cache when the platform allows it.
+/// On many Unix systems this works best before Tokio starts worker threads, so [`crate::init_local_offset`] is still the important startup call.
 ///
 /// ## Scheduling
 ///
 /// | Scenario      | Delay           | Strategy                              |
 /// |---------------|-----------------|---------------------------------------|
 /// | Success       | 1 hour          | Periodic restart                      |
-/// | Failure       | 5 s → 5 min     | Exponential backoff with equal jitter |
+/// | Failure       | 5 s to 5 min    | Exponential backoff with equal jitter |
 /// | Duplicate     | Replaces        | [`AdmissionPolicy::Replace`]          |
 ///
 /// ## Example
 ///
-/// ```text
+/// ```
 /// use solti_observe::timezone_sync;
 ///
 /// let (task, spec) = timezone_sync();
-/// supervisor.submit_with_task(task, &spec).await?;
+///
+/// assert_eq!(spec.slot().as_str(), "solti-logger-tz-sync");
+/// let _ = task;
 /// ```
 pub fn timezone_sync() -> (TaskRef, TaskSpec) {
     let task: TaskRef = TaskFn::arc(TZ_SYNC_SLOT, |ctx: TaskContext| async move {

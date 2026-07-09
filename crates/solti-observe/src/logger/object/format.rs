@@ -1,6 +1,6 @@
-//! # Output format value object ([`LoggerFormat`]).
+//! Log output format.
 //!
-//! Parses and represents the log output backend: `text`, `json`, or `journald`.
+//! [`LoggerFormat`] selects the backend installed by [`crate::init_logger`].
 
 use std::{fmt, str::FromStr};
 
@@ -10,7 +10,7 @@ use crate::logger::LoggerError;
 
 /// Output format for the logger.
 ///
-/// Determines which [`tracing_subscriber`] layer [`crate::init_logger`] installs.
+/// Values parse from lower or upper case strings. `journald` is accepted only on Linux.
 ///
 /// ## Variants
 ///
@@ -20,24 +20,23 @@ use crate::logger::LoggerError;
 /// | `Json`     | `tracing_subscriber::fmt::json`  | Log aggregation (ELK, Loki)      |
 /// | `Journald` | `tracing_journald`               | systemd services (Linux only)    |
 ///
-/// ## Parsing
+/// ## Example
 ///
-/// Supports case-insensitive [`FromStr`] and serde deserialization:
-///
-/// ```rust
+/// ```
 /// use solti_observe::LoggerFormat;
 ///
 /// let fmt: LoggerFormat = "json".parse().unwrap();
 /// assert_eq!(fmt, LoggerFormat::Json);
+/// assert_eq!(fmt.to_string(), "json");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LoggerFormat {
-    /// Text logs with optional ANSI colors (default).
+    /// Text logs with optional ANSI colors.
     Text,
-    /// Structured JSON logs (ANSI colors always disabled).
+    /// Structured JSON logs.
     Json,
-    /// systemd-journald output (Linux only).
+    /// systemd-journald output.
     ///
     /// Parsing or deserializing this variant on non-Linux returns an error.
     Journald,

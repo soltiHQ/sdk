@@ -1,19 +1,13 @@
-//! # Logger backend dispatch (internal).
+//! Logger backend dispatch.
 //!
-//! Builds and installs the global tracing subscriber per [`LoggerFormat`](crate::LoggerFormat):
-//! `Text` → `fmt::Layer` (RFC 3339 timer), `Json` → `fmt::Layer::json()`, `Journald` → `tracing_journald` (Linux; a stub returning [`LoggerError::JournaldNotSupported`](crate::LoggerError) elsewhere).
-//! All install via `try_init`, mapping a second call to [`LoggerError::AlreadyInitialized`](crate::LoggerError).
+//! Builds and installs the global tracing subscriber for each [`LoggerFormat`](crate::LoggerFormat).
 
 use tracing::Subscriber;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::logger::{config::LoggerConfig, error::LoggerError, object::LoggerRfc3339};
 
-/// Initializes the text logger.
-///
-/// ## Errors
-///
-/// - [`LoggerError::AlreadyInitialized`]: a global subscriber is already installed.
+/// Initialize the text logger.
 pub fn logger_text(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     let filter = cfg.level.to_env_filter();
     let timer = LoggerRfc3339::new(cfg.tz);
@@ -26,11 +20,7 @@ pub fn logger_text(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     init_subscriber(subscriber)
 }
 
-/// Initializes the JSON (structured) logger.
-///
-/// ## Errors
-///
-/// - [`LoggerError::AlreadyInitialized`]: a global subscriber is already installed.
+/// Initialize the JSON logger.
 pub fn logger_json(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     let filter = cfg.level.to_env_filter();
     let timer = LoggerRfc3339::new(cfg.tz);
@@ -44,12 +34,7 @@ pub fn logger_json(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     init_subscriber(subscriber)
 }
 
-/// Initializes the journald logger (Linux only).
-///
-/// ## Errors
-///
-/// - [`LoggerError::JournaldInitFailed`]: connecting to the systemd journal failed.
-/// - [`LoggerError::AlreadyInitialized`]: a global subscriber is already installed.
+/// Initialize the journald logger on Linux.
 #[cfg(target_os = "linux")]
 pub fn logger_journald(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     let filter = cfg.level.to_env_filter();
@@ -61,20 +46,12 @@ pub fn logger_journald(cfg: &LoggerConfig) -> Result<(), LoggerError> {
 }
 
 /// Stub for journald on non-Linux platforms.
-///
-/// ## Errors
-///
-/// Always returns [`LoggerError::JournaldNotSupported`].
 #[cfg(not(all(target_os = "linux")))]
 pub fn logger_journald(_cfg: &LoggerConfig) -> Result<(), LoggerError> {
     Err(LoggerError::JournaldNotSupported)
 }
 
 /// Installs the subscriber as the global default.
-///
-/// ## Errors
-///
-/// - [`LoggerError::AlreadyInitialized`]: `try_init` failed because a global subscriber exists.
 fn init_subscriber<S>(subscriber: S) -> Result<(), LoggerError>
 where
     S: Subscriber + Send + Sync + 'static,

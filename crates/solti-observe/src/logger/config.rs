@@ -5,14 +5,16 @@ use crate::logger::object::{LoggerFormat, LoggerLevel, LoggerTimeZone};
 
 /// Logger configuration passed to [`crate::init_logger`].
 ///
+/// The type is serde-friendly. Missing fields use the same values as [`Default`], so config files can stay small.
+///
+/// ## Example
+///
 /// ```rust
-/// use solti_observe::LoggerConfig;
+/// use solti_observe::{LoggerConfig, LoggerFormat};
 ///
-/// // Empty JSON → all defaults
 /// let cfg: LoggerConfig = serde_json::from_str("{}").unwrap();
-/// assert_eq!(cfg.format, solti_observe::LoggerFormat::Text);
+/// assert_eq!(cfg.format, LoggerFormat::Text);
 ///
-/// // Override only what you need
 /// let cfg: LoggerConfig = serde_json::from_str(r#"{"level":"debug"}"#).unwrap();
 /// assert_eq!(cfg.level.as_str(), "debug");
 /// ```
@@ -27,22 +29,16 @@ use crate::logger::object::{LoggerFormat, LoggerLevel, LoggerTimeZone};
 /// | `with_targets` | `true`  | Include module/target names in output      |
 /// | `use_color`    | `true`  | Colored output (auto-disabled if not TTY)  |
 ///
-/// ## Also
-///
-/// - [`init_logger`](crate::init_logger) consumes this config to install the global subscriber.
-/// - [`LoggerTimeZone`] timezone variants and the `init_local_offset` requirement.
-/// - [`LoggerFormat`] output format variants and their backends.
-/// - [`LoggerLevel`] validated filter expression syntax.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoggerConfig {
-    /// Output format: [`LoggerFormat::Text`], [`LoggerFormat::Json`], or [`LoggerFormat::Journald`].
+    /// Output format: text, JSON, or journald.
     pub format: LoggerFormat,
-    /// Log level filter expression (e.g. `"info"`, `"solti_exec=trace,info"`).
+    /// Log level filter expression, such as `"info"` or `"solti_exec=trace,info"`.
     ///
     /// Validated on construction: see [`LoggerLevel`] for syntax.
     pub level: LoggerLevel,
-    /// Timestamp timezone: [`LoggerTimeZone::Utc`] or [`LoggerTimeZone::Local`].
+    /// Timestamp timezone.
     pub tz: LoggerTimeZone,
     /// Whether to include module/target names in log output.
     pub with_targets: bool,
@@ -65,21 +61,18 @@ impl Default for LoggerConfig {
 }
 
 impl LoggerConfig {
-    /// Determines whether colored output should be used.
+    /// Return whether text logs should use ANSI colors.
     ///
-    /// Color is enabled only if:
-    /// `use_color` config is `true` AND stdout is a terminal.
+    /// Color is enabled only when `use_color` is `true` and stdout is a terminal.
+    /// JSON logs ignore colors.
     ///
-    /// This method should be called during logger initialization, not during
-    /// config parsing, to ensure accurate terminal detection.
+    /// ## Example
     ///
-    /// # Examples
     /// ```rust
     /// use solti_observe::LoggerConfig;
     ///
     /// let config = LoggerConfig::default();
-    /// let should_use_color = config.should_use_color();
-    /// // Returns true only if stdout is currently a terminal
+    /// let _color = config.should_use_color();
     /// ```
     pub fn should_use_color(&self) -> bool {
         self.use_color && std::io::stdout().is_terminal()

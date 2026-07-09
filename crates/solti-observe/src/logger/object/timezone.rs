@@ -1,4 +1,4 @@
-//! # Local-timezone offset cache ([`LoggerTimeZone`]).
+//! Local timezone offset cache.
 
 use std::{
     fmt,
@@ -20,10 +20,9 @@ use crate::logger::error::LoggerError;
 ///
 /// Updated by `init_local_offset()` on startup and `sync_local_offset()` periodically.
 ///
-/// An atomic (instead of a lock) keeps the per-log-line read wait-free and
-/// re-entrancy safe: `sync_local_offset()` emits a `debug!` that the fmt layer
-/// formats synchronously on the same thread, reading this cache. With a lock
-/// held across that log call the read would self-deadlock.
+/// An atomic (instead of a lock) keeps the per-log-line read wait-free and re-entrancy safe:
+/// `sync_local_offset()` emits a `debug!` that the fmt layer formats synchronously on the same thread, reading this cache.
+/// With a lock held across that log call the read would self-deadlock.
 static LOCAL_OFFSET_SECONDS: AtomicI32 = AtomicI32::new(0);
 
 /// Tracks whether local offset initialization has been attempted.
@@ -31,9 +30,9 @@ static LOCAL_OFFSET_SECONDS: AtomicI32 = AtomicI32::new(0);
 /// Set to `true` after first successful detection or explicit initialization.
 static INIT_DONE: OnceLock<()> = OnceLock::new();
 
-/// Timezone configuration for log timestamps.
+/// Timezone setting for log timestamps.
 ///
-/// Controls which UTC offset is applied to RFC 3339 timestamps in log output.
+/// UTC is the default. Local time needs a cached UTC offset.
 ///
 /// ## Variants
 ///
@@ -42,22 +41,23 @@ static INIT_DONE: OnceLock<()> = OnceLock::new();
 /// | `Utc`   | `2025-01-15T10:30:00+00:00`  | None (always works)                |
 /// | `Local` | `2025-01-15T13:30:00+03:00`  | [`init_local_offset`] before tokio |
 ///
-/// ## Default
+/// ## Example
 ///
-/// Defaults to `Utc`.
+/// ```
+/// use solti_observe::LoggerTimeZone;
 ///
-/// ## Parsing
-///
-/// Case-insensitive [`FromStr`]: `"utc"`, `"UTC"`, `"local"`, `"LOCAL"`.
+/// let tz: LoggerTimeZone = "local".parse().unwrap();
+/// assert_eq!(tz, LoggerTimeZone::Local);
+/// assert_eq!(LoggerTimeZone::Utc.to_string(), "utc");
+/// ```
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub enum LoggerTimeZone {
-    /// UTC timezone.
+    /// UTC timestamps.
     Utc,
     /// Local system timezone.
     ///
-    /// Requires [`init_local_offset`] to be called in `main()` before
-    /// spawning the tokio runtime. Without it, falls back to UTC with
-    /// a warning on stderr.
+    /// Requires [`init_local_offset`] to be called in `main()` before spawning the tokio runtime.
+    /// Without it, falls back to UTC with a warning on stderr.
     Local,
 }
 
@@ -90,22 +90,21 @@ impl fmt::Display for LoggerTimeZone {
     }
 }
 
-/// Detects the local UTC offset and caches it for timestamp formatting.
+/// Detect the local UTC offset and cache it for timestamp formatting.
 ///
-/// **Must be called in `main()` before spawning the tokio runtime.**
+/// Call it in `main()` before spawning the Tokio runtime when you use [`LoggerTimeZone::Local`].
 ///
 /// ## Why
 ///
 /// On most Unix platforms, reading `/etc/localtime` is only safe in a single-threaded process.
-/// Once tokio spawns its worker threads, the `time` crate's `UtcOffset::current_local_offset()`
-/// returns `Err`. Timestamps then silently fall back to UTC.
+/// Once Tokio spawns worker threads, the `time` crate often returns an error.
+/// Timestamps then fall back to UTC.
 ///
 /// ## Behaviour
 ///
 /// - Caches the detected offset in a global atomic (whole seconds).
 /// - Falls back to UTC silently if detection fails.
-/// - Idempotent - safe to call multiple times; only the first call
-///   triggers detection.
+/// - Safe to call multiple times; each call tries detection again and stores the latest result.
 ///
 /// ## Example
 ///
@@ -121,7 +120,7 @@ impl fmt::Display for LoggerTimeZone {
 /// }
 ///
 /// async fn async_main() {
-///     // timestamps will use local timezone
+///     // Timestamps can use local time after init_logger is called.
 /// }
 /// ```
 pub fn init_local_offset() {
@@ -130,18 +129,12 @@ pub fn init_local_offset() {
     let _ = INIT_DONE.set(());
 }
 
-/// Re-detects the system UTC offset and updates the global cache.
+/// Re-detect the system UTC offset and update the global cache.
 ///
-/// Called periodically by the [`crate::timezone_sync`] task. The cache is
-/// updated with a single atomic store **before** the `debug!` below, so the
-/// fmt layer can read the fresh value while formatting that very log line.
+/// Called periodically by the [`crate::timezone_sync`] task.
+/// The cache is updated with a single atomic store **before** the `debug!` below;
+/// the fmt layer can read the fresh value while formatting that very log line.
 ///
-/// ## Errors
-///
-/// Currently always returns `Ok`. Detection fails whenever the process is
-/// multi-threaded (on most Unix platforms), which is the normal state under
-/// tokio - the sync is then skipped with a debug log and the cache keeps the
-/// offset detected by [`init_local_offset`].
 #[cfg(feature = "timezone-sync")]
 pub(crate) fn sync_local_offset() -> Result<(), LoggerError> {
     match UtcOffset::current_local_offset() {
@@ -164,7 +157,7 @@ pub(crate) fn sync_local_offset() -> Result<(), LoggerError> {
     }
 }
 
-/// Returns the cached local offset for timestamp formatting.
+/// Return the cached local offset for timestamp formatting.
 ///
 /// On first call (if [`init_local_offset`] was never called) attempts a one-shot detection.
 /// On failure prints a warning to stderr and falls back to UTC.
@@ -187,16 +180,16 @@ pub(crate) fn get_or_detect_local_offset() -> UtcOffset {
     offset_from_seconds(LOCAL_OFFSET_SECONDS.load(Ordering::Relaxed))
 }
 
-/// Converts cached whole seconds back into a [`UtcOffset`].
+/// Convert cached whole seconds back into a [`UtcOffset`].
 ///
-/// The cache only ever holds values produced by `UtcOffset::whole_seconds()`,
-/// so the conversion cannot fail; UTC is a defensive fallback rather than a
-/// reachable branch.
+/// The cache only ever holds values produced by `UtcOffset::whole_seconds()`;
+/// the conversion cannot fail;
+/// UTC is a defensive fallback rather than a reachable branch.
 fn offset_from_seconds(seconds: i32) -> UtcOffset {
     UtcOffset::from_whole_seconds(seconds).unwrap_or(UtcOffset::UTC)
 }
 
-/// Formats offset as `UTC±HH` or `UTC±HH:MM`.
+/// Format offset as `UTC+HH` or `UTC+HH:MM`.
 ///
 /// Examples: `"UTC+00"`, `"UTC+03:30"`, `"UTC-05"`
 #[cfg(feature = "timezone-sync")]
@@ -271,17 +264,12 @@ mod tests {
         assert_eq!(format_offset(offset), "UTC-05");
     }
 
-    // Single test for everything touching the global offset cache: separate
-    // #[test] functions run on parallel threads and would race on the statics.
     #[test]
     fn offset_cache_updates_are_visible() {
         init_local_offset();
         let offset = get_or_detect_local_offset();
         assert!(offset.whole_hours().abs() <= 14);
 
-        // An atomic store (as done by sync_local_offset) is immediately
-        // visible to readers; INIT_DONE is already set, so no re-detection
-        // overwrites it.
         let positive = UtcOffset::from_hms(3, 30, 0).unwrap();
         LOCAL_OFFSET_SECONDS.store(positive.whole_seconds(), Ordering::Relaxed);
         assert_eq!(get_or_detect_local_offset(), positive);
@@ -290,7 +278,6 @@ mod tests {
         LOCAL_OFFSET_SECONDS.store(negative.whole_seconds(), Ordering::Relaxed);
         assert_eq!(get_or_detect_local_offset(), negative);
 
-        // Restore the real local offset for any later reader.
         init_local_offset();
     }
 

@@ -1,145 +1,242 @@
 # solti-observe
-Observability primitives for the solti task execution system.
 
-Wires [`tracing`](https://docs.rs/tracing) into solti: logger initialization, supervision event logging, and timezone sync.
+> Logging and event traces for Solti agents.
 
-## Quick start
+`solti-observe` is the logging crate for the Solti SDK.
+It installs a `tracing` subscriber, keeps logger config in small value types, and can forward taskvisor lifecycle events into your logs.
+
+Use it when you build an agent binary and want one clear place for logs, local timestamps, and task lifecycle traces.
+
+## The logging setup you stop repeating
+
+Most agents need the same boot code:
+
+```rust,ignore
+// choose text/json/journald
+// choose level filter
+// decide UTC or local timestamps
+// install tracing once
+```
+
+With `solti-observe`, this becomes a `LoggerConfig` plus one call:
+
 ```rust,no_run
-use solti_observe::{LoggerConfig, LoggerLevel, init_local_offset, init_logger};
+use solti_observe::{LoggerConfig, LoggerLevel, init_logger};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1) Must run before the tokio runtime spawns threads.
+    let config = LoggerConfig {
+        level: LoggerLevel::new("solti_core=debug,info")?,
+        ..Default::default()
+    };
+
+    init_logger(&config)?;
+    tracing::info!("agent ready");
+    Ok(())
+}
+```
+
+`init_logger` installs the global tracing subscriber. It can succeed only once in a process.
+
+## Quick Start
+
+### Text Logs
+
+Text logs are the default. They are best for local development and service logs read by people:
+
+```rust,no_run
+use solti_observe::{LoggerConfig, init_logger};
+
+fn main() -> Result<(), solti_observe::LoggerError> {
+    init_logger(&LoggerConfig::default())?;
+    tracing::info!("ready");
+    Ok(())
+}
+```
+
+### JSON Logs
+
+JSON logs are useful for Loki, ELK, or another log pipeline:
+
+```rust,no_run
+use solti_observe::{LoggerConfig, LoggerFormat, init_logger};
+
+fn main() -> Result<(), solti_observe::LoggerError> {
+    let config = LoggerConfig {
+        format: LoggerFormat::Json,
+        with_targets: true,
+        ..Default::default()
+    };
+
+    init_logger(&config)?;
+    Ok(())
+}
+```
+
+### Config From JSON
+
+`LoggerConfig` supports serde. Missing fields use defaults:
+
+```rust
+use solti_observe::{LoggerConfig, LoggerFormat};
+
+let config: LoggerConfig = serde_json::from_str(r#"{
+    "format": "json",
+    "level": "taskvisor=debug,info",
+    "with_targets": true
+}"#).unwrap();
+
+assert_eq!(config.format, LoggerFormat::Json);
+assert_eq!(config.level.as_str(), "taskvisor=debug,info");
+```
+
+### Local Timestamps
+
+If you want local timestamps, call `init_local_offset` before Tokio starts worker threads:
+
+```rust,no_run
+use solti_observe::{
+    LoggerConfig, LoggerTimeZone, init_local_offset, init_logger,
+};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_local_offset();
 
     tokio::runtime::Runtime::new()?.block_on(async {
-        // 2) Install the global tracing subscriber.
-        let cfg = LoggerConfig {
-            level: LoggerLevel::new("info")?,
+        let config = LoggerConfig {
+            tz: LoggerTimeZone::Local,
             ..Default::default()
         };
-        init_logger(&cfg)?;
 
-        tracing::info!("ready");
+        init_logger(&config)?;
+        tracing::info!("local timestamps are ready");
         Ok(())
     })
 }
 ```
 
-## Architecture
-```text
-  main()
-  ├─ init_local_offset()          before tokio runtime (single-threaded)
-  └─ tokio::Runtime::new()
-      └─ async_main()
-          ├─ init_logger(&cfg)    installs global tracing subscriber
-          │   ├─ Text  → fmt::Layer (colored, RFC 3339 timestamps)
-          │   ├─ Json  → fmt::Layer::json()
-          │   └─ Journald → tracing_journald::layer() (Linux only)
-          │
-          ├─ TracingBridge              (feature: subscriber)
-          │   └─ on_event() → trace!/debug!/info!/warn!/error!
-          │
-          └─ timezone_sync()            (feature: timezone-sync)
-              └─ periodic re-detection of local UTC offset
-```
+UTC is the default and always works.
 
-## Logger formats
+## What Ships
 
-| Format     | Backend                          | Use case                         |
-|------------|----------------------------------|----------------------------------|
-| `Text`     | `tracing_subscriber::fmt`        | Local development, human reading |
-| `Json`     | `tracing_subscriber::fmt::json`  | Log aggregation (ELK, Loki)      |
-| `Journald` | `tracing_journald`               | systemd services (Linux only)    |
+| Item                | Feature         | Use it for                                 |
+|---------------------|-----------------|--------------------------------------------|
+| `LoggerConfig`      | always          | Logger settings with serde defaults        |
+| `LoggerFormat`      | always          | `text`, `json`, or `journald`              |
+| `LoggerLevel`       | always          | Validated `EnvFilter` strings              |
+| `LoggerTimeZone`    | always          | `utc` or `local` timestamps                |
+| `init_logger`       | always          | Install the global tracing subscriber      |
+| `init_local_offset` | always          | Cache local UTC offset before Tokio starts |
+| `TracingBridge`     | `subscriber`    | Send taskvisor events to `tracing`         |
+| `timezone_sync`     | `timezone-sync` | Build a supervised offset refresh task     |
 
-## Configuration
-
-| Field          | Default | Description                               |
-|----------------|---------|-------------------------------------------|
-| `format`       | `Text`  | Human-readable colored output             |
-| `level`        | `info`  | `EnvFilter` expression                    |
-| `tz`           | `Utc`   | Timestamp timezone                        |
-| `with_targets` | `true`  | Include module/target names in output     |
-| `use_color`    | `true`  | Colored output (auto-disabled if not TTY) |
-
-Supports serde deserialization with missing-field defaults:
-```text
-{}                                → all defaults
-{"level": "debug"}                → debug level, rest defaults
-{"format": "json", "tz": "local"} → JSON with local timestamps
-```
-
-## Event logging (feature `subscriber`)
-
-The feature re-exports `TracingBridge` from taskvisor.
-It forwards every supervision event to tracing under target `taskvisor`, with a stable `event` label and structured fields (`seq`, `id`, `task`, `attempt`, `reason`, `delay_ms`, `timeout_ms`, `duration_ms`, `exit_code`, `backoff_source`).
-Failures arrive as ERROR, timeouts and permanent retry give-ups as WARN, milestones as INFO, chatty events as DEBUG.
-See the [taskvisor docs](https://docs.rs/taskvisor) for the full level mapping.
-
-## Local timezone support
-```text
-  Problem:  UtcOffset::current_local_offset() reads /etc/localtime
-            which is unsafe in multi-threaded processes (tokio)
-
-  Solution: init_local_offset()    call in main() before Runtime::new() -
-                                   this is where the offset is actually captured
-            timezone_sync()        periodic re-detection (best effort, see below)
-
-  Fallback: if init_local_offset() is not called, the first timestamp runs a
-            one-shot detection; under a running runtime it fails → UTC + stderr warning
-```
-
-## Timezone sync task (feature `timezone-sync`)
-
-`timezone_sync()` returns a `(TaskRef, TaskSpec)` pair: a periodic task
-(1 hour period via `RestartPolicy::periodic`, `AdmissionPolicy::Replace` in the
-`solti-logger-tz-sync` slot) that re-runs local offset detection.
+## Core Model
 
 ```text
-  Attempt outcome     What happens
-  ───────────────     ────────────
-  Detection succeeds  cache updated, offset change logged at DEBUG
-  Detection fails     skipped with a DEBUG log - the task still returns Ok
-  Duplicate submit    running instance is replaced (AdmissionPolicy::Replace)
+LoggerConfig
+  |
+  v
+init_logger()
+  |
+  |-- text logger
+  |-- JSON logger
+  |-- journald logger (Linux only)
+  |
+  v
+tracing macros and taskvisor event logs
 ```
 
-In practice detection succeeds only while the process is single-threaded
-(a `time` 0.3 restriction), so under a multi-threaded tokio runtime nearly
-every attempt is a skip and the effective offset stays the one captured by
-`init_local_offset()` at startup. Because the task body never returns an
-error, the configured backoff (5 s → 5 min exponential, equal jitter) is
-defensive only - no current failure path exercises it.
+Optional pieces plug into the same process:
 
-## Feature flags
-
-| Flag            | Default | Dependencies                             | Effect                          |
-|-----------------|---------|------------------------------------------|---------------------------------|
-| `subscriber`    | off     | `taskvisor` (+ its `tracing` feature)    | `TracingBridge` re-export       |
-| `timezone-sync` | off     | `taskvisor`, `solti-model`               | timezone_sync() periodic task   |
-
-## Key types
-
-| Type                     | Purpose                                                   |
-|--------------------------|-----------------------------------------------------------|
-| `LoggerConfig`           | Logger configuration (serde-deserializable)               |
-| `LoggerFormat`           | Output format: `Text`, `Json`, `Journald`                 |
-| `LoggerLevel`            | Validated `EnvFilter` expression wrapper                  |
-| `LoggerTimeZone`         | Timestamp timezone: `Utc`, `Local`                        |
-| `LoggerError`            | Error type for initialization and parsing                 |
-| `TracingBridge`          | Logs taskvisor events via tracing (feature: `subscriber`) |
-
-## Error model
 ```text
-  Variant                When
-  ───────                ────
-  InvalidFormat          unknown format string (not text/json/journald)
-  JournaldNotSupported   journald on non-Linux platform
-  JournaldInitFailed     journald layer init error (Linux)
-  AlreadyInitialized     init_logger() called twice
-  InvalidTimeZone        unknown timezone string (not utc/local)
-  InvalidLevel           invalid EnvFilter expression
+taskvisor events -- TracingBridge --> tracing
+
+timezone_sync task -- refresh attempt --> local offset cache
 ```
+
+## Logger Config
+
+Defaults are conservative:
+
+| Field          | Default  | Meaning                                   |
+|----------------|----------|-------------------------------------------|
+| `format`       | `Text`   | Human-readable logs                       |
+| `level`        | `info`   | Global filter expression                  |
+| `tz`           | `Utc`    | UTC timestamps                            |
+| `with_targets` | `true`   | Include module targets                    |
+| `use_color`    | `true`   | Use colors only when stdout is a terminal |
+
+`LoggerLevel` accepts the same syntax as `tracing_subscriber::EnvFilter`:
+
+```rust
+use solti_observe::LoggerLevel;
+
+let level = LoggerLevel::new("solti_exec=trace,taskvisor=debug,info").unwrap();
+assert_eq!(level.as_str(), "solti_exec=trace,taskvisor=debug,info");
+```
+
+## Formats
+
+| Format     | Output          | Notes                                        |
+|------------|-----------------|----------------------------------------------|
+| `Text`     | formatted lines | Best for development and normal service logs |
+| `Json`     | structured JSON | Best for log collectors                      |
+| `Journald` | systemd journal | Linux only                                   |
+
+On non-Linux platforms, parsing or using `journald` returns `LoggerError::JournaldNotSupported`.
+
+## Event Logging
+
+Enable the `subscriber` feature to re-export `taskvisor::TracingBridge`.
+It logs supervisor and controller events with target `taskvisor`.
+
+```rust,ignore
+use std::sync::Arc;
+use solti_observe::TracingBridge;
+use taskvisor::Subscribe;
+
+let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(TracingBridge)];
+```
+
+Each event carries a stable `event` label and optional fields such as `seq`, `id`, `task`, `attempt`, `reason`, `delay_ms`, `timeout_ms`, `duration_ms`, and `exit_code`.
+
+Level mapping lives in taskvisor. In short: failures are `ERROR`, timeouts and rejected work are `WARN`, lifecycle milestones are `INFO`, and noisy state changes are `DEBUG`.
+
+## Timezone Sync Task
+
+Enable the `timezone-sync` feature to build a periodic supervised task:
+
+```rust,ignore
+use solti_observe::timezone_sync;
+
+let (task, spec) = timezone_sync();
+supervisor.submit_with_task(task, &spec).await?;
+```
+
+The task uses slot `solti-logger-tz-sync`, `AdmissionPolicy::Replace`, a 1 hour success period, and a defensive 5 second to 5 minute backoff.
+
+In practice, local offset detection often works only before Tokio starts worker threads. So the important call is still `init_local_offset()` during process startup. The sync task is best-effort and useful on platforms where re-detection is allowed later.
+
+## Feature Flags
+
+| Flag            | Default  | Effect                    |
+|-----------------|----------|---------------------------|
+| `subscriber`    | off      | Re-export `TracingBridge` |
+| `timezone-sync` | off      | Expose `timezone_sync()`  |
+
+## Error Model
+
+| Error                  | When it happens                                            |
+|------------------------|------------------------------------------------------------|
+| `InvalidFormat`        | format is not `text`, `json`, or `journald`                |
+| `JournaldNotSupported` | journald was requested outside Linux                       |
+| `JournaldInitFailed`   | systemd journal setup failed                               |
+| `AlreadyInitialized`   | `init_logger` was called after a subscriber already exists |
+| `InvalidTimeZone`      | timezone is not `utc` or `local`                           |
+| `InvalidLevel`         | `EnvFilter` could not parse the level string               |
 
 ## Notes
-- `init_logger` can only be called **once** per process - subsequent calls return `AlreadyInitialized`.
-- `init_local_offset` is safe to call multiple times: each call re-runs detection and overwrites the cached offset.
-- `TracingBridge` lives in taskvisor; this crate only re-exports it. Level policy and fields evolve upstream.
+
+- Call `init_logger` once, near process start.
+- Call `init_local_offset` before creating a Tokio runtime when `LoggerTimeZone::Local` is used.
+- Use `solti-prometheus` for metrics. This crate is for logs and event traces.
+- `TracingBridge` is implemented by taskvisor and re-exported here for agent wiring.

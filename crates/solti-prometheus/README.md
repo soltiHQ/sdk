@@ -115,16 +115,16 @@ let (task, spec) = server(registry, "0.0.0.0:9090");
 
 ## What Ships
 
-| Component | Metrics | Feature | Use it for |
-|-----------|---------|---------|------------|
-| `PrometheusMetrics` | `solti_runner_*` | always | Runner execution metrics |
-| `PrometheusSubscriber` | `solti_sv_*`, `solti_ctrl_*` | always | Taskvisor and controller events |
-| `PrometheusApiMetrics` | `solti_api_*` | `api` | HTTP/gRPC API request metrics |
-| `PrometheusDiscoverMetrics` | `solti_discover_*` | `discover` | Control-plane heartbeat metrics |
-| `register_process_collector` | `process_*` | `process` | Process CPU, memory, file descriptors |
-| `register_build_info` | `solti_build_info` | always | Build identity labels |
-| `server` | `/metrics` endpoint | `server` | Supervised HTTP metrics endpoint |
-| `PrometheusStateCollector` | `solti_sv_tasks_by_phase` | `state` | Pull-based task phase snapshot |
+| Component                    | Metrics                      | Feature    | Use it for                            |
+|------------------------------|------------------------------|------------|---------------------------------------|
+| `PrometheusMetrics`          | `solti_runner_*`             | always     | Runner execution metrics              |
+| `PrometheusSubscriber`       | `solti_sv_*`, `solti_ctrl_*` | always     | Taskvisor and controller events       |
+| `PrometheusApiMetrics`       | `solti_api_*`                | `api`      | HTTP/gRPC API request metrics         |
+| `PrometheusDiscoverMetrics`  | `solti_discover_*`           | `discover` | Control-plane heartbeat metrics       |
+| `register_process_collector` | `process_*`                  | `process`  | Process CPU, memory, file descriptors |
+| `register_build_info`        | `solti_build_info`           | always     | Build identity labels                 |
+| `server`                     | `/metrics` endpoint          | `server`   | Supervised HTTP metrics endpoint      |
+| `PrometheusStateCollector`   | `solti_sv_tasks_by_phase`    | `state`    | Pull-based task phase snapshot        |
 
 ## Core Model
 
@@ -149,12 +149,12 @@ All collectors should share one `Registry`. This gives you one scrape endpoint w
 `PrometheusMetrics` implements `solti_runner::MetricsBackend`.
 Runners call it when a task starts, completes, or fails during setup.
 
-| Metric | Type | Labels | Meaning |
-|--------|------|--------|---------|
-| `solti_runner_tasks_started_total` | Counter | `runner` | Task start events |
-| `solti_runner_tasks_completed_total` | Counter | `runner`, `outcome` | Task completion events |
-| `solti_runner_task_duration_seconds` | Histogram | `runner`, `outcome` | Per-attempt duration |
-| `solti_runner_errors_total` | Counter | `runner`, `error` | Runner setup or cleanup errors |
+| Metric                               | Type      | Labels              | Meaning                        |
+|--------------------------------------|-----------|---------------------|--------------------------------|
+| `solti_runner_tasks_started_total`   | Counter   | `runner`            | Task start events              |
+| `solti_runner_tasks_completed_total` | Counter   | `runner`, `outcome` | Task completion events         |
+| `solti_runner_task_duration_seconds` | Histogram | `runner`, `outcome` | Per-attempt duration           |
+| `solti_runner_errors_total`          | Counter   | `runner`, `error`   | Runner setup or cleanup errors |
 
 Duration buckets are in seconds:
 `0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 1800, 3600`.
@@ -164,25 +164,25 @@ Duration buckets are in seconds:
 `PrometheusSubscriber` implements `taskvisor::Subscribe`.
 It watches taskvisor events and updates supervision metrics.
 
-| Metric | Type | Labels | Meaning |
-|--------|------|--------|---------|
-| `solti_sv_tasks_in_flight` | Gauge | none | Attempts currently running, best effort |
-| `solti_sv_task_restarts_total` | Counter | none | Restarts where attempt > 1 |
-| `solti_sv_task_backoff_count_total` | Counter | `source` | Backoff events |
-| `solti_sv_task_backoff_duration_seconds` | Histogram | none | Backoff delay |
-| `solti_sv_task_terminal_total` | Counter | `reason` | Terminal actor state |
-| `solti_sv_attempts_to_finalize` | Histogram | `outcome` | Attempts before final actor state |
-| `solti_sv_task_timeouts_total` | Counter | none | Timeout events |
-| `solti_sv_subscriber_overflow_total` | Counter | none | Lost events in subscriber queues |
-| `solti_sv_subscriber_panicked_total` | Counter | none | Subscriber panics |
-| `solti_sv_tasks_by_phase` | Gauge | `phase` | Pull-based phase snapshot, feature `state` |
+| Metric                                   | Type      | Labels    | Meaning                                    |
+|------------------------------------------|-----------|-----------|--------------------------------------------|
+| `solti_sv_tasks_in_flight`               | Gauge     | none      | Attempts currently running, best effort    |
+| `solti_sv_task_restarts_total`           | Counter   | none      | Restarts where attempt > 1                 |
+| `solti_sv_task_backoff_count_total`      | Counter   | `source`  | Backoff events                             |
+| `solti_sv_task_backoff_duration_seconds` | Histogram | none      | Backoff delay                              |
+| `solti_sv_task_terminal_total`           | Counter   | `reason`  | Terminal actor state                       |
+| `solti_sv_attempts_to_finalize`          | Histogram | `outcome` | Attempts before final actor state          |
+| `solti_sv_task_timeouts_total`           | Counter   | none      | Timeout events                             |
+| `solti_sv_subscriber_overflow_total`     | Counter   | none      | Lost events in subscriber queues           |
+| `solti_sv_subscriber_panicked_total`     | Counter   | none      | Subscriber panics                          |
+| `solti_sv_tasks_by_phase`                | Gauge     | `phase`   | Pull-based phase snapshot, feature `state` |
 
 Controller metrics:
 
-| Metric | Type | Labels | Meaning |
-|--------|------|--------|---------|
-| `solti_ctrl_submissions_total` | Counter | none | Controller submissions |
-| `solti_ctrl_rejections_total` | Counter | `reason` | Controller rejections by cause |
+| Metric                         | Type    | Labels   | Meaning                        |
+|--------------------------------|---------|----------|--------------------------------|
+| `solti_ctrl_submissions_total` | Counter | none     | Controller submissions         |
+| `solti_ctrl_rejections_total`  | Counter | `reason` | Controller rejections by cause |
 
 `solti_sv_tasks_in_flight` is event-based and best effort. If you need an authoritative current count, enable `state` and register `PrometheusStateCollector`.
 
@@ -190,11 +190,11 @@ Controller metrics:
 
 Enable `api` to use `PrometheusApiMetrics`.
 
-| Metric | Type | Labels | Meaning |
-|--------|------|--------|---------|
-| `solti_api_requests_total` | Counter | `transport`, `method`, `path`, `status` | Completed requests |
-| `solti_api_request_duration_seconds` | Histogram | `transport`, `method`, `path` | Request duration |
-| `solti_api_in_flight_requests` | Gauge | `transport` | Current in-flight requests |
+| Metric                               | Type      | Labels                                  | Meaning                    |
+|--------------------------------------|-----------|-----------------------------------------|----------------------------|
+| `solti_api_requests_total`           | Counter   | `transport`, `method`, `path`, `status` | Completed requests         |
+| `solti_api_request_duration_seconds` | Histogram | `transport`, `method`, `path`           | Request duration           |
+| `solti_api_in_flight_requests`       | Gauge     | `transport`                             | Current in-flight requests |
 
 `path` is bounded. HTTP uses templated routes such as `/api/v1/tasks/{id}`. gRPC uses method paths from the proto service.
 
@@ -202,15 +202,15 @@ Enable `api` to use `PrometheusApiMetrics`.
 
 Enable `discover` to use `PrometheusDiscoverMetrics`.
 
-| Metric | Type | Labels | Meaning |
-|--------|------|--------|---------|
-| `solti_discover_attempts_total` | Counter | none | Sync attempts |
-| `solti_discover_outcomes_total` | Counter | `outcome` | `success` or `failure` |
-| `solti_discover_duration_seconds` | Histogram | `outcome` | Sync call duration |
-| `solti_discover_failures_total` | Counter | `reason` | Failure reason |
-| `solti_discover_last_success_timestamp_seconds` | Gauge | none | UNIX time of last success |
-| `solti_discover_holds_total` | Counter | none | Server-advised retry holds |
-| `solti_discover_hold_duration_seconds` | Histogram | none | Hold duration |
+| Metric                                          | Type      | Labels    | Meaning                    |
+|-------------------------------------------------|-----------|-----------|----------------------------|
+| `solti_discover_attempts_total`                 | Counter   | none      | Sync attempts              |
+| `solti_discover_outcomes_total`                 | Counter   | `outcome` | `success` or `failure`     |
+| `solti_discover_duration_seconds`               | Histogram | `outcome` | Sync call duration         |
+| `solti_discover_failures_total`                 | Counter   | `reason`  | Failure reason             |
+| `solti_discover_last_success_timestamp_seconds` | Gauge     | none      | UNIX time of last success  |
+| `solti_discover_holds_total`                    | Counter   | none      | Server-advised retry holds |
+| `solti_discover_hold_duration_seconds`          | Histogram | none      | Hold duration              |
 
 ## Process Metrics
 
@@ -250,32 +250,32 @@ ControllerRejected  -> controller_rejections{reason}.inc()
 
 Prometheus labels stay low-cardinality and bounded.
 
-| Label | Values |
-|-------|--------|
-| `runner` | `subprocess`, `wasm`, `container` |
-| `outcome` | `success`, `failure`, `canceled`, `timeout` |
-| `error` | `cgroup_prepare_failed`, `backend_config_failed`, `spawn_failed`, `module_load_failed` |
-| `source` | `failure`, `success` |
-| `reason` | bounded terminal, rejection, and discovery reason labels |
-| `transport` | `http`, `grpc` |
-| `method` | HTTP method or gRPC method name |
-| `path` | templated HTTP route or gRPC method path |
-| `status` | HTTP status code or gRPC code number |
+| Label       | Values                                                                                 |
+|-------------|----------------------------------------------------------------------------------------|
+| `runner`    | `subprocess`, `wasm`, `container`                                                      |
+| `outcome`   | `success`, `failure`, `canceled`, `timeout`                                            |
+| `error`     | `cgroup_prepare_failed`, `backend_config_failed`, `spawn_failed`, `module_load_failed` |
+| `source`    | `failure`, `success`                                                                   |
+| `reason`    | bounded terminal, rejection, and discovery reason labels                               |
+| `transport` | `http`, `grpc`                                                                         |
+| `method`    | HTTP method or gRPC method name                                                        |
+| `path`      | templated HTTP route or gRPC method path                                               |
+| `status`    | HTTP status code or gRPC code number                                                   |
 
 ## Feature Flags
 
-| Flag | Default | Effect |
-|------|---------|--------|
-| `api` | off | Enables `PrometheusApiMetrics` |
-| `discover` | off | Enables `PrometheusDiscoverMetrics` |
-| `process` | off | Registers real `process_*` metrics on Linux |
-| `server` | off | Enables the supervised `/metrics` HTTP task |
-| `state` | off | Enables `PrometheusStateCollector` |
+| Flag       | Default  | Effect                                      |
+|------------|----------|---------------------------------------------|
+| `api`      | off      | Enables `PrometheusApiMetrics`              |
+| `discover` | off      | Enables `PrometheusDiscoverMetrics`         |
+| `process`  | off      | Registers real `process_*` metrics on Linux |
+| `server`   | off      | Enables the supervised `/metrics` HTTP task |
+| `state`    | off      | Enables `PrometheusStateCollector`          |
 
 ## Notes
 
 - All collectors should share one `prometheus::Registry`.
-- Durations passed in milliseconds are converted to seconds for histograms.
 - `PrometheusSubscriber` uses `DEFAULT_QUEUE_CAPACITY` by default.
-- If a collector is registered twice in the same registry, Prometheus returns `AlreadyReg`.
+- Durations passed in milliseconds are converted to seconds for histograms.
 - Full agent examples live in `examples/agentd-http` and `examples/agentd-grpc`.
+- If a collector is registered twice in the same registry, Prometheus returns `AlreadyReg`.

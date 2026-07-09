@@ -1,7 +1,6 @@
-//! # Validated `EnvFilter` expression value object ([`LoggerLevel`]).
+//! Validated log level filter.
 //!
-//! Wraps a `tracing_subscriber` `EnvFilter` directive string. The string is validated at
-//! construction. It cannot fail later at subscriber-install time.
+//! [`LoggerLevel`] wraps a `tracing_subscriber::EnvFilter` string and checks it when config is parsed.
 
 use std::{convert::TryFrom, str::FromStr};
 
@@ -12,11 +11,11 @@ use crate::logger::LoggerError;
 
 /// Validated wrapper around a [`tracing_subscriber::EnvFilter`] expression.
 ///
-/// Stores the raw filter string and validates it on construction via `EnvFilter::try_new`.
+/// The raw string is preserved. This lets config files round-trip without changing the user's filter expression.
 ///
-/// ## Accepted syntax
+/// ## Accepted Syntax
 ///
-/// Any expression accepted by [`EnvFilter`](tracing_subscriber::EnvFilter):
+/// Any expression accepted by [`EnvFilter`](tracing_subscriber::EnvFilter) can be used:
 ///
 /// | Expression                                 | Meaning                                          |
 /// |--------------------------------------------|--------------------------------------------------|
@@ -25,24 +24,23 @@ use crate::logger::LoggerError;
 /// | `"solti_exec=trace,info"`                  | Trace for `solti_exec`, info for everything else |
 /// | `"solti_core=debug,solti_exec=trace,warn"` | Per-crate overrides with global fallback         |
 ///
-/// ## Construction
+/// ## Example
 ///
-/// ```rust
+/// ```
 /// use solti_observe::LoggerLevel;
 ///
-/// // From &str
 /// let lvl = LoggerLevel::new("info").unwrap();
+/// assert_eq!(lvl.as_str(), "info");
 ///
-/// // Via FromStr / parse
 /// let lvl: LoggerLevel = "solti_exec=trace,info".parse().unwrap();
+/// assert_eq!(lvl.as_str(), "solti_exec=trace,info");
 ///
-/// // Invalid expressions are rejected
 /// assert!(LoggerLevel::new("my_crate=lol").is_err());
 /// ```
 ///
 /// ## Serialization
 ///
-/// Serializes to / deserializes from a plain JSON string:
+/// It serializes to and from a plain JSON string:
 ///
 /// ```rust
 /// # use solti_observe::LoggerLevel;
@@ -56,16 +54,15 @@ use crate::logger::LoggerError;
 pub struct LoggerLevel(String);
 
 impl LoggerLevel {
-    /// Creates a new `LoggerLevel` from a string-like value.
+    /// Create a new `LoggerLevel` from a string-like value.
     ///
     /// This is a convenience wrapper around [`TryFrom<String>`].
     ///
     /// ## Errors
     ///
-    /// - [`LoggerError::InvalidLevel`]: the value is not a valid `EnvFilter` directive
-    ///   string (carries the input and the parse error).
+    /// - [`LoggerError::InvalidLevel`]: the value is not a valid `EnvFilter` directive string (carries the input and the parse error).
     ///
-    /// # Examples
+    /// ## Example
     /// ```
     /// use solti_observe::LoggerLevel;
     ///
@@ -76,12 +73,11 @@ impl LoggerLevel {
         Self::try_from(s.into())
     }
 
-    /// Returns the underlying filter string as `&str`.
+    /// Return the underlying filter string.
     ///
-    /// This is exactly what was provided in config
-    /// (e.g. `"info"` or `"solti_exec=trace,taskvisor=debug,info"`).
+    /// This is exactly what was provided in config, such as `"info"` or `"solti_exec=trace,taskvisor=debug,info"`.
     ///
-    /// # Examples
+    /// ## Example
     /// ```
     /// use solti_observe::LoggerLevel;
     ///
@@ -93,9 +89,9 @@ impl LoggerLevel {
         &self.0
     }
 
-    /// Parses the underlying string into a `tracing_subscriber::EnvFilter`.
+    /// Convert this value into a `tracing_subscriber::EnvFilter`.
     ///
-    /// # Examples
+    /// ## Example
     /// ```
     /// use solti_observe::LoggerLevel;
     ///
