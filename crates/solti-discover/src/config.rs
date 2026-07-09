@@ -138,7 +138,7 @@ impl DiscoverConfigBuilder {
         self
     }
 
-    /// Declare agent capabilities (see `proto/v1/sync.proto` for known values).
+    /// Declare agent capabilities (see `proto/solti/discover/v1/discovery.proto` for known values).
     pub fn capabilities(mut self, capabilities: Vec<String>) -> Self {
         self.capabilities = capabilities;
         self

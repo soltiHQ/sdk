@@ -13,7 +13,8 @@ use crate::{PemSource, TlsError};
 /// Client-side TLS configuration.
 ///
 /// Construct via [`ClientTlsConfig::builder`].
-/// `client_cert` and `client_key` are paired: supply both (mTLS) or neither - the builder rejects one without the other.
+/// `client_cert` and `client_key` are paired: supply both (mTLS) or neither - the builder rejects one without the other,
+/// and [`into_rustls_config`](Self::into_rustls_config) re-checks the pair for directly constructed values.
 ///
 /// ## Security
 ///
@@ -65,6 +66,8 @@ impl ClientTlsConfig {
     /// - [`TlsError::Io`]: reading a [`PemSource::Path`] from disk failed, or a PEM block is structurally malformed.
     /// - [`TlsError::NoCertificates`]: the `ca` (or `client_cert`) PEM held no `CERTIFICATE` blocks.
     /// - [`TlsError::NoPrivateKey`]: the `client_key` PEM held no private key.
+    /// - [`TlsError::MissingField`]: `client_cert` or `client_key` was set without its pair (carries `"client_key"` / `"client_cert"`).
+    ///   Only reachable by constructing the struct directly - the builder rejects unpaired fields at `build()`.
     /// - [`TlsError::Rustls`]: `rustls` rejected the config - e.g. a CA cert that `RootCertStore::add` refused, or a client cert/key mismatch.
     pub fn into_rustls_config(self) -> Result<rustls::ClientConfig, TlsError> {
         crate::ensure_default_provider();
@@ -86,7 +89,12 @@ impl ClientTlsConfig {
                 let key = crate::load_key_from_pem(key_bytes.as_slice())?;
                 builder.with_client_auth_cert(certs, key)?
             }
-            _ => builder.with_no_client_auth(),
+            (None, None) => builder.with_no_client_auth(),
+            // Unpaired combinations are unreachable through the builder, but the
+            // fields are `pub`: a directly constructed config must fail loudly
+            // instead of silently downgrading to plain TLS.
+            (Some(_), None) => return Err(TlsError::MissingField("client_key")),
+            (None, Some(_)) => return Err(TlsError::MissingField("client_cert")),
         };
 
         config.alpn_protocols = self.alpn;
@@ -293,6 +301,52 @@ mod tests {
             .build()
             .unwrap();
         let _rustls = cfg.into_rustls_config().unwrap();
+    }
+
+    #[test]
+    fn into_rustls_config_succeeds_when_constructed_directly_without_mtls() {
+        let (ca, _) = rcgen_self_signed();
+        let cfg = ClientTlsConfig {
+            ca: PemSource::Bytes(ca),
+            client_cert: None,
+            client_key: None,
+            alpn: Vec::new(),
+        };
+        let _rustls = cfg.into_rustls_config().unwrap();
+    }
+
+    #[test]
+    fn into_rustls_config_rejects_direct_cert_without_key() {
+        let (ca, _) = rcgen_self_signed();
+        let (cert, _) = rcgen_self_signed();
+        let cfg = ClientTlsConfig {
+            ca: PemSource::Bytes(ca),
+            client_cert: Some(PemSource::Bytes(cert)),
+            client_key: None,
+            alpn: Vec::new(),
+        };
+        let err = cfg.into_rustls_config().unwrap_err();
+        assert!(
+            matches!(err, TlsError::MissingField("client_key")),
+            "unpaired client_cert must not silently disable mTLS, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn into_rustls_config_rejects_direct_key_without_cert() {
+        let (ca, _) = rcgen_self_signed();
+        let (_, key) = rcgen_self_signed();
+        let cfg = ClientTlsConfig {
+            ca: PemSource::Bytes(ca),
+            client_cert: None,
+            client_key: Some(PemSource::Bytes(key)),
+            alpn: Vec::new(),
+        };
+        let err = cfg.into_rustls_config().unwrap_err();
+        assert!(
+            matches!(err, TlsError::MissingField("client_cert")),
+            "unpaired client_key must not silently disable mTLS, got {err:?}"
+        );
     }
 
     #[test]

@@ -108,6 +108,9 @@ pub(crate) mod proto_api {
 }
 
 #[cfg(any(feature = "grpc", feature = "http"))]
+mod auth;
+
+#[cfg(any(feature = "grpc", feature = "http"))]
 mod convert;
 
 #[cfg(any(feature = "grpc", feature = "http"))]

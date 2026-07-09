@@ -9,20 +9,18 @@
 //!     │
 //!     ├──► build_task_config(spec, ctx)
 //!     │     ├──► match TaskKind::Subprocess(SubprocessSpec { .. })
-//!     │     ├──► resolve_mode(mode) → Resolved { command, args, script_tempfile? }
-//!     │     │     ├──► Command { command, args } → clone, tempfile = None
-//!     │     │     └──► Script { runtime, body }  → decode base64
-//!     │     │                                    → write to NamedTempFile (0600)
-//!     │     │                                    → args = [path, extra...]
-//!     │     │                                    → tempfile = Some(tmp)
+//!     │     ├──► resolve_mode(mode) → Resolved { command, args, script_body? }
+//!     │     │     ├──► Command { command, args } → clone, script_body = None
+//!     │     │     └──► Script { runtime, body }  → decode base64 (size-checked)
+//!     │     │                                    → script_body = Some(body)
 //!     │     ├──► merge_env(task_env, runner_env)→ BTreeMap
 //!     │     └──► SubprocessTaskConfig { run_id, seq, command, args, env, cwd, fail_on_non_zero }
 //!     │
 //!     ├──► prepare backend (cgroup dirs, if configured)
 //!     │
 //!     ├──► build Arc<TaskExecContext>
-//!     │     └──► { task_cfg, runner_cfg, cgroup_name, metrics, log_cfg, script_tempfile? }
-//!     │          tempfile kept alive until context drops → Drop = unlink
+//!     │     └──► { task_cfg, runner_cfg, cgroup_name, metrics, log_cfg, script_body? }
+//!     │          no disk I/O on the submit path: the tempfile is written per attempt
 //!     │
 //!     └──► return TaskFn closure → run_subprocess(ctx, cancel)
 //! ```
@@ -33,6 +31,10 @@
 //!     │
 //!     ├──► metrics.record_task_started()
 //!     ├──► prepare_backend() → create cgroup dirs
+//!     ├──► materialize_script() (Script mode only)
+//!     │      - spawn_blocking: NamedTempFile (0600) + write + fsync
+//!     │      - tempfile path is prepended to args
+//!     │      - lives until the attempt ends → Drop = unlink
 //!     ├──► build_command() → Command with:
 //!     │      - args, env, cwd, piped stdout/stderr
 //!     │      - process_group(0)   (Unix: new pgid for kill-whole-subtree)
@@ -164,9 +166,9 @@ impl SubprocessRunner {
         &self,
         spec: &TaskSpec,
         ctx: &BuildContext,
-    ) -> Result<(SubprocessTaskConfig, Option<NamedTempFile>), RunnerError> {
+    ) -> Result<(SubprocessTaskConfig, Option<Arc<str>>), RunnerError> {
         let slot = spec.slot();
-        let (cfg, script_tempfile) = match spec.kind() {
+        let (cfg, script_body) = match spec.kind() {
             TaskKind::Subprocess(SubprocessSpec {
                 mode,
                 env,
@@ -182,7 +184,7 @@ impl SubprocessRunner {
                 let Resolved {
                     command,
                     args,
-                    script_tempfile,
+                    script_body,
                 } = Self::resolve_mode(mode, max_body)?;
                 let run_id = self.build_run_id(slot.as_str());
                 let cfg = SubprocessTaskConfig {
@@ -194,7 +196,7 @@ impl SubprocessRunner {
                     command,
                     args,
                 };
-                (cfg, script_tempfile)
+                (cfg, script_body)
             }
             other => {
                 return Err(RunnerError::UnsupportedKind {
@@ -210,14 +212,19 @@ impl SubprocessRunner {
                 .check_cwd(cfg.cwd.as_deref())
                 .map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
         }
-        Ok((cfg, script_tempfile))
+        Ok((cfg, script_body))
     }
 
     /// Resolve [`SubprocessMode`](solti_model::SubprocessMode) into a command + args pair ready for `execve`.
     ///
     /// ## Script transport
     ///
-    /// For `Script` mode the body is written to a `NamedTempFile` (mode 0600) and the interpreter is invoked with the file path: *not* with `-c "<inline>"`.
+    /// For `Script` mode the body is decoded (and size-checked) here, but the
+    /// tempfile is **not** written yet: `build_task` runs on the async submit
+    /// path, so the disk I/O (create + write + fsync) is deferred to
+    /// [`materialize_script`] inside the task body, where it runs on a blocking
+    /// thread per attempt. The interpreter is then invoked with the tempfile
+    /// path: *not* with `-c "<inline>"`.
     ///
     /// ## Limits
     ///
@@ -231,49 +238,19 @@ impl SubprocessRunner {
             solti_model::SubprocessMode::Command { command, args } => Ok(Resolved {
                 command: command.clone(),
                 args: args.clone(),
-                script_tempfile: None,
+                script_body: None,
             }),
             solti_model::SubprocessMode::Script { runtime, args, .. } => {
                 let script = mode
                     .decode_body_with_limit(max_script_body_bytes)
                     .map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
 
-                let mut tmp = NamedTempFile::with_prefix("solti-script-").map_err(|e| {
-                    RunnerError::InvalidSpec(format!("failed to create script tempfile: {e}"))
-                })?;
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let perms = std::fs::Permissions::from_mode(0o600);
-                    if let Err(e) = tmp.as_file().set_permissions(perms) {
-                        return Err(RunnerError::InvalidSpec(format!(
-                            "failed to chmod 0600 script tempfile: {e}"
-                        )));
-                    }
-                }
-
-                tmp.write_all(script.as_bytes()).map_err(|e| {
-                    RunnerError::InvalidSpec(format!("failed to write script body: {e}"))
-                })?;
-                tmp.as_file()
-                    .sync_all()
-                    .or_else(|_| tmp.as_file().flush())
-                    .map_err(|e| {
-                        RunnerError::InvalidSpec(format!("failed to flush script tempfile: {e}"))
-                    })?;
-
                 let (cmd, _flag_deprecated_for_tempfile_transport) = runtime.resolve();
-                let path = tmp.path().to_string_lossy().into_owned();
-
-                let mut full_args = Vec::with_capacity(1 + args.len());
-                full_args.push(path);
-                full_args.extend(args.iter().cloned());
 
                 Ok(Resolved {
                     command: cmd.to_string(),
-                    args: full_args,
-                    script_tempfile: Some(tmp),
+                    args: args.clone(),
+                    script_body: Some(Arc::from(script)),
                 })
             }
             _ => Err(RunnerError::InvalidSpec(
@@ -289,8 +266,11 @@ struct Resolved {
     command: String,
     args: Vec<String>,
 
-    /// Tempfile holding the script body for `Script` mode; `None` for `Command`.
-    script_tempfile: Option<NamedTempFile>,
+    /// Decoded script body for `Script` mode; `None` for `Command`.
+    ///
+    /// Written to a tempfile by [`materialize_script`] when the task runs;
+    /// the tempfile path is prepended to `args` at spawn time.
+    script_body: Option<Arc<str>>,
 }
 
 impl Runner for SubprocessRunner {
@@ -310,11 +290,13 @@ impl Runner for SubprocessRunner {
     /// ## Errors
     ///
     /// - [`RunnerError::UnsupportedKind`]: `spec.kind()` is not `TaskKind::Subprocess`.
-    /// - [`RunnerError::InvalidSpec`]: the command is empty, the script body is not
-    ///   valid base64 or exceeds the configured size limit, or the script tempfile
-    ///   could not be created or written.
+    /// - [`RunnerError::InvalidSpec`]: the command is empty, or the script body is
+    ///   not valid base64 or exceeds the configured size limit.
+    ///
+    /// The script tempfile is written inside the task body (per attempt); an I/O
+    /// failure there fails the run with a fatal `TaskError`, not a build error.
     fn build_task(&self, spec: &TaskSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
-        let (task_cfg, script_tempfile) = self.build_task_config(spec, ctx)?;
+        let (task_cfg, script_body) = self.build_task_config(spec, ctx)?;
 
         trace!(
             slot = %spec.slot(),
@@ -355,7 +337,7 @@ impl Runner for SubprocessRunner {
             output_registry: Arc::clone(ctx.output_registry()),
             attempt: AtomicU32::new(0),
 
-            _script_tempfile: script_tempfile.map(Arc::new),
+            script_body,
         });
 
         let run_id = exec_ctx.task_cfg.run_id.to_string();
@@ -377,12 +359,23 @@ struct TaskExecContext {
     log_cfg: LogConfig,
     attempt: AtomicU32,
 
-    _script_tempfile: Option<Arc<NamedTempFile>>,
+    /// Decoded script body for `Script` mode; `None` for `Command`.
+    ///
+    /// Materialized into a fresh 0600 tempfile on every attempt by
+    /// [`materialize_script`]; the tempfile is unlinked when the attempt ends.
+    script_body: Option<Arc<str>>,
 }
 
 /// Build the OS command from task configuration.
-fn build_command(ctx: &TaskExecContext) -> Command {
+///
+/// `script_path` is the materialized script tempfile for `Script` mode; it is
+/// prepended to the task args so the interpreter receives it as its first
+/// argument. `None` for `Command` mode.
+fn build_command(ctx: &TaskExecContext, script_path: Option<&std::path::Path>) -> Command {
     let mut cmd = Command::new(&ctx.task_cfg.command);
+    if let Some(path) = script_path {
+        cmd.arg(path);
+    }
     cmd.args(&ctx.task_cfg.args);
     if let Some(cwd) = &ctx.task_cfg.cwd {
         cmd.current_dir(cwd);
@@ -539,6 +532,57 @@ async fn kill_process_group(child: &mut tokio::process::Child, run_id: &str) {
     }
 }
 
+/// Create the script tempfile: 0600 permissions, body written and flushed to disk.
+///
+/// Runs on a blocking thread (see [`materialize_script`]): `sync_all` can park
+/// the calling thread for tens of milliseconds and must never run on a tokio
+/// worker. The returned handle unlinks the file on drop.
+fn write_script_tempfile(dir: &std::path::Path, body: &str) -> Result<NamedTempFile, String> {
+    let mut tmp = NamedTempFile::with_prefix_in("solti-script-", dir)
+        .map_err(|e| format!("failed to create script tempfile: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        tmp.as_file()
+            .set_permissions(perms)
+            .map_err(|e| format!("failed to chmod 0600 script tempfile: {e}"))?;
+    }
+
+    tmp.write_all(body.as_bytes())
+        .map_err(|e| format!("failed to write script body: {e}"))?;
+    tmp.as_file()
+        .sync_all()
+        .or_else(|_| tmp.as_file().flush())
+        .map_err(|e| format!("failed to flush script tempfile: {e}"))?;
+
+    Ok(tmp)
+}
+
+/// Materialize the decoded script body into a tempfile, off the async runtime.
+///
+/// Called once per attempt from [`run_subprocess`]; the disk I/O (create +
+/// write + fsync, bodies up to 2 MiB) runs via `spawn_blocking` so the submit
+/// path and sibling tasks on the same worker are never stalled. A failure is
+/// fatal for the attempt, mirroring the spawn-failure path.
+async fn materialize_script(
+    ctx: &TaskExecContext,
+    body: Arc<str>,
+) -> Result<NamedTempFile, TaskError> {
+    let written =
+        tokio::task::spawn_blocking(move || write_script_tempfile(&std::env::temp_dir(), &body))
+            .await
+            .map_err(|e| format!("script tempfile write task failed: {e}"))
+            .and_then(|res| res);
+
+    written.map_err(|e| {
+        ctx.metrics
+            .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+        TaskError::fatal(e)
+    })
+}
+
 /// Prepare backend resources (cgroup directories) before spawn.
 fn prepare_backend(ctx: &TaskExecContext) -> Result<(), TaskError> {
     if let Some(backend_cfg) = &ctx.runner_cfg {
@@ -616,7 +660,16 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
     prepare_backend(&ctx)?;
 
     let _cgroup_guard = CgroupGuard(ctx.cgroup_name.as_deref());
-    let mut cmd = build_command(&ctx);
+
+    // Script mode: write the body to a 0600 tempfile on a blocking thread.
+    // The handle must outlive the child (the interpreter reads the file as it
+    // executes); it is dropped — and the file unlinked — when this attempt ends.
+    let script_tempfile = match &ctx.script_body {
+        Some(body) => Some(materialize_script(&ctx, Arc::clone(body)).await?),
+        None => None,
+    };
+
+    let mut cmd = build_command(&ctx, script_tempfile.as_ref().map(|t| t.path()));
     apply_backend(&mut cmd, &ctx)?;
 
     let mut child = match cmd.spawn() {
@@ -776,6 +829,31 @@ mod tests {
         .unwrap()
     }
 
+    fn mk_script_spec(slot: &str, body: &[u8], args: &[&str]) -> TaskSpec {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        TaskSpec::builder(
+            slot,
+            TaskKind::Subprocess(SubprocessSpec::new(
+                solti_model::SubprocessMode::Script {
+                    runtime: solti_model::Runtime::Bash,
+                    body: BASE64.encode(body),
+                    args: args.iter().map(|s| s.to_string()).collect(),
+                },
+                Default::default(),
+                None,
+                Default::default(),
+            )),
+            5_000u64,
+        )
+        .restart(solti_model::RestartPolicy::Never)
+        .backoff(mk_backoff())
+        .admission(solti_model::AdmissionPolicy::DropIfRunning)
+        .build()
+        .unwrap()
+    }
+
     fn mk_embedded_spec(slot: &str) -> TaskSpec {
         TaskSpec::builder(slot, TaskKind::Embedded, 5_000u64)
             .restart(solti_model::RestartPolicy::Never)
@@ -806,14 +884,14 @@ mod tests {
             log_cfg: LogConfig::default(),
             output_registry: Arc::new(OutputRegistry::default()),
             attempt: AtomicU32::new(0),
-            _script_tempfile: None,
+            script_body: None,
         }
     }
 
     #[test]
     fn build_command_sets_args_and_pipes() {
         let ctx = make_exec_ctx();
-        let cmd = build_command(&ctx);
+        let cmd = build_command(&ctx, None);
         let std_cmd = cmd.as_std();
         assert_eq!(std_cmd.get_program(), "echo");
         let args: Vec<_> = std_cmd.get_args().collect();
@@ -838,10 +916,18 @@ mod tests {
     }
 
     #[test]
+    fn build_command_prepends_script_path() {
+        let ctx = make_exec_ctx();
+        let cmd = build_command(&ctx, Some(std::path::Path::new("/tmp/solti-script-x")));
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert_eq!(args, vec!["/tmp/solti-script-x", "hello"]);
+    }
+
+    #[test]
     fn build_command_sets_env() {
         let mut ctx = make_exec_ctx();
         ctx.task_cfg.env.insert("FOO".into(), "bar".into());
-        let cmd = build_command(&ctx);
+        let cmd = build_command(&ctx, None);
         let envs: Vec<_> = cmd.as_std().get_envs().collect();
         assert!(
             envs.iter()
@@ -872,7 +958,7 @@ mod tests {
         // Default (Inherit): no env_clear, no synthetic PATH — the child inherits
         // the agent's PATH as before.
         let ctx = ctx_with_backend(SubprocessBackendConfig::new());
-        let cmd = build_command(&ctx);
+        let cmd = build_command(&ctx, None);
         assert!(!env_of(&cmd).contains_key("PATH"));
     }
 
@@ -881,7 +967,7 @@ mod tests {
         use crate::subprocess::backend::{EnvPolicy, SAFE_DEFAULT_PATH};
         let ctx =
             ctx_with_backend(SubprocessBackendConfig::new().with_env_policy(EnvPolicy::Clear));
-        let cmd = build_command(&ctx);
+        let cmd = build_command(&ctx, None);
         let env = env_of(&cmd);
         assert_eq!(env.get("PATH"), Some(&Some(SAFE_DEFAULT_PATH.to_string())));
     }
@@ -894,7 +980,7 @@ mod tests {
         ctx.task_cfg
             .env
             .insert("PATH".into(), "/opt/custom/bin".into());
-        let cmd = build_command(&ctx);
+        let cmd = build_command(&ctx, None);
         assert_eq!(
             env_of(&cmd).get("PATH"),
             Some(&Some("/opt/custom/bin".to_string()))
@@ -907,7 +993,7 @@ mod tests {
         let mut ctx =
             ctx_with_backend(SubprocessBackendConfig::new().with_env_policy(EnvPolicy::Clear));
         ctx.task_cfg.env.insert("FOO".into(), "bar".into());
-        let cmd = build_command(&ctx);
+        let cmd = build_command(&ctx, None);
         assert_eq!(env_of(&cmd).get("FOO"), Some(&Some("bar".to_string())));
     }
 
@@ -919,7 +1005,7 @@ mod tests {
         let ctx = ctx_with_backend(SubprocessBackendConfig::new().with_env_policy(
             EnvPolicy::Allowlist(vec!["SOLTI_DEFINITELY_ABSENT_VAR_XYZ".into()]),
         ));
-        let cmd = build_command(&ctx);
+        let cmd = build_command(&ctx, None);
         assert_eq!(
             env_of(&cmd).get("PATH"),
             Some(&Some(SAFE_DEFAULT_PATH.to_string()))
@@ -998,31 +1084,70 @@ mod tests {
 
     #[test]
     fn build_task_returns_task_ref_for_script_mode() {
-        use base64::Engine;
-        use base64::engine::general_purpose::STANDARD as BASE64;
-
         let runner = SubprocessRunner::new("test-runner");
-        let spec = TaskSpec::builder(
-            "test-slot",
-            TaskKind::Subprocess(solti_model::SubprocessSpec::new(
-                solti_model::SubprocessMode::Script {
-                    runtime: solti_model::Runtime::Bash,
-                    body: BASE64.encode(b"echo hello"),
-                    args: vec![],
-                },
-                Default::default(),
-                None,
-                Default::default(),
-            )),
-            5_000u64,
-        )
-        .restart(solti_model::RestartPolicy::Never)
-        .backoff(mk_backoff())
-        .admission(solti_model::AdmissionPolicy::DropIfRunning)
-        .build()
-        .unwrap();
+        let spec = mk_script_spec("test-slot", b"echo hello", &[]);
         let result = runner.build_task(&spec, &BuildContext::default());
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn script_task_runs_and_streams_output() {
+        use solti_model::{OutputEvent, TaskId};
+        use solti_runner::OutputRegistry;
+        use std::time::Duration;
+
+        let registry = Arc::new(OutputRegistry::new(64));
+        let ctx = BuildContext::default().with_output_registry(registry.clone());
+
+        let runner = SubprocessRunner::new("test-runner");
+        let spec = mk_script_spec("script-e2e", b"echo \"hello-$1\"", &["script"]);
+        let task_ref = runner.build_task(&spec, &ctx).unwrap();
+        let task_id = TaskId::from(task_ref.name());
+        let mut rx = registry.subscribe(&task_id).unwrap();
+
+        let cancel = TaskContext::detached();
+        task_ref
+            .spawn(cancel)
+            .await
+            .expect("script task must succeed");
+
+        let mut found = false;
+        for _ in 0..100 {
+            if let Ok(OutputEvent::Chunk(c)) = rx.try_recv() {
+                if std::str::from_utf8(&c.line)
+                    .unwrap_or_default()
+                    .contains("hello-script")
+                {
+                    found = true;
+                    break;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        assert!(
+            found,
+            "script output must reach the registry (tempfile materialized at run time, extra args preserved)"
+        );
+    }
+
+    #[tokio::test]
+    async fn script_task_can_be_spawned_repeatedly() {
+        // The tempfile is materialized per attempt; a retry after the first
+        // attempt (and its tempfile) is gone must still find its script.
+        let runner = SubprocessRunner::new("test-runner");
+        let spec = mk_script_spec("script-retry", b"exit 0", &[]);
+        let task_ref = runner.build_task(&spec, &BuildContext::default()).unwrap();
+
+        let ctx = TaskContext::detached();
+        task_ref
+            .spawn(ctx.clone())
+            .await
+            .expect("first attempt must succeed");
+        task_ref
+            .spawn(ctx)
+            .await
+            .expect("second attempt must succeed");
     }
 
     #[test]
@@ -1034,14 +1159,11 @@ mod tests {
         let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap();
         assert_eq!(r.command, "ls");
         assert_eq!(r.args, vec!["-la"]);
-        assert!(
-            r.script_tempfile.is_none(),
-            "Command mode needs no tempfile"
-        );
+        assert!(r.script_body.is_none(), "Command mode carries no script");
     }
 
     #[test]
-    fn resolve_mode_script_bash_uses_tempfile() {
+    fn resolve_mode_script_defers_tempfile_to_run_time() {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -1052,26 +1174,14 @@ mod tests {
         };
         let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap();
         assert_eq!(r.command, "bash");
-        assert_eq!(r.args.len(), 2, "args: {:?}", r.args);
-        assert_eq!(r.args[1], "extra");
+        assert_eq!(
+            r.args,
+            vec!["extra"],
+            "resolve must not touch the disk: the tempfile path is prepended at spawn time"
+        );
 
-        let tmp = r
-            .script_tempfile
-            .expect("Script mode must produce a tempfile");
-        assert_eq!(tmp.path().to_string_lossy(), r.args[0]);
-        let written = std::fs::read_to_string(tmp.path()).expect("tempfile readable");
-        assert_eq!(written, "echo hello");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::metadata(tmp.path()).unwrap().permissions();
-            assert_eq!(
-                perms.mode() & 0o777,
-                0o600,
-                "tempfile must be chmod 0600 (may carry secrets)"
-            );
-        }
+        let body = r.script_body.expect("Script mode must carry the body");
+        assert_eq!(&*body, "echo hello");
     }
 
     #[test]
@@ -1089,9 +1199,48 @@ mod tests {
         };
         let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap();
         assert_eq!(r.command, "ruby");
-        assert_eq!(r.args.len(), 1, "only the tempfile path, no flag");
-        assert!(!r.args[0].contains("-e"), "flag must not leak into args");
-        assert!(r.script_tempfile.is_some());
+        assert!(r.args.is_empty(), "flag must not leak into args");
+        assert!(r.script_body.is_some());
+    }
+
+    #[test]
+    fn write_script_tempfile_writes_body_with_0600() {
+        let tmp = write_script_tempfile(&std::env::temp_dir(), "echo hello")
+            .expect("tempfile must be written");
+        let written = std::fs::read_to_string(tmp.path()).expect("tempfile readable");
+        assert_eq!(written, "echo hello");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(tmp.path()).unwrap().permissions();
+            assert_eq!(
+                perms.mode() & 0o777,
+                0o600,
+                "tempfile must be chmod 0600 (may carry secrets)"
+            );
+        }
+    }
+
+    #[test]
+    fn write_script_tempfile_fails_loudly_on_bad_dir() {
+        let bogus = std::env::temp_dir().join("solti-definitely-missing-dir-xyz");
+        let err = write_script_tempfile(&bogus, "echo hello")
+            .expect_err("nonexistent dir must fail tempfile creation");
+        assert!(
+            err.contains("failed to create script tempfile"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_script_writes_tempfile_off_the_runtime() {
+        let ctx = make_exec_ctx();
+        let tmp = materialize_script(&ctx, Arc::from("echo hi"))
+            .await
+            .expect("materialization must succeed");
+        let written = std::fs::read_to_string(tmp.path()).unwrap();
+        assert_eq!(written, "echo hi");
     }
 
     #[cfg(unix)]
@@ -1364,14 +1513,13 @@ mod tests {
             args: vec![],
         };
         let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES)
-            .expect("200 KiB script must resolve via tempfile");
+            .expect("200 KiB script must resolve via tempfile transport");
         assert_eq!(r.command, "bash");
-        assert_eq!(r.args.len(), 1);
-        let tmp = r
-            .script_tempfile
-            .expect("large Script must allocate a tempfile");
-        let written = std::fs::read(tmp.path()).unwrap();
-        assert_eq!(written.len(), payload.len());
+        assert!(r.args.is_empty());
+        let body = r
+            .script_body
+            .expect("large Script must carry the decoded body");
+        assert_eq!(body.len(), payload.len());
     }
 
     #[test]

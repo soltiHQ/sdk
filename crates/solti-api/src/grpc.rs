@@ -14,6 +14,7 @@ use tracing::debug;
 
 use solti_model::{TaskQuery, Token};
 
+use crate::auth::{assert_auth_token_not_empty, bearer_value};
 use crate::convert::{output_event_to_proto, proto_to_domain_phase, tasks_page_to_proto};
 use crate::error::ApiError;
 use crate::handler::ApiHandler;
@@ -52,7 +53,10 @@ where
     where
         F: Future<Output = Result<Response<T>, Status>>,
     {
-        self.metrics.record_in_flight_delta(Transport::Grpc, 1);
+        // Guard, not paired calls: a client hang-up drops this future at the
+        // `.await` below, and the `-1` half of a paired decrement would never
+        // run, drifting the gauge upward forever.
+        let _in_flight = InFlightGuard::enter(&self.metrics);
         let start = Instant::now();
         let result = fut.await;
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -60,11 +64,38 @@ where
             Ok(_) => 0u16,
             Err(s) => s.code() as u16,
         };
+        // The latency/status metric intentionally covers only RPCs that ran to
+        // completion (`record_request` is documented as "record a completed
+        // request"): a cancelled RPC has neither a final status nor a full
+        // duration, so it adjusts the in-flight gauge and nothing else.
         let path = format!("/solti.task.v1.TaskService/{}", method);
         self.metrics
             .record_request(Transport::Grpc, method, &path, status, duration_ms);
-        self.metrics.record_in_flight_delta(Transport::Grpc, -1);
         result
+    }
+}
+
+/// RAII guard for the gRPC in-flight gauge.
+///
+/// Records `+1` on construction and `-1` in `Drop`, so the gauge stays balanced
+/// even when the RPC future is cancelled mid-flight (tonic drops the handler
+/// future as soon as the client goes away).
+struct InFlightGuard {
+    metrics: ApiMetricsHandle,
+}
+
+impl InFlightGuard {
+    fn enter(metrics: &ApiMetricsHandle) -> Self {
+        metrics.record_in_flight_delta(Transport::Grpc, 1);
+        Self {
+            metrics: Arc::clone(metrics),
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.metrics.record_in_flight_delta(Transport::Grpc, -1);
     }
 }
 
@@ -133,15 +164,11 @@ impl Interceptor for BearerAuth {
     }
 }
 
-/// Extract the credential from an `authorization` metadata value, accepting the scheme case-insensitively.
-///
-/// The credential is returned verbatim after the first space. It is never trimmed and is matched byte-for-byte by [`Token::verify`].
-fn bearer_value(header: &str) -> Option<&str> {
-    let (scheme, token) = header.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("bearer").then_some(token)
-}
-
 /// Like [`build_grpc_server`] but enforcing a bearer token on every call.
+///
+/// ## Panics
+///
+/// Panics when `token` is empty — see [`build_grpc_server_with_metrics_auth`].
 pub fn build_grpc_server_with_auth<H>(
     handler: Arc<H>,
     token: Token,
@@ -155,6 +182,11 @@ where
 /// Like [`build_grpc_server_with_metrics`] but enforcing a bearer token.
 ///
 /// Wraps the configured server (message-size limits preserved) in an [`InterceptedService`] that gates every call on the token.
+///
+/// ## Panics
+///
+/// Panics when `token` is empty: an empty shared secret would accept an empty
+/// bearer credential (`authorization: Bearer `), silently disabling authentication.
 pub fn build_grpc_server_with_metrics_auth<H>(
     handler: Arc<H>,
     metrics: ApiMetricsHandle,
@@ -163,6 +195,7 @@ pub fn build_grpc_server_with_metrics_auth<H>(
 where
     H: ApiHandler,
 {
+    assert_auth_token_not_empty(&token);
     InterceptedService::new(
         build_grpc_server_with_metrics(handler, metrics),
         BearerAuth { expected: token },
@@ -500,15 +533,153 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
+    // --- BearerAuth interceptor ---------------------------------------------
+
+    fn auth_interceptor(secret: &str) -> BearerAuth {
+        BearerAuth {
+            expected: Token::new(secret),
+        }
+    }
+
+    fn request_with_authorization(value: &str) -> Request<()> {
+        let mut req = Request::new(());
+        req.metadata_mut()
+            .insert("authorization", value.parse().expect("ascii metadata"));
+        req
+    }
+
     #[test]
-    fn bearer_value_accepts_scheme_case_insensitively() {
-        assert_eq!(bearer_value("Bearer tok"), Some("tok"));
-        assert_eq!(bearer_value("bearer tok"), Some("tok"));
-        assert_eq!(bearer_value("BEARER tok"), Some("tok"));
-        assert_eq!(bearer_value("BeArEr tok"), Some("tok"));
-        assert_eq!(bearer_value("Bearer a b"), Some("a b"));
-        assert_eq!(bearer_value("Basic tok"), None);
-        assert_eq!(bearer_value("tok"), None);
-        assert_eq!(bearer_value(""), None);
+    fn bearer_auth_rejects_missing_metadata() {
+        let mut auth = auth_interceptor("sekret");
+        let status = auth.call(Request::new(())).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn bearer_auth_rejects_wrong_token() {
+        let mut auth = auth_interceptor("sekret");
+        let status = auth
+            .call(request_with_authorization("Bearer not-the-secret"))
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn bearer_auth_rejects_credential_without_scheme() {
+        let mut auth = auth_interceptor("sekret");
+        let status = auth.call(request_with_authorization("sekret")).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn bearer_auth_rejects_non_bearer_scheme() {
+        let mut auth = auth_interceptor("sekret");
+        let status = auth
+            .call(request_with_authorization("Basic sekret"))
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn bearer_auth_accepts_valid_token_scheme_case_insensitively() {
+        for header in ["Bearer sekret", "bearer sekret", "BEARER sekret"] {
+            let mut auth = auth_interceptor("sekret");
+            assert!(
+                auth.call(request_with_authorization(header)).is_ok(),
+                "header {header:?} must pass"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "auth token must not be empty")]
+    fn build_grpc_server_with_auth_panics_on_empty_token() {
+        let _ = build_grpc_server_with_auth(Arc::new(StreamMock), Token::new(""));
+    }
+
+    // --- instrument() metrics ------------------------------------------------
+
+    #[derive(Debug, Default)]
+    struct GaugeProbe {
+        in_flight: std::sync::atomic::AtomicI64,
+        completed: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::metrics::ApiMetricsBackend for GaugeProbe {
+        fn record_request(
+            &self,
+            _transport: crate::metrics::Transport,
+            _method: &str,
+            _path: &str,
+            _status: u16,
+            _duration_ms: u64,
+        ) {
+            self.completed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn record_in_flight_delta(&self, _transport: crate::metrics::Transport, delta: i64) {
+            self.in_flight
+                .fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn probed_service() -> (Arc<GaugeProbe>, TaskApiService<StreamMock>) {
+        let probe = Arc::new(GaugeProbe::default());
+        let handle: ApiMetricsHandle = probe.clone();
+        (
+            probe,
+            TaskApiService::new_with_metrics(Arc::new(StreamMock), handle),
+        )
+    }
+
+    #[tokio::test]
+    async fn instrument_records_completed_request_and_balances_gauge() {
+        use std::sync::atomic::Ordering;
+
+        let (probe, svc) = probed_service();
+        let result = svc
+            .instrument("Probe", async { Ok(Response::new(())) })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(probe.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn in_flight_gauge_recovers_when_rpc_future_is_dropped() {
+        use std::future::Future;
+        use std::sync::atomic::Ordering;
+        use std::task::{Context, Poll, Waker};
+
+        let (probe, svc) = probed_service();
+
+        // Never-completing RPC body: models a handler still working when the
+        // client hangs up and tonic drops the whole future.
+        let mut fut = Box::pin(svc.instrument(
+            "Probe",
+            std::future::pending::<Result<Response<()>, Status>>(),
+        ));
+
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(
+            probe.in_flight.load(Ordering::SeqCst),
+            1,
+            "gauge must be armed after the first poll"
+        );
+
+        drop(fut);
+        assert_eq!(
+            probe.in_flight.load(Ordering::SeqCst),
+            0,
+            "dropping the future must release the in-flight slot"
+        );
+        assert_eq!(
+            probe.completed.load(Ordering::SeqCst),
+            0,
+            "a cancelled RPC must not be recorded as completed"
+        );
     }
 }

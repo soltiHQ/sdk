@@ -20,8 +20,11 @@ use crate::logger::object::timezone::{LoggerTimeZone, get_or_detect_local_offset
 /// | [`LoggerTimeZone::Utc`]   | Always `+00:00`               | `2025-01-15T10:30:00+00:00`    |
 /// | [`LoggerTimeZone::Local`] | Cached local offset (per-call)| `2025-01-15T13:30:00+03:00`    |
 ///
-/// In `Local` mode the cached offset is read on **every** call. DST changes picked up
-/// by [`timezone_sync`](crate::timezone_sync) apply without restarting the logger.
+/// In `Local` mode the cached offset is read (one atomic load, no locking) on **every**
+/// call, so any cache update applies without restarting the logger. In practice the
+/// offset stays as detected by [`init_local_offset`](crate::init_local_offset) at startup:
+/// on most Unix platforms re-detection by the `timezone_sync` task fails once the process
+/// is multi-threaded, so DST transitions are only picked up where the platform allows it.
 ///
 /// ## Also
 ///

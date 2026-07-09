@@ -38,6 +38,7 @@ use tracing::debug;
 
 use crate::{
     MAX_REQUEST_BYTES,
+    auth::{assert_auth_token_not_empty, bearer_value},
     convert::{self, tasks_page_to_proto},
     error::ApiError,
     handler::ApiHandler,
@@ -127,7 +128,13 @@ where
     /// This is the same shared secret the agent presents to the control plane in discovery.
     /// One config value enables both directions.
     /// Orthogonal to TLS. When unset, no auth is enforced.
+    ///
+    /// ## Panics
+    ///
+    /// Panics when `token` is empty: an empty shared secret would accept an empty
+    /// bearer credential (`Authorization: Bearer `), silently disabling authentication.
     pub fn with_auth(mut self, token: Token) -> Self {
+        assert_auth_token_not_empty(&token);
         self.auth = Some(token);
         self
     }
@@ -173,12 +180,6 @@ async fn require_bearer(State(expected): State<Token>, req: Request, next: Next)
     } else {
         ApiError::Unauthenticated("missing or invalid bearer token".into()).into_response()
     }
-}
-
-/// Extract the credential from an `Authorization` header value, accepting the scheme case-insensitively.
-fn bearer_value(header: &str) -> Option<&str> {
-    let (scheme, token) = header.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("bearer").then_some(token)
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,21 +342,4 @@ where
         Ok(Event::default().event(name).data(data))
     });
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::bearer_value;
-
-    #[test]
-    fn bearer_value_accepts_scheme_case_insensitively() {
-        assert_eq!(bearer_value("Bearer tok"), Some("tok"));
-        assert_eq!(bearer_value("bearer tok"), Some("tok"));
-        assert_eq!(bearer_value("BEARER tok"), Some("tok"));
-        assert_eq!(bearer_value("BeArEr tok"), Some("tok"));
-        assert_eq!(bearer_value("Bearer a b"), Some("a b"));
-        assert_eq!(bearer_value("Basic tok"), None);
-        assert_eq!(bearer_value("tok"), None);
-        assert_eq!(bearer_value(""), None);
-    }
 }

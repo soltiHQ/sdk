@@ -2,10 +2,10 @@
 //!
 //! Periodic sync task that registers an agent with the control plane and reports liveness and platform telemetry.
 //!
-//! | feature | transport         | protocol                      |
-//! |---------|-------------------|-------------------------------|
-//! | `grpc`  | tonic gRPC client | `proto/v1/sync.proto`         |
-//! | `http`  | reqwest HTTP/JSON | `POST /api/v1/discovery/sync` |
+//! | feature | transport         | protocol                                  |
+//! |---------|-------------------|-------------------------------------------|
+//! | `grpc`  | tonic gRPC client | `proto/solti/discover/v1/discovery.proto` |
+//! | `http`  | reqwest HTTP/JSON | `POST /api/v1/discovery/sync`             |
 //!
 //! ## Quick start
 //!

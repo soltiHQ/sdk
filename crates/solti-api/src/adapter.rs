@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use solti_core::SupervisorApi;
-use solti_model::{OutputEvent, Task, TaskId, TaskPage, TaskQuery, TaskRun, TaskSpec};
+use solti_model::{OutputEvent, Task, TaskId, TaskKind, TaskPage, TaskQuery, TaskRun, TaskSpec};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
@@ -30,6 +30,16 @@ impl SupervisorApiAdapter {
     pub fn new(supervisor: Arc<SupervisorApi>) -> Self {
         Self { supervisor }
     }
+
+    /// Embedded tasks live in supervisor state but have no wire representation
+    /// (`TaskData::try_from` rejects them). Every per-id operation treats them
+    /// as absent, so agent-internal tasks can neither be observed nor deleted
+    /// through the API.
+    fn hidden_from_wire(&self, id: &TaskId) -> bool {
+        self.supervisor
+            .get_task(id)
+            .is_some_and(|t| matches!(t.spec().kind(), TaskKind::Embedded))
+    }
 }
 
 #[async_trait]
@@ -39,7 +49,10 @@ impl ApiHandler for SupervisorApiAdapter {
     }
 
     async fn get_task_status(&self, id: &TaskId) -> Result<Option<Task>, ApiError> {
-        Ok(self.supervisor.get_task(id))
+        Ok(self
+            .supervisor
+            .get_task(id)
+            .filter(|t| !matches!(t.spec().kind(), TaskKind::Embedded)))
     }
 
     async fn query_tasks(&self, query: TaskQuery) -> Result<TaskPage<Task>, ApiError> {
@@ -47,10 +60,16 @@ impl ApiHandler for SupervisorApiAdapter {
     }
 
     async fn list_task_runs(&self, id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
+        if self.hidden_from_wire(id) {
+            return Ok(Vec::new());
+        }
         Ok(self.supervisor.list_task_runs(id))
     }
 
     async fn delete_task(&self, id: &TaskId) -> Result<(), ApiError> {
+        if self.hidden_from_wire(id) {
+            return Err(ApiError::TaskNotFound(id.to_string()));
+        }
         self.supervisor
             .delete_task(id)
             .await
@@ -58,6 +77,9 @@ impl ApiHandler for SupervisorApiAdapter {
     }
 
     async fn stream_task_logs(&self, id: &TaskId) -> Result<OutputEventStream, ApiError> {
+        if self.hidden_from_wire(id) {
+            return Err(ApiError::TaskNotFound(id.to_string()));
+        }
         let receiver = self
             .supervisor
             .output_registry()
@@ -70,5 +92,109 @@ impl ApiHandler for SupervisorApiAdapter {
             )
         });
         Ok(Box::pin(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use solti_core::{RunnerRouter, StateConfig};
+    use taskvisor::{ControllerConfig, SupervisorConfig, TaskContext, TaskError, TaskFn, TaskRef};
+
+    async fn supervisor() -> SupervisorApi {
+        SupervisorApi::new(
+            SupervisorConfig::default(),
+            ControllerConfig::default(),
+            Vec::new(),
+            RunnerRouter::new(),
+            StateConfig::default(),
+        )
+        .await
+        .expect("SupervisorApi::new")
+    }
+
+    #[tokio::test]
+    async fn get_task_status_hides_embedded_tasks() {
+        let api = supervisor().await;
+
+        // Embedded tasks enter state only through `submit_with_task` (a pre-built
+        // task body); the wire path can never create them, but a point GET by id
+        // used to reach them via `state.get` and fail the proto conversion.
+        let task: TaskRef = TaskFn::arc("embedded-probe", |_ctx: TaskContext| async move {
+            Ok::<(), TaskError>(())
+        });
+        let spec = TaskSpec::builder("slot-embedded", TaskKind::Embedded, 5_000_u64)
+            .build()
+            .expect("spec builds");
+        let task_id = api
+            .submit_with_task(task, &spec)
+            .await
+            .expect("submit_with_task");
+
+        assert!(
+            api.get_task(&task_id).is_some(),
+            "supervisor state must still hold the embedded task"
+        );
+
+        let adapter = SupervisorApiAdapter::new(Arc::new(api));
+        let visible = adapter
+            .get_task_status(&task_id)
+            .await
+            .expect("get_task_status must not fail");
+        assert!(
+            visible.is_none(),
+            "embedded tasks must be reported as absent over the API"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_tasks_are_absent_for_all_per_id_operations() {
+        let api = supervisor().await;
+
+        let task: TaskRef = TaskFn::arc("embedded-guard", |_ctx: TaskContext| async move {
+            Ok::<(), TaskError>(())
+        });
+        let spec = TaskSpec::builder("slot-embedded-guard", TaskKind::Embedded, 5_000_u64)
+            .build()
+            .expect("spec builds");
+        let task_id = api
+            .submit_with_task(task, &spec)
+            .await
+            .expect("submit_with_task");
+
+        let adapter = SupervisorApiAdapter::new(Arc::new(api));
+
+        let runs = adapter
+            .list_task_runs(&task_id)
+            .await
+            .expect("list_task_runs must not fail");
+        assert!(runs.is_empty(), "embedded runs must not leak over the API");
+
+        let deleted = adapter.delete_task(&task_id).await;
+        assert!(
+            matches!(deleted, Err(ApiError::TaskNotFound(_))),
+            "deleting an embedded task must look like an unknown id, got {deleted:?}"
+        );
+        assert!(
+            adapter.supervisor.get_task(&task_id).is_some(),
+            "the embedded task must survive the delete attempt"
+        );
+
+        let stream = adapter.stream_task_logs(&task_id).await;
+        assert!(
+            matches!(stream, Err(ApiError::TaskNotFound(_))),
+            "embedded log streams must look like an unknown id"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_task_status_unknown_id_is_none() {
+        let adapter = SupervisorApiAdapter::new(Arc::new(supervisor().await));
+        let visible = adapter
+            .get_task_status(&TaskId::from("no-such-task"))
+            .await
+            .expect("get_task_status must not fail");
+        assert!(visible.is_none());
     }
 }

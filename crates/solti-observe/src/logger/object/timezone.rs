@@ -1,8 +1,13 @@
 //! # Local-timezone offset cache ([`LoggerTimeZone`]).
 
-use std::{fmt, str::FromStr, sync::OnceLock};
-
-use parking_lot::RwLock;
+use std::{
+    fmt,
+    str::FromStr,
+    sync::{
+        OnceLock,
+        atomic::{AtomicI32, Ordering},
+    },
+};
 
 use serde::{Deserialize, Serialize};
 use time::UtcOffset;
@@ -11,10 +16,15 @@ use tracing::debug;
 
 use crate::logger::error::LoggerError;
 
-/// Global cache for the local UTC offset.
+/// Global cache for the local UTC offset, stored as whole seconds (0 = UTC).
 ///
 /// Updated by `init_local_offset()` on startup and `sync_local_offset()` periodically.
-static LOCAL_OFFSET: RwLock<UtcOffset> = RwLock::new(UtcOffset::UTC);
+///
+/// An atomic (instead of a lock) keeps the per-log-line read wait-free and
+/// re-entrancy safe: `sync_local_offset()` emits a `debug!` that the fmt layer
+/// formats synchronously on the same thread, reading this cache. With a lock
+/// held across that log call the read would self-deadlock.
+static LOCAL_OFFSET_SECONDS: AtomicI32 = AtomicI32::new(0);
 
 /// Tracks whether local offset initialization has been attempted.
 ///
@@ -92,7 +102,7 @@ impl fmt::Display for LoggerTimeZone {
 ///
 /// ## Behaviour
 ///
-/// - Caches the detected offset in a global `parking_lot::RwLock<UtcOffset>`.
+/// - Caches the detected offset in a global atomic (whole seconds).
 /// - Falls back to UTC silently if detection fails.
 /// - Idempotent - safe to call multiple times; only the first call
 ///   triggers detection.
@@ -116,29 +126,32 @@ impl fmt::Display for LoggerTimeZone {
 /// ```
 pub fn init_local_offset() {
     let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
-    *LOCAL_OFFSET.write() = offset;
+    LOCAL_OFFSET_SECONDS.store(offset.whole_seconds(), Ordering::Relaxed);
     let _ = INIT_DONE.set(());
 }
 
 /// Re-detects the system UTC offset and updates the global cache.
 ///
-/// Called periodically by the [`crate::timezone_sync`] task.
+/// Called periodically by the [`crate::timezone_sync`] task. The cache is
+/// updated with a single atomic store **before** the `debug!` below, so the
+/// fmt layer can read the fresh value while formatting that very log line.
 ///
 /// ## Errors
 ///
-/// Currently always returns `Ok`. A failed detection (multi-threaded context)
-/// is logged at debug level and skipped.
+/// Currently always returns `Ok`. Detection fails whenever the process is
+/// multi-threaded (on most Unix platforms), which is the normal state under
+/// tokio - the sync is then skipped with a debug log and the cache keeps the
+/// offset detected by [`init_local_offset`].
 #[cfg(feature = "timezone-sync")]
 pub(crate) fn sync_local_offset() -> Result<(), LoggerError> {
     match UtcOffset::current_local_offset() {
         Ok(new_offset) => {
-            let mut guard = LOCAL_OFFSET.write();
-            let old_offset = *guard;
-            if old_offset != new_offset {
-                *guard = new_offset;
+            let new_seconds = new_offset.whole_seconds();
+            let old_seconds = LOCAL_OFFSET_SECONDS.swap(new_seconds, Ordering::Relaxed);
+            if old_seconds != new_seconds {
                 debug!(
                     "TZ offset updated: {} -> {}",
-                    format_offset(old_offset),
+                    format_offset(offset_from_seconds(old_seconds)),
                     format_offset(new_offset)
                 );
             }
@@ -155,10 +168,12 @@ pub(crate) fn sync_local_offset() -> Result<(), LoggerError> {
 ///
 /// On first call (if [`init_local_offset`] was never called) attempts a one-shot detection.
 /// On failure prints a warning to stderr and falls back to UTC.
+///
+/// Subsequent calls are a single atomic load - safe on the logging hot path.
 pub(crate) fn get_or_detect_local_offset() -> UtcOffset {
     INIT_DONE.get_or_init(|| match UtcOffset::current_local_offset() {
         Ok(detected) => {
-            *LOCAL_OFFSET.write() = detected;
+            LOCAL_OFFSET_SECONDS.store(detected.whole_seconds(), Ordering::Relaxed);
         }
         Err(_) => {
             eprintln!(
@@ -169,7 +184,16 @@ pub(crate) fn get_or_detect_local_offset() -> UtcOffset {
         }
     });
 
-    *LOCAL_OFFSET.read()
+    offset_from_seconds(LOCAL_OFFSET_SECONDS.load(Ordering::Relaxed))
+}
+
+/// Converts cached whole seconds back into a [`UtcOffset`].
+///
+/// The cache only ever holds values produced by `UtcOffset::whole_seconds()`,
+/// so the conversion cannot fail; UTC is a defensive fallback rather than a
+/// reachable branch.
+fn offset_from_seconds(seconds: i32) -> UtcOffset {
+    UtcOffset::from_whole_seconds(seconds).unwrap_or(UtcOffset::UTC)
 }
 
 /// Formats offset as `UTC±HH` or `UTC±HH:MM`.
@@ -247,10 +271,38 @@ mod tests {
         assert_eq!(format_offset(offset), "UTC-05");
     }
 
+    // Single test for everything touching the global offset cache: separate
+    // #[test] functions run on parallel threads and would race on the statics.
     #[test]
-    fn get_after_init_returns_value() {
+    fn offset_cache_updates_are_visible() {
         init_local_offset();
         let offset = get_or_detect_local_offset();
         assert!(offset.whole_hours().abs() <= 14);
+
+        // An atomic store (as done by sync_local_offset) is immediately
+        // visible to readers; INIT_DONE is already set, so no re-detection
+        // overwrites it.
+        let positive = UtcOffset::from_hms(3, 30, 0).unwrap();
+        LOCAL_OFFSET_SECONDS.store(positive.whole_seconds(), Ordering::Relaxed);
+        assert_eq!(get_or_detect_local_offset(), positive);
+
+        let negative = UtcOffset::from_hms(-5, -45, 0).unwrap();
+        LOCAL_OFFSET_SECONDS.store(negative.whole_seconds(), Ordering::Relaxed);
+        assert_eq!(get_or_detect_local_offset(), negative);
+
+        // Restore the real local offset for any later reader.
+        init_local_offset();
+    }
+
+    #[test]
+    fn offset_seconds_roundtrip() {
+        for offset in [
+            UtcOffset::UTC,
+            UtcOffset::from_hms(14, 0, 0).unwrap(),
+            UtcOffset::from_hms(-12, 0, 0).unwrap(),
+            UtcOffset::from_hms(5, 45, 0).unwrap(),
+        ] {
+            assert_eq!(offset_from_seconds(offset.whole_seconds()), offset);
+        }
     }
 }

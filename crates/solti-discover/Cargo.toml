@@ -16,6 +16,7 @@ include = [
     "src/**/*.rs",
     "Cargo.toml",
     "README.md",
+    "sync_v1.md",
     "build.rs",
 ]
 
@@ -50,3 +51,6 @@ solti-tls   = { workspace = true, optional = true }
 pbjson-build        = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 tonic-prost-build   = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }

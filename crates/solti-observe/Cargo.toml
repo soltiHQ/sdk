@@ -17,7 +17,6 @@ subscriber    = ["dep:taskvisor", "taskvisor/tracing"]
 timezone-sync = ["dep:taskvisor", "dep:solti-model"]
 
 [dependencies]
-parking_lot        = { workspace = true }
 serde              = { workspace = true, features = ["derive"] }
 taskvisor          = { workspace = true, optional = true, features = ["controller"] }
 time               = { workspace = true, features = ["formatting", "local-offset"] }

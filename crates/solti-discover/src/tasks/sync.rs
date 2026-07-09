@@ -102,24 +102,7 @@ pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError
     }
 
     #[cfg(feature = "http")]
-    let http_client = {
-        #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
-            .timeout(Duration::from_millis(config.request_timeout_ms))
-            .user_agent(USER_AGENT);
-
-        #[cfg(feature = "tls")]
-        if let Some(tls) = &config.tls {
-            // `into_rustls_config` consumes the value; clone to keep the original on `config` (gRPC path also uses it).
-            let rustls_cfg = tls.clone().into_rustls_config().map_err(|e| {
-                DiscoverError::InvalidConfig(format!("tls into_rustls_config: {e}"))
-            })?;
-            builder = builder.use_preconfigured_tls(rustls_cfg);
-        }
-
-        builder.build()?
-    };
+    let http_client = build_http_client(&config)?;
 
     let metrics = config.metrics.clone();
 
@@ -382,6 +365,33 @@ async fn invoke_grpc_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
     }
 }
 
+/// Build the `reqwest` client used by the HTTP transport.
+///
+/// Redirects are disabled: the control-plane endpoint is operator-configured,
+/// so following redirects is never needed and would only widen the attack
+/// surface (e.g. replaying the bearer token to a redirect target).
+#[cfg(feature = "http")]
+fn build_http_client(config: &DiscoverConfig) -> Result<reqwest::Client, DiscoverError> {
+    #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
+        .timeout(Duration::from_millis(config.request_timeout_ms))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(USER_AGENT);
+
+    #[cfg(feature = "tls")]
+    if let Some(tls) = &config.tls {
+        // `into_rustls_config` consumes the value; clone to keep the original on `config` (gRPC path also uses it).
+        let rustls_cfg = tls
+            .clone()
+            .into_rustls_config()
+            .map_err(|e| DiscoverError::InvalidConfig(format!("tls into_rustls_config: {e}")))?;
+        builder = builder.use_preconfigured_tls(rustls_cfg);
+    }
+
+    Ok(builder.build()?)
+}
+
 #[cfg(feature = "http")]
 async fn invoke_http_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
     let request = stamp_request(&ctx.base_request);
@@ -538,7 +548,7 @@ fn http_sync_path(api_version: u32) -> String {
 
 #[cfg(feature = "http")]
 async fn read_body_bounded(
-    response: reqwest::Response,
+    mut response: reqwest::Response,
     max_bytes: u64,
 ) -> Result<String, DiscoverError> {
     if let Some(len) = response.content_length()
@@ -549,15 +559,20 @@ async fn read_body_bounded(
         )));
     }
 
-    let bytes = response.bytes().await?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(DiscoverError::InvalidResponse(format!(
-            "response body {} bytes exceeds cap {max_bytes}",
-            bytes.len()
-        )));
+    // Without a trustworthy Content-Length (e.g. chunked transfer encoding) the
+    // body must be read incrementally: buffering it whole before the cap check
+    // would let the server force an arbitrarily large allocation.
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if (body.len() as u64).saturating_add(chunk.len() as u64) > max_bytes {
+            return Err(DiscoverError::InvalidResponse(format!(
+                "response body exceeds cap {max_bytes} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
     }
 
-    String::from_utf8(bytes.to_vec())
+    String::from_utf8(body)
         .map_err(|e| DiscoverError::InvalidResponse(format!("response body is not UTF-8: {e}")))
 }
 
@@ -782,5 +797,139 @@ mod tests {
             "jitter should vary between calls; got only {} distinct values out of 100",
             seen.len()
         );
+    }
+
+    /// Raw TCP stub serving one hand-written HTTP/1.1 response, then closing.
+    #[cfg(feature = "http")]
+    async fn one_shot_http_stub(response: &'static [u8]) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub listener");
+        let addr = listener.local_addr().expect("stub local addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut discard = [0u8; 1024];
+            let _ = socket.read(&mut discard).await;
+            socket.write_all(response).await.expect("write response");
+        });
+        addr
+    }
+
+    #[cfg(feature = "http")]
+    fn test_config() -> crate::DiscoverConfig {
+        crate::DiscoverConfig::builder(
+            solti_model::AgentId::from("agent-1"),
+            "agent-1",
+            "http://127.0.0.1:8085",
+            "http://127.0.0.1:9000",
+            crate::DiscoveryTransport::Http,
+            30_000,
+            1,
+        )
+        .build()
+        .expect("config builds")
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn read_body_bounded_rejects_oversized_chunked_body_before_stream_ends() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub listener");
+        let addr = listener.local_addr().expect("stub local addr");
+
+        // Endless chunked response: no Content-Length, no terminating 0-chunk.
+        // The stub only stops once the client hangs up, so an implementation
+        // that buffers the whole body before checking the cap never returns.
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut discard = [0u8; 1024];
+            let _ = socket.read(&mut discard).await;
+            if socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let payload = [b'a'; 4096];
+            loop {
+                // 0x1000 == 4096-byte chunk.
+                if socket.write_all(b"1000\r\n").await.is_err()
+                    || socket.write_all(&payload).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                    || socket.flush().await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let response = build_http_client(&test_config())
+            .expect("client builds")
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("stub accepts the request");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_body_bounded(response, MAX_RESPONSE_BODY_BYTES),
+        )
+        .await
+        .expect("cap must trip while the stream is still open, not after buffering it");
+
+        match result {
+            Err(DiscoverError::InvalidResponse(msg)) => {
+                assert!(msg.contains("exceeds cap"), "unexpected message: {msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn read_body_bounded_accepts_chunked_body_within_cap() {
+        let addr = one_shot_http_stub(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+              b\r\nhello world\r\n0\r\n\r\n",
+        )
+        .await;
+
+        let response = build_http_client(&test_config())
+            .expect("client builds")
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("stub accepts the request");
+
+        let body = read_body_bounded(response, MAX_RESPONSE_BODY_BYTES)
+            .await
+            .expect("small chunked body is accepted");
+        assert_eq!(body, "hello world");
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn http_client_does_not_follow_redirects() {
+        // Location points at a closed port: a client that follows the redirect
+        // fails with a connect error instead of returning this 302 response.
+        let addr = one_shot_http_stub(
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+
+        let response = build_http_client(&test_config())
+            .expect("client builds")
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("redirect must be returned, not followed");
+
+        assert_eq!(response.status().as_u16(), 302);
     }
 }

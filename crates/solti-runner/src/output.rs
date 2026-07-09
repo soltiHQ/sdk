@@ -23,6 +23,7 @@
 //! Channels are [`tokio::sync::broadcast`] with a fixed ring capacity (see [`OutputRegistry::new`]).
 //! A slow subscriber never blocks the runner: it receives a `Lagged` signal and continues from the freshest events still in the ring window.
 //! Writes without any live subscriber are dropped silently.
+//! The ring is allocated upfront per task, so capacity is a per-task memory vs lag-tolerance trade-off.
 //!
 //! ## Also
 //!
@@ -98,7 +99,7 @@ impl OutputSink {
 
 /// Per-task broadcast registry.
 ///
-/// One [`broadcast::Sender`] per [`TaskId`], reused across all attempts of that task, with a fixed ring capacity (see [`OutputRegistry::new`]; [`Default`] uses `1024`).
+/// One [`broadcast::Sender`] per [`TaskId`], reused across all attempts of that task, with a fixed ring capacity (see [`OutputRegistry::new`]; [`Default`] uses [`DEFAULT_CAPACITY`](Self::DEFAULT_CAPACITY)).
 /// Lifecycle is owned by the supervisor (`solti-core`), see the module-level docs.
 /// The registry never self-reaps; the supervisor must call [`evict`](Self::evict).
 ///
@@ -129,7 +130,15 @@ pub struct OutputRegistry {
 }
 
 impl OutputRegistry {
+    /// Default per-task ring capacity (in events), used by [`Default`].
+    ///
+    /// Sized for a live tail: enough to absorb output bursts before a subscriber sees `Lagged`, without the upfront ring allocation dominating per-task memory.
+    pub const DEFAULT_CAPACITY: usize = 256;
+
     /// Build an empty registry.
+    ///
+    /// `capacity` is the ring size of every per-task broadcast channel, allocated upfront when the channel is created (even with zero subscribers).
+    /// Larger values let slower subscribers fall further behind before `Lagged`; smaller values cut the fixed per-task memory cost.
     pub fn new(capacity: usize) -> Self {
         Self {
             channels: RwLock::new(HashMap::new()),
@@ -205,9 +214,9 @@ impl OutputRegistry {
 }
 
 impl Default for OutputRegistry {
-    /// Default capacity: 1024 events per task.
+    /// Build a registry with [`DEFAULT_CAPACITY`](Self::DEFAULT_CAPACITY) events per task.
     fn default() -> Self {
-        Self::new(1024)
+        Self::new(Self::DEFAULT_CAPACITY)
     }
 }
 
@@ -470,6 +479,13 @@ mod tests {
         let _ = reg.sink_for(task.clone(), 1);
         let _ = reg.subscribe(&task).unwrap();
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn registry_default_uses_default_capacity() {
+        let reg = OutputRegistry::default();
+        assert_eq!(reg.capacity, OutputRegistry::DEFAULT_CAPACITY);
+        assert_eq!(OutputRegistry::DEFAULT_CAPACITY, 256);
     }
 
     #[tokio::test]
