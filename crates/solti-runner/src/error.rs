@@ -1,13 +1,7 @@
 //! # Runner errors.
-//!
-//! [`RunnerError`] covers both routing failures ([`RunnerRouter::build`](crate::RunnerRouter::build)) and task-build failures ([`Runner::build_task`](crate::Runner::build_task)).
 
 use thiserror::Error;
 
-/// Error type for runner selection and task construction.
-///
-/// Returned by [`RunnerRouter::build`](crate::RunnerRouter::build) and [`Runner::build_task`](crate::Runner::build_task).
-/// The enum is `#[non_exhaustive]`: match with a wildcard arm.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RunnerError {
@@ -36,7 +30,7 @@ pub enum RunnerError {
     #[error("missing field: {0}")]
     MissingField(&'static str),
 
-    /// I/O error during task setup (spawn, cgroup, module read, …).
+    /// I/O error during task setup (spawn, cgroup, module read, etc.).
     /// The underlying [`std::io::Error`] is preserved as the source. Callers can inspect its [`ErrorKind`](std::io::ErrorKind).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

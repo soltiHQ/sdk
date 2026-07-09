@@ -1,29 +1,32 @@
 //! # Task output broadcast hub.
 //!
-//! Carries a running task's stdout/stderr (and run-boundary markers) from the runner to any number of live subscribers (a gRPC/SSE log tail, a recorder).
+//! Carries a task's stdout and stderr from a runner to live subscribers.
+//! Subscribers may be HTTP SSE streams, gRPC streams, recorders, or tests.
 //!
 //! ```text
-//!   runner attempt ──► OutputSink::stdout_line / stderr_line
-//!                            │  (OutputEvent::Chunk)
-//!                            ▼
+//!   runner attempt -> OutputSink::stdout_line / stderr_line
+//!                            |  (OutputEvent::Chunk)
+//!                            v
 //!                   broadcast::Sender  (one per TaskId, capacity N)
-//!                       │        │        │
-//!                       ▼        ▼        ▼
-//!                    sub #1    sub #2    sub #N      (OutputRegistry::subscribe)
+//!                       |        |        |
+//!                       v        v        v
+//!                    sub #1    sub #2    sub #N
 //! ```
 //!
 //! ## Per-task channel lifecycle (owned by `solti-core`)
 //!
-//! 1. `ensure_channel` / `sink_for` create the channel - **one [`broadcast::Sender`] per [`TaskId`], reused across every attempt** of that task. A retried task's runs merge into one stream.
-//! 2. `subscribe` attaches a receiver; `announce_run_started` / `announce_run_finished` emit the run-boundary markers.
-//! 3. `evict` drops the channel once the task is fully terminal (`Exhausted` / `Removed`). The supervisor drives this; the registry never self-reaps.
+//! 1. `ensure_channel` or `sink_for` creates one channel per [`TaskId`].
+//! 2. All attempts of the same task share that channel.
+//! 3. `subscribe` attaches a receiver.
+//! 4. `announce_run_started` and `announce_run_finished` add run markers.
+//! 5. `evict` drops the channel when the task is fully terminal.
 //!
 //! ## Lossy by design
 //!
-//! Channels are [`tokio::sync::broadcast`] with a fixed ring capacity (see [`OutputRegistry::new`]).
-//! A slow subscriber never blocks the runner: it receives a `Lagged` signal and continues from the freshest events still in the ring window.
-//! Writes without any live subscriber are dropped silently.
-//! The ring is allocated upfront per task, so capacity is a per-task memory vs lag-tolerance trade-off.
+//! Channels are [`tokio::sync::broadcast`] with a fixed ring capacity.
+//! A slow subscriber never blocks the runner.
+//! It receives a `Lagged` signal and continues from newer events still in the ring.
+//! Writes with no live subscriber are dropped silently.
 //!
 //! ## Also
 //!
@@ -43,8 +46,9 @@ use tokio::sync::broadcast;
 /// Sink for one task-run attempt.
 ///
 /// Created by [`OutputRegistry::sink_for`] when a runner starts an attempt;
-/// the runner pushes lines into it, subscribers (via [`OutputRegistry::subscribe`]) receive [`OutputEvent`]s on the other end.
-/// Writes are **lossy** - see the module-level "Lossy by design".
+/// the runner pushes lines into it, and subscribers receive [`OutputEvent`]s on the other end.
+///
+/// Writes are lossy. A slow or missing subscriber never blocks a runner.
 ///
 /// ## Also
 ///
@@ -58,7 +62,22 @@ pub struct OutputSink {
 }
 
 impl OutputSink {
-    /// Build a sink wrapping the given broadcast `Sender`.
+    /// Build a sink wrapping the given broadcast sender.
+    ///
+    /// Most callers should use [`OutputRegistry::sink_for`] instead.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::OutputEvent;
+    /// use solti_runner::OutputSink;
+    /// use tokio::sync::broadcast;
+    ///
+    /// let (tx, _rx) = broadcast::channel::<OutputEvent>(16);
+    /// let sink = OutputSink::new(tx, 2);
+    ///
+    /// assert_eq!(sink.attempt(), 2);
+    /// ```
     pub fn new(sender: broadcast::Sender<OutputEvent>, attempt: u32) -> Self {
         Self {
             sender,
@@ -69,18 +88,71 @@ impl OutputSink {
     }
 
     /// Push one stdout line.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use solti_model::{OutputEvent, StreamKind};
+    /// use solti_runner::OutputSink;
+    /// use tokio::sync::broadcast;
+    ///
+    /// let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
+    /// let sink = OutputSink::new(tx, 1);
+    ///
+    /// sink.stdout_line(Bytes::from_static(b"hello"));
+    ///
+    /// match rx.try_recv().unwrap() {
+    ///     OutputEvent::Chunk(chunk) => {
+    ///         assert_eq!(chunk.stream, StreamKind::Stdout);
+    ///         assert_eq!(&chunk.line[..], b"hello");
+    ///     }
+    ///     other => panic!("unexpected event: {other:?}"),
+    /// }
+    /// ```
     pub fn stdout_line(&self, line: Bytes) {
         let seq = self.seq_stdout.fetch_add(1, Ordering::Relaxed);
         self.push(StreamKind::Stdout, seq, line);
     }
 
     /// Push one stderr line.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use solti_model::{OutputEvent, StreamKind};
+    /// use solti_runner::OutputSink;
+    /// use tokio::sync::broadcast;
+    ///
+    /// let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
+    /// let sink = OutputSink::new(tx, 1);
+    ///
+    /// sink.stderr_line(Bytes::from_static(b"oops"));
+    ///
+    /// match rx.try_recv().unwrap() {
+    ///     OutputEvent::Chunk(chunk) => assert_eq!(chunk.stream, StreamKind::Stderr),
+    ///     other => panic!("unexpected event: {other:?}"),
+    /// }
+    /// ```
     pub fn stderr_line(&self, line: Bytes) {
         let seq = self.seq_stderr.fetch_add(1, Ordering::Relaxed);
         self.push(StreamKind::Stderr, seq, line);
     }
 
-    /// Which run attempt this sink belongs to.
+    /// Return the run attempt this sink belongs to.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::TaskId;
+    /// use solti_runner::OutputRegistry;
+    ///
+    /// let registry = OutputRegistry::new(16);
+    /// let sink = registry.sink_for(TaskId::from("task-1"), 3);
+    ///
+    /// assert_eq!(sink.attempt(), 3);
+    /// ```
     pub fn attempt(&self) -> u32 {
         self.attempt
     }
@@ -99,9 +171,8 @@ impl OutputSink {
 
 /// Per-task broadcast registry.
 ///
-/// One [`broadcast::Sender`] per [`TaskId`], reused across all attempts of that task, with a fixed ring capacity (see [`OutputRegistry::new`]; [`Default`] uses [`DEFAULT_CAPACITY`](Self::DEFAULT_CAPACITY)).
-/// Lifecycle is owned by the supervisor (`solti-core`), see the module-level docs.
-/// The registry never self-reaps; the supervisor must call [`evict`](Self::evict).
+/// It keeps one [`broadcast::Sender`] per [`TaskId`], reused across all attempts of that task.
+/// The supervisor owns the lifecycle and must call [`evict`](Self::evict) when the task is done.
 ///
 /// ## Also
 ///
@@ -132,13 +203,23 @@ pub struct OutputRegistry {
 impl OutputRegistry {
     /// Default per-task ring capacity (in events), used by [`Default`].
     ///
-    /// Sized for a live tail: enough to absorb output bursts before a subscriber sees `Lagged`, without the upfront ring allocation dominating per-task memory.
+    /// Sized for a live tail:
+    /// enough to absorb output bursts before a subscriber sees `Lagged`, without making the per-task ring too large.
     pub const DEFAULT_CAPACITY: usize = 256;
 
     /// Build an empty registry.
     ///
-    /// `capacity` is the ring size of every per-task broadcast channel, allocated upfront when the channel is created (even with zero subscribers).
-    /// Larger values let slower subscribers fall further behind before `Lagged`; smaller values cut the fixed per-task memory cost.
+    /// `capacity` is the ring size of every per-task broadcast channel.
+    /// Larger values let slower subscribers fall further behind before `Lagged`; smaller values reduce per-task memory.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_runner::OutputRegistry;
+    ///
+    /// let registry = OutputRegistry::new(64);
+    /// assert_eq!(registry.active_channels(), 0);
+    /// ```
     pub fn new(capacity: usize) -> Self {
         Self {
             channels: RwLock::new(HashMap::new()),
@@ -149,6 +230,19 @@ impl OutputRegistry {
     /// Pre-create the broadcast channel for `task_id` without producing a sink.
     ///
     /// No-op if the channel already exists.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::TaskId;
+    /// use solti_runner::OutputRegistry;
+    ///
+    /// let registry = OutputRegistry::new(16);
+    /// let task_id = TaskId::from("task-1");
+    ///
+    /// registry.ensure_channel(task_id.clone());
+    /// assert!(registry.subscribe(&task_id).is_some());
+    /// ```
     pub fn ensure_channel(&self, task_id: TaskId) {
         let mut channels = self.channels.write();
         channels
@@ -159,6 +253,20 @@ impl OutputRegistry {
     /// Get an [`OutputSink`] for `(task_id, attempt)`.
     /// The first call for a given `task_id` creates the broadcast channel; subsequent calls reuse it (multi-run merge).
     /// The returned sink has fresh per-stream `seq` counters scoped to this attempt.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::TaskId;
+    /// use solti_runner::OutputRegistry;
+    ///
+    /// let registry = OutputRegistry::new(16);
+    /// let task_id = TaskId::from("task-1");
+    ///
+    /// let sink = registry.sink_for(task_id.clone(), 1);
+    /// assert_eq!(sink.attempt(), 1);
+    /// assert!(registry.subscribe(&task_id).is_some());
+    /// ```
     pub fn sink_for(&self, task_id: TaskId, attempt: u32) -> OutputSink {
         let mut channels = self.channels.write();
         let sender = channels
@@ -169,14 +277,45 @@ impl OutputRegistry {
     }
 
     /// Subscribe to a task's output stream.
+    ///
+    /// Returns `None` if no channel exists for this task.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::TaskId;
+    /// use solti_runner::OutputRegistry;
+    ///
+    /// let registry = OutputRegistry::new(16);
+    /// let task_id = TaskId::from("task-1");
+    ///
+    /// assert!(registry.subscribe(&task_id).is_none());
+    /// registry.ensure_channel(task_id.clone());
+    /// assert!(registry.subscribe(&task_id).is_some());
+    /// ```
     pub fn subscribe(&self, task_id: &TaskId) -> Option<broadcast::Receiver<OutputEvent>> {
         let channels = self.channels.read();
         channels.get(task_id).map(|s| s.subscribe())
     }
 
-    /// Push a [`OutputEvent::RunStarted`] into the channel.
+    /// Push an [`OutputEvent::RunStarted`] into the channel.
     ///
     /// No-op if no channel exists for this task.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{OutputEvent, TaskId};
+    /// use solti_runner::OutputRegistry;
+    ///
+    /// let registry = OutputRegistry::new(16);
+    /// let task_id = TaskId::from("task-1");
+    /// registry.ensure_channel(task_id.clone());
+    /// let mut rx = registry.subscribe(&task_id).unwrap();
+    ///
+    /// registry.announce_run_started(&task_id, 1);
+    /// assert!(matches!(rx.try_recv().unwrap(), OutputEvent::RunStarted { attempt: 1, .. }));
+    /// ```
     pub fn announce_run_started(&self, task_id: &TaskId, attempt: u32) {
         let channels = self.channels.read();
         if let Some(sender) = channels.get(task_id) {
@@ -187,9 +326,27 @@ impl OutputRegistry {
         }
     }
 
-    /// Push a [`OutputEvent::RunFinished`] into the channel.
+    /// Push an [`OutputEvent::RunFinished`] into the channel.
     ///
     /// No-op if no channel exists for this task.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{OutputEvent, TaskId};
+    /// use solti_runner::OutputRegistry;
+    ///
+    /// let registry = OutputRegistry::new(16);
+    /// let task_id = TaskId::from("task-1");
+    /// registry.ensure_channel(task_id.clone());
+    /// let mut rx = registry.subscribe(&task_id).unwrap();
+    ///
+    /// registry.announce_run_finished(&task_id, 1, Some(0));
+    /// assert!(matches!(
+    ///     rx.try_recv().unwrap(),
+    ///     OutputEvent::RunFinished { attempt: 1, exit_code: Some(0), .. }
+    /// ));
+    /// ```
     pub fn announce_run_finished(&self, task_id: &TaskId, attempt: u32, exit_code: Option<i32>) {
         let channels = self.channels.read();
         if let Some(sender) = channels.get(task_id) {
@@ -202,12 +359,39 @@ impl OutputRegistry {
     }
 
     /// Drop the broadcast channel for `task_id`.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::TaskId;
+    /// use solti_runner::OutputRegistry;
+    ///
+    /// let registry = OutputRegistry::new(16);
+    /// let task_id = TaskId::from("task-1");
+    ///
+    /// registry.ensure_channel(task_id.clone());
+    /// registry.evict(&task_id);
+    ///
+    /// assert!(registry.subscribe(&task_id).is_none());
+    /// ```
     pub fn evict(&self, task_id: &TaskId) {
         let mut channels = self.channels.write();
         channels.remove(task_id);
     }
 
-    /// Number of tasks with an active channel.
+    /// Return the number of tasks with an active output channel.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::TaskId;
+    /// use solti_runner::OutputRegistry;
+    ///
+    /// let registry = OutputRegistry::new(16);
+    /// registry.ensure_channel(TaskId::from("task-1"));
+    ///
+    /// assert_eq!(registry.active_channels(), 1);
+    /// ```
     pub fn active_channels(&self) -> usize {
         self.channels.read().len()
     }

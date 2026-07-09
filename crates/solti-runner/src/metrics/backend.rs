@@ -1,7 +1,7 @@
 //! # Metrics backend trait and label types.
 //!
-//! [`MetricsBackend`] is the abstraction for collecting task execution metrics.
-//! Concrete backends (e.g. `solti-prometheus`) implement this trait.
+//! [`MetricsBackend`] is the abstraction for task execution metrics.
+//! Concrete backends, such as `solti-prometheus`, implement this trait.
 //!
 //! See the [metrics module](super) for the convenience [`noop_metrics`](super::noop_metrics) constructor.
 
@@ -22,7 +22,15 @@ pub enum RunnerType {
 }
 
 impl RunnerType {
-    /// Return label value for metrics.
+    /// Return the stable label value for metrics.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_runner::RunnerType;
+    ///
+    /// assert_eq!(RunnerType::Subprocess.as_label(), "subprocess");
+    /// ```
     #[inline]
     pub fn as_label(self) -> &'static str {
         match self {
@@ -33,15 +41,15 @@ impl RunnerType {
     }
 }
 
-/// Runner setup/teardown error kind for metrics labeling.
+/// Runner setup or teardown error kind for metrics labeling.
 ///
-/// Passed to [`MetricsBackend::record_runner_error`] so dashboards can slice errors by a bounded, low-cardinality label rather than free-form strings.
+/// Passed to [`MetricsBackend::record_runner_error`]; dashboards can use a bounded label instead of free-form error strings.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RunnerErrorKind {
     /// cgroup v2 preparation (creation / attribute write) failed.
     CgroupPrepareFailed,
-    /// Applying runner-specific configuration to the task command failed (rlimits, capabilities, namespaces, …).
+    /// Applying runner-specific configuration to the task command failed.
     BackendConfigFailed,
     /// Spawning the child process or actor failed.
     SpawnFailed,
@@ -50,7 +58,15 @@ pub enum RunnerErrorKind {
 }
 
 impl RunnerErrorKind {
-    /// Return label value for metrics.
+    /// Return the stable label value for metrics.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_runner::RunnerErrorKind;
+    ///
+    /// assert_eq!(RunnerErrorKind::SpawnFailed.as_label(), "spawn_failed");
+    /// ```
     #[inline]
     pub fn as_label(self) -> &'static str {
         match self {
@@ -77,7 +93,15 @@ pub enum MetricOutcome {
 }
 
 impl MetricOutcome {
-    /// Return label value for metrics.
+    /// Return the stable label value for metrics.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_runner::MetricOutcome;
+    ///
+    /// assert_eq!(MetricOutcome::Success.as_label(), "success");
+    /// ```
     #[inline]
     pub fn as_label(&self) -> &'static str {
         match self {
@@ -91,8 +115,39 @@ impl MetricOutcome {
 
 /// Backend metrics collection interface.
 ///
-/// This trait abstracts metrics collection across different backends.
-/// Implementations are injected via [`crate::BuildContext`] and used by all runners.
+/// Implementations are injected via [`crate::BuildContext`] and used by runners.
+///
+/// ## Example
+///
+/// ```
+/// use std::sync::atomic::{AtomicU64, Ordering};
+/// use solti_runner::{MetricOutcome, MetricsBackend, RunnerErrorKind, RunnerType};
+///
+/// #[derive(Default)]
+/// struct Counter {
+///     starts: AtomicU64,
+/// }
+///
+/// impl MetricsBackend for Counter {
+///     fn record_task_started(&self, _runner_type: RunnerType) {
+///         self.starts.fetch_add(1, Ordering::Relaxed);
+///     }
+///
+///     fn record_task_completed(
+///         &self,
+///         _runner_type: RunnerType,
+///         _outcome: MetricOutcome,
+///         _duration_ms: u64,
+///     ) {
+///     }
+///
+///     fn record_runner_error(&self, _runner_type: RunnerType, _error_kind: RunnerErrorKind) {}
+/// }
+///
+/// let metrics = Counter::default();
+/// metrics.record_task_started(RunnerType::Subprocess);
+/// assert_eq!(metrics.starts.load(Ordering::Relaxed), 1);
+/// ```
 ///
 /// ## Also
 ///
@@ -100,14 +155,14 @@ impl MetricOutcome {
 /// - [`crate::BuildContext::metrics`]: access the handle from within a runner.
 /// - `solti-prometheus::PrometheusMetrics` is a production Prometheus implementation.
 pub trait MetricsBackend: Send + Sync + 'static {
-    /// Record task spawn event.
+    /// Record a task start event.
     ///
-    /// Called when a task is submitted and starts executing.
+    /// Called when a runner starts executing a task attempt.
     fn record_task_started(&self, runner_type: RunnerType);
 
     /// Record task completion with outcome and duration.
     ///
-    /// Called when task exits (success, failure, timeout, cancel).
+    /// Called when a task exits with success, failure, timeout, or cancel.
     fn record_task_completed(
         &self,
         runner_type: RunnerType,
@@ -115,7 +170,7 @@ pub trait MetricsBackend: Send + Sync + 'static {
         duration_ms: u64,
     );
 
-    /// Record runner-specific error during task setup/teardown.
+    /// Record a runner-specific error during task setup or cleanup.
     ///
     /// Called when runner fails to spawn/cleanup a task.
     /// This is separate from task failures (which are `record_task_completed` with `Failure`).

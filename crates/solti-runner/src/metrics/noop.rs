@@ -2,10 +2,19 @@
 
 use crate::metrics::backend::{MetricOutcome, MetricsBackend, RunnerErrorKind, RunnerType};
 
-/// Zero-cost [`MetricsBackend`](super::MetricsBackend) that discards everything.
+/// Zero-cost [`MetricsBackend`](super::MetricsBackend) that discards all records.
 ///
-/// Zero-sized (`size_of::<NoOpMetrics>() == 0`) and the default backend of [`BuildContext`](crate::BuildContext);
-/// every method is an `#[inline(always)]` empty body that compiles to nothing.
+/// It is zero-sized and is the default backend of [`BuildContext`](crate::BuildContext).
+///
+/// ## Example
+///
+/// ```
+/// use solti_runner::{MetricOutcome, MetricsBackend, NoOpMetrics, RunnerType};
+///
+/// let metrics = NoOpMetrics;
+/// metrics.record_task_started(RunnerType::Subprocess);
+/// metrics.record_task_completed(RunnerType::Subprocess, MetricOutcome::Success, 10);
+/// ```
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoOpMetrics;
 

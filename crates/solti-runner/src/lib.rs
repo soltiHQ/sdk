@@ -1,101 +1,84 @@
 //! # solti-runner
 //!
-//! Runner plugin interface, routing, and execution metrics for the solti task system.
+//! Runner plugin interface for Solti tasks.
 //!
-//! This crate defines how task executors (runners) are declared, selected, and observed.
-//! It sits between the domain model ([`solti_model`]) and the orchestration layer (`solti-core`), providing a stable plugin boundary.
+//! This crate defines how a concrete backend turns a [`solti_model::TaskSpec`] into a [`taskvisor::TaskRef`].
 //!
-//! ## Architecture
+//! Use it when one agent binary needs one or more execution backends: subprocesses, containers, WASM modules, or your own runner.
+//!
+//! ## Core Model
 //!
 //! ```text
-//!  TaskSpec ──► RunnerRouter ──► Runner::build_task() ──► TaskRef
-//!                  │                    ▲
-//!                  │  label matching    │  BuildContext
-//!                  │  + supports()      │  (env + metrics)
-//!                  ▼                    │
-//!              RunnerEntry          MetricsHandle
-//!              (runner + labels)    (Arc<dyn MetricsBackend>)
+//! TaskSpec
+//!   |
+//!   v
+//! RunnerRouter
+//!   |
+//!   | checks Runner::supports(spec)
+//!   | checks runner labels, if the spec has a selector
+//!   v
+//! Runner::build_task(spec, BuildContext)
+//!   |
+//!   v
+//! taskvisor::TaskRef
 //! ```
 //!
-//! ## Public API
+//! A [`Runner`] builds one executable task.
+//! A [`RunnerRouter`] chooses a runner for a spec.
+//! A [`BuildContext`] carries shared handles such as env, metrics, and output streaming.
 //!
-//! | Item                  | Description                                                                                       |
-//! |-----------------------|---------------------------------------------------------------------------------------------------|
-//! | [`Runner`]            | Trait that concrete executors implement                                                           |
-//! | [`RunnerRouter`]      | Selects a runner for a given [`TaskSpec`](solti_model::TaskSpec) by `supports()` + label matching |
-//! | [`BuildContext`]      | Shared dependencies injected into runners (env + metrics)                                         |
-//! | [`RunId`]             | Human-readable run identifier (`{runner}-{slot}-{seq}`)                                           |
-//! | [`RunnerError`]       | Error type for runner operations                                                                  |
-//! | [`MetricsBackend`]    | Trait for collecting task execution metrics                                                       |
-//! | [`MetricsHandle`]     | `Arc<dyn MetricsBackend>` — cloneable shared handle                                               |
-//! | [`NoOpMetrics`]       | Zero-size backend that compiles to nothing                                                        |
-//! | [`RunnerType`]        | Metric label: `Subprocess`, `Container`, `Wasm`                                                   |
-//! | [`MetricOutcome`]     | Metric label: `Success`, `Failure`, `Canceled`, `Timeout`                                         |
+//! ## Main Types
 //!
-//! ## Runner implementation
+//! | Area          | Types                                                  |
+//! |---------------|--------------------------------------------------------|
+//! | Runner plugin | [`Runner`], [`RunnerRouter`]                           |
+//! | Build data    | [`BuildContext`]                                       |
+//! | Output        | [`OutputRegistry`], [`OutputSink`]                     |
+//! | Run identity  | [`RunId`], [`make_run_id`]                             |
+//! | Metrics       | [`MetricsBackend`], [`MetricsHandle`], [`NoOpMetrics`] |
+//! | Metric labels | [`RunnerType`], [`MetricOutcome`], [`RunnerErrorKind`] |
+//! | Errors        | [`RunnerError`]                                        |
 //!
-//! A runner must implement [`Runner`] and be registered in a [`RunnerRouter`]:
+//! ## Quick Start
 //!
-//! ```rust,no_run
-//! use solti_runner::{BuildContext, Runner, RunnerError};
-//! use solti_model::{TaskKind, TaskSpec};
-//! use taskvisor::TaskRef;
-//!
-//! struct MyRunner;
-//!
-//! impl Runner for MyRunner {
-//!     fn name(&self) -> &'static str { "my-runner" }
-//!
-//!     fn supports(&self, spec: &TaskSpec) -> bool {
-//!         matches!(spec.kind(), TaskKind::Subprocess(_))
-//!     }
-//!
-//!     fn build_task(&self, _spec: &TaskSpec, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
-//!         // build and return a TaskRef
-//!         todo!()
-//!     }
-//! }
-//! ```
-//!
-//! ## Routing
-//!
-//! [`RunnerRouter`] selects the first registered runner that:
-//! returns `true` from [`Runner::supports`] for the given spec, and satisfies the [`RunnerSelector`](solti_model::RunnerSelector) label constraints (if any).
+//! Register a runner and let the router build the task:
 //!
 //! ```rust,no_run
 //! use std::sync::Arc;
 //! use solti_runner::RunnerRouter;
-//! # use solti_runner::{BuildContext, Runner, RunnerError};
+//!
 //! # use solti_model::{TaskKind, TaskSpec};
+//! # use solti_runner::{BuildContext, Runner, RunnerError};
 //! # use taskvisor::TaskRef;
 //! # struct MyRunner;
 //! # impl Runner for MyRunner {
 //! #     fn name(&self) -> &'static str { "my-runner" }
 //! #     fn supports(&self, spec: &TaskSpec) -> bool { matches!(spec.kind(), TaskKind::Subprocess(_)) }
-//! #     fn build_task(&self, _s: &TaskSpec, _c: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
+//! #     fn build_task(&self, _spec: &TaskSpec, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
 //! # }
-//! # fn demo(spec: &TaskSpec) -> Result<(), RunnerError> {
+//! # fn demo(spec: &TaskSpec) -> Result<TaskRef, RunnerError> {
 //! let mut router = RunnerRouter::new();
 //! router.register(Arc::new(MyRunner));
 //!
-//! let task_ref = router.build(spec)?;
-//! # let _ = task_ref;
-//! # Ok(())
+//! let task = router.build(spec)?;
+//! # Ok(task)
 //! # }
 //! ```
 //!
-//! ## Metrics
+//! ## Routing
 //!
-//! Metrics are collected via [`MetricsBackend`], injected through [`BuildContext`].
-//! Backends like `solti-prometheus` implement [`MetricsBackend`] for production use.
-//! The default is [`NoOpMetrics`] (zero-cost).
+//! Runners are checked in registration order.
+//! The first runner that returns `true` from [`Runner::supports`] and matches the optional [`solti_model::RunnerSelector`] is used.
 //!
-//! ## Also
+//! [`solti_model::TaskKind::Embedded`] is not routed.
+//! Embedded tasks are already built as `TaskRef` values and should be submitted directly through `solti-core`.
 //!
-//! - [`solti_model`] - domain types consumed by runners ([`TaskSpec`](solti_model::TaskSpec), [`TaskKind`](solti_model::TaskKind)).
-//! - [`taskvisor::TaskRef`] - the concrete task handle returned by [`Runner::build_task`].
-//! - `solti-prometheus` - Prometheus [`MetricsBackend`] implementation.
-//! - `solti-exec` - subprocess runner implementation.
+//! ## Output and Metrics
+//!
+//! [`OutputRegistry`] lets runners publish live stdout and stderr lines for HTTP or gRPC log tails.
+//!
+//! [`MetricsBackend`] is the task execution metrics trait.
+//! The default backend is [`NoOpMetrics`]; production agents can use `solti-prometheus`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -105,23 +88,23 @@
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
-mod error;
-pub use error::RunnerError;
-
 mod runner;
 pub use runner::Runner;
+
+mod error;
+pub use error::RunnerError;
 
 mod context;
 pub use context::BuildContext;
 
-mod output;
-pub use output::{OutputRegistry, OutputSink};
+mod router;
+pub use router::RunnerRouter;
 
 mod id;
 pub use id::{RunId, make_run_id};
 
-mod router;
-pub use router::RunnerRouter;
+mod output;
+pub use output::{OutputRegistry, OutputSink};
 
 pub mod metrics;
 pub use metrics::{
