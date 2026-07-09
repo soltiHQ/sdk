@@ -1,4 +1,4 @@
-//! # Per-attempt timeout.
+//! Per-attempt timeout.
 //!
 //! [`Timeout`] is a validated wrapper over milliseconds, used in [`TaskSpec`](crate::TaskSpec).
 
@@ -23,11 +23,29 @@ pub struct Timeout(u64);
 
 impl Timeout {
     /// Create a new timeout value.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::Timeout;
+    ///
+    /// let timeout = Timeout::new(5_000);
+    /// assert_eq!(timeout.as_millis(), 5_000);
+    /// ```
     pub const fn new(ms: u64) -> Self {
         Self(ms)
     }
 
     /// Get the timeout in milliseconds.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::Timeout;
+    ///
+    /// let timeout: Timeout = 10_000u64.into();
+    /// assert_eq!(timeout.as_millis(), 10_000);
+    /// ```
     pub const fn as_millis(&self) -> u64 {
         self.0
     }

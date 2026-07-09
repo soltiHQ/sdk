@@ -1,16 +1,10 @@
-//! # Boolean toggle.
+//! Boolean toggle.
 //!
 //! [`Flag`] provides `enabled()`/`disabled()` constructors with serde support.
 
 use serde::{Deserialize, Serialize};
 
-/// Universal boolean flag with explicit enable/disable semantics.
-///
-/// ```text
-///  Flag::enabled()   ─► is_enabled() == true
-///  Flag::disabled()  ─► is_enabled() == false
-///  Flag::default()   ─► enabled (opt-in disable)
-/// ```
+/// Boolean flag with explicit enable/disable constructors.
 ///
 /// ```rust
 /// use solti_model::Flag;
@@ -30,12 +24,28 @@ pub struct Flag(bool);
 
 impl Flag {
     /// Create an enabled flag.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::Flag;
+    ///
+    /// assert!(Flag::enabled().is_enabled());
+    /// ```
     #[inline]
     pub const fn enabled() -> Self {
         Self(true)
     }
 
     /// Create a disabled flag.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::Flag;
+    ///
+    /// assert!(Flag::disabled().is_disabled());
+    /// ```
     #[inline]
     pub const fn disabled() -> Self {
         Self(false)

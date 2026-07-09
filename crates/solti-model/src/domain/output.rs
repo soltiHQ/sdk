@@ -2,17 +2,16 @@
 //!
 //! ## Wire encodings (contract)
 //!
-//! The same events cross the API boundary in two encodings, and they are
-//! **different by design**:
+//! The same events cross the API boundary in two encodings, and they are **different by design**:
 //!
-//! | Transport | Encoding | Source of truth |
-//! |-----------|----------|-----------------|
-//! | HTTP SSE  | this module's serde (`type`-tagged camelCase JSON, ms timestamps) | [`OutputEvent`] derives |
-//! | gRPC      | proto `StreamTaskLogsResponse` (binary protobuf) | `solti-api/proto/solti/task/v1/api.proto` |
+//! | Transport | Encoding                                                          | Source of truth                           |
+//! |-----------|-------------------------------------------------------------------|-------------------------------------------|
+//! | HTTP SSE  | this module's serde (`type`-tagged camelCase JSON, ms timestamps) | [`OutputEvent`] derives                   |
+//! | gRPC      | proto `StreamTaskLogsResponse` (binary protobuf)                  | `solti-api/proto/solti/task/v1/api.proto` |
 //!
-//! Do not switch the SSE path to pbjson-generated JSON: the shapes differ
-//! (`oneof` nesting vs flat `type` tag) and existing SSE consumers parse this
-//! module's shape. A pinning test below locks the SSE encoding.
+//! Do not switch the SSE path to pbjson-generated JSON:
+//! the shapes differ (`oneof` nesting vs flat `type` tag) and existing SSE consumers parse this module's shape.
+//! A pinning test below locks the SSE encoding.
 
 use std::time::SystemTime;
 
@@ -20,6 +19,15 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 /// Which standard stream a chunk came from.
+///
+/// ## Example
+///
+/// ```
+/// use solti_model::StreamKind;
+///
+/// let json = serde_json::to_string(&StreamKind::Stdout).unwrap();
+/// assert_eq!(json, r#""stdout""#);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamKind {
@@ -39,6 +47,25 @@ pub enum StreamKind {
 /// {"type":"runStarted","attempt":1,"startedAt":1700}
 /// {"type":"runFinished","attempt":1,"exitCode":0,"finishedAt":1701}
 /// {"type":"lagged","skipped":42}
+/// ```
+///
+/// ## Example
+///
+/// ```
+/// use bytes::Bytes;
+/// use solti_model::{OutputChunk, OutputEvent, StreamKind};
+/// use std::time::SystemTime;
+///
+/// let event = OutputEvent::Chunk(OutputChunk {
+///     attempt: 1,
+///     stream: StreamKind::Stdout,
+///     seq: 0,
+///     ts: SystemTime::UNIX_EPOCH,
+///     line: Bytes::from_static(b"hello"),
+/// });
+///
+/// let json = serde_json::to_string(&event).unwrap();
+/// assert!(json.contains(r#""type":"chunk""#));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -81,6 +108,24 @@ pub enum OutputEvent {
 ///
 /// Carried through `tokio::sync::broadcast` channels in-process;
 /// sent to clients via SSE / gRPC server-stream.
+///
+/// ## Example
+///
+/// ```
+/// use bytes::Bytes;
+/// use solti_model::{OutputChunk, StreamKind};
+/// use std::time::SystemTime;
+///
+/// let chunk = OutputChunk {
+///     attempt: 1,
+///     stream: StreamKind::Stderr,
+///     seq: 7,
+///     ts: SystemTime::UNIX_EPOCH,
+///     line: Bytes::from_static(b"warning"),
+/// };
+///
+/// assert_eq!(chunk.seq, 7);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputChunk {
@@ -138,8 +183,6 @@ mod tests {
 
     #[test]
     fn sse_wire_shape_is_pinned() {
-        // The SSE encoding is a public contract (see the module doc).
-        // If this test fails, an SSE consumer somewhere just broke.
         let chunk = OutputEvent::Chunk(OutputChunk {
             attempt: 1,
             stream: StreamKind::Stdout,

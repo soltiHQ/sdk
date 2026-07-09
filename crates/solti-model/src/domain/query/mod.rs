@@ -1,15 +1,10 @@
 //! Query and pagination types.
 //!
 //! ```text
-//!  TaskQuery
-//!  ┌───────────────────────────────────────────┐
-//!  │  status: Vec<TaskPhase>   OR semantics    │
-//!  │  slot:   Option<Slot>     filter by lane  │
-//!  │  limit:  usize            page size       │
-//!  │  offset: usize            skip N          │
-//!  └────────────────┬──────────────────────────┘
-//!                   ▼
-//!  TaskPage<T> { items: Vec<T>, total: usize }
+//! TaskQuery -> state query -> TaskPage<T>
+//!
+//! status filters use OR semantics.
+//! an empty status filter matches all phases.
 //! ```
 
 mod task;

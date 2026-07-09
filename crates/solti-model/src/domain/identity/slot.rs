@@ -1,4 +1,4 @@
-//! # Execution slot.
+//! Execution slot.
 //!
 //! [`Slot`] is the logical execution lane name (newtype over `Arc<str>`).
 
@@ -12,18 +12,7 @@ arc_str_newtype! {
     /// Logical identifier for a controller slot.
     ///
     /// A slot groups tasks that share a single execution lane.
-    ///
-    /// ```text
-    ///  Slot: "build-pipeline"         Slot: "deploy"
-    ///  ┌───────────────────────┐      ┌────────────────────────┐
-    ///  │  TaskId: sub-build-1  │      │  TaskId: sub-deploy-1  │
-    ///  │  TaskId: sub-build-2  │      │  TaskId: sub-deploy-2  │
-    ///  │  TaskId: sub-build-3  │      │  TaskId: sub-deploy-3  │
-    ///  │        ...            │      │        ...             │
-    ///  └───────────────────────┘      └────────────────────────┘
-    ///         one lane                        one lane
-    ///     (one at a time)                  (one at a time)
-    /// ```
+    /// Controllers use slots for admission policy and queue behavior.
     ///
     /// ```rust
     /// use solti_model::Slot;
@@ -46,6 +35,15 @@ impl Slot {
     ///
     /// - [`ModelError::Invalid`]: the name is empty, longer than [`SLOT_MAX_LEN`],
     ///   equal to `"."` or `".."`, or contains a byte outside `[A-Za-z0-9._-]`.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::Slot;
+    ///
+    /// assert!(Slot::new("build.frontend").validate_format().is_ok());
+    /// assert!(Slot::new("build/frontend").validate_format().is_err());
+    /// ```
     pub fn validate_format(&self) -> Result<(), ModelError> {
         validate_identity("slot", self.as_str(), SLOT_MAX_LEN)
     }
@@ -117,7 +115,8 @@ mod tests {
     #[test]
     fn validate_format_rejects_invalid() {
         assert!(Slot::new("build/frontend").validate_format().is_err());
-        assert!(Slot::new("с кириллицей").validate_format().is_err());
+        let non_ascii = String::from_utf8(vec![0xc3, 0xa9]).unwrap();
+        assert!(Slot::new(&non_ascii).validate_format().is_err());
         assert!(Slot::new("with space").validate_format().is_err());
         assert!(Slot::new("a\nb").validate_format().is_err());
         assert!(Slot::new(".").validate_format().is_err());

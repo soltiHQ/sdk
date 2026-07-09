@@ -1,4 +1,4 @@
-//! # Key-value metadata labels.
+//! Key-value metadata labels.
 //!
 //! [`Labels`] is an ordered map used for runner routing and task filtering.
 
@@ -6,31 +6,66 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Structured key–value metadata based on [`BTreeMap`].
+/// Structured key-value metadata based on [`BTreeMap`].
+///
+/// Iteration order is stable because labels are stored in key order.
+///
+/// ## Example
+///
+/// ```
+/// use solti_model::Labels;
+///
+/// let mut labels = Labels::new();
+/// labels.insert("zone", "eu");
+/// labels.insert("gpu", "h100");
+///
+/// assert_eq!(labels.get("zone"), Some("eu"));
+/// assert!(labels.contains_key("gpu"));
+/// ```
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Labels(BTreeMap<String, String>);
 
 impl Labels {
     /// Create an empty set of labels.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::Labels;
+    ///
+    /// let labels = Labels::new();
+    /// assert!(labels.is_empty());
+    /// ```
     #[inline]
     pub fn new() -> Self {
         Self(BTreeMap::new())
     }
 
-    /// Returns the number of labels.
+    /// Return the number of labels.
     #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// Returns `true` if no labels are present.
+    /// Return `true` if no labels are present.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
     /// Insert or overwrite a label.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::Labels;
+    ///
+    /// let mut labels = Labels::new();
+    /// labels.insert("tier", "dev").insert("tier", "prod");
+    ///
+    /// assert_eq!(labels.get("tier"), Some("prod"));
+    /// ```
     #[inline]
     pub fn insert<K, V>(&mut self, key: K, val: V) -> &mut Self
     where
@@ -47,13 +82,26 @@ impl Labels {
         self.0.get(key).map(|s| s.as_str())
     }
 
-    /// Check whether a key exists (regardless of its value).
+    /// Check whether a key exists, regardless of its value.
     #[inline]
     pub fn contains_key(&self, key: &str) -> bool {
         self.0.contains_key(key)
     }
 
     /// Iterate through all labels as `(&str, &str)` pairs.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::Labels;
+    ///
+    /// let mut labels = Labels::new();
+    /// labels.insert("b", "2");
+    /// labels.insert("a", "1");
+    ///
+    /// let pairs: Vec<_> = labels.iter().collect();
+    /// assert_eq!(pairs, vec![("a", "1"), ("b", "2")]);
+    /// ```
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))

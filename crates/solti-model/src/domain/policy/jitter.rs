@@ -1,4 +1,4 @@
-//! # Jitter strategy.
+//! Jitter strategy.
 //!
 //! [`JitterPolicy`] adds randomness to backoff delays to prevent thundering-herd effects.
 
@@ -9,16 +9,26 @@ use crate::error::{ModelError, ModelResult};
 
 /// Controls how random jitter is applied to backoff delays.
 ///
-/// Jitter distributes retries over time, preventing synchronized "retry storms" when many tasks fail simultaneously.
+/// Jitter spreads retries over time.
+/// This helps avoid many agents retrying at the same instant.
 ///
 /// | Variant        | Delay range                  | Collision resistance |
 /// |----------------|------------------------------|----------------------|
 /// | `None`         | exactly `base`               | none (deterministic) |
 /// | `Full`         | uniform `[0, base]`          | highest              |
-/// | `Equal`        | `base/2 ± rand(base/2)`      | moderate             |
+/// | `Equal`        | around half to full base     | moderate             |
 /// | `Decorrelated` | `min(max, rand(base * 3))`   | high                 |
 ///
 /// The exact math is implemented in the backoff subsystem; this enum only selects the strategy.
+///
+/// ## Example
+///
+/// ```
+/// use solti_model::JitterPolicy;
+///
+/// assert_eq!("equal".parse::<JitterPolicy>().unwrap(), JitterPolicy::Equal);
+/// assert_eq!("".parse::<JitterPolicy>().unwrap(), JitterPolicy::Full);
+/// ```
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]

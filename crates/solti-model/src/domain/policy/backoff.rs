@@ -1,4 +1,4 @@
-//! # Backoff policy.
+//! Backoff policy.
 //!
 //! [`BackoffPolicy`] controls retry delay growth: initial delay, max cap, factor, and jitter.
 
@@ -18,13 +18,22 @@ use crate::error::{ModelError, ModelResult};
 /// | `max_ms`   | `u64`          | `30_000`  | Maximum delay cap (ms)                |
 /// | `factor`   | `f64`          | `2.0`     | Exponential growth multiplier         |
 ///
-/// Growth example with `factor = 2.0`: 1 s → 2 s → 4 s → 8 s → … → 30 s (capped).
+/// With `factor = 2.0`, delay grows like this: 1 s, 2 s, 4 s, 8 s, then up to the `max_ms` cap.
 ///
-/// ## Also
+/// ## Example
 ///
-/// - [`JitterPolicy`](super::JitterPolicy) jitter strategy applied to each delay.
-/// - [`RestartPolicy`](super::RestartPolicy) controls *when* to restart; backoff controls *delay*.
-/// - [`BackoffPolicy::validate`] parameter validation.
+/// ```
+/// use solti_model::{BackoffPolicy, JitterPolicy};
+///
+/// let backoff = BackoffPolicy {
+///     jitter: JitterPolicy::Equal,
+///     first_ms: 1_000,
+///     max_ms: 30_000,
+///     factor: 2.0,
+/// };
+///
+/// backoff.validate().unwrap();
+/// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(try_from = "raw::BackoffPolicyRaw")]
@@ -75,10 +84,16 @@ impl BackoffPolicy {
     /// - `max_ms >= first_ms`
     /// - `factor >= 1.0` and finite
     ///
-    /// ## Errors
+    /// ## Example
     ///
-    /// - [`ModelError::Invalid`]: `first_ms` is zero, `max_ms` is less than `first_ms`,
-    ///   or `factor` is not finite or below `1.0`.
+    /// ```
+    /// use solti_model::BackoffPolicy;
+    ///
+    /// let mut backoff = BackoffPolicy::default();
+    /// backoff.first_ms = 0;
+    ///
+    /// assert!(backoff.validate().is_err());
+    /// ```
     pub fn validate(&self) -> ModelResult<()> {
         if self.first_ms == 0 {
             return Err(ModelError::Invalid(Cow::Borrowed(

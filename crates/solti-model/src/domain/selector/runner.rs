@@ -1,4 +1,4 @@
-//! # Runner selector.
+//! Runner selector.
 //!
 //! [`RunnerSelector`] matches runners by label equality and expression-based requirements.
 
@@ -9,31 +9,29 @@ use crate::Labels;
 
 /// Label selector for runner routing.
 ///
-/// ```text
-///  TaskSpec
-///  ┌────────────────────────────────────────────────────────┐
-///  │  runner_selector:                                      │
-///  │    match_labels:      { "zone": "eu" }                 │
-///  │    match_expressions: [ {key:"gpu", op:Exists} ]       │
-///  └──────────────────────────┬─────────────────────────────┘
-///                             │  ALL requirements ANDed
-///                             ▼
-///  RunnerRouter::pick()
-///  ┌────────────────────────────────────────────────────────┐
-///  │  Runner A  labels: {"zone":"us","gpu":"a100"}  ✗ skip  │
-///  │  Runner B  labels: {"zone":"eu","gpu":"h100"}  ✓ match │
-///  │  Runner C  labels: {"zone":"eu"}               ✗ skip  │
-///  └────────────────────────────────────────────────────────┘
-/// ```
-///
 /// Both `match_labels` and `match_expressions` are ANDed together.
 /// An empty selector matches every runner.
 ///
-/// ## Also
+/// ## Example
 ///
-/// - [`SelectorRequirement`] individual expression-based requirement.
-/// - [`SelectorOperator`] set operators (`In`, `NotIn`, `Exists`, `DoesNotExist`).
-/// - [`TaskSpec`](crate::TaskSpec) carries optional `runner_selector`.
+/// ```
+/// use solti_model::{Labels, RunnerSelector, SelectorRequirement};
+///
+/// let selector = RunnerSelector {
+///     match_labels: {
+///         let mut labels = Labels::new();
+///         labels.insert("zone", "eu");
+///         labels
+///     },
+///     match_expressions: vec![SelectorRequirement::exists("gpu")],
+/// };
+///
+/// let mut runner = Labels::new();
+/// runner.insert("zone", "eu");
+/// runner.insert("gpu", "h100");
+///
+/// assert!(selector.matches(&runner));
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunnerSelector {
@@ -47,13 +45,38 @@ pub struct RunnerSelector {
 }
 
 impl RunnerSelector {
-    /// Empty selector (matches everything).
+    /// Create an empty selector.
+    ///
+    /// An empty selector matches every runner.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{Labels, RunnerSelector};
+    ///
+    /// assert!(RunnerSelector::new().matches(&Labels::new()));
+    /// ```
     #[inline]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Selector from exact key=value pairs only.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{Labels, RunnerSelector};
+    ///
+    /// let mut labels = Labels::new();
+    /// labels.insert("zone", "eu");
+    ///
+    /// let selector = RunnerSelector::from_labels(labels);
+    ///
+    /// let mut runner = Labels::new();
+    /// runner.insert("zone", "eu");
+    /// assert!(selector.matches(&runner));
+    /// ```
     #[inline]
     pub fn from_labels(labels: Labels) -> Self {
         Self {
@@ -63,6 +86,20 @@ impl RunnerSelector {
     }
 
     /// Selector from expressions only.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{Labels, RunnerSelector, SelectorRequirement};
+    ///
+    /// let selector = RunnerSelector::from_expressions(vec![
+    ///     SelectorRequirement::exists("gpu"),
+    /// ]);
+    ///
+    /// let mut runner = Labels::new();
+    /// runner.insert("gpu", "a100");
+    /// assert!(selector.matches(&runner));
+    /// ```
     #[inline]
     pub fn from_expressions(expr: Vec<SelectorRequirement>) -> Self {
         Self {
@@ -71,17 +108,32 @@ impl RunnerSelector {
         }
     }
 
-    /// Returns `true` if the selector has no requirements (matches everything).
+    /// Return `true` if the selector has no requirements.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.match_labels.is_empty() && self.match_expressions.is_empty()
     }
 
-    /// Check whether `labels` satisfy **all** requirements of this selector.
+    /// Check whether `labels` satisfy all requirements of this selector.
     ///
     /// - Each `match_labels` entry requires an exact key=value match.
     /// - Each `match_expressions` entry is evaluated per its operator.
     /// - All requirements are ANDed.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{Labels, RunnerSelector, SelectorRequirement};
+    ///
+    /// let selector = RunnerSelector::from_expressions(vec![
+    ///     SelectorRequirement::r#in("gpu", vec!["a100".into(), "h100".into()]),
+    /// ]);
+    ///
+    /// let mut labels = Labels::new();
+    /// labels.insert("gpu", "h100");
+    ///
+    /// assert!(selector.matches(&labels));
+    /// ```
     pub fn matches(&self, labels: &Labels) -> bool {
         for (key, expected) in &self.match_labels {
             match labels.get(key) {

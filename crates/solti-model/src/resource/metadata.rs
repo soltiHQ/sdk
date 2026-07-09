@@ -1,6 +1,6 @@
-//! # Object metadata.
+//! Object metadata.
 //!
-//! [`ObjectMeta`] tracks identity, versioning (`resource_version`), and timestamps.
+//! [`ObjectMeta`] tracks identity, resource version, and timestamps.
 
 use std::time::SystemTime;
 
@@ -8,14 +8,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::TaskId;
 
-/// Resource metadata.
+/// Resource metadata for a task.
 ///
-/// Identity (`id`), optimistic-concurrency counter (`resource_version`), and lifecycle timestamps.
+/// `resource_version` starts at `1` and is bumped when the task changes.
 /// Slot and labels live in [`crate::TaskSpec`] as the single source of truth.
 ///
-/// ## Also
+/// ## Example
 ///
-/// - [`Task`](crate::Task) aggregate that embeds `ObjectMeta`.
+/// ```
+/// use solti_model::{ObjectMeta, TaskId};
+///
+/// let meta = ObjectMeta::new(TaskId::from("task-1"));
+/// assert_eq!(meta.id.as_str(), "task-1");
+/// assert_eq!(meta.resource_version, 1);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectMeta {
@@ -33,6 +39,15 @@ pub struct ObjectMeta {
 
 impl ObjectMeta {
     /// Create metadata for a new resource.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{ObjectMeta, TaskId};
+    ///
+    /// let meta = ObjectMeta::new(TaskId::from("task-1"));
+    /// assert_eq!(meta.resource_version, 1);
+    /// ```
     pub fn new(id: TaskId) -> Self {
         let now = SystemTime::now();
 
@@ -45,6 +60,16 @@ impl ObjectMeta {
     }
 
     /// Increment `resource_version` and stamp `updated_at`.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{ObjectMeta, TaskId};
+    ///
+    /// let mut meta = ObjectMeta::new(TaskId::from("task-1"));
+    /// meta.bump_resource_version();
+    /// assert_eq!(meta.resource_version, 2);
+    /// ```
     pub fn bump_resource_version(&mut self) {
         self.updated_at = SystemTime::now();
         self.resource_version += 1;

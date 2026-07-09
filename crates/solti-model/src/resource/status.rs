@@ -1,4 +1,4 @@
-//! # Task status.
+//! Task status.
 //!
 //! [`TaskStatus`] tracks observed state: phase, attempt count, exit code, last error.
 
@@ -8,10 +8,15 @@ use crate::TaskPhase;
 
 /// Observed runtime state of a task.
 ///
-/// ## Also
+/// ## Example
 ///
-/// - [`TaskPhase`] lifecycle phase enum.
-/// - [`Task`](crate::Task) aggregate that embeds `TaskStatus`.
+/// ```
+/// use solti_model::{TaskPhase, TaskStatus};
+///
+/// let status = TaskStatus::pending();
+/// assert_eq!(status.phase, TaskPhase::Pending);
+/// assert_eq!(status.attempt, 0);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskStatus {
@@ -29,6 +34,16 @@ pub struct TaskStatus {
 
 impl TaskStatus {
     /// Create initial pending status.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{TaskPhase, TaskStatus};
+    ///
+    /// let status = TaskStatus::pending();
+    /// assert_eq!(status.phase, TaskPhase::Pending);
+    /// assert!(status.error.is_none());
+    /// ```
     pub fn pending() -> Self {
         Self {
             phase: TaskPhase::Pending,

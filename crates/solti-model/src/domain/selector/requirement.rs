@@ -1,4 +1,4 @@
-//! # Selector requirement.
+//! Selector requirement.
 //!
 //! [`SelectorRequirement`] is a single label constraint used in [`RunnerSelector`](crate::RunnerSelector).
 
@@ -8,13 +8,19 @@ use super::SelectorOperator;
 
 /// Single set-based requirement for label matching.
 ///
-/// ```text
-///  { key: "gpu", operator: In, values: ["a100", "h100"] } ⇒ runner must have label gpu ∈ {"a100", "h100"}
-///
-///  { key: "zone", operator: Exists, values: [] } ⇒ runner must have label  zone  (any value)
-/// ```
-///
 /// Used inside [`super::RunnerSelector::match_expressions`].
+///
+/// ## Example
+///
+/// ```
+/// use solti_model::{SelectorOperator, SelectorRequirement};
+///
+/// let req = SelectorRequirement::r#in("gpu", vec!["a100".into(), "h100".into()]);
+///
+/// assert_eq!(req.key, "gpu");
+/// assert_eq!(req.operator, SelectorOperator::In);
+/// req.validate().unwrap();
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SelectorRequirement {
@@ -35,10 +41,14 @@ impl SelectorRequirement {
     /// - `In`/`NotIn` must have non-empty `values`
     /// - `Exists`/`DoesNotExist` must have empty `values`
     ///
-    /// ## Errors
+    /// ## Example
     ///
-    /// - [`ModelError::Invalid`](crate::ModelError::Invalid): `key` is empty, `In`/`NotIn`
-    ///   has empty `values`, or `Exists`/`DoesNotExist` has non-empty `values`.
+    /// ```
+    /// use solti_model::SelectorRequirement;
+    ///
+    /// assert!(SelectorRequirement::exists("gpu").validate().is_ok());
+    /// assert!(SelectorRequirement::r#in("gpu", vec![]).validate().is_err());
+    /// ```
     pub fn validate(&self) -> crate::error::ModelResult<()> {
         use std::borrow::Cow;
 
@@ -68,7 +78,16 @@ impl SelectorRequirement {
         Ok(())
     }
 
-    /// Shorthand: require `key ∈ values`.
+    /// Shorthand: require `key` to be in `values`.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{SelectorOperator, SelectorRequirement};
+    ///
+    /// let req = SelectorRequirement::r#in("gpu", vec!["h100".into()]);
+    /// assert_eq!(req.operator, SelectorOperator::In);
+    /// ```
     #[inline]
     pub fn r#in(key: impl Into<String>, values: Vec<String>) -> Self {
         Self {
@@ -78,7 +97,7 @@ impl SelectorRequirement {
         }
     }
 
-    /// Shorthand: require `key ∉ values`.
+    /// Shorthand: require `key` to not be in `values`.
     #[inline]
     pub fn not_in(key: impl Into<String>, values: Vec<String>) -> Self {
         Self {
@@ -98,7 +117,7 @@ impl SelectorRequirement {
         }
     }
 
-    /// Shorthand: require label key to NOT exist.
+    /// Shorthand: require label key to not exist.
     #[inline]
     pub fn does_not_exist(key: impl Into<String>) -> Self {
         Self {

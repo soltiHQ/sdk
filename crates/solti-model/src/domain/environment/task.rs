@@ -1,26 +1,35 @@
-//! # Task-level environment variables.
+//! Task-level environment variables.
 //!
 //! [`TaskEnv`] is an ordered list of key-value pairs attached to a single task spec.
 
 env_newtype! {
     /// Environment variables passed to a task at submission time.
     ///
-    /// ```text
-    ///  TaskSpec
-    ///  ┌───────────────────────────────┐
-    ///  │  kind: Subprocess {           │
-    ///  │    env: TaskEnv [             │
-    ///  │      FOO=from-task,           │  ← user-defined
-    ///  │      BAR=task-only,           │
-    ///  │    ]                          │
-    ///  │  }                            │
-    ///  └───────────────────────────────┘
+    /// Duplicate keys are allowed. Lookup uses last-value-wins semantics.
+    ///
+    /// ```
+    /// use solti_model::TaskEnv;
+    ///
+    /// let mut env = TaskEnv::new();
+    /// env.push("APP_MODE", "dev");
+    /// env.push("APP_MODE", "prod");
+    ///
+    /// assert_eq!(env.get("APP_MODE"), Some("prod"));
     /// ```
     pub struct TaskEnv;
 }
 
 impl TaskEnv {
-    /// Create an environment containing a single key–value pair.
+    /// Create an environment containing a single key-value pair.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::TaskEnv;
+    ///
+    /// let env = TaskEnv::single("APP_MODE", "batch");
+    /// assert_eq!(env.get("APP_MODE"), Some("batch"));
+    /// ```
     #[inline]
     pub fn single<K, V>(key: K, value: V) -> Self
     where

@@ -1,22 +1,9 @@
 //! Environment variable types for tasks and runners.
 //!
 //! ```text
-//!  TaskEnv (user-defined)       RunnerEnv (runner-level)
-//!  ├─ FOO=from-task             ├─ FOO=from-runner      ← runner wins
-//!  ├─ BAR=task-only             ├─ PATH=/safe/bin
-//!  └─ BAZ=task                  └─ RUNNER=prod-01
-//!            │                           │
-//!            └──────────┬────────────────┘
-//!                       ▼
-//!              merge(task, runner)
-//!                       │
-//!                       ▼
-//!         Vec<(String, String)>  → Command::envs()
-//!         ├─ FOO=from-runner       (runner wins)
-//!         ├─ BAR=task-only
-//!         ├─ BAZ=task
-//!         ├─ PATH=/safe/bin
-//!         └─ RUNNER=prod-01
+//! TaskEnv + RunnerEnv -> merge_env() -> sorted map for process env
+//!
+//! If both sides define the same key, RunnerEnv wins.
 //! ```
 
 // `#[macro_use]` must come before any module that uses the macro
@@ -34,8 +21,26 @@ use std::collections::BTreeMap;
 
 /// Merge task and runner environments.
 ///
-/// **Runner environment takes precedence**: if a key exists in both, the runner value wins.
-/// Returns a sorted, deduplicated `BTreeMap` ready for `Command::envs()`.
+/// Runner environment takes precedence: if a key exists in both, the runner
+/// value wins. The result is a sorted, deduplicated map ready for
+/// `Command::envs()`.
+///
+/// ## Example
+///
+/// ```
+/// use solti_model::{RunnerEnv, TaskEnv, merge_env};
+///
+/// let mut task = TaskEnv::new();
+/// task.push("PATH", "/user/bin");
+/// task.push("APP_MODE", "batch");
+///
+/// let mut runner = RunnerEnv::new();
+/// runner.push("PATH", "/safe/bin");
+///
+/// let env = merge_env(&task, &runner);
+/// assert_eq!(env.get("PATH").map(String::as_str), Some("/safe/bin"));
+/// assert_eq!(env.get("APP_MODE").map(String::as_str), Some("batch"));
+/// ```
 pub fn merge(task: &TaskEnv, runner: &RunnerEnv) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for kv in runner.into_iter().rev().chain(task.into_iter().rev()) {

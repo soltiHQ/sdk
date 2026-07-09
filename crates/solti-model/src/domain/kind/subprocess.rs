@@ -1,4 +1,4 @@
-//! # Subprocess execution specification.
+//! Subprocess execution specification.
 //!
 //! [`SubprocessSpec`] and [`SubprocessMode`] define how OS subprocess tasks are configured and validated.
 
@@ -12,18 +12,16 @@ use crate::error::{ModelError, ModelResult};
 /// Maximum script body size (after base64 decode) accepted by the model.
 pub const MAX_SCRIPT_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-/// Upper bound on the encoded length of a standard (padded) base64 string
-/// that decodes to at most `max_bytes` bytes: 4 output characters per full
-/// or partial 3-byte input group.
+/// Upper bound on the encoded length of a standard (padded) base64 string that decodes
+/// to at most `max_bytes` bytes: 4 output characters per full or partial 3-byte input group.
 const fn max_encoded_len(max_bytes: usize) -> usize {
     max_bytes.div_ceil(3).saturating_mul(4)
 }
 
 /// Decode a base64 script body, enforcing `max_bytes` on the decoded size.
 ///
-/// Bodies whose encoded length already exceeds [`max_encoded_len`] are
-/// rejected up front, before any decode buffer is allocated, so oversized
-/// input cannot force a large allocation just to be refused.
+/// Bodies whose encoded length already exceeds [`max_encoded_len`] are rejected up front, before any decode buffer is allocated;
+/// oversized input cannot force a large allocation just to be refused.
 fn decode_script_body(body: &str, max_bytes: usize) -> ModelResult<Vec<u8>> {
     if body.is_empty() {
         return Err(ModelError::Invalid("script body cannot be empty".into()));
@@ -60,6 +58,22 @@ fn decode_script_body(body: &str, max_bytes: usize) -> ModelResult<Vec<u8>> {
 /// |-----------|----------------------------------------------------------------------------|
 /// | `Command` | Direct binary execution via `execve(command, args)`                        |
 /// | `Script`  | Script passed to an interpreter: `execve(runtime, [flag, body, ...args])`  |
+///
+/// ## Example
+///
+/// ```
+/// use base64::Engine;
+/// use base64::engine::general_purpose::STANDARD as BASE64;
+/// use solti_model::{Runtime, SubprocessMode};
+///
+/// let mode = SubprocessMode::Script {
+///     runtime: Runtime::Bash,
+///     body: BASE64.encode("echo hello"),
+///     args: vec![],
+/// };
+///
+/// assert_eq!(mode.decode_body().unwrap(), "echo hello");
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -85,33 +99,52 @@ pub enum SubprocessMode {
 }
 
 impl SubprocessMode {
-    /// Decode the base64 script body to a UTF-8 string, capped at the default [`MAX_SCRIPT_BODY_BYTES`].
+    /// Decode the base64 script body to a UTF-8 string.
     ///
     /// Returns `Ok(body)` for the `Script` variant.
     /// To use a different cap, call [`decode_body_with_limit`](Self::decode_body_with_limit).
     ///
-    /// ## Errors
+    /// ## Example
     ///
-    /// - [`ModelError::Invalid`]: called on the `Command` variant, the body is empty,
-    ///   the body is not valid base64, the decoded body exceeds [`MAX_SCRIPT_BODY_BYTES`],
-    ///   or the decoded bytes are not valid UTF-8.
+    /// ```
+    /// use base64::Engine;
+    /// use base64::engine::general_purpose::STANDARD as BASE64;
+    /// use solti_model::{Runtime, SubprocessMode};
+    ///
+    /// let mode = SubprocessMode::Script {
+    ///     runtime: Runtime::Bash,
+    ///     body: BASE64.encode("echo hello"),
+    ///     args: vec![],
+    /// };
+    ///
+    /// assert_eq!(mode.decode_body().unwrap(), "echo hello");
+    /// ```
     pub fn decode_body(&self) -> ModelResult<String> {
         self.decode_body_with_limit(MAX_SCRIPT_BODY_BYTES)
     }
 
-    /// Decode the base64 script body to a UTF-8 string, rejecting any body whose decoded size exceeds `max_bytes`.
+    /// Decode the base64 script body with a custom decoded size limit.
     ///
     /// [`decode_body`](Self::decode_body) applies the default [`MAX_SCRIPT_BODY_BYTES`];
     /// pass an explicit `max_bytes` to tighten or relax the cap where needed.
     ///
-    /// Bodies whose encoded length already exceeds the maximum possible for
-    /// `max_bytes` are rejected before any decoding takes place.
+    /// Bodies whose encoded length already exceeds the maximum possible for `max_bytes` are rejected before any decoding takes place.
     ///
-    /// ## Errors
+    /// ## Example
     ///
-    /// - [`ModelError::Invalid`]: called on the `Command` variant, the body is empty,
-    ///   the body is not valid base64, the decoded body exceeds `max_bytes`,
-    ///   or the decoded bytes are not valid UTF-8.
+    /// ```
+    /// use base64::Engine;
+    /// use base64::engine::general_purpose::STANDARD as BASE64;
+    /// use solti_model::{Runtime, SubprocessMode};
+    ///
+    /// let mode = SubprocessMode::Script {
+    ///     runtime: Runtime::Bash,
+    ///     body: BASE64.encode("echo hello"),
+    ///     args: vec![],
+    /// };
+    ///
+    /// assert!(mode.decode_body_with_limit(4).is_err());
+    /// ```
     pub fn decode_body_with_limit(&self, max_bytes: usize) -> ModelResult<String> {
         match self {
             SubprocessMode::Command { .. } => Err(ModelError::Invalid(
@@ -133,11 +166,18 @@ impl SubprocessMode {
     /// - `Script`: body must not be empty, must be valid base64, must decode to UTF-8.
     /// - `Script` + `Custom` runtime: command and flag must not be empty.
     ///
-    /// ## Errors
+    /// ## Example
     ///
-    /// - [`ModelError::Invalid`]: `Command` has an empty command; `Script` has an empty,
-    ///   non-base64, oversized (over [`MAX_SCRIPT_BODY_BYTES`]), or non-UTF-8 body;
-    ///   or a `Custom` runtime has an empty command or flag.
+    /// ```
+    /// use solti_model::SubprocessMode;
+    ///
+    /// let mode = SubprocessMode::Command {
+    ///     command: "echo".into(),
+    ///     args: vec!["hello".into()],
+    /// };
+    ///
+    /// mode.validate().unwrap();
+    /// ```
     pub fn validate(&self) -> ModelResult<()> {
         match self {
             SubprocessMode::Command { command, .. } => {
@@ -393,9 +433,6 @@ mod tests {
 
     #[test]
     fn encoded_body_at_threshold_reaches_decoded_size_check() {
-        // Exactly the maximum possible encoded length for the cap: the length
-        // pre-check passes, and the decoded size (MAX + 1 here, since "A" * 4
-        // decodes to 3 bytes) is what gets rejected.
         let threshold = MAX_SCRIPT_BODY_BYTES.div_ceil(3) * 4;
         let mode = SubprocessMode::Script {
             runtime: Runtime::Bash,
@@ -414,9 +451,6 @@ mod tests {
 
     #[test]
     fn encoded_body_one_char_over_threshold_fails_before_decode() {
-        // One character past the maximum possible encoded length. The length is
-        // not even valid for base64, so getting the limit error instead of a
-        // base64 error proves the pre-check runs before any decoding.
         let threshold = MAX_SCRIPT_BODY_BYTES.div_ceil(3) * 4;
         let mode = SubprocessMode::Script {
             runtime: Runtime::Bash,
@@ -439,9 +473,6 @@ mod tests {
 
     #[test]
     fn huge_encoded_body_is_rejected_without_decoding() {
-        // 100 MiB of 'A' is valid base64, but the encoded length alone puts it
-        // over the cap, so both entry points must refuse it before allocating
-        // a ~75 MiB decode buffer.
         let body = "A".repeat(100 * 1024 * 1024);
         let mode = SubprocessMode::Script {
             runtime: Runtime::Bash,
@@ -465,9 +496,7 @@ mod tests {
             body: encode(s),
             args: vec![],
         };
-        // Exactly at the limit: Ok.
         assert_eq!(script("12345").decode_body_with_limit(5).unwrap(), "12345");
-        // One byte over: Err.
         script("123456")
             .decode_body_with_limit(5)
             .expect_err("body one byte over the limit must be rejected");

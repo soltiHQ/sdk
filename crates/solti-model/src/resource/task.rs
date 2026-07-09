@@ -1,6 +1,6 @@
-//! # Task resource.
+//! Task resource.
 //!
-//! [`Task`] is the K8s-style aggregate: metadata + spec + status.
+//! [`Task`] combines metadata, desired spec, and observed status.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,13 +16,19 @@ use crate::{
 /// - `spec`     - desired state: what to run and how ([`TaskSpec`])
 /// - `metadata` - identity, versioning, timestamps ([`ObjectMeta`])
 ///
-/// ## Also
+/// ## Example
 ///
-/// - [`TaskSpec`] desired state (what to run, how to restart).
-/// - [`TaskStatus`] observed state (phase, attempt, exit code).
-/// - [`TaskRun`](crate::TaskRun) per-attempt execution record.
-/// - [`ObjectMeta`] identity and versioning.
-/// - [`TaskPhase`] lifecycle state machine.
+/// ```
+/// use solti_model::{Task, TaskId, TaskKind, TaskPhase, TaskSpec};
+///
+/// let spec = TaskSpec::builder("build", TaskKind::Embedded, 1_000u64)
+///     .build()
+///     .unwrap();
+/// let task = Task::new(TaskId::from("embedded-build-1"), spec);
+///
+/// assert_eq!(*task.phase(), TaskPhase::Pending);
+/// assert_eq!(task.slot().as_str(), "build");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
@@ -33,6 +39,20 @@ pub struct Task {
 
 impl Task {
     /// Create a new task in [`TaskPhase::Pending`] phase.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{Task, TaskId, TaskKind, TaskPhase, TaskSpec};
+    ///
+    /// let spec = TaskSpec::builder("build", TaskKind::Embedded, 1_000u64)
+    ///     .build()
+    ///     .unwrap();
+    /// let task = Task::new(TaskId::from("task-1"), spec);
+    ///
+    /// assert_eq!(*task.phase(), TaskPhase::Pending);
+    /// assert_eq!(task.metadata().resource_version, 1);
+    /// ```
     pub fn new(id: TaskId, spec: TaskSpec) -> Self {
         Self {
             metadata: ObjectMeta::new(id),
@@ -59,38 +79,78 @@ impl Task {
         &self.spec
     }
 
-    /// Destructure into `(metadata, spec, status)`. Used by transport
-    /// layers that need owned fields for serialization into wire types.
+    /// Destructure into `(metadata, spec, status)`.
+    ///
+    /// Transport layers use this when they need owned fields for wire types.
     #[inline]
     pub fn into_parts(self) -> (ObjectMeta, TaskSpec, TaskStatus) {
         (self.metadata, self.spec, self.status)
     }
 
-    /// Transition the task into a new attempt: bumps attempt counter, sets phase to `Running`, clears error/exit_code.
+    /// Transition the task into a new running attempt.
+    ///
+    /// This bumps the attempt counter, sets phase to `Running`, clears `error` and `exit_code`, and bumps `resource_version`.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{Task, TaskId, TaskKind, TaskPhase, TaskSpec};
+    ///
+    /// let spec = TaskSpec::builder("build", TaskKind::Embedded, 1_000u64)
+    ///     .build()
+    ///     .unwrap();
+    /// let mut task = Task::new(TaskId::from("task-1"), spec);
+    ///
+    /// task.transition_starting();
+    ///
+    /// assert_eq!(*task.phase(), TaskPhase::Running);
+    /// assert_eq!(task.status().attempt, 1);
+    /// ```
     pub fn transition_starting(&mut self) {
         self.increment_attempt();
         self.update_phase(TaskPhase::Running, None, None);
     }
 
-    /// Transition the current attempt into a terminal phase with optional error and exit code.
+    /// Transition the current attempt into a terminal phase.
     ///
     /// Rejects illegal transitions:
     /// - target phase must be terminal (see [`TaskPhase::is_terminal`]);
     ///   finishing into `Pending` or `Running` is a logic bug upstream.
     ///
-    /// Sticky terminals: once an attempt has reached a final state, a later,
-    /// conflicting terminal event must not overwrite it. taskvisor emits two
-    /// terminal events per run (the per-attempt
-    /// `TaskStopped`/`TaskCanceled`/`TaskFailed` followed by the actor-level
-    /// `ActorExhausted`/`ActorDead`); without this guard a trailing
-    /// `ActorExhausted` would flip a `Canceled` run into `Exhausted`. Exactly
-    /// one refinement is allowed: the generic failure phase (`Failed`) may be
-    /// refined into a more specific disposition (`Exhausted`/`Timeout`).
-    /// Re-applying the current phase is a harmless no-op that keeps the
-    /// recorded error/exit code; every other conflicting terminal event is
-    /// silently ignored (`Ok(())`).
+    /// Sticky terminals:
+    /// once an attempt has reached a final state, a later terminal event must not overwrite it.
     ///
-    /// Bumps `resource_version` only when the phase actually changes.
+    /// taskvisor has two event levels:
+    /// - attempt events: `TaskStopped`, `TaskCanceled`, `TaskFailed`;
+    /// - actor events: `ActorExhausted`, `ActorDead`.
+    ///
+    /// Some flows produce both levels for the same attempt.
+    /// For example, `TimeoutHit` + `TaskFailed` can mark an attempt as `Timeout`, and a later `ActorExhausted` may report that the actor is done.
+    /// Without this guard, that later actor event could replace the more specific attempt result.
+    ///
+    /// Exactly one refinement is allowed:
+    /// the generic failure phase (`Failed`) may be refined into a more specific disposition (`Exhausted`/`Timeout`).
+    /// Re-applying the current phase is a harmless no-op that keeps the recorded error/exit code;
+    /// every other conflicting terminal event is silently ignored (`Ok(())`).
+    ///
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{Task, TaskId, TaskKind, TaskPhase, TaskSpec};
+    ///
+    /// let spec = TaskSpec::builder("build", TaskKind::Embedded, 1_000u64)
+    ///     .build()
+    ///     .unwrap();
+    /// let mut task = Task::new(TaskId::from("task-1"), spec);
+    ///
+    /// task.transition_starting();
+    /// task.transition_finished(TaskPhase::Failed, Some("boom".into()), Some(1))?;
+    ///
+    /// assert_eq!(*task.phase(), TaskPhase::Failed);
+    /// assert_eq!(task.status().error.as_deref(), Some("boom"));
+    /// # Ok::<(), solti_model::ModelError>(())
+    /// ```
     pub fn transition_finished(
         &mut self,
         phase: TaskPhase,
@@ -103,15 +163,9 @@ impl Task {
             ));
         }
         if self.status.phase == phase {
-            // Re-applying the current phase: keep the recorded error/exit_code
-            // and do not bump resource_version.
             return Ok(());
         }
         if self.status.phase.is_terminal() {
-            // Keep the first terminal disposition; the only rewrite allowed is
-            // refining a generic Failed into Exhausted/Timeout. Everything
-            // else (e.g. a trailing ActorExhausted after a Timeout/Cancel) is
-            // ignored.
             let refines_failed = self.status.phase == TaskPhase::Failed
                 && matches!(phase, TaskPhase::Exhausted | TaskPhase::Timeout);
             if !refines_failed {
@@ -222,9 +276,6 @@ mod tests {
 
     #[test]
     fn canceled_is_not_overwritten_by_a_later_terminal_event() {
-        // A self-canceling task emits TaskCanceled (-> Canceled) and then an
-        // actor-level ActorExhausted: that trailing terminal must not flip the
-        // intentional Canceled into Exhausted/Failed.
         let mut task = Task::new("task-1".into(), test_spec());
         task.transition_starting();
         task.transition_finished(TaskPhase::Canceled, None, None)
@@ -254,8 +305,6 @@ mod tests {
 
     #[test]
     fn timeout_is_not_overwritten_by_a_later_terminal_event() {
-        // A timed-out attempt is finalized as Timeout by the TimeoutHit/TaskFailed
-        // pairing; the trailing actor-level ActorExhausted must not erase it.
         let mut task = Task::new("task-1".into(), test_spec());
         task.transition_starting();
         task.transition_finished(TaskPhase::Timeout, Some("deadline".into()), None)
@@ -269,8 +318,6 @@ mod tests {
 
     #[test]
     fn failed_can_be_refined_to_exhausted() {
-        // The per-attempt TaskFailed lands as Failed; the actor-level
-        // ActorExhausted refines it to Exhausted. This refinement must survive.
         let mut task = Task::new("task-1".into(), test_spec());
         task.transition_starting();
         task.transition_finished(TaskPhase::Failed, Some("attempt".into()), None)
@@ -285,8 +332,6 @@ mod tests {
 
     #[test]
     fn failed_can_be_refined_to_timeout() {
-        // TimeoutHit may only be classified after the per-attempt TaskFailed
-        // already landed as Failed; the refinement into Timeout must survive.
         let mut task = Task::new("task-1".into(), test_spec());
         task.transition_starting();
         task.transition_finished(TaskPhase::Failed, Some("attempt".into()), None)
@@ -301,8 +346,6 @@ mod tests {
 
     #[test]
     fn exhausted_survives_late_failed() {
-        // Exhausted is a final disposition: a straggling per-attempt TaskFailed
-        // (or ActorDead) must not downgrade it back to the generic Failed.
         let mut task = Task::new("task-1".into(), test_spec());
         task.transition_starting();
         task.transition_finished(TaskPhase::Exhausted, Some("max_retries".into()), Some(1))
@@ -320,8 +363,6 @@ mod tests {
 
     #[test]
     fn failed_cannot_become_succeeded_or_canceled() {
-        // Failed may only be refined into Exhausted/Timeout; flipping it into
-        // Succeeded or Canceled would rewrite history.
         let mut task = Task::new("task-1".into(), test_spec());
         task.transition_starting();
         task.transition_finished(TaskPhase::Failed, Some("boom".into()), Some(1))
@@ -343,8 +384,6 @@ mod tests {
 
     #[test]
     fn same_phase_reapply_is_noop() {
-        // Re-applying the current terminal phase must not touch anything:
-        // no version bump, no error/exit_code overwrite (not even with None).
         let mut task = Task::new("task-1".into(), test_spec());
         task.transition_starting();
         task.transition_finished(TaskPhase::Failed, Some("first".into()), Some(1))
@@ -362,8 +401,6 @@ mod tests {
 
     #[test]
     fn same_phase_reapply_is_noop_for_sticky_terminals() {
-        // The self-cancel flow re-applies Canceled (TaskCanceled followed by
-        // ActorExhausted classified as Canceled): the second apply is inert.
         let mut task = Task::new("task-1".into(), test_spec());
         task.transition_starting();
         task.transition_finished(TaskPhase::Canceled, Some("graceful".into()), None)
@@ -380,8 +417,6 @@ mod tests {
 
     #[test]
     fn transition_starting_still_leaves_terminal_phase() {
-        // A retry after a failed attempt goes through transition_starting,
-        // which is unconditional: terminal stickiness must not block it.
         let mut task = Task::new("task-1".into(), test_spec());
         task.transition_starting();
         task.transition_finished(TaskPhase::Failed, Some("boom".into()), Some(1))

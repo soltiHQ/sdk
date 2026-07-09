@@ -1,29 +1,13 @@
-//! K8s-style resource model.
+//! Resource model.
+//!
+//! A [`Task`] is the top-level resource. It has metadata, desired spec, and observed status.
 //!
 //! ```text
-//!  ┌─────────────────────────────────────────────────────────┐
-//!  │                      Task                               │
-//!  │                                                         │
-//!  │  ObjectMeta            TaskSpec          TaskStatus     │
-//!  │  ├─ id: TaskId         ├─ slot            ├─ phase      │
-//!  │  ├─ resource_version   ├─ kind            ├─ attempt    │
-//!  │  ├─ created_at         ├─ timeout         ├─ error      │
-//!  │  └─ updated_at         ├─ restart         └─ exit_code  │
-//!  │                        ├─ backoff                       │
-//!  │                        ├─ admission                     │
-//!  │                        ├─ runner_selector               │
-//!  │                        └─ labels                        │
-//!  └─────────────────────────────────────────────────────────┘
+//! Task
+//!   metadata: ObjectMeta
+//!   spec:     TaskSpec
+//!   status:   TaskStatus
 //! ```
-//!
-//! | Type                | Role                                                |
-//! |---------------------|-----------------------------------------------------|
-//! | [`Task`]            | Top-level resource = metadata + spec + status       |
-//! | [`ObjectMeta`]      | Identity, versioning, timestamps                    |
-//! | [`TaskSpec`]        | Desired state - what to run, how to supervise       |
-//! | [`TaskSpecBuilder`] | Validated builder for [`TaskSpec`]                  |
-//! | [`TaskRun`]         | Record of a single task execution attempt           |
-//! | [`TaskStatus`]      | Observed state - phase, attempt count, last error   |
 
 mod spec;
 pub use spec::{TaskSpec, TaskSpecBuilder};

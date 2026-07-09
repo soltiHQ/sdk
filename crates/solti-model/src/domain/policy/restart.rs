@@ -1,4 +1,4 @@
-//! # Restart policy.
+//! Restart policy.
 //!
 //! [`RestartPolicy`] controls when a task is restarted after completion or failure.
 
@@ -7,7 +7,7 @@ use std::str::FromStr;
 
 use crate::error::{ModelError, ModelResult};
 
-/// Determines whether a task should be automatically restarted after completion or failure.
+/// Determines whether a task should restart after completion or failure.
 ///
 /// | Variant     | Behaviour                                                    |
 /// |-------------|--------------------------------------------------------------|
@@ -20,10 +20,17 @@ use crate::error::{ModelError, ModelResult};
 ///
 /// Cancellation (via controller or shutdown) is **not** treated as failure and will not trigger a restart.
 ///
-/// ## Also
+/// ## Example
 ///
-/// - [`BackoffPolicy`](super::BackoffPolicy) delay between restart attempts.
-/// - [`TaskSpec`](crate::TaskSpec) carries `restart` as a field.
+/// ```
+/// use solti_model::RestartPolicy;
+///
+/// let retry_errors = RestartPolicy::OnFailure;
+/// let service = RestartPolicy::always();
+/// let periodic = RestartPolicy::periodic(60_000);
+///
+/// let _ = (retry_errors, service, periodic);
+/// ```
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[non_exhaustive]
@@ -35,15 +42,14 @@ pub enum RestartPolicy {
     OnFailure,
     /// Always restart after completion.
     ///
-    /// - `interval_ms: None` - restart immediately after the previous run completes (tight loop tempered only by [`BackoffPolicy`](super::BackoffPolicy) on failure).
+    /// - `interval_ms: None` - repeat as soon as possible after a successful run.
     /// - `interval_ms: Some(n)` - wait `n` milliseconds between runs (periodic task).
-    /// - `Some(0)` is treated as immediate and is semantically identical to `None`; prefer `None` for clarity.
+    /// - `Some(0)` means immediate repeat; prefer `None` for clarity.
     ///
-    /// **Caution:** `interval_ms: None` (or `Some(0)`) is appropriate for a task
-    /// that *blocks* (a long-running service that should respawn immediately if it
-    /// ever exits). For a task that returns *quickly* on success it produces a hot
-    /// restart loop with no delay floor — use `interval_ms: Some(n)` for anything
-    /// that completes fast and is meant to repeat.
+    /// Use the immediate form for blocking tasks, such as a long-running service that should respawn as soon as it exits.
+    ///
+    /// For quick successful jobs that are meant to repeat, use `interval_ms: Some(n)`.
+    /// taskvisor protects instant success loops with a small internal floor, but `None` still means "run again immediately", not "run on a schedule".
     #[serde(rename_all = "camelCase")]
     Always {
         /// Delay in milliseconds between runs. `None` (or `Some(0)`) restarts immediately.
@@ -53,12 +59,36 @@ pub enum RestartPolicy {
 }
 
 impl RestartPolicy {
-    /// Create an Always policy without interval (immediate restart).
+    /// Create an `Always` policy without an interval.
+    ///
+    /// This restarts immediately after a run finishes.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::RestartPolicy;
+    ///
+    /// assert_eq!(
+    ///     RestartPolicy::always(),
+    ///     RestartPolicy::Always { interval_ms: None },
+    /// );
+    /// ```
     pub const fn always() -> Self {
         RestartPolicy::Always { interval_ms: None }
     }
 
-    /// Create an Always policy with periodic interval.
+    /// Create an `Always` policy with a periodic interval.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::RestartPolicy;
+    ///
+    /// assert_eq!(
+    ///     RestartPolicy::periodic(5_000),
+    ///     RestartPolicy::Always { interval_ms: Some(5_000) },
+    /// );
+    /// ```
     pub const fn periodic(interval_ms: u64) -> Self {
         RestartPolicy::Always {
             interval_ms: Some(interval_ms),

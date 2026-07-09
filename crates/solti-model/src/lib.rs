@@ -1,161 +1,155 @@
-//! # solti-model
+//! Shared task model for Solti agents and control planes.
 //!
-//! Domain model for the solti task execution system.
+//! `solti-model` contains the data types that all Solti crates speak.
+//! It defines task specs, task status, ids, policies, runner selectors, environment variables, output events, and agent tokens.
 //!
-//! This crate defines the core resource types.
+//! Use it when you build a Solti API, runner, supervisor, control plane, or tool that reads or writes task data.
 //!
-//! ## Architecture
+//! ## Quick Start
 //!
-//! ```text
-//!  ┌──────────────────────────────────────────────────────────┐
-//!  │                      Task                                │
-//!  │                                                          │
-//!  │  ObjectMeta            TaskSpec            TaskStatus    │
-//!  │  ├─ id: TaskId         ├─ slot: Slot       ├─ phase      │
-//!  │  ├─ resource_version   ├─ kind: TaskKind   ├─ attempt    │
-//!  │  ├─ created_at         ├─ timeout          ├─ exit_code  │
-//!  │  └─ updated_at         ├─ restart          └─ error      │
-//!  │                        ├─ backoff                        │
-//!  │                        ├─ admission                      │
-//!  │                        ├─ runner_selector                │
-//!  │                        └─ labels                         │
-//!  └──────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! ## Resource model
-//!
-//! | Section         | Type             | Responsibility                                                  |
-//! |-----------------|------------------|-----------------------------------------------------------------|
-//! | **metadata**    | [`ObjectMeta`]   | Identity, versioning, timestamps                                |
-//! | **status**      | [`TaskStatus`]   | Observed state: phase, attempt count, exit code, last error     |
-//! | **spec**        | [`TaskSpec`]     | Desired state (private fields; build via [`TaskSpec::builder`]) |
-//!
-//! Slot and labels live in `spec` as the single source of truth.
-//! [`Task`] provides convenience accessors ([`Task::slot`], [`Task::labels`]) that delegate to `spec`.
-//!
-//! ## Versioning
-//!
-//! [`ObjectMeta::resource_version`] is a monotonic counter bumped on every change
-//! (spec or status) for optimistic concurrency.
-//!
-//! ## Task lifecycle
-//!
-//! ```text
-//!  Pending ──► Running ──► Succeeded
-//!                │
-//!                ├──► Failed ──► (restart) ──► Running
-//!                │      └──► Exhausted / Timeout  (refined by a later, more specific signal)
-//!                ├──► Timeout
-//!                ├──► Canceled
-//!                └──► Exhausted (retry budget spent)
-//! ```
-//!
-//! Terminal phases: `Succeeded`, `Failed`, `Timeout`, `Canceled`, `Exhausted`.
-//! `Succeeded`, `Canceled`, and `Timeout` are sticky: a conflicting late signal cannot overwrite them.
-//! `Failed` may be refined into `Exhausted` or `Timeout` (see `Task::transition_finished`).
-//! See [`TaskPhase::is_terminal`].
-//!
-//! ## Task kinds
-//!
-//! [`TaskKind`] defines what a task actually runs:
-//!
-//! | Variant        | Description                                          |
-//! |----------------|------------------------------------------------------|
-//! | `Subprocess`   | External process (`command`, `args`, `env`, `cwd`)   |
-//! | `Wasm`         | WebAssembly module                                   |
-//! | `Container`    | OCI container image                                  |
-//! | `Embedded`     | Code-defined task (in-process `TaskRef`)             |
-//!
-//! `Subprocess` tasks go through `solti_runner::RunnerRouter`; `Embedded` tasks are submitted directly via `SupervisorApi::submit_with_task`.
-//!
-//! ## Policies
-//!
-//! | Policy               | Controls                                                 |
-//! |----------------------|----------------------------------------------------------|
-//! | [`RestartPolicy`]    | When to restart: `Never`, `OnFailure`, `Always`          |
-//! | [`BackoffPolicy`]    | Delay between retries: initial, max, factor, jitter      |
-//! | [`JitterPolicy`]     | Jitter strategy: `None`, `Full`, `Equal`, `Decorrelated` |
-//! | [`AdmissionPolicy`]  | Duplicate handling: `DropIfRunning`, `Replace`, `Queue`  |
-//!
-//! ## Construction
-//!
-//! [`TaskSpec`] fields are private; construct via [`TaskSpec::builder`]:
+//! Build a task spec and validate it at the submit boundary:
 //!
 //! ```rust
-//! # use solti_model::{ModelError, RestartPolicy, TaskKind, TaskSpec};
-//! # fn demo() -> Result<(), ModelError> {
-//! # let kind = TaskKind::Embedded;
-//! let spec = TaskSpec::builder("my-slot", kind, 5_000u64)
-//!     .restart(RestartPolicy::OnFailure)
-//!     .build()?;
-//! # Ok(())
-//! # }
-//! # demo().unwrap();
+//! use solti_model::{
+//!     Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec,
+//! };
+//!
+//! let kind = TaskKind::Subprocess(SubprocessSpec::new(
+//!     SubprocessMode::Command {
+//!         command: "echo".into(),
+//!         args: vec!["hello".into()],
+//!     },
+//!     TaskEnv::default(),
+//!     None,
+//!     Flag::enabled(),
+//! ));
+//!
+//! let spec = TaskSpec::builder("hello", kind, 5_000u64)
+//!     .build()
+//!     .expect("valid spec");
+//!
+//! spec.validate().expect("submittable spec");
+//! assert_eq!(spec.slot().as_str(), "hello");
 //! ```
 //!
-//! See [`TaskSpecBuilder`] for the full API.
+//! Create a task resource from a spec:
+//!
+//! ```rust
+//! use solti_model::{Task, TaskId, TaskKind, TaskPhase, TaskSpec};
+//!
+//! let spec = TaskSpec::builder("cleanup", TaskKind::Embedded, 1_000u64)
+//!     .build()
+//!     .unwrap();
+//!
+//! let task = Task::new(TaskId::from("embedded-cleanup-1"), spec);
+//!
+//! assert_eq!(*task.phase(), TaskPhase::Pending);
+//! assert_eq!(task.id().as_str(), "embedded-cleanup-1");
+//! ```
+//!
+//! `TaskKind::Embedded` is valid as model data, but [`TaskSpec::validate`] rejects it for runner-based submit.
+//! Embedded tasks must be submitted with a real `TaskRef`.
+//!
+//! ## What Ships
+//!
+//! | Area        | Main Types                                                                                         |
+//! |-------------|----------------------------------------------------------------------------------------------------|
+//! | Resource    | [`Task`], [`TaskSpec`], [`TaskStatus`], [`ObjectMeta`], [`TaskRun`]                                |
+//! | Identity    | [`Slot`], [`TaskId`], [`AgentId`]                                                                  |
+//! | Execution   | [`TaskKind`], [`SubprocessSpec`], [`SubprocessMode`], [`WasmSpec`], [`ContainerSpec`], [`Runtime`] |
+//! | Policies    | [`RestartPolicy`], [`BackoffPolicy`], [`JitterPolicy`], [`AdmissionPolicy`], [`Timeout`]           |
+//! | Routing     | [`Labels`], [`RunnerSelector`], [`SelectorRequirement`], [`SelectorOperator`]                      |
+//! | Environment | [`TaskEnv`], [`RunnerEnv`], [`KeyValue`], [`merge_env`]                                            |
+//! | Query       | [`TaskQuery`], [`TaskPage`]                                                                        |
+//! | Output      | [`OutputEvent`], [`OutputChunk`], [`StreamKind`]                                                   |
+//! | Auth        | [`Token`]                                                                                          |
+//! | Errors      | [`ModelError`], [`ModelResult`]                                                                    |
+//!
+//! ## Core Model
+//!
+//! ```text
+//! Task
+//!   metadata: ObjectMeta
+//!   spec:     TaskSpec
+//!   status:   TaskStatus
+//!
+//! TaskSpec
+//!   slot, kind, timeout, restart, backoff, admission
+//!   max_retries, runner_selector, labels
+//!
+//! TaskStatus
+//!   phase, attempt, exit_code, error
+//! ```
+//!
+//! [`TaskSpec`] says what should run. [`TaskStatus`] says what happened.
+//! [`ObjectMeta`] carries identity, version, and timestamps.
+//!
+//! ## Lifecycle
+//!
+//! ```text
+//! Pending -> Running -> Succeeded
+//!               |
+//!               +-> Failed -> maybe restart
+//!               +-> Timeout
+//!               +-> Canceled
+//!               +-> Exhausted
+//! ```
+//!
+//! Terminal phases are `Succeeded`, `Failed`, `Timeout`, `Canceled`, and `Exhausted`.
+//! See [`TaskPhase::is_terminal`].
+//!
+//! ## Task Kinds
+//!
+//! [`TaskKind`] describes what a task runs:
+//!
+//! | Kind         | Meaning                | Routed by runner |
+//! |--------------|------------------------|------------------|
+//! | `Subprocess` | Host command or script | yes              |
+//! | `Container`  | OCI image              | yes              |
+//! | `Wasm`       | WASI module            | yes              |
+//! | `Embedded`   | In-process task        | no               |
+//!
+//! Routable variants are consumed by `solti-runner`.
+//! Embedded tasks are submitted directly by `solti-core`.
+//!
+//! ## Selectors
+//!
+//! [`RunnerSelector`] matches runner labels. All requirements are ANDed:
+//!
+//! ```rust
+//! use solti_model::{Labels, RunnerSelector, SelectorRequirement};
+//!
+//! let selector = RunnerSelector {
+//!     match_labels: {
+//!         let mut labels = Labels::new();
+//!         labels.insert("zone", "eu");
+//!         labels
+//!     },
+//!     match_expressions: vec![SelectorRequirement::exists("gpu")],
+//! };
+//!
+//! let mut runner = Labels::new();
+//! runner.insert("zone", "eu");
+//! runner.insert("gpu", "h100");
+//!
+//! assert!(selector.matches(&runner));
+//! ```
+//!
+//! ## Environment
+//!
+//! [`TaskEnv`] comes from the task. [`RunnerEnv`] comes from the runner.
+//! [`merge_env`] combines them, with runner values winning on duplicate keys.
+//!
+//! ## Auth
+//!
+//! [`Token`] is the shared bearer secret between an agent and the control plane.
+//! Its `Debug` output is redacted, and [`Token::verify`] compares in constant time.
 //!
 //! ## Also
 //!
 //! - `solti-runner` consumes [`TaskSpec`] and [`TaskKind`] to build executable tasks.
 //! - `solti-core` manages [`Task`] lifecycle and state transitions.
-//! - `solti-api` serializes/deserializes model types over gRPC and HTTP.
-//!
-//! ## Domain types
-//!
-//! | Type               | Description                                               |
-//! |--------------------|-----------------------------------------------------------|
-//! | [`Slot`]           | Logical execution lane (newtype over `Arc<str>`)          |
-//! | [`TaskId`]         | Unique task identifier (newtype over `Arc<str>`)          |
-//! | [`Timeout`]        | Per-attempt timeout in milliseconds                       |
-//! | [`Labels`]         | Key-value metadata for routing and filtering              |
-//! | [`TaskEnv`]        | Ordered environment variables for task execution          |
-//! | [`Flag`]           | Boolean toggle with `enabled()`/`disabled()` constructors |
-//! | [`TaskQuery`]      | Builder for filtered, paginated task listing              |
-//! | [`TaskPage`]       | Paginated query result                                    |
-//! | [`TaskSpecBuilder`]| Validated builder for [`TaskSpec`]                        |
-//!
-//! ## Example
-//!
-//! ```rust
-//! use solti_model::{
-//!     BackoffPolicy, JitterPolicy,
-//!     RestartPolicy, SubprocessMode, SubprocessSpec, Task, TaskKind, TaskPhase, TaskSpec,
-//! };
-//!
-//! // 1) Build a task spec via the builder
-//! let spec = TaskSpec::builder(
-//!     "my-worker",
-//!     TaskKind::Subprocess(SubprocessSpec::new(
-//!         SubprocessMode::Command {
-//!             command: "echo".into(),
-//!             args: vec!["hello".into()],
-//!         },
-//!         Default::default(),
-//!         None,
-//!         Default::default(),
-//!     )),
-//!     5_000u64,
-//! )
-//! .restart(RestartPolicy::OnFailure)
-//! .backoff(BackoffPolicy {
-//!     jitter: JitterPolicy::Equal,
-//!     first_ms: 1_000,
-//!     max_ms: 30_000,
-//!     factor: 2.0,
-//! })
-//! .build()
-//! .expect("spec should be valid");
-//!
-//! // 2) Validate at submit boundary (checks business rules like no Embedded)
-//! spec.validate().expect("spec should pass submit validation");
-//!
-//! // 3) Create a task resource (normally done by the supervisor)
-//! let task = Task::new("task-001".into(), spec);
-//! assert_eq!(task.slot(), "my-worker");
-//! assert_eq!(*task.phase(), TaskPhase::Pending);
-//! assert_eq!(task.metadata().resource_version, 1);
-//! ```
+//! - `solti-api` serializes model types over gRPC and HTTP.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

@@ -1,4 +1,4 @@
-//! # Task execution backends.
+//! Task execution backends.
 //!
 //! [`TaskKind`] defines what a task actually runs: subprocess, WASM, container, or embedded code.
 
@@ -19,10 +19,24 @@ use crate::{Flag, SubprocessMode, TaskEnv};
 ///
 /// Routable variants go through `RunnerRouter::pick()`.
 ///
-/// ## Also
+/// ## Example
 ///
-/// - [`TaskSpec`](crate::TaskSpec) - embeds `TaskKind` as its execution backend.
-/// - `solti_runner::RunnerRouter`  - picks a runner based on kind and selector.
+/// ```
+/// use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind};
+///
+/// let kind = TaskKind::Subprocess(SubprocessSpec::new(
+///     SubprocessMode::Command {
+///         command: "echo".into(),
+///         args: vec!["hello".into()],
+///     },
+///     TaskEnv::default(),
+///     None,
+///     Flag::enabled(),
+/// ));
+///
+/// assert_eq!(kind.kind(), "subprocess");
+/// kind.validate().unwrap();
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -44,13 +58,21 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
-    /// Returns a short symbolic identifier for the runtime kind.
+    /// Return a short symbolic identifier for the runtime kind.
     ///
     /// This is primarily intended for logging, metrics and routing:
     /// - `"subprocess"`
     /// - `"container"`
     /// - `"embedded"`
     /// - `"wasm"`
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::TaskKind;
+    ///
+    /// assert_eq!(TaskKind::Embedded.kind(), "embedded");
+    /// ```
     #[inline]
     pub fn kind(&self) -> &'static str {
         match self {
@@ -63,18 +85,28 @@ impl TaskKind {
 
     /// Validate kind-specific constraints.
     ///
-    /// Delegates to the inner spec: [`SubprocessMode::validate`], [`WasmSpec::validate`],
-    /// [`ContainerSpec::validate`]. `Embedded` always passes.
+    /// Delegates to the inner spec: [`SubprocessMode::validate`], [`WasmSpec::validate`], [`ContainerSpec::validate`].
+    /// `Embedded` always passes.
     ///
-    /// ## Errors
+    /// ## Example
     ///
-    /// - [`ModelError::Invalid`](crate::ModelError::Invalid): the inner spec failed its
-    ///   validation (empty command, malformed script body, empty module path, empty image).
+    /// ```
+    /// use solti_model::{ContainerSpec, TaskEnv, TaskKind};
+    ///
+    /// let kind = TaskKind::Container(ContainerSpec::new(
+    ///     "redis:7".into(),
+    ///     None,
+    ///     vec![],
+    ///     TaskEnv::default(),
+    /// ));
+    ///
+    /// kind.validate().unwrap();
+    /// ```
     pub fn validate(&self) -> crate::error::ModelResult<()> {
         match self {
             TaskKind::Subprocess(spec) => spec.mode.validate(),
-            TaskKind::Wasm(spec) => spec.validate(),
             TaskKind::Container(spec) => spec.validate(),
+            TaskKind::Wasm(spec) => spec.validate(),
             TaskKind::Embedded => Ok(()),
         }
     }
@@ -84,15 +116,31 @@ impl WasmSpec {
     /// Construct a WASM spec from its module path and options.
     ///
     /// `WasmSpec` is `#[non_exhaustive]`; use this constructor instead of a struct literal.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    /// use solti_model::{TaskEnv, WasmSpec};
+    ///
+    /// let spec = WasmSpec::new(PathBuf::from("job.wasm"), vec!["--help".into()], TaskEnv::default());
+    /// assert_eq!(spec.module, PathBuf::from("job.wasm"));
+    /// ```
     pub fn new(module: PathBuf, args: Vec<String>, env: TaskEnv) -> Self {
         Self { module, args, env }
     }
 
     /// Validate structural constraints.
     ///
-    /// ## Errors
+    /// ## Example
     ///
-    /// - [`ModelError::Invalid`](crate::ModelError::Invalid): `module` path is empty.
+    /// ```
+    /// use std::path::PathBuf;
+    /// use solti_model::{TaskEnv, WasmSpec};
+    ///
+    /// let spec = WasmSpec::new(PathBuf::from("job.wasm"), vec![], TaskEnv::default());
+    /// spec.validate().unwrap();
+    /// ```
     pub fn validate(&self) -> crate::error::ModelResult<()> {
         if self.module.as_os_str().is_empty() {
             return Err(crate::error::ModelError::Invalid(
@@ -107,6 +155,21 @@ impl ContainerSpec {
     /// Construct a container spec from its image and options.
     ///
     /// `ContainerSpec` is `#[non_exhaustive]`; use this constructor instead of a struct literal.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{ContainerSpec, TaskEnv};
+    ///
+    /// let spec = ContainerSpec::new(
+    ///     "docker.io/library/redis:7".into(),
+    ///     None,
+    ///     vec![],
+    ///     TaskEnv::default(),
+    /// );
+    ///
+    /// assert_eq!(spec.image, "docker.io/library/redis:7");
+    /// ```
     pub fn new(
         image: String,
         command: Option<Vec<String>>,
@@ -123,9 +186,14 @@ impl ContainerSpec {
 
     /// Validate structural constraints.
     ///
-    /// ## Errors
+    /// ## Example
     ///
-    /// - [`ModelError::Invalid`](crate::ModelError::Invalid): `image` is empty or whitespace-only.
+    /// ```
+    /// use solti_model::{ContainerSpec, TaskEnv};
+    ///
+    /// let spec = ContainerSpec::new("redis:7".into(), None, vec![], TaskEnv::default());
+    /// spec.validate().unwrap();
+    /// ```
     pub fn validate(&self) -> crate::error::ModelResult<()> {
         if self.image.trim().is_empty() {
             return Err(crate::error::ModelError::Invalid(
@@ -229,8 +297,8 @@ mod tests {
 /// Specification for subprocess execution on the host.
 ///
 /// Supports two execution strategies via [`SubprocessMode`]:
-/// - **Command** — direct binary execution (`execve(command, args)`)
-/// - **Script** — script interpreted by a [`Runtime`](crate::Runtime) (`execve(runtime, [flag, body, ...args])`)
+/// - command: direct binary execution;
+/// - script: script body passed to a [`Runtime`](crate::Runtime).
 ///
 /// Common fields (`env`, `cwd`, `fail_on_non_zero`) apply to both modes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -256,6 +324,24 @@ impl SubprocessSpec {
     /// Construct a subprocess spec from its execution mode and common options.
     ///
     /// `SubprocessSpec` is `#[non_exhaustive]`; use this constructor instead of a struct literal.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv};
+    ///
+    /// let spec = SubprocessSpec::new(
+    ///     SubprocessMode::Command {
+    ///         command: "echo".into(),
+    ///         args: vec!["hello".into()],
+    ///     },
+    ///     TaskEnv::default(),
+    ///     None,
+    ///     Flag::enabled(),
+    /// );
+    ///
+    /// assert!(spec.fail_on_non_zero.is_enabled());
+    /// ```
     pub fn new(
         mode: SubprocessMode,
         env: TaskEnv,

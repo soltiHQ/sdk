@@ -1,158 +1,40 @@
 # solti-model
-Domain model for the solti task execution system.
 
-Defines core resource types: `Task`, `TaskSpec`, `TaskStatus`, `ObjectMeta`, and all supporting domain primitives (phases, policies, selectors, identity newtypes).
+> Shared task model for Solti agents and control planes.
 
-## Architecture
-```text
- ┌──────────────────────────────────────────────────────────┐
- │                      Task                                │
- │                                                          │
- │  ObjectMeta            TaskSpec            TaskStatus    │
- │  ├─ id: TaskId         ├─ slot: Slot       ├─ phase      │
- │  ├─ resource_version   ├─ kind: TaskKind   ├─ attempt    │
- │  ├─ created_at         ├─ timeout          ├─ exit_code  │
- │  └─ updated_at         ├─ restart          └─ error      │
- │                        ├─ backoff                        │
- │                        ├─ admission                      │
- │                        ├─ runner_selector                │
- │                        └─ labels                         │
- └──────────────────────────────────────────────────────────┘
+`solti-model` contains the data types that all Solti crates speak.
+It defines task specs, task status, ids, policies, runner selectors, environment variables, output events, and agent tokens.
+
+Use it when you build a Solti API, runner, supervisor, control plane, or tool that reads or writes task data.
+
+## The shape everyone shares
+
+Without one model crate, each layer has to invent its own task shape:
+
+```rust,ignore
+struct ApiTaskSpec { /* ... */ }
+struct RunnerTaskSpec { /* ... */ }
+struct ControlPlaneTaskSpec { /* ... */ }
 ```
 
-## Resource model
+With `solti-model`, all layers use the same resource:
 
-| Section      | Type         | Responsibility                                                |
-|--------------|--------------|---------------------------------------------------------------|
-| **metadata** | `ObjectMeta` | Identity, `resource_version`, timestamps                      |
-| **spec**     | `TaskSpec`   | Desired state (private fields; build via `TaskSpec::builder`) |
-| **status**   | `TaskStatus` | Observed state: phase, attempt count, exit code, error        |
-
-## Task lifecycle
 ```text
- Pending ──► Running ──► Succeeded
-               │
-               ├──► Failed ──► (restart) ──► Running
-               ├──► Timeout
-               ├──► Canceled
-               └──► Exhausted (max retries reached)
+Task
+  metadata: ObjectMeta
+  spec:     TaskSpec
+  status:   TaskStatus
 ```
 
-Terminal phases: `Succeeded`, `Failed`, `Timeout`, `Canceled`, `Exhausted`.
+`TaskSpec` says what should run. `TaskStatus` says what happened. `ObjectMeta` carries identity, version, and timestamps.
 
-## Task kinds
+## Quick Start
 
-| Variant      | Backend                        | Routable |
-|--------------|--------------------------------|----------|
-| `Subprocess` | OS process (`command`, `args`) | yes      |
-| `Container`  | OCI container image            | yes      |
-| `Wasm`       | WASI module (`.wasm`)          | yes      |
-| `Embedded`   | In-process `TaskRef`           | no       |
+Build a task spec and validate it at the submit boundary:
 
-`Embedded` tasks are submitted directly via `SupervisorApi::submit_with_task`.
-Routable variants go through `RunnerRouter::pick()`.
-
-`Subprocess` has two execution strategies (see `SubprocessMode`):
-- **Command**: `execve(command, args)` directly.
-- **Script**: interpreter + script body. The body is **base64-encoded, UTF-8**, capped at `MAX_SCRIPT_BODY_BYTES` (2 MiB after decode). Interpreters: `Bash`, `Python`, `Node`, `Custom { command, flag }`.
-
-## Policies
-
-| Type              | Controls                                                 |
-|-------------------|----------------------------------------------------------|
-| `RestartPolicy`   | When to restart: `Never`, `OnFailure`, `Always`          |
-| `BackoffPolicy`   | Delay between retries: initial, max, factor, jitter      |
-| `JitterPolicy`    | Jitter strategy: `None`, `Full`, `Equal`, `Decorrelated` |
-| `AdmissionPolicy` | Duplicate handling: `DropIfRunning`, `Replace`, `Queue`  |
-
-## Runner selector
-```text
- TaskSpec.runner_selector
- ┌──────────────────────────────────────────────────────┐
- │  match_labels:      { "zone": "eu" }                 │
- │  match_expressions: [ {key:"gpu", op:Exists} ]       │
- └──────────────────────────┬───────────────────────────┘
-                            │  ALL requirements ANDed
-                            ▼
- RunnerRouter::pick()
- ┌──────────────────────────────────────────────────────┐
- │  Runner A  labels: {"zone":"us","gpu":"a100"}  ✗     │
- │  Runner B  labels: {"zone":"eu","gpu":"h100"}  ✓     │
- │  Runner C  labels: {"zone":"eu"}               ✗     │
- └──────────────────────────────────────────────────────┘
-```
-
-Operators: `In`, `NotIn`, `Exists`, `DoesNotExist`.
-
-## Key types
-
-| Type               | Description                                                              |
-|--------------------|--------------------------------------------------------------------------|
-| `Task`             | K8s-style aggregate: metadata + spec + status                            |
-| `TaskSpec`         | Desired state (private fields, build via builder)                        |
-| `TaskSpecBuilder`  | Validated builder for `TaskSpec`                                         |
-| `TaskStatus`       | Observed state: phase, attempt, exit code, error                         |
-| `ObjectMeta`       | Identity, versioning, timestamps                                         |
-| `TaskRun`          | Per-attempt execution record with start/finish times                     |
-| `TaskPhase`        | Lifecycle phase enum (7 variants)                                        |
-| `TaskKind`         | Execution backend: Subprocess, Wasm, Container, Embedded                 |
-| `Slot`             | Logical execution lane (newtype over `Arc<str>`)                         |
-| `TaskId`           | Unique task identifier (newtype over `Arc<str>`)                         |
-| `AgentId`          | Agent identifier (newtype over `Arc<str>`)                               |
-| `Token`            | Shared agent↔CP bearer secret (redacted `Debug`, constant-time `verify`) |
-| `Timeout`          | Per-attempt timeout in milliseconds                                      |
-| `Labels`           | Key-value metadata for routing and filtering                             |
-| `TaskEnv`          | Ordered environment variables for task execution                         |
-| `RunnerEnv`        | Ordered environment variables for runner injection                       |
-| `Flag`             | Boolean toggle with `enabled()`/`disabled()` constructors                |
-| `RunnerSelector`   | Label selector for runner routing                                        |
-| `TaskQuery`        | Builder for filtered, paginated task listing                             |
-| `TaskPage`         | Paginated query result                                                   |
-| `OutputChunk`      | One stdout/stderr line from a task attempt                               |
-| `OutputEvent`      | Tagged enum: `Chunk` / `RunStarted` / `RunFinished` / `Lagged`           |
-| `StreamKind`       | `Stdout` or `Stderr` discriminator carried by `OutputChunk`              |
-
-## Size limits
-
-Exposed as `pub const` so downstream layers (API, CP, UI) share one source of truth.
-
-| Constant                | Value   | Enforced by                         |
-|-------------------------|---------|-------------------------------------|
-| `MAX_SCRIPT_BODY_BYTES` | 2 MiB   | `SubprocessMode::Script::validate`  |
-| `SLOT_MAX_LEN`          | 64      | `Slot::validate_format`             |
-| `TASK_ID_MAX_LEN`       | 256     | `TaskId::validate_format`           |
-| `AGENT_ID_MAX_LEN`      | 128     | `AgentId::validate_format`          |
-
-## Identity rules
-
-`Slot`, `TaskId`, `AgentId` allow `[A-Za-z0-9._-]` only, reject `.` and `..`.
-No whitespace, no path separators, no non-ASCII: these values reach cgroup paths, tempfile names, `execve` argv, and log fields, where anything else misbehaves. 
-Validation runs at `TaskSpec::validate` / submit time.
-
-## Authentication
-
-`Token` is the shared bearer secret used in **both** directions of agent ⇄ control-plane communication:
-- agent → CP discovery: the agent presents it (`solti-discover`);
-- CP → agent API: the agent verifies inbound calls against it (`solti-api`).
-
-One secret per agent enables auth symmetrically from a single config value. 
-It rides in the transport (`Authorization: Bearer <token>` / gRPC `authorization` metadata), never in a message body. 
-`Debug` is redacted; `verify()` compares in constant time. 
-Orthogonal to TLS - both can be enabled independently.
-
-Construct via `Token::new` (literal), `Token::from_env` / `Token::from_file` (readers), or `Token::generate()` (fresh 256-bit OS-random, prefixed `solti_agt_`). 
-`generate()` performs **no** persistence - the SDK is a library and does not decide where the secret lives; the agent binary owns that (file, vault, k8s secret). 
-The zero-ops flow lives in the agent: "read from my store; if absent, `generate()` then persist".
-
-## Versioning
-
-`ObjectMeta.resource_version` is a monotonic counter bumped on every change
-(spec or status) for optimistic concurrency control.
-
-## Construction
-```rust,no_run
+```rust
 use solti_model::{
-    BackoffPolicy, JitterPolicy, RestartPolicy, SubprocessMode, SubprocessSpec, TaskKind, TaskSpec,
+    Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec,
 };
 
 let kind = TaskKind::Subprocess(SubprocessSpec::new(
@@ -160,45 +42,253 @@ let kind = TaskKind::Subprocess(SubprocessSpec::new(
         command: "echo".into(),
         args: vec!["hello".into()],
     },
-    Default::default(),
+    TaskEnv::default(),
     None,
-    Default::default(),
+    Flag::enabled(),
 ));
 
-let spec = TaskSpec::builder("my-slot", kind, 5_000u64)
-    .restart(RestartPolicy::OnFailure)
-    .backoff(BackoffPolicy {
-        jitter: JitterPolicy::Equal,
-        first_ms: 1_000,
-        max_ms: 30_000,
-        factor: 2.0,
-    })
+let spec = TaskSpec::builder("hello", kind, 5_000u64)
     .build()
-    .expect("spec should be valid");
+    .expect("valid spec");
 
-// Submit-boundary validation (rejects Embedded).
-spec.validate().expect("spec should pass submit validation");
+spec.validate().expect("submittable spec");
+assert_eq!(spec.slot().as_str(), "hello");
 ```
 
-## Error model
+Create a task resource from that spec:
+
+```rust
+use solti_model::{Task, TaskId, TaskKind, TaskPhase, TaskSpec};
+
+let spec = TaskSpec::builder("cleanup", TaskKind::Embedded, 1_000u64)
+    .build()
+    .unwrap();
+
+let task = Task::new(TaskId::from("embedded-cleanup-1"), spec);
+
+assert_eq!(*task.phase(), TaskPhase::Pending);
+assert_eq!(task.id().as_str(), "embedded-cleanup-1");
+```
+
+`TaskKind::Embedded` is valid as model data, but `TaskSpec::validate()` rejects it for runner-based submit. Embedded tasks must be submitted with a real `TaskRef`.
+
+## What Ships
+
+| Area | Main Types |
+|------|------------|
+| Resource | `Task`, `TaskSpec`, `TaskStatus`, `ObjectMeta`, `TaskRun` |
+| Identity | `Slot`, `TaskId`, `AgentId` |
+| Execution | `TaskKind`, `SubprocessSpec`, `SubprocessMode`, `WasmSpec`, `ContainerSpec`, `Runtime` |
+| Policies | `RestartPolicy`, `BackoffPolicy`, `JitterPolicy`, `AdmissionPolicy`, `Timeout` |
+| Routing | `Labels`, `RunnerSelector`, `SelectorRequirement`, `SelectorOperator` |
+| Environment | `TaskEnv`, `RunnerEnv`, `KeyValue`, `merge_env` |
+| Query | `TaskQuery`, `TaskPage` |
+| Output | `OutputEvent`, `OutputChunk`, `StreamKind` |
+| Auth | `Token` |
+| Errors | `ModelError`, `ModelResult` |
+
+## Core Model
+
 ```text
- Variant             When
- ───────             ────
- UnknownAdmission    unknown admission policy string
- UnknownRestart      unknown restart policy string
- UnknownJitter       unknown jitter policy string
- UnknownTaskPhase    unknown task phase string
- Invalid             structural validation failure (empty slot, bad backoff, etc.)
+TaskSpec
+  slot
+  kind
+  timeout
+  restart
+  backoff
+  admission
+  max_retries
+  runner_selector
+  labels
+
+TaskStatus
+  phase
+  attempt
+  exit_code
+  error
+
+ObjectMeta
+  id
+  resource_version
+  created_at
+  updated_at
+```
+
+Most fields are private on `TaskSpec`. Build specs with `TaskSpec::builder()` or parse them with serde.
+Deserialization also validates the shape.
+
+## Task Lifecycle
+
+```text
+Pending -> Running -> Succeeded
+              |
+              +-> Failed -> maybe restart
+              +-> Timeout
+              +-> Canceled
+              +-> Exhausted
+```
+
+Terminal phases are `Succeeded`, `Failed`, `Timeout`, `Canceled`, and `Exhausted`.
+
+`Task` keeps terminal updates stable. A late actor event should not turn a canceled run into an exhausted run. The only allowed refinement is `Failed` into a more specific terminal phase such as `Timeout` or `Exhausted`.
+
+## Task Kinds
+
+| Kind | Meaning | Routed by runner |
+|------|---------|------------------|
+| `Subprocess` | Host command or script | yes |
+| `Container` | OCI image | yes |
+| `Wasm` | WASI module | yes |
+| `Embedded` | In-process task | no |
+
+Subprocess command example:
+
+```rust
+use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind};
+
+let kind = TaskKind::Subprocess(SubprocessSpec::new(
+    SubprocessMode::Command {
+        command: "date".into(),
+        args: vec![],
+    },
+    TaskEnv::default(),
+    None,
+    Flag::enabled(),
+));
+
+assert_eq!(kind.kind(), "subprocess");
+```
+
+Subprocess scripts store their body as standard base64. The decoded UTF-8 body is capped by `MAX_SCRIPT_BODY_BYTES`.
+
+## Policies
+
+`RestartPolicy` controls when the supervisor runs another attempt.
+
+```rust
+use solti_model::RestartPolicy;
+
+let once = RestartPolicy::Never;
+let retry_on_error = RestartPolicy::OnFailure;
+let hourly = RestartPolicy::periodic(60 * 60 * 1000);
+
+let _ = (once, retry_on_error, hourly);
+```
+
+`BackoffPolicy` controls delay between failure retries:
+
+```rust
+use solti_model::{BackoffPolicy, JitterPolicy};
+
+let backoff = BackoffPolicy {
+    jitter: JitterPolicy::Equal,
+    first_ms: 1_000,
+    max_ms: 30_000,
+    factor: 2.0,
+};
+
+backoff.validate().unwrap();
+```
+
+`AdmissionPolicy` controls duplicate submissions into the same slot: drop, replace, or queue.
+
+## Runner Selectors
+
+Runner selectors match runner labels. All requirements are ANDed.
+
+```rust
+use solti_model::{Labels, RunnerSelector, SelectorRequirement};
+
+let selector = RunnerSelector {
+    match_labels: {
+        let mut labels = Labels::new();
+        labels.insert("zone", "eu");
+        labels
+    },
+    match_expressions: vec![SelectorRequirement::exists("gpu")],
+};
+
+let mut runner = Labels::new();
+runner.insert("zone", "eu");
+runner.insert("gpu", "h100");
+
+assert!(selector.matches(&runner));
+```
+
+## Environment
+
+`TaskEnv` comes from the task. `RunnerEnv` comes from the runner. When they are merged, runner values win:
+
+```rust
+use solti_model::{RunnerEnv, TaskEnv, merge_env};
+
+let mut task = TaskEnv::new();
+task.push("PATH", "/user/bin");
+task.push("APP_MODE", "batch");
+
+let mut runner = RunnerEnv::new();
+runner.push("PATH", "/safe/bin");
+
+let env = merge_env(&task, &runner);
+assert_eq!(env.get("PATH").map(String::as_str), Some("/safe/bin"));
+assert_eq!(env.get("APP_MODE").map(String::as_str), Some("batch"));
+```
+
+## Identity Rules
+
+`Slot`, `TaskId`, and `AgentId` are cheap `Arc<str>` wrappers.
+They allow only `[A-Za-z0-9._-]`, reject empty strings, reject `"."` and `".."`, and have length limits:
+
+| Type | Limit |
+|------|-------|
+| `Slot` | 64 bytes |
+| `AgentId` | 128 bytes |
+| `TaskId` | 256 bytes |
+
+These values can reach cgroup names, temp paths, logs, and wire protocols, so the model keeps them boring on purpose.
+
+## Authentication
+
+`Token` is the shared bearer secret between an agent and the control plane.
+The agent can present it to the control plane, and the agent API can verify inbound calls with the same value.
+
+```rust
+use solti_model::Token;
+
+let token = Token::new("secret");
+assert!(token.verify("secret"));
+assert!(!token.verify("other"));
+assert_eq!(format!("{token:?}"), "Token(***redacted***)");
+```
+
+`Token::generate()` creates a fresh random token and does not persist it. The agent binary decides where to store it: file, secret manager, Kubernetes secret, or another store.
+
+## Output Events
+
+Live task output uses `OutputEvent`.
+The HTTP SSE shape is this crate's serde JSON shape. gRPC uses protobuf through `solti-api`.
+
+```rust
+use bytes::Bytes;
+use solti_model::{OutputChunk, OutputEvent, StreamKind};
+use std::time::SystemTime;
+
+let event = OutputEvent::Chunk(OutputChunk {
+    attempt: 1,
+    stream: StreamKind::Stdout,
+    seq: 0,
+    ts: SystemTime::UNIX_EPOCH,
+    line: Bytes::from_static(b"hello"),
+});
+
+let json = serde_json::to_string(&event).unwrap();
+assert!(json.contains(r#""type":"chunk""#));
 ```
 
 ## Notes
-- `TaskSpec` fields are private — use `TaskSpec::builder()` for construction and `serde` for deserialization.
-- Deserialization goes through `#[serde(try_from = "TaskSpecRaw")]` which validates on parse.
-- `BackoffPolicy` is **also** validated on deserialize via its own `try_from` raw; zero `first_ms`, inverted `max_ms`, or non-finite/`<1.0` `factor` are rejected at parse time.
-- Identity newtypes (`Slot`, `TaskId`, `AgentId`) wrap `Arc<str>` via `arc_str_newtype!`; environment newtypes (`TaskEnv`, `RunnerEnv`) wrap `Vec<KeyValue>` via `env_newtype!`. Both macros keep parallel types in lockstep.
-- `BackoffPolicy` implements `Eq`/`Hash` via `f64::to_bits()` for the `factor` field.
-- `TaskPhase`, `RestartPolicy`, `AdmissionPolicy`, `JitterPolicy` all implement `FromStr` for CLI/config parsing.
-- `Labels` is backed by `BTreeMap<String, String>` for deterministic iteration order.
-- Most types derive `Serialize`/`Deserialize` with `camelCase` field renaming. The one exception is `SelectorOperator`, which serializes as PascalCase (`In`, `NotIn`, `Exists`, `DoesNotExist`) to match the Kubernetes `LabelSelectorOperator` convention.
-- `TaskKind`, `TaskPhase`, `RestartPolicy`, `AdmissionPolicy`, `JitterPolicy`, `SelectorOperator` are `#[non_exhaustive]` — adding new variants is a non-breaking change.
-- Pagination constants for list endpoints: `DEFAULT_LIMIT = 100`, `MAX_LIMIT = 1000` (re-exported as `pub const` so downstream API layers share one source of truth).
+
+- Most public enums are `#[non_exhaustive]`; match them with a fallback arm.
+- `Labels` uses `BTreeMap`, so iteration order is stable.
+- `TaskEnv` and `RunnerEnv` preserve insertion order and use last-value-wins lookup.
+- `BackoffPolicy` validates on construction through serde and through `TaskSpecBuilder::build`.
+- Pagination uses `DEFAULT_LIMIT = 100` and `MAX_LIMIT = 1000`.

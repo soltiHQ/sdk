@@ -1,4 +1,4 @@
-//! # Task query builder.
+//! Task query builder.
 //!
 //! [`TaskQuery`] and [`TaskPage`] support filtered, paginated task listing.
 
@@ -15,24 +15,25 @@ pub const MAX_LIMIT: usize = 1000;
 
 /// Query parameters for listing tasks with filtering and pagination.
 ///
-/// ```text
-///  TaskQuery::new()
-///      .with_slot("build")      // filter by slot
-///      .with_active()           // Pending | Running
-///      .with_limit(50)
-///      .with_offset(0)
-///                │
-///                ▼  state.query(&q)
-///  TaskPage { items: [Task, ...], total: 123 }
-/// ```
-///
 /// An empty `status` filter matches **all** phases (no filtering).
 /// Multiple [`with_status`](Self::with_status) calls accumulate with OR semantics.
 ///
-/// ## Also
+/// ## Example
 ///
-/// - [`TaskPage`] paginated result returned by state queries.
-/// - [`TaskPhase`](crate::TaskPhase) phase values used as status filters.
+/// ```
+/// use solti_model::{TaskPhase, TaskQuery};
+///
+/// let query = TaskQuery::new()
+///     .with_slot("build")
+///     .with_active()
+///     .with_limit(50)
+///     .with_offset(100);
+///
+/// assert_eq!(query.slot().unwrap().as_str(), "build");
+/// assert_eq!(query.limit(), 50);
+/// assert!(query.matches_phase(&TaskPhase::Pending));
+/// assert!(!query.matches_phase(&TaskPhase::Failed));
+/// ```
 #[derive(Debug, Clone)]
 pub struct TaskQuery {
     status: Vec<TaskPhase>,
@@ -58,7 +59,17 @@ pub struct TaskPage<T> {
 }
 
 impl TaskQuery {
-    /// Create a new query with default pagination (`limit=100`, `offset=0`) and without filters.
+    /// Create a new query with default pagination and without filters.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{DEFAULT_LIMIT, TaskPhase, TaskQuery};
+    ///
+    /// let query = TaskQuery::new();
+    /// assert_eq!(query.limit(), DEFAULT_LIMIT);
+    /// assert!(query.matches_phase(&TaskPhase::Failed));
+    /// ```
     #[inline]
     pub fn new() -> Self {
         Self {
@@ -76,7 +87,9 @@ impl TaskQuery {
         self
     }
 
-    /// Add a phase filter. Multiple calls accumulate (OR semantics).
+    /// Add a phase filter.
+    ///
+    /// Multiple calls accumulate with OR semantics.
     #[inline]
     pub fn with_status(mut self, status: TaskPhase) -> Self {
         if !self.status.contains(&status) {
@@ -85,7 +98,7 @@ impl TaskQuery {
         self
     }
 
-    /// Filter by all active phases (`Pending`, `Running`).
+    /// Filter by all active phases: `Pending` and `Running`.
     #[inline]
     pub fn with_active(self) -> Self {
         self.with_status(TaskPhase::Pending)
@@ -102,7 +115,9 @@ impl TaskQuery {
             .with_status(TaskPhase::Failed)
     }
 
-    /// Set page size. Capped at `1000`.
+    /// Set page size.
+    ///
+    /// Values above [`MAX_LIMIT`] are capped.
     #[inline]
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = limit.min(MAX_LIMIT);
@@ -116,7 +131,7 @@ impl TaskQuery {
         self
     }
 
-    /// Returns `true` if the given phase passes the status filter.
+    /// Return `true` if the given phase passes the status filter.
     ///
     /// An empty filter matches all phases.
     #[inline]

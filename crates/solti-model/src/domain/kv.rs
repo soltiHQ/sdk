@@ -1,10 +1,20 @@
-//! # Generic key-value pair.
+//! Generic key-value pair.
 //!
 //! [`KeyValue`] is used for environment variables and other ordered pair collections.
 
 use serde::{Deserialize, Serialize};
 
-/// Key–value pair used for environment variables or generic metadata.
+/// Key-value pair used for environment variables or generic metadata.
+///
+/// ## Example
+///
+/// ```
+/// use solti_model::KeyValue;
+///
+/// let kv = KeyValue::new("APP_MODE", "batch");
+/// assert_eq!(kv.key(), "APP_MODE");
+/// assert_eq!(kv.value(), "batch");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyValue {
     /// Name of the variable or key.
@@ -14,7 +24,7 @@ pub struct KeyValue {
 }
 
 impl KeyValue {
-    /// Create a new key–value pair.
+    /// Create a new key-value pair.
     #[inline]
     pub fn new<K, V>(key: K, value: V) -> Self
     where

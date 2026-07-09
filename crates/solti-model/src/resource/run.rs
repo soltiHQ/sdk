@@ -1,6 +1,6 @@
-//! # Task run record.
+//! Task run record.
 //!
-//! [`TaskRun`] captures a single execution attempt with start/finish times and outcome.
+//! [`TaskRun`] captures one execution attempt.
 
 use std::time::SystemTime;
 
@@ -11,24 +11,21 @@ use crate::TaskPhase;
 /// Record of a single task execution attempt.
 ///
 /// Each time the supervisor starts a task, a new `TaskRun` is created.
-/// When the attempt finishes (success, failure, timeout, etc.), the run is closed with the terminal phase and timestamp.
+/// When the attempt finishes, the run is closed with a terminal phase and timestamp.
 ///
-/// Runs are associated with a [`Task`](crate::Task) via its [`TaskId`](crate::TaskId) and ordered by attempt number.
+/// Runs are ordered by attempt number.
 ///
-/// ## Also
+/// ## Example
 ///
-/// - [`Task`](crate::Task) parent resource.
-/// - [`TaskPhase`] phase values stored in `phase` field.
+/// ```
+/// use solti_model::{TaskPhase, TaskRun};
 ///
-/// # Lifecycle
+/// let mut run = TaskRun::starting(1);
+/// assert!(run.is_active());
 ///
-/// ```text
-///   TaskStarting  ──►  TaskRun { phase: Running, finished_at: None }
-///        │
-///        ├──► TaskStopped    ──► phase = Succeeded, finished_at = Some(now)
-///        ├──► TaskFailed     ──► phase = Failed,    finished_at = Some(now)
-///        ├──► TimeoutHit     ──► phase = Timeout,   finished_at = Some(now)
-///        └──► ActorExhausted ──► phase = Exhausted, finished_at = Some(now)
+/// run.finish(TaskPhase::Succeeded, None, Some(0));
+/// assert!(!run.is_active());
+/// assert_eq!(run.phase, TaskPhase::Succeeded);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,6 +54,17 @@ pub struct TaskRun {
 
 impl TaskRun {
     /// Create a new run record for an attempt that just started.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{TaskPhase, TaskRun};
+    ///
+    /// let run = TaskRun::starting(2);
+    /// assert_eq!(run.attempt, 2);
+    /// assert_eq!(run.phase, TaskPhase::Running);
+    /// assert!(run.finished_at.is_none());
+    /// ```
     pub fn starting(attempt: u32) -> Self {
         Self {
             attempt,
@@ -69,6 +77,18 @@ impl TaskRun {
     }
 
     /// Close the run with a terminal phase.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{TaskPhase, TaskRun};
+    ///
+    /// let mut run = TaskRun::starting(1);
+    /// run.finish(TaskPhase::Failed, Some("boom".into()), Some(1));
+    ///
+    /// assert_eq!(run.error.as_deref(), Some("boom"));
+    /// assert_eq!(run.exit_code, Some(1));
+    /// ```
     pub fn finish(&mut self, phase: TaskPhase, error: Option<String>, exit_code: Option<i32>) {
         self.finished_at = Some(SystemTime::now());
         self.phase = phase;
@@ -76,7 +96,19 @@ impl TaskRun {
         self.exit_code = exit_code;
     }
 
-    /// Whether this run is still in progress.
+    /// Return whether this run is still in progress.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{TaskPhase, TaskRun};
+    ///
+    /// let mut run = TaskRun::starting(1);
+    /// assert!(run.is_active());
+    ///
+    /// run.finish(TaskPhase::Succeeded, None, None);
+    /// assert!(!run.is_active());
+    /// ```
     pub fn is_active(&self) -> bool {
         self.finished_at.is_none()
     }

@@ -1,4 +1,4 @@
-//! # Selector operators.
+//! Selector operators.
 //!
 //! [`SelectorOperator`] defines comparison operators for label-based runner selection.
 
@@ -10,11 +10,18 @@ use serde::{Deserialize, Serialize};
 ///
 /// | Operator       | Semantics                               |
 /// |----------------|-----------------------------------------|
-/// | `In`           | label value ∈ {values}                  |
-/// | `NotIn`        | label value ∉ {values}                  |
+/// | `In`           | label value is one of `values`          |
+/// | `NotIn`        | label value is not one of `values`      |
 /// | `Exists`       | label key is present (values ignored)   |
 /// | `DoesNotExist` | label key is absent  (values ignored)   |
 ///
+/// ## Example
+///
+/// ```
+/// use solti_model::SelectorOperator;
+///
+/// assert_eq!(SelectorOperator::DoesNotExist.to_string(), "DoesNotExist");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SelectorOperator {

@@ -1,17 +1,19 @@
-//! # Runner-level environment variables.
+//! Runner-level environment variables.
 //!
 //! [`RunnerEnv`] provides base environment variables shared across all tasks on a runner.
 
 env_newtype! {
     /// Environment variables injected by the runner.
     ///
-    /// ```text
-    ///  RunnerEnv (runner-level defaults)
-    ///  ┌───────────────────────────────┐
-    ///  │  PATH=/safe/bin               │  ← enforced by runner
-    ///  │  RUNNER_NAME=prod-01          │
-    ///  │  FOO=from-runner              │  ← overrides task FOO
-    ///  └───────────────────────────────┘
+    /// Runner values override task values when merged with [`merge_env`](crate::merge_env).
+    ///
+    /// ```
+    /// use solti_model::RunnerEnv;
+    ///
+    /// let mut env = RunnerEnv::new();
+    /// env.push("PATH", "/safe/bin");
+    ///
+    /// assert_eq!(env.get("PATH"), Some("/safe/bin"));
     /// ```
     ///
     pub struct RunnerEnv;

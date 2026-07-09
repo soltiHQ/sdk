@@ -1,4 +1,4 @@
-//! # Admission policy.
+//! Admission policy.
 //!
 //! [`AdmissionPolicy`] controls how duplicate task submissions are handled.
 
@@ -10,13 +10,22 @@ use crate::error::{ModelError, ModelResult};
 /// Defines how the controller admits a new task into a slot.
 ///
 /// A slot may only run one task at a time.
-/// When a new task arrives, the controller applies the selected policy to determine what to do if the slot is already occupied.
+/// When a new task arrives, this policy says what to do if the slot is already occupied.
 ///
 /// | Variant         | Behaviour                                              |
 /// |-----------------|--------------------------------------------------------|
 /// | `DropIfRunning` | Ignore the new task, return success without scheduling |
 /// | `Replace`       | Cancel the running task, schedule the new one          |
 /// | `Queue`         | Enqueue the new task, run when slot becomes free       |
+///
+/// ## Example
+///
+/// ```
+/// use solti_model::AdmissionPolicy;
+///
+/// assert_eq!("replace".parse::<AdmissionPolicy>().unwrap(), AdmissionPolicy::Replace);
+/// assert_eq!("queue".parse::<AdmissionPolicy>().unwrap(), AdmissionPolicy::Queue);
+/// ```
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]

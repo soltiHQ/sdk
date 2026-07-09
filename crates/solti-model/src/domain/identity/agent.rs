@@ -1,4 +1,4 @@
-//! # Agent identifier.
+//! Agent identifier.
 //!
 //! [`AgentId`] identifies an agent instance in multi-agent deployments.
 
@@ -9,10 +9,10 @@ use crate::error::ModelError;
 pub const AGENT_ID_MAX_LEN: usize = 128;
 
 arc_str_newtype! {
-    /// Unique identifier for a solti agent instance.
+    /// Unique identifier for a Solti agent instance.
     ///
     /// Represents the identity of a running agent process.
-    /// The caller is responsible for providing a meaningful ID (e.g. UUID, hostname, pod name).
+    /// The caller is responsible for providing a meaningful ID, such as a UUID, hostname, or pod name.
     ///
     /// ```rust
     /// use solti_model::AgentId;
@@ -29,7 +29,7 @@ arc_str_newtype! {
 }
 
 impl AgentId {
-    /// Validate that the agent id is safe to use across the SDK and the wire protocol.
+    /// Validate that the agent id is safe to use across the SDK and wire protocol.
     ///
     /// See `validate_identity` (module-private) for the exact rules.
     ///
@@ -37,6 +37,15 @@ impl AgentId {
     ///
     /// - [`ModelError::Invalid`]: the id is empty, longer than [`AGENT_ID_MAX_LEN`],
     ///   equal to `"."` or `".."`, or contains a byte outside `[A-Za-z0-9._-]`.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::AgentId;
+    ///
+    /// assert!(AgentId::new("worker-pod-7b9f4").validate_format().is_ok());
+    /// assert!(AgentId::new("worker/pod").validate_format().is_err());
+    /// ```
     pub fn validate_format(&self) -> Result<(), ModelError> {
         validate_identity("agent_id", self.as_str(), AGENT_ID_MAX_LEN)
     }

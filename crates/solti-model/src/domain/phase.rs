@@ -1,4 +1,4 @@
-//! # Task lifecycle phases.
+//! Task lifecycle phases.
 //!
 //! [`TaskPhase`] represents the current state of a task in the supervision lifecycle.
 
@@ -9,15 +9,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ModelError, ModelResult};
 
-/// Current execution phase of a single task attempt.
+/// Current execution phase of a task.
 ///
-/// Phases describe the state of the **current attempt**.
+/// Phases describe the state visible on [`TaskStatus`](crate::TaskStatus).
 ///
-/// ## Also
+/// ## Example
 ///
-/// - [`RestartPolicy`](crate::RestartPolicy) governs what happens after a terminal phase.
-/// - [`TaskStatus`](crate::TaskStatus) carries the current phase.
-/// - [`TaskPhase::is_terminal`] checks for final states.
+/// ```
+/// use solti_model::TaskPhase;
+///
+/// let phase: TaskPhase = "running".parse().unwrap();
+/// assert!(phase.is_active());
+/// assert_eq!(phase.to_string(), "running");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -72,10 +76,19 @@ impl FromStr for TaskPhase {
 }
 
 impl TaskPhase {
-    /// Returns `true` if the current attempt has reached a final state.
+    /// Return `true` if the task has reached a final state.
     ///
     /// A terminal phase means this attempt will not transition further.
-    /// The supervisor may still start a **new** attempt based on the [`RestartPolicy`](crate::RestartPolicy).
+    /// The supervisor may still start a new attempt based on the [`RestartPolicy`](crate::RestartPolicy).
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::TaskPhase;
+    ///
+    /// assert!(TaskPhase::Succeeded.is_terminal());
+    /// assert!(!TaskPhase::Running.is_terminal());
+    /// ```
     #[inline]
     pub fn is_terminal(&self) -> bool {
         matches!(
@@ -88,7 +101,16 @@ impl TaskPhase {
         )
     }
 
-    /// Returns `true` if the task is still active (pending or running).
+    /// Return `true` if the task is still pending or running.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::TaskPhase;
+    ///
+    /// assert!(TaskPhase::Pending.is_active());
+    /// assert!(!TaskPhase::Failed.is_active());
+    /// ```
     #[inline]
     pub fn is_active(&self) -> bool {
         matches!(self, TaskPhase::Pending | TaskPhase::Running)

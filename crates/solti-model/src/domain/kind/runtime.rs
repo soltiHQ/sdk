@@ -1,4 +1,4 @@
-//! # Script runtime resolution.
+//! Script runtime resolution.
 //!
 //! [`Runtime`] maps script languages to interpreter paths for subprocess `Script` mode.
 
@@ -7,6 +7,20 @@ use serde::{Deserialize, Serialize};
 /// Script interpreter for subprocess script execution.
 ///
 /// [`Custom`](Runtime::Custom) allows arbitrary interpreter configuration.
+///
+/// ## Example
+///
+/// ```
+/// use solti_model::Runtime;
+///
+/// assert_eq!(Runtime::Python.resolve(), ("python3", "-c"));
+///
+/// let runtime = Runtime::Custom {
+///     command: "ruby".into(),
+///     flag: "-e".into(),
+/// };
+/// assert_eq!(runtime.resolve(), ("ruby", "-e"));
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]

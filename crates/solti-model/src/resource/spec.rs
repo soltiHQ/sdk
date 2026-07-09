@@ -1,6 +1,6 @@
-//! # Task specification.
+//! Task specification.
 //!
-//! [`TaskSpec`] defines the desired state; constructed via [`TaskSpecBuilder`].
+//! [`TaskSpec`] defines desired state: what to run and how the supervisor should manage it.
 
 use std::num::NonZeroU32;
 
@@ -11,23 +11,23 @@ use crate::{
     error::{ModelError, ModelResult},
 };
 
-/// Desired state specification.
+/// Desired state for a task.
 ///
-/// `TaskSpec` describes *what* should be run and *how* it should be managed by the runtime.
+/// Build it with [`TaskSpec::builder`]. Fields are private so every spec goes through validation.
 ///
-/// Fields cover:
-/// - logical grouping (`slot`)
-/// - execution backend (`kind`)
-/// - concurrency control (`admission`)
-/// - lifecycle policies (`timeout`, `restart`, `backoff`)
+/// ## Example
 ///
-/// ## Also
+/// ```
+/// use solti_model::{RestartPolicy, TaskKind, TaskSpec};
 ///
-/// - [`TaskSpecBuilder`] validated builder (via [`TaskSpec::builder`]).
-/// - [`TaskKind`] execution backend variants.
-/// - [`RestartPolicy`] / [`BackoffPolicy`] lifecycle policies.
-/// - [`AdmissionPolicy`] duplicate handling.
-/// - [`RunnerSelector`] label-based runner routing.
+/// let spec = TaskSpec::builder("daily-cleanup", TaskKind::Embedded, 5_000u64)
+///     .restart(RestartPolicy::periodic(60_000))
+///     .build()
+///     .unwrap();
+///
+/// assert_eq!(spec.slot().as_str(), "daily-cleanup");
+/// assert_eq!(spec.timeout().as_millis(), 5_000);
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(try_from = "raw::TaskSpecRaw")]
@@ -87,22 +87,21 @@ impl TaskSpec {
 
     /// Maximum failure-driven retries per run.
     ///
-    /// `None` means unlimited, the default. The invariant lives in the type:
-    /// a zero budget is not representable.
-    /// Counts only failure retries (the counter resets on success); when the
-    /// budget is exhausted the supervisor stops restarting the task.
+    /// `None` means unlimited, the default.
+    /// The invariant lives in the type: a zero budget is not representable.
+    /// Counts only failure retries (the counter resets on success); when the budget is exhausted the supervisor stops restarting the task.
     #[inline]
     pub fn max_retries(&self) -> Option<NonZeroU32> {
         self.max_retries
     }
 
-    /// Label selector for runner routing (if present).
+    /// Label selector for runner routing, if present.
     #[inline]
     pub fn runner_selector(&self) -> Option<&RunnerSelector> {
         self.runner_selector.as_ref()
     }
 
-    /// Metadata labels for routing / scheduling / observability.
+    /// Metadata labels for routing, scheduling, and observability.
     #[inline]
     pub fn labels(&self) -> &Labels {
         &self.labels
@@ -142,16 +141,47 @@ impl TaskSpec {
 }
 
 impl TaskSpec {
-    /// Attach a runner selector used by the router (consuming builder-style).
+    /// Attach a runner selector used by the router.
+    ///
+    /// This is useful when a spec came from a stored value and a caller wants to add routing before submit.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{Labels, RunnerSelector, TaskKind, TaskSpec};
+    ///
+    /// let mut labels = Labels::new();
+    /// labels.insert("zone", "eu");
+    ///
+    /// let spec = TaskSpec::builder("build", TaskKind::Embedded, 1_000u64)
+    ///     .build()
+    ///     .unwrap()
+    ///     .with_runner_selector(RunnerSelector::from_labels(labels));
+    ///
+    /// assert!(spec.runner_selector().is_some());
+    /// ```
     #[inline]
     pub fn with_runner_selector(mut self, sel: RunnerSelector) -> Self {
         self.runner_selector = Some(sel);
         self
     }
 
-    /// Override the admission policy (consuming builder-style).
+    /// Override the admission policy.
     ///
-    /// Used by the apply/upgrade path to force [`AdmissionPolicy::Replace`] regardless of the spec's declared admission.
+    /// Used by apply or upgrade paths that need to force [`AdmissionPolicy::Replace`] regardless of the original spec.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{AdmissionPolicy, TaskKind, TaskSpec};
+    ///
+    /// let spec = TaskSpec::builder("agent", TaskKind::Embedded, 1_000u64)
+    ///     .build()
+    ///     .unwrap()
+    ///     .with_admission(AdmissionPolicy::Replace);
+    ///
+    /// assert_eq!(spec.admission(), AdmissionPolicy::Replace);
+    /// ```
     #[inline]
     pub fn with_admission(mut self, admission: AdmissionPolicy) -> Self {
         self.admission = admission;
@@ -160,15 +190,35 @@ impl TaskSpec {
 }
 
 impl TaskSpec {
-    /// Validate the spec at the **submit boundary**.
+    /// Validate the spec at the submit boundary.
     ///
     /// Runs the full structural validation and then rejects [`TaskKind::Embedded`].
     ///
-    /// ## Errors
+    /// ## Example
     ///
-    /// - [`ModelError::Invalid`]: a structural check failed (empty or malformed `slot`,
-    ///   zero `timeout`, invalid `kind`, `backoff`, or `runner_selector`), or `kind` is
-    ///   [`TaskKind::Embedded`] (submit that via `submit_with_task` instead).
+    /// ```
+    /// use solti_model::{
+    ///     Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec,
+    /// };
+    ///
+    /// let spec = TaskSpec::builder(
+    ///     "hello",
+    ///     TaskKind::Subprocess(SubprocessSpec::new(
+    ///         SubprocessMode::Command {
+    ///             command: "echo".into(),
+    ///             args: vec!["hello".into()],
+    ///         },
+    ///         TaskEnv::default(),
+    ///         None,
+    ///         Flag::enabled(),
+    ///     )),
+    ///     1_000u64,
+    /// )
+    /// .build()
+    /// .unwrap();
+    ///
+    /// spec.validate().unwrap();
+    /// ```
     pub fn validate(&self) -> ModelResult<()> {
         self.validate_structural()?;
         if matches!(self.kind, TaskKind::Embedded) {
@@ -183,9 +233,9 @@ impl TaskSpec {
     ///
     /// Checks:
     /// - `slot` is not empty
+    /// - `backoff` parameters are sane
     /// - `timeout` is greater than zero
     /// - `kind` specific constraints (e.g. non-empty command)
-    /// - `backoff` parameters are sane
     /// - `runner_selector` requirements are structurally valid
     fn validate_structural(&self) -> ModelResult<()> {
         self.slot.validate_format()?;
@@ -205,20 +255,30 @@ impl TaskSpec {
     }
 }
 
-/// Builder for [`TaskSpec`] that validates structural invariants on [`build`](TaskSpecBuilder::build).
+/// Builder for [`TaskSpec`].
 ///
 /// Required fields (`slot`, `kind`, `timeout`) are set in the constructor.
 /// Optional fields have sensible defaults:
-/// - `backoff`: [`BackoffPolicy::default`] (full jitter, 1 s → 30 s, factor 2)
+/// - `backoff`: [`BackoffPolicy::default`] (full jitter, 1 second to 30 seconds, factor 2)
 /// - `admission`: [`AdmissionPolicy::DropIfRunning`]
 /// - `restart`: [`RestartPolicy::Never`]
 /// - `runner_selector`: `None`
 /// - `labels`: empty
 ///
-/// ## Also
+/// ## Example
 ///
-/// - [`TaskSpec::builder`] entry point.
-/// - [`TaskSpec::validate`] submit-boundary validation (rejects `Embedded`).
+/// ```
+/// use solti_model::{AdmissionPolicy, RestartPolicy, TaskKind, TaskSpec};
+///
+/// let spec = TaskSpec::builder("service", TaskKind::Embedded, 5_000u64)
+///     .restart(RestartPolicy::always())
+///     .admission(AdmissionPolicy::Replace)
+///     .build()
+///     .unwrap();
+///
+/// assert_eq!(spec.restart(), RestartPolicy::always());
+/// assert_eq!(spec.admission(), AdmissionPolicy::Replace);
+/// ```
 pub struct TaskSpecBuilder {
     runner_selector: Option<RunnerSelector>,
 
@@ -311,11 +371,17 @@ impl TaskSpecBuilder {
     /// This checks everything **except** the [`TaskKind::Embedded`] business rule
     /// (which is enforced at the submit boundary by [`TaskSpec::validate`]).
     ///
-    /// ## Errors
+    /// ## Example
     ///
-    /// - [`ModelError::Invalid`]: `slot` is empty or malformed, `timeout` is zero,
-    ///   `kind` fails kind-specific validation, `backoff` parameters are invalid,
-    ///   or a `runner_selector` requirement is invalid.
+    /// ```
+    /// use solti_model::{TaskKind, TaskSpec};
+    ///
+    /// let err = TaskSpec::builder("", TaskKind::Embedded, 1_000u64)
+    ///     .build()
+    ///     .unwrap_err();
+    ///
+    /// assert!(err.to_string().contains("slot"));
+    /// ```
     pub fn build(self) -> ModelResult<TaskSpec> {
         let spec = TaskSpec {
             runner_selector: self.runner_selector,

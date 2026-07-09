@@ -24,7 +24,7 @@ macro_rules! env_newtype {
                 Self(Vec::new())
             }
 
-            /// Returns the number of key–value pairs.
+            /// Return the number of key-value pairs.
             #[inline]
             pub fn len(&self) -> usize {
                 self.0.len()
@@ -36,7 +36,7 @@ macro_rules! env_newtype {
                 self.0.is_empty()
             }
 
-            /// Iterate over all key–value pairs in insertion order.
+            /// Iterate over all key-value pairs in insertion order.
             #[inline]
             pub fn iter(&self) -> impl Iterator<Item = &$crate::KeyValue> {
                 self.0.iter()
@@ -52,7 +52,7 @@ macro_rules! env_newtype {
                     .map(|kv| kv.value())
             }
 
-            /// Append a key–value pair.
+            /// Append a key-value pair.
             #[inline]
             pub fn push<K, V>(&mut self, key: K, value: V)
             where

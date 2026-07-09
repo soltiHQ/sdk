@@ -1,14 +1,9 @@
-//! # Model errors.
+//! Model errors.
 
 use std::borrow::Cow;
 
 use thiserror::Error;
 
-/// Error type for parsing and validating model types.
-///
-/// The `Unknown*` variants come from `FromStr` implementations on policy and
-/// phase enums. [`ModelError::Invalid`] covers structural and business-rule
-/// validation (builders, `validate` methods, serde `try_from` raws).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ModelError {
@@ -28,7 +23,7 @@ pub enum ModelError {
     #[error("unknown task phase: {0}")]
     UnknownTaskPhase(String),
 
-    /// A structural or business-rule validation failure (empty slot, zero timeout, bad backoff, `Embedded` kind at the submit boundary, malformed identity, …).
+    /// A structural or business-rule validation failure.
     #[error("invalid model: {0}")]
     Invalid(Cow<'static, str>),
 }

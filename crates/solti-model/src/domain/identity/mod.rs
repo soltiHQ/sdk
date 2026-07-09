@@ -1,18 +1,8 @@
 //! Resource identity types.
 //!
-//! ```text
-//!  TaskSpec { slot: "build" }
-//!           │
-//!           ▼  runner.build()
-//!  ┌────────────────────────────────────────────┐
-//!  │  Slot: "build"          (stable, logical)  │
-//!  │  TaskId: "sub-build-1"  (unique, run)      │
-//!  └────────────────────────────────────────────┘
-//! ```
-//!
-//! - [`Slot`]    - logical execution lane, stays the same across submissions.
-//! - [`TaskId`]  - unique per run, format `{runner}-{slot}-{seq:x}`.
+//! - [`Slot`] - logical execution lane, stable across submissions.
 //! - [`AgentId`] - identity of a running agent process.
+//! - [`TaskId`] - unique task resource id.
 
 #[macro_use]
 mod macros;
@@ -31,21 +21,20 @@ use std::borrow::Cow;
 
 /// Validate that an identifier is safe to use across the SDK.
 ///
-/// **Rules**:
+/// Rules:
 /// - length in `1..=max_len`
-/// - characters restricted to `[A-Za-z0-9._-]` _(ASCII, no path separators, no whitespace, no control characters, no Unicode)_
+/// - characters restricted to `[A-Za-z0-9._-]`
 /// - not equal to `"."` or `".."` (path-traversal tokens even without `/`)
 ///
-/// **Why these:**
+/// Why these:
 /// Unvalidated values leak into:
 ///  - `/sys/fs/cgroup/{name}` directory creation,
 ///  - `tokio::process::Command` argv
 ///  - tempfile paths,
 ///  - logs
 ///
-/// A slot containing `/` creates a nested cgroup dir instead of the intended one;
-/// A slot containing `\n` corrupts log parsing;
-/// Non-ASCII produces mojibake on containers with unset locale.
+/// A slot containing `/` creates a nested cgroup directory instead of the intended one.
+/// A slot containing `\n` corrupts log parsing.
 pub(crate) fn validate_identity(kind: &'static str, s: &str, l: usize) -> Result<(), ModelError> {
     if s.is_empty() {
         return Err(ModelError::Invalid(Cow::Owned(format!(
@@ -118,7 +107,8 @@ mod validate_tests {
 
     #[test]
     fn rejects_non_ascii() {
-        assert!(validate_identity("slot", "построение", 64).is_err());
+        let non_ascii = String::from_utf8(vec![0xc3, 0xa9]).unwrap();
+        assert!(validate_identity("slot", &non_ascii, 64).is_err());
         assert!(validate_identity("slot", "a\u{200b}b", 64).is_err());
     }
 
