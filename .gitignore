@@ -26,14 +26,12 @@ target
 # Cache files
 .cache
 
-# Rust library
-Cargo.lock
-
 # Taskfile
 .task/
 
-# Vendored gRPC contract: pulled from soltiHQ/proto via `task proto/vendor`.
-crates/*/proto/
+# Vendored gRPC contract (`crates/*/proto/`) is committed so a fresh checkout
+# builds offline; `task proto/vendor` re-pulls it from soltiHQ/proto at the
+# revision pinned in Taskfile.yml.
 
 # examples/podium: generated dev PKI (see certs/gen.sh) — never committed.
 examples/podium/certs/*.crt

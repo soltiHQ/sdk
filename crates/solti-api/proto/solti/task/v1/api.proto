@@ -1,0 +1,143 @@
+syntax = "proto3";
+
+package solti.task.v1;
+
+import "solti/task/v1/types.proto";
+
+// Task management API exposed by the agent.
+// The control-plane is the client; the agent runs the tasks.
+service TaskService {
+  // Submit a new task; returns its id.
+  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+
+  // Apply a spec to its slot.
+  // Always force-replaces regardless of the spec's admission.
+  rpc ApplyTask(ApplyTaskRequest) returns (ApplyTaskResponse);
+
+  // Get one task's full state by id.
+  rpc GetTaskStatus(GetTaskStatusRequest) returns (GetTaskStatusResponse);
+
+  // List tasks with optional filters and pagination.
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+
+  // List the attempt history of one task (oldest first).
+  rpc ListTaskRuns(ListTaskRunsRequest) returns (ListTaskRunsResponse);
+
+  // Stop a task and purge its history.
+  rpc DeleteTask(DeleteTaskRequest) returns (DeleteTaskResponse);
+
+  // Live-tail stdout/stderr events for a task, merged across attempts.
+  rpc StreamTaskLogs(StreamTaskLogsRequest) returns (stream StreamTaskLogsResponse);
+}
+
+// SubmitTask input.
+message SubmitTaskRequest {
+  CreateSpec spec = 1; // task definition; required
+}
+
+// SubmitTask output.
+message SubmitTaskResponse {
+  string task_id = 1; // id of the new task; empty means soft failure, retry
+}
+
+// ApplyTask input.
+message ApplyTaskRequest {
+  CreateSpec spec = 1; // task definition; required
+}
+
+// ApplyTask output.
+message ApplyTaskResponse {
+  string task_id = 1; // id of the task running in the slot after apply
+}
+
+// GetTaskStatus input.
+message GetTaskStatusRequest {
+  string task_id = 1;
+}
+
+// GetTaskStatus output.
+message GetTaskStatusResponse {
+  optional TaskData task = 1; // absent if no task has this id
+}
+
+// ListTasks input.
+// Filters are ANDed; omitted filters match all.
+message ListTasksRequest {
+  optional string     slot   = 1; // filter by slot
+  optional TaskPhase phase  = 2; // filter by phase
+  uint32              limit  = 3; // page size; 0 = default 100, max 1000
+  uint32              offset = 4; // page offset; default 0
+}
+
+// ListTasks output.
+message ListTasksResponse {
+  repeated TaskData tasks = 1; // one page of tasks
+  uint32            total = 2; // total tasks matching the filters
+}
+
+// ListTaskRuns input.
+message ListTaskRunsRequest {
+  string task_id = 1;
+}
+
+// ListTaskRuns output.
+message ListTaskRunsResponse {
+  repeated TaskRunInfo runs = 1; // attempts, oldest first
+}
+
+// DeleteTask input.
+message DeleteTaskRequest {
+  string task_id = 1;
+}
+
+// DeleteTask output. Empty on success.
+message DeleteTaskResponse {}
+
+// StreamTaskLogs input.
+message StreamTaskLogsRequest {
+  string task_id = 1;
+}
+
+// Source stream of a captured output line.
+enum OutputStreamKind {
+  OUTPUT_STREAM_KIND_UNSPECIFIED = 0;
+  OUTPUT_STREAM_KIND_STDOUT      = 1;
+  OUTPUT_STREAM_KIND_STDERR      = 2;
+}
+
+// One captured line of process output.
+message OutputChunk {
+  uint32           attempt = 1; // attempt that produced the line (1-based)
+  OutputStreamKind stream  = 2; // stdout or stderr
+  uint64           seq     = 3; // per-stream sequence; resets each attempt
+  int64            ts      = 4; // time the agent read the line (ms)
+  bytes            line    = 5; // raw line content
+}
+
+// A new attempt started.
+message RunStarted {
+  uint32 attempt    = 1; // attempt number (1-based)
+  int64  started_at = 2; // start time (ms)
+}
+
+// The current attempt ended. Stop accumulating its chunks.
+message RunFinished {
+  uint32         attempt     = 1; // attempt number (1-based)
+  optional int32 exit_code   = 2; // exit code; absent if killed or timed out
+  int64          finished_at = 3; // end time (ms)
+}
+
+// The subscriber fell behind and the server dropped events.
+message Lagged {
+  uint64 skipped = 1; // number of events missed
+}
+
+// One StreamTaskLogs event: exactly one field is set.
+message StreamTaskLogsResponse {
+  oneof kind {
+    OutputChunk chunk        = 1; // output line
+    RunStarted  run_started  = 2; // attempt started
+    RunFinished run_finished = 3; // attempt ended
+    Lagged      lagged       = 4; // events were dropped
+  }
+}

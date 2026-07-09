@@ -1,12 +1,14 @@
 version: '3'
 
+# Remote includes are pinned to soltiHQ/actions v1 by commit SHA, not `main`,
+# so a push to the actions repo cannot silently change what runs here.
 includes:
   rust:
-    taskfile: https://raw.githubusercontent.com/soltiHQ/actions/main/taskfiles/rust/Taskfile.yml
+    taskfile: https://raw.githubusercontent.com/soltiHQ/actions/be0b13df45cb3d522f4ed22dbdf3125a2032f252/taskfiles/rust/Taskfile.yml # v1
     vars:
       image_patch: "-1"
   helpers:
-    taskfile: https://raw.githubusercontent.com/soltiHQ/actions/main/taskfiles/helpers/Taskfile.yml
+    taskfile: https://raw.githubusercontent.com/soltiHQ/actions/be0b13df45cb3d522f4ed22dbdf3125a2032f252/taskfiles/helpers/Taskfile.yml # v1
 
 vars:
   publish_crates:

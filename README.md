@@ -22,27 +22,22 @@ Built on [taskvisor](https://github.com/soltiHQ/taskvisor).
 ```text
 ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
                        your agent binary
-├───────────┬────────────────┬──────────────────┬───────────────┤
-│ solti-api │ solti-discover │ solti-prometheus │ solti-observe │
-│ HTTP/gRPC │  heartbeat     │     metrics      │    logging    │
-├───────────┴────────────────┴──────────────────┴───────────────┤
-│        solti-tls - shared TLS / mTLS config (optional)        │
-├───────────────────────────────────────────────────────────────┤
-│                          solti-core                           │
-│                  SupervisorApi · state · sweep                │
-├───────────────────────────────────────────────────────────────┤
-│                         solti-runner                          │
-│                  Runner trait · router · metrics              │
-├───────────────────────────┬───────────────────────────────────┤
-│       solti-exec          │            (future)               │
-│       subprocess          │         wasm · container          │
-├───────────────────────────┴───────────────────────────────────┤
-│                         solti-model                           │
+├───────────────┬──────────────────┬───────────┬────────────────┤
+│ solti-observe │ solti-prometheus │ solti-api │ solti-discover │   ┌────────────────┐
+│    logging    │     metrics      │ HTTP/gRPC │   heartbeat    │──►│   solti-tls    │
+├───────────────┴──────────────────┴───────────┴────────────────┤   │ TLS/mTLS config│
+│                          solti-core                           │   │ (`tls` feature)│
+│                  SupervisorApi · state · sweep                │   └────────────────┘
+├───────────────────────────────────────────────────────────────┤   ┌────────────────┐
+│                         solti-runner                          │◄──┤   solti-exec   │
+│                  Runner trait · router · metrics              │   │   subprocess   │
+├───────────────────────────────────────────────────────────────┤   │ (Runner plugin)│
+│                         solti-model                           │   └────────────────┘
 │            domain types · policies · selectors · specs        │
 └───────────────────────────────────────────────────────────────┘
 ```
 
-Upper layers depend on lower ones; no cycles. The top row is entirely optional — use only what your agent needs.
+Arrows point at the dependency; inside the stack each layer only depends on layers below it, no cycles. The top row is entirely optional — use only what your agent needs. Two crates live beside the stack rather than in it: `solti-exec` is a plugin — it depends on `solti-runner` (implements the `Runner` trait) and your binary registers it into the router; `solti-core` never depends on it, so alternative runners (WASM, containers, in-process) slot in the same way. `solti-tls` is a standalone utility with no SDK dependencies, pulled in by `solti-api` and `solti-discover` only when their `tls` feature is enabled. `solti-prometheus` implements the metrics traits of `solti-runner` and, behind feature flags, those of `solti-api` / `solti-discover`.
 
 ## Crates
 
@@ -244,6 +239,8 @@ External cancellation moves a task to `Canceled`.
 
 ## Development
 
+A fresh clone builds offline — no extra tooling or network access needed:
+
 ```bash
 cargo build --workspace
 cargo test --workspace
@@ -252,6 +249,7 @@ cargo test --workspace
 cargo run -p agentd-http     # HTTP transport, :8085
 cargo run -p agentd-grpc     # gRPC transport, :50052
 cargo run -p tls-roundtrip   # mTLS demo (HTTPS :18443 + gRPC :18444)
+cargo run -p podium -- --config examples/podium/config.toml   # config-driven Podium agent
 
 # Feature-gated builds
 cargo build -p solti-api      --features http
@@ -259,6 +257,17 @@ cargo build -p solti-api      --features grpc
 cargo build -p solti-api      --features grpc,tls
 cargo build -p solti-discover --features http,tls
 ```
+
+The gRPC contract (`crates/solti-api/proto/`, `crates/solti-discover/proto/`) is vendored from
+[`soltiHQ/proto`](https://github.com/soltiHQ/proto) and committed, so builds never fetch it. To
+update the contract, install [go-task](https://taskfile.dev) and run:
+
+```bash
+task proto/vendor
+```
+
+The revision is pinned in [`Taskfile.yml`](Taskfile.yml) (`proto_ref` under the `proto/vendor`
+task) — bump it there, re-vendor, and commit the refreshed `.proto` files.
 
 ## Dashboards
 

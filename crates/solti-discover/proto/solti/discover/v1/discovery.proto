@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package solti.discover.v1;
+
+// Agent discovery and heartbeat.
+// The agent is the client; the control-plane is the server.
+
+service DiscoverService {
+  // Sync registers the agent and reports its status.
+  // The agent calls it once at startup and then on every heartbeat.
+  rpc Sync(SyncRequest) returns (SyncResponse);
+}
+
+// Transport an agent exposes for its API endpoint.
+enum EndpointType {
+  ENDPOINT_TYPE_UNSPECIFIED = 0; // invalid; rejected by the server
+  ENDPOINT_TYPE_GRPC        = 1; // gRPC
+  ENDPOINT_TYPE_HTTP        = 2; // HTTP
+}
+
+// One heartbeat from an agent.
+message SyncRequest {
+  string              id                   = 1;  // agent id (UUID); required
+  string              name                 = 2;  // display name
+  string              endpoint             = 3;  // address to reach the agent, e.g. "127.0.0.1:50050"; required
+  int64               uptime_seconds       = 4;  // seconds since the agent started
+  string              os                   = 5;  // OS name, e.g. "Ubuntu 22.04"
+  string              arch                 = 6;  // CPU arch, e.g. "x86_64", "aarch64"
+  string              platform             = 7;  // OS family, e.g. "linux", "macos"
+  int64               ts                   = 8;  // send time (Unix seconds)
+  map<string, string> metadata             = 9;  // free-form agent-supplied tags
+  EndpointType        endpoint_type        = 10; // transport for `endpoint`; required
+  int32               api_version          = 11; // API version the agent speaks (1 = v1)
+  int32               heartbeat_interval_s = 12; // agent's heartbeat period (seconds); >= 1
+  repeated string     capabilities         = 13; // optional features, e.g. "task_runs", "task_delete"
+}
+
+// Reply to one heartbeat.
+message SyncResponse {
+  bool   success       = 1; // true if accepted
+  string reason        = 2; // human-readable cause when success = false
+  int32  retry_after_s = 3; // suggested wait before next Sync (seconds); 0 = use client default
+}

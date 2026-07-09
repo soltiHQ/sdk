@@ -70,28 +70,53 @@ jobs:
             exit 1
           fi
 
+      # Internal path-deps are declared once, in [workspace.dependencies] of the
+      # root Cargo.toml; member crates only reference them via `workspace = true`.
       - name: Verify internal path-deps versions
         shell: bash
-        env:
-          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
-          TAG_VERSION="${REF_NAME#v}"
-          
+          WS_VERSION=$(awk '
+            /^\[workspace.package\]/ { in_section=1; next }
+            /^\[/ { in_section=0 }
+            in_section && /^[[:space:]]*version[[:space:]]*=/ {
+              sub(/^[^"]*"/, "")
+              sub(/".*$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)
+
+          if [ -z "$WS_VERSION" ]; then
+            echo "::error::failed to read workspace.package.version from Cargo.toml"
+            exit 1
+          fi
+
+          found=0
           bad=0
           while IFS= read -r line; do
-            file=${line%%:*}
-            rest=${line#*:}
-            ver=$(printf '%s' "$rest" | grep -oE 'version[[:space:]]*=[[:space:]]*"[^"]*"' | sed -E 's/.*"([^"]*)".*/\1/')
-            if [ -z "$ver" ] || [ "$ver" != "$TAG_VERSION" ]; then
-              echo "::error file=$file::internal path-dep version '$ver' != workspace '$TAG_VERSION' — line: ${rest}"
+            found=$((found + 1))
+            ver=$(printf '%s' "$line" | grep -oE 'version[[:space:]]*=[[:space:]]*"[^"]*"' | sed -E 's/.*"([^"]*)".*/\1/' || true)
+            if [ -z "$ver" ] || [ "$ver" != "$WS_VERSION" ]; then
+              echo "::error file=Cargo.toml::internal dep version '$ver' != workspace '$WS_VERSION' — line: ${line}"
               bad=$((bad + 1))
             fi
-          done < <(grep -n -E '^[[:space:]]*solti-[a-z-]+[[:space:]]*=[[:space:]]*\{.*path[[:space:]]*=' crates/*/Cargo.toml)
+          done < <(awk '
+            /^\[workspace.dependencies\]/ { in_section=1; next }
+            /^\[/ { in_section=0 }
+            in_section && /^[[:space:]]*solti-[a-z-]+[[:space:]]*=[[:space:]]*\{.*path[[:space:]]*=/ { print }
+          ' Cargo.toml)
+
+          # Guard against silent degradation: the scan matching nothing means the
+          # pattern (or the manifest layout) broke, not that everything is fine.
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no solti-* path-deps found in [workspace.dependencies] of Cargo.toml"
+            exit 1
+          fi
 
           if [ "$bad" -gt 0 ]; then
-            echo "::error::$bad internal path-dep(s) misaligned with workspace version"
+            echo "::error::$bad internal path-dep(s) misaligned with workspace version '$WS_VERSION'"
             exit 1
           fi
 
@@ -106,15 +131,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - name: Vendor proto
-        uses: soltiHQ/actions/taskfile@main
+      # Vendored proto is committed to git, so re-vendoring at the pinned ref
+      # must be a no-op. If it dirties the tree, the committed copy drifted from
+      # the pin and `cargo publish` (allow-dirty: "false") fails the release.
+      - name: Vendor proto (drift check)
+        uses: soltiHQ/actions/taskfile@be0b13df45cb3d522f4ed22dbdf3125a2032f252 # v1
         with:
           command: proto/vendor
-      - uses: soltiHQ/actions/cargo-publish@main
+      - uses: soltiHQ/actions/cargo-publish@be0b13df45cb3d522f4ed22dbdf3125a2032f252 # v1
         with:
           token: ${{ secrets.CRATES_IO_TOKEN }}
           crates: ${{ needs.crates.outputs.list }}
-          allow-dirty: "true"
+          allow-dirty: "false"
 
   gh-release:
     name: GitHub release
