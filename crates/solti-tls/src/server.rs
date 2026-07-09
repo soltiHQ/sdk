@@ -1,8 +1,15 @@
-//! # Server-side TLS configuration.
+//! # Server TLS config.
 //!
-//! [`ServerTlsConfig`] (built via [`ServerTlsConfigBuilder`]) describes a TLS listener:
-//! the server's own cert/key, an optional client-CA bundle that turns on **mandatory** mTLS, and ALPN.
-//! [`ServerTlsConfig::into_rustls_config`] performs the I/O + parsing and yields a [`rustls::ServerConfig`].
+//! [`ServerTlsConfig`] describes a TLS listener.
+//!
+//! It stores:
+//! - the server certificate chain,
+//! - the server private key,
+//! - an optional client CA for mTLS,
+//! - optional ALPN protocols.
+//!
+//! The builder only stores intent.
+//! PEM files are read later by [`ServerTlsConfig::into_rustls_config`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,9 +22,10 @@ use crate::{PemSource, TlsError};
 ///
 /// ## Security
 ///
-/// `key` (and `cert`/`client_ca`) are held as [`PemSource`]; the `Bytes` variant keeps the raw private key.
-/// The derived `Debug` redacts those bytes (see [`PemSource`]) and logging this struct will not leak the key.
-/// The key is **not** zeroed while the config is alive.
+/// `key` is a [`PemSource`].
+/// If it uses [`PemSource::Bytes`], it holds raw private key bytes.
+/// `Debug` output is redacted; logging this struct does not print the key.
+/// The key bytes are not zeroed on drop.
 ///
 /// ## Also
 ///
@@ -39,31 +47,55 @@ pub struct ServerTlsConfig {
 }
 
 impl ServerTlsConfig {
-    /// Start a new builder.
+    /// Start a new server TLS builder.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_tls::ServerTlsConfig;
+    ///
+    /// let cfg = ServerTlsConfig::builder()
+    ///     .cert_pem_bytes(b"-----BEGIN CERTIFICATE-----\n...".to_vec())
+    ///     .key_pem_bytes(b"-----BEGIN PRIVATE KEY-----\n...".to_vec())
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// assert!(cfg.client_ca.is_none());
+    /// ```
     pub fn builder() -> ServerTlsConfigBuilder {
         ServerTlsConfigBuilder::default()
     }
 
     /// Build a [`rustls::ServerConfig`] from this configuration.
     ///
-    /// Reads the PEM sources (disk or memory), parses the cert chain and key, optionally constructs a `WebPkiClientVerifier` for mTLS, and applies ALPN.
-    /// Auto-installs the `ring` [`CryptoProvider`](crate::ensure_default_provider) if none is set process-wide.
+    /// Reads the PEM sources, parses the cert chain and key.
+    /// Optionally enables mTLS, applies ALPN, and returns a ready `rustls` config.
+    ///
+    /// It also calls [`ensure_default_provider`](crate::ensure_default_provider);
+    /// the `ring` provider is installed if no provider exists yet.
     ///
     /// ## Security
     ///
-    /// The server always presents `cert` + `key`.
-    /// If `client_ca` is set, client authentication is **mandatory**:
-    /// the server demands a client certificate chaining to that CA and rejects unauthenticated clients at the handshake (`WebPkiClientVerifier` defaults to deny-anonymous).
+    /// The server always presents `cert` and `key`.
+    /// If `client_ca` is set, client authentication is mandatory.
+    /// Clients without a valid certificate are rejected during the TLS handshake.
     ///
-    /// Server *hostname* is not this method's concern: it is the client that verifies the server's identity.
+    /// ## Example
     ///
-    /// ## Errors
+    /// ```rust,no_run
+    /// use solti_tls::ServerTlsConfig;
     ///
-    /// - [`TlsError::Io`]: reading a [`PemSource::Path`] from disk failed, or a PEM block is structurally malformed.
-    /// - [`TlsError::NoCertificates`]: the `cert` (or `client_ca`) PEM held no `CERTIFICATE` blocks.
-    /// - [`TlsError::NoPrivateKey`]: the `key` PEM held no private key.
-    /// - [`TlsError::ClientVerifier`]: building the mTLS client verifier failed (e.g. no usable trust anchors in `client_ca`).
-    /// - [`TlsError::Rustls`]: `rustls` rejected the config - most commonly a cert/key mismatch, or a CA cert that `RootCertStore::add` refused.
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let rustls_config = ServerTlsConfig::builder()
+    ///     .cert_pem_file("/etc/solti/tls/server.crt")
+    ///     .key_pem_file("/etc/solti/tls/server.key")
+    ///     .with_alpn(["h2"])
+    ///     .build()?
+    ///     .into_rustls_config()?;
+    ///
+    /// # let _ = rustls_config;
+    /// # Ok(()) }
+    /// ```
     pub fn into_rustls_config(self) -> Result<rustls::ServerConfig, TlsError> {
         crate::ensure_default_provider();
 
@@ -106,12 +138,40 @@ pub struct ServerTlsConfigBuilder {
 
 impl ServerTlsConfigBuilder {
     /// Set the server cert chain from any [`PemSource`].
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_tls::{PemSource, ServerTlsConfig};
+    ///
+    /// let cfg = ServerTlsConfig::builder()
+    ///     .cert(PemSource::Bytes(b"cert".to_vec()))
+    ///     .key(PemSource::Bytes(b"key".to_vec()))
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// assert!(matches!(cfg.cert, PemSource::Bytes(_)));
+    /// ```
     pub fn cert(mut self, src: PemSource) -> Self {
         self.cert = Some(src);
         self
     }
 
     /// Set the server private key from any [`PemSource`].
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_tls::{PemSource, ServerTlsConfig};
+    ///
+    /// let cfg = ServerTlsConfig::builder()
+    ///     .cert(PemSource::Bytes(b"cert".to_vec()))
+    ///     .key(PemSource::Bytes(b"key".to_vec()))
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// assert!(matches!(cfg.key, PemSource::Bytes(_)));
+    /// ```
     pub fn key(mut self, src: PemSource) -> Self {
         self.key = Some(src);
         self
@@ -119,8 +179,22 @@ impl ServerTlsConfigBuilder {
 
     /// Set the ALPN protocol list, in preference order.
     ///
-    /// Pass `["h2"]` for gRPC-only, `["h2", "http/1.1"]` for axum HTTP.
-    /// Default is empty (no ALPN negotiation).
+    /// Pass `["h2"]` for gRPC-only, or `["h2", "http/1.1"]` for HTTP/2 and HTTP/1.1. The default is empty.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_tls::ServerTlsConfig;
+    ///
+    /// let cfg = ServerTlsConfig::builder()
+    ///     .cert_pem_bytes(b"cert".to_vec())
+    ///     .key_pem_bytes(b"key".to_vec())
+    ///     .with_alpn(["h2", "http/1.1"])
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// assert_eq!(cfg.alpn, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    /// ```
     pub fn with_alpn<I, S>(mut self, protocols: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -160,7 +234,24 @@ impl ServerTlsConfigBuilder {
         self.require_client_ca(PemSource::Bytes(bytes.into()))
     }
 
-    /// Require client certificates signed by this CA bundle (turns on mTLS).
+    /// Require client certificates signed by this CA bundle.
+    ///
+    /// This turns on mTLS for the server.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_tls::{PemSource, ServerTlsConfig};
+    ///
+    /// let cfg = ServerTlsConfig::builder()
+    ///     .cert_pem_bytes(b"cert".to_vec())
+    ///     .key_pem_bytes(b"key".to_vec())
+    ///     .require_client_ca(PemSource::Bytes(b"ca".to_vec()))
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// assert!(cfg.client_ca.is_some());
+    /// ```
     pub fn require_client_ca(mut self, src: PemSource) -> Self {
         self.client_ca = Some(src);
         self
@@ -169,11 +260,9 @@ impl ServerTlsConfigBuilder {
     /// Finalize the configuration.
     ///
     /// Validates that `cert` and `key` are present.
-    /// Does no I/O - the PEM sources are read later by [`ServerTlsConfig::into_rustls_config`].
     ///
-    /// ## Errors
-    ///
-    /// - [`TlsError::MissingField`]: `cert` or `key` was never set (carries `"cert"` / `"key"`).
+    /// This does no I/O.
+    /// PEM files are read later by [`ServerTlsConfig::into_rustls_config`].
     ///
     /// ## Example
     ///
@@ -186,7 +275,7 @@ impl ServerTlsConfigBuilder {
     ///     .with_alpn(["h2"])
     ///     .build()
     ///     .unwrap();
-    /// assert!(cfg.client_ca.is_none()); // standard TLS until require_client_ca
+    /// assert!(cfg.client_ca.is_none()); // standard TLS, not mTLS
     /// ```
     pub fn build(self) -> Result<ServerTlsConfig, TlsError> {
         let cert = self.cert.ok_or(TlsError::MissingField("cert"))?;

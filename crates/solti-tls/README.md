@@ -1,213 +1,105 @@
 # solti-tls
 
-Shared TLS / mTLS configuration for Solti network-facing crates. 
-Builders that hold *intent* (paths or in-memory PEM bytes) and produce `rustls::ServerConfig` / `rustls::ClientConfig` on demand. 
+> Shared TLS and mTLS config for Solti network crates.
 
-## Architecture
+`solti-tls` helps Solti crates use the same TLS shape everywhere. 
+You can pass PEM files from disk or PEM bytes from memory. 
+The crate builds a `rustls::ServerConfig` or `rustls::ClientConfig` only when you need it.
 
-```text
- ┌──────────────────────┐         ┌──────────────────────┐
- │   PemSource::Path    │         │   PemSource::Bytes   │
- │ (read at into_*())   │         │ (already in memory)  │
- └─────────┬────────────┘         └──────────┬───────────┘
-           │                                 │
-           ▼                                 ▼
-       ┌───────────────────────────────────────┐
-       │     ServerTlsConfig / ClientTlsConfig │
-       │     (Builder → built struct)          │
-       └───────────────────┬───────────────────┘
-                           │ into_rustls_config()
-                           ▼
-       ┌───────────────────────────────────────┐
-       │  rustls::ServerConfig / ClientConfig  │
-       │    (ALPN applied, mTLS verifier set)  │
-       └───────────────────────────────────────┘
-```
+It is used by crates such as `solti-api` and `solti-discover`, but it has no dependency on them.
 
-## Why this crate
+## The setup you stop repeating
 
-- **Single source of truth**: one TLS config shape for every solti network-facing crate (`solti-api`, `solti-discover`, ...).
-- **Lazy I/O**: paths are read only at `into_rustls_config()`. A config can be cloned around freely before any cert is touched.
-- **Both paths and bytes**: cert may live on disk or arrive in memory. 
-- **Auto-installs `ring`**: calls `rustls::crypto::ring::default_provider().install_default()` if no `CryptoProvider` is set process-wide.
-- **mTLS first-class**: server and client builders both have a single `require_client_ca…` / `client_cert…` knob.
-
-## Quick start
-
-### TLS-terminated server
-
-```rust,no_run
-use solti_tls::ServerTlsConfig;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let server_cfg = ServerTlsConfig::builder()
-        .cert_pem_file("/etc/solti/tls/server.crt")
-        .key_pem_file("/etc/solti/tls/server.key")
-        .with_alpn(["h2"])                  // gRPC; ["h2", "http/1.1"] for HTTP
-        .build()?
-        .into_rustls_config()?;             // -> rustls::ServerConfig
-
-    // Plug into axum-server:
-    // axum_server::bind_rustls(addr, RustlsConfig::from_config(Arc::new(server_cfg)))
-    //     .serve(router.into_make_service()).await?;
-    Ok(())
-}
-```
-
-### TLS-validating client
-
-```rust,no_run
-use solti_tls::ClientTlsConfig;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client_cfg = ClientTlsConfig::builder()
-        .ca_pem_file("/etc/solti/tls/control-plane-ca.crt")
-        .with_alpn(["h2"])
-        .build()?
-        .into_rustls_config()?;             // -> rustls::ClientConfig
-
-    // Plug into reqwest:
-    // let http = reqwest::Client::builder().use_preconfigured_tls(client_cfg).build()?;
-    Ok(())
-}
-```
-
-## mTLS
-
-Server requires a client certificate signed by `clients-ca.crt`:
-
-```rust,no_run
-use solti_tls::ServerTlsConfig;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let server_cfg = ServerTlsConfig::builder()
-        .cert_pem_file("/etc/solti/tls/server.crt")
-        .key_pem_file("/etc/solti/tls/server.key")
-        .require_client_ca_pem_file("/etc/solti/tls/clients-ca.crt")
-        .build()?
-        .into_rustls_config()?;
-    Ok(())
-}
-```
-
-Client presents its own certificate:
-
-```rust,no_run
-use solti_tls::ClientTlsConfig;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client_cfg = ClientTlsConfig::builder()
-        .ca_pem_file("/etc/solti/tls/control-plane-ca.crt")
-        .client_cert_pem_file("/etc/solti/tls/agent.crt")
-        .client_key_pem_file("/etc/solti/tls/agent.key")
-        .build()?
-        .into_rustls_config()?;
-    Ok(())
-}
-```
-
-`client_cert` and `client_key` must be set together (or neither). Setting only
-one returns `TlsError::MissingField("client_key")` / `MissingField("client_cert")`.
-
-## Key types
-
-| Type                      | Role                                                                |
-|---------------------------|---------------------------------------------------------------------|
-| `ServerTlsConfig`         | Server-side intent (cert, key, optional client-CA, ALPN)            |
-| `ServerTlsConfigBuilder`  | Validated builder; missing required fields fail at `build()`        |
-| `ClientTlsConfig`         | Client-side intent (CA, optional client cert+key, ALPN)             |
-| `ClientTlsConfigBuilder`  | Validated builder; client cert/key must be paired                   |
-| `PemSource`               | `Path(PathBuf)` or `Bytes(Vec<u8>)` — lazy read via `read()`        |
-| `TlsError`                | `#[non_exhaustive]` error enum (see *Error model*)                  |
-| `ensure_default_provider` | Idempotently installs `ring` as the rustls `CryptoProvider`         |
-| `load_certs_from_pem`     | Pure parser: PEM bytes → `Vec<CertificateDer<'static>>`             |
-| `load_key_from_pem`       | Pure parser: PEM bytes → `PrivateKeyDer<'static>`                   |
-
-## PemSource: paths vs bytes
-
-```rust,no_run
-use solti_tls::PemSource;
-
-// File on disk: read at into_rustls_config() time
-let from_disk = PemSource::Path("/etc/solti/tls/server.crt".into());
-
-// In-memory blob (e.g. from Vault, AWS Secrets Manager, env var)
-let from_memory = PemSource::Bytes(b"-----BEGIN CERTIFICATE-----\n...".to_vec());
-```
-
-The builder convenience methods cover both forms:
-
-| Path form                       | Bytes form                       |
-|---------------------------------|----------------------------------|
-| `cert_pem_file(path)`           | `cert_pem_bytes(bytes)`          |
-| `key_pem_file(path)`            | `key_pem_bytes(bytes)`           |
-| `ca_pem_file(path)`             | `ca_pem_bytes(bytes)`            |
-| `require_client_ca_pem_file(p)` | `require_client_ca_pem_bytes(b)` |
-| `client_cert_pem_file(path)`    | `client_cert_pem_bytes(bytes)`   |
-| `client_key_pem_file(path)`     | `client_key_pem_bytes(bytes)`    |
-
-## ALPN
-
-ALPN protocols are stored in preference order and copied verbatim into `rustls::*Config::alpn_protocols`. The default is empty (no ALPN).
-
-| Use case   | `with_alpn(...)`         |
-|------------|--------------------------|
-| gRPC only  | `["h2"]`                 |
-| HTTP/2 + 1 | `["h2", "http/1.1"]`     |
-| HTTP/1.1   | `["http/1.1"]`           |
-
-## Integration patterns
-
-### `solti-api` server (gRPC + tonic)
+TLS setup often becomes the same code in every binary:
 
 ```rust,ignore
-use solti_api::{GrpcApi, to_tonic_server_tls};
+let cert = std::fs::read("/etc/solti/tls/server.crt")?;
+let key = std::fs::read("/etc/solti/tls/server.key")?;
+// parse PEM, install provider, set ALPN, build rustls config...
+```
+
+With `solti-tls`, the binary only describes what it wants:
+
+```rust,no_run
 use solti_tls::ServerTlsConfig;
 
 let server_tls = ServerTlsConfig::builder()
     .cert_pem_file("/etc/solti/tls/server.crt")
     .key_pem_file("/etc/solti/tls/server.key")
+    .with_alpn(["h2"])
     .build()?;
 
-let tls_cfg = to_tonic_server_tls(&server_tls)?;
-tonic::transport::Server::builder()
-    .tls_config(tls_cfg)?
-    .add_service(GrpcApi::new(adapter).server())
-    .serve("0.0.0.0:50443".parse()?)
-    .await?;
+let rustls_config = server_tls.into_rustls_config()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Requires `solti-api` features `grpc + tls`.
+No PEM is read during `build()`. 
+File I/O and parsing happen in `into_rustls_config()`.
 
-### `solti-api` server (HTTP + axum-server)
+## Quick Start
 
-axum does not terminate TLS itself; bind through `axum-server`:
+### TLS Server
 
-```rust,ignore
-use axum_server::tls_rustls::RustlsConfig;
-use solti_api::HttpApi;
+Use this for an API server that presents a certificate to clients:
+
+```rust,no_run
 use solti_tls::ServerTlsConfig;
 
-let rustls_cfg = ServerTlsConfig::builder()
-    .cert_pem_file("/etc/solti/tls/server.crt")
-    .key_pem_file("/etc/solti/tls/server.key")
-    .with_alpn(["h2", "http/1.1"])
-    .build()?
-    .into_rustls_config()?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let rustls_config = ServerTlsConfig::builder()
+        .cert_pem_file("/etc/solti/tls/server.crt")
+        .key_pem_file("/etc/solti/tls/server.key")
+        .with_alpn(["h2"]) // gRPC. Use ["h2", "http/1.1"] for HTTP too.
+        .build()?
+        .into_rustls_config()?;
 
-let router = HttpApi::new(handler).router();
-axum_server::bind_rustls(addr, RustlsConfig::from_config(Arc::new(rustls_cfg)))
-    .serve(router.into_make_service()).await?;
+    // Pass `rustls_config` to tonic, axum-server, or tokio-rustls.
+    let _ = rustls_config;
+    Ok(())
+}
 ```
 
-`solti-tls` does **not** depend on `axum-server`; add it in your binary.
+### TLS Client
 
-### `solti-discover` client (gRPC + HTTP)
+Use this for a client that verifies the server certificate with your CA bundle:
 
-`with_tls` accepts a `solti_tls::ClientTlsConfig` directly:
+```rust,no_run
+use solti_tls::ClientTlsConfig;
 
-```rust,ignore
-use solti_discover::DiscoverConfig;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let rustls_config = ClientTlsConfig::builder()
+        .ca_pem_file("/etc/solti/tls/control-plane-ca.crt")
+        .with_alpn(["h2"])
+        .build()?
+        .into_rustls_config()?;
+
+    // Pass `rustls_config` to reqwest, tonic, or tokio-rustls.
+    let _ = rustls_config;
+    Ok(())
+}
+```
+
+## Add mTLS
+
+mTLS means both sides have certificates.
+
+On the server, require client certificates signed by a client CA:
+
+```rust,no_run
+use solti_tls::ServerTlsConfig;
+
+let server_tls = ServerTlsConfig::builder()
+    .cert_pem_file("/etc/solti/tls/server.crt")
+    .key_pem_file("/etc/solti/tls/server.key")
+    .require_client_ca_pem_file("/etc/solti/tls/clients-ca.crt")
+    .build()?;
+# let _ = server_tls;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+On the client, send a client certificate and key:
+
+```rust,no_run
 use solti_tls::ClientTlsConfig;
 
 let client_tls = ClientTlsConfig::builder()
@@ -215,59 +107,133 @@ let client_tls = ClientTlsConfig::builder()
     .client_cert_pem_file("/etc/solti/tls/agent.crt")
     .client_key_pem_file("/etc/solti/tls/agent.key")
     .build()?;
-
-let cfg = DiscoverConfig::builder(/* ... */)
-    .with_tls(client_tls)
-    .build()?;
+# let _ = client_tls;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Internally, `solti-discover`:
-- For HTTP (reqwest) uses `use_preconfigured_tls(rustls_config)`: passes the built `rustls::ClientConfig` straight in.
-- For gRPC (tonic) converts to `tonic::transport::ClientTlsConfig`: tonic builds its own internal rustls config from PEM blobs.
+`client_cert` and `client_key` must be set together. If only one is set, `build()` returns `TlsError::MissingField`.
 
-Requires `solti-discover` features `tls + (http or grpc)`.
+## Why solti-tls?
 
-## Cryptography
+- **One shape**: server and client TLS config look the same across Solti crates.
+- **Lazy I/O**: paths are read only when `into_rustls_config()` runs.
+- **Paths or bytes**: load certs from disk, Vault, env vars, or any secret store.
+- **mTLS is first-class**: one builder call enables client certificate checks.
+- **rustls defaults**: config is built on `rustls` safe defaults.
+- **Provider install**: `ring` is installed as the process-wide rustls provider if none is set.
 
-- **Provider**: `ring` (selected via the `rustls` feature `ring`). 
-- **Roots**: no `rustls-native-certs` integration. Trust roots come exclusively from PEM bundles you provide. 
-  This is intentional: for service-to-service TLS in a controlled environment, the trust set is tightly defined.
-- **Auto-install**: `into_rustls_config()` calls `ensure_default_provider()` which installs `ring` if no provider is set process-wide. 
+## When to Use It
 
-## Security model
+Use this crate when your binary needs TLS config for:
+- a Solti API server;
+- an agent that connects to a control plane;
+- a test or demo that wants in-memory PEM bytes;
+- any service that wants one small TLS config type instead of custom setup code.
 
-**Verified:** the server certificate chains to the CA you supply (`ClientTlsConfig`); under mTLS the client certificate chains to `require_client_ca(..)` and client auth is **mandatory** (`ServerTlsConfig`).
+This crate does not open sockets. It only builds `rustls` configs.
 
-**Not verified here (caller's responsibility):**
-- *Hostname / SAN* - matched by `rustls` at connect time against the `ServerName` you pass to `TlsConnector::connect(..)` / tonic / reqwest. 
-  Pass the real server name; a wrong one silently weakens identity checking. 
-  Do not install a `dangerous()` verifier.
-- *Revocation* - no OCSP / CRL; rely on short cert lifetimes.
-- *TLS versions / suites* - `rustls` safe defaults (TLS 1.2 + 1.3); no min-version policy. 
-  Provider is `ring` (not configurable here).
+## How It Works
 
-**Secrets:** `PemSource::Bytes` may hold a private key. Its `Debug` output is redacted:
-logging a config does not leak the key. Key bytes are not zeroized on drop.
+```text
+PemSource::Path                 PemSource::Bytes
+       \                        /
+        \                      /
+         v                    v
+    ServerTlsConfig / ClientTlsConfig
+         |
+         | into_rustls_config()
+         v
+    rustls::ServerConfig / rustls::ClientConfig
+```
 
-## Error model
+`build()` validates required fields. `into_rustls_config()` reads PEM, parses certs and keys, applies ALPN, and builds the final `rustls` config.
 
-| Variant            | Cause                                                                     |
-|--------------------|---------------------------------------------------------------------------|
-| `Io`               | `PemSource::Path::read()` failed (`std::io::Error` is the source)         |
-| `NoCertificates`   | PEM input parsed cleanly but contained no `CERTIFICATE` blocks            |
-| `NoPrivateKey`     | PEM input parsed cleanly but contained no `PRIVATE KEY` block             |
-| `MissingField`     | Builder rejected on `build()` (e.g. `cert`, `key`, paired `client_cert`)  |
-| `Rustls`           | `rustls` rejected the configuration (cert/key mismatch, etc.)             |
-| `ClientVerifier`   | `WebPkiClientVerifier::builder(...).build()` rejected the trust roots     |
+## Main Types
 
-All variants implement `std::error::Error`. The enum is `#[non_exhaustive]`.
+| Area      | Types                                       |
+|-----------|---------------------------------------------|
+| Server    | `ServerTlsConfig`, `ServerTlsConfigBuilder` |
+| Client    | `ClientTlsConfig`, `ClientTlsConfigBuilder` |
+| PEM input | `PemSource`                                 |
+| Parsing   | `load_certs_from_pem`, `load_key_from_pem`  |
+| Provider  | `ensure_default_provider`                   |
+| Errors    | `TlsError`                                  |
 
-## Feature flags
+## PEM Sources
 
-This crate has no public feature flags: `default = []`, all functionality is always built. 
-Consumers of `solti-tls` (e.g. `solti-api`, `solti-discover`) gate their integration behind their own `tls` feature.
+A PEM source can be a file path or bytes:
 
-## Notes
+```rust
+use solti_tls::PemSource;
 
-- `into_rustls_config()` consumes `self`. Clone the config first if you need to keep the builder-side struct around (e.g. for diagnostics).
-- `solti-tls` __does not configure session resumption, ticket keys, or OCSP stapling__: defaults from `rustls` apply.
+let from_disk = PemSource::Path("/etc/solti/tls/server.crt".into());
+let from_memory = PemSource::Bytes(b"-----BEGIN CERTIFICATE-----\n...".to_vec());
+
+assert!(format!("{from_memory:?}").contains("redacted"));
+# let _ = from_disk;
+```
+
+Builder methods exist for both forms:
+
+| File method                        | Bytes method                         |
+|------------------------------------|--------------------------------------|
+| `cert_pem_file(path)`              | `cert_pem_bytes(bytes)`              |
+| `key_pem_file(path)`               | `key_pem_bytes(bytes)`               |
+| `ca_pem_file(path)`                | `ca_pem_bytes(bytes)`                |
+| `require_client_ca_pem_file(path)` | `require_client_ca_pem_bytes(bytes)` |
+| `client_cert_pem_file(path)`       | `client_cert_pem_bytes(bytes)`       |
+| `client_key_pem_file(path)`        | `client_key_pem_bytes(bytes)`        |
+
+`PemSource::Bytes` may hold private keys. Its `Debug` output is redacted, but the bytes are not zeroized on drop.
+
+## ALPN
+
+ALPN protocols are copied into `rustls` in the order you pass them:
+
+| Use case            | Value                |
+|---------------------|----------------------|
+| gRPC only           | `["h2"]`             |
+| HTTP/2 and HTTP/1.1 | `["h2", "http/1.1"]` |
+| HTTP/1.1 only       | `["http/1.1"]`       |
+
+The default is empty: no ALPN is requested.
+
+## Security Model
+
+What this crate verifies:
+- A client config verifies that the server certificate chains to the CA bundle you pass.
+- A server config with `require_client_ca_*` requires a client certificate signed by that CA.
+- Trust roots come only from your PEM. The OS trust store is not used.
+
+What the caller must still do:
+- Pass the real server name when connecting. Hostname and SAN checks happen at connect time, not when this config is built.
+- Do not replace the verifier with a `dangerous()` one unless you are writing a controlled test.
+- Handle certificate rotation and revocation policy. This crate does not check OCSP or CRLs.
+- Choose short certificate lifetimes if you need a simple revocation story.
+
+TLS protocol versions and cipher suites come from `rustls` safe defaults. The provider is `ring`.
+
+## Error Handling
+
+`TlsError` covers all fallible work in this crate:
+
+| Variant          | Meaning                                                               |
+|------------------|-----------------------------------------------------------------------|
+| `Io`             | Could not read a PEM file, or PEM parsing returned an I/O-style error |
+| `NoCertificates` | A cert or CA PEM had no `CERTIFICATE` blocks                          |
+| `NoPrivateKey`   | A key PEM had no private key block                                    |
+| `MissingField`   | A required builder field was missing                                  |
+| `Rustls`         | `rustls` rejected the final config                                    |
+| `ClientVerifier` | The mTLS client verifier could not be built                           |
+
+The enum is `#[non_exhaustive]`, so match it with a wildcard arm.
+
+## Integration Notes
+
+For `solti-api` gRPC, use `solti_api::to_tonic_server_tls` with a `ServerTlsConfig`.
+
+For `solti-api` HTTP, build a `rustls::ServerConfig` and pass it to `axum-server`.
+`solti-tls` does not depend on `axum-server`; add that in your binary.
+
+For `solti-discover`, pass `ClientTlsConfig` to `DiscoverConfigBuilder::with_tls(...)`.
+The discover crate converts it for HTTP or gRPC based on enabled features.

@@ -1,4 +1,4 @@
-//! # PEM → DER parsing helpers.
+//! # PEM to DER parsing helpers.
 
 use std::io::BufRead;
 
@@ -6,12 +6,10 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::TlsError;
 
-/// Parse **all** `CERTIFICATE` blocks out of a PEM byte stream, in file order (leaf-first by convention for a chain).
+/// Parse all `CERTIFICATE` blocks from a PEM byte stream.
 ///
-/// ## Errors
-///
-/// - [`TlsError::Io`]: the reader failed, or a PEM block is structurally malformed (`rustls-pemfile` reports both as [`std::io::Error`]).
-/// - [`TlsError::NoCertificates`]: the input parsed cleanly but held no `CERTIFICATE` blocks.
+/// Certificates are returned in file order.
+/// For a certificate chain, put the leaf certificate first.
 ///
 /// ## Also
 ///
@@ -39,19 +37,24 @@ pub fn load_certs_from_pem<R: BufRead>(
     Ok(certs)
 }
 
-/// Parse the **first** private key (`PKCS#8`, `PKCS#1`, or `SEC1`) out of a PEM byte stream.
+/// Parse the first private key from a PEM byte stream.
 ///
-/// If the stream contains more than one key, only the first is returned and the rest are **silently ignored**.
+/// Supported key forms are `PKCS#8`, `PKCS#1`, and `SEC1`.
+/// If the stream contains more than one key, only the first one is returned.
 /// Pass a PEM that holds exactly the intended key.
-///
-/// ## Errors
-///
-/// - [`TlsError::Io`]: the reader failed, or a PEM block is structurally malformed.
-/// - [`TlsError::NoPrivateKey`]: no private-key block was found in the input.
 ///
 /// ## Also
 ///
-/// - [`load_certs_from_pem`] — the certificate counterpart (which, unlike this function, returns *all* blocks).
+/// - [`load_certs_from_pem`] - the certificate counterpart (which, unlike this function, returns *all* blocks).
+///
+/// ## Example
+///
+/// ```
+/// use solti_tls::{load_key_from_pem, TlsError};
+///
+/// let err = load_key_from_pem(&b"not a key"[..]).unwrap_err();
+/// assert!(matches!(err, TlsError::NoPrivateKey));
+/// ```
 pub fn load_key_from_pem<R: BufRead>(reader: R) -> Result<PrivateKeyDer<'static>, TlsError> {
     let mut reader = reader;
     let key = rustls_pemfile::private_key(&mut reader)?;

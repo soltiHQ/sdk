@@ -1,9 +1,5 @@
-//! # TLS configuration error type.
+//! # TLS error type.
 
-/// Error type for every fallible operation in this crate.
-///
-/// One `#[non_exhaustive]` enum covers builder validation, PEM I/O, PEM parsing, and `rustls` config assembly.
-/// Match the variants you care about and keep a wildcard arm for future ones.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TlsError {

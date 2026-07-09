@@ -1,10 +1,28 @@
-//! # PEM source: file path or in-memory buffer.
+//! # PEM source.
 
 use std::path::PathBuf;
 
 use crate::TlsError;
 
 /// Where a PEM blob lives.
+///
+/// Use [`Path`](Self::Path) when the PEM is on disk.
+/// Use [`Bytes`](Self::Bytes) when another system already loaded the PEM for you, for example a secret store.
+///
+/// `Bytes` may contain private key material.
+/// Its `Debug` output is redacted.
+///
+/// ## Example
+///
+/// ```
+/// use solti_tls::PemSource;
+///
+/// let file = PemSource::Path("/etc/solti/tls/server.crt".into());
+/// let memory = PemSource::Bytes(b"-----BEGIN CERTIFICATE-----\n...".to_vec());
+///
+/// assert!(format!("{memory:?}").contains("redacted"));
+/// # let _ = file;
+/// ```
 #[derive(Clone)]
 pub enum PemSource {
     /// PEM file on disk; read at `into_rustls_config()` time.
@@ -26,11 +44,7 @@ impl PemSource {
     /// Read the PEM bytes from the source.
     ///
     /// - [`PemSource::Path`] performs file I/O.
-    /// - [`PemSource::Bytes`] returns a fresh **clone** of the buffer and never fails.
-    ///
-    /// ## Errors
-    ///
-    /// - [`TlsError::Io`]: reading a [`PemSource::Path`] from disk failed (missing file, permissions, ...).
+    /// - [`PemSource::Bytes`] returns a fresh clone of the buffer and never fails.
     ///
     /// ## Also
     ///
@@ -103,6 +117,6 @@ mod tests {
     fn read_returns_io_error_for_missing_path() {
         let src = PemSource::Path("/definitely/does/not/exist.pem".into());
         let err = src.read().unwrap_err();
-        assert!(matches!(err, crate::TlsError::Io(_)));
+        assert!(matches!(err, TlsError::Io(_)));
     }
 }
