@@ -161,7 +161,7 @@ ALPN protocols are stored in preference order and copied verbatim into `rustls::
 ### `solti-api` server (gRPC + tonic)
 
 ```rust,ignore
-use solti_api::{build_grpc_server, to_tonic_server_tls};
+use solti_api::{GrpcApi, to_tonic_server_tls};
 use solti_tls::ServerTlsConfig;
 
 let server_tls = ServerTlsConfig::builder()
@@ -172,7 +172,7 @@ let server_tls = ServerTlsConfig::builder()
 let tls_cfg = to_tonic_server_tls(&server_tls)?;
 tonic::transport::Server::builder()
     .tls_config(tls_cfg)?
-    .add_service(build_grpc_server(adapter))
+    .add_service(GrpcApi::new(adapter).server())
     .serve("0.0.0.0:50443".parse()?)
     .await?;
 ```

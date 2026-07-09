@@ -80,20 +80,34 @@ See the [taskvisor docs](https://docs.rs/taskvisor) for the full level mapping.
   Problem:  UtcOffset::current_local_offset() reads /etc/localtime
             which is unsafe in multi-threaded processes (tokio)
 
-  Solution: init_local_offset()    call in main() before Runtime::new()
-            timezone_sync()        periodic re-detection (handles DST)
+  Solution: init_local_offset()    call in main() before Runtime::new() -
+                                   this is where the offset is actually captured
+            timezone_sync()        periodic re-detection (best effort, see below)
 
-  Fallback: if init_local_offset() is not called → UTC + stderr warning
+  Fallback: if init_local_offset() is not called, the first timestamp runs a
+            one-shot detection; under a running runtime it fails → UTC + stderr warning
 ```
 
 ## Timezone sync task (feature `timezone-sync`)
+
+`timezone_sync()` returns a `(TaskRef, TaskSpec)` pair: a periodic task
+(1 hour period via `RestartPolicy::periodic`, `AdmissionPolicy::Replace` in the
+`solti-logger-tz-sync` slot) that re-runs local offset detection.
+
 ```text
-  Scenario      Delay           Strategy
-  ────────      ─────           ────────
-  Success       1 hour          periodic restart (RestartPolicy::Always)
-  Failure       5 s → 5 min     exponential backoff with equal jitter
-  Duplicate     replaces        AdmissionPolicy::Replace
+  Attempt outcome     What happens
+  ───────────────     ────────────
+  Detection succeeds  cache updated, offset change logged at DEBUG
+  Detection fails     skipped with a DEBUG log - the task still returns Ok
+  Duplicate submit    running instance is replaced (AdmissionPolicy::Replace)
 ```
+
+In practice detection succeeds only while the process is single-threaded
+(a `time` 0.3 restriction), so under a multi-threaded tokio runtime nearly
+every attempt is a skip and the effective offset stays the one captured by
+`init_local_offset()` at startup. Because the task body never returns an
+error, the configured backoff (5 s → 5 min exponential, equal jitter) is
+defensive only - no current failure path exercises it.
 
 ## Feature flags
 
@@ -110,7 +124,6 @@ See the [taskvisor docs](https://docs.rs/taskvisor) for the full level mapping.
 | `LoggerFormat`           | Output format: `Text`, `Json`, `Journald`                 |
 | `LoggerLevel`            | Validated `EnvFilter` expression wrapper                  |
 | `LoggerTimeZone`         | Timestamp timezone: `Utc`, `Local`                        |
-| `LoggerRfc3339`          | RFC 3339 formatter implementing `FormatTime`              |
 | `LoggerError`            | Error type for initialization and parsing                 |
 | `TracingBridge`          | Logs taskvisor events via tracing (feature: `subscriber`) |
 
@@ -128,5 +141,5 @@ See the [taskvisor docs](https://docs.rs/taskvisor) for the full level mapping.
 
 ## Notes
 - `init_logger` can only be called **once** per process - subsequent calls return `AlreadyInitialized`.
-- `init_local_offset` is idempotent: safe to call multiple times, only the first triggers detection.
+- `init_local_offset` is safe to call multiple times: each call re-runs detection and overwrites the cached offset.
 - `TracingBridge` lives in taskvisor; this crate only re-exports it. Level policy and fields evolve upstream.

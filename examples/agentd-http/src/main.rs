@@ -153,7 +153,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         format!("http://{ADDR}"),
         &control_plane,
         DiscoveryTransport::Http,
-        10_000,
+        10_000, // heartbeat interval (ms)
         API_VERSION,
     )
     .with_metrics(discover_metrics);

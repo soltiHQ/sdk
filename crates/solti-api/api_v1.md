@@ -45,9 +45,8 @@ Both transports are unauthenticated by default. To require a shared bearer token
 - **HTTP**: `HttpApi::new(handler).with_auth(token)` — every request must carry an
   `Authorization: Bearer <token>` header, otherwise it is rejected with
   `401 Unauthorized` before reaching any handler.
-- **gRPC**: `build_grpc_server_with_auth(handler, token)` (or
-  `build_grpc_server_with_metrics_auth`) — every call must carry
-  `authorization: Bearer <token>` metadata, otherwise it fails with
+- **gRPC**: `GrpcApi::new(handler).with_auth(token).server()` — every call must
+  carry `authorization: Bearer <token>` metadata, otherwise it fails with
   `UNAUTHENTICATED`.
 
 The `Bearer` scheme is matched case-insensitively and the token is compared in
@@ -92,8 +91,8 @@ should set **their** `MaxCallRecvMsgSize` / `max_decoding_message_size`
 to 4 MiB as well. Otherwise a large `ListTasks` / `ListTaskRuns` response
 on a busy agent will fail with `ResourceExhausted` on the client.
 
-For Rust: use [`solti_api::build_grpc_server`](#) on the server side — it
-applies both limits in one call. For Go clients: set
+For Rust: use [`solti_api::GrpcApi`](#) on the server side — `server()`
+applies both limits. For Go clients: set
 `grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(4 << 20),
 grpc.MaxCallSendMsgSize(4 << 20))` at dial time.
 

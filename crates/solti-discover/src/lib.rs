@@ -21,7 +21,7 @@
 //!     "http://127.0.0.1:8085", // this agent's endpoint
 //!     "http://127.0.0.1:9000", // control-plane endpoint
 //!     DiscoveryTransport::Http,
-//!     30_000, // sync interval (ms)
+//!     30_000, // heartbeat interval (ms)
 //!     1,      // api_version
 //! )
 //! .build()?;
@@ -33,6 +33,14 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! ## Time units
+//!
+//! Every public numeric duration in this crate is in **milliseconds** and carries an `_ms` suffix
+//! (`delay_ms`, `connect_timeout_ms`, `request_timeout_ms`).
+//! The one seconds-valued exception is `retry_after_s` on [`DiscoverError::Rejected`]:
+//! it mirrors the control-plane wire contract verbatim
+//! (field `retry_after_s` in `proto/solti/discover/v1/discovery.proto`).
 //!
 //! ## Also
 //!

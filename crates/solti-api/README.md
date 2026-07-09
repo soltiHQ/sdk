@@ -100,7 +100,7 @@ Script bodies are separately capped in the model at [`solti_model::MAX_SCRIPT_BO
 
 | Flag   | Enables                                                                           | Dependencies                            |
 |--------|-----------------------------------------------------------------------------------|-----------------------------------------|
-| `grpc` | `TaskApiService`, `TaskServiceServer`, proto codegen                              | `tonic`, `tonic-prost`, `prost`         |
+| `grpc` | `GrpcApi`, `TaskApiService`, `TaskServiceServer`, proto codegen                   | `tonic`, `tonic-prost`, `prost`         |
 | `http` | `HttpApi`, axum router, proto-JSON serde                                          | `axum`, `serde_json`, `prost`, `pbjson` |
 | `tls`  | `to_tonic_server_tls(&ServerTlsConfig)` adapter (under `grpc`); pulls `solti-tls` | `solti-tls`; activates `tonic/tls-ring` |
 
@@ -113,7 +113,7 @@ For gRPC:
 ```rust,no_run
 use std::sync::Arc;
 
-use solti_api::{SupervisorApiAdapter, build_grpc_server, to_tonic_server_tls};
+use solti_api::{GrpcApi, SupervisorApiAdapter, to_tonic_server_tls};
 use solti_tls::ServerTlsConfig;
 
 async fn serve_tls(adapter: Arc<SupervisorApiAdapter>) -> Result<(), Box<dyn std::error::Error>> {
@@ -126,7 +126,7 @@ async fn serve_tls(adapter: Arc<SupervisorApiAdapter>) -> Result<(), Box<dyn std
     let tls_cfg = to_tonic_server_tls(&server_tls)?;
     tonic::transport::Server::builder()
         .tls_config(tls_cfg)?
-        .add_service(build_grpc_server(adapter))
+        .add_service(GrpcApi::new(adapter).server())
         .serve("0.0.0.0:50443".parse()?)
         .await?;
     Ok(())
@@ -164,11 +164,13 @@ gRPC:
 ```rust,no_run
 use std::sync::Arc;
 
-use solti_api::{SupervisorApiAdapter, build_grpc_server_with_auth};
+use solti_api::{GrpcApi, SupervisorApiAdapter};
 use solti_model::Token;
 
 async fn serve_grpc(adapter: Arc<SupervisorApiAdapter>) -> Result<(), Box<dyn std::error::Error>> {
-    let svc = build_grpc_server_with_auth(adapter, Token::from_env("SOLTI_AGENT_TOKEN")?);
+    let svc = GrpcApi::new(adapter)
+        .with_auth(Token::from_env("SOLTI_AGENT_TOKEN")?)
+        .server();
     tonic::transport::Server::builder()
         .add_service(svc)
         .serve("0.0.0.0:50051".parse()?)
@@ -177,7 +179,7 @@ async fn serve_grpc(adapter: Arc<SupervisorApiAdapter>) -> Result<(), Box<dyn st
 }
 ```
 
-When no token is configured (plain `HttpApi::new(...).router()` / `build_grpc_server(...)`), no auth is enforced.
+When no token is configured (plain `HttpApi::new(...).router()` / `GrpcApi::new(...).server()`), no auth is enforced.
 
 ## Build
 

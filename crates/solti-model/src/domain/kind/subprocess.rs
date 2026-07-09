@@ -12,6 +12,48 @@ use crate::error::{ModelError, ModelResult};
 /// Maximum script body size (after base64 decode) accepted by the model.
 pub const MAX_SCRIPT_BODY_BYTES: usize = 2 * 1024 * 1024;
 
+/// Upper bound on the encoded length of a standard (padded) base64 string
+/// that decodes to at most `max_bytes` bytes: 4 output characters per full
+/// or partial 3-byte input group.
+const fn max_encoded_len(max_bytes: usize) -> usize {
+    max_bytes.div_ceil(3).saturating_mul(4)
+}
+
+/// Decode a base64 script body, enforcing `max_bytes` on the decoded size.
+///
+/// Bodies whose encoded length already exceeds [`max_encoded_len`] are
+/// rejected up front, before any decode buffer is allocated, so oversized
+/// input cannot force a large allocation just to be refused.
+fn decode_script_body(body: &str, max_bytes: usize) -> ModelResult<Vec<u8>> {
+    if body.is_empty() {
+        return Err(ModelError::Invalid("script body cannot be empty".into()));
+    }
+    if body.len() > max_encoded_len(max_bytes) {
+        return Err(ModelError::Invalid(
+            format!(
+                "script body is {} bytes (base64-encoded), maximum allowed is {} bytes (decoded)",
+                body.len(),
+                max_bytes
+            )
+            .into(),
+        ));
+    }
+    let bytes = BASE64
+        .decode(body)
+        .map_err(|e| ModelError::Invalid(format!("invalid base64 body: {e}").into()))?;
+    if bytes.len() > max_bytes {
+        return Err(ModelError::Invalid(
+            format!(
+                "script body is {} bytes (decoded), maximum allowed is {} bytes",
+                bytes.len(),
+                max_bytes
+            )
+            .into(),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Execution strategy for a subprocess task.
 ///
 /// | Variant   | What it does                                                               |
@@ -62,6 +104,9 @@ impl SubprocessMode {
     /// [`decode_body`](Self::decode_body) applies the default [`MAX_SCRIPT_BODY_BYTES`];
     /// pass an explicit `max_bytes` to tighten or relax the cap where needed.
     ///
+    /// Bodies whose encoded length already exceeds the maximum possible for
+    /// `max_bytes` are rejected before any decoding takes place.
+    ///
     /// ## Errors
     ///
     /// - [`ModelError::Invalid`]: called on the `Command` variant, the body is empty,
@@ -73,22 +118,7 @@ impl SubprocessMode {
                 "decode_body called on Command mode".into(),
             )),
             SubprocessMode::Script { body, .. } => {
-                if body.is_empty() {
-                    return Err(ModelError::Invalid("script body cannot be empty".into()));
-                }
-                let bytes = BASE64
-                    .decode(body)
-                    .map_err(|e| ModelError::Invalid(format!("invalid base64 body: {e}").into()))?;
-                if bytes.len() > max_bytes {
-                    return Err(ModelError::Invalid(
-                        format!(
-                            "script body is {} bytes (decoded), maximum allowed is {} bytes",
-                            bytes.len(),
-                            max_bytes
-                        )
-                        .into(),
-                    ));
-                }
+                let bytes = decode_script_body(body, max_bytes)?;
                 String::from_utf8(bytes).map_err(|e| {
                     ModelError::Invalid(format!("script body is not valid UTF-8: {e}").into())
                 })
@@ -118,22 +148,7 @@ impl SubprocessMode {
                 }
             }
             SubprocessMode::Script { runtime, body, .. } => {
-                if body.is_empty() {
-                    return Err(ModelError::Invalid("script body cannot be empty".into()));
-                }
-                let bytes = BASE64
-                    .decode(body)
-                    .map_err(|e| ModelError::Invalid(format!("invalid base64 body: {e}").into()))?;
-                if bytes.len() > MAX_SCRIPT_BODY_BYTES {
-                    return Err(ModelError::Invalid(
-                        format!(
-                            "script body is {} bytes (decoded), maximum allowed is {} bytes",
-                            bytes.len(),
-                            MAX_SCRIPT_BODY_BYTES
-                        )
-                        .into(),
-                    ));
-                }
+                let bytes = decode_script_body(body, MAX_SCRIPT_BODY_BYTES)?;
                 std::str::from_utf8(&bytes).map_err(|e| {
                     ModelError::Invalid(format!("script body is not valid UTF-8: {e}").into())
                 })?;
@@ -374,6 +389,88 @@ mod tests {
             msg.contains(&MAX_SCRIPT_BODY_BYTES.to_string()),
             "error should mention the limit, got: {msg}"
         );
+    }
+
+    #[test]
+    fn encoded_body_at_threshold_reaches_decoded_size_check() {
+        // Exactly the maximum possible encoded length for the cap: the length
+        // pre-check passes, and the decoded size (MAX + 1 here, since "A" * 4
+        // decodes to 3 bytes) is what gets rejected.
+        let threshold = MAX_SCRIPT_BODY_BYTES.div_ceil(3) * 4;
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Bash,
+            body: "A".repeat(threshold),
+            args: vec![],
+        };
+        let err = mode
+            .validate()
+            .expect_err("decoded body over the limit must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("(decoded)"),
+            "body at the encoded threshold must be rejected by the decoded-size check, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn encoded_body_one_char_over_threshold_fails_before_decode() {
+        // One character past the maximum possible encoded length. The length is
+        // not even valid for base64, so getting the limit error instead of a
+        // base64 error proves the pre-check runs before any decoding.
+        let threshold = MAX_SCRIPT_BODY_BYTES.div_ceil(3) * 4;
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Bash,
+            body: "A".repeat(threshold + 1),
+            args: vec![],
+        };
+        let err = mode
+            .validate()
+            .expect_err("body over the encoded threshold must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&MAX_SCRIPT_BODY_BYTES.to_string()),
+            "error should mention the limit, got: {msg}"
+        );
+        assert!(
+            !msg.contains("invalid base64"),
+            "the size pre-check must fire before base64 decoding, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn huge_encoded_body_is_rejected_without_decoding() {
+        // 100 MiB of 'A' is valid base64, but the encoded length alone puts it
+        // over the cap, so both entry points must refuse it before allocating
+        // a ~75 MiB decode buffer.
+        let body = "A".repeat(100 * 1024 * 1024);
+        let mode = SubprocessMode::Script {
+            runtime: Runtime::Bash,
+            body,
+            args: vec![],
+        };
+        let err = mode
+            .validate()
+            .expect_err("huge encoded body must be rejected");
+        assert!(err.to_string().contains(&MAX_SCRIPT_BODY_BYTES.to_string()));
+        let err = mode
+            .decode_body()
+            .expect_err("huge encoded body must be rejected");
+        assert!(err.to_string().contains(&MAX_SCRIPT_BODY_BYTES.to_string()));
+    }
+
+    #[test]
+    fn decode_body_with_limit_boundary() {
+        let script = |s: &str| SubprocessMode::Script {
+            runtime: Runtime::Bash,
+            body: encode(s),
+            args: vec![],
+        };
+        // Exactly at the limit: Ok.
+        assert_eq!(script("12345").decode_body_with_limit(5).unwrap(), "12345");
+        // One byte over: Err.
+        script("123456")
+            .decode_body_with_limit(5)
+            .expect_err("body one byte over the limit must be rejected");
     }
 
     #[test]

@@ -38,8 +38,8 @@ use tonic::transport::Server;
 use tracing::info;
 
 use solti_api::{
-    API_VERSION, HttpApi, SupervisorApiAdapter, build_grpc_server_with_metrics,
-    build_grpc_server_with_metrics_auth, http_metrics_middleware, to_tonic_server_tls,
+    API_VERSION, GrpcApi, HttpApi, SupervisorApiAdapter, http_metrics_middleware,
+    to_tonic_server_tls,
 };
 use solti_core::{StateConfig, SupervisorApi};
 use solti_discover::{DiscoverConfig, DiscoveryTransport};
@@ -142,7 +142,7 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             None,
             Flag::enabled(),
         ));
-        let spec = TaskSpec::builder(cfg.task.name.as_str(), kind, 86_400_000u64)
+        let spec = TaskSpec::builder(cfg.task.name.as_str(), kind, 86_400_000u64) // per-attempt timeout (ms): 24h
             .restart(RestartPolicy::always())
             .admission(AdmissionPolicy::Replace)
             .build()?;
@@ -250,21 +250,14 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             );
             let addr = listen.parse()?;
 
-            // The auth interceptor changes the concrete service type; branch the serve.
-            match token {
-                Some(t) => {
-                    builder
-                        .add_service(build_grpc_server_with_metrics_auth(handler, api_metrics, t))
-                        .serve_with_shutdown(addr, shutdown_signal())
-                        .await?;
-                }
-                None => {
-                    builder
-                        .add_service(build_grpc_server_with_metrics(handler, api_metrics))
-                        .serve_with_shutdown(addr, shutdown_signal())
-                        .await?;
-                }
+            let mut api = GrpcApi::new(handler).with_metrics(api_metrics);
+            if let Some(t) = token {
+                api = api.with_auth(t);
             }
+            builder
+                .add_service(api.server())
+                .serve_with_shutdown(addr, shutdown_signal())
+                .await?;
         }
     }
 

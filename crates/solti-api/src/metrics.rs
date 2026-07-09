@@ -7,7 +7,7 @@
 //! - HTTP: apply [`http_metrics_middleware`] via [`axum::middleware::from_fn_with_state`]
 //!   on the router returned by [`HttpApi::router`](crate::HttpApi::router).
 //! - gRPC: construct the service with [`TaskApiService::new_with_metrics`](crate::TaskApiService::new_with_metrics)
-//!   or call [`build_grpc_server_with_metrics`](crate::build_grpc_server_with_metrics).
+//!   or chain [`GrpcApi::with_metrics`](crate::GrpcApi::with_metrics).
 
 use std::sync::Arc;
 

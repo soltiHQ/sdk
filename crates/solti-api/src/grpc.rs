@@ -1,6 +1,7 @@
 //! # gRPC transport.
 //!
 //! [`TaskApiService`] implements the generated `TaskService` trait from `proto/solti/task/v1/api.proto`, delegating to an [`ApiHandler`](crate::ApiHandler).
+//! [`GrpcApi`] assembles the configured server (size limits, optional metrics and bearer auth).
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -99,61 +100,123 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// Build a configured `TaskServiceServer` with no-op metrics.
+/// Complete gRPC service type produced by [`GrpcApi::server`].
+///
+/// The [`BearerAuth`] layer is always present, so the service type does not
+/// depend on whether auth is enabled; without a configured token the
+/// interceptor passes every call through.
+pub type GrpcServer<H> = InterceptedService<TaskServiceServer<TaskApiService<H>>, BearerAuth>;
+
+/// gRPC API service builder.
+///
+/// Mirrors [`HttpApi`](crate::HttpApi): construct from a handler, chain the optional
+/// [`with_auth`](Self::with_auth) / [`with_metrics`](Self::with_metrics) steps,
+/// then call [`server`](Self::server) to obtain a service ready for
+/// `tonic::transport::Server::builder().add_service(...)`.
 ///
 /// ## Example
 ///
 /// ```rust,no_run
 /// # use std::sync::Arc;
-/// # use solti_api::{build_grpc_server, SupervisorApiAdapter};
+/// # use solti_api::{GrpcApi, SupervisorApiAdapter};
 /// # async fn example(adapter: Arc<SupervisorApiAdapter>) -> Result<(), Box<dyn std::error::Error>> {
-/// let svc = build_grpc_server(adapter);
+/// let svc = GrpcApi::new(adapter).server();
 /// tonic::transport::Server::builder()
 ///     .add_service(svc)
 ///     .serve("0.0.0.0:50052".parse()?)
 ///     .await?;
 /// # Ok(()) }
 /// ```
-pub fn build_grpc_server<H>(handler: Arc<H>) -> TaskServiceServer<TaskApiService<H>>
-where
-    H: ApiHandler,
-{
-    build_grpc_server_with_metrics(handler, noop_api_metrics())
-}
-
-/// Build a configured `TaskServiceServer` with an explicit metrics backend.
-pub fn build_grpc_server_with_metrics<H>(
+///
+/// ## Also
+///
+/// - [`ApiHandler`](crate::ApiHandler) the trait backing all RPCs.
+/// - [`ApiError`](crate::ApiError) mapped to `tonic::Status`.
+pub struct GrpcApi<H> {
     handler: Arc<H>,
     metrics: ApiMetricsHandle,
-) -> TaskServiceServer<TaskApiService<H>>
+    auth: Option<Token>,
+}
+
+impl<H> GrpcApi<H>
 where
     H: ApiHandler,
 {
-    TaskServiceServer::new(TaskApiService::new_with_metrics(handler, metrics))
-        .max_decoding_message_size(crate::MAX_REQUEST_BYTES)
-        .max_encoding_message_size(crate::MAX_REQUEST_BYTES)
+    /// Create new gRPC API with the given handler.
+    pub fn new(handler: Arc<H>) -> Self {
+        Self {
+            handler,
+            metrics: noop_api_metrics(),
+            auth: None,
+        }
+    }
+
+    /// Require a bearer token on every call.
+    ///
+    /// When set, calls without valid `authorization: Bearer <token>` metadata are rejected with `Unauthenticated` before reaching any handler.
+    /// This is the same shared secret the agent presents to the control plane in discovery.
+    /// One config value enables both directions.
+    /// Orthogonal to TLS. When unset, no auth is enforced.
+    ///
+    /// ## Panics
+    ///
+    /// Panics when `token` is empty: an empty shared secret would accept an empty
+    /// bearer credential (`authorization: Bearer `), silently disabling authentication.
+    pub fn with_auth(mut self, token: Token) -> Self {
+        assert_auth_token_not_empty(&token);
+        self.auth = Some(token);
+        self
+    }
+
+    /// Attach a metrics backend. When not set, a zero-cost no-op is used.
+    pub fn with_metrics(mut self, metrics: ApiMetricsHandle) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Build the configured gRPC service.
+    ///
+    /// Applies the [`MAX_REQUEST_BYTES`](crate::MAX_REQUEST_BYTES) encoding/decoding limits,
+    /// and wraps the server in a [`BearerAuth`] interceptor — a pass-through unless
+    /// [`with_auth`](Self::with_auth) was called.
+    pub fn server(self) -> GrpcServer<H> {
+        let inner =
+            TaskServiceServer::new(TaskApiService::new_with_metrics(self.handler, self.metrics))
+                .max_decoding_message_size(crate::MAX_REQUEST_BYTES)
+                .max_encoding_message_size(crate::MAX_REQUEST_BYTES);
+        InterceptedService::new(
+            inner,
+            BearerAuth {
+                expected: self.auth,
+            },
+        )
+    }
 }
 
 /// gRPC interceptor enforcing a bearer token on every call.
 ///
 /// Verifies `authorization: Bearer <token>` metadata in constant time and rejects with `Unauthenticated` otherwise.
+/// Without a configured token (plain [`GrpcApi::new`] + [`server`](GrpcApi::server)) it passes every call through.
 ///
 /// This is the same shared secret the agent presents to the control plane in discovery.
 /// One config value enables both directions.
-/// Orthogonal to TLS. Install via [`build_grpc_server_with_auth`] / [`build_grpc_server_with_metrics_auth`].
+/// Orthogonal to TLS. Install via [`GrpcApi::with_auth`].
 #[derive(Clone)]
 pub struct BearerAuth {
-    expected: Token,
+    expected: Option<Token>,
 }
 
 impl Interceptor for BearerAuth {
     fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        let Some(expected) = &self.expected else {
+            return Ok(request);
+        };
         let ok = request
             .metadata()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(bearer_value)
-            .map(|presented| self.expected.verify(presented))
+            .map(|presented| expected.verify(presented))
             .unwrap_or(false);
 
         if ok {
@@ -162,44 +225,6 @@ impl Interceptor for BearerAuth {
             Err(Status::unauthenticated("missing or invalid bearer token"))
         }
     }
-}
-
-/// Like [`build_grpc_server`] but enforcing a bearer token on every call.
-///
-/// ## Panics
-///
-/// Panics when `token` is empty — see [`build_grpc_server_with_metrics_auth`].
-pub fn build_grpc_server_with_auth<H>(
-    handler: Arc<H>,
-    token: Token,
-) -> InterceptedService<TaskServiceServer<TaskApiService<H>>, BearerAuth>
-where
-    H: ApiHandler,
-{
-    build_grpc_server_with_metrics_auth(handler, noop_api_metrics(), token)
-}
-
-/// Like [`build_grpc_server_with_metrics`] but enforcing a bearer token.
-///
-/// Wraps the configured server (message-size limits preserved) in an [`InterceptedService`] that gates every call on the token.
-///
-/// ## Panics
-///
-/// Panics when `token` is empty: an empty shared secret would accept an empty
-/// bearer credential (`authorization: Bearer `), silently disabling authentication.
-pub fn build_grpc_server_with_metrics_auth<H>(
-    handler: Arc<H>,
-    metrics: ApiMetricsHandle,
-    token: Token,
-) -> InterceptedService<TaskServiceServer<TaskApiService<H>>, BearerAuth>
-where
-    H: ApiHandler,
-{
-    assert_auth_token_not_empty(&token);
-    InterceptedService::new(
-        build_grpc_server_with_metrics(handler, metrics),
-        BearerAuth { expected: token },
-    )
 }
 
 #[tonic::async_trait]
@@ -537,7 +562,7 @@ mod tests {
 
     fn auth_interceptor(secret: &str) -> BearerAuth {
         BearerAuth {
-            expected: Token::new(secret),
+            expected: Some(Token::new(secret)),
         }
     }
 
@@ -592,9 +617,19 @@ mod tests {
     }
 
     #[test]
+    fn bearer_auth_passes_through_when_no_token_configured() {
+        let mut auth = BearerAuth { expected: None };
+        assert!(auth.call(Request::new(())).is_ok());
+        assert!(
+            auth.call(request_with_authorization("Bearer anything"))
+                .is_ok()
+        );
+    }
+
+    #[test]
     #[should_panic(expected = "auth token must not be empty")]
-    fn build_grpc_server_with_auth_panics_on_empty_token() {
-        let _ = build_grpc_server_with_auth(Arc::new(StreamMock), Token::new(""));
+    fn grpc_api_with_auth_panics_on_empty_token() {
+        let _ = GrpcApi::new(Arc::new(StreamMock)).with_auth(Token::new(""));
     }
 
     // --- instrument() metrics ------------------------------------------------

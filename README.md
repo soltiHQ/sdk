@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         Flag::enabled(),
     ));
-    let spec = TaskSpec::builder("hello", kind, 30_000u64)
+    let spec = TaskSpec::builder("hello", kind, 30_000u64) // per-attempt timeout (ms)
         .restart(RestartPolicy::Never)
         .admission(AdmissionPolicy::Replace)
         .build()?;

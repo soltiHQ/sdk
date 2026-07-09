@@ -3,10 +3,10 @@
 //! Dual-transport API layer exposing task operations over gRPC and HTTP.
 //! Both transports share the same wire types generated from `proto/solti/task/v1/*.proto` and delegate to an [`ApiHandler`] implementation.
 //!
-//! | feature | transport         | module                                |
-//! |---------|-------------------|---------------------------------------|
-//! | `grpc`  | tonic gRPC server | `TaskApiService`, `TaskServiceServer` |
-//! | `http`  | axum HTTP/JSON    | `HttpApi`                             |
+//! | feature | transport         | module                                           |
+//! |---------|-------------------|--------------------------------------------------|
+//! | `grpc`  | tonic gRPC server | `GrpcApi`, `TaskApiService`, `TaskServiceServer` |
+//! | `http`  | axum HTTP/JSON    | `HttpApi`                                        |
 //!
 //! ## Quick start
 //!
@@ -19,10 +19,10 @@
     doc = "```rust,no_run,ignore"
 )]
 //! # use std::sync::Arc;
-//! # use solti_api::{HttpApi, SupervisorApiAdapter, TaskApiService, TaskServiceServer};
+//! # use solti_api::{GrpcApi, HttpApi, SupervisorApiAdapter};
 //! # fn wire(supervisor: Arc<solti_core::SupervisorApi>) {
 //! let handler = Arc::new(SupervisorApiAdapter::new(supervisor));
-//! let grpc    = TaskServiceServer::new(TaskApiService::new(handler.clone()));
+//! let grpc    = GrpcApi::new(handler.clone()).server();
 //! let http    = HttpApi::new(handler).router();
 //! # let _ = (grpc, http);
 //! # }
@@ -120,10 +120,7 @@ mod validate;
 mod grpc;
 
 #[cfg(feature = "grpc")]
-pub use grpc::{
-    BearerAuth, TaskApiService, build_grpc_server, build_grpc_server_with_auth,
-    build_grpc_server_with_metrics, build_grpc_server_with_metrics_auth,
-};
+pub use grpc::{BearerAuth, GrpcApi, GrpcServer, TaskApiService};
 
 #[cfg(feature = "grpc")]
 pub use proto_api::task_service_server::TaskServiceServer;

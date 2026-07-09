@@ -59,10 +59,7 @@ use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::info;
 
-use solti_api::{
-    API_VERSION, SupervisorApiAdapter, build_grpc_server_with_metrics,
-    build_grpc_server_with_metrics_auth, to_tonic_server_tls,
-};
+use solti_api::{API_VERSION, GrpcApi, SupervisorApiAdapter, to_tonic_server_tls};
 use solti_core::{StateConfig, SupervisorApi};
 use solti_discover::{DiscoverConfig, DiscoveryTransport};
 use solti_exec::subprocess::register_subprocess_runner;
@@ -155,7 +152,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         ADVERTISED,
         &control_plane,
         DiscoveryTransport::Grpc,
-        10_000,
+        10_000, // heartbeat interval (ms)
         API_VERSION,
     )
     .with_metrics(discover_metrics);
@@ -185,21 +182,14 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let scheme = if tls_on { "grpcs" } else { "grpc" };
     info!("{scheme} {ADDR}  →  heartbeat {control_plane}");
 
-    // The auth interceptor changes the concrete service type; branch the serve.
-    match token {
-        Some(t) => {
-            builder
-                .add_service(build_grpc_server_with_metrics_auth(handler, api_metrics, t))
-                .serve_with_shutdown(addr, shutdown_signal())
-                .await?;
-        }
-        None => {
-            builder
-                .add_service(build_grpc_server_with_metrics(handler, api_metrics))
-                .serve_with_shutdown(addr, shutdown_signal())
-                .await?;
-        }
+    let mut api = GrpcApi::new(handler).with_metrics(api_metrics);
+    if let Some(t) = token {
+        api = api.with_auth(t);
     }
+    builder
+        .add_service(api.server())
+        .serve_with_shutdown(addr, shutdown_signal())
+        .await?;
 
     // Drain the supervision tree: cancels tasks cooperatively (grace period),
     // then force-aborts stragglers. Without this, SIGINT/SIGTERM would kill

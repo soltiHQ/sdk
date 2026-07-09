@@ -7,7 +7,7 @@
 //!
 //! ```rust,no_run
 //! # use std::sync::Arc;
-//! use solti_api::{SupervisorApiAdapter, build_grpc_server, to_tonic_server_tls};
+//! use solti_api::{GrpcApi, SupervisorApiAdapter, to_tonic_server_tls};
 //! use solti_tls::ServerTlsConfig;
 //!
 //! # async fn serve(adapter: Arc<SupervisorApiAdapter>) -> Result<(), Box<dyn std::error::Error>> {
@@ -20,7 +20,7 @@
 //! let tls_cfg = to_tonic_server_tls(&server_tls)?;
 //! tonic::transport::Server::builder()
 //!     .tls_config(tls_cfg)?
-//!     .add_service(build_grpc_server(adapter))
+//!     .add_service(GrpcApi::new(adapter).server())
 //!     .serve("0.0.0.0:50443".parse()?)
 //!     .await?;
 //! # Ok(()) }

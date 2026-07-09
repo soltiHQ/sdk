@@ -80,6 +80,14 @@ pub struct DiscoverConfig {
 
 impl DiscoverConfig {
     /// Start a builder for `DiscoverConfig`.
+    ///
+    /// Positional parameters:
+    /// - `agent_id`, `name` — agent identity reported to the control plane.
+    /// - `agent_endpoint` — this agent's API address, as the control plane should dial it.
+    /// - `control_plane_endpoint` — discovery endpoint to sync against.
+    /// - `transport` — gRPC or HTTP (see [`DiscoveryTransport`]).
+    /// - `delay_ms` — heartbeat (sync) interval, in **milliseconds**.
+    /// - `api_version` — discovery protocol major version.
     pub fn builder(
         agent_id: AgentId,
         name: impl Into<String>,
@@ -152,13 +160,13 @@ impl DiscoverConfigBuilder {
         self
     }
 
-    /// Transport-level connect timeout (ms).
+    /// Transport-level connect timeout, in milliseconds.
     pub fn connect_timeout_ms(mut self, ms: u64) -> Self {
         self.connect_timeout_ms = ms;
         self
     }
 
-    /// End-to-end request timeout (ms).
+    /// End-to-end request timeout, in milliseconds.
     pub fn request_timeout_ms(mut self, ms: u64) -> Self {
         self.request_timeout_ms = ms;
         self

@@ -14,6 +14,10 @@
 //!           │     ├──► short? → Cow::Borrowed (zero alloc)
 //!           │     └──► long?  → Cow::Owned("prefix... (truncated N bytes)")
 //!           │
+//!           ├──► sanitize_line(line) — tracing copy only, sink gets it untouched
+//!           │     ├──► clean? → Cow::Borrowed (zero alloc)
+//!           │     └──► control bytes? → Cow::Owned with \xNN escapes
+//!           │
 //!           └──► emit via tracing:
 //!                 ├──► stdout + stdout_info  → info!
 //!                 ├──► stderr + stderr_warn  → warn!
@@ -168,6 +172,7 @@ pub(crate) async fn log_stream<R>(
         };
 
         let line = truncate_line(&raw_line, config.max_line_length);
+        let log_line = sanitize_line(&line);
         line_count += 1;
 
         if stream.use_elevated_level(config) {
@@ -177,14 +182,14 @@ pub(crate) async fn log_stream<R>(
                     stream = %stream_name,
                     line_num = line_count,
                     "{}",
-                    line
+                    log_line
                 ),
                 StreamKind::Stderr => warn!(
                     task = %run_id,
                     stream = %stream_name,
                     line_num = line_count,
                     "{}",
-                    line
+                    log_line
                 ),
             }
         } else {
@@ -193,7 +198,7 @@ pub(crate) async fn log_stream<R>(
                 stream = %stream_name,
                 line_num = line_count,
                 "{}",
-                line
+                log_line
             );
         }
 
@@ -215,6 +220,42 @@ pub(crate) async fn log_stream<R>(
         total_lines = line_count,
         "stream closed"
     );
+}
+
+/// Escape control characters for safe `tracing` output.
+///
+/// Untrusted subprocess output may contain ANSI escape sequences, carriage
+/// returns, or other control bytes that can corrupt the operator terminal,
+/// forge log lines, or break log parsers. Every C0 control character except
+/// `\t`, plus DEL (0x7F), is replaced with a readable `\xNN` hex escape
+/// (e.g. ESC becomes the four literal characters `\x1b`).
+///
+/// Returns `Cow::Borrowed` when the line is already clean (zero-alloc for the
+/// common case). Only the copy emitted via `tracing` is sanitized; the
+/// [`OutputSink`] broadcast path receives the line bytes untouched.
+pub(crate) fn sanitize_line(line: &str) -> Cow<'_, str> {
+    fn needs_escape(c: char) -> bool {
+        c.is_ascii_control() && c != '\t'
+    }
+
+    let Some(first) = line.find(needs_escape) else {
+        return Cow::Borrowed(line);
+    };
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(line.len() + 8);
+    out.push_str(&line[..first]);
+    for c in line[first..].chars() {
+        if needs_escape(c) {
+            let b = c as u8;
+            out.push_str("\\x");
+            out.push(HEX[usize::from(b >> 4)] as char);
+            out.push(HEX[usize::from(b & 0x0f)] as char);
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// Truncate line by Unicode scalar count, safe for UTF-8.
@@ -286,6 +327,76 @@ mod tests {
     fn truncate_line_single_char_limit() {
         let result = truncate_line("abc", 1);
         assert_eq!(&*result, "a... (truncated 2 bytes)");
+    }
+
+    #[test]
+    fn sanitize_line_clean_line_borrowed() {
+        let result = sanitize_line("hello world");
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(&*result, "hello world");
+    }
+
+    #[test]
+    fn sanitize_line_escapes_ansi_sequence() {
+        let result = sanitize_line("\x1b[31mred\x1b[0m");
+        assert!(matches!(result, Cow::Owned(_)));
+        assert_eq!(&*result, "\\x1b[31mred\\x1b[0m");
+    }
+
+    #[test]
+    fn sanitize_line_preserves_tab() {
+        let result = sanitize_line("col1\tcol2");
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(&*result, "col1\tcol2");
+    }
+
+    #[test]
+    fn sanitize_line_escapes_carriage_return() {
+        assert_eq!(&*sanitize_line("fake\rline"), "fake\\x0dline");
+    }
+
+    #[test]
+    fn sanitize_line_escapes_del_and_nul() {
+        assert_eq!(&*sanitize_line("a\x7fb"), "a\\x7fb");
+        assert_eq!(&*sanitize_line("a\0b"), "a\\x00b");
+    }
+
+    #[test]
+    fn sanitize_line_unicode_passes_through_borrowed() {
+        let result = sanitize_line("привет мир");
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(&*result, "привет мир");
+    }
+
+    #[test]
+    fn sanitize_line_control_between_unicode_chars() {
+        assert_eq!(&*sanitize_line("привет\x1bмир"), "привет\\x1bмир");
+    }
+
+    #[tokio::test]
+    async fn log_stream_sink_receives_raw_control_bytes() {
+        let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
+        let sink = OutputSink::new(tx, 1);
+
+        log_stream(
+            "\x1b[31mred\x1b[0m\n".as_bytes(),
+            "task-raw",
+            StreamKind::Stdout,
+            &LogConfig::default(),
+            Some(&sink),
+        )
+        .await;
+
+        match rx.recv().await.unwrap() {
+            OutputEvent::Chunk(c) => {
+                assert_eq!(
+                    &c.line[..],
+                    b"\x1b[31mred\x1b[0m",
+                    "broadcast path must carry raw bytes, not the sanitized tracing copy"
+                );
+            }
+            other => panic!("expected Chunk, got {other:?}"),
+        }
     }
 
     #[tokio::test]
