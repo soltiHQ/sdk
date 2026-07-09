@@ -19,6 +19,7 @@
 //! | `TaskOutcome::Failed` | [`TaskPhase::Exhausted`] | The retry budget ran out; the task kept failing. |
 //! | `TaskOutcome::Fatal` | [`TaskPhase::Failed`] | A permanent error stopped the task at once. |
 //! | rejection with a cancel-like reason | [`TaskPhase::Canceled`] | User- or shutdown-initiated, not an error. |
+//! | rejection reason `dropped: ...` | [`TaskPhase::Canceled`] | The task's own `DropIfRunning` admission policy skipped the run: a routine skip, not an error. |
 
 use solti_model::TaskPhase;
 
@@ -29,9 +30,17 @@ use taskvisor::reasons;
 /// Applies to `ControllerRejected` / `TaskAddFailed` events and to
 /// [`taskvisor::TaskOutcome::Rejected`]. User- or shutdown-initiated removals
 /// ([`reasons::REMOVED_FROM_QUEUE`], [`reasons::SUPERSEDED_BY_REPLACE`],
-/// [`reasons::CONTROLLER_SHUTTING_DOWN`]) are a clean [`TaskPhase::Canceled`].
-/// Everything else (queue full, duplicate name, ...) is [`TaskPhase::Failed`].
+/// [`reasons::CONTROLLER_SHUTTING_DOWN`]) and admission-policy drops
+/// (`AdmissionPolicy::DropIfRunning` on a busy slot) are a clean
+/// [`TaskPhase::Canceled`]. Everything else (queue full, duplicate name, ...)
+/// is [`TaskPhase::Failed`].
 pub(crate) fn phase_for_rejection(reason: &str) -> TaskPhase {
+    // taskvisor 0.4 has no constant for the DropIfRunning rejection: it emits
+    // the free-form "dropped: slot busy (...)". The stable part is the prefix,
+    // pinned by `tests/reason_contract.rs`.
+    if reason.starts_with("dropped:") {
+        return TaskPhase::Canceled;
+    }
     match reason {
         reasons::REMOVED_FROM_QUEUE
         | reasons::SUPERSEDED_BY_REPLACE
@@ -110,6 +119,19 @@ mod tests {
     fn rejection_other_reasons_map_to_failed() {
         for reason in ["queue_full: 3/3", "already_exists", ""] {
             assert_eq!(phase_for_rejection(reason), TaskPhase::Failed);
+        }
+    }
+
+    #[test]
+    fn rejection_admission_drop_maps_to_canceled() {
+        // AdmissionPolicy::DropIfRunning on a busy slot: a routine skip by the
+        // task's own admission policy, keyed on the "dropped:" prefix.
+        for reason in [
+            "dropped: slot busy (running)",
+            "dropped: slot busy (admitting)",
+            "dropped: slot busy (terminating)",
+        ] {
+            assert_eq!(phase_for_rejection(reason), TaskPhase::Canceled);
         }
     }
 

@@ -138,6 +138,10 @@ impl Subscribe for StateSubscriber {
                     warn!(task = %task_id, "ActorExhausted event for unknown task");
                 }
                 self.output_registry.evict(&task_id);
+                // The actor is gone for good: release the binding so the entry
+                // is not mistaken for a live periodic task if the trailing
+                // TaskRemoved is lost to bus lag (the sweep spares bound entries).
+                self.state.unbind(&task_id);
                 self.timed_out.lock().remove(&task_id);
             }
             EventKind::ActorDead => {
@@ -160,6 +164,9 @@ impl Subscribe for StateSubscriber {
                     warn!(task = %task_id, "ActorDead event for unknown task");
                 }
                 self.output_registry.evict(&task_id);
+                // Same as ActorExhausted: a dead actor never emits again, so the
+                // binding must not keep shielding the entry from the sweep.
+                self.state.unbind(&task_id);
                 self.timed_out.lock().remove(&task_id);
             }
             EventKind::ControllerRejected | EventKind::TaskAddFailed => {
@@ -327,6 +334,84 @@ mod tests {
         };
         let (_, removed) = state.sweep(&config);
         assert_eq!(removed, 1, "unbound terminal rejection entry must be swept");
+        assert!(state.get(&id).is_none());
+    }
+
+    #[test]
+    fn actor_exhausted_unbinds_so_sweep_reaps_the_entry() {
+        use crate::state::StateConfig;
+        use std::time::Duration;
+
+        let state = TaskState::new();
+        let id = TaskId::from("exh-reap");
+        state.add_task(id.clone(), test_spec());
+        let tv = taskvisor::TaskId::for_tests();
+        state.bind_tv(&id, tv);
+        state.transition_starting(&id);
+        let sub = StateSubscriber::with_output_registry(
+            state.clone(),
+            Arc::new(OutputRegistry::default()),
+        );
+
+        // The terminal actor event arrives, but the paired TaskRemoved is lost
+        // to bus lag: the entry must still become reachable for the sweep.
+        sub.on_event(
+            &Event::new(EventKind::ActorExhausted)
+                .with_task("exh-reap")
+                .with_id(tv)
+                .with_attempt(1)
+                .with_reason("max_retries_exceeded(1/1)"),
+        );
+        assert!(
+            state.tv_for(&id).is_none(),
+            "a terminal actor event must release the identity binding"
+        );
+
+        let config = StateConfig {
+            run_ttl: Duration::ZERO,
+            task_ttl: Duration::ZERO,
+            ..StateConfig::default()
+        };
+        let (_, removed) = state.sweep(&config);
+        assert_eq!(removed, 1, "the unbound terminal entry must be reaped");
+        assert!(state.get(&id).is_none());
+    }
+
+    #[test]
+    fn actor_dead_unbinds_so_sweep_reaps_the_entry() {
+        use crate::state::StateConfig;
+        use std::time::Duration;
+
+        let state = TaskState::new();
+        let id = TaskId::from("dead-reap");
+        state.add_task(id.clone(), test_spec());
+        let tv = taskvisor::TaskId::for_tests();
+        state.bind_tv(&id, tv);
+        state.transition_starting(&id);
+        let sub = StateSubscriber::with_output_registry(
+            state.clone(),
+            Arc::new(OutputRegistry::default()),
+        );
+
+        sub.on_event(
+            &Event::new(EventKind::ActorDead)
+                .with_task("dead-reap")
+                .with_id(tv)
+                .with_attempt(1)
+                .with_reason("fatal error (no retry): boom"),
+        );
+        assert!(
+            state.tv_for(&id).is_none(),
+            "ActorDead must release the identity binding"
+        );
+
+        let config = StateConfig {
+            run_ttl: Duration::ZERO,
+            task_ttl: Duration::ZERO,
+            ..StateConfig::default()
+        };
+        let (_, removed) = state.sweep(&config);
+        assert_eq!(removed, 1, "the unbound terminal entry must be reaped");
         assert!(state.get(&id).is_none());
     }
 

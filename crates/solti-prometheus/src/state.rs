@@ -7,7 +7,6 @@ use prometheus::core::{Collector, Desc};
 use prometheus::proto::MetricFamily;
 use solti_core::TaskState;
 use solti_model::TaskPhase;
-use std::collections::HashMap;
 
 use crate::register::Sub;
 
@@ -53,10 +52,11 @@ fn phase_label(phase: TaskPhase) -> &'static str {
 ///
 /// ## Cost
 ///
-/// `O(N)` per scrape where `N` is the current number of tasks in state.
-/// With a typical scrape interval of 10–30s and a fleet of <10k tasks this is
-/// negligible. If it ever becomes hot, the natural next step is to maintain
-/// phase counters inside [`TaskState`] directly.
+/// `O(N)` per scrape where `N` is the current number of tasks in state:
+/// [`TaskState::count_by_phase`] tallies the phases under a single read lock
+/// without cloning any task (a clone would drag whole specs along, including
+/// script bodies). With a typical scrape interval of 10–30s and a fleet of
+/// <10k tasks this is negligible.
 ///
 /// ## Example
 ///
@@ -113,11 +113,7 @@ impl Collector for PrometheusStateCollector {
     }
 
     fn collect(&self) -> Vec<MetricFamily> {
-        let tasks = self.state.list_all();
-        let mut counts: HashMap<TaskPhase, u64> = HashMap::with_capacity(ALL_PHASES.len());
-        for task in &tasks {
-            *counts.entry(task.status().phase).or_insert(0) += 1;
-        }
+        let counts = self.state.count_by_phase();
         for phase in ALL_PHASES {
             let count = counts.get(phase).copied().unwrap_or(0);
             self.gauge

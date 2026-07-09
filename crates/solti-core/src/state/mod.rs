@@ -21,7 +21,9 @@ use std::{
 use parking_lot::RwLock;
 use tracing::debug;
 
-use solti_model::{Slot, Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskRun, TaskSpec};
+use solti_model::{
+    Slot, Task, TaskId, TaskKind, TaskPage, TaskPhase, TaskQuery, TaskRun, TaskSpec,
+};
 
 use crate::error::CoreError;
 
@@ -129,6 +131,11 @@ impl TaskState {
                 existing.status().phase
             )));
         }
+
+        // Replacing a terminal previous incarnation: sever its identity binding
+        // so a stale completion waiter can no longer resolve into the fresh entry
+        // during the reserve -> bind_tv window (see `finalize_if_bound`).
+        Self::unbind_locked(&mut inner, &id);
 
         let slot = spec.slot().clone();
         let task = Task::new(id.clone(), spec);
@@ -256,7 +263,16 @@ impl TaskState {
         exit_code: Option<i32>,
     ) -> bool {
         let mut inner = self.inner.write();
+        Self::transition_finished_locked(&mut inner, id, phase, error, exit_code)
+    }
 
+    fn transition_finished_locked(
+        inner: &mut TaskStateInner,
+        id: &TaskId,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+    ) -> bool {
         let found = if let Some(task) = inner.tasks.get_mut(id) {
             match task.transition_finished(phase, error.clone(), exit_code) {
                 Ok(()) => true,
@@ -276,6 +292,44 @@ impl TaskState {
         }
 
         found
+    }
+
+    /// Atomically finalize the entry bound to taskvisor run identity `tv_raw`.
+    ///
+    /// All checks and mutations happen under one write lock:
+    ///
+    /// 1. The binding must still be bidirectionally current: `by_tv[tv_raw]` resolves to an entry whose `tv_of` points back at `tv_raw`.
+    ///    A stale completion waiter can therefore never touch a newer incarnation that already re-reserved the name (see [`reserve`](Self::reserve)).
+    /// 2. The binding is released unconditionally: the waiter fires only once the actor has fully terminated (see [`unbind`](Self::unbind)).
+    /// 3. The phase transition is applied unless the entry is already terminal - the completion plane must never demote an event-derived phase.
+    ///    `force` overrides that guard for rejected submissions, which must reach a terminal phase even if the event plane already touched the
+    ///    entry (`Task::transition_finished` stays sticky-terminal).
+    ///
+    /// Returns the bound entry's id so the caller can evict per-task resources (e.g. output channels) outside the lock; `None` for a stale binding.
+    pub(crate) fn finalize_if_bound(
+        &self,
+        tv_raw: u64,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+        force: bool,
+    ) -> Option<TaskId> {
+        let mut inner = self.inner.write();
+
+        let id = inner.by_tv.get(&tv_raw)?.clone();
+        if inner.tv_of.get(&id).map(|tv| tv.get()) != Some(tv_raw) {
+            return None;
+        }
+        Self::unbind_locked(&mut inner, &id);
+
+        let already_terminal = inner
+            .tasks
+            .get(&id)
+            .is_none_or(|t| t.status().phase.is_terminal());
+        if force || !already_terminal {
+            Self::transition_finished_locked(&mut inner, &id, phase, error, exit_code);
+        }
+        Some(id)
     }
 
     /// List all runs for a task (oldest first).
@@ -334,6 +388,26 @@ impl TaskState {
             .filter(|task| !is_internal_slot(task.slot().as_str()) && task.status().phase == phase)
             .cloned()
             .collect()
+    }
+
+    /// Count tasks per phase (excluding solti-core's internal embedded tasks).
+    ///
+    /// Same visibility as [`list_all`](Self::list_all), but a single read-lock
+    /// pass with no `Task` clones (a clone drags the whole spec along,
+    /// including script bodies). Built for scrape-style consumers like the
+    /// Prometheus phase collector that only need the totals; phases with no
+    /// tasks are absent from the map.
+    pub fn count_by_phase(&self) -> HashMap<TaskPhase, usize> {
+        let inner = self.inner.read();
+        let mut counts: HashMap<TaskPhase, usize> = HashMap::new();
+        for task in inner
+            .tasks
+            .values()
+            .filter(|task| !is_internal_slot(task.slot().as_str()))
+        {
+            *counts.entry(task.status().phase).or_insert(0) += 1;
+        }
+        counts
     }
 
     /// Run a sweep pass.
@@ -409,6 +483,11 @@ impl TaskState {
     /// Filters are applied inside a single read lock.
     /// When `slot` is specified, uses the `by_slot` index to narrow the scan.
     /// `total` in the result reflects the count *after* filtering, *before* pagination.
+    ///
+    /// This is the API-facing listing: [`TaskKind::Embedded`] entries (in-process
+    /// machinery such as discovery sync or metric servers) are excluded in both
+    /// branches **before** `total` is computed and the page is cut, so `total`
+    /// always agrees with the items a client can actually see.
     pub fn query(&self, q: &TaskQuery) -> TaskPage<Task> {
         let inner = self.inner.read();
 
@@ -416,7 +495,11 @@ impl TaskState {
             Some(slot) => {
                 let ids = inner.by_slot.get(slot.as_str());
                 match ids {
-                    Some(ids) => Box::new(ids.iter().filter_map(|id| inner.tasks.get(id))),
+                    Some(ids) => Box::new(
+                        ids.iter()
+                            .filter_map(|id| inner.tasks.get(id))
+                            .filter(|task| is_query_visible(task)),
+                    ),
                     None => {
                         return TaskPage {
                             items: vec![],
@@ -425,12 +508,7 @@ impl TaskState {
                     }
                 }
             }
-            None => Box::new(
-                inner
-                    .tasks
-                    .values()
-                    .filter(|task| !is_internal_slot(task.slot().as_str())),
-            ),
+            None => Box::new(inner.tasks.values().filter(|task| is_query_visible(task))),
         };
 
         let iter: Box<dyn Iterator<Item = &Task>> = if q.status_filters().is_empty() {
@@ -490,12 +568,40 @@ fn is_internal_slot(slot: &str) -> bool {
     slot == sweep::SWEEP_SLOT
 }
 
+/// `true` if a task may surface through the paginated query API.
+///
+/// Internal slots and [`TaskKind::Embedded`] entries are host-side machinery:
+/// they must be cut *before* `total` is computed, or pagination arithmetic on
+/// the API boundary stops adding up (`solti-api` keeps its own filter purely
+/// as a safety net).
+fn is_query_visible(task: &Task) -> bool {
+    !is_internal_slot(task.slot().as_str()) && !matches!(task.spec().kind(), TaskKind::Embedded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solti_model::TaskKind;
+    use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv};
+
+    fn subprocess_kind() -> TaskKind {
+        TaskKind::Subprocess(SubprocessSpec::new(
+            SubprocessMode::Command {
+                command: "true".into(),
+                args: vec![],
+            },
+            TaskEnv::default(),
+            None,
+            Flag::enabled(),
+        ))
+    }
 
     fn default_spec_with_slot(slot: &str) -> TaskSpec {
+        TaskSpec::builder(slot, subprocess_kind(), 5_000_u64)
+            .build()
+            .expect("valid spec")
+    }
+
+    fn embedded_spec_with_slot(slot: &str) -> TaskSpec {
         TaskSpec::builder(slot, TaskKind::Embedded, 5_000_u64)
             .build()
             .expect("valid spec")
@@ -659,7 +765,7 @@ mod tests {
         );
         state.add_task(
             TaskId::from(super::sweep::SWEEP_SLOT),
-            default_spec_with_slot(super::sweep::SWEEP_SLOT),
+            embedded_spec_with_slot(super::sweep::SWEEP_SLOT),
         );
 
         assert_eq!(state.list_all().len(), 1);
@@ -677,8 +783,58 @@ mod tests {
         assert_eq!(page.items.len(), 1);
 
         let page = state.query(&TaskQuery::new().with_slot(super::sweep::SWEEP_SLOT));
-        assert_eq!(page.total, 1);
-        assert_eq!(state.list_by_slot(super::sweep::SWEEP_SLOT).len(), 1);
+        assert_eq!(
+            page.total, 0,
+            "the slot-indexed query branch hides embedded tasks too"
+        );
+        assert!(page.items.is_empty());
+        assert_eq!(
+            state.list_by_slot(super::sweep::SWEEP_SLOT).len(),
+            1,
+            "the raw in-crate slot listing still sees the entry"
+        );
+    }
+
+    #[test]
+    fn query_excludes_embedded_tasks_before_pagination() {
+        let state = TaskState::new();
+        state.add_task(TaskId::from("user-a"), default_spec_with_slot("mixed"));
+        state.add_task(TaskId::from("user-b"), default_spec_with_slot("mixed"));
+        state.add_task(TaskId::from("user-c"), default_spec_with_slot("mixed"));
+        state.add_task(TaskId::from("user-d"), default_spec_with_slot("mixed"));
+        // Embedded entries sort *before* "user-*": if they were cut only after
+        // pagination, the first pages would come up short of `total`.
+        for name in [
+            "solti-discover-sync",
+            "solti-logger-tz-sync",
+            "solti-metrics-server",
+        ] {
+            state.add_task(TaskId::from(name), embedded_spec_with_slot("mixed"));
+        }
+
+        let mut seen = 0usize;
+        for offset in [0usize, 2, 4] {
+            let page = state.query(&TaskQuery::new().with_offset(offset).with_limit(2));
+            assert_eq!(page.total, 4, "total counts only routable tasks");
+            assert!(
+                page.items
+                    .iter()
+                    .all(|t| !matches!(t.spec().kind(), TaskKind::Embedded)),
+                "no page may leak an embedded task"
+            );
+            seen += page.items.len();
+        }
+        assert_eq!(seen, 4, "pages must add up to exactly total");
+
+        // The slot-indexed branch (?slot=) applies the same visibility rule.
+        let page = state.query(&TaskQuery::new().with_slot("mixed").with_limit(100));
+        assert_eq!(page.total, 4);
+        assert_eq!(page.items.len(), 4);
+        assert!(
+            page.items
+                .iter()
+                .all(|t| !matches!(t.spec().kind(), TaskKind::Embedded))
+        );
     }
 
     #[test]
@@ -1199,5 +1355,135 @@ mod tests {
         assert_eq!(runs[0].phase, TaskPhase::Failed);
         assert_eq!(runs[1].attempt, 2);
         assert_eq!(runs[1].phase, TaskPhase::Succeeded);
+    }
+
+    #[test]
+    fn finalize_if_bound_finalizes_and_unbinds_a_current_binding() {
+        let state = TaskState::new();
+        let id = TaskId::from("bound");
+        state.add_task(id.clone(), default_spec());
+        let tv = taskvisor::TaskId::for_tests();
+        state.bind_tv(&id, tv);
+        state.transition_starting(&id);
+
+        let finalized = state.finalize_if_bound(tv.get(), TaskPhase::Succeeded, None, None, false);
+
+        assert_eq!(finalized, Some(id.clone()));
+        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Succeeded);
+        assert!(state.tv_for(&id).is_none(), "binding must be released");
+        assert!(state.resolve_tv(tv.get()).is_none());
+    }
+
+    #[test]
+    fn finalize_if_bound_ignores_a_stale_binding_after_rebind() {
+        let state = TaskState::new();
+        let id = TaskId::from("rebound");
+        state.add_task(id.clone(), default_spec());
+        let old = taskvisor::TaskId::for_tests();
+        let new = taskvisor::TaskId::for_tests();
+        state.bind_tv(&id, old);
+        state.bind_tv(&id, new);
+        state.transition_starting(&id);
+
+        let finalized = state.finalize_if_bound(
+            old.get(),
+            TaskPhase::Failed,
+            Some("stale".into()),
+            None,
+            false,
+        );
+
+        assert_eq!(finalized, None, "a stale binding must be a no-op");
+        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Running);
+        assert_eq!(
+            state.tv_for(&id).map(|tv| tv.get()),
+            Some(new.get()),
+            "the current binding must survive"
+        );
+    }
+
+    #[test]
+    fn finalize_if_bound_keeps_a_terminal_phase_but_still_unbinds() {
+        let state = TaskState::new();
+        let id = TaskId::from("done");
+        state.add_task(id.clone(), default_spec());
+        let tv = taskvisor::TaskId::for_tests();
+        state.bind_tv(&id, tv);
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Failed, Some("boom".into()), Some(1));
+
+        let finalized = state.finalize_if_bound(tv.get(), TaskPhase::Succeeded, None, None, false);
+
+        assert_eq!(finalized, Some(id.clone()), "the binding was current");
+        assert_eq!(
+            state.get(&id).unwrap().status().phase,
+            TaskPhase::Failed,
+            "an already-terminal entry keeps its event-derived phase"
+        );
+        assert!(
+            state.tv_for(&id).is_none(),
+            "the binding is released even when the phase is kept"
+        );
+    }
+
+    #[test]
+    fn reserve_severs_the_previous_incarnations_binding() {
+        let state = TaskState::new();
+        let id = TaskId::from("respawn");
+        state.reserve(id.clone(), default_spec()).unwrap();
+        let old_tv = taskvisor::TaskId::for_tests();
+        state.bind_tv(&id, old_tv);
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Failed, None, None);
+
+        // The new incarnation reserved the name; its bind_tv has not happened yet.
+        state.reserve(id.clone(), default_spec()).unwrap();
+
+        assert!(
+            state.resolve_tv(old_tv.get()).is_none(),
+            "reserve must sever the previous incarnation's binding"
+        );
+        assert_eq!(
+            state.finalize_if_bound(old_tv.get(), TaskPhase::Succeeded, None, None, false),
+            None,
+            "a stale waiter must not touch the fresh entry"
+        );
+        assert_eq!(
+            state.get(&id).unwrap().status().phase,
+            TaskPhase::Pending,
+            "the new incarnation stays untouched"
+        );
+    }
+
+    #[test]
+    fn count_by_phase_counts_without_clones_or_internal_tasks() {
+        let state = TaskState::new();
+        state.add_task(TaskId::from("p1"), default_spec_with_slot("s"));
+        state.add_task(TaskId::from("r1"), default_spec_with_slot("s"));
+        state.add_task(TaskId::from("r2"), default_spec_with_slot("s"));
+        state.add_task(TaskId::from("f1"), default_spec_with_slot("s"));
+        state.transition_starting(&TaskId::from("r1"));
+        state.transition_starting(&TaskId::from("r2"));
+        state.transition_starting(&TaskId::from("f1"));
+        state.transition_finished(&TaskId::from("f1"), TaskPhase::Failed, None, None);
+        state.add_task(
+            TaskId::from(super::sweep::SWEEP_SLOT),
+            embedded_spec_with_slot(super::sweep::SWEEP_SLOT),
+        );
+
+        let counts = state.count_by_phase();
+        assert_eq!(
+            counts.get(&TaskPhase::Pending).copied(),
+            Some(1),
+            "the internal sweep task must not be counted"
+        );
+        assert_eq!(counts.get(&TaskPhase::Running).copied(), Some(2));
+        assert_eq!(counts.get(&TaskPhase::Failed).copied(), Some(1));
+        assert_eq!(
+            counts.get(&TaskPhase::Succeeded),
+            None,
+            "empty phases are absent from the map"
+        );
+        assert_eq!(counts.values().sum::<usize>(), 4);
     }
 }

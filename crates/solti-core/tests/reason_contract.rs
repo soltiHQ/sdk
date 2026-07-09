@@ -107,6 +107,57 @@ async fn taskvisor_emits_task_returned_canceled() {
 }
 
 #[tokio::test]
+async fn taskvisor_rejects_drop_if_running_with_dropped_prefix() {
+    // solti-core's phase crosswalk (`map::phase::phase_for_rejection`) keys the
+    // DropIfRunning rejection on the free-form reason's "dropped:" prefix —
+    // taskvisor 0.4 exports no constant for it. Pin the prefix here.
+    let sup = Supervisor::builder(SupervisorConfig::default())
+        .with_controller(ControllerConfig::default())
+        .build();
+    let handle = sup.serve();
+
+    let busy: TaskRef = TaskFn::arc("busy-head", |ctx: TaskContext| async move {
+        ctx.cancelled().await;
+        Ok::<(), TaskError>(())
+    });
+    let dropped: TaskRef = TaskFn::arc("dropped-tail", |_ctx: TaskContext| async move {
+        Ok::<(), TaskError>(())
+    });
+    let mk_spec = |task: TaskRef| {
+        ControllerSpec::new(
+            AdmissionPolicy::DropIfRunning,
+            TaskSpec::new(
+                task,
+                RestartPolicy::Never,
+                backoff(),
+                Some(Duration::from_secs(30)),
+            ),
+        )
+        .with_slot("drop-slot")
+    };
+
+    let (_a, _aw) = handle
+        .submit_and_watch(mk_spec(busy))
+        .await
+        .expect("submit A");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (_b, bw) = handle
+        .submit_and_watch(mk_spec(dropped))
+        .await
+        .expect("submit B");
+
+    let outcome = bw.wait().await.expect("waiter resolves to an outcome");
+    match outcome {
+        taskvisor::TaskOutcome::Rejected { reason } => assert!(
+            reason.starts_with("dropped:"),
+            "DropIfRunning on a busy slot must keep the 'dropped:' reason prefix, got {reason:?}"
+        ),
+        other => panic!("expected Rejected for a busy DropIfRunning slot, got {other:?}"),
+    }
+    let _ = handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn taskvisor_emits_superseded_by_replace() {
     let cap = Capture::default();
     let events = Arc::clone(&cap.events);

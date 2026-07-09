@@ -32,10 +32,9 @@
 //! ## Quick start
 //!
 //! ```rust,no_run
-//! use solti_core::{CoreError, StateConfig, SupervisorApi};
+//! use solti_core::taskvisor::{ControllerConfig, SupervisorConfig};
+//! use solti_core::{CoreError, RunnerRouter, StateConfig, SupervisorApi};
 //! use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec};
-//! use solti_runner::RunnerRouter;
-//! use taskvisor::{ControllerConfig, SupervisorConfig};
 //!
 //! async fn demo() -> Result<(), CoreError> {
 //!     let api = SupervisorApi::new(
@@ -71,7 +70,9 @@
 //!
 //! - [`solti_model::TaskSpec`] input spec submitted via [`SupervisorApi::submit`].
 //! - [`taskvisor::Supervisor`] underlying runtime that manages actor lifecycle.
-//! - [`solti_runner::RunnerRouter`] picks a runner for each `TaskKind`.
+//! - [`RunnerRouter`] picks a runner for each `TaskKind`.
+//! - [`taskvisor`], [`RunnerRouter`] and [`OutputRegistry`] are re-exported so
+//!   consumers build against the same runtime versions as this crate.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -94,3 +95,6 @@ pub use supervisor::SupervisorApi;
 
 mod state;
 pub use state::{StateConfig, TaskState};
+
+pub use solti_runner::{OutputRegistry, RunnerRouter};
+pub use taskvisor;

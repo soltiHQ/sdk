@@ -15,8 +15,9 @@
 //! - The **completion plane** (`finalize_from_outcome`, fed by the *guaranteed* per-submission `TaskWaiter` oneshot) is authoritative **only** for terminal
 //!   liveness - it ensures a run still reaches a terminal phase when its terminal event was dropped under bus lag.
 //!
-//! The backstop must therefore stay a **no-op on already-terminal entries** (enforced here and by `Task::transition_finished`'s sticky-terminal guard).
-//! It can never demote a richer event-derived phase.
+//! The backstop must therefore stay a **phase no-op on already-terminal entries** (enforced by `TaskState::finalize_if_bound` and by
+//! `Task::transition_finished`'s sticky-terminal guard); it still releases the identity binding, because the waiter fires only once the
+//! actor has fully terminated. It can never demote a richer event-derived phase.
 //! Both planes classify outcomes and rejections through one crosswalk (`map::phase`). They can never disagree on the final phase.
 use std::{
     sync::{
@@ -347,8 +348,13 @@ impl SupervisorApi {
 
     /// Backstop finalization of a state entry from taskvisor's guaranteed [`TaskOutcome`].
     ///
-    /// Idempotent and event-friendly: resolves the run identity, and acts **only** if the entry exists and is not already in a terminal phase.
-    /// A `Rejected` outcome (the submission never ran) drops the provisional entry.
+    /// Idempotent and event-friendly. The whole check-and-finalize step is one
+    /// atomic [`TaskState::finalize_if_bound`] call: the binding must still be
+    /// current (a stale waiter from a previous incarnation is a no-op, even if
+    /// the name was already re-reserved), an already-terminal entry keeps its
+    /// event-derived phase, and the binding is always released - the waiter
+    /// fires only once the actor has fully terminated. A `Rejected` outcome
+    /// (the submission never ran) finalizes even an already-terminal entry.
     fn finalize_from_outcome(
         state: &TaskState,
         output_registry: &OutputRegistry,
@@ -357,25 +363,11 @@ impl SupervisorApi {
     ) {
         use taskvisor::TaskOutcome;
 
-        let Some(model_id) = state.resolve_tv(tv_raw) else {
-            return;
-        };
-
-        // A rejection finalizes unconditionally: the submission never ran, the
-        // provisional entry must reach a terminal phase even if the event plane
-        // already touched it (transition_finished stays sticky-terminal).
-        if !matches!(outcome, TaskOutcome::Rejected { .. })
-            && state
-                .get(&model_id)
-                .is_none_or(|t| t.status().phase.is_terminal())
-        {
-            return;
-        }
-
         let (phase, error, exit_code) = phase::phase_for_outcome(outcome);
-        state.transition_finished(&model_id, phase, error, exit_code);
-        output_registry.evict(&model_id);
-        state.unbind(&model_id);
+        let force = matches!(outcome, TaskOutcome::Rejected { .. });
+        if let Some(model_id) = state.finalize_if_bound(tv_raw, phase, error, exit_code, force) {
+            output_registry.evict(&model_id);
+        }
     }
 
     /// Roll back resources reserved by [`submit_with_task`] before `handle.submit`.
@@ -1048,13 +1040,63 @@ mod tests {
             &registry,
             tv_raw,
             &TaskOutcome::Rejected {
-                reason: "dropped: slot busy (running)".into(),
+                reason: "queue_full: 3/3".into(),
             },
         );
 
         let task = state.get(&id).expect("rejected entry stays observable");
         assert_eq!(task.status().phase, TaskPhase::Failed);
         assert!(registry.subscribe(&id).is_none(), "output channel evicted");
+    }
+
+    #[test]
+    fn backstop_rejected_admission_drop_is_canceled() {
+        let (state, id, tv_raw) = bound_running_state("rej-drop");
+        let registry = OutputRegistry::default();
+
+        SupervisorApi::finalize_from_outcome(
+            &state,
+            &registry,
+            tv_raw,
+            &TaskOutcome::Rejected {
+                reason: "dropped: slot busy (running)".into(),
+            },
+        );
+
+        assert_eq!(
+            state.get(&id).unwrap().status().phase,
+            TaskPhase::Canceled,
+            "a DropIfRunning skip is the task's own admission policy, not an error"
+        );
+    }
+
+    #[test]
+    fn backstop_stale_waiter_cannot_finalize_a_new_incarnation() {
+        let (state, id, old_tv_raw) = bound_running_state("stale-waiter");
+        let registry = OutputRegistry::default();
+        state.transition_finished(&id, TaskPhase::Failed, Some("boom".into()), Some(1));
+
+        // A resubmit wins the name: reserve replaces the terminal entry, but the
+        // new incarnation's bind_tv has not happened yet.
+        let spec = TaskSpec::builder("stale-waiter", TaskKind::Embedded, 5_000_u64)
+            .build()
+            .expect("valid spec");
+        state
+            .reserve(id.clone(), spec)
+            .expect("terminal name is reusable");
+
+        SupervisorApi::finalize_from_outcome(
+            &state,
+            &registry,
+            old_tv_raw,
+            &TaskOutcome::Completed,
+        );
+
+        assert_eq!(
+            state.get(&id).unwrap().status().phase,
+            TaskPhase::Pending,
+            "a stale waiter must never finalize the new incarnation"
+        );
     }
 
     #[test]

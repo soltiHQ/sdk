@@ -78,15 +78,17 @@ impl Task {
     /// - target phase must be terminal (see [`TaskPhase::is_terminal`]);
     ///   finishing into `Pending` or `Running` is a logic bug upstream.
     ///
-    /// Sticky terminals: once an attempt has reached a specific final state
-    /// (`Succeeded`, `Canceled`, or `Timeout`), a later, conflicting terminal
-    /// event must not overwrite it. taskvisor emits two terminal events per run (the
-    /// per-attempt `TaskStopped`/`TaskCanceled`/`TaskFailed` followed by the
-    /// actor-level `ActorExhausted`/`ActorDead`); without this guard a trailing
-    /// `ActorExhausted` would flip a `Canceled` run into `Exhausted`. A
-    /// failure-class phase (`Failed`) is still allowed to be refined into a more
-    /// specific disposition (`Exhausted`/`Timeout`), and re-applying the same
-    /// phase is a harmless no-op.
+    /// Sticky terminals: once an attempt has reached a final state, a later,
+    /// conflicting terminal event must not overwrite it. taskvisor emits two
+    /// terminal events per run (the per-attempt
+    /// `TaskStopped`/`TaskCanceled`/`TaskFailed` followed by the actor-level
+    /// `ActorExhausted`/`ActorDead`); without this guard a trailing
+    /// `ActorExhausted` would flip a `Canceled` run into `Exhausted`. Exactly
+    /// one refinement is allowed: the generic failure phase (`Failed`) may be
+    /// refined into a more specific disposition (`Exhausted`/`Timeout`).
+    /// Re-applying the current phase is a harmless no-op that keeps the
+    /// recorded error/exit code; every other conflicting terminal event is
+    /// silently ignored (`Ok(())`).
     ///
     /// Bumps `resource_version` only when the phase actually changes.
     pub fn transition_finished(
@@ -100,14 +102,21 @@ impl Task {
                 format!("transition_finished requires a terminal phase, got {phase}").into(),
             ));
         }
-        if matches!(
-            self.status.phase,
-            TaskPhase::Succeeded | TaskPhase::Canceled | TaskPhase::Timeout
-        ) && self.status.phase != phase
-        {
-            // Keep the intentional/specific terminal; ignore the conflicting
-            // overwrite (e.g. a trailing ActorExhausted after a Timeout/Cancel).
+        if self.status.phase == phase {
+            // Re-applying the current phase: keep the recorded error/exit_code
+            // and do not bump resource_version.
             return Ok(());
+        }
+        if self.status.phase.is_terminal() {
+            // Keep the first terminal disposition; the only rewrite allowed is
+            // refining a generic Failed into Exhausted/Timeout. Everything
+            // else (e.g. a trailing ActorExhausted after a Timeout/Cancel) is
+            // ignored.
+            let refines_failed = self.status.phase == TaskPhase::Failed
+                && matches!(phase, TaskPhase::Exhausted | TaskPhase::Timeout);
+            if !refines_failed {
+                return Ok(());
+            }
         }
         self.update_phase(phase, error, exit_code);
         Ok(())
@@ -272,6 +281,118 @@ mod tests {
 
         assert_eq!(task.status().phase, TaskPhase::Exhausted);
         assert_eq!(task.status().error.as_deref(), Some("max_retries"));
+    }
+
+    #[test]
+    fn failed_can_be_refined_to_timeout() {
+        // TimeoutHit may only be classified after the per-attempt TaskFailed
+        // already landed as Failed; the refinement into Timeout must survive.
+        let mut task = Task::new("task-1".into(), test_spec());
+        task.transition_starting();
+        task.transition_finished(TaskPhase::Failed, Some("attempt".into()), None)
+            .unwrap();
+
+        task.transition_finished(TaskPhase::Timeout, Some("deadline".into()), None)
+            .unwrap();
+
+        assert_eq!(task.status().phase, TaskPhase::Timeout);
+        assert_eq!(task.status().error.as_deref(), Some("deadline"));
+    }
+
+    #[test]
+    fn exhausted_survives_late_failed() {
+        // Exhausted is a final disposition: a straggling per-attempt TaskFailed
+        // (or ActorDead) must not downgrade it back to the generic Failed.
+        let mut task = Task::new("task-1".into(), test_spec());
+        task.transition_starting();
+        task.transition_finished(TaskPhase::Exhausted, Some("max_retries".into()), Some(1))
+            .unwrap();
+        let version = task.metadata().resource_version;
+
+        task.transition_finished(TaskPhase::Failed, Some("late".into()), Some(2))
+            .unwrap();
+
+        assert_eq!(task.status().phase, TaskPhase::Exhausted);
+        assert_eq!(task.status().error.as_deref(), Some("max_retries"));
+        assert_eq!(task.status().exit_code, Some(1));
+        assert_eq!(task.metadata().resource_version, version);
+    }
+
+    #[test]
+    fn failed_cannot_become_succeeded_or_canceled() {
+        // Failed may only be refined into Exhausted/Timeout; flipping it into
+        // Succeeded or Canceled would rewrite history.
+        let mut task = Task::new("task-1".into(), test_spec());
+        task.transition_starting();
+        task.transition_finished(TaskPhase::Failed, Some("boom".into()), Some(1))
+            .unwrap();
+        let version = task.metadata().resource_version;
+
+        task.transition_finished(TaskPhase::Succeeded, None, None)
+            .unwrap();
+        assert_eq!(task.status().phase, TaskPhase::Failed);
+
+        task.transition_finished(TaskPhase::Canceled, None, None)
+            .unwrap();
+        assert_eq!(task.status().phase, TaskPhase::Failed);
+
+        assert_eq!(task.status().error.as_deref(), Some("boom"));
+        assert_eq!(task.status().exit_code, Some(1));
+        assert_eq!(task.metadata().resource_version, version);
+    }
+
+    #[test]
+    fn same_phase_reapply_is_noop() {
+        // Re-applying the current terminal phase must not touch anything:
+        // no version bump, no error/exit_code overwrite (not even with None).
+        let mut task = Task::new("task-1".into(), test_spec());
+        task.transition_starting();
+        task.transition_finished(TaskPhase::Failed, Some("first".into()), Some(1))
+            .unwrap();
+        let version = task.metadata().resource_version;
+
+        task.transition_finished(TaskPhase::Failed, Some("second".into()), None)
+            .unwrap();
+
+        assert_eq!(task.status().phase, TaskPhase::Failed);
+        assert_eq!(task.status().error.as_deref(), Some("first"));
+        assert_eq!(task.status().exit_code, Some(1));
+        assert_eq!(task.metadata().resource_version, version);
+    }
+
+    #[test]
+    fn same_phase_reapply_is_noop_for_sticky_terminals() {
+        // The self-cancel flow re-applies Canceled (TaskCanceled followed by
+        // ActorExhausted classified as Canceled): the second apply is inert.
+        let mut task = Task::new("task-1".into(), test_spec());
+        task.transition_starting();
+        task.transition_finished(TaskPhase::Canceled, Some("graceful".into()), None)
+            .unwrap();
+        let version = task.metadata().resource_version;
+
+        task.transition_finished(TaskPhase::Canceled, None, None)
+            .unwrap();
+
+        assert_eq!(task.status().phase, TaskPhase::Canceled);
+        assert_eq!(task.status().error.as_deref(), Some("graceful"));
+        assert_eq!(task.metadata().resource_version, version);
+    }
+
+    #[test]
+    fn transition_starting_still_leaves_terminal_phase() {
+        // A retry after a failed attempt goes through transition_starting,
+        // which is unconditional: terminal stickiness must not block it.
+        let mut task = Task::new("task-1".into(), test_spec());
+        task.transition_starting();
+        task.transition_finished(TaskPhase::Failed, Some("boom".into()), Some(1))
+            .unwrap();
+
+        task.transition_starting();
+
+        assert_eq!(task.status().phase, TaskPhase::Running);
+        assert_eq!(task.status().attempt, 2);
+        assert!(task.status().error.is_none());
+        assert_eq!(task.status().exit_code, None);
     }
 
     #[test]
