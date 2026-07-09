@@ -1,7 +1,7 @@
-//! # Discovery-heartbeat Prometheus metrics (feature `discover`).
+//! # Discovery Prometheus metrics (feature `discover`).
 //!
-//! [`PrometheusDiscoverMetrics`] implements [`solti_discover::DiscoverMetricsBackend`], exposing `solti_discover_*`
-//! attempt / outcome / duration / failure / hold metrics for the control-plane discovery heartbeat.
+//! [`PrometheusDiscoverMetrics`] implements [`solti_discover::DiscoverMetricsBackend`].
+//! It exposes attempt, outcome, duration, failure, and hold metrics for the control-plane discovery heartbeat.
 //!
 //! See the [crate root](crate) for architecture and namespace overview.
 
@@ -41,10 +41,25 @@ pub struct PrometheusDiscoverMetrics {
 impl PrometheusDiscoverMetrics {
     /// Register all discovery metrics into `registry`.
     ///
-    /// ## Errors
+    /// ## Example
     ///
-    /// - [`prometheus::Error::AlreadyReg`]: one of the `solti_discover_*` metrics is already
-    ///   registered in `registry` (e.g. another instance was built against the same registry).
+    /// ```
+    /// use std::sync::Arc;
+    /// use solti_discover::{DiscoverFailReason, DiscoverMetricsBackend};
+    /// use solti_prometheus::{PrometheusDiscoverMetrics, Registry};
+    ///
+    /// # fn main() -> Result<(), prometheus::Error> {
+    /// let registry = Arc::new(Registry::new());
+    /// let metrics = PrometheusDiscoverMetrics::new(registry.clone())?;
+    ///
+    /// metrics.record_attempt();
+    /// metrics.record_success(25);
+    /// metrics.record_failure(50, DiscoverFailReason::Timeout);
+    /// metrics.record_hold(10);
+    ///
+    /// assert!(!registry.gather().is_empty());
+    /// # Ok(()) }
+    /// ```
     pub fn new(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
         let r = Sub::new(&registry, "discover");
 

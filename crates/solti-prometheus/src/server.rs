@@ -1,7 +1,9 @@
 //! # Embedded metrics HTTP server (feature `server`).
 //!
-//! [`server`] builds a supervised axum task that serves `/metrics` (Prometheus text exposition, `text/plain; version=0.0.4`) from a shared [`Registry`].
-//! Bind/serve failures are retried under supervisor backoff; shutdown is cooperative via the task's [`TaskContext`](taskvisor::TaskContext).
+//! [`server`] builds a supervised axum task that serves `/metrics` from a shared [`Registry`].
+//! Bind and serve failures are retried under supervisor backoff.
+//!
+//! Shutdown is cooperative through [`TaskContext`](taskvisor::TaskContext).
 //! The task runs under [`AdmissionPolicy::Replace`] in the [`METRICS_SERVER_SLOT`] slot.
 //!
 //! See the [crate root](crate) for the namespace/architecture overview.
@@ -23,24 +25,30 @@ use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tracing::{debug, error, info};
 
 /// Logical slot name for the metrics server task.
+///
+/// ## Example
+///
+/// ```
+/// assert_eq!(solti_prometheus::METRICS_SERVER_SLOT, "solti-metrics-server");
+/// ```
 pub const METRICS_SERVER_SLOT: &str = "solti-metrics-server";
 
-/// Per-attempt timeout in milliseconds (effectively infinite — long-running server).
+/// Per-attempt timeout in milliseconds (effectively infinite for this long-running server).
 const METRICS_SERVER_TIMEOUT_MS: u64 = u64::MAX;
 
 /// Prometheus text exposition content-type (format version 0.0.4).
 const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// Initial backoff delay on failure (ms).
+/// Initial backoff delay on failure in milliseconds.
 const BACKOFF_FIRST_MS: u64 = 1_000;
 
-/// Maximum backoff delay on repeated failures (ms).
+/// Maximum backoff delay on repeated failures in milliseconds.
 const BACKOFF_MAX_MS: u64 = 30_000;
 
 /// Backoff multiplier per consecutive failure.
 const BACKOFF_FACTOR: f64 = 2.0;
 
-/// Builds the metrics HTTP server task and its supervision specification.
+/// Build the metrics HTTP server task and its supervision spec.
 ///
 /// Serves `/metrics` (Prometheus text exposition format) from the given shared [`Registry`].
 /// The task runs under supervisor control so bind and serve errors are retried with backoff;
@@ -51,7 +59,7 @@ const BACKOFF_FACTOR: f64 = 2.0;
 /// | Scenario      | Delay           | Strategy                              |
 /// |---------------|-----------------|---------------------------------------|
 /// | Success       | Immediate       | Always restart (server runs forever)  |
-/// | Failure       | 1 s → 30 s      | Exponential backoff with equal jitter |
+/// | Failure       | 1 s to 30 s     | Exponential backoff with equal jitter |
 /// | Duplicate     | Replaces        | [`AdmissionPolicy::Replace`]          |
 ///
 /// ## Example

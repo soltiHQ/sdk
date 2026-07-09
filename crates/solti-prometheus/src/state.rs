@@ -1,6 +1,6 @@
 //! # Supervisor state collector.
 //!
-//! [`PrometheusStateCollector`] is a `prometheus::core::Collector` that exposes the current number of tasks per [`TaskPhase`] as `solti_sv_tasks_by_phase{phase}`.
+//! [`PrometheusStateCollector`] exposes the current number of tasks per [`TaskPhase`] as `solti_sv_tasks_by_phase{phase}`.
 
 use prometheus::GaugeVec;
 use prometheus::core::{Collector, Desc};
@@ -39,24 +39,21 @@ fn phase_label(phase: TaskPhase) -> &'static str {
 
 /// Pull-based Prometheus collector for `solti_sv_tasks_by_phase{phase}`.
 ///
-/// Register once with a shared [`prometheus::Registry`] alongside the other solti
-/// collectors. On each scrape, all phases from [`TaskPhase`] are emitted; empty
-/// phases return `0` so dashboards can rely on a stable label set.
+/// Register once with a shared [`prometheus::Registry`] alongside the other Solti collectors.
+/// On each scrape, all phases from [`TaskPhase`] are emitted; empty phases return `0` so dashboards can rely on a stable label set.
 ///
-/// Counts are recomputed from [`TaskState`] on every scrape. Unlike the
-/// event-gauge `solti_sv_tasks_in_flight`, this collector self-corrects and
-/// never accrues drift. The residual limitation is upstream: a `Running` count
-/// reflects the `TaskStarting` events `TaskState` has observed. A start dropped
-/// under bus lag is undercounted until the entry's phase next changes (bounded,
-/// not cumulative).
+/// Counts are recomputed from [`TaskState`] on every scrape.
+/// Unlike the event-gauge `solti_sv_tasks_in_flight`, this collector self-corrects and never accrues drift.
+/// The residual limitation is upstream: a `Running` count reflects the `TaskStarting` events `TaskState` has observed.
+/// A start dropped under bus lag is undercounted until the entry's phase next changes (bounded, not cumulative).
 ///
 /// ## Cost
 ///
 /// `O(N)` per scrape where `N` is the current number of tasks in state:
-/// [`TaskState::count_by_phase`] tallies the phases under a single read lock
-/// without cloning any task (a clone would drag whole specs along, including
-/// script bodies). With a typical scrape interval of 10–30s and a fleet of
-/// <10k tasks this is negligible.
+/// [`TaskState::count_by_phase`] tallies the phases under a single read lock without cloning any task
+/// (a clone would drag whole specs along, including script bodies).
+///
+/// With a typical scrape interval of 10-30s and a fleet of <10k tasks this is negligible.
 ///
 /// ## Example
 ///
@@ -79,18 +76,23 @@ pub struct PrometheusStateCollector {
 }
 
 impl PrometheusStateCollector {
-    /// Create a new collector wired to `state`. The collector holds a cheap
-    /// `Arc` clone of [`TaskState`] and will always observe the most recent
-    /// mutations made by the supervisor's state subscriber.
+    /// Create a new collector wired to `state`.
     ///
-    /// ## Errors
+    /// ## Example
     ///
-    /// - [`prometheus::Error::Msg`]: the metric descriptor failed validation.
-    ///   The names used here are fixed and valid, and this does not happen in practice.
+    /// ```
+    /// use prometheus::core::Collector;
+    /// use solti_core::TaskState;
+    /// use solti_prometheus::PrometheusStateCollector;
+    ///
+    /// # fn main() -> Result<(), prometheus::Error> {
+    /// let state = TaskState::new();
+    /// let collector = PrometheusStateCollector::new(state)?;
+    ///
+    /// assert!(!collector.collect().is_empty());
+    /// # Ok(()) }
+    /// ```
     pub fn new(state: TaskState) -> Result<Self, prometheus::Error> {
-        // We piggy-back on the existing `Sub` helper only for namespace/subsystem —
-        // the gauge is *not* registered into a registry here, the caller does that
-        // when they register the collector itself.
         let gauge = Sub::gauge_vec_unregistered(
             "sv",
             "tasks_by_phase",
@@ -213,7 +215,6 @@ mod tests {
             Some(1.0)
         );
 
-        // Finish the running task, rescrape — expected phase counts move.
         state.seed_finished(&TaskId::from("t1"), TaskPhase::Succeeded, None, None);
         let families = collector.collect();
         assert_eq!(

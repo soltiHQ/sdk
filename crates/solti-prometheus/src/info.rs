@@ -1,7 +1,6 @@
 //! Build-time identity exposed as `solti_build_info` gauge (value always `1`).
 //!
-//! Labels carry the identity fields — dashboards and alerts use them to pin
-//! observations to a specific build. Typical labels:
+//! Labels carry the identity fields - dashboards and alerts use them to pin observations to a specific build. Typical labels:
 //!
 //!  - `version`
 //!  - `git_sha`
@@ -13,11 +12,6 @@ use prometheus::{IntGauge, Opts, Registry};
 /// Register a `solti_build_info{labels...}` gauge with value `1`.
 ///
 /// Labels are set as *constant* labels: they live on the metric descriptor and never change during process lifetime.
-///
-/// ## Errors
-///
-/// - [`prometheus::Error::Msg`]: a key in `labels` is not a valid Prometheus label name.
-/// - [`prometheus::Error::AlreadyReg`]: a `solti_build_info` gauge is already registered in `registry`.
 ///
 /// ## Example
 ///

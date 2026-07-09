@@ -1,6 +1,6 @@
 //! Private helpers for building and registering Prometheus metrics.
 //!
-//! All solti collectors share the `solti_<subsystem>_<name>` naming scheme and the same "build → register clone" boilerplate.
+//! All solti collectors share the `solti_<subsystem>_<name>` naming scheme and the same "build -> register clone" boilerplate.
 //! [`Sub`] binds a [`Registry`] and a subsystem name together so constructors collapse to one line per metric.
 
 use prometheus::{

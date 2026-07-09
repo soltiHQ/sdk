@@ -1,6 +1,7 @@
-//! # Runner-level Prometheus metrics.
+//! # Runner Prometheus metrics.
 //!
-//! [`PrometheusMetrics`] implements [`MetricsBackend`] and exposes counters and histograms for task execution events reported by runners.
+//! [`PrometheusMetrics`] implements [`MetricsBackend`] for Solti runners.
+//! It exposes counters and histograms for task starts, completions, durations, and runner setup errors.
 //!
 //! See the [crate root](crate) for architecture and namespace overview.
 
@@ -12,7 +13,7 @@ use solti_runner::{MetricOutcome, MetricsBackend, RunnerErrorKind, RunnerType};
 
 use crate::register::{Sub, ms_to_secs};
 
-/// Prometheus metrics backend for solti runners.
+/// Prometheus metrics backend for Solti runners.
 ///
 /// Implements [`MetricsBackend`] and exposes runner-level metrics in Prometheus format.
 /// Runners call the trait methods during task lifecycle.
@@ -46,7 +47,7 @@ use crate::register::{Sub, ms_to_secs};
 /// use solti_prometheus::PrometheusMetrics;
 /// use solti_runner::{MetricsBackend, RunnerType};
 ///
-/// // `new_isolated` owns a private registry — no shared wiring needed.
+/// // `new_isolated` owns a private registry - no shared wiring needed.
 /// let metrics = PrometheusMetrics::new_isolated().unwrap();
 /// metrics.record_task_started(RunnerType::Subprocess);
 ///
@@ -66,16 +67,27 @@ pub struct PrometheusMetrics {
 }
 
 impl PrometheusMetrics {
-    /// Create a new metrics backend, registering all counters and histograms into the given [`Registry`].
+    /// Create a new metrics backend and register it into `registry`.
     ///
-    /// Primary constructor — mirrors the shape used by other backends in this
+    /// Primary constructor - mirrors the shape used by other backends in this
     /// crate ([`PrometheusSubscriber::new`](crate::PrometheusSubscriber::new),
     /// `PrometheusApiMetrics::new`, `PrometheusDiscoverMetrics::new`).
     ///
-    /// ## Errors
+    /// ## Example
     ///
-    /// - [`prometheus::Error::AlreadyReg`]: one of the `solti_runner_*` metrics is already
-    ///   registered in `registry` (e.g. another backend was built against the same registry).
+    /// ```
+    /// use std::sync::Arc;
+    /// use solti_prometheus::{PrometheusMetrics, Registry};
+    /// use solti_runner::{MetricsBackend, RunnerType};
+    ///
+    /// # fn main() -> Result<(), prometheus::Error> {
+    /// let registry = Arc::new(Registry::new());
+    /// let metrics = PrometheusMetrics::new(registry.clone())?;
+    ///
+    /// metrics.record_task_started(RunnerType::Subprocess);
+    /// assert!(!registry.gather().is_empty());
+    /// # Ok(()) }
+    /// ```
     pub fn new(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
         let r = Sub::new(&registry, "runner");
 
@@ -113,15 +125,21 @@ impl PrometheusMetrics {
         })
     }
 
-    /// Create a new metrics backend with an **isolated** registry.
+    /// Create a new metrics backend with an isolated registry.
     ///
-    /// Convenience for tests / standalone use. Most agents share a single
-    /// registry across collectors via [`Self::new`].
+    /// Convenience for tests / standalone use. Most agents share a single registry across collectors via [`Self::new`].
     ///
-    /// ## Errors
+    /// ## Example
     ///
-    /// Same as [`Self::new`]. The registry is fresh and private here, and
-    /// registration into it does not collide in practice.
+    /// ```
+    /// use solti_prometheus::PrometheusMetrics;
+    /// use solti_runner::{MetricsBackend, RunnerType};
+    ///
+    /// let metrics = PrometheusMetrics::new_isolated().unwrap();
+    /// metrics.record_task_started(RunnerType::Subprocess);
+    ///
+    /// assert!(!metrics.gather().is_empty());
+    /// ```
     pub fn new_isolated() -> Result<Self, prometheus::Error> {
         Self::new(Arc::new(Registry::new()))
     }
@@ -133,18 +151,40 @@ impl PrometheusMetrics {
     /// See [`Self::new`].
     #[deprecated(
         since = "0.0.2",
-        note = "use `PrometheusMetrics::new(registry)` — same signature, consistent with the other backends"
+        note = "use `PrometheusMetrics::new(registry)` - same signature, consistent with the other backends"
     )]
     pub fn new_with_registry(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
         Self::new(registry)
     }
 
-    /// Gather all metrics for exposition.
+    /// Gather all metrics from the underlying registry.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_prometheus::PrometheusMetrics;
+    /// use solti_runner::{MetricsBackend, RunnerType};
+    ///
+    /// let metrics = PrometheusMetrics::new_isolated().unwrap();
+    /// metrics.record_task_started(RunnerType::Subprocess);
+    ///
+    /// let families = metrics.gather();
+    /// assert!(families.iter().any(|f| f.name() == "solti_runner_tasks_started_total"));
+    /// ```
     pub fn gather(&self) -> Vec<MetricFamily> {
         self.registry.gather()
     }
 
-    /// Get reference to underlying prometheus registry.
+    /// Get the underlying Prometheus registry.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_prometheus::PrometheusMetrics;
+    ///
+    /// let metrics = PrometheusMetrics::new_isolated().unwrap();
+    /// assert!(metrics.registry().gather().is_empty());
+    /// ```
     pub fn registry(&self) -> &Arc<Registry> {
         &self.registry
     }

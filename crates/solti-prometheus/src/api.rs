@@ -1,7 +1,7 @@
-//! # API-layer Prometheus metrics (feature `api`).
+//! # API Prometheus metrics (feature `api`).
 //!
-//! [`PrometheusApiMetrics`] implements [`solti_api::ApiMetricsBackend`], exposing `solti_api_*`
-//! request counters, duration histograms, and an in-flight gauge for both the HTTP and gRPC transports.
+//! [`PrometheusApiMetrics`] implements [`solti_api::ApiMetricsBackend`].
+//! It exposes request counters, duration histograms, and an in-flight gauge for HTTP and gRPC API traffic.
 //!
 //! See the [crate root](crate) for architecture and namespace overview.
 
@@ -24,7 +24,9 @@ use crate::register::{Sub, ms_to_secs};
 ///
 /// ## Cardinality
 ///
-/// `path` is a **templated** route (e.g. `/api/v1/tasks/{id}`) for HTTP thanks to `axum::extract::MatchedPath`, and a full method path (`/solti.task.v1.TaskService/SubmitTask`) for gRPC.
+/// `path` is a templated route for HTTP, such as `/api/v1/tasks/{id}`.
+/// For gRPC it is the full method path, such as `/solti.task.v1.TaskService/SubmitTask`.
+///
 /// In both cases the set is bounded by the proto/api definition.
 pub struct PrometheusApiMetrics {
     requests_total: CounterVec,
@@ -35,10 +37,24 @@ pub struct PrometheusApiMetrics {
 impl PrometheusApiMetrics {
     /// Register all API metrics into `registry`.
     ///
-    /// ## Errors
+    /// ## Example
     ///
-    /// - [`prometheus::Error::AlreadyReg`]: one of the `solti_api_*` metrics is already
-    ///   registered in `registry` (e.g. another instance was built against the same registry).
+    /// ```
+    /// use std::sync::Arc;
+    /// use solti_api::{ApiMetricsBackend, Transport};
+    /// use solti_prometheus::{PrometheusApiMetrics, Registry};
+    ///
+    /// # fn main() -> Result<(), prometheus::Error> {
+    /// let registry = Arc::new(Registry::new());
+    /// let metrics = PrometheusApiMetrics::new(registry.clone())?;
+    ///
+    /// metrics.record_in_flight_delta(Transport::Http, 1);
+    /// metrics.record_request(Transport::Http, "GET", "/api/v1/tasks", 200, 12);
+    /// metrics.record_in_flight_delta(Transport::Http, -1);
+    ///
+    /// assert!(!registry.gather().is_empty());
+    /// # Ok(()) }
+    /// ```
     pub fn new(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
         let r = Sub::new(&registry, "api");
 
@@ -85,7 +101,6 @@ impl ApiMetricsBackend for PrometheusApiMetrics {
         duration_ms: u64,
     ) {
         let t = transport.as_label();
-        // Zero-alloc stringify: `itoa::Buffer` lives on the stack.
         let mut buf = itoa::Buffer::new();
         let s = buf.format(status);
         self.requests_total

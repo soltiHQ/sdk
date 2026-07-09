@@ -2,6 +2,20 @@
 
 use thiserror::Error;
 
+/// Errors returned by runner implementations.
+///
+/// The enum keeps setup and validation failures in one place, so callers can
+/// decide whether to reject the task, retry it later, or report an internal
+/// runner problem.
+///
+/// ## Example
+///
+/// ```rust
+/// use solti_runner::RunnerError;
+///
+/// let error = RunnerError::MissingField("command");
+/// assert_eq!(error.to_string(), "missing field: command");
+/// ```
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RunnerError {
