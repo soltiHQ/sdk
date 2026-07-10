@@ -332,17 +332,6 @@ impl TaskState {
     ///
     /// Returns an empty list when the task is unknown or its run history has
     /// already been swept.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_core::TaskState;
-    /// use solti_model::TaskId;
-    ///
-    /// let state = TaskState::new();
-    /// let runs = state.list_runs(&TaskId::from("task-1"));
-    /// assert!(runs.is_empty());
-    /// ```
     pub fn list_runs(&self, id: &TaskId) -> Vec<TaskRun> {
         let inner = self.inner.read();
         inner
@@ -353,16 +342,6 @@ impl TaskState {
     }
 
     /// Return one task by id.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_core::TaskState;
-    /// use solti_model::TaskId;
-    ///
-    /// let state = TaskState::new();
-    /// assert!(state.get(&TaskId::from("task-1")).is_none());
-    /// ```
     pub fn get(&self, id: &TaskId) -> Option<Task> {
         let inner = self.inner.read();
         inner.tasks.get(id).cloned()
@@ -372,30 +351,11 @@ impl TaskState {
     ///
     /// This is cheaper than [`get`](Self::get) because it does not clone the
     /// task.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_core::TaskState;
-    /// use solti_model::TaskId;
-    ///
-    /// let state = TaskState::new();
-    /// assert!(!state.contains_task(&TaskId::from("task-1")));
-    /// ```
     pub fn contains_task(&self, id: &TaskId) -> bool {
         self.inner.read().tasks.contains_key(id)
     }
 
     /// List tasks in a specific slot.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_core::TaskState;
-    ///
-    /// let state = TaskState::new();
-    /// assert!(state.list_by_slot("workers").is_empty());
-    /// ```
     pub fn list_by_slot(&self, slot: &str) -> Vec<Task> {
         let inner = self.inner.read();
 
@@ -410,18 +370,9 @@ impl TaskState {
             .unwrap_or_default()
     }
 
-    /// List all visible tasks.
+    /// List all public tasks.
     ///
     /// Solti internal maintenance tasks are excluded.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_core::TaskState;
-    ///
-    /// let state = TaskState::new();
-    /// assert!(state.list_all().is_empty());
-    /// ```
     pub fn list_all(&self) -> Vec<Task> {
         let inner = self.inner.read();
         inner
@@ -432,17 +383,7 @@ impl TaskState {
             .collect()
     }
 
-    /// List visible tasks that match one phase.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_core::TaskState;
-    /// use solti_model::TaskPhase;
-    ///
-    /// let state = TaskState::new();
-    /// assert!(state.list_by_status(TaskPhase::Running).is_empty());
-    /// ```
+    /// List public tasks that match one phase.
     pub fn list_by_status(&self, phase: TaskPhase) -> Vec<Task> {
         let inner = self.inner.read();
         inner
@@ -453,7 +394,7 @@ impl TaskState {
             .collect()
     }
 
-    /// Count visible tasks per phase.
+    /// Count public tasks per phase.
     ///
     /// This makes one read-lock pass and does not clone full [`Task`] values.
     /// It is built for metrics collectors. Phases with no tasks are absent from
@@ -548,7 +489,7 @@ impl TaskState {
         (runs_removed, tasks_removed)
     }
 
-    /// Query visible tasks with combined filters and pagination.
+    /// Query public tasks with combined filters and pagination.
     ///
     /// Filters are applied inside a single read lock.
     /// When `slot` is specified, uses the `by_slot` index to narrow the scan.

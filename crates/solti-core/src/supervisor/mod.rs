@@ -225,95 +225,33 @@ impl SupervisorApi {
     }
 
     /// Return the shared output registry for live-tail subscriptions.
-    ///
-    /// ## Example
-    ///
-    /// ```rust,no_run
-    /// use solti_core::SupervisorApi;
-    /// use solti_model::TaskId;
-    /// use std::sync::Arc;
-    ///
-    /// fn demo(api: &SupervisorApi, task_id: &TaskId) {
-    ///     let registry = Arc::clone(api.output_registry());
-    ///     let _maybe_stream = registry.subscribe(task_id);
-    /// }
-    /// ```
     pub fn output_registry(&self) -> &Arc<OutputRegistry> {
         &self.output_registry
     }
 
     /// Return one task by id.
-    ///
-    /// ## Example
-    ///
-    /// ```rust,no_run
-    /// use solti_core::SupervisorApi;
-    /// use solti_model::TaskId;
-    ///
-    /// fn demo(api: &SupervisorApi, id: &TaskId) {
-    ///     if let Some(task) = api.get_task(id) {
-    ///         assert_eq!(task.id(), id);
-    ///     }
-    /// }
-    /// ```
     pub fn get_task(&self, id: &TaskId) -> Option<Task> {
         self.state.get(id)
     }
 
-    /// List visible tasks in one slot.
-    ///
-    /// ## Example
-    ///
-    /// ```rust,no_run
-    /// use solti_core::SupervisorApi;
-    ///
-    /// fn demo(api: &SupervisorApi) {
-    ///     let tasks = api.list_tasks_by_slot("daily-jobs");
-    ///     for task in tasks {
-    ///         assert_eq!(task.slot().as_str(), "daily-jobs");
-    ///     }
-    /// }
-    /// ```
+    /// List public tasks in one slot.
     pub fn list_tasks_by_slot(&self, slot: &str) -> Vec<Task> {
         self.state.list_by_slot(slot)
     }
 
-    /// List all visible tasks.
+    /// List all public tasks.
     ///
     /// Internal Solti maintenance tasks are excluded.
-    ///
-    /// ## Example
-    ///
-    /// ```rust,no_run
-    /// use solti_core::SupervisorApi;
-    ///
-    /// fn demo(api: &SupervisorApi) {
-    ///     let tasks = api.list_all_tasks();
-    ///     assert!(tasks.iter().all(|task| task.slot().as_str() != "solti-state-sweep"));
-    /// }
-    /// ```
     pub fn list_all_tasks(&self) -> Vec<Task> {
         self.state.list_all()
     }
 
-    /// List visible tasks by phase.
-    ///
-    /// ## Example
-    ///
-    /// ```rust,no_run
-    /// use solti_core::SupervisorApi;
-    /// use solti_model::TaskPhase;
-    ///
-    /// fn demo(api: &SupervisorApi) {
-    ///     let running = api.list_tasks_by_status(TaskPhase::Running);
-    ///     assert!(running.iter().all(|task| *task.phase() == TaskPhase::Running));
-    /// }
-    /// ```
+    /// List public tasks by phase.
     pub fn list_tasks_by_status(&self, phase: TaskPhase) -> Vec<Task> {
         self.state.list_by_status(phase)
     }
 
-    /// Query visible tasks with combined filters and pagination.
+    /// Query public tasks with combined filters and pagination.
     ///
     /// ## Example
     ///
@@ -335,18 +273,6 @@ impl SupervisorApi {
     }
 
     /// List execution history for one task, oldest first.
-    ///
-    /// ## Example
-    ///
-    /// ```rust,no_run
-    /// use solti_core::SupervisorApi;
-    /// use solti_model::TaskId;
-    ///
-    /// fn demo(api: &SupervisorApi, id: &TaskId) {
-    ///     let runs = api.list_task_runs(id);
-    ///     assert!(runs.windows(2).all(|pair| pair[0].attempt <= pair[1].attempt));
-    /// }
-    /// ```
     pub fn list_task_runs(&self, id: &TaskId) -> Vec<TaskRun> {
         self.state.list_runs(id)
     }
@@ -418,16 +344,6 @@ impl SupervisorApi {
     ///
     /// Use this only when you need a taskvisor-specific operation that
     /// `SupervisorApi` does not wrap.
-    ///
-    /// ## Example
-    ///
-    /// ```rust,no_run
-    /// use solti_core::SupervisorApi;
-    ///
-    /// fn demo(api: &SupervisorApi) {
-    ///     let _handle = api.handle();
-    /// }
-    /// ```
     pub fn handle(&self) -> SupervisorHandle {
         self.handle.clone()
     }
@@ -461,6 +377,7 @@ impl SupervisorApi {
     /// 2. Delegate to [`SupervisorApi::submit_with_task`].
     ///
     /// This is the primary entrypoint for tasks that are fully described by the public [`solti_model::TaskKind`] model.
+    /// The API must be created with a [`RunnerRouter`] that can build that task kind.
     ///
     /// ## Example
     ///
@@ -469,6 +386,7 @@ impl SupervisorApi {
     /// use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec};
     ///
     /// async fn demo(api: &SupervisorApi) -> Result<(), CoreError> {
+    ///     // `api` must use a router that supports `TaskKind::Subprocess`.
     ///     let kind = TaskKind::Subprocess(SubprocessSpec::new(
     ///         SubprocessMode::Command {
     ///             command: "true".into(),

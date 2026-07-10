@@ -9,32 +9,30 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use solti_core::taskvisor::{ControllerConfig, SupervisorConfig};
+//! use solti_core::taskvisor::{
+//!     ControllerConfig, SupervisorConfig, TaskContext, TaskError, TaskFn,
+//! };
 //! use solti_core::{CoreError, RunnerRouter, StateConfig, SupervisorApi};
-//! use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec};
+//! use solti_model::{RestartPolicy, TaskKind, TaskSpec};
 //!
 //! async fn demo() -> Result<(), CoreError> {
 //!     let api = SupervisorApi::new(
 //!         SupervisorConfig::default(),
 //!         ControllerConfig::default(),
-//!         Vec::new(),          // extra event subscribers
-//!         RunnerRouter::new(), // register runners for Subprocess/Wasm/Container here
+//!         Vec::new(),
+//!         RunnerRouter::new(),
 //!         StateConfig::default(),
 //!     )
 //!     .await?;
 //!
-//!     let kind = TaskKind::Subprocess(SubprocessSpec::new(
-//!         SubprocessMode::Command {
-//!             command: "echo".into(),
-//!             args: vec!["hello".into()],
-//!         },
-//!         TaskEnv::default(),
-//!         None,
-//!         Flag::enabled(),
-//!     ));
-//!     let spec = TaskSpec::builder("demo-slot", kind, 5_000_u64).build()?;
+//!     let task = TaskFn::arc("embedded-demo", |_ctx: TaskContext| async move {
+//!         Ok::<(), TaskError>(())
+//!     });
+//!     let spec = TaskSpec::builder("embedded", TaskKind::Embedded, 1_000_u64)
+//!         .restart(RestartPolicy::Never)
+//!         .build()?;
 //!
-//!     let task_id = api.submit(&spec).await?;
+//!     let task_id = api.submit_with_task(task, &spec).await?;
 //!     let _task = api.get_task(&task_id);
 //!     let _runs = api.list_task_runs(&task_id);
 //!
@@ -53,8 +51,9 @@
 //!   -> OutputRegistry streams live output
 //! ```
 //!
-//! `submit()` is the normal path for model tasks. `submit_with_task()` is the
-//! path for embedded Rust tasks that already have a `taskvisor::TaskRef`.
+//! `submit_with_task()` is for embedded Rust tasks that already have a
+//! `taskvisor::TaskRef`. Use `submit()` when a [`RunnerRouter`] can build the
+//! task from its [`solti_model::TaskKind`].
 //!
 //! ## State
 //!

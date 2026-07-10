@@ -14,44 +14,6 @@ and read their run history from one Rust API.
 ## Quick Start
 
 ```rust,no_run
-use solti_core::taskvisor::{ControllerConfig, SupervisorConfig};
-use solti_core::{CoreError, RunnerRouter, StateConfig, SupervisorApi};
-use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec};
-
-async fn demo() -> Result<(), CoreError> {
-    let api = SupervisorApi::new(
-        SupervisorConfig::default(),
-        ControllerConfig::default(),
-        Vec::new(),          // extra taskvisor subscribers
-        RunnerRouter::new(), // add concrete runners in the host application
-        StateConfig::default(),
-    )
-    .await?;
-
-    let kind = TaskKind::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Command {
-            command: "echo".into(),
-            args: vec!["hello".into()],
-        },
-        TaskEnv::default(),
-        None,
-        Flag::enabled(),
-    ));
-    let spec = TaskSpec::builder("demo-slot", kind, 5_000_u64).build()?;
-
-    let task_id = api.submit(&spec).await?;
-    let _task = api.get_task(&task_id);
-    let _runs = api.list_task_runs(&task_id);
-
-    api.shutdown().await?;
-    Ok(())
-}
-```
-
-`submit()` is for model tasks that a `RunnerRouter` can build.
-For in-process tasks, use `submit_with_task()`.
-
-```rust,no_run
 use solti_core::taskvisor::{
     ControllerConfig, SupervisorConfig, TaskContext, TaskError, TaskFn,
 };
@@ -77,10 +39,33 @@ async fn demo() -> Result<(), CoreError> {
 
     let task_id = api.submit_with_task(task, &spec).await?;
     let _task = api.get_task(&task_id);
+    let _runs = api.list_task_runs(&task_id);
 
     api.shutdown().await?;
     Ok(())
 }
+```
+
+This example uses `submit_with_task()` because embedded tasks are already built
+as `taskvisor::TaskRef`.
+
+Use `submit()` when the task is described only by `TaskSpec` and your
+`RunnerRouter` has a runner for that `TaskKind`.
+
+```rust,ignore
+let mut router = RunnerRouter::new();
+router.register(my_runner);
+
+let api = SupervisorApi::new(
+    SupervisorConfig::default(),
+    ControllerConfig::default(),
+    Vec::new(),
+    router,
+    StateConfig::default(),
+)
+.await?;
+
+let task_id = api.submit(&spec).await?;
 ```
 
 ## Core Model
@@ -93,8 +78,8 @@ TaskSpec
   -> OutputRegistry announces live-tail events
 ```
 
-`SupervisorApi` is the main public entry point. It owns the taskvisor runtime, the runner
-router, shared in-memory state, and the output registry.
+`SupervisorApi` is the main public entry point. It owns the taskvisor runtime,
+the runner router, shared in-memory state, and the output registry.
 
 ## Submit Path
 
@@ -134,7 +119,7 @@ into `Exhausted`.
 Common reads:
 
 - `get_task(id)` - one task by id.
-- `list_all_tasks()` - visible tasks, excluding internal Solti tasks.
+- `list_all_tasks()` - public tasks, excluding internal Solti tasks.
 - `query_tasks(query)` - combined filters and pagination.
 - `list_task_runs(id)` - run history for one task.
 - `state().count_by_phase()` - cheap counts for metrics.
