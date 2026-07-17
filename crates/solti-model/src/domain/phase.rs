@@ -76,7 +76,7 @@ impl FromStr for TaskPhase {
 }
 
 impl TaskPhase {
-    /// Return `true` if the task has reached a final state.
+    /// Return `true` if this observed phase is terminal for the current attempt.
     ///
     /// A terminal phase means this attempt will not transition further.
     /// The supervisor may still start a new attempt based on the [`RestartPolicy`](crate::RestartPolicy).

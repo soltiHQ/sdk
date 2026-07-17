@@ -130,7 +130,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let state_collector = PrometheusStateCollector::new(supervisor.state())?;
     registry.register(Box::new(state_collector))?;
 
-    // Internal tasks travel the same pipeline as user TaskSpecs: submit → dispatch → run.
+    // Internal tasks use direct submission and then the same supervised runtime lifecycle.
     let (tz_task, tz_spec) = timezone_sync();
     supervisor.submit_with_task(tz_task, &tz_spec).await?;
 
@@ -168,9 +168,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // --- API: control plane → agent ---
     let api_metrics: Arc<dyn solti_api::ApiMetricsBackend> =
         Arc::new(PrometheusApiMetrics::new(registry.clone())?);
-    // Keep a supervisor handle for graceful shutdown after the server stops.
-    let sup_handle = supervisor.handle();
-    let handler = Arc::new(SupervisorApiAdapter::new(Arc::new(supervisor)));
+    // Keep the full SDK supervisor so shutdown also drains completion workers.
+    let supervisor = Arc::new(supervisor);
+    let handler = Arc::new(SupervisorApiAdapter::new(Arc::clone(&supervisor)));
 
     let mut builder = Server::builder();
     let tls_on = server_tls.is_some();
@@ -191,11 +191,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 
-    // Drain the supervision tree: cancels tasks cooperatively (grace period),
+    // Drain the supervised runtime: cancels tasks cooperatively (grace period),
     // then force-aborts stragglers. Without this, SIGINT/SIGTERM would kill
     // the process and orphan task subprocesses.
     info!("server stopped; shutting down supervisor");
-    sup_handle.shutdown().await?;
+    supervisor.shutdown().await?;
     Ok(())
 }
 

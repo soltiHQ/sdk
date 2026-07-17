@@ -21,7 +21,7 @@ taskvisor   = { workspace = true }
 tracing     = { workspace = true }
 serde       = { workspace = true, features = ["derive"] }
 axum        = { workspace = true }
-axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 tonic       = { workspace = true, features = ["tls-ring", "transport"] }
 clap        = { version = "4", features = ["derive"] }
 toml        = "0.8"

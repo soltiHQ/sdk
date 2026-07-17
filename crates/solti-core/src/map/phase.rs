@@ -1,91 +1,133 @@
-//! taskvisor to model phase crosswalk.
+//! Taskvisor to model phase crosswalk.
 //!
-//! The single home for the semantic mapping from taskvisor vocabulary (outcomes, event `reason` strings) into [`TaskPhase`].
+//! This module is the single home for semantic mapping from Taskvisor's typed
+//! final outcomes and rejection kinds into [`TaskPhase`]. Both state paths use
+//! it:
 //!
-//! Both state-reconstruction paths call these classifiers:
+//! - the best-effort event path maps `TaskFinished.outcome_kind` and typed
+//!   rejection events;
+//! - the reliable completion path maps [`taskvisor::TaskOutcome`].
 //!
-//! - the event path ([`StateSubscriber`](crate::state::StateSubscriber)) for `ActorExhausted` and rejection events;
-//! - the completion path (`SupervisorApi::finalize_from_outcome`) for the guaranteed [`taskvisor::TaskOutcome`].
+//! Diagnostic `reason` text may be retained as an error message, but it never
+//! selects a phase.
 //!
-//! One implementation keeps both paths on the same final phase.
+//! ## Crosswalk
 //!
-//! ## The subtle rows
-//!
-//! | taskvisor says                      | model phase              | Why                                                                                            |
-//! |-------------------------------------|--------------------------|------------------------------------------------------------------------------------------------|
-//! | `TaskOutcome::Failed`               | [`TaskPhase::Exhausted`] | The retry budget ran out; the task kept failing.                                               |
-//! | `TaskOutcome::Fatal`                | [`TaskPhase::Failed`]    | A permanent error stopped the task at once.                                                    |
-//! | rejection with a cancel-like reason | [`TaskPhase::Canceled`]  | User- or shutdown-initiated, not an error.                                                     |
-//! | rejection reason `dropped: ...`     | [`TaskPhase::Canceled`]  | The task's own `DropIfRunning` admission policy skipped the run: a routine skip, not an error. |
+//! | Taskvisor category                    | Model phase              | Why                                                        |
+//! |----------------------------------------|--------------------------|------------------------------------------------------------|
+//! | `TaskOutcomeKind::Completed`           | [`TaskPhase::Succeeded`] | The final attempt succeeded.                               |
+//! | `TaskOutcomeKind::Failed`              | [`TaskPhase::Exhausted`] | A retryable failure reached its policy stop condition.     |
+//! | `TaskOutcomeKind::Fatal`               | [`TaskPhase::Failed`]    | A permanent error stopped the task.                        |
+//! | `TaskOutcomeKind::Canceled`            | [`TaskPhase::Canceled`]  | The task stopped cooperatively.                            |
+//! | `TaskOutcomeKind::ForceAborted`        | [`TaskPhase::Canceled`]  | Cancellation completed through the runtime's abort path.   |
+//! | `TaskOutcomeKind::Panicked`            | [`TaskPhase::Failed`]    | The internal managed runner failed.                        |
+//! | cancel-like [`taskvisor::RejectionKind`] | [`TaskPhase::Canceled`] | Work was intentionally skipped or removed before running. |
 
 use solti_model::TaskPhase;
+use taskvisor::{RejectionKind, TaskOutcomeKind};
 
-use taskvisor::reasons;
-
-/// Classify a rejection reason into a terminal phase.
+/// SDK-owned diagnostic used for a force-aborted final outcome.
 ///
-/// Applies to `ControllerRejected` / `TaskAddFailed` events and to [`taskvisor::TaskOutcome::Rejected`].
-/// User- or shutdown-initiated removals ([`reasons::REMOVED_FROM_QUEUE`], [`reasons::SUPERSEDED_BY_REPLACE`], [`reasons::CONTROLLER_SHUTTING_DOWN`])
-/// and admission-policy drops (`AdmissionPolicy::DropIfRunning` on a busy slot) are a clean [`TaskPhase::Canceled`].
-/// Everything else (queue full, duplicate name, ...) is [`TaskPhase::Failed`].
-pub(crate) fn phase_for_rejection(reason: &str) -> TaskPhase {
-    if reason.starts_with("dropped:") {
-        return TaskPhase::Canceled;
-    }
-    match reason {
-        reasons::REMOVED_FROM_QUEUE
-        | reasons::SUPERSEDED_BY_REPLACE
-        | reasons::CONTROLLER_SHUTTING_DOWN => TaskPhase::Canceled,
+/// The value preserves the SDK's existing status payload without depending on
+/// Taskvisor's diagnostic `reason` strings.
+pub(crate) const FORCE_ABORTED_ERROR: &str = "force_terminated_after_grace";
+
+/// SDK-owned diagnostic used when Taskvisor reports an internal runner panic.
+///
+/// The value preserves the SDK's existing status payload.
+pub(crate) const TASK_RUNNER_PANICKED_ERROR: &str = "actor panicked";
+
+/// Classify a typed rejection into a terminal phase.
+///
+/// Applies to `ControllerRejected` / `TaskAddFailed` events and to
+/// [`taskvisor::TaskOutcome::Rejected`]. User- or shutdown-initiated removals
+/// and admission-policy skips are clean cancellation. Everything else is a
+/// failed submission.
+pub(crate) fn phase_for_rejection(kind: RejectionKind) -> TaskPhase {
+    match kind {
+        RejectionKind::SlotBusy
+        | RejectionKind::RemovedFromQueue
+        | RejectionKind::SupersededByReplace
+        | RejectionKind::ControllerShuttingDown => TaskPhase::Canceled,
         _ => TaskPhase::Failed,
     }
 }
 
-/// Classify an `ActorExhausted` reason into `(phase, error)`.
+/// Crosswalk a typed final outcome event into `(phase, error, exit_code)`.
 ///
-/// - [`reasons::POLICY_EXHAUSTED_SUCCESS`]: a normal one-shot completion maps to [`TaskPhase::Succeeded`], no error.
-/// - [`reasons::TASK_RETURNED_CANCELED`]: a cooperative self-stop maps to [`TaskPhase::Canceled`], no error.
-/// - Anything else (`max_retries_exceeded(...)`, ...) maps to [`TaskPhase::Exhausted`] with the reason as the error text.
-pub(crate) fn phase_for_exhausted(reason: Option<&str>) -> (TaskPhase, Option<String>) {
-    match reason {
-        Some(reasons::POLICY_EXHAUSTED_SUCCESS) => (TaskPhase::Succeeded, None),
-        Some(reasons::TASK_RETURNED_CANCELED) => (TaskPhase::Canceled, None),
-        Some(other) => (TaskPhase::Exhausted, Some(other.to_string())),
-        None => (TaskPhase::Exhausted, Some("exhausted".to_string())),
+/// `reason` is copied only for outcome categories that carry failure details.
+/// It is never parsed or compared. Unknown future categories degrade to
+/// [`TaskPhase::Failed`] with an SDK-owned diagnostic.
+pub(crate) fn phase_for_outcome_kind(
+    kind: TaskOutcomeKind,
+    reason: Option<&str>,
+    exit_code: Option<i32>,
+) -> (TaskPhase, Option<String>, Option<i32>) {
+    match kind {
+        TaskOutcomeKind::Completed => (TaskPhase::Succeeded, None, None),
+        TaskOutcomeKind::Failed => (
+            TaskPhase::Exhausted,
+            Some(
+                reason
+                    .unwrap_or("task retry policy stopped after a failure")
+                    .to_string(),
+            ),
+            exit_code,
+        ),
+        TaskOutcomeKind::Fatal => (
+            TaskPhase::Failed,
+            Some(reason.unwrap_or("task reported a fatal error").to_string()),
+            exit_code,
+        ),
+        TaskOutcomeKind::Canceled => (TaskPhase::Canceled, None, None),
+        TaskOutcomeKind::ForceAborted => (
+            TaskPhase::Canceled,
+            Some(FORCE_ABORTED_ERROR.to_string()),
+            None,
+        ),
+        TaskOutcomeKind::Panicked => (
+            TaskPhase::Failed,
+            Some(TASK_RUNNER_PANICKED_ERROR.to_string()),
+            None,
+        ),
+        // Rejected work normally uses ControllerRejected / TaskAddFailed, not
+        // TaskFinished. Without RejectionKind, failure is the conservative
+        // event-side classification. The direct outcome path below retains the
+        // precise typed rejection mapping.
+        TaskOutcomeKind::Rejected => (
+            TaskPhase::Failed,
+            Some(reason.unwrap_or("task submission was rejected").to_string()),
+            None,
+        ),
+        _ => (
+            TaskPhase::Failed,
+            Some("unknown task outcome kind".to_string()),
+            exit_code,
+        ),
     }
 }
 
-/// Crosswalk a guaranteed [`taskvisor::TaskOutcome`] into `(phase, error, exit_code)`.
+/// Crosswalk a direct [`taskvisor::TaskOutcome`] into
+/// `(phase, error, exit_code)`.
 ///
-/// `Rejected` delegates to [`phase_for_rejection`], keeping both paths on one classifier.
-/// Unknown future variants degrade to [`TaskPhase::Failed`] with a diagnostic error text.
+/// Rejected work delegates to [`phase_for_rejection`]. All other known
+/// variants share the same [`TaskOutcomeKind`] crosswalk as `TaskFinished`.
 pub(crate) fn phase_for_outcome(
     outcome: &taskvisor::TaskOutcome,
 ) -> (TaskPhase, Option<String>, Option<i32>) {
     use taskvisor::TaskOutcome;
 
     match outcome {
-        TaskOutcome::Completed => (TaskPhase::Succeeded, None, None),
         TaskOutcome::Failed {
             reason, exit_code, ..
-        } => (TaskPhase::Exhausted, Some(reason.to_string()), *exit_code),
-        TaskOutcome::Fatal {
-            reason, exit_code, ..
-        } => (TaskPhase::Failed, Some(reason.to_string()), *exit_code),
-        TaskOutcome::Canceled => (TaskPhase::Canceled, None, None),
-        TaskOutcome::ForceAborted => (
-            TaskPhase::Canceled,
-            Some("force_terminated_after_grace".to_string()),
-            None,
-        ),
-        TaskOutcome::Panicked => (TaskPhase::Failed, Some("actor panicked".to_string()), None),
-        TaskOutcome::Rejected { reason } => {
-            (phase_for_rejection(reason), Some(reason.to_string()), None)
         }
-        _ => (
-            TaskPhase::Failed,
-            Some("unknown task outcome".to_string()),
-            None,
-        ),
+        | TaskOutcome::Fatal {
+            reason, exit_code, ..
+        } => phase_for_outcome_kind(outcome.kind(), Some(reason), *exit_code),
+        TaskOutcome::Rejected { kind, reason, .. } => {
+            (phase_for_rejection(*kind), Some(reason.to_string()), None)
+        }
+        _ => phase_for_outcome_kind(outcome.kind(), None, None),
     }
 }
 
@@ -95,104 +137,133 @@ mod tests {
     use taskvisor::TaskOutcome;
 
     #[test]
-    fn rejection_cancel_like_reasons_map_to_canceled() {
-        for reason in [
-            reasons::REMOVED_FROM_QUEUE,
-            reasons::SUPERSEDED_BY_REPLACE,
-            reasons::CONTROLLER_SHUTTING_DOWN,
+    fn rejection_cancel_like_kinds_map_to_canceled() {
+        for kind in [
+            RejectionKind::RemovedFromQueue,
+            RejectionKind::SupersededByReplace,
+            RejectionKind::ControllerShuttingDown,
+            RejectionKind::SlotBusy,
         ] {
-            assert_eq!(phase_for_rejection(reason), TaskPhase::Canceled);
+            assert_eq!(phase_for_rejection(kind), TaskPhase::Canceled);
         }
     }
 
     #[test]
-    fn rejection_other_reasons_map_to_failed() {
-        for reason in ["queue_full: 3/3", "already_exists", ""] {
-            assert_eq!(phase_for_rejection(reason), TaskPhase::Failed);
-        }
-    }
-
-    #[test]
-    fn rejection_admission_drop_maps_to_canceled() {
-        for reason in [
-            "dropped: slot busy (running)",
-            "dropped: slot busy (admitting)",
-            "dropped: slot busy (terminating)",
+    fn rejection_failure_kinds_map_to_failed() {
+        for kind in [
+            RejectionKind::QueueFull,
+            RejectionKind::AlreadyExists,
+            RejectionKind::BatchRejected,
+            RejectionKind::AdmissionFailed,
         ] {
-            assert_eq!(phase_for_rejection(reason), TaskPhase::Canceled);
+            assert_eq!(phase_for_rejection(kind), TaskPhase::Failed);
         }
     }
 
     #[test]
-    fn exhausted_success_and_self_cancel_carry_no_error() {
+    fn typed_outcome_kinds_have_an_explicit_crosswalk() {
+        for (kind, expected) in [
+            (TaskOutcomeKind::Completed, TaskPhase::Succeeded),
+            (TaskOutcomeKind::Failed, TaskPhase::Exhausted),
+            (TaskOutcomeKind::Fatal, TaskPhase::Failed),
+            (TaskOutcomeKind::Canceled, TaskPhase::Canceled),
+            (TaskOutcomeKind::ForceAborted, TaskPhase::Canceled),
+            (TaskOutcomeKind::Panicked, TaskPhase::Failed),
+            (TaskOutcomeKind::Rejected, TaskPhase::Failed),
+        ] {
+            assert_eq!(
+                phase_for_outcome_kind(kind, Some("diagnostic"), Some(9)).0,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_text_never_selects_the_phase() {
         assert_eq!(
-            phase_for_exhausted(Some(reasons::POLICY_EXHAUSTED_SUCCESS)),
-            (TaskPhase::Succeeded, None)
+            phase_for_outcome_kind(
+                TaskOutcomeKind::Completed,
+                Some("retry limit reached after 3 retries"),
+                Some(1),
+            ),
+            (TaskPhase::Succeeded, None, None),
         );
         assert_eq!(
-            phase_for_exhausted(Some(reasons::TASK_RETURNED_CANCELED)),
-            (TaskPhase::Canceled, None)
+            phase_for_outcome_kind(
+                TaskOutcomeKind::Failed,
+                Some("this text claims success"),
+                Some(7),
+            ),
+            (
+                TaskPhase::Exhausted,
+                Some("this text claims success".to_string()),
+                Some(7),
+            ),
         );
     }
 
     #[test]
-    fn exhausted_retry_limit_keeps_the_reason_as_error() {
-        let (phase, error) = phase_for_exhausted(Some("max_retries_exceeded(3/3): boom"));
-        assert_eq!(phase, TaskPhase::Exhausted);
-        assert_eq!(error.as_deref(), Some("max_retries_exceeded(3/3): boom"));
-
-        let (phase, error) = phase_for_exhausted(None);
-        assert_eq!(phase, TaskPhase::Exhausted);
-        assert_eq!(error.as_deref(), Some("exhausted"));
-    }
-
-    #[test]
-    fn outcome_failed_is_exhausted_and_fatal_is_failed() {
+    fn direct_failed_and_fatal_outcomes_keep_diagnostics() {
         let failed = TaskOutcome::failed_for_tests("boom", Some(3));
-        let (phase, error, exit_code) = phase_for_outcome(&failed);
-        assert_eq!(phase, TaskPhase::Exhausted);
-        assert_eq!(error.as_deref(), Some("boom"));
-        assert_eq!(exit_code, Some(3));
+        assert_eq!(
+            phase_for_outcome(&failed),
+            (TaskPhase::Exhausted, Some("boom".to_string()), Some(3)),
+        );
 
         let fatal = TaskOutcome::fatal_for_tests("bad config", None);
-        let (phase, error, exit_code) = phase_for_outcome(&fatal);
-        assert_eq!(phase, TaskPhase::Failed);
-        assert_eq!(error.as_deref(), Some("bad config"));
-        assert_eq!(exit_code, None);
+        assert_eq!(
+            phase_for_outcome(&fatal),
+            (TaskPhase::Failed, Some("bad config".to_string()), None),
+        );
     }
 
     #[test]
-    fn outcome_terminal_variants_map_cleanly() {
-        let (phase, error, _) = phase_for_outcome(&TaskOutcome::Panicked);
-        assert_eq!(phase, TaskPhase::Failed);
-        assert_eq!(error.as_deref(), Some("actor panicked"));
-
+    fn direct_terminal_outcomes_share_the_typed_crosswalk() {
         assert_eq!(
             phase_for_outcome(&TaskOutcome::Completed),
-            (TaskPhase::Succeeded, None, None)
+            (TaskPhase::Succeeded, None, None),
         );
         assert_eq!(
             phase_for_outcome(&TaskOutcome::Canceled),
-            (TaskPhase::Canceled, None, None)
+            (TaskPhase::Canceled, None, None),
         );
-        let (phase, error, _) = phase_for_outcome(&TaskOutcome::ForceAborted);
-        assert_eq!(phase, TaskPhase::Canceled);
-        assert_eq!(error.as_deref(), Some("force_terminated_after_grace"));
+        assert_eq!(
+            phase_for_outcome(&TaskOutcome::ForceAborted),
+            (
+                TaskPhase::Canceled,
+                Some(FORCE_ABORTED_ERROR.to_string()),
+                None,
+            ),
+        );
+        assert_eq!(
+            phase_for_outcome(&TaskOutcome::Panicked),
+            (
+                TaskPhase::Failed,
+                Some(TASK_RUNNER_PANICKED_ERROR.to_string()),
+                None,
+            ),
+        );
     }
 
     #[test]
-    fn outcome_rejected_uses_the_shared_rejection_classifier() {
-        let canceled = TaskOutcome::Rejected {
-            reason: reasons::REMOVED_FROM_QUEUE.into(),
-        };
-        let (phase, error, _) = phase_for_outcome(&canceled);
-        assert_eq!(phase, TaskPhase::Canceled);
-        assert_eq!(error.as_deref(), Some(reasons::REMOVED_FROM_QUEUE));
+    fn direct_rejection_uses_the_typed_rejection_classifier() {
+        let canceled = TaskOutcome::rejected_for_tests(
+            RejectionKind::RemovedFromQueue,
+            "removed before registration",
+        );
+        assert_eq!(
+            phase_for_outcome(&canceled),
+            (
+                TaskPhase::Canceled,
+                Some("removed before registration".to_string()),
+                None,
+            ),
+        );
 
-        let failed = TaskOutcome::Rejected {
-            reason: "queue_full: 3/3".into(),
-        };
-        let (phase, _, _) = phase_for_outcome(&failed);
-        assert_eq!(phase, TaskPhase::Failed);
+        let failed = TaskOutcome::rejected_for_tests(
+            RejectionKind::QueueFull,
+            "slot queue reached capacity",
+        );
+        assert_eq!(phase_for_outcome(&failed).0, TaskPhase::Failed);
     }
 }

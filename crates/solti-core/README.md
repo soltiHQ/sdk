@@ -90,12 +90,21 @@ submit(spec)
   -> submit_with_task(task, spec)
       -> reserve a TaskState entry
       -> map Solti policies to taskvisor policies
-      -> submit to taskvisor
-      -> bind the Solti TaskId to the taskvisor run id
+      -> prepare the taskvisor submission identity
+      -> bind the Solti TaskId to the taskvisor submission identity
+      -> submit to taskvisor's bounded controller command queue
 ```
 
 `submit_with_task()` skips the router. It is the right API for embedded Rust
 tasks that already have a `taskvisor::TaskRef`.
+
+The SDK installs the local identity binding before controller intake, while no
+event for that prepared identity can exist yet. `Ok(TaskId)` confirms queue
+intake. Slot admission, runtime registration, and task-body start still happen
+asynchronously. A later admission rejection is delivered through the direct
+completion waiter and becomes a terminal task state. If intake fails, or the
+submit future is cancelled before intake, the provisional state reservation is
+rolled back; a previously retained terminal resource with the same id is restored.
 
 ## State Path
 
@@ -103,13 +112,21 @@ tasks that already have a `taskvisor::TaskRef`.
 
 - Event path: taskvisor lifecycle events update phases, attempts, run history,
   and live-tail announcements.
-- Completion path: taskvisor `TaskWaiter` gives a guaranteed final outcome if
-  a terminal event was missed by the event bus.
+- Direct completion path: taskvisor `TaskWaiter` supplies the authoritative
+  outcome independently of the best-effort event bus.
 
-The event bus is best-effort, so the completion path is a safety path. It must not
-replace a more specific event-derived phase. For example, a task that timed out
-should stay `Timeout`; a later actor-level `ActorExhausted` must not turn it
-into `Exhausted`.
+Final phases are selected from `TaskOutcomeKind` and `RejectionKind`. Event
+`reason` text is kept only as diagnostic detail and is never parsed as schema.
+
+For registered tasks, `TaskRemoved` is used as a FIFO barrier so attempt events
+normally reach the state subscriber before identity and output cleanup. If that
+best-effort barrier is lost or delayed, the direct outcome finalizes after a
+bounded wait; attempt detail remains best-effort. The joined outcome reconciles
+the resource-level final disposition while attempt history keeps its own result.
+A concrete attempt `Timeout` stays more specific than the final
+`TaskOutcomeKind::Failed`, which maps to the resource-level `Exhausted` phase.
+Completion waiters run on the supervisor's construction runtime and are drained
+by `shutdown()`.
 
 ## TaskState
 
@@ -165,8 +182,8 @@ All fallible APIs return `CoreError`.
 
 | Variant | Meaning |
 |---------|---------|
-| `Supervisor` | taskvisor submit, cancel, remove, or shutdown failed. |
-| `AlreadyExists` | a non-terminal task with the same id is already active. |
+| `Supervisor` | taskvisor submit, cancel, or shutdown failed. |
+| `AlreadyExists` | a live submission still owns the same task id, including a bound task between attempts. |
 | `NotFound` | the requested task does not exist. |
 | `Mapping` | a Solti policy could not be mapped to taskvisor. |
 | `Runner` | the runner router could not build a task. |
@@ -185,9 +202,12 @@ match arm.
 
 ## Notes
 
-- `SupervisorApi::new()` registers the state subscriber automatically.
-- `new_with_output_registry()` lets the runner side and API side share one
-  output registry.
+- `SupervisorApi::new()` registers the state subscriber automatically and uses
+  the router's output registry for API live-tail streams.
+- `new_with_output_registry()` replaces the router registry with the supplied
+  one, preserving the same output-path invariant.
 - `delete_task()` is idempotent and removes both task state and run history.
 - `cancel_task()` returns `NotFound` when no task exists.
+- Cancellation uses taskvisor's unified identity path: registered work is joined,
+  while controller-queued work is removed before it starts.
 - `uptime_seconds()` reports process uptime from the first `SupervisorApi::new()`.

@@ -75,7 +75,7 @@ runner_metrics.record_task_completed(
 );
 
 let supervisor_metrics = PrometheusSubscriber::new(registry.clone())?;
-supervisor_metrics.on_event(&Event::new(EventKind::TaskStarting).with_attempt(1));
+supervisor_metrics.on_event(&Event::new(EventKind::AttemptStarting).with_attempt(1));
 
 assert!(!registry.gather().is_empty());
 # Ok(()) }
@@ -170,8 +170,7 @@ It watches taskvisor events and updates supervision metrics.
 | `solti_sv_task_restarts_total`           | Counter   | none      | Restarts where attempt > 1                 |
 | `solti_sv_task_backoff_count_total`      | Counter   | `source`  | Backoff events                             |
 | `solti_sv_task_backoff_duration_seconds` | Histogram | none      | Backoff delay                              |
-| `solti_sv_task_terminal_total`           | Counter   | `reason`  | Terminal actor state                       |
-| `solti_sv_attempts_to_finalize`          | Histogram | `outcome` | Attempts before final actor state          |
+| `solti_sv_task_terminal_total`           | Counter   | `outcome` | Final task outcomes                        |
 | `solti_sv_task_timeouts_total`           | Counter   | none      | Timeout events                             |
 | `solti_sv_subscriber_overflow_total`     | Counter   | none      | Lost events in subscriber queues           |
 | `solti_sv_subscriber_panicked_total`     | Counter   | none      | Subscriber panics                          |
@@ -185,6 +184,9 @@ Controller metrics:
 | `solti_ctrl_rejections_total`  | Counter | `reason` | Controller rejections by cause |
 
 `solti_sv_tasks_in_flight` is event-based and best effort. If you need an authoritative current count, enable `state` and register `PrometheusStateCollector`.
+
+The terminal `rejected` label is defensive. Current Taskvisor admission
+rejections use `solti_ctrl_rejections_total`; they do not emit `TaskFinished`.
 
 ## API Metrics
 
@@ -228,22 +230,22 @@ On non-Linux targets, or without the `process` feature, `register_process_collec
 ## Event Mapping
 
 ```text
-TaskStarting        -> tasks_in_flight.inc()
-                       task_restarts.inc() if attempt > 1
-TaskStopped         -> tasks_in_flight.dec()
-TaskCanceled        -> tasks_in_flight.dec()
-TaskFailed          -> tasks_in_flight.dec()
-TimeoutHit          -> task_timeouts.inc()
-BackoffScheduled    -> task_backoff_count{source}.inc()
-                       task_backoff_duration.observe(delay)
-ActorExhausted      -> task_terminal{reason}.inc()
-                       attempts_to_finalize{outcome}.observe(attempt)
-ActorDead           -> task_terminal{reason="fatal"}.inc()
-                       attempts_to_finalize{outcome="fatal"}.observe(attempt)
-SubscriberOverflow  -> subscriber_overflow.inc()
-SubscriberPanicked  -> subscriber_panicked.inc()
-ControllerSubmitted -> controller_submissions.inc()
-ControllerRejected  -> controller_rejections{reason}.inc()
+AttemptStarting       -> tasks_in_flight.inc()
+                          task_restarts.inc() if attempt > 1
+AttemptSucceeded      -> tasks_in_flight.dec()
+AttemptCanceled       -> tasks_in_flight.dec()
+AttemptFailed         -> tasks_in_flight.dec()
+AttemptTimedOut       -> tasks_in_flight.dec()
+                          task_timeouts.inc()
+BackoffScheduled      -> task_backoff_count{source}.inc()
+                          task_backoff_duration.observe(delay)
+TaskFinished          -> task_terminal{outcome}.inc()
+                          tasks_in_flight.dec() for force-abort/panic fallback
+SubscriberOverflow    -> subscriber_overflow.inc()
+SubscriberPanicked    -> subscriber_panicked.inc()
+RuntimeFailure        -> runtime_failures.inc()
+ControllerSubmitted   -> controller_submissions.inc()
+ControllerRejected    -> controller_rejections{reason}.inc()
 ```
 
 ## Label Cardinality
@@ -253,10 +255,11 @@ Prometheus labels stay low-cardinality and bounded.
 | Label       | Values                                                                                 |
 |-------------|----------------------------------------------------------------------------------------|
 | `runner`    | `subprocess`, `wasm`, `container`                                                      |
-| `outcome`   | `success`, `failure`, `canceled`, `timeout`                                            |
+| `outcome` (runner/discovery) | `success`, `failure`, `canceled`, `timeout`                              |
+| `outcome` (task terminal) | `completed`, `exhausted`, `fatal`, `canceled`, `force_aborted`, `panicked`, `rejected`, `other`, `unknown` |
 | `error`     | `cgroup_prepare_failed`, `backend_config_failed`, `spawn_failed`, `module_load_failed` |
 | `source`    | `failure`, `success`                                                                   |
-| `reason`    | bounded terminal, rejection, and discovery reason labels                               |
+| `reason`    | bounded rejection and discovery reason labels                                         |
 | `transport` | `http`, `grpc`                                                                         |
 | `method`    | HTTP method or gRPC method name                                                        |
 | `path`      | templated HTTP route or gRPC method path                                               |

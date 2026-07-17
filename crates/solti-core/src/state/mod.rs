@@ -18,7 +18,7 @@ use std::{
     time::SystemTime,
 };
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use tracing::debug;
 
 use solti_model::{
@@ -26,6 +26,23 @@ use solti_model::{
 };
 
 use crate::error::CoreError;
+
+/// Serializes short state/output lifecycle commits across the event, waiter,
+/// and management paths.
+///
+/// Async controller waits stay outside this gate. It only closes the small
+/// resolve-then-mutate windows where a reusable [`TaskId`] could otherwise let
+/// an old incarnation touch a newer one.
+#[derive(Clone, Default)]
+pub(crate) struct LifecycleGate {
+    inner: Arc<Mutex<()>>,
+}
+
+impl LifecycleGate {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
+        self.inner.lock()
+    }
+}
 
 /// Shared in-memory task state.
 ///
@@ -54,13 +71,23 @@ struct TaskStateInner {
     by_slot: HashMap<Slot, Vec<TaskId>>,
     /// Execution history: task_id -> ordered list of runs (oldest first).
     runs: HashMap<TaskId, VecDeque<TaskRun>>,
-    /// taskvisor run identity (raw) -> task entry.
+    /// Raw taskvisor task/submission identity -> task entry.
     /// The canonical correlation key for incoming events: labels are reusable, identities are not.
     by_tv: HashMap<u64, TaskId>,
-    /// Task entry -> its current taskvisor run identity.
+    /// Task entry -> its current taskvisor task/submission identity.
     tv_of: HashMap<TaskId, taskvisor::TaskId>,
     /// Per-task run-history cap (oldest finished runs evicted past this).
     max_runs_per_task: usize,
+}
+
+/// Previous retained resource replaced by a provisional submission.
+///
+/// The supervisor keeps this payload armed until controller-queue intake
+/// succeeds. If intake fails or the submit future is dropped, the exact prior
+/// terminal resource is restored while its run history remains untouched.
+#[derive(Debug)]
+pub(crate) struct ReservationRollback {
+    previous: Option<Task>,
 }
 
 impl TaskState {
@@ -117,20 +144,40 @@ impl TaskState {
 
     /// Atomically reserve a task name with a provisional entry.
     ///
-    /// Returns [`CoreError::AlreadyExists`] if a **non-terminal** entry already holds this name (the previous incarnation is still active).
-    /// Otherwise, it inserts the provisional entry: idempotent on the slot index, exactly like [`add_task`](Self::add_task) and returns `Ok(())`.
-    pub(crate) fn reserve(&self, id: TaskId, spec: TaskSpec) -> Result<(), CoreError> {
+    /// Returns [`CoreError::AlreadyExists`] if a non-terminal entry already holds
+    /// this name, or if a terminal per-attempt phase is still bound to a live
+    /// taskvisor task lifecycle (for example, during backoff or a success interval).
+    /// Otherwise, it inserts the provisional entry and returns an undo payload
+    /// for the previous retained terminal resource, if any. Slot indexing stays
+    /// idempotent, exactly like [`add_task`](Self::add_task).
+    pub(crate) fn reserve(
+        &self,
+        id: TaskId,
+        spec: TaskSpec,
+    ) -> Result<ReservationRollback, CoreError> {
         let mut inner = self.inner.write();
 
         if let Some(existing) = inner.tasks.get(&id)
-            && !existing.status().phase.is_terminal()
+            && (!existing.status().phase.is_terminal() || inner.tv_of.contains_key(&id))
         {
             return Err(CoreError::AlreadyExists(format!(
                 "task '{id}' is already active (phase {})",
                 existing.status().phase
             )));
         }
+
+        let previous = inner.tasks.remove(&id);
+        let previous_slot = previous.as_ref().map(|task| task.slot().clone());
         Self::unbind_locked(&mut inner, &id);
+
+        if let Some(previous_slot) = previous_slot
+            && let Some(ids) = inner.by_slot.get_mut(&previous_slot)
+        {
+            ids.retain(|task_id| task_id != &id);
+            if ids.is_empty() {
+                inner.by_slot.remove(&previous_slot);
+            }
+        }
 
         let slot = spec.slot().clone();
         let task = Task::new(id.clone(), spec);
@@ -139,12 +186,39 @@ impl TaskState {
             ids.push(id.clone());
         }
         inner.tasks.insert(id, task);
-        Ok(())
+        Ok(ReservationRollback { previous })
     }
 
-    /// Bind a task entry to its current taskvisor run identity.
+    /// Roll back one still-provisional reservation.
     ///
-    /// Called at submission time (the id is pre-minted by `submit()`).
+    /// The caller serializes this with the shared lifecycle gate and same-id
+    /// management lock. Run history is deliberately left unchanged.
+    pub(crate) fn rollback_reservation(&self, id: &TaskId, rollback: ReservationRollback) {
+        let mut inner = self.inner.write();
+
+        Self::unbind_locked(&mut inner, id);
+        if let Some(provisional) = inner.tasks.remove(id)
+            && let Some(ids) = inner.by_slot.get_mut(provisional.slot())
+        {
+            ids.retain(|task_id| task_id != id);
+            if ids.is_empty() {
+                inner.by_slot.remove(provisional.slot());
+            }
+        }
+
+        if let Some(previous) = rollback.previous {
+            let slot = previous.slot().clone();
+            let ids = inner.by_slot.entry(slot).or_default();
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+            inner.tasks.insert(id.clone(), previous);
+        }
+    }
+
+    /// Bind a task entry to its current taskvisor task/submission identity.
+    ///
+    /// Called after taskvisor prepares the identity and before controller intake.
     /// Rebinding the same entry to a new identity drops the previous binding.
     /// Late events from the previous incarnation no longer resolve to this entry.
     pub(crate) fn bind_tv(&self, id: &TaskId, tv: taskvisor::TaskId) {
@@ -155,12 +229,12 @@ impl TaskState {
         inner.by_tv.insert(tv.get(), id.clone());
     }
 
-    /// Resolve a taskvisor run identity to its task entry (if currently bound).
+    /// Resolve a taskvisor task/submission identity to its task entry (if currently bound).
     pub(crate) fn resolve_tv(&self, tv: u64) -> Option<TaskId> {
         self.inner.read().by_tv.get(&tv).cloned()
     }
 
-    /// The taskvisor run identity currently bound to a task entry (if any).
+    /// The taskvisor task/submission identity currently bound to a task entry (if any).
     pub(crate) fn tv_for(&self, id: &TaskId) -> Option<taskvisor::TaskId> {
         self.inner.read().tv_of.get(id).copied()
     }
@@ -171,38 +245,17 @@ impl TaskState {
         }
     }
 
-    /// Release the taskvisor identity binding for a task entry, if any.
-    ///
-    /// The sweep deliberately spares any entry that is still **bound**: a periodic task sits in a terminal phase between runs while its actor is alive (see [`sweep`](Self::sweep)).
-    /// Terminal finalizations that do *not* flow through `TaskRemoved` (admission rejections, lag-dropped terminals reconstructed by the completion path)
-    /// must therefore call this to drop the binding. Otherwise the entry is mistaken for a live periodic task and is never reaped.
+    /// Test helper that simulates reliable completion releasing an identity binding.
+    #[cfg(test)]
     pub(crate) fn unbind(&self, id: &TaskId) {
         let mut inner = self.inner.write();
         Self::unbind_locked(&mut inner, id);
     }
 
-    /// Unregister a task from state (called on `TaskRemoved` event).
-    ///
-    /// Removes the task entry, its slot index, and its identity binding, but **preserves run history** (cleaned later by sweep).
-    /// Compare with [`delete_task`](Self::delete_task) which removes both.
-    pub(crate) fn unregister_task(&self, id: &TaskId) {
-        let mut inner = self.inner.write();
-
-        Self::unbind_locked(&mut inner, id);
-        if let Some(task) = inner.tasks.remove(id)
-            && let Some(ids) = inner.by_slot.get_mut(task.slot())
-        {
-            ids.retain(|task_id| task_id != id);
-            if ids.is_empty() {
-                inner.by_slot.remove(task.slot());
-            }
-        }
-    }
-
     /// Delete a task **and** its run history. Returns `true` if the task existed.
     ///
-    /// This is the API-driven full removal.
-    /// Compare with [`unregister_task`](Self::unregister_task) which preserves runs.
+    /// This is the API-driven full removal. Submission rollback uses
+    /// [`rollback_reservation`](Self::rollback_reservation) and preserves runs.
     pub(crate) fn delete_task(&self, id: &TaskId) -> bool {
         let mut inner = self.inner.write();
         inner.runs.remove(id);
@@ -290,18 +343,49 @@ impl TaskState {
         found
     }
 
-    /// Atomically finalize the entry bound to taskvisor run identity `tv_raw`.
+    fn reconcile_finished_locked(
+        inner: &mut TaskStateInner,
+        id: &TaskId,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+    ) -> bool {
+        let found = if let Some(task) = inner.tasks.get_mut(id) {
+            match task.reconcile_finished(phase, error.clone(), exit_code) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(task = %id, error = %e, "ignoring illegal reconciliation");
+                    return false;
+                }
+            }
+        } else {
+            false
+        };
+
+        if let Some(runs) = inner.runs.get_mut(id)
+            && let Some(run) = runs.back_mut().filter(|run| run.is_active())
+        {
+            run.finish(phase, error, exit_code);
+        }
+
+        found
+    }
+
+    /// Atomically finalize the entry bound to taskvisor identity `tv_raw`.
     ///
     /// All checks and mutations happen under one write lock:
     ///
     /// 1. The binding must still be bidirectionally current: `by_tv[tv_raw]` resolves to an entry whose `tv_of` points back at `tv_raw`.
     ///    A stale completion waiter can therefore never touch a newer incarnation that already re-reserved the name (see [`reserve`](Self::reserve)).
-    /// 2. The binding is released unconditionally: the waiter fires only once the actor has fully terminated (see [`unbind`](Self::unbind)).
-    /// 3. The phase transition is applied unless the entry is already terminal - the completion path must never demote an event-derived phase.
-    ///    `force` overrides that guard for rejected submissions, which must reach a terminal phase even if the event path already touched the
-    ///    entry (`Task::transition_finished` stays sticky-terminal).
+    /// 2. The binding is released unconditionally: the waiter fires only once the managed task has fully terminated.
+    /// 3. A terminal event-derived phase normally stays sticky, except for the
+    ///    model's explicit `Failed` to `Exhausted`/`Timeout` refinement.
+    ///    `force` reconciles the resource with an authoritative task outcome;
+    ///    a concrete attempt `Timeout` is still preserved over the task's
+    ///    generic `Exhausted` disposition.
     ///
-    /// Returns the bound entry's id so the caller can evict per-task resources (e.g. output channels) outside the lock; `None` for a stale binding.
+    /// Returns the bound entry's id so the caller can evict per-task resources
+    /// before releasing the shared lifecycle gate; `None` for a stale binding.
     pub(crate) fn finalize_if_bound(
         &self,
         tv_raw: u64,
@@ -318,11 +402,16 @@ impl TaskState {
         }
         Self::unbind_locked(&mut inner, &id);
 
-        let already_terminal = inner
-            .tasks
-            .get(&id)
-            .is_none_or(|t| t.status().phase.is_terminal());
-        if force || !already_terminal {
+        let current_phase = inner.tasks.get(&id).map(|task| task.status().phase);
+        let preserve_timeout =
+            force && current_phase == Some(TaskPhase::Timeout) && phase == TaskPhase::Exhausted;
+        let refines_failed = current_phase == Some(TaskPhase::Failed)
+            && matches!(phase, TaskPhase::Exhausted | TaskPhase::Timeout);
+        if force && !preserve_timeout {
+            Self::reconcile_finished_locked(&mut inner, &id, phase, error, exit_code);
+        } else if !preserve_timeout
+            && (refines_failed || current_phase.is_some_and(|current| !current.is_terminal()))
+        {
             Self::transition_finished_locked(&mut inner, &id, phase, error, exit_code);
         }
         Some(id)
@@ -735,15 +824,42 @@ mod tests {
     }
 
     #[test]
-    fn unregister_task_removes_from_state() {
+    fn reserve_moves_a_reused_terminal_name_to_its_new_slot() {
         let state = TaskState::new();
-        let id = TaskId::from("task-1");
+        let id = TaskId::from("moved");
 
-        state.add_task(id.clone(), default_spec());
-        assert!(state.get(&id).is_some());
+        state
+            .reserve(id.clone(), default_spec_with_slot("old-slot"))
+            .unwrap();
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Succeeded, None, None);
 
-        state.unregister_task(&id);
-        assert!(state.get(&id).is_none());
+        state
+            .reserve(id.clone(), default_spec_with_slot("new-slot"))
+            .unwrap();
+
+        assert!(
+            state.list_by_slot("old-slot").is_empty(),
+            "the previous slot index must not retain the reused id"
+        );
+        assert_eq!(state.list_by_slot("new-slot").len(), 1);
+        assert_eq!(state.get(&id).unwrap().slot().as_str(), "new-slot");
+    }
+
+    #[test]
+    fn reserve_rejects_a_terminal_phase_while_the_actor_is_still_bound() {
+        let state = TaskState::new();
+        let id = TaskId::from("bound-between-attempts");
+
+        state.reserve(id.clone(), default_spec()).unwrap();
+        state.bind_tv(&id, taskvisor::TaskId::for_tests());
+        state.transition_starting(&id);
+        state.transition_finished(&id, TaskPhase::Succeeded, None, None);
+
+        let err = state
+            .reserve(id.clone(), default_spec())
+            .expect_err("a bound task must retain its name between attempts");
+        assert!(matches!(err, CoreError::AlreadyExists(_)));
     }
 
     #[test]
@@ -924,22 +1040,6 @@ mod tests {
     }
 
     #[test]
-    fn unregister_task_preserves_runs() {
-        let state = TaskState::new();
-        let id = TaskId::from("task-1");
-
-        state.add_task(id.clone(), default_spec());
-        state.transition_starting(&id);
-        state.transition_finished(&id, TaskPhase::Succeeded, None, None);
-
-        state.unregister_task(&id);
-
-        assert!(state.get(&id).is_none());
-        let runs = state.list_runs(&id);
-        assert_eq!(runs.len(), 1);
-    }
-
-    #[test]
     fn list_runs_empty_for_unknown_task() {
         let state = TaskState::new();
         let runs = state.list_runs(&TaskId::from("nonexistent"));
@@ -1093,7 +1193,7 @@ mod tests {
         let (_, tasks_removed) = state.sweep(&config);
         assert_eq!(
             tasks_removed, 0,
-            "a task whose actor is still alive (bound) must survive the sweep"
+            "a task whose runtime lifecycle is still active (bound) must survive the sweep"
         );
         assert!(state.get(&id).is_some());
     }
@@ -1451,7 +1551,7 @@ mod tests {
     }
 
     #[test]
-    fn reserve_severs_the_previous_incarnations_binding() {
+    fn reserve_after_cleanup_stays_isolated_from_previous_binding() {
         let state = TaskState::new();
         let id = TaskId::from("respawn");
         state.reserve(id.clone(), default_spec()).unwrap();
@@ -1460,12 +1560,15 @@ mod tests {
         state.transition_starting(&id);
         state.transition_finished(&id, TaskPhase::Failed, None, None);
 
+        // The managed task has completed cleanup and released the runtime binding.
+        state.unbind(&id);
+
         // The new incarnation reserved the name; its bind_tv has not happened yet.
         state.reserve(id.clone(), default_spec()).unwrap();
 
         assert!(
             state.resolve_tv(old_tv.get()).is_none(),
-            "reserve must sever the previous incarnation's binding"
+            "the previous incarnation's binding stays released"
         );
         assert_eq!(
             state.finalize_if_bound(old_tv.get(), TaskPhase::Succeeded, None, None, false),

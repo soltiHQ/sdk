@@ -2,7 +2,7 @@
 
 **Modular Rust toolkit for building task-orchestration agents.**
 
-Pick what you need: run a subprocess with restart policies, build a headless scheduler, expose an HTTP/gRPC API, or connect to a [Podium](https://github.com/soltiHQ/podium) control-plane. Every layer is optional except `solti-model` (domain types) and `solti-core` (supervision).
+Pick what you need: run a subprocess with restart policies, build a headless scheduler, expose an HTTP/gRPC API, or connect to a [Podium](https://github.com/soltiHQ/podium) control-plane. The foundation is `solti-model` + `solti-runner` + `solti-core`; every layer above it is optional.
 
 Built on [taskvisor](https://github.com/soltiHQ/taskvisor).
 
@@ -13,9 +13,9 @@ Built on [taskvisor](https://github.com/soltiHQ/taskvisor).
 - **Managed agent**: add `solti-discover` to register with a Podium control-plane. The control-plane pushes specs, the agent executes.
 - **TLS / mTLS everywhere**: `solti-tls` provides a single config shape for `solti-api` (server) and `solti-discover` (client). Same builder, paths or in-memory PEM, mTLS as a one-line knob.
 - **Bearer-token auth**: one shared secret (`solti_model::Token`) authenticates both directions — `solti-discover` presents it to the control-plane, `solti-api` verifies inbound calls against it. Constant-time check, redacted in logs, orthogonal to TLS, enabled from a single config value.
-- **Live-tail task output**: subscribe to a task's stdout/stderr over HTTP Server-Sent Events (`GET /api/v1/tasks/{id}/logs`) or gRPC server-streaming (`StreamTaskLogs`). One subscription covers all retries with explicit run-boundary markers; the agent never persists output.
+- **Live-tail task output**: subscribe to a task's stdout/stderr over HTTP Server-Sent Events (`GET /api/v1/tasks/{id}/logs`) or gRPC server-streaming (`StreamTaskLogs`). One live subscription can span retries and includes best-effort run-boundary markers; the agent never persists or replays output.
 - **Custom runner**: implement the `Runner` trait to execute tasks your way (WASM, containers, in-process functions). The router dispatches by label selectors.
-- **Embedded tasks**: `TaskKind::Embedded` runs async Rust closures under the same supervision tree as subprocesses. Sweep, timezone sync, and discovery heartbeat use it internally.
+- **Embedded tasks**: `TaskKind::Embedded` runs async Rust closures under the same supervisor as subprocesses. Sweep, timezone sync, and discovery heartbeat use it internally.
 
 ## Architecture
 
@@ -45,7 +45,7 @@ Arrows point at the dependency; inside the stack each layer only depends on laye
 |------------------------------------------------|---------------------------------------------------------------|---------------------------|
 | [`solti-model`](crates/solti-model)            | Domain types: specs, policies, selectors, identifiers         | yes                       |
 | [`solti-runner`](crates/solti-runner)          | Runner plugin trait, label-based routing, metrics interface   | yes                       |
-| [`solti-exec`](crates/solti-exec)              | Subprocess runner: cgroups v2, capabilities, rlimits (Linux)  | if you run subprocesses   |
+| [`solti-exec`](crates/solti-exec)              | Subprocess runner: POSIX rlimits; Linux cgroups and sandboxing | if you run subprocesses   |
 | [`solti-core`](crates/solti-core)              | Supervisor orchestration, in-memory state, sweep              | yes                       |
 | [`solti-api`](crates/solti-api)                | HTTP/JSON and gRPC API layer (feature-gated)                  | if you need a network API |
 | [`solti-discover`](crates/solti-discover)      | Agent registration and heartbeat to Podium control-plane      | if managed by Podium      |
@@ -60,33 +60,38 @@ Each crate has its own README with a detailed reference.
 ### Prerequisites
 
 - Rust 2024 edition (1.90+)
-- Subprocess runner is Linux-only (cgroups v2, capabilities). The rest of the SDK is cross-platform.
+- Subprocess execution is cross-platform. Linux-specific sandbox controls include cgroups v2, capabilities, seccomp, and namespaces; strict enforcement of those controls requires Linux.
 
 ### Minimal: run a task from code
 
 No API, no discovery — just supervision and execution:
 
 ```rust
+use std::{sync::Arc, time::Duration};
 use solti_core::{StateConfig, SupervisorApi};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
     AdmissionPolicy, Flag, RestartPolicy, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind,
     TaskSpec,
 };
-use solti_runner::RunnerRouter;
+use solti_runner::{BuildContext, OutputRegistry, RunnerRouter};
 use taskvisor::{ControllerConfig, SupervisorConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut router = RunnerRouter::new();
+    let output_registry = Arc::new(OutputRegistry::default());
+    let context = BuildContext::default()
+        .with_output_registry(Arc::clone(&output_registry));
+    let mut router = RunnerRouter::new().with_context(context);
     register_subprocess_runner(&mut router, "default")?;
 
-    let supervisor = SupervisorApi::new(
+    let supervisor = SupervisorApi::new_with_output_registry(
         SupervisorConfig::default(),
         ControllerConfig::default(),
         vec![],
         router,
         StateConfig::default(),
+        output_registry,
     )
     .await?;
 
@@ -107,6 +112,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let task_id = supervisor.submit(&spec).await?;
     println!("submitted: {task_id}");
 
+    // submit() confirms controller-queue intake. Observe the asynchronous result.
+    let phase = tokio::time::timeout(Duration::from_secs(35), async {
+        loop {
+            if let Some(task) = supervisor.get_task(&task_id) {
+                let phase = task.status().phase;
+                if phase.is_terminal() {
+                    break phase;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await?;
+    println!("finished: {task_id} ({phase})");
+
+    supervisor.shutdown().await?;
     Ok(())
 }
 ```
@@ -115,17 +136,25 @@ Enough for a headless scheduler, CI runner, or background job processor.
 
 ### With network API
 
-Add `solti-api` to expose tasks over HTTP:
+Enable the `http` feature on `solti-api` to expose tasks over HTTP. Keep the
+same shared-output-registry setup above, but replace the one-shot wait/shutdown
+tail with a long-running server:
 
 ```rust
 use std::sync::Arc;
 use solti_api::{HttpApi, SupervisorApiAdapter};
 
-let handler = Arc::new(SupervisorApiAdapter::new(Arc::new(supervisor)));
+let supervisor = Arc::new(supervisor);
+let handler = Arc::new(SupervisorApiAdapter::new(Arc::clone(&supervisor)));
 let app = HttpApi::new(handler).router();
 
 let listener = tokio::net::TcpListener::bind("0.0.0.0:8085").await?;
-axum::serve(listener, app).await?;
+axum::serve(listener, app)
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
+supervisor.shutdown().await?;
 ```
 
 ```bash
@@ -190,52 +219,39 @@ Plug `server` into `tonic`/`axum-server`, or pass `client` to `DiscoverConfigBui
 
 ## Key features
 
-**Supervision**: automatic restarts, configurable backoff (full / equal / decorrelated jitter), per-attempt timeouts, graceful cancellation via `CancellationToken`.
+**Supervision**: automatic restarts, configurable backoff (full / equal / decorrelated jitter), per-attempt timeouts, and cooperative cancellation through `taskvisor::TaskContext`.
 
-**Admission control**: duplicate submission on the same slot: drop, replace, or queue. Configurable per spec.
+**Admission control**: a new submission targeting a busy slot can be dropped, replace the current owner, or wait in a queue. Configurable per spec.
 
 **Runner routing**: tasks carry label selectors, runners register with labels. Ship multiple runners in one binary.
 
-**Subprocess isolation (Linux)**: cgroup v2 resource limits, capability dropping, rlimit enforcement.
+**Subprocess isolation**: POSIX rlimits plus Linux cgroup v2 limits, capability dropping, seccomp, and namespaces.
 
 **Embedded tasks**: async Rust closures supervised next to subprocesses. Used internally for sweep, timezone sync, and discovery heartbeat.
 
 **Dual-transport API**: HTTP/JSON (axum) and gRPC (tonic) behind feature flags. Use one, both, or neither.
 
-**Live-tail output**: stdout/stderr broadcast per task over SSE and gRPC server-streaming. Multi-run merge (retries inherit the channel), backpressure-aware (`Lagged` event on slow subscribers), zero-copy line payloads via `bytes::Bytes`.
+**Live-tail output**: stdout/stderr broadcast per task over SSE and gRPC server-streaming. Multi-run merge (retries inherit the channel), bounded and lossy delivery (`Lagged` reports events missed by slow subscribers), zero-copy line payloads via `bytes::Bytes`.
 
 **Observability**: structured logging (`tracing`, JSON / text / journald, local timezone), Prometheus metrics, lifecycle event subscribers.
 
 ## Task lifecycle
 
 ```text
-         submit
-           │
-           ▼
-       ┌────────┐
-       │Pending │
-       └───┬────┘
-           │ runner picks up
-           ▼
-       ┌────────┐    timeout     ┌─────────┐
-       │Running │───────────────►│ Timeout │
-       └───┬────┘                └─────────┘
-           │
-     ┌─────┴───────┐
-     │             │
-     ▼             ▼
-┌─────────┐  ┌────────┐                       ┌───────────┐
-│Succeeded│  │ Failed │── retries exhausted──►│ Exhausted │
-└─────────┘  └────────┘                       └───────────┘
-                 │
-                 │ restart policy
-                 ▼
-             ┌────────┐
-             │Running │  (next attempt)
-             └────────┘
+Pending ──► Running ──► attempt outcome: Succeeded | Failed | Timeout
+               ▲                              │
+               └──── restart policy ──────────┤
+                                              │ lifecycle joins
+                                              ▼
+                         Succeeded | Failed | Timeout | Exhausted | Canceled
 ```
 
-External cancellation moves a task to `Canceled`.
+`Succeeded`, `Failed`, and `Timeout` may describe an attempt and be followed by
+another `Running` attempt: `Always` can restart success, while `OnFailure` can
+restart failures and timeouts. Fatal errors or panics may finalize as `Failed`, a
+final timeout can remain `Timeout`, and a spent retry budget becomes `Exhausted`.
+The joined lifecycle outcome determines the retained resource phase; attempt
+history remains available through `TaskRun`.
 
 ## Development
 

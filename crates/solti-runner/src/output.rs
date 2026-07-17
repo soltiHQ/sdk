@@ -19,7 +19,13 @@
 //! 2. All attempts of the same task share that channel.
 //! 3. `subscribe` attaches a receiver.
 //! 4. `announce_run_started` and `announce_run_finished` add run markers.
-//! 5. `evict` drops the channel when the task is fully terminal.
+//! 5. `evict` removes the registry-owned sender when the task is fully terminal.
+//!    An already-open receiver closes after any outstanding [`OutputSink`] clones
+//!    are dropped as well.
+//!
+//! A [`TaskId`] may be reused only after its previous lifecycle is terminal.
+//! An [`OutputSink`] belongs to one such lifecycle: runners acquire it inside an
+//! attempt and must not carry it across submission or same-id reuse boundaries.
 //!
 //! ## Lossy by design
 //!
@@ -173,6 +179,8 @@ impl OutputSink {
 ///
 /// It keeps one [`broadcast::Sender`] per [`TaskId`], reused across all attempts of that task.
 /// The supervisor owns the lifecycle and must call [`evict`](Self::evict) when the task is done.
+/// Runners acquire sinks lazily per attempt; a sink is not generation-safe
+/// across terminal cleanup and later reuse of the same [`TaskId`].
 ///
 /// ## Also
 ///
@@ -209,7 +217,8 @@ impl OutputRegistry {
 
     /// Build an empty registry.
     ///
-    /// `capacity` is the ring size of every per-task broadcast channel.
+    /// `capacity` is the ring size of every per-task broadcast channel and is
+    /// clamped to at least `1`.
     /// Larger values let slower subscribers fall further behind before `Lagged`; smaller values reduce per-task memory.
     ///
     /// ## Example
@@ -223,7 +232,7 @@ impl OutputRegistry {
     pub fn new(capacity: usize) -> Self {
         Self {
             channels: RwLock::new(HashMap::new()),
-            capacity,
+            capacity: capacity.max(1),
         }
     }
 
@@ -244,10 +253,23 @@ impl OutputRegistry {
     /// assert!(registry.subscribe(&task_id).is_some());
     /// ```
     pub fn ensure_channel(&self, task_id: TaskId) {
+        self.ensure_channel_if_absent(task_id);
+    }
+
+    /// Pre-create the broadcast channel for `task_id` and report ownership.
+    ///
+    /// Returns `true` when this call created the channel and `false` when the
+    /// registry already contained one. This lets a provisional operation roll
+    /// back only the channel it owns.
+    pub fn ensure_channel_if_absent(&self, task_id: TaskId) -> bool {
         let mut channels = self.channels.write();
-        channels
-            .entry(task_id)
-            .or_insert_with(|| broadcast::channel::<OutputEvent>(self.capacity).0);
+        match channels.entry(task_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(broadcast::channel::<OutputEvent>(self.capacity).0);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        }
     }
 
     /// Get an [`OutputSink`] for `(task_id, attempt)`.
@@ -358,7 +380,11 @@ impl OutputRegistry {
         }
     }
 
-    /// Drop the broadcast channel for `task_id`.
+    /// Remove the registry-owned broadcast sender for `task_id`.
+    ///
+    /// Existing receivers close once every outstanding [`OutputSink`] clone has
+    /// also been dropped. New [`subscribe`](Self::subscribe) calls return `None`
+    /// immediately after eviction.
     ///
     /// ## Example
     ///
@@ -666,10 +692,30 @@ mod tests {
     }
 
     #[test]
+    fn registry_ensure_channel_if_absent_reports_ownership() {
+        let reg = OutputRegistry::new(16);
+        let task = TaskId::from("t-owned");
+
+        assert!(reg.ensure_channel_if_absent(task.clone()));
+        assert!(!reg.ensure_channel_if_absent(task));
+    }
+
+    #[test]
     fn registry_default_uses_default_capacity() {
         let reg = OutputRegistry::default();
         assert_eq!(reg.capacity, OutputRegistry::DEFAULT_CAPACITY);
         assert_eq!(OutputRegistry::DEFAULT_CAPACITY, 256);
+    }
+
+    #[test]
+    fn registry_zero_capacity_is_clamped_and_safe() {
+        let reg = OutputRegistry::new(0);
+        let task = TaskId::from("t-zero");
+
+        reg.ensure_channel(task.clone());
+
+        assert_eq!(reg.capacity, 1);
+        assert!(reg.subscribe(&task).is_some());
     }
 
     #[tokio::test]

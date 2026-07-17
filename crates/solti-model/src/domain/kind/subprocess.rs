@@ -54,10 +54,15 @@ fn decode_script_body(body: &str, max_bytes: usize) -> ModelResult<Vec<u8>> {
 
 /// Execution strategy for a subprocess task.
 ///
-/// | Variant   | What it does                                                               |
-/// |-----------|----------------------------------------------------------------------------|
-/// | `Command` | Direct binary execution via `execve(command, args)`                        |
-/// | `Script`  | Script passed to an interpreter: `execve(runtime, [flag, body, ...args])`  |
+/// | Variant   | What it does                                                        |
+/// |-----------|---------------------------------------------------------------------|
+/// | `Command` | Direct binary execution via `execve(command, args)`                 |
+/// | `Script`  | Decoded script input for a runner-selected interpreter transport   |
+///
+/// The built-in `solti-exec` runner materializes scripts into temporary files
+/// and invokes `runtime_command temporary_file ...args`. Consequently,
+/// [`Runtime::Custom`](crate::Runtime::Custom)'s legacy inline `flag` is kept
+/// for wire compatibility but is not used by that runner.
 ///
 /// ## Example
 ///

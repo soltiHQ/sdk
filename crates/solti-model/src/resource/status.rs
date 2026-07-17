@@ -27,7 +27,7 @@ pub struct TaskStatus {
     /// Process exit code (Subprocess/Container only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
-    /// Last error message (present when phase is Failed/Timeout).
+    /// Last lifecycle diagnostic, when one accompanies the current phase.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

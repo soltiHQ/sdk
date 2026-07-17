@@ -187,7 +187,7 @@ mod tests {
             (
                 CoreError::Supervisor {
                     op: "cancel",
-                    source: taskvisor::RuntimeError::TaskAlreadyExists { name: "x".into() }.into(),
+                    source: taskvisor::RuntimeError::CommandQueueFull.into(),
                 },
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
@@ -217,7 +217,7 @@ mod tests {
             (
                 CoreError::Supervisor {
                     op: "cancel",
-                    source: taskvisor::RuntimeError::TaskAlreadyExists { name: "x".into() }.into(),
+                    source: taskvisor::RuntimeError::CommandQueueFull.into(),
                 },
                 Code::Internal,
             ),

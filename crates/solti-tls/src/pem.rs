@@ -2,7 +2,10 @@
 
 use std::io::BufRead;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer,
+    pem::{Error as PemError, PemObject, ReadIter},
+};
 
 use crate::TlsError;
 
@@ -27,10 +30,9 @@ use crate::TlsError;
 pub fn load_certs_from_pem<R: BufRead>(
     reader: R,
 ) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-    let mut reader = reader;
-
-    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
-    let certs = certs?;
+    let certs = CertificateDer::pem_reader_iter(reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_pem_error)?;
     if certs.is_empty() {
         return Err(TlsError::NoCertificates);
     }
@@ -56,14 +58,25 @@ pub fn load_certs_from_pem<R: BufRead>(
 /// assert!(matches!(err, TlsError::NoPrivateKey));
 /// ```
 pub fn load_key_from_pem<R: BufRead>(reader: R) -> Result<PrivateKeyDer<'static>, TlsError> {
-    let mut reader = reader;
-    let key = rustls_pemfile::private_key(&mut reader)?;
-    key.ok_or(TlsError::NoPrivateKey)
+    match ReadIter::<_, PrivateKeyDer<'static>>::new(reader).next() {
+        Some(Ok(key)) => Ok(key),
+        Some(Err(error)) => Err(map_pem_error(error)),
+        None => Err(TlsError::NoPrivateKey),
+    }
+}
+
+fn map_pem_error(error: PemError) -> TlsError {
+    match error {
+        PemError::Io(error) => TlsError::Io(error),
+        error => TlsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::io::Cursor;
 
     fn self_signed_cert_pem() -> String {
         let bundle = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
@@ -97,6 +110,23 @@ mod tests {
         let key_pem = bundle.signing_key.serialize_pem();
         let key = load_key_from_pem(key_pem.as_bytes()).unwrap();
         assert!(matches!(key, PrivateKeyDer::Pkcs8(_)));
+    }
+
+    #[test]
+    fn load_key_from_pem_leaves_a_reused_reader_at_the_next_block() {
+        let first = rcgen::generate_simple_self_signed(vec!["first.example".into()]).unwrap();
+        let second = rcgen::generate_simple_self_signed(vec!["second.example".into()]).unwrap();
+        let pem = format!(
+            "{}{}",
+            first.signing_key.serialize_pem(),
+            second.signing_key.serialize_pem()
+        );
+        let mut reader = Cursor::new(pem.into_bytes());
+
+        let first_key = load_key_from_pem(&mut reader).expect("first key");
+        let second_key = load_key_from_pem(&mut reader).expect("second key");
+
+        assert_ne!(first_key.secret_der(), second_key.secret_der());
     }
 
     #[test]

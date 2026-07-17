@@ -30,7 +30,7 @@ keywords     = ["async", "tasks", "supervisor", "orchestration", "solti"]
 categories   = ["asynchronous", "concurrency"]
 
 [workspace.dependencies]
-anyhow              = "1.0.102"
+anyhow              = "1.0.103"
 async-trait         = "0.1.89"
 axum                = "0.8.9"
 base64              = "0.22.1"
@@ -50,16 +50,17 @@ protoc-bin-vendored = { version = "3.2.0" }
 rcgen               = "0.14.8"
 reqwest             = "0.13.4"
 rustls              = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile      = "2.2.0"
 seccompiler         = "0.5.0"
 serde               = { version = "1.0.228", features = ["derive"] }
 serde_json          = "1.0.150"
 subtle              = "2.6.1"
-taskvisor           = { version = "0.4.1" }
+# SDK development uses the adjacent Taskvisor checkout.
+taskvisor           = { version = "0.7.0" }
 tempfile            = "3.27.0"
 thiserror           = "2.0.18"
 time                = { version = "0.3.51" }
 tokio               = { version = "1.52.3" }
+tokio-util          = { version = "0.7.18", features = ["rt"] }
 tokio-rustls        = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 tokio-stream        = "0.1.18"
 tonic               = "0.14.6"

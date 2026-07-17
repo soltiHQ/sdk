@@ -3,7 +3,7 @@ Task execution backends for the solti task system.
 
 Provides concrete `Runner` implementations that turn `TaskSpec` into running OS processes.
 
-It currently ships a single backend - `SubprocessRunner` with optional Linux sandboxing (rlimits, cgroup v2, capabilities).
+It currently ships a single backend: `SubprocessRunner` with POSIX rlimits and optional Linux sandboxing (cgroup v2, capabilities, seccomp, namespaces).
 
 ## Quick start
 ```rust,no_run
@@ -34,33 +34,30 @@ fn main() -> Result<(), solti_exec::ExecError> {
  SubprocessRunner
      │
      ├──► build_task_config(spec, ctx)
-     │     ├──► resolve SubprocessMode → (command, args [, script_tempfile])
-     │     │        (Script mode: body → NamedTempFile 0600 → path as argv[0])
+     │     ├──► validate/resolve mode → command + args + optional script body
      │     ├──► merge_env(task_env, runner_env)
      │     └──► SubprocessTaskConfig { run_id, command, args, env, cwd }
      │
-     ├──► prepare backend (cgroup dirs, if configured)
-     │
-     └──► run_subprocess(ctx, cancel)
-           ├──► build Command + apply pre_exec hooks
-           │     (process_group(0), kill_on_drop(true))
-           ├──► spawn + pipe stdout/stderr
-           ├──► select! biased { child.wait(), cancel → killpg }
-           ├──► record metrics
-           └──► cleanup cgroup (if any)
+     └──► each task attempt
+           └──► run_subprocess(ctx, cancel)
+                 ├──► prepare backend (cgroup dirs, if configured)
+                 ├──► materialize script tempfile (Script mode)
+                 ├──► build Command + apply pre_exec hooks
+                 ├──► spawn + pipe stdout/stderr
+                 ├──► acquire OutputSink + start log streams
+                 ├──► select! biased { child.wait(), cancel → killpg }
+                 ├──► record metrics
+                 └──► cleanup cgroup (if any)
 ```
 
 ## Subprocess lifecycle
 ```text
- build_task ──► prepare_backend ──► spawn ──► log_stream (stdout/stderr)
-                                   (pgid,                  ├──► tracing::info/warn
-                                    kill_on_drop)          └──► OutputSink (if registry wired)
-                                      │
-                                      ├──► child.wait() → evaluate exit
-                                      ├──► cancel.cancelled() → killpg -SIGKILL
-                                      │                       → wait() to reap
-                                      ▼
-                                  metrics + cleanup
+ task attempt ──► prepare_backend ──► script tempfile ──► spawn
+                                      (when needed)        │
+                                                           ├──► OutputSink + log streams
+                                                           ├──► child.wait() → evaluate exit
+                                                           ├──► cancel → kill + reap
+                                                           └──► metrics + cleanup
 ```
 
 `biased` select prefers `child.wait()` over `cancel.cancelled()` — a process that has already exited cleanly is never misreported as cancelled, even if the cancel token fired in the same microsecond.
@@ -165,13 +162,13 @@ Duplicate names are rejected via `router.contains_label()` → `ExecError::Dupli
 
 ## Notes
 - `SubprocessRunner` implements `Runner` trait from `solti-runner`.
-- Mode resolution: `Command` → direct exec; `Script` → decode base64 body → write to a `NamedTempFile` (mode 0600) → exec interpreter with the path. The tempfile is kept alive for the task's lifetime via `Arc` and unlinked on drop.
+- Mode resolution: `Command` → direct exec; `Script` → on each attempt, decode the base64 body, write a fresh `NamedTempFile` (mode 0600), and exec the interpreter with its path. The tempfile stays alive for that attempt and is unlinked on drop.
 - Script body is capped at `solti_model::MAX_SCRIPT_BODY_BYTES` (2 MiB, decoded) by the model; the tempfile transport avoids Linux's per-arg `MAX_ARG_STRLEN` (128 KiB) limit that `-c <inline>` would hit.
 - Cancel uses **process-group kill** on Unix: `Command::process_group(0)` sets pgid = child pid, then cancel sends `SIGKILL` to `-pgid` so forked helpers (`sleep 1000 &`) die together with the parent. `kill_on_drop(true)` covers the drop-without-wait path.
 - Environment merge: runner env overrides task env (last-writer-wins via `BTreeMap`). Parent env is currently inherited — no automatic `env_clear()`.
 - Cgroup lifecycle is two-phase: `prepare` (mkdir + write limits in parent) → `attach` (join PID in child via pre_exec).
 - Cgroup names are auto-generated: `{runner}-{slot}-{seq:x}-{timestamp:x}`.
 - Line truncation uses `Cow::Borrowed` for the common case (zero-alloc hot path).
-- `log_stream` is double-headed: every line goes to `tracing` (existing path) and, if the supervisor wired an `OutputRegistry` into `BuildContext`, also to a `solti_runner::OutputSink` (live-tail subscribers). When no registry is attached, the sink push is a no-op cost (one Arc clone, one `broadcast::send` that returns `Err` and is ignored).
+- `log_stream` is double-headed: every line goes to `tracing` and to the attempt's `solti_runner::OutputSink`. `BuildContext` always owns an `OutputRegistry`; when there are no live receivers, `broadcast::send` returns `Err` and the runner ignores it.
 - `LinuxCapability` values match `<linux/capability.h>` from Linux 6.x.
-- On non-Linux platforms, all sandboxing is no-op with `tracing::warn`.
+- On non-Linux platforms, Linux-specific sandbox controls are unavailable; generic subprocess execution remains supported.

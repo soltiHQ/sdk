@@ -4,7 +4,8 @@
 //!
 //! Two directions, one module tree:
 //! - this file maps model policies **into** taskvisor structures (submit path);
-//! - [`phase`] maps taskvisor outcomes and reasons **back** into model phases (state-reconstruction path, shared by both state paths).
+//! - [`phase`] maps typed taskvisor outcome and rejection categories **back**
+//!   into model phases (state-reconstruction path, shared by both state paths).
 
 pub(crate) mod phase;
 

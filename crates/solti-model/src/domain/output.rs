@@ -39,7 +39,7 @@ pub enum StreamKind {
 
 /// One event in the live-tail stream of a task.
 ///
-/// Carries either an output line, a run boundary marker, or a backpressure signal.
+/// Carries either an output line, a best-effort run marker, or a lag/loss notification.
 /// Wire format is JSON-tagged on `type`:
 ///
 /// ```text
@@ -74,7 +74,10 @@ pub enum OutputEvent {
     /// One line of stdout/stderr from the currently active run.
     Chunk(OutputChunk),
 
-    /// A new run attempt has started; sequence numbers reset from this point on.
+    /// Best-effort observation that a new run attempt has started.
+    ///
+    /// This marker is not an ordering barrier for chunks. Use each chunk's
+    /// `attempt`, `stream`, and `seq` fields for grouping and ordering.
     #[serde(rename_all = "camelCase")]
     RunStarted {
         /// Attempt number of the run that just started.
@@ -84,7 +87,10 @@ pub enum OutputEvent {
         started_at: SystemTime,
     },
 
-    /// The current run finished. Consumers can stop accumulating chunks for this attempt.
+    /// Best-effort observation that a run attempt has finished.
+    ///
+    /// This marker is not an ordering barrier: chunks for the same attempt may
+    /// still be observed after it.
     #[serde(rename_all = "camelCase")]
     RunFinished {
         /// Attempt number of the run that finished.
@@ -135,12 +141,16 @@ pub struct OutputChunk {
     pub attempt: u32,
     /// stdout or stderr.
     pub stream: StreamKind,
-    /// Monotonic sequence number within this attempt; resets on next run.
+    /// Monotonic sequence number per stream within this attempt.
+    ///
+    /// `stdout` and `stderr` have independent counters, each reset for a new attempt.
     pub seq: u64,
     /// Wall-clock time the line was read by the agent (unix milliseconds on the wire).
     #[serde(with = "crate::resource::metadata::time_serde")]
     pub ts: SystemTime,
-    /// One line, already truncated/cleaned by the runner.
+    /// One line, truncated to the runner's configured limit.
+    ///
+    /// Live-tail payloads are not sanitized and may contain control characters.
     #[serde(with = "bytes_as_utf8_string")]
     pub line: Bytes,
 }

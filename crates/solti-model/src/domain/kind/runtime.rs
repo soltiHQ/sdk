@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 /// Script interpreter for subprocess script execution.
 ///
 /// [`Custom`](Runtime::Custom) allows arbitrary interpreter configuration.
+/// Its `flag` is part of the legacy inline-script wire shape. The built-in
+/// `solti-exec` runner uses tempfile transport and therefore uses the command
+/// but not this flag; custom runners may interpret the pair themselves.
 ///
 /// ## Example
 ///
@@ -31,17 +34,21 @@ pub enum Runtime {
     Python,
     /// Node.js runtime: resolves to `("node", "-e")`.
     Node,
-    /// Custom interpreter with explicit command and flag.
+    /// Custom interpreter with an explicit command and legacy inline flag.
     Custom {
         /// Interpreter binary (e.g. `"ruby"`, `"/usr/bin/perl"`).
         command: String,
-        /// Flag that precedes the script body (e.g. `"-e"`).
+        /// Legacy flag that precedes an inline script body (e.g. `"-e"`).
+        /// The built-in `solti-exec` tempfile transport ignores it.
         flag: String,
     },
 }
 
 impl Runtime {
-    /// Resolve runtime to `(command, flag)` pair used to build the OS command.
+    /// Resolve runtime to its configured `(command, inline_flag)` pair.
+    ///
+    /// The built-in `solti-exec` runner uses only `command` because it passes a
+    /// temporary-file path instead of an inline script body.
     ///
     /// ```rust
     /// use solti_model::Runtime;

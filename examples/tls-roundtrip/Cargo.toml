@@ -19,7 +19,7 @@ rcgen = { workspace = true }
 
 # HTTPS half: axum router + axum-server with rustls.
 axum = { workspace = true }
-axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 
 # gRPC half: tonic with TLS + the standard health-check service for a real RPC.
 tonic = { workspace = true, features = ["tls-ring", "transport"] }

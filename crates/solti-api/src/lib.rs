@@ -30,7 +30,7 @@
 //!
 //! ## Also
 //!
-//! - [`ApiHandler`] transport-agnostic trait with 6 operations.
+//! - [`ApiHandler`] transport-agnostic trait with 7 operations.
 //! - [`ApiError`] unified error type mapped to gRPC Status / HTTP JSON.
 //! - [`SupervisorApiAdapter`] default adapter bridging to `SupervisorApi`.
 

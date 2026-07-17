@@ -44,7 +44,7 @@ fn phase_label(phase: TaskPhase) -> &'static str {
 ///
 /// Counts are recomputed from [`TaskState`] on every scrape.
 /// Unlike the event-gauge `solti_sv_tasks_in_flight`, this collector self-corrects and never accrues drift.
-/// The residual limitation is upstream: a `Running` count reflects the `TaskStarting` events `TaskState` has observed.
+/// The residual limitation is upstream: a `Running` count reflects the `AttemptStarting` events `TaskState` has observed.
 /// A start dropped under bus lag is undercounted until the entry's phase next changes (bounded, not cumulative).
 ///
 /// ## Cost

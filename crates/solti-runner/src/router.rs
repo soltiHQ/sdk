@@ -13,9 +13,9 @@ use solti_model::{Labels, TaskKind, TaskSpec};
 use taskvisor::TaskRef;
 use tracing::{debug, instrument, trace};
 
-use crate::context::BuildContext;
 use crate::error::RunnerError;
 use crate::runner::Runner;
+use crate::{context::BuildContext, output::OutputRegistry};
 
 /// Single runner entry with optional static labels used for routing.
 struct RunnerEntry {
@@ -106,6 +106,23 @@ impl RunnerRouter {
     pub fn with_context(mut self, ctx: BuildContext) -> Self {
         self.ctx = ctx;
         self
+    }
+
+    /// Replace the output registry in the existing build context.
+    ///
+    /// Environment and metrics configuration are preserved. Supervisor
+    /// constructors use this to keep runner output and API live-tail streams on
+    /// the same registry.
+    #[inline]
+    pub fn with_output_registry(mut self, registry: Arc<OutputRegistry>) -> Self {
+        self.ctx = self.ctx.with_output_registry(registry);
+        self
+    }
+
+    /// Return the output registry injected into runners built by this router.
+    #[inline]
+    pub fn output_registry(&self) -> &Arc<OutputRegistry> {
+        self.ctx.output_registry()
     }
 
     /// Register a new runner without labels.
@@ -367,6 +384,14 @@ mod tests {
             Ok(_) => panic!("expected RunnerError::NoRunner for TaskKind::Embedded, got Ok(..)"),
             Err(e) => panic!("expected RunnerError::NoRunner for TaskKind::Embedded, got {e:?}"),
         }
+    }
+
+    #[test]
+    fn output_registry_can_be_rebound_without_rebuilding_the_router() {
+        let registry = Arc::new(OutputRegistry::new(32));
+        let router = RunnerRouter::new().with_output_registry(Arc::clone(&registry));
+
+        assert!(Arc::ptr_eq(router.output_registry(), &registry));
     }
 
     #[test]

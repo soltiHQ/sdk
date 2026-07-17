@@ -27,10 +27,10 @@ use solti_runner::RunnerError;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CoreError {
-    /// A taskvisor runtime failure (submit / cancel / remove / shutdown). Maps to `500`.
+    /// A taskvisor runtime failure (submit / cancel / shutdown). Maps to `500`.
     ///
     /// Carries the typed [`taskvisor::Error`] as the source; `op` is a stable
-    /// label for the failed operation: `"submit"`, `"cancel"`, `"remove"`, or `"shutdown"`.
+    /// label for the failed operation: `"submit"`, `"cancel"`, or `"shutdown"`.
     #[error("supervisor {op} failed: {source}")]
     Supervisor {
         /// The operation that failed.
@@ -40,7 +40,7 @@ pub enum CoreError {
         source: taskvisor::Error,
     },
 
-    /// A task with this name is already active (non-terminal).
+    /// A live submission still owns this task name, including a bound task between attempts.
     /// Kept distinct from a generic supervisor error; callers map it to `409 Conflict`.
     #[error("task already exists: {0}")]
     AlreadyExists(String),

@@ -120,17 +120,24 @@ Deserialization also validates the shape.
 ## Task Lifecycle
 
 ```text
-Pending -> Running -> Succeeded
-              |
-              +-> Failed -> maybe restart
-              +-> Timeout
-              +-> Canceled
-              +-> Exhausted
+Pending -> Running -> attempt outcome: Succeeded | Failed | Timeout
+              ^                              |
+              +--------- restart policy -----+
+                                             |
+                                             +-> lifecycle disposition:
+                                                 Succeeded | Failed | Timeout |
+                                                 Exhausted | Canceled
 ```
 
 Terminal phases are `Succeeded`, `Failed`, `Timeout`, `Canceled`, and `Exhausted`.
+They end the current attempt observation, but a restart policy may start another
+attempt after `Succeeded`, `Failed`, or `Timeout`.
 
 `Task` keeps terminal updates stable. A late actor event should not turn a canceled run into an exhausted run. The only allowed refinement is `Failed` into a more specific terminal phase such as `Timeout` or `Exhausted`.
+
+After the whole lifecycle is joined, `Task::reconcile_finished` may replace an
+attempt-derived terminal phase with the authoritative resource disposition;
+the separate `TaskRun` record keeps the attempt result.
 
 ## Task Kinds
 
@@ -190,7 +197,7 @@ let backoff = BackoffPolicy {
 backoff.validate().unwrap();
 ```
 
-`AdmissionPolicy` controls duplicate submissions into the same slot: drop, replace, or queue.
+`AdmissionPolicy` controls a new submission targeting a busy slot: drop, replace, or queue.
 
 ## Runner Selectors
 

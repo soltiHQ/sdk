@@ -87,15 +87,18 @@
 //! ## Lifecycle
 //!
 //! ```text
-//! Pending -> Running -> Succeeded
-//!               |
-//!               +-> Failed -> maybe restart
-//!               +-> Timeout
-//!               +-> Canceled
-//!               +-> Exhausted
+//! Pending -> Running -> attempt outcome: Succeeded | Failed | Timeout
+//!               ^                              |
+//!               +--------- restart policy -----+
+//!                                              |
+//!                                              +-> lifecycle disposition:
+//!                                                  Succeeded | Failed | Timeout |
+//!                                                  Exhausted | Canceled
 //! ```
 //!
 //! Terminal phases are `Succeeded`, `Failed`, `Timeout`, `Canceled`, and `Exhausted`.
+//! A terminal attempt phase may still be followed by another attempt according
+//! to the restart policy.
 //! See [`TaskPhase::is_terminal`].
 //!
 //! ## Task Kinds

@@ -61,7 +61,7 @@ Per-version API surface is documented in separate files: [api_v1.md](api_v1.md).
 
 | Type                   | Role                                                                             |
 |------------------------|----------------------------------------------------------------------------------|
-| `ApiHandler`           | Transport-agnostic trait with 6 operations (CRUD + log stream)                   |
+| `ApiHandler`           | Transport-agnostic trait with 7 operations (management, runs, and log stream)     |
 | `OutputEventStream`    | `Pin<Box<dyn Stream<Item = OutputEvent> + Send>>` returned by `stream_task_logs` |
 | `SupervisorApiAdapter` | Default adapter bridging to `SupervisorApi`                                      |
 | `ApiError`             | Unified error mapped to gRPC Status / HTTP JSON                                  |

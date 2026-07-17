@@ -43,24 +43,30 @@ pub trait ApiHandler: Send + Sync + 'static {
     /// Submit a new task for execution.
     ///
     /// The spec's own admission policy decides what happens when the slot is busy.
+    /// The returned id identifies the new task resource after the bounded
+    /// controller command queue accepts its submission. Slot admission, runtime
+    /// registration, and task start happen asynchronously; query task status to
+    /// observe the result.
     ///
     /// ## Errors
     ///
     /// The bundled [`SupervisorApiAdapter`](crate::SupervisorApiAdapter) returns:
     ///
     /// - [`ApiError::Core`]: the supervisor rejected the spec (invalid spec, no matching runner,
-    ///   a non-terminal task with the same name, or an internal submit failure).
+    ///   a live submission already owning the same task id, or an internal submit failure).
     ///
     /// Custom implementations may return other variants, e.g. [`ApiError::Internal`].
     async fn submit_task(&self, spec: TaskSpec) -> Result<TaskId, ApiError>;
 
     /// Apply a spec to its slot (declarative upsert).
-    /// Returns the id of the task running in the slot after apply.
+    /// Returns the new submission's task id after controller-queue intake.
+    /// This is not confirmation that admission or task start has completed.
     ///
     /// Note: this **forces** [`AdmissionPolicy::Replace`], overriding any admission
-    /// policy on the supplied `spec` — that is the point of "apply" (latest spec
-    /// wins the slot). Use [`submit_task`](Self::submit_task) to honor the spec's
-    /// own admission policy.
+    /// policy on the supplied `spec`. If the slot is busy, the controller requests
+    /// removal of its owner and puts this submission next; a later apply can
+    /// supersede it before admission. Use [`submit_task`](Self::submit_task) to
+    /// honor the spec's own admission policy.
     ///
     /// ## Errors
     ///
@@ -100,18 +106,23 @@ pub trait ApiHandler: Send + Sync + 'static {
 
     /// Stop a task and purge its run history.
     ///
-    /// Idempotent: returns `Ok(())` even when the task is not registered on the agent.
+    /// Idempotent: returns `Ok(())` when no task resource or bound submission is known.
     ///
     /// ## Errors
     ///
-    /// - [`ApiError::Core`]: the supervisor failed to cancel the bound run
-    ///   (cancellation timeout or internal runtime failure).
+    /// - [`ApiError::Core`]: the supervisor failed to cancel the bound submission,
+    ///   whether registered or controller-queued (timeout or internal runtime failure).
     async fn delete_task(&self, id: &TaskId) -> Result<(), ApiError>;
 
     /// Subscribe to the live-tail stream of stdout/stderr lines for a task.
     ///
-    /// Returns an [`OutputEventStream`] that yields [`OutputEvent`]s in real time.
-    /// The stream covers all subsequent runs of the task (multi-run merge) and ends when the task is fully terminal and evicted.
+    /// Returns a lossy, live-only [`OutputEventStream`] that yields
+    /// [`OutputEvent`]s in real time without persistence or replay. It can cover
+    /// subsequent runs of the task (multi-run merge); lifecycle boundary events
+    /// are best-effort observations, not ordering barriers for output chunks.
+    /// Terminal cleanup removes the registry sender; an already-open stream
+    /// closes after any outstanding runner-owned output-sink clones are also
+    /// dropped.
     ///
     /// ## Errors
     ///

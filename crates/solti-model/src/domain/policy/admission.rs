@@ -1,6 +1,6 @@
 //! Admission policy.
 //!
-//! [`AdmissionPolicy`] controls how duplicate task submissions are handled.
+//! [`AdmissionPolicy`] controls how a new submission targets a busy slot.
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -9,14 +9,16 @@ use crate::error::{ModelError, ModelResult};
 
 /// Defines how the controller admits a new task into a slot.
 ///
-/// A slot may only run one task at a time.
-/// When a new task arrives, this policy says what to do if the slot is already occupied.
+/// A slot tracks at most one active owner or admission candidate. It remains busy
+/// during admission, while a registered owner is alive (including backoff or time
+/// between attempts), and while that owner is being removed. When a new submission
+/// arrives, this policy says what to do with it.
 ///
-/// | Variant         | Behaviour                                              |
-/// |-----------------|--------------------------------------------------------|
-/// | `DropIfRunning` | Ignore the new task, return success without scheduling |
-/// | `Replace`       | Cancel the running task, schedule the new one          |
-/// | `Queue`         | Enqueue the new task, run when slot becomes free       |
+/// | Variant         | Behaviour                                                        |
+/// |-----------------|------------------------------------------------------------------|
+/// | `DropIfRunning` | Reject the new submission while the slot is busy                 |
+/// | `Replace`       | Request owner removal and make the new submission next           |
+/// | `Queue`         | Append to the bounded FIFO queue and admit when the slot is free  |
 ///
 /// ## Example
 ///
@@ -30,12 +32,13 @@ use crate::error::{ModelError, ModelResult};
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum AdmissionPolicy {
-    /// If the slot already has a running task, ignore the new one.
+    /// Reject the new submission if the slot is busy in any lifecycle phase.
     #[default]
     DropIfRunning,
-    /// Cancel the currently running task in the slot and replace it with the newly submitted task.
+    /// Request removal of the current owner and put the new submission next.
+    /// A later replacement supersedes a replacement that is still pending.
     Replace,
-    /// Enqueue the new task to be executed after the current one completes.
+    /// Append the submission to the bounded FIFO queue for this slot.
     Queue,
 }
 

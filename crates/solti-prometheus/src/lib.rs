@@ -58,7 +58,7 @@
 //! );
 //!
 //! let supervisor_metrics = PrometheusSubscriber::new(registry.clone())?;
-//! supervisor_metrics.on_event(&Event::new(EventKind::TaskStarting).with_attempt(1));
+//! supervisor_metrics.on_event(&Event::new(EventKind::AttemptStarting).with_attempt(1));
 //!
 //! register_build_info(&registry, &[("version", env!("CARGO_PKG_VERSION"))])?;
 //!

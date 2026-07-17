@@ -16,8 +16,13 @@
 
 `SubmitTask` honors the admission policy declared in the spec. `ApplyTask` is the
 declarative upsert: it **forces `ADMISSION_POLICY_REPLACE`**, overriding whatever
-admission the spec declares — the latest applied spec wins the slot — and returns
-the id of the task running in the slot after apply.
+admission the spec declares. If the slot is busy, the controller requests removal
+of its current owner and puts the new submission next; a later apply can supersede
+it before admission.
+
+Both operations return the new submission's task id after the bounded controller
+command queue accepts it. This is not confirmation of slot admission, runtime
+registration, or task start. Query task status to observe the asynchronous result.
 
 `DeleteTask` is the single teardown primitive: it stops the task and purges its run history.
 
@@ -200,10 +205,14 @@ Custom runtime example:
 }
 ```
 
+`flag` remains required for wire compatibility. The built-in `solti-exec`
+runner executes a temporary script file and ignores this legacy inline flag.
+
 ### Apply a task (declarative upsert)
 
 Same body shape as submit. The `admission` in the spec is **ignored**: apply
-always force-replaces whatever occupies the slot.
+always uses `ADMISSION_POLICY_REPLACE`. For a busy slot, this requests removal of
+the current owner and makes the new submission next.
 
 ```bash
 curl -X PUT http://localhost:8080/api/v1/tasks \
@@ -230,7 +239,7 @@ curl -X PUT http://localhost:8080/api/v1/tasks \
   }'
 ```
 
-Response `200 OK` — the id of the task running in the slot after apply:
+Response `200 OK` — the new submission's task id after controller-queue intake:
 ```json
 {
   "taskId": "tsk_01JR..."
@@ -355,8 +364,10 @@ omitted when the process was killed or timed out.
 
 ### Stream task logs (Server-Sent Events)
 
-Live tail of stdout/stderr. One subscription covers all retries of the task with
-run-boundary markers between them. `404` if the task has no live channel.
+Live-only tail of stdout/stderr. A subscription can remain open across retries;
+run-boundary markers are best-effort lifecycle observations. Output is neither
+persisted nor replayed, so a new subscriber sees only later events. `404` if the
+task has no live channel.
 
 ```bash
 curl -N http://localhost:8080/api/v1/tasks/tsk_01JR.../logs
@@ -383,7 +394,7 @@ event: lagged
 data: {"type":"lagged","skipped":42}
 ```
 
-- `run-started` / `run-finished` bracket each attempt; `seq` resets to 0 on every new run.
+- `run-started` / `run-finished` identify observed attempt boundaries, but they are lossy and are not ordering barriers for chunks. `seq` resets to 0 independently for `stdout` and `stderr` on every new run.
 - `exitCode` in `runFinished` is omitted when the process was killed or timed out.
 - `lagged` means the subscriber fell behind and `skipped` events were dropped.
 
@@ -410,7 +421,7 @@ Safe to retry — deleting an already-gone task is a no-op.
 | 400         | `InvalidRequest`  | Validation failure (empty slot, bad spec, invalid phase), also `Core::InvalidSpec`  |
 | 401         | `Unauthenticated` | Bearer token missing or invalid (only when [auth](#authentication) is enabled)      |
 | 404         | `TaskNotFound`    | Task ID not found or no live log channel, also `Core::NotFound`                     |
-| 409         | `AlreadyExists`   | `Core::AlreadyExists` — a non-terminal task with the same name occupies the slot    |
+| 409         | `AlreadyExists`   | `Core::AlreadyExists` — a live submission still owns the same task id (including between attempts) |
 | 413         | `PayloadTooLarge` | Request body exceeds 4 MiB (`RequestBodyLimitLayer`) — see "Size limits"            |
 | 500         | `Internal`        | Supervisor/infra error (also `Core::{Supervisor,Mapping,Runner}`)                   |
 
@@ -511,11 +522,14 @@ Custom runtime:
 }
 ```
 
+`flag` remains required for wire compatibility. The built-in `solti-exec`
+runner executes a temporary script file and ignores this legacy inline flag.
+
 ### Apply a task
 
-Same request shape as `SubmitTask`; the spec's `admission` is ignored and the
-slot is always force-replaced. Returns the id of the task running in the slot
-after apply.
+Same request shape as `SubmitTask`; the spec's `admission` is ignored and
+`ADMISSION_POLICY_REPLACE` is always used. Returns the new submission's task id
+after controller-queue intake; admission and task start complete asynchronously.
 
 ```bash
 grpcurl -plaintext \
@@ -612,7 +626,7 @@ grpcurl -plaintext \
 | `INVALID_ARGUMENT`   | `InvalidRequest`      | Validation failure, also `Core::InvalidSpec`                        |
 | `UNAUTHENTICATED`    | `Unauthenticated`     | Bearer token missing or invalid (only when [auth](#authentication) is enabled) |
 | `NOT_FOUND`          | `TaskNotFound`        | Task ID not found or no live log channel, also `Core::NotFound`     |
-| `ALREADY_EXISTS`     | `Core::AlreadyExists` | A non-terminal task with the same name occupies the slot            |
+| `ALREADY_EXISTS`     | `Core::AlreadyExists` | A live submission still owns the same task id (including between attempts) |
 | `RESOURCE_EXHAUSTED` | `PayloadTooLarge`     | Message exceeds the 4 MiB cap — see "Size limits"                   |
 | `INTERNAL`           | `Internal` / `Core`   | Supervisor or internal error (also `Core::{Supervisor,Mapping,Runner}`) |
 

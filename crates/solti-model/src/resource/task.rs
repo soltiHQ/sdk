@@ -121,12 +121,15 @@ impl Task {
     /// once an attempt has reached a final state, a later terminal event must not overwrite it.
     ///
     /// taskvisor has two event levels:
-    /// - attempt events: `TaskStopped`, `TaskCanceled`, `TaskFailed`;
-    /// - actor events: `ActorExhausted`, `ActorDead`.
+    /// - attempt events: `AttemptSucceeded`, `AttemptCanceled`,
+    ///   `AttemptFailed`, and `AttemptTimedOut`;
+    /// - the final task event: `TaskFinished` with a typed outcome kind.
     ///
     /// Some flows produce both levels for the same attempt.
-    /// For example, `TimeoutHit` + `TaskFailed` can mark an attempt as `Timeout`, and a later `ActorExhausted` may report that the actor is done.
-    /// Without this guard, that later actor event could replace the more specific attempt result.
+    /// For example, `AttemptTimedOut` can mark an attempt as `Timeout`, while a
+    /// later `TaskFinished(Failed)` reports that the retry policy has stopped.
+    /// Without this guard, the final task event could replace the more specific
+    /// attempt result.
     ///
     /// Exactly one refinement is allowed:
     /// the generic failure phase (`Failed`) may be refined into a more specific disposition (`Exhausted`/`Timeout`).
@@ -171,6 +174,41 @@ impl Task {
             if !refines_failed {
                 return Ok(());
             }
+        }
+        self.update_phase(phase, error, exit_code);
+        Ok(())
+    }
+
+    /// Reconcile the resource with an authoritative final lifecycle outcome.
+    ///
+    /// Unlike [`transition_finished`](Self::transition_finished), this may
+    /// replace a conflicting terminal phase previously derived from an attempt
+    /// event. Use it only after the task lifecycle has ended and no later
+    /// attempt can start. Per-attempt history should keep its own outcome.
+    ///
+    /// Re-applying the same phase refreshes differing diagnostics from the
+    /// authoritative outcome; an identical disposition is a no-op. The target
+    /// must be terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when `phase` is `Pending` or `Running`.
+    pub fn reconcile_finished(
+        &mut self,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+    ) -> ModelResult<()> {
+        if !phase.is_terminal() {
+            return Err(ModelError::Invalid(
+                format!("reconcile_finished requires a terminal phase, got {phase}").into(),
+            ));
+        }
+        if self.status.phase == phase
+            && self.status.error == error
+            && self.status.exit_code == exit_code
+        {
+            return Ok(());
         }
         self.update_phase(phase, error, exit_code);
         Ok(())
@@ -301,6 +339,46 @@ mod tests {
 
         assert_eq!(task.status().phase, TaskPhase::Succeeded);
         assert!(task.status().error.is_none());
+    }
+
+    #[test]
+    fn authoritative_reconciliation_can_replace_an_attempt_terminal() {
+        let mut task = Task::new("task-1".into(), test_spec());
+        task.transition_starting();
+        task.transition_finished(TaskPhase::Succeeded, None, None)
+            .unwrap();
+
+        task.reconcile_finished(TaskPhase::Canceled, Some("removed".into()), None)
+            .unwrap();
+
+        assert_eq!(task.status().phase, TaskPhase::Canceled);
+        assert_eq!(task.status().error.as_deref(), Some("removed"));
+    }
+
+    #[test]
+    fn authoritative_reconciliation_refreshes_same_phase_diagnostics() {
+        let mut task = Task::new("task-1".into(), test_spec());
+        task.transition_starting();
+        task.transition_finished(TaskPhase::Failed, Some("actor_panic".into()), Some(1))
+            .unwrap();
+
+        task.reconcile_finished(TaskPhase::Failed, Some("actor panicked".into()), None)
+            .unwrap();
+
+        assert_eq!(task.status().phase, TaskPhase::Failed);
+        assert_eq!(task.status().error.as_deref(), Some("actor panicked"));
+        assert_eq!(task.status().exit_code, None);
+    }
+
+    #[test]
+    fn authoritative_reconciliation_rejects_a_non_terminal_target() {
+        let mut task = Task::new("task-1".into(), test_spec());
+
+        let err = task
+            .reconcile_finished(TaskPhase::Running, None, None)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("terminal phase"));
     }
 
     #[test]

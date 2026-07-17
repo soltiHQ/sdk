@@ -21,6 +21,7 @@ parking_lot = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 tokio       = { workspace = true }
+tokio-util  = { workspace = true }
 
 solti-model  = { workspace = true }
 solti-runner = { workspace = true }

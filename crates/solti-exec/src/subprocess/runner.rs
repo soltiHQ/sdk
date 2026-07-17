@@ -295,6 +295,10 @@ impl Runner for SubprocessRunner {
     ///
     /// The script tempfile is written inside the task body (per attempt); an I/O
     /// failure there fails the run with a fatal `TaskError`, not a build error.
+    /// The output sink is also acquired inside each attempt. A supervisor
+    /// pre-creates the live-tail channel when it binds the submission;
+    /// standalone callers that subscribe before spawning should call
+    /// [`OutputRegistry::ensure_channel`].
     fn build_task(&self, spec: &TaskSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
         let (task_cfg, script_body) = self.build_task_config(spec, ctx)?;
 
@@ -324,9 +328,6 @@ impl Runner for SubprocessRunner {
             .as_ref()
             .map(|c| *c.log_config())
             .unwrap_or_default();
-
-        let task_id = TaskId::from(Arc::clone(&task_cfg.run_id));
-        ctx.output_registry().ensure_channel(task_id);
 
         let exec_ctx = Arc::new(TaskExecContext {
             task_cfg,
@@ -1103,6 +1104,7 @@ mod tests {
         let spec = mk_script_spec("script-e2e", b"echo \"hello-$1\"", &["script"]);
         let task_ref = runner.build_task(&spec, &ctx).unwrap();
         let task_id = TaskId::from(task_ref.name());
+        registry.ensure_channel(task_id.clone());
         let mut rx = registry.subscribe(&task_id).unwrap();
 
         let cancel = TaskContext::detached();
@@ -1414,10 +1416,11 @@ mod tests {
         let spec = mk_subprocess_spec_with_args("echo-slot", "echo", &["hello-stream"]);
         let task_ref = runner.build_task(&spec, &ctx).unwrap();
         let task_id = TaskId::from(task_ref.name());
+        registry.ensure_channel(task_id.clone());
 
         let mut rx = registry
             .subscribe(&task_id)
-            .expect("registry must have channel after build_task");
+            .expect("standalone caller pre-created the output channel");
 
         let cancel = TaskContext::detached();
         task_ref.spawn(cancel).await.expect("echo must succeed");
@@ -1453,6 +1456,7 @@ mod tests {
         let spec = mk_subprocess_spec_with_args("attempts-slot", "echo", &["x"]);
         let task_ref = runner.build_task(&spec, &ctx).unwrap();
         let task_id = TaskId::from(task_ref.name());
+        registry.ensure_channel(task_id.clone());
         let mut rx = registry.subscribe(&task_id).unwrap();
 
         let ctx = TaskContext::detached();

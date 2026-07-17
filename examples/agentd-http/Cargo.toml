@@ -19,4 +19,4 @@ tokio       = { workspace = true, features = ["rt-multi-thread", "signal"] }
 taskvisor   = { workspace = true }
 tracing     = { workspace = true }
 axum        = { workspace = true }
-axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }

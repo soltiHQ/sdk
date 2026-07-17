@@ -61,6 +61,9 @@ pub trait Runner: Send + Sync {
     /// Build a concrete [`TaskRef`] for the given spec.
     ///
     /// The [`BuildContext`] carries shared dependencies injected at router setup time, such as env, metrics, and output registry.
+    /// Build may be followed by a rejected submission, and the returned task may
+    /// run more than once. Capture immutable configuration here; acquire
+    /// attempt-scoped resources, including output sinks, inside the task body.
     fn build_task(&self, spec: &TaskSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError>;
 
     /// Builds a default run id for a given slot.

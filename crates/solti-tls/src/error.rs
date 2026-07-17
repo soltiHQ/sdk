@@ -1,5 +1,6 @@
 //! # TLS error type.
 
+/// Errors returned while loading PEM material and constructing TLS configurations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TlsError {

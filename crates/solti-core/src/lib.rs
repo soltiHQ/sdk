@@ -60,11 +60,19 @@
 //! Task state is rebuilt from two sources:
 //!
 //! - taskvisor events, which carry attempt-level detail;
-//! - taskvisor completion waiters, which repair terminal state if a final event
-//!   was dropped by the best-effort event bus.
+//! - direct taskvisor completion outcomes, which repair terminal state if a
+//!   final event was dropped by the best-effort event bus.
 //!
-//! Terminal phases are sticky. A later actor-level event must not replace a more
-//! specific phase such as `Timeout` or `Canceled`.
+//! Final phases use typed outcome and rejection categories. Event `reason`
+//! text remains diagnostic and is never parsed to choose a phase.
+//!
+//! `TaskRemoved` normally acts as a FIFO barrier before cleanup so attempt
+//! events can update run history first; the direct outcome is the bounded
+//! fallback if that best-effort barrier is lost or delayed.
+//!
+//! The joined outcome reconciles the resource-level disposition. Attempt
+//! history remains independent, and a concrete `Timeout` stays more specific
+//! than the final task's generic `Exhausted` disposition.
 //!
 //! ## Common Types
 //!

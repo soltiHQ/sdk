@@ -17,7 +17,7 @@ use crate::error::{ModelError, ModelResult};
 /// | `None`         | exactly `base`               | none (deterministic) |
 /// | `Full`         | uniform `[0, base]`          | highest              |
 /// | `Equal`        | around half to full base     | moderate             |
-/// | `Decorrelated` | `min(max, rand(base * 3))`   | high                 |
+/// | `Decorrelated` | uniform `[first, min(base * 3, max)]` | high       |
 ///
 /// The exact math is implemented in the backoff subsystem; this enum only selects the strategy.
 ///
@@ -40,7 +40,8 @@ pub enum JitterPolicy {
     None,
     /// Equal jitter: delay is sampled around the midpoint (`base / 2`), providing a balance between stability and randomness.
     Equal,
-    /// Decorrelated jitter: delay is sampled from `min(max, rand(base * 3))`.
+    /// Memoryless randomized band: delay is sampled uniformly from
+    /// `[first, min(base * 3, max)]`.
     Decorrelated,
 }
 

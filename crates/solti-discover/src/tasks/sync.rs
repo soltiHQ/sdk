@@ -612,7 +612,7 @@ mod tests {
         // The attempt body may legitimately sleep through startup jitter (up to
         // delay_ms) plus a server-advised retry hold (up to MAX_RETRY_AFTER_S)
         // before even sending the request. The per-attempt timeout must cover
-        // that, or taskvisor kills healthy heartbeats with TimeoutHit cycles.
+        // that, or taskvisor kills healthy heartbeats with AttemptTimedOut cycles.
         let delay_ms = 30_000u64;
         let config = crate::DiscoverConfig::builder(
             solti_model::AgentId::from("agent-1"),

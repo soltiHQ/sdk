@@ -2,6 +2,7 @@
 
 use thiserror::Error;
 
+/// Errors returned while validating logger settings or installing the logging backend.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LoggerError {

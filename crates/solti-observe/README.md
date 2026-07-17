@@ -197,9 +197,15 @@ use taskvisor::Subscribe;
 let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(TracingBridge)];
 ```
 
-Each event carries a stable `event` label and optional fields such as `seq`, `id`, `task`, `attempt`, `reason`, `delay_ms`, `timeout_ms`, `duration_ms`, and `exit_code`.
+Each event carries a stable `event` label, `seq`, and any payload fields that
+apply: `id`, `task`, `attempt`, `reason`, `outcome_kind`, `rejection_kind`,
+`backoff_source`, `delay_ms`, `timeout_ms`, `duration_ms`, and `exit_code`.
 
-Level mapping lives in taskvisor. In short: failures are `ERROR`, timeouts and rejected work are `WARN`, lifecycle milestones are `INFO`, and noisy state changes are `DEBUG`.
+Level mapping lives in taskvisor. Failed attempts, fatal or panicked final
+outcomes, subscriber panics, and runtime failures are `ERROR`. Timeouts,
+non-fatal failed or force-aborted outcomes, overflow, and rejected work are
+`WARN`. Successful or canceled lifecycle milestones are `INFO`; starts,
+backoff, management requests, and slot transitions are `DEBUG`.
 
 ## Timezone Sync Task
 

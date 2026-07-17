@@ -31,7 +31,7 @@
 
 mod config;
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use clap::Parser;
 use tonic::transport::Server;
@@ -124,7 +124,7 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     let state_collector = PrometheusStateCollector::new(supervisor.state())?;
     registry.register(Box::new(state_collector))?;
 
-    // Internal tasks travel the same pipeline as user TaskSpecs: submit → dispatch → run.
+    // Internal tasks use direct submission and then the same supervised runtime lifecycle.
     let (tz_task, tz_spec) = timezone_sync();
     supervisor.submit_with_task(tz_task, &tz_spec).await?;
 
@@ -189,9 +189,9 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // --- API: control plane → agent ---
     let api_metrics: Arc<dyn solti_api::ApiMetricsBackend> =
         Arc::new(PrometheusApiMetrics::new(registry.clone())?);
-    // Keep a supervisor handle for graceful shutdown after the server stops.
-    let sup_handle = supervisor.handle();
-    let handler = Arc::new(SupervisorApiAdapter::new(Arc::new(supervisor)));
+    // Keep the full SDK supervisor so shutdown also drains completion workers.
+    let supervisor = Arc::new(supervisor);
+    let handler = Arc::new(SupervisorApiAdapter::new(Arc::clone(&supervisor)));
 
     let listen = cfg.agent.listen.clone();
     let secure = server_tls.is_some();
@@ -217,13 +217,14 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             match server_tls {
                 Some(tls) => {
                     let rustls = Arc::new(tls.into_rustls_config()?);
-                    let srv = axum_server::Handle::new();
+                    let addr: SocketAddr = listen.parse()?;
+                    let srv = axum_server::Handle::<SocketAddr>::new();
                     let srv2 = srv.clone();
                     tokio::spawn(async move {
                         shutdown_signal().await;
                         srv2.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
                     });
-                    axum_server::bind_rustls(listen.parse()?, RustlsConfig::from_config(rustls))
+                    axum_server::bind_rustls(addr, RustlsConfig::from_config(rustls))
                         .handle(srv)
                         .serve(app.into_make_service())
                         .await?;
@@ -261,11 +262,11 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Drain the supervision tree: cancels tasks cooperatively (grace period),
+    // Drain the supervised runtime: cancels tasks cooperatively (grace period),
     // then force-aborts stragglers. Without this, SIGINT/SIGTERM would kill
     // the process and orphan task subprocesses.
     info!("server stopped; shutting down supervisor");
-    sup_handle.shutdown().await?;
+    supervisor.shutdown().await?;
     Ok(())
 }
 
