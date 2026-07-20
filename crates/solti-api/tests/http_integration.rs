@@ -61,7 +61,7 @@ impl ApiHandler for MockHandler {
     ) -> Result<solti_api::OutputEventStream, ApiError> {
         // Mock surface: return a fixed two-event stream so the SSE handler
         // has something deterministic to render. Real adapter feeds this
-        // from a `tokio::sync::broadcast::Receiver` via BroadcastStream.
+        // from the core output subscription.
         use std::time::{Duration, UNIX_EPOCH};
 
         use bytes::Bytes;

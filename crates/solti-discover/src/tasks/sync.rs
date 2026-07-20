@@ -35,7 +35,6 @@ use std::time::Instant;
 
 use tracing::{debug, warn};
 
-use solti_core::uptime_seconds;
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
 };
@@ -44,6 +43,7 @@ use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use crate::config::{DiscoverConfig, DiscoveryTransport};
 use crate::errors::DiscoverError;
 use crate::metrics::{self, DiscoverMetricsHandle};
+use crate::uptime::UptimeSource;
 
 const SLOT: &str = "solti-discover-sync";
 
@@ -51,7 +51,7 @@ const SLOT: &str = "solti-discover-sync";
 #[cfg(feature = "http")]
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
-/// Build a heartbeat task and its spec from discovery config.
+/// Build a heartbeat task and its spec from discovery config and an uptime source.
 ///
 /// Returns `(TaskRef, TaskSpec)` ready for `SupervisorApi::submit_with_task`.
 ///
@@ -65,7 +65,11 @@ const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VE
 ///
 /// - [`DiscoverConfig`](crate::DiscoverConfig) controls endpoint, transport, interval.
 /// - [`DiscoverError`](crate::DiscoverError) failure modes surfaced via `TaskError::Fail`.
-pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError> {
+/// - [`UptimeSource`](crate::UptimeSource) defines the composition-owned uptime epoch.
+pub fn sync(
+    config: DiscoverConfig,
+    uptime: Arc<dyn UptimeSource>,
+) -> Result<(TaskRef, TaskSpec), DiscoverError> {
     let delay_ms = config.delay_ms;
 
     let backoff = config.backoff.clone().unwrap_or_else(|| BackoffPolicy {
@@ -115,6 +119,7 @@ pub fn sync(config: DiscoverConfig) -> Result<(TaskRef, TaskSpec), DiscoverError
         retry_hold_until: AtomicU64::new(0),
         startup_jitter_applied: AtomicBool::new(false),
         metrics,
+        uptime,
         config,
     });
 
@@ -204,6 +209,7 @@ struct SyncContext {
     /// subsequent restarts (e.g. after a transient failure) skip the jitter and stay on the periodic schedule.
     startup_jitter_applied: AtomicBool,
     metrics: DiscoverMetricsHandle,
+    uptime: Arc<dyn UptimeSource>,
 }
 
 /// Map a [`DiscoverError`] to a canonical failure-reason label.
@@ -342,7 +348,7 @@ async fn invoke_grpc_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
             .await?;
 
     let mut client = client.clone();
-    let mut request = tonic::Request::new(stamp_request(&ctx.base_request));
+    let mut request = tonic::Request::new(stamp_request(&ctx.base_request, ctx.uptime.as_ref()));
     if let Some(token) = &ctx.config.token {
         let value: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
             format!("Bearer {}", token.expose()).parse().map_err(|_| {
@@ -394,7 +400,7 @@ fn build_http_client(config: &DiscoverConfig) -> Result<reqwest::Client, Discove
 
 #[cfg(feature = "http")]
 async fn invoke_http_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
-    let request = stamp_request(&ctx.base_request);
+    let request = stamp_request(&ctx.base_request, ctx.uptime.as_ref());
 
     let url = format!(
         "{}{}",
@@ -481,10 +487,10 @@ fn build_base_request(cfg: &DiscoverConfig) -> SyncRequest {
     }
 }
 
-fn stamp_request(base: &SyncRequest) -> SyncRequest {
+fn stamp_request(base: &SyncRequest, uptime: &dyn UptimeSource) -> SyncRequest {
     SyncRequest {
         ts: now_unix_seconds() as i64,
-        uptime_seconds: uptime_seconds() as i64,
+        uptime_seconds: uptime.uptime_seconds() as i64,
         ..base.clone()
     }
 }
@@ -631,7 +637,7 @@ mod tests {
             + config.connect_timeout_ms
             + config.request_timeout_ms;
 
-        let (_task, spec) = sync(config).expect("sync builds");
+        let (_task, spec) = sync(config, Arc::new(|| 0)).expect("sync builds");
         assert!(
             spec.timeout().as_millis() >= worst_case_ms,
             "attempt timeout {}ms must cover the worst case {}ms",
@@ -830,6 +836,17 @@ mod tests {
         )
         .build()
         .expect("config builds")
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn stamp_request_reads_the_injected_uptime_source() {
+        let base = build_base_request(&test_config());
+        let source = || 42;
+
+        let request = stamp_request(&base, &source);
+
+        assert_eq!(request.uptime_seconds, 42);
     }
 
     #[cfg(feature = "http")]

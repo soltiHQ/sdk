@@ -1,0 +1,112 @@
+[package]
+name = "solti"
+description = "Thin feature and namespace façade for the modular Solti SDK."
+
+rust-version.workspace = true
+repository.workspace = true
+categories.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+
+model = ["dep:solti-model"]
+tls = ["dep:solti-tls"]
+
+taskvisor = ["dep:taskvisor"]
+taskvisor-controller = ["taskvisor", "taskvisor/controller"]
+taskvisor-logging = ["taskvisor", "taskvisor/logging"]
+taskvisor-tracing = ["taskvisor", "taskvisor/tracing"]
+taskvisor-tokio-util-interop = ["taskvisor", "taskvisor/tokio-util-interop"]
+
+runner = ["dep:solti-runner", "model", "taskvisor"]
+core = ["dep:solti-core", "model", "runner", "taskvisor-controller"]
+
+exec = ["dep:solti-exec"]
+exec-subprocess = ["exec", "model", "runner", "taskvisor", "solti-exec/subprocess"]
+exec-seccomp = ["exec-subprocess", "solti-exec/seccomp"]
+
+api = ["dep:solti-api", "model"]
+api-core-adapter = ["api", "core", "solti-api/core-adapter"]
+api-http = ["api", "solti-api/http"]
+api-grpc = ["api", "solti-api/grpc"]
+api-grpc-tls = ["api-grpc", "tls", "solti-api/grpc-tls"]
+
+discover = ["dep:solti-discover"]
+discover-http = ["discover", "model", "taskvisor", "solti-discover/http"]
+discover-grpc = ["discover", "model", "taskvisor", "solti-discover/grpc"]
+discover-tls = ["discover", "tls", "solti-discover/tls"]
+
+observe = ["dep:solti-observe"]
+observe-timezone-sync = [
+    "observe",
+    "model",
+    "taskvisor",
+    "solti-observe/timezone-sync",
+]
+
+# `prometheus` preserves solti-prometheus's compatible default integrations.
+# `prometheus-base` is the registry/build-info-only opt-in.
+prometheus-base = ["dep:solti-prometheus"]
+prometheus = ["prometheus-base", "prometheus-runner", "prometheus-taskvisor"]
+prometheus-api = ["prometheus-base", "api", "solti-prometheus/api"]
+prometheus-discover = ["prometheus-base", "discover", "solti-prometheus/discover"]
+prometheus-process = ["prometheus-base", "solti-prometheus/process"]
+prometheus-runner = ["prometheus-base", "runner", "solti-prometheus/runner"]
+prometheus-server = [
+    "prometheus-base",
+    "model",
+    "taskvisor",
+    "solti-prometheus/server",
+]
+prometheus-state = ["prometheus-base", "core", "model", "solti-prometheus/state"]
+prometheus-taskvisor = [
+    "prometheus-base",
+    "taskvisor-controller",
+    "solti-prometheus/taskvisor",
+]
+prometheus-full = [
+    "prometheus-api",
+    "prometheus-discover",
+    "prometheus-process",
+    "prometheus-runner",
+    "prometheus-server",
+    "prometheus-state",
+    "prometheus-taskvisor",
+]
+
+full = [
+    "api-core-adapter",
+    "api-http",
+    "api-grpc-tls",
+    "discover-http",
+    "discover-grpc",
+    "discover-tls",
+    "exec-seccomp",
+    "observe-timezone-sync",
+    "prometheus-full",
+    "taskvisor-logging",
+    "taskvisor-tracing",
+    "taskvisor-tokio-util-interop",
+]
+
+[dependencies]
+taskvisor = { workspace = true, optional = true }
+
+solti-api        = { workspace = true, optional = true }
+solti-core       = { workspace = true, optional = true }
+solti-discover   = { workspace = true, optional = true }
+solti-exec       = { workspace = true, optional = true }
+solti-model      = { workspace = true, optional = true }
+solti-observe    = { workspace = true, optional = true }
+solti-prometheus = { workspace = true, optional = true }
+solti-runner     = { workspace = true, optional = true }
+solti-tls        = { workspace = true, optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

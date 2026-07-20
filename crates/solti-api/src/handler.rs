@@ -20,11 +20,11 @@ pub type OutputEventStream = Pin<Box<dyn Stream<Item = OutputEvent> + Send + 'st
 ///
 /// ## Also
 ///
-/// - [`SupervisorApiAdapter`](crate::SupervisorApiAdapter) ready-to-use implementation.
+/// - `SupervisorApiAdapter` ready-to-use implementation (feature `core-adapter`).
 /// - [`ApiError`](crate::ApiError) error type returned by all methods.
 ///
 /// This trait abstracts the backend implementation, allowing users to:
-/// - Use the provided [`SupervisorApiAdapter`](crate::SupervisorApiAdapter)
+/// - Use the provided `SupervisorApiAdapter` with feature `core-adapter`.
 /// - Implement custom handlers with additional logic (auth, rate limiting, etc.)
 ///
 /// ## API surface
@@ -50,10 +50,11 @@ pub trait ApiHandler: Send + Sync + 'static {
     ///
     /// ## Errors
     ///
-    /// The bundled [`SupervisorApiAdapter`](crate::SupervisorApiAdapter) returns:
+    /// The bundled `SupervisorApiAdapter` returns:
     ///
-    /// - [`ApiError::Core`]: the supervisor rejected the spec (invalid spec, no matching runner,
-    ///   a live submission already owning the same task id, or an internal submit failure).
+    /// - [`ApiError::InvalidRequest`] when the supervisor rejects the spec;
+    /// - [`ApiError::AlreadyExists`] when a live submission owns the same task id;
+    /// - [`ApiError::Internal`] for runner, mapping, or runtime failures.
     ///
     /// Custom implementations may return other variants, e.g. [`ApiError::Internal`].
     async fn submit_task(&self, spec: TaskSpec) -> Result<TaskId, ApiError>;
@@ -82,7 +83,7 @@ pub trait ApiHandler: Send + Sync + 'static {
     ///
     /// ## Errors
     ///
-    /// The bundled [`SupervisorApiAdapter`](crate::SupervisorApiAdapter) never fails here:
+    /// The bundled `SupervisorApiAdapter` never fails here:
     /// a missing task is `Ok(None)`. Custom implementations may return any [`ApiError`].
     async fn get_task_status(&self, id: &TaskId) -> Result<Option<Task>, ApiError>;
 
@@ -92,7 +93,7 @@ pub trait ApiHandler: Send + Sync + 'static {
     ///
     /// ## Errors
     ///
-    /// The bundled [`SupervisorApiAdapter`](crate::SupervisorApiAdapter) never fails here.
+    /// The bundled `SupervisorApiAdapter` never fails here.
     /// Custom implementations may return any [`ApiError`].
     async fn query_tasks(&self, query: TaskQuery) -> Result<TaskPage<Task>, ApiError>;
 
@@ -100,7 +101,7 @@ pub trait ApiHandler: Send + Sync + 'static {
     ///
     /// ## Errors
     ///
-    /// The bundled [`SupervisorApiAdapter`](crate::SupervisorApiAdapter) never fails here:
+    /// The bundled `SupervisorApiAdapter` never fails here:
     /// an unknown id yields an empty list. Custom implementations may return any [`ApiError`].
     async fn list_task_runs(&self, id: &TaskId) -> Result<Vec<TaskRun>, ApiError>;
 
@@ -110,7 +111,7 @@ pub trait ApiHandler: Send + Sync + 'static {
     ///
     /// ## Errors
     ///
-    /// - [`ApiError::Core`]: the supervisor failed to cancel the bound submission,
+    /// - [`ApiError::Internal`]: the supervisor failed to cancel the bound submission,
     ///   whether registered or controller-queued (timeout or internal runtime failure).
     async fn delete_task(&self, id: &TaskId) -> Result<(), ApiError>;
 
@@ -120,14 +121,14 @@ pub trait ApiHandler: Send + Sync + 'static {
     /// [`OutputEvent`]s in real time without persistence or replay. It can cover
     /// subsequent runs of the task (multi-run merge); lifecycle boundary events
     /// are best-effort observations, not ordering barriers for output chunks.
-    /// Terminal cleanup removes the registry sender; an already-open stream
+    /// Terminal cleanup removes the core hub sender; an already-open stream
     /// closes after any outstanding runner-owned output-sink clones are also
     /// dropped.
     ///
     /// ## Errors
     ///
     /// - [`ApiError::TaskNotFound`]: no live output channel exists for this id
-    ///   (bundled [`SupervisorApiAdapter`](crate::SupervisorApiAdapter)).
+    ///   (bundled `SupervisorApiAdapter`).
     ///
     /// The default implementation never fails; it returns a stream that ends immediately.
     async fn stream_task_logs(&self, _id: &TaskId) -> Result<OutputEventStream, ApiError> {

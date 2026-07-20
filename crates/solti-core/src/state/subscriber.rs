@@ -3,7 +3,7 @@
 //! [`StateSubscriber`] implements [`Subscribe`](taskvisor::Subscribe) and owns three responsibilities driven off taskvisor's lifecycle events:
 //! - project attempt events into [`TaskState`](super::TaskState) transitions and `TaskRun` records;
 //! - project typed `TaskFinished` outcomes into the resource-level terminal phase;
-//! - drive per-run [`OutputRegistry`] announcements (`RunStarted` / `RunFinished`).
+//! - drive per-run output announcements (`RunStarted` / `RunFinished`).
 //!
 //! This is the event path. It is fed by taskvisor's best-effort broadcast bus.
 //! The direct completion outcome repairs a dropped terminal event. For a
@@ -26,8 +26,8 @@ use tracing::{trace, warn};
 
 use super::{LifecycleGate, TaskState};
 use crate::map::phase::{phase_for_outcome, phase_for_outcome_kind, phase_for_rejection};
+use crate::output::OutputHub;
 use solti_model::{TaskId, TaskPhase};
-use solti_runner::OutputRegistry;
 
 const STATE_SUBSCRIBER_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(2048).unwrap();
 const REMOVED_ID_CAPACITY: usize = 4096;
@@ -94,17 +94,17 @@ impl CompletionBarriers {
 /// - [`SupervisorApi::new`](crate::SupervisorApi::new) auto-registers this subscriber.
 pub struct StateSubscriber {
     state: TaskState,
-    output_registry: Arc<OutputRegistry>,
+    output_hub: Arc<OutputHub>,
     lifecycle_gate: LifecycleGate,
     completion_barriers: Mutex<CompletionBarriers>,
 }
 
 impl StateSubscriber {
-    /// Create a state subscriber over a shared [`TaskState`] and [`OutputRegistry`].
-    pub fn with_output_registry(state: TaskState, output_registry: Arc<OutputRegistry>) -> Self {
+    /// Create a state subscriber over shared task state and output hub.
+    pub(crate) fn with_output_hub(state: TaskState, output_hub: Arc<OutputHub>) -> Self {
         Self {
             state,
-            output_registry,
+            output_hub,
             lifecycle_gate: LifecycleGate::default(),
             completion_barriers: Mutex::new(CompletionBarriers::default()),
         }
@@ -121,8 +121,7 @@ impl StateSubscriber {
     /// submission can roll back only resources owned by its reservation.
     pub(crate) fn bind(&self, id: &TaskId, tv: taskvisor::TaskId, ensure_output: bool) -> bool {
         let _lifecycle = self.lifecycle_gate.lock();
-        let output_created =
-            ensure_output && self.output_registry.ensure_channel_if_absent(id.clone());
+        let output_created = ensure_output && self.output_hub.ensure_channel_if_absent(id.clone());
         self.state.bind_tv(id, tv);
         output_created
     }
@@ -244,7 +243,7 @@ impl StateSubscriber {
         let _lifecycle = self.lifecycle_gate.lock();
         let removed = self.state.delete_task(id);
         if removed || tv.is_some() {
-            self.output_registry.evict(id);
+            self.output_hub.evict(id);
         }
         if let Some(tv) = tv {
             self.mark_completed_locked(tv.get());
@@ -353,7 +352,7 @@ impl StateSubscriber {
             finalization.exit_code,
             finalization.force,
         ) {
-            self.output_registry.evict(&model_id);
+            self.output_hub.evict(&model_id);
         }
         self.mark_completed_locked(tv_raw);
     }
@@ -383,7 +382,7 @@ impl StateSubscriber {
             return;
         };
 
-        // Registry cleanup does not own the retained SDK resource. The
+        // Output cleanup does not own the retained SDK resource. The
         // direct completion finalizes it; explicit delete removes it eagerly.
         if event.kind == EventKind::TaskRemoved {
             self.task_removed_locked(tv_raw);
@@ -401,7 +400,7 @@ impl StateSubscriber {
                 if self.state.transition_starting(&task_id).is_none() {
                     warn!(task = %task_id, "AttemptStarting event for unknown task");
                 }
-                self.output_registry.announce_run_started(&task_id, attempt);
+                self.output_hub.announce_run_started(&task_id, attempt);
             }
             EventKind::AttemptSucceeded => {
                 trace!(task = %task_id, "task attempt succeeded");
@@ -411,7 +410,7 @@ impl StateSubscriber {
                 {
                     warn!(task = %task_id, "AttemptSucceeded event for unknown task");
                 }
-                self.output_registry
+                self.output_hub
                     .announce_run_finished(&task_id, attempt, None);
             }
             EventKind::AttemptCanceled => {
@@ -422,7 +421,7 @@ impl StateSubscriber {
                 {
                     warn!(task = %task_id, "AttemptCanceled event for unknown task");
                 }
-                self.output_registry
+                self.output_hub
                     .announce_run_finished(&task_id, attempt, None);
             }
             EventKind::AttemptFailed => {
@@ -445,7 +444,7 @@ impl StateSubscriber {
                 ) {
                     warn!(task = %task_id, "AttemptFailed event for unknown task");
                 }
-                self.output_registry
+                self.output_hub
                     .announce_run_finished(&task_id, attempt, event.exit_code);
             }
             EventKind::AttemptTimedOut => {
@@ -460,7 +459,7 @@ impl StateSubscriber {
                 {
                     warn!(task = %task_id, "AttemptTimedOut event for unknown task");
                 }
-                self.output_registry
+                self.output_hub
                     .announce_run_finished(&task_id, attempt, None);
             }
             EventKind::TaskFinished => {
@@ -575,8 +574,8 @@ mod tests {
     use super::*;
     use taskvisor::TaskOutcomeKind;
 
+    use crate::output::{OutputConfig, OutputHub};
     use solti_model::{OutputEvent, TaskKind, TaskSpec};
-    use solti_runner::OutputRegistry;
     use taskvisor::Event;
 
     fn test_spec() -> TaskSpec {
@@ -591,9 +590,9 @@ mod tests {
         state.add_task(id.clone(), test_spec());
         state.bind_tv(&id, taskvisor::TaskId::for_tests());
         state.transition_starting(&id);
-        let sub = StateSubscriber::with_output_registry(
+        let sub = StateSubscriber::with_output_hub(
             state.clone(),
-            Arc::new(solti_runner::OutputRegistry::default()),
+            Arc::new(OutputHub::new(OutputConfig::default())),
         );
         (sub, state, id)
     }
@@ -607,8 +606,8 @@ mod tests {
         let state = TaskState::new();
         let id = TaskId::from("prepared-start");
         state.add_task(id.clone(), test_spec());
-        let registry = Arc::new(OutputRegistry::new(16));
-        let sub = StateSubscriber::with_output_registry(state.clone(), Arc::clone(&registry));
+        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
+        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
         let tv = taskvisor::TaskId::for_tests();
 
         assert!(sub.bind(&id, tv, true));
@@ -621,7 +620,7 @@ mod tests {
         assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Running);
         assert_eq!(state.list_runs(&id).len(), 1);
         assert_eq!(state.list_runs(&id)[0].attempt, 1);
-        assert!(registry.subscribe(&id).is_some());
+        assert!(registry.subscribe_raw(&id).is_some());
     }
 
     #[tokio::test]
@@ -631,10 +630,10 @@ mod tests {
         state.add_task(id.clone(), test_spec());
         let tv = taskvisor::TaskId::for_tests();
         state.bind_tv(&id, tv);
-        let registry = Arc::new(OutputRegistry::new(16));
+        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
         registry.ensure_channel(id.clone());
-        let mut output = registry.subscribe(&id).expect("output channel");
-        let sub = Arc::new(StateSubscriber::with_output_registry(
+        let mut output = registry.subscribe_raw(&id).expect("output channel");
+        let sub = Arc::new(StateSubscriber::with_output_hub(
             state.clone(),
             Arc::clone(&registry),
         ));
@@ -666,7 +665,7 @@ mod tests {
         assert_eq!(state.list_runs(&id).len(), 1);
         assert_eq!(state.list_runs(&id)[0].phase, TaskPhase::Succeeded);
         assert!(state.tv_for(&id).is_none());
-        assert!(registry.subscribe(&id).is_none());
+        assert!(registry.subscribe_raw(&id).is_none());
         assert!(matches!(
             output.try_recv(),
             Ok(OutputEvent::RunStarted { attempt: 1, .. })
@@ -714,12 +713,12 @@ mod tests {
     fn idempotent_delete_does_not_evict_an_unknown_external_channel() {
         let state = TaskState::new();
         let id = TaskId::from("not-yet-submitted");
-        let registry = Arc::new(OutputRegistry::new(16));
+        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
         registry.ensure_channel(id.clone());
-        let sub = StateSubscriber::with_output_registry(state, Arc::clone(&registry));
+        let sub = StateSubscriber::with_output_hub(state, Arc::clone(&registry));
 
         assert!(!sub.delete_after_cleanup(&id, None));
-        assert!(registry.subscribe(&id).is_some());
+        assert!(registry.subscribe_raw(&id).is_some());
     }
 
     #[test]
@@ -860,9 +859,9 @@ mod tests {
         state.add_task(id.clone(), test_spec());
         let tv = taskvisor::TaskId::for_tests();
         state.bind_tv(&id, tv);
-        let registry = Arc::new(OutputRegistry::new(16));
+        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
         registry.ensure_channel(id.clone());
-        let sub = StateSubscriber::with_output_registry(state.clone(), Arc::clone(&registry));
+        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
 
         let ev = Event::new(EventKind::ControllerRejected)
             .with_task("some-slot")
@@ -881,7 +880,7 @@ mod tests {
             "rejection reason must be recorded"
         );
         assert!(
-            registry.subscribe(&id).is_some(),
+            registry.subscribe_raw(&id).is_some(),
             "the event path must not race the waiter's output cleanup"
         );
         assert!(
@@ -900,9 +899,9 @@ mod tests {
         state.add_task(id.clone(), test_spec());
         let tv = taskvisor::TaskId::for_tests();
         state.bind_tv(&id, tv);
-        let sub = StateSubscriber::with_output_registry(
+        let sub = StateSubscriber::with_output_hub(
             state.clone(),
-            Arc::new(OutputRegistry::default()),
+            Arc::new(OutputHub::new(OutputConfig::default())),
         );
 
         sub.on_event(
@@ -947,9 +946,9 @@ mod tests {
         let tv = taskvisor::TaskId::for_tests();
         state.bind_tv(&id, tv);
         state.transition_starting(&id);
-        let sub = StateSubscriber::with_output_registry(
+        let sub = StateSubscriber::with_output_hub(
             state.clone(),
-            Arc::new(OutputRegistry::default()),
+            Arc::new(OutputHub::new(OutputConfig::default())),
         );
 
         sub.on_event(
@@ -992,9 +991,9 @@ mod tests {
         let tv = taskvisor::TaskId::for_tests();
         state.bind_tv(&id, tv);
         state.transition_starting(&id);
-        let sub = StateSubscriber::with_output_registry(
+        let sub = StateSubscriber::with_output_hub(
             state.clone(),
-            Arc::new(OutputRegistry::default()),
+            Arc::new(OutputHub::new(OutputConfig::default())),
         );
 
         sub.on_event(
@@ -1033,9 +1032,9 @@ mod tests {
         state.add_task(id.clone(), test_spec());
         let tv = taskvisor::TaskId::for_tests();
         state.bind_tv(&id, tv);
-        let sub = StateSubscriber::with_output_registry(
+        let sub = StateSubscriber::with_output_hub(
             state.clone(),
-            Arc::new(OutputRegistry::default()),
+            Arc::new(OutputHub::new(OutputConfig::default())),
         );
 
         let ev = Event::new(EventKind::ControllerRejected)
@@ -1145,24 +1144,24 @@ mod tests {
         assert_eq!(task.status().exit_code, Some(1));
     }
 
-    fn setup_with_registry(
+    fn setup_with_output_hub(
         task_name: &str,
-    ) -> (StateSubscriber, TaskState, Arc<OutputRegistry>, TaskId) {
+    ) -> (StateSubscriber, TaskState, Arc<OutputHub>, TaskId) {
         let state = TaskState::new();
         let id = TaskId::from(task_name);
         state.add_task(id.clone(), test_spec());
         state.bind_tv(&id, taskvisor::TaskId::for_tests());
         state.transition_starting(&id);
-        let registry = Arc::new(OutputRegistry::new(16));
+        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
         registry.ensure_channel(id.clone());
-        let sub = StateSubscriber::with_output_registry(state.clone(), Arc::clone(&registry));
+        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
         (sub, state, registry, id)
     }
 
     #[test]
-    fn attempt_starting_announces_run_started_into_registry() {
-        let (sub, state, registry, id) = setup_with_registry("started-1");
-        let mut rx = registry.subscribe(&id).unwrap();
+    fn attempt_starting_announces_run_started_into_output_hub() {
+        let (sub, state, registry, id) = setup_with_output_hub("started-1");
+        let mut rx = registry.subscribe_raw(&id).unwrap();
 
         let ev = bound_event(&state, &id, EventKind::AttemptStarting).with_attempt(1);
         sub.on_event(&ev);
@@ -1175,8 +1174,8 @@ mod tests {
 
     #[test]
     fn attempt_succeeded_announces_run_finished_with_no_exit_code() {
-        let (sub, state, registry, id) = setup_with_registry("stopped-1");
-        let mut rx = registry.subscribe(&id).unwrap();
+        let (sub, state, registry, id) = setup_with_output_hub("stopped-1");
+        let mut rx = registry.subscribe_raw(&id).unwrap();
 
         let ev = bound_event(&state, &id, EventKind::AttemptSucceeded).with_attempt(2);
         sub.on_event(&ev);
@@ -1194,8 +1193,8 @@ mod tests {
 
     #[test]
     fn attempt_failed_announces_run_finished_with_exit_code() {
-        let (sub, state, registry, id) = setup_with_registry("failed-1");
-        let mut rx = registry.subscribe(&id).unwrap();
+        let (sub, state, registry, id) = setup_with_output_hub("failed-1");
+        let mut rx = registry.subscribe_raw(&id).unwrap();
 
         let ev = bound_event(&state, &id, EventKind::AttemptFailed)
             .with_attempt(3)
@@ -1215,8 +1214,8 @@ mod tests {
 
     #[test]
     fn task_finished_refines_state_without_duplicate_run_finished() {
-        let (sub, state, registry, id) = setup_with_registry("exh-evict");
-        let mut rx = registry.subscribe(&id).unwrap();
+        let (sub, state, registry, id) = setup_with_output_hub("exh-evict");
+        let mut rx = registry.subscribe_raw(&id).unwrap();
 
         sub.on_event(
             &bound_event(&state, &id, EventKind::AttemptFailed)
@@ -1239,15 +1238,15 @@ mod tests {
             "TaskFinished is task-level and must not announce a second RunFinished"
         );
         assert!(
-            registry.subscribe(&id).is_some(),
+            registry.subscribe_raw(&id).is_some(),
             "the direct completion path owns terminal channel eviction"
         );
     }
 
     #[test]
     fn attempt_timed_out_is_a_single_terminal_attempt_event() {
-        let (sub, state, registry, id) = setup_with_registry("slow-task");
-        let mut rx = registry.subscribe(&id).unwrap();
+        let (sub, state, registry, id) = setup_with_output_hub("slow-task");
+        let mut rx = registry.subscribe_raw(&id).unwrap();
 
         sub.on_event(
             &bound_event(&state, &id, EventKind::AttemptTimedOut)
@@ -1366,7 +1365,7 @@ mod tests {
 
     #[test]
     fn task_finished_fatal_waits_for_waiter_to_evict_channel() {
-        let (sub, state, registry, id) = setup_with_registry("dead-evict");
+        let (sub, state, registry, id) = setup_with_output_hub("dead-evict");
 
         let ev = bound_event(&state, &id, EventKind::TaskFinished)
             .with_outcome_kind(TaskOutcomeKind::Fatal)
@@ -1374,20 +1373,20 @@ mod tests {
         sub.on_event(&ev);
 
         assert!(
-            registry.subscribe(&id).is_some(),
+            registry.subscribe_raw(&id).is_some(),
             "the direct completion path owns terminal channel eviction"
         );
     }
 
     #[test]
     fn task_removed_does_not_bypass_waiter_cleanup_or_retention() {
-        let (sub, state, registry, id) = setup_with_registry("remove");
+        let (sub, state, registry, id) = setup_with_output_hub("remove");
 
         let ev = bound_event(&state, &id, EventKind::TaskRemoved);
         sub.on_event(&ev);
 
         assert!(
-            registry.subscribe(&id).is_some(),
+            registry.subscribe_raw(&id).is_some(),
             "TaskRemoved must not race the waiter's output cleanup"
         );
         assert!(state.get(&id).is_some(), "task_ttl retention stays intact");

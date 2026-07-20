@@ -1,6 +1,6 @@
 [package]
 name = "solti-observe"
-description = "Structured logging, timezone sync, and task-lifecycle tracing for the Solti SDK."
+description = "Structured logging and timezone sync for the Solti SDK."
 
 rust-version.workspace = true
 repository.workspace = true
@@ -13,12 +13,11 @@ license.workspace = true
 
 [features]
 default       = []
-subscriber    = ["dep:taskvisor", "taskvisor/tracing"]
 timezone-sync = ["dep:taskvisor", "dep:solti-model"]
 
 [dependencies]
 serde              = { workspace = true, features = ["derive"] }
-taskvisor          = { workspace = true, optional = true, features = ["controller"] }
+taskvisor          = { workspace = true, optional = true }
 time               = { workspace = true, features = ["formatting", "local-offset"] }
 thiserror          = { workspace = true }
 tracing            = { workspace = true }
@@ -32,5 +31,5 @@ serde_json = { workspace = true }
 tokio      = { workspace = true, features = ["rt", "rt-multi-thread"] }
 
 [package.metadata.docs.rs]
-features = ["subscriber", "timezone-sync"]
+features = ["timezone-sync"]
 rustdoc-args = ["--cfg", "docsrs"]

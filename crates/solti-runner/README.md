@@ -102,8 +102,8 @@ In a real agent, `solti-exec` provides the subprocess runner. You only implement
 - **One plugin shape**: every backend implements the same `Runner` trait.
 - **Simple routing**: the first registered runner that supports the spec is used.
 - **Label selection**: a task can ask for a runner with labels, such as `zone=eu` or `gpu=true`.
-- **Shared context**: runners receive env, metrics, and output registry handles through `BuildContext`.
-- **Live output**: runners can push stdout and stderr lines into an `OutputRegistry`.
+- **Shared context**: runners receive env, metrics, and an output producer capability through `BuildContext`.
+- **Live output**: runners push stdout and stderr through attempt-scoped `OutputSink` values without gaining subscription or lifecycle control.
 - **Low-cardinality metrics**: metrics labels are enums, not free-form error strings.
 
 ## When to Use It
@@ -166,30 +166,29 @@ If a `TaskSpec` has a `RunnerSelector`, the router only keeps runners whose labe
 
 ## Output Streaming
 
-`OutputRegistry` is a live output hub. A runner gets an `OutputSink` for one task attempt and pushes lines into it:
+`OutputPublisher` is the runner-facing producer port. A runner obtains an
+`OutputSink` inside each attempt and pushes lines into it:
 
 ```rust
 use bytes::Bytes;
-use solti_model::{OutputEvent, TaskId};
-use solti_runner::OutputRegistry;
+use solti_model::TaskId;
+use solti_runner::BuildContext;
 
-# async fn demo() {
-let registry = OutputRegistry::new(64);
+let context = BuildContext::default();
 let task_id = TaskId::from("task-1");
 
-let sink = registry.sink_for(task_id.clone(), 1);
-let mut rx = registry.subscribe(&task_id).unwrap();
-
-sink.stdout_line(Bytes::from_static(b"hello"));
-
-match rx.recv().await.unwrap() {
-    OutputEvent::Chunk(chunk) => assert_eq!(&chunk.line[..], b"hello"),
-    other => panic!("unexpected event: {other:?}"),
+if let Some(sink) = context.output_publisher().sink_for(&task_id, 1) {
+    sink.stdout_line(Bytes::from_static(b"hello"));
 }
-# }
 ```
 
-Channels are `tokio::sync::broadcast`. A slow subscriber does not block the runner. It may receive a lag signal and then continue from newer events.
+`BuildContext::default()` uses a no-op publisher. `solti-core` replaces it with
+its private live-output hub when constructing `SupervisorApi`. A custom
+standalone composition can inject its own `OutputPublisher` with
+`BuildContext::with_output_publisher()`.
+
+The producer call is synchronous and must remain non-blocking. The standard core
+implementation is lossy: slow consumers do not block runner execution.
 
 ## Metrics
 
@@ -211,7 +210,7 @@ The default backend is `NoOpMetrics`. Production agents can use `solti-prometheu
 |---------------|--------------------------------------------------|
 | Runner plugin | `Runner`, `RunnerRouter`                         |
 | Build data    | `BuildContext`                                   |
-| Output        | `OutputRegistry`, `OutputSink`                   |
+| Output        | `OutputPublisher`, `OutputPublisherHandle`, `OutputSink` |
 | Run identity  | `RunId`, `make_run_id`                           |
 | Metrics       | `MetricsBackend`, `MetricsHandle`, `NoOpMetrics` |
 | Metric labels | `RunnerType`, `MetricOutcome`, `RunnerErrorKind` |
@@ -236,5 +235,5 @@ The enum is `#[non_exhaustive]`, so match it with a wildcard arm.
 
 - `RunId` is `{runner}-{slot}-{seq}`.
 - The `seq` is process-global and starts at `1`.
-- `OutputRegistry` channels are per `TaskId` and reused across retries.
-- `BuildContext::default()` uses empty env, `NoOpMetrics`, and an empty `OutputRegistry`.
+- `OutputSink` sequence counters are attempt-scoped and independent for stdout and stderr.
+- `BuildContext::default()` uses empty env, `NoOpMetrics`, and a no-op output publisher.

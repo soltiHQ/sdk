@@ -6,19 +6,18 @@
 //! See [`Runner::build_task`](crate::Runner::build_task) for usage.
 
 use std::fmt;
-use std::sync::Arc;
 
 use solti_model::RunnerEnv;
 
 use crate::metrics::MetricsHandle;
-use crate::output::OutputRegistry;
+use crate::output::{OutputPublisherHandle, noop_output_publisher};
 
 /// Shared build context passed to all runners.
 ///
 /// It carries:
 /// - a metrics handle,
 /// - runner environment variables,
-/// - an output registry for live stdout/stderr streaming.
+/// - an output producer capability for live stdout/stderr streaming.
 ///
 /// Create it once at router setup time and pass it to [`RunnerRouter::with_context`](crate::RunnerRouter::with_context).
 ///
@@ -26,7 +25,7 @@ use crate::output::OutputRegistry;
 ///
 /// - `env`: empty [`RunnerEnv`]
 /// - `metrics`: [`NoOpMetrics`](crate::NoOpMetrics) (zero-cost)
-/// - `output_registry`: a fresh, empty [`OutputRegistry`](crate::OutputRegistry) (no live subscribers)
+/// - `output_publisher`: a no-op publisher (live output disabled)
 ///
 /// ## Also
 ///
@@ -47,7 +46,7 @@ use crate::output::OutputRegistry;
 /// ```
 #[derive(Clone)]
 pub struct BuildContext {
-    output_registry: Arc<OutputRegistry>,
+    output_publisher: OutputPublisherHandle,
     metrics: MetricsHandle,
     env: RunnerEnv,
 }
@@ -55,8 +54,7 @@ pub struct BuildContext {
 impl BuildContext {
     /// Create a new build context with the given env and metrics.
     ///
-    /// Starts with a fresh, empty [`OutputRegistry`].
-    /// To share the supervisor's live output registry, chain [`with_output_registry`](Self::with_output_registry).
+    /// Starts with a no-op output publisher.
     ///
     /// ## Example
     ///
@@ -71,7 +69,7 @@ impl BuildContext {
         Self {
             env,
             metrics,
-            output_registry: Arc::new(OutputRegistry::default()),
+            output_publisher: noop_output_publisher(),
         }
     }
 
@@ -101,21 +99,20 @@ impl BuildContext {
         &self.metrics
     }
 
-    /// Get a shared handle to the output registry.
+    /// Get the output producer capability injected into runners.
     ///
     /// ## Example
     ///
     /// ```
-    /// use solti_model::TaskId;
     /// use solti_runner::BuildContext;
     ///
     /// let ctx = BuildContext::default();
-    /// let sink = ctx.output_registry().sink_for(TaskId::from("task-1"), 1);
-    ///
-    /// assert_eq!(sink.attempt(), 1);
+    /// assert!(ctx.output_publisher()
+    ///     .sink_for(&solti_model::TaskId::from("task-1"), 1)
+    ///     .is_none());
     /// ```
-    pub fn output_registry(&self) -> &Arc<OutputRegistry> {
-        &self.output_registry
+    pub fn output_publisher(&self) -> &OutputPublisherHandle {
+        &self.output_publisher
     }
 
     /// Replace the environment and return updated context.
@@ -152,21 +149,9 @@ impl BuildContext {
         self
     }
 
-    /// Replace the output registry and return updated context.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use std::sync::Arc;
-    /// use solti_runner::{BuildContext, OutputRegistry};
-    ///
-    /// let registry = Arc::new(OutputRegistry::new(128));
-    /// let ctx = BuildContext::default().with_output_registry(registry.clone());
-    ///
-    /// assert!(Arc::ptr_eq(ctx.output_registry(), &registry));
-    /// ```
-    pub fn with_output_registry(mut self, registry: Arc<OutputRegistry>) -> Self {
-        self.output_registry = registry;
+    /// Replace the output producer capability and return updated context.
+    pub fn with_output_publisher(mut self, publisher: OutputPublisherHandle) -> Self {
+        self.output_publisher = publisher;
         self
     }
 }
@@ -176,7 +161,7 @@ impl Default for BuildContext {
         Self {
             env: RunnerEnv::default(),
             metrics: crate::metrics::noop_metrics(),
-            output_registry: Arc::new(OutputRegistry::default()),
+            output_publisher: noop_output_publisher(),
         }
     }
 }
@@ -201,9 +186,17 @@ mod tests {
     use std::sync::Arc;
 
     use super::BuildContext;
-    use crate::OutputRegistry;
+    use crate::{OutputPublisher, OutputPublisherHandle, OutputSink};
 
     use solti_model::{RunnerEnv, TaskId};
+
+    struct TestPublisher;
+
+    impl OutputPublisher for TestPublisher {
+        fn sink_for(&self, _task_id: &TaskId, attempt: u32) -> Option<OutputSink> {
+            Some(OutputSink::new(attempt, |_| {}))
+        }
+    }
 
     #[test]
     fn default_build_context_has_empty_env_and_noop_metrics() {
@@ -278,29 +271,27 @@ mod tests {
         );
     }
     #[test]
-    fn default_build_context_has_an_empty_output_registry() {
+    fn default_build_context_disables_output() {
         let ctx = BuildContext::default();
-        assert_eq!(ctx.output_registry().active_channels(), 0);
+        assert!(
+            ctx.output_publisher()
+                .sink_for(&TaskId::from("task"), 1)
+                .is_none()
+        );
     }
 
     #[test]
-    fn with_output_registry_replaces_registry() {
-        let custom = Arc::new(OutputRegistry::new(2048));
-        let _ = custom.sink_for(TaskId::from("seed"), 1);
+    fn with_output_publisher_replaces_publisher() {
+        let publisher: OutputPublisherHandle = Arc::new(TestPublisher);
+        let ctx = BuildContext::default().with_output_publisher(Arc::clone(&publisher));
 
-        let ctx = BuildContext::default().with_output_registry(custom.clone());
-
-        assert_eq!(ctx.output_registry().active_channels(), 1);
-        assert!(Arc::ptr_eq(ctx.output_registry(), &custom));
-    }
-
-    #[test]
-    fn output_registry_handle_is_shared_via_arc() {
-        let ctx = BuildContext::default();
-        let task = TaskId::from("shared");
-        let _sink = ctx.output_registry().sink_for(task.clone(), 1);
-
-        let handle = Arc::clone(ctx.output_registry());
-        assert!(handle.subscribe(&task).is_some());
+        assert!(Arc::ptr_eq(ctx.output_publisher(), &publisher));
+        assert_eq!(
+            ctx.output_publisher()
+                .sink_for(&TaskId::from("task"), 7)
+                .expect("enabled sink")
+                .attempt(),
+            7
+        );
     }
 }

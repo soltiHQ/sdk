@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use solti_model::Token;
-use solti_tls::{ClientTlsConfig, ServerTlsConfig};
+use solti::model::Token;
+use solti::tls::{ClientTlsConfig, ServerTlsConfig};
 
 type BoxErr = Box<dyn std::error::Error>;
 

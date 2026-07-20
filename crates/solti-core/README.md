@@ -14,11 +14,10 @@ and read their run history from one Rust API.
 ## Quick Start
 
 ```rust,no_run
-use solti_core::taskvisor::{
-    ControllerConfig, SupervisorConfig, TaskContext, TaskError, TaskFn,
-};
-use solti_core::{CoreError, RunnerRouter, StateConfig, SupervisorApi};
+use solti_core::{CoreError, StateConfig, SupervisorApi};
 use solti_model::{RestartPolicy, TaskKind, TaskSpec};
+use solti_runner::RunnerRouter;
+use taskvisor::{ControllerConfig, SupervisorConfig, TaskContext, TaskError, TaskFn};
 
 async fn demo() -> Result<(), CoreError> {
     let api = SupervisorApi::new(
@@ -75,11 +74,11 @@ TaskSpec
   -> RunnerRouter builds a task
   -> taskvisor runs the task
   -> StateSubscriber updates TaskState
-  -> OutputRegistry announces live-tail events
+  -> private OutputHub announces live-tail events
 ```
 
 `SupervisorApi` is the main public entry point. It owns the taskvisor runtime,
-the runner router, shared in-memory state, and the output registry.
+the runner router, shared in-memory state, and the private output hub.
 
 ## Submit Path
 
@@ -143,12 +142,39 @@ Common reads:
 
 `TaskState` clones are cheap. They share one internal `Arc<RwLock<_>>`.
 
-## Output Registry
+## Live Output
 
-`SupervisorApi::output_registry()` returns the shared `OutputRegistry`.
+`solti-core` owns the concrete output hub and the complete task-channel
+lifecycle. Runners receive only the `solti-runner::OutputPublisher` producer
+capability; consumers call `SupervisorApi::subscribe_output()` and receive an
+`OutputSubscription`.
 
-Runners write output chunks into it. API layers subscribe to it for live logs,
-for example HTTP SSE and gRPC server streams.
+The stream is lossy and live-only. A slow consumer receives
+`OutputEvent::Lagged` and continues with newer events. Terminal cleanup blocks
+new subscriptions; an existing subscription closes after outstanding runner
+sink clones are dropped.
+
+`SupervisorApi::new()` uses `OutputConfig::default()` with a per-task capacity
+of 256 events. Use `new_with_output_config()` to choose another capacity:
+
+```rust,no_run
+use solti_core::{CoreError, OutputConfig, StateConfig, SupervisorApi};
+use solti_runner::RunnerRouter;
+use taskvisor::{ControllerConfig, SupervisorConfig};
+
+async fn configured_output() -> Result<(), CoreError> {
+    let api = SupervisorApi::new_with_output_config(
+        SupervisorConfig::default(),
+        ControllerConfig::default(),
+        Vec::new(),
+        RunnerRouter::new(),
+        StateConfig::default(),
+        OutputConfig::new(1024),
+    )
+    .await?;
+    api.shutdown().await
+}
+```
 
 ## Retention
 
@@ -192,22 +218,13 @@ All fallible APIs return `CoreError`.
 `CoreError` is `#[non_exhaustive]`, so downstream code should keep a wildcard
 match arm.
 
-## Re-exports
-
-`solti-core` re-exports:
-
-- `taskvisor` - so applications use the same runtime version.
-- `RunnerRouter` and `OutputRegistry` - the runner-facing pieces used with the
-  supervisor.
-
 ## Notes
 
-- `SupervisorApi::new()` registers the state subscriber automatically and uses
-  the router's output registry for API live-tail streams.
-- `new_with_output_registry()` replaces the router registry with the supplied
-  one, preserving the same output-path invariant.
+- `SupervisorApi::new()` registers the state subscriber automatically, creates
+  the private output hub, and injects its producer capability into the router.
+- `new_with_output_config()` changes the per-task live-output ring capacity
+  without exposing the hub.
 - `delete_task()` is idempotent and removes both task state and run history.
 - `cancel_task()` returns `NotFound` when no task exists.
 - Cancellation uses taskvisor's unified identity path: registered work is joined,
   while controller-queued work is removed before it starts.
-- `uptime_seconds()` reports process uptime from the first `SupervisorApi::new()`.

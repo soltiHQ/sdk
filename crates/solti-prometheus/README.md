@@ -54,7 +54,10 @@ fn main() -> Result<(), prometheus::Error> {
 
 ### Runner and Supervisor Metrics
 
-These two collectors are always available:
+These two collectors are enabled by the default `runner` and `taskvisor`
+features. This preserves the crate's existing default API. Use
+`default-features = false` for a registry/build-info-only base and enable each
+adapter explicitly when building a smaller integration:
 
 ```rust
 use std::sync::Arc;
@@ -117,8 +120,8 @@ let (task, spec) = server(registry, "0.0.0.0:9090");
 
 | Component                    | Metrics                      | Feature    | Use it for                            |
 |------------------------------|------------------------------|------------|---------------------------------------|
-| `PrometheusMetrics`          | `solti_runner_*`             | always     | Runner execution metrics              |
-| `PrometheusSubscriber`       | `solti_sv_*`, `solti_ctrl_*` | always     | Taskvisor and controller events       |
+| `PrometheusMetrics`          | `solti_runner_*`             | `runner` (default)   | Runner execution metrics              |
+| `PrometheusSubscriber`       | `solti_sv_*`, `solti_ctrl_*` | `taskvisor` (default) | Taskvisor and controller events       |
 | `PrometheusApiMetrics`       | `solti_api_*`                | `api`      | HTTP/gRPC API request metrics         |
 | `PrometheusDiscoverMetrics`  | `solti_discover_*`           | `discover` | Control-plane heartbeat metrics       |
 | `register_process_collector` | `process_*`                  | `process`  | Process CPU, memory, file descriptors |
@@ -267,13 +270,20 @@ Prometheus labels stay low-cardinality and bounded.
 
 ## Feature Flags
 
-| Flag       | Default  | Effect                                      |
-|------------|----------|---------------------------------------------|
-| `api`      | off      | Enables `PrometheusApiMetrics`              |
-| `discover` | off      | Enables `PrometheusDiscoverMetrics`         |
-| `process`  | off      | Registers real `process_*` metrics on Linux |
-| `server`   | off      | Enables the supervised `/metrics` HTTP task |
-| `state`    | off      | Enables `PrometheusStateCollector`          |
+| Flag       | Default  | Effect                                           |
+|------------|----------|--------------------------------------------------|
+| `runner`   | on       | Enables `PrometheusMetrics`                      |
+| `taskvisor`| on       | Enables `PrometheusSubscriber` and controller metrics |
+| `api`      | off      | Enables `PrometheusApiMetrics`                   |
+| `discover` | off      | Enables `PrometheusDiscoverMetrics`              |
+| `process`  | off      | Registers real `process_*` metrics on Linux      |
+| `server`   | off      | Enables the supervised `/metrics` HTTP task      |
+| `state`    | off      | Enables `PrometheusStateCollector`               |
+| `full`     | off      | Enables every integration above                  |
+
+The no-default-features base exports `Registry`, `register_build_info`, and the
+portable `register_process_collector` entry point (a no-op unless `process` is
+enabled on Linux). It does not pull any Solti crate or Taskvisor.
 
 ## Notes
 

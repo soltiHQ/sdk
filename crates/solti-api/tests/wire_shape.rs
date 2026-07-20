@@ -192,9 +192,7 @@ impl ApiHandler for WireMock {
     async fn submit_task(&self, spec: TaskSpec) -> Result<TaskId, ApiError> {
         *self.last_admission.lock().unwrap() = Some(spec.admission());
         if self.submit_conflicts {
-            return Err(ApiError::Core(solti_core::CoreError::AlreadyExists(
-                "my-job".into(),
-            )));
+            return Err(ApiError::AlreadyExists("my-job".into()));
         }
         Ok(TaskId::from("tsk_wire_1"))
     }

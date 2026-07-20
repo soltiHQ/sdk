@@ -3,19 +3,39 @@
 //! All solti collectors share the `solti_<subsystem>_<name>` naming scheme and the same "build -> register clone" boilerplate.
 //! [`Sub`] binds a [`Registry`] and a subsystem name together so constructors collapse to one line per metric.
 
-use prometheus::{
-    Counter, CounterVec, Gauge, Histogram, HistogramOpts, HistogramVec, Opts, Registry,
-};
-// `GaugeVec` is only used by the feature-gated `gauge_vec` (api) / `gauge_vec_unregistered` (state).
 #[cfg(any(feature = "api", feature = "state"))]
 use prometheus::GaugeVec;
+#[cfg(any(feature = "api", feature = "discover", feature = "runner"))]
+use prometheus::HistogramVec;
+use prometheus::Opts;
+#[cfg(any(feature = "discover", feature = "taskvisor"))]
+use prometheus::{Counter, Gauge, Histogram};
+#[cfg(any(
+    feature = "api",
+    feature = "discover",
+    feature = "runner",
+    feature = "taskvisor"
+))]
+use prometheus::{CounterVec, HistogramOpts, Registry};
 
 /// Scoped registrar bound to a `solti` subsystem (e.g. `runner`, `sv`, `api`).
+#[cfg(any(
+    feature = "api",
+    feature = "discover",
+    feature = "runner",
+    feature = "taskvisor"
+))]
 pub(crate) struct Sub<'a> {
     registry: &'a Registry,
     subsystem: &'static str,
 }
 
+#[cfg(any(
+    feature = "api",
+    feature = "discover",
+    feature = "runner",
+    feature = "taskvisor"
+))]
 impl<'a> Sub<'a> {
     pub(crate) fn new(registry: &'a Registry, subsystem: &'static str) -> Self {
         Self {
@@ -37,6 +57,7 @@ impl<'a> Sub<'a> {
             .buckets(buckets)
     }
 
+    #[cfg(any(feature = "discover", feature = "taskvisor"))]
     pub(crate) fn counter(&self, name: &str, help: &str) -> Result<Counter, prometheus::Error> {
         let c = Counter::with_opts(self.opts(name, help))?;
         self.registry.register(Box::new(c.clone()))?;
@@ -54,6 +75,7 @@ impl<'a> Sub<'a> {
         Ok(c)
     }
 
+    #[cfg(any(feature = "discover", feature = "taskvisor"))]
     pub(crate) fn gauge(&self, name: &str, help: &str) -> Result<Gauge, prometheus::Error> {
         let g = Gauge::with_opts(self.opts(name, help))?;
         self.registry.register(Box::new(g.clone()))?;
@@ -72,6 +94,7 @@ impl<'a> Sub<'a> {
         Ok(g)
     }
 
+    #[cfg(any(feature = "discover", feature = "taskvisor"))]
     pub(crate) fn histogram(
         &self,
         name: &str,
@@ -83,24 +106,7 @@ impl<'a> Sub<'a> {
         Ok(h)
     }
 
-    /// Build a [`GaugeVec`] **without** registering it into a registry.
-    ///
-    /// Used by composite collectors that expose a `GaugeVec` via [`prometheus::core::Collector::collect`].
-    /// The caller registers the collector itself. Registering the inner metric here would register it twice.
-    #[cfg(feature = "state")]
-    #[inline]
-    pub(crate) fn gauge_vec_unregistered(
-        subsystem: &'static str,
-        name: &str,
-        help: &str,
-        labels: &[&str],
-    ) -> Result<GaugeVec, prometheus::Error> {
-        let opts = Opts::new(name, help)
-            .namespace("solti")
-            .subsystem(subsystem);
-        GaugeVec::new(opts, labels)
-    }
-
+    #[cfg(any(feature = "api", feature = "discover", feature = "runner"))]
     pub(crate) fn histogram_vec(
         &self,
         name: &str,
@@ -114,7 +120,30 @@ impl<'a> Sub<'a> {
     }
 }
 
+/// Build a [`GaugeVec`] without registering it into a registry.
+///
+/// Composite collectors register themselves; registering this inner metric as
+/// well would register it twice.
+#[cfg(feature = "state")]
+pub(crate) fn gauge_vec_unregistered(
+    subsystem: &'static str,
+    name: &str,
+    help: &str,
+    labels: &[&str],
+) -> Result<GaugeVec, prometheus::Error> {
+    let opts = Opts::new(name, help)
+        .namespace("solti")
+        .subsystem(subsystem);
+    GaugeVec::new(opts, labels)
+}
+
 /// Convert milliseconds to seconds for histogram observation.
+#[cfg(any(
+    feature = "api",
+    feature = "discover",
+    feature = "runner",
+    feature = "taskvisor"
+))]
 #[inline]
 pub(crate) fn ms_to_secs(ms: u64) -> f64 {
     ms as f64 / 1000.0

@@ -75,7 +75,7 @@ use tracing::{debug, trace, warn};
 
 use solti_model::{SubprocessSpec, TaskId, TaskKind, TaskSpec, merge_env};
 use solti_runner::{
-    BuildContext, OutputRegistry, Runner, RunnerError, RunnerErrorKind, RunnerType,
+    BuildContext, OutputPublisherHandle, Runner, RunnerError, RunnerErrorKind, RunnerType,
 };
 
 use crate::metrics::classify_task_error;
@@ -295,10 +295,8 @@ impl Runner for SubprocessRunner {
     ///
     /// The script tempfile is written inside the task body (per attempt); an I/O
     /// failure there fails the run with a fatal `TaskError`, not a build error.
-    /// The output sink is also acquired inside each attempt. A supervisor
-    /// pre-creates the live-tail channel when it binds the submission;
-    /// standalone callers that subscribe before spawning should call
-    /// [`OutputRegistry::ensure_channel`].
+    /// The output sink is also acquired inside each attempt from the producer
+    /// capability injected through [`BuildContext`].
     fn build_task(&self, spec: &TaskSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
         let (task_cfg, script_body) = self.build_task_config(spec, ctx)?;
 
@@ -335,7 +333,7 @@ impl Runner for SubprocessRunner {
             cgroup_name,
             metrics: ctx.metrics().clone(),
             log_cfg,
-            output_registry: Arc::clone(ctx.output_registry()),
+            output_publisher: Arc::clone(ctx.output_publisher()),
             attempt: AtomicU32::new(0),
 
             script_body,
@@ -354,7 +352,7 @@ impl Runner for SubprocessRunner {
 struct TaskExecContext {
     runner_cfg: Option<Arc<SubprocessBackendConfig>>,
     metrics: solti_runner::MetricsHandle,
-    output_registry: Arc<OutputRegistry>,
+    output_publisher: OutputPublisherHandle,
     task_cfg: SubprocessTaskConfig,
     cgroup_name: Option<String>,
     log_cfg: LogConfig,
@@ -692,7 +690,7 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
 
     let attempt = ctx.attempt.fetch_add(1, Ordering::Relaxed) + 1;
     let task_id = TaskId::from(Arc::clone(&ctx.task_cfg.run_id));
-    let sink = ctx.output_registry.sink_for(task_id, attempt);
+    let sink = ctx.output_publisher.sink_for(&task_id, attempt);
 
     let stdout = child
         .stdout
@@ -706,7 +704,7 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
             &run_id_stdout,
             StreamKind::Stdout,
             &log_cfg,
-            Some(&sink_stdout),
+            sink_stdout.as_ref(),
         )
         .await;
     });
@@ -723,7 +721,7 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
             &run_id_stderr,
             StreamKind::Stderr,
             &log_cfg,
-            Some(&sink_stderr),
+            sink_stderr.as_ref(),
         )
         .await;
     });
@@ -795,6 +793,32 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RecordingOutputPublisher {
+        sender: std::sync::mpsc::Sender<solti_model::OutputEvent>,
+    }
+
+    impl solti_runner::OutputPublisher for RecordingOutputPublisher {
+        fn sink_for(&self, _task_id: &TaskId, attempt: u32) -> Option<solti_runner::OutputSink> {
+            let sender = self.sender.clone();
+            Some(solti_runner::OutputSink::new(attempt, move |event| {
+                let _ = sender.send(event);
+            }))
+        }
+    }
+
+    fn recording_output_context() -> (
+        BuildContext,
+        std::sync::mpsc::Receiver<solti_model::OutputEvent>,
+    ) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let publisher: solti_runner::OutputPublisherHandle =
+            Arc::new(RecordingOutputPublisher { sender });
+        (
+            BuildContext::default().with_output_publisher(publisher),
+            receiver,
+        )
+    }
 
     fn mk_backoff() -> solti_model::BackoffPolicy {
         solti_model::BackoffPolicy {
@@ -883,7 +907,7 @@ mod tests {
             cgroup_name: None,
             metrics: solti_runner::noop_metrics(),
             log_cfg: LogConfig::default(),
-            output_registry: Arc::new(OutputRegistry::default()),
+            output_publisher: solti_runner::noop_output_publisher(),
             attempt: AtomicU32::new(0),
             script_body: None,
         }
@@ -1093,20 +1117,14 @@ mod tests {
 
     #[tokio::test]
     async fn script_task_runs_and_streams_output() {
-        use solti_model::{OutputEvent, TaskId};
-        use solti_runner::OutputRegistry;
+        use solti_model::OutputEvent;
         use std::time::Duration;
 
-        let registry = Arc::new(OutputRegistry::new(64));
-        let ctx = BuildContext::default().with_output_registry(registry.clone());
+        let (ctx, rx) = recording_output_context();
 
         let runner = SubprocessRunner::new("test-runner");
         let spec = mk_script_spec("script-e2e", b"echo \"hello-$1\"", &["script"]);
         let task_ref = runner.build_task(&spec, &ctx).unwrap();
-        let task_id = TaskId::from(task_ref.name());
-        registry.ensure_channel(task_id.clone());
-        let mut rx = registry.subscribe(&task_id).unwrap();
-
         let cancel = TaskContext::detached();
         task_ref
             .spawn(cancel)
@@ -1403,25 +1421,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subprocess_streams_stdout_into_output_registry() {
-        use solti_model::{OutputEvent, TaskId};
-        use solti_runner::OutputRegistry;
-        use std::sync::Arc;
+    async fn subprocess_streams_stdout_into_output_publisher() {
+        use solti_model::OutputEvent;
         use std::time::Duration;
 
-        let registry = Arc::new(OutputRegistry::new(64));
-        let ctx = BuildContext::default().with_output_registry(registry.clone());
+        let (ctx, rx) = recording_output_context();
 
         let runner = SubprocessRunner::new("test-runner");
         let spec = mk_subprocess_spec_with_args("echo-slot", "echo", &["hello-stream"]);
         let task_ref = runner.build_task(&spec, &ctx).unwrap();
-        let task_id = TaskId::from(task_ref.name());
-        registry.ensure_channel(task_id.clone());
-
-        let mut rx = registry
-            .subscribe(&task_id)
-            .expect("standalone caller pre-created the output channel");
-
         let cancel = TaskContext::detached();
         task_ref.spawn(cancel).await.expect("echo must succeed");
 
@@ -1445,20 +1453,13 @@ mod tests {
 
     #[tokio::test]
     async fn subprocess_attempt_counter_increments_on_each_spawn() {
-        use solti_model::{OutputEvent, TaskId};
-        use solti_runner::OutputRegistry;
-        use std::sync::Arc;
+        use solti_model::OutputEvent;
         use std::time::Duration;
 
-        let registry = Arc::new(OutputRegistry::new(64));
-        let ctx = BuildContext::default().with_output_registry(registry.clone());
+        let (ctx, rx) = recording_output_context();
         let runner = SubprocessRunner::new("test-runner");
         let spec = mk_subprocess_spec_with_args("attempts-slot", "echo", &["x"]);
         let task_ref = runner.build_task(&spec, &ctx).unwrap();
-        let task_id = TaskId::from(task_ref.name());
-        registry.ensure_channel(task_id.clone());
-        let mut rx = registry.subscribe(&task_id).unwrap();
-
         let ctx = TaskContext::detached();
         task_ref.spawn(ctx.clone()).await.unwrap();
         task_ref.spawn(ctx).await.unwrap();

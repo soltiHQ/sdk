@@ -26,8 +26,26 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []
-grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
-http = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:prost", "dep:pbjson"]
+grpc = [
+    "dep:prost",
+    "dep:solti-model",
+    "dep:taskvisor",
+    "dep:tokio",
+    "dep:tonic",
+    "dep:tonic-prost",
+    "dep:tracing",
+]
+http = [
+    "dep:pbjson",
+    "dep:prost",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:solti-model",
+    "dep:taskvisor",
+    "dep:tokio",
+    "dep:tracing",
+]
 tls  = ["dep:solti-tls", "tonic?/tls-ring", "reqwest?/rustls-no-provider", ]
 
 [dependencies]
@@ -36,15 +54,14 @@ prost       = { workspace = true, optional = true }
 reqwest     = { workspace = true, features = ["json"], optional = true }
 serde       = { workspace = true, optional = true }
 serde_json  = { workspace = true, optional = true }
-taskvisor   = { workspace = true }
+taskvisor   = { workspace = true, optional = true }
 thiserror   = { workspace = true }
-tokio       = { workspace = true }
+tokio       = { workspace = true, optional = true }
 tonic       = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
-tracing     = { workspace = true }
+tracing     = { workspace = true, optional = true }
 
-solti-core  = { workspace = true }
-solti-model = { workspace = true }
+solti-model = { workspace = true, optional = true }
 solti-tls   = { workspace = true, optional = true }
 
 [build-dependencies]

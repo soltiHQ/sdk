@@ -15,7 +15,7 @@ use tracing::{debug, instrument, trace};
 
 use crate::error::RunnerError;
 use crate::runner::Runner;
-use crate::{context::BuildContext, output::OutputRegistry};
+use crate::{context::BuildContext, output::OutputPublisherHandle};
 
 /// Single runner entry with optional static labels used for routing.
 struct RunnerEntry {
@@ -91,7 +91,7 @@ impl RunnerRouter {
 
     /// Set a custom build context for all runners managed by this router.
     ///
-    /// Use this to inject shared env, metrics, or output registry handles into every runner.
+    /// Use this to inject shared env, metrics, or an output producer capability into every runner.
     ///
     /// ## Example
     ///
@@ -108,21 +108,19 @@ impl RunnerRouter {
         self
     }
 
-    /// Replace the output registry in the existing build context.
+    /// Replace the output producer capability in the existing build context.
     ///
-    /// Environment and metrics configuration are preserved. Supervisor
-    /// constructors use this to keep runner output and API live-tail streams on
-    /// the same registry.
+    /// The environment and metrics configuration are preserved.
     #[inline]
-    pub fn with_output_registry(mut self, registry: Arc<OutputRegistry>) -> Self {
-        self.ctx = self.ctx.with_output_registry(registry);
+    pub fn with_output_publisher(mut self, publisher: OutputPublisherHandle) -> Self {
+        self.ctx = self.ctx.with_output_publisher(publisher);
         self
     }
 
-    /// Return the output registry injected into runners built by this router.
+    /// Return the output producer capability injected into built runners.
     #[inline]
-    pub fn output_registry(&self) -> &Arc<OutputRegistry> {
-        self.ctx.output_registry()
+    pub fn output_publisher(&self) -> &OutputPublisherHandle {
+        self.ctx.output_publisher()
     }
 
     /// Register a new runner without labels.
@@ -387,11 +385,22 @@ mod tests {
     }
 
     #[test]
-    fn output_registry_can_be_rebound_without_rebuilding_the_router() {
-        let registry = Arc::new(OutputRegistry::new(32));
-        let router = RunnerRouter::new().with_output_registry(Arc::clone(&registry));
+    fn output_publisher_can_be_rebound_without_rebuilding_the_router() {
+        struct Publisher;
+        impl crate::OutputPublisher for Publisher {
+            fn sink_for(
+                &self,
+                _task_id: &solti_model::TaskId,
+                attempt: u32,
+            ) -> Option<crate::OutputSink> {
+                Some(crate::OutputSink::new(attempt, |_| {}))
+            }
+        }
 
-        assert!(Arc::ptr_eq(router.output_registry(), &registry));
+        let publisher: crate::OutputPublisherHandle = Arc::new(Publisher);
+        let router = RunnerRouter::new().with_output_publisher(Arc::clone(&publisher));
+
+        assert!(Arc::ptr_eq(router.output_publisher(), &publisher));
     }
 
     #[test]

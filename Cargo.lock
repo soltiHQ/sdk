@@ -6,16 +6,7 @@ version = 4
 name = "agentd-grpc"
 version = "0.0.1"
 dependencies = [
- "solti-api",
- "solti-core",
- "solti-discover",
- "solti-exec",
- "solti-model",
- "solti-observe",
- "solti-prometheus",
- "solti-runner",
- "solti-tls",
- "taskvisor",
+ "solti",
  "tokio",
  "tonic",
  "tracing",
@@ -27,16 +18,7 @@ version = "0.0.1"
 dependencies = [
  "axum",
  "axum-server",
- "solti-api",
- "solti-core",
- "solti-discover",
- "solti-exec",
- "solti-model",
- "solti-observe",
- "solti-prometheus",
- "solti-runner",
- "solti-tls",
- "taskvisor",
+ "solti",
  "tokio",
  "tracing",
 ]
@@ -1329,16 +1311,7 @@ dependencies = [
  "axum-server",
  "clap",
  "serde",
- "solti-api",
- "solti-core",
- "solti-discover",
- "solti-exec",
- "solti-model",
- "solti-observe",
- "solti-prometheus",
- "solti-runner",
- "solti-tls",
- "taskvisor",
+ "solti",
  "tokio",
  "toml",
  "tonic",
@@ -2105,6 +2078,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "solti"
+version = "0.0.3"
+dependencies = [
+ "solti-api",
+ "solti-core",
+ "solti-discover",
+ "solti-exec",
+ "solti-model",
+ "solti-observe",
+ "solti-prometheus",
+ "solti-runner",
+ "solti-tls",
+ "taskvisor",
+]
+
+[[package]]
 name = "solti-api"
 version = "0.0.3"
 dependencies = [
@@ -2122,6 +2111,7 @@ dependencies = [
  "serde_json",
  "solti-core",
  "solti-model",
+ "solti-runner",
  "solti-tls",
  "taskvisor",
  "thiserror 2.0.18",
@@ -2139,12 +2129,14 @@ dependencies = [
 name = "solti-core"
 version = "0.0.3"
 dependencies = [
+ "bytes",
  "parking_lot",
  "solti-model",
  "solti-runner",
  "taskvisor",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tracing",
 ]
@@ -2160,7 +2152,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "solti-core",
  "solti-model",
  "solti-tls",
  "taskvisor",
@@ -2240,11 +2231,9 @@ name = "solti-runner"
 version = "0.0.3"
 dependencies = [
  "bytes",
- "parking_lot",
  "solti-model",
  "taskvisor",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
 ]
 

@@ -169,6 +169,6 @@ Duplicate names are rejected via `router.contains_label()` → `ExecError::Dupli
 - Cgroup lifecycle is two-phase: `prepare` (mkdir + write limits in parent) → `attach` (join PID in child via pre_exec).
 - Cgroup names are auto-generated: `{runner}-{slot}-{seq:x}-{timestamp:x}`.
 - Line truncation uses `Cow::Borrowed` for the common case (zero-alloc hot path).
-- `log_stream` is double-headed: every line goes to `tracing` and to the attempt's `solti_runner::OutputSink`. `BuildContext` always owns an `OutputRegistry`; when there are no live receivers, `broadcast::send` returns `Err` and the runner ignores it.
+- `log_stream` is double-headed: every line goes to `tracing` and, when enabled, to the attempt's `solti_runner::OutputSink`. `BuildContext` exposes only an `OutputPublisher`; its default disables live output, while `solti-core` injects the standard non-blocking publisher.
 - `LinuxCapability` values match `<linux/capability.h>` from Linux 6.x.
 - On non-Linux platforms, Linux-specific sandbox controls are unavailable; generic subprocess execution remains supported.

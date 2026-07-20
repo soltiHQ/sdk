@@ -59,23 +59,24 @@ use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::info;
 
-use solti_api::{API_VERSION, GrpcApi, SupervisorApiAdapter, to_tonic_server_tls};
-use solti_core::{StateConfig, SupervisorApi};
-use solti_discover::{DiscoverConfig, DiscoveryTransport};
-use solti_exec::subprocess::register_subprocess_runner;
-use solti_model::{AgentId, RunnerEnv, Token};
-use solti_observe::{
-    LoggerConfig, LoggerLevel, LoggerTimeZone, TracingBridge, init_local_offset, init_logger,
-    timezone_sync,
+use solti::api::{
+    API_VERSION, ApiMetricsBackend, GrpcApi, SupervisorApiAdapter, to_tonic_server_tls,
 };
-use solti_prometheus::{
+use solti::core::{StateConfig, SupervisorApi};
+use solti::discover::{self, DiscoverConfig, DiscoveryTransport, MonotonicUptime};
+use solti::exec::subprocess::register_subprocess_runner;
+use solti::model::{AgentId, RunnerEnv, Token};
+use solti::observe::{
+    LoggerConfig, LoggerLevel, LoggerTimeZone, init_local_offset, init_logger, timezone_sync,
+};
+use solti::prometheus::{
     PrometheusApiMetrics, PrometheusDiscoverMetrics, PrometheusMetrics, PrometheusStateCollector,
     PrometheusSubscriber, Registry, register_build_info, register_process_collector,
     server as metrics_server,
 };
-use solti_runner::{BuildContext, OutputRegistry, RunnerRouter};
-use solti_tls::{ClientTlsConfig, ServerTlsConfig};
-use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
+use solti::runner::{BuildContext, RunnerRouter};
+use solti::taskvisor::{ControllerConfig, Subscribe, SupervisorConfig, TracingBridge};
+use solti::tls::{ClientTlsConfig, ServerTlsConfig};
 
 const ADDR: &str = "[::]:50052";
 const ADVERTISED: &str = "localhost:50052";
@@ -88,6 +89,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
+    let uptime = Arc::new(MonotonicUptime::new());
+
     init_logger(&LoggerConfig {
         level: LoggerLevel::new("info")?,
         tz: LoggerTimeZone::Local,
@@ -106,24 +109,19 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         ],
     )?;
 
-    // Output registry: live-tail broadcast channels per task.
-    let output_registry = Arc::new(OutputRegistry::default());
-
     // Runner: executes TaskSpec bodies (subprocess here).
-    let ctx = BuildContext::new(RunnerEnv::default(), Arc::new(metrics))
-        .with_output_registry(Arc::clone(&output_registry));
+    let ctx = BuildContext::new(RunnerEnv::default(), Arc::new(metrics));
     let mut router = RunnerRouter::new().with_context(ctx);
     register_subprocess_runner(&mut router, "default")?;
 
     // Supervisor: owns every task, applies restart / backoff, fans events to subscribers.
     let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(TracingBridge), Arc::new(subscriber)];
-    let supervisor = SupervisorApi::new_with_output_registry(
+    let supervisor = SupervisorApi::new(
         SupervisorConfig::default(),
         ControllerConfig::default(),
         subscribers,
         router,
         StateConfig::default(),
-        Arc::clone(&output_registry),
     )
     .await?;
 
@@ -162,11 +160,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(tls) = client_tls {
         discover = discover.with_tls(tls);
     }
-    let (sync_task, sync_spec) = solti_discover::sync(discover.build()?)?;
+    let (sync_task, sync_spec) = discover::sync(discover.build()?, uptime)?;
     supervisor.submit_with_task(sync_task, &sync_spec).await?;
 
     // --- API: control plane → agent ---
-    let api_metrics: Arc<dyn solti_api::ApiMetricsBackend> =
+    let api_metrics: Arc<dyn ApiMetricsBackend> =
         Arc::new(PrometheusApiMetrics::new(registry.clone())?);
     // Keep the full SDK supervisor so shutdown also drains completion workers.
     let supervisor = Arc::new(supervisor);

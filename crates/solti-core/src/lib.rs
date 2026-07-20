@@ -9,11 +9,10 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use solti_core::taskvisor::{
-//!     ControllerConfig, SupervisorConfig, TaskContext, TaskError, TaskFn,
-//! };
-//! use solti_core::{CoreError, RunnerRouter, StateConfig, SupervisorApi};
+//! use solti_core::{CoreError, StateConfig, SupervisorApi};
 //! use solti_model::{RestartPolicy, TaskKind, TaskSpec};
+//! use solti_runner::RunnerRouter;
+//! use taskvisor::{ControllerConfig, SupervisorConfig, TaskContext, TaskError, TaskFn};
 //!
 //! async fn demo() -> Result<(), CoreError> {
 //!     let api = SupervisorApi::new(
@@ -48,7 +47,7 @@
 //!   -> RunnerRouter builds a task
 //!   -> taskvisor runs the task
 //!   -> TaskState stores phase and run history
-//!   -> OutputRegistry streams live output
+//!   -> core-owned output hub streams live output
 //! ```
 //!
 //! `submit_with_task()` is for embedded Rust tasks that already have a
@@ -82,12 +81,10 @@
 //! | [`StateConfig`] | Retention settings for tasks and run history. |
 //! | [`TaskState`] | Shared in-memory read handle. |
 //! | [`CoreError`] | Error type returned by fallible APIs. |
-//! | [`RunnerRouter`] | Builds concrete runner tasks from model specs. |
-//! | [`OutputRegistry`] | Live-tail output registry used by API streams. |
+//! | [`solti_runner::RunnerRouter`] | Builds concrete runner tasks from model specs. |
+//! | [`OutputConfig`] | Per-task live-output ring configuration. |
+//! | [`OutputSubscription`] | Consumer-only live-output stream. |
 //!
-//! [`taskvisor`], [`RunnerRouter`], and [`OutputRegistry`] are re-exported so
-//! host applications use the same runtime versions as this crate.
-
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -101,14 +98,11 @@ pub use error::CoreError;
 
 mod map;
 
-mod system;
-pub use system::uptime_seconds;
+mod output;
+pub use output::{OutputConfig, OutputSubscription};
 
 pub mod supervisor;
 pub use supervisor::SupervisorApi;
 
 mod state;
 pub use state::{StateConfig, TaskState};
-
-pub use solti_runner::{OutputRegistry, RunnerRouter};
-pub use taskvisor;

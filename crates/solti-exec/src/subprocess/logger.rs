@@ -283,6 +283,12 @@ mod tests {
     use solti_runner::OutputSink;
     use tokio::sync::broadcast;
 
+    fn output_sink(sender: broadcast::Sender<OutputEvent>, attempt: u32) -> OutputSink {
+        OutputSink::new(attempt, move |event| {
+            let _ = sender.send(event);
+        })
+    }
+
     #[test]
     fn truncate_line_short_line_borrowed() {
         let result = truncate_line("hello", 10);
@@ -376,7 +382,7 @@ mod tests {
     #[tokio::test]
     async fn log_stream_sink_receives_raw_control_bytes() {
         let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
-        let sink = OutputSink::new(tx, 1);
+        let sink = output_sink(tx, 1);
 
         log_stream(
             "\x1b[31mred\x1b[0m\n".as_bytes(),
@@ -402,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn log_stream_pushes_each_stdout_line_to_sink() {
         let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
-        let sink = OutputSink::new(tx, 1);
+        let sink = output_sink(tx, 1);
 
         let reader = "alpha\nbeta\ngamma\n".as_bytes();
         log_stream(
@@ -427,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn log_stream_pushes_stderr_line_with_stderr_kind() {
         let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
-        let sink = OutputSink::new(tx, 1);
+        let sink = output_sink(tx, 1);
 
         log_stream(
             "boom\n".as_bytes(),
@@ -454,7 +460,7 @@ mod tests {
             ..LogConfig::default()
         };
         let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
-        let sink = OutputSink::new(tx, 1);
+        let sink = output_sink(tx, 1);
 
         log_stream(
             "hello world\n".as_bytes(),
@@ -485,7 +491,7 @@ mod tests {
             ..LogConfig::default()
         };
         let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
-        let sink = OutputSink::new(tx, 1);
+        let sink = output_sink(tx, 1);
 
         log_stream(
             b"AAAAAAAA\nKEEPME\n".as_slice(),
@@ -515,7 +521,7 @@ mod tests {
             ..LogConfig::default()
         };
         let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
-        let sink = OutputSink::new(tx, 1);
+        let sink = output_sink(tx, 1);
 
         log_stream(
             b"AAAAAAAA".as_slice(),

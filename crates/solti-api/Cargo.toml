@@ -25,17 +25,15 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = []
-grpc    = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
-http    = ["dep:axum", "dep:pbjson", "dep:prost", "dep:serde_json", "dep:tower-http"]
-# `tls` only has effect on the gRPC transport (the `tls` module is gated on
-# `grpc`), so it implies `grpc` — enabling it alone would otherwise pull
-# `solti-tls` in without compiling anything that uses it.
-tls     = ["grpc", "dep:solti-tls", "tonic/tls-ring"]
+default      = []
+core-adapter = ["dep:solti-core"]
+grpc         = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
+grpc-tls     = ["grpc", "dep:solti-tls", "tonic/tls-ring"]
+http         = ["dep:axum", "dep:pbjson", "dep:prost", "dep:serde_json", "dep:tower-http"]
 
 [dependencies]
 async-trait  = { workspace = true }
-tokio-stream = { workspace = true, features = ["sync"] }
+tokio-stream = { workspace = true }
 axum         = { workspace = true, optional = true }
 pbjson       = { workspace = true, optional = true }
 prost        = { workspace = true, optional = true }
@@ -47,7 +45,7 @@ tonic-prost  = { workspace = true, optional = true }
 tower-http   = { workspace = true, features = ["limit"], optional = true }
 tracing      = { workspace = true }
 
-solti-core  = { workspace = true }
+solti-core  = { workspace = true, optional = true }
 solti-model = { workspace = true }
 solti-tls  = { workspace = true, optional = true }
 
@@ -56,6 +54,7 @@ base64         = { workspace = true }
 bytes          = { workspace = true }
 http-body-util = { workspace = true }
 rcgen          = { workspace = true }
+solti-runner    = { workspace = true }
 taskvisor      = { workspace = true }
 tokio          = { workspace = true, features = ["macros", "rt"] }
 tower          = { workspace = true, features = ["util"] }

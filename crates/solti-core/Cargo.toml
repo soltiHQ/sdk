@@ -21,12 +21,14 @@ parking_lot = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 tokio       = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 tokio-util  = { workspace = true }
 
 solti-model  = { workspace = true }
 solti-runner = { workspace = true }
 
 [dev-dependencies]
+bytes      = { workspace = true }
 taskvisor = { workspace = true, features = ["test-util"] }
 
 [package.metadata.docs.rs]

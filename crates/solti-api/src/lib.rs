@@ -3,19 +3,24 @@
 //! Dual-transport API layer exposing task operations over gRPC and HTTP.
 //! Both transports share the same wire types generated from `proto/solti/task/v1/*.proto` and delegate to an [`ApiHandler`] implementation.
 //!
-//! | feature | transport         | module                                           |
-//! |---------|-------------------|--------------------------------------------------|
-//! | `grpc`  | tonic gRPC server | `GrpcApi`, `TaskApiService`, `TaskServiceServer` |
-//! | `http`  | axum HTTP/JSON    | `HttpApi`                                        |
+//! | feature        | capability                                      |
+//! |----------------|-------------------------------------------------|
+//! | `core-adapter` | `SupervisorApiAdapter` for `solti-core`         |
+//! | `grpc`         | tonic gRPC server                               |
+//! | `grpc-tls`     | gRPC TLS adapter; implies `grpc`                |
+//! | `http`         | axum HTTP/JSON server                           |
 //!
 //! ## Quick start
 //!
 //! Build one [`ApiHandler`] and share it across both transports.
 //! The handler is `Arc`-wrapped once, then cloned into each server:
 //!
-#![cfg_attr(all(feature = "grpc", feature = "http"), doc = "```rust,no_run")]
 #![cfg_attr(
-    not(all(feature = "grpc", feature = "http")),
+    all(feature = "core-adapter", feature = "grpc", feature = "http"),
+    doc = "```rust,no_run"
+)]
+#![cfg_attr(
+    not(all(feature = "core-adapter", feature = "grpc", feature = "http")),
     doc = "```rust,no_run,ignore"
 )]
 //! # use std::sync::Arc;
@@ -32,7 +37,8 @@
 //!
 //! - [`ApiHandler`] transport-agnostic trait with 7 operations.
 //! - [`ApiError`] unified error type mapped to gRPC Status / HTTP JSON.
-//! - [`SupervisorApiAdapter`] default adapter bridging to `SupervisorApi`.
+//! - `SupervisorApiAdapter` optional adapter bridging to `SupervisorApi`
+//!   (feature `core-adapter`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -40,7 +46,13 @@
 /// Compiles the runnable Rust code blocks in `README.md` as doctests.
 ///
 /// Gated on every feature: the README examples cover both transports and TLS.
-#[cfg(all(doctest, feature = "grpc", feature = "http", feature = "tls"))]
+#[cfg(all(
+    doctest,
+    feature = "core-adapter",
+    feature = "grpc",
+    feature = "grpc-tls",
+    feature = "http"
+))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
@@ -74,7 +86,9 @@ pub use error::ApiError;
 mod handler;
 pub use handler::{ApiHandler, OutputEventStream};
 
+#[cfg(feature = "core-adapter")]
 mod adapter;
+#[cfg(feature = "core-adapter")]
 pub use adapter::SupervisorApiAdapter;
 
 mod metrics;
@@ -137,10 +151,10 @@ pub use http::HttpApi;
 #[cfg(feature = "http")]
 pub use axum;
 
-#[cfg(all(feature = "grpc", feature = "tls"))]
+#[cfg(feature = "grpc-tls")]
 mod tls;
 
-#[cfg(all(feature = "grpc", feature = "tls"))]
+#[cfg(feature = "grpc-tls")]
 pub use tls::to_tonic_server_tls;
 
 #[cfg(all(test, any(feature = "grpc", feature = "http")))]

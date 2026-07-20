@@ -12,8 +12,11 @@
 //! ```rust,no_run
 //! # #[cfg(feature = "http")]
 //! # fn wire() -> Result<(), Box<dyn std::error::Error>> {
-//! use solti_discover::{DiscoverConfig, DiscoveryTransport};
+//! use std::sync::Arc;
+//! use solti_discover::{DiscoverConfig, DiscoveryTransport, MonotonicUptime};
 //! use solti_model::AgentId;
+//!
+//! let uptime = Arc::new(MonotonicUptime::new());
 //!
 //! let cfg = DiscoverConfig::builder(
 //!     AgentId::from("agent-1"),
@@ -26,7 +29,7 @@
 //! )
 //! .build()?;
 //!
-//! let (task, spec) = solti_discover::sync(cfg)?;
+//! let (task, spec) = solti_discover::sync(cfg, uptime)?;
 //! // Submit to a running taskvisor supervisor:
 //! // supervisor.submit_with_task(task, &spec).await?;
 //! # let _ = (task, spec);
@@ -69,9 +72,6 @@ pub use metrics::{
 };
 
 #[cfg(any(feature = "grpc", feature = "http"))]
-pub use solti_model::Token;
-
-#[cfg(any(feature = "grpc", feature = "http"))]
 mod config;
 #[cfg(any(feature = "grpc", feature = "http"))]
 pub use config::{
@@ -83,6 +83,11 @@ pub use config::{
 mod tasks;
 #[cfg(any(feature = "grpc", feature = "http"))]
 pub use tasks::sync;
+
+#[cfg(any(feature = "grpc", feature = "http"))]
+mod uptime;
+#[cfg(any(feature = "grpc", feature = "http"))]
+pub use uptime::{MonotonicUptime, UptimeSource};
 
 #[cfg(any(feature = "grpc", feature = "http"))]
 pub(crate) mod proto {

@@ -5,19 +5,21 @@ edition = "2024"
 publish = false
 
 [dependencies]
-solti-prometheus = { path = "../../crates/solti-prometheus", features = ["server", "process", "discover", "api", "state"] }
-solti-observe    = { path = "../../crates/solti-observe",    features = ["timezone-sync", "subscriber"] }
-solti-exec       = { path = "../../crates/solti-exec",       features = ["subprocess"] }
 # Both transports compiled in: the active one is chosen at runtime from the TOML config.
-solti-api        = { path = "../../crates/solti-api",        features = ["http", "grpc", "tls"] }
-solti-discover   = { path = "../../crates/solti-discover",   features = ["http", "grpc", "tls"] }
-solti-runner     = { path = "../../crates/solti-runner" }
-solti-model      = { path = "../../crates/solti-model" }
-solti-core       = { path = "../../crates/solti-core" }
-solti-tls        = { path = "../../crates/solti-tls" }
+solti = { path = "../../crates/solti", features = [
+    "api-core-adapter",
+    "api-http",
+    "api-grpc-tls",
+    "discover-http",
+    "discover-grpc",
+    "discover-tls",
+    "exec-subprocess",
+    "observe-timezone-sync",
+    "prometheus-full",
+    "taskvisor-tracing",
+] }
 
 tokio       = { workspace = true, features = ["rt-multi-thread", "signal"] }
-taskvisor   = { workspace = true }
 tracing     = { workspace = true }
 serde       = { workspace = true, features = ["derive"] }
 axum        = { workspace = true }

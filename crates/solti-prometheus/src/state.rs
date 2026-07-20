@@ -8,7 +8,7 @@ use prometheus::proto::MetricFamily;
 use solti_core::TaskState;
 use solti_model::TaskPhase;
 
-use crate::register::Sub;
+use crate::register::gauge_vec_unregistered;
 
 /// All phases we want to be represented as gauges, even at zero.
 ///
@@ -93,7 +93,7 @@ impl PrometheusStateCollector {
     /// # Ok(()) }
     /// ```
     pub fn new(state: TaskState) -> Result<Self, prometheus::Error> {
-        let gauge = Sub::gauge_vec_unregistered(
+        let gauge = gauge_vec_unregistered(
             "sv",
             "tasks_by_phase",
             "Current number of tasks per phase (snapshot at scrape time)",

@@ -5,10 +5,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use solti_core::SupervisorApi;
-use solti_model::{OutputEvent, Task, TaskId, TaskKind, TaskPage, TaskQuery, TaskRun, TaskSpec};
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
+use solti_core::{CoreError, SupervisorApi};
+use solti_model::{Task, TaskId, TaskKind, TaskPage, TaskQuery, TaskRun, TaskSpec};
 
 use crate::error::ApiError;
 use crate::handler::{ApiHandler, OutputEventStream};
@@ -20,7 +18,7 @@ use crate::handler::{ApiHandler, OutputEventStream};
 /// ## Also
 ///
 /// - [`ApiHandler`] the trait this adapter implements.
-/// - [`ApiError::Core`] wraps `CoreError` from the supervisor.
+/// - [`ApiError`] receives API-owned categories translated from [`CoreError`].
 pub struct SupervisorApiAdapter {
     supervisor: Arc<SupervisorApi>,
 }
@@ -45,7 +43,7 @@ impl SupervisorApiAdapter {
 #[async_trait]
 impl ApiHandler for SupervisorApiAdapter {
     async fn submit_task(&self, spec: TaskSpec) -> Result<TaskId, ApiError> {
-        self.supervisor.submit(&spec).await.map_err(ApiError::from)
+        self.supervisor.submit(&spec).await.map_err(map_core_error)
     }
 
     async fn get_task_status(&self, id: &TaskId) -> Result<Option<Task>, ApiError> {
@@ -73,25 +71,27 @@ impl ApiHandler for SupervisorApiAdapter {
         self.supervisor
             .delete_task(id)
             .await
-            .map_err(ApiError::from)
+            .map_err(map_core_error)
     }
 
     async fn stream_task_logs(&self, id: &TaskId) -> Result<OutputEventStream, ApiError> {
         if self.hidden_from_wire(id) {
             return Err(ApiError::TaskNotFound(id.to_string()));
         }
-        let receiver = self
+        let stream = self
             .supervisor
-            .output_registry()
-            .subscribe(id)
+            .subscribe_output(id)
             .ok_or_else(|| ApiError::TaskNotFound(id.to_string()))?;
-
-        let stream = BroadcastStream::new(receiver).map(|res| {
-            res.unwrap_or_else(
-                |BroadcastStreamRecvError::Lagged(skipped)| OutputEvent::Lagged { skipped },
-            )
-        });
         Ok(Box::pin(stream))
+    }
+}
+
+fn map_core_error(error: CoreError) -> ApiError {
+    match error {
+        CoreError::InvalidSpec(inner) => ApiError::InvalidRequest(inner.to_string()),
+        CoreError::AlreadyExists(message) => ApiError::AlreadyExists(message),
+        CoreError::NotFound(message) => ApiError::TaskNotFound(message),
+        other => ApiError::Internal(other.to_string()),
     }
 }
 
@@ -99,7 +99,8 @@ impl ApiHandler for SupervisorApiAdapter {
 mod tests {
     use super::*;
 
-    use solti_core::{RunnerRouter, StateConfig};
+    use solti_core::StateConfig;
+    use solti_runner::RunnerRouter;
     use taskvisor::{ControllerConfig, SupervisorConfig, TaskContext, TaskError, TaskFn, TaskRef};
 
     async fn supervisor() -> SupervisorApi {
@@ -196,5 +197,24 @@ mod tests {
             .await
             .expect("get_task_status must not fail");
         assert!(visible.is_none());
+    }
+
+    #[test]
+    fn core_errors_translate_to_api_owned_categories() {
+        let invalid = map_core_error(CoreError::InvalidSpec(solti_model::ModelError::Invalid(
+            "bad".into(),
+        )));
+        assert!(
+            matches!(invalid, ApiError::InvalidRequest(message) if message == "invalid model: bad")
+        );
+
+        let duplicate = map_core_error(CoreError::AlreadyExists("duplicate".into()));
+        assert!(matches!(duplicate, ApiError::AlreadyExists(message) if message == "duplicate"));
+
+        let missing = map_core_error(CoreError::NotFound("missing".into()));
+        assert!(matches!(missing, ApiError::TaskNotFound(message) if message == "missing"));
+
+        let internal = map_core_error(CoreError::Mapping("mapping".into()));
+        assert!(matches!(internal, ApiError::Internal(message) if message.contains("mapping")));
     }
 }

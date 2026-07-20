@@ -1,11 +1,11 @@
 # solti-observe
 
-> Logging and event traces for Solti agents.
+> Structured logging and timezone support for Solti agents.
 
 `solti-observe` is the logging crate for the Solti SDK.
-It installs a `tracing` subscriber, keeps logger config in small value types, and can forward taskvisor lifecycle events into your logs.
+It installs a `tracing` subscriber and keeps logger config in small value types.
 
-Use it when you build an agent binary and want one clear place for logs, local timestamps, and task lifecycle traces.
+Use it when you build an agent binary and want one clear place for logs and local timestamps.
 
 ## The logging setup you stop repeating
 
@@ -126,7 +126,6 @@ UTC is the default and always works.
 | `LoggerTimeZone`    | always          | `utc` or `local` timestamps                |
 | `init_logger`       | always          | Install the global tracing subscriber      |
 | `init_local_offset` | always          | Cache local UTC offset before Tokio starts |
-| `TracingBridge`     | `subscriber`    | Send taskvisor events to `tracing`         |
 | `timezone_sync`     | `timezone-sync` | Build a supervised offset refresh task     |
 
 ## Core Model
@@ -142,14 +141,12 @@ init_logger()
   |-- journald logger (Linux only)
   |
   v
-tracing macros and taskvisor event logs
+tracing macros
 ```
 
-Optional pieces plug into the same process:
+The optional timezone task plugs into the same process:
 
 ```text
-taskvisor events -- TracingBridge --> tracing
-
 timezone_sync task -- refresh attempt --> local offset cache
 ```
 
@@ -184,29 +181,6 @@ assert_eq!(level.as_str(), "solti_exec=trace,taskvisor=debug,info");
 
 On non-Linux platforms, parsing or using `journald` returns `LoggerError::JournaldNotSupported`.
 
-## Event Logging
-
-Enable the `subscriber` feature to re-export `taskvisor::TracingBridge`.
-It logs supervisor and controller events with target `taskvisor`.
-
-```rust,ignore
-use std::sync::Arc;
-use solti_observe::TracingBridge;
-use taskvisor::Subscribe;
-
-let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(TracingBridge)];
-```
-
-Each event carries a stable `event` label, `seq`, and any payload fields that
-apply: `id`, `task`, `attempt`, `reason`, `outcome_kind`, `rejection_kind`,
-`backoff_source`, `delay_ms`, `timeout_ms`, `duration_ms`, and `exit_code`.
-
-Level mapping lives in taskvisor. Failed attempts, fatal or panicked final
-outcomes, subscriber panics, and runtime failures are `ERROR`. Timeouts,
-non-fatal failed or force-aborted outcomes, overflow, and rejected work are
-`WARN`. Successful or canceled lifecycle milestones are `INFO`; starts,
-backoff, management requests, and slot transitions are `DEBUG`.
-
 ## Timezone Sync Task
 
 Enable the `timezone-sync` feature to build a periodic supervised task:
@@ -224,10 +198,9 @@ In practice, local offset detection often works only before Tokio starts worker 
 
 ## Feature Flags
 
-| Flag            | Default  | Effect                    |
-|-----------------|----------|---------------------------|
-| `subscriber`    | off      | Re-export `TracingBridge` |
-| `timezone-sync` | off      | Expose `timezone_sync()`  |
+| Flag            | Default  | Effect                   |
+|-----------------|----------|--------------------------|
+| `timezone-sync` | off      | Expose `timezone_sync()` |
 
 ## Error Model
 
@@ -244,5 +217,4 @@ In practice, local offset detection often works only before Tokio starts worker 
 
 - Call `init_logger` once, near process start.
 - Call `init_local_offset` before creating a Tokio runtime when `LoggerTimeZone::Local` is used.
-- Use `solti-prometheus` for metrics. This crate is for logs and event traces.
-- `TracingBridge` is implemented by taskvisor and re-exported here for agent wiring.
+- Use `solti-prometheus` for metrics. This crate is for logging and timezone support.

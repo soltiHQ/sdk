@@ -370,6 +370,7 @@ impl Subscribe for PrometheusSubscriber {
 mod tests {
     use super::*;
     use prometheus::Encoder;
+    #[cfg(feature = "runner")]
     use solti_runner::MetricsBackend;
     use std::time::Duration;
 
@@ -794,6 +795,7 @@ mod tests {
         assert_eq!(sub.queue_capacity().get(), 1);
     }
 
+    #[cfg(feature = "runner")]
     #[test]
     fn shared_registry_with_backend() {
         let registry = Arc::new(Registry::new());

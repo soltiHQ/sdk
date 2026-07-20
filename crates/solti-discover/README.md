@@ -5,9 +5,9 @@ Dual-transport (gRPC + HTTP).
 
 ## Architecture
 ```text
- DiscoverConfig
+ DiscoverConfig + Arc<dyn UptimeSource>
      ▼
- sync(config) ──► (TaskRef, TaskSpec)
+ sync(config, uptime) ──► (TaskRef, TaskSpec)
      ├──► gRPC transport (tonic Channel)
      │        └──► DiscoverService.Sync
      ├──► HTTP transport (reqwest Client)
@@ -39,9 +39,11 @@ The binary is the integration point: solti-discover does not depend on solti-api
 | `DiscoverConfig`        | Agent identity, endpoint, transport, interval, capabilities           |
 | `DiscoverConfigBuilder` | Validated builder; enforces invariants on `build()`                   |
 | `DiscoveryTransport`    | Selects gRPC or HTTP path                                             |
+| `UptimeSource`          | Host-owned elapsed-time contract stamped into each heartbeat         |
+| `MonotonicUptime`       | Default monotonic implementation starting at explicit construction   |
 | `Token`                 | Bearer secret presented to the CP (re-export of `solti_model::Token`) |
 | `DiscoverError`         | Config, transport, parse, and rejection failures                      |
-| `sync()`                | Factory returns `Result<(TaskRef, TaskSpec), DiscoverError>`          |
+| `sync(config, uptime)`  | Factory returns `Result<(TaskRef, TaskSpec), DiscoverError>`          |
 | `SyncRequest`           | Protobuf message sent each cycle                                      |
 | `SyncResponse`          | Protobuf ack: `success`, optional `reason`, `retry_after_s`           |
 
@@ -72,6 +74,24 @@ Per-version protocol details: [sync_v1.md](sync_v1.md).
 | `tls`  | Adds `with_tls(...)` builder method (TLS / mTLS for transport) | `solti-tls`; activates `tonic/tls-ring` and `reqwest/rustls-no-provider` |
 
 No feature is enabled by default. `tls` is additive on top of `grpc`/`http`.
+
+## Uptime ownership
+
+The host explicitly owns the uptime epoch. Create the monotonic source at the
+agent-composition boundary and pass it to `sync`:
+
+```rust,ignore
+use std::sync::Arc;
+use solti_discover::MonotonicUptime;
+
+let uptime = Arc::new(MonotonicUptime::new());
+// Build the rest of the agent.
+let (task, spec) = solti_discover::sync(config, uptime)?;
+```
+
+`solti-discover` does not depend on `solti-core` and does not derive uptime from
+`SupervisorApi::new()`. Tests and custom composition roots can implement
+`UptimeSource` or pass a thread-safe `Fn() -> u64`.
 
 ### Enabling TLS
 
@@ -109,8 +129,8 @@ See the `solti-tls` README for the full integration story.
 ### Enabling token auth
 
 ```rust,no_run
-use solti_discover::{DiscoverConfig, DiscoveryTransport, Token};
-use solti_model::AgentId;
+use solti_discover::{DiscoverConfig, DiscoveryTransport};
+use solti_model::{AgentId, Token};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _cfg = DiscoverConfig::builder(

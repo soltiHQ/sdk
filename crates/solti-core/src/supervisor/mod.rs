@@ -2,7 +2,7 @@
 //!
 //! [`SupervisorApi`] is the main entry point of `solti-core`.
 //! It owns the taskvisor runtime, a runner router, in-memory state, and the
-//! output registry used for live logs.
+//! core-owned output hub used for live logs.
 //!
 //! ## State Reconstruction
 //!
@@ -41,12 +41,12 @@ use taskvisor::{
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, instrument, warn};
 
-use solti_runner::{OutputRegistry, RunnerRouter};
+use solti_runner::RunnerRouter;
 
-use crate::system::init_uptime;
 use crate::{
     error::CoreError,
     map::{to_admission_policy, to_backoff_policy, to_restart_policy},
+    output::{OutputConfig, OutputHub, OutputSubscription},
     state::{
         LifecycleGate, ReservationRollback, StateConfig, StateSubscriber, TaskState, state_sweep,
     },
@@ -61,8 +61,9 @@ use crate::{
 /// ## Example
 ///
 /// ```rust,no_run
-/// use solti_core::taskvisor::{ControllerConfig, SupervisorConfig};
-/// use solti_core::{CoreError, RunnerRouter, StateConfig, SupervisorApi};
+/// use solti_core::{CoreError, StateConfig, SupervisorApi};
+/// use solti_runner::RunnerRouter;
+/// use taskvisor::{ControllerConfig, SupervisorConfig};
 ///
 /// async fn demo() -> Result<(), CoreError> {
 ///     let api = SupervisorApi::new(
@@ -80,7 +81,7 @@ use crate::{
 /// }
 /// ```
 pub struct SupervisorApi {
-    output_registry: Arc<OutputRegistry>,
+    output_hub: Arc<OutputHub>,
     handle: SupervisorHandle,
     router: RunnerRouter,
     state: TaskState,
@@ -132,7 +133,7 @@ struct SubmitReservation {
     lifecycle_gate: LifecycleGate,
     task_id: TaskId,
     rollback: Option<ReservationRollback>,
-    output_registry: Option<Arc<OutputRegistry>>,
+    output_hub: Option<Arc<OutputHub>>,
 }
 
 impl SubmitReservation {
@@ -147,19 +148,19 @@ impl SubmitReservation {
             lifecycle_gate,
             task_id,
             rollback: Some(rollback),
-            output_registry: None,
+            output_hub: None,
         }
     }
 
-    fn track_output_channel(&mut self, output_registry: Arc<OutputRegistry>, created: bool) {
+    fn track_output_channel(&mut self, output_hub: Arc<OutputHub>, created: bool) {
         if created {
-            self.output_registry = Some(output_registry);
+            self.output_hub = Some(output_hub);
         }
     }
 
     fn commit(mut self) {
         self.rollback = None;
-        self.output_registry = None;
+        self.output_hub = None;
     }
 }
 
@@ -168,8 +169,8 @@ impl Drop for SubmitReservation {
         if let Some(rollback) = self.rollback.take() {
             let _lifecycle = self.lifecycle_gate.lock();
             self.state.rollback_reservation(&self.task_id, rollback);
-            if let Some(output_registry) = self.output_registry.take() {
-                output_registry.evict(&self.task_id);
+            if let Some(output_hub) = self.output_hub.take() {
+                output_hub.evict(&self.task_id);
             }
         }
     }
@@ -194,14 +195,15 @@ impl SupervisorApi {
     /// Create a supervisor and start its run loop in the background.
     ///
     /// `StateSubscriber` and the periodic state sweep task are registered
-    /// automatically. The supervisor uses the [`OutputRegistry`] already held
-    /// by `router`, so routed task output and API subscriptions cannot diverge.
+    /// automatically. The supervisor creates the output hub and injects its
+    /// producer capability into `router`.
     ///
     /// ## Example
     ///
     /// ```rust,no_run
-    /// use solti_core::taskvisor::{ControllerConfig, SupervisorConfig};
-    /// use solti_core::{CoreError, RunnerRouter, StateConfig, SupervisorApi};
+    /// use solti_core::{CoreError, StateConfig, SupervisorApi};
+    /// use solti_runner::RunnerRouter;
+    /// use taskvisor::{ControllerConfig, SupervisorConfig};
     ///
     /// async fn demo() -> Result<(), CoreError> {
     ///     let api = SupervisorApi::new(
@@ -229,39 +231,37 @@ impl SupervisorApi {
         router: RunnerRouter,
         state_cfg: StateConfig,
     ) -> Result<Self, CoreError> {
-        let output_registry = Arc::clone(router.output_registry());
-        Self::new_with_output_registry(
+        Self::new_with_output_config(
             sup_cfg,
             ctrl_cfg,
             subscribers,
             router,
             state_cfg,
-            output_registry,
+            OutputConfig::default(),
         )
         .await
     }
 
-    /// Create a supervisor with a caller-provided [`OutputRegistry`].
+    /// Create a supervisor with explicit live-output configuration.
     ///
-    /// The supplied registry replaces the router build context's registry, so
-    /// the runner side and API side always share the same live output path.
+    /// The supervisor owns the concrete hub and injects only its producer
+    /// capability into runners.
     ///
     /// ## Example
     ///
     /// ```rust,no_run
-    /// use solti_core::taskvisor::{ControllerConfig, SupervisorConfig};
-    /// use solti_core::{CoreError, OutputRegistry, RunnerRouter, StateConfig, SupervisorApi};
-    /// use std::sync::Arc;
+    /// use solti_core::{CoreError, OutputConfig, StateConfig, SupervisorApi};
+    /// use solti_runner::RunnerRouter;
+    /// use taskvisor::{ControllerConfig, SupervisorConfig};
     ///
     /// async fn demo() -> Result<(), CoreError> {
-    ///     let output_registry = Arc::new(OutputRegistry::default());
-    ///     let api = SupervisorApi::new_with_output_registry(
+    ///     let api = SupervisorApi::new_with_output_config(
     ///         SupervisorConfig::default(),
     ///         ControllerConfig::default(),
     ///         Vec::new(),
     ///         RunnerRouter::new(),
     ///         StateConfig::default(),
-    ///         output_registry,
+    ///         OutputConfig::new(1024),
     ///     )
     ///     .await?;
     ///
@@ -274,20 +274,21 @@ impl SupervisorApi {
     ///
     /// Returns [`CoreError::Supervisor`] if taskvisor rejects the embedded sweep
     /// task during startup.
-    pub async fn new_with_output_registry(
+    pub async fn new_with_output_config(
         sup_cfg: SupervisorConfig,
         ctrl_cfg: ControllerConfig,
         mut subscribers: Vec<Arc<dyn Subscribe>>,
         router: RunnerRouter,
         state_cfg: StateConfig,
-        output_registry: Arc<OutputRegistry>,
+        output_config: OutputConfig,
     ) -> Result<Self, CoreError> {
-        let router = router.with_output_registry(Arc::clone(&output_registry));
+        let output_hub = Arc::new(OutputHub::new(output_config));
+        let router = router.with_output_publisher(output_hub.clone());
         let state = TaskState::new();
         state.set_max_runs_per_task(state_cfg.max_runs_per_task);
-        let state_subscriber = Arc::new(StateSubscriber::with_output_registry(
+        let state_subscriber = Arc::new(StateSubscriber::with_output_hub(
             state.clone(),
-            Arc::clone(&output_registry),
+            Arc::clone(&output_hub),
         ));
         let lifecycle_gate = state_subscriber.lifecycle_gate();
         subscribers.push(state_subscriber.clone());
@@ -300,7 +301,6 @@ impl SupervisorApi {
             .build();
 
         let handle = sup.serve();
-        init_uptime();
 
         let api = Self {
             handle,
@@ -309,7 +309,7 @@ impl SupervisorApi {
             state_subscriber,
             task_operations: TaskOperationLocks::default(),
             lifecycle_gate,
-            output_registry,
+            output_hub,
             completion_runtime,
             completion_tasks: TaskTracker::new(),
             #[cfg(test)]
@@ -325,9 +325,11 @@ impl SupervisorApi {
         Ok(api)
     }
 
-    /// Return the shared output registry for live-tail subscriptions.
-    pub fn output_registry(&self) -> &Arc<OutputRegistry> {
-        &self.output_registry
+    /// Subscribe to one task's lossy, live-only output stream.
+    ///
+    /// Returns `None` when no active output lifecycle exists for `id`.
+    pub fn subscribe_output(&self, id: &TaskId) -> Option<OutputSubscription> {
+        self.output_hub.subscribe(id)
     }
 
     /// Return one task by id.
@@ -547,9 +549,9 @@ impl SupervisorApi {
     /// ## Example
     ///
     /// ```rust,no_run
-    /// use solti_core::taskvisor::{TaskContext, TaskError, TaskFn};
     /// use solti_core::{CoreError, SupervisorApi};
     /// use solti_model::{RestartPolicy, TaskKind, TaskSpec};
+    /// use taskvisor::{TaskContext, TaskError, TaskFn};
     ///
     /// async fn demo(api: &SupervisorApi) -> Result<(), CoreError> {
     ///     let task = TaskFn::arc("embedded-once", |_ctx: TaskContext| async move {
@@ -622,7 +624,7 @@ impl SupervisorApi {
             .map_err(|error| CoreError::supervisor("submit", error))?;
         let tv_id = prepared.id();
         let output_created = self.state_subscriber.bind(&task_id, tv_id, ensure_output);
-        reservation.track_output_channel(Arc::clone(&self.output_registry), output_created);
+        reservation.track_output_channel(Arc::clone(&self.output_hub), output_created);
 
         debug!("submitting pre-built task via controller");
         // A shutdown closes and waits this tracker after taskvisor has stopped.
@@ -780,7 +782,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use solti_model::{AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind};
-    use solti_runner::OutputRegistry;
     use taskvisor::{TaskContext, TaskError, TaskFn};
 
     fn mk_backoff() -> BackoffPolicy {
@@ -1025,8 +1026,8 @@ mod tests {
             alive,
             "task body must reach Running state before we try to delete"
         );
-        api.output_registry().ensure_channel(task_id.clone());
-        assert!(api.output_registry().subscribe(&task_id).is_some());
+        api.output_hub.ensure_channel(task_id.clone());
+        assert!(api.output_hub.subscribe_raw(&task_id).is_some());
 
         api.delete_task(&task_id)
             .await
@@ -1041,7 +1042,7 @@ mod tests {
             "run history must be purged by delete"
         );
         assert!(
-            api.output_registry().subscribe(&task_id).is_none(),
+            api.output_hub.subscribe_raw(&task_id).is_none(),
             "explicit delete must evict the output channel"
         );
 
@@ -1597,9 +1598,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supervisor_api_default_new_creates_empty_output_registry() {
+    async fn supervisor_api_default_new_creates_empty_output_hub() {
         let router = RunnerRouter::new();
-        let router_registry = Arc::clone(router.output_registry());
         let api = SupervisorApi::new(
             SupervisorConfig::default(),
             ControllerConfig::default(),
@@ -1610,34 +1610,32 @@ mod tests {
         .await
         .expect("SupervisorApi::new");
 
-        assert_eq!(api.output_registry().active_channels(), 0);
-        assert!(Arc::ptr_eq(api.output_registry(), &router_registry));
+        assert_eq!(api.output_hub.active_channels(), 0);
+        assert_eq!(api.output_hub.capacity(), OutputConfig::DEFAULT_CAPACITY);
     }
 
     #[tokio::test]
-    async fn supervisor_api_with_provided_registry_shares_arc() {
+    async fn supervisor_api_uses_explicit_output_config() {
         let router = RunnerRouter::new();
-        let registry = Arc::new(OutputRegistry::new(64));
-        registry.ensure_channel(TaskId::from("seeded"));
 
-        let api = SupervisorApi::new_with_output_registry(
+        let api = SupervisorApi::new_with_output_config(
             SupervisorConfig::default(),
             ControllerConfig::default(),
             Vec::new(),
             router,
             StateConfig::default(),
-            Arc::clone(&registry),
+            OutputConfig::new(64),
         )
         .await
-        .expect("SupervisorApi::new_with_output_registry");
+        .expect("SupervisorApi::new_with_output_config");
 
-        assert!(Arc::ptr_eq(api.output_registry(), &registry));
-        assert_eq!(api.output_registry().active_channels(), 1);
+        assert_eq!(api.output_hub.capacity(), 64);
+        assert_eq!(api.output_hub.active_channels(), 0);
     }
 
     #[test]
     fn submit_reservation_drop_restores_state_and_preserves_external_output_channel() {
-        let registry = Arc::new(OutputRegistry::default());
+        let registry = Arc::new(OutputHub::new(OutputConfig::default()));
         let state = TaskState::new();
         let ghost = TaskId::from("orphan-on-submit-fail");
         registry.ensure_channel(ghost.clone());
@@ -1669,7 +1667,7 @@ mod tests {
             channels_before,
             "rollback must not detach a channel or sink created outside the reservation"
         );
-        assert!(registry.subscribe(&ghost).is_some());
+        assert!(registry.subscribe_raw(&ghost).is_some());
         assert!(
             state.get(&ghost).is_none(),
             "state entry must be gone after rollback"
@@ -1679,7 +1677,7 @@ mod tests {
 
     #[test]
     fn submit_reservation_drop_removes_owned_binding_and_output_channel() {
-        let registry = Arc::new(OutputRegistry::default());
+        let registry = Arc::new(OutputHub::new(OutputConfig::default()));
         let state = TaskState::new();
         let task_id = TaskId::from("owned-submit-resources");
         let spec = TaskSpec::builder("owned-slot", TaskKind::Embedded, 1_000_u64)
@@ -1703,12 +1701,12 @@ mod tests {
 
         assert!(state.get(&task_id).is_none());
         assert!(state.resolve_tv(tv_id.get()).is_none());
-        assert!(registry.subscribe(&task_id).is_none());
+        assert!(registry.subscribe_raw(&task_id).is_none());
     }
 
     #[test]
     fn committed_submit_reservation_keeps_state_entry_and_output_channel() {
-        let registry = Arc::new(OutputRegistry::default());
+        let registry = Arc::new(OutputHub::new(OutputConfig::default()));
         let state = TaskState::new();
         let task_id = TaskId::from("accepted-submit");
         let spec = TaskSpec::builder("accepted-slot", TaskKind::Embedded, 1_000_u64)
@@ -1738,7 +1736,7 @@ mod tests {
 
     #[test]
     fn submit_reservation_rollback_restores_retained_terminal_resource() {
-        let registry = Arc::new(OutputRegistry::default());
+        let registry = Arc::new(OutputHub::new(OutputConfig::default()));
         let state = TaskState::new();
         let task_id = TaskId::from("retained-before-failed-submit");
         let old_spec = TaskSpec::builder("old-slot", TaskKind::Embedded, 1_000_u64)
@@ -1777,7 +1775,7 @@ mod tests {
         assert_eq!(state.list_by_slot("old-slot").len(), 1);
         assert!(state.list_by_slot("new-slot").is_empty());
         assert!(state.tv_for(&task_id).is_none());
-        assert!(registry.subscribe(&task_id).is_some());
+        assert!(registry.subscribe_raw(&task_id).is_some());
     }
 
     #[tokio::test]
@@ -1826,18 +1824,18 @@ mod tests {
 
     fn finalize_from_outcome(
         state: &TaskState,
-        registry: &Arc<OutputRegistry>,
+        registry: &Arc<OutputHub>,
         tv_raw: u64,
         outcome: &TaskOutcome,
     ) {
-        StateSubscriber::with_output_registry(state.clone(), Arc::clone(registry))
+        StateSubscriber::with_output_hub(state.clone(), Arc::clone(registry))
             .finalize_outcome_immediately_for_test(tv_raw, outcome);
     }
 
     #[test]
     fn backstop_finalizes_a_lost_terminal_outcome() {
         let (state, id, tv_raw) = bound_running_state("lost-1");
-        let registry = Arc::new(OutputRegistry::default());
+        let registry = Arc::new(OutputHub::new(OutputConfig::default()));
 
         finalize_from_outcome(&state, &registry, tv_raw, &TaskOutcome::Completed);
 
@@ -1847,15 +1845,18 @@ mod tests {
     #[test]
     fn backstop_evicts_output_channel_on_terminal_outcome() {
         let (state, id, tv_raw) = bound_running_state("leak-1");
-        let registry = Arc::new(OutputRegistry::default());
+        let registry = Arc::new(OutputHub::new(OutputConfig::default()));
         registry.ensure_channel(id.clone());
-        assert!(registry.subscribe(&id).is_some(), "channel exists before");
+        assert!(
+            registry.subscribe_raw(&id).is_some(),
+            "channel exists before"
+        );
 
         finalize_from_outcome(&state, &registry, tv_raw, &TaskOutcome::Completed);
 
         assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Succeeded);
         assert!(
-            registry.subscribe(&id).is_none(),
+            registry.subscribe_raw(&id).is_none(),
             "the backstop must evict the output channel on a terminal outcome"
         );
     }
@@ -1863,7 +1864,7 @@ mod tests {
     #[test]
     fn backstop_reconciles_a_stale_attempt_terminal_with_completed_outcome() {
         let (state, id, tv_raw) = bound_running_state("done-1");
-        let registry = Arc::new(OutputRegistry::default());
+        let registry = Arc::new(OutputHub::new(OutputConfig::default()));
         state.transition_finished(&id, TaskPhase::Failed, Some("boom".into()), Some(1));
 
         finalize_from_outcome(&state, &registry, tv_raw, &TaskOutcome::Completed);
@@ -1879,7 +1880,7 @@ mod tests {
     #[test]
     fn backstop_reconciles_same_phase_diagnostics_from_panicked_outcome() {
         let (state, id, tv_raw) = bound_running_state("panic-diagnostics");
-        let registry = Arc::new(OutputRegistry::default());
+        let registry = Arc::new(OutputHub::new(OutputConfig::default()));
         state.transition_finished(&id, TaskPhase::Failed, Some("actor_panic".into()), Some(1));
 
         finalize_from_outcome(&state, &registry, tv_raw, &TaskOutcome::Panicked);
@@ -1897,7 +1898,7 @@ mod tests {
     #[test]
     fn backstop_refines_failed_attempt_to_exhausted_actor_outcome() {
         let (state, id, tv_raw) = bound_running_state("exhausted-after-attempt");
-        let registry = Arc::new(OutputRegistry::default());
+        let registry = Arc::new(OutputHub::new(OutputConfig::default()));
         state.transition_finished(
             &id,
             TaskPhase::Failed,
@@ -1922,7 +1923,7 @@ mod tests {
     #[test]
     fn backstop_preserves_timeout_over_generic_exhausted_outcome() {
         let (state, id, tv_raw) = bound_running_state("timeout-before-exhaustion");
-        let registry = Arc::new(OutputRegistry::default());
+        let registry = Arc::new(OutputHub::new(OutputConfig::default()));
         state.transition_finished(
             &id,
             TaskPhase::Timeout,
@@ -1946,7 +1947,7 @@ mod tests {
     #[test]
     fn backstop_rejected_finalizes_entry_consistently_with_event_path() {
         let (state, id, tv_raw) = bound_running_state("rej-1");
-        let registry = Arc::new(OutputRegistry::default());
+        let registry = Arc::new(OutputHub::new(OutputConfig::default()));
         registry.ensure_channel(id.clone());
 
         let outcome =
@@ -1955,13 +1956,16 @@ mod tests {
 
         let task = state.get(&id).expect("rejected entry stays observable");
         assert_eq!(task.status().phase, TaskPhase::Failed);
-        assert!(registry.subscribe(&id).is_none(), "output channel evicted");
+        assert!(
+            registry.subscribe_raw(&id).is_none(),
+            "output channel evicted"
+        );
     }
 
     #[test]
     fn backstop_rejected_admission_drop_is_canceled() {
         let (state, id, tv_raw) = bound_running_state("rej-drop");
-        let registry = Arc::new(OutputRegistry::default());
+        let registry = Arc::new(OutputHub::new(OutputConfig::default()));
 
         let outcome = TaskOutcome::rejected_for_tests(
             taskvisor::RejectionKind::SlotBusy,
@@ -1979,7 +1983,7 @@ mod tests {
     #[test]
     fn backstop_stale_waiter_cannot_finalize_a_new_incarnation() {
         let (state, id, old_tv_raw) = bound_running_state("stale-waiter");
-        let registry = Arc::new(OutputRegistry::default());
+        let registry = Arc::new(OutputHub::new(OutputConfig::default()));
         state.transition_finished(&id, TaskPhase::Failed, Some("boom".into()), Some(1));
 
         // The old managed task completes cleanup before the name can be reused.
@@ -2006,7 +2010,7 @@ mod tests {
     #[test]
     fn backstop_rejected_user_drop_is_canceled() {
         let (state, id, tv_raw) = bound_running_state("rej-2");
-        let registry = Arc::new(OutputRegistry::default());
+        let registry = Arc::new(OutputHub::new(OutputConfig::default()));
 
         let outcome = TaskOutcome::rejected_for_tests(
             taskvisor::RejectionKind::RemovedFromQueue,
@@ -2020,7 +2024,7 @@ mod tests {
     #[test]
     fn backstop_noop_for_unknown_run_id() {
         let state = TaskState::new();
-        let registry = Arc::new(OutputRegistry::default());
+        let registry = Arc::new(OutputHub::new(OutputConfig::default()));
         finalize_from_outcome(&state, &registry, 999, &TaskOutcome::Completed);
     }
 }

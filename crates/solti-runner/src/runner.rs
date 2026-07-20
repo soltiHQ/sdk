@@ -60,7 +60,7 @@ pub trait Runner: Send + Sync {
 
     /// Build a concrete [`TaskRef`] for the given spec.
     ///
-    /// The [`BuildContext`] carries shared dependencies injected at router setup time, such as env, metrics, and output registry.
+    /// The [`BuildContext`] carries shared dependencies injected at router setup time, such as env, metrics, and the output producer capability.
     /// Build may be followed by a rejected submission, and the returned task may
     /// run more than once. Capture immutable configuration here; acquire
     /// attempt-scoped resources, including output sinks, inside the task body.

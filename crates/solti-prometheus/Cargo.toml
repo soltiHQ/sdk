@@ -13,23 +13,26 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default  = []
-api      = ["dep:solti-api"]
+default  = ["runner", "taskvisor"]
+api      = ["dep:itoa", "dep:solti-api"]
 discover = ["dep:solti-discover"]
+full     = ["api", "discover", "process", "runner", "server", "state", "taskvisor"]
 process  = ["prometheus/process"]
-server   = ["dep:axum", "dep:tokio", "dep:solti-model"]
+runner   = ["dep:solti-runner"]
+server   = ["dep:axum", "dep:solti-model", "dep:taskvisor", "dep:tokio", "dep:tracing"]
 state    = ["dep:solti-core", "dep:solti-model"]
+taskvisor = ["dep:taskvisor", "dep:tracing", "taskvisor/controller"]
 
 [dependencies]
 prometheus = { workspace = true }
-taskvisor  = { workspace = true, features = ["controller"] }
-tracing    = { workspace = true }
-itoa       = { workspace = true }
+taskvisor  = { workspace = true, optional = true }
+tracing    = { workspace = true, optional = true }
+itoa       = { workspace = true, optional = true }
 
 axum       = { workspace = true, optional = true }
 tokio      = { workspace = true, optional = true, features = ["net", "rt"] }
 
-solti-runner   = { workspace = true }
+solti-runner   = { workspace = true, optional = true }
 solti-model    = { workspace = true, optional = true }
 solti-discover = { workspace = true, optional = true }
 solti-api      = { workspace = true, optional = true }

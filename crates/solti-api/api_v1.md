@@ -416,14 +416,14 @@ Safe to retry — deleting an already-gone task is a no-op.
 }
 ```
 
-| HTTP Status | `error` label     | When                                                                                |
-|-------------|-------------------|-------------------------------------------------------------------------------------|
-| 400         | `InvalidRequest`  | Validation failure (empty slot, bad spec, invalid phase), also `Core::InvalidSpec`  |
-| 401         | `Unauthenticated` | Bearer token missing or invalid (only when [auth](#authentication) is enabled)      |
-| 404         | `TaskNotFound`    | Task ID not found or no live log channel, also `Core::NotFound`                     |
-| 409         | `AlreadyExists`   | `Core::AlreadyExists` — a live submission still owns the same task id (including between attempts) |
-| 413         | `PayloadTooLarge` | Request body exceeds 4 MiB (`RequestBodyLimitLayer`) — see "Size limits"            |
-| 500         | `Internal`        | Supervisor/infra error (also `Core::{Supervisor,Mapping,Runner}`)                   |
+| HTTP Status | `error` label     | When                                                                           |
+|-------------|-------------------|--------------------------------------------------------------------------------|
+| 400         | `InvalidRequest`  | Validation failure (empty slot, bad spec, invalid phase)                       |
+| 401         | `Unauthenticated` | Bearer token missing or invalid (only when [auth](#authentication) is enabled) |
+| 404         | `TaskNotFound`    | Task ID not found or no live log channel                                       |
+| 409         | `AlreadyExists`   | A live submission still owns the same task id (including between attempts)     |
+| 413         | `PayloadTooLarge` | Request body exceeds 4 MiB (`RequestBodyLimitLayer`) — see "Size limits"       |
+| 500         | `Internal`        | Supervisor, runner, mapping, or other infrastructure failure                   |
 
 ### JSON field presence
 
@@ -623,12 +623,12 @@ grpcurl -plaintext \
 
 | gRPC Status          | ApiError variant      | When                                                                |
 |----------------------|-----------------------|---------------------------------------------------------------------|
-| `INVALID_ARGUMENT`   | `InvalidRequest`      | Validation failure, also `Core::InvalidSpec`                        |
+| `INVALID_ARGUMENT`   | `InvalidRequest`      | Validation failure                                                  |
 | `UNAUTHENTICATED`    | `Unauthenticated`     | Bearer token missing or invalid (only when [auth](#authentication) is enabled) |
-| `NOT_FOUND`          | `TaskNotFound`        | Task ID not found or no live log channel, also `Core::NotFound`     |
-| `ALREADY_EXISTS`     | `Core::AlreadyExists` | A live submission still owns the same task id (including between attempts) |
+| `NOT_FOUND`          | `TaskNotFound`        | Task ID not found or no live log channel                            |
+| `ALREADY_EXISTS`     | `AlreadyExists`       | A live submission still owns the same task id (including between attempts) |
 | `RESOURCE_EXHAUSTED` | `PayloadTooLarge`     | Message exceeds the 4 MiB cap — see "Size limits"                   |
-| `INTERNAL`           | `Internal` / `Core`   | Supervisor or internal error (also `Core::{Supervisor,Mapping,Runner}`) |
+| `INTERNAL`           | `Internal`            | Supervisor, runner, mapping, or other infrastructure failure        |
 
 ---
 

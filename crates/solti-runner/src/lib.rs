@@ -33,7 +33,7 @@
 //! |---------------|--------------------------------------------------------|
 //! | Runner plugin | [`Runner`], [`RunnerRouter`]                           |
 //! | Build data    | [`BuildContext`]                                       |
-//! | Output        | [`OutputRegistry`], [`OutputSink`]                     |
+//! | Output        | [`OutputPublisher`], [`OutputSink`]                    |
 //! | Run identity  | [`RunId`], [`make_run_id`]                             |
 //! | Metrics       | [`MetricsBackend`], [`MetricsHandle`], [`NoOpMetrics`] |
 //! | Metric labels | [`RunnerType`], [`MetricOutcome`], [`RunnerErrorKind`] |
@@ -75,7 +75,9 @@
 //!
 //! ## Output and Metrics
 //!
-//! [`OutputRegistry`] lets runners publish live stdout and stderr lines for HTTP or gRPC log tails.
+//! [`OutputPublisher`] is the narrow producer port used to obtain an
+//! attempt-scoped [`OutputSink`]. Channel lifecycle and subscriptions belong to
+//! the composition layer, not to runners.
 //!
 //! [`MetricsBackend`] is the task execution metrics trait.
 //! The default backend is [`NoOpMetrics`]; production agents can use `solti-prometheus`.
@@ -104,7 +106,7 @@ mod id;
 pub use id::{RunId, make_run_id};
 
 mod output;
-pub use output::{OutputRegistry, OutputSink};
+pub use output::{OutputPublisher, OutputPublisherHandle, OutputSink, noop_output_publisher};
 
 pub mod metrics;
 pub use metrics::{

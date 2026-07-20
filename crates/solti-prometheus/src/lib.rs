@@ -90,15 +90,26 @@
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
+#[cfg(any(
+    feature = "api",
+    feature = "discover",
+    feature = "runner",
+    feature = "state",
+    feature = "taskvisor"
+))]
 mod register;
 
+#[cfg(feature = "taskvisor")]
 mod subscriber;
+#[cfg(feature = "taskvisor")]
 pub use subscriber::{DEFAULT_QUEUE_CAPACITY, PrometheusSubscriber};
 
 mod process;
 pub use process::register_process_collector;
 
+#[cfg(feature = "runner")]
 mod backend;
+#[cfg(feature = "runner")]
 pub use backend::PrometheusMetrics;
 
 mod info;

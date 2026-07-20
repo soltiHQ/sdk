@@ -13,7 +13,7 @@
      │        (backoff on failure)      │
 ```
 
-Each cycle stamps the base request with fresh `ts` and `uptime_seconds`, then sends via the configured transport.
+Each cycle stamps the base request with fresh `ts` and `uptime_seconds`, then sends via the configured transport. The host supplies the monotonic uptime source and explicitly owns its epoch.
 
 ## Protobuf contract
 
@@ -31,7 +31,7 @@ Defined in `proto/solti/discover/v1/discovery.proto` (package `solti.discover.v1
 | `os`                   | string             | OS distribution info (Linux `PRETTY_NAME`) |
 | `metadata`             | map<string,string> | User-provided key-value pairs              |
 | `ts`                   | int64              | Unix timestamp (seconds)                   |
-| `uptime_seconds`       | int64              | Agent process uptime                       |
+| `uptime_seconds`       | int64              | Elapsed time from the host-owned agent-composition epoch |
 | `endpoint_type`        | EndpointType       | `UNSPECIFIED = 0`, `GRPC = 1`, `HTTP = 2`  |
 | `api_version`          | int32              | Agent API protocol version (`1` = v1)      |
 | `heartbeat_interval_s` | int32              | Agent-reported sync interval (min 1)       |

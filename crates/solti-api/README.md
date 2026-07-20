@@ -16,12 +16,10 @@ Both transports delegate to an `ApiHandler` trait, decoupling wire format from b
      │                  │
      ▼                  ▼
  ApiHandler trait (transport-agnostic)
-     │
-     ▼
- SupervisorApiAdapter
-     │
-     ▼
- solti_core::SupervisorApi
+     └──► optional SupervisorApiAdapter (feature = "core-adapter")
+                  │
+                  ▼
+         solti_core::SupervisorApi
 ```
 
 ## Versioning
@@ -63,7 +61,7 @@ Per-version API surface is documented in separate files: [api_v1.md](api_v1.md).
 |------------------------|----------------------------------------------------------------------------------|
 | `ApiHandler`           | Transport-agnostic trait with 7 operations (management, runs, and log stream)     |
 | `OutputEventStream`    | `Pin<Box<dyn Stream<Item = OutputEvent> + Send>>` returned by `stream_task_logs` |
-| `SupervisorApiAdapter` | Default adapter bridging to `SupervisorApi`                                      |
+| `SupervisorApiAdapter` | Optional adapter bridging to `SupervisorApi` (feature `core-adapter`)            |
 | `ApiError`             | Unified error mapped to gRPC Status / HTTP JSON                                  |
 | `TaskApiService<H>`    | gRPC server impl (feature `grpc`)                                                |
 | `HttpApi<H>`           | axum router builder (feature `http`)                                             |
@@ -76,16 +74,17 @@ Per-version API surface is documented in separate files: [api_v1.md](api_v1.md).
 |-------------------|--------------------------------|-----------------------------|---------------------------|
 | `InvalidRequest`  | `INVALID_ARGUMENT`             | `400 Bad Request`           | `"InvalidRequest"`        |
 | `Unauthenticated` | `UNAUTHENTICATED`              | `401 Unauthorized`          | `"Unauthenticated"`       |
+| `AlreadyExists`   | `ALREADY_EXISTS`               | `409 Conflict`              | `"AlreadyExists"`         |
 | `TaskNotFound`    | `NOT_FOUND`                    | `404 Not Found`             | `"TaskNotFound"`          |
 | `PayloadTooLarge` | `RESOURCE_EXHAUSTED`           | `413 Payload Too Large`     | `"PayloadTooLarge"`       |
 | `Internal`        | `INTERNAL`                     | `500 Internal Server Error` | `"Internal"`              |
-| `Core`            | derived from inner `CoreError` | derived from inner          | derived from inner        |
 
-`Core` is split by the wrapped [`solti_core::CoreError`]:
-- `InvalidSpec` → `INVALID_ARGUMENT` / `400 Bad Request` / `"InvalidRequest"`
-- `AlreadyExists` → `ALREADY_EXISTS` / `409 Conflict` / `"AlreadyExists"`
-- `NotFound` → `NOT_FOUND` / `404 Not Found` / `"TaskNotFound"`
-- everything else (`Supervisor`, `Mapping`, `Runner`) → `INTERNAL` / `500 Internal Server Error` / `"Internal"`
+With `core-adapter`, `CoreError` is translated at the adapter boundary:
+
+- `InvalidSpec` → `InvalidRequest`;
+- `AlreadyExists` → `AlreadyExists`;
+- `NotFound` → `TaskNotFound`;
+- everything else (`Supervisor`, `Mapping`, `Runner`, or a future variant) → `Internal`.
 
 HTTP error body:
 ```json
@@ -98,13 +97,17 @@ Script bodies are separately capped in the model at [`solti_model::MAX_SCRIPT_BO
 
 ## Feature flags
 
-| Flag   | Enables                                                                           | Dependencies                            |
-|--------|-----------------------------------------------------------------------------------|-----------------------------------------|
-| `grpc` | `GrpcApi`, `TaskApiService`, `TaskServiceServer`, proto codegen                   | `tonic`, `tonic-prost`, `prost`         |
-| `http` | `HttpApi`, axum router, proto-JSON serde                                          | `axum`, `serde_json`, `prost`, `pbjson` |
-| `tls`  | `to_tonic_server_tls(&ServerTlsConfig)` adapter (under `grpc`); pulls `solti-tls` | `solti-tls`; activates `tonic/tls-ring` |
+| Flag           | Enables                                                         | Dependencies                            |
+|----------------|-----------------------------------------------------------------|-----------------------------------------|
+| `core-adapter` | `SupervisorApiAdapter`                                           | `solti-core`                            |
+| `grpc`         | `GrpcApi`, `TaskApiService`, `TaskServiceServer`, proto codegen | `tonic`, `tonic-prost`, `prost`         |
+| `grpc-tls`     | `to_tonic_server_tls(&ServerTlsConfig)`; implies `grpc`         | `solti-tls`; activates `tonic/tls-ring` |
+| `http`         | `HttpApi`, axum router, proto-JSON serde                        | `axum`, `serde_json`, `prost`, `pbjson` |
 
-No feature is enabled by default. `tls` **implies `grpc`** — the adapter targets tonic, and enabling `tls` alone would pull `solti-tls` in without compiling anything. HTTP TLS is terminated by the binary via `axum-server` (see below), not by this feature.
+No feature is enabled by default. `grpc-tls` implies `grpc`; HTTP TLS is
+terminated by the binary via `axum-server`, not by this feature. The former
+`tls` feature and `ApiError::Core` variant were removed in the stage 2 breaking
+boundary cleanup.
 
 ### Enabling TLS
 

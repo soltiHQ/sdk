@@ -1,10 +1,9 @@
-//! Logging and event traces for Solti agents.
+//! Structured logging and timezone support for Solti agents.
 //!
 //! `solti-observe` is the logging crate for the Solti SDK.
-//! It installs a [`tracing`] subscriber, keeps logger config in small value types,
-//! and can forward taskvisor lifecycle events into your logs.
+//! It installs a [`tracing`] subscriber and keeps logger config in small value types.
 //!
-//! Use it when you build an agent binary and want one clear place for logs, local timestamps, and task lifecycle traces.
+//! Use it when you build an agent binary and want one clear place for logs and local timestamps.
 //!
 //! ## Quick Start
 //!
@@ -60,7 +59,6 @@
 //! | [`LoggerTimeZone`]    | always          | `utc` or `local` timestamps                |
 //! | [`init_logger`]       | always          | Install the global tracing subscriber      |
 //! | [`init_local_offset`] | always          | Cache local UTC offset before Tokio starts |
-//! | `TracingBridge`       | `subscriber`    | Send taskvisor events to `tracing`         |
 //! | `timezone_sync`       | `timezone-sync` | Build a supervised offset refresh task     |
 //!
 //! ## Core Model
@@ -76,14 +74,12 @@
 //!   |-- journald logger (Linux only)
 //!   |
 //!   v
-//! tracing macros and taskvisor event logs
+//! tracing macros
 //! ```
 //!
-//! Optional feature pieces plug into the same process:
+//! The optional timezone task plugs into the same process:
 //!
 //! ```text
-//! taskvisor events -- TracingBridge --> tracing
-//!
 //! timezone_sync task -- refresh attempt --> local offset cache
 //! ```
 //!
@@ -103,19 +99,6 @@
 //! assert_eq!(config.level.as_str(), "solti_core=debug,info");
 //! ```
 //!
-//! ## Event Logging
-//!
-//! Enable the `subscriber` feature to re-export `taskvisor::TracingBridge`.
-//! It logs supervisor and controller events with target `taskvisor`.
-//!
-//! ```rust,ignore
-//! use std::sync::Arc;
-//! use solti_observe::TracingBridge;
-//! use taskvisor::Subscribe;
-//!
-//! let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(TracingBridge)];
-//! ```
-//!
 //! ## Timezone Sync
 //!
 //! Enable the `timezone-sync` feature to use `timezone_sync()`.
@@ -125,7 +108,6 @@
 //! ## Also
 //!
 //! - [`tracing`] is the structured logging framework used underneath.
-//! - `taskvisor::Subscribe` is the subscriber contract used by `TracingBridge`.
 //! - `solti-prometheus` is the metrics crate for the same event stream.
 //! - See `examples/agentd-http` and `examples/agentd-grpc` for full agent wiring.
 
@@ -146,11 +128,3 @@ pub use logger::{
 /// Build the periodic timezone refresh task.
 #[cfg(feature = "timezone-sync")]
 pub use logger::timezone_sync;
-
-/// Taskvisor subscriber that writes supervision events to `tracing`.
-///
-/// Enable the `subscriber` feature to use this re-export. The type itself
-/// lives in taskvisor; this crate exposes it next to the logger setup so agent
-/// binaries can wire all observability in one place.
-#[cfg(feature = "subscriber")]
-pub use taskvisor::TracingBridge;
