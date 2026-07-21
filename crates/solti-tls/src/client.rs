@@ -32,14 +32,15 @@ use crate::{PemSource, TlsError};
 /// - [`PemSource`], [`TlsError`].
 #[derive(Debug, Clone)]
 pub struct ClientTlsConfig {
-    /// Trusted CA bundle for verifying the server's certificate.
-    pub ca: PemSource,
-    /// Client certificate chain (`None` = no client cert).
-    pub client_cert: Option<PemSource>,
-    /// Client private key.
-    pub client_key: Option<PemSource>,
-    /// ALPN protocol list, in preference order.
-    pub alpn: Vec<Vec<u8>>,
+    ca: PemSource,
+    client_identity: Option<ClientIdentity>,
+    alpn: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct ClientIdentity {
+    cert: PemSource,
+    key: PemSource,
 }
 
 impl ClientTlsConfig {
@@ -55,10 +56,30 @@ impl ClientTlsConfig {
     ///     .build()
     ///     .unwrap();
     ///
-    /// assert!(cfg.client_cert.is_none());
+    /// assert!(cfg.client_identity().is_none());
     /// ```
     pub fn builder() -> ClientTlsConfigBuilder {
         ClientTlsConfigBuilder::default()
+    }
+
+    /// Trusted CA bundle used to verify the server certificate.
+    pub fn ca(&self) -> &PemSource {
+        &self.ca
+    }
+
+    /// Client certificate and private key used for mTLS.
+    ///
+    /// The pair is either present in full or absent. It cannot be partially
+    /// configured on a built [`ClientTlsConfig`].
+    pub fn client_identity(&self) -> Option<(&PemSource, &PemSource)> {
+        self.client_identity
+            .as_ref()
+            .map(|identity| (&identity.cert, &identity.key))
+    }
+
+    /// ALPN protocols in preference order.
+    pub fn alpn(&self) -> &[Vec<u8>] {
+        &self.alpn
     }
 
     /// Build a [`rustls::ClientConfig`].
@@ -109,17 +130,15 @@ impl ClientTlsConfig {
 
         let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
 
-        let mut config = match (self.client_cert, self.client_key) {
-            (Some(cert_src), Some(key_src)) => {
-                let cert_bytes = cert_src.read()?;
-                let key_bytes = key_src.read()?;
+        let mut config = match self.client_identity {
+            Some(identity) => {
+                let cert_bytes = identity.cert.read()?;
+                let key_bytes = identity.key.read()?;
                 let certs = crate::load_certs_from_pem(cert_bytes.as_slice())?;
                 let key = crate::load_key_from_pem(key_bytes.as_slice())?;
                 builder.with_client_auth_cert(certs, key)?
             }
-            (None, None) => builder.with_no_client_auth(),
-            (Some(_), None) => return Err(TlsError::MissingField("client_key")),
-            (None, Some(_)) => return Err(TlsError::MissingField("client_cert")),
+            None => builder.with_no_client_auth(),
         };
 
         config.alpn_protocols = self.alpn;
@@ -149,7 +168,7 @@ impl ClientTlsConfigBuilder {
     ///     .build()
     ///     .unwrap();
     ///
-    /// assert!(matches!(cfg.ca, PemSource::Bytes(_)));
+    /// assert!(matches!(cfg.ca(), PemSource::Bytes(_)));
     /// ```
     pub fn ca(mut self, src: PemSource) -> Self {
         self.ca = Some(src);
@@ -172,7 +191,7 @@ impl ClientTlsConfigBuilder {
     ///     .build()
     ///     .unwrap();
     ///
-    /// assert!(cfg.client_cert.is_some());
+    /// assert!(cfg.client_identity().is_some());
     /// ```
     pub fn client_cert(mut self, src: PemSource) -> Self {
         self.client_cert = Some(src);
@@ -195,7 +214,7 @@ impl ClientTlsConfigBuilder {
     ///     .build()
     ///     .unwrap();
     ///
-    /// assert!(cfg.client_key.is_some());
+    /// assert!(cfg.client_identity().is_some());
     /// ```
     pub fn client_key(mut self, src: PemSource) -> Self {
         self.client_key = Some(src);
@@ -218,7 +237,7 @@ impl ClientTlsConfigBuilder {
     ///     .build()
     ///     .unwrap();
     ///
-    /// assert_eq!(cfg.alpn, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    /// assert_eq!(cfg.alpn(), &[b"h2".to_vec(), b"http/1.1".to_vec()]);
     /// ```
     pub fn with_alpn<I, S>(mut self, protocols: I) -> Self
     where
@@ -285,10 +304,14 @@ impl ClientTlsConfigBuilder {
             (None, Some(_)) => return Err(TlsError::MissingField("client_cert")),
             _ => {}
         }
+        let client_identity = self
+            .client_cert
+            .zip(self.client_key)
+            .map(|(cert, key)| ClientIdentity { cert, key });
+
         Ok(ClientTlsConfig {
             ca,
-            client_cert: self.client_cert,
-            client_key: self.client_key,
+            client_identity,
             alpn: self.alpn,
         })
     }
@@ -305,10 +328,9 @@ mod tests {
             .ca_pem_bytes(b"--FAKE CA--".to_vec())
             .build()
             .unwrap();
-        assert!(matches!(cfg.ca, PemSource::Bytes(_)));
-        assert!(cfg.client_cert.is_none());
-        assert!(cfg.client_key.is_none());
-        assert!(cfg.alpn.is_empty());
+        assert!(matches!(cfg.ca(), PemSource::Bytes(_)));
+        assert!(cfg.client_identity().is_none());
+        assert!(cfg.alpn().is_empty());
     }
 
     #[test]
@@ -325,8 +347,9 @@ mod tests {
             .client_key_pem_bytes(b"key".to_vec())
             .build()
             .unwrap();
-        assert!(matches!(cfg.client_cert, Some(PemSource::Bytes(_))));
-        assert!(matches!(cfg.client_key, Some(PemSource::Bytes(_))));
+        let (cert, key) = cfg.client_identity().expect("mTLS identity");
+        assert!(matches!(cert, PemSource::Bytes(_)));
+        assert!(matches!(key, PemSource::Bytes(_)));
     }
 
     #[test]
@@ -356,7 +379,7 @@ mod tests {
             .with_alpn(["h2", "http/1.1"])
             .build()
             .unwrap();
-        assert_eq!(cfg.alpn, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        assert_eq!(cfg.alpn(), &[b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 
     fn rcgen_self_signed() -> (Vec<u8>, Vec<u8>) {
@@ -385,52 +408,6 @@ mod tests {
             .build()
             .unwrap();
         let _rustls = cfg.into_rustls_config().unwrap();
-    }
-
-    #[test]
-    fn into_rustls_config_succeeds_when_constructed_directly_without_mtls() {
-        let (ca, _) = rcgen_self_signed();
-        let cfg = ClientTlsConfig {
-            ca: PemSource::Bytes(ca),
-            client_cert: None,
-            client_key: None,
-            alpn: Vec::new(),
-        };
-        let _rustls = cfg.into_rustls_config().unwrap();
-    }
-
-    #[test]
-    fn into_rustls_config_rejects_direct_cert_without_key() {
-        let (ca, _) = rcgen_self_signed();
-        let (cert, _) = rcgen_self_signed();
-        let cfg = ClientTlsConfig {
-            ca: PemSource::Bytes(ca),
-            client_cert: Some(PemSource::Bytes(cert)),
-            client_key: None,
-            alpn: Vec::new(),
-        };
-        let err = cfg.into_rustls_config().unwrap_err();
-        assert!(
-            matches!(err, TlsError::MissingField("client_key")),
-            "unpaired client_cert must not silently disable mTLS, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn into_rustls_config_rejects_direct_key_without_cert() {
-        let (ca, _) = rcgen_self_signed();
-        let (_, key) = rcgen_self_signed();
-        let cfg = ClientTlsConfig {
-            ca: PemSource::Bytes(ca),
-            client_cert: None,
-            client_key: Some(PemSource::Bytes(key)),
-            alpn: Vec::new(),
-        };
-        let err = cfg.into_rustls_config().unwrap_err();
-        assert!(
-            matches!(err, TlsError::MissingField("client_cert")),
-            "unpaired client_key must not silently disable mTLS, got {err:?}"
-        );
     }
 
     #[test]

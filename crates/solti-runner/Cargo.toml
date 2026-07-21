@@ -16,11 +16,15 @@ default = []
 
 [dependencies]
 bytes       = { workspace = true }
+serde       = { workspace = true }
 taskvisor   = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 
 solti-model = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

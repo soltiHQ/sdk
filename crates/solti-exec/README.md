@@ -1,7 +1,7 @@
 # solti-exec
 Task execution backends for the solti task system.
 
-Provides concrete `Runner` implementations that turn `TaskSpec` into running OS processes.
+Provides concrete `Runner` implementations that turn `Task` resources into running OS processes.
 
 It currently ships a single backend: `SubprocessRunner` with POSIX rlimits and optional Linux sandboxing (cgroup v2, capabilities, seccomp, namespaces).
 
@@ -28,18 +28,19 @@ fn main() -> Result<(), solti_exec::ExecError> {
 
 ## Architecture
 ```text
- TaskSpec { kind: Subprocess(..) }
+ Task { spec.workload: Subprocess(..) }
      │
      ▼  RunnerRouter::pick()
  SubprocessRunner
      │
-     ├──► build_task_config(spec, ctx)
+     ├──► build_task_config(task, ctx)
      │     ├──► validate/resolve mode → command + args + optional script body
      │     ├──► merge_env(task_env, runner_env)
      │     └──► SubprocessTaskConfig { run_id, command, args, env, cwd }
      │
      └──► each task attempt
            └──► run_subprocess(ctx, cancel)
+                 ├──► allocate attempt + OutputSink
                  ├──► prepare backend (cgroup dirs, if configured)
                  ├──► materialize script tempfile (Script mode)
                  ├──► build Command + apply pre_exec hooks
@@ -52,7 +53,7 @@ fn main() -> Result<(), solti_exec::ExecError> {
 
 ## Subprocess lifecycle
 ```text
- task attempt ──► prepare_backend ──► script tempfile ──► spawn
+ task attempt ──► allocate attempt/output ──► prepare_backend ──► script tempfile ──► spawn
                                       (when needed)        │
                                                            ├──► OutputSink + log streams
                                                            ├──► child.wait() → evaluate exit
@@ -66,9 +67,8 @@ fn main() -> Result<(), solti_exec::ExecError> {
 
 | Type                      | Description                                                 |
 |---------------------------|-------------------------------------------------------------|
-| `SubprocessRunner`        | `Runner` impl for `TaskKind::Subprocess`                    |
+| `SubprocessRunner`        | `Runner` impl for `TaskWorkload::Subprocess`                |
 | `SubprocessBackendConfig` | Builder for rlimits + cgroups + security + logger settings  |
-| `SubprocessTaskConfig`    | Fully resolved per-task config (command, args, env, cwd)    |
 | `LogConfig`               | Stdout/stderr logging: truncation length, log levels        |
 | `RlimitConfig`            | POSIX rlimits (nofile, fsize, core)                         |
 | `CgroupLimits`            | cgroup v2: CPU quota/period, memory, PIDs                   |

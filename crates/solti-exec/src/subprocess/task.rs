@@ -1,11 +1,11 @@
 //! # Task: resolved subprocess configuration.
 //!
 //! [`SubprocessTaskConfig`] is the **fully resolved** config passed to the subprocess spawn loop.
-//! It is produced by [`SubprocessRunner::build_task_config`] from a [`TaskSpec`](solti_model::TaskSpec) + [`BuildContext`](solti_runner::BuildContext).
+//! It is produced by [`SubprocessRunner::build_task_config`] from a [`Task`](solti_model::Task) + [`BuildContext`](solti_runner::BuildContext).
 //!
 //! ## How it fits
 //! ```text
-//! TaskSpec (model)
+//! Task resource (model)
 //!     │
 //!     ├──► SubprocessRunner::build_task_config()
 //!     │     ├──► resolve SubprocessMode → (command, args)
@@ -41,7 +41,7 @@ use crate::ExecError;
 /// - [`SubprocessRunner`](super::SubprocessRunner) produces this config in `build_task`.
 /// - [`SubprocessBackendConfig`](super::SubprocessBackendConfig) runner-level settings applied at spawn.
 #[derive(Debug, Clone)]
-pub struct SubprocessTaskConfig {
+pub(crate) struct SubprocessTaskConfig {
     /// End-to-End log identifier.
     pub(crate) run_id: Arc<str>,
     /// Raw sequence number from run id generation (used for cgroup naming).

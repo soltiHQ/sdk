@@ -12,14 +12,22 @@
 mod spec;
 pub use spec::{TaskSpec, TaskSpecBuilder};
 
+mod annotations;
+pub use annotations::Annotations;
+
+mod condition;
+pub use condition::{ConditionStatus, TaskCondition, TaskConditionType};
+
 pub(crate) mod metadata;
-pub use metadata::ObjectMeta;
+pub use metadata::{ObjectMeta, Uid};
 
 mod status;
 pub use status::TaskStatus;
 
 mod task;
-pub use task::Task;
+pub use task::{
+    DesiredChange, TASK_API_VERSION, TASK_KIND, Task, TaskManifest, TaskManifestMeta, TypeMeta,
+};
 
 mod run;
 pub use run::TaskRun;

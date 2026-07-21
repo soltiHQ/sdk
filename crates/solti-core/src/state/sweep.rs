@@ -3,15 +3,19 @@
 //! [`state_sweep`] builds an embedded periodic task that sweeps expired runs and terminal tasks from [`TaskState`](super::TaskState).
 
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
+    AdmissionPolicy, BackoffPolicy, EmbeddedSpec, JitterPolicy, RestartPolicy, TaskManifest,
+    TaskSpec, TaskWorkload,
 };
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tracing::debug;
 
 use super::{StateConfig, TaskState};
 
-/// Logical slot name for the state sweep task.
-pub const SWEEP_SLOT: &str = "solti-state-sweep";
+/// Reserved resource name for the state sweep task.
+pub(crate) const SWEEP_NAME: &str = "solti-state-sweep";
+
+/// Reserved logical slot for the state sweep task.
+pub(crate) const SWEEP_SLOT: &str = "solti-state-sweep";
 
 /// Per-attempt timeout in milliseconds (30 seconds).
 const SWEEP_TIMEOUT_MS: u64 = 30_000;
@@ -43,13 +47,13 @@ const BACKOFF_FACTOR: f64 = 2.0;
 /// ```text
 /// let state = TaskState::new();
 /// let config = StateConfig::default();
-/// let (task, spec) = state_sweep(state, config);
-/// supervisor.submit_with_task(task, &spec).await?;
+/// let (task_ref, task) = state_sweep(state, config);
+/// supervisor.create_with_task(task, task_ref).await?;
 /// ```
-pub fn state_sweep(state: TaskState, config: StateConfig) -> (TaskRef, TaskSpec) {
+pub(crate) fn state_sweep(state: TaskState, config: StateConfig) -> (TaskRef, TaskManifest) {
     let sweep_interval_ms = config.sweep_interval.as_millis() as u64;
 
-    let task: TaskRef = TaskFn::arc(SWEEP_SLOT, move |ctx: TaskContext| {
+    let task_ref: TaskRef = TaskFn::arc(SWEEP_NAME, move |ctx: TaskContext| {
         let state = state.clone();
         let config = config.clone();
 
@@ -75,12 +79,17 @@ pub fn state_sweep(state: TaskState, config: StateConfig) -> (TaskRef, TaskSpec)
         max_ms: BACKOFF_MAX_MS,
         factor: BACKOFF_FACTOR,
     };
-    let spec = TaskSpec::builder(SWEEP_SLOT, TaskKind::Embedded, SWEEP_TIMEOUT_MS)
+    let workload = TaskWorkload::Embedded(
+        EmbeddedSpec::new(env!("CARGO_PKG_VERSION")).expect("package version must be non-empty"),
+    );
+    let spec = TaskSpec::builder(SWEEP_SLOT, workload, SWEEP_TIMEOUT_MS)
         .restart(RestartPolicy::periodic(sweep_interval_ms))
         .backoff(backoff)
         .admission(AdmissionPolicy::Replace)
         .build()
         .expect("state sweep spec must be valid");
 
-    (task, spec)
+    let manifest =
+        TaskManifest::new(SWEEP_NAME, spec).expect("state sweep Task manifest must be valid");
+    (task_ref, manifest)
 }

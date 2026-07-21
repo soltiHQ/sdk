@@ -15,17 +15,21 @@ pub(crate) fn output_event_to_proto(ev: OutputEvent) -> proto_api::StreamTaskLog
     let kind = match ev {
         OutputEvent::Chunk(c) => Kind::Chunk(output_chunk_to_proto(c)),
         OutputEvent::RunStarted {
+            generation,
             attempt,
             started_at,
         } => Kind::RunStarted(proto_api::RunStarted {
+            generation,
             attempt,
             started_at: system_time_to_ms(started_at),
         }),
         OutputEvent::RunFinished {
+            generation,
             attempt,
             exit_code,
             finished_at,
         } => Kind::RunFinished(proto_api::RunFinished {
+            generation,
             attempt,
             exit_code,
             finished_at: system_time_to_ms(finished_at),
@@ -39,6 +43,7 @@ pub(crate) fn output_event_to_proto(ev: OutputEvent) -> proto_api::StreamTaskLog
 
 fn output_chunk_to_proto(c: OutputChunk) -> proto_api::OutputChunk {
     proto_api::OutputChunk {
+        generation: c.generation,
         stream: stream_kind_to_proto(c.stream) as i32,
         ts: system_time_to_ms(c.ts),
         attempt: c.attempt,
@@ -65,6 +70,7 @@ mod tests {
     #[test]
     fn chunk_maps_all_fields() {
         let ev = OutputEvent::Chunk(OutputChunk {
+            generation: 2,
             attempt: 7,
             stream: StreamKind::Stderr,
             seq: 42,
@@ -79,6 +85,7 @@ mod tests {
             other => panic!("expected Chunk, got {other:?}"),
         };
         assert_eq!(chunk.attempt, 7);
+        assert_eq!(chunk.generation, 2);
         assert_eq!(chunk.stream, proto_api::OutputStreamKind::Stderr as i32);
         assert_eq!(chunk.seq, 42);
         assert_eq!(chunk.ts, 1_700_000_000_000);
@@ -91,6 +98,7 @@ mod tests {
         let original_ptr = original.as_ptr();
 
         let ev = OutputEvent::Chunk(OutputChunk {
+            generation: 1,
             attempt: 1,
             stream: StreamKind::Stdout,
             seq: 0,
@@ -113,12 +121,14 @@ mod tests {
     #[test]
     fn run_started_maps_attempt_and_ts() {
         let ev = OutputEvent::RunStarted {
+            generation: 4,
             attempt: 3,
             started_at: UNIX_EPOCH + Duration::from_millis(1234),
         };
         match output_event_to_proto(ev).kind.unwrap() {
             proto_api::stream_task_logs_response::Kind::RunStarted(r) => {
                 assert_eq!(r.attempt, 3);
+                assert_eq!(r.generation, 4);
                 assert_eq!(r.started_at, 1234);
             }
             other => panic!("expected RunStarted, got {other:?}"),
@@ -128,6 +138,7 @@ mod tests {
     #[test]
     fn run_finished_carries_exit_code_and_ts() {
         let ev = OutputEvent::RunFinished {
+            generation: 5,
             attempt: 2,
             exit_code: Some(0),
             finished_at: UNIX_EPOCH + Duration::from_millis(2222),
@@ -135,6 +146,7 @@ mod tests {
         match output_event_to_proto(ev).kind.unwrap() {
             proto_api::stream_task_logs_response::Kind::RunFinished(r) => {
                 assert_eq!(r.attempt, 2);
+                assert_eq!(r.generation, 5);
                 assert_eq!(r.exit_code, Some(0));
                 assert_eq!(r.finished_at, 2222);
             }

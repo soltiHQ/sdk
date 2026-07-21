@@ -15,7 +15,7 @@ and read their run history from one Rust API.
 
 ```rust,no_run
 use solti_core::{CoreError, StateConfig, SupervisorApi};
-use solti_model::{RestartPolicy, TaskKind, TaskSpec};
+use solti_model::{EmbeddedSpec, RestartPolicy, TaskManifest, TaskSpec, TaskWorkload};
 use solti_runner::RunnerRouter;
 use taskvisor::{ControllerConfig, SupervisorConfig, TaskContext, TaskError, TaskFn};
 
@@ -29,16 +29,19 @@ async fn demo() -> Result<(), CoreError> {
     )
     .await?;
 
-    let task = TaskFn::arc("embedded-demo", |_ctx: TaskContext| async move {
+    let task_ref = TaskFn::arc("embedded-demo", |_ctx: TaskContext| async move {
         Ok::<(), TaskError>(())
     });
-    let spec = TaskSpec::builder("embedded", TaskKind::Embedded, 1_000_u64)
+    let workload = TaskWorkload::Embedded(EmbeddedSpec::new("v1")?);
+    let spec = TaskSpec::builder("embedded", workload, 1_000_u64)
         .restart(RestartPolicy::Never)
         .build()?;
+    let manifest = TaskManifest::new("embedded-demo", spec)?;
+    let name = manifest.name().clone();
 
-    let task_id = api.submit_with_task(task, &spec).await?;
-    let _task = api.get_task(&task_id);
-    let _runs = api.list_task_runs(&task_id);
+    api.create_with_task(manifest, task_ref).await?;
+    let _task = api.get_task(&name);
+    let _runs = api.list_task_runs(&name);
 
     api.shutdown().await?;
     Ok(())

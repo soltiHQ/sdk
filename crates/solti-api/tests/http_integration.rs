@@ -13,7 +13,7 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 use solti_api::{ApiError, ApiHandler, HttpApi};
-use solti_model::{Task, TaskId, TaskPage, TaskQuery, TaskRun, TaskSpec};
+use solti_model::{Task, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun};
 
 /// Scriptable mock. `Default` succeeds at everything with harmless fixtures;
 /// flip a flag to exercise the error branches.
@@ -26,12 +26,17 @@ struct MockHandler {
 
 #[async_trait]
 impl ApiHandler for MockHandler {
-    async fn submit_task(&self, _spec: TaskSpec) -> Result<TaskId, ApiError> {
+    async fn create_task(&self, manifest: TaskManifest) -> Result<Task, ApiError> {
         self.submit_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(TaskId::from("tsk_mock_1"))
+        Task::from_manifest(manifest).map_err(|error| ApiError::Internal(error.to_string()))
     }
 
-    async fn get_task_status(&self, _id: &TaskId) -> Result<Option<Task>, ApiError> {
+    async fn apply_task(&self, manifest: TaskManifest) -> Result<Task, ApiError> {
+        self.submit_calls.fetch_add(1, Ordering::SeqCst);
+        Task::from_manifest(manifest).map_err(|error| ApiError::Internal(error.to_string()))
+    }
+
+    async fn get_task(&self, _id: &TaskId) -> Result<Option<Task>, ApiError> {
         Ok(None)
     }
 
@@ -42,8 +47,12 @@ impl ApiHandler for MockHandler {
         })
     }
 
-    async fn list_task_runs(&self, _id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
-        Ok(Vec::new())
+    async fn list_task_runs(&self, id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
+        if id.as_str() == "runs-missing" {
+            Err(ApiError::TaskNotFound(id.to_string()))
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     async fn delete_task(&self, id: &TaskId) -> Result<(), ApiError> {
@@ -73,10 +82,12 @@ impl ApiHandler for MockHandler {
 
         let events = vec![
             OutputEvent::RunStarted {
+                generation: 1,
                 attempt: 1,
                 started_at: UNIX_EPOCH + Duration::from_millis(1000),
             },
             OutputEvent::Chunk(OutputChunk {
+                generation: 1,
                 attempt: 1,
                 stream: StreamKind::Stdout,
                 seq: 0,
@@ -100,8 +111,18 @@ async fn body_json(resp: axum::http::Response<Body>) -> Value {
     serde_json::from_slice(&bytes).expect("response body must be valid json")
 }
 
+fn assert_status(body: &Value, reason: &str, code: u16) {
+    assert_eq!(body["apiVersion"], "v1");
+    assert_eq!(body["kind"], "Status");
+    assert_eq!(body["metadata"], serde_json::json!({}));
+    assert_eq!(body["status"], "Failure");
+    assert_eq!(body["reason"], reason);
+    assert_eq!(body["code"], code);
+    assert!(body["message"].is_string());
+}
+
 #[tokio::test]
-async fn submit_task_missing_spec_returns_400_with_structured_error() {
+async fn create_task_missing_required_resource_fields_returns_400() {
     let handler = Arc::new(MockHandler::default());
     let app = router_with(Arc::clone(&handler));
 
@@ -109,7 +130,7 @@ async fn submit_task_missing_spec_returns_400_with_structured_error() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/tasks")
+                .uri("/apis/solti.io/v1/tasks")
                 .header("content-type", "application/json")
                 .body(Body::from("{}"))
                 .unwrap(),
@@ -119,16 +140,35 @@ async fn submit_task_missing_spec_returns_400_with_structured_error() {
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_json(resp).await;
-    assert_eq!(body["error"], "InvalidRequest");
-    assert!(
-        body["message"].as_str().unwrap().contains("missing spec"),
-        "expected message to mention 'missing spec', got {body:?}"
+    assert_status(&body, "BadRequest", 400);
+    assert_eq!(handler.submit_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn create_task_without_json_content_type_returns_status_415() {
+    let handler = Arc::new(MockHandler::default());
+    let response = router_with(Arc::clone(&handler))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/apis/solti.io/v1/tasks")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_status(
+        &body_json(response).await,
+        "UnsupportedMediaType",
+        StatusCode::UNSUPPORTED_MEDIA_TYPE.as_u16(),
     );
     assert_eq!(handler.submit_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
-async fn submit_task_malformed_json_returns_envelope() {
+async fn create_task_malformed_json_returns_envelope() {
     let handler = Arc::new(MockHandler::default());
     let app = router_with(Arc::clone(&handler));
 
@@ -136,7 +176,7 @@ async fn submit_task_malformed_json_returns_envelope() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/tasks")
+                .uri("/apis/solti.io/v1/tasks")
                 .header("content-type", "application/json")
                 .body(Body::from("{ not json at all"))
                 .unwrap(),
@@ -155,7 +195,7 @@ async fn submit_task_malformed_json_returns_envelope() {
         "content-type must be JSON, got {ct:?}"
     );
     let body = body_json(resp).await;
-    assert_eq!(body["error"], "InvalidRequest");
+    assert_status(&body, "BadRequest", 400);
     assert!(
         body["message"].is_string(),
         "message field must be a non-empty string, got {body:?}"
@@ -164,7 +204,7 @@ async fn submit_task_malformed_json_returns_envelope() {
 }
 
 #[tokio::test]
-async fn submit_task_oversize_body_returns_envelope_413() {
+async fn create_task_oversize_body_returns_envelope_413() {
     let handler = Arc::new(MockHandler::default());
     let app = router_with(Arc::clone(&handler));
 
@@ -175,7 +215,7 @@ async fn submit_task_oversize_body_returns_envelope_413() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/tasks")
+                .uri("/apis/solti.io/v1/tasks")
                 .header("content-type", "application/json")
                 .body(Body::from(body))
                 .unwrap(),
@@ -194,32 +234,145 @@ async fn submit_task_oversize_body_returns_envelope_413() {
         "413 must be JSON, got {ct:?}"
     );
     let body = body_json(resp).await;
-    assert_eq!(body["error"], "PayloadTooLarge");
+    assert_status(&body, "RequestEntityTooLarge", 413);
     assert!(body["message"].as_str().unwrap().contains("exceeds"));
     assert_eq!(handler.submit_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
-async fn get_task_status_omits_task_field_when_absent() {
+async fn create_task_accepts_valid_json_between_axum_default_and_public_limit() {
+    let handler = Arc::new(MockHandler::default());
+    let app = router_with(Arc::clone(&handler));
+    let padding = "a".repeat(2 * 1024 * 1024 + 1024);
+    let body = serde_json::json!({
+        "apiVersion": "solti.io/v1",
+        "kind": "Task",
+        "metadata": {
+            "name": "large-valid-task"
+        },
+        "spec": {
+            "slot": "large-valid-task",
+            "workload": {
+                "apiVersion": "workloads.example.io/v1",
+                "kind": "LargePayload",
+                "spec": {
+                    "padding": padding
+                }
+            },
+            "timeout": 5000,
+            "restart": { "type": "never" },
+            "backoff": {
+                "jitter": "full",
+                "firstMs": 1000,
+                "maxMs": 10000,
+                "factor": 2.0
+            },
+            "admission": "dropIfRunning"
+        }
+    })
+    .to_string();
+    assert!(body.len() > 2 * 1024 * 1024);
+    assert!(body.len() < solti_api::MAX_REQUEST_BYTES);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/apis/solti.io/v1/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(handler.submit_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn get_task_returns_404_when_absent() {
     let app = router_with(Arc::new(MockHandler::default()));
 
     let resp = app
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/api/v1/tasks/unknown")
+                .uri("/apis/solti.io/v1/tasks/unknown")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = body_json(resp).await;
-    assert!(
-        body.get("task").is_none(),
-        "expected `task` field absent, got {body:?}"
-    );
+    assert_status(&body, "NotFound", 404);
+}
+
+#[tokio::test]
+async fn router_level_errors_use_status_resources() {
+    let cases = [
+        (
+            Method::GET,
+            "/apis/solti.io/v1/tasks/%FF",
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+        ),
+        (
+            Method::GET,
+            "/apis/solti.io/v1/unknown",
+            StatusCode::NOT_FOUND,
+            "NotFound",
+        ),
+        (
+            Method::GET,
+            "/api/v1/tasks",
+            StatusCode::NOT_FOUND,
+            "NotFound",
+        ),
+        (
+            Method::PATCH,
+            "/apis/solti.io/v1/tasks",
+            StatusCode::METHOD_NOT_ALLOWED,
+            "MethodNotAllowed",
+        ),
+    ];
+
+    for (method, uri, expected_status, reason) in cases {
+        let response = router_with(Arc::new(MockHandler::default()))
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), expected_status, "request {uri}");
+        assert_status(&body_json(response).await, reason, expected_status.as_u16());
+    }
+}
+
+#[tokio::test]
+async fn list_runs_for_unknown_parent_returns_404() {
+    let app = router_with(Arc::new(MockHandler::default()));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/apis/solti.io/v1/tasks/runs-missing/runs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_status(&body_json(resp).await, "NotFound", 404);
 }
 
 #[tokio::test]
@@ -234,7 +387,7 @@ async fn delete_unknown_task_returns_404_with_structured_error() {
         .oneshot(
             Request::builder()
                 .method(Method::DELETE)
-                .uri("/api/v1/tasks/missing")
+                .uri("/apis/solti.io/v1/tasks/missing")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -243,7 +396,7 @@ async fn delete_unknown_task_returns_404_with_structured_error() {
 
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = body_json(resp).await;
-    assert_eq!(body["error"], "TaskNotFound");
+    assert_status(&body, "NotFound", 404);
     assert!(body["message"].as_str().unwrap().contains("missing"));
     assert_eq!(handler.delete_calls.load(Ordering::SeqCst), 1);
 }
@@ -257,7 +410,7 @@ async fn delete_task_success_returns_204_no_content() {
         .oneshot(
             Request::builder()
                 .method(Method::DELETE)
-                .uri("/api/v1/tasks/tsk_1")
+                .uri("/apis/solti.io/v1/tasks/task-1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -276,7 +429,7 @@ async fn list_tasks_invalid_phase_returns_400() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/api/v1/tasks?phase=totally_bogus")
+                .uri("/apis/solti.io/v1/tasks?phase=totally_bogus")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -285,8 +438,27 @@ async fn list_tasks_invalid_phase_returns_400() {
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_json(resp).await;
-    assert_eq!(body["error"], "InvalidRequest");
+    assert_status(&body, "BadRequest", 400);
     assert!(body["message"].as_str().unwrap().contains("invalid phase"));
+}
+
+#[tokio::test]
+async fn list_tasks_invalid_pagination_returns_status_resource() {
+    let app = router_with(Arc::new(MockHandler::default()));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/apis/solti.io/v1/tasks?limit=not-a-number")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_status(&body_json(resp).await, "BadRequest", 400);
 }
 
 #[tokio::test]
@@ -297,7 +469,7 @@ async fn list_tasks_empty_returns_empty_list_and_zero_total() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/api/v1/tasks")
+                .uri("/apis/solti.io/v1/tasks")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -306,8 +478,10 @@ async fn list_tasks_empty_returns_empty_list_and_zero_total() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
-    assert_eq!(body["total"], 0);
-    assert!(body["tasks"].as_array().unwrap().is_empty());
+    assert_eq!(body["apiVersion"], "solti.io/v1");
+    assert_eq!(body["kind"], "TaskList");
+    assert_eq!(body["metadata"], serde_json::json!({}));
+    assert!(body["items"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -319,7 +493,7 @@ async fn request_body_limit_rejects_oversized_payload() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/tasks")
+                .uri("/apis/solti.io/v1/tasks")
                 .header("content-type", "application/json")
                 .body(Body::from(oversized))
                 .unwrap(),
@@ -331,14 +505,14 @@ async fn request_body_limit_rejects_oversized_payload() {
 }
 
 #[tokio::test]
-async fn get_task_status_empty_id_trimmed_returns_400() {
+async fn get_task_empty_name_trimmed_returns_400() {
     let app = router_with(Arc::new(MockHandler::default()));
 
     let resp = app
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/api/v1/tasks/%20%20")
+                .uri("/apis/solti.io/v1/tasks/%20%20")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -347,13 +521,33 @@ async fn get_task_status_empty_id_trimmed_returns_400() {
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_json(resp).await;
-    assert_eq!(body["error"], "InvalidRequest");
+    assert_status(&body, "BadRequest", 400);
     assert!(
         body["message"]
             .as_str()
             .unwrap()
-            .contains("task_id cannot be empty")
+            .contains("invalid task name")
     );
+}
+
+#[tokio::test]
+async fn get_task_rejects_non_empty_name_outside_the_model_format() {
+    let app = router_with(Arc::new(MockHandler::default()));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/apis/solti.io/v1/tasks/bad%24name")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_status(&body, "BadRequest", 400);
 }
 
 #[tokio::test]
@@ -365,7 +559,7 @@ async fn stream_task_logs_returns_sse_with_chunk_and_run_started_events() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/api/v1/tasks/some-task/logs")
+                .uri("/apis/solti.io/v1/tasks/some-task/logs")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -409,7 +603,7 @@ async fn stream_task_logs_missing_task_returns_404() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/api/v1/tasks/stream-missing/logs")
+                .uri("/apis/solti.io/v1/tasks/stream-missing/logs")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -418,7 +612,7 @@ async fn stream_task_logs_missing_task_returns_404() {
 
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = body_json(resp).await;
-    assert_eq!(body["error"], "TaskNotFound");
+    assert_status(&body, "NotFound", 404);
 }
 
 #[tokio::test]
@@ -429,7 +623,7 @@ async fn stream_task_logs_empty_id_returns_400() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/api/v1/tasks/%20%20/logs")
+                .uri("/apis/solti.io/v1/tasks/%20%20/logs")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -438,5 +632,5 @@ async fn stream_task_logs_empty_id_returns_400() {
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_json(resp).await;
-    assert_eq!(body["error"], "InvalidRequest");
+    assert_status(&body, "BadRequest", 400);
 }

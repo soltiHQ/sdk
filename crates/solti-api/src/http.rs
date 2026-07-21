@@ -1,19 +1,20 @@
 //! # HTTP/JSON transport.
 //!
-//! Axum router exposing [`ApiHandler`] operations as REST-shaped JSON endpoints.
-//! All paths share the `/api/v<MAJOR>` prefix where `MAJOR` is [`crate::API_VERSION`];
+//! Axum router exposing [`ApiHandler`] operations as Kubernetes-shaped JSON endpoints.
+//! All paths share the Kubernetes named-group prefix
+//! `/apis/solti.io/v<MAJOR>` where `MAJOR` is [`crate::API_VERSION`];
 //!
 //! _the examples below show the current value (`v1`)_.
 //!
-//! | Method | Endpoint                    | Handler                   |
-//! |--------|-----------------------------|---------------------------|
-//! | POST   | `/api/v1/tasks`             | submit                    |
-//! | PUT    | `/api/v1/tasks`             | apply (supersede/install) |
-//! | GET    | `/api/v1/tasks`             | list (query params)       |
-//! | GET    | `/api/v1/tasks/{id}`        | get status                |
-//! | GET    | `/api/v1/tasks/{id}/runs`   | list runs                 |
-//! | GET    | `/api/v1/tasks/{id}/logs`   | live-tail SSE stream      |
-//! | DELETE | `/api/v1/tasks/{id}`        | delete (stop+purge)       |
+//! | Method | Endpoint                              | Handler             |
+//! |--------|---------------------------------------|---------------------|
+//! | POST   | `/apis/solti.io/v1/tasks`             | create              |
+//! | PUT    | `/apis/solti.io/v1/tasks/{name}`      | apply               |
+//! | GET    | `/apis/solti.io/v1/tasks`             | list (query params) |
+//! | GET    | `/apis/solti.io/v1/tasks/{name}`      | get                 |
+//! | GET    | `/apis/solti.io/v1/tasks/{name}/runs` | list runs           |
+//! | GET    | `/apis/solti.io/v1/tasks/{name}/logs` | live-tail SSE       |
+//! | DELETE | `/apis/solti.io/v1/tasks/{name}`      | delete (stop+purge) |
 
 use std::sync::Arc;
 
@@ -21,8 +22,11 @@ use std::convert::Infallible;
 
 use axum::{
     Json, Router,
-    extract::{FromRequest, Path, Query, Request, State, rejection::JsonRejection},
-    http::StatusCode,
+    extract::{
+        DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, Request, State,
+        rejection::{JsonRejection, PathRejection, QueryRejection},
+    },
+    http::{StatusCode, request::Parts},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -30,8 +34,10 @@ use axum::{
     },
     routing::{delete, get, post, put},
 };
-use serde::{Deserialize, de::DeserializeOwned};
-use solti_model::{OutputEvent, TaskId, TaskPhase, TaskQuery, Token};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use solti_model::{
+    OutputEvent, TASK_API_VERSION, Task, TaskManifest, TaskPhase, TaskQuery, TaskRun, Token,
+};
 use tokio_stream::StreamExt;
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::debug;
@@ -39,11 +45,10 @@ use tracing::debug;
 use crate::{
     MAX_REQUEST_BYTES,
     auth::{assert_auth_token_not_empty, bearer_value},
-    convert::{self, tasks_page_to_proto},
     error::ApiError,
     handler::ApiHandler,
-    proto_api,
-    validate::{clamp_list_limit, non_empty_id},
+    validate::{clamp_list_limit, parse_task_id, validate_slot},
+    visibility::{manifest_is_visible, run_is_visible, task_is_visible},
 };
 // `api_url!` is `#[macro_export]` and therefore already accessible in this
 // module by its bare name — `use crate::api_url` would be redundant
@@ -67,12 +72,60 @@ where
     }
 }
 
+/// Wrapper around `axum::extract::Query<T>` that maps query decoding failures into [`ApiError`].
+pub(crate) struct ApiQuery<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for ApiQuery<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Query(value) = Query::<T>::from_request_parts(parts, state)
+            .await
+            .map_err(map_query_rejection)?;
+        Ok(ApiQuery(value))
+    }
+}
+
+/// Wrapper around `axum::extract::Path<T>` that maps path decoding failures
+/// into the same structured error contract as every other extractor.
+pub(crate) struct ApiPath<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for ApiPath<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Path(value) = Path::<T>::from_request_parts(parts, state)
+            .await
+            .map_err(map_path_rejection)?;
+        Ok(ApiPath(value))
+    }
+}
+
+fn map_path_rejection(rejection: PathRejection) -> ApiError {
+    ApiError::InvalidRequest(rejection.body_text())
+}
+
+fn map_query_rejection(rejection: QueryRejection) -> ApiError {
+    ApiError::InvalidRequest(rejection.body_text())
+}
+
 fn map_json_rejection(rej: JsonRejection) -> ApiError {
     if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
         return ApiError::PayloadTooLarge(format!(
             "request body exceeds the maximum of {} bytes",
             MAX_REQUEST_BYTES
         ));
+    }
+    if rej.status() == StatusCode::UNSUPPORTED_MEDIA_TYPE {
+        return ApiError::UnsupportedMediaType(rej.body_text());
     }
 
     let msg = rej.body_text();
@@ -87,16 +140,26 @@ fn map_json_rejection(rej: JsonRejection) -> ApiError {
 async fn map_413_envelope(req: Request, next: Next) -> Response {
     let resp = next.run(req).await;
     if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        let body = serde_json::json!({
-            "error": "PayloadTooLarge",
-            "message": format!(
-                "request body exceeds the maximum of {} bytes",
-                MAX_REQUEST_BYTES
-            ),
-        });
-        return (StatusCode::PAYLOAD_TOO_LARGE, Json(body)).into_response();
+        return ApiError::PayloadTooLarge(format!(
+            "request body exceeds the maximum of {} bytes",
+            MAX_REQUEST_BYTES
+        ))
+        .into_response();
     }
     resp
+}
+
+async fn route_not_found(req: Request) -> Response {
+    ApiError::NotFound(format!("no API route for `{}`", req.uri().path())).into_response()
+}
+
+async fn method_not_allowed(req: Request) -> Response {
+    ApiError::MethodNotAllowed(format!(
+        "method {} is not allowed for `{}`",
+        req.method(),
+        req.uri().path()
+    ))
+    .into_response()
 }
 
 /// HTTP API service builder.
@@ -145,13 +208,16 @@ where
     /// and when [`with_auth`](Self::with_auth) is set a bearer-token gate that runs before any handler.
     pub fn router(self) -> Router {
         let mut router = Router::new()
-            .route(api_url!("/tasks"), post(submit_task::<H>))
-            .route(api_url!("/tasks"), put(apply_task::<H>))
+            .route(api_url!("/tasks"), post(create_task::<H>))
             .route(api_url!("/tasks"), get(list_tasks::<H>))
-            .route(api_url!("/tasks/{id}"), get(get_task_status::<H>))
-            .route(api_url!("/tasks/{id}"), delete(delete_task::<H>))
-            .route(api_url!("/tasks/{id}/runs"), get(list_task_runs::<H>))
-            .route(api_url!("/tasks/{id}/logs"), get(stream_task_logs::<H>))
+            .route(api_url!("/tasks/{name}"), get(get_task::<H>))
+            .route(api_url!("/tasks/{name}"), put(apply_task::<H>))
+            .route(api_url!("/tasks/{name}"), delete(delete_task::<H>))
+            .route(api_url!("/tasks/{name}/runs"), get(list_task_runs::<H>))
+            .route(api_url!("/tasks/{name}/logs"), get(stream_task_logs::<H>))
+            .fallback(route_not_found)
+            .method_not_allowed_fallback(method_not_allowed)
+            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
             .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
             .layer(middleware::from_fn(map_413_envelope));
 
@@ -190,68 +256,99 @@ struct ListTasksParams {
     offset: Option<u32>,
 }
 
-async fn submit_task<H>(
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListMeta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remaining_item_count: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskList {
+    api_version: &'static str,
+    kind: &'static str,
+    metadata: ListMeta,
+    items: Vec<Task>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskRunList {
+    runs: Vec<TaskRun>,
+}
+
+fn reject_embedded_manifest(manifest: &TaskManifest) -> Result<(), ApiError> {
+    if !manifest_is_visible(manifest) {
+        return Err(ApiError::InvalidRequest(
+            "Embedded workloads are available only through the in-process SDK".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn public_task(task: Task) -> Result<Task, ApiError> {
+    if !task_is_visible(&task) {
+        return Err(ApiError::Internal(
+            "handler returned an Embedded workload through the public HTTP API".into(),
+        ));
+    }
+    Ok(task)
+}
+
+async fn create_task<H>(
     State(handler): State<Arc<H>>,
-    ApiJson(req): ApiJson<proto_api::SubmitTaskRequest>,
+    ApiJson(manifest): ApiJson<TaskManifest>,
 ) -> Result<impl IntoResponse, ApiError>
 where
     H: ApiHandler,
 {
-    let spec = req
-        .spec
-        .ok_or_else(|| ApiError::InvalidRequest("missing spec".into()))?;
-    let spec = convert::convert_create_spec(spec)?;
-
-    debug!(slot = %spec.slot(), kind = ?spec.kind(), "submitting task");
-    let task_id = handler.submit_task(spec).await?;
-
-    let response = proto_api::SubmitTaskResponse {
-        task_id: task_id.to_string(),
-    };
-    Ok((StatusCode::CREATED, Json(response)))
+    reject_embedded_manifest(&manifest)?;
+    debug!(name = %manifest.name(), "creating task");
+    let task = public_task(handler.create_task(manifest).await?)?;
+    Ok((StatusCode::CREATED, Json(task)))
 }
 
 async fn apply_task<H>(
     State(handler): State<Arc<H>>,
-    ApiJson(req): ApiJson<proto_api::ApplyTaskRequest>,
+    ApiPath(path_name): ApiPath<String>,
+    ApiJson(manifest): ApiJson<TaskManifest>,
 ) -> Result<impl IntoResponse, ApiError>
 where
     H: ApiHandler,
 {
-    let spec = req
-        .spec
-        .ok_or_else(|| ApiError::InvalidRequest("missing spec".into()))?;
-    let spec = convert::convert_create_spec(spec)?;
-
-    debug!(slot = %spec.slot(), kind = ?spec.kind(), "applying task");
-    let task_id = handler.apply_task(spec).await?;
-
-    let response = proto_api::ApplyTaskResponse {
-        task_id: task_id.to_string(),
-    };
-    Ok((StatusCode::OK, Json(response)))
+    let path_name = parse_task_id("task name", path_name)?;
+    reject_embedded_manifest(&manifest)?;
+    if manifest.name() != &path_name {
+        return Err(ApiError::InvalidRequest(format!(
+            "path task name `{path_name}` does not match metadata.name `{}`",
+            manifest.name()
+        )));
+    }
+    debug!(name = %manifest.name(), "applying task");
+    let task = public_task(handler.apply_task(manifest).await?)?;
+    Ok(Json(task))
 }
 
-async fn get_task_status<H>(
+async fn get_task<H>(
     State(handler): State<Arc<H>>,
-    Path(id): Path<String>,
+    ApiPath(name): ApiPath<String>,
 ) -> Result<impl IntoResponse, ApiError>
 where
     H: ApiHandler,
 {
-    non_empty_id("task_id", &id)?;
+    let name = parse_task_id("task name", name)?;
+    debug!(%name, "getting task");
+    let task = handler
+        .get_task(&name)
+        .await?
+        .ok_or_else(|| ApiError::TaskNotFound(name.to_string()))?;
 
-    let task_id = TaskId::from(id);
-    debug!(%task_id, "getting task status");
-    let task = handler.get_task_status(&task_id).await?;
-
-    let task = task.map(proto_api::TaskData::try_from).transpose()?;
-    Ok(Json(proto_api::GetTaskStatusResponse { task }))
+    Ok(Json(public_task(task)?))
 }
 
 async fn list_tasks<H>(
     State(handler): State<Arc<H>>,
-    Query(params): Query<ListTasksParams>,
+    ApiQuery(params): ApiQuery<ListTasksParams>,
 ) -> Result<impl IntoResponse, ApiError>
 where
     H: ApiHandler,
@@ -259,8 +356,7 @@ where
     let mut query = TaskQuery::new();
 
     if let Some(slot) = params.slot {
-        non_empty_id("slot", &slot)?;
-        query = query.with_slot(slot);
+        query = query.with_slot(validate_slot(slot)?);
     }
 
     if let Some(phase_str) = params.phase {
@@ -273,62 +369,79 @@ where
     }
 
     query = query.with_limit(clamp_list_limit(params.limit.unwrap_or(0)));
-    if let Some(offset) = params.offset {
-        query = query.with_offset(offset as usize);
+    let offset = params.offset.unwrap_or(0) as usize;
+    if offset > 0 {
+        query = query.with_offset(offset);
     }
 
     let page = handler.query_tasks(query).await?;
     debug!(count = page.items.len(), total = page.total, "tasks listed");
 
-    Ok(Json(tasks_page_to_proto(page)?))
+    for task in &page.items {
+        if !task_is_visible(task) {
+            return Err(ApiError::Internal(
+                "handler returned an Embedded workload through the public HTTP API".into(),
+            ));
+        }
+    }
+
+    let remaining_item_count = page
+        .total
+        .saturating_sub(offset.saturating_add(page.items.len()));
+    Ok(Json(TaskList {
+        api_version: TASK_API_VERSION,
+        kind: "TaskList",
+        metadata: ListMeta {
+            remaining_item_count: (remaining_item_count > 0).then_some(remaining_item_count),
+        },
+        items: page.items,
+    }))
 }
 
 async fn list_task_runs<H>(
     State(handler): State<Arc<H>>,
-    Path(id): Path<String>,
+    ApiPath(name): ApiPath<String>,
 ) -> Result<impl IntoResponse, ApiError>
 where
     H: ApiHandler,
 {
-    non_empty_id("task_id", &id)?;
-
-    let task_id = TaskId::from(id);
-    debug!(%task_id, "listing task runs");
-    let runs = handler.list_task_runs(&task_id).await?;
-    let runs = runs.into_iter().map(proto_api::TaskRunInfo::from).collect();
-
-    Ok(Json(proto_api::ListTaskRunsResponse { runs }))
+    let name = parse_task_id("task name", name)?;
+    debug!(%name, "listing task runs");
+    let runs = handler.list_task_runs(&name).await?;
+    if runs.iter().any(|run| !run_is_visible(run)) {
+        return Err(ApiError::Internal(
+            "handler returned Embedded run history through the public HTTP API".into(),
+        ));
+    }
+    Ok(Json(TaskRunList { runs }))
 }
 
 async fn delete_task<H>(
     State(handler): State<Arc<H>>,
-    Path(id): Path<String>,
+    ApiPath(name): ApiPath<String>,
 ) -> Result<impl IntoResponse, ApiError>
 where
     H: ApiHandler,
 {
-    non_empty_id("task_id", &id)?;
-
-    let task_id = TaskId::from(id);
-    handler.delete_task(&task_id).await?;
-    debug!(%task_id, "task deleted");
+    let name = parse_task_id("task name", name)?;
+    handler.delete_task(&name).await?;
+    debug!(%name, "task deleted");
 
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET /tasks/{id}/logs` - Server-Sent Events stream of [`OutputEvent`]s (live tail of stdout/stderr + run boundary markers + lag signals).
+/// `GET /apis/solti.io/v1/tasks/{name}/logs` - Server-Sent Events stream of
+/// [`OutputEvent`]s (live tail of stdout/stderr + run boundary markers + lag signals).
 async fn stream_task_logs<H>(
     State(handler): State<Arc<H>>,
-    Path(id): Path<String>,
+    ApiPath(name): ApiPath<String>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError>
 where
     H: ApiHandler,
 {
-    non_empty_id("task_id", &id)?;
-
-    let task_id = TaskId::from(id);
-    debug!(%task_id, "subscribing to task log stream");
-    let stream = handler.stream_task_logs(&task_id).await?;
+    let name = parse_task_id("task name", name)?;
+    debug!(%name, "subscribing to task log stream");
+    let stream = handler.stream_task_logs(&name).await?;
 
     let sse_stream = stream.map(|ev| {
         let name = match &ev {

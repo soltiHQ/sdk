@@ -1,4 +1,4 @@
-//! # Subprocess: OS process runner for `TaskKind::Subprocess`.
+//! # Subprocess: OS process runner for `TaskWorkload::Subprocess`.
 //!
 //! Executes tasks by spawning child OS processes with optional backend hardening (rlimits, cgroups, security capabilities).
 //!
@@ -8,7 +8,7 @@
 //! |-------------|---------------------------------------------------------|
 //! | `runner`    | [`SubprocessRunner`]: `Runner` trait impl + execution   |
 //! | `backend`   | [`SubprocessBackendConfig`]: rlimits, cgroups, security |
-//! | `task`      | [`SubprocessTaskConfig`]: resolved runtime config       |
+//! | `task`      | internal resolved runtime configuration                 |
 //! | `logger`    | [`LogConfig`] + stream capture, truncation, tracing     |
 //!
 //! ## Quick start
@@ -32,7 +32,6 @@ mod backend;
 pub use backend::{CwdPolicy, EnvPolicy, SubprocessBackendConfig};
 
 mod task;
-pub use task::SubprocessTaskConfig;
 
 mod logger;
 pub use logger::LogConfig;

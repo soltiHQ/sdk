@@ -69,25 +69,35 @@ message CustomRuntime {
   string flag    = 2; // inline-script flag, e.g. "-e"
 }
 
-// Run a script through a known or custom interpreter.
-message ScriptMode {
+// Typed script runtime selection.
+message Runtime {
   oneof runtime {
     ScriptRuntime well_known = 1; // built-in interpreter
     CustomRuntime custom     = 2; // user-defined interpreter
   }
-  string          body = 3; // script content, base64-encoded
-  repeated string args = 4;
 }
 
-// Run an external OS process.
-message SubprocessTask {
+// Run a script through a known or custom interpreter.
+message ScriptMode {
+  Runtime         runtime = 1;
+  string          body    = 2; // script content, base64-encoded
+  repeated string args    = 3;
+}
+
+// Typed subprocess execution strategy.
+message SubprocessMode {
   oneof mode {
     CommandMode command = 1; // direct command
     ScriptMode  script  = 2; // script via interpreter
   }
-  repeated KeyValue env              = 3;
-  optional string   cwd              = 4; // working directory; agent default if unset
-  bool              fail_on_non_zero = 5; // treat non-zero exit as failure
+}
+
+// Run an external OS process.
+message SubprocessTask {
+  SubprocessMode   mode             = 1;
+  repeated KeyValue env              = 2;
+  optional string   cwd              = 3; // working directory; agent default if unset
+  bool              fail_on_non_zero = 4; // treat non-zero exit as failure
 }
 
 // Run a WebAssembly module.
@@ -100,19 +110,37 @@ message WasmTask {
 
 // Run an OCI container.
 // (Reserved; agent support may be incomplete.)
-message ContainerTask {
-  string            image   = 1; // image reference
-  repeated string   command = 2; // entrypoint override; image default if empty
-  repeated string   args    = 3;
-  repeated KeyValue env     = 4;
+message ContainerCommand {
+  repeated string items = 1; // explicit entrypoint override; may be empty
 }
 
-// Execution backend for a task.
-message TaskKind {
-  oneof kind {
-    SubprocessTask subprocess = 1;
-    WasmTask       wasm       = 2;
-    ContainerTask  container  = 3;
+message ContainerTask {
+  string                   image   = 1; // image reference
+  optional ContainerCommand command = 2; // absent = image default, present = explicit override
+  repeated string          args    = 3;
+  repeated KeyValue        env     = 4;
+}
+
+// Workload implemented by an application-provided runner.
+// Mirrors Kubernetes RawExtension: `raw` is one UTF-8 JSON value.
+message RawExtension {
+  bytes raw = 1;
+}
+
+message ExtensionTask {
+  RawExtension spec = 1; // arbitrary JSON object interpreted by the runner
+}
+
+// Versioned desired workload handled by a registered runner.
+// Embedded workloads intentionally have no public representation.
+message TaskWorkload {
+  string api_version = 1; // workload API group/version; required
+  string kind        = 2; // workload kind; required; built-ins must match their typed spec
+  oneof spec {
+    SubprocessTask subprocess = 3;
+    WasmTask       wasm       = 4;
+    ContainerTask  container  = 5;
+    ExtensionTask  extension  = 6;
   }
 }
 
@@ -121,7 +149,7 @@ message BackoffPolicy {
   JitterPolicy jitter   = 1; // jitter applied to each delay
   uint64       first_ms = 2; // initial delay (ms); must be > 0
   uint64       max_ms   = 3; // delay cap (ms); must be >= first_ms
-  double       factor   = 4; // growth multiplier; must be finite and > 0
+  double       factor   = 4; // growth multiplier; must be finite and >= 1.0
 }
 
 // Comparison operator for one selector requirement.
@@ -146,49 +174,92 @@ message RunnerSelector {
   repeated SelectorRequirement match_expressions = 2; // set-based rules, ANDed with match_labels
 }
 
-// Immutable definition of a task, supplied at submission.
-message CreateSpec {
+// Desired state of a Task resource.
+message TaskSpec {
   string              slot                = 1;  // execution lane; non-empty, max 64 chars
-  TaskKind            kind                = 2;  // execution backend; required
+  TaskWorkload        workload            = 2;  // versioned executable desired state; required
   uint64              timeout_ms          = 3;  // per-attempt timeout (ms); must be > 0
   RestartPolicy       restart             = 4;  // restart policy
   optional uint64     restart_interval_ms = 5;  // delay between runs; ALWAYS only
   BackoffPolicy       backoff             = 6;  // retry backoff; required
   AdmissionPolicy     admission           = 7;  // slot-conflict policy
-  map<string, string> labels              = 8;  // metadata labels (routing / observability)
+  reserved 8;                                  // labels moved to ObjectMeta
   optional uint32     max_retries         = 9;  // failure-retry budget; omit = unlimited; 0 is invalid
   RunnerSelector      runner_selector     = 10; // label-based runner routing; omit = any runner
 }
 
+// User-owned metadata accepted on create and apply.
+message TaskManifestMeta {
+  string              name        = 1; // stable resource address
+  map<string, string> labels      = 2;
+  map<string, string> annotations = 3;
+}
+
+// Desired Task resource. Server-owned identity and status are deliberately absent.
+message TaskManifest {
+  string           api_version = 1; // solti.io/v1
+  string           kind        = 2; // Task
+  TaskManifestMeta metadata    = 3;
+  TaskSpec         spec        = 4;
+}
+
 // Identity, versioning and timestamps of a stored object.
 message ObjectMeta {
-  string id               = 1; // task id
-  int64  created_at       = 2; // creation time (ms)
-  int64  updated_at       = 3; // last-change time (ms)
-  uint64 resource_version = 4; // optimistic-lock counter; starts at 1, bumps on change
+  string              name               = 1; // stable resource address
+  string              uid                = 2; // server-assigned resource-incarnation identity
+  string              resource_version   = 3; // opaque store revision
+  uint64              generation         = 4; // desired-state generation
+  int64               creation_timestamp = 5; // creation time (ms)
+  map<string, string> labels              = 6;
+  map<string, string> annotations         = 7;
 }
 
-// Observed status of a task's current attempt.
+// Kubernetes-compatible three-valued condition status.
+enum ConditionStatus {
+  CONDITION_STATUS_UNSPECIFIED = 0;
+  CONDITION_STATUS_UNKNOWN     = 1;
+  CONDITION_STATUS_TRUE        = 2;
+  CONDITION_STATUS_FALSE       = 3;
+}
+
+// One observed condition for a Task resource.
+message TaskCondition {
+  string          type                 = 1;
+  ConditionStatus status               = 2;
+  uint64          observed_generation  = 3;
+  int64           last_transition_time = 4; // Unix time (ms)
+  string          reason               = 5;
+  string          message              = 6;
+}
+
+// Observed controller and execution status of a Task.
 message TaskStatus {
-  TaskPhase      phase     = 1; // current phase
-  uint32          attempt   = 2; // attempt number (1-based)
-  optional string error     = 3; // last error message, if any
-  optional int32  exit_code = 4; // process exit code, if the process exited
+  uint64                 observed_generation = 1; // latest desired generation processed by the controller
+  TaskPhase              phase                = 2; // current execution phase
+  uint32                 attempt              = 3; // execution attempt within observed_generation
+  optional string        error                = 4; // execution diagnostic, if any
+  optional int32         exit_code            = 5; // process exit code, if the process exited
+  repeated TaskCondition conditions           = 6; // controller conditions
 }
 
-// Full task state: identity + definition + current status.
-message TaskData {
-  ObjectMeta     metadata = 1; // identity, version, timestamps
-  CreateSpec     spec     = 2; // immutable definition
-  TaskStatus status   = 3; // current attempt status
+// Full Kubernetes-shaped Task resource.
+message Task {
+  string     api_version = 1; // solti.io/v1
+  string     kind        = 2; // Task
+  ObjectMeta metadata    = 3;
+  TaskSpec   spec        = 4;
+  TaskStatus status      = 5;
 }
 
 // History record for one finished or running attempt.
 message TaskRunInfo {
-  uint32          attempt     = 1; // attempt number (1-based)
-  TaskPhase      phase       = 2; // phase of this attempt
-  int64           started_at  = 3; // start time (ms)
-  optional int64  finished_at = 4; // end time (ms); absent while running
-  optional string error       = 5; // error message, if any
-  optional int32  exit_code   = 6; // process exit code, if the process exited
+  uint64          generation           = 1; // desired-state generation executed by this run
+  uint32          attempt              = 2; // attempt number within generation
+  TaskPhase       phase                = 3; // phase of this attempt
+  int64           started_at           = 4; // start time (ms)
+  optional int64  finished_at          = 5; // end time (ms); absent while running
+  optional string error                = 6; // error message, if any
+  optional int32  exit_code            = 7; // process exit code, if the process exited
+  string          workload_api_version = 8; // workload GVK apiVersion captured for this run
+  string          workload_kind        = 9; // workload GVK kind captured for this run
 }

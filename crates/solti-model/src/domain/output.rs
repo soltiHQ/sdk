@@ -43,9 +43,9 @@ pub enum StreamKind {
 /// Wire format is JSON-tagged on `type`:
 ///
 /// ```text
-/// {"type":"chunk","attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"..."}
-/// {"type":"runStarted","attempt":1,"startedAt":1700}
-/// {"type":"runFinished","attempt":1,"exitCode":0,"finishedAt":1701}
+/// {"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"..."}
+/// {"type":"runStarted","generation":2,"attempt":1,"startedAt":1700}
+/// {"type":"runFinished","generation":2,"attempt":1,"exitCode":0,"finishedAt":1701}
 /// {"type":"lagged","skipped":42}
 /// ```
 ///
@@ -57,6 +57,7 @@ pub enum StreamKind {
 /// use std::time::SystemTime;
 ///
 /// let event = OutputEvent::Chunk(OutputChunk {
+///     generation: 2,
 ///     attempt: 1,
 ///     stream: StreamKind::Stdout,
 ///     seq: 0,
@@ -77,9 +78,11 @@ pub enum OutputEvent {
     /// Best-effort observation that a new run attempt has started.
     ///
     /// This marker is not an ordering barrier for chunks. Use each chunk's
-    /// `attempt`, `stream`, and `seq` fields for grouping and ordering.
+    /// `generation`, `attempt`, `stream`, and `seq` fields for grouping and ordering.
     #[serde(rename_all = "camelCase")]
     RunStarted {
+        /// Desired-state generation executed by this run.
+        generation: u64,
         /// Attempt number of the run that just started.
         attempt: u32,
         /// Wall-clock start time (unix milliseconds on the wire).
@@ -89,10 +92,12 @@ pub enum OutputEvent {
 
     /// Best-effort observation that a run attempt has finished.
     ///
-    /// This marker is not an ordering barrier: chunks for the same attempt may
-    /// still be observed after it.
+    /// This marker is not an ordering barrier: chunks for the same generation
+    /// and attempt may still be observed after it.
     #[serde(rename_all = "camelCase")]
     RunFinished {
+        /// Desired-state generation executed by this run.
+        generation: u64,
         /// Attempt number of the run that finished.
         attempt: u32,
         /// Process exit code. `None` when the run ended without one (killed, canceled).
@@ -123,6 +128,7 @@ pub enum OutputEvent {
 /// use std::time::SystemTime;
 ///
 /// let chunk = OutputChunk {
+///     generation: 2,
 ///     attempt: 1,
 ///     stream: StreamKind::Stderr,
 ///     seq: 7,
@@ -135,13 +141,15 @@ pub enum OutputEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputChunk {
+    /// Desired-state generation this chunk belongs to.
+    pub generation: u64,
     /// Which attempt of the task this chunk belongs to (matches [`TaskRun::attempt`]).
     ///
     /// [`TaskRun::attempt`]: crate::TaskRun::attempt
     pub attempt: u32,
     /// stdout or stderr.
     pub stream: StreamKind,
-    /// Monotonic sequence number per stream within this attempt.
+    /// Monotonic sequence number per stream within this generation and attempt.
     ///
     /// `stdout` and `stderr` have independent counters, each reset for a new attempt.
     pub seq: u64,
@@ -194,6 +202,7 @@ mod tests {
     #[test]
     fn sse_wire_shape_is_pinned() {
         let chunk = OutputEvent::Chunk(OutputChunk {
+            generation: 2,
             attempt: 1,
             stream: StreamKind::Stdout,
             seq: 0,
@@ -202,7 +211,7 @@ mod tests {
         });
         assert_eq!(
             serde_json::to_string(&chunk).unwrap(),
-            r#"{"type":"chunk","attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"hi"}"#
+            r#"{"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"hi"}"#
         );
 
         let lagged = OutputEvent::Lagged { skipped: 42 };
@@ -215,6 +224,7 @@ mod tests {
     #[test]
     fn output_chunk_roundtrips_through_json() {
         let chunk = OutputChunk {
+            generation: 3,
             attempt: 7,
             stream: StreamKind::Stderr,
             seq: 42,
@@ -231,6 +241,7 @@ mod tests {
     #[test]
     fn output_chunk_serializes_ts_as_unix_milliseconds() {
         let chunk = OutputChunk {
+            generation: 1,
             attempt: 1,
             stream: StreamKind::Stdout,
             seq: 0,
@@ -248,6 +259,7 @@ mod tests {
     #[test]
     fn output_chunk_serializes_line_as_utf8_string_not_array() {
         let chunk = OutputChunk {
+            generation: 1,
             attempt: 1,
             stream: StreamKind::Stdout,
             seq: 0,
@@ -264,6 +276,7 @@ mod tests {
     #[test]
     fn output_event_chunk_inlines_chunk_fields() {
         let event = OutputEvent::Chunk(OutputChunk {
+            generation: 4,
             attempt: 3,
             stream: StreamKind::Stdout,
             seq: 5,
@@ -281,6 +294,7 @@ mod tests {
     #[test]
     fn output_event_run_started_carries_attempt_and_ts() {
         let event = OutputEvent::RunStarted {
+            generation: 4,
             attempt: 2,
             started_at: UNIX_EPOCH + Duration::from_millis(1234),
         };
@@ -294,6 +308,7 @@ mod tests {
     #[test]
     fn output_event_run_finished_carries_exit_code() {
         let event = OutputEvent::RunFinished {
+            generation: 4,
             attempt: 2,
             exit_code: Some(0),
             finished_at: UNIX_EPOCH + Duration::from_millis(2222),
@@ -318,6 +333,7 @@ mod tests {
     fn output_event_roundtrips_through_json() {
         let cases = [
             OutputEvent::Chunk(OutputChunk {
+                generation: 2,
                 attempt: 1,
                 stream: StreamKind::Stderr,
                 seq: 0,
@@ -325,10 +341,12 @@ mod tests {
                 line: Bytes::from_static(b"warning"),
             }),
             OutputEvent::RunStarted {
+                generation: 2,
                 attempt: 1,
                 started_at: UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
             },
             OutputEvent::RunFinished {
+                generation: 2,
                 attempt: 1,
                 exit_code: Some(42),
                 finished_at: UNIX_EPOCH + Duration::from_millis(1_700_000_001_000),
@@ -346,6 +364,7 @@ mod tests {
     #[test]
     fn output_chunk_uses_camel_case_keys() {
         let chunk = OutputChunk {
+            generation: 2,
             attempt: 2,
             stream: StreamKind::Stdout,
             seq: 9,
@@ -355,6 +374,7 @@ mod tests {
 
         let json = serde_json::to_string(&chunk).unwrap();
         for key in [
+            r#""generation":"#,
             r#""attempt":"#,
             r#""stream":"#,
             r#""seq":"#,
@@ -368,6 +388,7 @@ mod tests {
     #[test]
     fn output_chunk_clone_is_refcount_bump() {
         let original = OutputChunk {
+            generation: 1,
             attempt: 1,
             stream: StreamKind::Stdout,
             seq: 0,
@@ -381,6 +402,7 @@ mod tests {
     #[test]
     fn output_chunk_with_non_utf8_line_serializes_lossily_instead_of_failing() {
         let chunk = OutputChunk {
+            generation: 1,
             attempt: 1,
             stream: StreamKind::Stdout,
             seq: 0,

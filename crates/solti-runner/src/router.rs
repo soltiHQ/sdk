@@ -9,7 +9,7 @@
 //! See the [crate root](crate) for architecture overview.
 use std::sync::Arc;
 
-use solti_model::{Labels, TaskKind, TaskSpec};
+use solti_model::{Labels, Task, TaskWorkload};
 use taskvisor::TaskRef;
 use tracing::{debug, instrument, trace};
 
@@ -25,14 +25,14 @@ struct RunnerEntry {
     labels: Labels,
 }
 
-/// Router that selects a [`Runner`] for a [`TaskSpec`].
+/// Router that selects a [`Runner`] for a [`Task`].
 ///
 /// Runners are checked in the order they were registered.
-/// The first runner whose [`Runner::supports`] method returns `true` and satisfies the optional [`TaskSpec::runner_selector`] is used.
+/// The first runner whose [`Runner::supports`] method returns `true` and satisfies the optional [`TaskSpec::runner_selector`](solti_model::TaskSpec::runner_selector) is used.
 ///
 /// ## Notes
 ///
-/// - `TaskKind::Embedded` is not routable. Submit it directly with `SupervisorApi::submit_with_task`.
+/// - [`TaskWorkload::Embedded`] is not routable. Pass it with its prebuilt task to `SupervisorApi::create_with_task` or `SupervisorApi::apply_with_task`.
 /// - Default [`BuildContext`] uses empty env and [`NoOpMetrics`](crate::NoOpMetrics).
 ///
 /// ## Also
@@ -47,19 +47,19 @@ struct RunnerEntry {
 /// use std::sync::Arc;
 /// use solti_runner::RunnerRouter;
 /// # use solti_runner::{BuildContext, Runner, RunnerError};
-/// # use solti_model::{TaskKind, TaskSpec};
+/// # use solti_model::{Task, TaskWorkload};
 /// # use taskvisor::TaskRef;
 /// # struct MyRunner;
 /// # impl Runner for MyRunner {
 /// #     fn name(&self) -> &'static str { "my-runner" }
-/// #     fn supports(&self, spec: &TaskSpec) -> bool { matches!(spec.kind(), TaskKind::Subprocess(_)) }
-/// #     fn build_task(&self, _s: &TaskSpec, _c: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
+/// #     fn supports(&self, workload: &TaskWorkload) -> bool { matches!(workload, TaskWorkload::Subprocess(_)) }
+/// #     fn build_task(&self, _task: &Task, _c: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
 /// # }
-/// # fn demo(spec: &TaskSpec) -> Result<(), RunnerError> {
+/// # fn demo(resource: &Task) -> Result<(), RunnerError> {
 /// let mut router = RunnerRouter::new();
 /// router.register(Arc::new(MyRunner));
 ///
-/// let task_ref = router.build(spec)?; // picks the first runner that supports `spec`
+/// let task_ref = router.build(resource)?; // picks the first runner that supports the workload
 /// # let _ = task_ref;
 /// # Ok(())
 /// # }
@@ -133,13 +133,13 @@ impl RunnerRouter {
     /// use std::sync::Arc;
     /// use solti_runner::RunnerRouter;
     /// # use solti_runner::{BuildContext, Runner, RunnerError};
-    /// # use solti_model::TaskSpec;
+    /// # use solti_model::{Task, TaskWorkload};
     /// # use taskvisor::TaskRef;
     /// # struct MyRunner;
     /// # impl Runner for MyRunner {
     /// #     fn name(&self) -> &'static str { "my-runner" }
-    /// #     fn supports(&self, _spec: &TaskSpec) -> bool { true }
-    /// #     fn build_task(&self, _spec: &TaskSpec, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
+    /// #     fn supports(&self, _workload: &TaskWorkload) -> bool { true }
+    /// #     fn build_task(&self, _task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
     /// # }
     /// let mut router = RunnerRouter::new();
     /// router.register(Arc::new(MyRunner));
@@ -154,7 +154,7 @@ impl RunnerRouter {
 
     /// Register a new runner with static labels.
     ///
-    /// These labels are used only when [`TaskSpec::runner_selector`] is set.
+    /// These labels are used only when [`TaskSpec::runner_selector`](solti_model::TaskSpec::runner_selector) is set.
     ///
     /// ## Example
     ///
@@ -163,13 +163,13 @@ impl RunnerRouter {
     /// use solti_model::Labels;
     /// use solti_runner::RunnerRouter;
     /// # use solti_runner::{BuildContext, Runner, RunnerError};
-    /// # use solti_model::TaskSpec;
+    /// # use solti_model::{Task, TaskWorkload};
     /// # use taskvisor::TaskRef;
     /// # struct MyRunner;
     /// # impl Runner for MyRunner {
     /// #     fn name(&self) -> &'static str { "gpu-runner" }
-    /// #     fn supports(&self, _spec: &TaskSpec) -> bool { true }
-    /// #     fn build_task(&self, _spec: &TaskSpec, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
+    /// #     fn supports(&self, _workload: &TaskWorkload) -> bool { true }
+    /// #     fn build_task(&self, _task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
     /// # }
     /// let mut labels = Labels::new();
     /// labels.insert("gpu", "true");
@@ -183,45 +183,59 @@ impl RunnerRouter {
         self.runners.push(RunnerEntry { runner, labels });
     }
 
-    /// Pick the first runner that supports the spec and matches its selector.
+    /// Pick the first runner that supports the task workload and matches its selector.
     ///
     /// Routing rules:
-    /// - filter runners by `Runner::supports(spec)`;
-    /// - if `spec.runner_selector()` is set, keep only runners whose labels satisfy all selector requirements;
+    /// - filter runners by `Runner::supports(task.spec().workload())`;
+    /// - if `task.spec().runner_selector()` is set, keep only runners whose labels satisfy all selector requirements;
     /// - pick the first matching entry.
     ///
     /// ## Example
     ///
     /// ```rust,no_run
     /// # use std::sync::Arc;
-    /// # use solti_model::{TaskKind, TaskSpec};
+    /// # use solti_model::{Flag, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskWorkload};
     /// # use solti_runner::{BuildContext, Runner, RunnerError, RunnerRouter};
     /// # use taskvisor::TaskRef;
     /// # struct MyRunner;
     /// # impl Runner for MyRunner {
     /// #     fn name(&self) -> &'static str { "my-runner" }
-    /// #     fn supports(&self, _spec: &TaskSpec) -> bool { true }
-    /// #     fn build_task(&self, _spec: &TaskSpec, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
+    /// #     fn supports(&self, _workload: &TaskWorkload) -> bool { true }
+    /// #     fn build_task(&self, _task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
     /// # }
-    /// let spec = TaskSpec::builder("slot-a", TaskKind::Embedded, 1_000u64).build()?;
+    /// let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+    ///     SubprocessMode::Command { command: "echo".into(), args: vec![] },
+    ///     TaskEnv::default(),
+    ///     None,
+    ///     Flag::enabled(),
+    /// ));
+    /// let spec = solti_model::TaskSpec::builder("slot-a", workload, 1_000u64).build()?;
+    /// let task = Task::new("task-a", spec)?;
     /// let mut router = RunnerRouter::new();
     /// router.register(Arc::new(MyRunner));
     ///
-    /// let picked = router.pick(&spec).unwrap();
+    /// let picked = router.pick(&task).unwrap();
     /// assert_eq!(picked.name(), "my-runner");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn pick(&self, spec: &TaskSpec) -> Option<&Arc<dyn Runner>> {
-        let selector = spec.runner_selector();
+    pub fn pick(&self, task: &Task) -> Option<&Arc<dyn Runner>> {
+        let selector = task.spec().runner_selector();
+        let workload = task.spec().workload();
+        if matches!(workload, TaskWorkload::Embedded(_)) {
+            return None;
+        }
 
         let mut matching = self.runners.iter().filter(|entry| {
-            entry.runner.supports(spec) && selector.is_none_or(|sel| sel.matches(&entry.labels))
+            entry.runner.supports(workload) && selector.is_none_or(|sel| sel.matches(&entry.labels))
         });
 
         let first = matching.next()?;
         if matching.next().is_some() {
             debug!(
-                slot = %spec.slot(),
+                task = %task.name(),
+                slot = %task.slot(),
+                api_version = workload.api_version(),
+                kind = workload.kind(),
                 runner = first.runner.name(),
                 "multiple runners match this spec; using the first registered (registration order is significant)"
             );
@@ -229,55 +243,65 @@ impl RunnerRouter {
         Some(&first.runner)
     }
 
-    /// Build a [`TaskRef`] for the given spec using the selected runner.
+    /// Build a [`TaskRef`] for the given task using the selected runner.
     ///
-    /// `TaskKind::Embedded` is not routable and must be used with `SupervisorApi::submit_with_task`.
+    /// [`TaskWorkload::Embedded`] is not routable and must be used with `SupervisorApi::create_with_task` or `SupervisorApi::apply_with_task`.
     ///
     /// ## Example
     ///
     /// ```rust,no_run
     /// # use std::sync::Arc;
-    /// # use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec};
+    /// # use solti_model::{Flag, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskSpec, TaskWorkload};
     /// # use solti_runner::{BuildContext, Runner, RunnerError, RunnerRouter};
     /// # use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
     /// # struct MyRunner;
     /// # impl Runner for MyRunner {
     /// #     fn name(&self) -> &'static str { "my-runner" }
-    /// #     fn supports(&self, spec: &TaskSpec) -> bool { matches!(spec.kind(), TaskKind::Subprocess(_)) }
-    /// #     fn build_task(&self, spec: &TaskSpec, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
-    /// #         let id = self.build_run_id(spec.slot().as_ref());
+    /// #     fn supports(&self, workload: &TaskWorkload) -> bool { matches!(workload, TaskWorkload::Subprocess(_)) }
+    /// #     fn build_task(&self, task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
+    /// #         let id = self.build_run_id(task.slot().as_ref());
     /// #         Ok(TaskFn::arc(id.into_name(), |_ctx: TaskContext| async move { Ok::<(), TaskError>(()) }))
     /// #     }
     /// # }
-    /// let kind = TaskKind::Subprocess(SubprocessSpec::new(
+    /// let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
     ///     SubprocessMode::Command { command: "echo".into(), args: vec!["hi".into()] },
     ///     TaskEnv::default(),
     ///     None,
     ///     Flag::enabled(),
     /// ));
-    /// let spec = TaskSpec::builder("slot-a", kind, 1_000u64).build()?;
+    /// let spec = TaskSpec::builder("slot-a", workload, 1_000u64).build()?;
+    /// let task = Task::new("task-a", spec)?;
     ///
     /// let mut router = RunnerRouter::new();
     /// router.register(Arc::new(MyRunner));
     ///
-    /// let task = router.build(&spec)?;
-    /// # let _ = task;
+    /// let task_ref = router.build(&task)?;
+    /// # let _ = task_ref;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    #[instrument(level = "debug", skip(self, spec), fields(kind = ?spec.kind()))]
-    pub fn build(&self, spec: &TaskSpec) -> Result<TaskRef, RunnerError> {
-        trace!(spec = ?spec, "router received spec");
+    #[instrument(
+        level = "debug",
+        skip(self, task),
+        fields(
+            task = %task.name(),
+            api_version = task.spec().workload().api_version(),
+            kind = task.spec().workload().kind()
+        )
+    )]
+    pub fn build(&self, task: &Task) -> Result<TaskRef, RunnerError> {
+        trace!(task = ?task, "router received task");
 
-        if matches!(spec.kind(), TaskKind::Embedded) {
+        let workload = task.spec().workload();
+        if matches!(workload, TaskWorkload::Embedded(_)) {
             return Err(RunnerError::NoRunner(
-                "TaskKind::Embedded requires submit_with_task()".to_string(),
+                "solti.io/v1/Embedded requires create_with_task() or apply_with_task()".to_string(),
             ));
         }
-        let r = self
-            .pick(spec)
-            .ok_or_else(|| RunnerError::NoRunner(spec.kind().kind().to_string()))?;
+        let r = self.pick(task).ok_or_else(|| {
+            RunnerError::NoRunner(format!("{}/{}", workload.api_version(), workload.kind()))
+        })?;
 
-        let task = r.build_task(spec, &self.ctx)?;
+        let task = r.build_task(task, &self.ctx)?;
         debug!(runner = r.name(), "runner built task successfully");
         Ok(task)
     }
@@ -289,14 +313,14 @@ impl RunnerRouter {
     /// ```rust,no_run
     /// # use std::sync::Arc;
     /// # use solti_model::Labels;
-    /// # use solti_model::TaskSpec;
+    /// # use solti_model::{Task, TaskWorkload};
     /// # use solti_runner::{BuildContext, Runner, RunnerError, RunnerRouter};
     /// # use taskvisor::TaskRef;
     /// # struct MyRunner;
     /// # impl Runner for MyRunner {
     /// #     fn name(&self) -> &'static str { "gpu-runner" }
-    /// #     fn supports(&self, _spec: &TaskSpec) -> bool { true }
-    /// #     fn build_task(&self, _spec: &TaskSpec, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
+    /// #     fn supports(&self, _workload: &TaskWorkload) -> bool { true }
+    /// #     fn build_task(&self, _task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
     /// # }
     /// let mut labels = Labels::new();
     /// labels.insert("gpu", "true");
@@ -319,8 +343,8 @@ mod tests {
     use crate::RunnerError;
 
     use solti_model::{
-        AdmissionPolicy, BackoffPolicy, Flag, JitterPolicy, Labels, RunnerSelector, SubprocessMode,
-        SubprocessSpec, TaskEnv, WasmSpec,
+        AdmissionPolicy, BackoffPolicy, EmbeddedSpec, Flag, JitterPolicy, Labels, RunnerSelector,
+        SubprocessMode, SubprocessSpec, TaskEnv, TaskSpec, WasmSpec,
     };
     use std::path::PathBuf;
     use taskvisor::{TaskContext, TaskError, TaskFn};
@@ -332,15 +356,11 @@ mod tests {
             "subprocess-only"
         }
 
-        fn supports(&self, spec: &TaskSpec) -> bool {
-            matches!(spec.kind(), TaskKind::Subprocess(_))
+        fn supports(&self, workload: &TaskWorkload) -> bool {
+            matches!(workload, TaskWorkload::Subprocess(_))
         }
 
-        fn build_task(
-            &self,
-            _spec: &TaskSpec,
-            _ctx: &BuildContext,
-        ) -> Result<TaskRef, RunnerError> {
+        fn build_task(&self, _task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
             let task = TaskFn::arc("test-subprocess-runner", |_ctx: TaskContext| async move {
                 Ok::<(), TaskError>(())
             });
@@ -357,31 +377,68 @@ mod tests {
         }
     }
 
-    fn mk_spec(kind: TaskKind) -> TaskSpec {
-        TaskSpec::builder("test-slot", kind, 10_000_u64)
+    fn mk_task(workload: TaskWorkload) -> Task {
+        let spec = TaskSpec::builder("test-slot", workload, 10_000_u64)
             .backoff(mk_backoff())
             .admission(AdmissionPolicy::DropIfRunning)
             .build()
-            .expect("valid spec")
+            .expect("valid spec");
+        Task::new("test-task", spec).expect("valid task")
     }
 
     #[test]
-    fn build_fails_for_taskkind_embedded() {
+    fn build_fails_for_embedded_workload() {
         let router = RunnerRouter::new();
-        let spec = mk_spec(TaskKind::Embedded);
+        let task = mk_task(TaskWorkload::Embedded(
+            EmbeddedSpec::new("test-revision").expect("valid embedded revision"),
+        ));
 
-        let res = router.build(&spec);
+        let res = router.build(&task);
 
         match res {
             Err(RunnerError::NoRunner(msg)) => {
                 assert!(
-                    msg.contains("TaskKind::Embedded"),
+                    msg.contains("Embedded"),
                     "unexpected NoRunner message: {msg}"
                 );
             }
-            Ok(_) => panic!("expected RunnerError::NoRunner for TaskKind::Embedded, got Ok(..)"),
-            Err(e) => panic!("expected RunnerError::NoRunner for TaskKind::Embedded, got {e:?}"),
+            Ok(_) => panic!("expected RunnerError::NoRunner for Embedded workload, got Ok(..)"),
+            Err(e) => panic!("expected RunnerError::NoRunner for Embedded workload, got {e:?}"),
         }
+    }
+
+    #[test]
+    fn pick_never_routes_embedded_workload() {
+        struct AcceptsEverything;
+
+        impl Runner for AcceptsEverything {
+            fn name(&self) -> &'static str {
+                "accepts-everything"
+            }
+
+            fn supports(&self, _workload: &TaskWorkload) -> bool {
+                true
+            }
+
+            fn build_task(
+                &self,
+                _task: &Task,
+                _ctx: &BuildContext,
+            ) -> Result<TaskRef, RunnerError> {
+                unreachable!("Embedded workloads must not reach a runner")
+            }
+        }
+
+        let mut router = RunnerRouter::new();
+        router.register(Arc::new(AcceptsEverything));
+
+        assert!(
+            router
+                .pick(&mk_task(TaskWorkload::Embedded(
+                    EmbeddedSpec::new("test-revision").expect("valid embedded revision"),
+                )))
+                .is_none()
+        );
     }
 
     #[test]
@@ -390,10 +447,11 @@ mod tests {
         impl crate::OutputPublisher for Publisher {
             fn sink_for(
                 &self,
-                _task_id: &solti_model::TaskId,
+                _task_name: &solti_model::TaskId,
+                generation: u64,
                 attempt: u32,
             ) -> Option<crate::OutputSink> {
-                Some(crate::OutputSink::new(attempt, |_| {}))
+                Some(crate::OutputSink::new(generation, attempt, |_| {}))
             }
         }
 
@@ -408,7 +466,7 @@ mod tests {
         let mut router = RunnerRouter::new();
         router.register(Arc::new(SubprocessRunnerDummy));
 
-        let spec = mk_spec(TaskKind::Subprocess(SubprocessSpec::new(
+        let task = mk_task(TaskWorkload::Subprocess(SubprocessSpec::new(
             SubprocessMode::Command {
                 command: "echo".to_string(),
                 args: vec!["hello".into()],
@@ -418,7 +476,7 @@ mod tests {
             Flag::default(),
         )));
 
-        let res = router.build(&spec);
+        let res = router.build(&task);
 
         match res {
             Ok(_task) => {}
@@ -431,17 +489,17 @@ mod tests {
         let mut router = RunnerRouter::new();
         router.register(Arc::new(SubprocessRunnerDummy));
 
-        let spec = mk_spec(TaskKind::Wasm(WasmSpec::new(
+        let task = mk_task(TaskWorkload::Wasm(WasmSpec::new(
             PathBuf::from("mod.wasm"),
             Vec::new(),
             TaskEnv::default(),
         )));
 
-        let res = router.build(&spec);
+        let res = router.build(&task);
 
         match res {
             Err(RunnerError::NoRunner(kind)) => {
-                assert_eq!(kind, "wasm", "expected NoRunner(\"wasm\")");
+                assert_eq!(kind, "solti.io/v1/Wasm");
             }
             Ok(_) => panic!("expected RunnerError::NoRunner for wasm, got Ok(..)"),
             Err(e) => panic!("expected RunnerError::NoRunner for wasm, got {e:?}"),
@@ -458,13 +516,13 @@ mod tests {
                 "r1"
             }
 
-            fn supports(&self, _spec: &TaskSpec) -> bool {
+            fn supports(&self, _workload: &TaskWorkload) -> bool {
                 true
             }
 
             fn build_task(
                 &self,
-                _spec: &TaskSpec,
+                _task: &Task,
                 _ctx: &BuildContext,
             ) -> Result<TaskRef, RunnerError> {
                 Ok(TaskFn::arc("r1-task", |_ctx: TaskContext| async move {
@@ -478,13 +536,13 @@ mod tests {
                 "r2"
             }
 
-            fn supports(&self, _spec: &TaskSpec) -> bool {
+            fn supports(&self, _workload: &TaskWorkload) -> bool {
                 true
             }
 
             fn build_task(
                 &self,
-                _spec: &TaskSpec,
+                _task: &Task,
                 _ctx: &BuildContext,
             ) -> Result<TaskRef, RunnerError> {
                 Ok(TaskFn::arc("r2-task", |_ctx: TaskContext| async move {
@@ -502,8 +560,8 @@ mod tests {
         router.register_with_labels(Arc::new(R1), labels_r1);
         router.register_with_labels(Arc::new(R2), labels_r2);
 
-        let spec = {
-            let base = mk_spec(TaskKind::Subprocess(SubprocessSpec::new(
+        let task = {
+            let base = mk_task(TaskWorkload::Subprocess(SubprocessSpec::new(
                 SubprocessMode::Command {
                     command: "echo".into(),
                     args: vec!["hi".into()],
@@ -514,10 +572,58 @@ mod tests {
             )));
             let mut match_labels = Labels::new();
             match_labels.insert("runner-name", "runner-b");
-            base.with_runner_selector(RunnerSelector::from_labels(match_labels))
+            let (_, metadata, spec, status) = base.into_parts();
+            Task::from_parts(
+                solti_model::TypeMeta::task(),
+                metadata,
+                spec.with_runner_selector(RunnerSelector::from_labels(match_labels)),
+                status,
+            )
+            .unwrap()
         };
 
-        let picked = router.pick(&spec).expect("runner should be picked");
+        let picked = router.pick(&task).expect("runner should be picked");
         assert_eq!(picked.name(), "r2");
+    }
+
+    #[test]
+    fn application_defined_gvk_routes_through_registered_runner() {
+        struct ImageResizeRunner;
+
+        impl Runner for ImageResizeRunner {
+            fn name(&self) -> &'static str {
+                "image-resize"
+            }
+
+            fn supports(&self, workload: &TaskWorkload) -> bool {
+                workload.api_version() == "tasks.example.io/v1" && workload.kind() == "ImageResize"
+            }
+
+            fn build_task(
+                &self,
+                _task: &Task,
+                _ctx: &BuildContext,
+            ) -> Result<TaskRef, RunnerError> {
+                Ok(TaskFn::arc(
+                    "image-resize-run",
+                    |_ctx: TaskContext| async move { Ok::<(), TaskError>(()) },
+                ))
+            }
+        }
+
+        let workload = TaskWorkload::Extension(
+            solti_model::ExtensionWorkload::new(
+                "tasks.example.io/v1",
+                "ImageResize",
+                serde_json::json!({ "width": 1280 }),
+            )
+            .unwrap(),
+        );
+        let task = mk_task(workload);
+        let mut router = RunnerRouter::new();
+        router.register(Arc::new(ImageResizeRunner));
+
+        let built = router.build(&task).unwrap();
+        assert_eq!(built.name(), "image-resize-run");
     }
 }

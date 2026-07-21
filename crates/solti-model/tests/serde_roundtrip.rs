@@ -1,14 +1,15 @@
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, ContainerSpec, Flag, JitterPolicy, Labels, RestartPolicy,
-    RunnerSelector, Runtime, SelectorRequirement, SubprocessMode, SubprocessSpec, Task, TaskEnv,
-    TaskKind, TaskPhase, TaskRun, TaskSpec, WasmSpec,
+    AdmissionPolicy, BackoffPolicy, ContainerSpec, EmbeddedSpec, Flag, JitterPolicy, Labels,
+    RestartPolicy, RunnerSelector, Runtime, SelectorRequirement, SubprocessMode, SubprocessSpec,
+    Task, TaskEnv, TaskPhase, TaskRun, TaskSpec, TaskWorkload, WasmSpec,
 };
 
-fn fully_populated_spec(kind: TaskKind) -> TaskSpec {
-    let mut labels = Labels::new();
-    labels.insert("tier", "prod").insert("owner", "platform");
+fn embedded(revision: &str) -> TaskWorkload {
+    TaskWorkload::Embedded(EmbeddedSpec::new(revision).unwrap())
+}
 
+fn fully_populated_spec(workload: TaskWorkload) -> TaskSpec {
     let mut selector_labels = Labels::new();
     selector_labels.insert("zone", "eu-west-1");
 
@@ -20,7 +21,7 @@ fn fully_populated_spec(kind: TaskKind) -> TaskSpec {
         ],
     };
 
-    TaskSpec::builder("build-pipeline", kind, 30_000u64)
+    TaskSpec::builder("build-pipeline", workload, 30_000u64)
         .restart(RestartPolicy::periodic(60_000))
         .backoff(BackoffPolicy {
             jitter: JitterPolicy::Equal,
@@ -30,7 +31,6 @@ fn fully_populated_spec(kind: TaskKind) -> TaskSpec {
         })
         .admission(AdmissionPolicy::Replace)
         .runner_selector(selector)
-        .labels(labels)
         .build()
         .expect("spec must build cleanly")
 }
@@ -44,7 +44,7 @@ fn roundtrip(task: &Task) {
 
 #[test]
 fn roundtrip_subprocess_command() {
-    let spec = fully_populated_spec(TaskKind::Subprocess(SubprocessSpec::new(
+    let spec = fully_populated_spec(TaskWorkload::Subprocess(SubprocessSpec::new(
         SubprocessMode::Command {
             command: "/usr/bin/make".into(),
             args: vec!["-j4".into(), "test".into()],
@@ -58,20 +58,20 @@ fn roundtrip_subprocess_command() {
         Some(std::path::PathBuf::from("/workspace")),
         Flag::enabled(),
     )));
-    let mut task = Task::new("task-sub-cmd".into(), spec);
-    task.transition_starting();
-    task.transition_finished(TaskPhase::Failed, Some("retry".into()), None)
+    let mut task = Task::new("task-sub-cmd", spec).unwrap();
+    task.transition_starting(1, 1, "1").unwrap();
+    task.transition_finished(1, 1, TaskPhase::Failed, Some("retry".into()), None, "2")
         .unwrap();
-    task.transition_starting();
-    task.transition_finished(TaskPhase::Failed, Some("retry-2".into()), None)
+    task.transition_starting(1, 2, "3").unwrap();
+    task.transition_finished(1, 2, TaskPhase::Failed, Some("retry-2".into()), None, "4")
         .unwrap();
-    task.transition_starting(); // now attempt=3, phase=Running
+    task.transition_starting(1, 3, "5").unwrap();
     roundtrip(&task);
 }
 
 #[test]
 fn roundtrip_subprocess_script_custom() {
-    let spec = fully_populated_spec(TaskKind::Subprocess(SubprocessSpec::new(
+    let spec = fully_populated_spec(TaskWorkload::Subprocess(SubprocessSpec::new(
         SubprocessMode::Script {
             runtime: Runtime::Custom {
                 command: "ruby".into(),
@@ -84,48 +84,55 @@ fn roundtrip_subprocess_script_custom() {
         None,
         Flag::disabled(),
     )));
-    let task = Task::new("task-script".into(), spec);
+    let task = Task::new("task-script", spec).unwrap();
     roundtrip(&task);
 }
 
 #[test]
 fn roundtrip_wasm() {
-    let spec = fully_populated_spec(TaskKind::Wasm(WasmSpec::new(
+    let spec = fully_populated_spec(TaskWorkload::Wasm(WasmSpec::new(
         std::path::PathBuf::from("/modules/report.wasm"),
         vec!["--format=json".into()],
         TaskEnv::new(),
     )));
-    let task = Task::new("task-wasm".into(), spec);
+    let task = Task::new("task-wasm", spec).unwrap();
     roundtrip(&task);
 }
 
 #[test]
 fn roundtrip_container() {
-    let spec = fully_populated_spec(TaskKind::Container(ContainerSpec::new(
+    let spec = fully_populated_spec(TaskWorkload::Container(ContainerSpec::new(
         "registry.example.com/build:v1.2.3".into(),
         Some(vec!["sh".into(), "-c".into()]),
         vec!["echo hi".into()],
         TaskEnv::new(),
     )));
-    let mut task = Task::new("task-ctr".into(), spec);
-    task.transition_starting();
-    task.transition_finished(TaskPhase::Failed, Some("SIGKILL".into()), Some(137))
-        .unwrap();
+    let mut task = Task::new("task-ctr", spec).unwrap();
+    task.transition_starting(1, 1, "1").unwrap();
+    task.transition_finished(
+        1,
+        1,
+        TaskPhase::Failed,
+        Some("SIGKILL".into()),
+        Some(137),
+        "2",
+    )
+    .unwrap();
     roundtrip(&task);
 }
 
 #[test]
 fn roundtrip_embedded_bypasses_submit_validation() {
-    let spec = TaskSpec::builder("internal-sync", TaskKind::Embedded, 1_000u64)
+    let spec = TaskSpec::builder("internal-sync", embedded("test-v1"), 1_000u64)
         .build()
         .unwrap();
-    let task = Task::new("task-emb".into(), spec);
+    let task = Task::new("task-emb", spec).unwrap();
     roundtrip(&task);
 }
 
 #[test]
 fn task_run_roundtrip_preserves_all_fields() {
-    let mut run = TaskRun::starting(7);
+    let mut run = TaskRun::starting(3, 7, embedded("test-v1").type_meta());
     run.finish(
         TaskPhase::Exhausted,
         Some("retries exhausted".into()),
@@ -139,7 +146,7 @@ fn task_run_roundtrip_preserves_all_fields() {
 
 #[test]
 fn backoff_invalid_on_wire_rejected_when_nested_in_spec() {
-    let valid = fully_populated_spec(TaskKind::Embedded);
+    let valid = fully_populated_spec(embedded("test-v1"));
     let mut json: serde_json::Value = serde_json::to_value(&valid).unwrap();
     json["backoff"]["firstMs"] = serde_json::json!(0);
     let err = serde_json::from_value::<TaskSpec>(json).unwrap_err();

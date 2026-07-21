@@ -8,10 +8,21 @@ use crate::proto_api;
 impl From<&ObjectMeta> for proto_api::ObjectMeta {
     fn from(m: &ObjectMeta) -> Self {
         proto_api::ObjectMeta {
-            id: m.id.to_string(),
-            resource_version: m.resource_version,
-            created_at: system_time_to_ms(m.created_at),
-            updated_at: system_time_to_ms(m.updated_at),
+            name: m.name().to_string(),
+            uid: m.uid().to_string(),
+            resource_version: m.resource_version().to_owned(),
+            generation: m.generation(),
+            creation_timestamp: system_time_to_ms(m.creation_timestamp()),
+            labels: m
+                .labels()
+                .iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
+            annotations: m
+                .annotations()
+                .iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
         }
     }
 }

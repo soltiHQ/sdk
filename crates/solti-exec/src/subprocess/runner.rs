@@ -1,14 +1,14 @@
 //! # Runner: subprocess execution engine.
 //!
 //! [`SubprocessRunner`] implements the [`Runner`](solti_runner::Runner) trait to execute
-//! [`TaskKind::Subprocess`](solti_model::TaskKind::Subprocess) tasks as OS processes.
+//! [`TaskWorkload::Subprocess`](solti_model::TaskWorkload::Subprocess) tasks as OS processes.
 //!
 //! ## How it works
 //! ```text
-//! SubprocessRunner::build_task(spec, ctx)
+//! SubprocessRunner::build_task(task, ctx)
 //!     │
-//!     ├──► build_task_config(spec, ctx)
-//!     │     ├──► match TaskKind::Subprocess(SubprocessSpec { .. })
+//!     ├──► build_task_config(task, ctx)
+//!     │     ├──► match TaskWorkload::Subprocess(SubprocessSpec { .. })
 //!     │     ├──► resolve_mode(mode) → Resolved { command, args, script_body? }
 //!     │     │     ├──► Command { command, args } → clone, script_body = None
 //!     │     │     └──► Script { runtime, body }  → decode base64 (size-checked)
@@ -29,6 +29,7 @@
 //! ```text
 //! run_subprocess(ctx, cancel)
 //!     │
+//!     ├──► allocate attempt + OutputSink
 //!     ├──► metrics.record_task_started()
 //!     ├──► prepare_backend() → create cgroup dirs
 //!     ├──► materialize_script() (Script mode only)
@@ -73,9 +74,10 @@ use tempfile::NamedTempFile;
 use tokio::process::Command;
 use tracing::{debug, trace, warn};
 
-use solti_model::{SubprocessSpec, TaskId, TaskKind, TaskSpec, merge_env};
+use solti_model::{Runtime, SubprocessSpec, Task, TaskWorkload};
 use solti_runner::{
     BuildContext, OutputPublisherHandle, Runner, RunnerError, RunnerErrorKind, RunnerType,
+    merge_env,
 };
 
 use crate::metrics::classify_task_error;
@@ -85,12 +87,11 @@ use crate::subprocess::{
     task::SubprocessTaskConfig,
 };
 
-/// Runner that executes `TaskKind::Subprocess` as OS subprocesses.
+/// Runner that executes [`TaskWorkload::Subprocess`] as OS subprocesses.
 ///
 /// ## Also
 ///
 /// - [`SubprocessBackendConfig`] rlimits, cgroups, security applied to spawned processes.
-/// - [`SubprocessTaskConfig`](super::SubprocessTaskConfig) resolved per-task config.
 /// - [`register_subprocess_runner`](super::register_subprocess_runner) registration helper.
 /// - [`solti_runner::Runner`] trait this type implements.
 pub struct SubprocessRunner {
@@ -159,17 +160,18 @@ impl SubprocessRunner {
         })
     }
 
-    /// Build task configuration from `TaskSpec`.
+    /// Build task configuration from a [`Task`] resource.
     ///
     /// Returns the fully resolved config.
     fn build_task_config(
         &self,
-        spec: &TaskSpec,
+        task: &Task,
         ctx: &BuildContext,
     ) -> Result<(SubprocessTaskConfig, Option<Arc<str>>), RunnerError> {
+        let spec = task.spec();
         let slot = spec.slot();
-        let (cfg, script_body) = match spec.kind() {
-            TaskKind::Subprocess(SubprocessSpec {
+        let (cfg, script_body) = match spec.workload() {
+            TaskWorkload::Subprocess(SubprocessSpec {
                 mode,
                 env,
                 cwd,
@@ -201,7 +203,7 @@ impl SubprocessRunner {
             other => {
                 return Err(RunnerError::UnsupportedKind {
                     runner: self.name,
-                    kind: other.kind().to_string(),
+                    kind: format!("{}/{}", other.api_version(), other.kind()),
                 });
             }
         };
@@ -245,10 +247,10 @@ impl SubprocessRunner {
                     .decode_body_with_limit(max_script_body_bytes)
                     .map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
 
-                let (cmd, _flag_deprecated_for_tempfile_transport) = runtime.resolve();
+                let cmd = resolve_runtime_command(runtime)?;
 
                 Ok(Resolved {
-                    command: cmd.to_string(),
+                    command: cmd.to_owned(),
                     args: args.clone(),
                     script_body: Some(Arc::from(script)),
                 })
@@ -273,23 +275,39 @@ struct Resolved {
     script_body: Option<Arc<str>>,
 }
 
+/// Resolve model data into the executable selected by this backend.
+///
+/// The model owns only the serializable runtime choice. Executable names are a
+/// subprocess-backend policy and therefore live in `solti-exec`.
+fn resolve_runtime_command(runtime: &Runtime) -> Result<&str, RunnerError> {
+    match runtime {
+        Runtime::Bash => Ok("bash"),
+        Runtime::Python => Ok("python3"),
+        Runtime::Node => Ok("node"),
+        Runtime::Custom { command, .. } => Ok(command),
+        _ => Err(RunnerError::InvalidSpec(
+            "unsupported script runtime variant".into(),
+        )),
+    }
+}
+
 impl Runner for SubprocessRunner {
     fn name(&self) -> &'static str {
         self.name
     }
 
-    fn supports(&self, spec: &TaskSpec) -> bool {
-        matches!(spec.kind(), TaskKind::Subprocess(_))
+    fn supports(&self, workload: &TaskWorkload) -> bool {
+        matches!(workload, TaskWorkload::Subprocess(_))
     }
 
-    /// Turn a `TaskKind::Subprocess` spec into a runnable [`TaskRef`].
+    /// Turn a [`TaskWorkload::Subprocess`] resource into a runnable [`TaskRef`].
     ///
     /// Resolves the subprocess mode, merges the environment, and captures the
     /// resolved config in a closure that spawns the OS process when the task runs.
     ///
     /// ## Errors
     ///
-    /// - [`RunnerError::UnsupportedKind`]: `spec.kind()` is not `TaskKind::Subprocess`.
+    /// - [`RunnerError::UnsupportedKind`]: the task workload is not [`TaskWorkload::Subprocess`].
     /// - [`RunnerError::InvalidSpec`]: the command is empty, or the script body is
     ///   not valid base64 or exceeds the configured size limit.
     ///
@@ -297,12 +315,14 @@ impl Runner for SubprocessRunner {
     /// failure there fails the run with a fatal `TaskError`, not a build error.
     /// The output sink is also acquired inside each attempt from the producer
     /// capability injected through [`BuildContext`].
-    fn build_task(&self, spec: &TaskSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
-        let (task_cfg, script_body) = self.build_task_config(spec, ctx)?;
+    fn build_task(&self, task: &Task, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
+        let (task_cfg, script_body) = self.build_task_config(task, ctx)?;
 
         trace!(
-            slot = %spec.slot(),
-            task = %task_cfg.run_id,
+            resource = %task.name(),
+            generation = task.metadata().generation(),
+            slot = %task.slot(),
+            taskvisor_task = %task_cfg.run_id,
             "building subprocess task",
         );
 
@@ -314,7 +334,7 @@ impl Runner for SubprocessRunner {
                     .as_secs();
                 crate::utils::build_cgroup_name(
                     self.name,
-                    spec.slot().as_str(),
+                    task.slot().as_str(),
                     task_cfg.seq,
                     timestamp,
                 )
@@ -335,6 +355,8 @@ impl Runner for SubprocessRunner {
             log_cfg,
             output_publisher: Arc::clone(ctx.output_publisher()),
             attempt: AtomicU32::new(0),
+            generation: task.metadata().generation(),
+            resource_name: task.name().clone(),
 
             script_body,
         });
@@ -357,6 +379,8 @@ struct TaskExecContext {
     cgroup_name: Option<String>,
     log_cfg: LogConfig,
     attempt: AtomicU32,
+    generation: u64,
+    resource_name: solti_model::TaskId,
 
     /// Decoded script body for `Script` mode; `None` for `Command`.
     ///
@@ -646,6 +670,10 @@ const LOG_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// Execute a subprocess task with cancellation support, metrics, and cleanup.
 async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Result<(), TaskError> {
     let start = Instant::now();
+    let attempt = ctx.attempt.fetch_add(1, Ordering::Relaxed) + 1;
+    let sink = ctx
+        .output_publisher
+        .sink_for(&ctx.resource_name, ctx.generation, attempt);
 
     // Args and cwd are not logged: task arguments routinely carry tokens and
     // other secrets. Only the command name and the argument count are recorded.
@@ -687,10 +715,6 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
     );
 
     let log_cfg = ctx.log_cfg;
-
-    let attempt = ctx.attempt.fetch_add(1, Ordering::Relaxed) + 1;
-    let task_id = TaskId::from(Arc::clone(&ctx.task_cfg.run_id));
-    let sink = ctx.output_publisher.sink_for(&task_id, attempt);
 
     let stdout = child
         .stdout
@@ -794,29 +818,50 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
 mod tests {
     use super::*;
 
+    type SinkCalls = Arc<std::sync::Mutex<Vec<(solti_model::TaskId, u64, u32)>>>;
+
     struct RecordingOutputPublisher {
         sender: std::sync::mpsc::Sender<solti_model::OutputEvent>,
+        calls: SinkCalls,
     }
 
     impl solti_runner::OutputPublisher for RecordingOutputPublisher {
-        fn sink_for(&self, _task_id: &TaskId, attempt: u32) -> Option<solti_runner::OutputSink> {
+        fn sink_for(
+            &self,
+            task_name: &solti_model::TaskId,
+            generation: u64,
+            attempt: u32,
+        ) -> Option<solti_runner::OutputSink> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((task_name.clone(), generation, attempt));
             let sender = self.sender.clone();
-            Some(solti_runner::OutputSink::new(attempt, move |event| {
-                let _ = sender.send(event);
-            }))
+            Some(solti_runner::OutputSink::new(
+                generation,
+                attempt,
+                move |event| {
+                    let _ = sender.send(event);
+                },
+            ))
         }
     }
 
     fn recording_output_context() -> (
         BuildContext,
         std::sync::mpsc::Receiver<solti_model::OutputEvent>,
+        SinkCalls,
     ) {
         let (sender, receiver) = std::sync::mpsc::channel();
-        let publisher: solti_runner::OutputPublisherHandle =
-            Arc::new(RecordingOutputPublisher { sender });
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let publisher: solti_runner::OutputPublisherHandle = Arc::new(RecordingOutputPublisher {
+            sender,
+            calls: Arc::clone(&calls),
+        });
         (
             BuildContext::default().with_output_publisher(publisher),
             receiver,
+            calls,
         )
     }
 
@@ -829,14 +874,14 @@ mod tests {
         }
     }
 
-    fn mk_subprocess_spec(slot: &str, command: &str) -> TaskSpec {
+    fn mk_subprocess_spec(slot: &str, command: &str) -> Task {
         mk_subprocess_spec_with_args(slot, command, &[])
     }
 
-    fn mk_subprocess_spec_with_args(slot: &str, command: &str, args: &[&str]) -> TaskSpec {
-        TaskSpec::builder(
+    fn mk_subprocess_spec_with_args(slot: &str, command: &str, args: &[&str]) -> Task {
+        let spec = solti_model::TaskSpec::builder(
             slot,
-            TaskKind::Subprocess(SubprocessSpec::new(
+            TaskWorkload::Subprocess(SubprocessSpec::new(
                 solti_model::SubprocessMode::Command {
                     command: command.into(),
                     args: args.iter().map(|s| s.to_string()).collect(),
@@ -851,16 +896,17 @@ mod tests {
         .backoff(mk_backoff())
         .admission(solti_model::AdmissionPolicy::DropIfRunning)
         .build()
-        .unwrap()
+        .unwrap();
+        Task::new(format!("task-{slot}"), spec).unwrap()
     }
 
-    fn mk_script_spec(slot: &str, body: &[u8], args: &[&str]) -> TaskSpec {
+    fn mk_script_spec(slot: &str, body: &[u8], args: &[&str]) -> Task {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
-        TaskSpec::builder(
+        let spec = solti_model::TaskSpec::builder(
             slot,
-            TaskKind::Subprocess(SubprocessSpec::new(
+            TaskWorkload::Subprocess(SubprocessSpec::new(
                 solti_model::SubprocessMode::Script {
                     runtime: solti_model::Runtime::Bash,
                     body: BASE64.encode(body),
@@ -876,16 +922,21 @@ mod tests {
         .backoff(mk_backoff())
         .admission(solti_model::AdmissionPolicy::DropIfRunning)
         .build()
-        .unwrap()
+        .unwrap();
+        Task::new(format!("task-{slot}"), spec).unwrap()
     }
 
-    fn mk_embedded_spec(slot: &str) -> TaskSpec {
-        TaskSpec::builder(slot, TaskKind::Embedded, 5_000u64)
+    fn mk_embedded_spec(slot: &str) -> Task {
+        let workload = TaskWorkload::Embedded(
+            solti_model::EmbeddedSpec::new("test-revision").expect("valid embedded revision"),
+        );
+        let spec = solti_model::TaskSpec::builder(slot, workload, 5_000u64)
             .restart(solti_model::RestartPolicy::Never)
             .backoff(mk_backoff())
             .admission(solti_model::AdmissionPolicy::DropIfRunning)
             .build()
-            .unwrap()
+            .unwrap();
+        Task::new(format!("task-{slot}"), spec).unwrap()
     }
 
     fn make_task_cfg() -> SubprocessTaskConfig {
@@ -909,6 +960,8 @@ mod tests {
             log_cfg: LogConfig::default(),
             output_publisher: solti_runner::noop_output_publisher(),
             attempt: AtomicU32::new(0),
+            generation: 1,
+            resource_name: "test-resource".into(),
             script_body: None,
         }
     }
@@ -1076,9 +1129,11 @@ mod tests {
     #[test]
     fn build_task_returns_task_ref_for_subprocess() {
         let runner = SubprocessRunner::new("test-runner");
-        let spec = mk_subprocess_spec("test-slot", "echo");
-        let result = runner.build_task(&spec, &BuildContext::default());
-        assert!(result.is_ok());
+        let task = mk_subprocess_spec("test-slot", "echo");
+        let task_ref = runner.build_task(&task, &BuildContext::default()).unwrap();
+
+        assert_ne!(task_ref.name(), task.name().as_str());
+        assert!(task_ref.name().starts_with("test-runner-test-slot-"));
     }
 
     #[test]
@@ -1088,7 +1143,7 @@ mod tests {
         match runner.build_task(&spec, &BuildContext::default()) {
             Err(RunnerError::UnsupportedKind { runner, kind }) => {
                 assert_eq!(runner, "test-runner");
-                assert_eq!(kind, "embedded");
+                assert_eq!(kind, "solti.io/v1/Embedded");
             }
             Err(other) => panic!("expected UnsupportedKind, got {other:?}"),
             Ok(_) => panic!("expected error, got Ok"),
@@ -1098,13 +1153,33 @@ mod tests {
     #[test]
     fn supports_returns_true_for_subprocess() {
         let runner = SubprocessRunner::new("test");
-        assert!(runner.supports(&mk_subprocess_spec("s", "echo")));
+        let task = mk_subprocess_spec("s", "echo");
+        assert!(runner.supports(task.spec().workload()));
+    }
+
+    #[test]
+    fn runtime_executable_resolution_belongs_to_exec_backend() {
+        assert_eq!(resolve_runtime_command(&Runtime::Bash).unwrap(), "bash");
+        assert_eq!(
+            resolve_runtime_command(&Runtime::Python).unwrap(),
+            "python3"
+        );
+        assert_eq!(resolve_runtime_command(&Runtime::Node).unwrap(), "node");
+        assert_eq!(
+            resolve_runtime_command(&Runtime::Custom {
+                command: "ruby".into(),
+                flag: "-e".into(),
+            })
+            .unwrap(),
+            "ruby"
+        );
     }
 
     #[test]
     fn supports_returns_false_for_embedded() {
         let runner = SubprocessRunner::new("test");
-        assert!(!runner.supports(&mk_embedded_spec("s")));
+        let task = mk_embedded_spec("s");
+        assert!(!runner.supports(task.spec().workload()));
     }
 
     #[test]
@@ -1120,7 +1195,7 @@ mod tests {
         use solti_model::OutputEvent;
         use std::time::Duration;
 
-        let (ctx, rx) = recording_output_context();
+        let (ctx, rx, _calls) = recording_output_context();
 
         let runner = SubprocessRunner::new("test-runner");
         let spec = mk_script_spec("script-e2e", b"echo \"hello-$1\"", &["script"]);
@@ -1425,7 +1500,7 @@ mod tests {
         use solti_model::OutputEvent;
         use std::time::Duration;
 
-        let (ctx, rx) = recording_output_context();
+        let (ctx, rx, calls) = recording_output_context();
 
         let runner = SubprocessRunner::new("test-runner");
         let spec = mk_subprocess_spec_with_args("echo-slot", "echo", &["hello-stream"]);
@@ -1448,7 +1523,10 @@ mod tests {
 
         let chunk = found_line.expect("expected to receive 'hello-stream' line");
         assert_eq!(chunk.attempt, 1);
+        assert_eq!(chunk.generation, 1);
         assert_eq!(chunk.stream, solti_model::StreamKind::Stdout);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.as_slice(), &[("task-echo-slot".into(), 1, 1)]);
     }
 
     #[tokio::test]
@@ -1456,7 +1534,7 @@ mod tests {
         use solti_model::OutputEvent;
         use std::time::Duration;
 
-        let (ctx, rx) = recording_output_context();
+        let (ctx, rx, _calls) = recording_output_context();
         let runner = SubprocessRunner::new("test-runner");
         let spec = mk_subprocess_spec_with_args("attempts-slot", "echo", &["x"]);
         let task_ref = runner.build_task(&spec, &ctx).unwrap();
@@ -1476,6 +1554,26 @@ mod tests {
         }
         assert!(attempts.contains(&1), "attempt 1 missing: {attempts:?}");
         assert!(attempts.contains(&2), "attempt 2 missing: {attempts:?}");
+    }
+
+    #[tokio::test]
+    async fn attempt_is_allocated_before_spawn_failure() {
+        let (ctx, _rx, calls) = recording_output_context();
+        let runner = SubprocessRunner::new("test-runner");
+        let task = mk_subprocess_spec("failed-spawn", "/definitely/not/a/command");
+        let task_ref = runner.build_task(&task, &ctx).unwrap();
+
+        assert!(task_ref.spawn(TaskContext::detached()).await.is_err());
+        assert!(task_ref.spawn(TaskContext::detached()).await.is_err());
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.as_slice(),
+            &[
+                ("task-failed-spawn".into(), 1, 1),
+                ("task-failed-spawn".into(), 1, 2),
+            ]
+        );
     }
 
     #[tokio::test]

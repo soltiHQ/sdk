@@ -7,15 +7,14 @@ import "solti/task/v1/types.proto";
 // Task management API exposed by the agent.
 // The control-plane is the client; the agent runs the tasks.
 service TaskService {
-  // Submit a new task; returns its id.
-  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+  // Create a named Task resource. Fails when the name already exists.
+  rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
 
-  // Apply a spec to its slot.
-  // Always force-replaces regardless of the spec's admission.
+  // Declaratively create or update one named Task resource.
   rpc ApplyTask(ApplyTaskRequest) returns (ApplyTaskResponse);
 
-  // Get one task's full state by id.
-  rpc GetTaskStatus(GetTaskStatusRequest) returns (GetTaskStatusResponse);
+  // Get one Task resource by metadata.name.
+  rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
 
   // List tasks with optional filters and pagination.
   rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
@@ -30,34 +29,34 @@ service TaskService {
   rpc StreamTaskLogs(StreamTaskLogsRequest) returns (stream StreamTaskLogsResponse);
 }
 
-// SubmitTask input.
-message SubmitTaskRequest {
-  CreateSpec spec = 1; // task definition; required
+// CreateTask desired-state input.
+message CreateTaskRequest {
+  TaskManifest manifest = 1;
 }
 
-// SubmitTask output.
-message SubmitTaskResponse {
-  string task_id = 1; // id of the new task; empty means soft failure, retry
+// CreateTask output.
+message CreateTaskResponse {
+  Task task = 1;
 }
 
-// ApplyTask input.
+// ApplyTask desired-state input. The resource is addressed by manifest.metadata.name.
 message ApplyTaskRequest {
-  CreateSpec spec = 1; // task definition; required
+  TaskManifest manifest = 1;
 }
 
 // ApplyTask output.
 message ApplyTaskResponse {
-  string task_id = 1; // id of the task running in the slot after apply
+  Task task = 1;
 }
 
-// GetTaskStatus input.
-message GetTaskStatusRequest {
-  string task_id = 1;
+// GetTask input.
+message GetTaskRequest {
+  string name = 1;
 }
 
-// GetTaskStatus output.
-message GetTaskStatusResponse {
-  optional TaskData task = 1; // absent if no task has this id
+// GetTask output.
+message GetTaskResponse {
+  Task task = 1; // always present; an unknown name is returned as gRPC NotFound
 }
 
 // ListTasks input.
@@ -71,13 +70,13 @@ message ListTasksRequest {
 
 // ListTasks output.
 message ListTasksResponse {
-  repeated TaskData tasks = 1; // one page of tasks
+  repeated Task tasks     = 1; // one page of tasks
   uint32            total = 2; // total tasks matching the filters
 }
 
 // ListTaskRuns input.
 message ListTaskRunsRequest {
-  string task_id = 1;
+  string name = 1;
 }
 
 // ListTaskRuns output.
@@ -87,7 +86,7 @@ message ListTaskRunsResponse {
 
 // DeleteTask input.
 message DeleteTaskRequest {
-  string task_id = 1;
+  string name = 1;
 }
 
 // DeleteTask output. Empty on success.
@@ -95,7 +94,7 @@ message DeleteTaskResponse {}
 
 // StreamTaskLogs input.
 message StreamTaskLogsRequest {
-  string task_id = 1;
+  string name = 1;
 }
 
 // Source stream of a captured output line.
@@ -107,24 +106,27 @@ enum OutputStreamKind {
 
 // One captured line of process output.
 message OutputChunk {
-  uint32           attempt = 1; // attempt that produced the line (1-based)
-  OutputStreamKind stream  = 2; // stdout or stderr
-  uint64           seq     = 3; // per-stream sequence; resets each attempt
-  int64            ts      = 4; // time the agent read the line (ms)
-  bytes            line    = 5; // raw line content
+  uint64           generation = 1; // desired-state generation that produced the line
+  uint32           attempt    = 2; // attempt within generation
+  OutputStreamKind stream     = 3; // stdout or stderr
+  uint64           seq        = 4; // per-stream sequence; resets each attempt
+  int64            ts         = 5; // time the agent read the line (ms)
+  bytes            line       = 6; // raw line content
 }
 
 // A new attempt started.
 message RunStarted {
-  uint32 attempt    = 1; // attempt number (1-based)
-  int64  started_at = 2; // start time (ms)
+  uint64 generation = 1;
+  uint32 attempt    = 2;
+  int64  started_at = 3;
 }
 
 // The current attempt ended. Stop accumulating its chunks.
 message RunFinished {
-  uint32         attempt     = 1; // attempt number (1-based)
-  optional int32 exit_code   = 2; // exit code; absent if killed or timed out
-  int64          finished_at = 3; // end time (ms)
+  uint64         generation  = 1;
+  uint32         attempt     = 2;
+  optional int32 exit_code   = 3;
+  int64          finished_at = 4;
 }
 
 // The subscriber fell behind and the server dropped events.

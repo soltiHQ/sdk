@@ -130,13 +130,17 @@ impl Collector for PrometheusStateCollector {
 mod tests {
     use super::*;
     use prometheus::Registry;
-    use solti_model::{TaskId, TaskKind, TaskSpec};
+    use solti_model::{EmbeddedSpec, TaskId, TaskSpec, TaskWorkload};
     use std::sync::Arc;
 
     fn spec() -> TaskSpec {
-        TaskSpec::builder("slot", TaskKind::Embedded, 5_000_u64)
-            .build()
-            .expect("valid spec")
+        TaskSpec::builder(
+            "slot",
+            TaskWorkload::Embedded(EmbeddedSpec::new("prometheus-test-v1").unwrap()),
+            5_000_u64,
+        )
+        .build()
+        .expect("valid spec")
     }
 
     fn gauge_value(families: &[MetricFamily], name: &str, phase: &str) -> Option<f64> {

@@ -20,7 +20,7 @@ use solti_model::{OutputChunk, OutputEvent, StreamKind, TaskId};
 /// operations.
 pub trait OutputPublisher: Send + Sync {
     /// Return a sink for one task attempt, or `None` when output is disabled.
-    fn sink_for(&self, task_id: &TaskId, attempt: u32) -> Option<OutputSink>;
+    fn sink_for(&self, task_name: &TaskId, generation: u64, attempt: u32) -> Option<OutputSink>;
 }
 
 /// Shared output producer capability injected into runners.
@@ -35,7 +35,7 @@ pub fn noop_output_publisher() -> OutputPublisherHandle {
 struct NoOpOutputPublisher;
 
 impl OutputPublisher for NoOpOutputPublisher {
-    fn sink_for(&self, _task_id: &TaskId, _attempt: u32) -> Option<OutputSink> {
+    fn sink_for(&self, _task_name: &TaskId, _generation: u64, _attempt: u32) -> Option<OutputSink> {
         None
     }
 }
@@ -48,6 +48,7 @@ impl OutputPublisher for NoOpOutputPublisher {
 /// same per-stream counters.
 #[derive(Clone)]
 pub struct OutputSink {
+    generation: u64,
     attempt: u32,
     seq_stdout: Arc<AtomicU64>,
     seq_stderr: Arc<AtomicU64>,
@@ -60,11 +61,12 @@ impl OutputSink {
     /// This constructor is intended for [`OutputPublisher`] implementations.
     /// The callback must not block runner execution; live-output transports are
     /// expected to be lossy or otherwise non-blocking.
-    pub fn new<F>(attempt: u32, publish: F) -> Self
+    pub fn new<F>(generation: u64, attempt: u32, publish: F) -> Self
     where
         F: Fn(OutputEvent) + Send + Sync + 'static,
     {
         Self {
+            generation,
             attempt,
             seq_stdout: Arc::new(AtomicU64::new(0)),
             seq_stderr: Arc::new(AtomicU64::new(0)),
@@ -89,8 +91,14 @@ impl OutputSink {
         self.attempt
     }
 
+    /// Return the desired-state generation this sink belongs to.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     fn push(&self, stream: StreamKind, seq: u64, line: Bytes) {
         (self.publish)(OutputEvent::Chunk(OutputChunk {
+            generation: self.generation,
             attempt: self.attempt,
             stream,
             seq,
@@ -109,10 +117,10 @@ mod tests {
 
     use super::{OutputSink, noop_output_publisher};
 
-    fn recording_sink(attempt: u32) -> (OutputSink, Arc<Mutex<Vec<OutputEvent>>>) {
+    fn recording_sink(generation: u64, attempt: u32) -> (OutputSink, Arc<Mutex<Vec<OutputEvent>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&events);
-        let sink = OutputSink::new(attempt, move |event| {
+        let sink = OutputSink::new(generation, attempt, move |event| {
             recorded.lock().unwrap().push(event);
         });
         (sink, events)
@@ -120,7 +128,7 @@ mod tests {
 
     #[test]
     fn sink_publishes_stdout_and_stderr_chunks() {
-        let (sink, events) = recording_sink(3);
+        let (sink, events) = recording_sink(2, 3);
 
         sink.stdout_line(Bytes::from_static(b"hello"));
         sink.stderr_line(Bytes::from_static(b"oops"));
@@ -130,6 +138,7 @@ mod tests {
             panic!("expected stdout chunk");
         };
         assert_eq!(stdout.attempt, 3);
+        assert_eq!(stdout.generation, 2);
         assert_eq!(stdout.stream, StreamKind::Stdout);
         assert_eq!(stdout.seq, 0);
         assert_eq!(&stdout.line[..], b"hello");
@@ -145,7 +154,7 @@ mod tests {
 
     #[test]
     fn sink_clones_share_monotonic_counters_per_stream() {
-        let (sink, events) = recording_sink(1);
+        let (sink, events) = recording_sink(1, 1);
         let clone = sink.clone();
 
         sink.stdout_line(Bytes::from_static(b"a"));
@@ -174,7 +183,7 @@ mod tests {
 
     #[test]
     fn sink_forwards_bytes_without_copying_the_payload() {
-        let (sink, events) = recording_sink(1);
+        let (sink, events) = recording_sink(1, 1);
         let payload = Bytes::from_static(b"shared");
         let pointer = payload.as_ptr();
 
@@ -191,7 +200,7 @@ mod tests {
     fn noop_publisher_disables_output() {
         assert!(
             noop_output_publisher()
-                .sink_for(&TaskId::from("task-1"), 1)
+                .sink_for(&TaskId::from("task-1"), 1, 1)
                 .is_none()
         );
     }

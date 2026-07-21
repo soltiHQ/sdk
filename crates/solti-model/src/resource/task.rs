@@ -1,536 +1,1008 @@
-//! Task resource.
-//!
-//! [`Task`] combines metadata, desired spec, and observed status.
+//! Kubernetes-shaped task resource and its state transitions.
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Labels, ObjectMeta, Slot, TaskId, TaskPhase, TaskSpec, TaskStatus,
-    error::{ModelError, ModelResult},
+    Annotations, ConditionStatus, Labels, ModelError, ModelResult, ObjectMeta, Slot,
+    TaskConditionType, TaskId, TaskPhase, TaskSpec, TaskStatus, Uid,
 };
 
-/// Unified task resource.
-///
-/// Every task is represented as a single resource with three sections:
-/// - `status`   - observed state: current phase, attempts, errors ([`TaskStatus`])
-/// - `spec`     - desired state: what to run and how ([`TaskSpec`])
-/// - `metadata` - identity, versioning, timestamps ([`ObjectMeta`])
-///
-/// ## Example
-///
-/// ```
-/// use solti_model::{Task, TaskId, TaskKind, TaskPhase, TaskSpec};
-///
-/// let spec = TaskSpec::builder("build", TaskKind::Embedded, 1_000u64)
-///     .build()
-///     .unwrap();
-/// let task = Task::new(TaskId::from("embedded-build-1"), spec);
-///
-/// assert_eq!(*task.phase(), TaskPhase::Pending);
-/// assert_eq!(task.slot().as_str(), "build");
-/// ```
+/// API group and version of the built-in Task resource.
+pub const TASK_API_VERSION: &str = "solti.io/v1";
+
+/// Kind of the built-in Task resource.
+pub const TASK_KIND: &str = "Task";
+
+/// Classification of an apply operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesiredChange {
+    /// Desired state and user-owned metadata were already identical.
+    None,
+    /// Only labels and/or annotations changed.
+    Metadata,
+    /// Spec changed, optionally together with labels or annotations.
+    Spec,
+}
+
+impl DesiredChange {
+    /// Return whether apply changed the resource.
+    #[inline]
+    pub fn is_changed(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Group/version and kind identifying a resource schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Task {
-    metadata: ObjectMeta,
-    status: TaskStatus,
+pub struct TypeMeta {
+    api_version: String,
+    kind: String,
+}
+
+/// User-owned metadata accepted in a [`TaskManifest`].
+///
+/// Runtime identity, resource version, generation, creation time and status are
+/// deliberately absent because the state store owns them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskManifestMeta {
+    name: TaskId,
+    #[serde(default, skip_serializing_if = "Labels::is_empty")]
+    labels: Labels,
+    #[serde(default, skip_serializing_if = "Annotations::is_empty")]
+    annotations: Annotations,
+}
+
+impl TaskManifestMeta {
+    /// Build user-owned metadata for a named Task manifest.
+    pub fn new(name: impl Into<TaskId>) -> ModelResult<Self> {
+        let metadata = Self {
+            name: name.into(),
+            labels: Labels::new(),
+            annotations: Annotations::new(),
+        };
+        metadata.name.validate_format()?;
+        Ok(metadata)
+    }
+
+    /// Stable resource name.
+    #[inline]
+    pub fn name(&self) -> &TaskId {
+        &self.name
+    }
+
+    /// Selector metadata.
+    #[inline]
+    pub fn labels(&self) -> &Labels {
+        &self.labels
+    }
+
+    /// Free-form metadata.
+    #[inline]
+    pub fn annotations(&self) -> &Annotations {
+        &self.annotations
+    }
+
+    fn with_labels(mut self, labels: Labels) -> Self {
+        self.labels = labels;
+        self
+    }
+
+    fn with_annotations(mut self, annotations: Annotations) -> Self {
+        self.annotations = annotations;
+        self
+    }
+
+    fn validate(&self) -> ModelResult<()> {
+        self.name.validate_format()?;
+        self.labels.validate()?;
+        self.annotations.validate()
+    }
+}
+
+/// User-owned desired state accepted by create and apply operations.
+///
+/// Its serialized shape is `apiVersion`, `kind`, `metadata`, `spec`. Stored
+/// resources are represented by [`Task`] and additionally contain server-owned
+/// metadata and `status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(try_from = "raw::TaskManifestRaw")]
+pub struct TaskManifest {
+    #[serde(flatten)]
+    type_meta: TypeMeta,
+    metadata: TaskManifestMeta,
     spec: TaskSpec,
 }
 
-impl Task {
-    /// Create a new task in [`TaskPhase::Pending`] phase.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_model::{Task, TaskId, TaskKind, TaskPhase, TaskSpec};
-    ///
-    /// let spec = TaskSpec::builder("build", TaskKind::Embedded, 1_000u64)
-    ///     .build()
-    ///     .unwrap();
-    /// let task = Task::new(TaskId::from("task-1"), spec);
-    ///
-    /// assert_eq!(*task.phase(), TaskPhase::Pending);
-    /// assert_eq!(task.metadata().resource_version, 1);
-    /// ```
-    pub fn new(id: TaskId, spec: TaskSpec) -> Self {
-        Self {
-            metadata: ObjectMeta::new(id),
-            status: TaskStatus::pending(),
-            spec,
-        }
+impl TaskManifest {
+    /// Build a Task manifest from its stable name and desired spec.
+    pub fn new(name: impl Into<TaskId>, spec: TaskSpec) -> ModelResult<Self> {
+        Self::from_parts(TypeMeta::task(), TaskManifestMeta::new(name)?, spec)
     }
 
-    /// Resource metadata (identity, `resource_version`, timestamps).
+    /// Reconstruct a manifest from its serialized parts.
+    pub fn from_parts(
+        type_meta: TypeMeta,
+        metadata: TaskManifestMeta,
+        spec: TaskSpec,
+    ) -> ModelResult<Self> {
+        let manifest = Self {
+            type_meta,
+            metadata,
+            spec,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// Attach labels to the manifest.
+    #[must_use]
+    pub fn with_labels(mut self, labels: Labels) -> Self {
+        self.metadata = self.metadata.with_labels(labels);
+        self
+    }
+
+    /// Attach annotations to the manifest.
+    #[must_use]
+    pub fn with_annotations(mut self, annotations: Annotations) -> Self {
+        self.metadata = self.metadata.with_annotations(annotations);
+        self
+    }
+
+    /// Validate resource GVK, name and desired state.
+    pub fn validate(&self) -> ModelResult<()> {
+        self.type_meta.validate_task()?;
+        self.metadata.validate()?;
+        self.spec.validate()
+    }
+
+    /// Resource type metadata.
     #[inline]
-    pub fn metadata(&self) -> &ObjectMeta {
+    pub fn type_meta(&self) -> &TypeMeta {
+        &self.type_meta
+    }
+
+    /// User-owned resource metadata.
+    #[inline]
+    pub fn metadata(&self) -> &TaskManifestMeta {
         &self.metadata
     }
 
-    /// Observed state (phase, attempt, exit code, error).
+    /// Stable resource name.
     #[inline]
-    pub fn status(&self) -> &TaskStatus {
-        &self.status
+    pub fn name(&self) -> &TaskId {
+        self.metadata.name()
     }
 
-    /// Desired state (what to run, how to restart).
+    /// Desired state.
     #[inline]
     pub fn spec(&self) -> &TaskSpec {
         &self.spec
     }
 
-    /// Destructure into `(metadata, spec, status)`.
-    ///
-    /// Transport layers use this when they need owned fields for wire types.
-    #[inline]
-    pub fn into_parts(self) -> (ObjectMeta, TaskSpec, TaskStatus) {
-        (self.metadata, self.spec, self.status)
-    }
-
-    /// Transition the task into a new running attempt.
-    ///
-    /// This bumps the attempt counter, sets phase to `Running`, clears `error` and `exit_code`, and bumps `resource_version`.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_model::{Task, TaskId, TaskKind, TaskPhase, TaskSpec};
-    ///
-    /// let spec = TaskSpec::builder("build", TaskKind::Embedded, 1_000u64)
-    ///     .build()
-    ///     .unwrap();
-    /// let mut task = Task::new(TaskId::from("task-1"), spec);
-    ///
-    /// task.transition_starting();
-    ///
-    /// assert_eq!(*task.phase(), TaskPhase::Running);
-    /// assert_eq!(task.status().attempt, 1);
-    /// ```
-    pub fn transition_starting(&mut self) {
-        self.increment_attempt();
-        self.update_phase(TaskPhase::Running, None, None);
-    }
-
-    /// Transition the current attempt into a terminal phase.
-    ///
-    /// Rejects illegal transitions:
-    /// - target phase must be terminal (see [`TaskPhase::is_terminal`]);
-    ///   finishing into `Pending` or `Running` is a logic bug upstream.
-    ///
-    /// Sticky terminals:
-    /// once an attempt has reached a final state, a later terminal event must not overwrite it.
-    ///
-    /// taskvisor has two event levels:
-    /// - attempt events: `AttemptSucceeded`, `AttemptCanceled`,
-    ///   `AttemptFailed`, and `AttemptTimedOut`;
-    /// - the final task event: `TaskFinished` with a typed outcome kind.
-    ///
-    /// Some flows produce both levels for the same attempt.
-    /// For example, `AttemptTimedOut` can mark an attempt as `Timeout`, while a
-    /// later `TaskFinished(Failed)` reports that the retry policy has stopped.
-    /// Without this guard, the final task event could replace the more specific
-    /// attempt result.
-    ///
-    /// Exactly one refinement is allowed:
-    /// the generic failure phase (`Failed`) may be refined into a more specific disposition (`Exhausted`/`Timeout`).
-    /// Re-applying the current phase is a harmless no-op that keeps the recorded error/exit code;
-    /// every other conflicting terminal event is silently ignored (`Ok(())`).
-    ///
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_model::{Task, TaskId, TaskKind, TaskPhase, TaskSpec};
-    ///
-    /// let spec = TaskSpec::builder("build", TaskKind::Embedded, 1_000u64)
-    ///     .build()
-    ///     .unwrap();
-    /// let mut task = Task::new(TaskId::from("task-1"), spec);
-    ///
-    /// task.transition_starting();
-    /// task.transition_finished(TaskPhase::Failed, Some("boom".into()), Some(1))?;
-    ///
-    /// assert_eq!(*task.phase(), TaskPhase::Failed);
-    /// assert_eq!(task.status().error.as_deref(), Some("boom"));
-    /// # Ok::<(), solti_model::ModelError>(())
-    /// ```
-    pub fn transition_finished(
-        &mut self,
-        phase: TaskPhase,
-        error: Option<String>,
-        exit_code: Option<i32>,
-    ) -> ModelResult<()> {
-        if !phase.is_terminal() {
-            return Err(ModelError::Invalid(
-                format!("transition_finished requires a terminal phase, got {phase}").into(),
-            ));
-        }
-        if self.status.phase == phase {
-            return Ok(());
-        }
-        if self.status.phase.is_terminal() {
-            let refines_failed = self.status.phase == TaskPhase::Failed
-                && matches!(phase, TaskPhase::Exhausted | TaskPhase::Timeout);
-            if !refines_failed {
-                return Ok(());
-            }
-        }
-        self.update_phase(phase, error, exit_code);
-        Ok(())
-    }
-
-    /// Reconcile the resource with an authoritative final lifecycle outcome.
-    ///
-    /// Unlike [`transition_finished`](Self::transition_finished), this may
-    /// replace a conflicting terminal phase previously derived from an attempt
-    /// event. Use it only after the task lifecycle has ended and no later
-    /// attempt can start. Per-attempt history should keep its own outcome.
-    ///
-    /// Re-applying the same phase refreshes differing diagnostics from the
-    /// authoritative outcome; an identical disposition is a no-op. The target
-    /// must be terminal.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ModelError::Invalid`] when `phase` is `Pending` or `Running`.
-    pub fn reconcile_finished(
-        &mut self,
-        phase: TaskPhase,
-        error: Option<String>,
-        exit_code: Option<i32>,
-    ) -> ModelResult<()> {
-        if !phase.is_terminal() {
-            return Err(ModelError::Invalid(
-                format!("reconcile_finished requires a terminal phase, got {phase}").into(),
-            ));
-        }
-        if self.status.phase == phase
-            && self.status.error == error
-            && self.status.exit_code == exit_code
-        {
-            return Ok(());
-        }
-        self.update_phase(phase, error, exit_code);
-        Ok(())
-    }
-
-    /// Raw phase setter.
-    pub(crate) fn update_phase(
-        &mut self,
-        phase: TaskPhase,
-        error: Option<String>,
-        exit_code: Option<i32>,
-    ) {
-        self.metadata.bump_resource_version();
-        self.status.phase = phase;
-        self.status.error = error;
-        self.status.exit_code = exit_code;
-    }
-
-    /// Raw attempt bump. Crate-private (see [`update_phase`]).
-    pub(crate) fn increment_attempt(&mut self) {
-        self.metadata.bump_resource_version();
-        self.status.attempt += 1;
-    }
-
-    /// Task identifier (shortcut for `metadata.id`).
-    #[inline]
-    pub fn id(&self) -> &TaskId {
-        &self.metadata.id
-    }
-
-    /// Slot (shortcut for `spec.slot()`).
+    /// Logical concurrency slot.
     #[inline]
     pub fn slot(&self) -> &Slot {
         self.spec.slot()
     }
 
-    /// Labels (shortcut for `spec.labels()`).
-    #[inline]
-    pub fn labels(&self) -> &Labels {
-        self.spec.labels()
+    /// Destructure into type metadata, user-owned metadata and desired spec.
+    pub fn into_parts(self) -> (TypeMeta, TaskManifestMeta, TaskSpec) {
+        (self.type_meta, self.metadata, self.spec)
+    }
+}
+
+impl TypeMeta {
+    /// Type metadata for the built-in Task resource.
+    pub fn task() -> Self {
+        Self {
+            api_version: TASK_API_VERSION.to_owned(),
+            kind: TASK_KIND.to_owned(),
+        }
     }
 
-    /// Current phase (shortcut for `status.phase`).
+    /// Resource API group and version.
+    #[inline]
+    pub fn api_version(&self) -> &str {
+        &self.api_version
+    }
+
+    /// Resource kind.
+    #[inline]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    fn validate_task(&self) -> ModelResult<()> {
+        if self.api_version != TASK_API_VERSION {
+            return Err(ModelError::Invalid(
+                format!(
+                    "Task apiVersion must be `{TASK_API_VERSION}`, got `{}`",
+                    self.api_version
+                )
+                .into(),
+            ));
+        }
+        if self.kind != TASK_KIND {
+            return Err(ModelError::Invalid(
+                format!("Task kind must be `{TASK_KIND}`, got `{}`", self.kind).into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Declarative task resource.
+///
+/// The serialized shape is `apiVersion`, `kind`, `metadata`, `spec`, `status`.
+/// The resource name is stable across apply operations; UID and creation time
+/// identify one incarnation and are preserved by [`Self::apply_desired`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(try_from = "raw::TaskRaw")]
+pub struct Task {
+    #[serde(flatten)]
+    type_meta: TypeMeta,
+    metadata: ObjectMeta,
+    spec: TaskSpec,
+    status: TaskStatus,
+}
+
+impl Task {
+    /// Create a new stored Task resource with server-owned defaults.
+    ///
+    /// The UID and creation timestamp are generated, generation starts at `1`,
+    /// and status starts as unobserved `Pending`. The state store assigns the
+    /// initial resource version separately.
+    pub fn new(name: impl Into<TaskId>, spec: TaskSpec) -> ModelResult<Self> {
+        Self::from_manifest(TaskManifest::new(name, spec)?)
+    }
+
+    /// Materialize a new stored resource from user-owned desired state.
+    pub fn from_manifest(manifest: TaskManifest) -> ModelResult<Self> {
+        manifest.validate()?;
+        let (_, metadata, spec) = manifest.into_parts();
+        let task = Self {
+            type_meta: TypeMeta::task(),
+            metadata: ObjectMeta::new(metadata.name.clone())?,
+            spec,
+            status: TaskStatus::pending_for(0, 1),
+        }
+        .with_labels(metadata.labels)
+        .with_annotations(metadata.annotations);
+        task.validate()?;
+        Ok(task)
+    }
+
+    /// Reconstruct a resource from persisted parts.
+    pub fn from_parts(
+        type_meta: TypeMeta,
+        metadata: ObjectMeta,
+        spec: TaskSpec,
+        status: TaskStatus,
+    ) -> ModelResult<Self> {
+        let task = Self {
+            type_meta,
+            metadata,
+            spec,
+            status,
+        };
+        task.validate()?;
+        Ok(task)
+    }
+
+    /// Attach labels while constructing a new manifest.
+    #[must_use]
+    pub fn with_labels(mut self, labels: Labels) -> Self {
+        let annotations = self.metadata.annotations().clone();
+        self.metadata.apply_metadata(labels, annotations);
+        self
+    }
+
+    /// Attach annotations while constructing a new manifest.
+    #[must_use]
+    pub fn with_annotations(mut self, annotations: Annotations) -> Self {
+        let labels = self.metadata.labels().clone();
+        self.metadata.apply_metadata(labels, annotations);
+        self
+    }
+
+    /// Validate all resource-level invariants.
+    pub fn validate(&self) -> ModelResult<()> {
+        self.type_meta.validate_task()?;
+        self.metadata.name().validate_format()?;
+        self.metadata.labels().validate()?;
+        self.metadata.annotations().validate()?;
+        if self.metadata.generation() == 0 {
+            return Err(ModelError::Invalid(
+                "metadata.generation must be greater than zero".into(),
+            ));
+        }
+        if self.status.observed_generation > self.metadata.generation() {
+            return Err(ModelError::Invalid(
+                "status.observedGeneration cannot exceed metadata.generation".into(),
+            ));
+        }
+        if self.status.conditions.len() != 1
+            || self.status.conditions[0].condition_type != TaskConditionType::Reconciled
+        {
+            return Err(ModelError::Invalid(
+                "status.conditions must contain exactly one Reconciled condition".into(),
+            ));
+        }
+        if self.status.conditions[0].observed_generation > self.metadata.generation() {
+            return Err(ModelError::Invalid(
+                "status.conditions[].observedGeneration cannot exceed metadata.generation".into(),
+            ));
+        }
+        self.spec.validate()
+    }
+
+    /// Resource type metadata.
+    #[inline]
+    pub fn type_meta(&self) -> &TypeMeta {
+        &self.type_meta
+    }
+
+    /// Resource metadata.
+    #[inline]
+    pub fn metadata(&self) -> &ObjectMeta {
+        &self.metadata
+    }
+
+    /// Desired state.
+    #[inline]
+    pub fn spec(&self) -> &TaskSpec {
+        &self.spec
+    }
+
+    /// Observed state.
+    #[inline]
+    pub fn status(&self) -> &TaskStatus {
+        &self.status
+    }
+
+    /// Destructure into type metadata, object metadata, spec and status.
+    pub fn into_parts(self) -> (TypeMeta, ObjectMeta, TaskSpec, TaskStatus) {
+        (self.type_meta, self.metadata, self.spec, self.status)
+    }
+
+    /// Stable resource address (`metadata.name`).
+    #[inline]
+    pub fn name(&self) -> &TaskId {
+        self.metadata.name()
+    }
+
+    /// Compatibility shortcut for the stable resource address.
+    #[inline]
+    pub fn id(&self) -> &TaskId {
+        self.name()
+    }
+
+    /// Identity of this resource incarnation.
+    #[inline]
+    pub fn uid(&self) -> &Uid {
+        self.metadata.uid()
+    }
+
+    /// Logical concurrency slot.
+    #[inline]
+    pub fn slot(&self) -> &Slot {
+        self.spec.slot()
+    }
+
+    /// Resource labels.
+    #[inline]
+    pub fn labels(&self) -> &Labels {
+        self.metadata.labels()
+    }
+
+    /// Current lifecycle phase.
     #[inline]
     pub fn phase(&self) -> &TaskPhase {
         &self.status.phase
+    }
+
+    /// Assign the resource version produced by the state store.
+    pub fn set_resource_version(&mut self, resource_version: impl Into<String>) -> ModelResult<()> {
+        self.metadata.set_resource_version(resource_version)
+    }
+
+    /// Apply user-owned metadata and desired state to this named resource.
+    ///
+    /// UID and creation timestamp are preserved. Metadata-only changes leave
+    /// generation and status untouched. A spec change increments generation and
+    /// resets the phase and attempt for the new generation while retaining the
+    /// previous `observedGeneration` until reconciliation processes it.
+    pub fn apply_desired(
+        &mut self,
+        labels: Labels,
+        annotations: Annotations,
+        spec: TaskSpec,
+        resource_version: impl Into<String>,
+    ) -> ModelResult<DesiredChange> {
+        spec.validate()?;
+        labels.validate()?;
+        annotations.validate()?;
+        let metadata_changed =
+            self.metadata.labels() != &labels || self.metadata.annotations() != &annotations;
+        let spec_changed = self.spec != spec;
+        if !metadata_changed && !spec_changed {
+            return Ok(DesiredChange::None);
+        }
+
+        self.metadata.set_resource_version(resource_version)?;
+        if metadata_changed {
+            self.metadata.apply_metadata(labels, annotations);
+        }
+        if spec_changed {
+            self.spec = spec;
+            self.metadata.bump_generation();
+            self.status = self.status.pending_after(self.metadata.generation());
+        }
+        Ok(if spec_changed {
+            DesiredChange::Spec
+        } else {
+            DesiredChange::Metadata
+        })
+    }
+
+    /// Mark the current desired-state generation as observed.
+    pub fn mark_observed(&mut self, resource_version: impl Into<String>) -> ModelResult<bool> {
+        let generation = self.metadata.generation();
+        let condition = self.status.reconciled();
+        let changed = self.status.observed_generation != generation
+            || condition.status != ConditionStatus::True
+            || condition.observed_generation != generation
+            || condition.reason != "RuntimeAccepted"
+            || condition.message != "Taskvisor accepted the runtime realization";
+        if !changed {
+            return Ok(false);
+        }
+        self.metadata.set_resource_version(resource_version)?;
+        self.status.mark_reconciled(generation);
+        Ok(true)
+    }
+
+    /// Reschedule reconciliation for the current generation after a recorded failure.
+    pub fn mark_reconciliation_pending(
+        &mut self,
+        resource_version: impl Into<String>,
+    ) -> ModelResult<bool> {
+        if !self.status.reconciliation_failed() {
+            return Ok(false);
+        }
+        let generation = self.metadata.generation();
+        self.metadata.set_resource_version(resource_version)?;
+        self.status.mark_reconciliation_pending(generation);
+        self.status.phase = TaskPhase::Pending;
+        self.status.attempt = 0;
+        self.status.exit_code = None;
+        self.status.error = None;
+        Ok(true)
+    }
+
+    /// Record a failure to reconcile the current desired state.
+    ///
+    /// This is used for controller failures outside the execution lifecycle,
+    /// including routing, runner build, runtime cleanup and intake. Desired state
+    /// is retained.
+    pub fn mark_reconciliation_failed(
+        &mut self,
+        reason: impl Into<String>,
+        message: impl Into<String>,
+        resource_version: impl Into<String>,
+    ) -> ModelResult<bool> {
+        let reason = reason.into();
+        let message = message.into();
+        let generation = self.metadata.generation();
+        let condition = self.status.reconciled();
+        let changed = condition.status != ConditionStatus::False
+            || condition.observed_generation != generation
+            || condition.reason != reason
+            || condition.message != message
+            || self.status.observed_generation != generation
+            || self.status.phase != TaskPhase::Pending
+            || self.status.attempt != 0
+            || self.status.exit_code.is_some()
+            || self.status.error.is_some();
+        if !changed {
+            return Ok(false);
+        }
+        self.metadata.set_resource_version(resource_version)?;
+        self.status
+            .mark_reconciliation_failed(generation, reason, message);
+        self.status.phase = TaskPhase::Pending;
+        self.status.attempt = 0;
+        self.status.exit_code = None;
+        self.status.error = None;
+        Ok(true)
+    }
+
+    /// Start an authoritative attempt for the current desired-state generation.
+    ///
+    /// A stale generation is ignored and returns `Ok(false)`. Attempt numbers
+    /// come from the execution source of truth and are never incremented locally.
+    pub fn transition_starting(
+        &mut self,
+        generation: u64,
+        attempt: u32,
+        resource_version: impl Into<String>,
+    ) -> ModelResult<bool> {
+        if generation != self.metadata.generation() {
+            return Ok(false);
+        }
+        if attempt == 0 {
+            return Err(ModelError::Invalid(
+                "attempt must be greater than zero".into(),
+            ));
+        }
+        let changed = self.status.observed_generation != generation
+            || self.status.reconciled().status != ConditionStatus::True
+            || self.status.reconciled().observed_generation != generation
+            || self.status.phase != TaskPhase::Running
+            || self.status.attempt != attempt
+            || self.status.exit_code.is_some()
+            || self.status.error.is_some();
+        if !changed {
+            return Ok(false);
+        }
+        self.metadata.set_resource_version(resource_version)?;
+        self.status.mark_reconciled(generation);
+        self.status.phase = TaskPhase::Running;
+        self.status.attempt = attempt;
+        self.status.exit_code = None;
+        self.status.error = None;
+        Ok(true)
+    }
+
+    /// Transition the current generation into a terminal attempt phase.
+    ///
+    /// Stale generations are ignored. Terminal phases are sticky, except that a
+    /// generic `Failed` may be refined to `Exhausted` or `Timeout`.
+    pub fn transition_finished(
+        &mut self,
+        generation: u64,
+        attempt: u32,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+        resource_version: impl Into<String>,
+    ) -> ModelResult<bool> {
+        if generation != self.metadata.generation() {
+            return Ok(false);
+        }
+        if attempt == 0 {
+            return Err(ModelError::Invalid(
+                "attempt must be greater than zero".into(),
+            ));
+        }
+        if !phase.is_terminal() {
+            return Err(ModelError::Invalid(
+                format!("transition_finished requires a terminal phase, got {phase}").into(),
+            ));
+        }
+        if attempt < self.status.attempt {
+            return Ok(false);
+        }
+        let same_attempt = attempt == self.status.attempt;
+        let reconciled = self.status.reconciled().status == ConditionStatus::True
+            && self.status.reconciled().observed_generation == generation;
+        if same_attempt && self.status.phase == phase && reconciled {
+            return Ok(false);
+        }
+        if same_attempt && self.status.phase.is_terminal() && reconciled {
+            let refines_failed = self.status.phase == TaskPhase::Failed
+                && matches!(phase, TaskPhase::Exhausted | TaskPhase::Timeout);
+            if !refines_failed {
+                return Ok(false);
+            }
+        }
+        self.metadata.set_resource_version(resource_version)?;
+        self.status.attempt = attempt;
+        self.set_terminal(generation, phase, error, exit_code);
+        Ok(true)
+    }
+
+    /// Reconcile with an authoritative final lifecycle outcome.
+    ///
+    /// Unlike [`Self::transition_finished`], this may replace a conflicting
+    /// terminal attempt phase. A stale generation is ignored.
+    pub fn reconcile_finished(
+        &mut self,
+        generation: u64,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+        resource_version: impl Into<String>,
+    ) -> ModelResult<bool> {
+        if generation != self.metadata.generation() {
+            return Ok(false);
+        }
+        if !phase.is_terminal() {
+            return Err(ModelError::Invalid(
+                format!("reconcile_finished requires a terminal phase, got {phase}").into(),
+            ));
+        }
+        let changed = self.status.observed_generation != generation
+            || self.status.reconciled().status != ConditionStatus::True
+            || self.status.reconciled().observed_generation != generation
+            || self.status.phase != phase
+            || self.status.error != error
+            || self.status.exit_code != exit_code;
+        if !changed {
+            return Ok(false);
+        }
+        self.metadata.set_resource_version(resource_version)?;
+        self.set_terminal(generation, phase, error, exit_code);
+        Ok(true)
+    }
+
+    fn set_terminal(
+        &mut self,
+        generation: u64,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+    ) {
+        self.status.mark_reconciled(generation);
+        self.status.phase = phase;
+        self.status.error = error;
+        self.status.exit_code = exit_code;
+    }
+}
+
+impl From<&Task> for TaskManifest {
+    fn from(task: &Task) -> Self {
+        Self {
+            type_meta: task.type_meta.clone(),
+            metadata: TaskManifestMeta {
+                name: task.name().clone(),
+                labels: task.metadata.labels().clone(),
+                annotations: task.metadata.annotations().clone(),
+            },
+            spec: task.spec.clone(),
+        }
+    }
+}
+
+impl From<Task> for TaskManifest {
+    fn from(task: Task) -> Self {
+        Self::from(&task)
+    }
+}
+
+mod raw {
+    use super::*;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub(super) struct TaskRaw {
+        #[serde(flatten)]
+        type_meta: TypeMeta,
+        metadata: ObjectMeta,
+        spec: TaskSpec,
+        status: TaskStatus,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub(super) struct TaskManifestRaw {
+        #[serde(flatten)]
+        type_meta: TypeMeta,
+        metadata: TaskManifestMeta,
+        spec: TaskSpec,
+    }
+
+    impl TryFrom<TaskRaw> for Task {
+        type Error = ModelError;
+
+        fn try_from(raw: TaskRaw) -> Result<Self, Self::Error> {
+            Task::from_parts(raw.type_meta, raw.metadata, raw.spec, raw.status)
+        }
+    }
+
+    impl TryFrom<TaskManifestRaw> for TaskManifest {
+        type Error = ModelError;
+
+        fn try_from(raw: TaskManifestRaw) -> Result<Self, Self::Error> {
+            TaskManifest::from_parts(raw.type_meta, raw.metadata, raw.spec)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TaskKind;
+    use crate::{EmbeddedSpec, TaskWorkload};
 
-    fn test_spec() -> TaskSpec {
-        TaskSpec::builder("slot-a", TaskKind::Embedded, 5_000u64)
-            .build()
-            .expect("test spec must be valid")
+    fn spec(slot: &str) -> TaskSpec {
+        TaskSpec::builder(
+            slot,
+            TaskWorkload::Embedded(EmbeddedSpec::new("test-v1").unwrap()),
+            5_000_u64,
+        )
+        .build()
+        .unwrap()
+    }
+
+    fn task() -> Task {
+        let mut task = Task::new("task-a", spec("slot-a")).unwrap();
+        task.set_resource_version("1").unwrap();
+        task
     }
 
     #[test]
-    fn new_creates_pending_task() {
-        let task = Task::new("task-1".into(), test_spec());
+    fn new_creates_valid_unobserved_resource() {
+        let task = Task::new("task-a", spec("slot-a")).unwrap();
 
-        assert_eq!(task.status().phase, TaskPhase::Pending);
-        assert_eq!(task.metadata().resource_version, 1);
-        assert_eq!(task.metadata().id, "task-1");
-        assert!(task.status().error.is_none());
-        assert_eq!(task.status().attempt, 0);
-        assert_eq!(task.slot(), "slot-a");
+        assert_eq!(task.type_meta().api_version(), TASK_API_VERSION);
+        assert_eq!(task.type_meta().kind(), TASK_KIND);
+        assert_eq!(task.name(), "task-a");
+        assert!(!task.uid().as_str().is_empty());
+        assert_eq!(task.metadata().generation(), 1);
+        assert_eq!(task.status().observed_generation, 0);
+        assert_eq!(*task.phase(), TaskPhase::Pending);
+        assert_eq!(task.status().reconciled().status, ConditionStatus::Unknown);
+        assert_eq!(task.status().reconciled().observed_generation, 1);
     }
 
     #[test]
-    fn transition_starting_sets_running_and_bumps() {
-        let mut task = Task::new("task-1".into(), test_spec());
-        task.transition_starting();
+    fn serde_shape_and_roundtrip_are_crd_shaped() {
+        let task = task();
+        let json = serde_json::to_value(&task).unwrap();
 
-        assert_eq!(task.status().phase, TaskPhase::Running);
-        assert_eq!(task.status().attempt, 1);
-        assert_eq!(task.metadata().resource_version, 3);
+        assert_eq!(json["apiVersion"], TASK_API_VERSION);
+        assert_eq!(json["kind"], TASK_KIND);
+        assert!(json.get("metadata").is_some());
+        assert!(json.get("spec").is_some());
+        assert!(json.get("status").is_some());
+
+        let back: Task = serde_json::from_value(json).unwrap();
+        assert_eq!(back, task);
     }
 
     #[test]
-    fn transition_finished_accepts_terminal_and_carries_error() {
-        let mut task = Task::new("task-1".into(), test_spec());
-        task.transition_starting();
-        task.transition_finished(TaskPhase::Failed, Some("boom".into()), Some(1))
-            .unwrap();
+    fn manifest_serde_contains_only_user_owned_resource_fields() {
+        let mut labels = Labels::new();
+        labels.insert("tier", "worker");
+        let manifest = TaskManifest::new("task-a", spec("slot-a"))
+            .unwrap()
+            .with_labels(labels);
 
-        assert_eq!(task.status().phase, TaskPhase::Failed);
-        assert_eq!(task.status().error.as_deref(), Some("boom"));
-        assert_eq!(task.status().exit_code, Some(1));
+        let json = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(json["apiVersion"], TASK_API_VERSION);
+        assert_eq!(json["kind"], TASK_KIND);
+        assert_eq!(json["metadata"]["name"], "task-a");
+        assert!(json.get("spec").is_some());
+        assert!(json.get("status").is_none());
+        for server_owned in ["uid", "resourceVersion", "generation", "creationTimestamp"] {
+            assert!(json["metadata"].get(server_owned).is_none());
+        }
+
+        let back: TaskManifest = serde_json::from_value(json).unwrap();
+        assert_eq!(back, manifest);
     }
 
     #[test]
-    fn transition_finished_rejects_non_terminal_phase() {
-        let mut task = Task::new("task-1".into(), test_spec());
-        let err = task
-            .transition_finished(TaskPhase::Running, None, None)
-            .unwrap_err();
-        assert!(err.to_string().contains("terminal phase"));
+    fn stored_task_roundtrips_through_its_desired_manifest() {
+        let stored = task();
+        let manifest = TaskManifest::from(&stored);
+        let rematerialized = Task::from_manifest(manifest).unwrap();
+
+        assert_eq!(rematerialized.name(), stored.name());
+        assert_eq!(rematerialized.spec(), stored.spec());
+        assert_eq!(
+            rematerialized.metadata().labels(),
+            stored.metadata().labels()
+        );
+        assert_ne!(rematerialized.uid(), stored.uid());
+        assert_eq!(rematerialized.status().phase, TaskPhase::Pending);
     }
 
     #[test]
-    fn canceled_is_not_overwritten_by_a_later_terminal_event() {
-        let mut task = Task::new("task-1".into(), test_spec());
-        task.transition_starting();
-        task.transition_finished(TaskPhase::Canceled, None, None)
-            .unwrap();
+    fn manifest_deserialization_rejects_wrong_resource_gvk() {
+        let manifest = TaskManifest::new("task-a", spec("slot-a")).unwrap();
+        let mut json = serde_json::to_value(manifest).unwrap();
+        json["kind"] = serde_json::json!("Other");
 
-        task.transition_finished(TaskPhase::Exhausted, Some("budget".into()), Some(1))
-            .unwrap();
-
-        assert_eq!(task.status().phase, TaskPhase::Canceled);
-        assert!(task.status().error.is_none());
-        assert_eq!(task.status().exit_code, None);
+        let error = serde_json::from_value::<TaskManifest>(json).unwrap_err();
+        assert!(error.to_string().contains("Task kind"));
     }
 
     #[test]
-    fn succeeded_is_not_overwritten_by_a_later_terminal_event() {
-        let mut task = Task::new("task-1".into(), test_spec());
-        task.transition_starting();
-        task.transition_finished(TaskPhase::Succeeded, None, None)
-            .unwrap();
+    fn manifest_deserialization_rejects_invalid_metadata() {
+        let manifest = TaskManifest::new("task-a", spec("slot-a")).unwrap();
+        let mut json = serde_json::to_value(manifest).unwrap();
+        json["metadata"]["labels"] = serde_json::json!({ "example.io/bad key": "value" });
 
-        task.transition_finished(TaskPhase::Failed, Some("late".into()), Some(2))
-            .unwrap();
-
-        assert_eq!(task.status().phase, TaskPhase::Succeeded);
-        assert!(task.status().error.is_none());
+        let error = serde_json::from_value::<TaskManifest>(json).unwrap_err();
+        assert!(error.to_string().contains("label key"));
     }
 
     #[test]
-    fn authoritative_reconciliation_can_replace_an_attempt_terminal() {
-        let mut task = Task::new("task-1".into(), test_spec());
-        task.transition_starting();
-        task.transition_finished(TaskPhase::Succeeded, None, None)
-            .unwrap();
+    fn serde_rejects_wrong_resource_gvk() {
+        let mut json = serde_json::to_value(task()).unwrap();
+        json["kind"] = serde_json::json!("Other");
 
-        task.reconcile_finished(TaskPhase::Canceled, Some("removed".into()), None)
-            .unwrap();
-
-        assert_eq!(task.status().phase, TaskPhase::Canceled);
-        assert_eq!(task.status().error.as_deref(), Some("removed"));
+        let error = serde_json::from_value::<Task>(json).unwrap_err();
+        assert!(error.to_string().contains("Task kind"));
     }
 
     #[test]
-    fn authoritative_reconciliation_refreshes_same_phase_diagnostics() {
-        let mut task = Task::new("task-1".into(), test_spec());
-        task.transition_starting();
-        task.transition_finished(TaskPhase::Failed, Some("actor_panic".into()), Some(1))
+    fn metadata_only_apply_preserves_generation_and_status() {
+        let mut task = task();
+        let uid = task.uid().clone();
+        let creation = task.metadata().creation_timestamp();
+        let mut labels = Labels::new();
+        labels.insert("tier", "prod");
+
+        let changed = task
+            .apply_desired(labels, Annotations::new(), spec("slot-a"), "2")
             .unwrap();
 
-        task.reconcile_finished(TaskPhase::Failed, Some("actor panicked".into()), None)
-            .unwrap();
-
-        assert_eq!(task.status().phase, TaskPhase::Failed);
-        assert_eq!(task.status().error.as_deref(), Some("actor panicked"));
-        assert_eq!(task.status().exit_code, None);
-    }
-
-    #[test]
-    fn authoritative_reconciliation_rejects_a_non_terminal_target() {
-        let mut task = Task::new("task-1".into(), test_spec());
-
-        let err = task
-            .reconcile_finished(TaskPhase::Running, None, None)
-            .unwrap_err();
-
-        assert!(err.to_string().contains("terminal phase"));
-    }
-
-    #[test]
-    fn timeout_is_not_overwritten_by_a_later_terminal_event() {
-        let mut task = Task::new("task-1".into(), test_spec());
-        task.transition_starting();
-        task.transition_finished(TaskPhase::Timeout, Some("deadline".into()), None)
-            .unwrap();
-
-        task.transition_finished(TaskPhase::Exhausted, Some("budget".into()), None)
-            .unwrap();
-
-        assert_eq!(task.status().phase, TaskPhase::Timeout);
-    }
-
-    #[test]
-    fn failed_can_be_refined_to_exhausted() {
-        let mut task = Task::new("task-1".into(), test_spec());
-        task.transition_starting();
-        task.transition_finished(TaskPhase::Failed, Some("attempt".into()), None)
-            .unwrap();
-
-        task.transition_finished(TaskPhase::Exhausted, Some("max_retries".into()), None)
-            .unwrap();
-
-        assert_eq!(task.status().phase, TaskPhase::Exhausted);
-        assert_eq!(task.status().error.as_deref(), Some("max_retries"));
-    }
-
-    #[test]
-    fn failed_can_be_refined_to_timeout() {
-        let mut task = Task::new("task-1".into(), test_spec());
-        task.transition_starting();
-        task.transition_finished(TaskPhase::Failed, Some("attempt".into()), None)
-            .unwrap();
-
-        task.transition_finished(TaskPhase::Timeout, Some("deadline".into()), None)
-            .unwrap();
-
-        assert_eq!(task.status().phase, TaskPhase::Timeout);
-        assert_eq!(task.status().error.as_deref(), Some("deadline"));
-    }
-
-    #[test]
-    fn exhausted_survives_late_failed() {
-        let mut task = Task::new("task-1".into(), test_spec());
-        task.transition_starting();
-        task.transition_finished(TaskPhase::Exhausted, Some("max_retries".into()), Some(1))
-            .unwrap();
-        let version = task.metadata().resource_version;
-
-        task.transition_finished(TaskPhase::Failed, Some("late".into()), Some(2))
-            .unwrap();
-
-        assert_eq!(task.status().phase, TaskPhase::Exhausted);
-        assert_eq!(task.status().error.as_deref(), Some("max_retries"));
-        assert_eq!(task.status().exit_code, Some(1));
-        assert_eq!(task.metadata().resource_version, version);
-    }
-
-    #[test]
-    fn failed_cannot_become_succeeded_or_canceled() {
-        let mut task = Task::new("task-1".into(), test_spec());
-        task.transition_starting();
-        task.transition_finished(TaskPhase::Failed, Some("boom".into()), Some(1))
-            .unwrap();
-        let version = task.metadata().resource_version;
-
-        task.transition_finished(TaskPhase::Succeeded, None, None)
-            .unwrap();
-        assert_eq!(task.status().phase, TaskPhase::Failed);
-
-        task.transition_finished(TaskPhase::Canceled, None, None)
-            .unwrap();
-        assert_eq!(task.status().phase, TaskPhase::Failed);
-
-        assert_eq!(task.status().error.as_deref(), Some("boom"));
-        assert_eq!(task.status().exit_code, Some(1));
-        assert_eq!(task.metadata().resource_version, version);
-    }
-
-    #[test]
-    fn same_phase_reapply_is_noop() {
-        let mut task = Task::new("task-1".into(), test_spec());
-        task.transition_starting();
-        task.transition_finished(TaskPhase::Failed, Some("first".into()), Some(1))
-            .unwrap();
-        let version = task.metadata().resource_version;
-
-        task.transition_finished(TaskPhase::Failed, Some("second".into()), None)
-            .unwrap();
-
-        assert_eq!(task.status().phase, TaskPhase::Failed);
-        assert_eq!(task.status().error.as_deref(), Some("first"));
-        assert_eq!(task.status().exit_code, Some(1));
-        assert_eq!(task.metadata().resource_version, version);
-    }
-
-    #[test]
-    fn same_phase_reapply_is_noop_for_sticky_terminals() {
-        let mut task = Task::new("task-1".into(), test_spec());
-        task.transition_starting();
-        task.transition_finished(TaskPhase::Canceled, Some("graceful".into()), None)
-            .unwrap();
-        let version = task.metadata().resource_version;
-
-        task.transition_finished(TaskPhase::Canceled, None, None)
-            .unwrap();
-
-        assert_eq!(task.status().phase, TaskPhase::Canceled);
-        assert_eq!(task.status().error.as_deref(), Some("graceful"));
-        assert_eq!(task.metadata().resource_version, version);
-    }
-
-    #[test]
-    fn transition_starting_still_leaves_terminal_phase() {
-        let mut task = Task::new("task-1".into(), test_spec());
-        task.transition_starting();
-        task.transition_finished(TaskPhase::Failed, Some("boom".into()), Some(1))
-            .unwrap();
-
-        task.transition_starting();
-
-        assert_eq!(task.status().phase, TaskPhase::Running);
-        assert_eq!(task.status().attempt, 2);
-        assert!(task.status().error.is_none());
-        assert_eq!(task.status().exit_code, None);
-    }
-
-    #[test]
-    fn convenience_accessors() {
-        let spec = TaskSpec::builder("slot-1", TaskKind::Embedded, 5_000u64)
-            .build()
-            .unwrap();
-        let task = Task::new("id-1".into(), spec);
-
-        assert_eq!(task.slot(), &Slot::from("slot-1"));
-        assert_eq!(task.id(), &TaskId::from("id-1"));
+        assert_eq!(changed, DesiredChange::Metadata);
+        assert_eq!(task.metadata().generation(), 1);
+        assert_eq!(task.uid(), &uid);
+        assert_eq!(task.metadata().creation_timestamp(), creation);
+        assert_eq!(task.metadata().resource_version(), "2");
         assert_eq!(*task.phase(), TaskPhase::Pending);
     }
 
     #[test]
-    fn serde_roundtrip() {
-        let spec = TaskSpec::builder("slot-1", TaskKind::Embedded, 5_000u64)
-            .build()
-            .unwrap();
-        let task = Task::new("id-1".into(), spec);
-        let json = serde_json::to_string(&task).unwrap();
-        let back: Task = serde_json::from_str(&json).unwrap();
+    fn spec_apply_increments_generation_and_resets_execution_state() {
+        let mut task = task();
+        task.transition_starting(1, 4, "2").unwrap();
 
-        assert_eq!(back.status().phase, TaskPhase::Pending);
-        assert_eq!(back.metadata().resource_version, 1);
-        assert_eq!(back.metadata().id, "id-1");
+        let change = task
+            .apply_desired(Labels::new(), Annotations::new(), spec("slot-b"), "3")
+            .unwrap();
+
+        assert_eq!(change, DesiredChange::Spec);
+        assert_eq!(task.metadata().generation(), 2);
+        assert_eq!(task.status().observed_generation, 1);
+        assert_eq!(task.status().attempt, 0);
+        assert_eq!(*task.phase(), TaskPhase::Pending);
+        assert_eq!(task.status().reconciled().status, ConditionStatus::Unknown);
+        assert_eq!(task.status().reconciled().observed_generation, 2);
+        assert_eq!(task.slot(), "slot-b");
+    }
+
+    #[test]
+    fn embedded_revision_change_is_a_spec_change() {
+        let mut task = task();
+        let transition_time = task.status().reconciled().last_transition_time;
+        let changed_spec = TaskSpec::builder(
+            "slot-a",
+            TaskWorkload::Embedded(EmbeddedSpec::new("test-v2").unwrap()),
+            5_000_u64,
+        )
+        .build()
+        .unwrap();
+
+        let change = task
+            .apply_desired(Labels::new(), Annotations::new(), changed_spec, "2")
+            .unwrap();
+
+        assert_eq!(change, DesiredChange::Spec);
+        assert_eq!(task.metadata().generation(), 2);
+        let TaskWorkload::Embedded(embedded) = task.spec().workload() else {
+            panic!("workload must remain Embedded");
+        };
+        assert_eq!(embedded.revision(), "test-v2");
+        assert_eq!(
+            task.status().reconciled().last_transition_time,
+            transition_time,
+            "lastTransitionTime changes only when condition status changes"
+        );
+    }
+
+    #[test]
+    fn starting_uses_authoritative_attempt_and_observes_generation() {
+        let mut task = task();
+
+        assert!(task.transition_starting(1, 7, "2").unwrap());
+        assert_eq!(task.status().attempt, 7);
+        assert_eq!(task.status().observed_generation, 1);
+        assert_eq!(*task.phase(), TaskPhase::Running);
+    }
+
+    #[test]
+    fn terminal_event_sets_attempt_when_start_event_was_not_observed() {
+        let mut task = task();
+
+        task.transition_finished(1, 3, TaskPhase::Succeeded, None, Some(0), "2")
+            .unwrap();
+
+        assert_eq!(task.status().attempt, 3);
+        assert_eq!(task.status().observed_generation, 1);
+        assert_eq!(*task.phase(), TaskPhase::Succeeded);
+    }
+
+    #[test]
+    fn no_op_apply_does_not_consume_resource_version() {
+        let mut task = task();
+
+        let change = task
+            .apply_desired(Labels::new(), Annotations::new(), spec("slot-a"), "2")
+            .unwrap();
+
+        assert_eq!(change, DesiredChange::None);
+        assert_eq!(task.metadata().resource_version(), "1");
+    }
+
+    #[test]
+    fn invalid_metadata_apply_is_rejected_without_mutation() {
+        let mut task = task();
+        let before = task.clone();
+        let mut labels = Labels::new();
+        labels.insert("bad key", "value");
+
+        assert!(
+            task.apply_desired(labels, Annotations::new(), spec("slot-b"), "2")
+                .is_err()
+        );
+        assert_eq!(task, before);
+    }
+
+    #[test]
+    fn stale_generation_status_is_ignored_without_bumping_version() {
+        let mut task = task();
+
+        assert!(!task.transition_starting(2, 1, "2").unwrap());
+        assert_eq!(task.metadata().resource_version(), "1");
+        assert_eq!(*task.phase(), TaskPhase::Pending);
+    }
+
+    #[test]
+    fn reconciliation_failure_observes_generation_and_retains_spec() {
+        let mut task = task();
+
+        assert!(
+            task.mark_reconciliation_failed("RunnerBuildFailed", "no runner", "2")
+                .unwrap()
+        );
+        assert_eq!(task.status().observed_generation, 1);
+        assert_eq!(*task.phase(), TaskPhase::Pending);
+        assert_eq!(task.status().attempt, 0);
+        assert!(task.status().error.is_none());
+        assert_eq!(task.status().reconciled().status, ConditionStatus::False);
+        assert_eq!(task.status().reconciled().reason, "RunnerBuildFailed");
+        assert_eq!(task.status().reconciled().message, "no runner");
+        assert_eq!(task.slot(), "slot-a");
+    }
+
+    #[test]
+    fn failed_reconciliation_can_be_rescheduled_without_changing_generation() {
+        let mut task = task();
+        task.mark_reconciliation_failed("RunnerBuildFailed", "no runner", "2")
+            .unwrap();
+
+        assert!(task.mark_reconciliation_pending("3").unwrap());
+        assert_eq!(task.metadata().generation(), 1);
+        assert_eq!(task.metadata().resource_version(), "3");
+        assert_eq!(task.status().reconciled().status, ConditionStatus::Unknown);
+        assert_eq!(task.status().reconciled().observed_generation, 1);
+    }
+
+    #[test]
+    fn sticky_terminal_can_only_refine_failed() {
+        let mut task = task();
+        task.transition_starting(1, 1, "2").unwrap();
+        task.transition_finished(1, 1, TaskPhase::Failed, Some("attempt".into()), None, "3")
+            .unwrap();
+
+        assert!(
+            !task
+                .transition_finished(1, 1, TaskPhase::Succeeded, None, Some(0), "4")
+                .unwrap()
+        );
+        assert!(
+            task.transition_finished(1, 1, TaskPhase::Exhausted, Some("budget".into()), None, "4",)
+                .unwrap()
+        );
+        assert_eq!(*task.phase(), TaskPhase::Exhausted);
     }
 }

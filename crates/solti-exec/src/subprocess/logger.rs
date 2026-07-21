@@ -284,7 +284,7 @@ mod tests {
     use tokio::sync::broadcast;
 
     fn output_sink(sender: broadcast::Sender<OutputEvent>, attempt: u32) -> OutputSink {
-        OutputSink::new(attempt, move |event| {
+        OutputSink::new(1, attempt, move |event| {
             let _ = sender.send(event);
         })
     }

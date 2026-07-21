@@ -3,7 +3,7 @@
 > Runner plugin interface for Solti tasks.
 
 `solti-runner` sits between `solti-model` and `solti-core`.
-It does not run tasks by itself. It defines how a concrete backend, called a runner, turns a `TaskSpec` into a `taskvisor::TaskRef`.
+It does not run tasks by itself. It defines how a concrete backend, called a runner, turns a `Task` resource into a `taskvisor::TaskRef`.
 
 Use it when you want one agent binary to support different execution backends: subprocesses, containers, WASM modules, or your own runner.
 
@@ -12,11 +12,12 @@ Use it when you want one agent binary to support different execution backends: s
 Without a router, each agent has to decide how to run a task:
 
 ```rust,ignore
-match spec.kind() {
-    TaskKind::Subprocess(_) => build_subprocess_task(spec)?,
-    TaskKind::Wasm(_) => build_wasm_task(spec)?,
-    TaskKind::Container(_) => build_container_task(spec)?,
-    TaskKind::Embedded => return Err("embedded tasks are already built"),
+match task.spec().workload() {
+    TaskWorkload::Subprocess(_) => build_subprocess_task(task)?,
+    TaskWorkload::Wasm(_) => build_wasm_task(task)?,
+    TaskWorkload::Container(_) => build_container_task(task)?,
+    TaskWorkload::Extension(_) => build_extension_task(task)?,
+    TaskWorkload::Embedded(_) => return Err("embedded tasks are already built"),
 }
 ```
 
@@ -27,19 +28,19 @@ use std::sync::Arc;
 use solti_runner::RunnerRouter;
 
 # use solti_runner::{BuildContext, Runner, RunnerError};
-# use solti_model::{TaskKind, TaskSpec};
+# use solti_model::{Task, TaskWorkload};
 # use taskvisor::TaskRef;
 # struct MyRunner;
 # impl Runner for MyRunner {
 #     fn name(&self) -> &'static str { "my-runner" }
-#     fn supports(&self, spec: &TaskSpec) -> bool { matches!(spec.kind(), TaskKind::Subprocess(_)) }
-#     fn build_task(&self, _spec: &TaskSpec, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
+#     fn supports(&self, workload: &TaskWorkload) -> bool { matches!(workload, TaskWorkload::Subprocess(_)) }
+#     fn build_task(&self, _task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
 # }
-# fn wire(spec: &TaskSpec) -> Result<TaskRef, RunnerError> {
+# fn wire(resource: &Task) -> Result<TaskRef, RunnerError> {
 let mut router = RunnerRouter::new();
 router.register(Arc::new(MyRunner));
 
-let task = router.build(spec)?;
+let task = router.build(resource)?;
 # Ok(task)
 # }
 ```
@@ -51,7 +52,7 @@ Implement `Runner`, register it, and ask the router to build a task:
 ```rust,no_run
 use std::sync::Arc;
 
-use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec};
+use solti_model::{Flag, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskSpec, TaskWorkload};
 use solti_runner::{BuildContext, Runner, RunnerError, RunnerRouter};
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 
@@ -62,12 +63,12 @@ impl Runner for EchoRunner {
         "echo"
     }
 
-    fn supports(&self, spec: &TaskSpec) -> bool {
-        matches!(spec.kind(), TaskKind::Subprocess(_))
+    fn supports(&self, workload: &TaskWorkload) -> bool {
+        matches!(workload, TaskWorkload::Subprocess(_))
     }
 
-    fn build_task(&self, spec: &TaskSpec, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
-        let run_id = self.build_run_id(spec.slot().as_ref());
+    fn build_task(&self, task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
+        let run_id = self.build_run_id(task.slot().as_ref());
         Ok(TaskFn::arc(run_id.into_name(), |_ctx: TaskContext| async move {
             Ok::<(), TaskError>(())
         }))
@@ -75,7 +76,7 @@ impl Runner for EchoRunner {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let kind = TaskKind::Subprocess(SubprocessSpec::new(
+    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
         SubprocessMode::Command {
             command: "echo".into(),
             args: vec!["hello".into()],
@@ -84,12 +85,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         Flag::enabled(),
     ));
-    let spec = TaskSpec::builder("hello", kind, 5_000u64).build()?;
+    let spec = TaskSpec::builder("hello", workload, 5_000u64).build()?;
+    let resource = Task::new("hello", spec)?;
 
     let mut router = RunnerRouter::new();
     router.register(Arc::new(EchoRunner));
 
-    let task = router.build(&spec)?;
+    let task = router.build(&resource)?;
     let _ = task;
     Ok(())
 }
@@ -116,20 +118,20 @@ Use this crate when you write:
 - a metrics backend for task execution;
 - live-tail output support for a runner.
 
-Do not use it for `TaskKind::Embedded`. Embedded tasks already come as a `TaskRef`; submit them with `SupervisorApi::submit_with_task`.
+Do not route `TaskWorkload::Embedded`. Embedded resources already come with a `TaskRef`; pass both to `SupervisorApi::create_with_task` or `SupervisorApi::apply_with_task`.
 
 ## Core Model
 
 ```text
-TaskSpec
+Task
   |
   v
 RunnerRouter
   |
-  | checks Runner::supports(spec)
-  | checks runner labels, if the spec has a selector
+  | checks Runner::supports(task.spec.workload)
+  | checks runner labels, if the task spec has a selector
   v
-Runner::build_task(spec, BuildContext)
+Runner::build_task(task, BuildContext)
   |
   v
 taskvisor::TaskRef
@@ -147,13 +149,13 @@ use solti_model::Labels;
 use solti_runner::RunnerRouter;
 
 # use solti_runner::{BuildContext, Runner, RunnerError};
-# use solti_model::{TaskKind, TaskSpec};
+# use solti_model::{Task, TaskWorkload};
 # use taskvisor::TaskRef;
 # struct MyRunner;
 # impl Runner for MyRunner {
 #     fn name(&self) -> &'static str { "gpu-runner" }
-#     fn supports(&self, _spec: &TaskSpec) -> bool { true }
-#     fn build_task(&self, _spec: &TaskSpec, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
+#     fn supports(&self, _workload: &TaskWorkload) -> bool { true }
+#     fn build_task(&self, _task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
 # }
 let mut labels = Labels::new();
 labels.insert("gpu", "true");
@@ -162,7 +164,7 @@ let mut router = RunnerRouter::new();
 router.register_with_labels(Arc::new(MyRunner), labels);
 ```
 
-If a `TaskSpec` has a `RunnerSelector`, the router only keeps runners whose labels match that selector.
+If a task spec has a `RunnerSelector`, the router only keeps runners whose labels match that selector.
 
 ## Output Streaming
 
@@ -177,7 +179,7 @@ use solti_runner::BuildContext;
 let context = BuildContext::default();
 let task_id = TaskId::from("task-1");
 
-if let Some(sink) = context.output_publisher().sink_for(&task_id, 1) {
+if let Some(sink) = context.output_publisher().sink_for(&task_id, 1, 1) {
     sink.stdout_line(Bytes::from_static(b"hello"));
 }
 ```

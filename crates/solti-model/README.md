@@ -21,6 +21,7 @@ With `solti-model`, all layers use the same resource:
 
 ```text
 Task
+  apiVersion, kind
   metadata: ObjectMeta
   spec:     TaskSpec
   status:   TaskStatus
@@ -34,10 +35,10 @@ Build a task spec and validate it at the submit boundary:
 
 ```rust
 use solti_model::{
-    Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec,
+    Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskSpec, TaskWorkload,
 };
 
-let kind = TaskKind::Subprocess(SubprocessSpec::new(
+let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
     SubprocessMode::Command {
         command: "echo".into(),
         args: vec!["hello".into()],
@@ -47,7 +48,7 @@ let kind = TaskKind::Subprocess(SubprocessSpec::new(
     Flag::enabled(),
 ));
 
-let spec = TaskSpec::builder("hello", kind, 5_000u64)
+let spec = TaskSpec::builder("hello", workload, 5_000u64)
     .build()
     .expect("valid spec");
 
@@ -58,19 +59,20 @@ assert_eq!(spec.slot().as_str(), "hello");
 Create a task resource from that spec:
 
 ```rust
-use solti_model::{Task, TaskId, TaskKind, TaskPhase, TaskSpec};
+use solti_model::{EmbeddedSpec, Task, TaskId, TaskPhase, TaskSpec, TaskWorkload};
 
-let spec = TaskSpec::builder("cleanup", TaskKind::Embedded, 1_000u64)
+let workload = TaskWorkload::Embedded(EmbeddedSpec::new("v1").unwrap());
+let spec = TaskSpec::builder("cleanup", workload, 1_000u64)
     .build()
     .unwrap();
 
-let task = Task::new(TaskId::from("embedded-cleanup-1"), spec);
+let task = Task::new(TaskId::from("embedded-cleanup-1"), spec).unwrap();
 
 assert_eq!(*task.phase(), TaskPhase::Pending);
 assert_eq!(task.id().as_str(), "embedded-cleanup-1");
 ```
 
-`TaskKind::Embedded` is valid as model data, but `TaskSpec::validate()` rejects it for runner-based submit. Embedded tasks must be submitted with a real `TaskRef`.
+The shared model accepts embedded workloads. Transport and runner layers own their admission and routability rules.
 
 ## What Ships
 
@@ -78,10 +80,10 @@ assert_eq!(task.id().as_str(), "embedded-cleanup-1");
 |-------------|----------------------------------------------------------------------------------------|
 | Resource    | `Task`, `TaskSpec`, `TaskStatus`, `ObjectMeta`, `TaskRun`                              |
 | Identity    | `Slot`, `TaskId`, `AgentId`                                                            |
-| Execution   | `TaskKind`, `SubprocessSpec`, `SubprocessMode`, `WasmSpec`, `ContainerSpec`, `Runtime` |
+| Execution   | `TaskWorkload`, `ExtensionWorkload`, `SubprocessSpec`, `WasmSpec`, `ContainerSpec`     |
 | Policies    | `RestartPolicy`, `BackoffPolicy`, `JitterPolicy`, `AdmissionPolicy`, `Timeout`         |
 | Routing     | `Labels`, `RunnerSelector`, `SelectorRequirement`, `SelectorOperator`                  |
-| Environment | `TaskEnv`, `RunnerEnv`, `KeyValue`, `merge_env`                                        |
+| Environment | `TaskEnv`, `KeyValue`                                                                 |
 | Query       | `TaskQuery`, `TaskPage`                                                                |
 | Output      | `OutputEvent`, `OutputChunk`, `StreamKind`                                             |
 | Auth        | `Token`                                                                                |
@@ -92,26 +94,29 @@ assert_eq!(task.id().as_str(), "embedded-cleanup-1");
 ```text
 TaskSpec
   slot
-  kind
+  workload
   timeout
   restart
   backoff
   admission
   max_retries
   runner_selector
-  labels
 
 TaskStatus
+  observed_generation
   phase
   attempt
   exit_code
   error
 
 ObjectMeta
-  id
+  name
+  uid
   resource_version
-  created_at
-  updated_at
+  generation
+  creation_timestamp
+  labels
+  annotations
 ```
 
 Most fields are private on `TaskSpec`. Build specs with `TaskSpec::builder()` or parse them with serde.
@@ -139,7 +144,7 @@ After the whole lifecycle is joined, `Task::reconcile_finished` may replace an
 attempt-derived terminal phase with the authoritative resource disposition;
 the separate `TaskRun` record keeps the attempt result.
 
-## Task Kinds
+## Task Workloads
 
 | Kind         | Meaning                | Routed by runner  |
 |--------------|------------------------|-------------------|
@@ -147,13 +152,14 @@ the separate `TaskRun` record keeps the attempt result.
 | `Container`  | OCI image              | yes               |
 | `Wasm`       | WASI module            | yes               |
 | `Embedded`   | In-process task        | no                |
+| `Extension`  | Application-defined    | by registered GVK |
 
 Subprocess command example:
 
 ```rust
-use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind};
+use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskWorkload};
 
-let kind = TaskKind::Subprocess(SubprocessSpec::new(
+let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
     SubprocessMode::Command {
         command: "date".into(),
         args: vec![],
@@ -163,7 +169,7 @@ let kind = TaskKind::Subprocess(SubprocessSpec::new(
     Flag::enabled(),
 ));
 
-assert_eq!(kind.kind(), "subprocess");
+assert_eq!(workload.kind(), "Subprocess");
 ```
 
 Subprocess scripts store their body as standard base64. The decoded UTF-8 body is capped by `MAX_SCRIPT_BODY_BYTES`.
@@ -224,21 +230,17 @@ assert!(selector.matches(&runner));
 
 ## Environment
 
-`TaskEnv` comes from the task. `RunnerEnv` comes from the runner. When they are merged, runner values win:
+`TaskEnv` is desired-state data carried by a task. Runner-owned environment and the merge policy belong to `solti-runner`:
 
 ```rust
-use solti_model::{RunnerEnv, TaskEnv, merge_env};
+use solti_model::TaskEnv;
 
 let mut task = TaskEnv::new();
 task.push("PATH", "/user/bin");
 task.push("APP_MODE", "batch");
 
-let mut runner = RunnerEnv::new();
-runner.push("PATH", "/safe/bin");
-
-let env = merge_env(&task, &runner);
-assert_eq!(env.get("PATH").map(String::as_str), Some("/safe/bin"));
-assert_eq!(env.get("APP_MODE").map(String::as_str), Some("batch"));
+assert_eq!(task.get("PATH"), Some("/user/bin"));
+assert_eq!(task.get("APP_MODE"), Some("batch"));
 ```
 
 ## Identity Rules
@@ -281,6 +283,7 @@ use solti_model::{OutputChunk, OutputEvent, StreamKind};
 use std::time::SystemTime;
 
 let event = OutputEvent::Chunk(OutputChunk {
+    generation: 1,
     attempt: 1,
     stream: StreamKind::Stdout,
     seq: 0,
@@ -296,6 +299,6 @@ assert!(json.contains(r#""type":"chunk""#));
 
 - Most public enums are `#[non_exhaustive]`; match them with a fallback arm.
 - `Labels` uses `BTreeMap`, so iteration order is stable.
-- `TaskEnv` and `RunnerEnv` preserve insertion order and use last-value-wins lookup.
+- `TaskEnv` preserves insertion order and uses last-value-wins lookup.
 - `BackoffPolicy` validates on construction through serde and through `TaskSpecBuilder::build`.
 - Pagination uses `DEFAULT_LIMIT = 100` and `MAX_LIMIT = 1000`.

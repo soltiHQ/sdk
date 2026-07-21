@@ -1,6 +1,6 @@
 //! # solti-exec - task execution backends.
 //!
-//! Provides concrete [`Runner`](solti_runner::Runner) implementations that turn [`TaskSpec`](solti_model::TaskSpec)
+//! Provides concrete [`Runner`](solti_runner::Runner) implementations that turn [`Task`](solti_model::Task) resources
 //! into running OS processes (and, in the future, WASM / container backends).
 //!
 //! ## Feature flags
@@ -15,18 +15,18 @@
 //! # #[cfg(feature = "subprocess")]
 //! # {
 //! use solti_exec::subprocess::{SubprocessRunner, register_subprocess_runner};
-//! use solti_model::{SubprocessMode, SubprocessSpec, TaskKind, TaskSpec};
+//! use solti_model::{SubprocessMode, SubprocessSpec, Task, TaskSpec, TaskWorkload};
 //! use solti_runner::{BuildContext, Runner, RunnerRouter};
 //!
 //! // The usual path: register the runner in a router.
 //! let mut router = RunnerRouter::new();
 //! register_subprocess_runner(&mut router, "default")?;
 //!
-//! // Or drive the runner directly: TaskSpec -> runnable task.
+//! // Or drive the runner directly: Task resource -> runnable task.
 //! let runner = SubprocessRunner::new("direct");
 //! let spec = TaskSpec::builder(
 //!     "hello",
-//!     TaskKind::Subprocess(SubprocessSpec::new(
+//!     TaskWorkload::Subprocess(SubprocessSpec::new(
 //!         SubprocessMode::Command {
 //!             command: "echo".into(),
 //!             args: vec!["hi".into()],
@@ -38,7 +38,8 @@
 //!     5_000u64,
 //! )
 //! .build()?;
-//! let task = runner.build_task(&spec, &BuildContext::default())?;
+//! let resource = Task::new("hello", spec)?;
+//! let task = runner.build_task(&resource, &BuildContext::default())?;
 //! # }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -46,7 +47,7 @@
 //! ## Also
 //!
 //! - [`solti_runner::Runner`] trait implemented by backends in this crate.
-//! - [`solti_model::TaskKind`] determines which backend handles the task.
+//! - [`solti_model::TaskWorkload`] determines which backend handles the task.
 //! - [`solti_runner::RunnerRouter`] routes tasks to registered runners.
 
 #![deny(unsafe_op_in_unsafe_fn)]

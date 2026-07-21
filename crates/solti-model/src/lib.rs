@@ -11,10 +11,10 @@
 //!
 //! ```rust
 //! use solti_model::{
-//!     Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind, TaskSpec,
+//!     Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskSpec, TaskWorkload,
 //! };
 //!
-//! let kind = TaskKind::Subprocess(SubprocessSpec::new(
+//! let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
 //!     SubprocessMode::Command {
 //!         command: "echo".into(),
 //!         args: vec!["hello".into()],
@@ -24,7 +24,7 @@
 //!     Flag::enabled(),
 //! ));
 //!
-//! let spec = TaskSpec::builder("hello", kind, 5_000u64)
+//! let spec = TaskSpec::builder("hello", workload, 5_000u64)
 //!     .build()
 //!     .expect("valid spec");
 //!
@@ -35,20 +35,21 @@
 //! Create a task resource from a spec:
 //!
 //! ```rust
-//! use solti_model::{Task, TaskId, TaskKind, TaskPhase, TaskSpec};
+//! use solti_model::{EmbeddedSpec, Task, TaskId, TaskPhase, TaskSpec, TaskWorkload};
 //!
-//! let spec = TaskSpec::builder("cleanup", TaskKind::Embedded, 1_000u64)
+//! let workload = TaskWorkload::Embedded(EmbeddedSpec::new("v1").unwrap());
+//! let spec = TaskSpec::builder("cleanup", workload, 1_000u64)
 //!     .build()
 //!     .unwrap();
 //!
-//! let task = Task::new(TaskId::from("embedded-cleanup-1"), spec);
+//! let task = Task::new(TaskId::from("embedded-cleanup-1"), spec).unwrap();
 //!
 //! assert_eq!(*task.phase(), TaskPhase::Pending);
 //! assert_eq!(task.id().as_str(), "embedded-cleanup-1");
 //! ```
 //!
-//! `TaskKind::Embedded` is valid as model data, but [`TaskSpec::validate`] rejects it for runner-based submit.
-//! Embedded tasks must be submitted with a real `TaskRef`.
+//! The shared model accepts embedded workloads. Transport and runner layers own
+//! their separate admission and routability rules.
 //!
 //! ## What Ships
 //!
@@ -56,10 +57,10 @@
 //! |-------------|----------------------------------------------------------------------------------------------------|
 //! | Resource    | [`Task`], [`TaskSpec`], [`TaskStatus`], [`ObjectMeta`], [`TaskRun`]                                |
 //! | Identity    | [`Slot`], [`TaskId`], [`AgentId`]                                                                  |
-//! | Execution   | [`TaskKind`], [`SubprocessSpec`], [`SubprocessMode`], [`WasmSpec`], [`ContainerSpec`], [`Runtime`] |
+//! | Execution   | [`TaskWorkload`], [`ExtensionWorkload`], [`SubprocessSpec`], [`WasmSpec`], [`ContainerSpec`]       |
 //! | Policies    | [`RestartPolicy`], [`BackoffPolicy`], [`JitterPolicy`], [`AdmissionPolicy`], [`Timeout`]           |
 //! | Routing     | [`Labels`], [`RunnerSelector`], [`SelectorRequirement`], [`SelectorOperator`]                      |
-//! | Environment | [`TaskEnv`], [`RunnerEnv`], [`KeyValue`], [`merge_env`]                                            |
+//! | Environment | [`TaskEnv`], [`KeyValue`]                                                                           |
 //! | Query       | [`TaskQuery`], [`TaskPage`]                                                                        |
 //! | Output      | [`OutputEvent`], [`OutputChunk`], [`StreamKind`]                                                   |
 //! | Auth        | [`Token`]                                                                                          |
@@ -69,16 +70,17 @@
 //!
 //! ```text
 //! Task
+//!   apiVersion, kind
 //!   metadata: ObjectMeta
 //!   spec:     TaskSpec
 //!   status:   TaskStatus
 //!
 //! TaskSpec
-//!   slot, kind, timeout, restart, backoff, admission
-//!   max_retries, runner_selector, labels
+//!   slot, workload, timeout, restart, backoff, admission
+//!   max_retries, runner_selector
 //!
 //! TaskStatus
-//!   phase, attempt, exit_code, error
+//!   observed_generation, conditions, phase, attempt, exit_code, error
 //! ```
 //!
 //! [`TaskSpec`] says what should run. [`TaskStatus`] says what happened.
@@ -101,9 +103,9 @@
 //! to the restart policy.
 //! See [`TaskPhase::is_terminal`].
 //!
-//! ## Task Kinds
+//! ## Task Workloads
 //!
-//! [`TaskKind`] describes what a task runs:
+//! [`TaskWorkload`] describes what a task runs:
 //!
 //! | Kind         | Meaning                | Routed by runner |
 //! |--------------|------------------------|------------------|
@@ -111,6 +113,7 @@
 //! | `Container`  | OCI image              | yes              |
 //! | `Wasm`       | WASI module            | yes              |
 //! | `Embedded`   | In-process task        | no               |
+//! | `Extension`  | Application-defined    | by registered GVK |
 //!
 //! Routable variants are consumed by `solti-runner`.
 //! Embedded tasks are submitted directly by `solti-core`.
@@ -138,11 +141,6 @@
 //! assert!(selector.matches(&runner));
 //! ```
 //!
-//! ## Environment
-//!
-//! [`TaskEnv`] comes from the task. [`RunnerEnv`] comes from the runner.
-//! [`merge_env`] combines them, with runner values winning on duplicate keys.
-//!
 //! ## Auth
 //!
 //! [`Token`] is the shared bearer secret between an agent and the control plane.
@@ -150,7 +148,7 @@
 //!
 //! ## Also
 //!
-//! - `solti-runner` consumes [`TaskSpec`] and [`TaskKind`] to build executable tasks.
+//! - `solti-runner` consumes [`TaskSpec`] and [`TaskWorkload`] to build executable tasks.
 //! - `solti-core` manages [`Task`] lifecycle and state transitions.
 //! - `solti-api` serializes model types over gRPC and HTTP.
 
@@ -164,18 +162,25 @@ struct ReadmeDoctests;
 
 mod domain;
 pub use domain::{
-    AGENT_ID_MAX_LEN, AdmissionPolicy, AgentId, BackoffPolicy, ContainerSpec, DEFAULT_LIMIT, Flag,
-    JitterPolicy, KeyValue, Labels, LabelsIter, MAX_LIMIT, MAX_SCRIPT_BODY_BYTES, OutputChunk,
-    OutputEvent, RestartPolicy, RunnerEnv, RunnerSelector, Runtime, SLOT_MAX_LEN, SelectorOperator,
-    SelectorRequirement, Slot, StreamKind, SubprocessMode, SubprocessSpec, TASK_ID_MAX_LEN,
-    TaskEnv, TaskId, TaskKind, TaskPage, TaskPhase, TaskQuery, Timeout, WasmSpec, merge_env,
+    AGENT_ID_MAX_LEN, AdmissionPolicy, AgentId, BackoffPolicy, ContainerSpec, DEFAULT_LIMIT,
+    EmbeddedSpec, ExtensionWorkload, Flag, JitterPolicy, KeyValue, Labels, LabelsIter, MAX_LIMIT,
+    MAX_SCRIPT_BODY_BYTES, OutputChunk, OutputEvent, RestartPolicy, RunnerSelector, Runtime,
+    SLOT_MAX_LEN, SelectorOperator, SelectorRequirement, Slot, StreamKind, SubprocessMode,
+    SubprocessSpec, TASK_ID_MAX_LEN, TaskEnv, TaskId, TaskPage, TaskPhase, TaskQuery, TaskWorkload,
+    Timeout, WORKLOAD_API_VERSION, WasmSpec, WorkloadTypeMeta,
 };
 
 mod resource;
-pub use resource::{ObjectMeta, Task, TaskRun, TaskSpec, TaskSpecBuilder, TaskStatus};
+pub use resource::{
+    Annotations, ConditionStatus, DesiredChange, ObjectMeta, TASK_API_VERSION, TASK_KIND, Task,
+    TaskCondition, TaskConditionType, TaskManifest, TaskManifestMeta, TaskRun, TaskSpec,
+    TaskSpecBuilder, TaskStatus, TypeMeta, Uid,
+};
 
 mod error;
 pub use error::{ModelError, ModelResult};
 
 mod auth;
 pub use auth::Token;
+
+mod validation;

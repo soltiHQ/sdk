@@ -52,11 +52,7 @@ impl SelectorRequirement {
     pub fn validate(&self) -> crate::error::ModelResult<()> {
         use std::borrow::Cow;
 
-        if self.key.is_empty() {
-            return Err(crate::ModelError::Invalid(Cow::Borrowed(
-                "selector requirement key must not be empty",
-            )));
-        }
+        crate::validation::validate_qualified_name("selector requirement key", &self.key)?;
         match self.operator {
             SelectorOperator::In | SelectorOperator::NotIn => {
                 if self.values.is_empty() {
@@ -64,6 +60,9 @@ impl SelectorRequirement {
                         "selector requirement '{}' with operator {} must have non-empty values",
                         self.key, self.operator,
                     ))));
+                }
+                for value in &self.values {
+                    crate::validation::validate_label_value("selector requirement value", value)?;
                 }
             }
             SelectorOperator::Exists | SelectorOperator::DoesNotExist => {
@@ -175,6 +174,23 @@ mod tests {
         assert!(
             !json.contains("values"),
             "empty values should be skipped: {json}"
+        );
+    }
+
+    #[test]
+    fn validate_uses_kubernetes_label_rules() {
+        SelectorRequirement::r#in(
+            "workloads.example.io/class",
+            vec!["gpu_fast".into(), "".into()],
+        )
+        .validate()
+        .unwrap();
+
+        assert!(SelectorRequirement::exists("bad key").validate().is_err());
+        assert!(
+            SelectorRequirement::r#in("valid", vec!["-invalid".into()])
+                .validate()
+                .is_err()
         );
     }
 }

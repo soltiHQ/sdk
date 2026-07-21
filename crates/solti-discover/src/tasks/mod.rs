@@ -1,6 +1,7 @@
 //! # Embedded discovery tasks.
 //!
-//! Each function returns `(TaskRef, TaskSpec)` ready for `SupervisorApi::submit_with_task`.
+//! Each factory returns a prebuilt runtime task and a complete desired Task resource.
 
 mod sync;
+mod transport;
 pub use sync::sync;

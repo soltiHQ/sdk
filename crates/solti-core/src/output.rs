@@ -129,10 +129,11 @@ impl OutputHub {
             .map(broadcast::Sender::subscribe)
     }
 
-    pub(crate) fn announce_run_started(&self, task_id: &TaskId, attempt: u32) {
+    pub(crate) fn announce_run_started(&self, task_id: &TaskId, generation: u64, attempt: u32) {
         self.send(
             task_id,
             OutputEvent::RunStarted {
+                generation,
                 attempt,
                 started_at: SystemTime::now(),
             },
@@ -142,12 +143,14 @@ impl OutputHub {
     pub(crate) fn announce_run_finished(
         &self,
         task_id: &TaskId,
+        generation: u64,
         attempt: u32,
         exit_code: Option<i32>,
     ) {
         self.send(
             task_id,
             OutputEvent::RunFinished {
+                generation,
                 attempt,
                 exit_code,
                 finished_at: SystemTime::now(),
@@ -169,17 +172,12 @@ impl OutputHub {
     pub(crate) fn active_channels(&self) -> usize {
         self.channels.read().len()
     }
-
-    #[cfg(test)]
-    pub(crate) fn capacity(&self) -> usize {
-        self.capacity
-    }
 }
 
 impl OutputPublisher for OutputHub {
-    fn sink_for(&self, task_id: &TaskId, attempt: u32) -> Option<OutputSink> {
+    fn sink_for(&self, task_id: &TaskId, generation: u64, attempt: u32) -> Option<OutputSink> {
         let sender = self.channels.read().get(task_id)?.clone();
-        Some(OutputSink::new(attempt, move |event| {
+        Some(OutputSink::new(generation, attempt, move |event| {
             let _ = sender.send(event);
         }))
     }
@@ -213,7 +211,7 @@ mod tests {
         let hub = OutputHub::new(OutputConfig::default());
         let task_id = TaskId::from("missing");
 
-        assert!(hub.sink_for(&task_id, 1).is_none());
+        assert!(hub.sink_for(&task_id, 1, 1).is_none());
         assert_eq!(hub.active_channels(), 0);
     }
 
@@ -224,27 +222,32 @@ mod tests {
         assert!(hub.ensure_channel_if_absent(task_id.clone()));
         let mut output = hub.subscribe(&task_id).expect("output subscription");
 
-        hub.announce_run_started(&task_id, 1);
-        hub.sink_for(&task_id, 1)
+        hub.announce_run_started(&task_id, 1, 1);
+        hub.sink_for(&task_id, 1, 1)
             .expect("attempt one sink")
             .stdout_line(Bytes::from_static(b"one"));
-        hub.announce_run_finished(&task_id, 1, Some(1));
-        hub.announce_run_started(&task_id, 2);
-        hub.sink_for(&task_id, 2)
+        hub.announce_run_finished(&task_id, 1, 1, Some(1));
+        hub.announce_run_started(&task_id, 1, 2);
+        hub.sink_for(&task_id, 1, 2)
             .expect("attempt two sink")
             .stderr_line(Bytes::from_static(b"two"));
 
         assert!(matches!(
             output.next().await,
-            Some(OutputEvent::RunStarted { attempt: 1, .. })
+            Some(OutputEvent::RunStarted {
+                generation: 1,
+                attempt: 1,
+                ..
+            })
         ));
         assert!(matches!(
             output.next().await,
-            Some(OutputEvent::Chunk(chunk)) if chunk.attempt == 1 && &chunk.line[..] == b"one"
+            Some(OutputEvent::Chunk(chunk)) if chunk.generation == 1 && chunk.attempt == 1 && &chunk.line[..] == b"one"
         ));
         assert!(matches!(
             output.next().await,
             Some(OutputEvent::RunFinished {
+                generation: 1,
                 attempt: 1,
                 exit_code: Some(1),
                 ..
@@ -252,11 +255,15 @@ mod tests {
         ));
         assert!(matches!(
             output.next().await,
-            Some(OutputEvent::RunStarted { attempt: 2, .. })
+            Some(OutputEvent::RunStarted {
+                generation: 1,
+                attempt: 2,
+                ..
+            })
         ));
         assert!(matches!(
             output.next().await,
-            Some(OutputEvent::Chunk(chunk)) if chunk.attempt == 2 && &chunk.line[..] == b"two"
+            Some(OutputEvent::Chunk(chunk)) if chunk.generation == 1 && chunk.attempt == 2 && &chunk.line[..] == b"two"
         ));
     }
 
@@ -266,7 +273,7 @@ mod tests {
         let task_id = TaskId::from("lagged");
         hub.ensure_channel_if_absent(task_id.clone());
         let mut output = hub.subscribe(&task_id).expect("output subscription");
-        let sink = hub.sink_for(&task_id, 1).expect("sink");
+        let sink = hub.sink_for(&task_id, 1, 1).expect("sink");
 
         sink.stdout_line(Bytes::from_static(b"one"));
         sink.stdout_line(Bytes::from_static(b"two"));
@@ -287,7 +294,7 @@ mod tests {
         let task_id = TaskId::from("closing");
         hub.ensure_channel_if_absent(task_id.clone());
         let mut output = hub.subscribe(&task_id).expect("output subscription");
-        let sink = hub.sink_for(&task_id, 1).expect("sink");
+        let sink = hub.sink_for(&task_id, 1, 1).expect("sink");
         let outstanding = sink.clone();
 
         hub.evict(&task_id);
@@ -312,7 +319,7 @@ mod tests {
         let task_id = TaskId::from("reused");
         hub.ensure_channel_if_absent(task_id.clone());
         let mut old_output = hub.subscribe(&task_id).expect("old subscription");
-        let stale_sink = hub.sink_for(&task_id, 1).expect("old sink");
+        let stale_sink = hub.sink_for(&task_id, 1, 1).expect("old sink");
 
         hub.evict(&task_id);
         hub.ensure_channel_if_absent(task_id.clone());

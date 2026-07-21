@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::{ModelResult, validation};
+
 /// Structured key-value metadata based on [`BTreeMap`].
 ///
 /// Iteration order is stable because labels are stored in key order.
@@ -106,6 +108,15 @@ impl Labels {
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
+
+    /// Validate all entries using Kubernetes label key and value rules.
+    pub fn validate(&self) -> ModelResult<()> {
+        for (key, value) in &self.0 {
+            validation::validate_qualified_name("label key", key)?;
+            validation::validate_label_value("label value", value)?;
+        }
+        Ok(())
+    }
 }
 
 impl<'a> IntoIterator for &'a Labels {
@@ -198,5 +209,26 @@ mod tests {
 
         let back: Labels = serde_json::from_str(&json).unwrap();
         assert_eq!(back.get("runner-tag"), Some("prod"));
+    }
+
+    #[test]
+    fn validate_accepts_kubernetes_qualified_labels() {
+        let mut labels = Labels::new();
+        labels
+            .insert("app.kubernetes.io/name", "solti_agent-1")
+            .insert("empty", "");
+
+        labels.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_invalid_key_or_value() {
+        let mut invalid_key = Labels::new();
+        invalid_key.insert("example.io/bad key", "value");
+        assert!(invalid_key.validate().is_err());
+
+        let mut invalid_value = Labels::new();
+        invalid_value.insert("example.io/name", "-value");
+        assert!(invalid_value.validate().is_err());
     }
 }

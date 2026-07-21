@@ -114,6 +114,15 @@ impl RunnerSelector {
         self.match_labels.is_empty() && self.match_expressions.is_empty()
     }
 
+    /// Validate exact matches and set-based requirements as a Kubernetes label selector.
+    pub fn validate(&self) -> crate::ModelResult<()> {
+        self.match_labels.validate()?;
+        for requirement in &self.match_expressions {
+            requirement.validate()?;
+        }
+        Ok(())
+    }
+
     /// Check whether `labels` satisfy all requirements of this selector.
     ///
     /// - Each `match_labels` entry requires an exact key=value match.
@@ -289,5 +298,17 @@ mod tests {
     fn is_empty() {
         assert!(RunnerSelector::new().is_empty());
         assert!(!RunnerSelector::from_labels(labels_of(&[("k", "v")])).is_empty());
+    }
+
+    #[test]
+    fn validate_checks_match_labels_and_expressions() {
+        let mut invalid = Labels::new();
+        invalid.insert("bad key", "value");
+        assert!(RunnerSelector::from_labels(invalid).validate().is_err());
+
+        let selector = RunnerSelector::from_expressions(vec![SelectorRequirement::exists(
+            "example.io/capability",
+        )]);
+        selector.validate().unwrap();
     }
 }

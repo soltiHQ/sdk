@@ -24,7 +24,7 @@ use crate::register::{Sub, ms_to_secs};
 ///
 /// ## Cardinality
 ///
-/// `path` is a templated route for HTTP, such as `/api/v1/tasks/{id}`.
+/// `path` is a templated route for HTTP, such as `/apis/solti.io/v1/tasks/{name}`.
 /// For gRPC it is the full method path, such as `/solti.task.v1.TaskService/SubmitTask`.
 ///
 /// In both cases the set is bounded by the proto/api definition.
@@ -49,7 +49,13 @@ impl PrometheusApiMetrics {
     /// let metrics = PrometheusApiMetrics::new(registry.clone())?;
     ///
     /// metrics.record_in_flight_delta(Transport::Http, 1);
-    /// metrics.record_request(Transport::Http, "GET", "/api/v1/tasks", 200, 12);
+    /// metrics.record_request(
+    ///     Transport::Http,
+    ///     "GET",
+    ///     "/apis/solti.io/v1/tasks",
+    ///     200,
+    ///     12,
+    /// );
     /// metrics.record_in_flight_delta(Transport::Http, -1);
     ///
     /// assert!(!registry.gather().is_empty());

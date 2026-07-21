@@ -24,7 +24,7 @@ use taskvisor::{Event, EventKind, Subscribe};
 use tokio::sync::watch;
 use tracing::{trace, warn};
 
-use super::{LifecycleGate, TaskState};
+use super::{LifecycleGate, ResourceGeneration, RuntimeBinding, TaskState};
 use crate::map::phase::{phase_for_outcome, phase_for_outcome_kind, phase_for_rejection};
 use crate::output::OutputHub;
 use solti_model::{TaskId, TaskPhase};
@@ -110,20 +110,46 @@ impl StateSubscriber {
         }
     }
 
-    /// Clone the short-lived lifecycle gate shared with the supervisor.
-    pub(crate) fn lifecycle_gate(&self) -> LifecycleGate {
-        self.lifecycle_gate.clone()
-    }
-
     /// Bind a prepared controller submission before it can publish events.
     ///
-    /// Returns whether this binding created its output channel, so a failed
-    /// submission can roll back only resources owned by its reservation.
-    pub(crate) fn bind(&self, id: &TaskId, tv: taskvisor::TaskId, ensure_output: bool) -> bool {
+    /// Returns `false` when the resource UID or generation is no longer current.
+    pub(crate) fn bind(
+        &self,
+        resource: ResourceGeneration,
+        tv: taskvisor::TaskId,
+        ensure_output: bool,
+    ) -> bool {
         let _lifecycle = self.lifecycle_gate.lock();
-        let output_created = ensure_output && self.output_hub.ensure_channel_if_absent(id.clone());
-        self.state.bind_tv(id, tv);
-        output_created
+        let task_id = resource.name.clone();
+        if !self.state.bind_tv(resource, tv) {
+            return false;
+        }
+        if ensure_output {
+            self.output_hub.ensure_channel_if_absent(task_id);
+        }
+        true
+    }
+
+    /// Release one exact failed intake binding and retain its desired generation
+    /// with a reconciliation failure status.
+    pub(crate) fn fail_bound_reconciliation(
+        &self,
+        binding: &RuntimeBinding,
+        reason: &'static str,
+        message: String,
+    ) -> bool {
+        let _lifecycle = self.lifecycle_gate.lock();
+        if self.state.resolve_tv(binding.tv.get()).as_ref() != Some(binding) {
+            return false;
+        }
+
+        self.state.unbind_tv(binding.tv.get());
+        self.output_hub.evict(&binding.resource.name);
+        let changed = self
+            .state
+            .mark_reconciliation_failed(&binding.resource, reason, message);
+        self.mark_completed_locked(binding.tv.get());
+        changed
     }
 
     /// Finalize one current binding from the direct completion channel.
@@ -365,7 +391,7 @@ impl StateSubscriber {
     }
 
     /// Resolve the task entry an event belongs to.
-    fn resolve(&self, event: &Event) -> Option<TaskId> {
+    fn resolve(&self, event: &Event) -> Option<RuntimeBinding> {
         self.state.resolve_tv(event.id?.get())
     }
 }
@@ -378,9 +404,10 @@ impl StateSubscriber {
         };
         let tv_raw = tv.get();
 
-        let Some(task_id) = self.resolve(event) else {
+        let Some(binding) = self.resolve(event) else {
             return;
         };
+        let task_id = &binding.resource.name;
 
         // Output cleanup does not own the retained SDK resource. The
         // direct completion finalizes it; explicit delete removes it eagerly.
@@ -389,42 +416,77 @@ impl StateSubscriber {
             return;
         }
 
-        let attempt = event.attempt.unwrap_or(0);
-
         match event.kind {
             EventKind::TaskAdded => {
                 trace!(task = %task_id, "task added event received (already in state)");
             }
             EventKind::AttemptStarting => {
+                let Some(attempt) = event.attempt else {
+                    warn!(task = %task_id, "AttemptStarting event has no attempt");
+                    return;
+                };
                 trace!(task = %task_id, "task attempt starting");
-                if self.state.transition_starting(&task_id).is_none() {
-                    warn!(task = %task_id, "AttemptStarting event for unknown task");
+                if self.state.transition_attempt_starting(&binding, attempt) {
+                    self.output_hub.announce_run_started(
+                        task_id,
+                        binding.resource.generation,
+                        attempt,
+                    );
+                } else {
+                    warn!(task = %task_id, "AttemptStarting event for stale task generation");
                 }
-                self.output_hub.announce_run_started(&task_id, attempt);
             }
             EventKind::AttemptSucceeded => {
+                let Some(attempt) = event.attempt else {
+                    warn!(task = %task_id, "AttemptSucceeded event has no attempt");
+                    return;
+                };
                 trace!(task = %task_id, "task attempt succeeded");
-                if !self
-                    .state
-                    .transition_finished(&task_id, TaskPhase::Succeeded, None, None)
-                {
-                    warn!(task = %task_id, "AttemptSucceeded event for unknown task");
+                if self.state.transition_attempt_finished(
+                    &binding,
+                    attempt,
+                    TaskPhase::Succeeded,
+                    None,
+                    None,
+                ) {
+                    self.output_hub.announce_run_finished(
+                        task_id,
+                        binding.resource.generation,
+                        attempt,
+                        None,
+                    );
+                } else {
+                    warn!(task = %task_id, "AttemptSucceeded event for stale task generation");
                 }
-                self.output_hub
-                    .announce_run_finished(&task_id, attempt, None);
             }
             EventKind::AttemptCanceled => {
+                let Some(attempt) = event.attempt else {
+                    warn!(task = %task_id, "AttemptCanceled event has no attempt");
+                    return;
+                };
                 trace!(task = %task_id, "task attempt canceled cooperatively");
-                if !self
-                    .state
-                    .transition_finished(&task_id, TaskPhase::Canceled, None, None)
-                {
-                    warn!(task = %task_id, "AttemptCanceled event for unknown task");
+                if self.state.transition_attempt_finished(
+                    &binding,
+                    attempt,
+                    TaskPhase::Canceled,
+                    None,
+                    None,
+                ) {
+                    self.output_hub.announce_run_finished(
+                        task_id,
+                        binding.resource.generation,
+                        attempt,
+                        None,
+                    );
+                } else {
+                    warn!(task = %task_id, "AttemptCanceled event for stale task generation");
                 }
-                self.output_hub
-                    .announce_run_finished(&task_id, attempt, None);
             }
             EventKind::AttemptFailed => {
+                let Some(attempt) = event.attempt else {
+                    warn!(task = %task_id, "AttemptFailed event has no attempt");
+                    return;
+                };
                 let reason = event
                     .reason
                     .as_ref()
@@ -436,31 +498,49 @@ impl StateSubscriber {
                     exit_code = ?event.exit_code,
                     "task attempt failed",
                 );
-                if !self.state.transition_finished(
-                    &task_id,
+                if self.state.transition_attempt_finished(
+                    &binding,
+                    attempt,
                     TaskPhase::Failed,
                     Some(reason),
                     event.exit_code,
                 ) {
-                    warn!(task = %task_id, "AttemptFailed event for unknown task");
+                    self.output_hub.announce_run_finished(
+                        task_id,
+                        binding.resource.generation,
+                        attempt,
+                        event.exit_code,
+                    );
+                } else {
+                    warn!(task = %task_id, "AttemptFailed event for stale task generation");
                 }
-                self.output_hub
-                    .announce_run_finished(&task_id, attempt, event.exit_code);
             }
             EventKind::AttemptTimedOut => {
+                let Some(attempt) = event.attempt else {
+                    warn!(task = %task_id, "AttemptTimedOut event has no attempt");
+                    return;
+                };
                 let error = event.timeout_ms.map_or_else(
                     || "task attempt timed out".to_string(),
                     |timeout_ms| format!("task attempt timed out after {timeout_ms} ms"),
                 );
                 trace!(task = %task_id, "task attempt timed out");
-                if !self
-                    .state
-                    .transition_finished(&task_id, TaskPhase::Timeout, Some(error), None)
-                {
-                    warn!(task = %task_id, "AttemptTimedOut event for unknown task");
+                if self.state.transition_attempt_finished(
+                    &binding,
+                    attempt,
+                    TaskPhase::Timeout,
+                    Some(error),
+                    None,
+                ) {
+                    self.output_hub.announce_run_finished(
+                        task_id,
+                        binding.resource.generation,
+                        attempt,
+                        None,
+                    );
+                } else {
+                    warn!(task = %task_id, "AttemptTimedOut event for stale task generation");
                 }
-                self.output_hub
-                    .announce_run_finished(&task_id, attempt, None);
             }
             EventKind::TaskFinished => {
                 let Some(outcome_kind) = event.outcome_kind else {
@@ -477,9 +557,9 @@ impl StateSubscriber {
                 );
                 if !self
                     .state
-                    .transition_finished(&task_id, phase, error, exit_code)
+                    .transition_task_finished(&binding, phase, error, exit_code)
                 {
-                    warn!(task = %task_id, "TaskFinished event for unknown task");
+                    warn!(task = %task_id, "TaskFinished event for stale task generation");
                 }
             }
             EventKind::ControllerRejected => {
@@ -494,9 +574,9 @@ impl StateSubscriber {
                     .unwrap_or(TaskPhase::Failed);
                 if !self
                     .state
-                    .transition_finished(&task_id, phase, Some(reason), None)
+                    .transition_task_finished(&binding, phase, Some(reason), None)
                 {
-                    warn!(task = %task_id, "rejection event for unknown task");
+                    warn!(task = %task_id, "rejection event for stale task generation");
                 }
             }
             EventKind::TaskAddFailed => {
@@ -511,9 +591,9 @@ impl StateSubscriber {
                     .unwrap_or(TaskPhase::Failed);
                 if !self
                     .state
-                    .transition_finished(&task_id, phase, Some(reason), None)
+                    .transition_task_finished(&binding, phase, Some(reason), None)
                 {
-                    warn!(task = %task_id, "TaskAddFailed event for unknown task");
+                    warn!(task = %task_id, "TaskAddFailed event for stale task generation");
                 }
             }
             _ => {}
@@ -575,21 +655,58 @@ mod tests {
     use taskvisor::TaskOutcomeKind;
 
     use crate::output::{OutputConfig, OutputHub};
-    use solti_model::{OutputEvent, TaskKind, TaskSpec};
+    use solti_model::{
+        ConditionStatus, EmbeddedSpec, OutputEvent, TaskManifest, TaskSpec, TaskWorkload,
+    };
     use taskvisor::Event;
 
     fn test_spec() -> TaskSpec {
-        TaskSpec::builder("slot", TaskKind::Embedded, 5_000_u64)
-            .build()
-            .expect("valid spec")
+        TaskSpec::builder(
+            "slot",
+            TaskWorkload::Embedded(EmbeddedSpec::new("test-v1").unwrap()),
+            5_000_u64,
+        )
+        .build()
+        .expect("valid spec")
+    }
+
+    fn changed_test_spec() -> TaskSpec {
+        TaskSpec::builder(
+            "slot",
+            TaskWorkload::Embedded(EmbeddedSpec::new("test-v2").unwrap()),
+            6_000_u64,
+        )
+        .build()
+        .expect("valid spec")
+    }
+
+    fn add_test_task(state: &TaskState, task_name: &str) -> TaskId {
+        let id = TaskId::from(task_name);
+        state.add_task(TaskManifest::new(id.clone(), test_spec()).expect("valid manifest"));
+        id
+    }
+
+    fn bind_test_task(state: &TaskState, id: &TaskId, tv: taskvisor::TaskId) -> RuntimeBinding {
+        let resource = ResourceGeneration::from_task(&state.get(id).expect("task must exist"));
+        assert!(state.bind_tv(resource.clone(), tv));
+        RuntimeBinding { resource, tv }
+    }
+
+    trait TestTaskStateExt {
+        fn tv_for(&self, id: &TaskId) -> Option<taskvisor::TaskId>;
+    }
+
+    impl TestTaskStateExt for TaskState {
+        fn tv_for(&self, id: &TaskId) -> Option<taskvisor::TaskId> {
+            self.binding_for(id).map(|binding| binding.tv)
+        }
     }
 
     fn setup(task_name: &str) -> (StateSubscriber, TaskState, TaskId) {
         let state = TaskState::new();
-        let id = TaskId::from(task_name);
-        state.add_task(id.clone(), test_spec());
-        state.bind_tv(&id, taskvisor::TaskId::for_tests());
-        state.transition_starting(&id);
+        let id = add_test_task(&state, task_name);
+        let binding = bind_test_task(&state, &id, taskvisor::TaskId::for_tests());
+        assert!(state.transition_attempt_starting(&binding, 1));
         let sub = StateSubscriber::with_output_hub(
             state.clone(),
             Arc::new(OutputHub::new(OutputConfig::default())),
@@ -604,13 +721,13 @@ mod tests {
     #[test]
     fn prepared_binding_routes_the_first_event_without_replay() {
         let state = TaskState::new();
-        let id = TaskId::from("prepared-start");
-        state.add_task(id.clone(), test_spec());
+        let id = add_test_task(&state, "prepared-start");
         let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
         let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
         let tv = taskvisor::TaskId::for_tests();
+        let resource = ResourceGeneration::from_task(&state.get(&id).expect("task must exist"));
 
-        assert!(sub.bind(&id, tv, true));
+        assert!(sub.bind(resource, tv, true));
         sub.on_event(
             &Event::new(EventKind::AttemptStarting)
                 .with_id(tv)
@@ -623,13 +740,198 @@ mod tests {
         assert!(registry.subscribe_raw(&id).is_some());
     }
 
+    #[test]
+    fn terminal_event_uses_authoritative_attempt_when_start_was_dropped() {
+        let state = TaskState::new();
+        let id = add_test_task(&state, "dropped-start");
+        let tv = taskvisor::TaskId::for_tests();
+        bind_test_task(&state, &id, tv);
+        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
+        registry.ensure_channel(id.clone());
+        let mut output = registry.subscribe_raw(&id).expect("output channel");
+        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
+
+        sub.on_event(
+            &Event::new(EventKind::AttemptFailed)
+                .with_id(tv)
+                .with_attempt(2)
+                .with_reason("start event was dropped")
+                .with_exit_code(7),
+        );
+
+        let task = state.get(&id).expect("task exists");
+        assert_eq!(task.status().attempt, 2);
+        assert_eq!(task.status().phase, TaskPhase::Failed);
+        let runs = state.list_runs(&id);
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].generation, runs[0].attempt), (1, 2));
+        assert_eq!(runs[0].phase, TaskPhase::Failed);
+        assert!(matches!(
+            output.try_recv(),
+            Ok(OutputEvent::RunFinished {
+                generation: 1,
+                attempt: 2,
+                exit_code: Some(7),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn attempt_event_without_attempt_is_ignored_without_attempt_zero() {
+        let state = TaskState::new();
+        let id = add_test_task(&state, "missing-attempt");
+        let tv = taskvisor::TaskId::for_tests();
+        bind_test_task(&state, &id, tv);
+        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
+        registry.ensure_channel(id.clone());
+        let mut output = registry.subscribe_raw(&id).expect("output channel");
+        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
+
+        sub.on_event(
+            &Event::new(EventKind::AttemptFailed)
+                .with_id(tv)
+                .with_reason("missing authoritative attempt"),
+        );
+
+        let task = state.get(&id).expect("task exists");
+        assert_eq!(task.status().phase, TaskPhase::Pending);
+        assert_eq!(task.status().attempt, 0);
+        assert!(state.list_runs(&id).is_empty());
+        assert!(output.try_recv().is_err());
+    }
+
+    #[test]
+    fn old_generation_attempt_closes_only_its_run() {
+        let state = TaskState::new();
+        let id = add_test_task(&state, "old-generation");
+        let tv = taskvisor::TaskId::for_tests();
+        let old_binding = bind_test_task(&state, &id, tv);
+        assert!(state.transition_attempt_starting(&old_binding, 1));
+        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
+        registry.ensure_channel(id.clone());
+        let mut output = registry.subscribe_raw(&id).expect("output channel");
+        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
+
+        let desired =
+            TaskManifest::new(id.clone(), changed_test_spec()).expect("valid desired task");
+        let commit = state.apply_desired(&desired).expect("apply must succeed");
+        assert_eq!(commit.task.metadata().generation(), 2);
+        assert_eq!(commit.task.status().phase, TaskPhase::Pending);
+
+        sub.on_event(
+            &Event::new(EventKind::AttemptFailed)
+                .with_id(tv)
+                .with_attempt(1)
+                .with_reason("old generation stopped")
+                .with_exit_code(9),
+        );
+
+        let current = state.get(&id).expect("current task exists");
+        assert_eq!(current.metadata().generation(), 2);
+        assert_eq!(current.status().phase, TaskPhase::Pending);
+        assert_eq!(current.status().attempt, 0);
+        let runs = state.list_runs(&id);
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].generation, runs[0].attempt), (1, 1));
+        assert_eq!(runs[0].phase, TaskPhase::Failed);
+        assert!(matches!(
+            output.try_recv(),
+            Ok(OutputEvent::RunFinished {
+                generation: 1,
+                attempt: 1,
+                exit_code: Some(9),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn stale_incarnation_event_cannot_touch_recreated_resource() {
+        let state = TaskState::new();
+        let id = add_test_task(&state, "recreated");
+        let old_task = state.get(&id).expect("old task exists");
+        let old_tv = taskvisor::TaskId::for_tests();
+        bind_test_task(&state, &id, old_tv);
+        assert!(state.delete_task(&id));
+
+        let recreated_id = add_test_task(&state, "recreated");
+        let recreated = state.get(&recreated_id).expect("new task exists");
+        assert_ne!(old_task.uid(), recreated.uid());
+        let new_tv = taskvisor::TaskId::for_tests();
+        bind_test_task(&state, &recreated_id, new_tv);
+        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
+        registry.ensure_channel(recreated_id.clone());
+        let mut output = registry
+            .subscribe_raw(&recreated_id)
+            .expect("output channel");
+        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
+
+        sub.on_event(
+            &Event::new(EventKind::AttemptFailed)
+                .with_id(old_tv)
+                .with_attempt(1)
+                .with_reason("late old incarnation"),
+        );
+
+        let current = state.get(&recreated_id).expect("new task remains");
+        assert_eq!(current.uid(), recreated.uid());
+        assert_eq!(current.status().phase, TaskPhase::Pending);
+        assert!(state.list_runs(&recreated_id).is_empty());
+        assert_eq!(state.tv_for(&recreated_id), Some(new_tv));
+        assert!(output.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_intake_cleanup_is_fenced_by_exact_binding() {
+        let state = TaskState::new();
+        let id = add_test_task(&state, "intake-failure");
+        let old_tv = taskvisor::TaskId::for_tests();
+        let stale = bind_test_task(&state, &id, old_tv);
+        let current_tv = taskvisor::TaskId::for_tests();
+        let current = bind_test_task(&state, &id, current_tv);
+        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
+        registry.ensure_channel(id.clone());
+        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
+
+        assert!(!sub.fail_bound_reconciliation(
+            &stale,
+            "RuntimeSubmissionFailed",
+            "stale intake failure".into(),
+        ));
+        assert_eq!(state.tv_for(&id), Some(current_tv));
+        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Pending);
+        assert!(registry.subscribe_raw(&id).is_some());
+
+        assert!(sub.fail_bound_reconciliation(
+            &current,
+            "RuntimeSubmissionFailed",
+            "controller intake failed".into(),
+        ));
+        assert!(state.tv_for(&id).is_none());
+        let failed = state.get(&id).expect("desired resource is retained");
+        assert_eq!(failed.status().phase, TaskPhase::Pending);
+        assert_eq!(failed.status().observed_generation, 1);
+        assert_eq!(failed.status().attempt, 0);
+        assert!(failed.status().error.is_none());
+        assert_eq!(failed.status().reconciled().status, ConditionStatus::False);
+        assert_eq!(
+            failed.status().reconciled().reason,
+            "RuntimeSubmissionFailed"
+        );
+        assert_eq!(
+            failed.status().reconciled().message,
+            "controller intake failed"
+        );
+        assert!(registry.subscribe_raw(&id).is_none());
+    }
+
     #[tokio::test]
     async fn task_removed_barrier_preserves_queued_attempt_events_before_cleanup() {
         let state = TaskState::new();
-        let id = TaskId::from("fast-attempt");
-        state.add_task(id.clone(), test_spec());
+        let id = add_test_task(&state, "fast-attempt");
         let tv = taskvisor::TaskId::for_tests();
-        state.bind_tv(&id, tv);
+        bind_test_task(&state, &id, tv);
         let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
         registry.ensure_channel(id.clone());
         let mut output = registry.subscribe_raw(&id).expect("output channel");
@@ -825,8 +1127,8 @@ mod tests {
             taskvisor::TaskId::for_tests(),
             taskvisor::TaskId::for_tests(),
         ];
-        state.bind_tv(&id, tvs[0]);
-        state.bind_tv(&id, tvs[1]);
+        bind_test_task(&state, &id, tvs[0]);
+        bind_test_task(&state, &id, tvs[1]);
 
         let stale = Event::new(EventKind::TaskRemoved)
             .with_task("reuse-x")
@@ -855,10 +1157,9 @@ mod tests {
     #[test]
     fn controller_rejection_projects_phase_but_waiter_owns_cleanup() {
         let state = TaskState::new();
-        let id = TaskId::from("rejected-task");
-        state.add_task(id.clone(), test_spec());
+        let id = add_test_task(&state, "rejected-task");
         let tv = taskvisor::TaskId::for_tests();
-        state.bind_tv(&id, tv);
+        bind_test_task(&state, &id, tv);
         let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
         registry.ensure_channel(id.clone());
         let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
@@ -895,10 +1196,9 @@ mod tests {
         use std::time::Duration;
 
         let state = TaskState::new();
-        let id = TaskId::from("rej-reap");
-        state.add_task(id.clone(), test_spec());
+        let id = add_test_task(&state, "rej-reap");
         let tv = taskvisor::TaskId::for_tests();
-        state.bind_tv(&id, tv);
+        bind_test_task(&state, &id, tv);
         let sub = StateSubscriber::with_output_hub(
             state.clone(),
             Arc::new(OutputHub::new(OutputConfig::default())),
@@ -941,11 +1241,10 @@ mod tests {
         use std::time::Duration;
 
         let state = TaskState::new();
-        let id = TaskId::from("exh-reap");
-        state.add_task(id.clone(), test_spec());
+        let id = add_test_task(&state, "exh-reap");
         let tv = taskvisor::TaskId::for_tests();
-        state.bind_tv(&id, tv);
-        state.transition_starting(&id);
+        let binding = bind_test_task(&state, &id, tv);
+        assert!(state.transition_attempt_starting(&binding, 1));
         let sub = StateSubscriber::with_output_hub(
             state.clone(),
             Arc::new(OutputHub::new(OutputConfig::default())),
@@ -986,11 +1285,10 @@ mod tests {
         use std::time::Duration;
 
         let state = TaskState::new();
-        let id = TaskId::from("dead-reap");
-        state.add_task(id.clone(), test_spec());
+        let id = add_test_task(&state, "dead-reap");
         let tv = taskvisor::TaskId::for_tests();
-        state.bind_tv(&id, tv);
-        state.transition_starting(&id);
+        let binding = bind_test_task(&state, &id, tv);
+        assert!(state.transition_attempt_starting(&binding, 1));
         let sub = StateSubscriber::with_output_hub(
             state.clone(),
             Arc::new(OutputHub::new(OutputConfig::default())),
@@ -1028,10 +1326,9 @@ mod tests {
     #[test]
     fn user_initiated_queue_removal_is_canceled_phase() {
         let state = TaskState::new();
-        let id = TaskId::from("victim");
-        state.add_task(id.clone(), test_spec());
+        let id = add_test_task(&state, "victim");
         let tv = taskvisor::TaskId::for_tests();
-        state.bind_tv(&id, tv);
+        bind_test_task(&state, &id, tv);
         let sub = StateSubscriber::with_output_hub(
             state.clone(),
             Arc::new(OutputHub::new(OutputConfig::default())),
@@ -1144,30 +1441,44 @@ mod tests {
         assert_eq!(task.status().exit_code, Some(1));
     }
 
-    fn setup_with_output_hub(
+    fn setup_pending_with_output_hub(
         task_name: &str,
     ) -> (StateSubscriber, TaskState, Arc<OutputHub>, TaskId) {
         let state = TaskState::new();
-        let id = TaskId::from(task_name);
-        state.add_task(id.clone(), test_spec());
-        state.bind_tv(&id, taskvisor::TaskId::for_tests());
-        state.transition_starting(&id);
+        let id = add_test_task(&state, task_name);
+        bind_test_task(&state, &id, taskvisor::TaskId::for_tests());
         let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
         registry.ensure_channel(id.clone());
         let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
         (sub, state, registry, id)
     }
 
+    fn setup_with_output_hub(
+        task_name: &str,
+    ) -> (StateSubscriber, TaskState, Arc<OutputHub>, TaskId) {
+        let setup = setup_pending_with_output_hub(task_name);
+        let binding = setup.1.binding_for(&setup.3).expect("task must be bound");
+        assert!(setup.1.transition_attempt_starting(&binding, 1));
+        setup
+    }
+
     #[test]
     fn attempt_starting_announces_run_started_into_output_hub() {
-        let (sub, state, registry, id) = setup_with_output_hub("started-1");
+        let (sub, state, registry, id) = setup_pending_with_output_hub("started-1");
         let mut rx = registry.subscribe_raw(&id).unwrap();
 
         let ev = bound_event(&state, &id, EventKind::AttemptStarting).with_attempt(1);
         sub.on_event(&ev);
 
         match rx.try_recv().unwrap() {
-            OutputEvent::RunStarted { attempt, .. } => assert_eq!(attempt, 1),
+            OutputEvent::RunStarted {
+                generation,
+                attempt,
+                ..
+            } => {
+                assert_eq!(generation, 1);
+                assert_eq!(attempt, 1);
+            }
             other => panic!("expected RunStarted, got {other:?}"),
         }
     }
@@ -1177,18 +1488,68 @@ mod tests {
         let (sub, state, registry, id) = setup_with_output_hub("stopped-1");
         let mut rx = registry.subscribe_raw(&id).unwrap();
 
-        let ev = bound_event(&state, &id, EventKind::AttemptSucceeded).with_attempt(2);
+        let ev = bound_event(&state, &id, EventKind::AttemptSucceeded).with_attempt(1);
         sub.on_event(&ev);
 
         match rx.try_recv().unwrap() {
             OutputEvent::RunFinished {
-                attempt, exit_code, ..
+                generation,
+                attempt,
+                exit_code,
+                ..
             } => {
-                assert_eq!(attempt, 2);
+                assert_eq!(generation, 1);
+                assert_eq!(attempt, 1);
                 assert_eq!(exit_code, None);
             }
             other => panic!("expected RunFinished, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn duplicate_attempt_succeeded_does_not_announce_a_second_run_finished() {
+        let (sub, state, registry, id) = setup_with_output_hub("stopped-duplicate");
+        let mut rx = registry.subscribe_raw(&id).unwrap();
+        let event = bound_event(&state, &id, EventKind::AttemptSucceeded).with_attempt(1);
+
+        sub.on_event(&event);
+        sub.on_event(&event);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(OutputEvent::RunFinished { attempt: 1, .. })
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "a duplicate terminal attempt event must be an exact no-op"
+        );
+    }
+
+    #[test]
+    fn duplicate_old_generation_terminal_does_not_announce_again_after_apply() {
+        let (sub, state, registry, id) = setup_with_output_hub("stopped-old-generation");
+        let mut rx = registry.subscribe_raw(&id).unwrap();
+        let event = bound_event(&state, &id, EventKind::AttemptSucceeded).with_attempt(1);
+
+        sub.on_event(&event);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(OutputEvent::RunFinished {
+                generation: 1,
+                attempt: 1,
+                ..
+            })
+        ));
+
+        state
+            .apply_desired(&TaskManifest::new(id.clone(), changed_test_spec()).unwrap())
+            .unwrap();
+        sub.on_event(&event);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a duplicate terminal event from the previous generation must remain a no-op"
+        );
     }
 
     #[test]
@@ -1197,15 +1558,19 @@ mod tests {
         let mut rx = registry.subscribe_raw(&id).unwrap();
 
         let ev = bound_event(&state, &id, EventKind::AttemptFailed)
-            .with_attempt(3)
+            .with_attempt(1)
             .with_exit_code(17);
         sub.on_event(&ev);
 
         match rx.try_recv().unwrap() {
             OutputEvent::RunFinished {
-                attempt, exit_code, ..
+                generation,
+                attempt,
+                exit_code,
+                ..
             } => {
-                assert_eq!(attempt, 3);
+                assert_eq!(generation, 1);
+                assert_eq!(attempt, 1);
                 assert_eq!(exit_code, Some(17));
             }
             other => panic!("expected RunFinished, got {other:?}"),
@@ -1219,7 +1584,7 @@ mod tests {
 
         sub.on_event(
             &bound_event(&state, &id, EventKind::AttemptFailed)
-                .with_attempt(5)
+                .with_attempt(1)
                 .with_exit_code(1),
         );
         sub.on_event(
@@ -1230,7 +1595,14 @@ mod tests {
         );
 
         match rx.try_recv().unwrap() {
-            OutputEvent::RunFinished { attempt, .. } => assert_eq!(attempt, 5),
+            OutputEvent::RunFinished {
+                generation,
+                attempt,
+                ..
+            } => {
+                assert_eq!(generation, 1);
+                assert_eq!(attempt, 1);
+            }
             other => panic!("expected RunFinished, got {other:?}"),
         }
         assert!(

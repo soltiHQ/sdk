@@ -7,8 +7,7 @@ use thiserror::Error;
 /// Every handler and conversion failure becomes one of these variants.
 /// The transport layers map each variant to a wire response:
 /// gRPC via `From<ApiError> for tonic::Status`, HTTP via `axum::response::IntoResponse`
-/// (JSON body `{ "error": <label>, "message": <detail> }`).
-/// The stable `error` label comes from [`ApiError::as_label`].
+/// (a Kubernetes-style `Status` resource).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ApiError {
@@ -20,7 +19,7 @@ pub enum ApiError {
     #[error("unauthenticated: {0}")]
     Unauthenticated(String),
 
-    /// A live task already owns the requested identity. → `409` / `AlreadyExists`.
+    /// A retained Task resource already owns the requested name. → `409` / `AlreadyExists`.
     #[error("task already exists: {0}")]
     AlreadyExists(String),
 
@@ -28,9 +27,25 @@ pub enum ApiError {
     #[error("task not found: {0}")]
     TaskNotFound(String),
 
+    /// No public resource or route matched the request. → `404` / `NotFound`.
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    /// The resource exists, but does not support the requested method. → `405` / `Unimplemented`.
+    #[error("method not allowed: {0}")]
+    MethodNotAllowed(String),
+
+    /// Request media type is missing or unsupported. → `415` / `InvalidArgument`.
+    #[error("unsupported media type: {0}")]
+    UnsupportedMediaType(String),
+
     /// Request body exceeded the configured limit. → `413` / `ResourceExhausted`.
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
+
+    /// Service is temporarily unable to accept work. → `503` / `Unavailable`.
+    #[error("service unavailable: {0}")]
+    Unavailable(String),
 
     /// Unexpected server-side failure with no more specific mapping. → `500` / `Internal`.
     #[error("internal error: {0}")]
@@ -38,7 +53,7 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    /// Short stable label for this variant, surfaced in HTTP error bodies and logs.
+    /// Short stable diagnostic label for this variant.
     pub fn as_label(&self) -> &'static str {
         match self {
             ApiError::PayloadTooLarge(_) => "PayloadTooLarge",
@@ -46,7 +61,27 @@ impl ApiError {
             ApiError::Unauthenticated(_) => "Unauthenticated",
             ApiError::AlreadyExists(_) => "AlreadyExists",
             ApiError::TaskNotFound(_) => "TaskNotFound",
+            ApiError::NotFound(_) => "NotFound",
+            ApiError::MethodNotAllowed(_) => "MethodNotAllowed",
+            ApiError::UnsupportedMediaType(_) => "UnsupportedMediaType",
+            ApiError::Unavailable(_) => "Unavailable",
             ApiError::Internal(_) => "Internal",
+        }
+    }
+
+    #[cfg(feature = "http")]
+    fn http_reason(&self) -> &'static str {
+        match self {
+            ApiError::InvalidRequest(_) => "BadRequest",
+            ApiError::Unauthenticated(_) => "Unauthorized",
+            ApiError::AlreadyExists(_) => "AlreadyExists",
+            ApiError::TaskNotFound(_) => "NotFound",
+            ApiError::NotFound(_) => "NotFound",
+            ApiError::MethodNotAllowed(_) => "MethodNotAllowed",
+            ApiError::UnsupportedMediaType(_) => "UnsupportedMediaType",
+            ApiError::PayloadTooLarge(_) => "RequestEntityTooLarge",
+            ApiError::Unavailable(_) => "ServiceUnavailable",
+            ApiError::Internal(_) => "InternalError",
         }
     }
 }
@@ -60,6 +95,10 @@ impl From<ApiError> for tonic::Status {
             ApiError::Unauthenticated(msg) => tonic::Status::unauthenticated(msg),
             ApiError::AlreadyExists(msg) => tonic::Status::already_exists(msg),
             ApiError::TaskNotFound(msg) => tonic::Status::not_found(msg),
+            ApiError::NotFound(msg) => tonic::Status::not_found(msg),
+            ApiError::MethodNotAllowed(msg) => tonic::Status::unimplemented(msg),
+            ApiError::UnsupportedMediaType(msg) => tonic::Status::invalid_argument(msg),
+            ApiError::Unavailable(msg) => tonic::Status::unavailable(msg),
             ApiError::Internal(msg) => tonic::Status::internal(msg),
         }
     }
@@ -69,18 +108,46 @@ impl From<ApiError> for tonic::Status {
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         use axum::http::StatusCode;
+        use serde::Serialize;
 
-        let label = self.as_label();
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct StatusResource<'a> {
+            api_version: &'static str,
+            kind: &'static str,
+            metadata: StatusMeta,
+            status: &'static str,
+            message: &'a str,
+            reason: &'static str,
+            code: u16,
+        }
+
+        #[derive(Serialize)]
+        struct StatusMeta {}
+
+        let reason = self.http_reason();
         let (status, message) = match self {
             ApiError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Unauthenticated(msg) => (StatusCode::UNAUTHORIZED, msg),
             ApiError::AlreadyExists(msg) => (StatusCode::CONFLICT, msg),
             ApiError::TaskNotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            ApiError::MethodNotAllowed(msg) => (StatusCode::METHOD_NOT_ALLOWED, msg),
+            ApiError::UnsupportedMediaType(msg) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, msg),
             ApiError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg),
+            ApiError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
-        let body = serde_json::json!({ "error": label, "message": message });
+        let body = StatusResource {
+            api_version: "v1",
+            kind: "Status",
+            metadata: StatusMeta {},
+            status: "Failure",
+            message: &message,
+            reason,
+            code: status.as_u16(),
+        };
         (status, axum::Json(body)).into_response()
     }
 }
@@ -96,7 +163,14 @@ mod tests {
             (ApiError::Unauthenticated("x".into()), "Unauthenticated"),
             (ApiError::AlreadyExists("x".into()), "AlreadyExists"),
             (ApiError::TaskNotFound("x".into()), "TaskNotFound"),
+            (ApiError::NotFound("x".into()), "NotFound"),
+            (ApiError::MethodNotAllowed("x".into()), "MethodNotAllowed"),
+            (
+                ApiError::UnsupportedMediaType("x".into()),
+                "UnsupportedMediaType",
+            ),
             (ApiError::PayloadTooLarge("x".into()), "PayloadTooLarge"),
+            (ApiError::Unavailable("x".into()), "Unavailable"),
             (ApiError::Internal("x".into()), "Internal"),
         ];
 
@@ -122,5 +196,24 @@ mod tests {
 
         let status = tonic::Status::from(ApiError::AlreadyExists("x".into()));
         assert_eq!(status.code(), Code::AlreadyExists);
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn unavailable_maps_to_http_service_unavailable() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        let response = ApiError::Unavailable("x".into()).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn unavailable_maps_to_grpc_unavailable() {
+        use tonic::Code;
+
+        let status = tonic::Status::from(ApiError::Unavailable("x".into()));
+        assert_eq!(status.code(), Code::Unavailable);
     }
 }

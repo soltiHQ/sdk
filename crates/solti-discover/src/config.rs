@@ -73,6 +73,7 @@ pub struct DiscoverConfig {
     pub(crate) backoff: Option<BackoffPolicy>,
     pub(crate) connect_timeout_ms: u64,
     pub(crate) request_timeout_ms: u64,
+    pub(crate) task_revision: String,
     pub(crate) metrics: DiscoverMetricsHandle,
     #[cfg(feature = "tls")]
     pub(crate) tls: Option<solti_tls::ClientTlsConfig>,
@@ -111,6 +112,7 @@ impl DiscoverConfig {
             backoff: None,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
+            task_revision: concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")).into(),
             metrics: noop_discover_metrics(),
             #[cfg(feature = "tls")]
             tls: None,
@@ -134,6 +136,7 @@ pub struct DiscoverConfigBuilder {
     backoff: Option<BackoffPolicy>,
     connect_timeout_ms: u64,
     request_timeout_ms: u64,
+    task_revision: String,
     metrics: DiscoverMetricsHandle,
     #[cfg(feature = "tls")]
     tls: Option<solti_tls::ClientTlsConfig>,
@@ -169,6 +172,15 @@ impl DiscoverConfigBuilder {
     /// End-to-end request timeout, in milliseconds.
     pub fn request_timeout_ms(mut self, ms: u64) -> Self {
         self.request_timeout_ms = ms;
+        self
+    }
+
+    /// Set the desired revision of the embedded discovery runtime.
+    ///
+    /// Change this value when code or captured configuration that is not part
+    /// of [`solti_model::TaskSpec`] changes and an existing task is applied.
+    pub fn task_revision(mut self, revision: impl Into<String>) -> Self {
+        self.task_revision = revision.into();
         self
     }
 
@@ -243,6 +255,11 @@ impl DiscoverConfigBuilder {
                 "request_timeout_ms must be > 0".into(),
             ));
         }
+        if self.task_revision.trim().is_empty() {
+            return Err(DiscoverError::InvalidConfig(
+                "task_revision must not be empty".into(),
+            ));
+        }
         if let Some(token) = &self.token
             && token.is_empty()
         {
@@ -270,6 +287,7 @@ impl DiscoverConfigBuilder {
             backoff: self.backoff,
             connect_timeout_ms: self.connect_timeout_ms,
             request_timeout_ms: self.request_timeout_ms,
+            task_revision: self.task_revision,
             metrics: self.metrics,
             #[cfg(feature = "tls")]
             tls: self.tls,

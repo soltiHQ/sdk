@@ -13,7 +13,7 @@ license.workspace = true
 
 [features]
 default   = []
-test-util = []
+test-util = ["taskvisor/test-util"]
 
 [dependencies]
 taskvisor   = { workspace = true, features = ["controller"] }

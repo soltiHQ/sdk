@@ -17,7 +17,7 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 use solti_api::{ApiError, ApiHandler, HttpApi};
-use solti_model::{Task, TaskId, TaskPage, TaskQuery, TaskRun, TaskSpec, Token};
+use solti_model::{Task, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun, Token};
 
 const SECRET: &str = "sekret-token-1";
 
@@ -30,12 +30,17 @@ struct MockHandler {
 
 #[async_trait]
 impl ApiHandler for MockHandler {
-    async fn submit_task(&self, _spec: TaskSpec) -> Result<TaskId, ApiError> {
+    async fn create_task(&self, manifest: TaskManifest) -> Result<Task, ApiError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(TaskId::from("tsk_mock_1"))
+        Task::from_manifest(manifest).map_err(|error| ApiError::Internal(error.to_string()))
     }
 
-    async fn get_task_status(&self, _id: &TaskId) -> Result<Option<Task>, ApiError> {
+    async fn apply_task(&self, manifest: TaskManifest) -> Result<Task, ApiError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Task::from_manifest(manifest).map_err(|error| ApiError::Internal(error.to_string()))
+    }
+
+    async fn get_task(&self, _id: &TaskId) -> Result<Option<Task>, ApiError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(None)
     }
@@ -101,11 +106,16 @@ async fn request_without_token_is_rejected_with_401() {
     let handler = Arc::new(MockHandler::default());
     let app = secured_router(Arc::clone(&handler));
 
-    let resp = app.oneshot(get("/api/v1/tasks")).await.unwrap();
+    let resp = app.oneshot(get("/apis/solti.io/v1/tasks")).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let body = body_json(resp).await;
-    assert_eq!(body["error"], "Unauthenticated");
+    assert_eq!(body["apiVersion"], "v1");
+    assert_eq!(body["kind"], "Status");
+    assert_eq!(body["metadata"], serde_json::json!({}));
+    assert_eq!(body["status"], "Failure");
+    assert_eq!(body["reason"], "Unauthorized");
+    assert_eq!(body["code"], 401);
     assert!(
         body["message"].as_str().unwrap().contains("bearer token"),
         "expected message to mention the bearer token, got {body:?}"
@@ -124,7 +134,7 @@ async fn request_with_wrong_token_is_rejected_with_401() {
 
     let resp = app
         .oneshot(get_with_authorization(
-            "/api/v1/tasks",
+            "/apis/solti.io/v1/tasks",
             "Bearer not-the-secret",
         ))
         .await
@@ -132,7 +142,7 @@ async fn request_with_wrong_token_is_rejected_with_401() {
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let body = body_json(resp).await;
-    assert_eq!(body["error"], "Unauthenticated");
+    assert_eq!(body["reason"], "Unauthorized");
     assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
 }
 
@@ -143,7 +153,7 @@ async fn request_with_non_bearer_scheme_is_rejected_with_401() {
 
     let resp = app
         .oneshot(get_with_authorization(
-            "/api/v1/tasks",
+            "/apis/solti.io/v1/tasks",
             &format!("Basic {SECRET}"),
         ))
         .await
@@ -160,7 +170,7 @@ async fn request_with_valid_token_reaches_the_handler() {
 
     let resp = app
         .oneshot(get_with_authorization(
-            "/api/v1/tasks",
+            "/apis/solti.io/v1/tasks",
             &format!("Bearer {SECRET}"),
         ))
         .await
@@ -168,7 +178,10 @@ async fn request_with_valid_token_reaches_the_handler() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
-    assert_eq!(body["total"], 0);
+    assert_eq!(body["apiVersion"], "solti.io/v1");
+    assert_eq!(body["kind"], "TaskList");
+    assert_eq!(body["metadata"], serde_json::json!({}));
+    assert_eq!(body["items"], serde_json::json!([]));
     assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
 }
 
@@ -180,7 +193,7 @@ async fn bearer_scheme_is_accepted_case_insensitively() {
 
         let resp = app
             .oneshot(get_with_authorization(
-                "/api/v1/tasks",
+                "/apis/solti.io/v1/tasks",
                 &format!("{scheme} {SECRET}"),
             ))
             .await
@@ -200,11 +213,14 @@ async fn sse_logs_route_without_token_is_rejected_with_401() {
     let handler = Arc::new(MockHandler::default());
     let app = secured_router(Arc::clone(&handler));
 
-    let resp = app.oneshot(get("/api/v1/tasks/tsk_1/logs")).await.unwrap();
+    let resp = app
+        .oneshot(get("/apis/solti.io/v1/tasks/task-1/logs"))
+        .await
+        .unwrap();
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let body = body_json(resp).await;
-    assert_eq!(body["error"], "Unauthenticated");
+    assert_eq!(body["reason"], "Unauthorized");
     assert_eq!(
         handler.calls.load(Ordering::SeqCst),
         0,
@@ -219,7 +235,7 @@ async fn sse_logs_route_with_valid_token_streams() {
 
     let resp = app
         .oneshot(get_with_authorization(
-            "/api/v1/tasks/tsk_1/logs",
+            "/apis/solti.io/v1/tasks/task-1/logs",
             &format!("Bearer {SECRET}"),
         ))
         .await

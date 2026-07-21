@@ -45,12 +45,12 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig as TonicServerTls}
 ///
 /// [`PemSource::Path`]: solti_tls::PemSource::Path
 pub fn to_tonic_server_tls(cfg: &ServerTlsConfig) -> Result<TonicServerTls, TlsError> {
-    let cert_bytes = cfg.cert.read()?;
-    let key_bytes = cfg.key.read()?;
+    let cert_bytes = cfg.cert().read()?;
+    let key_bytes = cfg.key().read()?;
 
     let mut tls = TonicServerTls::new().identity(Identity::from_pem(cert_bytes, key_bytes));
 
-    if let Some(ca_src) = &cfg.client_ca {
+    if let Some(ca_src) = cfg.client_ca() {
         let ca_bytes = ca_src.read()?;
         tls = tls.client_ca_root(Certificate::from_pem(ca_bytes));
     }

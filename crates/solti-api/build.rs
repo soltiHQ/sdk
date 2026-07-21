@@ -1,30 +1,36 @@
+use std::error::Error;
+
+#[cfg(feature = "grpc")]
 use std::{
     env,
-    error::Error,
     path::{Path, PathBuf},
 };
 
 /// API major version on the build-script side.
 const API_MAJOR: u32 = 1;
 
+#[cfg(feature = "grpc")]
 const PROTO_ROOT: &str = "proto";
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed={PROTO_ROOT}");
     println!("cargo:rustc-env=SOLTI_API_MAJOR={API_MAJOR}");
+
+    #[cfg(feature = "grpc")]
+    build_grpc()?;
+
+    Ok(())
+}
+
+#[cfg(feature = "grpc")]
+fn build_grpc() -> Result<(), Box<dyn Error>> {
+    println!("cargo:rerun-if-changed={PROTO_ROOT}");
 
     let protoc_path =
         protoc_bin_vendored::protoc_bin_path().expect("failed to get vendored protoc binary");
 
     unsafe {
         env::set_var("PROTOC", &protoc_path);
-    }
-
-    let grpc = env::var_os("CARGO_FEATURE_GRPC").is_some();
-    let http = env::var_os("CARGO_FEATURE_HTTP").is_some();
-    if !grpc && !http {
-        return Ok(());
     }
 
     let major_dir = Path::new(PROTO_ROOT)
@@ -49,29 +55,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("cargo:rerun-if-changed={}", p.display());
     }
 
-    let out_dir: PathBuf = env::var("OUT_DIR")?.into();
-    let descriptor_path = out_dir.join("solti_api_descriptor.bin");
-
     tonic_prost_build::configure()
-        .build_server(grpc)
-        .build_client(grpc)
+        .build_server(true)
+        .build_client(true)
         .bytes(".solti.task.v1.OutputChunk.line")
-        .file_descriptor_set_path(&descriptor_path)
         .compile_protos(&protos, &[PathBuf::from(PROTO_ROOT)])?;
-
-    if http {
-        let proto_package = format!(".solti.task.v{API_MAJOR}");
-        let descriptor_set = std::fs::read(&descriptor_path)?;
-        pbjson_build::Builder::new()
-            .emit_fields()
-            .register_descriptors(&descriptor_set)?
-            .build(&[&proto_package])?;
-    }
 
     Ok(())
 }
 
 /// Recursively collect every `*.proto` file under `root`.
+#[cfg(feature = "grpc")]
 fn collect_proto_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];

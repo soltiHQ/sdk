@@ -7,8 +7,7 @@
 
 use std::fmt;
 
-use solti_model::RunnerEnv;
-
+use crate::RunnerEnv;
 use crate::metrics::MetricsHandle;
 use crate::output::{OutputPublisherHandle, noop_output_publisher};
 
@@ -35,8 +34,7 @@ use crate::output::{OutputPublisherHandle, noop_output_publisher};
 /// ## Example
 ///
 /// ```
-/// use solti_model::RunnerEnv;
-/// use solti_runner::{BuildContext, noop_metrics};
+/// use solti_runner::{BuildContext, RunnerEnv, noop_metrics};
 ///
 /// let mut env = RunnerEnv::new();
 /// env.push("PATH", "/usr/bin");
@@ -59,8 +57,7 @@ impl BuildContext {
     /// ## Example
     ///
     /// ```
-    /// use solti_model::RunnerEnv;
-    /// use solti_runner::{BuildContext, noop_metrics};
+    /// use solti_runner::{BuildContext, RunnerEnv, noop_metrics};
     ///
     /// let ctx = BuildContext::new(RunnerEnv::new(), noop_metrics());
     /// assert_eq!(ctx.env().len(), 0);
@@ -108,7 +105,7 @@ impl BuildContext {
     ///
     /// let ctx = BuildContext::default();
     /// assert!(ctx.output_publisher()
-    ///     .sink_for(&solti_model::TaskId::from("task-1"), 1)
+    ///     .sink_for(&solti_model::TaskId::from("task-1"), 1, 1)
     ///     .is_none());
     /// ```
     pub fn output_publisher(&self) -> &OutputPublisherHandle {
@@ -120,8 +117,7 @@ impl BuildContext {
     /// ## Example
     ///
     /// ```
-    /// use solti_model::RunnerEnv;
-    /// use solti_runner::BuildContext;
+    /// use solti_runner::{BuildContext, RunnerEnv};
     ///
     /// let mut env = RunnerEnv::new();
     /// env.push("FOO", "bar");
@@ -188,13 +184,20 @@ mod tests {
     use super::BuildContext;
     use crate::{OutputPublisher, OutputPublisherHandle, OutputSink};
 
-    use solti_model::{RunnerEnv, TaskId};
+    use solti_model::TaskId;
+
+    use crate::RunnerEnv;
 
     struct TestPublisher;
 
     impl OutputPublisher for TestPublisher {
-        fn sink_for(&self, _task_id: &TaskId, attempt: u32) -> Option<OutputSink> {
-            Some(OutputSink::new(attempt, |_| {}))
+        fn sink_for(
+            &self,
+            _task_name: &TaskId,
+            generation: u64,
+            attempt: u32,
+        ) -> Option<OutputSink> {
+            Some(OutputSink::new(generation, attempt, |_| {}))
         }
     }
 
@@ -275,7 +278,7 @@ mod tests {
         let ctx = BuildContext::default();
         assert!(
             ctx.output_publisher()
-                .sink_for(&TaskId::from("task"), 1)
+                .sink_for(&TaskId::from("task"), 1, 1)
                 .is_none()
         );
     }
@@ -288,10 +291,17 @@ mod tests {
         assert!(Arc::ptr_eq(ctx.output_publisher(), &publisher));
         assert_eq!(
             ctx.output_publisher()
-                .sink_for(&TaskId::from("task"), 7)
+                .sink_for(&TaskId::from("task"), 3, 7)
                 .expect("enabled sink")
                 .attempt(),
             7
+        );
+        assert_eq!(
+            ctx.output_publisher()
+                .sink_for(&TaskId::from("task"), 3, 7)
+                .expect("enabled sink")
+                .generation(),
+            3
         );
     }
 }

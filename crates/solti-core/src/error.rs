@@ -27,10 +27,20 @@ use solti_runner::RunnerError;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CoreError {
+    /// The supervisor has started shutting down and no longer accepts desired-state writes.
+    /// The API adapter maps this temporary state to `503 Service Unavailable`.
+    #[error("supervisor is shutting down")]
+    ShuttingDown,
+
+    /// A public operation targeted a core-owned resource name or slot.
+    #[error("reserved core resource: {0}")]
+    ReservedResource(String),
+
     /// A taskvisor runtime failure (submit / cancel / shutdown). Maps to `500`.
     ///
     /// Carries the typed [`taskvisor::Error`] as the source; `op` is a stable
-    /// label for the failed operation: `"submit"`, `"cancel"`, or `"shutdown"`.
+    /// label for the failed operation, such as `"prepare"`, `"submit"`,
+    /// `"cancel"`, or `"shutdown"`.
     #[error("supervisor {op} failed: {source}")]
     Supervisor {
         /// The operation that failed.
@@ -40,7 +50,7 @@ pub enum CoreError {
         source: taskvisor::Error,
     },
 
-    /// A live submission still owns this task name, including a bound task between attempts.
+    /// A retained Task resource already owns this metadata.name.
     /// Kept distinct from a generic supervisor error; callers map it to `409 Conflict`.
     #[error("task already exists: {0}")]
     AlreadyExists(String),

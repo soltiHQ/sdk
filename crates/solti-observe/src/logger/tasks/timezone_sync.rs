@@ -1,10 +1,11 @@
 //! Timezone-sync supervised task.
 //!
-//! [`timezone_sync`](crate::timezone_sync) returns a `(TaskRef, TaskSpec)`
+//! [`timezone_sync`](crate::timezone_sync) returns a `(TaskRef, TaskManifest)`
 //! pair for a periodic task that tries to refresh the local UTC offset.
 
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
+    AdmissionPolicy, BackoffPolicy, EmbeddedSpec, JitterPolicy, RestartPolicy, TaskManifest,
+    TaskSpec, TaskWorkload,
 };
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tracing::debug;
@@ -47,12 +48,12 @@ const BACKOFF_FACTOR: f64 = 2.0;
 /// ```
 /// use solti_observe::timezone_sync;
 ///
-/// let (task, spec) = timezone_sync();
+/// let (task_ref, task) = timezone_sync();
 ///
-/// assert_eq!(spec.slot().as_str(), "solti-logger-tz-sync");
-/// let _ = task;
+/// assert_eq!(task.slot().as_str(), "solti-logger-tz-sync");
+/// let _ = task_ref;
 /// ```
-pub fn timezone_sync() -> (TaskRef, TaskSpec) {
+pub fn timezone_sync() -> (TaskRef, TaskManifest) {
     let task: TaskRef = TaskFn::arc(TZ_SYNC_SLOT, |ctx: TaskContext| async move {
         debug!("timezone sync started");
 
@@ -76,12 +77,24 @@ pub fn timezone_sync() -> (TaskRef, TaskSpec) {
         max_ms: BACKOFF_MAX_MS,
         factor: BACKOFF_FACTOR,
     };
-    let spec = TaskSpec::builder(TZ_SYNC_SLOT, TaskKind::Embedded, TZ_SYNC_TIMEOUT_MS)
-        .restart(RestartPolicy::periodic(TZ_SYNC_PERIOD_MS))
-        .backoff(backoff)
-        .admission(AdmissionPolicy::Replace)
-        .build()
-        .expect("timezone sync spec must be valid");
+    let embedded = EmbeddedSpec::new(concat!(
+        env!("CARGO_PKG_NAME"),
+        "@",
+        env!("CARGO_PKG_VERSION")
+    ))
+    .expect("timezone sync revision must be valid");
+    let spec = TaskSpec::builder(
+        TZ_SYNC_SLOT,
+        TaskWorkload::Embedded(embedded),
+        TZ_SYNC_TIMEOUT_MS,
+    )
+    .restart(RestartPolicy::periodic(TZ_SYNC_PERIOD_MS))
+    .backoff(backoff)
+    .admission(AdmissionPolicy::Replace)
+    .build()
+    .expect("timezone sync spec must be valid");
 
-    (task, spec)
+    let manifest =
+        TaskManifest::new(TZ_SYNC_SLOT, spec).expect("timezone sync Task manifest must be valid");
+    (task, manifest)
 }

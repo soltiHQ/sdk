@@ -34,16 +34,10 @@ use crate::{PemSource, TlsError};
 /// - [`PemSource`], [`TlsError`].
 #[derive(Debug, Clone)]
 pub struct ServerTlsConfig {
-    /// Server certificate chain (leaf first).
-    pub cert: PemSource,
-    /// Server private key (PKCS#8, PKCS#1, or SEC1).
-    pub key: PemSource,
-    /// Trusted CA bundle for verifying client certificates (mTLS).
-    /// `None` = standard TLS (no client cert required).
-    pub client_ca: Option<PemSource>,
-    /// ALPN protocol list, in preference order (e.g. `[b"h2"]` for gRPC).
-    /// Empty = no ALPN negotiation requested.
-    pub alpn: Vec<Vec<u8>>,
+    cert: PemSource,
+    key: PemSource,
+    client_ca: Option<PemSource>,
+    alpn: Vec<Vec<u8>>,
 }
 
 impl ServerTlsConfig {
@@ -60,10 +54,30 @@ impl ServerTlsConfig {
     ///     .build()
     ///     .unwrap();
     ///
-    /// assert!(cfg.client_ca.is_none());
+    /// assert!(cfg.client_ca().is_none());
     /// ```
     pub fn builder() -> ServerTlsConfigBuilder {
         ServerTlsConfigBuilder::default()
+    }
+
+    /// Server certificate chain, leaf certificate first.
+    pub fn cert(&self) -> &PemSource {
+        &self.cert
+    }
+
+    /// Server private key.
+    pub fn key(&self) -> &PemSource {
+        &self.key
+    }
+
+    /// CA bundle used to verify mandatory mTLS client certificates.
+    pub fn client_ca(&self) -> Option<&PemSource> {
+        self.client_ca.as_ref()
+    }
+
+    /// ALPN protocols in preference order.
+    pub fn alpn(&self) -> &[Vec<u8>] {
+        &self.alpn
     }
 
     /// Build a [`rustls::ServerConfig`] from this configuration.
@@ -150,7 +164,7 @@ impl ServerTlsConfigBuilder {
     ///     .build()
     ///     .unwrap();
     ///
-    /// assert!(matches!(cfg.cert, PemSource::Bytes(_)));
+    /// assert!(matches!(cfg.cert(), PemSource::Bytes(_)));
     /// ```
     pub fn cert(mut self, src: PemSource) -> Self {
         self.cert = Some(src);
@@ -170,7 +184,7 @@ impl ServerTlsConfigBuilder {
     ///     .build()
     ///     .unwrap();
     ///
-    /// assert!(matches!(cfg.key, PemSource::Bytes(_)));
+    /// assert!(matches!(cfg.key(), PemSource::Bytes(_)));
     /// ```
     pub fn key(mut self, src: PemSource) -> Self {
         self.key = Some(src);
@@ -193,7 +207,7 @@ impl ServerTlsConfigBuilder {
     ///     .build()
     ///     .unwrap();
     ///
-    /// assert_eq!(cfg.alpn, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    /// assert_eq!(cfg.alpn(), &[b"h2".to_vec(), b"http/1.1".to_vec()]);
     /// ```
     pub fn with_alpn<I, S>(mut self, protocols: I) -> Self
     where
@@ -250,7 +264,7 @@ impl ServerTlsConfigBuilder {
     ///     .build()
     ///     .unwrap();
     ///
-    /// assert!(cfg.client_ca.is_some());
+    /// assert!(cfg.client_ca().is_some());
     /// ```
     pub fn require_client_ca(mut self, src: PemSource) -> Self {
         self.client_ca = Some(src);
@@ -275,7 +289,7 @@ impl ServerTlsConfigBuilder {
     ///     .with_alpn(["h2"])
     ///     .build()
     ///     .unwrap();
-    /// assert!(cfg.client_ca.is_none()); // standard TLS, not mTLS
+    /// assert!(cfg.client_ca().is_none()); // standard TLS, not mTLS
     /// ```
     pub fn build(self) -> Result<ServerTlsConfig, TlsError> {
         let cert = self.cert.ok_or(TlsError::MissingField("cert"))?;
@@ -319,8 +333,8 @@ mod tests {
             .key_pem_bytes(b"--FAKE KEY--".to_vec())
             .build()
             .unwrap();
-        assert!(matches!(cfg.cert, PemSource::Bytes(_)));
-        assert!(matches!(cfg.key, PemSource::Bytes(_)));
+        assert!(matches!(cfg.cert(), PemSource::Bytes(_)));
+        assert!(matches!(cfg.key(), PemSource::Bytes(_)));
     }
 
     #[test]
@@ -348,7 +362,7 @@ mod tests {
             .key_pem_bytes(vec![1])
             .build()
             .unwrap();
-        assert!(matches!(cfg.cert, PemSource::Path(_)));
+        assert!(matches!(cfg.cert(), PemSource::Path(_)));
     }
 
     #[test]
@@ -358,7 +372,7 @@ mod tests {
             .key_pem_bytes(vec![2])
             .build()
             .unwrap();
-        assert!(cfg.client_ca.is_none());
+        assert!(cfg.client_ca().is_none());
     }
 
     #[test]
@@ -369,7 +383,7 @@ mod tests {
             .require_client_ca_pem_bytes(b"--FAKE CA--".to_vec())
             .build()
             .unwrap();
-        assert!(matches!(cfg.client_ca, Some(PemSource::Bytes(_))));
+        assert!(matches!(cfg.client_ca(), Some(PemSource::Bytes(_))));
     }
 
     #[test]
@@ -380,7 +394,7 @@ mod tests {
             .require_client_ca_pem_file("/etc/ca.crt")
             .build()
             .unwrap();
-        assert!(matches!(cfg.client_ca, Some(PemSource::Path(_))));
+        assert!(matches!(cfg.client_ca(), Some(PemSource::Path(_))));
     }
 
     #[test]
@@ -390,7 +404,7 @@ mod tests {
             .key_pem_bytes(vec![2])
             .build()
             .unwrap();
-        assert!(cfg.alpn.is_empty());
+        assert!(cfg.alpn().is_empty());
     }
 
     #[test]
@@ -401,7 +415,7 @@ mod tests {
             .with_alpn(["h2", "http/1.1"])
             .build()
             .unwrap();
-        assert_eq!(cfg.alpn, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        assert_eq!(cfg.alpn(), &[b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 
     fn rcgen_self_signed() -> (Vec<u8>, Vec<u8>) {

@@ -1,14 +1,118 @@
-//! Task execution backends.
-//!
-//! [`TaskKind`] defines what a task actually runs: subprocess, WASM, container, or embedded code.
+//! Typed built-in and extensible task workloads.
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 
-use crate::{Flag, SubprocessMode, TaskEnv};
+use crate::{Flag, ModelError, ModelResult, SubprocessMode, TaskEnv, validation};
 
-/// Execution backend for a task.
+/// API group and version shared by built-in Solti workloads.
+pub const WORKLOAD_API_VERSION: &str = "solti.io/v1";
+
+/// API version and kind identifying one workload schema.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadTypeMeta {
+    api_version: String,
+    kind: String,
+}
+
+impl<'de> Deserialize<'de> for WorkloadTypeMeta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RawWorkloadTypeMeta {
+            api_version: String,
+            kind: String,
+        }
+
+        let raw = RawWorkloadTypeMeta::deserialize(deserializer)?;
+        Self::new(raw.api_version, raw.kind).map_err(serde::de::Error::custom)
+    }
+}
+
+impl WorkloadTypeMeta {
+    /// Build workload type metadata.
+    pub fn new(api_version: impl Into<String>, kind: impl Into<String>) -> ModelResult<Self> {
+        let type_meta = Self {
+            api_version: api_version.into(),
+            kind: kind.into(),
+        };
+        type_meta.validate()?;
+        Ok(type_meta)
+    }
+
+    /// Workload API group and version.
+    #[inline]
+    pub fn api_version(&self) -> &str {
+        &self.api_version
+    }
+
+    /// Workload resource kind.
+    #[inline]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    fn validate(&self) -> ModelResult<()> {
+        validation::validate_crd_api_version("workload apiVersion", &self.api_version)?;
+        validation::validate_crd_kind("workload kind", &self.kind)
+    }
+}
+
+/// Desired state of an in-process task implementation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddedSpec {
+    revision: String,
+}
+
+impl<'de> Deserialize<'de> for EmbeddedSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawEmbeddedSpec {
+            revision: String,
+        }
+
+        let raw = RawEmbeddedSpec::deserialize(deserializer)?;
+        Self::new(raw.revision).map_err(serde::de::Error::custom)
+    }
+}
+
+impl EmbeddedSpec {
+    /// Build an embedded workload spec with an implementation revision.
+    pub fn new(revision: impl Into<String>) -> ModelResult<Self> {
+        let spec = Self {
+            revision: revision.into(),
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Caller-controlled implementation revision.
+    #[inline]
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    fn validate(&self) -> ModelResult<()> {
+        if self.revision.trim().is_empty() {
+            return Err(ModelError::Invalid(
+                "embedded workload revision must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Executable desired state nested in a [`TaskSpec`](crate::TaskSpec).
 ///
 /// | Variant      | Backend                        | Routable |
 /// |--------------|--------------------------------|----------|
@@ -16,15 +120,16 @@ use crate::{Flag, SubprocessMode, TaskEnv};
 /// | `Container`  | OCI container image            | yes      |
 /// | `Embedded`   | In-process `TaskRef`           | no       |
 /// | `Wasm`       | WASI module (`.wasm`)          | yes      |
+/// | `Extension`  | Application-provided runner    | yes      |
 ///
 /// Routable variants go through `RunnerRouter::pick()`.
 ///
 /// ## Example
 ///
 /// ```
-/// use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind};
+/// use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskWorkload};
 ///
-/// let kind = TaskKind::Subprocess(SubprocessSpec::new(
+/// let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
 ///     SubprocessMode::Command {
 ///         command: "echo".into(),
 ///         args: vec!["hello".into()],
@@ -34,13 +139,12 @@ use crate::{Flag, SubprocessMode, TaskEnv};
 ///     Flag::enabled(),
 /// ));
 ///
-/// assert_eq!(kind.kind(), "subprocess");
-/// kind.validate().unwrap();
+/// assert_eq!(workload.kind(), "Subprocess");
+/// workload.validate().unwrap();
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum TaskKind {
+pub enum TaskWorkload {
     /// Execute a subprocess on the host.
     Subprocess(SubprocessSpec),
 
@@ -52,63 +156,251 @@ pub enum TaskKind {
 
     /// Built-in / code-defined task that does not require a runner.
     ///
-    /// Used only with `SupervisorApi::submit_with_task()`.
-    /// Any attempt to submit this via `submit()` (which builds via runners) must be rejected.
-    Embedded,
+    /// Used only with `SupervisorApi::create_with_task()` or `SupervisorApi::apply_with_task()`.
+    /// Runner-backed reconciliation must reject this workload before runner selection.
+    Embedded(EmbeddedSpec),
+
+    /// A workload implemented by an application-provided runner.
+    Extension(ExtensionWorkload),
 }
 
-impl TaskKind {
-    /// Return a short symbolic identifier for the runtime kind.
+/// Serializable GVK envelope for an application-provided workload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionWorkload {
+    api_version: String,
+    kind: String,
+    spec: Value,
+}
+
+impl<'de> Deserialize<'de> for ExtensionWorkload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawWorkloadEnvelope::deserialize(deserializer)?;
+        Self::new(raw.api_version, raw.kind, raw.spec).map_err(serde::de::Error::custom)
+    }
+}
+
+impl ExtensionWorkload {
+    /// Build and validate an extension workload envelope.
     ///
-    /// This is primarily intended for logging, metrics and routing:
-    /// - `"subprocess"`
-    /// - `"container"`
-    /// - `"embedded"`
-    /// - `"wasm"`
+    /// The `solti.io` API group is reserved for built-in Solti workloads.
+    pub fn new(
+        api_version: impl Into<String>,
+        kind: impl Into<String>,
+        spec: Value,
+    ) -> ModelResult<Self> {
+        let workload = Self {
+            api_version: api_version.into(),
+            kind: kind.into(),
+            spec,
+        };
+        workload.validate()?;
+        Ok(workload)
+    }
+
+    /// Workload API group and version.
+    #[inline]
+    pub fn api_version(&self) -> &str {
+        &self.api_version
+    }
+
+    /// Workload resource kind.
+    #[inline]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Opaque workload-specific desired state.
+    #[inline]
+    pub fn spec(&self) -> &Value {
+        &self.spec
+    }
+
+    fn validate(&self) -> ModelResult<()> {
+        let group = validation::validate_crd_api_version(
+            "extension workload apiVersion",
+            &self.api_version,
+        )?;
+        validation::validate_crd_kind("extension workload kind", &self.kind)?;
+        if group == "solti.io" {
+            return Err(ModelError::Invalid(
+                format!(
+                    "extension workload GVK {}/{} uses the reserved solti.io API group",
+                    self.api_version, self.kind
+                )
+                .into(),
+            ));
+        }
+        if !self.spec.is_object() {
+            return Err(ModelError::Invalid(
+                "extension workload spec must be a JSON object".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl TaskWorkload {
+    /// Return the workload API group and version.
+    #[inline]
+    pub fn api_version(&self) -> &str {
+        match self {
+            Self::Extension(workload) => workload.api_version(),
+            _ => WORKLOAD_API_VERSION,
+        }
+    }
+
+    /// Return owned workload type metadata suitable for historical snapshots.
+    pub fn type_meta(&self) -> WorkloadTypeMeta {
+        WorkloadTypeMeta {
+            api_version: self.api_version().to_owned(),
+            kind: self.kind().to_owned(),
+        }
+    }
+
+    /// Return the workload resource kind.
     ///
     /// ## Example
     ///
     /// ```
-    /// use solti_model::TaskKind;
+    /// use solti_model::TaskWorkload;
     ///
-    /// assert_eq!(TaskKind::Embedded.kind(), "embedded");
+    /// let embedded = TaskWorkload::Embedded(solti_model::EmbeddedSpec::new("v1").unwrap());
+    /// assert_eq!(embedded.kind(), "Embedded");
     /// ```
     #[inline]
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &str {
         match self {
-            TaskKind::Subprocess(_) => "subprocess",
-            TaskKind::Container(_) => "container",
-            TaskKind::Embedded => "embedded",
-            TaskKind::Wasm(_) => "wasm",
+            Self::Subprocess(_) => "Subprocess",
+            Self::Container(_) => "Container",
+            Self::Embedded(_) => "Embedded",
+            Self::Wasm(_) => "Wasm",
+            Self::Extension(workload) => workload.kind(),
         }
     }
 
     /// Validate kind-specific constraints.
     ///
     /// Delegates to the inner spec: [`SubprocessMode::validate`], [`WasmSpec::validate`], [`ContainerSpec::validate`].
-    /// `Embedded` always passes.
+    /// `Embedded` requires a non-empty implementation revision.
     ///
     /// ## Example
     ///
     /// ```
-    /// use solti_model::{ContainerSpec, TaskEnv, TaskKind};
+    /// use solti_model::{ContainerSpec, TaskEnv, TaskWorkload};
     ///
-    /// let kind = TaskKind::Container(ContainerSpec::new(
+    /// let workload = TaskWorkload::Container(ContainerSpec::new(
     ///     "redis:7".into(),
     ///     None,
     ///     vec![],
     ///     TaskEnv::default(),
     /// ));
     ///
-    /// kind.validate().unwrap();
+    /// workload.validate().unwrap();
     /// ```
-    pub fn validate(&self) -> crate::error::ModelResult<()> {
+    pub fn validate(&self) -> ModelResult<()> {
         match self {
-            TaskKind::Subprocess(spec) => spec.mode.validate(),
-            TaskKind::Container(spec) => spec.validate(),
-            TaskKind::Wasm(spec) => spec.validate(),
-            TaskKind::Embedded => Ok(()),
+            Self::Subprocess(spec) => spec.mode.validate(),
+            Self::Container(spec) => spec.validate(),
+            Self::Wasm(spec) => spec.validate(),
+            Self::Embedded(spec) => spec.validate(),
+            Self::Extension(workload) => workload.validate(),
         }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkloadEnvelope<'a, T> {
+    api_version: &'a str,
+    kind: &'a str,
+    spec: T,
+}
+
+impl Serialize for TaskWorkload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Subprocess(spec) => WorkloadEnvelope {
+                api_version: self.api_version(),
+                kind: self.kind(),
+                spec,
+            }
+            .serialize(serializer),
+            Self::Wasm(spec) => WorkloadEnvelope {
+                api_version: self.api_version(),
+                kind: self.kind(),
+                spec,
+            }
+            .serialize(serializer),
+            Self::Container(spec) => WorkloadEnvelope {
+                api_version: self.api_version(),
+                kind: self.kind(),
+                spec,
+            }
+            .serialize(serializer),
+            Self::Embedded(spec) => WorkloadEnvelope {
+                api_version: self.api_version(),
+                kind: self.kind(),
+                spec,
+            }
+            .serialize(serializer),
+            Self::Extension(workload) => WorkloadEnvelope {
+                api_version: workload.api_version(),
+                kind: workload.kind(),
+                spec: workload.spec(),
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawWorkloadEnvelope {
+    api_version: String,
+    kind: String,
+    spec: Value,
+}
+
+impl<'de> Deserialize<'de> for TaskWorkload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawWorkloadEnvelope::deserialize(deserializer)?;
+        let workload = if raw.api_version == WORKLOAD_API_VERSION {
+            match raw.kind.as_str() {
+                "Subprocess" => Self::Subprocess(
+                    serde_json::from_value(raw.spec).map_err(serde::de::Error::custom)?,
+                ),
+                "Wasm" => {
+                    Self::Wasm(serde_json::from_value(raw.spec).map_err(serde::de::Error::custom)?)
+                }
+                "Container" => Self::Container(
+                    serde_json::from_value(raw.spec).map_err(serde::de::Error::custom)?,
+                ),
+                "Embedded" => Self::Embedded(
+                    serde_json::from_value(raw.spec).map_err(serde::de::Error::custom)?,
+                ),
+                _ => Self::Extension(
+                    ExtensionWorkload::new(raw.api_version, raw.kind, raw.spec)
+                        .map_err(serde::de::Error::custom)?,
+                ),
+            }
+        } else {
+            Self::Extension(
+                ExtensionWorkload::new(raw.api_version, raw.kind, raw.spec)
+                    .map_err(serde::de::Error::custom)?,
+            )
+        };
+        workload.validate().map_err(serde::de::Error::custom)?;
+        Ok(workload)
     }
 }
 
@@ -211,7 +503,7 @@ mod tests {
 
     #[test]
     fn task_kind_validate_rejects_empty_container_image() {
-        let kind = TaskKind::Container(ContainerSpec {
+        let kind = TaskWorkload::Container(ContainerSpec {
             image: "".into(),
             command: None,
             args: vec![],
@@ -223,7 +515,7 @@ mod tests {
 
     #[test]
     fn task_kind_validate_rejects_whitespace_container_image() {
-        let kind = TaskKind::Container(ContainerSpec {
+        let kind = TaskWorkload::Container(ContainerSpec {
             image: "  \t".into(),
             command: None,
             args: vec![],
@@ -234,7 +526,7 @@ mod tests {
 
     #[test]
     fn task_kind_validate_rejects_empty_wasm_module() {
-        let kind = TaskKind::Wasm(WasmSpec {
+        let kind = TaskWorkload::Wasm(WasmSpec {
             module: PathBuf::new(),
             args: vec![],
             env: Default::default(),
@@ -245,7 +537,7 @@ mod tests {
 
     #[test]
     fn task_kind_validate_accepts_valid_container() {
-        let kind = TaskKind::Container(ContainerSpec {
+        let kind = TaskWorkload::Container(ContainerSpec {
             image: "nginx:latest".into(),
             command: None,
             args: vec![],
@@ -256,7 +548,128 @@ mod tests {
 
     #[test]
     fn task_kind_validate_accepts_embedded() {
-        assert!(TaskKind::Embedded.validate().is_ok());
+        assert!(
+            TaskWorkload::Embedded(EmbeddedSpec::new("v1").unwrap())
+                .validate()
+                .is_ok()
+        );
+        assert!(EmbeddedSpec::new("  ").is_err());
+    }
+
+    #[test]
+    fn built_in_workload_uses_gvk_envelope() {
+        let json = serde_json::to_value(TaskWorkload::Embedded(
+            EmbeddedSpec::new("build-42").unwrap(),
+        ))
+        .unwrap();
+
+        assert_eq!(json["apiVersion"], "solti.io/v1");
+        assert_eq!(json["kind"], "Embedded");
+        assert_eq!(json["spec"], serde_json::json!({"revision": "build-42"}));
+    }
+
+    #[test]
+    fn extension_workload_roundtrips_unknown_gvk() {
+        let workload = TaskWorkload::Extension(
+            ExtensionWorkload::new(
+                "tasks.example.io/v1alpha1",
+                "ImageResize",
+                serde_json::json!({ "width": 1280, "format": "webp" }),
+            )
+            .unwrap(),
+        );
+
+        let json = serde_json::to_string(&workload).unwrap();
+        let back: TaskWorkload = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back, workload);
+        assert_eq!(back.api_version(), "tasks.example.io/v1alpha1");
+        assert_eq!(back.kind(), "ImageResize");
+    }
+
+    #[test]
+    fn extension_workload_rejects_reserved_solti_api_group() {
+        for api_version in [WORKLOAD_API_VERSION, "solti.io/v2"] {
+            let error =
+                ExtensionWorkload::new(api_version, "Custom", serde_json::json!({})).unwrap_err();
+
+            assert!(
+                error.to_string().contains("reserved"),
+                "apiVersion={api_version}"
+            );
+        }
+    }
+
+    #[test]
+    fn extension_workload_allows_builtin_kind_in_another_api_version() {
+        for kind in ["Subprocess", "Wasm", "Container", "Embedded"] {
+            let workload = TaskWorkload::Extension(
+                ExtensionWorkload::new(
+                    "tasks.example.io/v1",
+                    kind,
+                    serde_json::json!({ "custom": true }),
+                )
+                .unwrap(),
+            );
+
+            let json = serde_json::to_string(&workload).unwrap();
+            let back: TaskWorkload = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, workload, "kind={kind}");
+        }
+    }
+
+    #[test]
+    fn extension_envelope_roundtrips_directly() {
+        let workload = ExtensionWorkload::new(
+            "tasks.example.io/v1",
+            "Report",
+            serde_json::json!({ "format": "json" }),
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&workload).unwrap();
+        let back: ExtensionWorkload = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back, workload);
+    }
+
+    #[test]
+    fn extension_workload_rejects_empty_gvk_parts() {
+        let error = ExtensionWorkload::new("", "Example", serde_json::json!({})).unwrap_err();
+        assert!(error.to_string().contains("apiVersion"));
+    }
+
+    #[test]
+    fn workload_gvk_uses_kubernetes_crd_validation() {
+        WorkloadTypeMeta::new("tasks.example.io/v1alpha1", "ImageResize").unwrap();
+        ExtensionWorkload::new("tasks.example.io/v1", "custom-kind", serde_json::json!({}))
+            .unwrap();
+
+        for api_version in [
+            " solti.io/v1",
+            "bad/version/extra",
+            "example/v1",
+            "tasks.example.io/1v",
+        ] {
+            assert!(
+                ExtensionWorkload::new(api_version, "Example", serde_json::json!({})).is_err(),
+                "apiVersion={api_version}"
+            );
+        }
+        for kind in ["", "1Example", "Bad Kind", "_Example"] {
+            assert!(
+                ExtensionWorkload::new("tasks.example.io/v1", kind, serde_json::json!({})).is_err(),
+                "kind={kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn extension_workload_requires_object_spec() {
+        let error =
+            ExtensionWorkload::new("example.io/v1", "Example", serde_json::json!(42)).unwrap_err();
+
+        assert!(error.to_string().contains("JSON object"));
     }
 
     #[test]

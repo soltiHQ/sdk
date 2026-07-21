@@ -21,39 +21,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Upper bound on server-advised hold time (seconds).
 const MAX_RETRY_AFTER_S: i32 = 3_600;
 
-#[cfg(feature = "grpc")]
-use crate::proto::discover_service_client::DiscoverServiceClient;
-use crate::proto::{SyncRequest, SyncResponse};
-
-#[cfg(feature = "http")]
-const MAX_BODY_PREVIEW_BYTES: usize = 1024;
-
-#[cfg(feature = "http")]
-const MAX_RESPONSE_BODY_BYTES: u64 = 64 * 1024;
+use crate::proto::SyncRequest;
 
 use std::time::Instant;
 
 use tracing::{debug, warn};
 
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
+    AdmissionPolicy, BackoffPolicy, EmbeddedSpec, JitterPolicy, RestartPolicy, TaskManifest,
+    TaskSpec, TaskWorkload,
 };
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 
-use crate::config::{DiscoverConfig, DiscoveryTransport};
+use crate::config::DiscoverConfig;
 use crate::errors::DiscoverError;
 use crate::metrics::{self, DiscoverMetricsHandle};
+use crate::tasks::transport::TransportAdapter;
 use crate::uptime::UptimeSource;
 
 const SLOT: &str = "solti-discover-sync";
 
-/// User-Agent sent by the HTTP transport: `"solti-discover/<version>"`.
-#[cfg(feature = "http")]
-const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
-
 /// Build a heartbeat task and its spec from discovery config and an uptime source.
 ///
-/// Returns `(TaskRef, TaskSpec)` ready for `SupervisorApi::submit_with_task`.
+/// Returns a prebuilt runtime task and its complete desired resource.
 ///
 /// ## Errors
 ///
@@ -69,7 +59,7 @@ const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VE
 pub fn sync(
     config: DiscoverConfig,
     uptime: Arc<dyn UptimeSource>,
-) -> Result<(TaskRef, TaskSpec), DiscoverError> {
+) -> Result<(TaskRef, TaskManifest), DiscoverError> {
     let delay_ms = config.delay_ms;
 
     let backoff = config.backoff.clone().unwrap_or_else(|| BackoffPolicy {
@@ -89,7 +79,9 @@ pub fn sync(
         .saturating_add(config.request_timeout_ms)
         .saturating_add(1_000);
 
-    let spec = TaskSpec::builder(SLOT, TaskKind::Embedded, attempt_timeout_ms)
+    let embedded = EmbeddedSpec::new(config.task_revision.clone())
+        .map_err(|e| DiscoverError::SpecBuild(e.to_string()))?;
+    let spec = TaskSpec::builder(SLOT, TaskWorkload::Embedded(embedded), attempt_timeout_ms)
         .restart(RestartPolicy::periodic(delay_ms))
         .backoff(backoff)
         .admission(AdmissionPolicy::Replace)
@@ -105,22 +97,17 @@ pub fn sync(
         );
     }
 
-    #[cfg(feature = "http")]
-    let http_client = build_http_client(&config)?;
-
+    let transport = TransportAdapter::from_config(&config)?;
     let metrics = config.metrics.clone();
 
     let ctx = Arc::new(SyncContext {
         base_request,
-        #[cfg(feature = "http")]
-        http_client,
-        #[cfg(feature = "grpc")]
-        grpc_client: tokio::sync::OnceCell::new(),
+        delay_ms,
+        transport,
         retry_hold_until: AtomicU64::new(0),
         startup_jitter_applied: AtomicBool::new(false),
         metrics,
         uptime,
-        config,
     });
 
     let task: TaskRef = TaskFn::arc(SLOT, move |cancel: TaskContext| {
@@ -128,7 +115,7 @@ pub fn sync(
 
         async move {
             if !ctx.startup_jitter_applied.swap(true, Ordering::Relaxed) {
-                let jitter = Duration::from_millis(startup_jitter_ms(ctx.config.delay_ms));
+                let jitter = Duration::from_millis(startup_jitter_ms(ctx.delay_ms));
                 debug!(
                     jitter_ms = jitter.as_millis() as u64,
                     "applying startup jitter before first sync",
@@ -152,7 +139,10 @@ pub fn sync(
             debug!("sending sync request to control plane");
             ctx.metrics.record_attempt();
             let start = Instant::now();
-            let result = cancel.run_until_cancelled(invoke_sync(&ctx)).await?;
+            let request = stamp_request(&ctx.base_request, ctx.uptime.as_ref());
+            let result = cancel
+                .run_until_cancelled(ctx.transport.sync(request))
+                .await?;
             let duration_ms = start.elapsed().as_millis() as u64;
             match result {
                 Ok(()) => {
@@ -189,16 +179,15 @@ pub fn sync(
             }
         }
     });
-    Ok((task, spec))
+    let manifest =
+        TaskManifest::new(SLOT, spec).map_err(|e| DiscoverError::SpecBuild(e.to_string()))?;
+    Ok((task, manifest))
 }
 
 struct SyncContext {
-    config: DiscoverConfig,
     base_request: SyncRequest,
-    #[cfg(feature = "http")]
-    http_client: reqwest::Client,
-    #[cfg(feature = "grpc")]
-    grpc_client: tokio::sync::OnceCell<DiscoverServiceClient<tonic::transport::Channel>>,
+    delay_ms: u64,
+    transport: TransportAdapter,
     /// Unix timestamp (seconds) before which the next sync attempt must wait.
     ///
     /// `0` means no active hold. Updated to `now + retry_after_s` when the control plane returns `Rejected { retry_after_s: Some(_) }`;
@@ -278,165 +267,6 @@ fn tls_enabled(_config: &DiscoverConfig) -> bool {
     {
         false
     }
-}
-
-async fn invoke_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
-    match ctx.config.transport {
-        #[cfg(feature = "grpc")]
-        DiscoveryTransport::Grpc => invoke_grpc_sync(ctx).await,
-        #[cfg(feature = "http")]
-        DiscoveryTransport::Http => invoke_http_sync(ctx).await,
-    }
-}
-
-/// Convert [`solti_tls::ClientTlsConfig`] into [`tonic::transport::ClientTlsConfig`].
-///
-/// Reads PEM bytes via [`solti_tls::PemSource`] and re-shapes them into the PEM-blob types that tonic expects (`Certificate::from_pem`, `Identity::from_pem`).
-/// tonic builds its own internal `rustls::ClientConfig`: we cannot pass a pre-built one through.
-#[cfg(all(feature = "grpc", feature = "tls"))]
-fn build_tonic_client_tls(
-    cfg: &solti_tls::ClientTlsConfig,
-) -> Result<tonic::transport::ClientTlsConfig, DiscoverError> {
-    use tonic::transport::{Certificate, ClientTlsConfig as TonicTls, Identity};
-
-    let ca_bytes = cfg
-        .ca
-        .read()
-        .map_err(|e| DiscoverError::InvalidConfig(format!("read ca pem: {e}")))?;
-
-    let mut tls = TonicTls::new().ca_certificate(Certificate::from_pem(ca_bytes));
-
-    if let (Some(cert_src), Some(key_src)) = (&cfg.client_cert, &cfg.client_key) {
-        let cert_bytes = cert_src
-            .read()
-            .map_err(|e| DiscoverError::InvalidConfig(format!("read client cert pem: {e}")))?;
-        let key_bytes = key_src
-            .read()
-            .map_err(|e| DiscoverError::InvalidConfig(format!("read client key pem: {e}")))?;
-        tls = tls.identity(Identity::from_pem(cert_bytes, key_bytes));
-    }
-
-    Ok(tls)
-}
-
-#[cfg(feature = "grpc")]
-async fn invoke_grpc_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
-    let client =
-        ctx.grpc_client
-            .get_or_try_init(|| async {
-                #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
-                let mut endpoint = tonic::transport::Endpoint::from_shared(
-                    ctx.config.control_plane_endpoint.clone(),
-                )
-                .map_err(|e| {
-                    DiscoverError::InvalidConfig(format!("invalid control_plane_endpoint: {}", e))
-                })?
-                .connect_timeout(Duration::from_millis(ctx.config.connect_timeout_ms))
-                .timeout(Duration::from_millis(ctx.config.request_timeout_ms));
-
-                #[cfg(feature = "tls")]
-                if let Some(tls) = &ctx.config.tls {
-                    let tonic_tls = build_tonic_client_tls(tls)?;
-                    endpoint = endpoint
-                        .tls_config(tonic_tls)
-                        .map_err(|e| DiscoverError::InvalidConfig(format!("tls_config: {e}")))?;
-                }
-
-                let channel = endpoint.connect().await?;
-                Ok::<_, DiscoverError>(DiscoverServiceClient::new(channel))
-            })
-            .await?;
-
-    let mut client = client.clone();
-    let mut request = tonic::Request::new(stamp_request(&ctx.base_request, ctx.uptime.as_ref()));
-    if let Some(token) = &ctx.config.token {
-        let value: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
-            format!("Bearer {}", token.expose()).parse().map_err(|_| {
-                DiscoverError::InvalidConfig(
-                    "token contains characters invalid for an Authorization header".into(),
-                )
-            })?;
-        request.metadata_mut().insert("authorization", value);
-    }
-    match client.sync(request).await {
-        Ok(response) => validate_response(response.into_inner()),
-        Err(status) => match status.code() {
-            tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
-                Err(DiscoverError::AuthFailed {
-                    reason: format!("grpc {:?}: {}", status.code(), status.message()),
-                })
-            }
-            _ => Err(DiscoverError::from(status)),
-        },
-    }
-}
-
-/// Build the `reqwest` client used by the HTTP transport.
-///
-/// Redirects are disabled: the control-plane endpoint is operator-configured,
-/// so following redirects is never needed and would only widen the attack
-/// surface (e.g. replaying the bearer token to a redirect target).
-#[cfg(feature = "http")]
-fn build_http_client(config: &DiscoverConfig) -> Result<reqwest::Client, DiscoverError> {
-    #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
-        .timeout(Duration::from_millis(config.request_timeout_ms))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(USER_AGENT);
-
-    #[cfg(feature = "tls")]
-    if let Some(tls) = &config.tls {
-        // `into_rustls_config` consumes the value; clone to keep the original on `config` (gRPC path also uses it).
-        let rustls_cfg = tls
-            .clone()
-            .into_rustls_config()
-            .map_err(|e| DiscoverError::InvalidConfig(format!("tls into_rustls_config: {e}")))?;
-        builder = builder.use_preconfigured_tls(rustls_cfg);
-    }
-
-    Ok(builder.build()?)
-}
-
-#[cfg(feature = "http")]
-async fn invoke_http_sync(ctx: &SyncContext) -> Result<(), DiscoverError> {
-    let request = stamp_request(&ctx.base_request, ctx.uptime.as_ref());
-
-    let url = format!(
-        "{}{}",
-        ctx.config.control_plane_endpoint,
-        http_sync_path(ctx.config.api_version),
-    );
-    let mut http_req = ctx.http_client.post(url).json(&request);
-    if let Some(token) = &ctx.config.token {
-        http_req = http_req.bearer_auth(token.expose());
-    }
-    let response = http_req.send().await?;
-
-    let status = response.status();
-    let body = read_body_bounded(response, MAX_RESPONSE_BODY_BYTES).await?;
-
-    if !status.is_success() {
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            return Err(DiscoverError::AuthFailed {
-                reason: format!("http {}: {}", status.as_u16(), truncate_body(&body)),
-            });
-        }
-        return Err(DiscoverError::HttpStatus {
-            code: status.as_u16(),
-            body: truncate_body(&body),
-        });
-    }
-
-    let sync_response: SyncResponse = serde_json::from_str(&body).map_err(|e| {
-        DiscoverError::InvalidResponse(format!(
-            "failed to parse response: {}, body: {}",
-            e,
-            truncate_body(&body)
-        ))
-    })?;
-
-    validate_response(sync_response)
 }
 
 #[inline]
@@ -519,84 +349,6 @@ fn startup_jitter_ms(max_ms: u64) -> u64 {
     mixed % max_ms
 }
 
-/// Turn a `success=false` response into [`DiscoverError::Rejected`].
-///
-/// `reason` is propagated **verbatim** from the control plane:
-/// treat it as untrusted server text (do not interpolate it into anything trust-sensitive).
-fn validate_response(response: SyncResponse) -> Result<(), DiscoverError> {
-    if !response.success {
-        let reason = if response.reason.is_empty() {
-            "control plane returned success=false".to_string()
-        } else {
-            response.reason
-        };
-        let retry_after_s = if response.retry_after_s > 0 {
-            Some(response.retry_after_s)
-        } else {
-            None
-        };
-        return Err(DiscoverError::Rejected {
-            reason,
-            retry_after_s,
-        });
-    }
-    Ok(())
-}
-
-/// HTTP path for the sync RPC, derived from `api_version`.
-///
-/// `api_version = 1` → `"/api/v1/discovery/sync"`.
-/// Ensures the wire path and the `api_version` field of [`SyncRequest`] stay in lockstep.
-#[cfg(feature = "http")]
-fn http_sync_path(api_version: u32) -> String {
-    format!("/api/v{api_version}/discovery/sync")
-}
-
-#[cfg(feature = "http")]
-async fn read_body_bounded(
-    mut response: reqwest::Response,
-    max_bytes: u64,
-) -> Result<String, DiscoverError> {
-    if let Some(len) = response.content_length()
-        && len > max_bytes
-    {
-        return Err(DiscoverError::InvalidResponse(format!(
-            "response body {len} bytes exceeds cap {max_bytes}"
-        )));
-    }
-
-    // Without a trustworthy Content-Length (e.g. chunked transfer encoding) the
-    // body must be read incrementally: buffering it whole before the cap check
-    // would let the server force an arbitrarily large allocation.
-    let mut body: Vec<u8> = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if (body.len() as u64).saturating_add(chunk.len() as u64) > max_bytes {
-            return Err(DiscoverError::InvalidResponse(format!(
-                "response body exceeds cap {max_bytes} bytes"
-            )));
-        }
-        body.extend_from_slice(&chunk);
-    }
-
-    String::from_utf8(body)
-        .map_err(|e| DiscoverError::InvalidResponse(format!("response body is not UTF-8: {e}")))
-}
-
-/// Truncate a response body preview at a char boundary, capping at ~1 KiB.
-#[cfg(feature = "http")]
-fn truncate_body(body: &str) -> String {
-    if body.len() <= MAX_BODY_PREVIEW_BYTES {
-        return body.to_string();
-    }
-    let mut end = MAX_BODY_PREVIEW_BYTES;
-    while end > 0 && !body.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut truncated = body[..end].to_string();
-    truncated.push_str("... [truncated]");
-    truncated
-}
-
 /// Compute remaining wait until a server-advised retry deadline.
 ///
 /// Returns `Some(wait)` when `hold_until_unix_s` is in the future, `None` otherwise.
@@ -637,11 +389,11 @@ mod tests {
             + config.connect_timeout_ms
             + config.request_timeout_ms;
 
-        let (_task, spec) = sync(config, Arc::new(|| 0)).expect("sync builds");
+        let (_task_ref, task) = sync(config, Arc::new(|| 0)).expect("sync builds");
         assert!(
-            spec.timeout().as_millis() >= worst_case_ms,
+            task.spec().timeout().as_millis() >= worst_case_ms,
             "attempt timeout {}ms must cover the worst case {}ms",
-            spec.timeout().as_millis(),
+            task.spec().timeout().as_millis(),
             worst_case_ms
         );
     }
@@ -668,77 +420,6 @@ mod tests {
             compute_hold_wait(1_001, 1_000),
             Some(Duration::from_secs(1))
         );
-    }
-
-    #[cfg(feature = "http")]
-    #[test]
-    fn http_sync_path_derives_from_api_version() {
-        assert_eq!(http_sync_path(1), "/api/v1/discovery/sync");
-        assert_eq!(http_sync_path(2), "/api/v2/discovery/sync");
-        assert_eq!(http_sync_path(42), "/api/v42/discovery/sync");
-    }
-
-    #[test]
-    fn validate_response_success_ok() {
-        let r = SyncResponse {
-            success: true,
-            reason: String::new(),
-            retry_after_s: 0,
-        };
-        assert!(validate_response(r).is_ok());
-    }
-
-    #[test]
-    fn validate_response_rejection_without_reason_uses_default() {
-        let r = SyncResponse {
-            success: false,
-            reason: String::new(),
-            retry_after_s: 0,
-        };
-        match validate_response(r) {
-            Err(DiscoverError::Rejected {
-                reason,
-                retry_after_s,
-            }) => {
-                assert!(reason.contains("success=false"));
-                assert_eq!(retry_after_s, None);
-            }
-            other => panic!("expected Rejected, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn validate_response_rejection_with_hint_is_preserved() {
-        let r = SyncResponse {
-            success: false,
-            reason: "overloaded".into(),
-            retry_after_s: 60,
-        };
-        match validate_response(r) {
-            Err(DiscoverError::Rejected {
-                reason,
-                retry_after_s,
-            }) => {
-                assert_eq!(reason, "overloaded");
-                assert_eq!(retry_after_s, Some(60));
-            }
-            other => panic!("expected Rejected, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn validate_response_rejection_negative_hint_is_dropped() {
-        let r = SyncResponse {
-            success: false,
-            reason: "bad".into(),
-            retry_after_s: -5,
-        };
-        match validate_response(r) {
-            Err(DiscoverError::Rejected { retry_after_s, .. }) => {
-                assert_eq!(retry_after_s, None);
-            }
-            other => panic!("expected Rejected, got {other:?}"),
-        }
     }
 
     #[test]
@@ -805,24 +486,6 @@ mod tests {
         );
     }
 
-    /// Raw TCP stub serving one hand-written HTTP/1.1 response, then closing.
-    #[cfg(feature = "http")]
-    async fn one_shot_http_stub(response: &'static [u8]) -> std::net::SocketAddr {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind stub listener");
-        let addr = listener.local_addr().expect("stub local addr");
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept");
-            let mut discard = [0u8; 1024];
-            let _ = socket.read(&mut discard).await;
-            socket.write_all(response).await.expect("write response");
-        });
-        addr
-    }
-
     #[cfg(feature = "http")]
     fn test_config() -> crate::DiscoverConfig {
         crate::DiscoverConfig::builder(
@@ -847,106 +510,5 @@ mod tests {
         let request = stamp_request(&base, &source);
 
         assert_eq!(request.uptime_seconds, 42);
-    }
-
-    #[cfg(feature = "http")]
-    #[tokio::test]
-    async fn read_body_bounded_rejects_oversized_chunked_body_before_stream_ends() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind stub listener");
-        let addr = listener.local_addr().expect("stub local addr");
-
-        // Endless chunked response: no Content-Length, no terminating 0-chunk.
-        // The stub only stops once the client hangs up, so an implementation
-        // that buffers the whole body before checking the cap never returns.
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept");
-            let mut discard = [0u8; 1024];
-            let _ = socket.read(&mut discard).await;
-            if socket
-                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
-                .await
-                .is_err()
-            {
-                return;
-            }
-            let payload = [b'a'; 4096];
-            loop {
-                // 0x1000 == 4096-byte chunk.
-                if socket.write_all(b"1000\r\n").await.is_err()
-                    || socket.write_all(&payload).await.is_err()
-                    || socket.write_all(b"\r\n").await.is_err()
-                    || socket.flush().await.is_err()
-                {
-                    break;
-                }
-            }
-        });
-
-        let response = build_http_client(&test_config())
-            .expect("client builds")
-            .get(format!("http://{addr}/"))
-            .send()
-            .await
-            .expect("stub accepts the request");
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            read_body_bounded(response, MAX_RESPONSE_BODY_BYTES),
-        )
-        .await
-        .expect("cap must trip while the stream is still open, not after buffering it");
-
-        match result {
-            Err(DiscoverError::InvalidResponse(msg)) => {
-                assert!(msg.contains("exceeds cap"), "unexpected message: {msg}");
-            }
-            other => panic!("expected InvalidResponse, got {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "http")]
-    #[tokio::test]
-    async fn read_body_bounded_accepts_chunked_body_within_cap() {
-        let addr = one_shot_http_stub(
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
-              b\r\nhello world\r\n0\r\n\r\n",
-        )
-        .await;
-
-        let response = build_http_client(&test_config())
-            .expect("client builds")
-            .get(format!("http://{addr}/"))
-            .send()
-            .await
-            .expect("stub accepts the request");
-
-        let body = read_body_bounded(response, MAX_RESPONSE_BODY_BYTES)
-            .await
-            .expect("small chunked body is accepted");
-        assert_eq!(body, "hello world");
-    }
-
-    #[cfg(feature = "http")]
-    #[tokio::test]
-    async fn http_client_does_not_follow_redirects() {
-        // Location points at a closed port: a client that follows the redirect
-        // fails with a connect error instead of returning this 302 response.
-        let addr = one_shot_http_stub(
-            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/\r\nContent-Length: 0\r\n\r\n",
-        )
-        .await;
-
-        let response = build_http_client(&test_config())
-            .expect("client builds")
-            .get(format!("http://{addr}/"))
-            .send()
-            .await
-            .expect("redirect must be returned, not followed");
-
-        assert_eq!(response.status().as_u16(), 302);
     }
 }

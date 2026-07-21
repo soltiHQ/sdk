@@ -17,13 +17,31 @@ use solti_model::{TaskQuery, Token};
 
 use crate::auth::{assert_auth_token_not_empty, bearer_value};
 use crate::convert::{output_event_to_proto, proto_to_domain_phase, tasks_page_to_proto};
-use crate::error::ApiError;
 use crate::handler::ApiHandler;
 use crate::metrics::{ApiMetricsHandle, Transport, noop_api_metrics};
 use crate::proto_api::{
     self, task_service_server::TaskService, task_service_server::TaskServiceServer,
 };
-use crate::validate::{clamp_list_limit, non_empty_id};
+use crate::validate::{clamp_list_limit, parse_task_id, validate_slot};
+
+/// Generated protobuf messages and tonic client/server types for API version 1.
+///
+/// This is the stable public entry point for applications acting as gRPC
+/// clients. Transport implementations in this crate use the same generated
+/// DTOs internally.
+///
+/// ```rust
+/// use solti_api::grpc::v1::{Task, TaskServiceClient};
+///
+/// let task: Option<Task> = None;
+/// let client: Option<TaskServiceClient<solti_api::tonic::transport::Channel>> = None;
+/// let _ = (task, client);
+/// ```
+pub mod v1 {
+    pub use crate::proto_api::task_service_client::TaskServiceClient;
+    pub use crate::proto_api::task_service_server::TaskServiceServer;
+    pub use crate::proto_api::*;
+}
 
 /// gRPC service wrapping an [`ApiHandler`](crate::ApiHandler).
 ///
@@ -118,8 +136,8 @@ pub type GrpcServer<H> = InterceptedService<TaskServiceServer<TaskApiService<H>>
 ///
 /// ```rust,no_run
 /// # use std::sync::Arc;
-/// # use solti_api::{GrpcApi, SupervisorApiAdapter};
-/// # async fn example(adapter: Arc<SupervisorApiAdapter>) -> Result<(), Box<dyn std::error::Error>> {
+/// # use solti_api::{ApiHandler, GrpcApi};
+/// # async fn example<H: ApiHandler>(adapter: Arc<H>) -> Result<(), Box<dyn std::error::Error>> {
 /// let svc = GrpcApi::new(adapter).server();
 /// tonic::transport::Server::builder()
 ///     .add_service(svc)
@@ -232,25 +250,28 @@ impl<H> TaskService for TaskApiService<H>
 where
     H: ApiHandler,
 {
-    async fn submit_task(
+    async fn create_task(
         &self,
-        request: Request<proto_api::SubmitTaskRequest>,
-    ) -> Result<Response<proto_api::SubmitTaskResponse>, Status> {
-        self.instrument("SubmitTask", async move {
+        request: Request<proto_api::CreateTaskRequest>,
+    ) -> Result<Response<proto_api::CreateTaskResponse>, Status> {
+        self.instrument("CreateTask", async move {
             let req = request.into_inner();
 
-            let spec = req
-                .spec
-                .ok_or_else(|| Status::invalid_argument("missing spec"))?;
+            let manifest = req
+                .manifest
+                .ok_or_else(|| Status::invalid_argument("missing manifest"))?;
+            let manifest =
+                crate::convert::task_manifest_from_proto(manifest).map_err(Status::from)?;
+            debug!(name = %manifest.name(), "grpc: creating task");
+            let task = self
+                .handler
+                .create_task(manifest)
+                .await
+                .map_err(Status::from)?;
+            let task = proto_api::Task::try_from(task).map_err(Status::from)?;
 
-            let spec =
-                crate::convert::convert_create_spec(spec).map_err(|e: ApiError| Status::from(e))?;
-
-            debug!(slot = %spec.slot(), kind = ?spec.kind(), "grpc: submitting task");
-            let task_id = self.handler.submit_task(spec).await.map_err(Status::from)?;
-
-            Ok(Response::new(proto_api::SubmitTaskResponse {
-                task_id: task_id.to_string(),
+            Ok(Response::new(proto_api::CreateTaskResponse {
+                task: Some(task),
             }))
         })
         .await
@@ -263,47 +284,48 @@ where
         self.instrument("ApplyTask", async move {
             let req = request.into_inner();
 
-            let spec = req
-                .spec
-                .ok_or_else(|| Status::invalid_argument("missing spec"))?;
-
-            let spec =
-                crate::convert::convert_create_spec(spec).map_err(|e: ApiError| Status::from(e))?;
-
-            debug!(slot = %spec.slot(), kind = ?spec.kind(), "grpc: applying task");
-            let task_id = self.handler.apply_task(spec).await.map_err(Status::from)?;
+            let manifest = req
+                .manifest
+                .ok_or_else(|| Status::invalid_argument("missing manifest"))?;
+            let manifest =
+                crate::convert::task_manifest_from_proto(manifest).map_err(Status::from)?;
+            debug!(name = %manifest.name(), "grpc: applying task");
+            let task = self
+                .handler
+                .apply_task(manifest)
+                .await
+                .map_err(Status::from)?;
+            let task = proto_api::Task::try_from(task).map_err(Status::from)?;
 
             Ok(Response::new(proto_api::ApplyTaskResponse {
-                task_id: task_id.to_string(),
+                task: Some(task),
             }))
         })
         .await
     }
 
-    async fn get_task_status(
+    async fn get_task(
         &self,
-        request: Request<proto_api::GetTaskStatusRequest>,
-    ) -> Result<Response<proto_api::GetTaskStatusResponse>, Status> {
-        self.instrument("GetTaskStatus", async move {
+        request: Request<proto_api::GetTaskRequest>,
+    ) -> Result<Response<proto_api::GetTaskResponse>, Status> {
+        self.instrument("GetTask", async move {
             let req = request.into_inner();
 
-            non_empty_id("task_id", &req.task_id).map_err(Status::from)?;
-
-            let task_id = solti_model::TaskId::from(req.task_id);
+            let task_id = parse_task_id("task name", req.name).map_err(Status::from)?;
             debug!(%task_id, "grpc: getting task status");
 
-            let info = self
+            let task = self
                 .handler
-                .get_task_status(&task_id)
+                .get_task(&task_id)
                 .await
-                .map_err(Status::from)?;
+                .map_err(Status::from)?
+                .ok_or_else(|| Status::from(crate::ApiError::TaskNotFound(task_id.to_string())))?;
 
-            let task = info
-                .map(proto_api::TaskData::try_from)
-                .transpose()
-                .map_err(Status::from)?;
+            let task = proto_api::Task::try_from(task).map_err(Status::from)?;
 
-            Ok(Response::new(proto_api::GetTaskStatusResponse { task }))
+            Ok(Response::new(proto_api::GetTaskResponse {
+                task: Some(task),
+            }))
         })
         .await
     }
@@ -318,8 +340,7 @@ where
             let mut query = TaskQuery::new();
 
             if let Some(slot) = req.slot {
-                non_empty_id("slot", &slot).map_err(Status::from)?;
-                query = query.with_slot(slot);
+                query = query.with_slot(validate_slot(slot).map_err(Status::from)?);
             }
 
             if let Some(phase_raw) = req.phase {
@@ -357,9 +378,7 @@ where
         self.instrument("ListTaskRuns", async move {
             let req = request.into_inner();
 
-            non_empty_id("task_id", &req.task_id).map_err(Status::from)?;
-
-            let task_id = solti_model::TaskId::from(req.task_id);
+            let task_id = parse_task_id("task name", req.name).map_err(Status::from)?;
             debug!(%task_id, "grpc: listing task runs");
 
             let runs = self
@@ -368,7 +387,11 @@ where
                 .await
                 .map_err(Status::from)?;
 
-            let runs = runs.into_iter().map(proto_api::TaskRunInfo::from).collect();
+            let runs = runs
+                .into_iter()
+                .map(proto_api::TaskRunInfo::try_from)
+                .collect::<Result<_, _>>()
+                .map_err(Status::from)?;
 
             Ok(Response::new(proto_api::ListTaskRunsResponse { runs }))
         })
@@ -382,9 +405,7 @@ where
         self.instrument("DeleteTask", async move {
             let req = request.into_inner();
 
-            non_empty_id("task_id", &req.task_id).map_err(Status::from)?;
-
-            let task_id = solti_model::TaskId::from(req.task_id);
+            let task_id = parse_task_id("task name", req.name).map_err(Status::from)?;
             debug!(%task_id, "grpc: deleting task");
 
             self.handler
@@ -412,9 +433,7 @@ where
         request: Request<proto_api::StreamTaskLogsRequest>,
     ) -> Result<Response<Self::StreamTaskLogsStream>, Status> {
         let req = request.into_inner();
-        non_empty_id("task_id", &req.task_id).map_err(Status::from)?;
-
-        let task_id = solti_model::TaskId::from(req.task_id);
+        let task_id = parse_task_id("task name", req.name).map_err(Status::from)?;
         debug!(%task_id, "grpc: subscribing to task log stream");
 
         let domain_stream = self
@@ -437,8 +456,8 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use solti_model::{
-        OutputChunk, OutputEvent, StreamKind as ModelStreamKind, Task, TaskId, TaskPage, TaskQuery,
-        TaskRun, TaskSpec,
+        OutputChunk, OutputEvent, StreamKind as ModelStreamKind, Task, TaskId, TaskManifest,
+        TaskPage, TaskQuery, TaskRun, WORKLOAD_API_VERSION, WorkloadTypeMeta,
     };
 
     use crate::error::ApiError;
@@ -448,17 +467,25 @@ mod tests {
 
     #[async_trait]
     impl ApiHandler for StreamMock {
-        async fn submit_task(&self, _spec: TaskSpec) -> Result<TaskId, ApiError> {
+        async fn create_task(&self, _manifest: TaskManifest) -> Result<Task, ApiError> {
             unreachable!()
         }
-        async fn get_task_status(&self, _id: &TaskId) -> Result<Option<Task>, ApiError> {
+        async fn apply_task(&self, _manifest: TaskManifest) -> Result<Task, ApiError> {
             unreachable!()
+        }
+        async fn get_task(&self, _id: &TaskId) -> Result<Option<Task>, ApiError> {
+            Ok(None)
         }
         async fn query_tasks(&self, _q: TaskQuery) -> Result<TaskPage<Task>, ApiError> {
             unreachable!()
         }
-        async fn list_task_runs(&self, _id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
-            unreachable!()
+        async fn list_task_runs(&self, id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
+            let workload = if id.as_str() == "embedded-run" {
+                WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Embedded").unwrap()
+            } else {
+                WorkloadTypeMeta::new("workloads.example.io/v1", "DatabaseBackup").unwrap()
+            };
+            Ok(vec![TaskRun::starting(2, 1, workload)])
         }
         async fn delete_task(&self, _id: &TaskId) -> Result<(), ApiError> {
             unreachable!()
@@ -469,10 +496,12 @@ mod tests {
             }
             let events = vec![
                 OutputEvent::RunStarted {
+                    generation: 2,
                     attempt: 1,
                     started_at: UNIX_EPOCH + Duration::from_millis(1000),
                 },
                 OutputEvent::Chunk(OutputChunk {
+                    generation: 2,
                     attempt: 1,
                     stream: ModelStreamKind::Stdout,
                     seq: 0,
@@ -480,6 +509,7 @@ mod tests {
                     line: Bytes::from_static(b"hello-grpc"),
                 }),
                 OutputEvent::RunFinished {
+                    generation: 2,
                     attempt: 1,
                     exit_code: Some(0),
                     finished_at: UNIX_EPOCH + Duration::from_millis(1500),
@@ -494,10 +524,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_task_maps_missing_resource_to_not_found_status() {
+        let status = service()
+            .get_task(Request::new(proto_api::GetTaskRequest {
+                name: "missing".into(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn list_task_runs_exposes_historical_workload_gvk() {
+        let response = service()
+            .list_task_runs(Request::new(proto_api::ListTaskRunsRequest {
+                name: "extension-run".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.runs.len(), 1);
+        assert_eq!(
+            response.runs[0].workload_api_version,
+            "workloads.example.io/v1"
+        );
+        assert_eq!(response.runs[0].workload_kind, "DatabaseBackup");
+    }
+
+    #[tokio::test]
+    async fn list_task_runs_guards_embedded_history_from_custom_handler() {
+        let status = service()
+            .list_task_runs(Request::new(proto_api::ListTaskRunsRequest {
+                name: "embedded-run".into(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::Internal);
+    }
+
+    #[tokio::test]
     async fn stream_task_logs_returns_three_proto_events_in_order() {
         let svc = service();
         let req = Request::new(proto_api::StreamTaskLogsRequest {
-            task_id: "tsk_1".into(),
+            name: "task-1".into(),
         });
 
         let response = svc.stream_task_logs(req).await.expect("stream Ok");
@@ -505,6 +577,7 @@ mod tests {
 
         match stream.next().await.unwrap().unwrap().kind.unwrap() {
             proto_api::stream_task_logs_response::Kind::RunStarted(r) => {
+                assert_eq!(r.generation, 2);
                 assert_eq!(r.attempt, 1);
                 assert_eq!(r.started_at, 1000);
             }
@@ -513,6 +586,7 @@ mod tests {
 
         match stream.next().await.unwrap().unwrap().kind.unwrap() {
             proto_api::stream_task_logs_response::Kind::Chunk(c) => {
+                assert_eq!(c.generation, 2);
                 assert_eq!(c.attempt, 1);
                 assert_eq!(c.stream, proto_api::OutputStreamKind::Stdout as i32);
                 assert_eq!(c.seq, 0);
@@ -523,6 +597,7 @@ mod tests {
 
         match stream.next().await.unwrap().unwrap().kind.unwrap() {
             proto_api::stream_task_logs_response::Kind::RunFinished(r) => {
+                assert_eq!(r.generation, 2);
                 assert_eq!(r.attempt, 1);
                 assert_eq!(r.exit_code, Some(0));
                 assert_eq!(r.finished_at, 1500);
@@ -533,23 +608,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_task_logs_rejects_empty_task_id() {
+    async fn stream_task_logs_rejects_every_invalid_model_name() {
         let svc = service();
-        let req = Request::new(proto_api::StreamTaskLogsRequest {
-            task_id: "  ".into(),
-        });
-        let status = match svc.stream_task_logs(req).await {
-            Err(s) => s,
-            Ok(_) => panic!("expected error status"),
-        };
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        for invalid in ["  ", "a/b", "a b", ".", "bad$name"] {
+            let req = Request::new(proto_api::StreamTaskLogsRequest {
+                name: invalid.into(),
+            });
+            let status = match svc.stream_task_logs(req).await {
+                Err(s) => s,
+                Ok(_) => panic!("expected error status for {invalid:?}"),
+            };
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        }
     }
 
     #[tokio::test]
     async fn stream_task_logs_maps_task_not_found_to_not_found_status() {
         let svc = service();
         let req = Request::new(proto_api::StreamTaskLogsRequest {
-            task_id: "missing".into(),
+            name: "missing".into(),
         });
         let status = match svc.stream_task_logs(req).await {
             Err(s) => s,

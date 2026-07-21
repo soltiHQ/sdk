@@ -37,8 +37,8 @@ impl Transport {
 /// ## Labels
 ///
 /// - `transport`: `http` | `grpc`
-/// - `method`: HTTP method (`GET`, `POST`, ...) for HTTP, RPC method name (`SubmitTask`, ...) for gRPC
-/// - `path`: templated route (`/api/v1/tasks/{id}`) for HTTP via `MatchedPath`, full RPC path (`/solti.task.v1.TaskService/SubmitTask`) for gRPC
+/// - `method`: HTTP method (`GET`, `POST`, ...) for HTTP, RPC method name (`CreateTask`, ...) for gRPC
+/// - `path`: templated route (`/apis/solti.io/v1/tasks/{name}`) for HTTP via `MatchedPath`, full RPC path (`/solti.task.v1.TaskService/CreateTask`) for gRPC
 /// - `status`: HTTP status code (200/404/500/...) for HTTP, gRPC code number for gRPC
 ///
 /// Cardinality stays bounded because routes are a closed set per version and templated paths avoid per-resource-id explosion.
@@ -77,7 +77,9 @@ pub fn noop_api_metrics() -> ApiMetricsHandle {
 /// Apply via `axum::middleware::from_fn_with_state(metrics, http_metrics_middleware)`.
 ///
 /// Uses [`axum::extract::MatchedPath`] to capture the route **template**
-/// (e.g. `/api/v1/tasks/{id}`) instead of the raw URL — keeps `path` cardinality bounded.
+/// (e.g. `/apis/solti.io/v1/tasks/{name}`) instead of the raw URL. Requests
+/// without a matched route use one stable fallback label, keeping `path`
+/// cardinality bounded.
 #[cfg(feature = "http")]
 pub async fn http_metrics_middleware(
     axum::extract::State(metrics): axum::extract::State<ApiMetricsHandle>,
@@ -89,7 +91,7 @@ pub async fn http_metrics_middleware(
         .extensions()
         .get::<axum::extract::MatchedPath>()
         .map(|mp| mp.as_str().to_string())
-        .unwrap_or_else(|| request.uri().path().to_string());
+        .unwrap_or_else(|| "<unmatched>".to_string());
 
     metrics.record_in_flight_delta(Transport::Http, 1);
     let start = std::time::Instant::now();
@@ -99,4 +101,55 @@ pub async fn http_metrics_middleware(
     metrics.record_request(Transport::Http, &method, &path, status, duration_ms);
     metrics.record_in_flight_delta(Transport::Http, -1);
     response
+}
+
+#[cfg(all(test, feature = "http"))]
+mod tests {
+    use std::sync::Mutex;
+
+    use axum::{Router, body::Body, http::Request, middleware};
+    use tower::ServiceExt;
+
+    use super::*;
+
+    #[derive(Debug, Default)]
+    struct Probe {
+        paths: Mutex<Vec<String>>,
+    }
+
+    impl ApiMetricsBackend for Probe {
+        fn record_request(
+            &self,
+            _transport: Transport,
+            _method: &str,
+            path: &str,
+            _status: u16,
+            _duration_ms: u64,
+        ) {
+            self.paths.lock().unwrap().push(path.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn unmatched_routes_use_one_bounded_path_label() {
+        let probe = Arc::new(Probe::default());
+        let metrics: ApiMetricsHandle = probe.clone();
+        let app = Router::new()
+            .fallback(|| async { axum::http::StatusCode::NOT_FOUND })
+            .layer(middleware::from_fn_with_state(
+                metrics,
+                http_metrics_middleware,
+            ));
+
+        for path in ["/missing/one", "/missing/two"] {
+            app.clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let paths = probe.paths.lock().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|path| path == "<unmatched>"));
+    }
 }

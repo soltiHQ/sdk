@@ -9,7 +9,7 @@
 //! - [`MetricsBackend`]: trait with `record_task_started`, `record_task_completed`, `record_runner_error`.
 //! - [`MetricOutcome`]: metric label enum: `Success`, `Failure`, `Canceled`, `Timeout`.
 //! - [`MetricsHandle`]: `Arc<dyn MetricsBackend>`, cloneable shared handle.
-//! - [`RunnerType`]: metric label enum: `Subprocess`, `Wasm`, `Container`.
+//! - [`RunnerType`]: built-in and application-defined runner labels.
 //! - [`noop_metrics`]: convenience constructor for `Arc<NoOpMetrics>`.
 //! - [`NoOpMetrics`]: zero-size backend that discards all records.
 mod backend;

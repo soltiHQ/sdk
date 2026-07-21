@@ -216,10 +216,11 @@ impl SubprocessBackendConfig {
         self
     }
 
-    /// Override the maximum decoded script-body size (default [`MAX_SCRIPT_BODY_BYTES`]).
+    /// Tighten the maximum decoded script-body size (default [`MAX_SCRIPT_BODY_BYTES`]).
     ///
     /// Applies to `Script`-mode subprocesses: a body whose decoded size exceeds this is rejected at build time.
-    /// A value of `0` is rejected when the runner config is validated.
+    /// Zero and values above the hard 2 MiB model limit are rejected when the
+    /// runner config is validated.
     pub fn with_max_script_body_bytes(mut self, max: usize) -> Self {
         self.max_script_body_bytes = Some(max);
         self
@@ -315,10 +316,12 @@ impl SubprocessBackendConfig {
                 "log_config.max_line_bytes cannot be zero (all output would be swallowed)".into(),
             ));
         }
-        if self.max_script_body_bytes == Some(0) {
-            return Err(InvalidRunnerConfig(
-                "max_script_body_bytes cannot be zero (all scripts would be rejected)".into(),
-            ));
+        if let Some(max) = self.max_script_body_bytes
+            && (max == 0 || max > MAX_SCRIPT_BODY_BYTES)
+        {
+            return Err(InvalidRunnerConfig(format!(
+                "max_script_body_bytes must be in 1..={MAX_SCRIPT_BODY_BYTES}, got {max}"
+            )));
         }
         if let Some(security) = &self.security {
             security.validate()?;
@@ -544,6 +547,14 @@ mod tests {
         let cfg = SubprocessBackendConfig::new().with_max_script_body_bytes(0);
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("max_script_body_bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn max_script_body_bytes_above_hard_limit_rejected() {
+        let cfg =
+            SubprocessBackendConfig::new().with_max_script_body_bytes(MAX_SCRIPT_BODY_BYTES + 1);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("1..="), "got: {err}");
     }
 
     #[test]

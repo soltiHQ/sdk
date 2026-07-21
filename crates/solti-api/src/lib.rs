@@ -1,7 +1,8 @@
 //! # solti-api - task management API.
 //!
 //! Dual-transport API layer exposing task operations over gRPC and HTTP.
-//! Both transports share the same wire types generated from `proto/solti/task/v1/*.proto` and delegate to an [`ApiHandler`] implementation.
+//! HTTP uses the model-owned CRD JSON representation; gRPC uses versioned
+//! protobuf DTOs. Both delegate domain values to the same [`ApiHandler`].
 //!
 //! | feature        | capability                                      |
 //! |----------------|-------------------------------------------------|
@@ -64,18 +65,23 @@ macro_rules! solti_api_major {
     };
 }
 
-/// Compose a compile-time URL path rooted at `/api/v<API_MAJOR>`.
+/// Compose a compile-time Kubernetes named-group URL rooted at
+/// `/apis/solti.io/v<API_MAJOR>`.
 #[cfg(feature = "http")]
 #[doc(hidden)]
 #[macro_export]
 macro_rules! api_url {
     ($path:literal) => {
-        concat!("/api/v", $crate::solti_api_major!(), $path)
+        concat!("/apis/solti.io/v", $crate::solti_api_major!(), $path)
     };
 }
 
 /// Current API protocol version.
 pub const API_VERSION: u32 = solti_api_major!();
+
+/// Root path of the HTTP API's Kubernetes named group.
+#[cfg(feature = "http")]
+pub const HTTP_API_ROOT: &str = api_url!("");
 
 /// Maximum accepted request body / message size for both HTTP and gRPC transports. **4 MiB.**
 pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
@@ -98,10 +104,9 @@ pub use metrics::{
     ApiMetricsBackend, ApiMetricsHandle, NoOpApiMetrics, Transport, noop_api_metrics,
 };
 
-// Generated prost/pbjson output carries no doc comments; suppress the doc
+// Generated prost output carries no doc comments; suppress the doc
 // lints on this module only. Never suppress them crate-wide.
-#[cfg(any(feature = "grpc", feature = "http"))]
-#[cfg_attr(not(feature = "grpc"), allow(dead_code))]
+#[cfg(feature = "grpc")]
 #[allow(missing_docs)]
 #[allow(rustdoc::all)]
 pub(crate) mod proto_api {
@@ -111,33 +116,31 @@ pub(crate) mod proto_api {
         solti_api_major!(),
         ".rs"
     ));
-
-    #[cfg(feature = "http")]
-    include!(concat!(
-        env!("OUT_DIR"),
-        "/solti.task.v",
-        solti_api_major!(),
-        ".serde.rs"
-    ));
 }
 
 #[cfg(any(feature = "grpc", feature = "http"))]
 mod auth;
 
-#[cfg(any(feature = "grpc", feature = "http"))]
+#[cfg(feature = "grpc")]
 mod convert;
 
 #[cfg(any(feature = "grpc", feature = "http"))]
 mod validate;
 
+#[cfg(any(feature = "grpc", feature = "http", feature = "core-adapter"))]
+mod visibility;
+
 #[cfg(feature = "grpc")]
-mod grpc;
+pub mod grpc;
 
 #[cfg(feature = "grpc")]
 pub use grpc::{BearerAuth, GrpcApi, GrpcServer, TaskApiService};
 
 #[cfg(feature = "grpc")]
 pub use proto_api::task_service_server::TaskServiceServer;
+
+#[cfg(feature = "grpc")]
+pub use proto_api::task_service_client::TaskServiceClient;
 
 #[cfg(feature = "grpc")]
 pub use tonic;
@@ -165,6 +168,18 @@ mod api_major_guard {
             super::API_VERSION.to_string(),
             env!("SOLTI_API_MAJOR"),
             "lib.rs solti_api_major!() must match build.rs API_MAJOR",
+        );
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn http_api_root_uses_the_current_named_group_version() {
+        assert_eq!(super::HTTP_API_ROOT, "/apis/solti.io/v1");
+        assert_eq!(super::api_url!("/tasks"), "/apis/solti.io/v1/tasks");
+        assert_eq!(
+            super::HTTP_API_ROOT.strip_prefix("/apis/"),
+            Some(solti_model::TASK_API_VERSION),
+            "HTTP named group must match the Task resource apiVersion",
         );
     }
 }

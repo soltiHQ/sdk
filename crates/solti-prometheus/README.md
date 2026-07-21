@@ -108,12 +108,14 @@ Enable the `server` feature to build a supervised embedded task that serves `/me
 use std::sync::Arc;
 use solti_prometheus::{Registry, server};
 
+# fn main() -> Result<(), solti_model::ModelError> {
 let registry = Arc::new(Registry::new());
-let (task, spec) = server(registry, "0.0.0.0:9090");
+let (task_ref, manifest) = server(registry, "0.0.0.0:9090", "my-agent@v1")?;
 
 // Submit to solti-core:
-// supervisor.submit_with_task(task, &spec).await?;
-# let _ = (task, spec);
+// supervisor.create_with_task(manifest, task_ref).await?;
+# let _ = (task_ref, manifest);
+# Ok(()) }
 ```
 
 ## What Ships

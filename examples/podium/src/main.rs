@@ -45,8 +45,8 @@ use solti::core::{StateConfig, SupervisorApi};
 use solti::discover::{self, DiscoverConfig, DiscoveryTransport, MonotonicUptime};
 use solti::exec::subprocess::register_subprocess_runner;
 use solti::model::{
-    AdmissionPolicy, AgentId, Flag, RestartPolicy, RunnerEnv, SubprocessMode, SubprocessSpec,
-    TaskEnv, TaskKind, TaskSpec,
+    AdmissionPolicy, AgentId, Flag, RestartPolicy, SubprocessMode, SubprocessSpec, TaskEnv,
+    TaskManifest, TaskSpec, TaskWorkload,
 };
 use solti::observe::{
     LoggerConfig, LoggerLevel, LoggerTimeZone, init_local_offset, init_logger, timezone_sync,
@@ -56,7 +56,7 @@ use solti::prometheus::{
     PrometheusSubscriber, Registry, register_build_info, register_process_collector,
     server as metrics_server,
 };
-use solti::runner::{BuildContext, RunnerRouter};
+use solti::runner::{BuildContext, RunnerEnv, RunnerRouter};
 use solti::taskvisor::{ControllerConfig, Subscribe, SupervisorConfig, TracingBridge};
 
 use crate::config::{Config, Transport};
@@ -120,16 +120,22 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     let state_collector = PrometheusStateCollector::new(supervisor.state())?;
     registry.register(Box::new(state_collector))?;
 
-    // Internal tasks use direct submission and then the same supervised runtime lifecycle.
-    let (tz_task, tz_spec) = timezone_sync();
-    supervisor.submit_with_task(tz_task, &tz_spec).await?;
+    // Embedded resources use a prebuilt runtime task and the same supervised lifecycle.
+    let (tz_task_ref, tz_task) = timezone_sync();
+    supervisor.create_with_task(tz_task, tz_task_ref).await?;
 
-    let (m_task, m_spec) = metrics_server(registry.clone(), METRICS_ADDR);
-    supervisor.submit_with_task(m_task, &m_spec).await?;
+    let (metrics_task_ref, metrics_task) = metrics_server(
+        registry.clone(),
+        METRICS_ADDR,
+        concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")),
+    )?;
+    supervisor
+        .create_with_task(metrics_task, metrics_task_ref)
+        .await?;
 
     // --- Optional local demo task; the agent does something on its own ---
     if cfg.task.enabled {
-        let kind = TaskKind::Subprocess(SubprocessSpec::new(
+        let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
             SubprocessMode::Command {
                 command: cfg.task.command.clone(),
                 args: cfg.task.args.clone(),
@@ -138,11 +144,13 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             None,
             Flag::enabled(),
         ));
-        let spec = TaskSpec::builder(cfg.task.name.as_str(), kind, 86_400_000u64) // per-attempt timeout (ms): 24h
+        let spec = TaskSpec::builder(cfg.task.name.as_str(), workload, 86_400_000u64) // per-attempt timeout (ms): 24h
             .restart(RestartPolicy::always())
             .admission(AdmissionPolicy::Replace)
             .build()?;
-        supervisor.submit(&spec).await?;
+        supervisor
+            .create_task(TaskManifest::new(cfg.task.name.as_str(), spec)?)
+            .await?;
         info!("submitted demo task '{}'", cfg.task.name);
     }
 
@@ -179,8 +187,10 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(tls) = client_tls {
         discover = discover.with_tls(tls);
     }
-    let (sync_task, sync_spec) = discover::sync(discover.build()?, uptime)?;
-    supervisor.submit_with_task(sync_task, &sync_spec).await?;
+    let (sync_task_ref, sync_task) = discover::sync(discover.build()?, uptime)?;
+    supervisor
+        .create_with_task(sync_task, sync_task_ref)
+        .await?;
 
     // --- API: control plane → agent ---
     let api_metrics: Arc<dyn ApiMetricsBackend> =

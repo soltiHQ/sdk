@@ -14,7 +14,6 @@ license.workspace = true
 [features]
 default    = []
 subprocess = [
-    "dep:base64",
     "dep:bytes",
     "dep:libc",
     "dep:solti-model",
@@ -31,7 +30,6 @@ subprocess = [
 seccomp    = ["subprocess", "dep:seccompiler"]
 
 [dependencies]
-base64     = { workspace = true, optional = true }
 bytes      = { workspace = true, optional = true }
 libc       = { workspace = true, optional = true }
 tempfile   = { workspace = true, optional = true }
@@ -48,6 +46,7 @@ solti-runner = { workspace = true, optional = true }
 seccompiler = { workspace = true, optional = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 taskvisor = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 

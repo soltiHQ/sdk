@@ -6,10 +6,10 @@
 //! |-----------------|--------------------------------------------------------------|---------------------------------------------|
 //! | `policy/`       | [`RestartPolicy`], [`BackoffPolicy`], [`AdmissionPolicy`]    | Lifecycle and concurrency policies          |
 //! | `selector/`     | [`RunnerSelector`], [`SelectorRequirement`]                  | K8s-style label selector for runner routing |
-//! | `environment/`  | [`TaskEnv`], [`RunnerEnv`], [`merge_env`]                    | Env-var handling with runner-wins merge     |
+//! | `environment/`  | [`TaskEnv`]                                                  | Task-provided environment variables         |
 //! | `query/`        | [`TaskQuery`], [`TaskPage`]                                  | Filtered, paginated task listing            |
 //! | `identity/`     | [`AgentId`], [`Slot`], [`TaskId`]                            | Resource identity (`Arc<str>`)              |
-//! | `kind/`         | [`TaskKind`]                                                 | Execution backend enum                      |
+//! | `kind/`         | [`TaskWorkload`]                                             | Typed and extensible workload model         |
 //! | `label`         | [`Labels`]                                                   | Key-value metadata (`BTreeMap`)             |
 //! | `flag`          | [`Flag`]                                                     | Boolean toggle                              |
 //! | `kv`            | [`KeyValue`]                                                 | Generic key-value pair                      |
@@ -18,8 +18,8 @@
 
 mod kind;
 pub use kind::{
-    ContainerSpec, MAX_SCRIPT_BODY_BYTES, Runtime, SubprocessMode, SubprocessSpec, TaskKind,
-    WasmSpec,
+    ContainerSpec, EmbeddedSpec, ExtensionWorkload, MAX_SCRIPT_BODY_BYTES, Runtime, SubprocessMode,
+    SubprocessSpec, TaskWorkload, WORKLOAD_API_VERSION, WasmSpec, WorkloadTypeMeta,
 };
 
 mod identity;
@@ -32,7 +32,7 @@ mod selector;
 pub use selector::{RunnerSelector, SelectorOperator, SelectorRequirement};
 
 mod environment;
-pub use environment::{RunnerEnv, TaskEnv, merge as merge_env};
+pub use environment::TaskEnv;
 
 mod query;
 pub use query::{DEFAULT_LIMIT, MAX_LIMIT, TaskPage, TaskQuery};

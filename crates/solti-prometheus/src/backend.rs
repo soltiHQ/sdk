@@ -29,11 +29,12 @@ use crate::register::{Sub, ms_to_secs};
 ///
 /// ## Labels
 ///
-/// All label sets have low, bounded cardinality:
+/// Built-in labels have bounded cardinality. Applications registering custom
+/// runners must keep their custom runner labels bounded.
 ///
 /// | Label     | Values                                                                                                            | Cardinality |
 /// |-----------|-------------------------------------------------------------------------------------------------------------------|-------------|
-/// | `runner`  | `subprocess`, `wasm`, `container`                                                                                 | Low         |
+/// | `runner`  | `subprocess`, `wasm`, `container`, or an application-defined stable label                                        | App-owned   |
 /// | `outcome` | `success`, `failure`, `canceled`, `timeout`                                                                       | Low         |
 /// | `error`   | `cgroup_prepare_failed`, `backend_config_failed`, `spawn_failed`, `module_load_failed` (from [`RunnerErrorKind`]) | Low         |
 ///
@@ -311,5 +312,19 @@ mod tests {
 
         metrics.record_task_started(RunnerType::Subprocess);
         assert!(!registry.gather().is_empty());
+    }
+
+    #[test]
+    fn custom_runner_type_is_exported_as_its_label() {
+        let metrics = PrometheusMetrics::new_isolated().unwrap();
+        metrics.record_task_started(RunnerType::Custom("image-resize".into()));
+
+        let families = metrics.gather();
+        let started = families
+            .iter()
+            .find(|family| family.name() == "solti_runner_tasks_started_total")
+            .unwrap();
+        let label = started.get_metric()[0].get_label()[0].value();
+        assert_eq!(label, "image-resize");
     }
 }

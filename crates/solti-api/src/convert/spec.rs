@@ -1,40 +1,36 @@
-//! # `TaskSpec` && `CreateSpec` conversion.
+//! # Domain/wire `TaskSpec` conversion.
 //!
 //! This module covers both directions:
 //!
 //! | Direction     | Entry point              | Shape                                      |
 //! |---------------|--------------------------|--------------------------------------------|
-//! | Domain → wire | [`spec_to_proto`]        | used by `task.rs` when building `TaskData` |
-//! | Wire → domain | [`convert_create_spec`]  | gRPC/HTTP submit path                      |
+//! | Domain → wire | [`spec_to_proto`]       | resource responses                         |
+//! | Wire → domain | [`convert_task_spec`]   | create/apply manifests                     |
 
 use std::num::NonZeroU32;
 
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, ContainerSpec, Flag, JitterPolicy, Labels, RestartPolicy,
-    RunnerSelector, Runtime, SelectorOperator, SelectorRequirement, Slot, SubprocessMode,
-    SubprocessSpec, TaskEnv, TaskKind, TaskSpec, WasmSpec,
+    AdmissionPolicy, BackoffPolicy, ContainerSpec, ExtensionWorkload, Flag, JitterPolicy, Labels,
+    RestartPolicy, RunnerSelector, Runtime, SelectorOperator, SelectorRequirement, Slot,
+    SubprocessMode, SubprocessSpec, TaskEnv, TaskSpec, TaskWorkload, WORKLOAD_API_VERSION,
+    WasmSpec,
 };
 
 use crate::error::ApiError;
 use crate::proto_api;
 use crate::validate::{validate_slot, validate_timeout};
 
-/// Build a proto [`proto_api::CreateSpec`] from a domain [`TaskSpec`].
-pub(super) fn spec_to_proto(spec: &TaskSpec) -> Result<proto_api::CreateSpec, ApiError> {
+/// Build a wire [`proto_api::TaskSpec`] from a domain [`TaskSpec`].
+pub(super) fn spec_to_proto(spec: &TaskSpec) -> Result<proto_api::TaskSpec, ApiError> {
     let (restart, restart_interval_ms) = restart_to_proto(spec.restart());
-    Ok(proto_api::CreateSpec {
+    Ok(proto_api::TaskSpec {
         admission: admission_to_proto(spec.admission()) as i32,
         backoff: Some(backoff_to_proto(spec.backoff())),
-        kind: Some(kind_to_proto(spec.kind())?),
+        workload: Some(workload_to_proto(spec.workload())?),
         timeout_ms: spec.timeout().as_millis(),
         slot: spec.slot().to_string(),
         restart: restart as i32,
         restart_interval_ms,
-        labels: spec
-            .labels()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
         max_retries: spec.max_retries().map(NonZeroU32::get),
         runner_selector: spec.runner_selector().map(selector_to_proto),
     })
@@ -69,12 +65,14 @@ fn operator_to_proto(op: SelectorOperator) -> proto_api::SelectorOperator {
     }
 }
 
-fn kind_to_proto(kind: &TaskKind) -> Result<proto_api::TaskKind, ApiError> {
-    let inner = match kind {
-        TaskKind::Subprocess(sub) => {
+pub(crate) fn workload_to_proto(
+    workload: &TaskWorkload,
+) -> Result<proto_api::TaskWorkload, ApiError> {
+    let spec = match workload {
+        TaskWorkload::Subprocess(sub) => {
             let mode = match &sub.mode {
                 SubprocessMode::Command { command, args } => {
-                    proto_api::subprocess_task::Mode::Command(proto_api::CommandMode {
+                    proto_api::subprocess_mode::Mode::Command(proto_api::CommandMode {
                         command: command.clone(),
                         args: args.clone(),
                     })
@@ -85,17 +83,17 @@ fn kind_to_proto(kind: &TaskKind) -> Result<proto_api::TaskKind, ApiError> {
                     args,
                 } => {
                     let runtime_proto = match runtime {
-                        Runtime::Bash => proto_api::script_mode::Runtime::WellKnown(
+                        Runtime::Bash => proto_api::runtime::Runtime::WellKnown(
                             proto_api::ScriptRuntime::Bash as i32,
                         ),
-                        Runtime::Python => proto_api::script_mode::Runtime::WellKnown(
+                        Runtime::Python => proto_api::runtime::Runtime::WellKnown(
                             proto_api::ScriptRuntime::Python as i32,
                         ),
-                        Runtime::Node => proto_api::script_mode::Runtime::WellKnown(
+                        Runtime::Node => proto_api::runtime::Runtime::WellKnown(
                             proto_api::ScriptRuntime::Node as i32,
                         ),
                         Runtime::Custom { command, flag } => {
-                            proto_api::script_mode::Runtime::Custom(proto_api::CustomRuntime {
+                            proto_api::runtime::Runtime::Custom(proto_api::CustomRuntime {
                                 command: command.clone(),
                                 flag: flag.clone(),
                             })
@@ -106,8 +104,10 @@ fn kind_to_proto(kind: &TaskKind) -> Result<proto_api::TaskKind, ApiError> {
                             ));
                         }
                     };
-                    proto_api::subprocess_task::Mode::Script(proto_api::ScriptMode {
-                        runtime: Some(runtime_proto),
+                    proto_api::subprocess_mode::Mode::Script(proto_api::ScriptMode {
+                        runtime: Some(proto_api::Runtime {
+                            runtime: Some(runtime_proto),
+                        }),
                         body: body.clone(),
                         args: args.clone(),
                     })
@@ -118,38 +118,55 @@ fn kind_to_proto(kind: &TaskKind) -> Result<proto_api::TaskKind, ApiError> {
                     ));
                 }
             };
-            proto_api::task_kind::Kind::Subprocess(proto_api::SubprocessTask {
-                mode: Some(mode),
+            proto_api::task_workload::Spec::Subprocess(proto_api::SubprocessTask {
+                mode: Some(proto_api::SubprocessMode { mode: Some(mode) }),
                 env: env_to_proto(&sub.env),
                 cwd: sub.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
                 fail_on_non_zero: sub.fail_on_non_zero.into(),
             })
         }
-        TaskKind::Wasm(w) => proto_api::task_kind::Kind::Wasm(proto_api::WasmTask {
+        TaskWorkload::Wasm(w) => proto_api::task_workload::Spec::Wasm(proto_api::WasmTask {
             module: w.module.to_string_lossy().to_string(),
             env: env_to_proto(&w.env),
             args: w.args.clone(),
         }),
-        TaskKind::Container(c) => proto_api::task_kind::Kind::Container(proto_api::ContainerTask {
-            command: c.command.clone().unwrap_or_default(),
-            env: env_to_proto(&c.env),
-            image: c.image.clone(),
-            args: c.args.clone(),
-        }),
-        TaskKind::Embedded => {
-            return Err(ApiError::InvalidRequest(
-                "embedded tasks have no wire representation and cannot cross the API boundary"
-                    .into(),
+        TaskWorkload::Container(c) => {
+            proto_api::task_workload::Spec::Container(proto_api::ContainerTask {
+                command: c.command.as_ref().map(|items| proto_api::ContainerCommand {
+                    items: items.clone(),
+                }),
+                env: env_to_proto(&c.env),
+                image: c.image.clone(),
+                args: c.args.clone(),
+            })
+        }
+        TaskWorkload::Embedded(_) => {
+            return Err(ApiError::Internal(
+                "handler returned an Embedded workload with no wire representation".into(),
             ));
         }
-        other => {
-            return Err(ApiError::Internal(format!(
-                "unsupported task kind variant: {:?}",
-                other
-            )));
+        TaskWorkload::Extension(extension) => {
+            proto_api::task_workload::Spec::Extension(proto_api::ExtensionTask {
+                spec: Some(proto_api::RawExtension {
+                    raw: serde_json::to_vec(extension.spec()).map_err(|error| {
+                        ApiError::Internal(format!(
+                            "failed to encode extension workload spec: {error}"
+                        ))
+                    })?,
+                }),
+            })
+        }
+        _ => {
+            return Err(ApiError::Internal(
+                "handler returned a workload kind with no public wire representation".into(),
+            ));
         }
     };
-    Ok(proto_api::TaskKind { kind: Some(inner) })
+    Ok(proto_api::TaskWorkload {
+        api_version: workload.api_version().to_owned(),
+        kind: workload.kind().to_owned(),
+        spec: Some(spec),
+    })
 }
 
 fn env_to_proto(env: &TaskEnv) -> Vec<proto_api::KeyValue> {
@@ -195,7 +212,7 @@ fn admission_to_proto(policy: AdmissionPolicy) -> proto_api::AdmissionPolicy {
     }
 }
 
-/// Convert a proto [`proto_api::CreateSpec`] into a domain [`TaskSpec`].
+/// Convert a wire [`proto_api::TaskSpec`] into a domain [`TaskSpec`].
 ///
 /// Single validation gate for both transports: every submit/apply request passes through here.
 ///
@@ -207,16 +224,13 @@ fn admission_to_proto(policy: AdmissionPolicy) -> proto_api::AdmissionPolicy {
 ///   - `UNSPECIFIED` / out-of-range enum value (restart, admission, jitter, selector operator);
 ///   - kind-specific field rejected (empty command, empty script body, empty wasm module path, empty container image);
 ///   - the final `TaskSpec::build` validation failed (e.g. backoff `factor < 1.0`).
-pub fn convert_create_spec(spec: proto_api::CreateSpec) -> Result<TaskSpec, ApiError> {
-    let slot: Slot = validate_slot(spec.slot)?.into();
+pub fn convert_task_spec(spec: proto_api::TaskSpec) -> Result<TaskSpec, ApiError> {
+    let slot: Slot = validate_slot(spec.slot)?;
 
-    let kind = spec
-        .kind
-        .ok_or_else(|| ApiError::InvalidRequest("missing task kind".into()))?
-        .kind
-        .ok_or_else(|| ApiError::InvalidRequest("missing task kind variant".into()))?;
-
-    let task_kind = convert_task_kind(kind)?;
+    let workload = spec
+        .workload
+        .ok_or_else(|| ApiError::InvalidRequest("missing task workload".into()))?;
+    let task_workload = convert_task_workload(workload)?;
 
     let restart = convert_restart_policy(
         proto_api::RestartPolicy::try_from(spec.restart)
@@ -238,14 +252,13 @@ pub fn convert_create_spec(spec: proto_api::CreateSpec) -> Result<TaskSpec, ApiE
         Some(n) => NonZeroU32::new(n),
     };
 
-    let mut builder = TaskSpec::builder(slot, task_kind, validate_timeout(spec.timeout_ms)?)
+    let mut builder = TaskSpec::builder(slot, task_workload, validate_timeout(spec.timeout_ms)?)
         .restart(restart)
         .backoff(convert_backoff_policy(backoff)?)
         .admission(convert_admission_policy(
             proto_api::AdmissionPolicy::try_from(spec.admission)
                 .map_err(|_| ApiError::InvalidRequest("invalid admission strategy".into()))?,
         )?)
-        .labels(convert_labels(spec.labels))
         .max_retries(max_retries);
 
     if let Some(sel) = spec.runner_selector {
@@ -290,25 +303,40 @@ fn convert_runner_selector(sel: proto_api::RunnerSelector) -> Result<RunnerSelec
     })
 }
 
-fn convert_task_kind(kind: proto_api::task_kind::Kind) -> Result<TaskKind, ApiError> {
-    match kind {
-        proto_api::task_kind::Kind::Subprocess(sub) => {
+pub(crate) fn convert_task_workload(
+    workload: proto_api::TaskWorkload,
+) -> Result<TaskWorkload, ApiError> {
+    let api_version = workload.api_version;
+    let kind = workload.kind;
+    let spec = workload
+        .spec
+        .ok_or_else(|| ApiError::InvalidRequest("missing workload spec".into()))?;
+
+    match spec {
+        proto_api::task_workload::Spec::Subprocess(sub) => {
+            validate_builtin_workload_gvk(&api_version, &kind, "Subprocess")?;
             let mode = sub
                 .mode
                 .ok_or_else(|| ApiError::InvalidRequest("missing subprocess mode".into()))?;
+            let mode = mode
+                .mode
+                .ok_or_else(|| ApiError::InvalidRequest("missing typed subprocess mode".into()))?;
 
             let subprocess_mode = match mode {
-                proto_api::subprocess_task::Mode::Command(cmd) => SubprocessMode::Command {
+                proto_api::subprocess_mode::Mode::Command(cmd) => SubprocessMode::Command {
                     command: cmd.command,
                     args: cmd.args,
                 },
-                proto_api::subprocess_task::Mode::Script(script) => {
+                proto_api::subprocess_mode::Mode::Script(script) => {
                     let runtime = script
                         .runtime
                         .ok_or_else(|| ApiError::InvalidRequest("missing script runtime".into()))?;
+                    let runtime = runtime.runtime.ok_or_else(|| {
+                        ApiError::InvalidRequest("missing typed script runtime".into())
+                    })?;
 
                     let runtime = match runtime {
-                        proto_api::script_mode::Runtime::WellKnown(val) => {
+                        proto_api::runtime::Runtime::WellKnown(val) => {
                             match proto_api::ScriptRuntime::try_from(val) {
                                 Ok(proto_api::ScriptRuntime::Bash) => Runtime::Bash,
                                 Ok(proto_api::ScriptRuntime::Python) => Runtime::Python,
@@ -320,7 +348,7 @@ fn convert_task_kind(kind: proto_api::task_kind::Kind) -> Result<TaskKind, ApiEr
                                 }
                             }
                         }
-                        proto_api::script_mode::Runtime::Custom(c) => Runtime::Custom {
+                        proto_api::runtime::Runtime::Custom(c) => Runtime::Custom {
                             command: c.command,
                             flag: c.flag,
                         },
@@ -338,41 +366,70 @@ fn convert_task_kind(kind: proto_api::task_kind::Kind) -> Result<TaskKind, ApiEr
                 .validate()
                 .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
 
-            Ok(TaskKind::Subprocess(SubprocessSpec::new(
+            Ok(TaskWorkload::Subprocess(SubprocessSpec::new(
                 subprocess_mode,
                 convert_env(sub.env),
                 sub.cwd.map(std::path::PathBuf::from),
                 Flag::from(sub.fail_on_non_zero),
             )))
         }
-        proto_api::task_kind::Kind::Wasm(wasm) => {
+        proto_api::task_workload::Spec::Wasm(wasm) => {
+            validate_builtin_workload_gvk(&api_version, &kind, "Wasm")?;
             if wasm.module.trim().is_empty() {
                 return Err(ApiError::InvalidRequest("wasm module path is empty".into()));
             }
 
-            Ok(TaskKind::Wasm(WasmSpec::new(
+            Ok(TaskWorkload::Wasm(WasmSpec::new(
                 std::path::PathBuf::from(wasm.module),
                 wasm.args,
                 convert_env(wasm.env),
             )))
         }
-        proto_api::task_kind::Kind::Container(cont) => {
+        proto_api::task_workload::Spec::Container(cont) => {
+            validate_builtin_workload_gvk(&api_version, &kind, "Container")?;
             if cont.image.trim().is_empty() {
                 return Err(ApiError::InvalidRequest("container image is empty".into()));
             }
 
-            Ok(TaskKind::Container(ContainerSpec::new(
+            Ok(TaskWorkload::Container(ContainerSpec::new(
                 cont.image,
-                if cont.command.is_empty() {
-                    None
-                } else {
-                    Some(cont.command)
-                },
+                cont.command.map(|command| command.items),
                 cont.args,
                 convert_env(cont.env),
             )))
         }
+        proto_api::task_workload::Spec::Extension(extension) => {
+            let spec = extension.spec.ok_or_else(|| {
+                ApiError::InvalidRequest("missing extension workload spec".into())
+            })?;
+            let spec = serde_json::from_slice(&spec.raw).map_err(|error| {
+                ApiError::InvalidRequest(format!(
+                    "extension workload spec is not valid UTF-8 JSON: {error}"
+                ))
+            })?;
+            ExtensionWorkload::new(api_version, kind, spec)
+                .map(TaskWorkload::Extension)
+                .map_err(|error| ApiError::InvalidRequest(error.to_string()))
+        }
     }
+}
+
+fn validate_builtin_workload_gvk(
+    api_version: &str,
+    kind: &str,
+    expected_kind: &str,
+) -> Result<(), ApiError> {
+    if api_version != WORKLOAD_API_VERSION {
+        return Err(ApiError::InvalidRequest(format!(
+            "unsupported built-in workload apiVersion `{api_version}`",
+        )));
+    }
+    if kind != expected_kind {
+        return Err(ApiError::InvalidRequest(format!(
+            "workload kind `{kind}` does not match `{expected_kind}` spec",
+        )));
+    }
+    Ok(())
 }
 
 fn convert_env(kvs: Vec<proto_api::KeyValue>) -> TaskEnv {
@@ -441,7 +498,7 @@ fn convert_admission_policy(
     }
 }
 
-fn convert_labels(map: std::collections::HashMap<String, String>) -> Labels {
+pub(super) fn convert_labels(map: std::collections::HashMap<String, String>) -> Labels {
     let mut labels = Labels::new();
     for (k, v) in map {
         labels.insert(k, v);
@@ -454,25 +511,34 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn make_subprocess_kind(command: &str) -> proto_api::TaskKind {
-        proto_api::TaskKind {
-            kind: Some(proto_api::task_kind::Kind::Subprocess(
-                proto_api::SubprocessTask {
-                    mode: Some(proto_api::subprocess_task::Mode::Command(
+    fn make_workload(kind: &str, spec: proto_api::task_workload::Spec) -> proto_api::TaskWorkload {
+        proto_api::TaskWorkload {
+            api_version: WORKLOAD_API_VERSION.to_owned(),
+            kind: kind.to_owned(),
+            spec: Some(spec),
+        }
+    }
+
+    fn make_subprocess_workload(command: &str) -> proto_api::TaskWorkload {
+        make_workload(
+            "Subprocess",
+            proto_api::task_workload::Spec::Subprocess(proto_api::SubprocessTask {
+                mode: Some(proto_api::SubprocessMode {
+                    mode: Some(proto_api::subprocess_mode::Mode::Command(
                         proto_api::CommandMode {
                             command: command.to_string(),
                             args: vec!["-l".to_string()],
                         },
                     )),
-                    env: vec![proto_api::KeyValue {
-                        key: "PATH".to_string(),
-                        value: "/usr/bin".to_string(),
-                    }],
-                    cwd: Some("/tmp".to_string()),
-                    fail_on_non_zero: true,
-                },
-            )),
-        }
+                }),
+                env: vec![proto_api::KeyValue {
+                    key: "PATH".to_string(),
+                    value: "/usr/bin".to_string(),
+                }],
+                cwd: Some("/tmp".to_string()),
+                fail_on_non_zero: true,
+            }),
+        )
     }
 
     fn make_backoff() -> proto_api::BackoffPolicy {
@@ -484,27 +550,26 @@ mod tests {
         }
     }
 
-    fn make_valid_create_spec() -> proto_api::CreateSpec {
-        proto_api::CreateSpec {
+    fn make_valid_task_spec() -> proto_api::TaskSpec {
+        proto_api::TaskSpec {
             slot: "test-slot".to_string(),
-            kind: Some(make_subprocess_kind("ls")),
+            workload: Some(make_subprocess_workload("ls")),
             timeout_ms: 5_000,
             restart: proto_api::RestartPolicy::OnFailure as i32,
             restart_interval_ms: None,
             backoff: Some(make_backoff()),
             admission: proto_api::AdmissionPolicy::DropIfRunning as i32,
-            labels: HashMap::new(),
             max_retries: None,
             runner_selector: None,
         }
     }
 
     #[test]
-    fn create_spec_max_retries_round_trips() {
-        let mut proto = make_valid_create_spec();
+    fn task_spec_max_retries_round_trips() {
+        let mut proto = make_valid_task_spec();
         proto.max_retries = Some(3);
 
-        let spec = convert_create_spec(proto).unwrap();
+        let spec = convert_task_spec(proto).unwrap();
         assert_eq!(spec.max_retries().map(NonZeroU32::get), Some(3));
 
         let back = spec_to_proto(&spec).unwrap();
@@ -512,17 +577,17 @@ mod tests {
     }
 
     #[test]
-    fn create_spec_zero_max_retries_is_rejected() {
-        let mut proto = make_valid_create_spec();
+    fn task_spec_zero_max_retries_is_rejected() {
+        let mut proto = make_valid_task_spec();
         proto.max_retries = Some(0);
 
-        let err = convert_create_spec(proto).unwrap_err();
+        let err = convert_task_spec(proto).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("max_retries")));
     }
 
     #[test]
-    fn create_spec_runner_selector_round_trips() {
-        let mut proto = make_valid_create_spec();
+    fn task_spec_runner_selector_round_trips() {
+        let mut proto = make_valid_task_spec();
         proto.runner_selector = Some(proto_api::RunnerSelector {
             match_labels: HashMap::from([("zone".to_string(), "eu".to_string())]),
             match_expressions: vec![proto_api::SelectorRequirement {
@@ -532,7 +597,7 @@ mod tests {
             }],
         });
 
-        let spec = convert_create_spec(proto).unwrap();
+        let spec = convert_task_spec(proto).unwrap();
         let sel = spec
             .runner_selector()
             .expect("selector must survive convert");
@@ -552,8 +617,8 @@ mod tests {
     }
 
     #[test]
-    fn create_spec_invalid_selector_operator_is_rejected() {
-        let mut proto = make_valid_create_spec();
+    fn task_spec_invalid_selector_operator_is_rejected() {
+        let mut proto = make_valid_task_spec();
         proto.runner_selector = Some(proto_api::RunnerSelector {
             match_labels: HashMap::new(),
             match_expressions: vec![proto_api::SelectorRequirement {
@@ -563,18 +628,18 @@ mod tests {
             }],
         });
 
-        let err = convert_create_spec(proto).unwrap_err();
+        let err = convert_task_spec(proto).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("arch")));
     }
 
     #[test]
-    fn create_spec_subprocess_valid() {
-        let cs = convert_create_spec(make_valid_create_spec()).unwrap();
+    fn task_spec_subprocess_valid() {
+        let cs = convert_task_spec(make_valid_task_spec()).unwrap();
         assert_eq!(cs.slot(), "test-slot");
         assert_eq!(cs.timeout().as_millis(), 5_000);
         assert!(matches!(
-            cs.kind(),
-            TaskKind::Subprocess(SubprocessSpec { mode: SubprocessMode::Command { command, .. }, .. }) if command == "ls"
+            cs.workload(),
+            TaskWorkload::Subprocess(SubprocessSpec { mode: SubprocessMode::Command { command, .. }, .. }) if command == "ls"
         ));
         assert!(matches!(cs.restart(), RestartPolicy::OnFailure));
         assert!(matches!(cs.admission(), AdmissionPolicy::DropIfRunning));
@@ -583,77 +648,192 @@ mod tests {
     }
 
     #[test]
-    fn create_spec_wasm_valid() {
-        let spec = proto_api::CreateSpec {
-            kind: Some(proto_api::TaskKind {
-                kind: Some(proto_api::task_kind::Kind::Wasm(proto_api::WasmTask {
+    fn task_spec_wasm_valid() {
+        let spec = proto_api::TaskSpec {
+            workload: Some(make_workload(
+                "Wasm",
+                proto_api::task_workload::Spec::Wasm(proto_api::WasmTask {
                     module: "/app/module.wasm".to_string(),
                     args: vec!["--verbose".to_string()],
                     env: vec![],
-                })),
-            }),
-            ..make_valid_create_spec()
+                }),
+            )),
+            ..make_valid_task_spec()
         };
 
-        let cs = convert_create_spec(spec).unwrap();
+        let cs = convert_task_spec(spec).unwrap();
         assert!(
-            matches!(cs.kind(), TaskKind::Wasm(WasmSpec { module, .. }) if module.to_str() == Some("/app/module.wasm"))
+            matches!(cs.workload(), TaskWorkload::Wasm(WasmSpec { module, .. }) if module.to_str() == Some("/app/module.wasm"))
         );
     }
 
     #[test]
-    fn create_spec_container_valid() {
-        let spec = proto_api::CreateSpec {
-            kind: Some(proto_api::TaskKind {
-                kind: Some(proto_api::task_kind::Kind::Container(
-                    proto_api::ContainerTask {
-                        image: "alpine:latest".to_string(),
-                        command: vec!["sh".to_string(), "-c".to_string()],
-                        args: vec!["echo hello".to_string()],
-                        env: vec![],
-                    },
-                )),
-            }),
-            ..make_valid_create_spec()
+    fn task_spec_container_valid() {
+        let spec = proto_api::TaskSpec {
+            workload: Some(make_workload(
+                "Container",
+                proto_api::task_workload::Spec::Container(proto_api::ContainerTask {
+                    image: "alpine:latest".to_string(),
+                    command: Some(proto_api::ContainerCommand {
+                        items: vec!["sh".to_string(), "-c".to_string()],
+                    }),
+                    args: vec!["echo hello".to_string()],
+                    env: vec![],
+                }),
+            )),
+            ..make_valid_task_spec()
         };
 
-        let cs = convert_create_spec(spec).unwrap();
+        let cs = convert_task_spec(spec).unwrap();
         assert!(
-            matches!(cs.kind(), TaskKind::Container(ContainerSpec { image, .. }) if image == "alpine:latest")
+            matches!(cs.workload(), TaskWorkload::Container(ContainerSpec { image, .. }) if image == "alpine:latest")
         );
     }
 
     #[test]
-    fn create_spec_container_empty_command_becomes_none() {
-        let spec = proto_api::CreateSpec {
-            kind: Some(proto_api::TaskKind {
-                kind: Some(proto_api::task_kind::Kind::Container(
-                    proto_api::ContainerTask {
-                        image: "nginx".to_string(),
-                        command: vec![],
-                        args: vec![],
-                        env: vec![],
-                    },
-                )),
-            }),
-            ..make_valid_create_spec()
+    fn task_spec_container_absent_command_becomes_none() {
+        let spec = proto_api::TaskSpec {
+            workload: Some(make_workload(
+                "Container",
+                proto_api::task_workload::Spec::Container(proto_api::ContainerTask {
+                    image: "nginx".to_string(),
+                    command: None,
+                    args: vec![],
+                    env: vec![],
+                }),
+            )),
+            ..make_valid_task_spec()
         };
 
-        let cs = convert_create_spec(spec).unwrap();
+        let cs = convert_task_spec(spec).unwrap();
         assert!(matches!(
-            cs.kind(),
-            TaskKind::Container(ContainerSpec { command: None, .. })
+            cs.workload(),
+            TaskWorkload::Container(ContainerSpec { command: None, .. })
         ));
     }
 
     #[test]
-    fn create_spec_always_with_interval() {
-        let spec = proto_api::CreateSpec {
+    fn task_spec_container_present_empty_command_stays_some_empty() {
+        let spec = proto_api::TaskSpec {
+            workload: Some(make_workload(
+                "Container",
+                proto_api::task_workload::Spec::Container(proto_api::ContainerTask {
+                    image: "nginx".to_string(),
+                    command: Some(proto_api::ContainerCommand { items: vec![] }),
+                    args: vec![],
+                    env: vec![],
+                }),
+            )),
+            ..make_valid_task_spec()
+        };
+
+        let converted = convert_task_spec(spec).unwrap();
+        assert!(matches!(
+            converted.workload(),
+            TaskWorkload::Container(ContainerSpec { command: Some(command), .. }) if command.is_empty()
+        ));
+
+        let proto = spec_to_proto(&converted).unwrap();
+        let Some(proto_api::task_workload::Spec::Container(container)) =
+            proto.workload.and_then(|workload| workload.spec)
+        else {
+            panic!("expected container workload");
+        };
+        assert_eq!(container.command.unwrap().items, Vec::<String>::new());
+    }
+
+    #[test]
+    fn extension_workload_round_trips_nested_json_object() {
+        let expected = serde_json::json!({
+            "enabled": true,
+            "exactInteger": 9_007_199_254_740_993_u64,
+            "limits": { "cpu": 2.5, "memory": null },
+            "names": ["primary", "replica"]
+        });
+        let workload = TaskWorkload::Extension(
+            ExtensionWorkload::new(
+                "workloads.example.io/v1",
+                "DatabaseBackup",
+                expected.clone(),
+            )
+            .unwrap(),
+        );
+
+        let proto = workload_to_proto(&workload).unwrap();
+        assert_eq!(proto.api_version, "workloads.example.io/v1");
+        assert_eq!(proto.kind, "DatabaseBackup");
+
+        let converted = convert_task_workload(proto).unwrap();
+        let TaskWorkload::Extension(extension) = converted else {
+            panic!("expected extension workload");
+        };
+        assert_eq!(extension.api_version(), "workloads.example.io/v1");
+        assert_eq!(extension.kind(), "DatabaseBackup");
+        assert_eq!(extension.spec(), &expected);
+    }
+
+    #[test]
+    fn extension_workload_uses_model_reserved_gvk_validation() {
+        let proto = proto_api::TaskWorkload {
+            api_version: WORKLOAD_API_VERSION.to_owned(),
+            kind: "Subprocess".into(),
+            spec: Some(proto_api::task_workload::Spec::Extension(
+                proto_api::ExtensionTask {
+                    spec: Some(proto_api::RawExtension {
+                        raw: b"{}".to_vec(),
+                    }),
+                },
+            )),
+        };
+
+        let error = convert_task_workload(proto).unwrap_err();
+        assert!(matches!(error, ApiError::InvalidRequest(message) if message.contains("reserved")));
+    }
+
+    #[test]
+    fn extension_workload_rejects_missing_struct() {
+        let proto = proto_api::TaskWorkload {
+            api_version: "workloads.example.io/v1".into(),
+            kind: "DatabaseBackup".into(),
+            spec: Some(proto_api::task_workload::Spec::Extension(
+                proto_api::ExtensionTask { spec: None },
+            )),
+        };
+
+        let error = convert_task_workload(proto).unwrap_err();
+        assert!(
+            matches!(error, ApiError::InvalidRequest(message) if message.contains("missing extension workload spec"))
+        );
+    }
+
+    #[test]
+    fn extension_workload_rejects_non_object_raw_json() {
+        let proto = proto_api::TaskWorkload {
+            api_version: "workloads.example.io/v1".into(),
+            kind: "DatabaseBackup".into(),
+            spec: Some(proto_api::task_workload::Spec::Extension(
+                proto_api::ExtensionTask {
+                    spec: Some(proto_api::RawExtension {
+                        raw: br#"["not", "an", "object"]"#.to_vec(),
+                    }),
+                },
+            )),
+        };
+
+        let error = convert_task_workload(proto).unwrap_err();
+        assert!(
+            matches!(error, ApiError::InvalidRequest(message) if message.contains("JSON object"))
+        );
+    }
+
+    #[test]
+    fn task_spec_always_with_interval() {
+        let spec = proto_api::TaskSpec {
             restart: proto_api::RestartPolicy::Always as i32,
             restart_interval_ms: Some(5_000),
-            ..make_valid_create_spec()
+            ..make_valid_task_spec()
         };
-        let cs = convert_create_spec(spec).unwrap();
+        let cs = convert_task_spec(spec).unwrap();
         assert!(matches!(
             cs.restart(),
             RestartPolicy::Always {
@@ -663,13 +843,13 @@ mod tests {
     }
 
     #[test]
-    fn create_spec_always_without_interval() {
-        let spec = proto_api::CreateSpec {
+    fn task_spec_always_without_interval() {
+        let spec = proto_api::TaskSpec {
             restart: proto_api::RestartPolicy::Always as i32,
             restart_interval_ms: None,
-            ..make_valid_create_spec()
+            ..make_valid_task_spec()
         };
-        let cs = convert_create_spec(spec).unwrap();
+        let cs = convert_task_spec(spec).unwrap();
         assert!(matches!(
             cs.restart(),
             RestartPolicy::Always { interval_ms: None }
@@ -677,26 +857,21 @@ mod tests {
     }
 
     #[test]
-    fn create_spec_with_labels() {
+    fn metadata_labels_convert() {
         let mut labels = HashMap::new();
         labels.insert("runner-name".to_string(), "gpu".to_string());
         labels.insert("env".to_string(), "prod".to_string());
 
-        let spec = proto_api::CreateSpec {
-            labels,
-            ..make_valid_create_spec()
-        };
-
-        let cs = convert_create_spec(spec).unwrap();
-        assert_eq!(cs.labels().get("runner-name"), Some("gpu"));
-        assert_eq!(cs.labels().get("env"), Some("prod"));
+        let labels = convert_labels(labels);
+        assert_eq!(labels.get("runner-name"), Some("gpu"));
+        assert_eq!(labels.get("env"), Some("prod"));
     }
 
     #[test]
-    fn create_spec_env_conversion() {
-        let cs = convert_create_spec(make_valid_create_spec()).unwrap();
-        match cs.kind() {
-            TaskKind::Subprocess(SubprocessSpec { env, .. }) => {
+    fn task_spec_env_conversion() {
+        let cs = convert_task_spec(make_valid_task_spec()).unwrap();
+        match cs.workload() {
+            TaskWorkload::Subprocess(SubprocessSpec { env, .. }) => {
                 assert_eq!(env.get("PATH"), Some("/usr/bin"));
             }
             _ => panic!("expected subprocess kind"),
@@ -704,35 +879,38 @@ mod tests {
     }
 
     #[test]
-    fn create_spec_subprocess_script_bash() {
+    fn task_spec_subprocess_script_bash() {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
-        let spec = proto_api::CreateSpec {
-            kind: Some(proto_api::TaskKind {
-                kind: Some(proto_api::task_kind::Kind::Subprocess(
-                    proto_api::SubprocessTask {
-                        mode: Some(proto_api::subprocess_task::Mode::Script(
+        let spec = proto_api::TaskSpec {
+            workload: Some(make_workload(
+                "Subprocess",
+                proto_api::task_workload::Spec::Subprocess(proto_api::SubprocessTask {
+                    mode: Some(proto_api::SubprocessMode {
+                        mode: Some(proto_api::subprocess_mode::Mode::Script(
                             proto_api::ScriptMode {
-                                runtime: Some(proto_api::script_mode::Runtime::WellKnown(
-                                    proto_api::ScriptRuntime::Bash as i32,
-                                )),
+                                runtime: Some(proto_api::Runtime {
+                                    runtime: Some(proto_api::runtime::Runtime::WellKnown(
+                                        proto_api::ScriptRuntime::Bash as i32,
+                                    )),
+                                }),
                                 body: BASE64.encode(b"echo hello"),
                                 args: vec![],
                             },
                         )),
-                        env: vec![],
-                        cwd: None,
-                        fail_on_non_zero: true,
-                    },
-                )),
-            }),
-            ..make_valid_create_spec()
+                    }),
+                    env: vec![],
+                    cwd: None,
+                    fail_on_non_zero: true,
+                }),
+            )),
+            ..make_valid_task_spec()
         };
 
-        let cs = convert_create_spec(spec).unwrap();
-        match cs.kind() {
-            TaskKind::Subprocess(SubprocessSpec { mode, .. }) => {
+        let cs = convert_task_spec(spec).unwrap();
+        match cs.workload() {
+            TaskWorkload::Subprocess(SubprocessSpec { mode, .. }) => {
                 assert!(matches!(
                     mode,
                     SubprocessMode::Script {
@@ -746,38 +924,41 @@ mod tests {
     }
 
     #[test]
-    fn create_spec_subprocess_script_custom_runtime() {
+    fn task_spec_subprocess_script_custom_runtime() {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
-        let spec = proto_api::CreateSpec {
-            kind: Some(proto_api::TaskKind {
-                kind: Some(proto_api::task_kind::Kind::Subprocess(
-                    proto_api::SubprocessTask {
-                        mode: Some(proto_api::subprocess_task::Mode::Script(
+        let spec = proto_api::TaskSpec {
+            workload: Some(make_workload(
+                "Subprocess",
+                proto_api::task_workload::Spec::Subprocess(proto_api::SubprocessTask {
+                    mode: Some(proto_api::SubprocessMode {
+                        mode: Some(proto_api::subprocess_mode::Mode::Script(
                             proto_api::ScriptMode {
-                                runtime: Some(proto_api::script_mode::Runtime::Custom(
-                                    proto_api::CustomRuntime {
-                                        command: "ruby".into(),
-                                        flag: "-e".into(),
-                                    },
-                                )),
+                                runtime: Some(proto_api::Runtime {
+                                    runtime: Some(proto_api::runtime::Runtime::Custom(
+                                        proto_api::CustomRuntime {
+                                            command: "ruby".into(),
+                                            flag: "-e".into(),
+                                        },
+                                    )),
+                                }),
                                 body: BASE64.encode(b"puts 'hello'"),
                                 args: vec![],
                             },
                         )),
-                        env: vec![],
-                        cwd: None,
-                        fail_on_non_zero: false,
-                    },
-                )),
-            }),
-            ..make_valid_create_spec()
+                    }),
+                    env: vec![],
+                    cwd: None,
+                    fail_on_non_zero: false,
+                }),
+            )),
+            ..make_valid_task_spec()
         };
 
-        let cs = convert_create_spec(spec).unwrap();
-        match cs.kind() {
-            TaskKind::Subprocess(SubprocessSpec { mode, .. }) => {
+        let cs = convert_task_spec(spec).unwrap();
+        match cs.workload() {
+            TaskWorkload::Subprocess(SubprocessSpec { mode, .. }) => {
                 assert!(matches!(
                     mode,
                     SubprocessMode::Script {
@@ -792,11 +973,11 @@ mod tests {
 
     #[test]
     fn restart_never() {
-        let spec = proto_api::CreateSpec {
+        let spec = proto_api::TaskSpec {
             restart: proto_api::RestartPolicy::Never as i32,
-            ..make_valid_create_spec()
+            ..make_valid_task_spec()
         };
-        let cs = convert_create_spec(spec).unwrap();
+        let cs = convert_task_spec(spec).unwrap();
         assert!(matches!(cs.restart(), RestartPolicy::Never));
     }
 
@@ -813,14 +994,14 @@ mod tests {
         ];
 
         for (proto_jitter, expected) in cases {
-            let spec = proto_api::CreateSpec {
+            let spec = proto_api::TaskSpec {
                 backoff: Some(proto_api::BackoffPolicy {
                     jitter: proto_jitter as i32,
                     ..make_backoff()
                 }),
-                ..make_valid_create_spec()
+                ..make_valid_task_spec()
             };
-            let cs = convert_create_spec(spec).unwrap();
+            let cs = convert_task_spec(spec).unwrap();
             assert_eq!(cs.backoff().jitter, expected);
         }
     }
@@ -840,11 +1021,11 @@ mod tests {
         ];
 
         for (proto_adm, expected) in cases {
-            let spec = proto_api::CreateSpec {
+            let spec = proto_api::TaskSpec {
                 admission: proto_adm as i32,
-                ..make_valid_create_spec()
+                ..make_valid_task_spec()
             };
-            let cs = convert_create_spec(spec).unwrap();
+            let cs = convert_task_spec(spec).unwrap();
             assert_eq!(cs.admission(), expected);
         }
     }
@@ -852,34 +1033,66 @@ mod tests {
     // ----- rejection paths -----
 
     #[test]
-    fn reject_missing_kind() {
-        let spec = proto_api::CreateSpec {
-            kind: None,
-            ..make_valid_create_spec()
+    fn reject_missing_workload() {
+        let spec = proto_api::TaskSpec {
+            workload: None,
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing task kind")));
-    }
-
-    #[test]
-    fn reject_missing_kind_variant() {
-        let spec = proto_api::CreateSpec {
-            kind: Some(proto_api::TaskKind { kind: None }),
-            ..make_valid_create_spec()
-        };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing task kind variant"))
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing task workload"))
         );
     }
 
     #[test]
-    fn reject_empty_subprocess_command() {
-        let spec = proto_api::CreateSpec {
-            kind: Some(make_subprocess_kind("")),
-            ..make_valid_create_spec()
+    fn reject_missing_workload_spec() {
+        let spec = proto_api::TaskSpec {
+            workload: Some(proto_api::TaskWorkload {
+                api_version: WORKLOAD_API_VERSION.to_owned(),
+                kind: "Subprocess".into(),
+                spec: None,
+            }),
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing workload spec"))
+        );
+    }
+
+    #[test]
+    fn reject_unknown_workload_api_version() {
+        let mut workload = make_subprocess_workload("echo");
+        workload.api_version = "other.io/v1".into();
+        let spec = proto_api::TaskSpec {
+            workload: Some(workload),
+            ..make_valid_task_spec()
+        };
+
+        let err = convert_task_spec(spec).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("apiVersion")));
+    }
+
+    #[test]
+    fn reject_workload_kind_that_disagrees_with_spec() {
+        let mut workload = make_subprocess_workload("echo");
+        workload.kind = "Container".into();
+        let spec = proto_api::TaskSpec {
+            workload: Some(workload),
+            ..make_valid_task_spec()
+        };
+
+        let err = convert_task_spec(spec).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("does not match")));
+    }
+
+    #[test]
+    fn reject_empty_subprocess_command() {
+        let spec = proto_api::TaskSpec {
+            workload: Some(make_subprocess_workload("")),
+            ..make_valid_task_spec()
+        };
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("command cannot be empty"))
         );
@@ -887,11 +1100,11 @@ mod tests {
 
     #[test]
     fn reject_whitespace_subprocess_command() {
-        let spec = proto_api::CreateSpec {
-            kind: Some(make_subprocess_kind("   ")),
-            ..make_valid_create_spec()
+        let spec = proto_api::TaskSpec {
+            workload: Some(make_subprocess_workload("   ")),
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("command cannot be empty"))
         );
@@ -899,20 +1112,19 @@ mod tests {
 
     #[test]
     fn reject_missing_subprocess_mode() {
-        let spec = proto_api::CreateSpec {
-            kind: Some(proto_api::TaskKind {
-                kind: Some(proto_api::task_kind::Kind::Subprocess(
-                    proto_api::SubprocessTask {
-                        mode: None,
-                        env: vec![],
-                        cwd: None,
-                        fail_on_non_zero: false,
-                    },
-                )),
-            }),
-            ..make_valid_create_spec()
+        let spec = proto_api::TaskSpec {
+            workload: Some(make_workload(
+                "Subprocess",
+                proto_api::task_workload::Spec::Subprocess(proto_api::SubprocessTask {
+                    mode: None,
+                    env: vec![],
+                    cwd: None,
+                    fail_on_non_zero: false,
+                }),
+            )),
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing subprocess mode"))
         );
@@ -920,28 +1132,31 @@ mod tests {
 
     #[test]
     fn reject_empty_script_body() {
-        let spec = proto_api::CreateSpec {
-            kind: Some(proto_api::TaskKind {
-                kind: Some(proto_api::task_kind::Kind::Subprocess(
-                    proto_api::SubprocessTask {
-                        mode: Some(proto_api::subprocess_task::Mode::Script(
+        let spec = proto_api::TaskSpec {
+            workload: Some(make_workload(
+                "Subprocess",
+                proto_api::task_workload::Spec::Subprocess(proto_api::SubprocessTask {
+                    mode: Some(proto_api::SubprocessMode {
+                        mode: Some(proto_api::subprocess_mode::Mode::Script(
                             proto_api::ScriptMode {
-                                runtime: Some(proto_api::script_mode::Runtime::WellKnown(
-                                    proto_api::ScriptRuntime::Bash as i32,
-                                )),
+                                runtime: Some(proto_api::Runtime {
+                                    runtime: Some(proto_api::runtime::Runtime::WellKnown(
+                                        proto_api::ScriptRuntime::Bash as i32,
+                                    )),
+                                }),
                                 body: "".into(),
                                 args: vec![],
                             },
                         )),
-                        env: vec![],
-                        cwd: None,
-                        fail_on_non_zero: false,
-                    },
-                )),
-            }),
-            ..make_valid_create_spec()
+                    }),
+                    env: vec![],
+                    cwd: None,
+                    fail_on_non_zero: false,
+                }),
+            )),
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("body cannot be empty"))
         );
@@ -952,26 +1167,27 @@ mod tests {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
-        let spec = proto_api::CreateSpec {
-            kind: Some(proto_api::TaskKind {
-                kind: Some(proto_api::task_kind::Kind::Subprocess(
-                    proto_api::SubprocessTask {
-                        mode: Some(proto_api::subprocess_task::Mode::Script(
+        let spec = proto_api::TaskSpec {
+            workload: Some(make_workload(
+                "Subprocess",
+                proto_api::task_workload::Spec::Subprocess(proto_api::SubprocessTask {
+                    mode: Some(proto_api::SubprocessMode {
+                        mode: Some(proto_api::subprocess_mode::Mode::Script(
                             proto_api::ScriptMode {
                                 runtime: None,
                                 body: BASE64.encode(b"echo hello"),
                                 args: vec![],
                             },
                         )),
-                        env: vec![],
-                        cwd: None,
-                        fail_on_non_zero: false,
-                    },
-                )),
-            }),
-            ..make_valid_create_spec()
+                    }),
+                    env: vec![],
+                    cwd: None,
+                    fail_on_non_zero: false,
+                }),
+            )),
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing script runtime"))
         );
@@ -979,17 +1195,18 @@ mod tests {
 
     #[test]
     fn reject_empty_wasm_module() {
-        let spec = proto_api::CreateSpec {
-            kind: Some(proto_api::TaskKind {
-                kind: Some(proto_api::task_kind::Kind::Wasm(proto_api::WasmTask {
+        let spec = proto_api::TaskSpec {
+            workload: Some(make_workload(
+                "Wasm",
+                proto_api::task_workload::Spec::Wasm(proto_api::WasmTask {
                     module: "".to_string(),
                     args: vec![],
                     env: vec![],
-                })),
-            }),
-            ..make_valid_create_spec()
+                }),
+            )),
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("wasm module path is empty"))
         );
@@ -997,20 +1214,19 @@ mod tests {
 
     #[test]
     fn reject_empty_container_image() {
-        let spec = proto_api::CreateSpec {
-            kind: Some(proto_api::TaskKind {
-                kind: Some(proto_api::task_kind::Kind::Container(
-                    proto_api::ContainerTask {
-                        image: "".to_string(),
-                        command: vec![],
-                        args: vec![],
-                        env: vec![],
-                    },
-                )),
-            }),
-            ..make_valid_create_spec()
+        let spec = proto_api::TaskSpec {
+            workload: Some(make_workload(
+                "Container",
+                proto_api::task_workload::Spec::Container(proto_api::ContainerTask {
+                    image: "".to_string(),
+                    command: None,
+                    args: vec![],
+                    env: vec![],
+                }),
+            )),
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("container image is empty"))
         );
@@ -1018,35 +1234,31 @@ mod tests {
 
     #[test]
     fn reject_empty_slot() {
-        let spec = proto_api::CreateSpec {
+        let spec = proto_api::TaskSpec {
             slot: "".to_string(),
-            ..make_valid_create_spec()
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
-        assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("slot cannot be empty"))
-        );
+        let err = convert_task_spec(spec).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("invalid slot")));
     }
 
     #[test]
     fn reject_whitespace_slot() {
-        let spec = proto_api::CreateSpec {
+        let spec = proto_api::TaskSpec {
             slot: "   ".to_string(),
-            ..make_valid_create_spec()
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
-        assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("slot cannot be empty"))
-        );
+        let err = convert_task_spec(spec).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("invalid slot")));
     }
 
     #[test]
     fn reject_zero_timeout() {
-        let spec = proto_api::CreateSpec {
+        let spec = proto_api::TaskSpec {
             timeout_ms: 0,
-            ..make_valid_create_spec()
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("timeout_ms cannot be zero"))
         );
@@ -1054,24 +1266,24 @@ mod tests {
 
     #[test]
     fn reject_missing_backoff() {
-        let spec = proto_api::CreateSpec {
+        let spec = proto_api::TaskSpec {
             backoff: None,
-            ..make_valid_create_spec()
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing backoff")));
     }
 
     #[test]
     fn reject_zero_backoff_first_ms() {
-        let spec = proto_api::CreateSpec {
+        let spec = proto_api::TaskSpec {
             backoff: Some(proto_api::BackoffPolicy {
                 first_ms: 0,
                 ..make_backoff()
             }),
-            ..make_valid_create_spec()
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("first_ms must be greater than zero"))
         );
@@ -1079,14 +1291,14 @@ mod tests {
 
     #[test]
     fn reject_zero_backoff_max_ms() {
-        let spec = proto_api::CreateSpec {
+        let spec = proto_api::TaskSpec {
             backoff: Some(proto_api::BackoffPolicy {
                 max_ms: 0,
                 ..make_backoff()
             }),
-            ..make_valid_create_spec()
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("max_ms must be >= first_ms"))
         );
@@ -1097,73 +1309,73 @@ mod tests {
         // Regression: factor 0.5 used to pass the API precheck (factor > 0.0)
         // and fail later inside build with a confusing error. The model rule
         // (factor >= 1.0) is now the only rule.
-        let spec = proto_api::CreateSpec {
+        let spec = proto_api::TaskSpec {
             backoff: Some(proto_api::BackoffPolicy {
                 factor: 0.5,
                 ..make_backoff()
             }),
-            ..make_valid_create_spec()
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains(">= 1.0")));
     }
 
     #[test]
     fn reject_negative_backoff_factor() {
-        let spec = proto_api::CreateSpec {
+        let spec = proto_api::TaskSpec {
             backoff: Some(proto_api::BackoffPolicy {
                 factor: -1.0,
                 ..make_backoff()
             }),
-            ..make_valid_create_spec()
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be")));
     }
 
     #[test]
     fn reject_zero_backoff_factor() {
-        let spec = proto_api::CreateSpec {
+        let spec = proto_api::TaskSpec {
             backoff: Some(proto_api::BackoffPolicy {
                 factor: 0.0,
                 ..make_backoff()
             }),
-            ..make_valid_create_spec()
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("factor must be")));
     }
 
     #[test]
     fn reject_unspecified_jitter() {
-        let spec = proto_api::CreateSpec {
+        let spec = proto_api::TaskSpec {
             backoff: Some(proto_api::BackoffPolicy {
                 jitter: proto_api::JitterPolicy::Unspecified as i32,
                 ..make_backoff()
             }),
-            ..make_valid_create_spec()
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("jitter")));
     }
 
     #[test]
     fn reject_unspecified_restart() {
-        let spec = proto_api::CreateSpec {
+        let spec = proto_api::TaskSpec {
             restart: proto_api::RestartPolicy::Unspecified as i32,
-            ..make_valid_create_spec()
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("restart")));
     }
 
     #[test]
     fn reject_unspecified_admission() {
-        let spec = proto_api::CreateSpec {
+        let spec = proto_api::TaskSpec {
             admission: proto_api::AdmissionPolicy::Unspecified as i32,
-            ..make_valid_create_spec()
+            ..make_valid_task_spec()
         };
-        let err = convert_create_spec(spec).unwrap_err();
+        let err = convert_task_spec(spec).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("admission")));
     }
 }

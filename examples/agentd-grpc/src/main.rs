@@ -65,7 +65,7 @@ use solti::api::{
 use solti::core::{StateConfig, SupervisorApi};
 use solti::discover::{self, DiscoverConfig, DiscoveryTransport, MonotonicUptime};
 use solti::exec::subprocess::register_subprocess_runner;
-use solti::model::{AgentId, RunnerEnv, Token};
+use solti::model::{AgentId, Token};
 use solti::observe::{
     LoggerConfig, LoggerLevel, LoggerTimeZone, init_local_offset, init_logger, timezone_sync,
 };
@@ -74,7 +74,7 @@ use solti::prometheus::{
     PrometheusSubscriber, Registry, register_build_info, register_process_collector,
     server as metrics_server,
 };
-use solti::runner::{BuildContext, RunnerRouter};
+use solti::runner::{BuildContext, RunnerEnv, RunnerRouter};
 use solti::taskvisor::{ControllerConfig, Subscribe, SupervisorConfig, TracingBridge};
 use solti::tls::{ClientTlsConfig, ServerTlsConfig};
 
@@ -128,12 +128,18 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let state_collector = PrometheusStateCollector::new(supervisor.state())?;
     registry.register(Box::new(state_collector))?;
 
-    // Internal tasks use direct submission and then the same supervised runtime lifecycle.
-    let (tz_task, tz_spec) = timezone_sync();
-    supervisor.submit_with_task(tz_task, &tz_spec).await?;
+    // Embedded resources use a prebuilt runtime task and the same supervised lifecycle.
+    let (tz_task_ref, tz_task) = timezone_sync();
+    supervisor.create_with_task(tz_task, tz_task_ref).await?;
 
-    let (m_task, m_spec) = metrics_server(registry.clone(), METRICS_ADDR);
-    supervisor.submit_with_task(m_task, &m_spec).await?;
+    let (metrics_task_ref, metrics_task) = metrics_server(
+        registry.clone(),
+        METRICS_ADDR,
+        concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")),
+    )?;
+    supervisor
+        .create_with_task(metrics_task, metrics_task_ref)
+        .await?;
 
     // --- Optional auth & TLS, selected by the environment ---
     let token = std::env::var("SOLTI_AGENT_TOKEN").ok().map(Token::new);
@@ -160,8 +166,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(tls) = client_tls {
         discover = discover.with_tls(tls);
     }
-    let (sync_task, sync_spec) = discover::sync(discover.build()?, uptime)?;
-    supervisor.submit_with_task(sync_task, &sync_spec).await?;
+    let (sync_task_ref, sync_task) = discover::sync(discover.build()?, uptime)?;
+    supervisor
+        .create_with_task(sync_task, sync_task_ref)
+        .await?;
 
     // --- API: control plane → agent ---
     let api_metrics: Arc<dyn ApiMetricsBackend> =

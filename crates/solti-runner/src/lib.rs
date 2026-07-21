@@ -2,22 +2,22 @@
 //!
 //! Runner plugin interface for Solti tasks.
 //!
-//! This crate defines how a concrete backend turns a [`solti_model::TaskSpec`] into a [`taskvisor::TaskRef`].
+//! This crate defines how a concrete backend turns a [`solti_model::Task`] into a [`taskvisor::TaskRef`].
 //!
 //! Use it when one agent binary needs one or more execution backends: subprocesses, containers, WASM modules, or your own runner.
 //!
 //! ## Core Model
 //!
 //! ```text
-//! TaskSpec
+//! Task
 //!   |
 //!   v
 //! RunnerRouter
 //!   |
-//!   | checks Runner::supports(spec)
-//!   | checks runner labels, if the spec has a selector
+//!   | checks Runner::supports(task.spec.workload)
+//!   | checks runner labels, if the task spec has a selector
 //!   v
-//! Runner::build_task(spec, BuildContext)
+//! Runner::build_task(task, BuildContext)
 //!   |
 //!   v
 //! taskvisor::TaskRef
@@ -47,20 +47,20 @@
 //! use std::sync::Arc;
 //! use solti_runner::RunnerRouter;
 //!
-//! # use solti_model::{TaskKind, TaskSpec};
+//! # use solti_model::{Task, TaskWorkload};
 //! # use solti_runner::{BuildContext, Runner, RunnerError};
 //! # use taskvisor::TaskRef;
 //! # struct MyRunner;
 //! # impl Runner for MyRunner {
 //! #     fn name(&self) -> &'static str { "my-runner" }
-//! #     fn supports(&self, spec: &TaskSpec) -> bool { matches!(spec.kind(), TaskKind::Subprocess(_)) }
-//! #     fn build_task(&self, _spec: &TaskSpec, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
+//! #     fn supports(&self, workload: &TaskWorkload) -> bool { matches!(workload, TaskWorkload::Subprocess(_)) }
+//! #     fn build_task(&self, _task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
 //! # }
-//! # fn demo(spec: &TaskSpec) -> Result<TaskRef, RunnerError> {
+//! # fn demo(resource: &Task) -> Result<TaskRef, RunnerError> {
 //! let mut router = RunnerRouter::new();
 //! router.register(Arc::new(MyRunner));
 //!
-//! let task = router.build(spec)?;
+//! let task = router.build(resource)?;
 //! # Ok(task)
 //! # }
 //! ```
@@ -70,7 +70,7 @@
 //! Runners are checked in registration order.
 //! The first runner that returns `true` from [`Runner::supports`] and matches the optional [`solti_model::RunnerSelector`] is used.
 //!
-//! [`solti_model::TaskKind::Embedded`] is not routed.
+//! [`solti_model::TaskWorkload::Embedded`] is not routed.
 //! Embedded tasks are already built as `TaskRef` values and should be submitted directly through `solti-core`.
 //!
 //! ## Output and Metrics
@@ -98,6 +98,9 @@ pub use error::RunnerError;
 
 mod context;
 pub use context::BuildContext;
+
+mod environment;
+pub use environment::{RunnerEnv, merge_env};
 
 mod router;
 pub use router::RunnerRouter;

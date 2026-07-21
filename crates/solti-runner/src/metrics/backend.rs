@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// Runner implementation type for metrics labeling.
 ///
 /// Passed to [`MetricsBackend`] methods so dashboards can slice metrics by runner backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RunnerType {
     /// OS subprocess runner.
@@ -19,6 +19,8 @@ pub enum RunnerType {
     Container,
     /// WebAssembly runner.
     Wasm,
+    /// Application-defined runner label.
+    Custom(String),
 }
 
 impl RunnerType {
@@ -32,11 +34,12 @@ impl RunnerType {
     /// assert_eq!(RunnerType::Subprocess.as_label(), "subprocess");
     /// ```
     #[inline]
-    pub fn as_label(self) -> &'static str {
+    pub fn as_label(&self) -> &str {
         match self {
             Self::Subprocess => "subprocess",
             Self::Container => "container",
             Self::Wasm => "wasm",
+            Self::Custom(label) => label,
         }
     }
 }
@@ -201,5 +204,11 @@ mod tests {
             RunnerErrorKind::ModuleLoadFailed.as_label(),
             "module_load_failed"
         );
+    }
+
+    #[test]
+    fn custom_runner_type_preserves_label() {
+        let runner_type = RunnerType::Custom("image-resize".into());
+        assert_eq!(runner_type.as_label(), "image-resize");
     }
 }

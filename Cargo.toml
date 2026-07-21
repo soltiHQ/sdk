@@ -31,14 +31,13 @@ keywords     = ["async", "tasks", "supervisor", "orchestration", "solti"]
 categories   = ["asynchronous", "concurrency"]
 
 [workspace.dependencies]
-anyhow              = "1.0.103"
-async-trait         = "0.1.89"
+anyhow              = "1.0.104"
+async-trait         = "0.1.91"
 axum                = "0.8.9"
 base64              = "0.22.1"
-bytes               = "1.12.0"
+bytes               = "1.12.1"
 getrandom           = "0.4.3"
-hostname            = "0.4.2"
-http-body-util      = "0.1.3"
+http-body-util      = "0.1.4"
 itoa                = "1.0.18"
 libc                = "0.2.177"
 parking_lot         = "0.12.5"
@@ -46,14 +45,13 @@ pbjson              = "0.9.0"
 pbjson-build        = "0.9.0"
 prometheus          = "0.14.0"
 prost               = "0.14.4"
-prost-types         = "0.14.4"
 protoc-bin-vendored = { version = "3.2.0" }
 rcgen               = "0.14.8"
 reqwest             = "0.13.4"
 rustls              = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 seccompiler         = "0.5.0"
-serde               = { version = "1.0.228", features = ["derive"] }
-serde_json          = "1.0.150"
+serde               = { version = "1.0.229", features = ["derive"] }
+serde_json          = "1.0.151"
 solti               = { path = "crates/solti",            version = "0.0.3", default-features = false }
 solti-api           = { path = "crates/solti-api",        version = "0.0.3", default-features = false }
 solti-core          = { path = "crates/solti-core",       version = "0.0.3", default-features = false }
@@ -81,4 +79,3 @@ tower-http          = "0.7.0"
 tracing             = "0.1.44"
 tracing-journald    = "0.3.2"
 tracing-subscriber  = { version = "0.3.23" }
-uuid                = "1.23.3"

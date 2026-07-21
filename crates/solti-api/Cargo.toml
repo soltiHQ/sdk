@@ -27,23 +27,36 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default      = []
 core-adapter = ["dep:solti-core"]
-grpc         = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
+grpc         = [
+    "dep:prost",
+    "dep:protoc-bin-vendored",
+    "dep:serde_json",
+    "dep:tonic",
+    "dep:tonic-prost",
+    "dep:tonic-prost-build",
+    "dep:tracing",
+]
 grpc-tls     = ["grpc", "dep:solti-tls", "tonic/tls-ring"]
-http         = ["dep:axum", "dep:pbjson", "dep:prost", "dep:serde_json", "dep:tower-http"]
+http         = [
+    "dep:axum",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tower-http",
+    "dep:tracing",
+]
 
 [dependencies]
 async-trait  = { workspace = true }
 tokio-stream = { workspace = true }
 axum         = { workspace = true, optional = true }
-pbjson       = { workspace = true, optional = true }
 prost        = { workspace = true, optional = true }
-serde        = { workspace = true, features = ["derive"] }
+serde        = { workspace = true, features = ["derive"], optional = true }
 serde_json   = { workspace = true, optional = true }
 thiserror    = { workspace = true }
 tonic        = { workspace = true, optional = true }
 tonic-prost  = { workspace = true, optional = true }
 tower-http   = { workspace = true, features = ["limit"], optional = true }
-tracing      = { workspace = true }
+tracing      = { workspace = true, optional = true }
 
 solti-core  = { workspace = true, optional = true }
 solti-model = { workspace = true }
@@ -54,12 +67,12 @@ base64         = { workspace = true }
 bytes          = { workspace = true }
 http-body-util = { workspace = true }
 rcgen          = { workspace = true }
+serde_json     = { workspace = true }
 solti-runner    = { workspace = true }
 taskvisor      = { workspace = true }
 tokio          = { workspace = true, features = ["macros", "rt"] }
 tower          = { workspace = true, features = ["util"] }
 
 [build-dependencies]
-pbjson-build        = { workspace = true }
-protoc-bin-vendored = { workspace = true }
-tonic-prost-build   = { workspace = true }
+protoc-bin-vendored = { workspace = true, optional = true }
+tonic-prost-build   = { workspace = true, optional = true }
