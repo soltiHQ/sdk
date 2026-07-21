@@ -61,7 +61,7 @@ use tonic_health::pb::health_client::HealthClient;
 use tracing::info;
 
 use solti_api::to_tonic_server_tls;
-use solti_tls::{ClientTlsConfig, ServerTlsConfig};
+use solti_tls::{ClientTlsConfig, ServerTlsConfig, TlsIdentity, TrustRoots};
 
 const HTTP_ADDR: &str = "127.0.0.1:18443";
 const GRPC_ADDR: &str = "127.0.0.1:18444";
@@ -127,13 +127,13 @@ async fn main() -> anyhow::Result<()> {
     let pki = make_pki().context("generating in-memory PKI")?;
 
     // ---- Server: HTTPS half (axum + axum-server + mTLS) ----
-    let http_server_cfg = ServerTlsConfig::builder()
-        .cert_pem_bytes(pki.server_cert_pem.clone())
-        .key_pem_bytes(pki.server_key_pem.clone())
-        .require_client_ca_pem_bytes(pki.ca_pem.clone())
-        .with_alpn(["h2", "http/1.1"])
-        .build()?
-        .into_rustls_config()?;
+    let mut http_server_cfg = ServerTlsConfig::new(TlsIdentity::from_pem_bytes(
+        pki.server_cert_pem.clone(),
+        pki.server_key_pem.clone(),
+    ))
+    .require_client_auth(TrustRoots::from_pem_bytes(pki.ca_pem.clone()))
+    .into_rustls_config()?;
+    http_server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let http_addr: SocketAddr = HTTP_ADDR.parse()?;
     let app = Router::new().route("/hello", get(|| async { "hello, mTLS!" }));
@@ -151,12 +151,12 @@ async fn main() -> anyhow::Result<()> {
     info!("HTTPS  listening on {http_addr}");
 
     // ---- Server: gRPC half (tonic + solti_api::to_tonic_server_tls + mTLS) ----
-    let grpc_server_cfg = ServerTlsConfig::builder()
-        .cert_pem_bytes(pki.server_cert_pem.clone())
-        .key_pem_bytes(pki.server_key_pem.clone())
-        .require_client_ca_pem_bytes(pki.ca_pem.clone())
-        .build()?;
-    let grpc_tonic_tls = to_tonic_server_tls(&grpc_server_cfg)?;
+    let grpc_server_cfg = ServerTlsConfig::new(TlsIdentity::from_pem_bytes(
+        pki.server_cert_pem.clone(),
+        pki.server_key_pem.clone(),
+    ))
+    .require_client_auth(TrustRoots::from_pem_bytes(pki.ca_pem.clone()));
+    let grpc_tonic_tls = to_tonic_server_tls(grpc_server_cfg)?;
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     // Mark the empty-string service ("") — the default — as SERVING.
@@ -178,15 +178,16 @@ async fn main() -> anyhow::Result<()> {
     // Give both servers a moment to bind their listeners.
     sleep(Duration::from_millis(250)).await;
 
-    // ---- Client: HTTPS round trip (reqwest + use_preconfigured_tls) ----
-    let client_cfg = ClientTlsConfig::builder()
-        .ca_pem_bytes(pki.ca_pem.clone())
-        .client_cert_pem_bytes(pki.client_cert_pem.clone())
-        .client_key_pem_bytes(pki.client_key_pem.clone())
-        .build()?
+    // ---- Client: HTTPS round trip (reqwest + transport-owned rustls config) ----
+    let mut client_cfg = ClientTlsConfig::new(TrustRoots::from_pem_bytes(pki.ca_pem.clone()))
+        .with_identity(TlsIdentity::from_pem_bytes(
+            pki.client_cert_pem.clone(),
+            pki.client_key_pem.clone(),
+        ))
         .into_rustls_config()?;
+    client_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let http_client = reqwest::Client::builder()
-        .use_preconfigured_tls(client_cfg)
+        .tls_backend_preconfigured(client_cfg)
         .build()?;
 
     let body = http_client

@@ -17,21 +17,28 @@ pub(in crate::tasks) struct GrpcAdapter {
     request_timeout: Duration,
     token: Option<Token>,
     #[cfg(feature = "tls")]
-    tls: Option<solti_tls::ClientTlsConfig>,
+    tls: Option<solti_tls::LoadedClientTlsConfig>,
     client: tokio::sync::OnceCell<DiscoverServiceClient<Channel>>,
 }
 
 impl GrpcAdapter {
-    pub(super) fn new(config: &DiscoverConfig) -> Self {
-        Self {
+    pub(super) fn new(config: &DiscoverConfig) -> Result<Self, DiscoverError> {
+        Ok(Self {
             endpoint: config.control_plane_endpoint.clone(),
             connect_timeout: Duration::from_millis(config.connect_timeout_ms),
             request_timeout: Duration::from_millis(config.request_timeout_ms),
             token: config.token.clone(),
             #[cfg(feature = "tls")]
-            tls: config.tls.clone(),
+            tls: config
+                .tls
+                .clone()
+                .map(solti_tls::ClientTlsConfig::load)
+                .transpose()
+                .map_err(|error| {
+                    DiscoverError::InvalidConfig(format!("load TLS material: {error}"))
+                })?,
             client: tokio::sync::OnceCell::new(),
-        }
+        })
     }
 
     pub(super) async fn sync(&self, request: SyncRequest) -> Result<(), DiscoverError> {
@@ -49,7 +56,7 @@ impl GrpcAdapter {
                 #[cfg(feature = "tls")]
                 if let Some(tls) = &self.tls {
                     endpoint = endpoint
-                        .tls_config(build_tonic_client_tls(tls)?)
+                        .tls_config(build_tonic_client_tls(tls))
                         .map_err(|e| DiscoverError::InvalidConfig(format!("tls_config: {e}")))?;
                 }
 
@@ -87,25 +94,18 @@ impl GrpcAdapter {
 /// Convert the shared TLS config into tonic's PEM-blob TLS config.
 #[cfg(feature = "tls")]
 fn build_tonic_client_tls(
-    cfg: &solti_tls::ClientTlsConfig,
-) -> Result<tonic::transport::ClientTlsConfig, DiscoverError> {
+    cfg: &solti_tls::LoadedClientTlsConfig,
+) -> tonic::transport::ClientTlsConfig {
     use tonic::transport::{Certificate, ClientTlsConfig as TonicTls, Identity};
 
-    let ca_bytes = cfg
-        .ca()
-        .read()
-        .map_err(|e| DiscoverError::InvalidConfig(format!("read ca pem: {e}")))?;
-    let mut tls = TonicTls::new().ca_certificate(Certificate::from_pem(ca_bytes));
+    let mut tls = TonicTls::new().ca_certificate(Certificate::from_pem(cfg.server_roots_pem()));
 
-    if let Some((cert_src, key_src)) = cfg.client_identity() {
-        let cert_bytes = cert_src
-            .read()
-            .map_err(|e| DiscoverError::InvalidConfig(format!("read client cert pem: {e}")))?;
-        let key_bytes = key_src
-            .read()
-            .map_err(|e| DiscoverError::InvalidConfig(format!("read client key pem: {e}")))?;
-        tls = tls.identity(Identity::from_pem(cert_bytes, key_bytes));
+    if let Some(identity) = cfg.identity() {
+        tls = tls.identity(Identity::from_pem(
+            identity.certificate_chain_pem(),
+            identity.expose_private_key_pem(),
+        ));
     }
 
-    Ok(tls)
+    tls
 }

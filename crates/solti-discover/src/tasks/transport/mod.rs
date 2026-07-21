@@ -27,7 +27,7 @@ impl TransportAdapter {
     pub(super) fn from_config(config: &DiscoverConfig) -> Result<Self, DiscoverError> {
         match &config.transport {
             #[cfg(feature = "grpc")]
-            DiscoveryTransport::Grpc => Ok(Self::Grpc(Box::new(GrpcAdapter::new(config)))),
+            DiscoveryTransport::Grpc => GrpcAdapter::new(config).map(Box::new).map(Self::Grpc),
             #[cfg(feature = "http")]
             DiscoveryTransport::Http => HttpAdapter::new(config).map(Self::Http),
         }

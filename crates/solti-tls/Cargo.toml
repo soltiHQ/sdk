@@ -18,6 +18,7 @@ default = []
 [dependencies]
 rustls         = { workspace = true }
 thiserror      = { workspace = true }
+zeroize       = { workspace = true }
 
 [dev-dependencies]
 rcgen        = { workspace = true }

@@ -79,11 +79,12 @@ fn build_client(config: &DiscoverConfig) -> Result<reqwest::Client, DiscoverErro
 
     #[cfg(feature = "tls")]
     if let Some(tls) = &config.tls {
-        let rustls_config = tls
+        let mut rustls_config = tls
             .clone()
             .into_rustls_config()
             .map_err(|e| DiscoverError::InvalidConfig(format!("tls into_rustls_config: {e}")))?;
-        builder = builder.use_preconfigured_tls(rustls_config);
+        rustls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        builder = builder.tls_backend_preconfigured(rustls_config);
     }
 
     Ok(builder.build()?)

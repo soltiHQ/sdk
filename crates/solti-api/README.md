@@ -101,7 +101,7 @@ Script bodies are separately capped in the model at [`solti_model::MAX_SCRIPT_BO
 |----------------|-----------------------------------------------------------------|-----------------------------------------|
 | `core-adapter` | `SupervisorApiAdapter`                                           | `solti-core`                            |
 | `grpc`         | `GrpcApi`, `TaskApiService`, `TaskServiceServer`, proto codegen | `tonic`, `tonic-prost`, `prost`         |
-| `grpc-tls`     | `to_tonic_server_tls(&ServerTlsConfig)`; implies `grpc`         | `solti-tls`; activates `tonic/tls-ring` |
+| `grpc-tls`     | `to_tonic_server_tls(ServerTlsConfig)`; implies `grpc`          | `solti-tls`; activates `tonic/tls-ring` |
 | `http`         | `HttpApi`, axum router, proto-JSON serde                        | `axum`, `serde_json`, `prost`, `pbjson` |
 
 No feature is enabled by default. `grpc-tls` implies `grpc`; HTTP TLS is
@@ -117,16 +117,18 @@ For gRPC:
 use std::sync::Arc;
 
 use solti_api::{GrpcApi, SupervisorApiAdapter, to_tonic_server_tls};
-use solti_tls::ServerTlsConfig;
+use solti_tls::{ServerTlsConfig, TlsIdentity, TrustRoots};
 
 async fn serve_tls(adapter: Arc<SupervisorApiAdapter>) -> Result<(), Box<dyn std::error::Error>> {
-    let server_tls = ServerTlsConfig::builder()
-        .cert_pem_file("/etc/solti/tls/server.crt")
-        .key_pem_file("/etc/solti/tls/server.key")
-        .require_client_ca_pem_file("/etc/solti/tls/clients-ca.crt") // optional
-        .build()?;
+    let server_tls = ServerTlsConfig::new(TlsIdentity::from_pem_files(
+        "/etc/solti/tls/server.crt",
+        "/etc/solti/tls/server.key",
+    ))
+    .require_client_auth(TrustRoots::from_pem_file(
+        "/etc/solti/tls/clients-ca.crt",
+    )); // omit for plain TLS
 
-    let tls_cfg = to_tonic_server_tls(&server_tls)?;
+    let tls_cfg = to_tonic_server_tls(server_tls)?;
     tonic::transport::Server::builder()
         .tls_config(tls_cfg)?
         .add_service(GrpcApi::new(adapter).server())

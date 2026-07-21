@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use solti::model::Token;
-use solti::tls::{ClientTlsConfig, ServerTlsConfig};
+use solti::tls::{ClientTlsConfig, ServerTlsConfig, TlsIdentity, TrustRoots};
 
 type BoxErr = Box<dyn std::error::Error>;
 
@@ -168,14 +168,12 @@ impl Config {
         }
         let cert = self.tls.cert.clone().ok_or("tls.cert is required")?;
         let key = self.tls.key.clone().ok_or("tls.key is required")?;
-        let mut b = ServerTlsConfig::builder()
-            .cert_pem_file(cert)
-            .key_pem_file(key);
+        let mut tls = ServerTlsConfig::new(TlsIdentity::from_pem_files(cert, key));
         if self.tls.mtls {
             let ca = self.tls.ca.clone().ok_or("tls.ca is required for mtls")?;
-            b = b.require_client_ca_pem_file(ca);
+            tls = tls.require_client_auth(TrustRoots::from_pem_file(ca));
         }
-        Ok(Some(b.build()?))
+        Ok(Some(tls))
     }
 
     /// Client TLS for discovery (the agent dials podium over TLS), if TLS is on.
@@ -184,7 +182,7 @@ impl Config {
             return Ok(None);
         }
         let ca = self.tls.ca.clone().ok_or("tls.ca is required")?;
-        let mut b = ClientTlsConfig::builder().ca_pem_file(ca);
+        let mut tls = ClientTlsConfig::new(TrustRoots::from_pem_file(ca));
         if self.tls.mtls {
             let cert = self
                 .tls
@@ -196,8 +194,8 @@ impl Config {
                 .client_key
                 .clone()
                 .ok_or("tls.client_key is required for mtls")?;
-            b = b.client_cert_pem_file(cert).client_key_pem_file(key);
+            tls = tls.with_identity(TlsIdentity::from_pem_files(cert, key));
         }
-        Ok(Some(b.build()?))
+        Ok(Some(tls))
     }
 }

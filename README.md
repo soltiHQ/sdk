@@ -201,22 +201,25 @@ Enable `grpc-tls` on `solti-api` (gRPC server) and/or `tls` on
 `solti-discover` (client). One config shape feeds both:
 
 ```rust
-use solti_tls::{ClientTlsConfig, ServerTlsConfig};
+use solti_tls::{ClientTlsConfig, ServerTlsConfig, TlsIdentity, TrustRoots};
 
 // Server: cert + key + optional client-CA for mTLS.
-let server = ServerTlsConfig::builder()
-    .cert_pem_file("/etc/solti/tls/server.crt")
-    .key_pem_file("/etc/solti/tls/server.key")
-    .require_client_ca_pem_file("/etc/solti/tls/clients-ca.crt") // omit for plain TLS
-    .with_alpn(["h2"])
-    .build()?;
+let server = ServerTlsConfig::new(TlsIdentity::from_pem_files(
+    "/etc/solti/tls/server.crt",
+    "/etc/solti/tls/server.key",
+))
+.require_client_auth(TrustRoots::from_pem_file(
+    "/etc/solti/tls/clients-ca.crt",
+)); // omit require_client_auth for plain TLS
 
 // Client: trust roots + optional client cert for mTLS.
-let client = ClientTlsConfig::builder()
-    .ca_pem_file("/etc/solti/tls/control-plane-ca.crt")
-    .client_cert_pem_file("/etc/solti/tls/agent.crt")
-    .client_key_pem_file("/etc/solti/tls/agent.key")
-    .build()?;
+let client = ClientTlsConfig::new(TrustRoots::from_pem_file(
+    "/etc/solti/tls/control-plane-ca.crt",
+))
+.with_identity(TlsIdentity::from_pem_files(
+    "/etc/solti/tls/agent.crt",
+    "/etc/solti/tls/agent.key",
+));
 ```
 
 Plug `server` into `tonic`/`axum-server`, or pass `client` to `DiscoverConfigBuilder::with_tls(...)`. End-to-end demo: [`examples/tls-roundtrip`](examples/tls-roundtrip).

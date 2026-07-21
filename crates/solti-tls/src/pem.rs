@@ -1,74 +1,40 @@
-//! # PEM to DER parsing helpers.
-
-use std::io::BufRead;
+//! # PEM parsing
 
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer,
-    pem::{Error as PemError, PemObject, ReadIter},
+    pem::{PemObject, ReadIter},
 };
 
-use crate::TlsError;
+use crate::{PemRole, TlsError};
 
-/// Parse all `CERTIFICATE` blocks from a PEM byte stream.
-///
-/// Certificates are returned in file order.
-/// For a certificate chain, put the leaf certificate first.
-///
-/// ## Also
-///
-/// - [`PemSource::read`](crate::PemSource::read) - produces the bytes fed here.
-/// - [`load_key_from_pem`] - the private-key counterpart.
-///
-/// ## Example
-///
-/// ```
-/// use solti_tls::{load_certs_from_pem, TlsError};
-///
-/// let err = load_certs_from_pem(&b"not a pem"[..]).unwrap_err();
-/// assert!(matches!(err, TlsError::NoCertificates));
-/// ```
-pub fn load_certs_from_pem<R: BufRead>(
-    reader: R,
+pub(crate) fn load_certificates(
+    pem: &[u8],
+    role: PemRole,
 ) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-    let certs = CertificateDer::pem_reader_iter(reader)
+    let certificates = CertificateDer::pem_reader_iter(pem)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(map_pem_error)?;
-    if certs.is_empty() {
-        return Err(TlsError::NoCertificates);
+        .map_err(|source| TlsError::InvalidPem { role, source })?;
+    if certificates.is_empty() {
+        return Err(TlsError::NoCertificates { role });
     }
-    Ok(certs)
+    Ok(certificates)
 }
 
-/// Parse the first private key from a PEM byte stream.
-///
-/// Supported key forms are `PKCS#8`, `PKCS#1`, and `SEC1`.
-/// If the stream contains more than one key, only the first one is returned.
-/// Pass a PEM that holds exactly the intended key.
-///
-/// ## Also
-///
-/// - [`load_certs_from_pem`] - the certificate counterpart (which, unlike this function, returns *all* blocks).
-///
-/// ## Example
-///
-/// ```
-/// use solti_tls::{load_key_from_pem, TlsError};
-///
-/// let err = load_key_from_pem(&b"not a key"[..]).unwrap_err();
-/// assert!(matches!(err, TlsError::NoPrivateKey));
-/// ```
-pub fn load_key_from_pem<R: BufRead>(reader: R) -> Result<PrivateKeyDer<'static>, TlsError> {
-    match ReadIter::<_, PrivateKeyDer<'static>>::new(reader).next() {
-        Some(Ok(key)) => Ok(key),
-        Some(Err(error)) => Err(map_pem_error(error)),
-        None => Err(TlsError::NoPrivateKey),
-    }
-}
+pub(crate) fn load_private_key(
+    pem: &[u8],
+    role: PemRole,
+) -> Result<PrivateKeyDer<'static>, TlsError> {
+    let mut keys = ReadIter::<_, PrivateKeyDer<'static>>::new(pem);
+    let key = match keys.next() {
+        Some(Ok(key)) => key,
+        Some(Err(source)) => return Err(TlsError::InvalidPem { role, source }),
+        None => return Err(TlsError::NoPrivateKey { role }),
+    };
 
-fn map_pem_error(error: PemError) -> TlsError {
-    match error {
-        PemError::Io(error) => TlsError::Io(error),
-        error => TlsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+    match keys.next() {
+        Some(Ok(_)) => Err(TlsError::MultiplePrivateKeys { role }),
+        Some(Err(source)) => Err(TlsError::InvalidPem { role, source }),
+        None => Ok(key),
     }
 }
 
@@ -76,63 +42,66 @@ fn map_pem_error(error: PemError) -> TlsError {
 mod tests {
     use super::*;
 
-    use std::io::Cursor;
-
-    fn self_signed_cert_pem() -> String {
+    fn self_signed() -> (Vec<u8>, Vec<u8>) {
         let bundle = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
-        bundle.cert.pem()
+        (
+            bundle.cert.pem().into_bytes(),
+            bundle.signing_key.serialize_pem().into_bytes(),
+        )
     }
 
     #[test]
-    fn load_certs_from_pem_returns_one_cert_for_one_pem() {
-        let pem = self_signed_cert_pem();
-        let certs = load_certs_from_pem(pem.as_bytes()).unwrap();
-        assert_eq!(certs.len(), 1);
+    fn parses_certificate_chain() {
+        let (certificate, _) = self_signed();
+        let certificates = load_certificates(&certificate, PemRole::ServerCertificate).unwrap();
+        assert_eq!(certificates.len(), 1);
     }
 
     #[test]
-    fn load_certs_from_pem_errors_when_input_has_no_certs() {
-        let err = load_certs_from_pem(&b""[..]).unwrap_err();
-        assert!(matches!(err, TlsError::NoCertificates));
+    fn missing_certificate_keeps_role() {
+        let error = load_certificates(b"not a certificate", PemRole::ClientTrustRoots).unwrap_err();
+        assert!(matches!(
+            error,
+            TlsError::NoCertificates {
+                role: PemRole::ClientTrustRoots
+            }
+        ));
     }
 
     #[test]
-    fn load_certs_from_pem_errors_when_input_has_only_a_private_key() {
-        let bundle = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
-        let key_pem = bundle.signing_key.serialize_pem();
-        let err = load_certs_from_pem(key_pem.as_bytes()).unwrap_err();
-        assert!(matches!(err, TlsError::NoCertificates));
+    fn malformed_certificate_is_not_reported_as_io() {
+        let error = load_certificates(
+            b"-----BEGIN CERTIFICATE-----\n%%%\n-----END CERTIFICATE-----",
+            PemRole::ServerCertificate,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            TlsError::InvalidPem {
+                role: PemRole::ServerCertificate,
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn load_key_from_pem_returns_pkcs8_for_rcgen_default() {
-        let bundle = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
-        let key_pem = bundle.signing_key.serialize_pem();
-        let key = load_key_from_pem(key_pem.as_bytes()).unwrap();
-        assert!(matches!(key, PrivateKeyDer::Pkcs8(_)));
+    fn parses_one_private_key() {
+        let (_, key) = self_signed();
+        let _key = load_private_key(&key, PemRole::ServerPrivateKey).unwrap();
     }
 
     #[test]
-    fn load_key_from_pem_leaves_a_reused_reader_at_the_next_block() {
-        let first = rcgen::generate_simple_self_signed(vec!["first.example".into()]).unwrap();
-        let second = rcgen::generate_simple_self_signed(vec!["second.example".into()]).unwrap();
-        let pem = format!(
-            "{}{}",
-            first.signing_key.serialize_pem(),
-            second.signing_key.serialize_pem()
-        );
-        let mut reader = Cursor::new(pem.into_bytes());
-
-        let first_key = load_key_from_pem(&mut reader).expect("first key");
-        let second_key = load_key_from_pem(&mut reader).expect("second key");
-
-        assert_ne!(first_key.secret_der(), second_key.secret_der());
-    }
-
-    #[test]
-    fn load_key_from_pem_errors_when_input_has_no_key() {
-        let pem = self_signed_cert_pem();
-        let err = load_key_from_pem(pem.as_bytes()).unwrap_err();
-        assert!(matches!(err, TlsError::NoPrivateKey));
+    fn rejects_multiple_private_keys() {
+        let (_, first) = self_signed();
+        let (_, second) = self_signed();
+        let mut pem = first;
+        pem.extend(second);
+        let error = load_private_key(&pem, PemRole::ClientPrivateKey).unwrap_err();
+        assert!(matches!(
+            error,
+            TlsError::MultiplePrivateKeys {
+                role: PemRole::ClientPrivateKey
+            }
+        ));
     }
 }

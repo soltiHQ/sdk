@@ -98,14 +98,16 @@ let (task, spec) = solti_discover::sync(config, uptime)?;
 ```rust,no_run
 use solti_discover::{DiscoverConfig, DiscoveryTransport};
 use solti_model::AgentId;
-use solti_tls::ClientTlsConfig;
+use solti_tls::{ClientTlsConfig, TlsIdentity, TrustRoots};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client_tls = ClientTlsConfig::builder()
-        .ca_pem_file("/etc/solti/tls/control-plane-ca.crt")
-        .client_cert_pem_file("/etc/solti/tls/agent.crt") // optional, for mTLS
-        .client_key_pem_file("/etc/solti/tls/agent.key")
-        .build()?;
+    let client_tls = ClientTlsConfig::new(TrustRoots::from_pem_file(
+        "/etc/solti/tls/control-plane-ca.crt",
+    ))
+    .with_identity(TlsIdentity::from_pem_files(
+        "/etc/solti/tls/agent.crt",
+        "/etc/solti/tls/agent.key",
+    )); // omit with_identity for plain TLS
 
     let _cfg = DiscoverConfig::builder(
         AgentId::from("agent-1"),
@@ -122,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-For HTTP (reqwest), the built `rustls::ClientConfig` is plugged in via `use_preconfigured_tls`. 
+For HTTP (reqwest), the built `rustls::ClientConfig` is plugged in via `tls_backend_preconfigured`.
 For gRPC (tonic), PEM bytes are re-shaped into `tonic::transport::ClientTlsConfig` (tonic builds its own internal rustls config). 
 See the `solti-tls` README for the full integration story.
 

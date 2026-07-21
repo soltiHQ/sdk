@@ -76,7 +76,7 @@ use solti::prometheus::{
 };
 use solti::runner::{BuildContext, RunnerEnv, RunnerRouter};
 use solti::taskvisor::{ControllerConfig, Subscribe, SupervisorConfig, TracingBridge};
-use solti::tls::{ClientTlsConfig, ServerTlsConfig};
+use solti::tls::{ClientTlsConfig, ServerTlsConfig, TlsIdentity, TrustRoots};
 
 const ADDR: &str = "[::]:50052";
 const ADVERTISED: &str = "localhost:50052";
@@ -181,7 +181,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = Server::builder();
     let tls_on = server_tls.is_some();
     if let Some(tls) = server_tls {
-        builder = builder.tls_config(to_tonic_server_tls(&tls)?)?;
+        builder = builder.tls_config(to_tonic_server_tls(tls)?)?;
     }
 
     let addr = ADDR.parse()?;
@@ -237,16 +237,16 @@ fn env_path(key: &str) -> Option<String> {
 /// Enabled when `SOLTI_TLS_CERT` and `SOLTI_TLS_KEY` are both set;
 /// `SOLTI_TLS_CLIENT_CA` (optional) turns on mTLS (require a client cert).
 fn server_tls_from_env() -> Result<Option<ServerTlsConfig>, Box<dyn std::error::Error>> {
-    let (Some(cert), Some(key)) = (env_path("SOLTI_TLS_CERT"), env_path("SOLTI_TLS_KEY")) else {
-        return Ok(None);
+    let identity = match (env_path("SOLTI_TLS_CERT"), env_path("SOLTI_TLS_KEY")) {
+        (None, None) => return Ok(None),
+        (Some(cert), Some(key)) => TlsIdentity::from_pem_files(cert, key),
+        _ => return Err("SOLTI_TLS_CERT and SOLTI_TLS_KEY must be set together".into()),
     };
-    let mut b = ServerTlsConfig::builder()
-        .cert_pem_file(cert)
-        .key_pem_file(key);
+    let mut tls = ServerTlsConfig::new(identity);
     if let Some(ca) = env_path("SOLTI_TLS_CLIENT_CA") {
-        b = b.require_client_ca_pem_file(ca);
+        tls = tls.require_client_auth(TrustRoots::from_pem_file(ca));
     }
-    Ok(Some(b.build()?))
+    Ok(Some(tls))
 }
 
 /// Discovery client TLS (the agent dials the control plane over TLS).
@@ -257,12 +257,18 @@ fn client_tls_from_env() -> Result<Option<ClientTlsConfig>, Box<dyn std::error::
     let Some(ca) = env_path("SOLTI_CP_CA") else {
         return Ok(None);
     };
-    let mut b = ClientTlsConfig::builder().ca_pem_file(ca);
-    if let (Some(cert), Some(key)) = (
+    let mut tls = ClientTlsConfig::new(TrustRoots::from_pem_file(ca));
+    match (
         env_path("SOLTI_CP_CLIENT_CERT"),
         env_path("SOLTI_CP_CLIENT_KEY"),
     ) {
-        b = b.client_cert_pem_file(cert).client_key_pem_file(key);
+        (None, None) => {}
+        (Some(cert), Some(key)) => {
+            tls = tls.with_identity(TlsIdentity::from_pem_files(cert, key));
+        }
+        _ => {
+            return Err("SOLTI_CP_CLIENT_CERT and SOLTI_CP_CLIENT_KEY must be set together".into());
+        }
     }
-    Ok(Some(b.build()?))
+    Ok(Some(tls))
 }

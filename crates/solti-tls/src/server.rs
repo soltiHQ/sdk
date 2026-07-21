@@ -1,501 +1,312 @@
-//! # Server TLS config.
+//! # Server TLS
 //!
-//! [`ServerTlsConfig`] describes a TLS listener.
-//!
-//! It stores:
-//! - the server certificate chain,
-//! - the server private key,
-//! - an optional client CA for mTLS,
-//! - optional ALPN protocols.
-//!
-//! The builder only stores intent.
-//! PEM files are read later by [`ServerTlsConfig::into_rustls_config`].
+//! [`ServerTlsConfig`] defines the server identity and optional client authentication.
+//! [`LoadedServerTlsConfig`] provides validated PEM to a transport adapter.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::{PemSource, TlsError};
+use crate::{LoadedTlsIdentity, PemRole, TlsError, TlsIdentity, TrustRoots};
 
-/// Server-side TLS configuration.
+/// TLS and mutual TLS settings for a server.
 ///
-/// Construct via [`ServerTlsConfig::builder`].
+/// A server identity is always required.
+/// It always contains both a certificate chain and its private key.
 ///
-/// ## Security
+/// | Configuration                            | Server behavior                                                        |
+/// |------------------------------------------|------------------------------------------------------------------------|
+/// | [`ServerTlsConfig::new`]                 | Presents the server identity and does not request a client certificate |
+/// | [`ServerTlsConfig::require_client_auth`] | Requires a client certificate accepted by the configured roots         |
 ///
-/// `key` is a [`PemSource`].
-/// If it uses [`PemSource::Bytes`], it holds raw private key bytes.
-/// `Debug` output is redacted; logging this struct does not print the key.
-/// The key bytes are not zeroed on drop.
+/// ## When Files Are Read
 ///
-/// ## Also
+/// Creating and changing the configuration does not read files.
+/// [`Self::load`] and [`Self::into_rustls_config`] read and validate all PEM sources.
 ///
-/// - [`ClientTlsConfig`](crate::ClientTlsConfig) - the peer side.
-/// - [`ServerTlsConfigBuilder`] - the builder.
-/// - [`PemSource`], [`TlsError`].
-#[derive(Debug, Clone)]
+/// ## ALPN
+///
+/// The generated rustls configuration has no ALPN protocols.
+/// The transport sets them.
+///
+/// ## Example
+///
+/// ```rust,no_run
+/// use solti_tls::{ServerTlsConfig, TlsIdentity, TrustRoots};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let server = ServerTlsConfig::new(TlsIdentity::from_pem_files(
+///     "/etc/solti/tls/server.crt",
+///     "/etc/solti/tls/server.key",
+/// ))
+/// .require_client_auth(TrustRoots::from_pem_file(
+///     "/etc/solti/tls/client-ca.crt",
+/// ));
+///
+/// let rustls = server.into_rustls_config()?;
+/// assert!(rustls.alpn_protocols.is_empty());
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ## See Also
+///
+/// [`ClientTlsConfig`](crate::ClientTlsConfig) configures the client.
+#[derive(Clone, Debug)]
 pub struct ServerTlsConfig {
-    cert: PemSource,
-    key: PemSource,
-    client_ca: Option<PemSource>,
-    alpn: Vec<Vec<u8>>,
+    identity: TlsIdentity,
+    client_auth_roots: Option<TrustRoots>,
 }
 
 impl ServerTlsConfig {
-    /// Start a new server TLS builder.
+    /// Creates server TLS settings with the identity presented to clients.
     ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_tls::ServerTlsConfig;
-    ///
-    /// let cfg = ServerTlsConfig::builder()
-    ///     .cert_pem_bytes(b"-----BEGIN CERTIFICATE-----\n...".to_vec())
-    ///     .key_pem_bytes(b"-----BEGIN PRIVATE KEY-----\n...".to_vec())
-    ///     .build()
-    ///     .unwrap();
-    ///
-    /// assert!(cfg.client_ca().is_none());
-    /// ```
-    pub fn builder() -> ServerTlsConfigBuilder {
-        ServerTlsConfigBuilder::default()
+    /// Client authentication is disabled until [`Self::require_client_auth`] is called.
+    /// This method does not read or validate the identity.
+    pub fn new(identity: TlsIdentity) -> Self {
+        Self {
+            identity,
+            client_auth_roots: None,
+        }
     }
 
-    /// Server certificate chain, leaf certificate first.
-    pub fn cert(&self) -> &PemSource {
-        &self.cert
+    /// Requires clients accepted by these trust roots.
+    ///
+    /// A client must present a certificate that rustls accepts.
+    /// A second call replaces the previous roots.
+    pub fn require_client_auth(mut self, roots: TrustRoots) -> Self {
+        self.client_auth_roots = Some(roots);
+        self
     }
 
-    /// Server private key.
-    pub fn key(&self) -> &PemSource {
-        &self.key
+    /// Returns the identity presented by the server.
+    pub fn identity(&self) -> &TlsIdentity {
+        &self.identity
     }
 
-    /// CA bundle used to verify mandatory mTLS client certificates.
-    pub fn client_ca(&self) -> Option<&PemSource> {
-        self.client_ca.as_ref()
+    /// Returns the roots used to verify client certificates.
+    ///
+    /// `None` means that client authentication is disabled.
+    pub fn client_auth_roots(&self) -> Option<&TrustRoots> {
+        self.client_auth_roots.as_ref()
     }
 
-    /// ALPN protocols in preference order.
-    pub fn alpn(&self) -> &[Vec<u8>] {
-        &self.alpn
+    /// Loads and validates PEM for a transport adapter.
+    ///
+    /// File errors include the purpose of the PEM and its path.
+    ///
+    /// # Errors
+    ///
+    /// - [`TlsError::ReadPem`] when a file cannot be read.
+    /// - [`TlsError::InvalidPem`], [`TlsError::NoCertificates`],
+    ///   [`TlsError::NoPrivateKey`], or [`TlsError::MultiplePrivateKeys`] when PEM is invalid.
+    /// - [`TlsError::InvalidCertificate`] when rustls rejects a trust root.
+    /// - [`TlsError::ClientVerifier`] when the client verifier cannot be built.
+    /// - [`TlsError::Configuration`] when the server certificate and key cannot be used together.
+    ///
+    /// # Security
+    ///
+    /// The loaded server identity contains private-key PEM.
+    /// This crate zeroizes it's buffer on drop.
+    /// An adapter may keep its own copy.
+    pub fn load(self) -> Result<LoadedServerTlsConfig, TlsError> {
+        let loaded = self.load_material()?;
+        let _ = loaded.rustls_config()?;
+        Ok(loaded)
     }
 
-    /// Build a [`rustls::ServerConfig`] from this configuration.
+    fn load_material(self) -> Result<LoadedServerTlsConfig, TlsError> {
+        Ok(LoadedServerTlsConfig {
+            identity: self
+                .identity
+                .load(PemRole::ServerCertificate, PemRole::ServerPrivateKey)?,
+            client_auth_roots: self
+                .client_auth_roots
+                .map(|roots| roots.load(PemRole::ClientTrustRoots))
+                .transpose()?,
+        })
+    }
+
+    /// Builds a [`rustls::ServerConfig`].
     ///
-    /// Reads the PEM sources, parses the cert chain and key.
-    /// Optionally enables mTLS, applies ALPN, and returns a ready `rustls` config.
+    /// Client-authentication roots make client certificates mandatory.
+    /// Without the roots, no client certificate is requested.
+    /// `alpn_protocols` is empty.
     ///
-    /// It also calls [`ensure_default_provider`](crate::ensure_default_provider);
-    /// the `ring` provider is installed if no provider exists yet.
+    /// # Errors
     ///
-    /// ## Security
-    ///
-    /// The server always presents `cert` and `key`.
-    /// If `client_ca` is set, client authentication is mandatory.
-    /// Clients without a valid certificate are rejected during the TLS handshake.
-    ///
-    /// ## Example
-    ///
-    /// ```rust,no_run
-    /// use solti_tls::ServerTlsConfig;
-    ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let rustls_config = ServerTlsConfig::builder()
-    ///     .cert_pem_file("/etc/solti/tls/server.crt")
-    ///     .key_pem_file("/etc/solti/tls/server.key")
-    ///     .with_alpn(["h2"])
-    ///     .build()?
-    ///     .into_rustls_config()?;
-    ///
-    /// # let _ = rustls_config;
-    /// # Ok(()) }
-    /// ```
+    /// Returns the same errors as [`Self::load`].
     pub fn into_rustls_config(self) -> Result<rustls::ServerConfig, TlsError> {
-        crate::ensure_default_provider();
+        self.load_material()?.rustls_config()
+    }
+}
 
-        let cert_bytes = self.cert.read()?;
-        let key_bytes = self.key.read()?;
+/// Loaded and validated server PEM for a transport adapter.
+///
+/// The identity has a valid certificate and private-key pair.
+/// If client roots are present, the client verifier was also built successfully.
+///
+/// `Debug` redacts the private key through [`LoadedTlsIdentity`].
+#[derive(Debug)]
+pub struct LoadedServerTlsConfig {
+    identity: LoadedTlsIdentity,
+    client_auth_roots: Option<Vec<u8>>,
+}
 
-        let certs = crate::load_certs_from_pem(cert_bytes.as_slice())?;
-        let key = crate::load_key_from_pem(key_bytes.as_slice())?;
+impl LoadedServerTlsConfig {
+    /// Returns the loaded server identity.
+    pub fn identity(&self) -> &LoadedTlsIdentity {
+        &self.identity
+    }
+
+    /// Returns loaded PEM roots used to verify client certificates.
+    ///
+    /// `None` means that client authentication is disabled.
+    pub fn client_auth_roots_pem(&self) -> Option<&[u8]> {
+        self.client_auth_roots.as_deref()
+    }
+
+    fn rustls_config(&self) -> Result<rustls::ServerConfig, TlsError> {
+        crate::provider::ensure_default_provider();
+
+        let certificates = crate::pem::load_certificates(
+            self.identity.certificate_chain_pem(),
+            PemRole::ServerCertificate,
+        )?;
+        let private_key = crate::pem::load_private_key(
+            self.identity.expose_private_key_pem(),
+            PemRole::ServerPrivateKey,
+        )?;
 
         let builder = rustls::ServerConfig::builder();
-        let server_builder = match self.client_ca {
-            Some(ca_src) => {
-                let ca_bytes = ca_src.read()?;
-                let ca_certs = crate::load_certs_from_pem(ca_bytes.as_slice())?;
+        let builder = match &self.client_auth_roots {
+            Some(client_auth_roots) => {
+                let certificates =
+                    crate::pem::load_certificates(client_auth_roots, PemRole::ClientTrustRoots)?;
                 let mut roots = rustls::RootCertStore::empty();
-                for ca in ca_certs {
-                    roots.add(ca)?;
+                for certificate in certificates {
+                    roots
+                        .add(certificate)
+                        .map_err(|source| TlsError::InvalidCertificate {
+                            role: PemRole::ClientTrustRoots,
+                            source,
+                        })?;
                 }
-                let verifier =
-                    rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
+                let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                    .build()
+                    .map_err(|source| TlsError::ClientVerifier { source })?;
                 builder.with_client_cert_verifier(verifier)
             }
             None => builder.with_no_client_auth(),
         };
 
-        let mut config = server_builder.with_single_cert(certs, key)?;
-        config.alpn_protocols = self.alpn;
-        Ok(config)
-    }
-}
-
-/// Incremental builder for [`ServerTlsConfig`].
-#[derive(Debug, Default, Clone)]
-pub struct ServerTlsConfigBuilder {
-    cert: Option<PemSource>,
-    key: Option<PemSource>,
-    client_ca: Option<PemSource>,
-    alpn: Vec<Vec<u8>>,
-}
-
-impl ServerTlsConfigBuilder {
-    /// Set the server cert chain from any [`PemSource`].
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_tls::{PemSource, ServerTlsConfig};
-    ///
-    /// let cfg = ServerTlsConfig::builder()
-    ///     .cert(PemSource::Bytes(b"cert".to_vec()))
-    ///     .key(PemSource::Bytes(b"key".to_vec()))
-    ///     .build()
-    ///     .unwrap();
-    ///
-    /// assert!(matches!(cfg.cert(), PemSource::Bytes(_)));
-    /// ```
-    pub fn cert(mut self, src: PemSource) -> Self {
-        self.cert = Some(src);
-        self
-    }
-
-    /// Set the server private key from any [`PemSource`].
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_tls::{PemSource, ServerTlsConfig};
-    ///
-    /// let cfg = ServerTlsConfig::builder()
-    ///     .cert(PemSource::Bytes(b"cert".to_vec()))
-    ///     .key(PemSource::Bytes(b"key".to_vec()))
-    ///     .build()
-    ///     .unwrap();
-    ///
-    /// assert!(matches!(cfg.key(), PemSource::Bytes(_)));
-    /// ```
-    pub fn key(mut self, src: PemSource) -> Self {
-        self.key = Some(src);
-        self
-    }
-
-    /// Set the ALPN protocol list, in preference order.
-    ///
-    /// Pass `["h2"]` for gRPC-only, or `["h2", "http/1.1"]` for HTTP/2 and HTTP/1.1. The default is empty.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_tls::ServerTlsConfig;
-    ///
-    /// let cfg = ServerTlsConfig::builder()
-    ///     .cert_pem_bytes(b"cert".to_vec())
-    ///     .key_pem_bytes(b"key".to_vec())
-    ///     .with_alpn(["h2", "http/1.1"])
-    ///     .build()
-    ///     .unwrap();
-    ///
-    /// assert_eq!(cfg.alpn(), &[b"h2".to_vec(), b"http/1.1".to_vec()]);
-    /// ```
-    pub fn with_alpn<I, S>(mut self, protocols: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<Vec<u8>>,
-    {
-        self.alpn = protocols.into_iter().map(Into::into).collect();
-        self
-    }
-
-    /// Convenience: set the server cert chain from a file path.
-    pub fn cert_pem_file(self, path: impl Into<PathBuf>) -> Self {
-        self.cert(PemSource::Path(path.into()))
-    }
-
-    /// Convenience: set the server cert chain from in-memory bytes.
-    pub fn cert_pem_bytes(self, bytes: impl Into<Vec<u8>>) -> Self {
-        self.cert(PemSource::Bytes(bytes.into()))
-    }
-
-    /// Convenience: set the server private key from a file path.
-    pub fn key_pem_file(self, path: impl Into<PathBuf>) -> Self {
-        self.key(PemSource::Path(path.into()))
-    }
-
-    /// Convenience: set the server private key from in-memory bytes.
-    pub fn key_pem_bytes(self, bytes: impl Into<Vec<u8>>) -> Self {
-        self.key(PemSource::Bytes(bytes.into()))
-    }
-
-    /// Convenience: enable mTLS with a CA bundle from a file path.
-    pub fn require_client_ca_pem_file(self, path: impl Into<PathBuf>) -> Self {
-        self.require_client_ca(PemSource::Path(path.into()))
-    }
-
-    /// Convenience: enable mTLS with a CA bundle from in-memory bytes.
-    pub fn require_client_ca_pem_bytes(self, bytes: impl Into<Vec<u8>>) -> Self {
-        self.require_client_ca(PemSource::Bytes(bytes.into()))
-    }
-
-    /// Require client certificates signed by this CA bundle.
-    ///
-    /// This turns on mTLS for the server.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_tls::{PemSource, ServerTlsConfig};
-    ///
-    /// let cfg = ServerTlsConfig::builder()
-    ///     .cert_pem_bytes(b"cert".to_vec())
-    ///     .key_pem_bytes(b"key".to_vec())
-    ///     .require_client_ca(PemSource::Bytes(b"ca".to_vec()))
-    ///     .build()
-    ///     .unwrap();
-    ///
-    /// assert!(cfg.client_ca().is_some());
-    /// ```
-    pub fn require_client_ca(mut self, src: PemSource) -> Self {
-        self.client_ca = Some(src);
-        self
-    }
-
-    /// Finalize the configuration.
-    ///
-    /// Validates that `cert` and `key` are present.
-    ///
-    /// This does no I/O.
-    /// PEM files are read later by [`ServerTlsConfig::into_rustls_config`].
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_tls::ServerTlsConfig;
-    ///
-    /// let cfg = ServerTlsConfig::builder()
-    ///     .cert_pem_bytes(b"-----BEGIN CERTIFICATE-----\n...".to_vec())
-    ///     .key_pem_bytes(b"-----BEGIN PRIVATE KEY-----\n...".to_vec())
-    ///     .with_alpn(["h2"])
-    ///     .build()
-    ///     .unwrap();
-    /// assert!(cfg.client_ca().is_none()); // standard TLS, not mTLS
-    /// ```
-    pub fn build(self) -> Result<ServerTlsConfig, TlsError> {
-        let cert = self.cert.ok_or(TlsError::MissingField("cert"))?;
-        let key = self.key.ok_or(TlsError::MissingField("key"))?;
-        Ok(ServerTlsConfig {
-            cert,
-            key,
-            client_ca: self.client_ca,
-            alpn: self.alpn,
-        })
+        builder
+            .with_single_cert(certificates, private_key)
+            .map_err(|source| TlsError::Configuration {
+                context: "server identity",
+                source,
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PemSource;
 
-    #[test]
-    fn debug_of_config_does_not_leak_key_bytes() {
-        let cfg = ServerTlsConfig::builder()
-            .cert_pem_bytes(vec![10, 20, 30])
-            .key_pem_bytes(vec![201, 202, 203])
-            .build()
-            .unwrap();
-        let rendered = format!("{cfg:?}");
-        assert!(
-            !rendered.contains("201") && !rendered.contains("202"),
-            "config Debug must not leak key bytes: {rendered}"
-        );
-        assert!(
-            rendered.contains("redacted"),
-            "expected redaction marker: {rendered}"
-        );
-    }
-
-    #[test]
-    fn builder_returns_config_when_cert_and_key_provided() {
-        let cfg = ServerTlsConfig::builder()
-            .cert_pem_bytes(b"--FAKE CERT--".to_vec())
-            .key_pem_bytes(b"--FAKE KEY--".to_vec())
-            .build()
-            .unwrap();
-        assert!(matches!(cfg.cert(), PemSource::Bytes(_)));
-        assert!(matches!(cfg.key(), PemSource::Bytes(_)));
-    }
-
-    #[test]
-    fn builder_errors_when_cert_is_missing() {
-        let err = ServerTlsConfig::builder()
-            .key_pem_bytes(vec![1])
-            .build()
-            .unwrap_err();
-        assert!(matches!(err, TlsError::MissingField("cert")));
-    }
-
-    #[test]
-    fn builder_errors_when_key_is_missing() {
-        let err = ServerTlsConfig::builder()
-            .cert_pem_bytes(vec![1])
-            .build()
-            .unwrap_err();
-        assert!(matches!(err, TlsError::MissingField("key")));
-    }
-
-    #[test]
-    fn cert_pem_file_creates_path_source() {
-        let cfg = ServerTlsConfig::builder()
-            .cert_pem_file("/etc/server.crt")
-            .key_pem_bytes(vec![1])
-            .build()
-            .unwrap();
-        assert!(matches!(cfg.cert(), PemSource::Path(_)));
-    }
-
-    #[test]
-    fn client_ca_defaults_to_none() {
-        let cfg = ServerTlsConfig::builder()
-            .cert_pem_bytes(vec![1])
-            .key_pem_bytes(vec![2])
-            .build()
-            .unwrap();
-        assert!(cfg.client_ca().is_none());
-    }
-
-    #[test]
-    fn require_client_ca_pem_bytes_enables_mtls() {
-        let cfg = ServerTlsConfig::builder()
-            .cert_pem_bytes(vec![1])
-            .key_pem_bytes(vec![2])
-            .require_client_ca_pem_bytes(b"--FAKE CA--".to_vec())
-            .build()
-            .unwrap();
-        assert!(matches!(cfg.client_ca(), Some(PemSource::Bytes(_))));
-    }
-
-    #[test]
-    fn require_client_ca_pem_file_enables_mtls() {
-        let cfg = ServerTlsConfig::builder()
-            .cert_pem_bytes(vec![1])
-            .key_pem_bytes(vec![2])
-            .require_client_ca_pem_file("/etc/ca.crt")
-            .build()
-            .unwrap();
-        assert!(matches!(cfg.client_ca(), Some(PemSource::Path(_))));
-    }
-
-    #[test]
-    fn alpn_defaults_to_empty() {
-        let cfg = ServerTlsConfig::builder()
-            .cert_pem_bytes(vec![1])
-            .key_pem_bytes(vec![2])
-            .build()
-            .unwrap();
-        assert!(cfg.alpn().is_empty());
-    }
-
-    #[test]
-    fn with_alpn_sets_protocols() {
-        let cfg = ServerTlsConfig::builder()
-            .cert_pem_bytes(vec![1])
-            .key_pem_bytes(vec![2])
-            .with_alpn(["h2", "http/1.1"])
-            .build()
-            .unwrap();
-        assert_eq!(cfg.alpn(), &[b"h2".to_vec(), b"http/1.1".to_vec()]);
-    }
-
-    fn rcgen_self_signed() -> (Vec<u8>, Vec<u8>) {
-        let b = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
+    fn self_signed() -> (Vec<u8>, Vec<u8>) {
+        let bundle = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
         (
-            b.cert.pem().into_bytes(),
-            b.signing_key.serialize_pem().into_bytes(),
+            bundle.cert.pem().into_bytes(),
+            bundle.signing_key.serialize_pem().into_bytes(),
         )
     }
 
     #[test]
-    fn into_rustls_config_succeeds_with_real_cert_and_key() {
-        let (cert, key) = rcgen_self_signed();
-        let cfg = ServerTlsConfig::builder()
-            .cert_pem_bytes(cert)
-            .key_pem_bytes(key)
-            .build()
-            .unwrap();
-
-        let _rustls = cfg.into_rustls_config().unwrap();
+    fn plain_tls_has_no_client_auth_roots() {
+        let config = ServerTlsConfig::new(TlsIdentity::from_pem_bytes(b"cert", b"key"));
+        assert!(config.client_auth_roots().is_none());
     }
 
     #[test]
-    fn into_rustls_config_succeeds_with_mtls_client_ca() {
-        let (cert, key) = rcgen_self_signed();
-        let (ca, _) = rcgen_self_signed();
-        let cfg = ServerTlsConfig::builder()
-            .cert_pem_bytes(cert)
-            .key_pem_bytes(key)
-            .require_client_ca_pem_bytes(ca)
-            .build()
-            .unwrap();
-
-        let _rustls = cfg.into_rustls_config().unwrap();
+    fn client_auth_is_explicit() {
+        let config = ServerTlsConfig::new(TlsIdentity::from_pem_bytes(b"cert", b"key"))
+            .require_client_auth(TrustRoots::from_pem_bytes(b"ca"));
+        assert!(config.client_auth_roots().is_some());
     }
 
     #[test]
-    fn into_rustls_config_propagates_alpn_to_rustls() {
-        let (cert, key) = rcgen_self_signed();
-        let cfg = ServerTlsConfig::builder()
-            .cert_pem_bytes(cert)
-            .key_pem_bytes(key)
-            .with_alpn(["h2"])
-            .build()
+    fn load_preserves_material_shape() {
+        let (certificate, private_key) = self_signed();
+        let (client_ca, _) = self_signed();
+        let expected_certificate = certificate.clone();
+        let expected_private_key = private_key.clone();
+        let expected_client_ca = client_ca.clone();
+        let loaded = ServerTlsConfig::new(TlsIdentity::from_pem_bytes(certificate, private_key))
+            .require_client_auth(TrustRoots::from_pem_bytes(client_ca))
+            .load()
             .unwrap();
-
-        let rustls = cfg.into_rustls_config().unwrap();
-        assert_eq!(rustls.alpn_protocols, vec![b"h2".to_vec()]);
-    }
-
-    #[test]
-    fn into_rustls_config_rejects_cert_key_mismatch() {
-        let (cert, _) = rcgen_self_signed();
-        let (_, other_key) = rcgen_self_signed();
-        let cfg = ServerTlsConfig::builder()
-            .cert_pem_bytes(cert)
-            .key_pem_bytes(other_key)
-            .build()
-            .unwrap();
-
-        let err = cfg.into_rustls_config().unwrap_err();
-        assert!(
-            matches!(err, TlsError::Rustls(_)),
-            "cert/key mismatch must surface as TlsError::Rustls, got {err:?}"
+        assert_eq!(
+            loaded.identity().certificate_chain_pem(),
+            expected_certificate
+        );
+        assert_eq!(
+            loaded.identity().expose_private_key_pem(),
+            expected_private_key
+        );
+        assert_eq!(
+            loaded.client_auth_roots_pem(),
+            Some(expected_client_ca.as_slice())
         );
     }
 
     #[test]
-    fn into_rustls_config_errors_on_malformed_cert_pem() {
-        let (_, key) = rcgen_self_signed();
-        let cfg = ServerTlsConfig::builder()
-            .cert_pem_bytes(b"not a pem".to_vec())
-            .key_pem_bytes(key)
-            .build()
+    fn builds_plain_rustls_config_without_transport_alpn() {
+        let (certificate, private_key) = self_signed();
+        let config = ServerTlsConfig::new(TlsIdentity::from_pem_bytes(certificate, private_key))
+            .into_rustls_config()
             .unwrap();
+        assert!(config.alpn_protocols.is_empty());
+    }
 
-        let err = cfg.into_rustls_config().unwrap_err();
-        assert!(
-            matches!(err, TlsError::NoCertificates),
-            "malformed cert PEM must surface as NoCertificates, got {err:?}"
-        );
+    #[test]
+    fn builds_mtls_rustls_config() {
+        let (certificate, private_key) = self_signed();
+        let (ca, _) = self_signed();
+        let _config = ServerTlsConfig::new(TlsIdentity::from_pem_bytes(certificate, private_key))
+            .require_client_auth(TrustRoots::from_pem_bytes(ca))
+            .into_rustls_config()
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_certificate_key_mismatch_with_context() {
+        let (certificate, _) = self_signed();
+        let (_, other_key) = self_signed();
+        let error = ServerTlsConfig::new(TlsIdentity::from_pem_bytes(certificate, other_key))
+            .into_rustls_config()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            TlsError::Configuration {
+                context: "server identity",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn malformed_certificate_reports_role() {
+        let (_, private_key) = self_signed();
+        let error = ServerTlsConfig::new(TlsIdentity::from_pem_bytes(
+            b"-----BEGIN CERTIFICATE-----\n%%%\n-----END CERTIFICATE-----",
+            private_key,
+        ))
+        .load()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            TlsError::InvalidPem {
+                role: PemRole::ServerCertificate,
+                ..
+            }
+        ));
     }
 }

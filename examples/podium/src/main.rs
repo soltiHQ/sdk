@@ -222,7 +222,9 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 
             match server_tls {
                 Some(tls) => {
-                    let rustls = Arc::new(tls.into_rustls_config()?);
+                    let mut rustls = tls.into_rustls_config()?;
+                    rustls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                    let rustls = Arc::new(rustls);
                     let addr: SocketAddr = listen.parse()?;
                     let srv = axum_server::Handle::<SocketAddr>::new();
                     let srv2 = srv.clone();
@@ -248,7 +250,7 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         Transport::Grpc => {
             let mut builder = Server::builder();
             if let Some(tls) = server_tls {
-                builder = builder.tls_config(to_tonic_server_tls(&tls)?)?;
+                builder = builder.tls_config(to_tonic_server_tls(tls)?)?;
             }
             let scheme = if secure { "grpcs" } else { "grpc" };
             info!(
