@@ -3,6 +3,17 @@
 //! [`PemSource`] holds certificates and trust roots.
 //! [`PrivateKeySource`] holds private keys in zeroizing storage.
 //! Both can use a file path or in-memory bytes.
+//!
+//! ## Flow
+//!
+//! ```text
+//! file path ──► read during load ──┐
+//!                                  ├──► PEM bytes
+//! memory bytes ────────────────────┘
+//! ```
+//!
+//! Constructors do not parse PEM.
+//! Client and server configurations load and validate it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,8 +29,8 @@ use crate::{PemRole, TlsError};
 /// | [`PemSource::file`]  | Reads the file when settings are loaded |
 /// | [`PemSource::bytes`] | Shares in-memory bytes between clones   |
 ///
-/// `Debug` shows a file path or byte length.
-/// It does not show in-memory PEM.
+/// File paths remain visible in `Debug`.
+/// In-memory PEM is redacted.
 ///
 /// ## See Also
 ///
@@ -37,8 +48,7 @@ enum PemSourceInner {
 impl PemSource {
     /// Creates a PEM source from a file path.
     ///
-    /// This method does not read the file.
-    /// The file is read when client or server settings are loaded or built.
+    /// This method only stores the path.
     ///
     /// ```
     /// use solti_tls::PemSource;
@@ -94,12 +104,13 @@ impl std::fmt::Debug for PemSource {
 /// | [`PrivateKeySource::file`]  | Reads the file when settings are loaded       |
 /// | [`PrivateKeySource::bytes`] | Shares zeroizing bytes between clones         |
 ///
-/// ## Private Keys
+/// ## Rules
 ///
-/// `Debug` does not show key bytes.
-/// In-memory bytes are zeroized after the last owner is dropped.
-/// Loaded configurations also keep key PEM in zeroizing storage.
-/// A TLS library or adapter may keep its own copy.
+/// - File paths remain visible in `Debug`.
+/// - In-memory key bytes are redacted.
+/// - In-memory key bytes are zeroized after the last owner is dropped.
+/// - Loaded identities keep key PEM in zeroizing storage.
+/// - A TLS library or adapter may keep its own copy.
 ///
 /// ## See Also
 ///
@@ -116,8 +127,8 @@ enum PrivateKeySourceInner {
 impl PrivateKeySource {
     /// Creates a private-key source from a file path.
     ///
-    /// This method does not read the file.
-    /// When loaded, the bytes are moved into zeroizing storage.
+    /// This method only stores the path.
+    /// Loading moves the file bytes into zeroizing storage.
     ///
     /// ```
     /// use solti_tls::PrivateKeySource;

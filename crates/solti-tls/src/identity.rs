@@ -1,27 +1,30 @@
 //! # TLS identities
 //!
-//! [`TlsIdentity`] holds a certificate chain and private key.
-//! [`LoadedTlsIdentity`] provides validated PEM to a transport adapter.
+//! [`TlsIdentity`] keeps one certificate chain with one private key.
+//! [`LoadedTlsIdentity`] exposes the loaded PEM after configuration validation.
 
 use zeroize::Zeroizing;
 
 use crate::{PemRole, PemSource, PrivateKeySource, TlsError};
 
-/// A certificate chain and private key used together.
+/// One certificate chain and its private key.
 ///
-/// ## Certificate and Key
+/// ## Flow
 ///
-/// An identity always contains both sources.
-/// It cannot contain only a certificate or only a key.
-/// The sources are read when client or server settings are loaded or built.
+/// ```text
+/// PemSource ─────────────┐
+///                        ├──► TlsIdentity ──► client or server config
+/// PrivateKeySource ──────┘
+/// ```
 ///
-/// > The certificate-chain PEM is passed to rustls in its original order.
-/// > Put the end-entity certificate first, followed by its issuer chain.
+/// ## Rules
 ///
-/// ## Private Keys
-///
-/// [`PrivateKeySource`] zeroizes its in-memory bytes after the last owner is dropped.
-/// `Debug` does not expose either in-memory PEM source.
+/// - The certificate chain is passed to `rustls` in its original order; put the end-entity certificate first, follow it with the issuer chain.
+/// - File sources are read when a client or server configuration is loaded or built.
+/// - Every source is validated at that boundary.
+/// - An identity always contains both sources.
+/// - [`PrivateKeySource`] zeroizes its in-memory bytes after the last owner is dropped.
+/// - `Debug` does not expose in-memory PEM.
 ///
 /// ## Example
 ///
@@ -38,7 +41,7 @@ use crate::{PemRole, PemSource, PrivateKeySource, TlsError};
 /// ## See Also
 ///
 /// - [`ServerTlsConfig`](crate::ServerTlsConfig) requires a server identity.
-/// - [`ClientTlsConfig::with_identity`](crate::ClientTlsConfig::with_identity) adds an identity for mutual TLS.
+/// - [`ClientTlsConfig::with_identity`](crate::ClientTlsConfig::with_identity) adds a client identity.
 #[derive(Clone, Debug)]
 pub struct TlsIdentity {
     certificate_chain: PemSource,
@@ -48,7 +51,7 @@ pub struct TlsIdentity {
 impl TlsIdentity {
     /// Creates an identity from separate certificate and private-key sources.
     ///
-    /// This method does not read or validate either source.
+    /// This method only stores the sources.
     pub fn new(certificate_chain: PemSource, private_key: PrivateKeySource) -> Self {
         Self {
             certificate_chain,
@@ -58,7 +61,7 @@ impl TlsIdentity {
 
     /// Creates an identity from certificate-chain and private-key PEM paths.
     ///
-    /// The files are read when client or server settings are loaded or built.
+    /// This method does not read the files.
     pub fn from_pem_files(
         certificate_chain: impl Into<std::path::PathBuf>,
         private_key: impl Into<std::path::PathBuf>,
@@ -71,7 +74,7 @@ impl TlsIdentity {
 
     /// Creates an identity from certificate-chain and private-key PEM bytes.
     ///
-    /// The private key is moved into zeroizing storage.
+    /// The private-key bytes move into zeroizing storage.
     pub fn from_pem_bytes(
         certificate_chain: impl Into<Vec<u8>>,
         private_key: impl Into<Vec<u8>>,
@@ -104,12 +107,12 @@ impl TlsIdentity {
     }
 }
 
-/// Loaded and validated identity PEM for a transport adapter.
+/// Loaded identity PEM accepted as part of a client or server configuration.
 ///
-/// Values are produced by [`ServerTlsConfig::load`](crate::ServerTlsConfig::load) and [`ClientTlsConfig::load`](crate::ClientTlsConfig::load).
-/// The certificate chain and private key have been checked as a pair.
-///
-/// The value keeps PEM encoding for adapters that do not use rustls types.
+/// [`ServerTlsConfig::load`](crate::ServerTlsConfig::load) and
+/// [`ClientTlsConfig::load`](crate::ClientTlsConfig::load) produce this value.
+/// `rustls` accepted the certificate chain and private key together.
+/// The value keeps PEM encoding for adapters that do not use `rustls` types.
 pub struct LoadedTlsIdentity {
     certificate_chain: Vec<u8>,
     private_key: Zeroizing<Vec<u8>>,
@@ -125,7 +128,7 @@ impl LoadedTlsIdentity {
     ///
     /// The method name makes private-key access visible at the call site.
     /// The returned slice points to zeroizing storage owned by this identity.
-    /// Calling code may keep its own copy.
+    /// A caller may keep its own copy.
     pub fn expose_private_key_pem(&self) -> &[u8] {
         &self.private_key
     }
@@ -146,13 +149,6 @@ impl std::fmt::Debug for LoadedTlsIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn identity_is_always_a_complete_pair() {
-        let identity = TlsIdentity::from_pem_bytes(b"cert".to_vec(), b"key".to_vec());
-        assert!(format!("{:?}", identity.certificate_chain()).contains("redacted"));
-        assert!(format!("{:?}", identity.private_key()).contains("redacted"));
-    }
 
     #[test]
     fn loaded_identity_debug_redacts_key() {

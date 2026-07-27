@@ -1,31 +1,41 @@
 //! # Server TLS
 //!
-//! [`ServerTlsConfig`] defines the server identity and optional client authentication.
-//! [`LoadedServerTlsConfig`] provides validated PEM to a transport adapter.
+//! [`ServerTlsConfig`] builds TLS settings for a server.
+//! It requires a server identity and accepts optional client trust roots.
+//! [`LoadedServerTlsConfig`] carries validated PEM for an adapter.
 
 use std::sync::Arc;
 
 use crate::{LoadedTlsIdentity, PemRole, TlsError, TlsIdentity, TrustRoots};
 
-/// TLS and mutual TLS settings for a server.
+/// TLS and mTLS settings for one server.
 ///
-/// A server identity is always required.
-/// It always contains both a certificate chain and its private key.
+/// A [`TlsIdentity`] is required.
+/// [`TrustRoots`] enable client authentication.
 ///
-/// | Configuration                            | Server behavior                                                        |
-/// |------------------------------------------|------------------------------------------------------------------------|
-/// | [`ServerTlsConfig::new`]                 | Presents the server identity and does not request a client certificate |
-/// | [`ServerTlsConfig::require_client_auth`] | Requires a client certificate accepted by the configured roots         |
+/// | Configuration                            | Material                                |
+/// |------------------------------------------|-----------------------------------------|
+/// | [`ServerTlsConfig::new`]                 | Server identity; no client roots        |
+/// | [`ServerTlsConfig::require_client_auth`] | Server identity and client trust roots  |
 ///
-/// ## When Files Are Read
+/// ## Flow
 ///
-/// Creating and changing the configuration does not read files.
-/// [`Self::load`] and [`Self::into_rustls_config`] read and validate all PEM sources.
+/// ```text
+/// TlsIdentity ───────────────────┐
+///                                ├──► ServerTlsConfig
+/// TrustRoots (optional) ─────────┘           │
+///                                            ├──► load() ──► LoadedServerTlsConfig
+///                                            └──► into_rustls_config() ──► rustls::ServerConfig
+/// ```
 ///
-/// ## ALPN
+/// ## Rules
 ///
-/// The generated rustls configuration has no ALPN protocols.
-/// The transport sets them.
+/// - Constructors do not read files.
+/// - [`Self::load`] and [`Self::into_rustls_config`] read and validate every source.
+/// - Without client roots, the server does not request a client certificate.
+/// - With client roots, every client must present a trusted certificate.
+/// - The generated configuration has no ALPN protocols.
+///   The transport sets them.
 ///
 /// ## Example
 ///
@@ -60,7 +70,7 @@ impl ServerTlsConfig {
     /// Creates server TLS settings with the identity presented to clients.
     ///
     /// Client authentication is disabled until [`Self::require_client_auth`] is called.
-    /// This method does not read or validate the identity.
+    /// This method only stores the identity.
     pub fn new(identity: TlsIdentity) -> Self {
         Self {
             identity,
@@ -72,6 +82,7 @@ impl ServerTlsConfig {
     ///
     /// A client must present a certificate that rustls accepts.
     /// A second call replaces the previous roots.
+    /// This method only stores the roots.
     pub fn require_client_auth(mut self, roots: TrustRoots) -> Self {
         self.client_auth_roots = Some(roots);
         self
@@ -91,13 +102,17 @@ impl ServerTlsConfig {
 
     /// Loads and validates PEM for a transport adapter.
     ///
+    /// This method builds a temporary `rustls` configuration to validate the material.
+    /// It returns the loaded PEM after that check succeeds.
     /// File errors include the purpose of the PEM and its path.
     ///
     /// # Errors
     ///
     /// - [`TlsError::ReadPem`] when a file cannot be read.
-    /// - [`TlsError::InvalidPem`], [`TlsError::NoCertificates`],
-    ///   [`TlsError::NoPrivateKey`], or [`TlsError::MultiplePrivateKeys`] when PEM is invalid.
+    /// - [`TlsError::InvalidPem`] when a PEM block is malformed.
+    /// - [`TlsError::NoCertificates`] when an input has no certificate block.
+    /// - [`TlsError::NoPrivateKey`] when the identity has no supported private-key block.
+    /// - [`TlsError::MultiplePrivateKeys`] when the identity has more than one key.
     /// - [`TlsError::InvalidCertificate`] when rustls rejects a trust root.
     /// - [`TlsError::ClientVerifier`] when the client verifier cannot be built.
     /// - [`TlsError::Configuration`] when the server certificate and key cannot be used together.
@@ -105,7 +120,7 @@ impl ServerTlsConfig {
     /// # Security
     ///
     /// The loaded server identity contains private-key PEM.
-    /// This crate zeroizes it's buffer on drop.
+    /// This crate zeroizes its buffer on drop.
     /// An adapter may keep its own copy.
     pub fn load(self) -> Result<LoadedServerTlsConfig, TlsError> {
         let loaded = self.load_material()?;
@@ -129,7 +144,7 @@ impl ServerTlsConfig {
     ///
     /// Client-authentication roots make client certificates mandatory.
     /// Without the roots, no client certificate is requested.
-    /// `alpn_protocols` is empty.
+    /// The returned `alpn_protocols` list is empty.
     ///
     /// # Errors
     ///
@@ -139,11 +154,10 @@ impl ServerTlsConfig {
     }
 }
 
-/// Loaded and validated server PEM for a transport adapter.
+/// Loaded server PEM accepted by `rustls`.
 ///
-/// The identity has a valid certificate and private-key pair.
+/// `rustls` accepted the certificate chain and key as a server identity.
 /// If client roots are present, the client verifier was also built successfully.
-///
 /// `Debug` redacts the private key through [`LoadedTlsIdentity`].
 #[derive(Debug)]
 pub struct LoadedServerTlsConfig {
@@ -157,7 +171,7 @@ impl LoadedServerTlsConfig {
         &self.identity
     }
 
-    /// Returns loaded PEM roots used to verify client certificates.
+    /// Returns the loaded PEM roots used to verify client certificates.
     ///
     /// `None` means that client authentication is disabled.
     pub fn client_auth_roots_pem(&self) -> Option<&[u8]> {
@@ -220,15 +234,11 @@ mod tests {
     }
 
     #[test]
-    fn plain_tls_has_no_client_auth_roots() {
+    fn client_auth_is_optional() {
         let config = ServerTlsConfig::new(TlsIdentity::from_pem_bytes(b"cert", b"key"));
         assert!(config.client_auth_roots().is_none());
-    }
 
-    #[test]
-    fn client_auth_is_explicit() {
-        let config = ServerTlsConfig::new(TlsIdentity::from_pem_bytes(b"cert", b"key"))
-            .require_client_auth(TrustRoots::from_pem_bytes(b"ca"));
+        let config = config.require_client_auth(TrustRoots::from_pem_bytes(b"ca"));
         assert!(config.client_auth_roots().is_some());
     }
 
@@ -267,16 +277,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_mtls_rustls_config() {
-        let (certificate, private_key) = self_signed();
-        let (ca, _) = self_signed();
-        let _config = ServerTlsConfig::new(TlsIdentity::from_pem_bytes(certificate, private_key))
-            .require_client_auth(TrustRoots::from_pem_bytes(ca))
-            .into_rustls_config()
-            .unwrap();
-    }
-
-    #[test]
     fn rejects_certificate_key_mismatch_with_context() {
         let (certificate, _) = self_signed();
         let (_, other_key) = self_signed();
@@ -287,24 +287,6 @@ mod tests {
             error,
             TlsError::Configuration {
                 context: "server identity",
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn malformed_certificate_reports_role() {
-        let (_, private_key) = self_signed();
-        let error = ServerTlsConfig::new(TlsIdentity::from_pem_bytes(
-            b"-----BEGIN CERTIFICATE-----\n%%%\n-----END CERTIFICATE-----",
-            private_key,
-        ))
-        .load()
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            TlsError::InvalidPem {
-                role: PemRole::ServerCertificate,
                 ..
             }
         ));

@@ -1,4 +1,7 @@
 //! # rustls crypto provider
+//!
+//! This module preserves an existing process-wide `rustls` provider.
+//! It installs the ring provider only when no default exists.
 
 pub(crate) fn ensure_default_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {

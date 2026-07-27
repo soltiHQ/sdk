@@ -1,4 +1,7 @@
 //! # TLS errors
+//!
+//! [`TlsError`] keeps failures grouped by loading and validation stage.
+//! [`PemRole`] identifies the purpose of affected PEM.
 
 use std::path::PathBuf;
 
@@ -33,29 +36,6 @@ impl std::fmt::Display for PemRole {
 }
 
 /// Errors returned while loading and validating TLS material.
-///
-/// Errors are grouped by where they happen:
-///
-/// | Step                   | Variants                                                                                                              |
-/// |------------------------|-----------------------------------------------------------------------------------------------------------------------|
-/// | Read a file            | [`TlsError::ReadPem`]                                                                                                 |
-/// | Parse PEM              | [`TlsError::InvalidPem`], [`TlsError::NoCertificates`], [`TlsError::NoPrivateKey`], [`TlsError::MultiplePrivateKeys`] |
-/// | Add a trust root       | [`TlsError::InvalidCertificate`]                                                                                      |
-/// | Build TLS settings     | [`TlsError::Configuration`], [`TlsError::ClientVerifier`]                                                             |
-///
-/// Match with a wildcard arm because this enum is non-exhaustive.
-///
-/// ```
-/// use solti_tls::TlsError;
-///
-/// fn is_file_error(error: &TlsError) -> bool {
-///     match error {
-///         TlsError::ReadPem { .. } => true,
-///         _ => false,
-///     }
-/// }
-/// # let _ = is_file_error;
-/// ```
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TlsError {

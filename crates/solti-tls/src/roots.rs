@@ -1,21 +1,24 @@
 //! # Trust roots
 //!
-//! [`TrustRoots`] holds certificates used to verify the other side of a connection.
+//! [`TrustRoots`] holds the certificates accepted as peer trust anchors.
+//! The same type verifies servers and mTLS clients.
 
 use crate::{PemRole, PemSource, TlsError};
 
-/// A PEM bundle of trusted certificates.
+/// A PEM bundle of peer trust anchors.
 ///
-/// The same type is used on both sides of a connection:
+/// ## Use
 ///
 /// | Configuration                                                                         | Verified peer      |
 /// |---------------------------------------------------------------------------------------|--------------------|
 /// | [`ClientTlsConfig`](crate::ClientTlsConfig)                                           | Server certificate |
 /// | [`ServerTlsConfig::require_client_auth`](crate::ServerTlsConfig::require_client_auth) | Client certificate |
 ///
-/// Construction does not read or parse the bundle.
-/// The client or server configuration reads and validates it.
-/// It must contain at least one PEM certificate block.
+/// ## Rules
+///
+/// - Construction does not read or parse the bundle.
+/// - The client or server configuration reads and validates it.
+/// - The bundle must contain at least one certificate PEM block.
 ///
 /// ## Example
 ///
@@ -37,12 +40,14 @@ impl TrustRoots {
 
     /// Creates trust roots from a PEM file path.
     ///
-    /// The client or server configuration reads the file later.
+    /// This method only stores the path.
     pub fn from_pem_file(path: impl Into<std::path::PathBuf>) -> Self {
         Self(PemSource::file(path))
     }
 
     /// Creates trust roots from in-memory PEM bytes.
+    ///
+    /// Clones share the same immutable buffer.
     pub fn from_pem_bytes(bytes: impl Into<Vec<u8>>) -> Self {
         Self(PemSource::bytes(bytes))
     }

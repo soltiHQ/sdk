@@ -1,29 +1,26 @@
 //! # solti-tls
 //!
-//! Shared TLS and mutual TLS configuration for Solti transports.
-//!
-//! Use it to define certificates, private keys, and trust roots once.
-//! A transport can build rustls directly or load validated PEM from the same configuration.
+//! Shared TLS and mTLS configuration for Solti transports.
+//! It loads PEM and uses `rustls` to check the configuration material.
+//! Callers own connections and application protocols.
 //!
 //! ## Start Here
 //!
 //! 1. Create a [`TlsIdentity`] from a certificate chain and private key.
 //! 2. Create [`ServerTlsConfig`] or [`ClientTlsConfig`].
-//! 3. Enable mutual TLS with [`ServerTlsConfig::require_client_auth`] and [`ClientTlsConfig::with_identity`].
-//! 4. Call `into_rustls_config()` for rustls or `load()` for a transport adapter.
+//! 3. Enable mutual TLS when needed; use [`ServerTlsConfig::require_client_auth`] and [`ClientTlsConfig::with_identity`].
+//! 4. Build `rustls` or load validated PEM for an adapter.
+//!
+//! ## Flow
 //!
 //! ```text
-//! PemSource + PrivateKeySource ──> TlsIdentity ──────────┐
-//!                                                        │
-//! PemSource ─────────────────────> TrustRoots ───────────┤
-//!                                                        ▼
-//!                                       ServerTlsConfig / ClientTlsConfig
-//!                                              │                  │
-//!                                              ▼                  ▼
-//!                                  into_rustls_config()          load()
-//!                                              │                  │
-//!                                              ▼                  ▼
-//!                                           rustls       transport adapter
+//! PemSource + PrivateKeySource ──► TlsIdentity ─┐
+//!                                               ├──► ServerTlsConfig / ClientTlsConfig
+//! PemSource ─────────────────────► TrustRoots ──┘               │
+//!                                                               ├──► into_rustls_config()
+//!                                                               │         └──► rustls config
+//!                                                               └──► load()
+//!                                                                         └──► validated PEM
 //! ```
 //!
 //! ## Client and Server
@@ -33,24 +30,20 @@
 //! | [`ServerTlsConfig`] | Server [`TlsIdentity`]                   | [`TrustRoots`] used to verify clients |
 //! | [`ClientTlsConfig`] | [`TrustRoots`] used to verify the server | Client [`TlsIdentity`]                |
 //!
-//! ## Certificate and Key
-//!
-//! A [`TlsIdentity`] always contains both a certificate chain and its private key.
-//! It cannot contain only one of them.
-//!
-//! ## When Files Are Read
+//! ## Loading
 //!
 //! Constructors do not read files.
 //! File sources are read by `load()` or `into_rustls_config()`.
+//! Both methods validate the material with `rustls`.
 //!
-//! Both methods parse the PEM, build the required rustls verifiers, and check certificate/private-key pairs.
-//! [`TlsError`] reports what failed; file errors also include the path.
+//! `load()` returns the original PEM after validation.
+//! `into_rustls_config()` returns the built `rustls` configuration.
+//! [`TlsError`] reports the failed stage.
 //!
 //! ## ALPN
 //!
-//! - Adapters can use [`LoadedServerTlsConfig`] or [`LoadedClientTlsConfig`] from `load()`.
 //! - `into_rustls_config()` leaves `alpn_protocols` empty.
-//! - The HTTP, gRPC, or other transport sets ALPN.
+//! - HTTP, gRPC, or another transport sets ALPN.
 //!
 //! ## Quick Start
 //!
@@ -79,8 +72,8 @@
 //! |---------------------------|-------------------------------------------------|
 //! | [`TlsIdentity`]           | Certificate chain and private key               |
 //! | [`TrustRoots`]            | Certificates used to verify the other side      |
-//! | [`ServerTlsConfig`]       | Server TLS and mutual TLS settings              |
-//! | [`ClientTlsConfig`]       | Client TLS and mutual TLS settings              |
+//! | [`ServerTlsConfig`]       | Server TLS and mTLS settings                    |
+//! | [`ClientTlsConfig`]       | Client TLS and mTLS settings                    |
 //! | [`LoadedTlsIdentity`]     | Loaded identity PEM for an adapter              |
 //! | [`LoadedServerTlsConfig`] | Loaded server PEM for an adapter                |
 //! | [`LoadedClientTlsConfig`] | Loaded client PEM for an adapter                |
@@ -90,11 +83,11 @@
 //!
 //! ## Security
 //!
-//! - [`ClientTlsConfig`] trusts only the configured roots. Operating-system roots are not added.
+//! - `into_rustls_config()` does not check a server name; `rustls` checks it during the client handshake.
+//! - [`ClientTlsConfig`] trusts only the configured roots; operating-system roots are not added.
 //! - [`ServerTlsConfig::require_client_auth`] makes client certificates mandatory.
 //! - A TLS library or adapter may keep its own copy of a private key.
 //! - Private-key buffers owned by this crate are zeroized on drop.
-//! - The server name is checked when the client connects.
 //! - OCSP and CRL checks are not configured.
 
 #![forbid(unsafe_code)]

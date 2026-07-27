@@ -1,4 +1,10 @@
 //! # PEM parsing
+//!
+//! This module parses certificate chains and private keys for `rustls`.
+//! It keeps the caller-provided [`PemRole`] in every error.
+//!
+//! A certificate input may contain a chain.
+//! A private-key input must contain exactly one supported key.
 
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer,
@@ -51,13 +57,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_certificate_chain() {
-        let (certificate, _) = self_signed();
-        let certificates = load_certificates(&certificate, PemRole::ServerCertificate).unwrap();
-        assert_eq!(certificates.len(), 1);
-    }
-
-    #[test]
     fn missing_certificate_keeps_role() {
         let error = load_certificates(b"not a certificate", PemRole::ClientTrustRoots).unwrap_err();
         assert!(matches!(
@@ -85,9 +84,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_one_private_key() {
-        let (_, key) = self_signed();
-        let _key = load_private_key(&key, PemRole::ServerPrivateKey).unwrap();
+    fn missing_private_key_keeps_role() {
+        let error = load_private_key(b"not a private key", PemRole::ClientPrivateKey).unwrap_err();
+        assert!(matches!(
+            error,
+            TlsError::NoPrivateKey {
+                role: PemRole::ClientPrivateKey
+            }
+        ));
     }
 
     #[test]

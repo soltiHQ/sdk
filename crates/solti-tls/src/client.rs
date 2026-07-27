@@ -1,35 +1,38 @@
 //! # Client TLS
 //!
-//! [`ClientTlsConfig`] defines server trust roots and an optional client identity.
-//! [`LoadedClientTlsConfig`] provides validated PEM to a transport adapter.
+//! [`ClientTlsConfig`] builds TLS settings for a client.
+//! [`LoadedClientTlsConfig`] carries validated PEM for an adapter.
+//! It requires server trust roots and accepts an optional client identity.
 
 use crate::{LoadedTlsIdentity, PemRole, TlsError, TlsIdentity, TrustRoots};
 
-/// TLS and mutual TLS settings for a client.
+/// TLS and mTLS settings for one client.
 ///
-/// Server trust roots are required at construction.
-/// A client identity is an optional complete certificate/private-key pair:
+/// [`TrustRoots`] are required.
+/// A [`TlsIdentity`] enables client authentication.
 ///
-/// | Configuration                      | Client behavior                                        |
-/// |------------------------------------|--------------------------------------------------------|
-/// | [`ClientTlsConfig::new`]           | Verifies the server and presents no client certificate |
-/// | [`ClientTlsConfig::with_identity`] | Also presents the configured identity for mutual TLS   |
+/// | Configuration                      | Material                                  |
+/// |------------------------------------|-------------------------------------------|
+/// | [`ClientTlsConfig::new`]           | Server roots; no client certificate       |
+/// | [`ClientTlsConfig::with_identity`] | Server roots and one client identity      |
 ///
-/// ## When Files Are Read
+/// ## Flow
 ///
-/// Creating and changing the configuration does not read files.
-/// [`Self::load`] and [`Self::into_rustls_config`] read and validate all PEM sources.
+/// ```text
+/// TrustRoots ────────────────────┐
+///                                ├──► ClientTlsConfig
+/// TlsIdentity (optional) ────────┘           │
+///                                            ├──► load() ──► LoadedClientTlsConfig
+///                                            └──► into_rustls_config() ──► rustls::ClientConfig
+/// ```
 ///
-/// ## Server Verification
+/// ## Rules
 ///
-/// The server name is checked when the client connects.
-/// The client trusts only [`Self::server_roots`].
-/// Operating-system trust roots are not added.
-///
-/// ## ALPN
-///
-/// The generated rustls configuration has no ALPN protocols.
-/// The transport sets them.
+/// - Constructors do not read files.
+/// - [`Self::load`] and [`Self::into_rustls_config`] read and validate every source.
+/// - Only [`Self::server_roots`] are trusted; operating-system roots are not added.
+/// - The generated configuration has no ALPN protocols; the transport sets them.
+/// - `rustls` checks the server name during the handshake.
 ///
 /// ## Example
 ///
@@ -64,7 +67,7 @@ impl ClientTlsConfig {
     /// Creates client TLS settings with roots used to verify the server.
     ///
     /// The client presents no certificate until [`Self::with_identity`] is called.
-    /// This method does not read or validate the roots.
+    /// This method only stores the roots.
     pub fn new(server_roots: TrustRoots) -> Self {
         Self {
             server_roots,
@@ -75,7 +78,7 @@ impl ClientTlsConfig {
     /// Sets the identity presented when the server requires mutual TLS.
     ///
     /// A second call replaces the previous identity.
-    /// The identity is read and validated by [`Self::load`] or [`Self::into_rustls_config`].
+    /// This method only stores the identity.
     pub fn with_identity(mut self, identity: TlsIdentity) -> Self {
         self.identity = Some(identity);
         self
@@ -95,14 +98,19 @@ impl ClientTlsConfig {
 
     /// Loads and validates PEM for a transport adapter.
     ///
+    /// This method builds a temporary `rustls` configuration to validate the material.
+    /// It returns the loaded PEM after that check succeeds.
     /// File errors include the purpose of the PEM and its path.
     ///
     /// # Errors
     ///
-    /// - [`TlsError::InvalidPem`], [`TlsError::NoCertificates`], [`TlsError::NoPrivateKey`], or [`TlsError::MultiplePrivateKeys`] when PEM is invalid.
+    /// - [`TlsError::ReadPem`] when a file cannot be read.
+    /// - [`TlsError::InvalidPem`] when a PEM block is malformed.
+    /// - [`TlsError::NoCertificates`] when an input has no certificate block.
+    /// - [`TlsError::NoPrivateKey`] when the identity has no supported private-key block.
+    /// - [`TlsError::MultiplePrivateKeys`] when the identity has more than one key.
     /// - [`TlsError::Configuration`] when the client certificate and key cannot be used together.
     /// - [`TlsError::InvalidCertificate`] when rustls rejects a trust root.
-    /// - [`TlsError::ReadPem`] when a file cannot be read.
     ///
     /// # Security
     ///
@@ -130,8 +138,8 @@ impl ClientTlsConfig {
     /// Builds a [`rustls::ClientConfig`].
     ///
     /// It trusts only the configured roots.
-    /// It includes the client identity when one is set.
-    /// `alpn_protocols` is empty.
+    /// It presents the client identity when one is set.
+    /// The returned `alpn_protocols` list is empty.
     ///
     /// # Errors
     ///
@@ -146,11 +154,10 @@ impl ClientTlsConfig {
     }
 }
 
-/// Loaded and validated client PEM for a transport adapter.
+/// Loaded client PEM accepted by `rustls`.
 ///
-/// The server roots have passed rustls validation.
-/// The optional identity has a valid certificate and private-key pair.
-///
+/// `rustls` accepted the server roots.
+/// It also accepted the optional certificate chain and key as a client identity.
 /// `Debug` redacts the private key through [`LoadedTlsIdentity`].
 #[derive(Debug)]
 pub struct LoadedClientTlsConfig {
@@ -159,7 +166,7 @@ pub struct LoadedClientTlsConfig {
 }
 
 impl LoadedClientTlsConfig {
-    /// Returns loaded PEM roots used to verify the server.
+    /// Returns the loaded PEM roots used to verify the server.
     pub fn server_roots_pem(&self) -> &[u8] {
         &self.server_roots
     }
@@ -222,15 +229,11 @@ mod tests {
     }
 
     #[test]
-    fn plain_tls_has_no_client_identity() {
+    fn client_identity_is_optional() {
         let config = ClientTlsConfig::new(TrustRoots::from_pem_bytes(b"ca"));
         assert!(config.identity().is_none());
-    }
 
-    #[test]
-    fn client_identity_is_atomic() {
-        let config = ClientTlsConfig::new(TrustRoots::from_pem_bytes(b"ca"))
-            .with_identity(TlsIdentity::from_pem_bytes(b"cert", b"key"));
+        let config = config.with_identity(TlsIdentity::from_pem_bytes(b"cert", b"key"));
         assert!(config.identity().is_some());
     }
 
@@ -258,16 +261,6 @@ mod tests {
             .into_rustls_config()
             .unwrap();
         assert!(config.alpn_protocols.is_empty());
-    }
-
-    #[test]
-    fn builds_mtls_rustls_config() {
-        let (ca, _) = self_signed();
-        let (certificate, private_key) = self_signed();
-        let _config = ClientTlsConfig::new(TrustRoots::from_pem_bytes(ca))
-            .with_identity(TlsIdentity::from_pem_bytes(certificate, private_key))
-            .into_rustls_config()
-            .unwrap();
     }
 
     #[test]

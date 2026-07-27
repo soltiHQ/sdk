@@ -1,35 +1,87 @@
 # solti-tls
 
-Shared declarative TLS and mTLS configuration for Solti transports.
+`solti-tls` defines TLS and mutual TLS material for Solti transports: `solti-api` builds a server config, `solti-discover` builds a client config.
+It validates certificates, private keys, and trust roots, then produces a `rustls` configuration or loaded PEM for a transport adapter.
 
-`solti-tls` owns certificate sources, private-key sources, identities, trust roots, loading, PEM validation, and conversion to rustls. 
+## Quick start
+
+```rust,no_run
+use solti_tls::{ServerTlsConfig, TlsIdentity};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = ServerTlsConfig::new(TlsIdentity::from_pem_files(
+        "/etc/solti/tls/server.crt",
+        "/etc/solti/tls/server.key",
+    ))
+    .into_rustls_config()?;
+
+    config.alpn_protocols = vec![b"h2".to_vec()]; // the transport sets ALPN
+    Ok(())
+}
+```
+
+Most callers use `into_rustls_config()`. 
+Use `load()` instead when an adapter (`reqwest`, `tonic`) consumes raw PEM rather than `rustls` types.
+
+## What it does
+
+- keeps a certificate chain and private key together as one identity;
+- gives HTTP, gRPC, and other adapters the same TLS input;
+- validates material before transport starts;
+- separates identities from trust roots;
+- makes client authentication explicit;
+- accepts PEM from files or memory.
+
+## Inputs and outputs
+
+| Value             | Input                                           |
+|-------------------|-------------------------------------------------|
+| `TlsIdentity`     | Certificate chain and private key               |
+| `TrustRoots`      | Certificates trusted for peer verification      |
+| `ServerTlsConfig` | Server identity and optional client trust roots |
+| `ClientTlsConfig` | Server trust roots and optional client identity |
+
+| Method                 | Output                                                              |
+|------------------------|---------------------------------------------------------------------|
+| `into_rustls_config()` | `rustls::ServerConfig` or `rustls::ClientConfig`                    |
+| `load()`               | Validated PEM in `LoadedServerTlsConfig` or `LoadedClientTlsConfig` |
+
+Constructors only store their inputs. Files are read by `load()` or `into_rustls_config()`.
 
 ## Server
+
+A server always requires an identity. 
+Client trust roots enable mandatory client authentication.
 
 ```rust,no_run
 use solti_tls::{ServerTlsConfig, TlsIdentity, TrustRoots};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let identity = TlsIdentity::from_pem_files(
+    let server = ServerTlsConfig::new(TlsIdentity::from_pem_files(
         "/etc/solti/tls/server.crt",
         "/etc/solti/tls/server.key",
-    );
+    ));
 
-    let server = ServerTlsConfig::new(identity)
+    // TLS without client authentication.
+    let plain = server.clone().into_rustls_config()?;
+
+    // Mutual TLS. Every client must present a trusted certificate.
+    let mtls = server
         .require_client_auth(TrustRoots::from_pem_file(
             "/etc/solti/tls/clients-ca.crt",
-        ));
+        ))
+        .into_rustls_config()?;
 
-    let mut rustls = server.into_rustls_config()?;
-    // The HTTP transport owns its application-protocol policy.
-    rustls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    assert!(plain.alpn_protocols.is_empty());
+    assert!(mtls.alpn_protocols.is_empty());
     Ok(())
 }
 ```
 
-Omit `require_client_auth` for ordinary server TLS. When it is present, a valid client certificate is mandatory.
-
 ## Client
+
+A client always requires roots for server verification. 
+A client identity enables mutual TLS.
 
 ```rust,no_run
 use solti_tls::{ClientTlsConfig, TlsIdentity, TrustRoots};
@@ -37,81 +89,85 @@ use solti_tls::{ClientTlsConfig, TlsIdentity, TrustRoots};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = ClientTlsConfig::new(TrustRoots::from_pem_file(
         "/etc/solti/tls/control-plane-ca.crt",
-    ))
-    .with_identity(TlsIdentity::from_pem_files(
-        "/etc/solti/tls/agent.crt",
-        "/etc/solti/tls/agent.key",
     ));
 
-    let rustls = client.into_rustls_config()?;
-    let _ = rustls;
+    // TLS without a client certificate.
+    let plain = client.clone().into_rustls_config()?;
+
+    // Mutual TLS. The client presents this identity to the server.
+    let mtls = client
+        .with_identity(TlsIdentity::from_pem_files(
+            "/etc/solti/tls/agent.crt",
+            "/etc/solti/tls/agent.key",
+        ))
+        .into_rustls_config()?;
+
+    assert!(plain.alpn_protocols.is_empty());
+    assert!(mtls.alpn_protocols.is_empty());
     Ok(())
 }
 ```
 
-Omit `with_identity` for ordinary client TLS. The client trusts only the configured roots; it does not implicitly use the operating-system trust store.
+The client trusts only the configured roots. 
+Operating-system roots are not added automatically.
 
-## Model
+## PEM sources
 
-```text
-PemSource + PrivateKeySource
-            |
-            v
-       TlsIdentity              PemSource
-            |                       |
-            +--------+--------------+
-                     v
-       ServerTlsConfig / ClientTlsConfig
-                  |             |
-                load()   into_rustls_config()
-                  |             |
-                  v             v
-          loaded PEM       rustls config
-          for adapters
-```
-
-- `load()` is the transport-adapter boundary for tonic and similar libraries.
-- `TlsIdentity` is always a complete certificate-chain/private-key pair.
-- `TrustRoots` distinguishes trust anchors from an identity certificate.
-- `ServerTlsConfig` always has a server identity.
-- `ClientTlsConfig` always has server trust roots.
-- PEM parser and process-wide rustls-provider setup are internal details.
-
-## Sources and private keys
+The convenience constructors accept either paths or bytes:
 
 ```rust
-use solti_tls::{PemSource, PrivateKeySource, TlsIdentity};
+use solti_tls::{TlsIdentity, TrustRoots};
 
-let certificate = PemSource::bytes(b"certificate PEM".to_vec());
-let private_key = PrivateKeySource::bytes(b"private-key PEM".to_vec());
-let identity = TlsIdentity::new(certificate, private_key);
+let identity = TlsIdentity::from_pem_bytes(
+    b"certificate PEM".to_vec(),
+    b"private-key PEM".to_vec(),
+);
+let roots = TrustRoots::from_pem_bytes(b"CA certificate PEM".to_vec());
 
-assert!(format!("{identity:?}").contains("redacted"));
+let _ = (identity, roots);
 ```
 
-Certificate and trust-root bytes are shared across config clones. Private-key bytes have a separate source type and are zeroized when the final source or loaded-material owner is dropped. A downstream TLS library may make its own copy after the bytes cross the adapter boundary.
+Use `TlsIdentity::new`, `PemSource`, and `PrivateKeySource` when certificate and private-key sources must be assembled separately.
 
-## ALPN
+## Transport adapters
 
-ALPN is not part of `ClientTlsConfig` or `ServerTlsConfig`. It describes an application transport, not certificate or trust policy:
+`load()` returns validated PEM when an adapter does not consume `rustls` configuration types directly:
 
-- tonic owns gRPC's `h2` configuration;
-- HTTP adapters set `h2` and/or `http/1.1` on their rustls config;
-- a direct rustls caller sets `alpn_protocols` after conversion.
+```rust,no_run
+use solti_tls::{ServerTlsConfig, TlsIdentity};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let loaded = ServerTlsConfig::new(TlsIdentity::from_pem_files(
+        "/etc/solti/tls/server.crt",
+        "/etc/solti/tls/server.key",
+    ))
+    .load()?;
+
+    let certificate_chain = loaded.identity().certificate_chain_pem();
+    let private_key = loaded.identity().expose_private_key_pem();
+    let _ = (certificate_chain, private_key);
+    Ok(())
+}
+```
+
+## Specific behavior
+
+- In-memory private keys and loaded private-key PEM are redacted in `Debug` and zeroized when their final crate-owned buffer is dropped.
+- Generated `rustls` configurations have no ALPN protocols. The transport sets `h2`, `http/1.1`, or another protocol.
+- `load()` and `into_rustls_config()` parse PEM and validate identities and trust roots.
+- `require_client_auth()` makes a trusted client certificate mandatory.
+- Server-name and SAN validation happens during the client handshake.
+- A transport or TLS library may retain its own private-key copy.
+- OCSP and CRL validation are not configured by this crate.
+- The first configuration build installs the `ring` `rustls` provider as the process default; an existing default is left untouched.
+- TLS 1.3 and TLS 1.2 are both accepted; this crate does not expose a version knob.
 
 ## Errors
 
-`TlsError` distinguishes:
+`TlsError` separates file, PEM, certificate, and configuration failures:
 
-- `ReadPem`: filesystem failure with the PEM role and exact path;
-- `InvalidPem`: malformed PEM syntax;
-- `NoCertificates`, `NoPrivateKey`, `MultiplePrivateKeys`: invalid material shape;
-- `InvalidCertificate`: a rejected trust anchor;
-- `Configuration`: a rejected certificate/private-key identity;
-- `ClientVerifier`: failure to build mandatory mTLS client verification.
-
-The enum is `#[non_exhaustive]`.
-
-Hostname and SAN validation happens when connecting, against the server name
-provided to rustls, tonic, or reqwest. OCSP and CRL checking are not configured
-by this crate.
+- `InvalidPem`, `NoCertificates`, `NoPrivateKey`, and `MultiplePrivateKeys` describe malformed material;
+- `InvalidCertificate` identifies a rejected trust root;
+- `Configuration` identifies an invalid certificate/private-key pair;
+- `ClientVerifier` identifies invalid client-authentication roots;
+- `ReadPem` includes the PEM role and path.
