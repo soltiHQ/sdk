@@ -36,9 +36,14 @@ const BACKOFF_FACTOR: f64 = 2.0;
 
 /// Builds the timezone refresh task and its manifest.
 ///
-/// A successful attempt replaces the cached offset with the current system value.
 /// An offset detection failure returns a retryable [`TaskError::Fail`].
 /// Cancellation before detection returns [`TaskError::Canceled`].
+///
+/// ## Refresh
+///
+/// Each attempt detects the current system offset.
+/// A successful attempt replaces the cached value.
+/// Later attempts can observe offset changes, including DST transitions.
 ///
 /// ## Task Settings
 ///

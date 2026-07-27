@@ -43,6 +43,9 @@ pub use tasks::timezone_sync;
 /// Detection happens before the global subscriber is installed.
 /// Journald does not use this setting.
 ///
+/// The detected offset stays in a process-global cache.
+/// Feature `timezone-sync` provides the refresh task.
+///
 /// ## Example
 ///
 /// ```rust,no_run

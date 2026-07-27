@@ -140,8 +140,8 @@ fn main() -> Result<(), solti_observe::LoggerError> {
 ```
 
 Local offset detection happens before the subscriber is installed.
-Detection failure returns `LoggerError::LocalOffsetUnavailable`.
-The logger does not replace a requested local timezone with UTC.
+A detection failure returns `LoggerError::LocalOffsetUnavailable`.
+The logger does not fall back to UTC.
 
 ## Timezone refresh task
 
@@ -168,8 +168,10 @@ The `timezone-sync` feature exposes a periodic embedded task:
 | Jitter          | Equal                                      |
 | Admission       | `AdmissionPolicy::Replace`                 |
 
-Each successful attempt replaces the cached offset with the current system value.
-Detection failure is returned as a retryable task error.
+Each attempt detects the current system offset.
+A successful attempt replaces the cached value.
+Later attempts can observe offset changes, including DST transitions.
+A detection failure returns a retryable task error.
 
 ## Feature flags
 
