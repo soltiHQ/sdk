@@ -155,7 +155,7 @@ impl Config {
         if let Some(path) = &self.auth.token_file {
             Ok(Some(Token::from_file(path)?))
         } else if let Some(t) = &self.auth.token {
-            Ok(Some(Token::new(t.clone())))
+            Ok(Some(Token::new(t.clone())?))
         } else {
             Err("auth.enabled requires auth.token or auth.token_file".into())
         }

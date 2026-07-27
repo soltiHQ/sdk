@@ -25,7 +25,7 @@ pub(super) enum TransportAdapter {
 impl TransportAdapter {
     /// Instantiate only the adapter selected by the validated configuration.
     pub(super) fn from_config(config: &DiscoverConfig) -> Result<Self, DiscoverError> {
-        match &config.transport {
+        match config.control_plane.transport {
             #[cfg(feature = "grpc")]
             DiscoveryTransport::Grpc => GrpcAdapter::new(config).map(Box::new).map(Self::Grpc),
             #[cfg(feature = "http")]
@@ -39,6 +39,15 @@ impl TransportAdapter {
             Self::Grpc(adapter) => adapter.sync(request).await,
             #[cfg(feature = "http")]
             Self::Http(adapter) => adapter.sync(request).await,
+        }
+    }
+
+    pub(super) fn is_secure(&self) -> bool {
+        match self {
+            #[cfg(feature = "grpc")]
+            Self::Grpc(adapter) => adapter.is_secure(),
+            #[cfg(feature = "http")]
+            Self::Http(adapter) => adapter.is_secure(),
         }
     }
 }
@@ -75,13 +84,13 @@ mod tests {
     #[cfg(all(feature = "grpc", feature = "http"))]
     fn config(transport: DiscoveryTransport) -> DiscoverConfig {
         DiscoverConfig::builder(
-            AgentId::from("agent-1"),
+            AgentId::new("agent-1").unwrap(),
             "agent-1",
-            "http://127.0.0.1:8085",
-            "http://127.0.0.1:9000",
-            transport,
+            crate::AgentEndpoint::new("http://127.0.0.1:8085", crate::AgentEndpointType::Http, 1)
+                .unwrap(),
+            crate::ControlPlaneEndpoint::new("http://127.0.0.1:9000", transport).unwrap(),
             30_000,
-            1,
+            "test@1",
         )
         .build()
         .expect("config builds")

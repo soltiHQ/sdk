@@ -2,20 +2,21 @@
 //!
 //! These small types keep logger config valid before [`init_logger`](crate::init_logger) installs the subscriber.
 //!
-//! - [`LoggerRfc3339`] RFC 3339 timestamp formatter for [`tracing_subscriber`].
-//! - [`init_local_offset`] pre-runtime local UTC offset detection.
-//! - [`LoggerFormat`] output format (`Text`, `Json`, `Journald`).
+//! - [`LoggerFormat`] output format (`Text`, `Json`, and optional `Journald`).
 //! - [`LoggerLevel`] validated `EnvFilter` expression wrapper.
 //! - [`LoggerTimeZone`] timestamp timezone (`Utc`, `Local`).
 
-pub mod timezone;
-pub use timezone::{LoggerTimeZone, init_local_offset};
+mod timezone;
+pub use timezone::LoggerTimeZone;
+pub(crate) use timezone::initialize_local_offset;
+#[cfg(feature = "timezone-sync")]
+pub(crate) use timezone::sync_local_offset;
 
-pub mod rfc3339;
-pub use rfc3339::LoggerRfc3339;
+mod rfc3339;
+pub(crate) use rfc3339::Rfc3339Timer;
 
-pub mod format;
+mod format;
 pub use format::LoggerFormat;
 
-pub mod level;
+mod level;
 pub use level::LoggerLevel;

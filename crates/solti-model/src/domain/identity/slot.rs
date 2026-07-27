@@ -17,10 +17,10 @@ arc_str_newtype! {
     /// ```rust
     /// use solti_model::Slot;
     ///
-    /// let slot = Slot::new("build-pipeline");
+    /// let slot = Slot::new("build-pipeline").unwrap();
     /// assert_eq!(slot.as_str(), "build-pipeline");
     ///
-    /// let slot: Slot = "deploy".into();
+    /// let slot = Slot::new("deploy").unwrap();
     /// assert_eq!(format!("{slot}"), "deploy");
     /// ```
     pub struct Slot;
@@ -41,8 +41,8 @@ impl Slot {
     /// ```
     /// use solti_model::Slot;
     ///
-    /// assert!(Slot::new("build.frontend").validate_format().is_ok());
-    /// assert!(Slot::new("build/frontend").validate_format().is_err());
+    /// assert!(Slot::new("build.frontend").is_ok());
+    /// assert!(Slot::new("build/frontend").is_err());
     /// ```
     pub fn validate_format(&self) -> Result<(), ModelError> {
         validate_identity("slot", self.as_str(), SLOT_MAX_LEN)
@@ -56,32 +56,32 @@ mod tests {
 
     #[test]
     fn new_and_as_str() {
-        let slot = Slot::new("my-slot");
+        let slot = Slot::new("my-slot").unwrap();
         assert_eq!(slot.as_str(), "my-slot");
     }
 
     #[test]
     fn from_str_and_string() {
-        let a: Slot = "abc".into();
-        let b: Slot = String::from("abc").into();
+        let a = Slot::new("abc").unwrap();
+        let b: Slot = "abc".parse().unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
     fn display() {
-        let slot = Slot::new("demo");
+        let slot = Slot::new("demo").unwrap();
         assert_eq!(format!("{slot}"), "demo");
     }
 
     #[test]
     fn partial_eq_with_str() {
-        let slot = Slot::new("test");
+        let slot = Slot::new("test").unwrap();
         assert_eq!(slot, *"test");
     }
 
     #[test]
     fn serde_transparent() {
-        let slot = Slot::new("build");
+        let slot = Slot::new("build").unwrap();
         let json = serde_json::to_string(&slot).unwrap();
         assert_eq!(json, "\"build\"");
 
@@ -91,14 +91,14 @@ mod tests {
 
     #[test]
     fn into_inner() {
-        let slot = Slot::new("owned");
+        let slot = Slot::new("owned").unwrap();
         let s: Arc<str> = slot.into_inner();
         assert_eq!(&*s, "owned");
     }
 
     #[test]
     fn clone_is_cheap() {
-        let slot = Slot::new("shared");
+        let slot = Slot::new("shared").unwrap();
         let cloned = slot.clone();
         let a: Arc<str> = slot.into_inner();
         let b: Arc<str> = cloned.into_inner();
@@ -107,19 +107,19 @@ mod tests {
 
     #[test]
     fn validate_format_accepts_valid() {
-        Slot::new("build.frontend").validate_format().unwrap();
-        Slot::new("build").validate_format().unwrap();
-        Slot::new("a").validate_format().unwrap();
+        Slot::new("build.frontend").unwrap();
+        Slot::new("build").unwrap();
+        Slot::new("a").unwrap();
     }
 
     #[test]
     fn validate_format_rejects_invalid() {
-        assert!(Slot::new("build/frontend").validate_format().is_err());
+        assert!(Slot::new("build/frontend").is_err());
         let non_ascii = String::from_utf8(vec![0xc3, 0xa9]).unwrap();
-        assert!(Slot::new(&non_ascii).validate_format().is_err());
-        assert!(Slot::new("with space").validate_format().is_err());
-        assert!(Slot::new("a\nb").validate_format().is_err());
-        assert!(Slot::new(".").validate_format().is_err());
-        assert!(Slot::new("").validate_format().is_err());
+        assert!(Slot::new(&non_ascii).is_err());
+        assert!(Slot::new("with space").is_err());
+        assert!(Slot::new("a\nb").is_err());
+        assert!(Slot::new(".").is_err());
+        assert!(Slot::new("").is_err());
     }
 }

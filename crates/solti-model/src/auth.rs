@@ -31,7 +31,7 @@ const GENERATED_ENTROPY_BYTES: usize = 32;
 /// ```
 /// use solti_model::Token;
 ///
-/// let token = Token::new("secret");
+/// let token = Token::new("secret").unwrap();
 ///
 /// assert!(token.verify("secret"));
 /// assert!(!token.verify("other"));
@@ -48,11 +48,11 @@ impl Token {
     /// ```
     /// use solti_model::Token;
     ///
-    /// let token = Token::new("  secret\n");
+    /// let token = Token::new("  secret\n").unwrap();
     /// assert_eq!(token.expose(), "secret");
     /// ```
-    pub fn new(token: impl Into<String>) -> Self {
-        Self(token.into().trim().to_string())
+    pub fn new(token: impl Into<String>) -> ModelResult<Self> {
+        Self::checked(token.into())
     }
 
     /// Generate a fresh random token.
@@ -65,14 +65,20 @@ impl Token {
     /// ```
     /// use solti_model::Token;
     ///
-    /// let token = Token::generate();
+    /// let token = Token::generate()?;
     /// assert!(token.expose().starts_with("solti_agt_"));
     /// assert!(token.verify(token.expose()));
+    /// # Ok::<(), solti_model::ModelError>(())
     /// ```
-    pub fn generate() -> Self {
+    pub fn generate() -> ModelResult<Self> {
         let mut buf = [0u8; GENERATED_ENTROPY_BYTES];
-        getrandom::fill(&mut buf).expect("getrandom: OS entropy source unavailable");
-        Self(format!("{GENERATED_PREFIX}{}", URL_SAFE_NO_PAD.encode(buf)))
+        getrandom::fill(&mut buf).map_err(|error| {
+            ModelError::Invalid(format!("OS entropy source unavailable: {error}").into())
+        })?;
+        Ok(Self(format!(
+            "{GENERATED_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(buf)
+        )))
     }
 
     /// Read the token from an environment variable.
@@ -124,11 +130,6 @@ impl Token {
         &self.0
     }
 
-    /// Return whether the token is empty after trimming.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
     /// Compare with a candidate presented by a caller.
     ///
     /// The comparison is constant-time for equal-length strings.
@@ -139,7 +140,7 @@ impl Token {
     /// ```
     /// use solti_model::Token;
     ///
-    /// let token = Token::new("secret");
+    /// let token = Token::new("secret").unwrap();
     /// assert!(token.verify("secret"));
     /// assert!(!token.verify("Secret"));
     /// ```
@@ -160,17 +161,19 @@ mod tests {
 
     #[test]
     fn new_trims_whitespace() {
-        assert_eq!(Token::new("  abc\n").expose(), "abc");
+        assert_eq!(Token::new("  abc\n").unwrap().expose(), "abc");
     }
 
     #[test]
     fn checked_rejects_empty() {
+        assert!(Token::new("").is_err());
+        assert!(Token::new(" \t\n").is_err());
         assert!(Token::from_env("__definitely_unset_var__").is_err());
     }
 
     #[test]
     fn verify_matches_only_exact() {
-        let t = Token::new("s3cr3t-value");
+        let t = Token::new("s3cr3t-value").unwrap();
         assert!(t.verify("s3cr3t-value"));
         assert!(!t.verify("s3cr3t-valuE"));
         assert!(!t.verify("s3cr3t"));
@@ -179,15 +182,15 @@ mod tests {
 
     #[test]
     fn debug_is_redacted() {
-        let t = Token::new("super-secret");
+        let t = Token::new("super-secret").unwrap();
         assert_eq!(format!("{t:?}"), "Token(***redacted***)");
         assert!(!format!("{t:?}").contains("super-secret"));
     }
 
     #[test]
     fn generate_is_prefixed_unique_and_self_verifying() {
-        let a = Token::generate();
-        let b = Token::generate();
+        let a = Token::generate().unwrap();
+        let b = Token::generate().unwrap();
         assert!(a.expose().starts_with("solti_agt_"));
         assert_ne!(a.expose(), b.expose(), "two generated tokens must differ");
         assert!(a.verify(a.expose()));

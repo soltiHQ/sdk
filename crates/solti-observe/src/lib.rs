@@ -1,11 +1,9 @@
-//! Structured logging and timezone support for Solti agents.
+//! # solti-observe
 //!
-//! `solti-observe` is the logging crate for the Solti SDK.
-//! It installs a [`tracing`] subscriber and keeps logger config in small value types.
+//! Structured logging for Solti binaries.
+//! The crate installs one global [`tracing`] subscriber from [`LoggerConfig`].
 //!
-//! Use it when you build an agent binary and want one clear place for logs and local timestamps.
-//!
-//! ## Quick Start
+//! ## Start Here
 //!
 //! ```rust,no_run
 //! use solti_observe::{LoggerConfig, LoggerLevel, init_logger};
@@ -22,94 +20,45 @@
 //! }
 //! ```
 //!
-//! [`init_logger`] installs the global tracing subscriber.
-//! It can succeed only once in a process.
+//! [`init_logger`] can succeed only once in a process.
+//!
+//! ## Formats
+//!
+//! | Format     | Feature    | Output                         |
+//! |------------|------------|--------------------------------|
+//! | `text`     | always     | Human-readable lines           |
+//! | `json`     | always     | Structured JSON                |
+//! | `journald` | `journald` | Native systemd journal records |
+//!
+//! Journald initialization is supported on Linux.
 //!
 //! ## Local Time
 //!
-//! UTC is the default and always works.
-//! If you want local timestamps, call [`init_local_offset`] before Tokio starts worker threads:
+//! UTC is the default. Local time is explicit:
 //!
 //! ```rust,no_run
-//! use solti_observe::{
-//!     LoggerConfig, LoggerTimeZone, init_local_offset, init_logger,
-//! };
+//! use solti_observe::{LoggerConfig, LoggerError, LoggerTimeZone, init_logger};
 //!
-//! fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     init_local_offset();
-//!
-//!     tokio::runtime::Runtime::new()?.block_on(async {
-//!         let config = LoggerConfig {
-//!             tz: LoggerTimeZone::Local,
-//!             ..Default::default()
-//!         };
-//!         init_logger(&config)?;
-//!         Ok(())
-//!     })
-//! }
+//! # fn main() -> Result<(), LoggerError> {
+//! init_logger(&LoggerConfig {
+//!     timezone: LoggerTimeZone::Local,
+//!     ..Default::default()
+//! })?;
+//! # Ok(()) }
 //! ```
 //!
-//! ## What Ships
+//! Logger initialization returns [`LoggerError::LocalOffsetUnavailable`] when
+//! the system offset cannot be determined. It never silently changes `local`
+//! to UTC.
 //!
-//! | Item                  | Feature         | Use it for                                 |
-//! |-----------------------|-----------------|--------------------------------------------|
-//! | [`LoggerConfig`]      | always          | Logger settings with serde defaults        |
-//! | [`LoggerFormat`]      | always          | `text`, `json`, or `journald`              |
-//! | [`LoggerLevel`]       | always          | Validated `EnvFilter` strings              |
-//! | [`LoggerTimeZone`]    | always          | `utc` or `local` timestamps                |
-//! | [`init_logger`]       | always          | Install the global tracing subscriber      |
-//! | [`init_local_offset`] | always          | Cache local UTC offset before Tokio starts |
-//! | `timezone_sync`       | `timezone-sync` | Build a supervised offset refresh task     |
+//! Feature `timezone-sync` adds a periodic supervised task that refreshes the
+//! cached offset. A failed refresh follows its Taskvisor retry policy.
 //!
-//! ## Core Model
+//! ## Feature Flags
 //!
-//! ```text
-//! LoggerConfig
-//!   |
-//!   v
-//! init_logger()
-//!   |
-//!   |-- text logger
-//!   |-- JSON logger
-//!   |-- journald logger (Linux only)
-//!   |
-//!   v
-//! tracing macros
-//! ```
-//!
-//! The optional timezone task plugs into the same process:
-//!
-//! ```text
-//! timezone_sync task -- refresh attempt --> local offset cache
-//! ```
-//!
-//! ## Config
-//!
-//! [`LoggerConfig`] defaults to text logs, `info` level, UTC timestamps, targets enabled, and color enabled only when stdout is a terminal.
-//!
-//! ```rust
-//! use solti_observe::{LoggerConfig, LoggerFormat};
-//!
-//! let config: LoggerConfig = serde_json::from_str(r#"{
-//!     "format": "json",
-//!     "level": "solti_core=debug,info"
-//! }"#).unwrap();
-//!
-//! assert_eq!(config.format, LoggerFormat::Json);
-//! assert_eq!(config.level.as_str(), "solti_core=debug,info");
-//! ```
-//!
-//! ## Timezone Sync
-//!
-//! Enable the `timezone-sync` feature to use `timezone_sync()`.
-//! It builds a periodic supervised task that tries to refresh the local UTC offset.
-//! The startup call to [`init_local_offset`] is still the important part on most platforms.
-//!
-//! ## Also
-//!
-//! - [`tracing`] is the structured logging framework used underneath.
-//! - `solti-prometheus` is the metrics crate for the same event stream.
-//! - See `examples/agentd-http` and `examples/agentd-grpc` for full agent wiring.
+//! - `journald`: native journald output.
+//! - `log-compat`: forwards records from the `log` facade into `tracing`.
+//! - `timezone-sync`: supervised local-offset refresh task.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -121,8 +70,7 @@ struct ReadmeDoctests;
 
 mod logger;
 pub use logger::{
-    LoggerConfig, LoggerError, LoggerFormat, LoggerLevel, LoggerTimeZone, init_local_offset,
-    init_logger,
+    LoggerConfig, LoggerError, LoggerFormat, LoggerLevel, LoggerTimeZone, init_logger,
 };
 
 /// Build the periodic timezone refresh task.

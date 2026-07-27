@@ -9,20 +9,13 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use solti_core::{CoreError, StateConfig, SupervisorApi};
+//! use solti_core::{CoreError, SupervisorApi};
 //! use solti_model::{EmbeddedSpec, RestartPolicy, TaskManifest, TaskSpec, TaskWorkload};
 //! use solti_runner::RunnerRouter;
-//! use taskvisor::{ControllerConfig, SupervisorConfig, TaskContext, TaskError, TaskFn};
+//! use taskvisor::{TaskContext, TaskError, TaskFn};
 //!
 //! async fn demo() -> Result<(), CoreError> {
-//!     let api = SupervisorApi::new(
-//!         SupervisorConfig::default(),
-//!         ControllerConfig::default(),
-//!         Vec::new(),
-//!         RunnerRouter::new(),
-//!         StateConfig::default(),
-//!     )
-//!     .await?;
+//!     let api = SupervisorApi::builder(RunnerRouter::new()).start().await?;
 //!
 //!     let task_ref = TaskFn::arc("embedded-demo", |_ctx: TaskContext| async move {
 //!         Ok::<(), TaskError>(())
@@ -34,7 +27,7 @@
 //!     let manifest = TaskManifest::new("embedded-demo", spec)?;
 //!     let name = manifest.name().clone();
 //!
-//!     api.create_with_task(manifest, task_ref).await?;
+//!     api.create_embedded_task(manifest, task_ref).await?;
 //!     let _task = api.get_task(&name);
 //!     let _runs = api.list_task_runs(&name);
 //!
@@ -53,10 +46,10 @@
 //!   -> core-owned output hub streams live output
 //! ```
 //!
-//! [`SupervisorApi::create_with_task`] and [`SupervisorApi::apply_with_task`]
+//! [`SupervisorApi::create_embedded_task`] and [`SupervisorApi::apply_embedded_task`]
 //! accept embedded Rust tasks that already have a `taskvisor::TaskRef`.
 //! [`SupervisorApi::create_task`] and [`SupervisorApi::apply_task`] route a
-//! resource through [`RunnerRouter`] using its [`solti_model::TaskWorkload`].
+//! resource through [`solti_runner::RunnerRouter`] using its [`solti_model::TaskWorkload`].
 //!
 //! ## State
 //!
@@ -82,6 +75,8 @@
 //! | Type | Role |
 //! |------|------|
 //! | [`SupervisorApi`] | Main public entry point over the supervisor runtime. |
+//! | [`SupervisorApiBuilder`] | Configures and starts the supervisor. |
+//! | [`ConfigError`] | Error from checked configuration setters. |
 //! | [`StateConfig`] | Retention settings for tasks and run history. |
 //! | [`TaskState`] | Shared in-memory read handle. |
 //! | [`CoreError`] | Error type returned by fallible APIs. |
@@ -98,15 +93,20 @@
 struct ReadmeDoctests;
 
 mod error;
-pub use error::CoreError;
+pub use error::{CoreError, WriteConflict, WritePreconditionViolation};
+
+mod config;
+pub use config::{ConfigError, StateConfig};
 
 mod map;
 
 mod output;
 pub use output::{OutputConfig, OutputSubscription};
 
-pub mod supervisor;
-pub use supervisor::SupervisorApi;
+mod runtime;
+
+mod supervisor;
+pub use supervisor::{SupervisorApi, SupervisorApiBuilder};
 
 mod state;
-pub use state::{StateConfig, TaskState};
+pub use state::{CollectionError, TaskState, TaskWatchSubscription};

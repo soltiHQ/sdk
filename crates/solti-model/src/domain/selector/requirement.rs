@@ -1,6 +1,6 @@
 //! Selector requirement.
 //!
-//! [`SelectorRequirement`] is a single label constraint used in [`RunnerSelector`](crate::RunnerSelector).
+//! [`SelectorRequirement`] is a single label constraint used in [`LabelSelector`](crate::LabelSelector).
 
 use serde::{Deserialize, Serialize};
 
@@ -8,7 +8,7 @@ use super::SelectorOperator;
 
 /// Single set-based requirement for label matching.
 ///
-/// Used inside [`super::RunnerSelector::match_expressions`].
+/// Used inside [`super::LabelSelector::match_expressions`].
 ///
 /// ## Example
 ///
@@ -22,7 +22,7 @@ use super::SelectorOperator;
 /// req.validate().unwrap();
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SelectorRequirement {
     /// Label key to evaluate.
     pub key: String,

@@ -5,7 +5,6 @@
 //!
 //! See the [crate root](crate) for architecture and namespace overview.
 
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use prometheus::{Counter, CounterVec, Gauge, Histogram, HistogramVec, Registry};
@@ -13,11 +12,11 @@ use solti_discover::{
     DiscoverFailReason, DiscoverMetricsBackend, OUTCOME_FAILURE, OUTCOME_SUCCESS,
 };
 
-use crate::register::{Sub, ms_to_secs};
+use crate::register::{MetricGroup, ms_to_secs};
 
 /// Prometheus implementation of [`DiscoverMetricsBackend`].
 ///
-/// ## Metrics (`solti_discover_*`)
+/// # Metrics (`solti_discover_*`)
 ///
 /// | Metric                                          | Type      | Labels    | Description                         |
 /// |-------------------------------------------------|-----------|-----------|-------------------------------------|
@@ -41,16 +40,15 @@ pub struct PrometheusDiscoverMetrics {
 impl PrometheusDiscoverMetrics {
     /// Register all discovery metrics into `registry`.
     ///
-    /// ## Example
+    /// # Example
     ///
     /// ```
-    /// use std::sync::Arc;
     /// use solti_discover::{DiscoverFailReason, DiscoverMetricsBackend};
     /// use solti_prometheus::{PrometheusDiscoverMetrics, Registry};
     ///
     /// # fn main() -> Result<(), prometheus::Error> {
-    /// let registry = Arc::new(Registry::new());
-    /// let metrics = PrometheusDiscoverMetrics::new(registry.clone())?;
+    /// let registry = Registry::new();
+    /// let metrics = PrometheusDiscoverMetrics::new(&registry)?;
     ///
     /// metrics.record_attempt();
     /// metrics.record_success(25);
@@ -60,36 +58,50 @@ impl PrometheusDiscoverMetrics {
     /// assert!(!registry.gather().is_empty());
     /// # Ok(()) }
     /// ```
-    pub fn new(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
-        let r = Sub::new(&registry, "discover");
+    pub fn new(registry: &Registry) -> Result<Self, prometheus::Error> {
+        let mut metrics = MetricGroup::new();
 
-        let attempts_total = r.counter("attempts_total", "Total discovery heartbeat attempts")?;
-        let outcomes_total = r.counter_vec(
+        let attempts_total = metrics.counter(
+            "discover",
+            "attempts_total",
+            "Total discovery heartbeat attempts",
+        )?;
+        let outcomes_total = metrics.counter_vec(
+            "discover",
             "outcomes_total",
             "Discovery heartbeat outcomes",
             &["outcome"],
         )?;
-        let duration_seconds = r.histogram_vec(
+        let duration_seconds = metrics.histogram_vec(
+            "discover",
             "duration_seconds",
             "Discovery heartbeat call duration",
             vec![0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0],
             &["outcome"],
         )?;
-        let failures_total = r.counter_vec(
+        let failures_total = metrics.counter_vec(
+            "discover",
             "failures_total",
             "Discovery heartbeat failures grouped by reason",
             &["reason"],
         )?;
-        let last_success_ts = r.gauge(
+        let last_success_ts = metrics.gauge(
+            "discover",
             "last_success_timestamp_seconds",
             "UNIX timestamp of the last successful heartbeat",
         )?;
-        let holds_total = r.counter("holds_total", "Server-advised retry holds observed")?;
-        let hold_duration_seconds = r.histogram(
+        let holds_total = metrics.counter(
+            "discover",
+            "holds_total",
+            "Server-advised retry holds observed",
+        )?;
+        let hold_duration_seconds = metrics.histogram(
+            "discover",
             "hold_duration_seconds",
             "Duration of server-advised retry holds",
             vec![1.0, 5.0, 15.0, 30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0],
         )?;
+        metrics.register(registry)?;
 
         Ok(Self {
             attempts_total,

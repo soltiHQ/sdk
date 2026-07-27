@@ -1,72 +1,32 @@
-//! # Runner: subprocess execution engine.
+//! Execute subprocess workloads.
 //!
-//! [`SubprocessRunner`] implements the [`Runner`](solti_runner::Runner) trait to execute
-//! [`TaskWorkload::Subprocess`](solti_model::TaskWorkload::Subprocess) tasks as OS processes.
+//! [`SubprocessRunner`] resolves one resource into a reusable task function.
+//! Mutable attempt state is created only when taskvisor starts an attempt.
 //!
-//! ## How it works
+//! ## Attempt Lifecycle
+//!
 //! ```text
-//! SubprocessRunner::build_task(task, ctx)
-//!     │
-//!     ├──► build_task_config(task, ctx)
-//!     │     ├──► match TaskWorkload::Subprocess(SubprocessSpec { .. })
-//!     │     ├──► resolve_mode(mode) → Resolved { command, args, script_body? }
-//!     │     │     ├──► Command { command, args } → clone, script_body = None
-//!     │     │     └──► Script { runtime, body }  → decode base64 (size-checked)
-//!     │     │                                    → script_body = Some(body)
-//!     │     ├──► merge_env(task_env, runner_env)→ BTreeMap
-//!     │     └──► SubprocessTaskConfig { run_id, seq, command, args, env, cwd, fail_on_non_zero }
-//!     │
-//!     ├──► prepare backend (cgroup dirs, if configured)
-//!     │
-//!     ├──► build Arc<TaskExecContext>
-//!     │     └──► { task_cfg, runner_cfg, cgroup_name, metrics, log_cfg, script_body? }
-//!     │          no disk I/O on the submit path: the tempfile is written per attempt
-//!     │
-//!     └──► return TaskFn closure → run_subprocess(ctx, cancel)
-//! ```
-//!
-//! ## Subprocess execution lifecycle
-//! ```text
-//! run_subprocess(ctx, cancel)
-//!     │
-//!     ├──► allocate attempt + OutputSink
-//!     ├──► metrics.record_task_started()
-//!     ├──► prepare_backend() → create cgroup dirs
-//!     ├──► materialize_script() (Script mode only)
-//!     │      - spawn_blocking: NamedTempFile (0600) + write + fsync
-//!     │      - tempfile path is prepended to args
-//!     │      - lives until the attempt ends → Drop = unlink
-//!     ├──► build_command() → Command with:
-//!     │      - args, env, cwd, piped stdout/stderr
-//!     │      - process_group(0)   (Unix: new pgid for kill-whole-subtree)
-//!     │      - kill_on_drop(true) (tokio SIGKILLs PID if future is dropped)
-//!     ├──► apply_backend() → install pre_exec hooks (rlimits, cgroup join, security)
-//!     ├──► cmd.spawn()
-//!     ├──► arm ProcessGroupGuard(pgid)  (Drop = killpg -SIGKILL pgid if the future is dropped)
-//!     │
-//!     ├──► tokio::spawn(log_stream(stdout, Stdout))
-//!     ├──► tokio::spawn(log_stream(stderr, Stderr))
-//!     │
-//!     ├──► select! { biased; ... }
-//!     │     ├──► child.wait() → evaluate_exit(status)
-//!     │     └──► cancel.cancelled() → kill_process_group() (killpg -SIGKILL pgid)
-//!     │                             → child.wait() to reap zombie
-//!     ├──► guard.disarm()  (child reaped; drop no longer kills)
-//!     │
-//!     ├──► metrics.record_task_completed(outcome, duration)
-//!     ├──► join!(stdout_task, stderr_task)
-//!     ├──► cleanup_cgroup() (if configured)
-//!     └──► return result
+//! allocate attempt
+//!       ▼
+//! prepare cgroup and script
+//!       ▼
+//! spawn one process group
+//!       ├──► stream stdout and stderr
+//!       ├──► wait for exit
+//!       └──► cancel or drop ──► kill process group
+//!       ▼
+//! stop remaining descendants and clean up cgroup
 //! ```
 
 use std::{
     io::Write as _,
+    path::PathBuf,
     process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
     },
-    time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
@@ -74,13 +34,12 @@ use tempfile::NamedTempFile;
 use tokio::process::Command;
 use tracing::{debug, trace, warn};
 
-use solti_model::{Runtime, SubprocessSpec, Task, TaskWorkload};
+use solti_model::{SubprocessSpec, Task, TaskWorkload, WORKLOAD_API_VERSION, WorkloadTypeMeta};
 use solti_runner::{
-    BuildContext, OutputPublisherHandle, Runner, RunnerError, RunnerErrorKind, RunnerType,
+    BuildContext, OutputPublisherHandle, RunId, Runner, RunnerError, RunnerErrorKind, RunnerType,
     merge_env,
 };
 
-use crate::metrics::classify_task_error;
 use crate::subprocess::{
     backend::SubprocessBackendConfig,
     logger::{LogConfig, StreamKind, log_stream},
@@ -96,22 +55,22 @@ use crate::subprocess::{
 /// - [`solti_runner::Runner`] trait this type implements.
 pub struct SubprocessRunner {
     /// Runner name.
-    name: &'static str,
+    name: String,
     /// Backend configuration applied to all tasks spawned by this runner.
     config: Option<Arc<SubprocessBackendConfig>>,
 }
 
 /// Validate a runner name before it is embedded into run IDs and cgroup paths.
 ///
-/// The name reaches the filesystem via `build_cgroup_name`, so it must not carry
-/// path separators, `.`/`..`, or non-portable characters. The rule matches the
-/// model's identity charset: non-empty, ASCII alphanumeric plus `-`, `_`, `.`,
-/// and no lone `.`/`..`, capped at 64 bytes.
+/// The name is used as a Kubernetes label value and as part of cgroup names.
 fn validate_runner_name(name: &str) -> Result<(), crate::ExecError> {
-    let ok = !name.is_empty()
-        && name.len() <= 64
-        && name != "."
-        && name != ".."
+    let edge_is_alphanumeric = name
+        .as_bytes()
+        .first()
+        .zip(name.as_bytes().last())
+        .is_some_and(|(first, last)| first.is_ascii_alphanumeric() && last.is_ascii_alphanumeric());
+    let ok = name.len() <= 63
+        && edge_is_alphanumeric
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
@@ -119,41 +78,34 @@ fn validate_runner_name(name: &str) -> Result<(), crate::ExecError> {
         Ok(())
     } else {
         Err(crate::ExecError::InvalidRunnerConfig(format!(
-            "invalid runner name {name:?}: must be 1..=64 chars of [A-Za-z0-9._-] and not '.'/'..'"
+            "invalid runner name {name:?}: must be a Kubernetes label value of 1..=63 ASCII characters"
         )))
     }
 }
 
 impl SubprocessRunner {
-    /// Create a new subprocess runner without backend configuration.
+    /// Create a subprocess runner with default settings.
     ///
-    /// `name` must be a valid runner identity (see [`with_config`](Self::with_config)
-    /// for the rule); it is embedded into run IDs and cgroup paths. Because this
-    /// constructor is infallible, an invalid name is a debug assertion here and
-    /// is rejected outright by [`with_config`](Self::with_config).
-    pub fn new(name: &'static str) -> Self {
-        debug_assert!(
-            validate_runner_name(name).is_ok(),
-            "invalid runner name {name:?}",
-        );
-        Self { name, config: None }
+    /// `name` is embedded into run IDs, cgroup paths, and the automatic runner label.
+    pub fn new(name: impl Into<String>) -> Result<Self, crate::ExecError> {
+        let name = name.into();
+        validate_runner_name(&name)?;
+        Ok(Self { name, config: None })
     }
 
     /// Create a subprocess runner with explicit backend configuration.
     ///
     /// ## Errors
     ///
-    /// - [`ExecError::InvalidRunnerConfig`](crate::ExecError::InvalidRunnerConfig): the
-    ///   `name` is not a valid runner identity (non-empty, `[A-Za-z0-9._-]`, ≤ 64 bytes,
-    ///   not `.`/`..`), or `config` failed validation. Config examples: a zero
-    ///   cgroup/rlimit/log limit, `keep_caps` without `drop_all_caps`, or
-    ///   `require_enforcement` on a non-Linux host.
+    /// - [`ExecError::InvalidRunnerConfig`](crate::ExecError::InvalidRunnerConfig):
+    ///   `name` is not a Kubernetes label value or `config` is invalid.
     pub fn with_config(
-        name: &'static str,
+        name: impl Into<String>,
         config: SubprocessBackendConfig,
     ) -> Result<Self, crate::ExecError> {
-        validate_runner_name(name)?;
-        config.validate()?;
+        let name = name.into();
+        validate_runner_name(&name)?;
+        let config = config.prepare()?;
         Ok(Self {
             name,
             config: Some(Arc::new(config)),
@@ -166,10 +118,10 @@ impl SubprocessRunner {
     fn build_task_config(
         &self,
         task: &Task,
+        run_id: &RunId,
         ctx: &BuildContext,
     ) -> Result<(SubprocessTaskConfig, Option<Arc<str>>), RunnerError> {
         let spec = task.spec();
-        let slot = spec.slot();
         let (cfg, script_body) = match spec.workload() {
             TaskWorkload::Subprocess(SubprocessSpec {
                 mode,
@@ -188,10 +140,9 @@ impl SubprocessRunner {
                     args,
                     script_body,
                 } = Self::resolve_mode(mode, max_body)?;
-                let run_id = self.build_run_id(slot.as_str());
                 let cfg = SubprocessTaskConfig {
                     seq: run_id.seq(),
-                    run_id: Arc::from(run_id.into_name()),
+                    run_id: Arc::from(run_id.name()),
                     fail_on_non_zero: *fail_on_non_zero,
                     env: merge_env(env, ctx.env()),
                     cwd: cwd.clone(),
@@ -201,18 +152,18 @@ impl SubprocessRunner {
                 (cfg, script_body)
             }
             other => {
-                return Err(RunnerError::UnsupportedKind {
-                    runner: self.name,
-                    kind: format!("{}/{}", other.api_version(), other.kind()),
+                return Err(RunnerError::UnsupportedWorkload {
+                    runner: self.name.clone(),
+                    api_version: other.api_version().to_owned(),
+                    kind: other.kind().to_owned(),
                 });
             }
         };
-        cfg.validate()
-            .map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
+        cfg.validate().map_err(RunnerError::InvalidSpec)?;
         if let Some(backend) = self.config.as_ref() {
             backend
                 .check_cwd(cfg.cwd.as_deref())
-                .map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
+                .map_err(RunnerError::InvalidSpec)?;
         }
         Ok((cfg, script_body))
     }
@@ -223,7 +174,7 @@ impl SubprocessRunner {
     ///
     /// For `Script` mode the body is decoded (and size-checked) here, but the
     /// tempfile is **not** written yet: `build_task` runs on the async submit
-    /// path, so the disk I/O (create + write + fsync) is deferred to
+    /// path. Disk I/O is deferred to
     /// [`materialize_script`] inside the task body, where it runs on a blocking
     /// thread per attempt. The interpreter is then invoked with the tempfile
     /// path: *not* with `-c "<inline>"`.
@@ -242,15 +193,15 @@ impl SubprocessRunner {
                 args: args.clone(),
                 script_body: None,
             }),
-            solti_model::SubprocessMode::Script { runtime, args, .. } => {
+            solti_model::SubprocessMode::Script {
+                interpreter, args, ..
+            } => {
                 let script = mode
                     .decode_body_with_limit(max_script_body_bytes)
                     .map_err(|e| RunnerError::InvalidSpec(e.to_string()))?;
 
-                let cmd = resolve_runtime_command(runtime)?;
-
                 Ok(Resolved {
-                    command: cmd.to_owned(),
+                    command: interpreter.clone(),
                     args: args.clone(),
                     script_body: Some(Arc::from(script)),
                 })
@@ -275,29 +226,16 @@ struct Resolved {
     script_body: Option<Arc<str>>,
 }
 
-/// Resolve model data into the executable selected by this backend.
-///
-/// The model owns only the serializable runtime choice. Executable names are a
-/// subprocess-backend policy and therefore live in `solti-exec`.
-fn resolve_runtime_command(runtime: &Runtime) -> Result<&str, RunnerError> {
-    match runtime {
-        Runtime::Bash => Ok("bash"),
-        Runtime::Python => Ok("python3"),
-        Runtime::Node => Ok("node"),
-        Runtime::Custom { command, .. } => Ok(command),
-        _ => Err(RunnerError::InvalidSpec(
-            "unsupported script runtime variant".into(),
-        )),
-    }
-}
-
 impl Runner for SubprocessRunner {
-    fn name(&self) -> &'static str {
-        self.name
+    fn name(&self) -> &str {
+        &self.name
     }
 
-    fn supports(&self, workload: &TaskWorkload) -> bool {
-        matches!(workload, TaskWorkload::Subprocess(_))
+    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+        vec![
+            WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess")
+                .expect("built-in workload GVK"),
+        ]
     }
 
     /// Turn a [`TaskWorkload::Subprocess`] resource into a runnable [`TaskRef`].
@@ -307,7 +245,7 @@ impl Runner for SubprocessRunner {
     ///
     /// ## Errors
     ///
-    /// - [`RunnerError::UnsupportedKind`]: the task workload is not [`TaskWorkload::Subprocess`].
+    /// - [`RunnerError::UnsupportedWorkload`]: the task workload is not [`TaskWorkload::Subprocess`].
     /// - [`RunnerError::InvalidSpec`]: the command is empty, or the script body is
     ///   not valid base64 or exceeds the configured size limit.
     ///
@@ -315,8 +253,13 @@ impl Runner for SubprocessRunner {
     /// failure there fails the run with a fatal `TaskError`, not a build error.
     /// The output sink is also acquired inside each attempt from the producer
     /// capability injected through [`BuildContext`].
-    fn build_task(&self, task: &Task, ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
-        let (task_cfg, script_body) = self.build_task_config(task, ctx)?;
+    fn build_task(
+        &self,
+        task: &Task,
+        run_id: &RunId,
+        ctx: &BuildContext,
+    ) -> Result<TaskRef, RunnerError> {
+        let (task_cfg, script_body) = self.build_task_config(task, run_id, ctx)?;
 
         trace!(
             resource = %task.name(),
@@ -333,7 +276,7 @@ impl Runner for SubprocessRunner {
                     .unwrap_or(StdDuration::from_secs(0))
                     .as_secs();
                 crate::utils::build_cgroup_name(
-                    self.name,
+                    &self.name,
                     task.slot().as_str(),
                     task_cfg.seq,
                     timestamp,
@@ -404,6 +347,7 @@ fn build_command(ctx: &TaskExecContext, script_path: Option<&std::path::Path>) -
         cmd.current_dir(cwd);
     }
     apply_env_policy(&mut cmd, ctx);
+    cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -429,19 +373,19 @@ fn build_command(ctx: &TaskExecContext, script_path: Option<&std::path::Path>) -
 
 /// Build the child's environment per the backend [`EnvPolicy`].
 ///
-/// The task's own vars are always applied last, so they win over inherited or
-/// allowlisted values. Under `Clear`/`Allowlist` a [safe `PATH`] is injected
-/// when the task set none, so a bare command name still resolves.
+/// Task variables are applied last and take precedence.
+/// `Clear` and `Allowlist` add a [safe `PATH`] when the task does not set one.
 ///
 /// [safe `PATH`]: crate::subprocess::backend::SAFE_DEFAULT_PATH
 fn apply_env_policy(cmd: &mut Command, ctx: &TaskExecContext) {
     use crate::subprocess::backend::{EnvPolicy, SAFE_DEFAULT_PATH};
 
+    let default_policy = EnvPolicy::default();
     let policy = ctx
         .runner_cfg
         .as_ref()
-        .map(|c| c.effective_env_policy())
-        .unwrap_or_default();
+        .map(|c| c.env_policy())
+        .unwrap_or(&default_policy);
 
     let task_sets_path = ctx.task_cfg.env.contains_key("PATH");
 
@@ -458,7 +402,7 @@ fn apply_env_policy(cmd: &mut Command, ctx: &TaskExecContext) {
         }
         EnvPolicy::Allowlist(keys) => {
             cmd.env_clear();
-            for key in &keys {
+            for key in keys {
                 if let Some(val) = std::env::var_os(key) {
                     cmd.env(key, val);
                 }
@@ -498,24 +442,28 @@ impl ProcessGroupGuard {
     fn disarm(&mut self) {
         self.pgid = None;
     }
-}
 
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {
+    fn kill(&self) {
         #[cfg(unix)]
         if let Some(pgid) = self.pgid {
             let rc = unsafe { libc::kill(-pgid, libc::SIGKILL) };
             if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::ESRCH) {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
                     warn!(
                         task = %self.run_id,
-                        error = %err,
-                        "killpg on drop failed; subtree may be orphaned",
+                        error = %error,
+                        "failed to kill subprocess group",
                     );
                 }
             }
         }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
@@ -555,14 +503,51 @@ async fn kill_process_group(child: &mut tokio::process::Child, run_id: &str) {
     }
 }
 
-/// Create the script tempfile: 0600 permissions, body written and flushed to disk.
-///
-/// Runs on a blocking thread (see [`materialize_script`]): `sync_all` can park
-/// the calling thread for tens of milliseconds and must never run on a tokio
-/// worker. The returned handle unlinks the file on drop.
-fn write_script_tempfile(dir: &std::path::Path, body: &str) -> Result<NamedTempFile, String> {
+/// Create a 0600 script tempfile and write its body.
+fn io_with_context(context: &str, source: std::io::Error) -> std::io::Error {
+    std::io::Error::new(source.kind(), format!("{context}: {source}"))
+}
+
+fn io_error_is_permanent(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::InvalidData
+            | std::io::ErrorKind::Unsupported
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOTDIR)
+            | Some(libc::EISDIR)
+            | Some(libc::ENOEXEC)
+            | Some(libc::E2BIG)
+            | Some(libc::EROFS)
+    ) {
+        return true;
+    }
+    false
+}
+
+fn task_io_error(context: &str, source: std::io::Error) -> TaskError {
+    let error = io_with_context(context, source);
+    if io_error_is_permanent(&error) {
+        TaskError::fatal_from(error)
+    } else {
+        TaskError::fail_from(error)
+    }
+}
+
+fn write_script_tempfile(
+    dir: &std::path::Path,
+    body: &str,
+) -> Result<NamedTempFile, std::io::Error> {
     let mut tmp = NamedTempFile::with_prefix_in("solti-script-", dir)
-        .map_err(|e| format!("failed to create script tempfile: {e}"))?;
+        .map_err(|e| io_with_context("failed to create script tempfile", e))?;
 
     #[cfg(unix)]
     {
@@ -570,15 +555,11 @@ fn write_script_tempfile(dir: &std::path::Path, body: &str) -> Result<NamedTempF
         let perms = std::fs::Permissions::from_mode(0o600);
         tmp.as_file()
             .set_permissions(perms)
-            .map_err(|e| format!("failed to chmod 0600 script tempfile: {e}"))?;
+            .map_err(|e| io_with_context("failed to chmod 0600 script tempfile", e))?;
     }
 
     tmp.write_all(body.as_bytes())
-        .map_err(|e| format!("failed to write script body: {e}"))?;
-    tmp.as_file()
-        .sync_all()
-        .or_else(|_| tmp.as_file().flush())
-        .map_err(|e| format!("failed to flush script tempfile: {e}"))?;
+        .map_err(|e| io_with_context("failed to write script body", e))?;
 
     Ok(tmp)
 }
@@ -586,54 +567,75 @@ fn write_script_tempfile(dir: &std::path::Path, body: &str) -> Result<NamedTempF
 /// Materialize the decoded script body into a tempfile, off the async runtime.
 ///
 /// Called once per attempt from [`run_subprocess`]; the disk I/O (create +
-/// write + fsync, bodies up to 2 MiB) runs via `spawn_blocking` so the submit
-/// path and sibling tasks on the same worker are never stalled. A failure is
-/// fatal for the attempt, mirroring the spawn-failure path.
+/// File I/O runs through `spawn_blocking`. A write failure ends the attempt.
 async fn materialize_script(
     ctx: &TaskExecContext,
     body: Arc<str>,
 ) -> Result<NamedTempFile, TaskError> {
     let written =
         tokio::task::spawn_blocking(move || write_script_tempfile(&std::env::temp_dir(), &body))
-            .await
-            .map_err(|e| format!("script tempfile write task failed: {e}"))
-            .and_then(|res| res);
+            .await;
 
-    written.map_err(|e| {
-        ctx.metrics
-            .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
-        TaskError::fatal(e)
-    })
+    match written {
+        Ok(Ok(file)) => Ok(file),
+        Ok(Err(error)) => {
+            ctx.metrics
+                .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+            Err(task_io_error("script materialization failed", error))
+        }
+        Err(error) => {
+            ctx.metrics
+                .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+            Err(TaskError::fail(format!(
+                "script materialization worker failed: {error}"
+            )))
+        }
+    }
 }
 
 /// Prepare backend resources (cgroup directories) before spawn.
-fn prepare_backend(ctx: &TaskExecContext) -> Result<(), TaskError> {
-    if let Some(backend_cfg) = &ctx.runner_cfg {
-        let cgroup_name_ref = ctx.cgroup_name.as_deref().unwrap_or(&ctx.task_cfg.run_id);
-
-        if let Err(e) = backend_cfg.prepare_cgroups(cgroup_name_ref) {
+async fn prepare_backend(
+    ctx: &TaskExecContext,
+    cgroup_name: Option<String>,
+) -> Result<Option<crate::utils::PreparedCgroup>, TaskError> {
+    let (Some(backend), Some(cgroup_name)) = (&ctx.runner_cfg, cgroup_name) else {
+        return Ok(None);
+    };
+    let backend = Arc::clone(backend);
+    let prepared = tokio::task::spawn_blocking(move || backend.prepare_cgroups(&cgroup_name)).await;
+    match prepared {
+        Ok(Ok(prepared)) => Ok(prepared),
+        Ok(Err(crate::ExecError::Io(error))) => {
             ctx.metrics
                 .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::CgroupPrepareFailed);
-            return Err(TaskError::fatal(format!("failed to prepare cgroup: {e}")));
+            Err(task_io_error("cgroup preparation failed", error))
+        }
+        Ok(Err(error)) => {
+            ctx.metrics
+                .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::CgroupPrepareFailed);
+            Err(TaskError::fatal(format!(
+                "cgroup preparation failed: {error}"
+            )))
+        }
+        Err(error) => {
+            ctx.metrics
+                .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::CgroupPrepareFailed);
+            Err(TaskError::fail(format!(
+                "cgroup preparation worker failed: {error}"
+            )))
         }
     }
-    Ok(())
 }
 
 /// Apply backend configuration (rlimits, cgroup join, security) to the command.
-fn apply_backend(cmd: &mut Command, ctx: &TaskExecContext) -> Result<(), TaskError> {
+fn apply_backend(
+    cmd: &mut Command,
+    ctx: &TaskExecContext,
+    prepared_cgroup: Option<crate::utils::PreparedCgroup>,
+) {
     if let Some(backend_cfg) = &ctx.runner_cfg {
-        let cgroup_name_ref = ctx.cgroup_name.as_deref().unwrap_or(&ctx.task_cfg.run_id);
-
-        if let Err(e) = backend_cfg.apply_to_command(cmd, cgroup_name_ref) {
-            ctx.metrics
-                .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::BackendConfigFailed);
-            return Err(TaskError::fatal(format!(
-                "failed to apply runner config: {e}"
-            )));
-        }
+        backend_cfg.apply_to_command(cmd, prepared_cgroup);
     }
-    Ok(())
 }
 
 /// Evaluate subprocess exit status.
@@ -654,13 +656,58 @@ fn evaluate_exit(
     }
 }
 
-/// RAII guard that calls `cleanup_cgroup` on drop.
-struct CgroupGuard<'a>(Option<&'a str>);
+/// Cgroup cleanup that also survives a dropped task future.
+struct CgroupGuard(Option<PathBuf>);
 
-impl Drop for CgroupGuard<'_> {
+impl CgroupGuard {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self(path)
+    }
+
+    async fn cleanup(mut self) {
+        if let Some(path) = self.0.clone() {
+            cleanup_cgroup(path).await;
+            self.0 = None;
+        }
+    }
+}
+
+impl Drop for CgroupGuard {
     fn drop(&mut self) {
-        if let Some(name) = self.0 {
-            crate::utils::cleanup_cgroup(name);
+        let Some(path) = self.0.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(cleanup_cgroup(path));
+        } else if let Err(error) = crate::utils::cleanup_cgroup(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(cgroup = %path.display(), error = %error, "failed to remove cgroup");
+        }
+    }
+}
+
+async fn cleanup_cgroup(path: PathBuf) {
+    const ATTEMPTS: usize = 10;
+    for attempt in 0..ATTEMPTS {
+        let current = path.clone();
+        let result =
+            tokio::task::spawn_blocking(move || crate::utils::cleanup_cgroup(&current)).await;
+        match result {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Ok(Err(error)) if attempt + 1 == ATTEMPTS => {
+                warn!(cgroup = %path.display(), error = %error, "failed to remove cgroup");
+                return;
+            }
+            Err(error) => {
+                warn!(cgroup = %path.display(), error = %error, "cgroup cleanup worker failed");
+                return;
+            }
+            Ok(Err(_)) => {
+                tokio::time::sleep(std::time::Duration::from_millis(10 * (attempt as u64 + 1)))
+                    .await;
+            }
         }
     }
 }
@@ -669,7 +716,6 @@ const LOG_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Execute a subprocess task with cancellation support, metrics, and cleanup.
 async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Result<(), TaskError> {
-    let start = Instant::now();
     let attempt = ctx.attempt.fetch_add(1, Ordering::Relaxed) + 1;
     let sink = ctx
         .output_publisher
@@ -684,9 +730,15 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
         "spawning subprocess",
     );
 
-    prepare_backend(&ctx)?;
-
-    let _cgroup_guard = CgroupGuard(ctx.cgroup_name.as_deref());
+    let cgroup_name = ctx
+        .cgroup_name
+        .as_ref()
+        .map(|base| format!("{base}-{attempt:x}"));
+    let prepared_cgroup = prepare_backend(&ctx, cgroup_name).await?;
+    let cgroup_path = prepared_cgroup
+        .as_ref()
+        .map(|prepared| prepared.path().to_path_buf());
+    let cgroup_guard = CgroupGuard::new(cgroup_path);
 
     // Script mode: write the body to a 0600 tempfile on a blocking thread.
     // The handle must outlive the child (the interpreter reads the file as it
@@ -697,18 +749,16 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
     };
 
     let mut cmd = build_command(&ctx, script_tempfile.as_ref().map(|t| t.path()));
-    apply_backend(&mut cmd, &ctx)?;
+    apply_backend(&mut cmd, &ctx, prepared_cgroup);
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             ctx.metrics
                 .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
-            return Err(TaskError::fatal(format!("spawn failed: {e}")));
+            return Err(task_io_error("spawn failed", e));
         }
     };
-    ctx.metrics.record_task_started(RunnerType::Subprocess);
-
     let mut pg_guard = ProcessGroupGuard::new(
         child.id().map(|pid| pid as i32),
         Arc::clone(&ctx.task_cfg.run_id),
@@ -753,8 +803,10 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
     let result = tokio::select! {
         biased;
         res = child.wait() => {
-            let status = res.map_err(|e| TaskError::fatal(format!("wait failed: {e}")))?;
-            evaluate_exit(status, &ctx.task_cfg)
+            match res {
+                Ok(status) => evaluate_exit(status, &ctx.task_cfg),
+                Err(error) => Err(task_io_error("wait failed", error)),
+            }
         }
         _ = cancel.cancelled() => {
             debug!(
@@ -767,43 +819,12 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
         }
     };
 
-    #[cfg(unix)]
-    let pgid = pg_guard.pgid;
-
-    pg_guard.disarm();
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-    let outcome = match &result {
-        Ok(()) => solti_runner::MetricOutcome::Success,
-        Err(e) => classify_task_error(e),
-    };
-    ctx.metrics
-        .record_task_completed(RunnerType::Subprocess, outcome, duration_ms);
-
     let drained = tokio::time::timeout(LOG_DRAIN_GRACE, async {
         let _ = tokio::join!(&mut stdout_task, &mut stderr_task);
     })
     .await;
     if drained.is_err() {
-        #[cfg(unix)]
-        if let Some(pgid) = pgid {
-            // SAFETY:
-            // `libc::kill` has no memory preconditions.
-            // The negative pid is the killpg idiom (targets the whole group, not a single pid);
-            // `pgid` was captured at spawn from `process_group(0)`, and the leader is already reaped, this reaches only still-living grandchildren.
-            // `ESRCH` (group already gone) is benign.
-            let rc = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::ESRCH) {
-                    warn!(
-                        task = %ctx.task_cfg.run_id,
-                        error = %err,
-                        "killpg of lingering subtree failed",
-                    );
-                }
-            }
-        }
+        pg_guard.kill();
         stdout_task.abort();
         stderr_task.abort();
         warn!(
@@ -811,6 +832,11 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
             "subprocess output drain timed out after leader exit; killed lingering process group",
         );
     }
+    // The task owns its entire process group. Descendants must not outlive the
+    // leader even when they detached their standard streams.
+    pg_guard.kill();
+    pg_guard.disarm();
+    cgroup_guard.cleanup().await;
     result
 }
 
@@ -908,7 +934,7 @@ mod tests {
             slot,
             TaskWorkload::Subprocess(SubprocessSpec::new(
                 solti_model::SubprocessMode::Script {
-                    runtime: solti_model::Runtime::Bash,
+                    interpreter: "bash".into(),
                     body: BASE64.encode(body),
                     args: args.iter().map(|s| s.to_string()).collect(),
                 },
@@ -939,6 +965,15 @@ mod tests {
         Task::new(format!("task-{slot}"), spec).unwrap()
     }
 
+    fn build_with_run_id(
+        runner: &SubprocessRunner,
+        task: &Task,
+        ctx: &BuildContext,
+    ) -> Result<TaskRef, RunnerError> {
+        let run_id = solti_runner::make_run_id(runner.name(), task.slot().as_str());
+        runner.build_task(task, &run_id, ctx)
+    }
+
     fn make_task_cfg() -> SubprocessTaskConfig {
         SubprocessTaskConfig {
             run_id: Arc::from("test-run-1"),
@@ -961,7 +996,7 @@ mod tests {
             output_publisher: solti_runner::noop_output_publisher(),
             attempt: AtomicU32::new(0),
             generation: 1,
-            resource_name: "test-resource".into(),
+            resource_name: solti_model::TaskId::new("test-resource").unwrap(),
             script_body: None,
         }
     }
@@ -991,6 +1026,15 @@ mod tests {
         let result = SubprocessRunner::with_config("bad/name", SubprocessBackendConfig::new());
         let err = result.err().expect("bad name must be rejected").to_string();
         assert!(err.contains("invalid runner name"), "got: {err}");
+    }
+
+    #[test]
+    fn runner_accepts_a_dynamically_owned_name() {
+        let suffix = 7;
+        let name = format!("runner-{suffix}");
+        let runner = SubprocessRunner::new(name.clone()).unwrap();
+
+        assert_eq!(runner.name(), name);
     }
 
     #[test]
@@ -1033,9 +1077,10 @@ mod tests {
 
     #[test]
     fn env_inherit_injects_no_path() {
-        // Default (Inherit): no env_clear, no synthetic PATH — the child inherits
-        // the agent's PATH as before.
-        let ctx = ctx_with_backend(SubprocessBackendConfig::new());
+        use crate::subprocess::backend::EnvPolicy;
+
+        let ctx =
+            ctx_with_backend(SubprocessBackendConfig::new().with_env_policy(EnvPolicy::Inherit));
         let cmd = build_command(&ctx, None);
         assert!(!env_of(&cmd).contains_key("PATH"));
     }
@@ -1128,9 +1173,9 @@ mod tests {
 
     #[test]
     fn build_task_returns_task_ref_for_subprocess() {
-        let runner = SubprocessRunner::new("test-runner");
+        let runner = SubprocessRunner::new("test-runner").unwrap();
         let task = mk_subprocess_spec("test-slot", "echo");
-        let task_ref = runner.build_task(&task, &BuildContext::default()).unwrap();
+        let task_ref = build_with_run_id(&runner, &task, &BuildContext::default()).unwrap();
 
         assert_ne!(task_ref.name(), task.name().as_str());
         assert!(task_ref.name().starts_with("test-runner-test-slot-"));
@@ -1138,55 +1183,49 @@ mod tests {
 
     #[test]
     fn build_task_rejects_non_subprocess_kind() {
-        let runner = SubprocessRunner::new("test-runner");
+        let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_embedded_spec("test-slot");
-        match runner.build_task(&spec, &BuildContext::default()) {
-            Err(RunnerError::UnsupportedKind { runner, kind }) => {
+        match build_with_run_id(&runner, &spec, &BuildContext::default()) {
+            Err(RunnerError::UnsupportedWorkload {
+                runner,
+                api_version,
+                kind,
+            }) => {
                 assert_eq!(runner, "test-runner");
-                assert_eq!(kind, "solti.io/v1/Embedded");
+                assert_eq!(api_version, "solti.io/v1");
+                assert_eq!(kind, "Embedded");
             }
-            Err(other) => panic!("expected UnsupportedKind, got {other:?}"),
+            Err(other) => panic!("expected UnsupportedWorkload, got {other:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
 
     #[test]
-    fn supports_returns_true_for_subprocess() {
-        let runner = SubprocessRunner::new("test");
+    fn workload_types_declares_subprocess() {
+        let runner = SubprocessRunner::new("test").unwrap();
         let task = mk_subprocess_spec("s", "echo");
-        assert!(runner.supports(task.spec().workload()));
-    }
-
-    #[test]
-    fn runtime_executable_resolution_belongs_to_exec_backend() {
-        assert_eq!(resolve_runtime_command(&Runtime::Bash).unwrap(), "bash");
         assert_eq!(
-            resolve_runtime_command(&Runtime::Python).unwrap(),
-            "python3"
-        );
-        assert_eq!(resolve_runtime_command(&Runtime::Node).unwrap(), "node");
-        assert_eq!(
-            resolve_runtime_command(&Runtime::Custom {
-                command: "ruby".into(),
-                flag: "-e".into(),
-            })
-            .unwrap(),
-            "ruby"
+            runner.workload_types(),
+            vec![task.spec().workload().type_meta()]
         );
     }
 
     #[test]
-    fn supports_returns_false_for_embedded() {
-        let runner = SubprocessRunner::new("test");
+    fn workload_types_excludes_embedded() {
+        let runner = SubprocessRunner::new("test").unwrap();
         let task = mk_embedded_spec("s");
-        assert!(!runner.supports(task.spec().workload()));
+        assert!(
+            !runner
+                .workload_types()
+                .contains(&task.spec().workload().type_meta())
+        );
     }
 
     #[test]
     fn build_task_returns_task_ref_for_script_mode() {
-        let runner = SubprocessRunner::new("test-runner");
+        let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_script_spec("test-slot", b"echo hello", &[]);
-        let result = runner.build_task(&spec, &BuildContext::default());
+        let result = build_with_run_id(&runner, &spec, &BuildContext::default());
         assert!(result.is_ok());
     }
 
@@ -1197,9 +1236,9 @@ mod tests {
 
         let (ctx, rx, _calls) = recording_output_context();
 
-        let runner = SubprocessRunner::new("test-runner");
+        let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_script_spec("script-e2e", b"echo \"hello-$1\"", &["script"]);
-        let task_ref = runner.build_task(&spec, &ctx).unwrap();
+        let task_ref = build_with_run_id(&runner, &spec, &ctx).unwrap();
         let cancel = TaskContext::detached();
         task_ref
             .spawn(cancel)
@@ -1230,9 +1269,9 @@ mod tests {
     async fn script_task_can_be_spawned_repeatedly() {
         // The tempfile is materialized per attempt; a retry after the first
         // attempt (and its tempfile) is gone must still find its script.
-        let runner = SubprocessRunner::new("test-runner");
+        let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_script_spec("script-retry", b"exit 0", &[]);
-        let task_ref = runner.build_task(&spec, &BuildContext::default()).unwrap();
+        let task_ref = build_with_run_id(&runner, &spec, &BuildContext::default()).unwrap();
 
         let ctx = TaskContext::detached();
         task_ref
@@ -1263,7 +1302,7 @@ mod tests {
         use base64::engine::general_purpose::STANDARD as BASE64;
 
         let mode = solti_model::SubprocessMode::Script {
-            runtime: solti_model::Runtime::Bash,
+            interpreter: "bash".into(),
             body: BASE64.encode(b"echo hello"),
             args: vec!["extra".into()],
         };
@@ -1280,21 +1319,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_mode_script_custom_ignores_flag() {
+    fn resolve_mode_script_uses_explicit_interpreter() {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
         let mode = solti_model::SubprocessMode::Script {
-            runtime: solti_model::Runtime::Custom {
-                command: "ruby".into(),
-                flag: "-e".into(),
-            },
+            interpreter: "ruby".into(),
             body: BASE64.encode(b"puts 'hi'"),
             args: vec![],
         };
         let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap();
         assert_eq!(r.command, "ruby");
-        assert!(r.args.is_empty(), "flag must not leak into args");
+        assert!(r.args.is_empty());
         assert!(r.script_body.is_some());
     }
 
@@ -1323,7 +1359,7 @@ mod tests {
         let err = write_script_tempfile(&bogus, "echo hello")
             .expect_err("nonexistent dir must fail tempfile creation");
         assert!(
-            err.contains("failed to create script tempfile"),
+            err.to_string().contains("failed to create script tempfile"),
             "got: {err}"
         );
     }
@@ -1438,9 +1474,9 @@ mod tests {
         // Fork a long-lived grandchild, record its pid, then block forever.
         let script = format!(r#"(sleep 60 & echo $! > {marker_str}) ; sleep 60"#);
 
-        let runner = SubprocessRunner::new("test-runner");
+        let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_subprocess_spec_with_args("drop-slot", "bash", &["-c", &script]);
-        let task_ref = runner.build_task(&spec, &BuildContext::default()).unwrap();
+        let task_ref = build_with_run_id(&runner, &spec, &BuildContext::default()).unwrap();
 
         // Run, then DROP the future via timeout — exactly what taskvisor does.
         let cancel = TaskContext::detached();
@@ -1486,7 +1522,7 @@ mod tests {
     #[test]
     fn resolve_mode_invalid_base64() {
         let mode = solti_model::SubprocessMode::Script {
-            runtime: solti_model::Runtime::Bash,
+            interpreter: "bash".into(),
             body: "not-valid!!!".into(),
             args: vec![],
         };
@@ -1502,9 +1538,9 @@ mod tests {
 
         let (ctx, rx, calls) = recording_output_context();
 
-        let runner = SubprocessRunner::new("test-runner");
+        let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_subprocess_spec_with_args("echo-slot", "echo", &["hello-stream"]);
-        let task_ref = runner.build_task(&spec, &ctx).unwrap();
+        let task_ref = build_with_run_id(&runner, &spec, &ctx).unwrap();
         let cancel = TaskContext::detached();
         task_ref.spawn(cancel).await.expect("echo must succeed");
 
@@ -1526,7 +1562,10 @@ mod tests {
         assert_eq!(chunk.generation, 1);
         assert_eq!(chunk.stream, solti_model::StreamKind::Stdout);
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.as_slice(), &[("task-echo-slot".into(), 1, 1)]);
+        assert_eq!(
+            calls.as_slice(),
+            &[(solti_model::TaskId::new("task-echo-slot").unwrap(), 1, 1)]
+        );
     }
 
     #[tokio::test]
@@ -1535,9 +1574,9 @@ mod tests {
         use std::time::Duration;
 
         let (ctx, rx, _calls) = recording_output_context();
-        let runner = SubprocessRunner::new("test-runner");
+        let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_subprocess_spec_with_args("attempts-slot", "echo", &["x"]);
-        let task_ref = runner.build_task(&spec, &ctx).unwrap();
+        let task_ref = build_with_run_id(&runner, &spec, &ctx).unwrap();
         let ctx = TaskContext::detached();
         task_ref.spawn(ctx.clone()).await.unwrap();
         task_ref.spawn(ctx).await.unwrap();
@@ -1559,9 +1598,9 @@ mod tests {
     #[tokio::test]
     async fn attempt_is_allocated_before_spawn_failure() {
         let (ctx, _rx, calls) = recording_output_context();
-        let runner = SubprocessRunner::new("test-runner");
+        let runner = SubprocessRunner::new("test-runner").unwrap();
         let task = mk_subprocess_spec("failed-spawn", "/definitely/not/a/command");
-        let task_ref = runner.build_task(&task, &ctx).unwrap();
+        let task_ref = build_with_run_id(&runner, &task, &ctx).unwrap();
 
         assert!(task_ref.spawn(TaskContext::detached()).await.is_err());
         assert!(task_ref.spawn(TaskContext::detached()).await.is_err());
@@ -1570,8 +1609,8 @@ mod tests {
         assert_eq!(
             calls.as_slice(),
             &[
-                ("task-failed-spawn".into(), 1, 1),
-                ("task-failed-spawn".into(), 1, 2),
+                (solti_model::TaskId::new("task-failed-spawn").unwrap(), 1, 1,),
+                (solti_model::TaskId::new("task-failed-spawn").unwrap(), 1, 2,),
             ]
         );
     }
@@ -1580,9 +1619,9 @@ mod tests {
     async fn run_subprocess_does_not_hang_on_daemonized_grandchild_holding_pipe() {
         use std::time::{Duration, Instant};
 
-        let runner = SubprocessRunner::new("hang-runner");
+        let runner = SubprocessRunner::new("hang-runner").unwrap();
         let spec = mk_subprocess_spec_with_args("hang-slot", "sh", &["-c", "sleep 30 & exit 0"]);
-        let task_ref = runner.build_task(&spec, &BuildContext::default()).unwrap();
+        let task_ref = build_with_run_id(&runner, &spec, &BuildContext::default()).unwrap();
 
         let started = Instant::now();
         let ctx = TaskContext::detached();
@@ -1600,6 +1639,51 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_task_kills_descendants_with_detached_output() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let marker = std::env::temp_dir().join(format!(
+            "solti-exec-detached-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let script = format!(
+            "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > {}; exit 0",
+            marker.display()
+        );
+
+        let runner = SubprocessRunner::new("descendant-runner").unwrap();
+        let spec = mk_subprocess_spec_with_args("descendant-slot", "sh", &["-c", &script]);
+        let task = build_with_run_id(&runner, &spec, &BuildContext::default()).unwrap();
+        task.spawn(TaskContext::detached()).await.unwrap();
+
+        let pid = std::fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let mut stopped = false;
+        for _ in 0..50 {
+            if unsafe { libc::kill(pid, 0) } != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = std::fs::remove_file(marker);
+
+        if !stopped {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            panic!("descendant {pid} survived successful task completion");
+        }
+    }
+
     #[test]
     fn resolve_mode_script_accepts_large_body() {
         use base64::Engine;
@@ -1611,7 +1695,7 @@ mod tests {
             .chain(std::iter::repeat_n(b'x', 200 * 1024))
             .collect();
         let mode = solti_model::SubprocessMode::Script {
-            runtime: solti_model::Runtime::Bash,
+            interpreter: "bash".into(),
             body: BASE64.encode(&payload),
             args: vec![],
         };
@@ -1631,7 +1715,7 @@ mod tests {
         use base64::engine::general_purpose::STANDARD as BASE64;
 
         let mode = solti_model::SubprocessMode::Script {
-            runtime: solti_model::Runtime::Bash,
+            interpreter: "bash".into(),
             body: BASE64.encode("a".repeat(100).as_bytes()),
             args: vec![],
         };

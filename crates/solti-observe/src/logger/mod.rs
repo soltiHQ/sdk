@@ -13,7 +13,7 @@ pub use object::LoggerFormat;
 
 mod object;
 pub use object::LoggerLevel;
-pub use object::{LoggerTimeZone, init_local_offset};
+pub use object::LoggerTimeZone;
 
 mod tasks;
 
@@ -28,18 +28,18 @@ pub use tasks::timezone_sync;
 /// |---------------------------|---------------------------------|------------------------------|
 /// | [`LoggerFormat::Text`]    | `tracing_subscriber::fmt`       | Colored, human-readable      |
 /// | [`LoggerFormat::Json`]    | `tracing_subscriber::fmt::json` | Structured, machine-readable |
-/// | [`LoggerFormat::Journald`]| `tracing_journald`              | Linux only                   |
+/// | `Journald`                | `tracing_journald`              | Feature `journald`, Linux    |
 ///
 /// After this call, all `tracing` macros use this config.
 /// The function can succeed only once per process.
-/// A later call returns [`LoggerError::AlreadyInitialized`].
+/// A later call returns an initialization error.
 ///
-/// ## Local timezone
+/// # Local timezone
 ///
-/// When using [`LoggerTimeZone::Local`], call [`init_local_offset`] in `main()` before spawning the Tokio runtime.
-/// See the [crate-level docs](crate#local-time) for details.
+/// Local offset detection happens before the global subscriber is installed.
+/// Failure is returned as [`LoggerError::LocalOffsetUnavailable`].
 ///
-/// ## Example
+/// # Example
 ///
 /// ```rust,no_run
 /// use solti_observe::{LoggerConfig, LoggerLevel, init_logger};
@@ -58,6 +58,7 @@ pub fn init_logger(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     match cfg.format {
         LoggerFormat::Text => log::logger_text(cfg),
         LoggerFormat::Json => log::logger_json(cfg),
+        #[cfg(feature = "journald")]
         LoggerFormat::Journald => log::logger_journald(cfg),
     }
 }

@@ -28,25 +28,30 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = []
 grpc = [
     "dep:prost",
+    "dep:protoc-bin-vendored",
     "dep:solti-model",
     "dep:taskvisor",
     "dep:tokio",
     "dep:tonic",
     "dep:tonic-prost",
+    "dep:tonic-prost-build",
     "dep:tracing",
 ]
 http = [
     "dep:pbjson",
+    "dep:pbjson-build",
     "dep:prost",
+    "dep:protoc-bin-vendored",
     "dep:reqwest",
     "dep:serde",
     "dep:serde_json",
     "dep:solti-model",
     "dep:taskvisor",
     "dep:tokio",
+    "dep:tonic-prost-build",
     "dep:tracing",
 ]
-tls  = ["dep:solti-tls", "tonic?/tls-ring", "reqwest?/rustls-no-provider", ]
+tls  = ["dep:solti-tls", "reqwest?/rustls-no-provider", "tonic?/tls-native-roots", "tonic?/tls-ring"]
 
 [dependencies]
 pbjson      = { workspace = true, optional = true }
@@ -65,9 +70,9 @@ solti-model = { workspace = true, optional = true }
 solti-tls   = { workspace = true, optional = true }
 
 [build-dependencies]
-pbjson-build        = { workspace = true }
-protoc-bin-vendored = { workspace = true }
-tonic-prost-build   = { workspace = true }
+pbjson-build        = { workspace = true, optional = true }
+protoc-bin-vendored = { workspace = true, optional = true }
+tonic-prost-build   = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }

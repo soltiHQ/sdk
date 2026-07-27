@@ -11,19 +11,24 @@ impl TryFrom<Task> for proto_api::Task {
 
     fn try_from(task: Task) -> Result<Self, Self::Error> {
         let (type_meta, metadata, spec, status) = task.into_parts();
+        let (observed_generation, phase, attempt, exit_code, error, conditions) =
+            status.into_parts();
 
         Ok(proto_api::Task {
             api_version: type_meta.api_version().to_owned(),
             kind: type_meta.kind().to_owned(),
-            metadata: Some(proto_api::ObjectMeta::from(&metadata)),
+            metadata: Some(proto_api::ObjectMeta::try_from(&metadata)?),
             spec: Some(spec_to_proto(&spec)?),
             status: Some(proto_api::TaskStatus {
-                observed_generation: status.observed_generation,
-                phase: proto_api::TaskPhase::from(status.phase) as i32,
-                exit_code: status.exit_code,
-                attempt: status.attempt,
-                error: status.error,
-                conditions: status.conditions.into_iter().map(Into::into).collect(),
+                observed_generation,
+                phase: proto_api::TaskPhase::try_from(phase)? as i32,
+                exit_code,
+                attempt,
+                error,
+                conditions: conditions
+                    .into_iter()
+                    .map(proto_api::TaskCondition::try_from)
+                    .collect::<Result<_, _>>()?,
             }),
         })
     }
@@ -55,11 +60,8 @@ pub(crate) fn task_manifest_from_proto(
         annotations.insert(key, value);
     }
     let manifest = TaskManifest::new(metadata.name, convert_task_spec(spec)?)
-        .map(|manifest| {
-            manifest
-                .with_labels(convert_labels(metadata.labels))
-                .with_annotations(annotations)
-        })
+        .and_then(|manifest| manifest.with_labels(convert_labels(metadata.labels)))
+        .and_then(|manifest| manifest.with_annotations(annotations))
         .map_err(|error| ApiError::InvalidRequest(error.to_string()))?;
     manifest
         .validate()
@@ -71,24 +73,54 @@ pub(crate) fn task_manifest_from_proto(
 pub(crate) fn tasks_page_to_proto(
     page: solti_model::TaskPage<solti_model::Task>,
 ) -> Result<proto_api::ListTasksResponse, ApiError> {
-    // `total` is the count of all matching tasks across pages, not the size of this
-    // page — preserve it from the domain page (saturating into the proto's u32).
-    let total = u32::try_from(page.total).unwrap_or(u32::MAX);
+    let remaining_item_count = u64::try_from(page.remaining_item_count).map_err(|_| {
+        ApiError::Internal("remaining task count is outside the protobuf range".into())
+    })?;
+    let continuation = page
+        .continuation
+        .map(crate::continuation::encode)
+        .transpose()?
+        .unwrap_or_default();
     let tasks: Vec<proto_api::Task> = page
         .items
         .into_iter()
         .map(proto_api::Task::try_from)
         .collect::<Result<_, _>>()?;
 
-    Ok(proto_api::ListTasksResponse { total, tasks })
+    Ok(proto_api::ListTasksResponse {
+        tasks,
+        resource_version: page.resource_version,
+        r#continue: continuation,
+        remaining_item_count: (remaining_item_count > 0).then_some(remaining_item_count),
+    })
+}
+
+/// Convert one domain Task watch event into its protobuf representation.
+pub(crate) fn task_watch_event_to_proto(
+    event: solti_model::TaskWatchEvent,
+) -> Result<proto_api::WatchTasksResponse, ApiError> {
+    let (event_type, task) = match event {
+        solti_model::TaskWatchEvent::Added(task) => (proto_api::TaskWatchEventType::Added, task),
+        solti_model::TaskWatchEvent::Modified(task) => {
+            (proto_api::TaskWatchEventType::Modified, task)
+        }
+        solti_model::TaskWatchEvent::Deleted(task) => {
+            (proto_api::TaskWatchEventType::Deleted, task)
+        }
+    };
+
+    Ok(proto_api::WatchTasksResponse {
+        r#type: event_type as i32,
+        object: Some(proto_api::Task::try_from(task)?),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use solti_model::{
-        EmbeddedSpec, Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskPhase, TaskSpec,
-        TaskWorkload,
+        EmbeddedSpec, Flag, SubprocessMode, SubprocessSpec, TaskContinuation, TaskEnv, TaskFilter,
+        TaskId, TaskPhase, TaskSpec, TaskWorkload,
     };
     use std::time::UNIX_EPOCH;
 
@@ -175,25 +207,31 @@ mod tests {
     }
 
     #[test]
-    fn list_response_total_reflects_full_match_count_not_page_size() {
-        // Simulate a paginated query: 5 total matches, but this page carries only 2 items.
+    fn list_response_carries_snapshot_continuation_and_remaining_count() {
         let mk = |id: &str| {
             let spec = TaskSpec::builder("slot", subprocess_workload(), 5_000_u64)
                 .build()
                 .unwrap();
             Task::new(id, spec).unwrap()
         };
+        let continuation =
+            TaskContinuation::new("store:9", TaskFilter::new(), TaskId::new("task-2").unwrap())
+                .unwrap();
         let page = solti_model::TaskPage {
             items: vec![mk("task-1"), mk("task-2")],
-            total: 5,
+            resource_version: "store:9".into(),
+            continuation: Some(continuation.clone()),
+            remaining_item_count: 3,
         };
 
         let resp = tasks_page_to_proto(page).expect("conversion must succeed");
 
-        assert_eq!(resp.tasks.len(), 2, "this page carries exactly 2 items");
+        assert_eq!(resp.tasks.len(), 2);
+        assert_eq!(resp.resource_version, "store:9");
+        assert_eq!(resp.remaining_item_count, Some(3));
         assert_eq!(
-            resp.total, 5,
-            "total must report all matching tasks across pages, not the current page size"
+            crate::continuation::decode(&resp.r#continue).unwrap(),
+            continuation
         );
     }
 

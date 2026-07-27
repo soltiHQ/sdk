@@ -200,7 +200,7 @@ mod tests {
     fn noop_publisher_disables_output() {
         assert!(
             noop_output_publisher()
-                .sink_for(&TaskId::from("task-1"), 1, 1)
+                .sink_for(&TaskId::new("task-1").unwrap(), 1, 1)
                 .is_none()
         );
     }

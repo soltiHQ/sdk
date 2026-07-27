@@ -7,28 +7,48 @@ use thiserror::Error;
 #[non_exhaustive]
 pub enum LoggerError {
     /// The format string was not one of `text` / `json` / `journald`.
-    #[error("Invalid log format: {0} (expected: text|json|journald)")]
+    #[error("invalid log format: {0}")]
     InvalidFormat(String),
 
+    /// Journald was requested without the `journald` feature.
+    #[error("journald support is not enabled")]
+    JournaldNotEnabled,
+
     /// The `journald` format was requested on a non-Linux target, where the systemd journal is unavailable.
-    #[error("Journald is not supported on this platform")]
+    #[cfg(feature = "journald")]
+    #[error("journald is not supported on this platform")]
     JournaldNotSupported,
 
-    /// Connecting to the systemd journal failed (carries the underlying error).
-    #[error("Failed to initialize journald: {0}")]
-    JournaldInitFailed(String),
+    /// Connecting to the systemd journal failed.
+    #[cfg(feature = "journald")]
+    #[error("failed to initialize journald")]
+    JournaldInitFailed(#[source] std::io::Error),
 
     /// A global tracing subscriber is already installed.
-    ///
-    /// [`init_logger`](crate::init_logger) can succeed at most once per process.
-    #[error("Logger already initialized")]
-    AlreadyInitialized,
+    #[cfg(not(feature = "log-compat"))]
+    #[error("global tracing subscriber is already installed")]
+    AlreadyInitialized(#[source] tracing::dispatcher::SetGlobalDefaultError),
+
+    /// The tracing subscriber or `log` compatibility bridge could not be installed.
+    #[cfg(feature = "log-compat")]
+    #[error("failed to initialize the global logger")]
+    LoggerInitFailed(#[source] tracing_subscriber::util::TryInitError),
 
     /// The timezone string was not `utc` or `local`.
-    #[error("Invalid timezone: {0}")]
+    #[error("invalid timezone: {0}")]
     InvalidTimeZone(String),
 
     /// The level/`EnvFilter` expression failed to parse.
-    #[error("Invalid log level: {0}")]
-    InvalidLevel(String),
+    #[error("invalid log level {value:?}")]
+    InvalidLevel {
+        /// Invalid filter expression.
+        value: String,
+        /// Parser error.
+        #[source]
+        source: tracing_subscriber::filter::ParseError,
+    },
+
+    /// The local UTC offset could not be determined.
+    #[error("failed to determine the local UTC offset")]
+    LocalOffsetUnavailable(#[source] time::error::IndeterminateOffset),
 }

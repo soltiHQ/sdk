@@ -1,31 +1,31 @@
 //! # `TaskPhase` conversion: domain enum ↔ wire enum.
 //!
-//! Domain `TaskPhase` is `#[non_exhaustive]`.
-//! The outgoing `From` impl logs and maps unknown variants to `Unspecified` instead of panicking.
+//! Domain `TaskPhase` is `#[non_exhaustive]`. Unknown domain variants are
+//! rejected rather than emitted as `Unspecified`.
 
 use solti_model::TaskPhase;
-use tracing::warn;
 
-#[cfg(feature = "grpc")]
 use crate::error::ApiError;
 use crate::proto_api;
 
-impl From<TaskPhase> for proto_api::TaskPhase {
-    fn from(phase: TaskPhase) -> Self {
-        match phase {
-            TaskPhase::Succeeded => proto_api::TaskPhase::Succeeded,
-            TaskPhase::Exhausted => proto_api::TaskPhase::Exhausted,
-            TaskPhase::Canceled => proto_api::TaskPhase::Canceled,
-            TaskPhase::Pending => proto_api::TaskPhase::Pending,
-            TaskPhase::Running => proto_api::TaskPhase::Running,
-            TaskPhase::Timeout => proto_api::TaskPhase::Timeout,
-            TaskPhase::Failed => proto_api::TaskPhase::Failed,
+impl TryFrom<TaskPhase> for proto_api::TaskPhase {
+    type Error = ApiError;
 
-            other => {
-                warn!(?other, "unknown TaskPhase variant, mapping to Unspecified");
-                proto_api::TaskPhase::Unspecified
+    fn try_from(phase: TaskPhase) -> Result<Self, Self::Error> {
+        Ok(match phase {
+            TaskPhase::Succeeded => Self::Succeeded,
+            TaskPhase::Exhausted => Self::Exhausted,
+            TaskPhase::Canceled => Self::Canceled,
+            TaskPhase::Pending => Self::Pending,
+            TaskPhase::Running => Self::Running,
+            TaskPhase::Timeout => Self::Timeout,
+            TaskPhase::Failed => Self::Failed,
+            _ => {
+                return Err(ApiError::Internal(
+                    "handler returned an unsupported task phase".into(),
+                ));
             }
-        }
+        })
     }
 }
 
@@ -67,7 +67,7 @@ mod tests {
         ];
 
         for (domain, expected_proto) in cases {
-            let proto = proto_api::TaskPhase::from(domain);
+            let proto = proto_api::TaskPhase::try_from(domain).unwrap();
             assert_eq!(proto, expected_proto, "mismatch for {:?}", domain);
         }
     }

@@ -5,12 +5,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use solti_core::{CoreError, SupervisorApi};
-use solti_model::{OutputEvent, Task, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun};
+use solti_core::{CollectionError, CoreError, SupervisorApi, WritePreconditionViolation};
+use solti_model::{
+    OutputEvent, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun,
+    WritePreconditions,
+};
 use tokio_stream::StreamExt;
 
-use crate::error::ApiError;
-use crate::handler::{ApiHandler, OutputEventStream};
+use crate::error::{ApiConflict, ApiError, ApiErrorCause};
+use crate::handler::{ApiHandler, OutputEventStream, TaskWatchEventStream};
 use crate::visibility::{manifest_is_visible, task_is_visible, workload_is_visible};
 
 /// Adapter that bridges [`SupervisorApi`] to [`ApiHandler`].
@@ -64,14 +67,18 @@ impl ApiHandler for SupervisorApiAdapter {
             .map_err(map_core_error)
     }
 
-    async fn apply_task(&self, manifest: TaskManifest) -> Result<Task, ApiError> {
+    async fn apply_task(
+        &self,
+        manifest: TaskManifest,
+        preconditions: WritePreconditions,
+    ) -> Result<Task, ApiError> {
         if !manifest_is_visible(&manifest) {
             return Err(ApiError::InvalidRequest(
                 "workload has no public wire representation".into(),
             ));
         }
         self.supervisor
-            .apply_task_where(manifest, task_is_visible)
+            .apply_task_where(manifest, preconditions, task_is_visible)
             .await
             .map_err(map_core_error)
     }
@@ -81,7 +88,23 @@ impl ApiHandler for SupervisorApiAdapter {
     }
 
     async fn query_tasks(&self, query: TaskQuery) -> Result<TaskPage<Task>, ApiError> {
-        Ok(self.supervisor.query_tasks_where(&query, task_is_visible))
+        self.supervisor
+            .query_tasks_where(&query, task_is_visible)
+            .map_err(map_collection_error)
+    }
+
+    async fn watch_tasks(
+        &self,
+        filter: TaskFilter,
+        resource_version: Option<String>,
+    ) -> Result<TaskWatchEventStream, ApiError> {
+        let stream = self
+            .supervisor
+            .watch_tasks_where(&filter, resource_version.as_deref(), task_is_visible)
+            .map_err(map_collection_error)?;
+        Ok(Box::pin(
+            stream.map(|event| event.map_err(map_collection_error)),
+        ))
     }
 
     async fn list_task_runs(&self, id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
@@ -91,9 +114,13 @@ impl ApiHandler for SupervisorApiAdapter {
             .ok_or_else(|| ApiError::TaskNotFound(id.to_string()))
     }
 
-    async fn delete_task(&self, id: &TaskId) -> Result<(), ApiError> {
+    async fn delete_task(
+        &self,
+        id: &TaskId,
+        preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
         self.supervisor
-            .delete_task_where(id, task_is_visible)
+            .delete_task_where(id, preconditions, task_is_visible)
             .await
             .map_err(map_core_error)
     }
@@ -113,11 +140,42 @@ impl ApiHandler for SupervisorApiAdapter {
 fn map_core_error(error: CoreError) -> ApiError {
     match error {
         CoreError::InvalidSpec(inner) => ApiError::InvalidRequest(inner.to_string()),
-        CoreError::ReservedResource(message) => ApiError::InvalidRequest(message),
         CoreError::AlreadyExists(message) => ApiError::AlreadyExists(message),
         CoreError::NotFound(message) => ApiError::TaskNotFound(message),
+        CoreError::Conflict(conflict) => {
+            let causes = conflict
+                .violations()
+                .iter()
+                .map(|violation| match violation {
+                    WritePreconditionViolation::Uid { .. } => {
+                        ApiErrorCause::new("UIDMismatch", violation.to_string())
+                            .with_field("preconditions.uid")
+                    }
+                    WritePreconditionViolation::ResourceVersion { .. } => {
+                        ApiErrorCause::new("ResourceVersionMismatch", violation.to_string())
+                            .with_field("preconditions.resourceVersion")
+                    }
+                    _ => ApiErrorCause::new("PreconditionFailed", violation.to_string()),
+                })
+                .collect();
+            ApiError::Conflict(ApiConflict::new(conflict.name().to_string(), causes))
+        }
         CoreError::ShuttingDown => ApiError::Unavailable("supervisor is shutting down".into()),
         other => ApiError::Internal(other.to_string()),
+    }
+}
+
+fn map_collection_error(error: CollectionError) -> ApiError {
+    match &error {
+        CollectionError::InvalidResourceVersion { .. }
+        | CollectionError::ContinuationFilterMismatch
+        | CollectionError::ContinuationCursorNotFound { .. } => {
+            ApiError::InvalidRequest(error.to_string())
+        }
+        CollectionError::ResourceVersionExpired { .. } => {
+            ApiError::ResourceVersionExpired(error.to_string())
+        }
+        _ => ApiError::Internal(error.to_string()),
     }
 }
 
@@ -128,47 +186,48 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     use bytes::Bytes;
-    use solti_core::StateConfig;
     use solti_model::{
         EmbeddedSpec, ExtensionWorkload, OutputChunk, StreamKind, TaskSpec, TaskWorkload,
+        WORKLOAD_API_VERSION, WorkloadTypeMeta,
     };
-    use solti_runner::{BuildContext, Runner, RunnerError, RunnerRouter};
-    use taskvisor::{ControllerConfig, SupervisorConfig, TaskContext, TaskError, TaskFn, TaskRef};
+    use solti_runner::{BuildContext, RunId, Runner, RunnerError, RunnerRouter};
+    use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 
     struct TestRunner;
 
     impl Runner for TestRunner {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "adapter-test"
         }
 
-        fn supports(&self, workload: &TaskWorkload) -> bool {
-            matches!(
-                workload,
-                TaskWorkload::Subprocess(_) | TaskWorkload::Extension(_)
-            )
+        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+            vec![
+                WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess")
+                    .expect("built-in workload GVK"),
+                WorkloadTypeMeta::new("workloads.example.io/v1", "ExampleJob")
+                    .expect("extension workload GVK"),
+            ]
         }
 
-        fn build_task(&self, task: &Task, _context: &BuildContext) -> Result<TaskRef, RunnerError> {
-            Ok(TaskFn::arc(
-                format!("runtime-{}", task.name()),
-                |_ctx: TaskContext| async move { Ok::<(), TaskError>(()) },
-            ))
+        fn build_task(
+            &self,
+            _task: &Task,
+            run_id: &RunId,
+            _context: &BuildContext,
+        ) -> Result<TaskRef, RunnerError> {
+            Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move {
+                Ok::<(), TaskError>(())
+            }))
         }
     }
 
     async fn supervisor() -> SupervisorApi {
         let mut router = RunnerRouter::new();
-        router.register(Arc::new(TestRunner));
-        SupervisorApi::new(
-            SupervisorConfig::default(),
-            ControllerConfig::default(),
-            Vec::new(),
-            router,
-            StateConfig::default(),
-        )
-        .await
-        .expect("SupervisorApi::new")
+        router.register(Arc::new(TestRunner)).unwrap();
+        SupervisorApi::builder(router)
+            .start()
+            .await
+            .expect("SupervisorApiBuilder::start")
     }
 
     #[tokio::test]
@@ -190,9 +249,9 @@ mod tests {
         .expect("spec builds");
         let manifest = TaskManifest::new("embedded-probe", spec).expect("manifest builds");
         let created = api
-            .create_with_task(manifest, task)
+            .create_embedded_task(manifest, task)
             .await
-            .expect("create_with_task");
+            .expect("create_embedded_task");
         let name = created.name().clone();
 
         assert!(
@@ -227,9 +286,9 @@ mod tests {
         .expect("spec builds");
         let manifest = TaskManifest::new("embedded-guard", spec).expect("manifest builds");
         let created = api
-            .create_with_task(manifest, task)
+            .create_embedded_task(manifest, task)
             .await
-            .expect("create_with_task");
+            .expect("create_embedded_task");
         let name = created.name().clone();
 
         let adapter = SupervisorApiAdapter::new(Arc::new(api));
@@ -240,7 +299,7 @@ mod tests {
             "embedded run history must look like an unknown id, got {runs:?}"
         );
 
-        let deleted = adapter.delete_task(&name).await;
+        let deleted = adapter.delete_task(&name, WritePreconditions::new()).await;
         assert!(
             matches!(deleted, Err(ApiError::TaskNotFound(_))),
             "deleting an embedded task must look like an unknown id, got {deleted:?}"
@@ -261,7 +320,7 @@ mod tests {
     async fn get_task_unknown_name_is_none() {
         let adapter = SupervisorApiAdapter::new(Arc::new(supervisor().await));
         let visible = adapter
-            .get_task(&TaskId::from("no-such-task"))
+            .get_task(&TaskId::new("no-such-task").unwrap())
             .await
             .expect("get_task must not fail");
         assert!(visible.is_none());
@@ -269,7 +328,9 @@ mod tests {
 
     #[tokio::test]
     async fn query_filters_sdk_only_workloads_before_pagination() {
-        use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskQuery};
+        use solti_model::{
+            Flag, LabelSelector, Labels, SubprocessMode, SubprocessSpec, TaskEnv, TaskQuery,
+        };
 
         let api = supervisor().await;
         let hidden_ref: TaskRef = TaskFn::arc("hidden-runtime", |_ctx: TaskContext| async move {
@@ -282,8 +343,13 @@ mod tests {
         )
         .build()
         .unwrap();
-        api.create_with_task(
-            TaskManifest::new("aaa-hidden", hidden_spec).unwrap(),
+        let mut hidden_labels = Labels::new();
+        hidden_labels.insert("environment", "production");
+        api.create_embedded_task(
+            TaskManifest::new("aaa-hidden", hidden_spec)
+                .unwrap()
+                .with_labels(hidden_labels)
+                .unwrap(),
             hidden_ref,
         )
         .await
@@ -302,19 +368,33 @@ mod tests {
             solti_model::TaskSpec::builder("visible-slot", visible_workload, 5_000_u64)
                 .build()
                 .unwrap();
-        api.create_task(TaskManifest::new("zzz-visible", visible_spec).unwrap())
-            .await
-            .unwrap();
+        let mut visible_labels = Labels::new();
+        visible_labels.insert("environment", "production");
+        api.create_task(
+            TaskManifest::new("zzz-visible", visible_spec)
+                .unwrap()
+                .with_labels(visible_labels)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
         let adapter = SupervisorApiAdapter::new(Arc::new(api));
+        let selector: LabelSelector = "environment=production".parse().unwrap();
         let page = adapter
-            .query_tasks(TaskQuery::new().with_limit(1))
+            .query_tasks(
+                TaskQuery::new()
+                    .with_label_selector(selector)
+                    .unwrap()
+                    .with_limit(1),
+            )
             .await
             .unwrap();
 
-        assert_eq!(page.total, 1);
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].name().as_str(), "zzz-visible");
+        assert!(page.continuation.is_none());
+        assert_eq!(page.remaining_item_count, 0);
     }
 
     #[tokio::test]
@@ -332,7 +412,7 @@ mod tests {
         )
         .build()
         .unwrap();
-        api.create_with_task(
+        api.create_embedded_task(
             TaskManifest::new("hidden-apply-target", hidden_spec).unwrap(),
             hidden_ref,
         )
@@ -356,13 +436,16 @@ mod tests {
         .unwrap();
         let adapter = SupervisorApiAdapter::new(Arc::new(api));
         let result = adapter
-            .apply_task(TaskManifest::new("hidden-apply-target", visible_spec).unwrap())
+            .apply_task(
+                TaskManifest::new("hidden-apply-target", visible_spec).unwrap(),
+                WritePreconditions::new(),
+            )
             .await;
 
         assert!(matches!(result, Err(ApiError::TaskNotFound(_))));
         let stored = adapter
             .supervisor
-            .get_task(&TaskId::from("hidden-apply-target"))
+            .get_task(&TaskId::new("hidden-apply-target").unwrap())
             .expect("embedded task remains stored");
         assert!(matches!(
             stored.spec().workload(),
@@ -390,8 +473,8 @@ mod tests {
             .create_task(TaskManifest::new("extension-task", spec).unwrap())
             .await
             .expect("extension workload must be accepted");
-        assert_eq!(created.status().phase, solti_model::TaskPhase::Pending);
-        assert_eq!(created.status().observed_generation, 0);
+        assert_eq!(created.status().phase(), solti_model::TaskPhase::Pending);
+        assert_eq!(created.status().observed_generation(), 0);
         let fetched = adapter
             .get_task(created.name())
             .await
@@ -419,14 +502,32 @@ mod tests {
         let missing = map_core_error(CoreError::NotFound("missing".into()));
         assert!(matches!(missing, ApiError::TaskNotFound(message) if message == "missing"));
 
-        let reserved = map_core_error(CoreError::ReservedResource("reserved".into()));
-        assert!(matches!(reserved, ApiError::InvalidRequest(message) if message == "reserved"));
-
         let shutting_down = map_core_error(CoreError::ShuttingDown);
         assert!(matches!(shutting_down, ApiError::Unavailable(_)));
 
         let internal = map_core_error(CoreError::Mapping("mapping".into()));
         assert!(matches!(internal, ApiError::Internal(message) if message.contains("mapping")));
+    }
+
+    #[test]
+    fn collection_errors_translate_to_api_owned_categories() {
+        let invalid = map_collection_error(CollectionError::InvalidResourceVersion {
+            resource_version: "bad".into(),
+        });
+        assert!(matches!(invalid, ApiError::InvalidRequest(_)));
+
+        let mismatch = map_collection_error(CollectionError::ContinuationFilterMismatch);
+        assert!(matches!(mismatch, ApiError::InvalidRequest(_)));
+
+        let missing_cursor = map_collection_error(CollectionError::ContinuationCursorNotFound {
+            name: TaskId::new("missing").unwrap(),
+        });
+        assert!(matches!(missing_cursor, ApiError::InvalidRequest(_)));
+
+        let expired = map_collection_error(CollectionError::ResourceVersionExpired {
+            resource_version: "old:1".into(),
+        });
+        assert!(matches!(expired, ApiError::ResourceVersionExpired(_)));
     }
 
     #[test]

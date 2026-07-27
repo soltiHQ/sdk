@@ -6,7 +6,7 @@ use thiserror::Error;
 
 /// Error type for parsing and validating model values.
 ///
-/// The enum is `#[non_exhaustive]`, so callers should keep a wildcard arm when
+/// The enum is `#[non_exhaustive]`. Callers should keep a wildcard arm when
 /// matching it.
 #[derive(Debug, Error)]
 #[non_exhaustive]

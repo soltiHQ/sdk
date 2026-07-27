@@ -91,19 +91,17 @@ assert_eq!(config.level.as_str(), "taskvisor=debug,info");
 
 ### Local Timestamps
 
-If you want local timestamps, call `init_local_offset` before Tokio starts worker threads:
+Local timestamps are selected in `LoggerConfig`:
 
 ```rust,no_run
 use solti_observe::{
-    LoggerConfig, LoggerTimeZone, init_local_offset, init_logger,
+    LoggerConfig, LoggerTimeZone, init_logger,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_local_offset();
-
     tokio::runtime::Runtime::new()?.block_on(async {
         let config = LoggerConfig {
-            tz: LoggerTimeZone::Local,
+            timezone: LoggerTimeZone::Local,
             ..Default::default()
         };
 
@@ -118,15 +116,15 @@ UTC is the default and always works.
 
 ## What Ships
 
-| Item                | Feature         | Use it for                                 |
-|---------------------|-----------------|--------------------------------------------|
-| `LoggerConfig`      | always          | Logger settings with serde defaults        |
-| `LoggerFormat`      | always          | `text`, `json`, or `journald`              |
-| `LoggerLevel`       | always          | Validated `EnvFilter` strings              |
-| `LoggerTimeZone`    | always          | `utc` or `local` timestamps                |
-| `init_logger`       | always          | Install the global tracing subscriber      |
-| `init_local_offset` | always          | Cache local UTC offset before Tokio starts |
-| `timezone_sync`     | `timezone-sync` | Build a supervised offset refresh task     |
+| Item             | Feature         | Use it for                             |
+|------------------|-----------------|----------------------------------------|
+| `LoggerConfig`   | always          | Logger settings with serde defaults    |
+| `LoggerFormat`   | always          | `text` or `json`                       |
+| journald format  | `journald`      | Native systemd journal output          |
+| `LoggerLevel`    | always          | Validated `EnvFilter` strings          |
+| `LoggerTimeZone` | always          | `utc` or `local` timestamps            |
+| `init_logger`    | always          | Install the global tracing subscriber  |
+| `timezone_sync`  | `timezone-sync` | Build a supervised offset refresh task |
 
 ## Core Model
 
@@ -138,7 +136,7 @@ init_logger()
   |
   |-- text logger
   |-- JSON logger
-  |-- journald logger (Linux only)
+  |-- journald logger (feature: journald, Linux only)
   |
   v
 tracing macros
@@ -158,7 +156,7 @@ Defaults are conservative:
 |----------------|----------|-------------------------------------------|
 | `format`       | `Text`   | Human-readable logs                       |
 | `level`        | `info`   | Global filter expression                  |
-| `tz`           | `Utc`    | UTC timestamps                            |
+| `timezone`     | `Utc`    | Text and JSON timestamp timezone          |
 | `with_targets` | `true`   | Include module targets                    |
 | `use_color`    | `true`   | Use colors only when stdout is a terminal |
 
@@ -177,9 +175,10 @@ assert_eq!(level.as_str(), "solti_exec=trace,taskvisor=debug,info");
 |------------|-----------------|----------------------------------------------|
 | `Text`     | formatted lines | Best for development and normal service logs |
 | `Json`     | structured JSON | Best for log collectors                      |
-| `Journald` | systemd journal | Linux only                                   |
+| `Journald` | systemd journal | Feature `journald`, Linux only               |
 
-On non-Linux platforms, parsing or using `journald` returns `LoggerError::JournaldNotSupported`.
+Without the feature, parsing `journald` returns `LoggerError::JournaldNotEnabled`.
+On non-Linux platforms, the enabled format returns `LoggerError::JournaldNotSupported`.
 
 ## Timezone Sync Task
 
@@ -188,33 +187,36 @@ Enable the `timezone-sync` feature to build a periodic supervised task:
 ```rust,ignore
 use solti_observe::timezone_sync;
 
-let (task, spec) = timezone_sync();
-supervisor.submit_with_task(task, &spec).await?;
+let (manifest, task_ref) = timezone_sync();
+supervisor.create_embedded_task(manifest, task_ref).await?;
 ```
 
-The task uses slot `solti-logger-tz-sync`, `AdmissionPolicy::Replace`, a 1 hour success period, and a defensive 5 second to 5 minute backoff.
-
-In practice, local offset detection often works only before Tokio starts worker threads. So the important call is still `init_local_offset()` during process startup. The sync task is best-effort and useful on platforms where re-detection is allowed later.
+The task uses slot `solti-observe-timezone-sync`, `AdmissionPolicy::Replace`, a 1 hour success period, and a 5 second to 5 minute backoff.
+An offset detection failure is retryable.
 
 ## Feature Flags
 
-| Flag            | Default  | Effect                   |
-|-----------------|----------|--------------------------|
-| `timezone-sync` | off      | Expose `timezone_sync()` |
+| Flag            | Default | Effect                                      |
+|-----------------|---------|---------------------------------------------|
+| `journald`      | off     | Enables native systemd journal output       |
+| `log-compat`    | off     | Forwards `log` records into `tracing`       |
+| `timezone-sync` | off     | Exposes `timezone_sync()`                   |
 
 ## Error Model
 
 | Error                  | When it happens                                            |
 |------------------------|------------------------------------------------------------|
 | `InvalidFormat`        | format is not `text`, `json`, or `journald`                |
-| `JournaldNotSupported` | journald was requested outside Linux                       |
-| `JournaldInitFailed`   | systemd journal setup failed                               |
-| `AlreadyInitialized`   | `init_logger` was called after a subscriber already exists |
+| `JournaldNotEnabled`   | journald was requested without its feature                  |
+| `JournaldNotSupported` | journald was requested outside Linux                        |
+| `JournaldInitFailed`   | systemd journal setup failed                                |
+| `AlreadyInitialized`   | a tracing subscriber already exists                        |
+| `LoggerInitFailed`     | subscriber or `log` bridge initialization failed            |
 | `InvalidTimeZone`      | timezone is not `utc` or `local`                           |
 | `InvalidLevel`         | `EnvFilter` could not parse the level string               |
+| `LocalOffsetUnavailable` | the system local offset could not be determined           |
 
 ## Notes
 
 - Call `init_logger` once, near process start.
-- Call `init_local_offset` before creating a Tokio runtime when `LoggerTimeZone::Local` is used.
 - Use `solti-prometheus` for metrics. This crate is for logging and timezone support.

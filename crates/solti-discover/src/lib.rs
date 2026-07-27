@@ -1,6 +1,7 @@
-//! # solti-discover - agent heartbeat.
+//! Agent registration and heartbeat.
 //!
-//! Periodic sync task that registers an agent with the control plane and reports liveness and platform telemetry.
+//! `solti-discover` builds one embedded periodic task. The task advertises the
+//! agent API and syncs liveness data with a control plane.
 //!
 //! | feature | transport         | protocol                                  |
 //! |---------|-------------------|-------------------------------------------|
@@ -13,26 +14,35 @@
 //! # #[cfg(feature = "http")]
 //! # fn wire() -> Result<(), Box<dyn std::error::Error>> {
 //! use std::sync::Arc;
-//! use solti_discover::{DiscoverConfig, DiscoveryTransport, MonotonicUptime};
+//! use solti_discover::{
+//!     AgentEndpoint, AgentEndpointType, ControlPlaneEndpoint, DiscoverConfig,
+//!     DiscoveryTransport, MonotonicUptime,
+//! };
 //! use solti_model::AgentId;
 //!
 //! let uptime = Arc::new(MonotonicUptime::new());
 //!
 //! let cfg = DiscoverConfig::builder(
-//!     AgentId::from("agent-1"),
+//!     AgentId::new("agent-1")?,
 //!     "agent-1",               // display name
-//!     "http://127.0.0.1:8085", // this agent's endpoint
-//!     "http://127.0.0.1:9000", // control-plane endpoint
-//!     DiscoveryTransport::Http,
-//!     30_000, // heartbeat interval (ms)
-//!     1,      // api_version
+//!     AgentEndpoint::new(
+//!         "http://127.0.0.1:8085",
+//!         AgentEndpointType::Http,
+//!         1,
+//!     )?,
+//!     ControlPlaneEndpoint::new(
+//!         "http://127.0.0.1:9000",
+//!         DiscoveryTransport::Http,
+//!     )?,
+//!     30_000,
+//!     "agent@1",
 //! )
 //! .build()?;
 //!
-//! let (task, spec) = solti_discover::sync(cfg, uptime)?;
-//! // Submit to a running taskvisor supervisor:
-//! // supervisor.submit_with_task(task, &spec).await?;
-//! # let _ = (task, spec);
+//! let (manifest, task_ref) = solti_discover::sync(cfg, uptime)?;
+//! // Submit to a running Solti supervisor:
+//! // supervisor.create_embedded_task(manifest, task_ref).await?;
+//! # let _ = (manifest, task_ref);
 //! # Ok(())
 //! # }
 //! ```
@@ -45,11 +55,8 @@
 //! it mirrors the control-plane wire contract verbatim
 //! (field `retry_after_s` in `proto/solti/discover/v1/discovery.proto`).
 //!
-//! ## Also
-//!
-//! - `DiscoverConfig` / `DiscoverConfigBuilder` (feature `grpc`/`http`): identity, endpoint, transport, timeouts, capabilities.
-//! - `sync` (feature `grpc`/`http`): factory returning `Result<(TaskRef, TaskSpec), DiscoverError>`.
-//! - [`DiscoverError`]: config, transport, parse, and rejection failures.
+//! [`AgentEndpoint`] describes the inbound agent API. [`ControlPlaneEndpoint`]
+//! describes the outbound discovery connection. These transports are independent.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -63,7 +70,7 @@
 struct ReadmeDoctests;
 
 mod errors;
-pub use errors::DiscoverError;
+pub use errors::{DiscoverError, Retryability};
 
 mod metrics;
 pub use metrics::{
@@ -75,8 +82,8 @@ pub use metrics::{
 mod config;
 #[cfg(any(feature = "grpc", feature = "http"))]
 pub use config::{
-    DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS, DiscoverConfig, DiscoverConfigBuilder,
-    DiscoveryTransport,
+    AgentEndpoint, AgentEndpointType, ControlPlaneEndpoint, DEFAULT_CONNECT_TIMEOUT_MS,
+    DEFAULT_REQUEST_TIMEOUT_MS, DiscoverConfig, DiscoverConfigBuilder, DiscoveryTransport,
 };
 
 #[cfg(any(feature = "grpc", feature = "http"))]
@@ -90,12 +97,29 @@ mod uptime;
 pub use uptime::{MonotonicUptime, UptimeSource};
 
 #[cfg(any(feature = "grpc", feature = "http"))]
-pub(crate) mod proto {
-    include!(concat!(env!("OUT_DIR"), "/solti.discover.v1.rs"));
+mod generated {
+    pub(crate) mod solti {
+        pub(crate) mod agent {
+            pub(crate) mod v1 {
+                include!(concat!(env!("OUT_DIR"), "/solti.agent.v1.rs"));
 
-    #[cfg(feature = "http")]
-    include!(concat!(env!("OUT_DIR"), "/solti.discover.v1.serde.rs"));
+                #[cfg(feature = "http")]
+                include!(concat!(env!("OUT_DIR"), "/solti.agent.v1.serde.rs"));
+            }
+        }
+
+        pub(crate) mod discover {
+            pub(crate) mod v1 {
+                include!(concat!(env!("OUT_DIR"), "/solti.discover.v1.rs"));
+
+                #[cfg(feature = "http")]
+                include!(concat!(env!("OUT_DIR"), "/solti.discover.v1.serde.rs"));
+            }
+        }
+    }
 }
 
 #[cfg(any(feature = "grpc", feature = "http"))]
-pub use proto::{SyncRequest, SyncResponse};
+pub(crate) use generated::solti::agent::v1 as proto_agent;
+#[cfg(any(feature = "grpc", feature = "http"))]
+pub(crate) use generated::solti::discover::v1 as proto;

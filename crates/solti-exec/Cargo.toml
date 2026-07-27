@@ -20,6 +20,7 @@ subprocess = [
     "dep:solti-runner",
     "dep:taskvisor",
     "dep:tempfile",
+    "dep:thiserror",
     "dep:tokio",
     "dep:tracing",
     "tokio/macros",
@@ -33,7 +34,7 @@ seccomp    = ["subprocess", "dep:seccompiler"]
 bytes      = { workspace = true, optional = true }
 libc       = { workspace = true, optional = true }
 tempfile   = { workspace = true, optional = true }
-thiserror  = { workspace = true }
+thiserror  = { workspace = true, optional = true }
 tracing    = { workspace = true, optional = true }
 tokio      = { workspace = true, features = ["io-util"], optional = true }
 taskvisor  = { workspace = true, optional = true }

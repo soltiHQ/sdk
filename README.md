@@ -10,12 +10,12 @@ Built on [taskvisor](https://github.com/soltiHQ/taskvisor).
 
 - **Standalone scheduler**: `solti-core` + `solti-exec`. Submit tasks from code; the supervisor handles retries, timeouts, and backoff.
 - **HTTP/gRPC service**: add `solti-api` to expose task management over the network. Pick HTTP (axum), gRPC (tonic), or both.
-- **Managed agent**: add `solti-discover` to register with a Podium control-plane. The control-plane pushes specs, the agent executes.
-- **TLS / mTLS everywhere**: `solti-tls` provides a single config shape for `solti-api` (server) and `solti-discover` (client). Same builder, paths or in-memory PEM, mTLS as a one-line knob.
+- **Managed agent**: add `solti-discover` to register with a Podium control-plane. The control-plane reaches the advertised agent API to manage tasks.
+- **TLS / mTLS everywhere**: `solti-tls` provides shared PEM sources, identities, and trust roots. Server and client configs stay separate.
 - **Bearer-token auth**: one shared secret (`solti_model::Token`) authenticates both directions — `solti-discover` presents it to the control-plane, `solti-api` verifies inbound calls against it. Constant-time check, redacted in logs, orthogonal to TLS, enabled from a single config value.
-- **Live-tail task output**: subscribe to a task's stdout/stderr over HTTP Server-Sent Events (`GET /api/v1/tasks/{id}/logs`) or gRPC server-streaming (`StreamTaskLogs`). One live subscription can span retries and includes best-effort run-boundary markers; the agent never persists or replays output.
-- **Custom runner**: implement the `Runner` trait to execute tasks your way (WASM, containers, in-process functions). The router dispatches by label selectors.
-- **Embedded tasks**: `TaskKind::Embedded` runs async Rust closures under the same supervisor as subprocesses. Sweep, timezone sync, and discovery heartbeat use it internally.
+- **Live-tail task output**: subscribe to a task's stdout/stderr over HTTP Server-Sent Events (`GET /apis/solti.io/v1/tasks/{name}/logs`) or gRPC server-streaming (`StreamTaskLogs`). One live subscription can span retries and includes best-effort run-boundary markers; the agent never persists or replays output.
+- **Custom runner**: implement the `Runner` trait to execute tasks your way (WASM, containers, in-process functions). The router dispatches by workload GVK and optional label selectors.
+- **Embedded tasks**: `TaskWorkload::Embedded` runs async Rust closures under the same supervisor as subprocesses. Timezone sync, discovery heartbeat, and the metrics server use it internally.
 
 ## Architecture
 
@@ -39,7 +39,7 @@ solti-core ──► solti-runner ──► solti-model
 solti-exec ──► solti-runner + solti-model + taskvisor
 ```
 
-Arrows point at the dependency; the graph has no cycles. The top row is entirely optional — use only what your agent needs. `solti-api` depends on core only through the explicit `core-adapter` feature; its base handler and transport crates are core-independent. `solti-discover` has no core dependency. Two crates live beside the stack rather than in it: `solti-exec` is a plugin — it depends on `solti-runner` (implements the `Runner` trait) and your binary registers it into the router; `solti-core` never depends on it, so alternative runners (WASM, containers, in-process) slot in the same way. `solti-tls` is a standalone utility with no SDK dependencies, pulled in by `solti-api/grpc-tls` or `solti-discover/tls`. `solti-prometheus` implements the metrics traits of `solti-runner` and, behind feature flags, those of `solti-api` / `solti-discover`.
+Arrows point at the dependency; the graph has no cycles. The top row is entirely optional — use only what your agent needs. `solti-api` depends on core only through the explicit `core-adapter` feature; its base handler and transport crates are core-independent. `solti-discover` has no core dependency. Two crates live beside the stack rather than in it: `solti-exec` is a plugin — it depends on `solti-runner` (implements the `Runner` trait) and your binary registers it into the router. `solti-core` never depends on it. Alternative runners (WASM, containers, in-process) slot in the same way. `solti-tls` is a standalone utility with no SDK dependencies, pulled in by `solti-api/grpc-tls` or `solti-discover/tls`. `solti-prometheus` implements the metrics traits of `solti-runner` and, behind feature flags, those of `solti-api` / `solti-discover`.
 
 ## Crates
 
@@ -47,12 +47,12 @@ Arrows point at the dependency; the graph has no cycles. The top row is entirely
 |------------------------------------------------|---------------------------------------------------------------|---------------------------|
 | [`solti`](crates/solti)                        | Optional umbrella with feature forwarding and namespaces      | recommended for binaries  |
 | [`solti-model`](crates/solti-model)            | Domain types: specs, policies, selectors, identifiers         | yes                       |
-| [`solti-runner`](crates/solti-runner)          | Runner plugin trait, label-based routing, metrics interface   | yes                       |
+| [`solti-runner`](crates/solti-runner)          | Runner plugin trait, GVK routing, optional label selectors    | yes                       |
 | [`solti-exec`](crates/solti-exec)              | Subprocess runner: POSIX rlimits; Linux cgroups and sandboxing | if you run subprocesses   |
-| [`solti-core`](crates/solti-core)              | Supervisor orchestration, in-memory state, sweep              | yes                       |
+| [`solti-core`](crates/solti-core)              | Supervisor orchestration, in-memory state, retention           | yes                       |
 | [`solti-api`](crates/solti-api)                | HTTP/JSON and gRPC API layer (feature-gated)                  | if you need a network API |
 | [`solti-discover`](crates/solti-discover)      | Agent registration and heartbeat to Podium control-plane      | if managed by Podium      |
-| [`solti-tls`](crates/solti-tls)                | Shared TLS / mTLS config (paths or in-memory PEM)             | if a TLS feature is enabled |
+| [`solti-tls`](crates/solti-tls)                | TLS / mTLS primitives and client/server configs               | if a TLS feature is enabled |
 | [`solti-observe`](crates/solti-observe)        | Structured logging with timezone sync                         | recommended               |
 | [`solti-prometheus`](crates/solti-prometheus)  | Prometheus metrics backend                                    | if you need metrics       |
 
@@ -74,8 +74,8 @@ use std::time::Duration;
 use solti_core::{StateConfig, SupervisorApi};
 use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::{
-    AdmissionPolicy, Flag, RestartPolicy, SubprocessMode, SubprocessSpec, TaskEnv, TaskKind,
-    TaskSpec,
+    AdmissionPolicy, Flag, RestartPolicy, SubprocessMode, SubprocessSpec, TaskEnv, TaskManifest,
+    TaskSpec, TaskWorkload,
 };
 use solti_runner::{BuildContext, RunnerRouter};
 use taskvisor::{ControllerConfig, SupervisorConfig};
@@ -85,16 +85,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut router = RunnerRouter::new().with_context(BuildContext::default());
     register_subprocess_runner(&mut router, "default")?;
 
-    let supervisor = SupervisorApi::new(
-        SupervisorConfig::default(),
-        ControllerConfig::default(),
-        vec![],
-        router,
-        StateConfig::default(),
-    )
-    .await?;
+    let supervisor = SupervisorApi::builder(router)
+        .with_runtime_config(SupervisorConfig::default())
+        .with_controller_config(ControllerConfig::default())
+        .with_state_config(StateConfig::default())
+        .start()
+        .await?;
 
-    let kind = TaskKind::Subprocess(SubprocessSpec::new(
+    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
         SubprocessMode::Command {
             command: "echo".into(),
             args: vec!["hello world".into()],
@@ -103,19 +101,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         Flag::enabled(),
     ));
-    let spec = TaskSpec::builder("hello", kind, 30_000u64) // per-attempt timeout (ms)
+    let spec = TaskSpec::builder("hello", workload, 30_000u64) // per-attempt timeout (ms)
         .restart(RestartPolicy::Never)
         .admission(AdmissionPolicy::Replace)
         .build()?;
 
-    let task_id = supervisor.submit(&spec).await?;
+    let created = supervisor
+        .create_task(TaskManifest::new("hello", spec)?)
+        .await?;
+    let task_id = created.name().clone();
     println!("submitted: {task_id}");
 
-    // submit() confirms controller-queue intake. Observe the asynchronous result.
+    // create_task() commits desired state. Observe reconciliation asynchronously.
     let phase = tokio::time::timeout(Duration::from_secs(35), async {
         loop {
             if let Some(task) = supervisor.get_task(&task_id) {
-                let phase = task.status().phase;
+                let phase = task.status().phase();
                 if phase.is_terminal() {
                     break phase;
                 }
@@ -158,13 +159,13 @@ supervisor.shutdown().await?;
 ```
 
 ```bash
-curl -X POST http://localhost:8085/api/v1/tasks -H 'Content-Type: application/json' -d '{"spec":{...}}'
-curl http://localhost:8085/api/v1/tasks
-curl http://localhost:8085/api/v1/tasks/{id}/runs
-curl -N http://localhost:8085/api/v1/tasks/{id}/logs    # live-tail SSE
+curl -X POST http://localhost:8085/apis/solti.io/v1/tasks -H 'Content-Type: application/json' --data-binary @task.json
+curl http://localhost:8085/apis/solti.io/v1/tasks
+curl http://localhost:8085/apis/solti.io/v1/tasks/{name}/runs
+curl -N http://localhost:8085/apis/solti.io/v1/tasks/{name}/logs
 ```
 
-See [`api_v1.md`](crates/solti-api/api_v1.md) for the full endpoint reference.
+See [`solti-api`](crates/solti-api) for the endpoint and wire-contract reference.
 
 ### With control-plane
 
@@ -173,24 +174,38 @@ Register with [Podium](https://github.com/soltiHQ/podium) and receive specs remo
 ```rust
 use std::sync::Arc;
 use solti_api::API_VERSION;
-use solti_discover::{DiscoverConfig, DiscoveryTransport, MonotonicUptime};
+use solti_core::SupervisorApi;
+use solti_discover::{
+    AgentEndpoint, AgentEndpointType, ControlPlaneEndpoint, DiscoverConfig,
+    DiscoveryTransport, MonotonicUptime,
+};
+use solti_exec::subprocess::register_subprocess_runner;
 use solti_model::AgentId;
+use solti_runner::RunnerRouter;
 
 let uptime = Arc::new(MonotonicUptime::new());
+let mut router = RunnerRouter::new();
+register_subprocess_runner(&mut router, "default")?;
+let capabilities = router.capabilities();
+let supervisor = SupervisorApi::builder(router).start().await?;
 
 let config = DiscoverConfig::builder(
-    AgentId::new("worker-001"),
+    AgentId::new("worker-001")?,
     "worker",
-    "http://this-host:8085",
-    "http://podium:8082",
-    DiscoveryTransport::Http,
-    10_000, // heartbeat interval (ms)
-    API_VERSION,
+    AgentEndpoint::new(
+        "http://this-host:8085",
+        AgentEndpointType::Http,
+        API_VERSION,
+    )?,
+    ControlPlaneEndpoint::new("http://podium:8082", DiscoveryTransport::Http)?,
+    10_000,
+    "worker-runtime@1",
 )
+.capabilities(capabilities)
 .build()?;
 
-let (task, spec) = solti_discover::sync(config, uptime)?;
-supervisor.submit_with_task(task, &spec).await?;
+let (manifest, task_ref) = solti_discover::sync(config, uptime)?;
+supervisor.create_embedded_task(manifest, task_ref).await?;
 ```
 
 See [`examples/agentd-http`](examples/agentd-http) and [`examples/agentd-grpc`](examples/agentd-grpc) for full reference agents - one per transport.
@@ -198,7 +213,7 @@ See [`examples/agentd-http`](examples/agentd-http) and [`examples/agentd-grpc`](
 ### With TLS / mTLS
 
 Enable `grpc-tls` on `solti-api` (gRPC server) and/or `tls` on
-`solti-discover` (client). One config shape feeds both:
+`solti-discover` (client). Shared PEM types feed separate server and client configs:
 
 ```rust
 use solti_tls::{ClientTlsConfig, ServerTlsConfig, TlsIdentity, TrustRoots};
@@ -230,11 +245,11 @@ Plug `server` into `tonic`/`axum-server`, or pass `client` to `DiscoverConfigBui
 
 **Admission control**: a new submission targeting a busy slot can be dropped, replace the current owner, or wait in a queue. Configurable per spec.
 
-**Runner routing**: tasks carry label selectors, runners register with labels. Ship multiple runners in one binary.
+**Runner routing**: runners declare supported workload GVKs; an optional runner selector filters matching runners by labels.
 
 **Subprocess isolation**: POSIX rlimits plus Linux cgroup v2 limits, capability dropping, seccomp, and namespaces.
 
-**Embedded tasks**: async Rust closures supervised next to subprocesses. Used internally for sweep, timezone sync, and discovery heartbeat.
+**Embedded tasks**: async Rust closures supervised next to subprocesses. Used internally for timezone sync, discovery heartbeat, and the metrics server.
 
 **Dual-transport API**: HTTP/JSON (axum) and gRPC (tonic) behind feature flags. Use one, both, or neither.
 
@@ -282,7 +297,7 @@ cargo build -p solti-discover --features http,tls
 ```
 
 The gRPC contract (`crates/solti-api/proto/`, `crates/solti-discover/proto/`) is vendored from
-[`soltiHQ/proto`](https://github.com/soltiHQ/proto) and committed, so builds never fetch it. To
+[`soltiHQ/proto`](https://github.com/soltiHQ/proto) and committed. Builds never fetch it. To
 update the contract, install [go-task](https://taskfile.dev) and run:
 
 ```bash

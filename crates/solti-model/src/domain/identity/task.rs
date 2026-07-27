@@ -17,7 +17,7 @@ arc_str_newtype! {
     /// ```
     /// use solti_model::TaskId;
     ///
-    /// let id = TaskId::new("subprocess-build-1");
+    /// let id = TaskId::new("subprocess-build-1").unwrap();
     /// assert_eq!(id.as_str(), "subprocess-build-1");
     /// ```
     pub struct TaskId;
@@ -39,8 +39,8 @@ impl TaskId {
     /// ```
     /// use solti_model::TaskId;
     ///
-    /// assert!(TaskId::new("subprocess-build-1").validate_format().is_ok());
-    /// assert!(TaskId::new("with/slash").validate_format().is_err());
+    /// assert!(TaskId::new("subprocess-build-1").is_ok());
+    /// assert!(TaskId::new("with/slash").is_err());
     /// ```
     pub fn validate_format(&self) -> Result<(), ModelError> {
         crate::validation::validate_dns1123_subdomain("task_id", self.as_str())
@@ -54,19 +54,19 @@ mod tests {
 
     #[test]
     fn task_id_from_string() {
-        let id = TaskId::from("subprocess-slot-2a");
+        let id = TaskId::new("subprocess-slot-2a").unwrap();
         assert_eq!(id.as_str(), "subprocess-slot-2a");
     }
 
     #[test]
     fn task_id_display() {
-        let id = TaskId::new("test-id");
+        let id = TaskId::new("test-id").unwrap();
         assert_eq!(format!("{}", id), "test-id");
     }
 
     #[test]
     fn task_id_serde_transparent() {
-        let id = TaskId::from("runner-slot-ff");
+        let id = TaskId::new("runner-slot-ff").unwrap();
         let json = serde_json::to_string(&id).unwrap();
         assert_eq!(json, r#""runner-slot-ff""#);
 
@@ -96,17 +96,17 @@ mod tests {
         use std::collections::HashSet;
 
         let mut set = HashSet::new();
-        set.insert(TaskId::from("id-1"));
-        set.insert(TaskId::from("id-2"));
-        set.insert(TaskId::from("id-1"));
+        set.insert(TaskId::new("id-1").unwrap());
+        set.insert(TaskId::new("id-2").unwrap());
+        set.insert(TaskId::new("id-1").unwrap());
 
         assert_eq!(set.len(), 2);
-        assert!(set.contains(&TaskId::from("id-1")));
+        assert!(set.contains(&TaskId::new("id-1").unwrap()));
     }
 
     #[test]
     fn clone_is_cheap() {
-        let id = TaskId::new("shared-task");
+        let id = TaskId::new("shared-task").unwrap();
         let cloned = id.clone();
         let a: Arc<str> = id.into_inner();
         let b: Arc<str> = cloned.into_inner();
@@ -115,27 +115,25 @@ mod tests {
 
     #[test]
     fn validate_format_accepts_runner_generated() {
-        TaskId::new("subprocess-build-1").validate_format().unwrap();
-        TaskId::new("subprocess-build.frontend-ff")
-            .validate_format()
-            .unwrap();
+        TaskId::new("subprocess-build-1").unwrap();
+        TaskId::new("subprocess-build.frontend-ff").unwrap();
     }
 
     #[test]
     fn validate_format_rejects_invalid() {
-        assert!(TaskId::new("").validate_format().is_err());
-        assert!(TaskId::new("with/slash").validate_format().is_err());
-        assert!(TaskId::new("with space").validate_format().is_err());
-        assert!(TaskId::new("UPPER").validate_format().is_err());
-        assert!(TaskId::new("with_underscore").validate_format().is_err());
-        assert!(TaskId::new("-leading").validate_format().is_err());
-        assert!(TaskId::new("trailing-").validate_format().is_err());
-        assert!(TaskId::new("empty..label").validate_format().is_err());
-        assert!(TaskId::new(&"x".repeat(64)).validate_format().is_ok());
+        assert!(TaskId::new("").is_err());
+        assert!(TaskId::new("with/slash").is_err());
+        assert!(TaskId::new("with space").is_err());
+        assert!(TaskId::new("UPPER").is_err());
+        assert!(TaskId::new("with_underscore").is_err());
+        assert!(TaskId::new("-leading").is_err());
+        assert!(TaskId::new("trailing-").is_err());
+        assert!(TaskId::new("empty..label").is_err());
+        assert!(TaskId::new("x".repeat(64)).is_ok());
         let max = "a".repeat(TASK_ID_MAX_LEN);
         assert_eq!(max.len(), TASK_ID_MAX_LEN);
-        assert!(TaskId::new(&max).validate_format().is_ok());
+        assert!(TaskId::new(&max).is_ok());
         let too_long = format!("{max}e");
-        assert!(TaskId::new(&too_long).validate_format().is_err());
+        assert!(TaskId::new(&too_long).is_err());
     }
 }

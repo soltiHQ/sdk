@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Annotations, ConditionStatus, Labels, ModelError, ModelResult, ObjectMeta, Slot,
-    TaskConditionType, TaskId, TaskPhase, TaskSpec, TaskStatus, Uid,
+    Annotations, ConditionStatus, Labels, ModelError, ModelResult, ObjectMeta, Slot, TaskCondition,
+    TaskId, TaskPhase, TaskSpec, TaskStatus, Uid,
 };
 
 /// API group and version of the built-in Task resource.
@@ -34,7 +34,7 @@ impl DesiredChange {
 
 /// Group/version and kind identifying a resource schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TypeMeta {
     api_version: String,
     kind: String,
@@ -45,7 +45,7 @@ pub struct TypeMeta {
 /// Runtime identity, resource version, generation, creation time and status are
 /// deliberately absent because the state store owns them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskManifestMeta {
     name: TaskId,
     #[serde(default, skip_serializing_if = "Labels::is_empty")]
@@ -56,9 +56,9 @@ pub struct TaskManifestMeta {
 
 impl TaskManifestMeta {
     /// Build user-owned metadata for a named Task manifest.
-    pub fn new(name: impl Into<TaskId>) -> ModelResult<Self> {
+    pub fn new(name: impl AsRef<str>) -> ModelResult<Self> {
         let metadata = Self {
-            name: name.into(),
+            name: TaskId::new(name)?,
             labels: Labels::new(),
             annotations: Annotations::new(),
         };
@@ -118,7 +118,7 @@ pub struct TaskManifest {
 
 impl TaskManifest {
     /// Build a Task manifest from its stable name and desired spec.
-    pub fn new(name: impl Into<TaskId>, spec: TaskSpec) -> ModelResult<Self> {
+    pub fn new(name: impl AsRef<str>, spec: TaskSpec) -> ModelResult<Self> {
         Self::from_parts(TypeMeta::task(), TaskManifestMeta::new(name)?, spec)
     }
 
@@ -138,17 +138,17 @@ impl TaskManifest {
     }
 
     /// Attach labels to the manifest.
-    #[must_use]
-    pub fn with_labels(mut self, labels: Labels) -> Self {
+    pub fn with_labels(mut self, labels: Labels) -> ModelResult<Self> {
+        labels.validate()?;
         self.metadata = self.metadata.with_labels(labels);
-        self
+        Ok(self)
     }
 
     /// Attach annotations to the manifest.
-    #[must_use]
-    pub fn with_annotations(mut self, annotations: Annotations) -> Self {
+    pub fn with_annotations(mut self, annotations: Annotations) -> ModelResult<Self> {
+        annotations.validate()?;
         self.metadata = self.metadata.with_annotations(annotations);
-        self
+        Ok(self)
     }
 
     /// Validate resource GVK, name and desired state.
@@ -256,7 +256,7 @@ impl Task {
     /// The UID and creation timestamp are generated, generation starts at `1`,
     /// and status starts as unobserved `Pending`. The state store assigns the
     /// initial resource version separately.
-    pub fn new(name: impl Into<TaskId>, spec: TaskSpec) -> ModelResult<Self> {
+    pub fn new(name: impl AsRef<str>, spec: TaskSpec) -> ModelResult<Self> {
         Self::from_manifest(TaskManifest::new(name, spec)?)
     }
 
@@ -264,14 +264,14 @@ impl Task {
     pub fn from_manifest(manifest: TaskManifest) -> ModelResult<Self> {
         manifest.validate()?;
         let (_, metadata, spec) = manifest.into_parts();
+        let mut object_meta = ObjectMeta::new(metadata.name.clone())?;
+        object_meta.apply_metadata(metadata.labels, metadata.annotations);
         let task = Self {
             type_meta: TypeMeta::task(),
-            metadata: ObjectMeta::new(metadata.name.clone())?,
+            metadata: object_meta,
             spec,
             status: TaskStatus::pending_for(0, 1),
-        }
-        .with_labels(metadata.labels)
-        .with_annotations(metadata.annotations);
+        };
         task.validate()?;
         Ok(task)
     }
@@ -293,22 +293,6 @@ impl Task {
         Ok(task)
     }
 
-    /// Attach labels while constructing a new manifest.
-    #[must_use]
-    pub fn with_labels(mut self, labels: Labels) -> Self {
-        let annotations = self.metadata.annotations().clone();
-        self.metadata.apply_metadata(labels, annotations);
-        self
-    }
-
-    /// Attach annotations while constructing a new manifest.
-    #[must_use]
-    pub fn with_annotations(mut self, annotations: Annotations) -> Self {
-        let labels = self.metadata.labels().clone();
-        self.metadata.apply_metadata(labels, annotations);
-        self
-    }
-
     /// Validate all resource-level invariants.
     pub fn validate(&self) -> ModelResult<()> {
         self.type_meta.validate_task()?;
@@ -325,14 +309,13 @@ impl Task {
                 "status.observedGeneration cannot exceed metadata.generation".into(),
             ));
         }
-        if self.status.conditions.len() != 1
-            || self.status.conditions[0].condition_type != TaskConditionType::Reconciled
+        self.status.validate()?;
+        if self
+            .status
+            .conditions()
+            .iter()
+            .any(|condition| condition.observed_generation() > self.metadata.generation())
         {
-            return Err(ModelError::Invalid(
-                "status.conditions must contain exactly one Reconciled condition".into(),
-            ));
-        }
-        if self.status.conditions[0].observed_generation > self.metadata.generation() {
             return Err(ModelError::Invalid(
                 "status.conditions[].observedGeneration cannot exceed metadata.generation".into(),
             ));
@@ -373,12 +356,6 @@ impl Task {
     #[inline]
     pub fn name(&self) -> &TaskId {
         self.metadata.name()
-    }
-
-    /// Compatibility shortcut for the stable resource address.
-    #[inline]
-    pub fn id(&self) -> &TaskId {
-        self.name()
     }
 
     /// Identity of this resource incarnation.
@@ -452,12 +429,12 @@ impl Task {
     /// Mark the current desired-state generation as observed.
     pub fn mark_observed(&mut self, resource_version: impl Into<String>) -> ModelResult<bool> {
         let generation = self.metadata.generation();
-        let condition = self.status.reconciled();
+        let condition = self.status.reconciled_required();
         let changed = self.status.observed_generation != generation
-            || condition.status != ConditionStatus::True
-            || condition.observed_generation != generation
-            || condition.reason != "RuntimeAccepted"
-            || condition.message != "Taskvisor accepted the runtime realization";
+            || condition.status() != ConditionStatus::True
+            || condition.observed_generation() != generation
+            || condition.reason() != "RuntimeAccepted"
+            || condition.message() != "runtime accepted the desired state";
         if !changed {
             return Ok(false);
         }
@@ -497,12 +474,13 @@ impl Task {
     ) -> ModelResult<bool> {
         let reason = reason.into();
         let message = message.into();
+        TaskCondition::validate_reason_message(&reason, &message)?;
         let generation = self.metadata.generation();
-        let condition = self.status.reconciled();
-        let changed = condition.status != ConditionStatus::False
-            || condition.observed_generation != generation
-            || condition.reason != reason
-            || condition.message != message
+        let condition = self.status.reconciled_required();
+        let changed = condition.status() != ConditionStatus::False
+            || condition.observed_generation() != generation
+            || condition.reason() != reason
+            || condition.message() != message
             || self.status.observed_generation != generation
             || self.status.phase != TaskPhase::Pending
             || self.status.attempt != 0
@@ -540,8 +518,8 @@ impl Task {
             ));
         }
         let changed = self.status.observed_generation != generation
-            || self.status.reconciled().status != ConditionStatus::True
-            || self.status.reconciled().observed_generation != generation
+            || self.status.reconciled_required().status() != ConditionStatus::True
+            || self.status.reconciled_required().observed_generation() != generation
             || self.status.phase != TaskPhase::Running
             || self.status.attempt != attempt
             || self.status.exit_code.is_some()
@@ -588,8 +566,8 @@ impl Task {
             return Ok(false);
         }
         let same_attempt = attempt == self.status.attempt;
-        let reconciled = self.status.reconciled().status == ConditionStatus::True
-            && self.status.reconciled().observed_generation == generation;
+        let reconciled = self.status.reconciled_required().status() == ConditionStatus::True
+            && self.status.reconciled_required().observed_generation() == generation;
         if same_attempt && self.status.phase == phase && reconciled {
             return Ok(false);
         }
@@ -627,8 +605,8 @@ impl Task {
             ));
         }
         let changed = self.status.observed_generation != generation
-            || self.status.reconciled().status != ConditionStatus::True
-            || self.status.reconciled().observed_generation != generation
+            || self.status.reconciled_required().status() != ConditionStatus::True
+            || self.status.reconciled_required().observed_generation() != generation
             || self.status.phase != phase
             || self.status.error != error
             || self.status.exit_code != exit_code;
@@ -678,20 +656,20 @@ mod raw {
     use super::*;
 
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
     pub(super) struct TaskRaw {
-        #[serde(flatten)]
-        type_meta: TypeMeta,
+        api_version: String,
+        kind: String,
         metadata: ObjectMeta,
         spec: TaskSpec,
         status: TaskStatus,
     }
 
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
     pub(super) struct TaskManifestRaw {
-        #[serde(flatten)]
-        type_meta: TypeMeta,
+        api_version: String,
+        kind: String,
         metadata: TaskManifestMeta,
         spec: TaskSpec,
     }
@@ -700,7 +678,15 @@ mod raw {
         type Error = ModelError;
 
         fn try_from(raw: TaskRaw) -> Result<Self, Self::Error> {
-            Task::from_parts(raw.type_meta, raw.metadata, raw.spec, raw.status)
+            Task::from_parts(
+                TypeMeta {
+                    api_version: raw.api_version,
+                    kind: raw.kind,
+                },
+                raw.metadata,
+                raw.spec,
+                raw.status,
+            )
         }
     }
 
@@ -708,7 +694,14 @@ mod raw {
         type Error = ModelError;
 
         fn try_from(raw: TaskManifestRaw) -> Result<Self, Self::Error> {
-            TaskManifest::from_parts(raw.type_meta, raw.metadata, raw.spec)
+            TaskManifest::from_parts(
+                TypeMeta {
+                    api_version: raw.api_version,
+                    kind: raw.kind,
+                },
+                raw.metadata,
+                raw.spec,
+            )
         }
     }
 }
@@ -743,10 +736,13 @@ mod tests {
         assert_eq!(task.name(), "task-a");
         assert!(!task.uid().as_str().is_empty());
         assert_eq!(task.metadata().generation(), 1);
-        assert_eq!(task.status().observed_generation, 0);
+        assert_eq!(task.status().observed_generation(), 0);
         assert_eq!(*task.phase(), TaskPhase::Pending);
-        assert_eq!(task.status().reconciled().status, ConditionStatus::Unknown);
-        assert_eq!(task.status().reconciled().observed_generation, 1);
+        assert_eq!(
+            task.status().reconciled().status(),
+            ConditionStatus::Unknown
+        );
+        assert_eq!(task.status().reconciled().observed_generation(), 1);
     }
 
     #[test]
@@ -770,7 +766,8 @@ mod tests {
         labels.insert("tier", "worker");
         let manifest = TaskManifest::new("task-a", spec("slot-a"))
             .unwrap()
-            .with_labels(labels);
+            .with_labels(labels)
+            .unwrap();
 
         let json = serde_json::to_value(&manifest).unwrap();
         assert_eq!(json["apiVersion"], TASK_API_VERSION);
@@ -799,7 +796,7 @@ mod tests {
             stored.metadata().labels()
         );
         assert_ne!(rematerialized.uid(), stored.uid());
-        assert_eq!(rematerialized.status().phase, TaskPhase::Pending);
+        assert_eq!(rematerialized.status().phase(), TaskPhase::Pending);
     }
 
     #[test]
@@ -820,6 +817,30 @@ mod tests {
 
         let error = serde_json::from_value::<TaskManifest>(json).unwrap_err();
         assert!(error.to_string().contains("label key"));
+    }
+
+    #[test]
+    fn manifest_rejects_unknown_fields_at_resource_and_metadata_levels() {
+        let manifest = TaskManifest::new("task-a", spec("slot-a")).unwrap();
+        let mut resource = serde_json::to_value(&manifest).unwrap();
+        resource["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<TaskManifest>(resource).is_err());
+
+        let mut metadata = serde_json::to_value(manifest).unwrap();
+        metadata["metadata"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<TaskManifest>(metadata).is_err());
+    }
+
+    #[test]
+    fn stored_task_rejects_unknown_status_and_server_metadata_fields() {
+        let stored = task();
+        let mut metadata = serde_json::to_value(&stored).unwrap();
+        metadata["metadata"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Task>(metadata).is_err());
+
+        let mut status = serde_json::to_value(stored).unwrap();
+        status["status"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Task>(status).is_err());
     }
 
     #[test]
@@ -862,18 +883,21 @@ mod tests {
 
         assert_eq!(change, DesiredChange::Spec);
         assert_eq!(task.metadata().generation(), 2);
-        assert_eq!(task.status().observed_generation, 1);
-        assert_eq!(task.status().attempt, 0);
+        assert_eq!(task.status().observed_generation(), 1);
+        assert_eq!(task.status().attempt(), 0);
         assert_eq!(*task.phase(), TaskPhase::Pending);
-        assert_eq!(task.status().reconciled().status, ConditionStatus::Unknown);
-        assert_eq!(task.status().reconciled().observed_generation, 2);
+        assert_eq!(
+            task.status().reconciled().status(),
+            ConditionStatus::Unknown
+        );
+        assert_eq!(task.status().reconciled().observed_generation(), 2);
         assert_eq!(task.slot(), "slot-b");
     }
 
     #[test]
     fn embedded_revision_change_is_a_spec_change() {
         let mut task = task();
-        let transition_time = task.status().reconciled().last_transition_time;
+        let transition_time = task.status().reconciled().last_transition_time();
         let changed_spec = TaskSpec::builder(
             "slot-a",
             TaskWorkload::Embedded(EmbeddedSpec::new("test-v2").unwrap()),
@@ -893,7 +917,7 @@ mod tests {
         };
         assert_eq!(embedded.revision(), "test-v2");
         assert_eq!(
-            task.status().reconciled().last_transition_time,
+            task.status().reconciled().last_transition_time(),
             transition_time,
             "lastTransitionTime changes only when condition status changes"
         );
@@ -904,8 +928,8 @@ mod tests {
         let mut task = task();
 
         assert!(task.transition_starting(1, 7, "2").unwrap());
-        assert_eq!(task.status().attempt, 7);
-        assert_eq!(task.status().observed_generation, 1);
+        assert_eq!(task.status().attempt(), 7);
+        assert_eq!(task.status().observed_generation(), 1);
         assert_eq!(*task.phase(), TaskPhase::Running);
     }
 
@@ -916,8 +940,8 @@ mod tests {
         task.transition_finished(1, 3, TaskPhase::Succeeded, None, Some(0), "2")
             .unwrap();
 
-        assert_eq!(task.status().attempt, 3);
-        assert_eq!(task.status().observed_generation, 1);
+        assert_eq!(task.status().attempt(), 3);
+        assert_eq!(task.status().observed_generation(), 1);
         assert_eq!(*task.phase(), TaskPhase::Succeeded);
     }
 
@@ -964,13 +988,13 @@ mod tests {
             task.mark_reconciliation_failed("RunnerBuildFailed", "no runner", "2")
                 .unwrap()
         );
-        assert_eq!(task.status().observed_generation, 1);
+        assert_eq!(task.status().observed_generation(), 1);
         assert_eq!(*task.phase(), TaskPhase::Pending);
-        assert_eq!(task.status().attempt, 0);
-        assert!(task.status().error.is_none());
-        assert_eq!(task.status().reconciled().status, ConditionStatus::False);
-        assert_eq!(task.status().reconciled().reason, "RunnerBuildFailed");
-        assert_eq!(task.status().reconciled().message, "no runner");
+        assert_eq!(task.status().attempt(), 0);
+        assert!(task.status().error().is_none());
+        assert_eq!(task.status().reconciled().status(), ConditionStatus::False);
+        assert_eq!(task.status().reconciled().reason(), "RunnerBuildFailed");
+        assert_eq!(task.status().reconciled().message(), "no runner");
         assert_eq!(task.slot(), "slot-a");
     }
 
@@ -983,8 +1007,11 @@ mod tests {
         assert!(task.mark_reconciliation_pending("3").unwrap());
         assert_eq!(task.metadata().generation(), 1);
         assert_eq!(task.metadata().resource_version(), "3");
-        assert_eq!(task.status().reconciled().status, ConditionStatus::Unknown);
-        assert_eq!(task.status().reconciled().observed_generation, 1);
+        assert_eq!(
+            task.status().reconciled().status(),
+            ConditionStatus::Unknown
+        );
+        assert_eq!(task.status().reconciled().observed_generation(), 1);
     }
 
     #[test]

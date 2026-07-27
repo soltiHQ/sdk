@@ -1,6 +1,6 @@
 //! # TLS adapters for the API transports.
 //!
-//! Bridges [`solti_tls::ServerTlsConfig`] to the transport-specific TLS config that tonic / axum-server expect.
+//! Bridges [`solti_tls::ServerTlsConfig`] to tonic's server TLS configuration.
 //! Available with the `grpc-tls` feature.
 //!
 //! ## Example

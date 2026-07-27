@@ -5,16 +5,14 @@
 //!
 //! See the [crate root](crate) for architecture and namespace overview.
 
-use std::sync::Arc;
-
 use prometheus::{CounterVec, GaugeVec, HistogramVec, Registry};
 use solti_api::{ApiMetricsBackend, Transport};
 
-use crate::register::{Sub, ms_to_secs};
+use crate::register::{MetricGroup, ms_to_secs};
 
 /// Prometheus implementation of [`ApiMetricsBackend`].
 ///
-/// ## Metrics (`solti_api_*`)
+/// # Metrics (`solti_api_*`)
 ///
 /// | Metric                               | Type      | Labels                                   | Description              |
 /// |--------------------------------------|-----------|------------------------------------------|--------------------------|
@@ -22,10 +20,10 @@ use crate::register::{Sub, ms_to_secs};
 /// | `solti_api_request_duration_seconds` | Histogram | `transport`, `method`, `path`            | Request duration         |
 /// | `solti_api_in_flight_requests`       | Gauge     | `transport`                              | In-flight request count  |
 ///
-/// ## Cardinality
+/// # Cardinality
 ///
 /// `path` is a templated route for HTTP, such as `/apis/solti.io/v1/tasks/{name}`.
-/// For gRPC it is the full method path, such as `/solti.task.v1.TaskService/SubmitTask`.
+/// For gRPC it is the full method path, such as `/solti.task.v1.TaskService/CreateTask`.
 ///
 /// In both cases the set is bounded by the proto/api definition.
 pub struct PrometheusApiMetrics {
@@ -37,16 +35,15 @@ pub struct PrometheusApiMetrics {
 impl PrometheusApiMetrics {
     /// Register all API metrics into `registry`.
     ///
-    /// ## Example
+    /// # Example
     ///
     /// ```
-    /// use std::sync::Arc;
     /// use solti_api::{ApiMetricsBackend, Transport};
     /// use solti_prometheus::{PrometheusApiMetrics, Registry};
     ///
     /// # fn main() -> Result<(), prometheus::Error> {
-    /// let registry = Arc::new(Registry::new());
-    /// let metrics = PrometheusApiMetrics::new(registry.clone())?;
+    /// let registry = Registry::new();
+    /// let metrics = PrometheusApiMetrics::new(&registry)?;
     ///
     /// metrics.record_in_flight_delta(Transport::Http, 1);
     /// metrics.record_request(
@@ -61,15 +58,17 @@ impl PrometheusApiMetrics {
     /// assert!(!registry.gather().is_empty());
     /// # Ok(()) }
     /// ```
-    pub fn new(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
-        let r = Sub::new(&registry, "api");
+    pub fn new(registry: &Registry) -> Result<Self, prometheus::Error> {
+        let mut metrics = MetricGroup::new();
 
-        let requests_total = r.counter_vec(
+        let requests_total = metrics.counter_vec(
+            "api",
             "requests_total",
             "Total completed API requests",
             &["transport", "method", "path", "status"],
         )?;
-        let duration_seconds = r.histogram_vec(
+        let duration_seconds = metrics.histogram_vec(
+            "api",
             "request_duration_seconds",
             "API request duration",
             vec![
@@ -77,11 +76,13 @@ impl PrometheusApiMetrics {
             ],
             &["transport", "method", "path"],
         )?;
-        let in_flight = r.gauge_vec(
+        let in_flight = metrics.gauge_vec(
+            "api",
             "in_flight_requests",
             "Current in-flight API requests",
             &["transport"],
         )?;
+        metrics.register(registry)?;
 
         Ok(Self {
             requests_total,
@@ -121,5 +122,35 @@ impl ApiMetricsBackend for PrometheusApiMetrics {
         self.in_flight
             .with_label_values(&[transport.as_label()])
             .add(delta as f64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prometheus::{HistogramOpts, Opts};
+
+    #[test]
+    fn registration_failure_does_not_leave_a_partial_group() {
+        let registry = Registry::new();
+        let conflict = HistogramVec::new(
+            HistogramOpts::new("request_duration_seconds", "API request duration")
+                .namespace("solti")
+                .subsystem("api"),
+            &["transport", "method", "path"],
+        )
+        .unwrap();
+        registry.register(Box::new(conflict)).unwrap();
+
+        assert!(PrometheusApiMetrics::new(&registry).is_err());
+
+        let requests = CounterVec::new(
+            Opts::new("requests_total", "Total completed API requests")
+                .namespace("solti")
+                .subsystem("api"),
+            &["transport", "method", "path", "status"],
+        )
+        .unwrap();
+        assert!(registry.register(Box::new(requests)).is_ok());
     }
 }

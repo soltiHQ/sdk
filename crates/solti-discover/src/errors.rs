@@ -1,12 +1,17 @@
-//! # Discovery error types.
+//! Discovery errors.
 
 use thiserror::Error;
 
-/// Failure modes of the discovery heartbeat.
-///
-/// Covers config validation, transport failures, response parsing, and control-plane rejections.
-/// The sync task maps terminal variants (see [`DiscoverError::is_terminal`]) to `TaskError::Fatal`;
-/// all other variants surface as `TaskError::Fail` and the supervisor retries with backoff.
+/// Whether a discovery failure may succeed without changing the desired config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retryability {
+    /// The supervisor may retry the operation.
+    Retryable,
+    /// The desired config or protocol interaction must change first.
+    Permanent,
+}
+
+/// Failure modes of discovery sync.
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum DiscoverError {
@@ -66,13 +71,38 @@ pub enum DiscoverError {
 }
 
 impl DiscoverError {
-    /// `true` for errors that indicate a misconfiguration, not a transient failure.
-    /// Sync treats these as terminal (Fatal) - the operator must act before the agent can make progress.
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            DiscoverError::AuthFailed { .. } | DiscoverError::InvalidConfig(_)
-        )
+    /// Classifies whether the supervisor may retry this failure.
+    pub fn retryability(&self) -> Retryability {
+        match self {
+            Self::InvalidConfig(_) | Self::SpecBuild(_) | Self::AuthFailed { .. } => {
+                Retryability::Permanent
+            }
+            Self::Rejected { .. } => Retryability::Retryable,
+            #[cfg(feature = "http")]
+            Self::HttpRequest(_) | Self::InvalidResponse(_) => Retryability::Retryable,
+            #[cfg(feature = "http")]
+            Self::HttpStatus { code, .. } => {
+                if matches!(*code, 408 | 425 | 429) || *code >= 500 {
+                    Retryability::Retryable
+                } else {
+                    Retryability::Permanent
+                }
+            }
+            #[cfg(feature = "grpc")]
+            Self::GrpcTransport(_) => Retryability::Retryable,
+            #[cfg(feature = "grpc")]
+            Self::GrpcStatus(status) => match status.code() {
+                tonic::Code::InvalidArgument
+                | tonic::Code::NotFound
+                | tonic::Code::AlreadyExists
+                | tonic::Code::Unauthenticated
+                | tonic::Code::PermissionDenied
+                | tonic::Code::FailedPrecondition
+                | tonic::Code::OutOfRange
+                | tonic::Code::Unimplemented => Retryability::Permanent,
+                _ => Retryability::Retryable,
+            },
+        }
     }
 }
 
@@ -80,5 +110,54 @@ impl DiscoverError {
 impl From<tonic::Status> for DiscoverError {
     fn from(status: tonic::Status) -> Self {
         DiscoverError::GrpcStatus(Box::new(status))
+    }
+}
+
+#[cfg(all(test, any(feature = "grpc", feature = "http")))]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn http_retryability_distinguishes_client_and_transient_statuses() {
+        for code in [400, 404, 409] {
+            let error = DiscoverError::HttpStatus {
+                code,
+                body: String::new(),
+            };
+            assert_eq!(error.retryability(), Retryability::Permanent);
+        }
+        for code in [408, 425, 429, 500, 503] {
+            let error = DiscoverError::HttpStatus {
+                code,
+                body: String::new(),
+            };
+            assert_eq!(error.retryability(), Retryability::Retryable);
+        }
+    }
+
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn grpc_retryability_distinguishes_client_and_transient_statuses() {
+        for code in [
+            tonic::Code::InvalidArgument,
+            tonic::Code::NotFound,
+            tonic::Code::FailedPrecondition,
+            tonic::Code::Unimplemented,
+        ] {
+            let error = DiscoverError::from(tonic::Status::new(code, "test"));
+            assert_eq!(error.retryability(), Retryability::Permanent);
+        }
+        for code in [
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::ResourceExhausted,
+            tonic::Code::Aborted,
+            tonic::Code::Internal,
+            tonic::Code::Unavailable,
+            tonic::Code::DataLoss,
+        ] {
+            let error = DiscoverError::from(tonic::Status::new(code, "test"));
+            assert_eq!(error.retryability(), Retryability::Retryable);
+        }
     }
 }

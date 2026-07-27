@@ -9,207 +9,34 @@
 
 use std::num::NonZeroU32;
 
-use solti_model::{
-    AdmissionPolicy, BackoffPolicy, ContainerSpec, ExtensionWorkload, Flag, JitterPolicy, Labels,
-    RestartPolicy, RunnerSelector, Runtime, SelectorOperator, SelectorRequirement, Slot,
-    SubprocessMode, SubprocessSpec, TaskEnv, TaskSpec, TaskWorkload, WORKLOAD_API_VERSION,
-    WasmSpec,
-};
+use solti_model::{Slot, TaskSpec};
 
 use crate::error::ApiError;
 use crate::proto_api;
 use crate::validate::{validate_slot, validate_timeout};
 
+use super::policy::{
+    admission_to_proto, backoff_to_proto, convert_admission_policy, convert_backoff_policy,
+    convert_restart_policy, restart_to_proto,
+};
+pub(super) use super::selector::convert_labels;
+use super::selector::{convert_label_selector, selector_to_proto};
+use super::workload::{convert_task_workload, workload_to_proto};
+
 /// Build a wire [`proto_api::TaskSpec`] from a domain [`TaskSpec`].
 pub(super) fn spec_to_proto(spec: &TaskSpec) -> Result<proto_api::TaskSpec, ApiError> {
-    let (restart, restart_interval_ms) = restart_to_proto(spec.restart());
+    let (restart, restart_interval_ms) = restart_to_proto(spec.restart())?;
     Ok(proto_api::TaskSpec {
-        admission: admission_to_proto(spec.admission()) as i32,
-        backoff: Some(backoff_to_proto(spec.backoff())),
+        admission: admission_to_proto(spec.admission())? as i32,
+        backoff: Some(backoff_to_proto(spec.backoff())?),
         workload: Some(workload_to_proto(spec.workload())?),
         timeout_ms: spec.timeout().as_millis(),
         slot: spec.slot().to_string(),
         restart: restart as i32,
         restart_interval_ms,
         max_retries: spec.max_retries().map(NonZeroU32::get),
-        runner_selector: spec.runner_selector().map(selector_to_proto),
+        runner_selector: spec.runner_selector().map(selector_to_proto).transpose()?,
     })
-}
-
-fn selector_to_proto(sel: &RunnerSelector) -> proto_api::RunnerSelector {
-    proto_api::RunnerSelector {
-        match_labels: sel
-            .match_labels
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
-        match_expressions: sel
-            .match_expressions
-            .iter()
-            .map(|req| proto_api::SelectorRequirement {
-                key: req.key.clone(),
-                operator: operator_to_proto(req.operator) as i32,
-                values: req.values.clone(),
-            })
-            .collect(),
-    }
-}
-
-fn operator_to_proto(op: SelectorOperator) -> proto_api::SelectorOperator {
-    match op {
-        SelectorOperator::In => proto_api::SelectorOperator::In,
-        SelectorOperator::NotIn => proto_api::SelectorOperator::NotIn,
-        SelectorOperator::Exists => proto_api::SelectorOperator::Exists,
-        SelectorOperator::DoesNotExist => proto_api::SelectorOperator::DoesNotExist,
-        _ => proto_api::SelectorOperator::Unspecified,
-    }
-}
-
-pub(crate) fn workload_to_proto(
-    workload: &TaskWorkload,
-) -> Result<proto_api::TaskWorkload, ApiError> {
-    let spec = match workload {
-        TaskWorkload::Subprocess(sub) => {
-            let mode = match &sub.mode {
-                SubprocessMode::Command { command, args } => {
-                    proto_api::subprocess_mode::Mode::Command(proto_api::CommandMode {
-                        command: command.clone(),
-                        args: args.clone(),
-                    })
-                }
-                SubprocessMode::Script {
-                    runtime,
-                    body,
-                    args,
-                } => {
-                    let runtime_proto = match runtime {
-                        Runtime::Bash => proto_api::runtime::Runtime::WellKnown(
-                            proto_api::ScriptRuntime::Bash as i32,
-                        ),
-                        Runtime::Python => proto_api::runtime::Runtime::WellKnown(
-                            proto_api::ScriptRuntime::Python as i32,
-                        ),
-                        Runtime::Node => proto_api::runtime::Runtime::WellKnown(
-                            proto_api::ScriptRuntime::Node as i32,
-                        ),
-                        Runtime::Custom { command, flag } => {
-                            proto_api::runtime::Runtime::Custom(proto_api::CustomRuntime {
-                                command: command.clone(),
-                                flag: flag.clone(),
-                            })
-                        }
-                        _ => {
-                            return Err(ApiError::Internal(
-                                "unsupported script runtime variant".into(),
-                            ));
-                        }
-                    };
-                    proto_api::subprocess_mode::Mode::Script(proto_api::ScriptMode {
-                        runtime: Some(proto_api::Runtime {
-                            runtime: Some(runtime_proto),
-                        }),
-                        body: body.clone(),
-                        args: args.clone(),
-                    })
-                }
-                _ => {
-                    return Err(ApiError::Internal(
-                        "unsupported subprocess mode variant".into(),
-                    ));
-                }
-            };
-            proto_api::task_workload::Spec::Subprocess(proto_api::SubprocessTask {
-                mode: Some(proto_api::SubprocessMode { mode: Some(mode) }),
-                env: env_to_proto(&sub.env),
-                cwd: sub.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
-                fail_on_non_zero: sub.fail_on_non_zero.into(),
-            })
-        }
-        TaskWorkload::Wasm(w) => proto_api::task_workload::Spec::Wasm(proto_api::WasmTask {
-            module: w.module.to_string_lossy().to_string(),
-            env: env_to_proto(&w.env),
-            args: w.args.clone(),
-        }),
-        TaskWorkload::Container(c) => {
-            proto_api::task_workload::Spec::Container(proto_api::ContainerTask {
-                command: c.command.as_ref().map(|items| proto_api::ContainerCommand {
-                    items: items.clone(),
-                }),
-                env: env_to_proto(&c.env),
-                image: c.image.clone(),
-                args: c.args.clone(),
-            })
-        }
-        TaskWorkload::Embedded(_) => {
-            return Err(ApiError::Internal(
-                "handler returned an Embedded workload with no wire representation".into(),
-            ));
-        }
-        TaskWorkload::Extension(extension) => {
-            proto_api::task_workload::Spec::Extension(proto_api::ExtensionTask {
-                spec: Some(proto_api::RawExtension {
-                    raw: serde_json::to_vec(extension.spec()).map_err(|error| {
-                        ApiError::Internal(format!(
-                            "failed to encode extension workload spec: {error}"
-                        ))
-                    })?,
-                }),
-            })
-        }
-        _ => {
-            return Err(ApiError::Internal(
-                "handler returned a workload kind with no public wire representation".into(),
-            ));
-        }
-    };
-    Ok(proto_api::TaskWorkload {
-        api_version: workload.api_version().to_owned(),
-        kind: workload.kind().to_owned(),
-        spec: Some(spec),
-    })
-}
-
-fn env_to_proto(env: &TaskEnv) -> Vec<proto_api::KeyValue> {
-    env.iter()
-        .map(|kv| proto_api::KeyValue {
-            key: kv.key().to_string(),
-            value: kv.value().to_string(),
-        })
-        .collect()
-}
-
-fn restart_to_proto(policy: RestartPolicy) -> (proto_api::RestartPolicy, Option<u64>) {
-    match policy {
-        RestartPolicy::Never => (proto_api::RestartPolicy::Never, None),
-        RestartPolicy::OnFailure => (proto_api::RestartPolicy::OnFailure, None),
-        RestartPolicy::Always { interval_ms } => (proto_api::RestartPolicy::Always, interval_ms),
-        _ => (proto_api::RestartPolicy::Unspecified, None),
-    }
-}
-
-fn backoff_to_proto(b: &BackoffPolicy) -> proto_api::BackoffPolicy {
-    let jitter = match b.jitter {
-        JitterPolicy::None => proto_api::JitterPolicy::None,
-        JitterPolicy::Full => proto_api::JitterPolicy::Full,
-        JitterPolicy::Equal => proto_api::JitterPolicy::Equal,
-        JitterPolicy::Decorrelated => proto_api::JitterPolicy::Decorrelated,
-        _ => proto_api::JitterPolicy::Unspecified,
-    };
-    proto_api::BackoffPolicy {
-        jitter: jitter as i32,
-        first_ms: b.first_ms,
-        max_ms: b.max_ms,
-        factor: b.factor,
-    }
-}
-
-fn admission_to_proto(policy: AdmissionPolicy) -> proto_api::AdmissionPolicy {
-    match policy {
-        AdmissionPolicy::DropIfRunning => proto_api::AdmissionPolicy::DropIfRunning,
-        AdmissionPolicy::Replace => proto_api::AdmissionPolicy::Replace,
-        AdmissionPolicy::Queue => proto_api::AdmissionPolicy::Queue,
-        _ => proto_api::AdmissionPolicy::Unspecified,
-    }
 }
 
 /// Convert a wire [`proto_api::TaskSpec`] into a domain [`TaskSpec`].
@@ -220,9 +47,9 @@ fn admission_to_proto(policy: AdmissionPolicy) -> proto_api::AdmissionPolicy {
 ///
 /// - [`ApiError::InvalidRequest`]: the wire spec is not a valid [`TaskSpec`]. Causes:
 ///   - empty `slot`, `timeout_ms == 0`, or `max_retries == 0` (omit the field instead);
-///   - missing `kind`, kind variant, subprocess mode, script runtime, or `backoff`;
+///   - missing `kind`, kind variant, subprocess mode, or `backoff`;
 ///   - `UNSPECIFIED` / out-of-range enum value (restart, admission, jitter, selector operator);
-///   - kind-specific field rejected (empty command, empty script body, empty wasm module path, empty container image);
+///   - kind-specific field rejected (empty command, interpreter, script body, wasm module path, or container image);
 ///   - the final `TaskSpec::build` validation failed (e.g. backoff `factor < 1.0`).
 pub fn convert_task_spec(spec: proto_api::TaskSpec) -> Result<TaskSpec, ApiError> {
     let slot: Slot = validate_slot(spec.slot)?;
@@ -262,7 +89,7 @@ pub fn convert_task_spec(spec: proto_api::TaskSpec) -> Result<TaskSpec, ApiError
         .max_retries(max_retries);
 
     if let Some(sel) = spec.runner_selector {
-        builder = builder.runner_selector(convert_runner_selector(sel)?);
+        builder = builder.runner_selector(convert_label_selector(sel)?);
     }
 
     let task_spec = builder
@@ -272,243 +99,14 @@ pub fn convert_task_spec(spec: proto_api::TaskSpec) -> Result<TaskSpec, ApiError
     Ok(task_spec)
 }
 
-fn convert_runner_selector(sel: proto_api::RunnerSelector) -> Result<RunnerSelector, ApiError> {
-    let match_expressions = sel
-        .match_expressions
-        .into_iter()
-        .map(|req| {
-            let operator = match proto_api::SelectorOperator::try_from(req.operator) {
-                Ok(proto_api::SelectorOperator::In) => SelectorOperator::In,
-                Ok(proto_api::SelectorOperator::NotIn) => SelectorOperator::NotIn,
-                Ok(proto_api::SelectorOperator::Exists) => SelectorOperator::Exists,
-                Ok(proto_api::SelectorOperator::DoesNotExist) => SelectorOperator::DoesNotExist,
-                _ => {
-                    return Err(ApiError::InvalidRequest(format!(
-                        "invalid selector operator for key '{}'",
-                        req.key
-                    )));
-                }
-            };
-            Ok(SelectorRequirement {
-                key: req.key,
-                operator,
-                values: req.values,
-            })
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
-
-    Ok(RunnerSelector {
-        match_labels: convert_labels(sel.match_labels),
-        match_expressions,
-    })
-}
-
-pub(crate) fn convert_task_workload(
-    workload: proto_api::TaskWorkload,
-) -> Result<TaskWorkload, ApiError> {
-    let api_version = workload.api_version;
-    let kind = workload.kind;
-    let spec = workload
-        .spec
-        .ok_or_else(|| ApiError::InvalidRequest("missing workload spec".into()))?;
-
-    match spec {
-        proto_api::task_workload::Spec::Subprocess(sub) => {
-            validate_builtin_workload_gvk(&api_version, &kind, "Subprocess")?;
-            let mode = sub
-                .mode
-                .ok_or_else(|| ApiError::InvalidRequest("missing subprocess mode".into()))?;
-            let mode = mode
-                .mode
-                .ok_or_else(|| ApiError::InvalidRequest("missing typed subprocess mode".into()))?;
-
-            let subprocess_mode = match mode {
-                proto_api::subprocess_mode::Mode::Command(cmd) => SubprocessMode::Command {
-                    command: cmd.command,
-                    args: cmd.args,
-                },
-                proto_api::subprocess_mode::Mode::Script(script) => {
-                    let runtime = script
-                        .runtime
-                        .ok_or_else(|| ApiError::InvalidRequest("missing script runtime".into()))?;
-                    let runtime = runtime.runtime.ok_or_else(|| {
-                        ApiError::InvalidRequest("missing typed script runtime".into())
-                    })?;
-
-                    let runtime = match runtime {
-                        proto_api::runtime::Runtime::WellKnown(val) => {
-                            match proto_api::ScriptRuntime::try_from(val) {
-                                Ok(proto_api::ScriptRuntime::Bash) => Runtime::Bash,
-                                Ok(proto_api::ScriptRuntime::Python) => Runtime::Python,
-                                Ok(proto_api::ScriptRuntime::Node) => Runtime::Node,
-                                _ => {
-                                    return Err(ApiError::InvalidRequest(
-                                        "unknown or unspecified script runtime".into(),
-                                    ));
-                                }
-                            }
-                        }
-                        proto_api::runtime::Runtime::Custom(c) => Runtime::Custom {
-                            command: c.command,
-                            flag: c.flag,
-                        },
-                    };
-
-                    SubprocessMode::Script {
-                        runtime,
-                        body: script.body,
-                        args: script.args,
-                    }
-                }
-            };
-
-            subprocess_mode
-                .validate()
-                .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
-
-            Ok(TaskWorkload::Subprocess(SubprocessSpec::new(
-                subprocess_mode,
-                convert_env(sub.env),
-                sub.cwd.map(std::path::PathBuf::from),
-                Flag::from(sub.fail_on_non_zero),
-            )))
-        }
-        proto_api::task_workload::Spec::Wasm(wasm) => {
-            validate_builtin_workload_gvk(&api_version, &kind, "Wasm")?;
-            if wasm.module.trim().is_empty() {
-                return Err(ApiError::InvalidRequest("wasm module path is empty".into()));
-            }
-
-            Ok(TaskWorkload::Wasm(WasmSpec::new(
-                std::path::PathBuf::from(wasm.module),
-                wasm.args,
-                convert_env(wasm.env),
-            )))
-        }
-        proto_api::task_workload::Spec::Container(cont) => {
-            validate_builtin_workload_gvk(&api_version, &kind, "Container")?;
-            if cont.image.trim().is_empty() {
-                return Err(ApiError::InvalidRequest("container image is empty".into()));
-            }
-
-            Ok(TaskWorkload::Container(ContainerSpec::new(
-                cont.image,
-                cont.command.map(|command| command.items),
-                cont.args,
-                convert_env(cont.env),
-            )))
-        }
-        proto_api::task_workload::Spec::Extension(extension) => {
-            let spec = extension.spec.ok_or_else(|| {
-                ApiError::InvalidRequest("missing extension workload spec".into())
-            })?;
-            let spec = serde_json::from_slice(&spec.raw).map_err(|error| {
-                ApiError::InvalidRequest(format!(
-                    "extension workload spec is not valid UTF-8 JSON: {error}"
-                ))
-            })?;
-            ExtensionWorkload::new(api_version, kind, spec)
-                .map(TaskWorkload::Extension)
-                .map_err(|error| ApiError::InvalidRequest(error.to_string()))
-        }
-    }
-}
-
-fn validate_builtin_workload_gvk(
-    api_version: &str,
-    kind: &str,
-    expected_kind: &str,
-) -> Result<(), ApiError> {
-    if api_version != WORKLOAD_API_VERSION {
-        return Err(ApiError::InvalidRequest(format!(
-            "unsupported built-in workload apiVersion `{api_version}`",
-        )));
-    }
-    if kind != expected_kind {
-        return Err(ApiError::InvalidRequest(format!(
-            "workload kind `{kind}` does not match `{expected_kind}` spec",
-        )));
-    }
-    Ok(())
-}
-
-fn convert_env(kvs: Vec<proto_api::KeyValue>) -> TaskEnv {
-    let mut env = TaskEnv::new();
-    for kv in kvs {
-        env.push(kv.key, kv.value);
-    }
-    env
-}
-
-fn convert_restart_policy(
-    strategy: proto_api::RestartPolicy,
-    interval_ms: Option<u64>,
-) -> Result<RestartPolicy, ApiError> {
-    match strategy {
-        proto_api::RestartPolicy::Never => Ok(RestartPolicy::Never),
-        proto_api::RestartPolicy::OnFailure => Ok(RestartPolicy::OnFailure),
-        proto_api::RestartPolicy::Always => Ok(RestartPolicy::Always { interval_ms }),
-
-        proto_api::RestartPolicy::Unspecified => Err(ApiError::InvalidRequest(
-            "restart strategy not specified".into(),
-        )),
-    }
-}
-
-fn convert_backoff_policy(backoff: proto_api::BackoffPolicy) -> Result<BackoffPolicy, ApiError> {
-    let jitter = proto_api::JitterPolicy::try_from(backoff.jitter)
-        .map_err(|_| ApiError::InvalidRequest("invalid jitter strategy".into()))?;
-
-    let jitter = match jitter {
-        proto_api::JitterPolicy::Decorrelated => JitterPolicy::Decorrelated,
-        proto_api::JitterPolicy::Equal => JitterPolicy::Equal,
-        proto_api::JitterPolicy::None => JitterPolicy::None,
-        proto_api::JitterPolicy::Full => JitterPolicy::Full,
-
-        proto_api::JitterPolicy::Unspecified => {
-            return Err(ApiError::InvalidRequest(
-                "jitter strategy not specified".into(),
-            ));
-        }
-    };
-
-    // No business validation here: the model's BackoffPolicy::validate is the
-    // single source of the rules and runs inside TaskSpec::build. Duplicating
-    // it once produced drifted rules (the API accepted factor < 1.0 that the
-    // model rejected later).
-    Ok(BackoffPolicy {
-        jitter,
-        first_ms: backoff.first_ms,
-        max_ms: backoff.max_ms,
-        factor: backoff.factor,
-    })
-}
-
-fn convert_admission_policy(
-    strategy: proto_api::AdmissionPolicy,
-) -> Result<AdmissionPolicy, ApiError> {
-    match strategy {
-        proto_api::AdmissionPolicy::DropIfRunning => Ok(AdmissionPolicy::DropIfRunning),
-        proto_api::AdmissionPolicy::Replace => Ok(AdmissionPolicy::Replace),
-        proto_api::AdmissionPolicy::Queue => Ok(AdmissionPolicy::Queue),
-
-        proto_api::AdmissionPolicy::Unspecified => Err(ApiError::InvalidRequest(
-            "admission strategy not specified".into(),
-        )),
-    }
-}
-
-pub(super) fn convert_labels(map: std::collections::HashMap<String, String>) -> Labels {
-    let mut labels = Labels::new();
-    for (k, v) in map {
-        labels.insert(k, v);
-    }
-    labels
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solti_model::{
+        AdmissionPolicy, ContainerSpec, ExtensionWorkload, JitterPolicy, RestartPolicy,
+        SelectorOperator, SubprocessMode, SubprocessSpec, TaskWorkload, WORKLOAD_API_VERSION,
+        WasmSpec,
+    };
     use std::collections::HashMap;
 
     fn make_workload(kind: &str, spec: proto_api::task_workload::Spec) -> proto_api::TaskWorkload {
@@ -588,7 +186,7 @@ mod tests {
     #[test]
     fn task_spec_runner_selector_round_trips() {
         let mut proto = make_valid_task_spec();
-        proto.runner_selector = Some(proto_api::RunnerSelector {
+        proto.runner_selector = Some(proto_api::LabelSelector {
             match_labels: HashMap::from([("zone".to_string(), "eu".to_string())]),
             match_expressions: vec![proto_api::SelectorRequirement {
                 key: "arch".to_string(),
@@ -619,7 +217,7 @@ mod tests {
     #[test]
     fn task_spec_invalid_selector_operator_is_rejected() {
         let mut proto = make_valid_task_spec();
-        proto.runner_selector = Some(proto_api::RunnerSelector {
+        proto.runner_selector = Some(proto_api::LabelSelector {
             match_labels: HashMap::new(),
             match_expressions: vec![proto_api::SelectorRequirement {
                 key: "arch".to_string(),
@@ -879,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn task_spec_subprocess_script_bash() {
+    fn task_spec_subprocess_script_interpreter() {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -890,11 +488,7 @@ mod tests {
                     mode: Some(proto_api::SubprocessMode {
                         mode: Some(proto_api::subprocess_mode::Mode::Script(
                             proto_api::ScriptMode {
-                                runtime: Some(proto_api::Runtime {
-                                    runtime: Some(proto_api::runtime::Runtime::WellKnown(
-                                        proto_api::ScriptRuntime::Bash as i32,
-                                    )),
-                                }),
+                                interpreter: "bash".into(),
                                 body: BASE64.encode(b"echo hello"),
                                 args: vec![],
                             },
@@ -914,9 +508,9 @@ mod tests {
                 assert!(matches!(
                     mode,
                     SubprocessMode::Script {
-                        runtime: Runtime::Bash,
+                        interpreter,
                         ..
-                    }
+                    } if interpreter == "bash"
                 ));
             }
             _ => panic!("expected subprocess"),
@@ -924,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn task_spec_subprocess_script_custom_runtime() {
+    fn task_spec_subprocess_script_custom_interpreter() {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -935,14 +529,7 @@ mod tests {
                     mode: Some(proto_api::SubprocessMode {
                         mode: Some(proto_api::subprocess_mode::Mode::Script(
                             proto_api::ScriptMode {
-                                runtime: Some(proto_api::Runtime {
-                                    runtime: Some(proto_api::runtime::Runtime::Custom(
-                                        proto_api::CustomRuntime {
-                                            command: "ruby".into(),
-                                            flag: "-e".into(),
-                                        },
-                                    )),
-                                }),
+                                interpreter: "ruby".into(),
                                 body: BASE64.encode(b"puts 'hello'"),
                                 args: vec![],
                             },
@@ -962,9 +549,9 @@ mod tests {
                 assert!(matches!(
                     mode,
                     SubprocessMode::Script {
-                        runtime: Runtime::Custom { .. },
+                        interpreter,
                         ..
-                    }
+                    } if interpreter == "ruby"
                 ));
             }
             _ => panic!("expected subprocess"),
@@ -1139,11 +726,7 @@ mod tests {
                     mode: Some(proto_api::SubprocessMode {
                         mode: Some(proto_api::subprocess_mode::Mode::Script(
                             proto_api::ScriptMode {
-                                runtime: Some(proto_api::Runtime {
-                                    runtime: Some(proto_api::runtime::Runtime::WellKnown(
-                                        proto_api::ScriptRuntime::Bash as i32,
-                                    )),
-                                }),
+                                interpreter: "bash".into(),
                                 body: "".into(),
                                 args: vec![],
                             },
@@ -1163,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn reject_missing_script_runtime() {
+    fn reject_empty_script_interpreter() {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -1174,7 +757,7 @@ mod tests {
                     mode: Some(proto_api::SubprocessMode {
                         mode: Some(proto_api::subprocess_mode::Mode::Script(
                             proto_api::ScriptMode {
-                                runtime: None,
+                                interpreter: "".into(),
                                 body: BASE64.encode(b"echo hello"),
                                 args: vec![],
                             },
@@ -1189,7 +772,7 @@ mod tests {
         };
         let err = convert_task_spec(spec).unwrap_err();
         assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("missing script runtime"))
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("interpreter cannot be empty"))
         );
     }
 

@@ -44,9 +44,6 @@
 //!   `SOLTI_CP_CLIENT_CERT` + `SOLTI_CP_CLIENT_KEY` (optional) present a client cert (mTLS).
 //! - `CONTROL_PLANE` — CP discovery endpoint (default `http://localhost:8082`).
 //!
-//! Talking to the agent and the full endpoint reference live in
-//! [`api_v1.md`](../../../crates/solti-api/api_v1.md).
-//!
 //! ## Next
 //!
 //! | Example                          | What it adds                                        |
@@ -60,31 +57,30 @@ use std::{net::SocketAddr, sync::Arc};
 use axum_server::tls_rustls::RustlsConfig;
 use tracing::info;
 
-use solti::api::{
-    API_VERSION, ApiMetricsBackend, HttpApi, SupervisorApiAdapter, http_metrics_middleware,
-};
+use solti::api::{API_VERSION, ApiMetricsBackend, HttpApi, SupervisorApiAdapter};
 use solti::core::{StateConfig, SupervisorApi};
-use solti::discover::{self, DiscoverConfig, DiscoveryTransport, MonotonicUptime};
+use solti::discover::{
+    self, AgentEndpoint, AgentEndpointType, ControlPlaneEndpoint, DiscoverConfig,
+    DiscoveryTransport, MonotonicUptime,
+};
 use solti::exec::subprocess::register_subprocess_runner;
 use solti::model::{AgentId, Token};
-use solti::observe::{
-    LoggerConfig, LoggerLevel, LoggerTimeZone, init_local_offset, init_logger, timezone_sync,
-};
+use solti::observe::{LoggerConfig, LoggerLevel, LoggerTimeZone, init_logger, timezone_sync};
 use solti::prometheus::{
-    PrometheusApiMetrics, PrometheusDiscoverMetrics, PrometheusMetrics, PrometheusStateCollector,
-    PrometheusSubscriber, Registry, register_build_info, register_process_collector,
-    server as metrics_server,
+    PrometheusApiMetrics, PrometheusCoreStateCollector, PrometheusDiscoverMetrics,
+    PrometheusRunnerMetrics, PrometheusTaskvisorSubscriber, Registry, register_build_info,
+    register_process_collector, server as metrics_server,
 };
 use solti::runner::{BuildContext, RunnerEnv, RunnerRouter};
 use solti::taskvisor::{ControllerConfig, Subscribe, SupervisorConfig, TracingBridge};
 use solti::tls::{ClientTlsConfig, ServerTlsConfig, TlsIdentity, TrustRoots};
 
 const ADDR: &str = "0.0.0.0:8085";
+const ADVERTISED: &str = "localhost:8085";
 const METRICS_ADDR: &str = "0.0.0.0:9090";
 const CONTROL_PLANE_DEFAULT: &str = "http://localhost:8082";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_local_offset();
     tokio::runtime::Runtime::new()?.block_on(async_main())
 }
 
@@ -93,13 +89,13 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     init_logger(&LoggerConfig {
         level: LoggerLevel::new("info")?,
-        tz: LoggerTimeZone::Local,
+        timezone: LoggerTimeZone::Local,
         ..Default::default()
     })?;
 
     let registry = Arc::new(Registry::new());
-    let metrics = PrometheusMetrics::new(registry.clone())?;
-    let prom_subscriber = PrometheusSubscriber::new(registry.clone())?;
+    let metrics = PrometheusRunnerMetrics::new(&registry)?;
+    let prom_subscriber = PrometheusTaskvisorSubscriber::new(&registry)?;
     register_process_collector(&registry)?;
     register_build_info(
         &registry,
@@ -113,53 +109,67 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = BuildContext::new(RunnerEnv::default(), Arc::new(metrics));
     let mut router = RunnerRouter::new().with_context(ctx);
     register_subprocess_runner(&mut router, "default")?;
+    let agent_capabilities = router.capabilities();
 
     // Supervisor: owns every task, applies restart / backoff, fans events to subscribers.
     let subscribers: Vec<Arc<dyn Subscribe>> =
         vec![Arc::new(TracingBridge), Arc::new(prom_subscriber)];
-    let supervisor = SupervisorApi::new(
-        SupervisorConfig::default(),
-        ControllerConfig::default(),
-        subscribers,
-        router,
-        StateConfig::default(),
-    )
-    .await?;
+    let supervisor = SupervisorApi::builder(router)
+        .with_runtime_config(SupervisorConfig::default())
+        .with_controller_config(ControllerConfig::default())
+        .with_subscribers(subscribers)
+        .with_state_config(StateConfig::default())
+        .start()
+        .await?;
 
-    let state_collector = PrometheusStateCollector::new(supervisor.state())?;
+    let state_collector = PrometheusCoreStateCollector::new(supervisor.state())?;
     registry.register(Box::new(state_collector))?;
 
     // Embedded resources use a prebuilt runtime task and the same supervised lifecycle.
-    let (tz_task_ref, tz_task) = timezone_sync();
-    supervisor.create_with_task(tz_task, tz_task_ref).await?;
+    let (tz_task, tz_task_ref) = timezone_sync();
+    supervisor
+        .create_embedded_task(tz_task, tz_task_ref)
+        .await?;
 
-    let (metrics_task_ref, metrics_task) = metrics_server(
+    let (metrics_task, metrics_task_ref) = metrics_server(
         registry.clone(),
         METRICS_ADDR,
         concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")),
     )?;
     supervisor
-        .create_with_task(metrics_task, metrics_task_ref)
+        .create_embedded_task(metrics_task, metrics_task_ref)
         .await?;
 
     // --- Optional auth & TLS, selected by the environment ---
-    let token = std::env::var("SOLTI_AGENT_TOKEN").ok().map(Token::new);
+    let token = std::env::var("SOLTI_AGENT_TOKEN")
+        .ok()
+        .map(Token::new)
+        .transpose()?;
     let server_tls = server_tls_from_env()?; // agent API server TLS (CP → agent)
     let client_tls = client_tls_from_env()?; // discovery client TLS (agent → CP)
 
     // --- Discovery: agent → control plane ---
     let control_plane =
         std::env::var("CONTROL_PLANE").unwrap_or_else(|_| CONTROL_PLANE_DEFAULT.to_string());
-    let discover_metrics = Arc::new(PrometheusDiscoverMetrics::new(registry.clone())?);
+    let discover_metrics = Arc::new(PrometheusDiscoverMetrics::new(&registry)?);
+    let agent_scheme = if server_tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     let mut discover = DiscoverConfig::builder(
-        AgentId::new("agentd-http-001"),
+        AgentId::new("agentd-http-001")?,
         "agentd-http",
-        format!("http://{ADDR}"),
-        &control_plane,
-        DiscoveryTransport::Http,
-        10_000, // heartbeat interval (ms)
-        API_VERSION,
+        AgentEndpoint::new(
+            format!("{agent_scheme}://{ADVERTISED}"),
+            AgentEndpointType::Http,
+            API_VERSION,
+        )?,
+        ControlPlaneEndpoint::new(&control_plane, DiscoveryTransport::Http)?,
+        10_000,
+        concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")),
     )
+    .capabilities(agent_capabilities)
     .with_metrics(discover_metrics);
     if let Some(t) = &token {
         discover = discover.with_token(t.clone());
@@ -167,26 +177,22 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(tls) = client_tls {
         discover = discover.with_tls(tls);
     }
-    let (sync_task_ref, sync_task) = discover::sync(discover.build()?, uptime)?;
+    let (sync_task, sync_task_ref) = discover::sync(discover.build()?, uptime)?;
     supervisor
-        .create_with_task(sync_task, sync_task_ref)
+        .create_embedded_task(sync_task, sync_task_ref)
         .await?;
 
     // --- API: control plane → agent ---
-    let api_metrics: Arc<dyn ApiMetricsBackend> =
-        Arc::new(PrometheusApiMetrics::new(registry.clone())?);
+    let api_metrics: Arc<dyn ApiMetricsBackend> = Arc::new(PrometheusApiMetrics::new(&registry)?);
     // Keep the full SDK supervisor so shutdown also drains completion workers.
     let supervisor = Arc::new(supervisor);
     let handler = Arc::new(SupervisorApiAdapter::new(Arc::clone(&supervisor)));
 
-    let mut api = HttpApi::new(handler);
+    let mut api = HttpApi::new(handler).with_metrics(api_metrics);
     if let Some(t) = token {
         api = api.with_auth(t);
     }
-    let app = api.router().layer(axum::middleware::from_fn_with_state(
-        api_metrics,
-        http_metrics_middleware,
-    ));
+    let app = api.router();
 
     let scheme = if server_tls.is_some() {
         "https"

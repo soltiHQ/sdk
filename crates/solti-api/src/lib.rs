@@ -36,7 +36,7 @@
 //!
 //! ## Also
 //!
-//! - [`ApiHandler`] transport-agnostic trait with 7 operations.
+//! - [`ApiHandler`] transport-agnostic trait with 8 operations.
 //! - [`ApiError`] unified error type mapped to gRPC Status / HTTP JSON.
 //! - `SupervisorApiAdapter` optional adapter bridging to `SupervisorApi`
 //!   (feature `core-adapter`).
@@ -87,10 +87,13 @@ pub const HTTP_API_ROOT: &str = api_url!("");
 pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
 mod error;
-pub use error::ApiError;
+pub use error::{ApiConflict, ApiError, ApiErrorCause};
 
 mod handler;
-pub use handler::{ApiHandler, OutputEventStream};
+pub use handler::{ApiHandler, OutputEventStream, TaskWatchEventStream};
+
+#[cfg(any(feature = "grpc", feature = "http"))]
+mod continuation;
 
 #[cfg(feature = "core-adapter")]
 mod adapter;
@@ -98,8 +101,6 @@ mod adapter;
 pub use adapter::SupervisorApiAdapter;
 
 mod metrics;
-#[cfg(feature = "http")]
-pub use metrics::http_metrics_middleware;
 pub use metrics::{
     ApiMetricsBackend, ApiMetricsHandle, NoOpApiMetrics, Transport, noop_api_metrics,
 };
@@ -121,9 +122,6 @@ pub(crate) mod proto_api {
 #[cfg(any(feature = "grpc", feature = "http"))]
 mod auth;
 
-#[cfg(feature = "grpc")]
-mod convert;
-
 #[cfg(any(feature = "grpc", feature = "http"))]
 mod validate;
 
@@ -134,13 +132,7 @@ mod visibility;
 pub mod grpc;
 
 #[cfg(feature = "grpc")]
-pub use grpc::{BearerAuth, GrpcApi, GrpcServer, TaskApiService};
-
-#[cfg(feature = "grpc")]
-pub use proto_api::task_service_server::TaskServiceServer;
-
-#[cfg(feature = "grpc")]
-pub use proto_api::task_service_client::TaskServiceClient;
+pub use grpc::GrpcApi;
 
 #[cfg(feature = "grpc")]
 pub use tonic;

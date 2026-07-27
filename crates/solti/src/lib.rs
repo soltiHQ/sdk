@@ -10,19 +10,11 @@
 //! ```
 //!
 //! ```rust,no_run
-//! use solti::core::{StateConfig, SupervisorApi};
+//! use solti::core::SupervisorApi;
 //! use solti::runner::RunnerRouter;
-//! use solti::taskvisor::{ControllerConfig, SupervisorConfig};
 //!
 //! async fn build() -> Result<SupervisorApi, solti::core::CoreError> {
-//!     SupervisorApi::new(
-//!         SupervisorConfig::default(),
-//!         ControllerConfig::default(),
-//!         Vec::new(),
-//!         RunnerRouter::new(),
-//!         StateConfig::default(),
-//!     )
-//!     .await
+//!     SupervisorApi::builder(RunnerRouter::new()).start().await
 //! }
 //! ```
 

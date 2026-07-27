@@ -17,7 +17,7 @@ use prometheus::Registry;
 /// Registers the upstream [`prometheus::process_collector::ProcessCollector`] into `registry`.
 /// It exposes the standard `process_*` metrics for the current process.
 ///
-/// ## Example
+/// # Example
 ///
 /// ```
 /// use solti_prometheus::{Registry, register_process_collector};
@@ -27,19 +27,18 @@ use prometheus::Registry;
 /// register_process_collector(&registry)?;
 /// # Ok(()) }
 /// ```
-#[cfg(all(feature = "process", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub fn register_process_collector(registry: &Registry) -> Result<(), prometheus::Error> {
     let collector = prometheus::process_collector::ProcessCollector::for_self();
     registry.register(Box::new(collector))
 }
 
-/// Register the default Prometheus process collector (fallback).
+/// Register the default Prometheus process collector on a non-Linux target.
 ///
 /// The upstream process collector only works on Linux.
-/// This fallback is compiled on other targets and when the `process` feature is off.
-/// It does nothing and returns `Ok(())`. Callers can wire it unconditionally.
+/// This implementation does nothing and returns `Ok(())`.
 ///
-/// ## Example
+/// # Example
 ///
 /// ```
 /// use solti_prometheus::{Registry, register_process_collector};
@@ -49,7 +48,7 @@ pub fn register_process_collector(registry: &Registry) -> Result<(), prometheus:
 /// register_process_collector(&registry)?;
 /// # Ok(()) }
 /// ```
-#[cfg(not(all(feature = "process", target_os = "linux")))]
+#[cfg(not(target_os = "linux"))]
 pub fn register_process_collector(_registry: &Registry) -> Result<(), prometheus::Error> {
     Ok(())
 }

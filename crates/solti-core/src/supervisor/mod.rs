@@ -10,37 +10,36 @@
 //! are not rolled back.
 
 use std::{
-    collections::HashMap,
-    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Weak,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use solti_model::{
-    ConditionStatus, ModelError, Task, TaskId, TaskManifest, TaskPage, TaskPhase, TaskQuery,
-    TaskRun, TaskWorkload, WorkloadTypeMeta,
+    ModelError, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun, TaskWorkload,
+    WorkloadTypeMeta, WritePreconditions,
 };
 use solti_runner::RunnerRouter;
-use taskvisor::{
-    ControllerConfig, ControllerSpec, PreparedSubmission, Subscribe, Supervisor, SupervisorConfig,
-    SupervisorHandle, TaskRef, TaskSpec as TvTaskSpec,
-};
+use taskvisor::{ControllerConfig, Subscribe, Supervisor, SupervisorConfig, TaskRef};
 use tokio::sync::oneshot;
-use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
-use tracing::{debug, info, instrument, warn};
+use tokio_util::task::task_tracker::TaskTrackerToken;
+use tracing::{debug, info, instrument};
 
 use crate::{
+    StateConfig,
     error::CoreError,
-    map::{to_admission_policy, to_backoff_policy, to_restart_policy},
     output::{OutputConfig, OutputHub, OutputSubscription},
+    runtime::{Reconciler, RuntimeObserver, RuntimeSource, TaskLocks},
     state::{
-        DesiredCommit, ResourceGeneration, RuntimeBinding, SWEEP_NAME, SWEEP_SLOT, StateConfig,
-        StateSubscriber, TaskState, state_sweep,
+        CollectionError, DesiredCommit, ResourceGeneration, RuntimeBinding, TaskState,
+        TaskWatchSubscription,
     },
 };
+
+mod builder;
+pub use builder::SupervisorApiBuilder;
 
 /// High-level API over desired Task resources and the Taskvisor runtime.
 pub struct SupervisorApi {
@@ -50,271 +49,17 @@ pub struct SupervisorApi {
     shutdown_started: AtomicBool,
 }
 
-/// Cloneable dependencies owned by reconciliation and completion workers.
-#[derive(Clone)]
-struct Reconciler {
-    output_hub: Arc<OutputHub>,
-    handle: SupervisorHandle,
-    router: Arc<RunnerRouter>,
-    state: TaskState,
-    state_subscriber: Arc<StateSubscriber>,
-    runtime: tokio::runtime::Handle,
-    tasks: TaskTracker,
-    runtime_operations: TaskLocks,
-    grace: Duration,
-}
-
-/// Source of the concrete Taskvisor task for one reconciliation.
-enum RuntimeSource {
-    Routed,
-    Prebuilt(TaskRef),
-}
-
 #[derive(Clone, Copy)]
 enum WriteMode {
     Create,
     Apply,
 }
 
-/// Weak keyed async locks for one class of per-resource operations.
-///
-/// Desired-state and runtime operations deliberately use distinct instances.
-#[derive(Clone, Default)]
-struct TaskLocks {
-    locks: Arc<parking_lot::Mutex<HashMap<TaskId, Weak<tokio::sync::Mutex<()>>>>>,
-}
-
 /// Desired-state commit together with an optional first-reconciliation acknowledgement.
 struct ScheduledWrite {
     committed: Task,
+    #[cfg(test)]
     reconciliation: Option<oneshot::Receiver<Task>>,
-}
-
-impl TaskLocks {
-    async fn lock(&self, name: &TaskId) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self.locks.lock();
-            if let Some(lock) = locks.get(name).and_then(Weak::upgrade) {
-                lock
-            } else {
-                locks.retain(|_, lock| lock.strong_count() > 0);
-                let lock = Arc::new(tokio::sync::Mutex::new(()));
-                locks.insert(name.clone(), Arc::downgrade(&lock));
-                lock
-            }
-        };
-        lock.lock_owned().await
-    }
-}
-
-impl Reconciler {
-    fn failure_reason(error: &CoreError) -> &'static str {
-        match error {
-            CoreError::Runner(_) => "RunnerBuildFailed",
-            CoreError::Mapping(_) => "PolicyMappingFailed",
-            CoreError::Supervisor { op: "prepare", .. } => "RuntimePreparationFailed",
-            _ => "ReconciliationFailed",
-        }
-    }
-
-    fn preflight(
-        &self,
-        task: &Task,
-        source: RuntimeSource,
-    ) -> Result<PreparedSubmission, CoreError> {
-        let task_ref = match source {
-            RuntimeSource::Routed => self.router.build(task)?,
-            RuntimeSource::Prebuilt(task_ref) => task_ref,
-        };
-        let spec = task.spec();
-        let task_spec = TvTaskSpec::new(
-            task_ref,
-            to_restart_policy(spec.restart())?,
-            to_backoff_policy(spec.backoff())?,
-            Some(Duration::from_millis(spec.timeout().as_millis())),
-        )
-        .with_max_retries(spec.max_retries());
-        let controller_spec =
-            ControllerSpec::new(to_admission_policy(spec.admission())?, task_spec)
-                .with_slot(spec.slot().as_str());
-
-        self.handle
-            .prepare_submission(controller_spec)
-            .map_err(|error| CoreError::supervisor("prepare", error))
-    }
-
-    async fn reconcile(&self, desired: Task, source: RuntimeSource, ensure_output: bool) -> Task {
-        let target = ResourceGeneration::from_task(&desired);
-        // Do not perform runner construction for a generation already superseded
-        // before this worker starts.
-        if !self.state.is_current(&target) {
-            return self.current(&target, desired);
-        }
-        let preflight_reconciler = self.clone();
-        let preflight_task = desired.clone();
-        let preflight = self
-            .runtime
-            .spawn_blocking(move || {
-                catch_unwind(AssertUnwindSafe(|| {
-                    preflight_reconciler.preflight(&preflight_task, source)
-                }))
-            })
-            .await;
-        let prepared = match preflight {
-            Ok(Ok(Ok(prepared))) => prepared,
-            Ok(Ok(Err(error))) => {
-                self.state.mark_reconciliation_failed(
-                    &target,
-                    Self::failure_reason(&error),
-                    error.to_string(),
-                );
-                return self.current(&target, desired);
-            }
-            Ok(Err(_)) => {
-                warn!(task = %target.name, "runner preflight panicked");
-                self.state.mark_reconciliation_failed(
-                    &target,
-                    "RunnerBuildPanicked",
-                    "reconciliation preflight panicked".to_string(),
-                );
-                return self.current(&target, desired);
-            }
-            Err(error) => {
-                warn!(task = %target.name, %error, "runner preflight worker was unavailable");
-                self.state.mark_reconciliation_failed(
-                    &target,
-                    "RunnerBuildUnavailable",
-                    "reconciliation preflight worker was unavailable".to_string(),
-                );
-                return self.current(&target, desired);
-            }
-        };
-
-        // Runner construction is allowed to overlap later desired commits. All
-        // Taskvisor effects for one resource name are serialized after that
-        // potentially blocking work, and stale generations stop here without
-        // touching the current realization.
-        let _runtime_operation = self.runtime_operations.lock(&target.name).await;
-        if !self.state.is_current(&target) {
-            return self.current(&target, desired);
-        }
-
-        // A new desired generation is already committed. The previous runtime is
-        // stopped only after the new generation has passed every synchronous
-        // preflight step.
-        if let Some(previous) = self.state.binding_for(&target.name)
-            && previous.resource != target
-        {
-            match self
-                .handle
-                .cancel_with_timeout(
-                    previous.tv,
-                    self.grace.saturating_add(Duration::from_secs(1)),
-                )
-                .await
-            {
-                Ok(_) => {
-                    self.state_subscriber
-                        .settle_after_confirmed_cleanup(previous.tv)
-                        .await;
-                }
-                Err(error) => {
-                    self.state.mark_reconciliation_failed(
-                        &target,
-                        "PreviousRuntimeCleanupFailed",
-                        CoreError::supervisor("cancel", error).to_string(),
-                    );
-                    return self.current(&target, desired);
-                }
-            }
-        }
-
-        // Desired state may advance while cancellation waits for confirmed
-        // cleanup. Never bind a prepared runtime for that stale generation.
-        if !self.state.is_current(&target) {
-            return self.current(&target, desired);
-        }
-
-        let tv = prepared.id();
-        if !self
-            .state_subscriber
-            .bind(target.clone(), tv, ensure_output)
-        {
-            self.state.mark_reconciliation_failed(
-                &target,
-                "RuntimeBindingFailed",
-                "resource changed before runtime binding".to_string(),
-            );
-            return self.current(&target, desired);
-        }
-        let binding = RuntimeBinding {
-            resource: target.clone(),
-            tv,
-        };
-
-        match prepared.submit_and_watch().await {
-            Ok((submitted, waiter)) => {
-                debug_assert_eq!(submitted, tv);
-                self.state.mark_observed(&target);
-                self.spawn_completion_waiter(binding, waiter);
-            }
-            Err(error) => {
-                self.state_subscriber.fail_bound_reconciliation(
-                    &binding,
-                    "RuntimeSubmissionFailed",
-                    CoreError::supervisor("submit", error).to_string(),
-                );
-            }
-        }
-        self.current(&target, desired)
-    }
-
-    fn current(&self, target: &ResourceGeneration, fallback: Task) -> Task {
-        self.state.get_retained(&target.name).unwrap_or(fallback)
-    }
-
-    fn spawn_completion_waiter(&self, binding: RuntimeBinding, waiter: taskvisor::TaskWaiter) {
-        let subscriber = Arc::clone(&self.state_subscriber);
-        let cleanup_handle = self.handle.clone();
-        let cleanup_timeout = self.grace.saturating_add(Duration::from_secs(1));
-        let tv = binding.tv;
-        let tv_raw = tv.get();
-        let task = self.tasks.spawn_on(
-            async move {
-                match waiter.wait().await {
-                    Ok(outcome) => subscriber.finalize_from_outcome(tv_raw, &outcome).await,
-                    Err(error) => {
-                        warn!(
-                            taskvisor_id = tv_raw,
-                            error = %error,
-                            "task completion channel closed without an outcome"
-                        );
-                        let unavailable = format!("task outcome unavailable: {error}");
-                        match cleanup_handle
-                            .cancel_with_timeout(tv, cleanup_timeout)
-                            .await
-                        {
-                            Ok(_) => {
-                                subscriber
-                                    .finalize_unavailable_after_cleanup(tv_raw, unavailable)
-                                    .await;
-                            }
-                            Err(cleanup_error) => {
-                                warn!(
-                                    taskvisor_id = tv_raw,
-                                    error = %cleanup_error,
-                                    "could not confirm cleanup after task outcome became unavailable"
-                                );
-                                subscriber.finalize_unavailable(tv_raw, unavailable);
-                            }
-                        }
-                    }
-                }
-            },
-            &self.runtime,
-        );
-        drop(task);
-    }
 }
 
 impl Drop for SupervisorApi {
@@ -323,6 +68,8 @@ impl Drop for SupervisorApi {
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.reconciler.state.close_watches();
+        self.reconciler.retention_stop.cancel();
         self.reconciler.tasks.close();
         let handle = self.reconciler.handle.clone();
         let tasks = self.reconciler.tasks.clone();
@@ -335,43 +82,28 @@ impl Drop for SupervisorApi {
 }
 
 impl SupervisorApi {
-    /// Create a supervisor and start its runtime.
-    pub async fn new(
+    /// Create a builder for a supervisor API.
+    pub fn builder(router: RunnerRouter) -> SupervisorApiBuilder {
+        SupervisorApiBuilder::new(router)
+    }
+
+    async fn start(
         sup_cfg: SupervisorConfig,
         ctrl_cfg: ControllerConfig,
         subscribers: Vec<Arc<dyn Subscribe>>,
         router: RunnerRouter,
         state_cfg: StateConfig,
-    ) -> Result<Self, CoreError> {
-        Self::new_with_output_config(
-            sup_cfg,
-            ctrl_cfg,
-            subscribers,
-            router,
-            state_cfg,
-            OutputConfig::default(),
-        )
-        .await
-    }
-
-    /// Create a supervisor with an explicit live-output buffer configuration.
-    pub async fn new_with_output_config(
-        sup_cfg: SupervisorConfig,
-        ctrl_cfg: ControllerConfig,
-        mut subscribers: Vec<Arc<dyn Subscribe>>,
-        router: RunnerRouter,
-        state_cfg: StateConfig,
         output_config: OutputConfig,
     ) -> Result<Self, CoreError> {
+        let mut subscribers = subscribers;
         let output_hub = Arc::new(OutputHub::new(output_config));
-        let router = Arc::new(router.with_output_publisher(output_hub.clone()));
-        let state = TaskState::new();
-        state.set_max_runs_per_task(state_cfg.max_runs_per_task);
-        let state_subscriber = Arc::new(StateSubscriber::with_output_hub(
+        let router = router.with_output_publisher(output_hub.clone());
+        let state = TaskState::try_with_config(state_cfg)?;
+        let observer = Arc::new(RuntimeObserver::with_output_hub(
             state.clone(),
             Arc::clone(&output_hub),
         ));
-        subscribers.push(state_subscriber.clone());
+        subscribers.push(observer.clone());
 
         let grace = sup_cfg.grace();
         let supervisor = Supervisor::builder(sup_cfg)
@@ -379,17 +111,7 @@ impl SupervisorApi {
             .with_controller(ctrl_cfg)
             .build();
         let handle = supervisor.serve();
-        let reconciler = Reconciler {
-            output_hub,
-            handle,
-            router,
-            state,
-            state_subscriber,
-            runtime: tokio::runtime::Handle::current(),
-            tasks: TaskTracker::new(),
-            runtime_operations: TaskLocks::default(),
-            grace,
-        };
+        let reconciler = Reconciler::new(output_hub, handle, router, state, observer, grace);
         let api = Self {
             reconciler,
             task_operations: TaskLocks::default(),
@@ -397,24 +119,8 @@ impl SupervisorApi {
             shutdown_started: AtomicBool::new(false),
         };
 
-        let (task_ref, manifest) = state_sweep(api.reconciler.state.clone(), state_cfg);
-        let scheduled = api
-            .write(
-                manifest,
-                RuntimeSource::Prebuilt(task_ref),
-                WriteMode::Create,
-                false,
-            )
-            .await?;
-        let sweep = api.await_reconciliation(scheduled).await;
-        if sweep.status().reconciled().status == ConditionStatus::False {
-            warn!(
-                reason = %sweep.status().reconciled().reason,
-                message = %sweep.status().reconciled().message,
-                "internal state sweep reconciliation failed"
-            );
-        }
-        info!("supervisor is ready (state sweep desired resource installed)");
+        api.reconciler.spawn_retention_worker(state_cfg);
+        info!("supervisor is ready");
         Ok(api)
     }
 
@@ -424,9 +130,14 @@ impl SupervisorApi {
     /// realization. Routing or runtime failures are recorded later in `status`;
     /// observe `status.conditions[type=Reconciled]` to track reconciliation.
     pub async fn create_task(&self, manifest: TaskManifest) -> Result<Task, CoreError> {
-        Self::ensure_public_manifest(&manifest)?;
         Ok(self
-            .write(manifest, RuntimeSource::Routed, WriteMode::Create, true)
+            .write(
+                manifest,
+                RuntimeSource::Routed,
+                WriteMode::Create,
+                WritePreconditions::new(),
+                true,
+            )
             .await?
             .committed)
     }
@@ -435,17 +146,17 @@ impl SupervisorApi {
     ///
     /// Runtime failures are reported asynchronously through the stored resource's
     /// `Reconciled` condition.
-    pub async fn create_with_task(
+    pub async fn create_embedded_task(
         &self,
         manifest: TaskManifest,
         task_ref: TaskRef,
     ) -> Result<Task, CoreError> {
-        Self::ensure_public_manifest(&manifest)?;
         Ok(self
             .write(
                 manifest,
                 RuntimeSource::Prebuilt(task_ref),
                 WriteMode::Create,
+                WritePreconditions::new(),
                 true,
             )
             .await?
@@ -459,9 +170,27 @@ impl SupervisorApi {
     /// condition. An identical apply schedules one manual retry only while that
     /// condition is `False`.
     pub async fn apply_task(&self, manifest: TaskManifest) -> Result<Task, CoreError> {
-        Self::ensure_public_manifest(&manifest)?;
+        self.apply_task_with_preconditions(manifest, WritePreconditions::new())
+            .await
+    }
+
+    /// Apply desired state after checking the current resource identity and version.
+    ///
+    /// Preconditions make this a conditional update. They prevent creation when
+    /// the resource is absent.
+    pub async fn apply_task_with_preconditions(
+        &self,
+        manifest: TaskManifest,
+        preconditions: WritePreconditions,
+    ) -> Result<Task, CoreError> {
         Ok(self
-            .write(manifest, RuntimeSource::Routed, WriteMode::Apply, true)
+            .write(
+                manifest,
+                RuntimeSource::Routed,
+                WriteMode::Apply,
+                preconditions,
+                true,
+            )
             .await?
             .committed)
     }
@@ -469,17 +198,17 @@ impl SupervisorApi {
     /// Apply desired state unless an existing resource is hidden by an adapter-owned policy.
     ///
     /// An absent resource is created normally. The visibility check and desired
-    /// commit share the same per-name lock, so an apply cannot replace a hidden
+    /// commit share the same per-name lock. An apply cannot replace a hidden
     /// incarnation through a check-then-write race.
     pub async fn apply_task_where<F>(
         &self,
         manifest: TaskManifest,
+        preconditions: WritePreconditions,
         predicate: F,
     ) -> Result<Task, CoreError>
     where
         F: Fn(&Task) -> bool,
     {
-        Self::ensure_public_manifest(&manifest)?;
         let name = manifest.name().clone();
         let operation = self.task_operations.lock(&name).await;
         if self
@@ -495,6 +224,7 @@ impl SupervisorApi {
                 manifest,
                 RuntimeSource::Routed,
                 WriteMode::Apply,
+                &preconditions,
                 true,
                 operation,
             )?
@@ -506,42 +236,32 @@ impl SupervisorApi {
     /// Runtime failures are reported asynchronously through the stored resource's
     /// `Reconciled` condition. An identical apply schedules one manual retry only
     /// while that condition is `False`.
-    pub async fn apply_with_task(
+    pub async fn apply_embedded_task(
         &self,
         manifest: TaskManifest,
         task_ref: TaskRef,
     ) -> Result<Task, CoreError> {
-        Self::ensure_public_manifest(&manifest)?;
+        self.apply_embedded_task_with_preconditions(manifest, task_ref, WritePreconditions::new())
+            .await
+    }
+
+    /// Apply an embedded task after checking the current resource identity and version.
+    pub async fn apply_embedded_task_with_preconditions(
+        &self,
+        manifest: TaskManifest,
+        task_ref: TaskRef,
+        preconditions: WritePreconditions,
+    ) -> Result<Task, CoreError> {
         Ok(self
             .write(
                 manifest,
                 RuntimeSource::Prebuilt(task_ref),
                 WriteMode::Apply,
+                preconditions,
                 true,
             )
             .await?
             .committed)
-    }
-
-    fn ensure_public_manifest(manifest: &TaskManifest) -> Result<(), CoreError> {
-        Self::ensure_public_name(manifest.name())?;
-        if manifest.slot().as_str() == SWEEP_SLOT {
-            return Err(CoreError::ReservedResource(format!(
-                "spec.slot '{}' is owned by solti-core",
-                SWEEP_SLOT
-            )));
-        }
-        Ok(())
-    }
-
-    fn ensure_public_name(name: &TaskId) -> Result<(), CoreError> {
-        if name.as_str() == SWEEP_NAME {
-            return Err(CoreError::ReservedResource(format!(
-                "metadata.name '{}' is owned by solti-core",
-                SWEEP_NAME
-            )));
-        }
-        Ok(())
     }
 
     async fn write(
@@ -549,6 +269,7 @@ impl SupervisorApi {
         manifest: TaskManifest,
         source: RuntimeSource,
         mode: WriteMode,
+        preconditions: WritePreconditions,
         ensure_output: bool,
     ) -> Result<ScheduledWrite, CoreError> {
         Self::ensure_runtime_contract(&manifest, &source)?;
@@ -556,7 +277,14 @@ impl SupervisorApi {
         // runtime diagnostic label and is deliberately not consulted here.
         let name = manifest.name().clone();
         let operation = self.task_operations.lock(&name).await;
-        self.write_locked(manifest, source, mode, ensure_output, operation)
+        self.write_locked(
+            manifest,
+            source,
+            mode,
+            &preconditions,
+            ensure_output,
+            operation,
+        )
     }
 
     fn write_locked(
@@ -564,6 +292,7 @@ impl SupervisorApi {
         manifest: TaskManifest,
         source: RuntimeSource,
         mode: WriteMode,
+        preconditions: &WritePreconditions,
         ensure_output: bool,
         _operation: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<ScheduledWrite, CoreError> {
@@ -577,37 +306,33 @@ impl SupervisorApi {
         // tracked worker spawn. TaskTracker::close does not reject spawns.
         let registration = self.reconciler.tasks.token();
         let commit = match mode {
-            WriteMode::Create => self.reconciler.state.create_desired(&manifest)?,
-            WriteMode::Apply => self.reconciler.state.apply_desired(&manifest)?,
+            WriteMode::Create => {
+                debug_assert!(preconditions.is_empty());
+                self.reconciler.state.create_desired(&manifest)?
+            }
+            WriteMode::Apply => self
+                .reconciler
+                .state
+                .apply_desired_with_preconditions(&manifest, preconditions)?,
         };
         if !commit.reconcile {
             drop(registration);
             return Ok(ScheduledWrite {
                 committed: commit.task,
+                #[cfg(test)]
                 reconciliation: None,
             });
         }
 
         let committed = commit.task.clone();
         let reconciliation = self.spawn_reconciliation(commit, source, ensure_output, registration);
+        #[cfg(not(test))]
+        drop(reconciliation);
         Ok(ScheduledWrite {
             committed,
+            #[cfg(test)]
             reconciliation: Some(reconciliation),
         })
-    }
-
-    async fn await_reconciliation(&self, scheduled: ScheduledWrite) -> Task {
-        let name = scheduled.committed.name().clone();
-        let fallback = scheduled.committed;
-        match scheduled.reconciliation {
-            Some(receiver) => receiver.await.unwrap_or_else(|_| {
-                self.reconciler
-                    .state
-                    .get_retained(&name)
-                    .unwrap_or(fallback)
-            }),
-            None => fallback,
-        }
     }
 
     fn ensure_runtime_contract(
@@ -623,7 +348,7 @@ impl SupervisorApi {
                 )))
             }
             (RuntimeSource::Routed, true) => Err(CoreError::InvalidSpec(ModelError::Invalid(
-                "spec.workload kind Embedded requires create_with_task() or apply_with_task()"
+                "spec.workload kind Embedded requires create_embedded_task() or apply_embedded_task()"
                     .into(),
             ))),
         }
@@ -655,9 +380,6 @@ impl SupervisorApi {
 
     /// Subscribe to one resource's lossy live output stream.
     pub fn subscribe_output(&self, name: &TaskId) -> Option<OutputSubscription> {
-        if name.as_str() == SWEEP_NAME {
-            return None;
-        }
         self.reconciler.output_hub.subscribe(name)
     }
 
@@ -674,9 +396,6 @@ impl SupervisorApi {
     where
         F: Fn(&Task) -> bool,
     {
-        if name.as_str() == SWEEP_NAME {
-            return None;
-        }
         let _operation = self.task_operations.lock(name).await;
         let _runtime_operation = self.reconciler.runtime_operations.lock(name).await;
         let task = self.reconciler.state.get_retained(name)?;
@@ -696,23 +415,8 @@ impl SupervisorApi {
         self.reconciler.state.get(name)
     }
 
-    /// List every retained public Task in one slot.
-    pub fn list_tasks_by_slot(&self, slot: &str) -> Vec<Task> {
-        self.reconciler.state.list_by_slot(slot)
-    }
-
-    /// List all retained public Tasks. Core's internal sweep resource is excluded.
-    pub fn list_all_tasks(&self) -> Vec<Task> {
-        self.reconciler.state.list_all()
-    }
-
-    /// List retained public Tasks in one phase.
-    pub fn list_tasks_by_status(&self, phase: TaskPhase) -> Vec<Task> {
-        self.reconciler.state.list_by_status(phase)
-    }
-
-    /// Query retained public Tasks with filters and pagination.
-    pub fn query_tasks(&self, query: &TaskQuery) -> TaskPage<Task> {
+    /// Query retained Tasks with filters and snapshot-consistent pagination.
+    pub fn query_tasks(&self, query: &TaskQuery) -> Result<TaskPage<Task>, CollectionError> {
         self.reconciler.state.query(query)
     }
 
@@ -720,12 +424,40 @@ impl SupervisorApi {
     ///
     /// Core itself does not attach wire-visibility semantics to workloads. A
     /// transport can use this method to hide unsupported workloads while still
-    /// receiving a correct `total`, offset and limit.
-    pub fn query_tasks_where<F>(&self, query: &TaskQuery, predicate: F) -> TaskPage<Task>
+    /// receiving a consistent continuation and remaining-item count.
+    pub fn query_tasks_where<F>(
+        &self,
+        query: &TaskQuery,
+        predicate: F,
+    ) -> Result<TaskPage<Task>, CollectionError>
     where
         F: Fn(&Task) -> bool,
     {
         self.reconciler.state.query_where(query, predicate)
+    }
+
+    /// Watch retained Task resources selected by `filter`.
+    pub fn watch_tasks(
+        &self,
+        filter: &TaskFilter,
+        resource_version: Option<&str>,
+    ) -> Result<TaskWatchSubscription, CollectionError> {
+        self.reconciler.state.watch(filter, resource_version)
+    }
+
+    /// Watch Tasks with an adapter-owned visibility predicate.
+    pub fn watch_tasks_where<F>(
+        &self,
+        filter: &TaskFilter,
+        resource_version: Option<&str>,
+        predicate: F,
+    ) -> Result<TaskWatchSubscription, CollectionError>
+    where
+        F: Fn(&Task) -> bool + Send + Sync + 'static,
+    {
+        self.reconciler
+            .state
+            .watch_where(filter, resource_version, predicate)
     }
 
     /// List execution history for one resource, oldest generation and attempt first.
@@ -736,15 +468,12 @@ impl SupervisorApi {
     /// List runs visible under an adapter-owned workload-GVK predicate.
     ///
     /// Visibility is checked under the same per-name operation lock used by
-    /// apply and delete, so an apply cannot change the workload between the
+    /// apply and delete. An apply cannot change the workload between the
     /// check and the run snapshot.
     pub async fn list_task_runs_where<F>(&self, name: &TaskId, predicate: F) -> Option<Vec<TaskRun>>
     where
         F: Fn(&WorkloadTypeMeta) -> bool,
     {
-        if name.as_str() == SWEEP_NAME {
-            return None;
-        }
         let _operation = self.task_operations.lock(name).await;
         let task = self.reconciler.state.get_retained(name)?;
         if !predicate(&task.spec().workload().type_meta()) {
@@ -755,7 +484,7 @@ impl SupervisorApi {
                 .state
                 .list_runs(name)
                 .into_iter()
-                .filter(|run| predicate(&run.workload))
+                .filter(|run| predicate(run.workload()))
                 .collect(),
         )
     }
@@ -790,7 +519,6 @@ impl SupervisorApi {
     /// create a hidden intent that suppresses later reconciliation.
     #[instrument(level = "debug", skip(self), fields(task = %name))]
     pub async fn cancel_task(&self, name: &TaskId) -> Result<(), CoreError> {
-        Self::ensure_public_name(name)?;
         let _operation = self.task_operations.lock(name).await;
         let _runtime_operation = self.reconciler.runtime_operations.lock(name).await;
         let was_known = self.reconciler.state.contains_task(name);
@@ -798,7 +526,7 @@ impl SupervisorApi {
         let claimed = cancellation.as_ref().is_some_and(|(_, claimed)| *claimed);
         if let Some((binding, _)) = cancellation {
             self.reconciler
-                .state_subscriber
+                .observer
                 .settle_after_confirmed_cleanup(binding.tv)
                 .await;
         }
@@ -812,8 +540,23 @@ impl SupervisorApi {
     /// Deleting a missing resource is an idempotent no-op.
     #[instrument(level = "debug", skip(self), fields(task = %name))]
     pub async fn delete_task(&self, name: &TaskId) -> Result<(), CoreError> {
-        Self::ensure_public_name(name)?;
         let _operation = self.task_operations.lock(name).await;
+        self.delete_task_locked(name).await
+    }
+
+    /// Delete a Task only when its identity and version match.
+    pub async fn delete_task_with_preconditions(
+        &self,
+        name: &TaskId,
+        preconditions: WritePreconditions,
+    ) -> Result<(), CoreError> {
+        let _operation = self.task_operations.lock(name).await;
+        let task = self
+            .reconciler
+            .state
+            .get_retained(name)
+            .ok_or_else(|| CoreError::NotFound(name.to_string()))?;
+        TaskState::check_write_preconditions(&task, &preconditions)?;
         self.delete_task_locked(name).await
     }
 
@@ -821,11 +564,15 @@ impl SupervisorApi {
     ///
     /// A missing resource or one rejected by the predicate is reported as absent.
     /// The unconditional [`delete_task`](Self::delete_task) remains idempotent.
-    pub async fn delete_task_where<F>(&self, name: &TaskId, predicate: F) -> Result<(), CoreError>
+    pub async fn delete_task_where<F>(
+        &self,
+        name: &TaskId,
+        preconditions: WritePreconditions,
+        predicate: F,
+    ) -> Result<(), CoreError>
     where
         F: Fn(&Task) -> bool,
     {
-        Self::ensure_public_name(name)?;
         let _operation = self.task_operations.lock(name).await;
         let Some(task) = self.reconciler.state.get_retained(name) else {
             return Err(CoreError::NotFound(name.to_string()));
@@ -833,6 +580,7 @@ impl SupervisorApi {
         if !predicate(&task) {
             return Err(CoreError::NotFound(name.to_string()));
         }
+        TaskState::check_write_preconditions(&task, &preconditions)?;
         self.delete_task_locked(name).await
     }
 
@@ -841,9 +589,7 @@ impl SupervisorApi {
         debug!(task = %name, "deleting task resource");
         let cancellation = self.cancel_bound(name).await?;
         let tv = cancellation.as_ref().map(|(binding, _)| binding.tv);
-        self.reconciler
-            .state_subscriber
-            .delete_after_cleanup(name, tv);
+        self.reconciler.observer.delete_after_cleanup(name, tv);
         Ok(())
     }
 
@@ -854,6 +600,8 @@ impl SupervisorApi {
         {
             let _spawn = self.spawn_gate.lock();
             if !self.shutdown_started.swap(true, Ordering::AcqRel) {
+                self.reconciler.state.close_watches();
+                self.reconciler.retention_stop.cancel();
                 self.reconciler.tasks.close();
             }
         }
@@ -878,11 +626,13 @@ mod tests {
 
     use parking_lot::{Condvar, Mutex};
     use solti_model::{
-        AdmissionPolicy, EmbeddedSpec, Flag, Labels, SubprocessMode, SubprocessSpec, TaskEnv,
-        TaskSpec, TaskWorkload,
+        AdmissionPolicy, ConditionStatus, EmbeddedSpec, Flag, Labels, Slot, SubprocessMode,
+        SubprocessSpec, TaskEnv, TaskPhase, TaskSpec, TaskWorkload, WORKLOAD_API_VERSION,
+        WorkloadTypeMeta,
     };
-    use solti_runner::{BuildContext, Runner, RunnerError};
+    use solti_runner::{BuildContext, RunId, Runner, RunnerError};
     use taskvisor::{TaskContext, TaskError, TaskFn};
+    use tokio_stream::StreamExt;
 
     use super::*;
 
@@ -923,11 +673,18 @@ mod tests {
         .unwrap()
     }
 
-    fn reserved_slot(name: &str) -> TaskManifest {
+    fn subprocess_workload_types() -> Vec<WorkloadTypeMeta> {
+        vec![
+            WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess")
+                .expect("built-in workload GVK"),
+        ]
+    }
+
+    fn retention_slot(name: &str) -> TaskManifest {
         TaskManifest::new(
             name,
             TaskSpec::builder(
-                SWEEP_SLOT,
+                "solti-state-sweep",
                 TaskWorkload::Embedded(EmbeddedSpec::new("test-v1").unwrap()),
                 1_000_u64,
             )
@@ -953,15 +710,7 @@ mod tests {
     }
 
     async fn api(router: RunnerRouter) -> SupervisorApi {
-        SupervisorApi::new(
-            SupervisorConfig::default(),
-            ControllerConfig::default(),
-            Vec::new(),
-            router,
-            StateConfig::default(),
-        )
-        .await
-        .unwrap()
+        SupervisorApi::builder(router).start().await.unwrap()
     }
 
     async fn wait_for_task(
@@ -985,7 +734,7 @@ mod tests {
 
     async fn wait_for_observed(api: &SupervisorApi, name: &TaskId, generation: u64) -> Task {
         wait_for_task(api, name, |task| {
-            task.status().observed_generation == generation
+            task.status().observed_generation() == generation
         })
         .await
     }
@@ -998,7 +747,7 @@ mod tests {
     ) -> Task {
         wait_for_task(api, name, |task| {
             let condition = task.status().reconciled();
-            condition.observed_generation == generation && condition.status == status
+            condition.observed_generation() == generation && condition.status() == status
         })
         .await
     }
@@ -1027,21 +776,26 @@ mod tests {
     }
 
     impl Runner for RecordingRunner {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "recording"
         }
 
-        fn supports(&self, workload: &TaskWorkload) -> bool {
-            matches!(workload, TaskWorkload::Subprocess(_))
+        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+            subprocess_workload_types()
         }
 
-        fn build_task(&self, task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
+        fn build_task(
+            &self,
+            task: &Task,
+            run_id: &RunId,
+            _ctx: &BuildContext,
+        ) -> Result<TaskRef, RunnerError> {
             self.seen.lock().push((
                 task.name().clone(),
                 task.metadata().generation(),
                 task.metadata().resource_version().to_string(),
             ));
-            Ok(immediate_task("runner-owned-runtime-name"))
+            Ok(immediate_task(run_id.name()))
         }
     }
 
@@ -1049,9 +803,11 @@ mod tests {
     async fn stale_generation_is_rejected_before_runner_build() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut router = RunnerRouter::new();
-        router.register(Arc::new(RecordingRunner {
-            seen: Arc::clone(&seen),
-        }));
+        router
+            .register(Arc::new(RecordingRunner {
+                seen: Arc::clone(&seen),
+            }))
+            .unwrap();
         let api = api(router).await;
         let stale = api
             .reconciler
@@ -1076,12 +832,12 @@ mod tests {
         assert!(
             api.reconciler
                 .state
-                .binding_for(&TaskId::from("stale-before-build"))
+                .binding_for(&TaskId::new("stale-before-build").unwrap())
                 .is_none()
         );
         api.reconciler
             .state
-            .delete_task(&TaskId::from("stale-before-build"));
+            .delete_task(&TaskId::new("stale-before-build").unwrap());
         api.shutdown().await.unwrap();
     }
 
@@ -1089,9 +845,11 @@ mod tests {
     async fn all_four_resource_write_paths_accept_desired_manifests() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut router = RunnerRouter::new();
-        router.register(Arc::new(RecordingRunner {
-            seen: Arc::clone(&seen),
-        }));
+        router
+            .register(Arc::new(RecordingRunner {
+                seen: Arc::clone(&seen),
+            }))
+            .unwrap();
         let api = api(router).await;
 
         let created = api
@@ -1100,15 +858,16 @@ mod tests {
             .unwrap();
         assert_eq!(created.name().as_str(), "routed-resource");
         assert!(!created.metadata().resource_version().is_empty());
-        assert_eq!(created.status().phase, TaskPhase::Pending);
-        assert_eq!(created.status().observed_generation, 0);
+        assert_eq!(created.status().phase(), TaskPhase::Pending);
+        assert_eq!(created.status().observed_generation(), 0);
         wait_for_observed(&api, created.name(), 1).await;
 
         let mut labels = Labels::new();
         labels.insert("team", "platform");
         let metadata_apply = TaskManifest::new("routed-resource", created.spec().clone())
             .unwrap()
-            .with_labels(labels.clone());
+            .with_labels(labels.clone())
+            .unwrap();
         let applied = api.apply_task(metadata_apply).await.unwrap();
         assert_eq!(applied.metadata().generation(), 1);
         assert_eq!(applied.metadata().labels(), &labels);
@@ -1118,34 +877,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(applied.metadata().generation(), 2);
-        assert_eq!(applied.status().phase, TaskPhase::Pending);
-        assert_eq!(applied.status().observed_generation, 1);
+        assert_eq!(applied.status().phase(), TaskPhase::Pending);
+        assert_eq!(applied.status().observed_generation(), 1);
         wait_for_observed(&api, applied.name(), 2).await;
 
         let embedded_created = api
-            .create_with_task(
+            .create_embedded_task(
                 embedded("embedded-resource", 1_000),
                 immediate_task("unrelated-runtime-name"),
             )
             .await
             .unwrap();
         assert_eq!(embedded_created.name().as_str(), "embedded-resource");
-        assert_eq!(embedded_created.status().phase, TaskPhase::Pending);
+        assert_eq!(embedded_created.status().phase(), TaskPhase::Pending);
         wait_for_observed(&api, embedded_created.name(), 1).await;
         assert!(
-            api.get_task(&TaskId::from("unrelated-runtime-name"))
+            api.get_task(&TaskId::new("unrelated-runtime-name").unwrap())
                 .is_none()
         );
 
         let embedded_applied = api
-            .apply_with_task(
+            .apply_embedded_task(
                 embedded("embedded-resource", 2_000),
                 immediate_task("another-runtime-name"),
             )
             .await
             .unwrap();
         assert_eq!(embedded_applied.metadata().generation(), 2);
-        assert_eq!(embedded_applied.status().phase, TaskPhase::Pending);
+        assert_eq!(embedded_applied.status().phase(), TaskPhase::Pending);
         wait_for_observed(&api, embedded_applied.name(), 2).await;
 
         {
@@ -1164,7 +923,7 @@ mod tests {
     async fn embedded_revision_controls_reconciliation_generation() {
         let api = api(RunnerRouter::new()).await;
         let first = api
-            .create_with_task(
+            .create_embedded_task(
                 embedded_with_revision("embedded-revision", 10_000, "v1"),
                 cancellable_task("runtime-v1"),
             )
@@ -1173,7 +932,7 @@ mod tests {
         let first_binding = wait_for_binding(&api, first.name(), 1).await;
 
         let unchanged = api
-            .apply_with_task(
+            .apply_embedded_task(
                 embedded_with_revision("embedded-revision", 10_000, "v1"),
                 cancellable_task("unused-runtime"),
             )
@@ -1187,14 +946,14 @@ mod tests {
         );
 
         let changed = api
-            .apply_with_task(
+            .apply_embedded_task(
                 embedded_with_revision("embedded-revision", 10_000, "v2"),
                 cancellable_task("runtime-v2"),
             )
             .await
             .unwrap();
         assert_eq!(changed.metadata().generation(), 2);
-        assert_eq!(changed.status().phase, TaskPhase::Pending);
+        assert_eq!(changed.status().phase(), TaskPhase::Pending);
         let changed_binding = wait_for_binding(&api, changed.name(), 2).await;
         assert_ne!(
             changed_binding, first_binding,
@@ -1210,77 +969,85 @@ mod tests {
         let api = api(RunnerRouter::new()).await;
 
         let prebuilt_routed = api
-            .create_with_task(
+            .create_embedded_task(
                 routed("prebuilt-routed", 1_000),
                 immediate_task("arbitrary-runtime"),
             )
             .await;
         assert!(matches!(prebuilt_routed, Err(CoreError::InvalidSpec(_))));
-        assert!(api.get_task(&TaskId::from("prebuilt-routed")).is_none());
+        assert!(
+            api.get_task(&TaskId::new("prebuilt-routed").unwrap())
+                .is_none()
+        );
 
         let routed_embedded = api.create_task(embedded("routed-embedded", 1_000)).await;
         assert!(matches!(routed_embedded, Err(CoreError::InvalidSpec(_))));
-        assert!(api.get_task(&TaskId::from("routed-embedded")).is_none());
+        assert!(
+            api.get_task(&TaskId::new("routed-embedded").unwrap())
+                .is_none()
+        );
 
         api.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn sweep_name_and_slot_are_reserved_from_every_public_operation() {
+    async fn retention_worker_does_not_reserve_a_resource_name_or_slot() {
         let api = api(RunnerRouter::new()).await;
-        let sweep_name = TaskId::from(SWEEP_NAME);
-        let binding = api
-            .reconciler
-            .state
-            .binding_for(&sweep_name)
-            .expect("private bootstrap installs the sweep runtime");
-
+        let sweep_name = TaskId::new("solti-state-sweep").unwrap();
         assert!(api.get_task(&sweep_name).is_none());
-        assert!(api.state().get(&sweep_name).is_none());
-        assert!(api.list_task_runs(&sweep_name).is_empty());
-        assert!(api.subscribe_output(&sweep_name).is_none());
-        assert!(api.list_tasks_by_slot(SWEEP_SLOT).is_empty());
-        assert!(
-            api.query_tasks(&TaskQuery::new())
-                .items
-                .iter()
-                .all(|task| task.name() != &sweep_name)
-        );
 
-        let mutations = [
-            api.create_task(embedded(SWEEP_NAME, 1_000)).await,
-            api.apply_task(reserved_slot("slot-intruder")).await,
-            api.create_with_task(
-                embedded(SWEEP_NAME, 1_000),
-                immediate_task("reserved-create"),
-            )
-            .await,
-            api.apply_with_task(
-                reserved_slot("slot-intruder-embedded"),
-                immediate_task("reserved-apply"),
-            )
-            .await,
-        ];
-        assert!(
-            mutations
-                .into_iter()
-                .all(|result| matches!(result, Err(CoreError::ReservedResource(_))))
-        );
-        assert!(matches!(
-            api.delete_task(&sweep_name).await,
-            Err(CoreError::ReservedResource(_))
-        ));
-        assert!(matches!(
-            api.cancel_task(&sweep_name).await,
-            Err(CoreError::ReservedResource(_))
-        ));
+        api.create_embedded_task(
+            embedded(sweep_name.as_str(), 1_000),
+            immediate_task("former-sweep-name"),
+        )
+        .await
+        .unwrap();
+        api.create_embedded_task(
+            retention_slot("former-sweep-slot"),
+            immediate_task("former-sweep-slot-runtime"),
+        )
+        .await
+        .unwrap();
 
+        assert!(api.get_task(&sweep_name).is_some());
         assert_eq!(
-            api.reconciler.state.binding_for(&sweep_name),
-            Some(binding),
-            "rejected public operations cannot stop the maintenance runtime"
+            api.query_tasks(&TaskQuery::new().with_slot(Slot::new("solti-state-sweep").unwrap()))
+                .unwrap()
+                .items
+                .len(),
+            1
         );
-        assert!(api.reconciler.state.get_retained(&sweep_name).is_some());
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_worker_removes_expired_terminal_resources() {
+        let config = StateConfig::new()
+            .with_run_ttl(Duration::ZERO)
+            .with_task_ttl(Duration::ZERO)
+            .try_with_sweep_interval(Duration::from_millis(1))
+            .unwrap();
+        let api = SupervisorApi::builder(RunnerRouter::new())
+            .with_state_config(config)
+            .start()
+            .await
+            .unwrap();
+        let task = api
+            .create_embedded_task(
+                embedded("retained-briefly", 1_000),
+                immediate_task("retained-briefly-runtime"),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while api.get_task(task.name()).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retention worker did not remove the terminal resource");
+
         api.shutdown().await.unwrap();
     }
 
@@ -1288,7 +1055,7 @@ mod tests {
     async fn conditional_reads_and_delete_share_the_resource_operation_lock() {
         let api = api(RunnerRouter::new()).await;
         let task = api
-            .create_with_task(
+            .create_embedded_task(
                 embedded("conditional", 10_000),
                 cancellable_task("conditional-runtime"),
             )
@@ -1318,16 +1085,49 @@ mod tests {
         assert_eq!(generation, task.metadata().generation());
 
         assert!(matches!(
-            api.delete_task_where(task.name(), |_| false).await,
+            api.delete_task_where(task.name(), WritePreconditions::new(), |_| false)
+                .await,
             Err(CoreError::NotFound(_))
         ));
         assert!(api.get_task(task.name()).is_some());
         assert!(matches!(
-            api.delete_task_where(&TaskId::from("missing"), |_| true)
-                .await,
+            api.delete_task_where(
+                &TaskId::new("missing").unwrap(),
+                WritePreconditions::new(),
+                |_| true,
+            )
+            .await,
             Err(CoreError::NotFound(_))
         ));
-        api.delete_task_where(task.name(), |_| true).await.unwrap();
+        api.delete_task_where(task.name(), WritePreconditions::new(), |_| true)
+            .await
+            .unwrap();
+        assert!(api.get_task(task.name()).is_none());
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checked_delete_rejects_stale_uid_before_removing_the_resource() {
+        let api = api(RunnerRouter::new()).await;
+        let task = api
+            .create_task(routed("checked-delete", 1_000))
+            .await
+            .unwrap();
+        let stale = WritePreconditions::new().with_uid(solti_model::Uid::new("stale-uid").unwrap());
+
+        let error = api
+            .delete_task_with_preconditions(task.name(), stale)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, CoreError::Conflict(_)));
+        assert!(api.get_task(task.name()).is_some());
+
+        let current = api.get_task(task.name()).unwrap();
+        let matching = WritePreconditions::new().with_uid(current.uid().clone());
+        api.delete_task_with_preconditions(task.name(), matching)
+            .await
+            .unwrap();
         assert!(api.get_task(task.name()).is_none());
         api.shutdown().await.unwrap();
     }
@@ -1375,8 +1175,8 @@ mod tests {
             .await
             .expect("the current parent is visible");
         assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].generation, 2);
-        assert_eq!(visible[0].workload.kind(), "Subprocess");
+        assert_eq!(visible[0].generation(), 2);
+        assert_eq!(visible[0].workload().kind(), "Subprocess");
 
         state.delete_task(current.name());
         api.shutdown().await.unwrap();
@@ -1386,7 +1186,7 @@ mod tests {
     async fn conditional_apply_cannot_replace_a_hidden_existing_resource() {
         let api = api(RunnerRouter::new()).await;
         let embedded = api
-            .create_with_task(
+            .create_embedded_task(
                 embedded("hidden-apply", 10_000),
                 cancellable_task("hidden-runtime"),
             )
@@ -1394,18 +1194,22 @@ mod tests {
             .unwrap();
 
         let result = api
-            .apply_task_where(routed("hidden-apply", 1_000), |current| {
-                !matches!(current.spec().workload(), TaskWorkload::Embedded(_))
-            })
+            .apply_task_where(
+                routed("hidden-apply", 1_000),
+                WritePreconditions::new(),
+                |current| !matches!(current.spec().workload(), TaskWorkload::Embedded(_)),
+            )
             .await;
 
         assert!(matches!(result, Err(CoreError::NotFound(_))));
         assert_eq!(api.get_task(embedded.name()), Some(embedded.clone()));
 
         let created = api
-            .apply_task_where(routed("new-visible", 1_000), |_| {
-                panic!("predicate must not run for an absent resource")
-            })
+            .apply_task_where(
+                routed("new-visible", 1_000),
+                WritePreconditions::new(),
+                |_| panic!("predicate must not run for an absent resource"),
+            )
             .await
             .unwrap();
         assert_eq!(created.name().as_str(), "new-visible");
@@ -1424,19 +1228,19 @@ mod tests {
             .await
             .expect("valid desired state is retained");
 
-        assert_eq!(task.status().phase, TaskPhase::Pending);
-        assert_eq!(task.status().observed_generation, 0);
+        assert_eq!(task.status().phase(), TaskPhase::Pending);
+        assert_eq!(task.status().observed_generation(), 0);
         let failed = wait_for_reconciled(&api, task.name(), 1, ConditionStatus::False).await;
-        assert_eq!(failed.status().phase, TaskPhase::Pending);
-        assert_eq!(failed.status().attempt, 0);
-        assert!(failed.status().error.is_none());
-        assert_eq!(failed.status().reconciled().reason, "RunnerBuildFailed");
+        assert_eq!(failed.status().phase(), TaskPhase::Pending);
+        assert_eq!(failed.status().attempt(), 0);
+        assert!(failed.status().error().is_none());
+        assert_eq!(failed.status().reconciled().reason(), "RunnerNotFound");
         assert!(
             failed
                 .status()
                 .reconciled()
-                .message
-                .contains("no suitable runner")
+                .message()
+                .contains("no runner matches")
         );
         assert_eq!(api.get_task(task.name()), Some(failed));
         api.shutdown().await.unwrap();
@@ -1445,15 +1249,20 @@ mod tests {
     struct PanicRunner;
 
     impl Runner for PanicRunner {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "panic"
         }
 
-        fn supports(&self, workload: &TaskWorkload) -> bool {
-            matches!(workload, TaskWorkload::Subprocess(_))
+        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+            subprocess_workload_types()
         }
 
-        fn build_task(&self, _task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
+        fn build_task(
+            &self,
+            _task: &Task,
+            _run_id: &RunId,
+            _ctx: &BuildContext,
+        ) -> Result<TaskRef, RunnerError> {
             panic!("runner build panic")
         }
     }
@@ -1461,7 +1270,7 @@ mod tests {
     #[tokio::test]
     async fn runner_panic_is_contained_as_reconciliation_failure() {
         let mut router = RunnerRouter::new();
-        router.register(Arc::new(PanicRunner));
+        router.register(Arc::new(PanicRunner)).unwrap();
         let api = api(router).await;
 
         let task = api
@@ -1469,15 +1278,15 @@ mod tests {
             .await
             .expect("desired state remains queryable");
 
-        assert_eq!(task.status().phase, TaskPhase::Pending);
-        assert_eq!(task.status().observed_generation, 0);
+        assert_eq!(task.status().phase(), TaskPhase::Pending);
+        assert_eq!(task.status().observed_generation(), 0);
         let failed = wait_for_reconciled(&api, task.name(), 1, ConditionStatus::False).await;
-        assert_eq!(failed.status().phase, TaskPhase::Pending);
-        assert_eq!(failed.status().attempt, 0);
-        assert!(failed.status().error.is_none());
-        assert_eq!(failed.status().reconciled().reason, "RunnerBuildPanicked");
+        assert_eq!(failed.status().phase(), TaskPhase::Pending);
+        assert_eq!(failed.status().attempt(), 0);
+        assert!(failed.status().error().is_none());
+        assert_eq!(failed.status().reconciled().reason(), "RunnerBuildPanicked");
         assert_eq!(
-            failed.status().reconciled().message,
+            failed.status().reconciled().message(),
             "reconciliation preflight panicked"
         );
         api.shutdown().await.unwrap();
@@ -1487,18 +1296,18 @@ mod tests {
     async fn failed_new_generation_does_not_cancel_the_old_runtime() {
         let api = api(RunnerRouter::new()).await;
         let first = api
-            .create_with_task(embedded("upgrade", 10_000), cancellable_task("old-runtime"))
+            .create_embedded_task(embedded("upgrade", 10_000), cancellable_task("old-runtime"))
             .await
             .unwrap();
         let previous = wait_for_binding(&api, first.name(), 1).await;
 
         let failed = api.apply_task(routed("upgrade", 2_000)).await.unwrap();
         assert_eq!(failed.metadata().generation(), 2);
-        assert_eq!(failed.status().phase, TaskPhase::Pending);
-        assert_eq!(failed.status().observed_generation, 1);
+        assert_eq!(failed.status().phase(), TaskPhase::Pending);
+        assert_eq!(failed.status().observed_generation(), 1);
         let failed = wait_for_reconciled(&api, failed.name(), 2, ConditionStatus::False).await;
-        assert_eq!(failed.status().phase, TaskPhase::Pending);
-        assert_eq!(failed.status().reconciled().reason, "RunnerBuildFailed");
+        assert_eq!(failed.status().phase(), TaskPhase::Pending);
+        assert_eq!(failed.status().reconciled().reason(), "RunnerNotFound");
         assert_eq!(
             api.reconciler.state.binding_for(first.name()),
             Some(previous),
@@ -1536,15 +1345,20 @@ mod tests {
     }
 
     impl Runner for FailOnceBlockingRunner {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "fail-once-blocking"
         }
 
-        fn supports(&self, workload: &TaskWorkload) -> bool {
-            matches!(workload, TaskWorkload::Subprocess(_))
+        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+            subprocess_workload_types()
         }
 
-        fn build_task(&self, _task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
+        fn build_task(
+            &self,
+            _task: &Task,
+            run_id: &RunId,
+            _ctx: &BuildContext,
+        ) -> Result<TaskRef, RunnerError> {
             let build = self.builds.fetch_add(1, Ordering::AcqRel);
             if build == 0 {
                 return Err(RunnerError::Internal("transient build failure".into()));
@@ -1556,7 +1370,7 @@ mod tests {
                     self.retry_gate.changed.wait(&mut open);
                 }
             }
-            Ok(immediate_task("retried-runtime"))
+            Ok(immediate_task(run_id.name()))
         }
     }
 
@@ -1565,20 +1379,25 @@ mod tests {
         let builds = Arc::new(AtomicUsize::new(0));
         let retry_gate = Arc::new(BuildGate::new());
         let mut router = RunnerRouter::new();
-        router.register(Arc::new(FailOnceBlockingRunner {
-            builds: Arc::clone(&builds),
-            retry_gate: Arc::clone(&retry_gate),
-        }));
+        router
+            .register(Arc::new(FailOnceBlockingRunner {
+                builds: Arc::clone(&builds),
+                retry_gate: Arc::clone(&retry_gate),
+            }))
+            .unwrap();
         let api = api(router).await;
         let manifest = routed("manual-retry", 1_000);
 
         let created = api.create_task(manifest.clone()).await.unwrap();
         let failed = wait_for_reconciled(&api, created.name(), 1, ConditionStatus::False).await;
-        assert_eq!(failed.status().reconciled().reason, "RunnerBuildFailed");
+        assert_eq!(failed.status().reconciled().reason(), "RunnerBuildFailed");
 
         let retry = api.apply_task(manifest.clone()).await.unwrap();
         assert_eq!(retry.metadata().generation(), 1);
-        assert_eq!(retry.status().reconciled().status, ConditionStatus::Unknown);
+        assert_eq!(
+            retry.status().reconciled().status(),
+            ConditionStatus::Unknown
+        );
         wait_for_build(&retry_gate).await;
 
         let duplicate = api.apply_task(manifest).await.unwrap();
@@ -1587,8 +1406,7 @@ mod tests {
         assert_eq!(builds.load(Ordering::Acquire), 2);
 
         retry_gate.release();
-        let reconciled = wait_for_reconciled(&api, created.name(), 1, ConditionStatus::True).await;
-        assert_eq!(reconciled.status().phase, TaskPhase::Pending);
+        wait_for_reconciled(&api, created.name(), 1, ConditionStatus::True).await;
         assert_eq!(builds.load(Ordering::Acquire), 2);
         api.shutdown().await.unwrap();
     }
@@ -1607,7 +1425,7 @@ mod tests {
     async fn conditional_delete_cannot_delete_a_generation_applied_after_its_predicate() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut router = RunnerRouter::new();
-        router.register(Arc::new(RecordingRunner { seen }));
+        router.register(Arc::new(RecordingRunner { seen })).unwrap();
         let api = Arc::new(api(router).await);
         let first = api
             .create_task(routed("visibility-race", 1_000))
@@ -1622,7 +1440,7 @@ mod tests {
             let name = name.clone();
             let gate = Arc::clone(&gate);
             tokio::spawn(async move {
-                api.delete_task_where(&name, move |task| {
+                api.delete_task_where(&name, WritePreconditions::new(), move |task| {
                     assert!(matches!(
                         task.spec().workload(),
                         TaskWorkload::Subprocess(_)
@@ -1649,7 +1467,7 @@ mod tests {
             let api = Arc::clone(&api);
             let name = name.clone();
             tokio::spawn(async move {
-                api.apply_with_task(
+                api.apply_embedded_task(
                     embedded(name.as_str(), 2_000),
                     immediate_task("hidden-runtime"),
                 )
@@ -1670,7 +1488,13 @@ mod tests {
             replacement.spec().workload(),
             TaskWorkload::Embedded(_)
         ));
-        assert_eq!(api.get_task(&name), Some(replacement));
+        let stored = api.get_task(&name).expect("replacement remains stored");
+        assert_eq!(stored.uid(), replacement.uid());
+        assert_eq!(
+            stored.metadata().generation(),
+            replacement.metadata().generation()
+        );
+        assert_eq!(stored.spec(), replacement.spec());
         api.shutdown().await.unwrap();
     }
 
@@ -1680,28 +1504,30 @@ mod tests {
     }
 
     impl Runner for BlockingRunner {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "blocking"
         }
 
-        fn supports(&self, workload: &TaskWorkload) -> bool {
-            matches!(workload, TaskWorkload::Subprocess(_))
+        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+            subprocess_workload_types()
         }
 
-        fn build_task(&self, _task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
+        fn build_task(
+            &self,
+            _task: &Task,
+            run_id: &RunId,
+            _ctx: &BuildContext,
+        ) -> Result<TaskRef, RunnerError> {
             self.gate.started.store(true, Ordering::Release);
             let mut open = self.gate.open.lock();
             while !*open {
                 self.gate.changed.wait(&mut open);
             }
             let runtime_started = Arc::clone(&self.runtime_started);
-            Ok(TaskFn::arc(
-                "blocked-build-runtime",
-                move |_ctx: TaskContext| {
-                    runtime_started.store(true, Ordering::Release);
-                    async move { Ok::<(), TaskError>(()) }
-                },
-            ))
+            Ok(TaskFn::arc(run_id.name(), move |_ctx: TaskContext| {
+                runtime_started.store(true, Ordering::Release);
+                async move { Ok::<(), TaskError>(()) }
+            }))
         }
     }
 
@@ -1710,12 +1536,14 @@ mod tests {
         let gate = Arc::new(BuildGate::new());
         let runtime_started = Arc::new(AtomicBool::new(false));
         let mut router = RunnerRouter::new();
-        router.register(Arc::new(BlockingRunner {
-            gate: Arc::clone(&gate),
-            runtime_started: Arc::clone(&runtime_started),
-        }));
+        router
+            .register(Arc::new(BlockingRunner {
+                gate: Arc::clone(&gate),
+                runtime_started: Arc::clone(&runtime_started),
+            }))
+            .unwrap();
         let api = api(router).await;
-        let name = TaskId::from("detached-request");
+        let name = TaskId::new("detached-request").unwrap();
 
         let committed = tokio::time::timeout(
             Duration::from_millis(250),
@@ -1724,8 +1552,8 @@ mod tests {
         .await
         .expect("desired commit must not wait for runner build")
         .unwrap();
-        assert_eq!(committed.status().phase, TaskPhase::Pending);
-        assert_eq!(committed.status().observed_generation, 0);
+        assert_eq!(committed.status().phase(), TaskPhase::Pending);
+        assert_eq!(committed.status().observed_generation(), 0);
         assert_eq!(api.get_task(&name), Some(committed));
 
         wait_for_build(&gate).await;
@@ -1748,15 +1576,20 @@ mod tests {
     }
 
     impl Runner for FirstBuildBlockingRunner {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "first-build-blocking"
         }
 
-        fn supports(&self, workload: &TaskWorkload) -> bool {
-            matches!(workload, TaskWorkload::Subprocess(_))
+        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+            subprocess_workload_types()
         }
 
-        fn build_task(&self, task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
+        fn build_task(
+            &self,
+            _task: &Task,
+            run_id: &RunId,
+            _ctx: &BuildContext,
+        ) -> Result<TaskRef, RunnerError> {
             if self.builds.fetch_add(1, Ordering::AcqRel) == 0 {
                 self.gate.started.store(true, Ordering::Release);
                 let mut open = self.gate.open.lock();
@@ -1764,10 +1597,7 @@ mod tests {
                     self.gate.changed.wait(&mut open);
                 }
             }
-            Ok(cancellable_task(&format!(
-                "runtime-generation-{}",
-                task.metadata().generation()
-            )))
+            Ok(cancellable_task(run_id.name()))
         }
     }
 
@@ -1775,18 +1605,21 @@ mod tests {
     async fn newer_apply_reconciles_while_previous_preflight_is_blocked() {
         let gate = Arc::new(BuildGate::new());
         let mut router = RunnerRouter::new();
-        router.register(Arc::new(FirstBuildBlockingRunner {
-            gate: Arc::clone(&gate),
-            builds: AtomicUsize::new(0),
-        }));
+        router
+            .register(Arc::new(FirstBuildBlockingRunner {
+                gate: Arc::clone(&gate),
+                builds: AtomicUsize::new(0),
+            }))
+            .unwrap();
         let api = api(router).await;
-        let name = TaskId::from("latest-generation-wins");
+        let name = TaskId::new("latest-generation-wins").unwrap();
 
         let first = api
             .write(
                 routed(name.as_str(), 1_000),
                 RuntimeSource::Routed,
                 WriteMode::Create,
+                WritePreconditions::new(),
                 true,
             )
             .await
@@ -1804,7 +1637,7 @@ mod tests {
         .expect("a newer desired commit must not wait for the old preflight")
         .unwrap();
         assert_eq!(second.metadata().generation(), 2);
-        assert_eq!(second.status().phase, TaskPhase::Pending);
+        assert_eq!(second.status().phase(), TaskPhase::Pending);
 
         let second_binding = wait_for_binding(&api, &name, 2).await;
         wait_for_observed(&api, &name, 2).await;
@@ -1827,18 +1660,21 @@ mod tests {
         let gate = Arc::new(BuildGate::new());
         let runtime_started = Arc::new(AtomicBool::new(false));
         let mut router = RunnerRouter::new();
-        router.register(Arc::new(BlockingRunner {
-            gate: Arc::clone(&gate),
-            runtime_started: Arc::clone(&runtime_started),
-        }));
+        router
+            .register(Arc::new(BlockingRunner {
+                gate: Arc::clone(&gate),
+                runtime_started: Arc::clone(&runtime_started),
+            }))
+            .unwrap();
         let api = api(router).await;
-        let name = TaskId::from("delete-before-bind");
+        let name = TaskId::new("delete-before-bind").unwrap();
 
         let scheduled = api
             .write(
                 routed(name.as_str(), 1_000),
                 RuntimeSource::Routed,
                 WriteMode::Create,
+                WritePreconditions::new(),
                 true,
             )
             .await
@@ -1875,13 +1711,30 @@ mod tests {
         api.shutdown().await.unwrap();
 
         let error = api
-            .create_with_task(
+            .create_embedded_task(
                 embedded("too-late", 1_000),
                 immediate_task("too-late-runtime"),
             )
             .await
             .unwrap_err();
         assert!(matches!(error, CoreError::ShuttingDown));
-        assert!(api.get_task(&TaskId::from("too-late")).is_none());
+        assert!(api.get_task(&TaskId::new("too-late").unwrap()).is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_and_drop_close_task_watches() {
+        let shutdown_api = api(RunnerRouter::new()).await;
+        let mut shutdown_watch = shutdown_api
+            .watch_tasks(&TaskFilter::new(), Some("0"))
+            .unwrap();
+        shutdown_api.shutdown().await.unwrap();
+        assert!(shutdown_watch.next().await.is_none());
+
+        let dropped_api = api(RunnerRouter::new()).await;
+        let mut dropped_watch = dropped_api
+            .watch_tasks(&TaskFilter::new(), Some("0"))
+            .unwrap();
+        drop(dropped_api);
+        assert!(dropped_watch.next().await.is_none());
     }
 }

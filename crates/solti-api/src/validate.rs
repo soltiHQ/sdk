@@ -5,19 +5,14 @@ use solti_model::{Slot, TaskId};
 
 /// Parse one task resource name through the model-owned validation boundary.
 pub(crate) fn parse_task_id(field: &'static str, value: String) -> Result<TaskId, ApiError> {
-    let id = TaskId::from(value);
-    id.validate_format()
-        .map_err(|error| ApiError::InvalidRequest(format!("invalid {field}: {error}")))?;
-    Ok(id)
+    TaskId::new(value)
+        .map_err(|error| ApiError::InvalidRequest(format!("invalid {field}: {error}")))
 }
 
 /// Parse one slot through the model-owned validation boundary.
 #[cfg(any(feature = "grpc", feature = "http"))]
 pub(crate) fn validate_slot(slot: String) -> Result<Slot, ApiError> {
-    let slot = Slot::from(slot);
-    slot.validate_format()
-        .map_err(|error| ApiError::InvalidRequest(format!("invalid slot: {error}")))?;
-    Ok(slot)
+    Slot::new(slot).map_err(|error| ApiError::InvalidRequest(format!("invalid slot: {error}")))
 }
 
 /// Reject `timeout_ms == 0`.
@@ -30,12 +25,19 @@ pub(crate) fn validate_timeout(timeout_ms: u64) -> Result<u64, ApiError> {
 }
 
 #[cfg(any(feature = "grpc", feature = "http"))]
-pub(crate) fn clamp_list_limit(raw: u32) -> usize {
+pub(crate) fn parse_list_limit(raw: u32) -> Result<usize, ApiError> {
     if raw == 0 {
-        return solti_model::DEFAULT_LIMIT;
+        return Ok(solti_model::DEFAULT_LIMIT);
     }
-    let bounded = usize::try_from(raw).unwrap_or(solti_model::MAX_LIMIT);
-    bounded.min(solti_model::MAX_LIMIT)
+    let limit = usize::try_from(raw)
+        .map_err(|_| ApiError::InvalidRequest(format!("limit `{raw}` is out of range")))?;
+    if limit > solti_model::MAX_LIMIT {
+        return Err(ApiError::InvalidRequest(format!(
+            "limit cannot exceed {}",
+            solti_model::MAX_LIMIT
+        )));
+    }
+    Ok(limit)
 }
 
 #[cfg(test)]
@@ -98,28 +100,25 @@ mod tests {
 
     #[cfg(any(feature = "grpc", feature = "http"))]
     #[test]
-    fn clamp_list_limit_zero_uses_default() {
-        assert_eq!(clamp_list_limit(0), solti_model::DEFAULT_LIMIT);
+    fn parse_list_limit_zero_uses_default() {
+        assert_eq!(parse_list_limit(0).unwrap(), solti_model::DEFAULT_LIMIT);
     }
 
     #[cfg(any(feature = "grpc", feature = "http"))]
     #[test]
-    fn clamp_list_limit_within_bounds_passes_through() {
-        assert_eq!(clamp_list_limit(1), 1);
-        assert_eq!(clamp_list_limit(50), 50);
+    fn parse_list_limit_within_bounds_passes_through() {
+        assert_eq!(parse_list_limit(1).unwrap(), 1);
+        assert_eq!(parse_list_limit(50).unwrap(), 50);
         assert_eq!(
-            clamp_list_limit(solti_model::MAX_LIMIT as u32),
+            parse_list_limit(solti_model::MAX_LIMIT as u32).unwrap(),
             solti_model::MAX_LIMIT
         );
     }
 
     #[cfg(any(feature = "grpc", feature = "http"))]
     #[test]
-    fn clamp_list_limit_above_cap_is_clamped() {
-        assert_eq!(
-            clamp_list_limit(solti_model::MAX_LIMIT as u32 + 1),
-            solti_model::MAX_LIMIT
-        );
-        assert_eq!(clamp_list_limit(u32::MAX), solti_model::MAX_LIMIT);
+    fn parse_list_limit_rejects_values_above_cap() {
+        assert!(parse_list_limit(solti_model::MAX_LIMIT as u32 + 1).is_err());
+        assert!(parse_list_limit(u32::MAX).is_err());
     }
 }

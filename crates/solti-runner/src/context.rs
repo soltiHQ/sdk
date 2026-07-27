@@ -1,4 +1,4 @@
-//! # Build context.
+//! # Build context
 //!
 //! [`BuildContext`] carries shared dependencies injected into runners at
 //! task-build time.
@@ -23,7 +23,7 @@ use crate::output::{OutputPublisherHandle, noop_output_publisher};
 /// ## Defaults
 ///
 /// - `env`: empty [`RunnerEnv`]
-/// - `metrics`: [`NoOpMetrics`](crate::NoOpMetrics) (zero-cost)
+/// - `metrics`: [`NoOpMetrics`](crate::NoOpMetrics)
 /// - `output_publisher`: a no-op publisher (live output disabled)
 ///
 /// ## Also
@@ -87,10 +87,13 @@ impl BuildContext {
     /// ## Example
     ///
     /// ```
-    /// use solti_runner::{BuildContext, RunnerType};
+    /// use solti_runner::{BuildContext, RunnerErrorKind, RunnerType};
     ///
     /// let ctx = BuildContext::default();
-    /// ctx.metrics().record_task_started(RunnerType::Subprocess);
+    /// ctx.metrics().record_runner_error(
+    ///     RunnerType::Subprocess,
+    ///     RunnerErrorKind::SpawnFailed,
+    /// );
     /// ```
     pub fn metrics(&self) -> &MetricsHandle {
         &self.metrics
@@ -105,7 +108,7 @@ impl BuildContext {
     ///
     /// let ctx = BuildContext::default();
     /// assert!(ctx.output_publisher()
-    ///     .sink_for(&solti_model::TaskId::from("task-1"), 1, 1)
+    ///     .sink_for(&solti_model::TaskId::new("task-1").unwrap(), 1, 1)
     ///     .is_none());
     /// ```
     pub fn output_publisher(&self) -> &OutputPublisherHandle {
@@ -135,10 +138,13 @@ impl BuildContext {
     /// ## Example
     ///
     /// ```
-    /// use solti_runner::{BuildContext, RunnerType, noop_metrics};
+    /// use solti_runner::{BuildContext, RunnerErrorKind, RunnerType, noop_metrics};
     ///
     /// let ctx = BuildContext::default().with_metrics(noop_metrics());
-    /// ctx.metrics().record_task_started(RunnerType::Subprocess);
+    /// ctx.metrics().record_runner_error(
+    ///     RunnerType::Subprocess,
+    ///     RunnerErrorKind::SpawnFailed,
+    /// );
     /// ```
     pub fn with_metrics(mut self, metrics: MetricsHandle) -> Self {
         self.metrics = metrics;
@@ -168,12 +174,6 @@ impl fmt::Debug for BuildContext {
             .field("env_len", &self.env.len())
             .field("metrics", &"<handle>")
             .finish()
-    }
-}
-
-impl fmt::Display for BuildContext {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "BuildContext(env_len={})", self.env.len())
     }
 }
 
@@ -245,20 +245,10 @@ mod tests {
 
         let ctx = BuildContext::new(env, metrics1).with_metrics(metrics2);
 
-        ctx.metrics()
-            .record_task_started(crate::RunnerType::Subprocess);
-    }
-
-    #[test]
-    fn display_includes_env_length() {
-        let mut env = RunnerEnv::new();
-        env.push("FOO", "bar");
-
-        let metrics = crate::metrics::noop_metrics();
-        let ctx = BuildContext::new(env, metrics);
-
-        let s = ctx.to_string();
-        assert_eq!(s, "BuildContext(env_len=1)");
+        ctx.metrics().record_runner_error(
+            crate::RunnerType::Subprocess,
+            crate::RunnerErrorKind::SpawnFailed,
+        );
     }
 
     #[test]
@@ -266,11 +256,9 @@ mod tests {
         let ctx = BuildContext::default();
         let handle = ctx.metrics().clone();
 
-        handle.record_task_started(crate::RunnerType::Subprocess);
-        handle.record_task_completed(
+        handle.record_runner_error(
             crate::RunnerType::Subprocess,
-            crate::MetricOutcome::Success,
-            100,
+            crate::RunnerErrorKind::SpawnFailed,
         );
     }
     #[test]
@@ -278,7 +266,7 @@ mod tests {
         let ctx = BuildContext::default();
         assert!(
             ctx.output_publisher()
-                .sink_for(&TaskId::from("task"), 1, 1)
+                .sink_for(&TaskId::new("task").unwrap(), 1, 1)
                 .is_none()
         );
     }
@@ -291,14 +279,14 @@ mod tests {
         assert!(Arc::ptr_eq(ctx.output_publisher(), &publisher));
         assert_eq!(
             ctx.output_publisher()
-                .sink_for(&TaskId::from("task"), 3, 7)
+                .sink_for(&TaskId::new("task").unwrap(), 3, 7)
                 .expect("enabled sink")
                 .attempt(),
             7
         );
         assert_eq!(
             ctx.output_publisher()
-                .sink_for(&TaskId::from("task"), 3, 7)
+                .sink_for(&TaskId::new("task").unwrap(), 3, 7)
                 .expect("enabled sink")
                 .generation(),
             3

@@ -7,7 +7,7 @@ use std::num::NonZeroU32;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AdmissionPolicy, BackoffPolicy, RestartPolicy, RunnerSelector, Slot, TaskWorkload, Timeout,
+    AdmissionPolicy, BackoffPolicy, LabelSelector, RestartPolicy, Slot, TaskWorkload, Timeout,
     error::{ModelError, ModelResult},
 };
 
@@ -44,7 +44,7 @@ pub struct TaskSpec {
     max_retries: Option<NonZeroU32>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    runner_selector: Option<RunnerSelector>,
+    runner_selector: Option<LabelSelector>,
 }
 
 impl TaskSpec {
@@ -96,7 +96,7 @@ impl TaskSpec {
 
     /// Label selector for runner routing, if present.
     #[inline]
-    pub fn runner_selector(&self) -> Option<&RunnerSelector> {
+    pub fn runner_selector(&self) -> Option<&LabelSelector> {
         self.runner_selector.as_ref()
     }
 }
@@ -125,9 +125,9 @@ impl TaskSpec {
     /// .expect("valid spec");
     /// ```
     pub fn builder(
-        slot: impl Into<Slot>,
+        slot: impl AsRef<str>,
         workload: TaskWorkload,
-        timeout: impl Into<Timeout>,
+        timeout: impl Into<u64>,
     ) -> TaskSpecBuilder {
         TaskSpecBuilder::new(slot, workload, timeout)
     }
@@ -141,7 +141,7 @@ impl TaskSpec {
     /// ## Example
     ///
     /// ```
-    /// use solti_model::{EmbeddedSpec, Labels, RunnerSelector, TaskSpec, TaskWorkload};
+    /// use solti_model::{EmbeddedSpec, Labels, LabelSelector, TaskSpec, TaskWorkload};
     ///
     /// let mut labels = Labels::new();
     /// labels.insert("zone", "eu");
@@ -150,12 +150,12 @@ impl TaskSpec {
     /// let spec = TaskSpec::builder("build", workload, 1_000u64)
     ///     .build()
     ///     .unwrap()
-    ///     .with_runner_selector(RunnerSelector::from_labels(labels));
+    ///     .with_runner_selector(LabelSelector::from_labels(labels));
     ///
     /// assert!(spec.runner_selector().is_some());
     /// ```
     #[inline]
-    pub fn with_runner_selector(mut self, sel: RunnerSelector) -> Self {
+    pub fn with_runner_selector(mut self, sel: LabelSelector) -> Self {
         self.runner_selector = Some(sel);
         self
     }
@@ -228,11 +228,6 @@ impl TaskSpec {
     /// - `runner_selector` requirements are structurally valid
     fn validate_structural(&self) -> ModelResult<()> {
         self.slot.validate_format()?;
-        if self.timeout.as_millis() == 0 {
-            return Err(ModelError::Invalid(
-                "timeout must be greater than zero".into(),
-            ));
-        }
         self.workload.validate()?;
         self.backoff.validate()?;
         if let Some(ref sel) = self.runner_selector {
@@ -267,30 +262,30 @@ impl TaskSpec {
 /// assert_eq!(spec.admission(), AdmissionPolicy::Replace);
 /// ```
 pub struct TaskSpecBuilder {
-    runner_selector: Option<RunnerSelector>,
+    runner_selector: Option<LabelSelector>,
 
     workload: TaskWorkload,
-    slot: Slot,
+    slot: String,
 
     backoff: BackoffPolicy,
     restart: RestartPolicy,
-    timeout: Timeout,
+    timeout_ms: u64,
     max_retries: Option<NonZeroU32>,
 
     admission: AdmissionPolicy,
 }
 
 impl TaskSpecBuilder {
-    fn new(slot: impl Into<Slot>, workload: TaskWorkload, timeout: impl Into<Timeout>) -> Self {
+    fn new(slot: impl AsRef<str>, workload: TaskWorkload, timeout: impl Into<u64>) -> Self {
         Self {
             runner_selector: None,
 
             workload,
-            slot: slot.into(),
+            slot: slot.as_ref().to_owned(),
 
             restart: RestartPolicy::default(),
             backoff: BackoffPolicy::default(),
-            timeout: timeout.into(),
+            timeout_ms: timeout.into(),
 
             admission: AdmissionPolicy::default(),
             max_retries: None,
@@ -340,7 +335,7 @@ impl TaskSpecBuilder {
 
     /// Set runner selector.
     #[must_use]
-    pub fn runner_selector(mut self, sel: RunnerSelector) -> Self {
+    pub fn runner_selector(mut self, sel: LabelSelector) -> Self {
         self.runner_selector = Some(sel);
         self
     }
@@ -367,11 +362,11 @@ impl TaskSpecBuilder {
             runner_selector: self.runner_selector,
 
             workload: self.workload,
-            slot: self.slot,
+            slot: Slot::new(self.slot)?,
 
             restart: self.restart,
             backoff: self.backoff,
-            timeout: self.timeout,
+            timeout: Timeout::new(self.timeout_ms)?,
 
             admission: self.admission,
             max_retries: self.max_retries,
@@ -385,7 +380,7 @@ mod raw {
     use super::*;
 
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
     pub(super) struct TaskSpecRaw {
         slot: Slot,
         workload: TaskWorkload,
@@ -397,7 +392,7 @@ mod raw {
         max_retries: Option<u32>,
 
         #[serde(default)]
-        runner_selector: Option<RunnerSelector>,
+        runner_selector: Option<LabelSelector>,
     }
 
     impl TryFrom<TaskSpecRaw> for TaskSpec {
@@ -554,6 +549,14 @@ mod tests {
 
         let err = serde_json::from_value::<TaskSpec>(json).unwrap_err();
         assert!(err.to_string().contains("maxRetries"), "error: {err}");
+    }
+
+    #[test]
+    fn serde_rejects_unknown_fields() {
+        let mut json = serde_json::to_value(valid_spec()).unwrap();
+        json["unexpected"] = serde_json::json!(true);
+
+        assert!(serde_json::from_value::<TaskSpec>(json).is_err());
     }
 
     #[test]

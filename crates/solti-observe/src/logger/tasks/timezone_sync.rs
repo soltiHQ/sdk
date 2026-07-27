@@ -1,6 +1,6 @@
 //! Timezone-sync supervised task.
 //!
-//! [`timezone_sync`](crate::timezone_sync) returns a `(TaskRef, TaskManifest)`
+//! [`timezone_sync`](crate::timezone_sync) returns a `(TaskManifest, TaskRef)`
 //! pair for a periodic task that tries to refresh the local UTC offset.
 
 use solti_model::{
@@ -10,16 +10,16 @@ use solti_model::{
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tracing::debug;
 
-use crate::logger::object::timezone::sync_local_offset;
+use crate::logger::object::sync_local_offset;
 
 /// Logical slot name for the timezone sync task.
-pub const TZ_SYNC_SLOT: &str = "solti-logger-tz-sync";
+const TIMEZONE_SYNC_SLOT: &str = "solti-observe-timezone-sync";
 
 /// Per-attempt timeout in milliseconds (60 seconds).
-pub const TZ_SYNC_TIMEOUT_MS: u64 = 60_000;
+const TIMEZONE_SYNC_TIMEOUT_MS: u64 = 60_000;
 
 /// Interval between successful sync attempts in milliseconds (1 hour).
-pub const TZ_SYNC_PERIOD_MS: u64 = 3_600_000;
+const TIMEZONE_SYNC_PERIOD_MS: u64 = 3_600_000;
 
 /// Initial backoff delay on failure (ms).
 const BACKOFF_FIRST_MS: u64 = 5_000;
@@ -32,10 +32,9 @@ const BACKOFF_FACTOR: f64 = 2.0;
 
 /// Build the timezone sync task and its supervision specification.
 ///
-/// The task calls `UtcOffset::current_local_offset()` and updates the global cache when the platform allows it.
-/// On many Unix systems this works best before Tokio starts worker threads, so [`crate::init_local_offset`] is still the important startup call.
+/// The task refreshes the offset used by local log timestamps.
 ///
-/// ## Scheduling
+/// # Scheduling
 ///
 /// | Scenario      | Delay           | Strategy                              |
 /// |---------------|-----------------|---------------------------------------|
@@ -43,32 +42,26 @@ const BACKOFF_FACTOR: f64 = 2.0;
 /// | Failure       | 5 s to 5 min    | Exponential backoff with equal jitter |
 /// | Duplicate     | Replaces        | [`AdmissionPolicy::Replace`]          |
 ///
-/// ## Example
+/// # Example
 ///
 /// ```
 /// use solti_observe::timezone_sync;
 ///
-/// let (task_ref, task) = timezone_sync();
+/// let (manifest, task_ref) = timezone_sync();
 ///
-/// assert_eq!(task.slot().as_str(), "solti-logger-tz-sync");
+/// assert_eq!(manifest.slot().as_str(), "solti-observe-timezone-sync");
 /// let _ = task_ref;
 /// ```
-pub fn timezone_sync() -> (TaskRef, TaskManifest) {
-    let task: TaskRef = TaskFn::arc(TZ_SYNC_SLOT, |ctx: TaskContext| async move {
+pub fn timezone_sync() -> (TaskManifest, TaskRef) {
+    let task: TaskRef = TaskFn::arc(TIMEZONE_SYNC_SLOT, |ctx: TaskContext| async move {
         debug!("timezone sync started");
 
         if ctx.is_cancelled() {
             return Err(TaskError::Canceled);
         }
-        match sync_local_offset() {
-            Ok(()) => {
-                debug!("timezone offset sync success");
-                Ok(())
-            }
-            Err(e) => Err(TaskError::fail(format!(
-                "failed to sync timezone offset: {e}"
-            ))),
-        }
+        sync_local_offset().map_err(|error| TaskError::fail(error.to_string()))?;
+        debug!("timezone offset sync completed");
+        Ok(())
     });
 
     let backoff = BackoffPolicy {
@@ -84,17 +77,17 @@ pub fn timezone_sync() -> (TaskRef, TaskManifest) {
     ))
     .expect("timezone sync revision must be valid");
     let spec = TaskSpec::builder(
-        TZ_SYNC_SLOT,
+        TIMEZONE_SYNC_SLOT,
         TaskWorkload::Embedded(embedded),
-        TZ_SYNC_TIMEOUT_MS,
+        TIMEZONE_SYNC_TIMEOUT_MS,
     )
-    .restart(RestartPolicy::periodic(TZ_SYNC_PERIOD_MS))
+    .restart(RestartPolicy::periodic(TIMEZONE_SYNC_PERIOD_MS))
     .backoff(backoff)
     .admission(AdmissionPolicy::Replace)
     .build()
     .expect("timezone sync spec must be valid");
 
-    let manifest =
-        TaskManifest::new(TZ_SYNC_SLOT, spec).expect("timezone sync Task manifest must be valid");
-    (task, manifest)
+    let manifest = TaskManifest::new(TIMEZONE_SYNC_SLOT, spec)
+        .expect("timezone sync Task manifest must be valid");
+    (manifest, task)
 }

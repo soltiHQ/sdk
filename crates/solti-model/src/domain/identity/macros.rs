@@ -20,10 +20,12 @@ macro_rules! arc_str_newtype {
         $vis struct $ty(std::sync::Arc<str>);
 
         impl $ty {
-            /// Create a new identifier from a string slice.
+            /// Validate and create an identifier from a string slice.
             #[inline]
-            pub fn new(s: &str) -> Self {
-                Self(std::sync::Arc::from(s))
+            pub fn new(s: impl AsRef<str>) -> $crate::ModelResult<Self> {
+                let id = Self(std::sync::Arc::from(s.as_ref()));
+                id.validate_format()?;
+                Ok(id)
             }
 
             /// Access the underlying string slice.
@@ -39,24 +41,12 @@ macro_rules! arc_str_newtype {
             }
         }
 
-        impl From<String> for $ty {
-            #[inline]
-            fn from(s: String) -> Self {
-                Self(std::sync::Arc::from(s))
-            }
-        }
+        impl std::str::FromStr for $ty {
+            type Err = $crate::ModelError;
 
-        impl From<&str> for $ty {
             #[inline]
-            fn from(s: &str) -> Self {
-                Self(std::sync::Arc::from(s))
-            }
-        }
-
-        impl From<std::sync::Arc<str>> for $ty {
-            #[inline]
-            fn from(s: std::sync::Arc<str>) -> Self {
-                Self(s)
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Self::new(s)
             }
         }
 
@@ -114,9 +104,7 @@ macro_rules! arc_str_newtype {
             /// past the charset rules (ids leak into filesystem and cgroup paths).
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
                 let s = String::deserialize(deserializer)?;
-                let id = Self(std::sync::Arc::from(s));
-                id.validate_format().map_err(serde::de::Error::custom)?;
-                Ok(id)
+                Self::new(s).map_err(serde::de::Error::custom)
             }
         }
     };

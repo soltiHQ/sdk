@@ -1,7 +1,7 @@
-//! # State event subscriber.
+//! # Runtime observer.
 //!
-//! [`StateSubscriber`] implements [`Subscribe`](taskvisor::Subscribe) and owns three responsibilities driven off taskvisor's lifecycle events:
-//! - project attempt events into [`TaskState`](super::TaskState) transitions and `TaskRun` records;
+//! [`RuntimeObserver`] implements [`Subscribe`](taskvisor::Subscribe) and owns three responsibilities driven off taskvisor's lifecycle events:
+//! - project attempt events into [`TaskState`](crate::TaskState) transitions and `TaskRun` records;
 //! - project typed `TaskFinished` outcomes into the resource-level terminal phase;
 //! - drive per-run output announcements (`RunStarted` / `RunFinished`).
 //!
@@ -9,7 +9,7 @@
 //! The direct completion outcome repairs a dropped terminal event. For a
 //! registered task, `TaskRemoved` normally acts as a per-subscriber FIFO
 //! barrier before binding/output cleanup. The direct outcome finalizes after a
-//! bounded wait if that barrier is lost or delayed, so per-attempt detail
+//! bounded wait if that barrier is lost or delayed. Per-attempt detail
 //! remains best-effort.
 
 use std::{
@@ -24,14 +24,27 @@ use taskvisor::{Event, EventKind, Subscribe};
 use tokio::sync::watch;
 use tracing::{trace, warn};
 
-use super::{LifecycleGate, ResourceGeneration, RuntimeBinding, TaskState};
 use crate::map::phase::{phase_for_outcome, phase_for_outcome_kind, phase_for_rejection};
 use crate::output::OutputHub;
+use crate::state::{ResourceGeneration, RuntimeBinding, TaskState};
 use solti_model::{TaskId, TaskPhase};
 
-const STATE_SUBSCRIBER_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(2048).unwrap();
+const RUNTIME_OBSERVER_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(2048).unwrap();
 const REMOVED_ID_CAPACITY: usize = 4096;
 const EVENT_BARRIER_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Serializes short state/output lifecycle commits across event, waiter, and
+/// management paths.
+#[derive(Clone, Default)]
+struct LifecycleGate {
+    inner: Arc<Mutex<()>>,
+}
+
+impl LifecycleGate {
+    fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.inner.lock()
+    }
+}
 
 #[derive(Clone)]
 struct Finalization {
@@ -90,17 +103,17 @@ impl CompletionBarriers {
 ///
 /// ## Also
 ///
-/// - [`TaskState`](super::TaskState) storage mutated by this subscriber.
-/// - [`SupervisorApi::new`](crate::SupervisorApi::new) auto-registers this subscriber.
-pub struct StateSubscriber {
+/// - [`TaskState`](crate::TaskState) stores the projected state.
+/// - [`SupervisorApiBuilder`](crate::SupervisorApiBuilder) installs this observer.
+pub(crate) struct RuntimeObserver {
     state: TaskState,
     output_hub: Arc<OutputHub>,
     lifecycle_gate: LifecycleGate,
     completion_barriers: Mutex<CompletionBarriers>,
 }
 
-impl StateSubscriber {
-    /// Create a state subscriber over shared task state and output hub.
+impl RuntimeObserver {
+    /// Create a runtime observer over shared task state and output hub.
     pub(crate) fn with_output_hub(state: TaskState, output_hub: Arc<OutputHub>) -> Self {
         Self {
             state,
@@ -396,7 +409,7 @@ impl StateSubscriber {
     }
 }
 
-impl StateSubscriber {
+impl RuntimeObserver {
     /// Apply one event while the shared lifecycle gate is held.
     fn apply_event_locked(&self, event: &Event) {
         let Some(tv) = event.id else {
@@ -601,7 +614,7 @@ impl StateSubscriber {
     }
 }
 
-impl Subscribe for StateSubscriber {
+impl Subscribe for RuntimeObserver {
     fn on_event(&self, event: &Event) {
         let _lifecycle = self.lifecycle_gate.lock();
         if event.kind == EventKind::SubscriberOverflow {
@@ -623,12 +636,12 @@ impl Subscribe for StateSubscriber {
 
     /// Per-subscriber event-queue depth: `2048`, a deliberate 2x of taskvisor's `1024` default.
     fn queue_capacity(&self) -> NonZeroUsize {
-        STATE_SUBSCRIBER_QUEUE_CAPACITY
+        RUNTIME_OBSERVER_QUEUE_CAPACITY
     }
 }
 
 #[cfg(test)]
-impl StateSubscriber {
+impl RuntimeObserver {
     pub(crate) fn finalize_outcome_immediately_for_test(
         &self,
         tv_raw: u64,
@@ -681,7 +694,7 @@ mod tests {
     }
 
     fn add_test_task(state: &TaskState, task_name: &str) -> TaskId {
-        let id = TaskId::from(task_name);
+        let id = TaskId::new(task_name).unwrap();
         state.add_task(TaskManifest::new(id.clone(), test_spec()).expect("valid manifest"));
         id
     }
@@ -702,12 +715,12 @@ mod tests {
         }
     }
 
-    fn setup(task_name: &str) -> (StateSubscriber, TaskState, TaskId) {
+    fn setup(task_name: &str) -> (RuntimeObserver, TaskState, TaskId) {
         let state = TaskState::new();
         let id = add_test_task(&state, task_name);
         let binding = bind_test_task(&state, &id, taskvisor::TaskId::for_tests());
         assert!(state.transition_attempt_starting(&binding, 1));
-        let sub = StateSubscriber::with_output_hub(
+        let sub = RuntimeObserver::with_output_hub(
             state.clone(),
             Arc::new(OutputHub::new(OutputConfig::default())),
         );
@@ -722,8 +735,8 @@ mod tests {
     fn prepared_binding_routes_the_first_event_without_replay() {
         let state = TaskState::new();
         let id = add_test_task(&state, "prepared-start");
-        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
-        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
+        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
+        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
         let tv = taskvisor::TaskId::for_tests();
         let resource = ResourceGeneration::from_task(&state.get(&id).expect("task must exist"));
 
@@ -734,9 +747,9 @@ mod tests {
                 .with_attempt(1),
         );
 
-        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Running);
+        assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Running);
         assert_eq!(state.list_runs(&id).len(), 1);
-        assert_eq!(state.list_runs(&id)[0].attempt, 1);
+        assert_eq!(state.list_runs(&id)[0].attempt(), 1);
         assert!(registry.subscribe_raw(&id).is_some());
     }
 
@@ -746,10 +759,10 @@ mod tests {
         let id = add_test_task(&state, "dropped-start");
         let tv = taskvisor::TaskId::for_tests();
         bind_test_task(&state, &id, tv);
-        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
+        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
         registry.ensure_channel(id.clone());
         let mut output = registry.subscribe_raw(&id).expect("output channel");
-        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
+        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
 
         sub.on_event(
             &Event::new(EventKind::AttemptFailed)
@@ -760,12 +773,12 @@ mod tests {
         );
 
         let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().attempt, 2);
-        assert_eq!(task.status().phase, TaskPhase::Failed);
+        assert_eq!(task.status().attempt(), 2);
+        assert_eq!(task.status().phase(), TaskPhase::Failed);
         let runs = state.list_runs(&id);
         assert_eq!(runs.len(), 1);
-        assert_eq!((runs[0].generation, runs[0].attempt), (1, 2));
-        assert_eq!(runs[0].phase, TaskPhase::Failed);
+        assert_eq!((runs[0].generation(), runs[0].attempt()), (1, 2));
+        assert_eq!(runs[0].phase(), TaskPhase::Failed);
         assert!(matches!(
             output.try_recv(),
             Ok(OutputEvent::RunFinished {
@@ -783,10 +796,10 @@ mod tests {
         let id = add_test_task(&state, "missing-attempt");
         let tv = taskvisor::TaskId::for_tests();
         bind_test_task(&state, &id, tv);
-        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
+        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
         registry.ensure_channel(id.clone());
         let mut output = registry.subscribe_raw(&id).expect("output channel");
-        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
+        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
 
         sub.on_event(
             &Event::new(EventKind::AttemptFailed)
@@ -795,8 +808,8 @@ mod tests {
         );
 
         let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().phase, TaskPhase::Pending);
-        assert_eq!(task.status().attempt, 0);
+        assert_eq!(task.status().phase(), TaskPhase::Pending);
+        assert_eq!(task.status().attempt(), 0);
         assert!(state.list_runs(&id).is_empty());
         assert!(output.try_recv().is_err());
     }
@@ -808,16 +821,16 @@ mod tests {
         let tv = taskvisor::TaskId::for_tests();
         let old_binding = bind_test_task(&state, &id, tv);
         assert!(state.transition_attempt_starting(&old_binding, 1));
-        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
+        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
         registry.ensure_channel(id.clone());
         let mut output = registry.subscribe_raw(&id).expect("output channel");
-        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
+        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
 
         let desired =
             TaskManifest::new(id.clone(), changed_test_spec()).expect("valid desired task");
         let commit = state.apply_desired(&desired).expect("apply must succeed");
         assert_eq!(commit.task.metadata().generation(), 2);
-        assert_eq!(commit.task.status().phase, TaskPhase::Pending);
+        assert_eq!(commit.task.status().phase(), TaskPhase::Pending);
 
         sub.on_event(
             &Event::new(EventKind::AttemptFailed)
@@ -829,12 +842,12 @@ mod tests {
 
         let current = state.get(&id).expect("current task exists");
         assert_eq!(current.metadata().generation(), 2);
-        assert_eq!(current.status().phase, TaskPhase::Pending);
-        assert_eq!(current.status().attempt, 0);
+        assert_eq!(current.status().phase(), TaskPhase::Pending);
+        assert_eq!(current.status().attempt(), 0);
         let runs = state.list_runs(&id);
         assert_eq!(runs.len(), 1);
-        assert_eq!((runs[0].generation, runs[0].attempt), (1, 1));
-        assert_eq!(runs[0].phase, TaskPhase::Failed);
+        assert_eq!((runs[0].generation(), runs[0].attempt()), (1, 1));
+        assert_eq!(runs[0].phase(), TaskPhase::Failed);
         assert!(matches!(
             output.try_recv(),
             Ok(OutputEvent::RunFinished {
@@ -860,12 +873,12 @@ mod tests {
         assert_ne!(old_task.uid(), recreated.uid());
         let new_tv = taskvisor::TaskId::for_tests();
         bind_test_task(&state, &recreated_id, new_tv);
-        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
+        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
         registry.ensure_channel(recreated_id.clone());
         let mut output = registry
             .subscribe_raw(&recreated_id)
             .expect("output channel");
-        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
+        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
 
         sub.on_event(
             &Event::new(EventKind::AttemptFailed)
@@ -876,7 +889,7 @@ mod tests {
 
         let current = state.get(&recreated_id).expect("new task remains");
         assert_eq!(current.uid(), recreated.uid());
-        assert_eq!(current.status().phase, TaskPhase::Pending);
+        assert_eq!(current.status().phase(), TaskPhase::Pending);
         assert!(state.list_runs(&recreated_id).is_empty());
         assert_eq!(state.tv_for(&recreated_id), Some(new_tv));
         assert!(output.try_recv().is_err());
@@ -890,9 +903,9 @@ mod tests {
         let stale = bind_test_task(&state, &id, old_tv);
         let current_tv = taskvisor::TaskId::for_tests();
         let current = bind_test_task(&state, &id, current_tv);
-        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
+        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
         registry.ensure_channel(id.clone());
-        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
+        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
 
         assert!(!sub.fail_bound_reconciliation(
             &stale,
@@ -900,7 +913,7 @@ mod tests {
             "stale intake failure".into(),
         ));
         assert_eq!(state.tv_for(&id), Some(current_tv));
-        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Pending);
+        assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Pending);
         assert!(registry.subscribe_raw(&id).is_some());
 
         assert!(sub.fail_bound_reconciliation(
@@ -910,17 +923,20 @@ mod tests {
         ));
         assert!(state.tv_for(&id).is_none());
         let failed = state.get(&id).expect("desired resource is retained");
-        assert_eq!(failed.status().phase, TaskPhase::Pending);
-        assert_eq!(failed.status().observed_generation, 1);
-        assert_eq!(failed.status().attempt, 0);
-        assert!(failed.status().error.is_none());
-        assert_eq!(failed.status().reconciled().status, ConditionStatus::False);
+        assert_eq!(failed.status().phase(), TaskPhase::Pending);
+        assert_eq!(failed.status().observed_generation(), 1);
+        assert_eq!(failed.status().attempt(), 0);
+        assert!(failed.status().error().is_none());
         assert_eq!(
-            failed.status().reconciled().reason,
+            failed.status().reconciled().status(),
+            ConditionStatus::False
+        );
+        assert_eq!(
+            failed.status().reconciled().reason(),
             "RuntimeSubmissionFailed"
         );
         assert_eq!(
-            failed.status().reconciled().message,
+            failed.status().reconciled().message(),
             "controller intake failed"
         );
         assert!(registry.subscribe_raw(&id).is_none());
@@ -932,10 +948,10 @@ mod tests {
         let id = add_test_task(&state, "fast-attempt");
         let tv = taskvisor::TaskId::for_tests();
         bind_test_task(&state, &id, tv);
-        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
+        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
         registry.ensure_channel(id.clone());
         let mut output = registry.subscribe_raw(&id).expect("output channel");
-        let sub = Arc::new(StateSubscriber::with_output_hub(
+        let sub = Arc::new(RuntimeObserver::with_output_hub(
             state.clone(),
             Arc::clone(&registry),
         ));
@@ -963,9 +979,9 @@ mod tests {
         completion.await.expect("completion task");
 
         let task = state.get(&id).expect("retained terminal task");
-        assert_eq!(task.status().phase, TaskPhase::Succeeded);
+        assert_eq!(task.status().phase(), TaskPhase::Succeeded);
         assert_eq!(state.list_runs(&id).len(), 1);
-        assert_eq!(state.list_runs(&id)[0].phase, TaskPhase::Succeeded);
+        assert_eq!(state.list_runs(&id)[0].phase(), TaskPhase::Succeeded);
         assert!(state.tv_for(&id).is_none());
         assert!(registry.subscribe_raw(&id).is_none());
         assert!(matches!(
@@ -992,7 +1008,10 @@ mod tests {
         sub.on_event(&Event::new(EventKind::TaskRemoved).with_id(tv));
 
         assert!(state.tv_for(&id).is_none());
-        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Succeeded);
+        assert_eq!(
+            state.get(&id).unwrap().status().phase(),
+            TaskPhase::Succeeded
+        );
     }
 
     #[tokio::test]
@@ -1014,10 +1033,10 @@ mod tests {
     #[test]
     fn idempotent_delete_does_not_evict_an_unknown_external_channel() {
         let state = TaskState::new();
-        let id = TaskId::from("not-yet-submitted");
-        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
+        let id = TaskId::new("not-yet-submitted").unwrap();
+        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
         registry.ensure_channel(id.clone());
-        let sub = StateSubscriber::with_output_hub(state, Arc::clone(&registry));
+        let sub = RuntimeObserver::with_output_hub(state, Arc::clone(&registry));
 
         assert!(!sub.delete_after_cleanup(&id, None));
         assert!(registry.subscribe_raw(&id).is_some());
@@ -1038,11 +1057,10 @@ mod tests {
 
         assert!(state.tv_for(&id).is_none());
         let task = state.get(&id).expect("retained failed task");
-        assert_eq!(task.status().phase, TaskPhase::Failed);
+        assert_eq!(task.status().phase(), TaskPhase::Failed);
         assert!(
             task.status()
-                .error
-                .as_deref()
+                .error()
                 .is_some_and(|error| error.contains("outcome unavailable"))
         );
     }
@@ -1062,7 +1080,7 @@ mod tests {
                     .with_reason(reason),
             );
 
-            assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Running);
+            assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Running);
             assert_eq!(state.tv_for(&id), Some(tv));
         }
     }
@@ -1099,7 +1117,7 @@ mod tests {
                     .with_reason(reason),
             );
 
-            assert_eq!(state.get(&id).unwrap().status().phase, expected);
+            assert_eq!(state.get(&id).unwrap().status().phase(), expected);
             assert_eq!(state.tv_for(&id), Some(tv));
         }
     }
@@ -1116,7 +1134,7 @@ mod tests {
                 .with_reason("future_registry_rejection"),
         );
 
-        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Failed);
+        assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Failed);
         assert_eq!(state.tv_for(&id), Some(tv));
     }
 
@@ -1160,9 +1178,9 @@ mod tests {
         let id = add_test_task(&state, "rejected-task");
         let tv = taskvisor::TaskId::for_tests();
         bind_test_task(&state, &id, tv);
-        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
+        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
         registry.ensure_channel(id.clone());
-        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
+        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
 
         let ev = Event::new(EventKind::ControllerRejected)
             .with_task("some-slot")
@@ -1172,11 +1190,10 @@ mod tests {
         sub.on_event(&ev);
 
         let task = state.get(&id).expect("entry kept for observability");
-        assert_eq!(task.status().phase, TaskPhase::Failed);
+        assert_eq!(task.status().phase(), TaskPhase::Failed);
         assert!(
             task.status()
-                .error
-                .as_deref()
+                .error()
                 .is_some_and(|e| e.contains("queue_full")),
             "rejection reason must be recorded"
         );
@@ -1192,14 +1209,14 @@ mod tests {
 
     #[test]
     fn controller_rejection_becomes_sweepable_only_after_waiter_cleanup() {
-        use crate::state::StateConfig;
+        use crate::StateConfig;
         use std::time::Duration;
 
         let state = TaskState::new();
         let id = add_test_task(&state, "rej-reap");
         let tv = taskvisor::TaskId::for_tests();
         bind_test_task(&state, &id, tv);
-        let sub = StateSubscriber::with_output_hub(
+        let sub = RuntimeObserver::with_output_hub(
             state.clone(),
             Arc::new(OutputHub::new(OutputConfig::default())),
         );
@@ -1212,11 +1229,9 @@ mod tests {
                 .with_reason("queue_full: 3/3"),
         );
 
-        let config = StateConfig {
-            run_ttl: Duration::ZERO,
-            task_ttl: Duration::ZERO,
-            ..StateConfig::default()
-        };
+        let config = StateConfig::new()
+            .with_run_ttl(Duration::ZERO)
+            .with_task_ttl(Duration::ZERO);
         let (_, removed) = state.sweep(&config);
         assert_eq!(removed, 0, "a still-bound submission must not be swept");
 
@@ -1237,7 +1252,7 @@ mod tests {
 
     #[test]
     fn task_finished_failed_becomes_sweepable_only_after_waiter_cleanup() {
-        use crate::state::StateConfig;
+        use crate::StateConfig;
         use std::time::Duration;
 
         let state = TaskState::new();
@@ -1245,7 +1260,7 @@ mod tests {
         let tv = taskvisor::TaskId::for_tests();
         let binding = bind_test_task(&state, &id, tv);
         assert!(state.transition_attempt_starting(&binding, 1));
-        let sub = StateSubscriber::with_output_hub(
+        let sub = RuntimeObserver::with_output_hub(
             state.clone(),
             Arc::new(OutputHub::new(OutputConfig::default())),
         );
@@ -1262,11 +1277,9 @@ mod tests {
             "TaskFinished projects state but the direct outcome still owns the binding"
         );
 
-        let config = StateConfig {
-            run_ttl: Duration::ZERO,
-            task_ttl: Duration::ZERO,
-            ..StateConfig::default()
-        };
+        let config = StateConfig::new()
+            .with_run_ttl(Duration::ZERO)
+            .with_task_ttl(Duration::ZERO);
         let (_, removed) = state.sweep(&config);
         assert_eq!(removed, 0, "a still-bound task must not be reaped");
 
@@ -1281,7 +1294,7 @@ mod tests {
 
     #[test]
     fn task_finished_fatal_becomes_sweepable_only_after_waiter_cleanup() {
-        use crate::state::StateConfig;
+        use crate::StateConfig;
         use std::time::Duration;
 
         let state = TaskState::new();
@@ -1289,7 +1302,7 @@ mod tests {
         let tv = taskvisor::TaskId::for_tests();
         let binding = bind_test_task(&state, &id, tv);
         assert!(state.transition_attempt_starting(&binding, 1));
-        let sub = StateSubscriber::with_output_hub(
+        let sub = RuntimeObserver::with_output_hub(
             state.clone(),
             Arc::new(OutputHub::new(OutputConfig::default())),
         );
@@ -1306,11 +1319,9 @@ mod tests {
             "TaskFinished must not take binding ownership from the direct outcome"
         );
 
-        let config = StateConfig {
-            run_ttl: Duration::ZERO,
-            task_ttl: Duration::ZERO,
-            ..StateConfig::default()
-        };
+        let config = StateConfig::new()
+            .with_run_ttl(Duration::ZERO)
+            .with_task_ttl(Duration::ZERO);
         let (_, removed) = state.sweep(&config);
         assert_eq!(removed, 0, "a still-bound task must not be reaped");
 
@@ -1329,7 +1340,7 @@ mod tests {
         let id = add_test_task(&state, "victim");
         let tv = taskvisor::TaskId::for_tests();
         bind_test_task(&state, &id, tv);
-        let sub = StateSubscriber::with_output_hub(
+        let sub = RuntimeObserver::with_output_hub(
             state.clone(),
             Arc::new(OutputHub::new(OutputConfig::default())),
         );
@@ -1343,7 +1354,7 @@ mod tests {
 
         let task = state.get(&id).expect("entry kept");
         assert_eq!(
-            task.status().phase,
+            task.status().phase(),
             TaskPhase::Canceled,
             "user-initiated removal is a cancellation, not a failure"
         );
@@ -1357,7 +1368,7 @@ mod tests {
         sub.on_event(&ev);
 
         let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().phase, TaskPhase::Canceled);
+        assert_eq!(task.status().phase(), TaskPhase::Canceled);
     }
 
     #[test]
@@ -1372,13 +1383,10 @@ mod tests {
         sub.on_event(&ev);
 
         let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().phase, TaskPhase::Failed);
-        assert_eq!(task.status().exit_code, Some(137));
-        assert_eq!(
-            task.status().error.as_deref(),
-            Some("fatal error (no retry): boom"),
-        );
-        assert!(task.status().phase.is_terminal());
+        assert_eq!(task.status().phase(), TaskPhase::Failed);
+        assert_eq!(task.status().exit_code(), Some(137));
+        assert_eq!(task.status().error(), Some("fatal error (no retry): boom"),);
+        assert!(task.status().phase().is_terminal());
     }
 
     #[test]
@@ -1392,8 +1400,8 @@ mod tests {
         sub.on_event(&ev);
 
         let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().phase, TaskPhase::Failed);
-        assert_eq!(task.status().exit_code, None);
+        assert_eq!(task.status().phase(), TaskPhase::Failed);
+        assert_eq!(task.status().exit_code(), None);
     }
 
     #[test]
@@ -1406,7 +1414,7 @@ mod tests {
 
         sub.on_event(&ev);
 
-        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Running);
+        assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Running);
     }
 
     #[test]
@@ -1421,8 +1429,8 @@ mod tests {
         sub.on_event(&ev);
 
         let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().phase, TaskPhase::Failed);
-        assert_eq!(task.status().exit_code, Some(2));
+        assert_eq!(task.status().phase(), TaskPhase::Failed);
+        assert_eq!(task.status().exit_code(), Some(2));
     }
 
     #[test]
@@ -1437,25 +1445,25 @@ mod tests {
         sub.on_event(&ev);
 
         let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().phase, TaskPhase::Exhausted);
-        assert_eq!(task.status().exit_code, Some(1));
+        assert_eq!(task.status().phase(), TaskPhase::Exhausted);
+        assert_eq!(task.status().exit_code(), Some(1));
     }
 
     fn setup_pending_with_output_hub(
         task_name: &str,
-    ) -> (StateSubscriber, TaskState, Arc<OutputHub>, TaskId) {
+    ) -> (RuntimeObserver, TaskState, Arc<OutputHub>, TaskId) {
         let state = TaskState::new();
         let id = add_test_task(&state, task_name);
         bind_test_task(&state, &id, taskvisor::TaskId::for_tests());
-        let registry = Arc::new(OutputHub::new(OutputConfig::new(16)));
+        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
         registry.ensure_channel(id.clone());
-        let sub = StateSubscriber::with_output_hub(state.clone(), Arc::clone(&registry));
+        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
         (sub, state, registry, id)
     }
 
     fn setup_with_output_hub(
         task_name: &str,
-    ) -> (StateSubscriber, TaskState, Arc<OutputHub>, TaskId) {
+    ) -> (RuntimeObserver, TaskState, Arc<OutputHub>, TaskId) {
         let setup = setup_pending_with_output_hub(task_name);
         let binding = setup.1.binding_for(&setup.3).expect("task must be bound");
         assert!(setup.1.transition_attempt_starting(&binding, 1));
@@ -1627,9 +1635,9 @@ mod tests {
         );
 
         let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().phase, TaskPhase::Timeout);
+        assert_eq!(task.status().phase(), TaskPhase::Timeout);
         assert_eq!(
-            task.status().error.as_deref(),
+            task.status().error(),
             Some("task attempt timed out after 250 ms"),
         );
         assert!(matches!(
@@ -1648,7 +1656,7 @@ mod tests {
                 .with_reason("boom"),
         );
 
-        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Failed);
+        assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Failed);
     }
 
     #[test]
@@ -1663,11 +1671,11 @@ mod tests {
 
         let task = state.get(&id).expect("task exists");
         assert_eq!(
-            task.status().phase,
+            task.status().phase(),
             TaskPhase::Canceled,
             "the typed outcome selects cancellation"
         );
-        assert!(task.status().error.is_none());
+        assert!(task.status().error().is_none());
     }
 
     #[test]
@@ -1695,8 +1703,8 @@ mod tests {
             );
 
             let task = state.get(&id).expect("task exists");
-            assert_eq!(task.status().phase, expected_phase);
-            assert_eq!(task.status().error.as_deref(), Some(expected_error));
+            assert_eq!(task.status().phase(), expected_phase);
+            assert_eq!(task.status().error(), Some(expected_error));
         }
     }
 
@@ -1713,12 +1721,12 @@ mod tests {
 
         let task = state.get(&id).expect("task exists");
         assert_eq!(
-            task.status().phase,
+            task.status().phase(),
             TaskPhase::Succeeded,
             "normal one-shot completion must stay Succeeded"
         );
         assert!(
-            task.status().error.is_none(),
+            task.status().error().is_none(),
             "Completed ignores diagnostic reason text"
         );
     }
@@ -1732,7 +1740,7 @@ mod tests {
                 .with_reason("fatal-looking diagnostic"),
         );
 
-        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Running);
+        assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Running);
     }
 
     #[test]

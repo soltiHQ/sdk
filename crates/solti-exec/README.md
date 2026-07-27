@@ -107,9 +107,9 @@ let backend = SubprocessBackendConfig::new()
     });
 ```
 
-All settings are optional — without a backend config the subprocess inherits parent process settings.
+Backend controls are optional. The child environment is cleared by default.
 
-By default, confinement is **best-effort**: if the sandbox cannot be applied (non-Linux host, missing `CAP_SETPCAP`, cgroup join failure) the child runs *unconfined* with a warning. Call `.with_require_enforcement(true)` to fail **closed** instead — a non-Linux host is rejected at config time, and on Linux a cgroup-join or capability-drop failure aborts the spawn. `keep_caps` is only meaningful with `drop_all_caps = true` (validated at config time).
+Configured limits and security controls are fail-closed. Invalid or unsupported settings are rejected when the runner is created. A pre-exec enforcement failure aborts the spawn. `keep_caps` requires `drop_all_caps = true`.
 
 ## Sandboxing (pre_exec hooks)
 ```text
@@ -118,39 +118,37 @@ By default, confinement is **best-effort**: if the sandbox cannot be applied (no
  │  child process (before execve)                                    │
  │                                                                   │
  │  1. rlimits: getrlimit → clamp → setrlimit                        │
- │  2. cgroup:  open /sys/fs/cgroup/{name}/cgroup.procs → write PID  │
- │  3. security: capget → mask → capset → no_new_privs               │
+ │  2. cgroup: join the prepared per-attempt group                   │
+ │  3. security: namespaces → identity → capabilities → seccomp     │
  │                                                                   │
  │  execve(command, args)                                            │
  └───────────────────────────────────────────────────────────────────┘
 ```
 
-All pre_exec hooks are **async-signal-safe**: zero heap allocation, only raw libc syscalls, `Copy`-only captures.
+Pre-exec hooks use operating-system process-control calls. Configuration is prepared before the process is forked.
 
 ## Registration
 ```text
  register_subprocess_runner(&mut router, "default")
      ├──► SubprocessRunner::new("default")
-     ├──► label "runner-name" = "default"
+     ├──► label "solti.io/runner-name" = "default"
      └──► router.register_with_labels()
 
  register_subprocess_runner_with_backend(&mut router, "secure", backend)
      ├──► validate backend config
      ├──► SubprocessRunner::with_config("secure", backend)
-     ├──► label "runner-name" = "secure"
+     ├──► label "solti.io/runner-name" = "secure"
      └──► router.register_with_labels()
 ```
 
-Duplicate names are rejected via `router.contains_label()` → `ExecError::DuplicateRunner`.
+Duplicate names are rejected by `RunnerRouter`.
 
 ## Error model
 ```text
  Variant               When
  ──────                ────
- DuplicateRunner       runner with this name already registered
+ Router                runner registration failure
  InvalidRunnerConfig   backend config validation failure
- InvalidSpec           task spec validation failure (empty command, etc.)
- Internal              unexpected internal error
  Io                    OS-level I/O error
 ```
 
@@ -158,16 +156,18 @@ Duplicate names are rejected via `router.contains_label()` → `ExecError::Dupli
 
 | Flag         | What it enables                                        |
 |--------------|--------------------------------------------------------|
-| `subprocess` | `subprocess` module, `libc`, `base64`, `tokio/process` |
+| `subprocess` | subprocess runner and its operating-system integration |
+| `seccomp`    | Linux seccomp blocklist                                |
 
 ## Notes
 - `SubprocessRunner` implements `Runner` trait from `solti-runner`.
-- Mode resolution: `Command` → direct exec; `Script` → on each attempt, decode the base64 body, write a fresh `NamedTempFile` (mode 0600), and exec the interpreter with its path. The tempfile stays alive for that attempt and is unlinked on drop.
+- Mode resolution: `Command` → direct exec; `Script` → decode the body at build time, write a fresh 0600 tempfile for each attempt, and exec the interpreter with its path. The tempfile is unlinked after the attempt.
 - Script body is capped at `solti_model::MAX_SCRIPT_BODY_BYTES` (2 MiB, decoded) by the model; the tempfile transport avoids Linux's per-arg `MAX_ARG_STRLEN` (128 KiB) limit that `-c <inline>` would hit.
-- Cancel uses **process-group kill** on Unix: `Command::process_group(0)` sets pgid = child pid, then cancel sends `SIGKILL` to `-pgid` so forked helpers (`sleep 1000 &`) die together with the parent. `kill_on_drop(true)` covers the drop-without-wait path.
-- Environment merge: runner env overrides task env (last-writer-wins via `BTreeMap`). Parent env is currently inherited — no automatic `env_clear()`.
+- Cancel, dropped futures, and normal completion stop the full process group on Unix.
+- The parent environment is cleared by default. `EnvPolicy::Inherit` and `EnvPolicy::Allowlist` are explicit choices.
 - Cgroup lifecycle is two-phase: `prepare` (mkdir + write limits in parent) → `attach` (join PID in child via pre_exec).
-- Cgroup names are auto-generated: `{runner}-{slot}-{seq:x}-{timestamp:x}`.
+- Cgroups are created under the process's current delegated cgroup unless `with_cgroup_parent` sets another parent.
+- Cgroup names are auto-generated per attempt: `{runner}-{slot}-{seq:x}-{timestamp:x}-{attempt:x}`.
 - Line truncation uses `Cow::Borrowed` for the common case (zero-alloc hot path).
 - `log_stream` is double-headed: every line goes to `tracing` and, when enabled, to the attempt's `solti_runner::OutputSink`. `BuildContext` exposes only an `OutputPublisher`; its default disables live output, while `solti-core` injects the standard non-blocking publisher.
 - `LinuxCapability` values match `<linux/capability.h>` from Linux 6.x.

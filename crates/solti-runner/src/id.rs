@@ -1,4 +1,4 @@
-//! # Run identifier generation.
+//! # Run identifier generation
 //!
 //! [`RunId`] is the per-execution task name for taskvisor.
 //!
@@ -92,11 +92,16 @@ impl RunId {
 pub fn make_run_id(runner_name: &str, slot: &str) -> RunId {
     let seq = next_seq();
     let name = format!("{runner_name}-{slot}-{seq}");
-    debug_assert!(
-        solti_model::TaskId::from(name.as_str())
-            .validate_format()
-            .is_ok(),
-        "make_run_id produced an invalid identity {name:?}: runner/slot has illegal chars or is too long"
-    );
     RunId { name, seq }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::make_run_id;
+
+    #[test]
+    fn accepts_valid_runner_and_slot_identity_characters() {
+        let id = make_run_id("Runner_A", "Build.Step_1");
+        assert!(id.name().starts_with("Runner_A-Build.Step_1-"));
+    }
 }

@@ -4,16 +4,19 @@
 
 use solti_model::{OutputChunk, OutputEvent, StreamKind};
 
+use crate::error::ApiError;
 use crate::proto_api;
 
 use super::time::system_time_to_ms;
 
 /// Convert one [`OutputEvent`] into its protobuf representation.
-pub(crate) fn output_event_to_proto(ev: OutputEvent) -> proto_api::StreamTaskLogsResponse {
+pub(crate) fn output_event_to_proto(
+    ev: OutputEvent,
+) -> Result<proto_api::StreamTaskLogsResponse, ApiError> {
     use proto_api::stream_task_logs_response::Kind;
 
     let kind = match ev {
-        OutputEvent::Chunk(c) => Kind::Chunk(output_chunk_to_proto(c)),
+        OutputEvent::Chunk(c) => Kind::Chunk(output_chunk_to_proto(c)?),
         OutputEvent::RunStarted {
             generation,
             attempt,
@@ -21,7 +24,7 @@ pub(crate) fn output_event_to_proto(ev: OutputEvent) -> proto_api::StreamTaskLog
         } => Kind::RunStarted(proto_api::RunStarted {
             generation,
             attempt,
-            started_at: system_time_to_ms(started_at),
+            started_at: system_time_to_ms(started_at)?,
         }),
         OutputEvent::RunFinished {
             generation,
@@ -32,24 +35,28 @@ pub(crate) fn output_event_to_proto(ev: OutputEvent) -> proto_api::StreamTaskLog
             generation,
             attempt,
             exit_code,
-            finished_at: system_time_to_ms(finished_at),
+            finished_at: system_time_to_ms(finished_at)?,
         }),
         OutputEvent::Lagged { skipped } => Kind::Lagged(proto_api::Lagged { skipped }),
-        _ => return proto_api::StreamTaskLogsResponse { kind: None },
+        _ => {
+            return Err(ApiError::Internal(
+                "handler returned an unsupported output event".into(),
+            ));
+        }
     };
 
-    proto_api::StreamTaskLogsResponse { kind: Some(kind) }
+    Ok(proto_api::StreamTaskLogsResponse { kind: Some(kind) })
 }
 
-fn output_chunk_to_proto(c: OutputChunk) -> proto_api::OutputChunk {
-    proto_api::OutputChunk {
+fn output_chunk_to_proto(c: OutputChunk) -> Result<proto_api::OutputChunk, ApiError> {
+    Ok(proto_api::OutputChunk {
         generation: c.generation,
         stream: stream_kind_to_proto(c.stream) as i32,
-        ts: system_time_to_ms(c.ts),
+        ts: system_time_to_ms(c.ts)?,
         attempt: c.attempt,
         line: c.line,
         seq: c.seq,
-    }
+    })
 }
 
 fn stream_kind_to_proto(k: StreamKind) -> proto_api::OutputStreamKind {
@@ -78,7 +85,7 @@ mod tests {
             line: Bytes::from_static(b"error: boom"),
         });
 
-        let proto = output_event_to_proto(ev);
+        let proto = output_event_to_proto(ev).unwrap();
         let kind = proto.kind.expect("kind must be set");
         let chunk = match kind {
             proto_api::stream_task_logs_response::Kind::Chunk(c) => c,
@@ -106,7 +113,7 @@ mod tests {
             line: original,
         });
 
-        let proto = output_event_to_proto(ev);
+        let proto = output_event_to_proto(ev).unwrap();
         let chunk = match proto.kind.unwrap() {
             proto_api::stream_task_logs_response::Kind::Chunk(c) => c,
             other => panic!("expected Chunk, got {other:?}"),
@@ -125,7 +132,7 @@ mod tests {
             attempt: 3,
             started_at: UNIX_EPOCH + Duration::from_millis(1234),
         };
-        match output_event_to_proto(ev).kind.unwrap() {
+        match output_event_to_proto(ev).unwrap().kind.unwrap() {
             proto_api::stream_task_logs_response::Kind::RunStarted(r) => {
                 assert_eq!(r.attempt, 3);
                 assert_eq!(r.generation, 4);
@@ -143,7 +150,7 @@ mod tests {
             exit_code: Some(0),
             finished_at: UNIX_EPOCH + Duration::from_millis(2222),
         };
-        match output_event_to_proto(ev).kind.unwrap() {
+        match output_event_to_proto(ev).unwrap().kind.unwrap() {
             proto_api::stream_task_logs_response::Kind::RunFinished(r) => {
                 assert_eq!(r.attempt, 2);
                 assert_eq!(r.generation, 5);
@@ -157,7 +164,7 @@ mod tests {
     #[test]
     fn lagged_carries_skipped_count() {
         let ev = OutputEvent::Lagged { skipped: 1500 };
-        match output_event_to_proto(ev).kind.unwrap() {
+        match output_event_to_proto(ev).unwrap().kind.unwrap() {
             proto_api::stream_task_logs_response::Kind::Lagged(l) => {
                 assert_eq!(l.skipped, 1500);
             }

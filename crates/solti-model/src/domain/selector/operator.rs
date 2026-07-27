@@ -1,6 +1,6 @@
 //! Selector operators.
 //!
-//! [`SelectorOperator`] defines comparison operators for label-based runner selection.
+//! [`SelectorOperator`] defines comparison operators for label selection.
 
 use std::fmt;
 

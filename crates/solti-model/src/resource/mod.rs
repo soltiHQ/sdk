@@ -21,6 +21,9 @@ pub use condition::{ConditionStatus, TaskCondition, TaskConditionType};
 pub(crate) mod metadata;
 pub use metadata::{ObjectMeta, Uid};
 
+mod preconditions;
+pub use preconditions::WritePreconditions;
+
 mod status;
 pub use status::TaskStatus;
 

@@ -24,7 +24,7 @@ impl<'de> Deserialize<'de> for WorkloadTypeMeta {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct RawWorkloadTypeMeta {
             api_version: String,
             kind: String,
@@ -77,6 +77,7 @@ impl<'de> Deserialize<'de> for EmbeddedSpec {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct RawEmbeddedSpec {
             revision: String,
         }
@@ -156,7 +157,7 @@ pub enum TaskWorkload {
 
     /// Built-in / code-defined task that does not require a runner.
     ///
-    /// Used only with `SupervisorApi::create_with_task()` or `SupervisorApi::apply_with_task()`.
+    /// Used only with `SupervisorApi::create_embedded_task()` or `SupervisorApi::apply_embedded_task()`.
     /// Runner-backed reconciliation must reject this workload before runner selection.
     Embedded(EmbeddedSpec),
 
@@ -361,7 +362,7 @@ impl Serialize for TaskWorkload {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RawWorkloadEnvelope {
     api_version: String,
     kind: String,
@@ -569,6 +570,18 @@ mod tests {
     }
 
     #[test]
+    fn built_in_workload_rejects_unknown_envelope_and_spec_fields() {
+        let workload = TaskWorkload::Embedded(EmbeddedSpec::new("build-42").unwrap());
+        let mut envelope = serde_json::to_value(&workload).unwrap();
+        envelope["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<TaskWorkload>(envelope).is_err());
+
+        let mut spec = serde_json::to_value(workload).unwrap();
+        spec["spec"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<TaskWorkload>(spec).is_err());
+    }
+
+    #[test]
     fn extension_workload_roundtrips_unknown_gvk() {
         let workload = TaskWorkload::Extension(
             ExtensionWorkload::new(
@@ -585,6 +598,25 @@ mod tests {
         assert_eq!(back, workload);
         assert_eq!(back.api_version(), "tasks.example.io/v1alpha1");
         assert_eq!(back.kind(), "ImageResize");
+    }
+
+    #[test]
+    fn extension_spec_preserves_application_owned_fields() {
+        let workload = TaskWorkload::Extension(
+            ExtensionWorkload::new(
+                "tasks.example.io/v1alpha1",
+                "ImageResize",
+                serde_json::json!({
+                    "unexpectedToSolti": true,
+                    "nested": { "applicationField": [1, 2, 3] }
+                }),
+            )
+            .unwrap(),
+        );
+
+        let back: TaskWorkload =
+            serde_json::from_value(serde_json::to_value(&workload).unwrap()).unwrap();
+        assert_eq!(back, workload);
     }
 
     #[test]
@@ -711,11 +743,11 @@ mod tests {
 ///
 /// Supports two execution strategies via [`SubprocessMode`]:
 /// - command: direct binary execution;
-/// - script: script body passed to a [`Runtime`](crate::Runtime).
+/// - script: script body passed to an explicit interpreter.
 ///
 /// Common fields (`env`, `cwd`, `fail_on_non_zero`) apply to both modes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SubprocessSpec {
     /// Execution strategy (command or script).
@@ -772,7 +804,7 @@ impl SubprocessSpec {
 
 /// Specification for WebAssembly module execution via a WASI-compatible runtime.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct WasmSpec {
     /// Path to the `.wasm` module.
@@ -787,7 +819,7 @@ pub struct WasmSpec {
 
 /// Specification for OCI-compatible container execution.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ContainerSpec {
     /// Container image (e.g. `"nginx:latest"`, `"docker.io/library/redis:7"`).

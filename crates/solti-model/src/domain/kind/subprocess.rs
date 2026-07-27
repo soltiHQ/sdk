@@ -6,7 +6,6 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
-use crate::Runtime;
 use crate::error::{ModelError, ModelResult};
 
 /// Maximum script body size (after base64 decode) accepted by the model.
@@ -57,22 +56,20 @@ fn decode_script_body(body: &str, max_bytes: usize) -> ModelResult<Vec<u8>> {
 /// | Variant   | What it does                                                        |
 /// |-----------|---------------------------------------------------------------------|
 /// | `Command` | Direct binary execution via `execve(command, args)`                 |
-/// | `Script`  | Decoded script input for a runner-selected interpreter transport   |
+/// | `Script`  | Decoded script input for an explicitly selected interpreter        |
 ///
 /// The built-in `solti-exec` runner materializes scripts into temporary files
-/// and invokes `runtime_command temporary_file ...args`. Consequently,
-/// [`Runtime::Custom`](crate::Runtime::Custom)'s legacy inline `flag` is kept
-/// for wire compatibility but is not used by that runner.
+/// and invokes `interpreter temporary_file ...args`.
 ///
 /// ## Example
 ///
 /// ```
 /// use base64::Engine;
 /// use base64::engine::general_purpose::STANDARD as BASE64;
-/// use solti_model::{Runtime, SubprocessMode};
+/// use solti_model::SubprocessMode;
 ///
 /// let mode = SubprocessMode::Script {
-///     runtime: Runtime::Bash,
+///     interpreter: "bash".into(),
 ///     body: BASE64.encode("echo hello"),
 ///     args: vec![],
 /// };
@@ -80,7 +77,7 @@ fn decode_script_body(body: &str, max_bytes: usize) -> ModelResult<Vec<u8>> {
 /// assert_eq!(mode.decode_body().unwrap(), "echo hello");
 /// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SubprocessMode {
     /// Direct binary execution.
@@ -91,10 +88,10 @@ pub enum SubprocessMode {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
     },
-    /// Script execution via a runtime interpreter.
+    /// Script execution via an explicit interpreter.
     Script {
-        /// Interpreter used to execute the script.
-        runtime: Runtime,
+        /// Interpreter executable name or path.
+        interpreter: String,
         /// Base64-encoded (standard alphabet) script body.
         body: String,
         /// Additional arguments passed after the script body.
@@ -114,10 +111,10 @@ impl SubprocessMode {
     /// ```
     /// use base64::Engine;
     /// use base64::engine::general_purpose::STANDARD as BASE64;
-    /// use solti_model::{Runtime, SubprocessMode};
+    /// use solti_model::SubprocessMode;
     ///
     /// let mode = SubprocessMode::Script {
-    ///     runtime: Runtime::Bash,
+    ///     interpreter: "bash".into(),
     ///     body: BASE64.encode("echo hello"),
     ///     args: vec![],
     /// };
@@ -140,10 +137,10 @@ impl SubprocessMode {
     /// ```
     /// use base64::Engine;
     /// use base64::engine::general_purpose::STANDARD as BASE64;
-    /// use solti_model::{Runtime, SubprocessMode};
+    /// use solti_model::SubprocessMode;
     ///
     /// let mode = SubprocessMode::Script {
-    ///     runtime: Runtime::Bash,
+    ///     interpreter: "bash".into(),
     ///     body: BASE64.encode("echo hello"),
     ///     args: vec![],
     /// };
@@ -168,8 +165,8 @@ impl SubprocessMode {
     ///
     /// Checks:
     /// - `Command`: command must not be empty.
-    /// - `Script`: body must not be empty, must be valid base64, must decode to UTF-8.
-    /// - `Script` + `Custom` runtime: command and flag must not be empty.
+    /// - `Script`: interpreter and body must not be empty.
+    /// - `Script`: body must be valid base64 and decode to UTF-8.
     ///
     /// ## Example
     ///
@@ -192,24 +189,18 @@ impl SubprocessMode {
                     ));
                 }
             }
-            SubprocessMode::Script { runtime, body, .. } => {
+            SubprocessMode::Script {
+                interpreter, body, ..
+            } => {
+                if interpreter.trim().is_empty() {
+                    return Err(ModelError::Invalid(
+                        "script interpreter cannot be empty".into(),
+                    ));
+                }
                 let bytes = decode_script_body(body, MAX_SCRIPT_BODY_BYTES)?;
                 std::str::from_utf8(&bytes).map_err(|e| {
                     ModelError::Invalid(format!("script body is not valid UTF-8: {e}").into())
                 })?;
-
-                if let Runtime::Custom { command, flag } = runtime {
-                    if command.trim().is_empty() {
-                        return Err(ModelError::Invalid(
-                            "custom runtime command cannot be empty".into(),
-                        ));
-                    }
-                    if flag.trim().is_empty() {
-                        return Err(ModelError::Invalid(
-                            "custom runtime flag cannot be empty".into(),
-                        ));
-                    }
-                }
             }
         }
         Ok(())
@@ -255,7 +246,7 @@ mod tests {
     #[test]
     fn script_valid_bash() {
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Bash,
+            interpreter: "bash".into(),
             body: encode("echo hello"),
             args: vec![],
         };
@@ -265,7 +256,7 @@ mod tests {
     #[test]
     fn script_empty_body_fails() {
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Bash,
+            interpreter: "bash".into(),
             body: "".into(),
             args: vec![],
         };
@@ -276,7 +267,7 @@ mod tests {
     #[test]
     fn script_invalid_base64_fails() {
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Bash,
+            interpreter: "bash".into(),
             body: "not-valid-base64!!!".into(),
             args: vec![],
         };
@@ -288,7 +279,7 @@ mod tests {
     fn script_non_utf8_body_fails() {
         let non_utf8 = BASE64.encode([0xFF, 0xFE, 0x80]);
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Bash,
+            interpreter: "bash".into(),
             body: non_utf8,
             args: vec![],
         };
@@ -297,12 +288,9 @@ mod tests {
     }
 
     #[test]
-    fn script_custom_runtime_valid() {
+    fn script_interpreter_valid() {
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Custom {
-                command: "ruby".into(),
-                flag: "-e".into(),
-            },
+            interpreter: "ruby".into(),
             body: encode("puts 'hello'"),
             args: vec![],
         };
@@ -310,43 +298,20 @@ mod tests {
     }
 
     #[test]
-    fn script_custom_empty_command_fails() {
+    fn script_empty_interpreter_fails() {
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Custom {
-                command: "".into(),
-                flag: "-e".into(),
-            },
+            interpreter: "".into(),
             body: encode("puts 'hello'"),
             args: vec![],
         };
         let err = mode.validate().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("custom runtime command cannot be empty")
-        );
-    }
-
-    #[test]
-    fn script_custom_empty_flag_fails() {
-        let mode = SubprocessMode::Script {
-            runtime: Runtime::Custom {
-                command: "ruby".into(),
-                flag: "".into(),
-            },
-            body: encode("puts 'hello'"),
-            args: vec![],
-        };
-        let err = mode.validate().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("custom runtime flag cannot be empty")
-        );
+        assert!(err.to_string().contains("interpreter cannot be empty"));
     }
 
     #[test]
     fn decode_body_returns_script() {
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Bash,
+            interpreter: "bash".into(),
             body: encode("echo hello"),
             args: vec![],
         };
@@ -356,7 +321,7 @@ mod tests {
     #[test]
     fn decode_body_with_limit_rejects_over_limit() {
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Bash,
+            interpreter: "bash".into(),
             body: encode("aaaaaaaaaa"),
             args: vec![],
         };
@@ -373,7 +338,7 @@ mod tests {
     #[test]
     fn decode_body_with_limit_accepts_within_limit() {
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Bash,
+            interpreter: "bash".into(),
             body: encode("echo hi"),
             args: vec![],
         };
@@ -384,7 +349,7 @@ mod tests {
     fn decode_body_enforces_the_default_cap() {
         let payload = "a".repeat(MAX_SCRIPT_BODY_BYTES + 1);
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Bash,
+            interpreter: "bash".into(),
             body: BASE64.encode(payload.as_bytes()),
             args: vec![],
         };
@@ -410,7 +375,7 @@ mod tests {
     fn script_body_within_limit_is_accepted() {
         let payload = "a".repeat(MAX_SCRIPT_BODY_BYTES);
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Bash,
+            interpreter: "bash".into(),
             body: BASE64.encode(payload.as_bytes()),
             args: vec![],
         };
@@ -422,7 +387,7 @@ mod tests {
     fn script_body_over_limit_is_rejected() {
         let payload = "a".repeat(MAX_SCRIPT_BODY_BYTES + 1);
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Bash,
+            interpreter: "bash".into(),
             body: BASE64.encode(payload.as_bytes()),
             args: vec![],
         };
@@ -440,7 +405,7 @@ mod tests {
     fn encoded_body_at_threshold_reaches_decoded_size_check() {
         let threshold = MAX_SCRIPT_BODY_BYTES.div_ceil(3) * 4;
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Bash,
+            interpreter: "bash".into(),
             body: "A".repeat(threshold),
             args: vec![],
         };
@@ -458,7 +423,7 @@ mod tests {
     fn encoded_body_one_char_over_threshold_fails_before_decode() {
         let threshold = MAX_SCRIPT_BODY_BYTES.div_ceil(3) * 4;
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Bash,
+            interpreter: "bash".into(),
             body: "A".repeat(threshold + 1),
             args: vec![],
         };
@@ -480,7 +445,7 @@ mod tests {
     fn huge_encoded_body_is_rejected_without_decoding() {
         let body = "A".repeat(100 * 1024 * 1024);
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Bash,
+            interpreter: "bash".into(),
             body,
             args: vec![],
         };
@@ -497,7 +462,7 @@ mod tests {
     #[test]
     fn decode_body_with_limit_boundary() {
         let script = |s: &str| SubprocessMode::Script {
-            runtime: Runtime::Bash,
+            interpreter: "bash".into(),
             body: encode(s),
             args: vec![],
         };
@@ -521,7 +486,7 @@ mod tests {
     #[test]
     fn serde_roundtrip_script() {
         let mode = SubprocessMode::Script {
-            runtime: Runtime::Python,
+            interpreter: "python3".into(),
             body: encode("print('hello')"),
             args: vec!["--verbose".into()],
         };

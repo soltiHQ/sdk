@@ -11,22 +11,27 @@
 //! | POST   | `/apis/solti.io/v1/tasks`             | create              |
 //! | PUT    | `/apis/solti.io/v1/tasks/{name}`      | apply               |
 //! | GET    | `/apis/solti.io/v1/tasks`             | list (query params) |
+//! | GET    | `/apis/solti.io/v1/tasks?watch=true`  | watch               |
 //! | GET    | `/apis/solti.io/v1/tasks/{name}`      | get                 |
 //! | GET    | `/apis/solti.io/v1/tasks/{name}/runs` | list runs           |
 //! | GET    | `/apis/solti.io/v1/tasks/{name}/logs` | live-tail SSE       |
 //! | DELETE | `/apis/solti.io/v1/tasks/{name}`      | delete (stop+purge) |
 
-use std::sync::Arc;
-
-use std::convert::Infallible;
+use std::{
+    convert::Infallible,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{
-        DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, Request, State,
+        DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, RawQuery, Request, State,
         rejection::{JsonRejection, PathRejection, QueryRejection},
     },
-    http::{StatusCode, request::Parts},
+    http::{HeaderValue, StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -36,18 +41,20 @@ use axum::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use solti_model::{
-    OutputEvent, TASK_API_VERSION, Task, TaskManifest, TaskPhase, TaskQuery, TaskRun, Token,
+    LabelSelector, OutputEvent, TASK_API_VERSION, Task, TaskFilter, TaskManifest, TaskPhase,
+    TaskQuery, TaskRun, TaskWatchEvent, Token, Uid, WritePreconditions,
 };
-use tokio_stream::StreamExt;
+use tokio_stream::{Stream, StreamExt};
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::debug;
 
 use crate::{
     MAX_REQUEST_BYTES,
-    auth::{assert_auth_token_not_empty, bearer_value},
-    error::ApiError,
-    handler::ApiHandler,
-    validate::{clamp_list_limit, parse_task_id, validate_slot},
+    auth::bearer_value,
+    error::{ApiError, HttpStatusResource},
+    handler::{ApiHandler, TaskWatchEventStream},
+    metrics::{ApiMetricsHandle, StreamingResponse, http_metrics_middleware, noop_api_metrics},
+    validate::{parse_list_limit, parse_task_id, validate_slot},
     visibility::{manifest_is_visible, run_is_visible, task_is_visible},
 };
 // `api_url!` is `#[macro_export]` and therefore already accessible in this
@@ -170,6 +177,7 @@ async fn method_not_allowed(req: Request) -> Response {
 /// - [`ApiError`](crate::ApiError) mapped to JSON + HTTP status codes.
 pub struct HttpApi<H> {
     handler: Arc<H>,
+    metrics: ApiMetricsHandle,
     auth: Option<Token>,
 }
 
@@ -181,6 +189,7 @@ where
     pub fn new(handler: Arc<H>) -> Self {
         Self {
             handler,
+            metrics: noop_api_metrics(),
             auth: None,
         }
     }
@@ -192,13 +201,14 @@ where
     /// One config value enables both directions.
     /// Orthogonal to TLS. When unset, no auth is enforced.
     ///
-    /// ## Panics
-    ///
-    /// Panics when `token` is empty: an empty shared secret would accept an empty
-    /// bearer credential (`Authorization: Bearer `), silently disabling authentication.
     pub fn with_auth(mut self, token: Token) -> Self {
-        assert_auth_token_not_empty(&token);
         self.auth = Some(token);
+        self
+    }
+
+    /// Attach a metrics backend. When not set, a no-op backend is used.
+    pub fn with_metrics(mut self, metrics: ApiMetricsHandle) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -226,6 +236,11 @@ where
             router = router.layer(middleware::from_fn_with_state(token, require_bearer));
         }
 
+        router = router.layer(middleware::from_fn_with_state(
+            self.metrics,
+            http_metrics_middleware,
+        ));
+
         router.with_state(self.handler)
     }
 }
@@ -248,17 +263,112 @@ async fn require_bearer(State(expected): State<Token>, req: Request, next: Next)
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default)]
 struct ListTasksParams {
     slot: Option<String>,
-    phase: Option<String>,
+    phases: Vec<String>,
+    label_selector: Option<String>,
     limit: Option<u32>,
-    offset: Option<u32>,
+    continuation: Option<String>,
+    resource_version: Option<String>,
+    watch: Option<bool>,
+}
+
+fn parse_list_tasks_params(raw_query: Option<&str>) -> Result<ListTasksParams, ApiError> {
+    let mut params = ListTasksParams::default();
+    for (key, value) in form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes()) {
+        match key.as_ref() {
+            "slot" => set_query_param(&mut params.slot, "slot", value.into_owned())?,
+            "phase" => params.phases.push(value.into_owned()),
+            "labelSelector" => set_query_param(
+                &mut params.label_selector,
+                "labelSelector",
+                value.into_owned(),
+            )?,
+            "limit" => {
+                let value = parse_u32_query_param("limit", &value)?;
+                set_query_param(&mut params.limit, "limit", value)?;
+            }
+            "continue" => {
+                set_query_param(&mut params.continuation, "continue", value.into_owned())?
+            }
+            "resourceVersion" => set_query_param(
+                &mut params.resource_version,
+                "resourceVersion",
+                value.into_owned(),
+            )?,
+            "watch" => {
+                let value = parse_watch_query_param(&value)?;
+                set_query_param(&mut params.watch, "watch", value)?;
+            }
+            other => {
+                return Err(ApiError::InvalidRequest(format!(
+                    "unknown query parameter `{other}`"
+                )));
+            }
+        }
+    }
+    Ok(params)
+}
+
+fn parse_watch_query_param(value: &str) -> Result<bool, ApiError> {
+    match value {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(ApiError::InvalidRequest(
+            "query parameter `watch` must be one of: true, false, 1, 0".into(),
+        )),
+    }
+}
+
+fn set_query_param<T>(target: &mut Option<T>, name: &str, value: T) -> Result<(), ApiError> {
+    if target.replace(value).is_some() {
+        return Err(ApiError::InvalidRequest(format!(
+            "query parameter `{name}` must not be repeated"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_u32_query_param(name: &str, value: &str) -> Result<u32, ApiError> {
+    value.parse().map_err(|_| {
+        ApiError::InvalidRequest(format!(
+            "query parameter `{name}` must be an unsigned 32-bit integer"
+        ))
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WriteParams {
+    uid: Option<String>,
+    resource_version: Option<String>,
+}
+
+fn parse_write_preconditions(params: WriteParams) -> Result<WritePreconditions, ApiError> {
+    let mut preconditions = WritePreconditions::new();
+    if let Some(uid) = params.uid {
+        preconditions = preconditions.with_uid(
+            Uid::new(uid)
+                .map_err(|error| ApiError::InvalidRequest(format!("invalid uid: {error}")))?,
+        );
+    }
+    if let Some(resource_version) = params.resource_version {
+        preconditions = preconditions
+            .with_resource_version(resource_version)
+            .map_err(|error| {
+                ApiError::InvalidRequest(format!("invalid resourceVersion: {error}"))
+            })?;
+    }
+    Ok(preconditions)
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ListMeta {
+    resource_version: String,
+    #[serde(rename = "continue", skip_serializing_if = "Option::is_none")]
+    continuation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     remaining_item_count: Option<usize>,
 }
@@ -275,6 +385,56 @@ struct TaskList {
 #[derive(Debug, Serialize)]
 struct TaskRunList {
     runs: Vec<TaskRun>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "object")]
+enum TaskWatchDocument {
+    #[serde(rename = "ADDED")]
+    Added(Task),
+    #[serde(rename = "MODIFIED")]
+    Modified(Task),
+    #[serde(rename = "DELETED")]
+    Deleted(Task),
+    #[serde(rename = "ERROR")]
+    Error(HttpStatusResource),
+}
+
+struct TaskWatchBodyStream {
+    source: TaskWatchEventStream,
+    terminated: bool,
+}
+
+impl TaskWatchBodyStream {
+    fn new(source: TaskWatchEventStream) -> Self {
+        Self {
+            source,
+            terminated: false,
+        }
+    }
+}
+
+impl Stream for TaskWatchBodyStream {
+    type Item = Result<Vec<u8>, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.terminated {
+            return Poll::Ready(None);
+        }
+
+        match self.source.as_mut().poll_next(context) {
+            Poll::Ready(Some(event)) => {
+                let event = event.and_then(public_watch_event);
+                self.terminated = event.is_err();
+                Poll::Ready(Some(Ok(encode_watch_document(event))))
+            }
+            Poll::Ready(None) => {
+                self.terminated = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 fn reject_embedded_manifest(manifest: &TaskManifest) -> Result<(), ApiError> {
@@ -295,6 +455,72 @@ fn public_task(task: Task) -> Result<Task, ApiError> {
     Ok(task)
 }
 
+fn build_task_filter(
+    slot: Option<String>,
+    phases: Vec<String>,
+    label_selector: Option<String>,
+) -> Result<TaskFilter, ApiError> {
+    let mut filter = TaskFilter::new();
+
+    if let Some(slot) = slot {
+        filter = filter.with_slot(validate_slot(slot)?);
+    }
+
+    for phase_str in phases {
+        let phase = phase_str.parse::<TaskPhase>().map_err(|_| {
+            ApiError::InvalidRequest(format!(
+                "invalid phase: '{phase_str}' (valid: pending, running, succeeded, failed, timeout, canceled, exhausted)"
+            ))
+        })?;
+        filter = filter.with_phase(phase);
+    }
+
+    if let Some(label_selector) = label_selector {
+        let selector = label_selector
+            .parse::<LabelSelector>()
+            .map_err(|error| ApiError::InvalidRequest(format!("invalid labelSelector: {error}")))?;
+        filter = filter
+            .with_label_selector(selector)
+            .map_err(|error| ApiError::InvalidRequest(error.to_string()))?;
+    }
+
+    Ok(filter)
+}
+
+fn public_watch_event(event: TaskWatchEvent) -> Result<TaskWatchEvent, ApiError> {
+    if !task_is_visible(event.object()) {
+        return Err(ApiError::Internal(
+            "handler returned an Embedded workload through the public HTTP watch".into(),
+        ));
+    }
+    Ok(event)
+}
+
+fn encode_watch_document(event: Result<TaskWatchEvent, ApiError>) -> Vec<u8> {
+    let document = match event {
+        Ok(TaskWatchEvent::Added(task)) => TaskWatchDocument::Added(task),
+        Ok(TaskWatchEvent::Modified(task)) => TaskWatchDocument::Modified(task),
+        Ok(TaskWatchEvent::Deleted(task)) => TaskWatchDocument::Deleted(task),
+        Err(error) => {
+            let (_, status) = error.into_http_status();
+            TaskWatchDocument::Error(status)
+        }
+    };
+
+    match serde_json::to_vec(&document) {
+        Ok(mut bytes) => {
+            bytes.push(b'\n');
+            bytes
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to serialize HTTP task watch event");
+            br#"{"type":"ERROR","object":{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Failure","message":"internal server error","reason":"InternalError","code":500}}
+"#
+            .to_vec()
+        }
+    }
+}
+
 async fn create_task<H>(
     State(handler): State<Arc<H>>,
     ApiJson(manifest): ApiJson<TaskManifest>,
@@ -311,6 +537,7 @@ where
 async fn apply_task<H>(
     State(handler): State<Arc<H>>,
     ApiPath(path_name): ApiPath<String>,
+    ApiQuery(params): ApiQuery<WriteParams>,
     ApiJson(manifest): ApiJson<TaskManifest>,
 ) -> Result<impl IntoResponse, ApiError>
 where
@@ -324,8 +551,9 @@ where
             manifest.name()
         )));
     }
+    let preconditions = parse_write_preconditions(params)?;
     debug!(name = %manifest.name(), "applying task");
-    let task = public_task(handler.apply_task(manifest).await?)?;
+    let task = public_task(handler.apply_task(manifest, preconditions).await?)?;
     Ok(Json(task))
 }
 
@@ -348,34 +576,74 @@ where
 
 async fn list_tasks<H>(
     State(handler): State<Arc<H>>,
-    ApiQuery(params): ApiQuery<ListTasksParams>,
-) -> Result<impl IntoResponse, ApiError>
+    RawQuery(raw_query): RawQuery,
+) -> Result<Response, ApiError>
 where
     H: ApiHandler,
 {
-    let mut query = TaskQuery::new();
+    let ListTasksParams {
+        slot,
+        phases,
+        label_selector,
+        limit,
+        continuation,
+        resource_version,
+        watch,
+    } = parse_list_tasks_params(raw_query.as_deref())?;
+    let filter = build_task_filter(slot, phases, label_selector)?;
 
-    if let Some(slot) = params.slot {
-        query = query.with_slot(validate_slot(slot)?);
+    if watch.unwrap_or(false) {
+        if limit.is_some() || continuation.is_some() {
+            return Err(ApiError::InvalidRequest(
+                "query parameters `limit` and `continue` are not supported for watch".into(),
+            ));
+        }
+        if resource_version
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(ApiError::InvalidRequest(
+                "query parameter `resourceVersion` must not be empty".into(),
+            ));
+        }
+
+        let stream = handler.watch_tasks(filter, resource_version).await?;
+        let body_stream = TaskWatchBodyStream::new(stream);
+        let mut response = Body::from_stream(body_stream).into_response();
+        response.extensions_mut().insert(StreamingResponse);
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return Ok(response);
     }
 
-    if let Some(phase_str) = params.phase {
-        let phase = phase_str.parse::<TaskPhase>().map_err(|_| {
-            ApiError::InvalidRequest(format!(
-                "invalid phase: '{phase_str}' (valid: pending, running, succeeded, failed, timeout, canceled, exhausted)"
-            ))
-        })?;
-        query = query.with_status(phase);
+    if resource_version.is_some() {
+        return Err(ApiError::InvalidRequest(
+            "query parameter `resourceVersion` requires `watch=true`".into(),
+        ));
     }
 
-    query = query.with_limit(clamp_list_limit(params.limit.unwrap_or(0)));
-    let offset = params.offset.unwrap_or(0) as usize;
-    if offset > 0 {
-        query = query.with_offset(offset);
+    let mut query = TaskQuery::from_filter(filter);
+    query = query.with_limit(parse_list_limit(limit.unwrap_or(0))?);
+    if let Some(token) = continuation {
+        if token.is_empty() {
+            return Err(ApiError::InvalidRequest(
+                "query parameter `continue` must not be empty".into(),
+            ));
+        }
+        query = query.with_continuation(crate::continuation::decode(&token)?);
     }
 
+    let page_filter = query.filter().clone();
+    let page_limit = query.limit();
     let page = handler.query_tasks(query).await?;
-    debug!(count = page.items.len(), total = page.total, "tasks listed");
+    crate::continuation::validate_page(&page, &page_filter, page_limit)?;
+    debug!(
+        count = page.items.len(),
+        remaining = page.remaining_item_count,
+        "tasks listed"
+    );
 
     for task in &page.items {
         if !task_is_visible(task) {
@@ -385,17 +653,22 @@ where
         }
     }
 
-    let remaining_item_count = page
-        .total
-        .saturating_sub(offset.saturating_add(page.items.len()));
+    let continuation = page
+        .continuation
+        .map(crate::continuation::encode)
+        .transpose()?;
     Ok(Json(TaskList {
         api_version: TASK_API_VERSION,
         kind: "TaskList",
         metadata: ListMeta {
-            remaining_item_count: (remaining_item_count > 0).then_some(remaining_item_count),
+            resource_version: page.resource_version,
+            continuation,
+            remaining_item_count: (page.remaining_item_count > 0)
+                .then_some(page.remaining_item_count),
         },
         items: page.items,
-    }))
+    })
+    .into_response())
 }
 
 async fn list_task_runs<H>(
@@ -419,12 +692,14 @@ where
 async fn delete_task<H>(
     State(handler): State<Arc<H>>,
     ApiPath(name): ApiPath<String>,
+    ApiQuery(params): ApiQuery<WriteParams>,
 ) -> Result<impl IntoResponse, ApiError>
 where
     H: ApiHandler,
 {
     let name = parse_task_id("task name", name)?;
-    handler.delete_task(&name).await?;
+    let preconditions = parse_write_preconditions(params)?;
+    handler.delete_task(&name, preconditions).await?;
     debug!(%name, "task deleted");
 
     Ok(StatusCode::NO_CONTENT)
@@ -435,7 +710,7 @@ where
 async fn stream_task_logs<H>(
     State(handler): State<Arc<H>>,
     ApiPath(name): ApiPath<String>,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError>
+) -> Result<Response, ApiError>
 where
     H: ApiHandler,
 {
@@ -451,8 +726,14 @@ where
             OutputEvent::Lagged { .. } => "lagged",
             _ => "unknown",
         };
-        let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
-        Ok(Event::default().event(name).data(data))
+        let data = serde_json::to_string(&ev).map_err(|error| {
+            ApiError::Internal(format!("failed to serialize output event: {error}"))
+        })?;
+        Ok::<Event, ApiError>(Event::default().event(name).data(data))
     });
-    Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+    let mut response = Sse::new(sse_stream)
+        .keep_alive(KeepAlive::default())
+        .into_response();
+    response.extensions_mut().insert(StreamingResponse);
+    Ok(response)
 }

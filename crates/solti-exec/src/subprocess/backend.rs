@@ -1,4 +1,4 @@
-//! # Backend: OS/kernel subprocess hardening.
+//! Runner-wide subprocess settings.
 //!
 //! [`SubprocessBackendConfig`] collects rlimits, cgroup v2, security, logging,
 //! and environment settings applied to every subprocess spawned by a runner.
@@ -12,134 +12,136 @@ use solti_model::MAX_SCRIPT_BODY_BYTES;
 
 use crate::ExecError::InvalidRunnerConfig;
 use crate::subprocess::logger::LogConfig;
-use crate::utils::{CgroupLimits, RlimitConfig, SecurityConfig};
+use crate::utils::{CgroupLimits, PreparedCgroup, RlimitConfig, SecurityConfig};
 use crate::utils::{attach_cgroup, attach_rlimits, attach_security};
 
 /// Minimal `PATH` injected when the environment is cleared and the task did not
 /// set its own. Without it, a bare command name (`echo`) would fail to resolve.
 pub(crate) const SAFE_DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
+pub(crate) fn validate_env_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("environment variable name cannot be empty".into());
+    }
+    if name.contains('=') || name.contains('\0') {
+        return Err(format!(
+            "invalid environment variable name {name:?}: '=' and NUL are not allowed"
+        ));
+    }
+    Ok(())
+}
+
 /// How the child process's environment is built.
 ///
-/// A subprocess started from an untrusted spec inherits the agent's environment
-/// by default, which commonly holds secrets (tokens, connection strings). This
-/// policy controls that boundary.
+/// The default is [`Clear`](Self::Clear).
 #[derive(Debug, Clone, Default)]
 pub enum EnvPolicy {
-    /// Inherit the agent's full environment, then apply the task's own vars on
-    /// top. The historical behavior. Convenient, but the child sees every
-    /// secret in the agent's environment. Use it only for trusted specs.
-    #[default]
+    /// Inherit the process environment, then apply task variables.
     Inherit,
-    /// Start from an empty environment: the child sees only the task's own vars
-    /// plus a safe default `PATH` when the task set none.
-    /// No agent secret can leak through the environment.
+    /// Use task variables and a safe default `PATH` only.
+    #[default]
     Clear,
-    /// Start from an empty environment, then pass through the named variables
-    /// from the agent's environment (plus the task's own vars). Use it to hand
-    /// a task exactly the variables it needs and nothing else.
+    /// Pass only the named process variables, task variables, and `PATH`.
     Allowlist(Vec<String>),
 }
 
 /// Where a task is allowed to set its working directory.
 ///
-/// A spec from an untrusted control plane carries a free-form `cwd`. Left
-/// unchecked, a task can run in any directory the agent can reach.
-///
-/// ## This is a build-time check, not a filesystem sandbox
-///
-/// [`Roots`](Self::Roots) validates the `cwd` when the task is built, then the
-/// process is spawned later. A writable path component can be swapped between
-/// the two (a TOCTOU race), and the check constrains only *where the process
-/// starts*, not what it can reach afterwards. For hostile workloads confine the
-/// filesystem itself with a mount namespace
-/// ([`Namespaces`](crate::Namespaces)) or run the agent inside a container.
+/// [`Roots`](Self::Roots) checks the starting directory at build time.
+/// It does not restrict files the process can open after it starts.
 #[derive(Debug, Clone, Default)]
 pub enum CwdPolicy {
-    /// Allow any `cwd` the spec provides. The historical behavior.
+    /// Allow any `cwd` in the task spec.
     #[default]
     Unrestricted,
-    /// The task's `cwd` must be set and must resolve (after following symlinks
-    /// and `..`) to a path inside one of these roots. A `cwd` that is omitted,
-    /// escapes, does not exist, or is not a directory is rejected at build time.
-    ///
-    /// Omitting `cwd` is rejected on purpose: inheriting the agent's working
-    /// directory would let a task sidestep the restriction entirely.
+    /// Require `cwd` to resolve inside one of these directories.
     Roots(Vec<PathBuf>),
 }
 
 impl CwdPolicy {
+    fn prepare(&mut self) -> Result<(), crate::ExecError> {
+        let CwdPolicy::Roots(roots) = self else {
+            return Ok(());
+        };
+        if roots.is_empty() {
+            return Err(InvalidRunnerConfig(
+                "cwd roots policy requires at least one root".into(),
+            ));
+        }
+
+        let mut prepared = Vec::with_capacity(roots.len());
+        for root in roots.iter() {
+            let real = root.canonicalize().map_err(|e| {
+                InvalidRunnerConfig(format!(
+                    "cwd root {} cannot be resolved: {e}",
+                    root.display()
+                ))
+            })?;
+            if !real.is_dir() {
+                return Err(InvalidRunnerConfig(format!(
+                    "cwd root {} is not a directory",
+                    real.display()
+                )));
+            }
+            prepared.push(real);
+        }
+        prepared.sort();
+        prepared.dedup();
+        *roots = prepared;
+        Ok(())
+    }
+
     /// Check a task-provided `cwd` against the policy.
     ///
     /// Under [`Unrestricted`](Self::Unrestricted) anything is allowed. Under
     /// [`Roots`](Self::Roots) the `cwd` is required and is canonicalized first,
     /// which resolves symlinks and `..` so a crafted path cannot traverse out
     /// of an allowed root at validation time.
-    fn check(&self, cwd: Option<&Path>) -> Result<(), crate::ExecError> {
+    fn check(&self, cwd: Option<&Path>) -> Result<(), String> {
         let CwdPolicy::Roots(roots) = self else {
             return Ok(());
         };
         let Some(cwd) = cwd else {
-            return Err(InvalidRunnerConfig(
+            return Err(
                 "cwd is required under a Roots policy; a task may not inherit the agent's cwd"
                     .into(),
-            ));
+            );
         };
 
-        let real = cwd.canonicalize().map_err(|e| {
-            InvalidRunnerConfig(format!("cwd {} cannot be resolved: {e}", cwd.display()))
-        })?;
+        let real = cwd
+            .canonicalize()
+            .map_err(|e| format!("cwd {} cannot be resolved: {e}", cwd.display()))?;
         if !real.is_dir() {
-            return Err(InvalidRunnerConfig(format!(
-                "cwd {} is not a directory",
-                real.display()
-            )));
+            return Err(format!("cwd {} is not a directory", real.display()));
         }
-        let allowed = roots.iter().any(|root| match root.canonicalize() {
-            Ok(root) => real.starts_with(&root),
-            Err(_) => false,
-        });
+        let allowed = roots.iter().any(|root| real.starts_with(root));
         if !allowed {
-            return Err(InvalidRunnerConfig(format!(
+            return Err(format!(
                 "cwd {} is outside the allowed roots",
                 real.display()
-            )));
+            ));
         }
         Ok(())
     }
 }
 
-/// Low-level OS/kernel configuration for subprocess execution.
-///
-/// Controls resource limits, security policies, and isolation mechanisms.
-/// All fields are optional — if not specified, the subprocess inherits parent process settings.
-///
-/// ## Also
-///
-/// - [`SubprocessRunner`](super::SubprocessRunner) runner that consumes this config.
-/// - [`RlimitConfig`](crate::utils::RlimitConfig) POSIX rlimit knobs.
-/// - [`CgroupLimits`](crate::utils::CgroupLimits) cgroup v2 knobs.
-/// - [`SecurityConfig`](crate::utils::SecurityConfig) Linux capability drop and `no_new_privs`.
-/// - [`EnvPolicy`] how the child environment is built.
-/// - [`CwdPolicy`] where a task may set its working directory.
-/// - [`LogConfig`](super::LogConfig) stdout/stderr log settings.
+/// Resource, security, environment, and output settings for a runner.
 #[derive(Debug, Clone, Default)]
 pub struct SubprocessBackendConfig {
     /// POSIX rlimit-based resource limits.
     rlimits: Option<RlimitConfig>,
     /// Linux cgroup v2 resource limits.
     cgroups: Option<CgroupLimits>,
+    /// Parent directory for per-attempt cgroups.
+    cgroup_parent: Option<PathBuf>,
     /// Security hardening.
     security: Option<SecurityConfig>,
-    /// How the child environment is built. Default [`EnvPolicy::Inherit`].
+    /// How the child environment is built. Default [`EnvPolicy::Clear`].
     env_policy: EnvPolicy,
     /// Where a task may set its working directory. Default [`CwdPolicy::Unrestricted`].
     cwd_policy: CwdPolicy,
     /// Subprocess output logging configuration.
     logger: LogConfig,
-    /// When `true`, confinement that cannot be applied is a hard error rather
-    /// than a best-effort warning. See [`with_require_enforcement`](Self::with_require_enforcement).
-    require_enforcement: bool,
     /// Maximum decoded script-body size for `Script`-mode subprocesses.
     /// `None` uses the model default [`MAX_SCRIPT_BODY_BYTES`].
     max_script_body_bytes: Option<usize>,
@@ -163,18 +165,22 @@ impl SubprocessBackendConfig {
         self
     }
 
+    /// Set the cgroup v2 parent directory.
+    ///
+    /// When omitted, the runner creates child groups under the process's current
+    /// delegated cgroup.
+    pub fn with_cgroup_parent(mut self, parent: impl Into<PathBuf>) -> Self {
+        self.cgroup_parent = Some(parent.into());
+        self
+    }
+
     /// Set security hardening.
     pub fn with_security(mut self, security: SecurityConfig) -> Self {
         self.security = Some(security);
         self
     }
 
-    /// Set the environment policy for spawned children (default [`EnvPolicy::Inherit`]).
-    ///
-    /// For untrusted specs prefer [`EnvPolicy::Clear`] or [`EnvPolicy::Allowlist`]
-    /// so the child cannot read the agent's secrets from the environment.
-    /// [`with_require_enforcement(true)`](Self::with_require_enforcement) upgrades
-    /// an `Inherit` policy to `Clear` automatically.
+    /// Set the environment policy for spawned children.
     pub fn with_env_policy(mut self, policy: EnvPolicy) -> Self {
         self.env_policy = policy;
         self
@@ -191,28 +197,13 @@ impl SubprocessBackendConfig {
     }
 
     /// Validate a task-provided `cwd` against the configured [`CwdPolicy`].
-    pub(crate) fn check_cwd(&self, cwd: Option<&Path>) -> Result<(), crate::ExecError> {
+    pub(crate) fn check_cwd(&self, cwd: Option<&Path>) -> Result<(), String> {
         self.cwd_policy.check(cwd)
     }
 
     /// Set logger configuration.
     pub fn with_logger(mut self, config: LogConfig) -> Self {
         self.logger = config;
-        self
-    }
-
-    /// Require that the configured confinement actually applies (default `false`).
-    ///
-    /// With the default best-effort policy a sandbox that cannot be applied only warns and runs the child **unconfined**.
-    /// When this is `true` and a security/cgroup config is present, confinement fails **closed**:
-    /// - on non-Linux it is rejected at config-validation time;
-    /// - on Linux the cgroup join and capability drop are forced into fail-on-error mode.
-    /// - an [`EnvPolicy::Inherit`] environment is upgraded to [`EnvPolicy::Clear`],
-    ///   so the agent's secrets never reach the child.
-    ///
-    /// Use it for security-critical deployments that must never run a job outside its sandbox.
-    pub fn with_require_enforcement(mut self, require: bool) -> Self {
-        self.require_enforcement = require;
         self
     }
 
@@ -231,26 +222,9 @@ impl SubprocessBackendConfig {
         self.max_script_body_bytes.unwrap_or(MAX_SCRIPT_BODY_BYTES)
     }
 
-    /// Cgroup limits with `fail_on_error` forced on when enforcement is required.
-    fn effective_cgroups(&self, cgroups: &CgroupLimits) -> CgroupLimits {
-        let mut c = cgroups.clone();
-        if self.require_enforcement {
-            c.fail_on_error = true;
-        }
-        c
-    }
-
-    /// Environment policy actually applied to a child.
-    ///
-    /// Under [`require_enforcement`](Self::with_require_enforcement) an
-    /// `Inherit` policy is upgraded to [`EnvPolicy::Clear`]: a deployment that
-    /// asked to fail closed must not leak the agent environment either.
-    /// An explicit `Allowlist` is respected as-is.
-    pub(crate) fn effective_env_policy(&self) -> EnvPolicy {
-        match (&self.env_policy, self.require_enforcement) {
-            (EnvPolicy::Inherit, true) => EnvPolicy::Clear,
-            (policy, _) => policy.clone(),
-        }
+    /// Environment policy applied to a child.
+    pub(crate) fn env_policy(&self) -> &EnvPolicy {
+        &self.env_policy
     }
 
     /// Get log configuration.
@@ -258,53 +232,18 @@ impl SubprocessBackendConfig {
         &self.logger
     }
 
-    /// Check if any backend features are configured.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.rlimits.is_none() && self.cgroups.is_none() && self.security.is_none()
-    }
+    /// Validate and normalize the configuration once at runner construction.
+    pub(crate) fn prepare(mut self) -> Result<Self, crate::ExecError> {
+        self.cwd_policy.prepare()?;
 
-    /// Validate the configuration.
-    pub(crate) fn validate(&self) -> Result<(), crate::ExecError> {
-        if let Some(cgroups) = &self.cgroups {
-            if let Some(cpu) = &cgroups.cpu {
-                if cpu.period == 0 {
-                    return Err(InvalidRunnerConfig(
-                        "cgroups.cpu.period cannot be zero".into(),
-                    ));
-                }
-                if let Some(q) = cpu.quota
-                    && q == 0
-                {
-                    return Err(InvalidRunnerConfig(
-                        "cgroups.cpu.quota cannot be zero (process would get no CPU)".into(),
-                    ));
-                }
-                if let Some(q) = cpu.quota
-                    && q > cpu.period
-                {
-                    return Err(InvalidRunnerConfig(
-                        "cgroups.cpu.quota exceeds period (>100% of one core)".into(),
-                    ));
-                }
-            }
-            if let Some(mem) = cgroups.memory
-                && mem == 0
-            {
-                return Err(InvalidRunnerConfig("cgroups.memory cannot be zero".into()));
-            }
-            if let Some(pids) = cgroups.pids
-                && pids == 0
-            {
-                return Err(InvalidRunnerConfig("cgroups.pids cannot be zero".into()));
+        if let EnvPolicy::Allowlist(keys) = &self.env_policy {
+            for key in keys {
+                validate_env_name(key).map_err(InvalidRunnerConfig)?;
             }
         }
-        if let Some(rlimits) = &self.rlimits
-            && let Some(fsize) = rlimits.max_file_size_bytes
-            && fsize == 0
-        {
-            return Err(InvalidRunnerConfig(
-                "rlimits.max_file_size_bytes cannot be zero".into(),
-            ));
+
+        if let Some(cgroups) = &self.cgroups {
+            validate_cgroup_limits(cgroups)?;
         }
         if self.logger.max_line_length == 0 {
             return Err(InvalidRunnerConfig(
@@ -326,14 +265,43 @@ impl SubprocessBackendConfig {
         if let Some(security) = &self.security {
             security.validate()?;
         }
-        #[cfg(not(target_os = "linux"))]
-        if self.require_enforcement && !self.is_empty() {
+
+        #[cfg(not(unix))]
+        if self
+            .rlimits
+            .as_ref()
+            .is_some_and(|limits| !limits.is_empty())
+        {
             return Err(InvalidRunnerConfig(format!(
-                "require_enforcement is set but OS={} cannot enforce cgroup/security confinement",
+                "rlimits are not supported on {}",
                 std::env::consts::OS
             )));
         }
-        Ok(())
+
+        #[cfg(not(target_os = "linux"))]
+        if self
+            .security
+            .as_ref()
+            .is_some_and(|security| !security.is_empty())
+        {
+            return Err(InvalidRunnerConfig(format!(
+                "process security settings are not supported on {}",
+                std::env::consts::OS
+            )));
+        }
+
+        if self.cgroups.is_some() {
+            let explicit_parent = self.cgroup_parent.clone();
+            self.cgroup_parent = Some(crate::utils::resolve_cgroup_parent(
+                explicit_parent.as_deref(),
+            )?);
+        } else if self.cgroup_parent.is_some() {
+            return Err(InvalidRunnerConfig(
+                "cgroup parent is set without cgroup limits".into(),
+            ));
+        }
+
+        Ok(self)
     }
 
     /// Check if cgroup limits are configured.
@@ -343,17 +311,23 @@ impl SubprocessBackendConfig {
 
     /// Prepare cgroup directory and write limit files (before spawn).
     ///
-    /// Must be called before `apply_to_command`. Returns `Ok(true)` if a cgroup was created successfully.
-    /// Runs in normal async context (safe to use std::fs).
-    pub(crate) fn prepare_cgroups(&self, cgroup_name: &str) -> Result<bool, crate::ExecError> {
+    /// Must be called before `apply_to_command`.
+    pub(crate) fn prepare_cgroups(
+        &self,
+        cgroup_name: &str,
+    ) -> Result<Option<PreparedCgroup>, crate::ExecError> {
         if let Some(cgroups) = &self.cgroups {
             trace!(
                 "subprocess backend: preparing cgroup: {:?} (group={})",
                 cgroups, cgroup_name
             );
-            crate::utils::prepare_cgroup(cgroup_name, &self.effective_cgroups(cgroups))
+            let parent = self
+                .cgroup_parent
+                .as_deref()
+                .expect("validated cgroup config must have a parent");
+            crate::utils::prepare_cgroup(parent, cgroup_name, cgroups).map(Some)
         } else {
-            Ok(false)
+            Ok(None)
         }
     }
 
@@ -368,111 +342,106 @@ impl SubprocessBackendConfig {
     pub(crate) fn apply_to_command(
         &self,
         cmd: &mut Command,
-        cgroup_name: &str,
-    ) -> Result<(), crate::ExecError> {
-        if self.is_empty() {
-            trace!("subprocess backend: nothing to apply (empty config)");
-            return Ok(());
-        }
-
+        prepared_cgroup: Option<PreparedCgroup>,
+    ) {
         if let Some(rlimits) = &self.rlimits {
             trace!("subprocess backend: attaching rlimits: {:?}", rlimits);
             attach_rlimits(cmd, rlimits);
         }
-        if let Some(cgroups) = &self.cgroups {
-            trace!(
-                "subprocess backend: attaching cgroup join hook (group={})",
-                cgroup_name
-            );
-            attach_cgroup(cmd, cgroup_name, &self.effective_cgroups(cgroups))?;
+        if let Some(prepared) = prepared_cgroup {
+            trace!(cgroup = %prepared.path().display(), "attaching cgroup join");
+            attach_cgroup(cmd, prepared);
         }
         if let Some(security) = &self.security {
             trace!(
                 "subprocess backend: attaching security config: {:?}",
                 security
             );
-            let security = if self.require_enforcement {
-                let mut s = security.clone();
-                s.fail_on_cap_error = true;
-                s
-            } else {
-                security.clone()
-            };
-            attach_security(cmd, &security);
+            attach_security(cmd, security);
         }
-        Ok(())
     }
+}
+
+fn validate_cgroup_limits(cgroups: &CgroupLimits) -> Result<(), crate::ExecError> {
+    if cgroups.is_empty() {
+        return Err(InvalidRunnerConfig(
+            "cgroups configuration must contain at least one limit".into(),
+        ));
+    }
+    if let Some(cpu) = &cgroups.cpu {
+        if cpu.period == 0 {
+            return Err(InvalidRunnerConfig(
+                "cgroups.cpu.period cannot be zero".into(),
+            ));
+        }
+        if cpu.quota == Some(0) {
+            return Err(InvalidRunnerConfig(
+                "cgroups.cpu.quota cannot be zero".into(),
+            ));
+        }
+    }
+    if cgroups.memory == Some(0) {
+        return Err(InvalidRunnerConfig("cgroups.memory cannot be zero".into()));
+    }
+    if cgroups.pids == Some(0) {
+        return Err(InvalidRunnerConfig("cgroups.pids cannot be zero".into()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::CpuMax;
-
-    #[test]
-    fn valid_cpu_config_passes() {
-        let cfg = SubprocessBackendConfig::new().with_cgroups(CgroupLimits {
-            cpu: Some(CpuMax {
-                quota: Some(50_000),
-                period: 100_000,
-            }),
-            ..Default::default()
-        });
-        assert!(cfg.validate().is_ok());
-    }
+    use crate::utils::{CpuMax, LinuxCapability};
 
     #[test]
     fn cpu_period_zero_rejected() {
-        let cfg = SubprocessBackendConfig::new().with_cgroups(CgroupLimits {
+        let limits = CgroupLimits {
             cpu: Some(CpuMax {
                 quota: Some(50_000),
                 period: 0,
             }),
             ..Default::default()
-        });
-        let err = cfg.validate().unwrap_err().to_string();
+        };
+        let err = validate_cgroup_limits(&limits).unwrap_err().to_string();
         assert!(err.contains("period"), "expected period error, got: {err}");
     }
 
     #[test]
     fn cpu_quota_zero_rejected() {
-        let cfg = SubprocessBackendConfig::new().with_cgroups(CgroupLimits {
+        let limits = CgroupLimits {
             cpu: Some(CpuMax {
                 quota: Some(0),
                 period: 100_000,
             }),
             ..Default::default()
-        });
-        let err = cfg.validate().unwrap_err().to_string();
+        };
+        let err = validate_cgroup_limits(&limits).unwrap_err().to_string();
         assert!(err.contains("quota"), "expected quota error, got: {err}");
     }
 
     #[test]
-    fn cpu_quota_exceeds_period_rejected() {
-        let cfg = SubprocessBackendConfig::new().with_cgroups(CgroupLimits {
+    fn cpu_quota_may_exceed_period() {
+        let limits = CgroupLimits {
             cpu: Some(CpuMax {
                 quota: Some(200_000),
                 period: 100_000,
             }),
             ..Default::default()
-        });
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("exceeds period"),
-            "expected exceeds error, got: {err}"
-        );
+        };
+        assert!(validate_cgroup_limits(&limits).is_ok());
     }
 
     #[test]
-    fn cpu_unlimited_quota_passes() {
-        let cfg = SubprocessBackendConfig::new().with_cgroups(CgroupLimits {
+    fn cpu_unlimited_quota_is_valid() {
+        let limits = CgroupLimits {
             cpu: Some(CpuMax {
                 quota: None,
                 period: 100_000,
             }),
             ..Default::default()
-        });
-        assert!(cfg.validate().is_ok());
+        };
+        assert!(validate_cgroup_limits(&limits).is_ok());
     }
 
     #[test]
@@ -481,19 +450,18 @@ mod tests {
             max_line_bytes: 0,
             ..LogConfig::default()
         });
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = cfg.prepare().unwrap_err().to_string();
         assert!(err.contains("max_line_bytes"), "got: {err}");
     }
 
     #[test]
     fn keep_caps_without_drop_all_caps_rejected() {
-        use crate::utils::{LinuxCapability, SecurityConfig};
-        let cfg = SubprocessBackendConfig::new().with_security(SecurityConfig {
+        let security = SecurityConfig {
             drop_all_caps: false,
             keep_caps: vec![LinuxCapability::NetBindService],
             ..Default::default()
-        });
-        let err = cfg.validate().unwrap_err().to_string();
+        };
+        let err = security.validate().unwrap_err().to_string();
         assert!(
             err.contains("keep_caps") && err.contains("drop_all_caps"),
             "got: {err}"
@@ -501,34 +469,20 @@ mod tests {
     }
 
     #[test]
-    fn keep_caps_with_drop_all_caps_passes() {
-        use crate::utils::{LinuxCapability, SecurityConfig};
-        let cfg = SubprocessBackendConfig::new().with_security(SecurityConfig {
+    fn keep_caps_with_drop_all_caps_is_valid() {
+        let security = SecurityConfig {
             drop_all_caps: true,
             keep_caps: vec![LinuxCapability::NetBindService],
             ..Default::default()
-        });
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn require_enforcement_fails_closed_on_non_linux() {
-        use crate::utils::SecurityConfig;
-        let cfg = SubprocessBackendConfig::new()
-            .with_security(SecurityConfig {
-                no_new_privs: true,
-                ..Default::default()
-            })
-            .with_require_enforcement(true);
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("require_enforcement"), "got: {err}");
+        };
+        assert!(security.validate().is_ok());
     }
 
     #[test]
-    fn require_enforcement_with_empty_config_is_ok() {
-        let cfg = SubprocessBackendConfig::new().with_require_enforcement(true);
-        assert!(cfg.validate().is_ok());
+    fn cgroup_parent_requires_limits() {
+        let config = SubprocessBackendConfig::new().with_cgroup_parent("/tmp");
+        let error = config.prepare().unwrap_err().to_string();
+        assert!(error.contains("without cgroup limits"), "got: {error}");
     }
 
     #[test]
@@ -545,7 +499,7 @@ mod tests {
     #[test]
     fn max_script_body_bytes_zero_rejected() {
         let cfg = SubprocessBackendConfig::new().with_max_script_body_bytes(0);
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = cfg.prepare().unwrap_err().to_string();
         assert!(err.contains("max_script_body_bytes"), "got: {err}");
     }
 
@@ -553,40 +507,22 @@ mod tests {
     fn max_script_body_bytes_above_hard_limit_rejected() {
         let cfg =
             SubprocessBackendConfig::new().with_max_script_body_bytes(MAX_SCRIPT_BODY_BYTES + 1);
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = cfg.prepare().unwrap_err().to_string();
         assert!(err.contains("1..="), "got: {err}");
     }
 
     #[test]
-    fn env_policy_defaults_to_inherit() {
+    fn env_policy_defaults_to_clear() {
         let cfg = SubprocessBackendConfig::new();
-        assert!(matches!(cfg.effective_env_policy(), EnvPolicy::Inherit));
+        assert!(matches!(cfg.env_policy(), EnvPolicy::Clear));
     }
 
     #[test]
-    fn require_enforcement_upgrades_inherit_to_clear() {
-        let cfg = SubprocessBackendConfig::new().with_require_enforcement(true);
-        assert!(
-            matches!(cfg.effective_env_policy(), EnvPolicy::Clear),
-            "a fail-closed deployment must not leak the agent environment"
-        );
-    }
-
-    #[test]
-    fn require_enforcement_leaves_explicit_allowlist_untouched() {
-        let cfg = SubprocessBackendConfig::new()
-            .with_env_policy(EnvPolicy::Allowlist(vec!["HOME".into()]))
-            .with_require_enforcement(true);
-        assert!(matches!(
-            cfg.effective_env_policy(),
-            EnvPolicy::Allowlist(keys) if keys == vec!["HOME".to_string()]
-        ));
-    }
-
-    #[test]
-    fn explicit_clear_without_enforcement_is_respected() {
-        let cfg = SubprocessBackendConfig::new().with_env_policy(EnvPolicy::Clear);
-        assert!(matches!(cfg.effective_env_policy(), EnvPolicy::Clear));
+    fn invalid_allowlist_key_is_rejected() {
+        let config = SubprocessBackendConfig::new()
+            .with_env_policy(EnvPolicy::Allowlist(vec!["BAD=KEY".into()]));
+        let error = config.prepare().unwrap_err().to_string();
+        assert!(error.contains("environment variable name"), "got: {error}");
     }
 
     #[test]
@@ -606,7 +542,9 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
 
         let cfg = SubprocessBackendConfig::new()
-            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]));
+            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]))
+            .prepare()
+            .unwrap();
 
         assert!(cfg.check_cwd(Some(&sub)).is_ok());
         assert!(cfg.check_cwd(Some(root.path())).is_ok());
@@ -616,7 +554,9 @@ mod tests {
     fn cwd_roots_requires_explicit_cwd() {
         let root = tempfile::TempDir::new().unwrap();
         let cfg = SubprocessBackendConfig::new()
-            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]));
+            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]))
+            .prepare()
+            .unwrap();
 
         let err = cfg.check_cwd(None).unwrap_err().to_string();
         assert!(err.contains("cwd is required"), "got: {err}");
@@ -628,7 +568,9 @@ mod tests {
         let other = tempfile::TempDir::new().unwrap();
 
         let cfg = SubprocessBackendConfig::new()
-            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]));
+            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]))
+            .prepare()
+            .unwrap();
 
         let err = cfg.check_cwd(Some(other.path())).unwrap_err().to_string();
         assert!(err.contains("outside the allowed roots"), "got: {err}");
@@ -638,7 +580,9 @@ mod tests {
     fn cwd_roots_rejects_nonexistent() {
         let root = tempfile::TempDir::new().unwrap();
         let cfg = SubprocessBackendConfig::new()
-            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]));
+            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]))
+            .prepare()
+            .unwrap();
 
         let missing = root.path().join("does-not-exist");
         let err = cfg.check_cwd(Some(&missing)).unwrap_err().to_string();
@@ -655,11 +599,21 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir(&outside).unwrap();
 
-        let cfg =
-            SubprocessBackendConfig::new().with_cwd_policy(CwdPolicy::Roots(vec![root.clone()]));
+        let cfg = SubprocessBackendConfig::new()
+            .with_cwd_policy(CwdPolicy::Roots(vec![root.clone()]))
+            .prepare()
+            .unwrap();
 
         let escape = root.join("..").join("outside");
         let err = cfg.check_cwd(Some(&escape)).unwrap_err().to_string();
         assert!(err.contains("outside the allowed roots"), "got: {err}");
+    }
+
+    #[test]
+    fn cwd_root_must_exist() {
+        let config = SubprocessBackendConfig::new()
+            .with_cwd_policy(CwdPolicy::Roots(vec![PathBuf::from("/missing/solti-root")]));
+        let error = config.prepare().unwrap_err().to_string();
+        assert!(error.contains("cannot be resolved"), "got: {error}");
     }
 }

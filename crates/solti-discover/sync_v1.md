@@ -1,6 +1,9 @@
 # Sync Protocol v1
 
-`API_VERSION = 1`
+The discovery protocol version is `v1`.
+
+`SyncRequest.api_version` is the version of the API exposed by the agent. It is
+data inside the discovery request and does not select the discovery protocol.
 
 ## Sync flow
 ```text
@@ -34,8 +37,23 @@ Defined in `proto/solti/discover/v1/discovery.proto` (package `solti.discover.v1
 | `uptime_seconds`       | int64              | Elapsed time from the host-owned agent-composition epoch |
 | `endpoint_type`        | EndpointType       | `UNSPECIFIED = 0`, `GRPC = 1`, `HTTP = 2`  |
 | `api_version`          | int32              | Agent API protocol version (`1` = v1)      |
-| `heartbeat_interval_s` | int32              | Agent-reported sync interval (min 1)       |
-| `capabilities`         | repeated string    | Agent-declared features (see proto)        |
+| `heartbeat_interval_s` | int32              | Agent-reported sync interval, rounded up   |
+| `capabilities`         | AgentCapabilities  | Registered runners and workload GVKs       |
+
+### Capabilities
+
+`AgentCapabilities.runners` keeps runner registration order. Each
+`RunnerCapability` contains:
+
+| Field       | Type               | Description                              |
+|-------------|--------------------|------------------------------------------|
+| `name`      | string             | Unique runner name                       |
+| `labels`    | map<string,string> | Labels matched by Task runner selectors  |
+| `workloads` | repeated WorkloadType | Exact workload GVKs handled by the runner |
+
+Each `WorkloadType` contains `api_version` and `kind`. Embedded workloads are
+not advertised because they do not use a runner. An empty `runners` list means
+the agent has no routable runner.
 
 ### SyncResponse fields
 

@@ -32,7 +32,7 @@ use crate::error::{ModelError, ModelResult};
 /// let _ = (retry_errors, service, periodic);
 /// ```
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum RestartPolicy {
     /// Never restart the task.

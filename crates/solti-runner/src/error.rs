@@ -1,51 +1,96 @@
-//! # Runner errors.
+//! # Runner and router errors
 
+use solti_model::ModelError;
 use thiserror::Error;
 
-/// Errors returned by runner implementations.
-///
-/// The enum keeps setup and validation failures in one place, so callers can
-/// decide whether to reject the task, retry it later, or report an internal
-/// runner problem.
-///
-/// ## Example
-///
-/// ```rust
-/// use solti_runner::RunnerError;
-///
-/// let error = RunnerError::MissingField("command");
-/// assert_eq!(error.to_string(), "missing field: command");
-/// ```
+/// Error returned by a concrete runner while it builds a task.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RunnerError {
-    /// No registered runner can handle the given task kind.
-    #[error("no suitable runner for task kind: {0}")]
-    NoRunner(String),
-
-    /// Runner does not support the requested task kind.
-    #[error("unsupported task kind for runner '{runner}': {kind}")]
-    UnsupportedKind {
-        /// Name of the runner that rejected the spec (see [`Runner::name`](crate::Runner::name)).
-        runner: &'static str,
-        /// Label of the rejected task kind (e.g. `"wasm"`).
+    /// The runner received a workload GVK it does not implement.
+    #[error("unsupported workload for runner '{runner}': {api_version}/{kind}")]
+    UnsupportedWorkload {
+        /// Runner name.
+        runner: String,
+        /// Workload API group and version.
+        api_version: String,
+        /// Workload kind.
         kind: String,
     },
 
-    /// Task specification is invalid for this runner.
+    /// The workload desired state is invalid for this runner.
     #[error("invalid specification: {0}")]
     InvalidSpec(String),
 
-    /// Internal runner error.
+    /// The runner could not build the task because of an internal failure.
     #[error("internal error: {0}")]
     Internal(String),
+}
 
-    /// Required field is missing from the task spec.
-    #[error("missing field: {0}")]
-    MissingField(&'static str),
+/// Error returned by [`RunnerRouter`](crate::RunnerRouter).
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum RouterError {
+    /// A runner with this name is already registered.
+    #[error("runner '{name}' is already registered")]
+    DuplicateRunner {
+        /// Duplicate runner name.
+        name: String,
+    },
 
-    /// I/O error during task setup (spawn, cgroup, module read, etc.).
-    /// The underlying [`std::io::Error`] is preserved as the source. Callers can inspect its [`ErrorKind`](std::io::ErrorKind).
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    /// Runner labels violate the model's Kubernetes label rules.
+    #[error("invalid labels for runner '{runner}': {source}")]
+    InvalidLabels {
+        /// Runner name.
+        runner: String,
+        /// Label validation failure.
+        #[source]
+        source: ModelError,
+    },
+
+    /// A runner's declared capability is invalid.
+    #[error("invalid capability for runner '{runner}': {source}")]
+    InvalidCapability {
+        /// Runner name.
+        runner: String,
+        /// Capability validation failure.
+        #[source]
+        source: ModelError,
+    },
+
+    /// Embedded workloads already carry a prebuilt task and are not routable.
+    #[error("embedded workload is not routable")]
+    EmbeddedWorkload,
+
+    /// No registered runner matches the workload GVK and selector.
+    #[error("no runner matches {api_version}/{kind}")]
+    NoRunner {
+        /// Workload API group and version.
+        api_version: String,
+        /// Workload kind.
+        kind: String,
+    },
+
+    /// The selected runner failed to build the task.
+    #[error("runner '{runner}' failed to build task: {source}")]
+    Build {
+        /// Selected runner name.
+        runner: String,
+        /// Concrete runner failure.
+        #[source]
+        source: RunnerError,
+    },
+
+    /// The runner returned a task with a name different from the allocated run id.
+    #[error(
+        "runner '{runner}' returned task name '{actual}', expected allocated run id '{expected}'"
+    )]
+    RunIdMismatch {
+        /// Selected runner name.
+        runner: String,
+        /// Run id allocated by the router.
+        expected: String,
+        /// Task name returned by the runner.
+        actual: String,
+    },
 }

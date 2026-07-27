@@ -16,8 +16,10 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use solti_api::{ApiError, ApiHandler, HttpApi};
-use solti_model::{Task, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun, Token};
+use solti_api::{ApiError, ApiHandler, HttpApi, TaskWatchEventStream};
+use solti_model::{
+    Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun, Token, WritePreconditions,
+};
 
 const SECRET: &str = "sekret-token-1";
 
@@ -35,7 +37,11 @@ impl ApiHandler for MockHandler {
         Task::from_manifest(manifest).map_err(|error| ApiError::Internal(error.to_string()))
     }
 
-    async fn apply_task(&self, manifest: TaskManifest) -> Result<Task, ApiError> {
+    async fn apply_task(
+        &self,
+        manifest: TaskManifest,
+        _preconditions: WritePreconditions,
+    ) -> Result<Task, ApiError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Task::from_manifest(manifest).map_err(|error| ApiError::Internal(error.to_string()))
     }
@@ -49,8 +55,19 @@ impl ApiHandler for MockHandler {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(TaskPage {
             items: Vec::new(),
-            total: 0,
+            resource_version: "test:1".into(),
+            continuation: None,
+            remaining_item_count: 0,
         })
+    }
+
+    async fn watch_tasks(
+        &self,
+        _filter: TaskFilter,
+        _resource_version: Option<String>,
+    ) -> Result<TaskWatchEventStream, ApiError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(tokio_stream::empty()))
     }
 
     async fn list_task_runs(&self, _id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
@@ -58,7 +75,11 @@ impl ApiHandler for MockHandler {
         Ok(Vec::new())
     }
 
-    async fn delete_task(&self, _id: &TaskId) -> Result<(), ApiError> {
+    async fn delete_task(
+        &self,
+        _id: &TaskId,
+        _preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -73,7 +94,9 @@ impl ApiHandler for MockHandler {
 }
 
 fn secured_router(handler: Arc<MockHandler>) -> axum::Router {
-    HttpApi::new(handler).with_auth(Token::new(SECRET)).router()
+    HttpApi::new(handler)
+        .with_auth(Token::new(SECRET).unwrap())
+        .router()
 }
 
 async fn body_json(resp: axum::http::Response<Body>) -> Value {
@@ -180,7 +203,10 @@ async fn request_with_valid_token_reaches_the_handler() {
     let body = body_json(resp).await;
     assert_eq!(body["apiVersion"], "solti.io/v1");
     assert_eq!(body["kind"], "TaskList");
-    assert_eq!(body["metadata"], serde_json::json!({}));
+    assert_eq!(
+        body["metadata"],
+        serde_json::json!({ "resourceVersion": "test:1" })
+    );
     assert_eq!(body["items"], serde_json::json!([]));
     assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
 }
@@ -255,7 +281,6 @@ async fn sse_logs_route_with_valid_token_streams() {
 }
 
 #[test]
-#[should_panic(expected = "auth token must not be empty")]
-fn with_auth_panics_on_empty_token() {
-    let _ = HttpApi::new(Arc::new(MockHandler::default())).with_auth(Token::new("   "));
+fn empty_auth_token_is_rejected_before_api_construction() {
+    assert!(Token::new("   ").is_err());
 }

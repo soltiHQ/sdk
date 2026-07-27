@@ -3,7 +3,7 @@
 > Shared task model for Solti agents and control planes.
 
 `solti-model` contains the data types that all Solti crates speak.
-It defines task specs, task status, ids, policies, runner selectors, environment variables, output events, and agent tokens.
+It defines task specs, task status, ids, policies, runner selectors, agent capabilities, environment variables, output events, and agent tokens.
 
 Use it when you build a Solti API, runner, supervisor, control plane, or tool that reads or writes task data.
 
@@ -59,17 +59,17 @@ assert_eq!(spec.slot().as_str(), "hello");
 Create a task resource from that spec:
 
 ```rust
-use solti_model::{EmbeddedSpec, Task, TaskId, TaskPhase, TaskSpec, TaskWorkload};
+use solti_model::{EmbeddedSpec, Task, TaskPhase, TaskSpec, TaskWorkload};
 
 let workload = TaskWorkload::Embedded(EmbeddedSpec::new("v1").unwrap());
 let spec = TaskSpec::builder("cleanup", workload, 1_000u64)
     .build()
     .unwrap();
 
-let task = Task::new(TaskId::from("embedded-cleanup-1"), spec).unwrap();
+let task = Task::new("embedded-cleanup-1", spec).unwrap();
 
 assert_eq!(*task.phase(), TaskPhase::Pending);
-assert_eq!(task.id().as_str(), "embedded-cleanup-1");
+assert_eq!(task.name().as_str(), "embedded-cleanup-1");
 ```
 
 The shared model accepts embedded workloads. Transport and runner layers own their admission and routability rules.
@@ -82,9 +82,10 @@ The shared model accepts embedded workloads. Transport and runner layers own the
 | Identity    | `Slot`, `TaskId`, `AgentId`                                                            |
 | Execution   | `TaskWorkload`, `ExtensionWorkload`, `SubprocessSpec`, `WasmSpec`, `ContainerSpec`     |
 | Policies    | `RestartPolicy`, `BackoffPolicy`, `JitterPolicy`, `AdmissionPolicy`, `Timeout`         |
-| Routing     | `Labels`, `RunnerSelector`, `SelectorRequirement`, `SelectorOperator`                  |
+| Routing     | `Labels`, `LabelSelector`, `SelectorRequirement`, `SelectorOperator`                  |
+| Capabilities | `AgentCapabilities`, `RunnerCapability`, `WorkloadTypeMeta`                         |
 | Environment | `TaskEnv`, `KeyValue`                                                                 |
-| Query       | `TaskQuery`, `TaskPage`                                                                |
+| Query        | `TaskFilter`, `TaskQuery`, `TaskContinuation`, `TaskPage`                             |
 | Output      | `OutputEvent`, `OutputChunk`, `StreamKind`                                             |
 | Auth        | `Token`                                                                                |
 | Errors      | `ModelError`, `ModelResult`                                                            |
@@ -210,9 +211,9 @@ backoff.validate().unwrap();
 Runner selectors match runner labels. All requirements are ANDed.
 
 ```rust
-use solti_model::{Labels, RunnerSelector, SelectorRequirement};
+use solti_model::{Labels, LabelSelector, SelectorRequirement};
 
-let selector = RunnerSelector {
+let selector = LabelSelector {
     match_labels: {
         let mut labels = Labels::new();
         labels.insert("zone", "eu");
@@ -254,7 +255,7 @@ They allow only `[A-Za-z0-9._-]`, reject empty strings, reject `"."` and `".."`,
 | `AgentId` | 128 bytes |
 | `TaskId`  | 256 bytes |
 
-These values can reach cgroup names, temp paths, logs, and wire protocols, so the model keeps them boring on purpose.
+These values can reach cgroup names, temp paths, logs, and wire protocols. The model keeps them boring on purpose.
 
 ## Authentication
 
@@ -264,7 +265,7 @@ The agent can present it to the control plane, and the agent API can verify inbo
 ```rust
 use solti_model::Token;
 
-let token = Token::new("secret");
+let token = Token::new("secret").unwrap();
 assert!(token.verify("secret"));
 assert!(!token.verify("other"));
 assert_eq!(format!("{token:?}"), "Token(***redacted***)");
@@ -298,7 +299,7 @@ assert!(json.contains(r#""type":"chunk""#));
 ## Notes
 
 - Most public enums are `#[non_exhaustive]`; match them with a fallback arm.
-- `Labels` uses `BTreeMap`, so iteration order is stable.
+- `Labels` uses `BTreeMap`. Iteration order is stable.
 - `TaskEnv` preserves insertion order and uses last-value-wins lookup.
 - `BackoffPolicy` validates on construction through serde and through `TaskSpecBuilder::build`.
 - Pagination uses `DEFAULT_LIMIT = 100` and `MAX_LIMIT = 1000`.

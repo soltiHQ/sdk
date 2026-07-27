@@ -13,30 +13,41 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default  = ["runner", "taskvisor"]
-api      = ["dep:itoa", "dep:solti-api"]
-discover = ["dep:solti-discover"]
-full     = ["api", "discover", "process", "runner", "server", "state", "taskvisor"]
-process  = ["prometheus/process"]
-runner   = ["dep:solti-runner"]
-server   = ["dep:axum", "dep:solti-model", "dep:taskvisor", "dep:tokio", "dep:tracing"]
-state    = ["dep:solti-core", "dep:solti-model"]
-taskvisor = ["dep:taskvisor", "dep:tracing", "taskvisor/controller"]
+default = []
+
+api                     = ["dep:itoa", "dep:solti-api"]
+discover                = ["dep:solti-discover"]
+process                 = ["prometheus/process"]
+runner                  = ["dep:solti-runner"]
+server                  = ["dep:axum", "dep:solti-model", "dep:taskvisor", "dep:tokio", "dep:tracing"]
+state                   = ["dep:solti-core", "dep:solti-model"]
+taskvisor               = ["dep:taskvisor"]
+taskvisor-controller     = ["taskvisor", "taskvisor/controller"]
+
+full = [
+    "api",
+    "discover",
+    "process",
+    "runner",
+    "server",
+    "state",
+    "taskvisor-controller",
+]
 
 [dependencies]
-prometheus = { workspace = true }
-taskvisor  = { workspace = true, optional = true }
-tracing    = { workspace = true, optional = true }
-itoa       = { workspace = true, optional = true }
-
 axum       = { workspace = true, optional = true }
-tokio      = { workspace = true, optional = true, features = ["net", "rt"] }
+itoa       = { workspace = true, optional = true }
+prometheus = { workspace = true }
 
-solti-runner   = { workspace = true, optional = true }
-solti-model    = { workspace = true, optional = true }
-solti-discover = { workspace = true, optional = true }
 solti-api      = { workspace = true, optional = true }
 solti-core     = { workspace = true, optional = true }
+solti-discover = { workspace = true, optional = true }
+solti-model    = { workspace = true, optional = true }
+solti-runner   = { workspace = true, optional = true }
+
+taskvisor = { workspace = true, optional = true }
+tokio     = { workspace = true, optional = true, features = ["net", "rt"] }
+tracing   = { workspace = true, optional = true }
 
 [dev-dependencies]
 solti-core = { workspace = true, features = ["test-util"] }

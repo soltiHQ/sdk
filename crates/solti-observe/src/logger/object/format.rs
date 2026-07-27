@@ -10,17 +10,17 @@ use crate::logger::LoggerError;
 
 /// Output format for the logger.
 ///
-/// Values parse from lower or upper case strings. `journald` is accepted only on Linux.
+/// Values parse without case sensitivity.
 ///
-/// ## Variants
+/// # Variants
 ///
 /// | Variant    | Backend                          | Use case                         |
 /// |------------|----------------------------------|----------------------------------|
 /// | `Text`     | `tracing_subscriber::fmt`        | Local development, human reading |
 /// | `Json`     | `tracing_subscriber::fmt::json`  | Log aggregation (ELK, Loki)      |
-/// | `Journald` | `tracing_journald`               | systemd services (Linux only)    |
+/// | `Journald` | `tracing_journald`               | Linux with feature `journald`    |
 ///
-/// ## Example
+/// # Example
 ///
 /// ```
 /// use solti_observe::LoggerFormat;
@@ -38,7 +38,8 @@ pub enum LoggerFormat {
     Json,
     /// systemd-journald output.
     ///
-    /// Parsing or deserializing this variant on non-Linux returns an error.
+    /// Available with feature `journald`. Initialization is supported on Linux.
+    #[cfg(feature = "journald")]
     Journald,
 }
 
@@ -57,13 +58,17 @@ impl FromStr for LoggerFormat {
             "text" => Ok(Self::Text),
             "json" => Ok(Self::Json),
             "journald" | "journal" => {
-                #[cfg(target_os = "linux")]
+                #[cfg(all(feature = "journald", target_os = "linux"))]
                 {
                     Ok(Self::Journald)
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(all(feature = "journald", not(target_os = "linux")))]
                 {
                     Err(LoggerError::JournaldNotSupported)
+                }
+                #[cfg(not(feature = "journald"))]
+                {
+                    Err(LoggerError::JournaldNotEnabled)
                 }
             }
             _ => Err(LoggerError::InvalidFormat(s.to_string())),
@@ -76,6 +81,7 @@ impl fmt::Display for LoggerFormat {
         let s = match self {
             LoggerFormat::Text => "text",
             LoggerFormat::Json => "json",
+            #[cfg(feature = "journald")]
             LoggerFormat::Journald => "journald",
         };
         f.write_str(s)
@@ -121,15 +127,21 @@ mod tests {
 
     #[test]
     fn journald_behavior_is_platform_specific() {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(feature = "journald", target_os = "linux"))]
         {
             assert!(LoggerFormat::from_str("journald").is_ok());
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(feature = "journald", not(target_os = "linux")))]
         {
             let err = LoggerFormat::from_str("journald").unwrap_err();
             assert!(matches!(err, LoggerError::JournaldNotSupported));
+        }
+
+        #[cfg(not(feature = "journald"))]
+        {
+            let err = LoggerFormat::from_str("journald").unwrap_err();
+            assert!(matches!(err, LoggerError::JournaldNotEnabled));
         }
     }
 
@@ -150,6 +162,7 @@ mod tests {
     fn display_returns_canonical_names() {
         assert_eq!(LoggerFormat::Text.to_string(), "text");
         assert_eq!(LoggerFormat::Json.to_string(), "json");
+        #[cfg(feature = "journald")]
         assert_eq!(LoggerFormat::Journald.to_string(), "journald");
     }
 
@@ -166,19 +179,16 @@ mod tests {
     fn serde_platform_checks() {
         let json = r#""journald""#;
 
-        #[cfg(target_os = "linux")]
+        #[cfg(all(feature = "journald", target_os = "linux"))]
         {
             let parsed: LoggerFormat = serde_json::from_str(json).unwrap();
             assert_eq!(parsed, LoggerFormat::Journald);
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(any(not(feature = "journald"), not(target_os = "linux")))]
         {
             let err = serde_json::from_str::<LoggerFormat>(json);
-            assert!(
-                err.is_err(),
-                "Journald deserialization should fail on non-Linux"
-            );
+            assert!(err.is_err());
         }
     }
 

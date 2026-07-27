@@ -27,10 +27,12 @@ impl Uid {
     }
 
     /// Generate a fresh UID from OS entropy.
-    pub fn generate() -> Self {
+    pub fn generate() -> ModelResult<Self> {
         let mut bytes = [0_u8; UID_ENTROPY_BYTES];
-        getrandom::fill(&mut bytes).expect("getrandom: OS entropy source unavailable");
-        Self(URL_SAFE_NO_PAD.encode(bytes))
+        getrandom::fill(&mut bytes).map_err(|error| {
+            ModelError::Invalid(format!("OS entropy source unavailable: {error}").into())
+        })?;
+        Ok(Self(URL_SAFE_NO_PAD.encode(bytes)))
     }
 
     /// Borrow the opaque UID value.
@@ -62,7 +64,7 @@ impl<'de> Deserialize<'de> for Uid {
 /// identifies the current incarnation. `resource_version` is intentionally an
 /// opaque string assigned by the state store; model code never parses it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObjectMeta {
     name: TaskId,
     uid: Uid,
@@ -82,7 +84,7 @@ impl ObjectMeta {
     /// The initial generation is `1`. The state store assigns the first
     /// resource version through [`Self::set_resource_version`].
     pub fn new(name: TaskId) -> ModelResult<Self> {
-        Self::with_uid(name, Uid::generate())
+        Self::with_uid(name, Uid::generate()?)
     }
 
     /// Create metadata with an existing server-assigned UID.
@@ -173,23 +175,25 @@ pub(crate) mod time_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    pub fn now() -> SystemTime {
+    pub(crate) fn now() -> SystemTime {
         let duration = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         UNIX_EPOCH + std::time::Duration::from_millis(duration.as_millis() as u64)
     }
 
-    pub fn serialize<S>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error>
+    pub(crate) fn serialize<S>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+        let since_epoch = time
+            .duration_since(UNIX_EPOCH)
+            .map_err(serde::ser::Error::custom)?;
         let ms = since_epoch.as_secs() * 1_000 + u64::from(since_epoch.subsec_millis());
         ms.serialize(serializer)
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<SystemTime, D::Error>
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<SystemTime, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -205,7 +209,7 @@ pub(crate) mod rfc3339_time_serde {
     use std::time::SystemTime;
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-    pub fn serialize<S>(timestamp: &SystemTime, serializer: S) -> Result<S::Ok, S::Error>
+    pub(crate) fn serialize<S>(timestamp: &SystemTime, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -215,7 +219,7 @@ pub(crate) mod rfc3339_time_serde {
             .and_then(|value| serializer.serialize_str(&value))
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<SystemTime, D::Error>
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<SystemTime, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -225,11 +229,11 @@ pub(crate) mod rfc3339_time_serde {
         Ok(SystemTime::from(timestamp))
     }
 
-    pub mod option {
+    pub(crate) mod option {
         use serde::{Deserialize, Deserializer, Serializer};
         use std::time::SystemTime;
 
-        pub fn serialize<S>(
+        pub(crate) fn serialize<S>(
             timestamp: &Option<SystemTime>,
             serializer: S,
         ) -> Result<S::Ok, S::Error>
@@ -242,7 +246,7 @@ pub(crate) mod rfc3339_time_serde {
             }
         }
 
-        pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<SystemTime>, D::Error>
+        pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<SystemTime>, D::Error>
         where
             D: Deserializer<'de>,
         {
@@ -266,7 +270,7 @@ mod tests {
 
     #[test]
     fn new_sets_server_identity_and_generation() {
-        let meta = ObjectMeta::new("task-a".into()).unwrap();
+        let meta = ObjectMeta::new(TaskId::new("task-a").unwrap()).unwrap();
 
         assert_eq!(meta.name(), "task-a");
         assert!(!meta.uid().as_str().is_empty());
@@ -276,7 +280,7 @@ mod tests {
 
     #[test]
     fn resource_version_is_stored_as_an_opaque_string() {
-        let mut meta = ObjectMeta::new("task-a".into()).unwrap();
+        let mut meta = ObjectMeta::new(TaskId::new("task-a").unwrap()).unwrap();
         meta.set_resource_version("store/revision:0021").unwrap();
 
         assert_eq!(meta.resource_version(), "store/revision:0021");
@@ -289,7 +293,7 @@ mod tests {
 
     #[test]
     fn serde_uses_kubernetes_field_names() {
-        let mut meta = ObjectMeta::new("task-a".into()).unwrap();
+        let mut meta = ObjectMeta::new(TaskId::new("task-a").unwrap()).unwrap();
         meta.set_resource_version("7").unwrap();
 
         let json = serde_json::to_value(&meta).unwrap();
@@ -302,7 +306,7 @@ mod tests {
 
     #[test]
     fn creation_timestamp_uses_rfc3339_and_roundtrips_exact_milliseconds() {
-        let mut meta = ObjectMeta::new("task-a".into()).unwrap();
+        let mut meta = ObjectMeta::new(TaskId::new("task-a").unwrap()).unwrap();
         meta.set_resource_version("1").unwrap();
         let mut json = serde_json::to_value(meta).unwrap();
         json["creationTimestamp"] = serde_json::json!("2025-01-02T03:04:05.678Z");
@@ -315,7 +319,7 @@ mod tests {
 
     #[test]
     fn creation_timestamp_rejects_unix_milliseconds() {
-        let meta = ObjectMeta::new("task-a".into()).unwrap();
+        let meta = ObjectMeta::new(TaskId::new("task-a").unwrap()).unwrap();
         let mut json = serde_json::to_value(meta).unwrap();
         json["creationTimestamp"] = serde_json::json!(1_735_786_800_000_u64);
 

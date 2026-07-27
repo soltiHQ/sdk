@@ -1,6 +1,6 @@
-//! # No-op metrics backend.
+//! # No-op metrics backend
 
-use crate::metrics::backend::{MetricOutcome, MetricsBackend, RunnerErrorKind, RunnerType};
+use crate::metrics::backend::{MetricsBackend, RunnerErrorKind, RunnerType};
 
 /// Zero-cost [`MetricsBackend`](super::MetricsBackend) that discards all records.
 ///
@@ -9,22 +9,15 @@ use crate::metrics::backend::{MetricOutcome, MetricsBackend, RunnerErrorKind, Ru
 /// ## Example
 ///
 /// ```
-/// use solti_runner::{MetricOutcome, MetricsBackend, NoOpMetrics, RunnerType};
+/// use solti_runner::{MetricsBackend, NoOpMetrics, RunnerErrorKind, RunnerType};
 ///
 /// let metrics = NoOpMetrics;
-/// metrics.record_task_started(RunnerType::Subprocess);
-/// metrics.record_task_completed(RunnerType::Subprocess, MetricOutcome::Success, 10);
+/// metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
 /// ```
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoOpMetrics;
 
 impl MetricsBackend for NoOpMetrics {
-    #[inline(always)]
-    fn record_task_started(&self, _: RunnerType) {}
-
-    #[inline(always)]
-    fn record_task_completed(&self, _: RunnerType, _: MetricOutcome, _: u64) {}
-
     #[inline(always)]
     fn record_runner_error(&self, _: RunnerType, _: RunnerErrorKind) {}
 }
@@ -42,9 +35,7 @@ mod tests {
     fn noop_can_be_called_repeatedly() {
         let metrics = NoOpMetrics;
         for _ in 0..1000 {
-            metrics.record_task_started(RunnerType::Subprocess);
             metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
-            metrics.record_task_completed(RunnerType::Subprocess, MetricOutcome::Success, 100);
         }
     }
 }

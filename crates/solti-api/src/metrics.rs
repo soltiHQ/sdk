@@ -3,13 +3,12 @@
 //! Implement [`ApiMetricsBackend`] to record per-request metrics.
 //! The default is [`NoOpApiMetrics`] - zero-cost when no handle is wired in.
 //!
-//! Wiring:
-//! - HTTP: apply [`http_metrics_middleware`] via [`axum::middleware::from_fn_with_state`]
-//!   on the router returned by [`HttpApi::router`](crate::HttpApi::router).
-//! - gRPC: construct the service with [`TaskApiService::new_with_metrics`](crate::TaskApiService::new_with_metrics)
-//!   or chain [`GrpcApi::with_metrics`](crate::GrpcApi::with_metrics).
+//! Both transport builders accept the same backend through `with_metrics`.
 
 use std::sync::Arc;
+
+#[cfg(any(feature = "grpc", feature = "http"))]
+use std::time::{Duration, Instant};
 
 /// Transport that served a request - the `transport` metric label.
 ///
@@ -72,16 +71,123 @@ pub fn noop_api_metrics() -> ApiMetricsHandle {
     Arc::new(NoOpApiMetrics)
 }
 
+/// Keeps the in-flight gauge balanced when a request future is cancelled.
+#[cfg(any(feature = "grpc", feature = "http"))]
+pub(crate) struct InFlightGuard {
+    metrics: ApiMetricsHandle,
+    transport: Transport,
+}
+
+#[cfg(any(feature = "grpc", feature = "http"))]
+impl InFlightGuard {
+    pub(crate) fn enter(metrics: &ApiMetricsHandle, transport: Transport) -> Self {
+        metrics.record_in_flight_delta(transport, 1);
+        Self {
+            metrics: Arc::clone(metrics),
+            transport,
+        }
+    }
+}
+
+#[cfg(any(feature = "grpc", feature = "http"))]
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.metrics.record_in_flight_delta(self.transport, -1);
+    }
+}
+
+#[cfg(any(feature = "grpc", feature = "http"))]
+pub(crate) struct RequestMetrics {
+    metrics: ApiMetricsHandle,
+    transport: Transport,
+    method: String,
+    path: String,
+    started_at: Instant,
+    in_flight: Option<InFlightGuard>,
+}
+
+#[cfg(any(feature = "grpc", feature = "http"))]
+impl RequestMetrics {
+    pub(crate) fn enter(
+        metrics: &ApiMetricsHandle,
+        transport: Transport,
+        method: impl Into<String>,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            metrics: Arc::clone(metrics),
+            transport,
+            method: method.into(),
+            path: path.into(),
+            started_at: Instant::now(),
+            in_flight: Some(InFlightGuard::enter(metrics, transport)),
+        }
+    }
+
+    pub(crate) fn complete(&mut self, status: u16) {
+        let Some(in_flight) = self.in_flight.take() else {
+            return;
+        };
+        let duration_ms = duration_millis(self.started_at.elapsed());
+        self.metrics.record_request(
+            self.transport,
+            &self.method,
+            &self.path,
+            status,
+            duration_ms,
+        );
+        drop(in_flight);
+    }
+}
+
+#[cfg(any(feature = "grpc", feature = "http"))]
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(feature = "http")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StreamingResponse;
+
+#[cfg(feature = "http")]
+struct HttpMetricsStream {
+    inner: axum::body::BodyDataStream,
+    request: RequestMetrics,
+    status: u16,
+}
+
+#[cfg(feature = "http")]
+impl tokio_stream::Stream for HttpMetricsStream {
+    type Item = Result<axum::body::Bytes, axum::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match std::pin::Pin::new(&mut self.inner).poll_next(context) {
+            std::task::Poll::Ready(Some(Err(error))) => {
+                let status = self.status;
+                self.request.complete(status);
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                let status = self.status;
+                self.request.complete(status);
+                std::task::Poll::Ready(None)
+            }
+            poll => poll,
+        }
+    }
+}
+
 /// Axum middleware that records per-request HTTP metrics.
-///
-/// Apply via `axum::middleware::from_fn_with_state(metrics, http_metrics_middleware)`.
 ///
 /// Uses [`axum::extract::MatchedPath`] to capture the route **template**
 /// (e.g. `/apis/solti.io/v1/tasks/{name}`) instead of the raw URL. Requests
 /// without a matched route use one stable fallback label, keeping `path`
 /// cardinality bounded.
 #[cfg(feature = "http")]
-pub async fn http_metrics_middleware(
+pub(crate) async fn http_metrics_middleware(
     axum::extract::State(metrics): axum::extract::State<ApiMetricsHandle>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -93,21 +199,39 @@ pub async fn http_metrics_middleware(
         .map(|mp| mp.as_str().to_string())
         .unwrap_or_else(|| "<unmatched>".to_string());
 
-    metrics.record_in_flight_delta(Transport::Http, 1);
-    let start = std::time::Instant::now();
+    let mut request_metrics = RequestMetrics::enter(&metrics, Transport::Http, method, path);
     let response = next.run(request).await;
-    let duration_ms = start.elapsed().as_millis() as u64;
     let status = response.status().as_u16();
-    metrics.record_request(Transport::Http, &method, &path, status, duration_ms);
-    metrics.record_in_flight_delta(Transport::Http, -1);
-    response
+    if response.extensions().get::<StreamingResponse>().is_some() {
+        let (parts, body) = response.into_parts();
+        let stream = HttpMetricsStream {
+            inner: body.into_data_stream(),
+            request: request_metrics,
+            status,
+        };
+        axum::response::Response::from_parts(parts, axum::body::Body::from_stream(stream))
+    } else {
+        request_metrics.complete(status);
+        response
+    }
 }
 
 #[cfg(all(test, feature = "http"))]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicI64, Ordering},
+    };
 
-    use axum::{Router, body::Body, http::Request, middleware};
+    use axum::{
+        Router,
+        body::{Body, Bytes},
+        http::{Request, StatusCode},
+        middleware,
+        response::Response,
+        routing::get,
+    };
+    use http_body_util::BodyExt;
     use tower::ServiceExt;
 
     use super::*;
@@ -115,6 +239,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct Probe {
         paths: Mutex<Vec<String>>,
+        statuses: Mutex<Vec<u16>>,
+        in_flight: AtomicI64,
     }
 
     impl ApiMetricsBackend for Probe {
@@ -123,10 +249,15 @@ mod tests {
             _transport: Transport,
             _method: &str,
             path: &str,
-            _status: u16,
+            status: u16,
             _duration_ms: u64,
         ) {
             self.paths.lock().unwrap().push(path.to_string());
+            self.statuses.lock().unwrap().push(status);
+        }
+
+        fn record_in_flight_delta(&self, _transport: Transport, delta: i64) {
+            self.in_flight.fetch_add(delta, Ordering::SeqCst);
         }
     }
 
@@ -151,5 +282,78 @@ mod tests {
         let paths = probe.paths.lock().unwrap();
         assert_eq!(paths.len(), 2);
         assert!(paths.iter().all(|path| path == "<unmatched>"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_http_in_flight_gauge() {
+        let probe = Arc::new(Probe::default());
+        let metrics: ApiMetricsHandle = probe.clone();
+        let app = Router::new()
+            .route(
+                "/pending",
+                get(|| async { std::future::pending::<axum::http::StatusCode>().await }),
+            )
+            .layer(middleware::from_fn_with_state(
+                metrics,
+                http_metrics_middleware,
+            ));
+
+        let request = Request::builder()
+            .uri("/pending")
+            .body(Body::empty())
+            .unwrap();
+        let task = tokio::spawn(app.oneshot(request));
+        for _ in 0..100 {
+            if probe.in_flight.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(probe.in_flight.load(Ordering::SeqCst), 1);
+
+        task.abort();
+        let _ = task.await;
+        assert_eq!(probe.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_body_error_records_sent_status_once() {
+        async fn error_stream() -> Response {
+            let stream = tokio_stream::once(Err::<Bytes, std::io::Error>(std::io::Error::other(
+                "stream failed",
+            )));
+            let mut response = Response::builder()
+                .status(StatusCode::ACCEPTED)
+                .body(Body::from_stream(stream))
+                .unwrap();
+            response.extensions_mut().insert(StreamingResponse);
+            response
+        }
+
+        let probe = Arc::new(Probe::default());
+        let metrics: ApiMetricsHandle = probe.clone();
+        let app = Router::new().route("/stream", get(error_stream)).layer(
+            middleware::from_fn_with_state(metrics, http_metrics_middleware),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(probe.in_flight.load(Ordering::SeqCst), 1);
+        assert!(probe.paths.lock().unwrap().is_empty());
+        assert!(response.into_body().collect().await.is_err());
+        assert_eq!(probe.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.paths.lock().unwrap().len(), 1);
+        assert_eq!(
+            probe.statuses.lock().unwrap().as_slice(),
+            &[StatusCode::ACCEPTED.as_u16()]
+        );
     }
 }

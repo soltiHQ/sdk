@@ -2,24 +2,73 @@
 
 use std::{fmt, time::SystemTime};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::{ModelError, ModelResult, validation};
 
 use super::metadata::time_serde;
 
-/// Stable type of a condition reported for a [`Task`](crate::Task).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-#[non_exhaustive]
-pub enum TaskConditionType {
-    /// Whether the desired generation was accepted by the runtime controller.
-    Reconciled,
+const CONDITION_TYPE_MAX_BYTES: usize = 316;
+const CONDITION_REASON_MAX_BYTES: usize = 1_024;
+const CONDITION_MESSAGE_MAX_BYTES: usize = 32_768;
+
+/// Stable and extensible type of a condition reported for a [`Task`](crate::Task).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TaskConditionType(String);
+
+impl TaskConditionType {
+    /// Validate and create a condition type.
+    pub fn new(value: impl Into<String>) -> ModelResult<Self> {
+        let value = value.into();
+        if value.len() > CONDITION_TYPE_MAX_BYTES {
+            return Err(ModelError::Invalid(
+                format!(
+                    "condition type length {} exceeds max {CONDITION_TYPE_MAX_BYTES}",
+                    value.len()
+                )
+                .into(),
+            ));
+        }
+        validation::validate_qualified_name("condition type", &value)?;
+        Ok(Self(value))
+    }
+
+    /// The controller condition for desired-state reconciliation.
+    pub fn reconciled() -> Self {
+        Self("Reconciled".into())
+    }
+
+    /// Borrow the serialized condition type.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn is_reconciled(&self) -> bool {
+        self.0 == "Reconciled"
+    }
 }
 
 impl fmt::Display for TaskConditionType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Reconciled => formatter.write_str("Reconciled"),
-        }
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for TaskConditionType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskConditionType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -37,34 +86,144 @@ pub enum ConditionStatus {
 
 /// One observed condition for a Task resource.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", try_from = "raw::TaskConditionRaw")]
 pub struct TaskCondition {
-    /// Stable condition type.
     #[serde(rename = "type")]
-    pub condition_type: TaskConditionType,
-    /// Current three-valued condition status.
-    pub status: ConditionStatus,
-    /// Desired generation this condition describes.
-    pub observed_generation: u64,
-    /// Time when `status` last changed.
+    condition_type: TaskConditionType,
+    status: ConditionStatus,
+    observed_generation: u64,
     #[serde(with = "super::metadata::rfc3339_time_serde")]
-    pub last_transition_time: SystemTime,
-    /// Stable machine-readable reason.
-    pub reason: String,
-    /// Human-readable diagnostic.
-    pub message: String,
+    last_transition_time: SystemTime,
+    reason: String,
+    message: String,
 }
 
 impl TaskCondition {
+    /// Build a validated condition.
+    pub fn new(
+        condition_type: TaskConditionType,
+        status: ConditionStatus,
+        observed_generation: u64,
+        last_transition_time: SystemTime,
+        reason: impl Into<String>,
+        message: impl Into<String>,
+    ) -> ModelResult<Self> {
+        let condition = Self {
+            condition_type,
+            status,
+            observed_generation,
+            last_transition_time,
+            reason: reason.into(),
+            message: message.into(),
+        };
+        condition.validate()?;
+        Ok(condition)
+    }
+
     pub(crate) fn reconciled_unknown(generation: u64) -> Self {
-        Self {
-            condition_type: TaskConditionType::Reconciled,
-            status: ConditionStatus::Unknown,
-            observed_generation: generation,
-            last_transition_time: time_serde::now(),
-            reason: "ReconciliationScheduled".into(),
-            message: "runtime reconciliation is scheduled".into(),
+        Self::new(
+            TaskConditionType::reconciled(),
+            ConditionStatus::Unknown,
+            generation,
+            time_serde::now(),
+            "ReconciliationScheduled",
+            "runtime reconciliation is scheduled",
+        )
+        .expect("built-in Reconciled condition is valid")
+    }
+
+    /// Stable condition type.
+    pub fn condition_type(&self) -> &TaskConditionType {
+        &self.condition_type
+    }
+
+    /// Current three-valued condition status.
+    pub fn status(&self) -> ConditionStatus {
+        self.status
+    }
+
+    /// Desired generation described by this condition.
+    pub fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+
+    /// Time when `status` last changed.
+    pub fn last_transition_time(&self) -> SystemTime {
+        self.last_transition_time
+    }
+
+    /// Stable machine-readable reason.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// Human-readable diagnostic.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Destructure a condition into its wire fields.
+    pub fn into_parts(
+        self,
+    ) -> (
+        TaskConditionType,
+        ConditionStatus,
+        u64,
+        SystemTime,
+        String,
+        String,
+    ) {
+        (
+            self.condition_type,
+            self.status,
+            self.observed_generation,
+            self.last_transition_time,
+            self.reason,
+            self.message,
+        )
+    }
+
+    pub(crate) fn validate_reason_message(reason: &str, message: &str) -> ModelResult<()> {
+        let bytes = reason.as_bytes();
+        if bytes.is_empty() {
+            return Err(ModelError::Invalid(
+                "condition reason must not be empty".into(),
+            ));
         }
+        if bytes.len() > CONDITION_REASON_MAX_BYTES {
+            return Err(ModelError::Invalid(
+                format!(
+                    "condition reason length {} exceeds max {CONDITION_REASON_MAX_BYTES}",
+                    bytes.len()
+                )
+                .into(),
+            ));
+        }
+        let valid_reason = bytes[0].is_ascii_alphabetic()
+            && (bytes[bytes.len() - 1].is_ascii_alphanumeric() || bytes[bytes.len() - 1] == b'_');
+        let valid_reason = valid_reason
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b',' | b':'));
+        if !valid_reason {
+            return Err(ModelError::Invalid(
+                "condition reason must follow Kubernetes reason rules".into(),
+            ));
+        }
+        if message.len() > CONDITION_MESSAGE_MAX_BYTES {
+            return Err(ModelError::Invalid(
+                format!(
+                    "condition message length {} exceeds max {CONDITION_MESSAGE_MAX_BYTES}",
+                    message.len()
+                )
+                .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate(&self) -> ModelResult<()> {
+        Self::validate_reason_message(&self.reason, &self.message)
     }
 
     pub(crate) fn transition(
@@ -91,5 +250,65 @@ impl TaskCondition {
         self.reason = reason;
         self.message = message;
         true
+    }
+}
+
+mod raw {
+    use super::*;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub(super) struct TaskConditionRaw {
+        #[serde(rename = "type")]
+        condition_type: TaskConditionType,
+        status: ConditionStatus,
+        observed_generation: u64,
+        #[serde(with = "super::super::metadata::rfc3339_time_serde")]
+        last_transition_time: SystemTime,
+        reason: String,
+        message: String,
+    }
+
+    impl TryFrom<TaskConditionRaw> for TaskCondition {
+        type Error = ModelError;
+
+        fn try_from(raw: TaskConditionRaw) -> Result<Self, Self::Error> {
+            TaskCondition::new(
+                raw.condition_type,
+                raw.status,
+                raw.observed_generation,
+                raw.last_transition_time,
+                raw.reason,
+                raw.message,
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn condition_type_is_extensible_and_validated() {
+        let condition_type = TaskConditionType::new("example.io/Available").unwrap();
+        assert_eq!(condition_type.as_str(), "example.io/Available");
+
+        assert!(TaskConditionType::new("").is_err());
+        assert!(TaskConditionType::new("bad type").is_err());
+    }
+
+    #[test]
+    fn condition_rejects_invalid_kubernetes_reason() {
+        let result = TaskCondition::new(
+            TaskConditionType::reconciled(),
+            ConditionStatus::False,
+            1,
+            SystemTime::UNIX_EPOCH,
+            "invalid-reason",
+            "diagnostic",
+        );
+
+        assert!(result.is_err());
     }
 }

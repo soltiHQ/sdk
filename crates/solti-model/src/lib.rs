@@ -35,17 +35,17 @@
 //! Create a task resource from a spec:
 //!
 //! ```rust
-//! use solti_model::{EmbeddedSpec, Task, TaskId, TaskPhase, TaskSpec, TaskWorkload};
+//! use solti_model::{EmbeddedSpec, Task, TaskPhase, TaskSpec, TaskWorkload};
 //!
 //! let workload = TaskWorkload::Embedded(EmbeddedSpec::new("v1").unwrap());
 //! let spec = TaskSpec::builder("cleanup", workload, 1_000u64)
 //!     .build()
 //!     .unwrap();
 //!
-//! let task = Task::new(TaskId::from("embedded-cleanup-1"), spec).unwrap();
+//! let task = Task::new("embedded-cleanup-1", spec).unwrap();
 //!
 //! assert_eq!(*task.phase(), TaskPhase::Pending);
-//! assert_eq!(task.id().as_str(), "embedded-cleanup-1");
+//! assert_eq!(task.name().as_str(), "embedded-cleanup-1");
 //! ```
 //!
 //! The shared model accepts embedded workloads. Transport and runner layers own
@@ -59,9 +59,10 @@
 //! | Identity    | [`Slot`], [`TaskId`], [`AgentId`]                                                                  |
 //! | Execution   | [`TaskWorkload`], [`ExtensionWorkload`], [`SubprocessSpec`], [`WasmSpec`], [`ContainerSpec`]       |
 //! | Policies    | [`RestartPolicy`], [`BackoffPolicy`], [`JitterPolicy`], [`AdmissionPolicy`], [`Timeout`]           |
-//! | Routing     | [`Labels`], [`RunnerSelector`], [`SelectorRequirement`], [`SelectorOperator`]                      |
+//! | Routing     | [`Labels`], [`LabelSelector`], [`SelectorRequirement`], [`SelectorOperator`]                      |
+//! | Capabilities| [`AgentCapabilities`], [`RunnerCapability`], [`WorkloadTypeMeta`]                                  |
 //! | Environment | [`TaskEnv`], [`KeyValue`]                                                                           |
-//! | Query       | [`TaskQuery`], [`TaskPage`]                                                                        |
+//! | Query       | [`TaskContinuation`], [`TaskFilter`], [`TaskQuery`], [`TaskPage`], [`TaskWatchEvent`]               |
 //! | Output      | [`OutputEvent`], [`OutputChunk`], [`StreamKind`]                                                   |
 //! | Auth        | [`Token`]                                                                                          |
 //! | Errors      | [`ModelError`], [`ModelResult`]                                                                    |
@@ -120,12 +121,12 @@
 //!
 //! ## Selectors
 //!
-//! [`RunnerSelector`] matches runner labels. All requirements are ANDed:
+//! [`LabelSelector`] matches runner labels. All requirements are ANDed:
 //!
 //! ```rust
-//! use solti_model::{Labels, RunnerSelector, SelectorRequirement};
+//! use solti_model::{Labels, LabelSelector, SelectorRequirement};
 //!
-//! let selector = RunnerSelector {
+//! let selector = LabelSelector {
 //!     match_labels: {
 //!         let mut labels = Labels::new();
 //!         labels.insert("zone", "eu");
@@ -162,19 +163,20 @@ struct ReadmeDoctests;
 
 mod domain;
 pub use domain::{
-    AGENT_ID_MAX_LEN, AdmissionPolicy, AgentId, BackoffPolicy, ContainerSpec, DEFAULT_LIMIT,
-    EmbeddedSpec, ExtensionWorkload, Flag, JitterPolicy, KeyValue, Labels, LabelsIter, MAX_LIMIT,
-    MAX_SCRIPT_BODY_BYTES, OutputChunk, OutputEvent, RestartPolicy, RunnerSelector, Runtime,
-    SLOT_MAX_LEN, SelectorOperator, SelectorRequirement, Slot, StreamKind, SubprocessMode,
-    SubprocessSpec, TASK_ID_MAX_LEN, TaskEnv, TaskId, TaskPage, TaskPhase, TaskQuery, TaskWorkload,
-    Timeout, WORKLOAD_API_VERSION, WasmSpec, WorkloadTypeMeta,
+    AGENT_ID_MAX_LEN, AdmissionPolicy, AgentCapabilities, AgentId, BackoffPolicy, ContainerSpec,
+    DEFAULT_LIMIT, EmbeddedSpec, ExtensionWorkload, Flag, JitterPolicy, KeyValue, LabelSelector,
+    Labels, LabelsIter, MAX_LIMIT, MAX_SCRIPT_BODY_BYTES, OutputChunk, OutputEvent, RestartPolicy,
+    RunnerCapability, SLOT_MAX_LEN, SelectorOperator, SelectorRequirement, Slot, StreamKind,
+    SubprocessMode, SubprocessSpec, TASK_ID_MAX_LEN, TaskContinuation, TaskEnv, TaskFilter, TaskId,
+    TaskPage, TaskPhase, TaskQuery, TaskWatchEvent, TaskWorkload, Timeout, WORKLOAD_API_VERSION,
+    WasmSpec, WorkloadTypeMeta,
 };
 
 mod resource;
 pub use resource::{
     Annotations, ConditionStatus, DesiredChange, ObjectMeta, TASK_API_VERSION, TASK_KIND, Task,
     TaskCondition, TaskConditionType, TaskManifest, TaskManifestMeta, TaskRun, TaskSpec,
-    TaskSpecBuilder, TaskStatus, TypeMeta, Uid,
+    TaskSpecBuilder, TaskStatus, TypeMeta, Uid, WritePreconditions,
 };
 
 mod error;

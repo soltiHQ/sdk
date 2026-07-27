@@ -19,9 +19,10 @@ tasks:
     cmds:
       - task: helpers:proto/vendor
         vars:
-          proto_ref: "v0.0.4"
+          proto_ref: "v0.0.6"
           MAPPINGS: |
             solti/task crates/solti-api/proto/solti/task
+            solti/agent crates/solti-discover/proto/solti/agent
             solti/discover crates/solti-discover/proto/solti/discover
 
   ci/fmt:

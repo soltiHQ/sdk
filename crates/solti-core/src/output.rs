@@ -1,6 +1,7 @@
 //! Core-owned live output hub and its public configuration/subscription ports.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::SystemTime;
@@ -13,28 +14,39 @@ use tokio_stream::Stream;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
+use crate::ConfigError;
+
 /// Configuration for per-task live output channels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputConfig {
-    capacity: usize,
+    capacity: NonZeroUsize,
 }
 
 impl OutputConfig {
     /// Default number of events retained by each task's lossy live-output ring.
-    pub const DEFAULT_CAPACITY: usize = 256;
+    pub const DEFAULT_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 
     /// Create output configuration with a per-task event capacity.
+    pub const fn new(capacity: NonZeroUsize) -> Self {
+        Self { capacity }
+    }
+
+    /// Create output configuration from a raw capacity.
     ///
-    /// A zero capacity is clamped to `1`, matching the minimum supported by the
-    /// underlying broadcast channel.
-    pub const fn new(capacity: usize) -> Self {
-        Self {
-            capacity: if capacity == 0 { 1 } else { capacity },
-        }
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Zero`] when `capacity` is zero.
+    pub const fn try_new(capacity: usize) -> Result<Self, ConfigError> {
+        let Some(capacity) = NonZeroUsize::new(capacity) else {
+            return Err(ConfigError::Zero {
+                field: "output_capacity",
+            });
+        };
+        Ok(Self::new(capacity))
     }
 
     /// Return the configured per-task event capacity.
-    pub const fn capacity(self) -> usize {
+    pub const fn capacity(self) -> NonZeroUsize {
         self.capacity
     }
 }
@@ -90,7 +102,7 @@ impl OutputHub {
     pub(crate) fn new(config: OutputConfig) -> Self {
         Self {
             channels: RwLock::new(HashMap::new()),
-            capacity: config.capacity(),
+            capacity: config.capacity().get(),
         }
     }
 
@@ -193,23 +205,28 @@ mod tests {
     use solti_runner::OutputPublisher;
     use tokio_stream::StreamExt;
 
-    use super::{OutputConfig, OutputHub};
+    use super::{ConfigError, OutputConfig, OutputHub};
 
     #[test]
-    fn config_preserves_default_and_clamps_zero() {
+    fn config_preserves_default_and_rejects_zero() {
         assert_eq!(
             OutputConfig::default().capacity(),
             OutputConfig::DEFAULT_CAPACITY
         );
-        assert_eq!(OutputConfig::DEFAULT_CAPACITY, 256);
-        assert_eq!(OutputConfig::new(0).capacity(), 1);
-        assert_eq!(OutputConfig::new(64).capacity(), 64);
+        assert_eq!(OutputConfig::DEFAULT_CAPACITY.get(), 256);
+        assert_eq!(
+            OutputConfig::try_new(0).unwrap_err(),
+            ConfigError::Zero {
+                field: "output_capacity"
+            }
+        );
+        assert_eq!(OutputConfig::try_new(64).unwrap().capacity().get(), 64);
     }
 
     #[test]
     fn producer_cannot_create_a_task_channel() {
         let hub = OutputHub::new(OutputConfig::default());
-        let task_id = TaskId::from("missing");
+        let task_id = TaskId::new("missing").unwrap();
 
         assert!(hub.sink_for(&task_id, 1, 1).is_none());
         assert_eq!(hub.active_channels(), 0);
@@ -217,8 +234,8 @@ mod tests {
 
     #[tokio::test]
     async fn attempts_share_one_stream_with_run_markers() {
-        let hub = OutputHub::new(OutputConfig::new(16));
-        let task_id = TaskId::from("retrying");
+        let hub = OutputHub::new(OutputConfig::try_new(16).unwrap());
+        let task_id = TaskId::new("retrying").unwrap();
         assert!(hub.ensure_channel_if_absent(task_id.clone()));
         let mut output = hub.subscribe(&task_id).expect("output subscription");
 
@@ -269,8 +286,8 @@ mod tests {
 
     #[tokio::test]
     async fn subscription_reports_lag_and_continues() {
-        let hub = OutputHub::new(OutputConfig::new(1));
-        let task_id = TaskId::from("lagged");
+        let hub = OutputHub::new(OutputConfig::try_new(1).unwrap());
+        let task_id = TaskId::new("lagged").unwrap();
         hub.ensure_channel_if_absent(task_id.clone());
         let mut output = hub.subscribe(&task_id).expect("output subscription");
         let sink = hub.sink_for(&task_id, 1, 1).expect("sink");
@@ -290,8 +307,8 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_evict_waits_for_outstanding_sink_clones() {
-        let hub = OutputHub::new(OutputConfig::new(8));
-        let task_id = TaskId::from("closing");
+        let hub = OutputHub::new(OutputConfig::try_new(8).unwrap());
+        let task_id = TaskId::new("closing").unwrap();
         hub.ensure_channel_if_absent(task_id.clone());
         let mut output = hub.subscribe(&task_id).expect("output subscription");
         let sink = hub.sink_for(&task_id, 1, 1).expect("sink");
@@ -315,8 +332,8 @@ mod tests {
 
     #[tokio::test]
     async fn stale_sink_cannot_publish_into_a_reused_task_id() {
-        let hub = Arc::new(OutputHub::new(OutputConfig::new(8)));
-        let task_id = TaskId::from("reused");
+        let hub = Arc::new(OutputHub::new(OutputConfig::try_new(8).unwrap()));
+        let task_id = TaskId::new("reused").unwrap();
         hub.ensure_channel_if_absent(task_id.clone());
         let mut old_output = hub.subscribe(&task_id).expect("old subscription");
         let stale_sink = hub.sink_for(&task_id, 1, 1).expect("old sink");

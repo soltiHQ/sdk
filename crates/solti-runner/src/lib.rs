@@ -14,10 +14,10 @@
 //!   v
 //! RunnerRouter
 //!   |
-//!   | checks Runner::supports(task.spec.workload)
+//!   | checks workload GVK
 //!   | checks runner labels, if the task spec has a selector
 //!   v
-//! Runner::build_task(task, BuildContext)
+//! Runner::build_task(task, RunId, BuildContext)
 //!   |
 //!   v
 //! taskvisor::TaskRef
@@ -36,8 +36,8 @@
 //! | Output        | [`OutputPublisher`], [`OutputSink`]                    |
 //! | Run identity  | [`RunId`], [`make_run_id`]                             |
 //! | Metrics       | [`MetricsBackend`], [`MetricsHandle`], [`NoOpMetrics`] |
-//! | Metric labels | [`RunnerType`], [`MetricOutcome`], [`RunnerErrorKind`] |
-//! | Errors        | [`RunnerError`]                                        |
+//! | Metric labels | [`RunnerType`], [`RunnerErrorKind`]                    |
+//! | Errors        | [`RouterError`], [`RunnerError`]                       |
 //!
 //! ## Quick Start
 //!
@@ -47,18 +47,22 @@
 //! use std::sync::Arc;
 //! use solti_runner::RunnerRouter;
 //!
-//! # use solti_model::{Task, TaskWorkload};
-//! # use solti_runner::{BuildContext, Runner, RunnerError};
-//! # use taskvisor::TaskRef;
+//! # use solti_model::{Task, WorkloadTypeMeta, WORKLOAD_API_VERSION};
+//! # use solti_runner::{BuildContext, RunId, Runner, RunnerError};
+//! # use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 //! # struct MyRunner;
 //! # impl Runner for MyRunner {
-//! #     fn name(&self) -> &'static str { "my-runner" }
-//! #     fn supports(&self, workload: &TaskWorkload) -> bool { matches!(workload, TaskWorkload::Subprocess(_)) }
-//! #     fn build_task(&self, _task: &Task, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
+//! #     fn name(&self) -> &str { "my-runner" }
+//! #     fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+//! #         vec![WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").expect("built-in workload GVK")]
+//! #     }
+//! #     fn build_task(&self, _task: &Task, run_id: &RunId, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
+//! #         Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move { Ok::<(), TaskError>(()) }))
+//! #     }
 //! # }
-//! # fn demo(resource: &Task) -> Result<TaskRef, RunnerError> {
+//! # fn demo(resource: &Task) -> Result<TaskRef, Box<dyn std::error::Error>> {
 //! let mut router = RunnerRouter::new();
-//! router.register(Arc::new(MyRunner));
+//! router.register(Arc::new(MyRunner))?;
 //!
 //! let task = router.build(resource)?;
 //! # Ok(task)
@@ -68,7 +72,7 @@
 //! ## Routing
 //!
 //! Runners are checked in registration order.
-//! The first runner that returns `true` from [`Runner::supports`] and matches the optional [`solti_model::RunnerSelector`] is used.
+//! The first runner whose GVK and labels match is used.
 //!
 //! [`solti_model::TaskWorkload::Embedded`] is not routed.
 //! Embedded tasks are already built as `TaskRef` values and should be submitted directly through `solti-core`.
@@ -79,7 +83,8 @@
 //! attempt-scoped [`OutputSink`]. Channel lifecycle and subscriptions belong to
 //! the composition layer, not to runners.
 //!
-//! [`MetricsBackend`] is the task execution metrics trait.
+//! [`MetricsBackend`] records runner-specific setup and cleanup errors.
+//! Task lifecycle metrics come from taskvisor events.
 //! The default backend is [`NoOpMetrics`]; production agents can use `solti-prometheus`.
 
 #![forbid(unsafe_code)]
@@ -94,7 +99,7 @@ mod runner;
 pub use runner::Runner;
 
 mod error;
-pub use error::RunnerError;
+pub use error::{RouterError, RunnerError};
 
 mod context;
 pub use context::BuildContext;
@@ -113,6 +118,5 @@ pub use output::{OutputPublisher, OutputPublisherHandle, OutputSink, noop_output
 
 pub mod metrics;
 pub use metrics::{
-    MetricOutcome, MetricsBackend, MetricsHandle, NoOpMetrics, RunnerErrorKind, RunnerType,
-    noop_metrics,
+    MetricsBackend, MetricsHandle, NoOpMetrics, RunnerErrorKind, RunnerType, noop_metrics,
 };

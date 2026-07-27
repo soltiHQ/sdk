@@ -38,23 +38,23 @@ use tonic::transport::Server;
 use tracing::info;
 
 use solti::api::{
-    API_VERSION, ApiMetricsBackend, GrpcApi, HttpApi, SupervisorApiAdapter,
-    http_metrics_middleware, to_tonic_server_tls,
+    API_VERSION, ApiMetricsBackend, GrpcApi, HttpApi, SupervisorApiAdapter, to_tonic_server_tls,
 };
 use solti::core::{StateConfig, SupervisorApi};
-use solti::discover::{self, DiscoverConfig, DiscoveryTransport, MonotonicUptime};
+use solti::discover::{
+    self, AgentEndpoint, AgentEndpointType, ControlPlaneEndpoint, DiscoverConfig,
+    DiscoveryTransport, MonotonicUptime,
+};
 use solti::exec::subprocess::register_subprocess_runner;
 use solti::model::{
     AdmissionPolicy, AgentId, Flag, RestartPolicy, SubprocessMode, SubprocessSpec, TaskEnv,
     TaskManifest, TaskSpec, TaskWorkload,
 };
-use solti::observe::{
-    LoggerConfig, LoggerLevel, LoggerTimeZone, init_local_offset, init_logger, timezone_sync,
-};
+use solti::observe::{LoggerConfig, LoggerLevel, LoggerTimeZone, init_logger, timezone_sync};
 use solti::prometheus::{
-    PrometheusApiMetrics, PrometheusDiscoverMetrics, PrometheusMetrics, PrometheusStateCollector,
-    PrometheusSubscriber, Registry, register_build_info, register_process_collector,
-    server as metrics_server,
+    PrometheusApiMetrics, PrometheusCoreStateCollector, PrometheusDiscoverMetrics,
+    PrometheusRunnerMetrics, PrometheusTaskvisorSubscriber, Registry, register_build_info,
+    register_process_collector, server as metrics_server,
 };
 use solti::runner::{BuildContext, RunnerEnv, RunnerRouter};
 use solti::taskvisor::{ControllerConfig, Subscribe, SupervisorConfig, TracingBridge};
@@ -75,7 +75,6 @@ struct Cli {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_local_offset();
     let cli = Cli::parse();
     let cfg = Config::load(&cli.config)?;
     tokio::runtime::Runtime::new()?.block_on(async_main(cfg))
@@ -86,14 +85,14 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     init_logger(&LoggerConfig {
         level: LoggerLevel::new("info")?,
-        tz: LoggerTimeZone::Local,
+        timezone: LoggerTimeZone::Local,
         ..Default::default()
     })?;
 
     // --- Metrics registry & subscribers ---
     let registry = Arc::new(Registry::new());
-    let metrics = PrometheusMetrics::new(registry.clone())?;
-    let prom_subscriber = PrometheusSubscriber::new(registry.clone())?;
+    let metrics = PrometheusRunnerMetrics::new(&registry)?;
+    let prom_subscriber = PrometheusTaskvisorSubscriber::new(&registry)?;
     register_process_collector(&registry)?;
     register_build_info(
         &registry,
@@ -104,33 +103,35 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = BuildContext::new(RunnerEnv::default(), Arc::new(metrics));
     let mut router = RunnerRouter::new().with_context(ctx);
     register_subprocess_runner(&mut router, "default")?;
+    let agent_capabilities = router.capabilities();
 
     // Supervisor: owns every task, applies restart / backoff, fans events to subscribers.
     let subscribers: Vec<Arc<dyn Subscribe>> =
         vec![Arc::new(TracingBridge), Arc::new(prom_subscriber)];
-    let supervisor = SupervisorApi::new(
-        SupervisorConfig::default(),
-        ControllerConfig::default(),
-        subscribers,
-        router,
-        StateConfig::default(),
-    )
-    .await?;
+    let supervisor = SupervisorApi::builder(router)
+        .with_runtime_config(SupervisorConfig::default())
+        .with_controller_config(ControllerConfig::default())
+        .with_subscribers(subscribers)
+        .with_state_config(StateConfig::default())
+        .start()
+        .await?;
 
-    let state_collector = PrometheusStateCollector::new(supervisor.state())?;
+    let state_collector = PrometheusCoreStateCollector::new(supervisor.state())?;
     registry.register(Box::new(state_collector))?;
 
     // Embedded resources use a prebuilt runtime task and the same supervised lifecycle.
-    let (tz_task_ref, tz_task) = timezone_sync();
-    supervisor.create_with_task(tz_task, tz_task_ref).await?;
+    let (tz_task, tz_task_ref) = timezone_sync();
+    supervisor
+        .create_embedded_task(tz_task, tz_task_ref)
+        .await?;
 
-    let (metrics_task_ref, metrics_task) = metrics_server(
+    let (metrics_task, metrics_task_ref) = metrics_server(
         registry.clone(),
         METRICS_ADDR,
         concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")),
     )?;
     supervisor
-        .create_with_task(metrics_task, metrics_task_ref)
+        .create_embedded_task(metrics_task, metrics_task_ref)
         .await?;
 
     // --- Optional local demo task; the agent does something on its own ---
@@ -160,26 +161,31 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     let client_tls = cfg.client_tls()?; // discovery client TLS (agent → podium)
 
     // --- Discovery: agent → control plane ---
-    let (disc_transport, advertise) = match cfg.transport {
+    let (agent_endpoint_type, discovery_transport, advertise) = match cfg.transport {
         Transport::Http => {
             let scheme = if cfg.tls.enabled { "https" } else { "http" };
             (
+                AgentEndpointType::Http,
                 DiscoveryTransport::Http,
                 format!("{scheme}://{}", cfg.agent.advertise),
             )
         }
-        Transport::Grpc => (DiscoveryTransport::Grpc, cfg.agent.advertise.clone()),
+        Transport::Grpc => (
+            AgentEndpointType::Grpc,
+            DiscoveryTransport::Grpc,
+            cfg.agent.advertise.clone(),
+        ),
     };
-    let discover_metrics = Arc::new(PrometheusDiscoverMetrics::new(registry.clone())?);
+    let discover_metrics = Arc::new(PrometheusDiscoverMetrics::new(&registry)?);
     let mut discover = DiscoverConfig::builder(
-        AgentId::new(cfg.agent.id.as_str()),
+        AgentId::new(cfg.agent.id.as_str())?,
         cfg.agent.name.as_str(),
-        advertise,
-        cfg.control_plane.endpoint.as_str(),
-        disc_transport,
+        AgentEndpoint::new(advertise, agent_endpoint_type, API_VERSION)?,
+        ControlPlaneEndpoint::new(cfg.control_plane.endpoint.as_str(), discovery_transport)?,
         cfg.control_plane.heartbeat_ms,
-        API_VERSION,
+        concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")),
     )
+    .capabilities(agent_capabilities)
     .with_metrics(discover_metrics);
     if let Some(t) = &token {
         discover = discover.with_token(t.clone());
@@ -187,14 +193,13 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(tls) = client_tls {
         discover = discover.with_tls(tls);
     }
-    let (sync_task_ref, sync_task) = discover::sync(discover.build()?, uptime)?;
+    let (sync_task, sync_task_ref) = discover::sync(discover.build()?, uptime)?;
     supervisor
-        .create_with_task(sync_task, sync_task_ref)
+        .create_embedded_task(sync_task, sync_task_ref)
         .await?;
 
     // --- API: control plane → agent ---
-    let api_metrics: Arc<dyn ApiMetricsBackend> =
-        Arc::new(PrometheusApiMetrics::new(registry.clone())?);
+    let api_metrics: Arc<dyn ApiMetricsBackend> = Arc::new(PrometheusApiMetrics::new(&registry)?);
     // Keep the full SDK supervisor so shutdown also drains completion workers.
     let supervisor = Arc::new(supervisor);
     let handler = Arc::new(SupervisorApiAdapter::new(Arc::clone(&supervisor)));
@@ -205,14 +210,11 @@ async fn async_main(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     match cfg.transport {
         // ---------------- HTTP (axum / axum-server) ----------------
         Transport::Http => {
-            let mut api = HttpApi::new(handler);
+            let mut api = HttpApi::new(handler).with_metrics(api_metrics);
             if let Some(t) = token {
                 api = api.with_auth(t);
             }
-            let app = api.router().layer(axum::middleware::from_fn_with_state(
-                api_metrics,
-                http_metrics_middleware,
-            ));
+            let app = api.router();
 
             let scheme = if secure { "https" } else { "http" };
             info!(

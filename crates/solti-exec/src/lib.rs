@@ -1,29 +1,25 @@
-//! # solti-exec - task execution backends.
+//! # solti-exec
 //!
-//! Provides concrete [`Runner`](solti_runner::Runner) implementations that turn [`Task`](solti_model::Task) resources
-//! into running OS processes (and, in the future, WASM / container backends).
+//! Runs Solti subprocess workloads as operating-system processes.
+//! The runner supports output streaming, cancellation, resource limits, and
+//! Linux process security.
 //!
-//! ## Feature flags
+//! Enable the `subprocess` feature to use this crate.
 //!
-//! | Flag          | What it enables                                             |
-//! |---------------|-------------------------------------------------------------|
-//! | `subprocess`  | `subprocess` module - OS process runner with sandboxing     |
-//!
-//! ## Quick start
+//! ## Quick Start
 //!
 //! ```rust,no_run
 //! # #[cfg(feature = "subprocess")]
 //! # {
 //! use solti_exec::subprocess::{SubprocessRunner, register_subprocess_runner};
 //! use solti_model::{SubprocessMode, SubprocessSpec, Task, TaskSpec, TaskWorkload};
-//! use solti_runner::{BuildContext, Runner, RunnerRouter};
+//! use solti_runner::{BuildContext, Runner, RunnerRouter, make_run_id};
 //!
-//! // The usual path: register the runner in a router.
 //! let mut router = RunnerRouter::new();
 //! register_subprocess_runner(&mut router, "default")?;
 //!
-//! // Or drive the runner directly: Task resource -> runnable task.
-//! let runner = SubprocessRunner::new("direct");
+//! // A runner can also be used directly.
+//! let runner = SubprocessRunner::new("direct")?;
 //! let spec = TaskSpec::builder(
 //!     "hello",
 //!     TaskWorkload::Subprocess(SubprocessSpec::new(
@@ -39,16 +35,14 @@
 //! )
 //! .build()?;
 //! let resource = Task::new("hello", spec)?;
-//! let task = runner.build_task(&resource, &BuildContext::default())?;
+//! let run_id = make_run_id(runner.name(), resource.slot().as_str());
+//! let task = runner.build_task(&resource, &run_id, &BuildContext::default())?;
 //! # }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! ## Also
-//!
-//! - [`solti_runner::Runner`] trait implemented by backends in this crate.
-//! - [`solti_model::TaskWorkload`] determines which backend handles the task.
-//! - [`solti_runner::RunnerRouter`] routes tasks to registered runners.
+//! [`solti_runner::RunnerRouter`] selects a runner from workload GVK and labels.
+//! [`solti_runner::Runner`] is the backend contract.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -58,11 +52,10 @@
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
-mod error;
-pub use error::ExecError;
-
 #[cfg(feature = "subprocess")]
-mod metrics;
+mod error;
+#[cfg(feature = "subprocess")]
+pub use error::ExecError;
 
 #[cfg(feature = "subprocess")]
 pub use utils::{

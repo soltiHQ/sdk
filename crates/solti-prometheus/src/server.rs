@@ -72,21 +72,21 @@ const BACKOFF_FACTOR: f64 = 2.0;
 /// let registry = Arc::new(Registry::new());
 /// // ... register collectors into `registry` ...
 ///
-/// let (task_ref, manifest) = server(
+/// let (manifest, task_ref) = server(
 ///     registry.clone(),
 ///     "0.0.0.0:9090",
 ///     "my-agent@v1",
 /// )?;
 /// // Submit to a running supervisor:
-/// // supervisor.create_with_task(manifest, task_ref).await?;
-/// # let _ = (task_ref, manifest);
+/// // supervisor.create_embedded_task(manifest, task_ref).await?;
+/// # let _ = (manifest, task_ref);
 /// # Ok::<(), solti_model::ModelError>(())
 /// ```
 pub fn server(
     registry: Arc<Registry>,
     addr: impl Into<String>,
     revision: impl Into<String>,
-) -> Result<(TaskRef, TaskManifest), solti_model::ModelError> {
+) -> Result<(TaskManifest, TaskRef), solti_model::ModelError> {
     let addr: String = addr.into();
     let caller_revision = EmbeddedSpec::new(revision)?;
     let revision = format!("{}|addr={addr}", caller_revision.revision());
@@ -145,7 +145,7 @@ pub fn server(
 
     let manifest = TaskManifest::new(METRICS_SERVER_SLOT, spec)?;
 
-    Ok((task, manifest))
+    Ok((manifest, task))
 }
 
 async fn metrics_handler(State(registry): State<Arc<Registry>>) -> axum::response::Response {
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn server_revision_covers_caller_state_and_listen_address() {
-        let (_, manifest) = server(
+        let (manifest, _) = server(
             Arc::new(Registry::new()),
             "127.0.0.1:9090",
             "agent-registry-v2",

@@ -4,10 +4,10 @@
 //!
 //! The same events cross the API boundary in two encodings, and they are **different by design**:
 //!
-//! | Transport | Encoding                                                          | Source of truth                           |
-//! |-----------|-------------------------------------------------------------------|-------------------------------------------|
-//! | HTTP SSE  | this module's serde (`type`-tagged camelCase JSON, ms timestamps) | [`OutputEvent`] derives                   |
-//! | gRPC      | proto `StreamTaskLogsResponse` (binary protobuf)                  | `solti-api/proto/solti/task/v1/api.proto` |
+//! | Transport | Encoding                                                             | Source of truth                           |
+//! |-----------|----------------------------------------------------------------------|-------------------------------------------|
+//! | HTTP SSE  | this module's serde (`type`-tagged JSON, ms timestamps, base64 lines) | [`OutputEvent`] derives                   |
+//! | gRPC      | proto `StreamTaskLogsResponse` (binary protobuf)                     | `solti-api/proto/solti/task/v1/api.proto` |
 //!
 //! Do not switch the SSE path to pbjson-generated JSON:
 //! the shapes differ (`oneof` nesting vs flat `type` tag) and existing SSE consumers parse this module's shape.
@@ -43,7 +43,7 @@ pub enum StreamKind {
 /// Wire format is JSON-tagged on `type`:
 ///
 /// ```text
-/// {"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"..."}
+/// {"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"aGVsbG8="}
 /// {"type":"runStarted","generation":2,"attempt":1,"startedAt":1700}
 /// {"type":"runFinished","generation":2,"attempt":1,"exitCode":0,"finishedAt":1701}
 /// {"type":"lagged","skipped":42}
@@ -158,13 +158,14 @@ pub struct OutputChunk {
     pub ts: SystemTime,
     /// One line, truncated to the runner's configured limit.
     ///
-    /// Live-tail payloads are not sanitized and may contain control characters.
-    #[serde(with = "bytes_as_utf8_string")]
+    /// JSON encodes the raw bytes as base64.
+    #[serde(with = "bytes_as_base64")]
     pub line: Bytes,
 }
 
-/// Serde adapter: serialize `Bytes` as a UTF-8 string in JSON, deserialize from a JSON string back into `Bytes`.
-mod bytes_as_utf8_string {
+/// Serde adapter for exact binary round trips through JSON.
+mod bytes_as_base64 {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use bytes::Bytes;
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -172,10 +173,7 @@ mod bytes_as_utf8_string {
     where
         S: Serializer,
     {
-        match std::str::from_utf8(b) {
-            Ok(txt) => s.serialize_str(txt),
-            Err(_) => s.serialize_str(&String::from_utf8_lossy(b)),
-        }
+        s.serialize_str(&STANDARD.encode(b))
     }
 
     pub(super) fn deserialize<'de, D>(d: D) -> Result<Bytes, D::Error>
@@ -183,7 +181,10 @@ mod bytes_as_utf8_string {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(d)?;
-        Ok(Bytes::from(s))
+        STANDARD
+            .decode(s)
+            .map(Bytes::from)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -211,7 +212,7 @@ mod tests {
         });
         assert_eq!(
             serde_json::to_string(&chunk).unwrap(),
-            r#"{"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"hi"}"#
+            r#"{"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"aGk="}"#
         );
 
         let lagged = OutputEvent::Lagged { skipped: 42 };
@@ -257,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn output_chunk_serializes_line_as_utf8_string_not_array() {
+    fn output_chunk_serializes_line_as_base64() {
         let chunk = OutputChunk {
             generation: 1,
             attempt: 1,
@@ -268,8 +269,8 @@ mod tests {
         };
         let json = serde_json::to_string(&chunk).unwrap();
         assert!(
-            json.contains(r#""line":"hello""#),
-            "line must serialize as JSON string, not byte array; got {json}"
+            json.contains(r#""line":"aGVsbG8=""#),
+            "line must serialize as base64; got {json}"
         );
     }
 
@@ -288,7 +289,7 @@ mod tests {
         assert!(json.contains(r#""type":"chunk""#), "missing tag in {json}");
         assert!(json.contains(r#""attempt":3"#), "{json}");
         assert!(json.contains(r#""stream":"stdout""#), "{json}");
-        assert!(json.contains(r#""line":"hello""#), "{json}");
+        assert!(json.contains(r#""line":"aGVsbG8=""#), "{json}");
     }
 
     #[test]
@@ -400,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn output_chunk_with_non_utf8_line_serializes_lossily_instead_of_failing() {
+    fn output_chunk_with_non_utf8_line_roundtrips_exactly() {
         let chunk = OutputChunk {
             generation: 1,
             attempt: 1,
@@ -410,13 +411,9 @@ mod tests {
             line: Bytes::from_static(&[b'h', b'i', 0xFF, 0xFE]),
         };
 
-        let json = serde_json::to_string(&chunk)
-            .expect("non-UTF8 line must serialize lossily, not error out");
-
-        assert!(json.contains("hi"), "valid prefix must survive: {json}");
-        assert!(
-            json.contains('\u{FFFD}'),
-            "invalid bytes must be replaced with U+FFFD, not dropped: {json}"
-        );
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(json.contains(r#""line":"aGn//g==""#), "{json}");
+        let decoded: OutputChunk = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, chunk);
     }
 }

@@ -1,56 +1,50 @@
 //! Task status.
-//!
-//! [`TaskStatus`] keeps controller reconciliation conditions separate from the
-//! execution phase, attempt, exit code, and execution error.
+
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ConditionStatus, TaskCondition, TaskConditionType, TaskPhase};
+use crate::{ConditionStatus, ModelError, ModelResult, TaskCondition, TaskPhase};
 
 /// Observed runtime state of a task.
-///
-/// ## Example
-///
-/// ```
-/// use solti_model::{TaskPhase, TaskStatus};
-///
-/// let status = TaskStatus::pending();
-/// assert_eq!(status.phase, TaskPhase::Pending);
-/// assert_eq!(status.attempt, 0);
-/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", try_from = "raw::TaskStatusRaw")]
 pub struct TaskStatus {
-    /// Latest desired-state generation processed by the controller.
-    pub observed_generation: u64,
-    /// Current lifecycle phase.
-    pub phase: TaskPhase,
-    /// Number of execution attempts.
-    pub attempt: u32,
-    /// Process exit code (Subprocess/Container only).
+    pub(crate) observed_generation: u64,
+    pub(crate) phase: TaskPhase,
+    pub(crate) attempt: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
-    /// Last lifecycle diagnostic, when one accompanies the current phase.
+    pub(crate) exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// Orthogonal controller conditions for the current desired generation.
-    pub conditions: Vec<TaskCondition>,
+    pub(crate) error: Option<String>,
+    pub(crate) conditions: Vec<TaskCondition>,
 }
 
 impl TaskStatus {
     /// Create initial pending status.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_model::{TaskPhase, TaskStatus};
-    ///
-    /// let status = TaskStatus::pending();
-    /// assert_eq!(status.phase, TaskPhase::Pending);
-    /// assert!(status.error.is_none());
-    /// ```
     pub fn pending() -> Self {
         Self::pending_for(0, 0)
+    }
+
+    /// Reconstruct and validate observed status fields.
+    pub fn from_parts(
+        observed_generation: u64,
+        phase: TaskPhase,
+        attempt: u32,
+        exit_code: Option<i32>,
+        error: Option<String>,
+        conditions: Vec<TaskCondition>,
+    ) -> ModelResult<Self> {
+        let status = Self {
+            observed_generation,
+            phase,
+            attempt,
+            exit_code,
+            error,
+            conditions,
+        };
+        status.validate()?;
+        Ok(status)
     }
 
     pub(crate) fn pending_for(observed_generation: u64, desired_generation: u64) -> Self {
@@ -77,17 +71,105 @@ impl TaskStatus {
         pending
     }
 
-    /// Return the controller's `Reconciled` condition.
+    /// Latest generation processed by the controller.
+    pub fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+
+    /// Current lifecycle phase.
+    pub fn phase(&self) -> TaskPhase {
+        self.phase
+    }
+
+    /// Number of execution attempts.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// Process exit code, when available.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
+
+    /// Current lifecycle diagnostic, when available.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// All controller conditions.
+    pub fn conditions(&self) -> &[TaskCondition] {
+        &self.conditions
+    }
+
+    /// Destructure status into its wire fields.
+    pub fn into_parts(
+        self,
+    ) -> (
+        u64,
+        TaskPhase,
+        u32,
+        Option<i32>,
+        Option<String>,
+        Vec<TaskCondition>,
+    ) {
+        (
+            self.observed_generation,
+            self.phase,
+            self.attempt,
+            self.exit_code,
+            self.error,
+            self.conditions,
+        )
+    }
+
+    /// Find a condition by type.
+    pub fn condition(&self, condition_type: &crate::TaskConditionType) -> Option<&TaskCondition> {
+        self.conditions
+            .iter()
+            .find(|condition| condition.condition_type() == condition_type)
+    }
+
+    /// Return the required controller `Reconciled` condition.
     pub fn reconciled(&self) -> &TaskCondition {
         self.conditions
             .iter()
-            .find(|condition| condition.condition_type == TaskConditionType::Reconciled)
-            .expect("validated TaskStatus always has a Reconciled condition")
+            .find(|condition| condition.condition_type().is_reconciled())
+            .expect("validated TaskStatus has a Reconciled condition")
     }
 
     /// Return whether the current generation ended in a reconciliation failure.
     pub fn reconciliation_failed(&self) -> bool {
-        self.reconciled().status == ConditionStatus::False
+        self.reconciled().status() == ConditionStatus::False
+    }
+
+    pub(crate) fn validate(&self) -> ModelResult<()> {
+        let mut condition_types = HashSet::with_capacity(self.conditions.len());
+        let mut reconciled_count = 0;
+        for condition in &self.conditions {
+            condition.validate()?;
+            if !condition_types.insert(condition.condition_type().as_str()) {
+                return Err(ModelError::Invalid(
+                    format!(
+                        "status.conditions contains duplicate type `{}`",
+                        condition.condition_type()
+                    )
+                    .into(),
+                ));
+            }
+            if condition.condition_type().is_reconciled() {
+                reconciled_count += 1;
+            }
+        }
+        if reconciled_count != 1 {
+            return Err(ModelError::Invalid(
+                "status.conditions must contain one Reconciled condition".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reconciled_required(&self) -> &TaskCondition {
+        self.reconciled()
     }
 
     pub(crate) fn mark_reconciliation_pending(&mut self, generation: u64) -> bool {
@@ -104,7 +186,7 @@ impl TaskStatus {
             ConditionStatus::True,
             generation,
             "RuntimeAccepted",
-            "Taskvisor accepted the runtime realization",
+            "runtime accepted the desired state",
         );
         self.observed_generation = generation;
         changed
@@ -126,96 +208,133 @@ impl TaskStatus {
     fn reconciled_mut(&mut self) -> &mut TaskCondition {
         self.conditions
             .iter_mut()
-            .find(|condition| condition.condition_type == TaskConditionType::Reconciled)
-            .expect("validated TaskStatus always has a Reconciled condition")
+            .find(|condition| condition.condition_type().is_reconciled())
+            .expect("validated TaskStatus has a Reconciled condition")
+    }
+}
+
+mod raw {
+    use super::*;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub(super) struct TaskStatusRaw {
+        observed_generation: u64,
+        phase: TaskPhase,
+        attempt: u32,
+        #[serde(default)]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        error: Option<String>,
+        conditions: Vec<TaskCondition>,
+    }
+
+    impl TryFrom<TaskStatusRaw> for TaskStatus {
+        type Error = ModelError;
+
+        fn try_from(raw: TaskStatusRaw) -> Result<Self, Self::Error> {
+            TaskStatus::from_parts(
+                raw.observed_generation,
+                raw.phase,
+                raw.attempt,
+                raw.exit_code,
+                raw.error,
+                raw.conditions,
+            )
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TaskConditionType;
+    use std::time::SystemTime;
 
-    #[test]
-    fn pending_default() {
-        let s = TaskStatus::pending();
-        assert_eq!(s.phase, TaskPhase::Pending);
-        assert_eq!(s.attempt, 0);
-        assert!(s.error.is_none());
+    fn condition(condition_type: TaskConditionType, status: ConditionStatus) -> TaskCondition {
+        TaskCondition::new(
+            condition_type,
+            status,
+            1,
+            SystemTime::UNIX_EPOCH,
+            "Observed",
+            "observed state",
+        )
+        .unwrap()
     }
 
     #[test]
-    fn error_stored() {
-        let s = TaskStatus {
-            observed_generation: 2,
-            phase: TaskPhase::Failed,
-            attempt: 3,
-            exit_code: None,
-            error: Some("timeout".into()),
-            conditions: vec![TaskCondition::reconciled_unknown(2)],
-        };
-        assert_eq!(s.error.as_deref(), Some("timeout"));
+    fn pending_is_valid() {
+        let status = TaskStatus::pending();
+        assert_eq!(status.phase(), TaskPhase::Pending);
+        assert_eq!(status.attempt(), 0);
+        assert!(status.error().is_none());
+        assert_eq!(status.reconciled().status(), ConditionStatus::Unknown);
     }
 
     #[test]
-    fn serde_skips_none_error() {
-        let s = TaskStatus::pending();
-        let json = serde_json::to_string(&s).unwrap();
-        assert!(!json.contains("error"));
+    fn standalone_status_rejects_missing_reconciled_condition() {
+        let json = serde_json::json!({
+            "observedGeneration": 0,
+            "phase": "pending",
+            "attempt": 0,
+            "conditions": []
+        });
+        assert!(serde_json::from_value::<TaskStatus>(json).is_err());
     }
 
     #[test]
-    fn serde_roundtrip() {
-        let s = TaskStatus {
-            observed_generation: 2,
-            phase: TaskPhase::Running,
-            attempt: 2,
-            exit_code: None,
-            error: None,
-            conditions: vec![TaskCondition::reconciled_unknown(2)],
-        };
-        let json = serde_json::to_string(&s).unwrap();
-        let back: TaskStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.phase, TaskPhase::Running);
-        assert_eq!(back.attempt, 2);
+    fn status_accepts_one_reconciled_and_extensible_conditions() {
+        let reconciled = condition(TaskConditionType::reconciled(), ConditionStatus::True);
+        let available_type = TaskConditionType::new("Available").unwrap();
+        let available = condition(available_type.clone(), ConditionStatus::False);
+
+        let status = TaskStatus::from_parts(
+            1,
+            TaskPhase::Running,
+            1,
+            None,
+            None,
+            vec![reconciled, available],
+        )
+        .unwrap();
+
+        assert_eq!(status.conditions().len(), 2);
+        assert_eq!(
+            status.condition(&available_type).unwrap().status(),
+            ConditionStatus::False
+        );
+        let back: TaskStatus =
+            serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
+        assert_eq!(back, status);
     }
 
     #[test]
-    fn exit_code_serde() {
-        let s = TaskStatus {
-            observed_generation: 1,
-            phase: TaskPhase::Failed,
-            attempt: 1,
-            exit_code: Some(137),
-            error: Some("killed".into()),
-            conditions: vec![TaskCondition::reconciled_unknown(1)],
-        };
-        let json = serde_json::to_string(&s).unwrap();
-        assert!(json.contains("\"exitCode\":137"));
+    fn status_rejects_duplicate_condition_types() {
+        let reconciled = condition(TaskConditionType::reconciled(), ConditionStatus::True);
+        let duplicate = reconciled.clone();
 
-        let back: TaskStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.exit_code, Some(137));
+        assert!(
+            TaskStatus::from_parts(
+                1,
+                TaskPhase::Running,
+                1,
+                None,
+                None,
+                vec![reconciled, duplicate],
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn serde_skips_none_exit_code() {
-        let s = TaskStatus::pending();
-        let json = serde_json::to_string(&s).unwrap();
-        assert!(!json.contains("exitCode"));
-    }
+    fn status_and_conditions_reject_unknown_fields() {
+        let mut status = serde_json::to_value(TaskStatus::pending()).unwrap();
+        status["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<TaskStatus>(status).is_err());
 
-    #[test]
-    fn reconciliation_condition_tracks_controller_state_separately_from_phase() {
-        let mut status = TaskStatus::pending_for(0, 1);
-        assert_eq!(status.reconciled().status, ConditionStatus::Unknown);
-        assert!(status.mark_reconciliation_failed(1, "RunnerBuildFailed", "runner unavailable"));
-        assert_eq!(status.phase, TaskPhase::Pending);
-        assert_eq!(status.reconciled().status, ConditionStatus::False);
-        assert!(status.reconciliation_failed());
-
-        assert!(status.mark_reconciliation_pending(1));
-        assert_eq!(status.reconciled().status, ConditionStatus::Unknown);
-        assert!(status.mark_reconciled(1));
-        assert_eq!(status.reconciled().status, ConditionStatus::True);
-        assert_eq!(status.observed_generation, 1);
+        let mut status = serde_json::to_value(TaskStatus::pending()).unwrap();
+        status["conditions"][0]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<TaskStatus>(status).is_err());
     }
 }

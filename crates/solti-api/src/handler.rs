@@ -6,13 +6,20 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use solti_model::{OutputEvent, Task, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun};
+use solti_model::{
+    OutputEvent, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun,
+    TaskWatchEvent, WritePreconditions,
+};
 use tokio_stream::Stream;
 
 use crate::error::ApiError;
 
 /// Boxed stream of [`OutputEvent`]s — the wire-side surface of live task logs.
 pub type OutputEventStream = Pin<Box<dyn Stream<Item = OutputEvent> + Send + 'static>>;
+
+/// Boxed stream of Task resource changes.
+pub type TaskWatchEventStream =
+    Pin<Box<dyn Stream<Item = Result<TaskWatchEvent, ApiError>> + Send + 'static>>;
 
 /// Task execution API handler.
 ///
@@ -33,6 +40,7 @@ pub type OutputEventStream = Pin<Box<dyn Stream<Item = OutputEvent> + Send + 'st
 /// | `apply_task`       | `PUT    /apis/solti.io/v1/tasks/{name}`      | `ApplyTask`      |
 /// | `get_task`         | `GET    /apis/solti.io/v1/tasks/{name}`      | `GetTask`        |
 /// | `query_tasks`      | `GET    /apis/solti.io/v1/tasks`             | `ListTasks`      |
+/// | `watch_tasks`      | `GET    /apis/solti.io/v1/tasks?watch=true`  | `WatchTasks`     |
 /// | `list_task_runs`   | `GET    /apis/solti.io/v1/tasks/{name}/runs` | `ListTaskRuns`   |
 /// | `delete_task`      | `DELETE /apis/solti.io/v1/tasks/{name}`      | `DeleteTask`     |
 /// | `stream_task_logs` | `GET    /apis/solti.io/v1/tasks/{name}/logs` | `StreamTaskLogs` |
@@ -61,10 +69,20 @@ pub trait ApiHandler: Send + Sync + 'static {
 
     /// Declaratively create or update the resource addressed by `metadata.name`.
     ///
+    /// Empty preconditions preserve upsert semantics. Non-empty preconditions
+    /// require an existing matching resource.
+    ///
     /// ## Errors
     ///
-    /// Same categories as [`create_task`](Self::create_task).
-    async fn apply_task(&self, manifest: TaskManifest) -> Result<Task, ApiError>;
+    /// Same categories as [`create_task`](Self::create_task), plus:
+    ///
+    /// - [`ApiError::TaskNotFound`] when conditional apply targets no resource;
+    /// - [`ApiError::Conflict`] when a precondition does not match.
+    async fn apply_task(
+        &self,
+        manifest: TaskManifest,
+        preconditions: WritePreconditions,
+    ) -> Result<Task, ApiError>;
 
     /// Get a current task resource by name.
     ///
@@ -76,15 +94,34 @@ pub trait ApiHandler: Send + Sync + 'static {
     /// a missing task is `Ok(None)`. Custom implementations may return any [`ApiError`].
     async fn get_task(&self, name: &TaskId) -> Result<Option<Task>, ApiError>;
 
-    /// Query tasks with combined filters and pagination.
-    ///
-    /// Supports filtering by slot and/or status simultaneously, with offset/limit pagination. Returns a page with total count.
+    /// Query tasks with combined filters and snapshot-consistent continuation pagination.
     ///
     /// ## Errors
     ///
-    /// The bundled `SupervisorApiAdapter` never fails here.
+    /// The bundled `SupervisorApiAdapter` returns [`ApiError::InvalidRequest`]
+    /// for an invalid continuation and [`ApiError::ResourceVersionExpired`]
+    /// when its snapshot is no longer retained.
     /// Custom implementations may return any [`ApiError`].
     async fn query_tasks(&self, query: TaskQuery) -> Result<TaskPage<Task>, ApiError>;
+
+    /// Watch changes to tasks matching the filter.
+    ///
+    /// An absent resource version or `"0"` starts with `Added` events for the
+    /// current matching resources. A specific version replays later retained
+    /// changes, then continues with live events.
+    ///
+    /// ## Errors
+    ///
+    /// - [`ApiError::ResourceVersionExpired`]: the requested position is no
+    ///   longer retained.
+    ///
+    /// Streams may later yield the same error when a subscriber falls behind
+    /// the retained history.
+    async fn watch_tasks(
+        &self,
+        filter: TaskFilter,
+        resource_version: Option<String>,
+    ) -> Result<TaskWatchEventStream, ApiError>;
 
     /// List execution history for a specific task (oldest first).
     ///
@@ -100,9 +137,14 @@ pub trait ApiHandler: Send + Sync + 'static {
     /// ## Errors
     ///
     /// - [`ApiError::TaskNotFound`]: the task is absent from the public API;
+    /// - [`ApiError::Conflict`]: a precondition does not match;
     /// - [`ApiError::Internal`]: the supervisor failed to cancel the bound submission,
     ///   whether registered or controller-queued (timeout or internal runtime failure).
-    async fn delete_task(&self, id: &TaskId) -> Result<(), ApiError>;
+    async fn delete_task(
+        &self,
+        id: &TaskId,
+        preconditions: WritePreconditions,
+    ) -> Result<(), ApiError>;
 
     /// Subscribe to the live-tail stream of stdout/stderr lines for a task.
     ///

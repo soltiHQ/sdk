@@ -8,7 +8,7 @@
 #   agent-client.crt  / .key        agent client cert    (agent  -> podium, mTLS)
 #   podium-client.crt / .key        podium client cert   (podium -> agent,  mTLS)
 #
-# All leaf certs are signed by the single CA, so each side trusts the other via ca.crt.
+# All leaf certs are signed by the single CA. Each side trusts the other via ca.crt.
 # Dev only — do NOT ship these.
 #
 # Requires: openssl (1.1.1+ for -addext / process substitution).

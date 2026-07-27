@@ -52,7 +52,7 @@ mod raw {
     use super::*;
 
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
     pub(super) struct BackoffPolicyRaw {
         pub jitter: super::super::JitterPolicy,
         pub first_ms: u64,

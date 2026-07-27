@@ -13,7 +13,9 @@ license.workspace = true
 
 [features]
 default       = []
-timezone-sync = ["dep:taskvisor", "dep:solti-model"]
+journald      = ["dep:tracing-journald"]
+log-compat    = ["tracing-subscriber/tracing-log"]
+timezone-sync = ["dep:solti-model", "dep:taskvisor"]
 
 [dependencies]
 serde              = { workspace = true, features = ["derive"] }
@@ -21,8 +23,8 @@ taskvisor          = { workspace = true, optional = true }
 time               = { workspace = true, features = ["formatting", "local-offset"] }
 thiserror          = { workspace = true }
 tracing            = { workspace = true }
-tracing-journald   = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+tracing-journald   = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, default-features = false, features = ["ansi", "env-filter", "json", "smallvec"] }
 
 solti-model = { workspace = true, optional = true }
 
@@ -31,5 +33,5 @@ serde_json = { workspace = true }
 tokio      = { workspace = true, features = ["rt", "rt-multi-thread"] }
 
 [package.metadata.docs.rs]
-features = ["timezone-sync"]
+all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

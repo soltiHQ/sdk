@@ -5,9 +5,9 @@ use crate::logger::object::{LoggerFormat, LoggerLevel, LoggerTimeZone};
 
 /// Logger configuration passed to [`crate::init_logger`].
 ///
-/// The type is serde-friendly. Missing fields use the same values as [`Default`], so config files can stay small.
+/// Missing fields use [`Default`].
 ///
-/// ## Example
+/// # Example
 ///
 /// ```rust
 /// use solti_observe::{LoggerConfig, LoggerFormat};
@@ -19,32 +19,32 @@ use crate::logger::object::{LoggerFormat, LoggerLevel, LoggerTimeZone};
 /// assert_eq!(cfg.level.as_str(), "debug");
 /// ```
 ///
-/// ## Defaults
+/// # Defaults
 ///
 /// | Field          | Default | Description                                |
 /// |----------------|---------|--------------------------------------------|
 /// | `format`       | `Text`  | Human-readable colored output              |
 /// | `level`        | `info`  | `tracing_subscriber::EnvFilter` expression |
-/// | `tz`           | `Utc`   | Timestamp timezone                         |
+/// | `timezone`     | `Utc`   | Timestamp timezone                         |
 /// | `with_targets` | `true`  | Include module/target names in output      |
 /// | `use_color`    | `true`  | Colored output (auto-disabled if not TTY)  |
 ///
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoggerConfig {
-    /// Output format: text, JSON, or journald.
+    /// Output format: text, JSON, or journald with feature `journald`.
     pub format: LoggerFormat,
     /// Log level filter expression, such as `"info"` or `"solti_exec=trace,info"`.
     ///
     /// Validated on construction: see [`LoggerLevel`] for syntax.
     pub level: LoggerLevel,
-    /// Timestamp timezone.
-    pub tz: LoggerTimeZone,
-    /// Whether to include module/target names in log output.
+    /// Timestamp timezone for text and JSON logs.
+    pub timezone: LoggerTimeZone,
+    /// Whether text and JSON logs include the event target.
     pub with_targets: bool,
     /// Whether to use colored output.
     ///
-    /// Actual color usage also depends on stdout being a terminal - see [`should_use_color`](Self::should_use_color).
+    /// Colors are used only for text written to an interactive terminal.
     pub use_color: bool,
 }
 
@@ -53,7 +53,7 @@ impl Default for LoggerConfig {
         Self {
             format: LoggerFormat::default(),
             level: LoggerLevel::default(),
-            tz: LoggerTimeZone::default(),
+            timezone: LoggerTimeZone::default(),
             with_targets: true,
             use_color: true,
         }
@@ -66,15 +66,7 @@ impl LoggerConfig {
     /// Color is enabled only when `use_color` is `true` and stdout is a terminal.
     /// JSON logs ignore colors.
     ///
-    /// ## Example
-    ///
-    /// ```rust
-    /// use solti_observe::LoggerConfig;
-    ///
-    /// let config = LoggerConfig::default();
-    /// let _color = config.should_use_color();
-    /// ```
-    pub fn should_use_color(&self) -> bool {
+    pub(crate) fn should_use_color(&self) -> bool {
         self.use_color && std::io::stdout().is_terminal()
     }
 }
@@ -88,7 +80,7 @@ mod tests {
         let config = LoggerConfig::default();
 
         assert_eq!(config.format, LoggerFormat::Text);
-        assert_eq!(config.tz, LoggerTimeZone::Utc);
+        assert_eq!(config.timezone, LoggerTimeZone::Utc);
         assert_eq!(config.level.as_str(), "info");
         assert!(config.with_targets);
         assert!(config.use_color);
@@ -98,7 +90,7 @@ mod tests {
     fn serde_roundtrip() {
         let config = LoggerConfig {
             format: LoggerFormat::Json,
-            tz: LoggerTimeZone::Local,
+            timezone: LoggerTimeZone::Local,
             level: "debug".parse().unwrap(),
             with_targets: false,
             use_color: false,
@@ -111,7 +103,7 @@ mod tests {
         assert_eq!(config.with_targets, parsed.with_targets);
         assert_eq!(config.use_color, parsed.use_color);
         assert_eq!(config.format, parsed.format);
-        assert_eq!(config.tz, parsed.tz);
+        assert_eq!(config.timezone, parsed.timezone);
     }
 
     #[test]
@@ -121,7 +113,7 @@ mod tests {
 
         assert_eq!(config.level.as_str(), LoggerLevel::default().as_str());
         assert_eq!(config.format, LoggerFormat::default());
-        assert_eq!(config.tz, LoggerTimeZone::default());
+        assert_eq!(config.timezone, LoggerTimeZone::default());
         assert!(config.with_targets);
         assert!(config.use_color);
     }

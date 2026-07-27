@@ -42,6 +42,8 @@ discover-grpc = ["discover", "model", "taskvisor", "solti-discover/grpc"]
 discover-tls = ["discover", "tls", "solti-discover/tls"]
 
 observe = ["dep:solti-observe"]
+observe-journald = ["observe", "solti-observe/journald"]
+observe-log-compat = ["observe", "solti-observe/log-compat"]
 observe-timezone-sync = [
     "observe",
     "model",
@@ -49,10 +51,10 @@ observe-timezone-sync = [
     "solti-observe/timezone-sync",
 ]
 
-# `prometheus` preserves solti-prometheus's compatible default integrations.
-# `prometheus-base` is the registry/build-info-only opt-in.
+# `prometheus-base` exposes the registry and build-info helper.
+# The other features add one owner-specific integration each.
 prometheus-base = ["dep:solti-prometheus"]
-prometheus = ["prometheus-base", "prometheus-runner", "prometheus-taskvisor"]
+prometheus = ["prometheus-base", "prometheus-runner", "prometheus-taskvisor-controller"]
 prometheus-api = ["prometheus-base", "api", "solti-prometheus/api"]
 prometheus-discover = ["prometheus-base", "discover", "solti-prometheus/discover"]
 prometheus-process = ["prometheus-base", "solti-prometheus/process"]
@@ -66,8 +68,13 @@ prometheus-server = [
 prometheus-state = ["prometheus-base", "core", "model", "solti-prometheus/state"]
 prometheus-taskvisor = [
     "prometheus-base",
-    "taskvisor-controller",
+    "taskvisor",
     "solti-prometheus/taskvisor",
+]
+prometheus-taskvisor-controller = [
+    "prometheus-taskvisor",
+    "taskvisor-controller",
+    "solti-prometheus/taskvisor-controller",
 ]
 prometheus-full = [
     "prometheus-api",
@@ -76,7 +83,7 @@ prometheus-full = [
     "prometheus-runner",
     "prometheus-server",
     "prometheus-state",
-    "prometheus-taskvisor",
+    "prometheus-taskvisor-controller",
 ]
 
 full = [
@@ -87,6 +94,8 @@ full = [
     "discover-grpc",
     "discover-tls",
     "exec-seccomp",
+    "observe-journald",
+    "observe-log-compat",
     "observe-timezone-sync",
     "prometheus-full",
     "taskvisor-logging",

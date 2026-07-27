@@ -13,7 +13,7 @@ use crate::logger::LoggerError;
 ///
 /// The raw string is preserved. This lets config files round-trip without changing the user's filter expression.
 ///
-/// ## Accepted Syntax
+/// # Accepted syntax
 ///
 /// Any expression accepted by [`EnvFilter`](tracing_subscriber::EnvFilter) can be used:
 ///
@@ -24,7 +24,7 @@ use crate::logger::LoggerError;
 /// | `"solti_exec=trace,info"`                  | Trace for `solti_exec`, info for everything else |
 /// | `"solti_core=debug,solti_exec=trace,warn"` | Per-crate overrides with global fallback         |
 ///
-/// ## Example
+/// # Example
 ///
 /// ```
 /// use solti_observe::LoggerLevel;
@@ -38,7 +38,7 @@ use crate::logger::LoggerError;
 /// assert!(LoggerLevel::new("my_crate=lol").is_err());
 /// ```
 ///
-/// ## Serialization
+/// # Serialization
 ///
 /// It serializes to and from a plain JSON string:
 ///
@@ -48,7 +48,7 @@ use crate::logger::LoggerError;
 /// let json = serde_json::to_string(&lvl).unwrap();
 /// assert_eq!(json, r#""debug""#);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "String")]
 #[serde(into = "String")]
 pub struct LoggerLevel(String);
@@ -58,11 +58,11 @@ impl LoggerLevel {
     ///
     /// This is a convenience wrapper around [`TryFrom<String>`].
     ///
-    /// ## Errors
+    /// # Errors
     ///
     /// - [`LoggerError::InvalidLevel`]: the value is not a valid `EnvFilter` directive string (carries the input and the parse error).
     ///
-    /// ## Example
+    /// # Example
     /// ```
     /// use solti_observe::LoggerLevel;
     ///
@@ -77,7 +77,7 @@ impl LoggerLevel {
     ///
     /// This is exactly what was provided in config, such as `"info"` or `"solti_exec=trace,taskvisor=debug,info"`.
     ///
-    /// ## Example
+    /// # Example
     /// ```
     /// use solti_observe::LoggerLevel;
     ///
@@ -89,16 +89,8 @@ impl LoggerLevel {
         &self.0
     }
 
-    /// Convert this value into a `tracing_subscriber::EnvFilter`.
-    ///
-    /// ## Example
-    /// ```
-    /// use solti_observe::LoggerLevel;
-    ///
-    /// let lvl = "solti_exec=trace,info".parse::<LoggerLevel>().unwrap();
-    /// let _ = lvl.to_env_filter();
-    /// ```
-    pub fn to_env_filter(&self) -> EnvFilter {
+    /// Convert this value into an environment filter.
+    pub(crate) fn to_env_filter(&self) -> EnvFilter {
         EnvFilter::try_new(self.as_str()).expect("LoggerLevel is always valid after construction")
     }
 }
@@ -118,10 +110,13 @@ impl FromStr for LoggerLevel {
 
 impl TryFrom<String> for LoggerLevel {
     type Error = LoggerError;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        match EnvFilter::try_new(&s) {
-            Ok(_) => Ok(LoggerLevel(s)),
-            Err(e) => Err(LoggerError::InvalidLevel(format!("{}: {}", s, e))),
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match EnvFilter::try_new(&value) {
+            Ok(_) => Ok(LoggerLevel(value)),
+            Err(parse_error) => Err(LoggerError::InvalidLevel {
+                value,
+                source: parse_error,
+            }),
         }
     }
 }
@@ -134,7 +129,6 @@ impl From<LoggerLevel> for String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json;
     use std::str::FromStr;
 
     use super::LoggerLevel;

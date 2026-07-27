@@ -1,4 +1,4 @@
-//! # Periodic sync (heartbeat) task.
+//! Periodic discovery sync task.
 //!
 //! ```text
 //! Agent                          Control Plane
@@ -9,57 +9,48 @@
 //!   |--- SyncRequest ----------------> |
 //! ```
 //!
-//! On failure the task returns `TaskError::Fail` and the supervisor applies backoff + restart policy from the spec.
+//! Retryable failures become `TaskError::Fail`. Permanent failures become
+//! `TaskError::Fatal`.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-#[cfg(any(feature = "grpc", feature = "http"))]
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Upper bound on server-advised hold time (seconds).
 const MAX_RETRY_AFTER_S: i32 = 3_600;
 
 use crate::proto::SyncRequest;
-
-use std::time::Instant;
+use crate::proto_agent::{
+    AgentCapabilities as ProtoAgentCapabilities, RunnerCapability as ProtoRunnerCapability,
+    WorkloadType as ProtoWorkloadType,
+};
 
 use tracing::{debug, warn};
 
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, EmbeddedSpec, JitterPolicy, RestartPolicy, TaskManifest,
-    TaskSpec, TaskWorkload,
+    AdmissionPolicy, AgentCapabilities, BackoffPolicy, EmbeddedSpec, JitterPolicy, RestartPolicy,
+    TaskManifest, TaskSpec, TaskWorkload,
 };
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 
 use crate::config::DiscoverConfig;
-use crate::errors::DiscoverError;
+use crate::errors::{DiscoverError, Retryability};
 use crate::metrics::{self, DiscoverMetricsHandle};
 use crate::tasks::transport::TransportAdapter;
 use crate::uptime::UptimeSource;
 
 const SLOT: &str = "solti-discover-sync";
 
-/// Build a heartbeat task and its spec from discovery config and an uptime source.
+/// Builds the embedded heartbeat task and its desired resource.
 ///
-/// Returns a prebuilt runtime task and its complete desired resource.
+/// # Errors
 ///
-/// ## Errors
-///
-/// - [`DiscoverError::SpecBuild`]: `TaskSpec` validation failed.
-/// - [`DiscoverError::HttpRequest`]: the `reqwest::Client` builder failed (feature `http`; rare - e.g. TLS backend init).
-/// - [`DiscoverError::InvalidConfig`]: the TLS config could not be converted into a `rustls` client config (features `http` + `tls`).
-///
-/// ## Also
-///
-/// - [`DiscoverConfig`](crate::DiscoverConfig) controls endpoint, transport, interval.
-/// - [`DiscoverError`](crate::DiscoverError) failure modes surfaced via `TaskError::Fail`.
-/// - [`UptimeSource`](crate::UptimeSource) defines the composition-owned uptime epoch.
+/// Returns [`DiscoverError`] when the task manifest or selected transport
+/// cannot be built from the validated config.
 pub fn sync(
     config: DiscoverConfig,
     uptime: Arc<dyn UptimeSource>,
-) -> Result<(TaskRef, TaskManifest), DiscoverError> {
+) -> Result<(TaskManifest, TaskRef), DiscoverError> {
     let delay_ms = config.delay_ms;
 
     let backoff = config.backoff.clone().unwrap_or_else(|| BackoffPolicy {
@@ -69,10 +60,6 @@ pub fn sync(
         factor: 2.0,
     });
 
-    // The per-attempt timeout must cover everything the attempt body may
-    // legitimately wait through: one-time startup jitter (up to delay_ms),
-    // a server-advised retry hold (up to MAX_RETRY_AFTER_S), and the request
-    // itself. Tying it to the heartbeat period would kill healthy attempts.
     let attempt_timeout_ms = delay_ms
         .saturating_add((MAX_RETRY_AFTER_S as u64).saturating_mul(1_000))
         .saturating_add(config.connect_timeout_ms)
@@ -88,23 +75,22 @@ pub fn sync(
         .build()
         .map_err(|e| DiscoverError::SpecBuild(e.to_string()))?;
 
-    let base_request = build_base_request(&config);
-
-    if config.token.is_some() && !tls_enabled(&config) {
+    let transport = TransportAdapter::from_config(&config)?;
+    if config.token.is_some() && !transport.is_secure() {
         warn!(
             "discovery: presenting a bearer token over a plaintext channel; \
              enable TLS to protect the credential in transit"
         );
     }
 
-    let transport = TransportAdapter::from_config(&config)?;
+    let base_request = build_base_request(&config);
     let metrics = config.metrics.clone();
 
     let ctx = Arc::new(SyncContext {
         base_request,
         delay_ms,
         transport,
-        retry_hold_until: AtomicU64::new(0),
+        retry_hold_until: Mutex::new(None),
         startup_jitter_applied: AtomicBool::new(false),
         metrics,
         uptime,
@@ -125,10 +111,7 @@ pub fn sync(
                     .await?;
             }
 
-            if let Some(wait) = compute_hold_wait(
-                ctx.retry_hold_until.load(Ordering::Relaxed),
-                now_unix_seconds(),
-            ) {
+            if let Some(wait) = ctx.retry_hold_wait() {
                 debug!(
                     wait_s = wait.as_secs(),
                     "waiting for server-advised retry hold"
@@ -147,7 +130,7 @@ pub fn sync(
             match result {
                 Ok(()) => {
                     ctx.metrics.record_success(duration_ms);
-                    ctx.retry_hold_until.store(0, Ordering::Relaxed);
+                    ctx.clear_retry_hold();
                     debug!("sync completed successfully");
                     Ok(())
                 }
@@ -163,17 +146,19 @@ pub fn sync(
                         if *s != clamped {
                             warn!(advised_s = *s, capped_s = clamped, "retry_after_s capped",);
                         }
-                        let hold_until = now_unix_seconds().saturating_add(clamped as u64);
-                        ctx.retry_hold_until.store(hold_until, Ordering::Relaxed);
+                        ctx.set_retry_hold(Duration::from_secs(clamped as u64));
                         ctx.metrics.record_hold(clamped as u64);
                     }
 
-                    if e.is_terminal() {
-                        warn!("sync failed fatally: {}", e);
-                        Err(TaskError::fatal(format!("sync fatally failed: {}", e)))
-                    } else {
-                        warn!("sync failed: {}", e);
-                        Err(TaskError::fail(format!("sync failed: {}", e)))
+                    match e.retryability() {
+                        Retryability::Permanent => {
+                            warn!("sync failed permanently: {}", e);
+                            Err(TaskError::fatal_from(e))
+                        }
+                        Retryability::Retryable => {
+                            warn!("sync failed: {}", e);
+                            Err(TaskError::fail_from(e))
+                        }
                     }
                 }
             }
@@ -181,24 +166,46 @@ pub fn sync(
     });
     let manifest =
         TaskManifest::new(SLOT, spec).map_err(|e| DiscoverError::SpecBuild(e.to_string()))?;
-    Ok((task, manifest))
+    Ok((manifest, task))
 }
 
 struct SyncContext {
     base_request: SyncRequest,
     delay_ms: u64,
     transport: TransportAdapter,
-    /// Unix timestamp (seconds) before which the next sync attempt must wait.
-    ///
-    /// `0` means no active hold. Updated to `now + retry_after_s` when the control plane returns `Rejected { retry_after_s: Some(_) }`;
-    /// cleared to `0` on successful sync.
-    retry_hold_until: AtomicU64,
-    /// Guard that makes the first-tick startup jitter run exactly once per process lifetime.
-    /// Set to `true` after the initial jitter sleep;
-    /// subsequent restarts (e.g. after a transient failure) skip the jitter and stay on the periodic schedule.
+    retry_hold_until: Mutex<Option<Instant>>,
     startup_jitter_applied: AtomicBool,
     metrics: DiscoverMetricsHandle,
     uptime: Arc<dyn UptimeSource>,
+}
+
+impl SyncContext {
+    fn clear_retry_hold(&self) {
+        *self
+            .retry_hold_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    fn retry_hold_wait(&self) -> Option<Duration> {
+        let mut deadline = self
+            .retry_hold_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wait = compute_hold_wait(*deadline, Instant::now());
+        if wait.is_none() {
+            *deadline = None;
+        }
+        wait
+    }
+
+    fn set_retry_hold(&self, duration: Duration) {
+        *self
+            .retry_hold_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Instant::now().checked_add(duration);
+    }
 }
 
 /// Map a [`DiscoverError`] to a canonical failure-reason label.
@@ -248,24 +255,13 @@ fn classify_failure(err: &DiscoverError) -> metrics::DiscoverFailReason {
                 | Code::NotFound
                 | Code::AlreadyExists
                 | Code::OutOfRange
-                | Code::Aborted
-                | Code::Cancelled => metrics::DiscoverFailReason::RejectedClient,
+                | Code::Unimplemented => metrics::DiscoverFailReason::RejectedClient,
+                Code::ResourceExhausted | Code::Aborted | Code::Cancelled => {
+                    metrics::DiscoverFailReason::RejectedServer
+                }
                 _ => metrics::DiscoverFailReason::Other,
             }
         }
-    }
-}
-
-/// Whether outbound TLS is configured.
-#[inline]
-fn tls_enabled(_config: &DiscoverConfig) -> bool {
-    #[cfg(feature = "tls")]
-    {
-        _config.tls.is_some()
-    }
-    #[cfg(not(feature = "tls"))]
-    {
-        false
     }
 }
 
@@ -303,17 +299,42 @@ fn build_base_request(cfg: &DiscoverConfig) -> SyncRequest {
     SyncRequest {
         id: cfg.agent_id.to_string(),
         name: cfg.name.clone(),
-        endpoint: cfg.agent_endpoint.clone(),
+        endpoint: cfg.agent_endpoint.address.clone(),
         platform: platform().to_string(),
         arch: arch().to_string(),
         os: os_info(),
         metadata: cfg.metadata.clone(),
         ts: 0,
         uptime_seconds: 0,
-        endpoint_type: cfg.transport.as_proto(),
-        api_version: cfg.api_version as i32,
-        heartbeat_interval_s: (cfg.delay_ms / 1000).max(1) as i32,
-        capabilities: cfg.capabilities.clone(),
+        endpoint_type: cfg.agent_endpoint.endpoint_type.as_proto(),
+        api_version: cfg.agent_endpoint.api_version,
+        heartbeat_interval_s: cfg.heartbeat_interval_s,
+        capabilities: Some(capabilities_to_proto(&cfg.capabilities)),
+    }
+}
+
+fn capabilities_to_proto(capabilities: &AgentCapabilities) -> ProtoAgentCapabilities {
+    ProtoAgentCapabilities {
+        runners: capabilities
+            .runners()
+            .iter()
+            .map(|runner| ProtoRunnerCapability {
+                name: runner.name().to_owned(),
+                labels: runner
+                    .labels()
+                    .iter()
+                    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                    .collect(),
+                workloads: runner
+                    .workload_types()
+                    .iter()
+                    .map(|workload| ProtoWorkloadType {
+                        api_version: workload.api_version().to_owned(),
+                        kind: workload.kind().to_owned(),
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -349,20 +370,66 @@ fn startup_jitter_ms(max_ms: u64) -> u64 {
     mixed % max_ms
 }
 
-/// Compute remaining wait until a server-advised retry deadline.
-///
-/// Returns `Some(wait)` when `hold_until_unix_s` is in the future, `None` otherwise.
-/// `hold_until_unix_s == 0` is treated as "no active hold".
-fn compute_hold_wait(hold_until_unix_s: u64, now_unix_s: u64) -> Option<Duration> {
-    if hold_until_unix_s == 0 || hold_until_unix_s <= now_unix_s {
-        return None;
-    }
-    Some(Duration::from_secs(hold_until_unix_s - now_unix_s))
+fn compute_hold_wait(deadline: Option<Instant>, now: Instant) -> Option<Duration> {
+    deadline
+        .and_then(|deadline| deadline.checked_duration_since(now))
+        .filter(|duration| !duration.is_zero())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solti_model::{Labels, RunnerCapability, WORKLOAD_API_VERSION, WorkloadTypeMeta};
+
+    #[test]
+    fn capabilities_preserve_runner_name_labels_and_workload_gvks() {
+        let mut labels = Labels::new();
+        labels.insert("solti.io/runner-name", "secure");
+        labels.insert("topology.solti.io/zone", "eu-1");
+        let capabilities = AgentCapabilities::new(vec![
+            RunnerCapability::new(
+                "secure",
+                labels,
+                vec![
+                    WorkloadTypeMeta::new("tasks.example.io/v1", "DatabaseBackup").unwrap(),
+                    WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").unwrap(),
+                ],
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+
+        let proto = capabilities_to_proto(&capabilities);
+
+        assert_eq!(proto.runners.len(), 1);
+        let runner = &proto.runners[0];
+        assert_eq!(runner.name, "secure");
+        assert_eq!(
+            runner
+                .labels
+                .get("solti.io/runner-name")
+                .map(String::as_str),
+            Some("secure"),
+        );
+        assert_eq!(
+            runner
+                .labels
+                .get("topology.solti.io/zone")
+                .map(String::as_str),
+            Some("eu-1"),
+        );
+        assert_eq!(
+            runner
+                .workloads
+                .iter()
+                .map(|workload| (workload.api_version.as_str(), workload.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (WORKLOAD_API_VERSION, "Subprocess"),
+                ("tasks.example.io/v1", "DatabaseBackup"),
+            ],
+        );
+    }
 
     #[cfg(feature = "http")]
     #[test]
@@ -373,13 +440,17 @@ mod tests {
         // that, or taskvisor kills healthy heartbeats with AttemptTimedOut cycles.
         let delay_ms = 30_000u64;
         let config = crate::DiscoverConfig::builder(
-            solti_model::AgentId::from("agent-1"),
+            solti_model::AgentId::new("agent-1").unwrap(),
             "agent-1",
-            "http://127.0.0.1:8085",
-            "http://127.0.0.1:9000",
-            crate::DiscoveryTransport::Http,
+            crate::AgentEndpoint::new("http://127.0.0.1:8085", crate::AgentEndpointType::Http, 1)
+                .unwrap(),
+            crate::ControlPlaneEndpoint::new(
+                "http://127.0.0.1:9000",
+                crate::DiscoveryTransport::Http,
+            )
+            .unwrap(),
             delay_ms,
-            1,
+            "test@1",
         )
         .build()
         .expect("config builds");
@@ -389,36 +460,36 @@ mod tests {
             + config.connect_timeout_ms
             + config.request_timeout_ms;
 
-        let (_task_ref, task) = sync(config, Arc::new(|| 0)).expect("sync builds");
+        let (manifest, _) = sync(config, Arc::new(|| 0)).expect("sync builds");
         assert!(
-            task.spec().timeout().as_millis() >= worst_case_ms,
+            manifest.spec().timeout().as_millis() >= worst_case_ms,
             "attempt timeout {}ms must cover the worst case {}ms",
-            task.spec().timeout().as_millis(),
+            manifest.spec().timeout().as_millis(),
             worst_case_ms
         );
     }
 
     #[test]
-    fn compute_hold_wait_zero_means_no_hold() {
-        assert_eq!(compute_hold_wait(0, 1_000), None);
-        assert_eq!(compute_hold_wait(0, 0), None);
+    fn compute_hold_wait_none_means_no_hold() {
+        assert_eq!(compute_hold_wait(None, Instant::now()), None);
     }
 
     #[test]
     fn compute_hold_wait_expired_returns_none() {
-        assert_eq!(compute_hold_wait(999, 1_000), None);
-        assert_eq!(compute_hold_wait(1_000, 1_000), None);
+        let now = Instant::now();
+        assert_eq!(compute_hold_wait(Some(now), now), None);
+        assert_eq!(
+            compute_hold_wait(Some(now - Duration::from_secs(1)), now),
+            None
+        );
     }
 
     #[test]
     fn compute_hold_wait_future_returns_remaining() {
+        let now = Instant::now();
         assert_eq!(
-            compute_hold_wait(1_060, 1_000),
+            compute_hold_wait(Some(now + Duration::from_secs(60)), now),
             Some(Duration::from_secs(60))
-        );
-        assert_eq!(
-            compute_hold_wait(1_001, 1_000),
-            Some(Duration::from_secs(1))
         );
     }
 
@@ -433,34 +504,34 @@ mod tests {
     }
 
     #[test]
-    fn auth_failed_is_terminal() {
+    fn auth_failed_is_permanent() {
         let e = DiscoverError::AuthFailed {
             reason: "http 401".into(),
         };
-        assert!(e.is_terminal(), "auth errors must be escalated to Fatal");
+        assert_eq!(e.retryability(), Retryability::Permanent);
     }
 
     #[test]
-    fn transient_errors_are_not_terminal() {
+    fn transient_errors_are_retryable() {
         #[cfg(feature = "http")]
         {
             let e = DiscoverError::HttpStatus {
                 code: 503,
                 body: "overloaded".into(),
             };
-            assert!(!e.is_terminal(), "5xx is transient; sync must retry");
+            assert_eq!(e.retryability(), Retryability::Retryable);
         }
         let e = DiscoverError::Rejected {
             reason: "overloaded".into(),
             retry_after_s: Some(60),
         };
-        assert!(!e.is_terminal());
+        assert_eq!(e.retryability(), Retryability::Retryable);
     }
 
     #[test]
-    fn invalid_config_is_terminal() {
+    fn invalid_config_is_permanent() {
         let e = DiscoverError::InvalidConfig("bad endpoint".into());
-        assert!(e.is_terminal());
+        assert_eq!(e.retryability(), Retryability::Permanent);
     }
 
     #[test]
@@ -489,13 +560,17 @@ mod tests {
     #[cfg(feature = "http")]
     fn test_config() -> crate::DiscoverConfig {
         crate::DiscoverConfig::builder(
-            solti_model::AgentId::from("agent-1"),
+            solti_model::AgentId::new("agent-1").unwrap(),
             "agent-1",
-            "http://127.0.0.1:8085",
-            "http://127.0.0.1:9000",
-            crate::DiscoveryTransport::Http,
+            crate::AgentEndpoint::new("http://127.0.0.1:8085", crate::AgentEndpointType::Http, 1)
+                .unwrap(),
+            crate::ControlPlaneEndpoint::new(
+                "http://127.0.0.1:9000",
+                crate::DiscoveryTransport::Http,
+            )
+            .unwrap(),
             30_000,
-            1,
+            "test@1",
         )
         .build()
         .expect("config builds")
@@ -510,5 +585,32 @@ mod tests {
         let request = stamp_request(&base, &source);
 
         assert_eq!(request.uptime_seconds, 42);
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn request_uses_the_advertised_transport_not_the_discovery_transport() {
+        let config = crate::DiscoverConfig::builder(
+            solti_model::AgentId::new("agent-1").unwrap(),
+            "agent-1",
+            crate::AgentEndpoint::new("127.0.0.1:50051", crate::AgentEndpointType::Grpc, 7)
+                .unwrap(),
+            crate::ControlPlaneEndpoint::new(
+                "http://127.0.0.1:9000",
+                crate::DiscoveryTransport::Http,
+            )
+            .unwrap(),
+            30_000,
+            "test@1",
+        )
+        .build()
+        .unwrap();
+
+        let request = build_base_request(&config);
+        assert_eq!(
+            request.endpoint_type,
+            crate::proto::EndpointType::Grpc as i32
+        );
+        assert_eq!(request.api_version, 7);
     }
 }

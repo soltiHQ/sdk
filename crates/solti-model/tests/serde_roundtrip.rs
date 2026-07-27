@@ -1,8 +1,8 @@
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, ContainerSpec, EmbeddedSpec, Flag, JitterPolicy, Labels,
-    RestartPolicy, RunnerSelector, Runtime, SelectorRequirement, SubprocessMode, SubprocessSpec,
-    Task, TaskEnv, TaskPhase, TaskRun, TaskSpec, TaskWorkload, WasmSpec,
+    AdmissionPolicy, BackoffPolicy, ContainerSpec, EmbeddedSpec, Flag, JitterPolicy, LabelSelector,
+    Labels, RestartPolicy, SelectorRequirement, SubprocessMode, SubprocessSpec, Task, TaskEnv,
+    TaskPhase, TaskRun, TaskSpec, TaskWorkload, WasmSpec,
 };
 
 fn embedded(revision: &str) -> TaskWorkload {
@@ -13,7 +13,7 @@ fn fully_populated_spec(workload: TaskWorkload) -> TaskSpec {
     let mut selector_labels = Labels::new();
     selector_labels.insert("zone", "eu-west-1");
 
-    let selector = RunnerSelector {
+    let selector = LabelSelector {
         match_labels: selector_labels,
         match_expressions: vec![
             SelectorRequirement::exists("gpu"),
@@ -70,13 +70,10 @@ fn roundtrip_subprocess_command() {
 }
 
 #[test]
-fn roundtrip_subprocess_script_custom() {
+fn roundtrip_subprocess_script_interpreter() {
     let spec = fully_populated_spec(TaskWorkload::Subprocess(SubprocessSpec::new(
         SubprocessMode::Script {
-            runtime: Runtime::Custom {
-                command: "ruby".into(),
-                flag: "-e".into(),
-            },
+            interpreter: "ruby".into(),
             body: BASE64.encode(b"puts 'ok'"),
             args: vec![],
         },
@@ -132,12 +129,13 @@ fn roundtrip_embedded_bypasses_submit_validation() {
 
 #[test]
 fn task_run_roundtrip_preserves_all_fields() {
-    let mut run = TaskRun::starting(3, 7, embedded("test-v1").type_meta());
+    let mut run = TaskRun::starting(3, 7, embedded("test-v1").type_meta()).unwrap();
     run.finish(
         TaskPhase::Exhausted,
         Some("retries exhausted".into()),
         Some(42),
-    );
+    )
+    .unwrap();
     let json1 = serde_json::to_string(&run).unwrap();
     let back: TaskRun = serde_json::from_str(&json1).unwrap();
     let json2 = serde_json::to_string(&back).unwrap();

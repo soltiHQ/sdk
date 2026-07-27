@@ -28,7 +28,7 @@ pub(crate) fn task_is_visible(task: &Task) -> bool {
 /// Return whether a historical run belongs on the public API surfaces.
 #[cfg(any(feature = "grpc", feature = "http"))]
 pub(crate) fn run_is_visible(run: &TaskRun) -> bool {
-    workload_is_visible(&run.workload)
+    workload_is_visible(run.workload())
 }
 
 #[cfg(test)]
