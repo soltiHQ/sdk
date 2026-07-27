@@ -1,7 +1,13 @@
-//! RFC 3339 timestamp formatter.
+//! # RFC 3339 timestamps
 //!
 //! The logger injects [`Rfc3339Timer`] into `tracing-subscriber`.
 //! It formats timestamps in UTC or with the cached local offset.
+//!
+//! ```text
+//! current UTC time + selected offset ──► RFC 3339 timestamp
+//! ```
+//!
+//! A formatting failure writes `<invalid-time>`.
 
 use std::fmt;
 
@@ -17,7 +23,7 @@ pub(crate) struct Rfc3339Timer {
 }
 
 impl Rfc3339Timer {
-    /// Create a formatter for the given timezone setting.
+    /// Creates a formatter for one timezone setting.
     pub(crate) fn new(tz: LoggerTimeZone) -> Self {
         Self { tz }
     }

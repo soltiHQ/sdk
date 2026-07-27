@@ -1,32 +1,42 @@
 [package]
 name = "solti-observe"
-description = "Structured logging and timezone sync for the Solti SDK."
+
+description   = "Structured logging and timezone sync for the Solti SDK."
+keywords      = ["logging", "tracing", "observability", "journald", "tasks"]
+categories    = ["development-tools::debugging"]
+documentation = "https://docs.rs/solti-observe"
+readme        = "README.md"
 
 rust-version.workspace = true
-repository.workspace = true
-categories = ["development-tools::debugging"]
-homepage.workspace = true
-keywords = ["logging", "tracing", "observability", "journald", "tasks"]
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+repository.workspace   = true
+homepage.workspace     = true
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
 
 [features]
-default       = []
+default = []
+
 journald      = ["dep:tracing-journald"]
 log-compat    = ["tracing-subscriber/tracing-log"]
 timezone-sync = ["dep:solti-model", "dep:taskvisor"]
 
+full = [
+    "journald",
+    "log-compat",
+    "timezone-sync",
+]
+
 [dependencies]
+solti-model = { workspace = true, optional = true }
+
 serde              = { workspace = true, features = ["derive"] }
 taskvisor          = { workspace = true, optional = true }
-time               = { workspace = true, features = ["formatting", "local-offset"] }
 thiserror          = { workspace = true }
+time               = { workspace = true, features = ["formatting", "local-offset"] }
 tracing            = { workspace = true }
 tracing-journald   = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, default-features = false, features = ["ansi", "env-filter", "json", "smallvec"] }
-
-solti-model = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

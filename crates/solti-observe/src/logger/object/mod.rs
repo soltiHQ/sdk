@@ -1,10 +1,12 @@
-//! Logger value objects.
+//! # Logger values
 //!
-//! These small types keep logger config valid before [`init_logger`](crate::init_logger) installs the subscriber.
+//! These types validate serialized settings before [`init_logger`](crate::init_logger) runs.
 //!
-//! - [`LoggerFormat`] output format (`Text`, `Json`, and optional `Journald`).
-//! - [`LoggerLevel`] validated `EnvFilter` expression wrapper.
-//! - [`LoggerTimeZone`] timestamp timezone (`Utc`, `Local`).
+//! | Type               | Value                                  |
+//! |--------------------|----------------------------------------|
+//! | [`LoggerFormat`]   | Text, JSON, or optional journald       |
+//! | [`LoggerLevel`]    | Validated `EnvFilter` expression       |
+//! | [`LoggerTimeZone`] | UTC or cached local timestamp timezone |
 
 mod timezone;
 pub use timezone::LoggerTimeZone;

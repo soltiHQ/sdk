@@ -1,13 +1,32 @@
+//! # Logger configuration
+//!
+//! [`LoggerConfig`] contains every setting used during logger installation.
+//! Serde fills omitted fields from [`Default`].
+//!
+//! ```text
+//! serialized config ──► LoggerConfig ──► init_logger
+//! ```
+
 use serde::{Deserialize, Serialize};
 use std::io::IsTerminal;
 
 use crate::logger::object::{LoggerFormat, LoggerLevel, LoggerTimeZone};
 
-/// Logger configuration passed to [`crate::init_logger`].
+/// Complete settings passed to [`crate::init_logger`].
 ///
-/// Missing fields use [`Default`].
+/// ## Defaults
 ///
-/// # Example
+/// | Field          | Default | Used by                                |
+/// |----------------|---------|----------------------------------------|
+/// | `format`       | `Text`  | Backend selection                      |
+/// | `level`        | `info`  | Every backend                          |
+/// | `timezone`     | `Utc`   | Text and JSON timestamps               |
+/// | `with_targets` | `true`  | Text and JSON event targets            |
+/// | `use_color`    | `true`  | Text output on an interactive terminal |
+///
+/// Missing Serde fields use these defaults.
+///
+/// ## Example
 ///
 /// ```rust
 /// use solti_observe::{LoggerConfig, LoggerFormat};
@@ -18,25 +37,14 @@ use crate::logger::object::{LoggerFormat, LoggerLevel, LoggerTimeZone};
 /// let cfg: LoggerConfig = serde_json::from_str(r#"{"level":"debug"}"#).unwrap();
 /// assert_eq!(cfg.level.as_str(), "debug");
 /// ```
-///
-/// # Defaults
-///
-/// | Field          | Default | Description                                |
-/// |----------------|---------|--------------------------------------------|
-/// | `format`       | `Text`  | Human-readable colored output              |
-/// | `level`        | `info`  | `tracing_subscriber::EnvFilter` expression |
-/// | `timezone`     | `Utc`   | Timestamp timezone                         |
-/// | `with_targets` | `true`  | Include module/target names in output      |
-/// | `use_color`    | `true`  | Colored output (auto-disabled if not TTY)  |
-///
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoggerConfig {
-    /// Output format: text, JSON, or journald with feature `journald`.
+    /// Output backend.
     pub format: LoggerFormat,
-    /// Log level filter expression, such as `"info"` or `"solti_exec=trace,info"`.
+    /// Validated event filter.
     ///
-    /// Validated on construction: see [`LoggerLevel`] for syntax.
+    /// See [`LoggerLevel`] for accepted expressions.
     pub level: LoggerLevel,
     /// Timestamp timezone for text and JSON logs.
     pub timezone: LoggerTimeZone,
@@ -61,11 +69,10 @@ impl Default for LoggerConfig {
 }
 
 impl LoggerConfig {
-    /// Return whether text logs should use ANSI colors.
+    /// Returns whether text output should use ANSI colors.
     ///
     /// Color is enabled only when `use_color` is `true` and stdout is a terminal.
     /// JSON logs ignore colors.
-    ///
     pub(crate) fn should_use_color(&self) -> bool {
         self.use_color && std::io::stdout().is_terminal()
     }
@@ -107,24 +114,13 @@ mod tests {
     }
 
     #[test]
-    fn serde_uses_defaults_for_missing_fields() {
-        let json = r#"{}"#;
-        let config: LoggerConfig = serde_json::from_str(json).unwrap();
-
-        assert_eq!(config.level.as_str(), LoggerLevel::default().as_str());
-        assert_eq!(config.format, LoggerFormat::default());
-        assert_eq!(config.timezone, LoggerTimeZone::default());
-        assert!(config.with_targets);
-        assert!(config.use_color);
-    }
-
-    #[test]
-    fn partial_deserialization() {
+    fn serde_applies_defaults_to_missing_fields() {
         let json = r#"{"format": "json", "level": "debug"}"#;
         let config: LoggerConfig = serde_json::from_str(json).unwrap();
 
         assert_eq!(config.format, LoggerFormat::Json);
         assert_eq!(config.level.as_str(), "debug");
+        assert_eq!(config.timezone, LoggerTimeZone::Utc);
         assert!(config.with_targets);
         assert!(config.use_color);
     }

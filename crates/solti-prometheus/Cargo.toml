@@ -37,19 +37,18 @@ full = [
 ]
 
 [dependencies]
-axum       = { workspace = true, optional = true }
-itoa       = { workspace = true, optional = true }
-prometheus = { workspace = true }
-
 solti-api      = { workspace = true, optional = true }
 solti-core     = { workspace = true, optional = true }
 solti-discover = { workspace = true, optional = true }
 solti-model    = { workspace = true, optional = true }
 solti-runner   = { workspace = true, optional = true }
 
-taskvisor = { workspace = true, optional = true }
-tokio     = { workspace = true, optional = true, features = ["net", "rt"] }
-tracing   = { workspace = true, optional = true }
+axum       = { workspace = true, optional = true }
+itoa       = { workspace = true, optional = true }
+prometheus = { workspace = true }
+taskvisor  = { workspace = true, optional = true }
+tokio      = { workspace = true, optional = true, features = ["net", "rt"] }
+tracing    = { workspace = true, optional = true }
 
 [dev-dependencies]
 solti-core = { workspace = true, features = ["test-util"] }

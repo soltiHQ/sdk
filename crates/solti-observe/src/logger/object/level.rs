@@ -1,6 +1,11 @@
-//! Validated log level filter.
+//! # Log filtering
 //!
-//! [`LoggerLevel`] wraps a `tracing_subscriber::EnvFilter` string and checks it when config is parsed.
+//! [`LoggerLevel`] validates a `tracing_subscriber::EnvFilter` expression.
+//! It keeps invalid filters out of [`LoggerConfig`](crate::LoggerConfig).
+//!
+//! ```text
+//! filter string ──► LoggerLevel ──► EnvFilter ──► subscriber
+//! ```
 
 use std::{convert::TryFrom, str::FromStr};
 
@@ -9,13 +14,14 @@ use tracing_subscriber::EnvFilter;
 
 use crate::logger::LoggerError;
 
-/// Validated wrapper around a [`tracing_subscriber::EnvFilter`] expression.
+/// Validated [`tracing_subscriber::EnvFilter`] expression.
 ///
-/// The raw string is preserved. This lets config files round-trip without changing the user's filter expression.
+/// The original string is preserved.
+/// Serialization does not rewrite the expression.
 ///
-/// # Accepted syntax
+/// ## Syntax
 ///
-/// Any expression accepted by [`EnvFilter`](tracing_subscriber::EnvFilter) can be used:
+/// Any expression accepted by [`EnvFilter`](tracing_subscriber::EnvFilter) can be used.
 ///
 /// | Expression                                 | Meaning                                          |
 /// |--------------------------------------------|--------------------------------------------------|
@@ -24,29 +30,20 @@ use crate::logger::LoggerError;
 /// | `"solti_exec=trace,info"`                  | Trace for `solti_exec`, info for everything else |
 /// | `"solti_core=debug,solti_exec=trace,warn"` | Per-crate overrides with global fallback         |
 ///
-/// # Example
+/// ## Serialization
+///
+/// Serde uses one plain string.
+///
+/// ## Example
 ///
 /// ```
 /// use solti_observe::LoggerLevel;
 ///
-/// let lvl = LoggerLevel::new("info").unwrap();
-/// assert_eq!(lvl.as_str(), "info");
-///
-/// let lvl: LoggerLevel = "solti_exec=trace,info".parse().unwrap();
-/// assert_eq!(lvl.as_str(), "solti_exec=trace,info");
+/// let level = LoggerLevel::new("solti_exec=trace,info").unwrap();
+/// assert_eq!(level.as_str(), "solti_exec=trace,info");
 ///
 /// assert!(LoggerLevel::new("my_crate=lol").is_err());
-/// ```
-///
-/// # Serialization
-///
-/// It serializes to and from a plain JSON string:
-///
-/// ```rust
-/// # use solti_observe::LoggerLevel;
-/// let lvl = LoggerLevel::new("debug").unwrap();
-/// let json = serde_json::to_string(&lvl).unwrap();
-/// assert_eq!(json, r#""debug""#);
+/// assert_eq!(serde_json::to_string(&level).unwrap(), r#""solti_exec=trace,info""#);
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "String")]
@@ -54,42 +51,22 @@ use crate::logger::LoggerError;
 pub struct LoggerLevel(String);
 
 impl LoggerLevel {
-    /// Create a new `LoggerLevel` from a string-like value.
-    ///
-    /// This is a convenience wrapper around [`TryFrom<String>`].
+    /// Creates a validated filter from a string-like value.
     ///
     /// # Errors
     ///
-    /// - [`LoggerError::InvalidLevel`]: the value is not a valid `EnvFilter` directive string (carries the input and the parse error).
-    ///
-    /// # Example
-    /// ```
-    /// use solti_observe::LoggerLevel;
-    ///
-    /// let lvl = LoggerLevel::new("info").unwrap();
-    /// assert_eq!(lvl.as_str(), "info");
-    /// ```
+    /// Returns [`LoggerError::InvalidLevel`] when `EnvFilter` rejects the expression.
     pub fn new(s: impl Into<String>) -> Result<Self, LoggerError> {
         Self::try_from(s.into())
     }
 
-    /// Return the underlying filter string.
-    ///
-    /// This is exactly what was provided in config, such as `"info"` or `"solti_exec=trace,taskvisor=debug,info"`.
-    ///
-    /// # Example
-    /// ```
-    /// use solti_observe::LoggerLevel;
-    ///
-    /// let lvl = "warn".parse::<LoggerLevel>().unwrap();
-    /// assert_eq!(lvl.as_str(), "warn");
-    /// ```
+    /// Returns the original filter string.
     #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    /// Convert this value into an environment filter.
+    /// Builds the validated environment filter.
     pub(crate) fn to_env_filter(&self) -> EnvFilter {
         EnvFilter::try_new(self.as_str()).expect("LoggerLevel is always valid after construction")
     }
@@ -134,7 +111,7 @@ mod tests {
     use super::LoggerLevel;
 
     #[test]
-    fn accepts_valid_levels() {
+    fn valid_levels_build_filters_through_both_constructors() {
         let ok = [
             "info",
             "warn",
@@ -145,11 +122,10 @@ mod tests {
         ];
 
         for lvl in ok {
-            let parsed = lvl.parse::<LoggerLevel>();
-            assert!(
-                parsed.is_ok(),
-                "expected valid LoggerLevel for {lvl}, got: {parsed:?}"
-            );
+            let parsed = lvl.parse::<LoggerLevel>().unwrap();
+            let constructed = LoggerLevel::new(lvl).unwrap();
+            assert_eq!(parsed, constructed);
+            let _filter = parsed.to_env_filter();
         }
     }
 
@@ -189,42 +165,10 @@ mod tests {
     }
 
     #[test]
-    fn serde_from_plain_string() {
-        let json = r#""debug""#;
-        let lvl: LoggerLevel = serde_json::from_str(json).unwrap();
-        assert_eq!(lvl.as_str(), "debug");
-    }
-
-    #[test]
     fn default_is_info_and_valid() {
         let lvl = LoggerLevel::default();
         assert_eq!(lvl.as_str(), "info");
 
         let _filter = lvl.to_env_filter();
-    }
-
-    #[test]
-    fn new_matches_parse() {
-        let a = LoggerLevel::new("warn").expect("valid level via new()");
-        let b: LoggerLevel = "warn".parse().expect("valid level via FromStr");
-
-        assert_eq!(a.as_str(), b.as_str());
-    }
-
-    #[test]
-    fn to_env_filter_never_panics_for_valid_input() {
-        let levels = [
-            "info",
-            "warn",
-            "error",
-            "trace",
-            "debug",
-            "my_crate=trace,info",
-        ];
-
-        for level_str in levels {
-            let lvl = level_str.parse::<LoggerLevel>().unwrap();
-            let _filter = lvl.to_env_filter();
-        }
     }
 }

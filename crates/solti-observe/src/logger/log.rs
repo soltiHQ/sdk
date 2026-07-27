@@ -1,6 +1,14 @@
-//! Logger backend dispatch.
+//! # Logger backends
 //!
-//! Builds and installs the global tracing subscriber for each [`LoggerFormat`](crate::LoggerFormat).
+//! This module builds the backend selected by [`LoggerFormat`](crate::LoggerFormat).
+//! It installs the result as the global tracing subscriber.
+//!
+//! ```text
+//! LoggerConfig
+//!      ├──► text layer ─────┐
+//!      ├──► JSON layer ─────┼──► global subscriber
+//!      └──► journald layer ─┘
+//! ```
 
 use tracing::Subscriber;
 #[cfg(feature = "log-compat")]
@@ -13,7 +21,7 @@ use crate::logger::{
     object::{LoggerTimeZone, Rfc3339Timer, initialize_local_offset},
 };
 
-/// Initialize the text logger.
+/// Initializes the text logger.
 pub(super) fn logger_text(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     let filter = cfg.level.to_env_filter();
     let timer = timer(cfg)?;
@@ -26,7 +34,7 @@ pub(super) fn logger_text(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     init_subscriber(subscriber)
 }
 
-/// Initialize the JSON logger.
+/// Initializes the JSON logger.
 pub(super) fn logger_json(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     let filter = cfg.level.to_env_filter();
     let timer = timer(cfg)?;
@@ -40,7 +48,10 @@ pub(super) fn logger_json(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     init_subscriber(subscriber)
 }
 
-/// Initialize the journald logger on Linux.
+/// Initializes the journald logger on Linux.
+///
+/// Journald uses the configured level filter.
+/// Its native layer owns record formatting.
 #[cfg(all(feature = "journald", target_os = "linux"))]
 pub(super) fn logger_journald(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     let filter = cfg.level.to_env_filter();
@@ -50,7 +61,7 @@ pub(super) fn logger_journald(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     init_subscriber(subscriber)
 }
 
-/// Stub for journald on non-Linux platforms.
+/// Rejects journald initialization on non-Linux platforms.
 #[cfg(all(feature = "journald", not(target_os = "linux")))]
 pub(super) fn logger_journald(_cfg: &LoggerConfig) -> Result<(), LoggerError> {
     Err(LoggerError::JournaldNotSupported)
@@ -63,7 +74,7 @@ fn timer(cfg: &LoggerConfig) -> Result<Rfc3339Timer, LoggerError> {
     Ok(Rfc3339Timer::new(cfg.timezone))
 }
 
-/// Installs the subscriber as the global default.
+/// Installs a subscriber as the global default.
 fn init_subscriber<S>(subscriber: S) -> Result<(), LoggerError>
 where
     S: Subscriber + Send + Sync + 'static,
@@ -82,6 +93,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(feature = "journald", not(target_os = "linux")))]
     use crate::logger::object::LoggerFormat;
     use std::{
         io::{self, Write},
@@ -99,34 +111,6 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
-    }
-
-    #[test]
-    fn text_config_has_correct_fields() {
-        let config = LoggerConfig {
-            format: LoggerFormat::Text,
-            timezone: LoggerTimeZone::Utc,
-            level: "info".parse().unwrap(),
-            with_targets: true,
-            use_color: false,
-        };
-
-        assert_eq!(config.format, LoggerFormat::Text);
-        assert_eq!(config.level.as_str(), "info");
-    }
-
-    #[test]
-    fn json_config_has_correct_fields() {
-        let config = LoggerConfig {
-            format: LoggerFormat::Json,
-            timezone: LoggerTimeZone::Utc,
-            level: "debug".parse().unwrap(),
-            with_targets: false,
-            use_color: true,
-        };
-
-        assert_eq!(config.format, LoggerFormat::Json);
-        assert_eq!(config.level.as_str(), "debug");
     }
 
     #[test]
@@ -185,16 +169,5 @@ mod tests {
         let event: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         let timestamp = event["timestamp"].as_str().unwrap();
         assert_eq!(timestamp.trim(), timestamp);
-    }
-
-    #[test]
-    fn env_filter_is_built_correctly() {
-        let config = LoggerConfig {
-            level: "my_crate=debug,info".parse().unwrap(),
-            ..Default::default()
-        };
-
-        let filter = config.level.to_env_filter();
-        let _ = format!("{:?}", filter);
     }
 }

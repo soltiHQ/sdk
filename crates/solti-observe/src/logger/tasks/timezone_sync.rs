@@ -1,7 +1,11 @@
-//! Timezone-sync supervised task.
+//! # Timezone refresh task
 //!
-//! [`timezone_sync`](crate::timezone_sync) returns a `(TaskManifest, TaskRef)`
-//! pair for a periodic task that tries to refresh the local UTC offset.
+//! [`timezone_sync`](crate::timezone_sync) builds a supervised offset refresh task.
+//!
+//! ```text
+//! system local offset ──► refresh attempt  ──► local offset cache
+//!                              └── failure ──► retry backoff
+//! ```
 
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, EmbeddedSpec, JitterPolicy, RestartPolicy, TaskManifest,
@@ -12,37 +16,44 @@ use tracing::debug;
 
 use crate::logger::object::sync_local_offset;
 
-/// Logical slot name for the timezone sync task.
+/// Logical slot for the refresh task.
 const TIMEZONE_SYNC_SLOT: &str = "solti-observe-timezone-sync";
 
-/// Per-attempt timeout in milliseconds (60 seconds).
+/// Per-attempt timeout in milliseconds.
 const TIMEZONE_SYNC_TIMEOUT_MS: u64 = 60_000;
 
-/// Interval between successful sync attempts in milliseconds (1 hour).
+/// Interval after a successful attempt in milliseconds.
 const TIMEZONE_SYNC_PERIOD_MS: u64 = 3_600_000;
 
-/// Initial backoff delay on failure (ms).
+/// Initial failure backoff in milliseconds.
 const BACKOFF_FIRST_MS: u64 = 5_000;
 
-/// Maximum backoff delay on repeated failures (ms).
+/// Maximum failure backoff in milliseconds.
 const BACKOFF_MAX_MS: u64 = 300_000;
 
-/// Backoff multiplier per consecutive failure.
+/// Backoff multiplier after each consecutive failure.
 const BACKOFF_FACTOR: f64 = 2.0;
 
-/// Build the timezone sync task and its supervision specification.
+/// Builds the timezone refresh task and its manifest.
 ///
-/// The task refreshes the offset used by local log timestamps.
+/// A successful attempt replaces the cached offset with the current system value.
+/// An offset detection failure returns a retryable [`TaskError::Fail`].
+/// Cancellation before detection returns [`TaskError::Canceled`].
 ///
-/// # Scheduling
+/// ## Task Settings
 ///
-/// | Scenario      | Delay           | Strategy                              |
-/// |---------------|-----------------|---------------------------------------|
-/// | Success       | 1 hour          | Periodic restart                      |
-/// | Failure       | 5 s to 5 min    | Exponential backoff with equal jitter |
-/// | Duplicate     | Replaces        | [`AdmissionPolicy::Replace`]          |
+/// | Setting         | Value                                      |
+/// |-----------------|--------------------------------------------|
+/// | Slot            | `solti-observe-timezone-sync`              |
+/// | Workload        | Embedded                                   |
+/// | Revision        | `solti-observe@<crate version>`            |
+/// | Attempt timeout | 60 seconds                                 |
+/// | Success period  | 1 hour                                     |
+/// | Backoff base    | 5 seconds to 5 minutes with factor `2`     |
+/// | Jitter          | Equal                                      |
+/// | Admission       | [`AdmissionPolicy::Replace`]               |
 ///
-/// # Example
+/// ## Example
 ///
 /// ```
 /// use solti_observe::timezone_sync;
@@ -90,4 +101,35 @@ pub fn timezone_sync() -> (TaskManifest, TaskRef) {
     let manifest = TaskManifest::new(TIMEZONE_SYNC_SLOT, spec)
         .expect("timezone sync Task manifest must be valid");
     (manifest, task)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_matches_the_refresh_contract() {
+        let (manifest, _) = timezone_sync();
+        let spec = manifest.spec();
+
+        assert_eq!(manifest.slot().as_str(), TIMEZONE_SYNC_SLOT);
+        assert_eq!(spec.timeout().as_millis(), TIMEZONE_SYNC_TIMEOUT_MS);
+        assert_eq!(
+            spec.restart(),
+            RestartPolicy::periodic(TIMEZONE_SYNC_PERIOD_MS)
+        );
+        assert_eq!(spec.admission(), AdmissionPolicy::Replace);
+        assert_eq!(spec.backoff().jitter, JitterPolicy::Equal);
+        assert_eq!(spec.backoff().first_ms, BACKOFF_FIRST_MS);
+        assert_eq!(spec.backoff().max_ms, BACKOFF_MAX_MS);
+        assert_eq!(spec.backoff().factor, BACKOFF_FACTOR);
+
+        let TaskWorkload::Embedded(embedded) = spec.workload() else {
+            panic!("timezone sync must use an Embedded workload");
+        };
+        assert_eq!(
+            embedded.revision(),
+            concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION"))
+        );
+    }
 }

@@ -1,12 +1,16 @@
-//! Logger error type.
+//! # Logger errors
+//!
+//! [`LoggerError`] reports invalid settings and backend installation failures.
 
 use thiserror::Error;
 
-/// Errors returned while validating logger settings or installing the logging backend.
+/// Error returned while validating settings or installing a logger.
+///
+/// Match with a wildcard arm because this enum is non-exhaustive.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LoggerError {
-    /// The format string was not one of `text` / `json` / `journald`.
+    /// The format string was not recognized.
     #[error("invalid log format: {0}")]
     InvalidFormat(String),
 
@@ -14,13 +18,15 @@ pub enum LoggerError {
     #[error("journald support is not enabled")]
     JournaldNotEnabled,
 
-    /// The `journald` format was requested on a non-Linux target, where the systemd journal is unavailable.
+    /// Journald was requested on a non-Linux target.
     #[cfg(feature = "journald")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "journald")))]
     #[error("journald is not supported on this platform")]
     JournaldNotSupported,
 
     /// Connecting to the systemd journal failed.
     #[cfg(feature = "journald")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "journald")))]
     #[error("failed to initialize journald")]
     JournaldInitFailed(#[source] std::io::Error),
 
@@ -31,6 +37,7 @@ pub enum LoggerError {
 
     /// The tracing subscriber or `log` compatibility bridge could not be installed.
     #[cfg(feature = "log-compat")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "log-compat")))]
     #[error("failed to initialize the global logger")]
     LoggerInitFailed(#[source] tracing_subscriber::util::TryInitError),
 
@@ -38,17 +45,17 @@ pub enum LoggerError {
     #[error("invalid timezone: {0}")]
     InvalidTimeZone(String),
 
-    /// The level/`EnvFilter` expression failed to parse.
+    /// The `EnvFilter` expression failed to parse.
     #[error("invalid log level {value:?}")]
     InvalidLevel {
-        /// Invalid filter expression.
+        /// Original filter expression.
         value: String,
-        /// Parser error.
+        /// Filter parser error.
         #[source]
         source: tracing_subscriber::filter::ParseError,
     },
 
-    /// The local UTC offset could not be determined.
+    /// The current local UTC offset could not be determined.
     #[error("failed to determine the local UTC offset")]
     LocalOffsetUnavailable(#[source] time::error::IndeterminateOffset),
 }
