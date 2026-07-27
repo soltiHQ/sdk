@@ -1,9 +1,15 @@
-//! # Discovery Prometheus metrics (feature `discover`).
+//! # Discovery metrics
 //!
-//! [`PrometheusDiscoverMetrics`] implements [`solti_discover::DiscoverMetricsBackend`].
-//! It exposes attempt, outcome, duration, failure, and hold metrics for the control-plane discovery heartbeat.
+//! [`PrometheusDiscoverMetrics`] implements [`DiscoverMetricsBackend`].
+//! It records control-plane heartbeat attempts and retry holds.
 //!
-//! See the [crate root](crate) for architecture and namespace overview.
+//! Enable it with the `discover` feature.
+//!
+//! ## Flow
+//!
+//! ```text
+//! Discovery task ──► DiscoverMetricsBackend ──► PrometheusDiscoverMetrics ──► Registry
+//! ```
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,9 +20,9 @@ use solti_discover::{
 
 use crate::register::{MetricGroup, ms_to_secs};
 
-/// Prometheus implementation of [`DiscoverMetricsBackend`].
+/// Prometheus discovery metrics.
 ///
-/// # Metrics (`solti_discover_*`)
+/// ## Metrics
 ///
 /// | Metric                                          | Type      | Labels    | Description                         |
 /// |-------------------------------------------------|-----------|-----------|-------------------------------------|
@@ -27,6 +33,55 @@ use crate::register::{MetricGroup, ms_to_secs};
 /// | `solti_discover_last_success_timestamp_seconds` | Gauge     | -         | UNIX time of last successful sync   |
 /// | `solti_discover_holds_total`                    | Counter   | -         | Server-advised retry holds received |
 /// | `solti_discover_hold_duration_seconds`          | Histogram | -         | Duration of advised holds           |
+///
+/// ## Event Mapping
+///
+/// ```text
+/// record_attempt()
+///   └──► attempts_total
+///
+/// record_success(duration_ms)
+///   ├──► outcomes_total{outcome="success"}
+///   ├──► duration_seconds{outcome="success"}
+///   └──► last_success_timestamp_seconds
+///
+/// record_failure(duration_ms, reason)
+///   ├──► outcomes_total{outcome="failure"}
+///   ├──► duration_seconds{outcome="failure"}
+///   └──► failures_total{reason}
+///
+/// record_hold(duration_s)
+///   ├──► holds_total
+///   └──► hold_duration_seconds
+/// ```
+///
+/// ## Rules
+///
+/// - Failure labels come from [`DiscoverFailReason::as_label`].
+/// - Attempt durations enter the backend in milliseconds.
+/// - Hold duration already enters the backend in seconds.
+/// - A success records the current UNIX timestamp.
+/// - A clock value before the UNIX epoch records `0`.
+/// - Duration histograms export seconds.
+///
+/// ## Example
+///
+/// ```
+/// use solti_discover::{DiscoverFailReason, DiscoverMetricsBackend};
+/// use solti_prometheus::{PrometheusDiscoverMetrics, Registry};
+///
+/// # fn main() -> Result<(), prometheus::Error> {
+/// let registry = Registry::new();
+/// let metrics = PrometheusDiscoverMetrics::new(&registry)?;
+///
+/// metrics.record_attempt();
+/// metrics.record_success(25);
+/// metrics.record_failure(50, DiscoverFailReason::Timeout);
+/// metrics.record_hold(10);
+///
+/// assert!(!registry.gather().is_empty());
+/// # Ok(()) }
+/// ```
 pub struct PrometheusDiscoverMetrics {
     attempts_total: Counter,
     outcomes_total: CounterVec,
@@ -38,26 +93,14 @@ pub struct PrometheusDiscoverMetrics {
 }
 
 impl PrometheusDiscoverMetrics {
-    /// Register all discovery metrics into `registry`.
+    /// Creates a discovery metrics backend and registers its collectors.
     ///
-    /// # Example
+    /// The returned backend updates the collectors in `registry`.
     ///
-    /// ```
-    /// use solti_discover::{DiscoverFailReason, DiscoverMetricsBackend};
-    /// use solti_prometheus::{PrometheusDiscoverMetrics, Registry};
+    /// # Errors
     ///
-    /// # fn main() -> Result<(), prometheus::Error> {
-    /// let registry = Registry::new();
-    /// let metrics = PrometheusDiscoverMetrics::new(&registry)?;
-    ///
-    /// metrics.record_attempt();
-    /// metrics.record_success(25);
-    /// metrics.record_failure(50, DiscoverFailReason::Timeout);
-    /// metrics.record_hold(10);
-    ///
-    /// assert!(!registry.gather().is_empty());
-    /// # Ok(()) }
-    /// ```
+    /// Returns a Prometheus error when the metric group cannot be created or registered.
+    /// A descriptor conflict returns [`prometheus::Error::AlreadyReg`].
     pub fn new(registry: &Registry) -> Result<Self, prometheus::Error> {
         let mut metrics = MetricGroup::new();
 

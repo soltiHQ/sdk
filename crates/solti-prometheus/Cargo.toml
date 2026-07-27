@@ -1,28 +1,30 @@
 [package]
 name = "solti-prometheus"
-description = "Prometheus metrics and exporter endpoint for the Solti task supervisor SDK."
+
+description   = "Prometheus metrics and exporter endpoint for the Solti task supervisor SDK."
+keywords      = ["prometheus", "metrics", "monitoring", "exporter", "tasks"]
+categories    = ["development-tools::profiling"]
 documentation = "https://docs.rs/solti-prometheus"
+readme        = "README.md"
 
 rust-version.workspace = true
-repository.workspace = true
-categories = ["development-tools::profiling"]
-homepage.workspace = true
-keywords = ["prometheus", "metrics", "monitoring", "exporter", "tasks"]
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+repository.workspace   = true
+homepage.workspace     = true
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
 
 [features]
 default = []
 
-api                     = ["dep:itoa", "dep:solti-api"]
-discover                = ["dep:solti-discover"]
-process                 = ["prometheus/process"]
-runner                  = ["dep:solti-runner"]
-server                  = ["dep:axum", "dep:solti-model", "dep:taskvisor", "dep:tokio", "dep:tracing"]
-state                   = ["dep:solti-core", "dep:solti-model"]
-taskvisor               = ["dep:taskvisor"]
-taskvisor-controller     = ["taskvisor", "taskvisor/controller"]
+api                  = ["dep:itoa", "dep:solti-api"]
+discover             = ["dep:solti-discover"]
+process              = ["prometheus/process"]
+runner               = ["dep:solti-runner"]
+server               = ["dep:axum", "dep:solti-model", "dep:taskvisor", "dep:tokio", "dep:tracing"]
+state                = ["dep:solti-core", "dep:solti-model"]
+taskvisor            = ["dep:taskvisor"]
+taskvisor-controller = ["taskvisor", "taskvisor/controller"]
 
 full = [
     "api",

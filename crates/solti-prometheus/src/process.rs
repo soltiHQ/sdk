@@ -1,8 +1,17 @@
-//! Process metrics.
+//! # Process metrics
 //!
-//! Registers Prometheus' standard `process_*` collectors when the platform and feature set support them.
+//! [`register_process_collector`] connects Prometheus process metrics to a registry.
+//! Enable it with the `process` feature.
 //!
-//! Exposes on Linux (no-op on other targets):
+//! ## Platform Flow
+//!
+//! ```text
+//! Linux    ──► ProcessCollector::for_self() ──► Registry
+//! other OS ──► no-op
+//! ```
+//!
+//! ## Linux Metrics
+//!
 //! - `process_resident_memory_bytes`
 //! - `process_virtual_memory_bytes`
 //! - `process_start_time_seconds`
@@ -12,12 +21,11 @@
 
 use prometheus::Registry;
 
-/// Register the default Prometheus process collector.
+/// Registers metrics for the current Linux process.
 ///
-/// Registers the upstream [`prometheus::process_collector::ProcessCollector`] into `registry`.
-/// It exposes the standard `process_*` metrics for the current process.
+/// This uses the upstream [`prometheus::process_collector::ProcessCollector`].
 ///
-/// # Example
+/// ## Example
 ///
 /// ```
 /// use solti_prometheus::{Registry, register_process_collector};
@@ -27,18 +35,23 @@ use prometheus::Registry;
 /// register_process_collector(&registry)?;
 /// # Ok(()) }
 /// ```
+///
+/// # Errors
+///
+/// Returns a Prometheus registration error.
+/// Registering another collector with the same descriptors returns [`prometheus::Error::AlreadyReg`].
 #[cfg(target_os = "linux")]
 pub fn register_process_collector(registry: &Registry) -> Result<(), prometheus::Error> {
     let collector = prometheus::process_collector::ProcessCollector::for_self();
     registry.register(Box::new(collector))
 }
 
-/// Register the default Prometheus process collector on a non-Linux target.
+/// Accepts process-metric registration on a non-Linux target.
 ///
-/// The upstream process collector only works on Linux.
-/// This implementation does nothing and returns `Ok(())`.
+/// This function does not register a collector.
+/// It always returns `Ok(())`.
 ///
-/// # Example
+/// ## Example
 ///
 /// ```
 /// use solti_prometheus::{Registry, register_process_collector};

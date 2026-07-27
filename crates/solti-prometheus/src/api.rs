@@ -1,31 +1,77 @@
-//! # API Prometheus metrics (feature `api`).
+//! # API metrics
 //!
-//! [`PrometheusApiMetrics`] implements [`solti_api::ApiMetricsBackend`].
-//! It exposes request counters, duration histograms, and an in-flight gauge for HTTP and gRPC API traffic.
+//! [`PrometheusApiMetrics`] implements [`ApiMetricsBackend`].
+//! It records HTTP and gRPC request traffic.
 //!
-//! See the [crate root](crate) for architecture and namespace overview.
+//! Enable it with the `api` feature.
+//!
+//! ## Flow
+//!
+//! ```text
+//! HTTP middleware ─┐
+//!                  ├──► ApiMetricsBackend ──► PrometheusApiMetrics ──► Registry
+//! gRPC service ────┘
+//! ```
 
 use prometheus::{CounterVec, GaugeVec, HistogramVec, Registry};
 use solti_api::{ApiMetricsBackend, Transport};
 
 use crate::register::{MetricGroup, ms_to_secs};
 
-/// Prometheus implementation of [`ApiMetricsBackend`].
+/// Prometheus API metrics.
 ///
-/// # Metrics (`solti_api_*`)
+/// ## Metrics
 ///
-/// | Metric                               | Type      | Labels                                   | Description              |
-/// |--------------------------------------|-----------|------------------------------------------|--------------------------|
-/// | `solti_api_requests_total`           | Counter   | `transport`, `method`, `path`, `status`  | Completed requests       |
-/// | `solti_api_request_duration_seconds` | Histogram | `transport`, `method`, `path`            | Request duration         |
-/// | `solti_api_in_flight_requests`       | Gauge     | `transport`                              | In-flight request count  |
+/// | Metric                               | Type      | Labels                                  |
+/// |--------------------------------------|-----------|-----------------------------------------|
+/// | `solti_api_requests_total`           | Counter   | `transport`, `method`, `path`, `status` |
+/// | `solti_api_request_duration_seconds` | Histogram | `transport`, `method`, `path`           |
+/// | `solti_api_in_flight_requests`       | Gauge     | `transport`                             |
 ///
-/// # Cardinality
+/// ## Labels
 ///
-/// `path` is a templated route for HTTP, such as `/apis/solti.io/v1/tasks/{name}`.
-/// For gRPC it is the full method path, such as `/solti.task.v1.TaskService/CreateTask`.
+/// `transport` is `http` or `grpc`.
+/// HTTP `path` values are matched route templates.
+/// gRPC `path` values are full service method paths.
 ///
-/// In both cases the set is bounded by the proto/api definition.
+/// ```text
+/// HTTP: /apis/solti.io/v1/tasks/{name}
+/// gRPC: /solti.task.v1.TaskService/CreateTask
+/// ```
+///
+/// `solti-api` supplies route templates and service method paths.
+/// This backend stores the provided labels without normalizing them.
+///
+/// ## Rules
+///
+/// - Construction registers all three collectors as one group.
+/// - Request durations enter the backend in milliseconds.
+/// - Histograms export those durations in seconds.
+/// - In-flight changes are applied as signed deltas.
+///
+/// ## Example
+///
+/// ```
+/// use solti_api::{ApiMetricsBackend, Transport};
+/// use solti_prometheus::{PrometheusApiMetrics, Registry};
+///
+/// # fn main() -> Result<(), prometheus::Error> {
+/// let registry = Registry::new();
+/// let metrics = PrometheusApiMetrics::new(&registry)?;
+///
+/// metrics.record_in_flight_delta(Transport::Http, 1);
+/// metrics.record_request(
+///     Transport::Http,
+///     "GET",
+///     "/apis/solti.io/v1/tasks",
+///     200,
+///     12,
+/// );
+/// metrics.record_in_flight_delta(Transport::Http, -1);
+///
+/// assert!(!registry.gather().is_empty());
+/// # Ok(()) }
+/// ```
 pub struct PrometheusApiMetrics {
     requests_total: CounterVec,
     duration_seconds: HistogramVec,
@@ -33,31 +79,14 @@ pub struct PrometheusApiMetrics {
 }
 
 impl PrometheusApiMetrics {
-    /// Register all API metrics into `registry`.
+    /// Creates an API metrics backend and registers its collectors.
     ///
-    /// # Example
+    /// The returned backend updates the collectors in `registry`.
     ///
-    /// ```
-    /// use solti_api::{ApiMetricsBackend, Transport};
-    /// use solti_prometheus::{PrometheusApiMetrics, Registry};
+    /// # Errors
     ///
-    /// # fn main() -> Result<(), prometheus::Error> {
-    /// let registry = Registry::new();
-    /// let metrics = PrometheusApiMetrics::new(&registry)?;
-    ///
-    /// metrics.record_in_flight_delta(Transport::Http, 1);
-    /// metrics.record_request(
-    ///     Transport::Http,
-    ///     "GET",
-    ///     "/apis/solti.io/v1/tasks",
-    ///     200,
-    ///     12,
-    /// );
-    /// metrics.record_in_flight_delta(Transport::Http, -1);
-    ///
-    /// assert!(!registry.gather().is_empty());
-    /// # Ok(()) }
-    /// ```
+    /// Returns a Prometheus error when the metric group cannot be created or registered.
+    /// A descriptor conflict returns [`prometheus::Error::AlreadyReg`].
     pub fn new(registry: &Registry) -> Result<Self, prometheus::Error> {
         let mut metrics = MetricGroup::new();
 

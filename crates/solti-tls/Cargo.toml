@@ -5,6 +5,7 @@ description   = "Shared TLS and mTLS configuration for Solti network crates, bas
 keywords      = ["tls", "rustls", "mtls", "certificate", "pem"]
 categories    = ["network-programming", "cryptography"]
 documentation = "https://docs.rs/solti-tls"
+readme        = "README.md"
 
 rust-version.workspace = true
 repository.workspace   = true
@@ -17,9 +18,9 @@ license.workspace      = true
 default = []
 
 [dependencies]
-rustls        = { workspace = true }
-thiserror     = { workspace = true }
-zeroize       = { workspace = true }
+rustls    = { workspace = true }
+thiserror = { workspace = true }
+zeroize   = { workspace = true }
 
 [dev-dependencies]
 rcgen        = { workspace = true }

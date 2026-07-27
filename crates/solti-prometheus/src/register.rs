@@ -1,4 +1,8 @@
-//! Private helpers for building and registering Prometheus metrics.
+//! # Metric registration
+//!
+//! This module builds related collectors and registers them as one collector.
+//!
+//! A descriptor conflict rejects the complete group.
 
 #[cfg(any(feature = "api", feature = "discover", feature = "taskvisor"))]
 use prometheus::HistogramOpts;
@@ -25,7 +29,7 @@ use prometheus::HistogramVec;
 #[cfg(any(feature = "discover", feature = "taskvisor"))]
 use prometheus::{Counter, Gauge, Histogram};
 
-/// One atomically registered group of related collectors.
+/// Related collectors registered as one Prometheus collector.
 #[cfg(any(
     feature = "api",
     feature = "discover",
@@ -178,7 +182,7 @@ impl Collector for MetricGroup {
     }
 }
 
-/// Build a [`GaugeVec`] without registering it into a registry.
+/// Creates a [`GaugeVec`] without registering it.
 #[cfg(feature = "state")]
 pub(crate) fn gauge_vec_unregistered(
     subsystem: &'static str,
@@ -192,7 +196,7 @@ pub(crate) fn gauge_vec_unregistered(
     prometheus::GaugeVec::new(opts, labels)
 }
 
-/// Convert milliseconds to seconds for histogram observation.
+/// Converts milliseconds to seconds.
 #[cfg(any(feature = "api", feature = "discover", feature = "taskvisor"))]
 #[inline]
 pub(crate) fn ms_to_secs(ms: u64) -> f64 {

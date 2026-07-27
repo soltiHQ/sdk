@@ -1,9 +1,15 @@
 //! # Runner Prometheus metrics
 //!
 //! [`PrometheusRunnerMetrics`] implements [`MetricsBackend`] for Solti runners.
-//! It exposes runner setup and cleanup errors.
+//! It records setup and cleanup errors.
 //!
-//! See the [crate root](crate) for architecture and namespace overview.
+//! Enable it with the `runner` feature.
+//!
+//! ## Flow
+//!
+//! ```text
+//! Runner ──► MetricsBackend ──► PrometheusRunnerMetrics ──► Registry
+//! ```
 
 use prometheus::{CounterVec, Registry};
 
@@ -11,28 +17,27 @@ use solti_runner::{MetricsBackend, RunnerErrorKind, RunnerType};
 
 use crate::register::MetricGroup;
 
-/// Prometheus metrics backend for Solti runners.
+/// Prometheus runner metrics.
 ///
-/// Implements [`MetricsBackend`] and exposes runner-level metrics in Prometheus format.
-/// Runners call the trait when backend setup or cleanup fails.
+/// ## Metrics
 ///
-/// # Metrics
+/// | Metric                      | Type    | Labels            | Description              |
+/// |-----------------------------|---------|-------------------|--------------------------|
+/// | `solti_runner_errors_total` | Counter | `runner`, `error` | Setup and cleanup errors |
 ///
-/// | Metric                               | Type      | Labels              | Description                    |
-/// |--------------------------------------|-----------|---------------------|--------------------------------|
-/// | `solti_runner_errors_total`          | Counter   | `runner`, `error`   | Runner setup/teardown errors   |
+/// ## Labels
 ///
-/// # Labels
+/// Built-in variants use stable labels from [`RunnerType`] and [`RunnerErrorKind`].
+/// Custom variants use the application-provided string unchanged.
 ///
-/// Built-in labels have bounded cardinality. Applications registering custom
-/// runners must keep their custom runner labels bounded.
+/// ```text
+/// RunnerType ──────► runner label
+/// RunnerErrorKind ─► error label
+/// ```
 ///
-/// | Label     | Values                                                                                                            | Cardinality |
-/// |-----------|-------------------------------------------------------------------------------------------------------------------|-------------|
-/// | `runner`  | `subprocess`, `wasm`, `container`, or an application-defined stable label                                        | App-owned   |
-/// | `error`   | `cgroup_prepare_failed`, `backend_config_failed`, `spawn_failed`, `module_load_failed` (from [`RunnerErrorKind`]) | Low         |
+/// The application controls cardinality for custom runner and error labels.
 ///
-/// # Example
+/// ## Example
 ///
 /// ```rust
 /// use solti_prometheus::{PrometheusRunnerMetrics, Registry};
@@ -44,32 +49,19 @@ use crate::register::MetricGroup;
 ///
 /// assert!(!registry.gather().is_empty());
 /// ```
-///
-/// # See also
-///
-/// - `PrometheusTaskvisorSubscriber`: supervision-level metrics from the event stream.
-/// - [`Registry`](prometheus::Registry): shared registry for a unified `/metrics` endpoint.
 pub struct PrometheusRunnerMetrics {
     runner_errors: CounterVec,
 }
 
 impl PrometheusRunnerMetrics {
-    /// Create a new metrics backend and register it into `registry`.
+    /// Creates a runner metrics backend and registers its collector.
     ///
-    /// # Example
+    /// The returned backend updates the collector in `registry`.
     ///
-    /// ```
-    /// use solti_prometheus::{PrometheusRunnerMetrics, Registry};
-    /// use solti_runner::{MetricsBackend, RunnerErrorKind, RunnerType};
+    /// # Errors
     ///
-    /// # fn main() -> Result<(), prometheus::Error> {
-    /// let registry = Registry::new();
-    /// let metrics = PrometheusRunnerMetrics::new(&registry)?;
-    ///
-    /// metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
-    /// assert!(!registry.gather().is_empty());
-    /// # Ok(()) }
-    /// ```
+    /// Returns a Prometheus error when the collector cannot be created or registered.
+    /// A descriptor conflict returns [`prometheus::Error::AlreadyReg`].
     pub fn new(registry: &Registry) -> Result<Self, prometheus::Error> {
         let mut metrics = MetricGroup::new();
 
@@ -125,15 +117,6 @@ mod tests {
             .expect("errors counter not found");
 
         assert_eq!(errors.get_metric().len(), 2);
-    }
-
-    #[test]
-    fn can_use_custom_registry() {
-        let registry = Registry::new();
-        let metrics = PrometheusRunnerMetrics::new(&registry).unwrap();
-
-        metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
-        assert!(!registry.gather().is_empty());
     }
 
     #[test]

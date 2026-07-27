@@ -1,292 +1,194 @@
 # solti-prometheus
 
-> Prometheus metrics for Solti agents.
+`solti-prometheus` is the metrics backend for the Solti SDK.
+Other crates (`solti-runner`, `solti-api`, `solti-discover`, `solti-core`) define metrics traits; this crate implements them against one shared Prometheus `Registry` and can expose it over `/metrics`.
 
-`solti-prometheus` gives Solti crates one shared Prometheus registry.
-Runner metrics, taskvisor events, API requests, discovery heartbeat, process stats, build info, and `/metrics` can all use that same registry.
+## Quick start
 
-The crate is modular. Use only the collectors your agent needs.
-
-## The metrics wiring you stop repeating
-
-Most agents need the same setup:
-
-```rust,ignore
-let registry = prometheus::Registry::new();
-// create runner metrics
-// create taskvisor subscriber
-// add build info
-// expose /metrics
-```
-
-With `solti-prometheus`, each part has a small collector:
-
-```rust,no_run
-use std::sync::Arc;
-
-use solti_prometheus::{
-    PrometheusRunnerMetrics, PrometheusTaskvisorSubscriber, Registry, register_build_info,
-    register_process_collector,
-};
-use solti_runner::{BuildContext, RunnerRouter};
-use taskvisor::Subscribe;
+```rust
+use solti_prometheus::{PrometheusRunnerMetrics, Registry, register_build_info};
+use solti_runner::{MetricsBackend, RunnerErrorKind, RunnerType};
 
 fn main() -> Result<(), prometheus::Error> {
-    let registry = Arc::new(Registry::new());
+    let registry = Registry::new();
 
-    let runner_metrics = PrometheusRunnerMetrics::new(&registry)?;
-    let supervisor_metrics = PrometheusTaskvisorSubscriber::new(&registry)?;
-
-    register_process_collector(&registry)?;
     register_build_info(&registry, &[("version", env!("CARGO_PKG_VERSION"))])?;
+    let runner = PrometheusRunnerMetrics::new(&registry)?;
 
-    let ctx = BuildContext::default().with_metrics(Arc::new(runner_metrics));
-    let router = RunnerRouter::new().with_context(ctx);
-
-    let subscribers: Vec<Arc<dyn Subscribe>> = vec![Arc::new(supervisor_metrics)];
-
-    let _ = (router, subscribers);
+    runner.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+    assert!(!registry.gather().is_empty());
     Ok(())
 }
 ```
 
-## Quick Start
+All integrations are disabled by default.
+Enable one feature per adapter you use; the source crate then calls it during normal handling.
 
-### Runner and Supervisor Metrics
+## What it does
 
-All integrations are disabled by default. Enable `runner`, `taskvisor`, or the
-other owner-specific features your binary uses:
+- keeps all collectors in one application-owned registry;
+- implements metrics traits from other Solti crates;
+- converts Taskvisor events into supervision metrics;
+- exposes current task phases from `TaskState`;
+- registers build and process metrics;
+- builds a supervised task for the `/metrics` endpoint;
+- keeps adapter dependencies behind features.
 
-```rust
-use std::sync::Arc;
+## Inputs and outputs
 
-use solti_prometheus::{PrometheusRunnerMetrics, PrometheusTaskvisorSubscriber, Registry};
-use solti_runner::{MetricsBackend, RunnerErrorKind, RunnerType};
-use taskvisor::{Event, EventKind, Subscribe};
+| API                                      | Input                                      | Output                                                  |
+|------------------------------------------|--------------------------------------------|---------------------------------------------------------|
+| `register_build_info`                    | Registry and constant labels               | `solti_build_info` gauge                                |
+| `PrometheusRunnerMetrics::new`           | Registry                                   | `solti_runner_*` collector                              |
+| `PrometheusTaskvisorSubscriber::new`     | Registry                                   | Taskvisor subscriber and `solti_taskvisor_*` collectors |
+| `PrometheusApiMetrics::new`              | Registry                                   | `solti_api_*` collector                                 |
+| `PrometheusDiscoverMetrics::new`         | Registry                                   | `solti_discover_*` collector                            |
+| `PrometheusCoreStateCollector::new`      | `TaskState`                                | Pull-based `solti_core_tasks_by_phase` collector        |
+| `register_process_collector`             | Registry                                   | Standard `process_*` collectors on Linux                |
+| `server`                                 | Shared registry, listen address, revision  | `TaskManifest` and embedded `TaskRef`                   |
 
-# fn main() -> Result<(), prometheus::Error> {
-let registry = Arc::new(Registry::new());
+Metrics adapter and subscriber constructors register their groups immediately.
+`PrometheusCoreStateCollector` is returned unregistered because it implements `prometheus::core::Collector`.
 
-let runner_metrics = PrometheusRunnerMetrics::new(&registry)?;
-runner_metrics.record_runner_error(
-    RunnerType::Subprocess,
-    RunnerErrorKind::SpawnFailed,
-);
+## Features
 
-let supervisor_metrics = PrometheusTaskvisorSubscriber::new(&registry)?;
-supervisor_metrics.on_event(&Event::new(EventKind::AttemptStarting).with_attempt(1));
+| Feature                 | Public integration                         |
+|-------------------------|--------------------------------------------|
+| `api`                   | `PrometheusApiMetrics`                     |
+| `discover`              | `PrometheusDiscoverMetrics`                |
+| `process`               | `register_process_collector`               |
+| `runner`                | `PrometheusRunnerMetrics`                  |
+| `server`                | supervised `/metrics` task                 |
+| `state`                 | `PrometheusCoreStateCollector`             |
+| `taskvisor`             | `PrometheusTaskvisorSubscriber`            |
+| `taskvisor-controller`  | controller metrics on the subscriber       |
+| `full`                  | every integration above                    |
 
-assert!(!registry.gather().is_empty());
-# Ok(()) }
+`Registry` and `register_build_info` are always available.
+The default feature set does not depend on another Solti crate or Taskvisor.
+
+## Shared registry
+
+Use one registry for every enabled adapter:
+
+```text
+prometheus::Registry
+  ├─ solti_build_info
+  ├─ solti_runner_*
+  ├─ solti_taskvisor_*
+  ├─ solti_taskvisor_controller_*
+  ├─ solti_api_*
+  ├─ solti_discover_*
+  ├─ solti_core_tasks_by_phase
+  └─ process_*
+             │
+             └─ GET /metrics
 ```
 
-### Build Info
+Each adapter registers its collectors as one group.
+A name conflict rejects the complete group without leaving part of it in the registry.
 
-Add one constant gauge with labels that identify the running binary:
+## API and discovery adapters
+
+The adapters implement the source-crate metrics traits.
+The source crates call them during normal request and discovery handling.
 
 ```rust
-use solti_prometheus::{Registry, register_build_info};
+use solti_api::{ApiMetricsBackend, Transport};
+use solti_discover::{DiscoverFailReason, DiscoverMetricsBackend};
+use solti_prometheus::{PrometheusApiMetrics, PrometheusDiscoverMetrics, Registry};
 
-# fn main() -> Result<(), prometheus::Error> {
-let registry = Registry::new();
-register_build_info(&registry, &[
-    ("version", env!("CARGO_PKG_VERSION")),
-    ("git_sha", "unknown"),
-])?;
-# Ok(()) }
+fn main() -> Result<(), prometheus::Error> {
+    let registry = Registry::new();
+    let api = PrometheusApiMetrics::new(&registry)?;
+    let discover = PrometheusDiscoverMetrics::new(&registry)?;
+
+    api.record_in_flight_delta(Transport::Http, 1);
+    api.record_request(
+        Transport::Http,
+        "GET",
+        "/apis/solti.io/v1/tasks/{name}",
+        200,
+        12,
+    );
+    api.record_in_flight_delta(Transport::Http, -1);
+
+    discover.record_attempt();
+    discover.record_success(25);
+    discover.record_failure(50, DiscoverFailReason::Timeout);
+    discover.record_hold(10);
+
+    Ok(())
+}
 ```
 
-### `/metrics` Server
+HTTP paths come from matched route templates.
+gRPC paths use the full service method path.
+Diagnostic text is not used as a metric label.
 
-Enable the `server` feature to build a supervised embedded task that serves `/metrics`:
+## Core state
+
+The state collector counts task phases on every scrape:
+
+```rust
+use solti_core::TaskState;
+use solti_prometheus::{PrometheusCoreStateCollector, Registry};
+
+fn main() -> Result<(), prometheus::Error> {
+    let registry = Registry::new();
+    let collector = PrometheusCoreStateCollector::new(TaskState::new())?;
+
+    registry.register(Box::new(collector))?;
+    assert!(!registry.gather().is_empty());
+    Ok(())
+}
+```
+
+Every known phase is emitted, including phases with a zero count.
+Future phase variants are aggregated under `phase="unknown"` until the crate maps them.
+
+## Metrics server
+
+The `server` feature builds an embedded task that serves the registry:
 
 ```rust,no_run
 use std::sync::Arc;
 use solti_prometheus::{Registry, server};
 
-# fn main() -> Result<(), solti_model::ModelError> {
-let registry = Arc::new(Registry::new());
-let (manifest, task_ref) = server(registry, "0.0.0.0:9090", "my-agent@v1")?;
+fn main() -> Result<(), solti_model::ModelError> {
+    let registry = Arc::new(Registry::new());
+    let (manifest, task_ref) = server(
+        registry,
+        "0.0.0.0:9090",
+        "agent-registry-v1",
+    )?;
 
-// Submit to solti-core:
-// supervisor.create_embedded_task(manifest, task_ref).await?;
-# let _ = (manifest, task_ref);
-# Ok(()) }
+    // Submit both values through the solti-core Embedded task API.
+    let _ = (manifest, task_ref);
+    Ok(())
+}
 ```
 
-## What Ships
+The task serves only `GET /metrics`.
+It uses `AdmissionPolicy::Replace` in the `solti-metrics-server` slot.
+It restarts after exit and backs off from 1 to 30 seconds after failure.
+The embedded revision includes the listen address.
 
-| Component                           | Metrics                         | Feature                   | Use it for                            |
-|-------------------------------------|---------------------------------|---------------------------|---------------------------------------|
-| `PrometheusRunnerMetrics`           | `solti_runner_*`                | `runner`                  | Runner backend errors                 |
-| `PrometheusTaskvisorSubscriber`     | `solti_taskvisor_*`             | `taskvisor`               | Taskvisor lifecycle events            |
-| controller metrics                  | `solti_taskvisor_controller_*`  | `taskvisor-controller`    | Taskvisor controller events           |
-| `PrometheusApiMetrics`              | `solti_api_*`                   | `api`                     | HTTP/gRPC API request metrics         |
-| `PrometheusDiscoverMetrics`         | `solti_discover_*`              | `discover`                | Control-plane heartbeat metrics       |
-| `register_process_collector`        | `process_*`                     | `process`                 | Process CPU, memory, file descriptors |
-| `register_build_info`               | `solti_build_info`              | always                    | Build identity labels                 |
-| `server`                            | `/metrics` endpoint             | `server`                  | Supervised HTTP metrics endpoint      |
-| `PrometheusCoreStateCollector`      | `solti_core_tasks_by_phase`     | `state`                   | Pull-based task phase snapshot        |
+## Specific behavior
 
-## Core Model
+- `solti_taskvisor_attempts_in_flight` follows a best-effort event stream and can drift after dropped events.
+- `PrometheusCoreStateCollector` recomputes phase counts from `TaskState` on each scrape.
+- `register_process_collector` is a no-op on other targets.
+- Build-info labels are constant and the gauge value is `1`.
+- Custom runner names become `runner` label values; the application controls their cardinality.
+- The default Taskvisor subscriber queue capacity is `2048` and can be overridden.
+- API, discovery, and Taskvisor millisecond durations are exported in seconds.
+- Discovery hold duration is already supplied in seconds.
+- Taskvisor labels come from typed event fields.
+- Process metrics are registered on Linux.
 
-```text
-Shared prometheus::Registry
-  |
-  |-- PrometheusRunnerMetrics         -> solti_runner_*
-  |-- PrometheusTaskvisorSubscriber   -> solti_taskvisor_*
-  |                                      solti_taskvisor_controller_* (feature: taskvisor-controller)
-  |-- PrometheusApiMetrics      -> solti_api_*          (feature: api)
-  |-- PrometheusDiscoverMetrics -> solti_discover_*     (feature: discover)
-  |-- register_process_collector -> process_*           (feature: process)
-  |-- register_build_info       -> solti_build_info
-  |
-  v
-/metrics text endpoint
-```
+## Errors
 
-All collectors should share one `Registry`. This gives you one scrape endpoint with all Solti metrics.
-
-## Runner Metrics
-
-`PrometheusRunnerMetrics` implements `solti_runner::MetricsBackend`.
-Runners call it when backend setup or cleanup fails.
-
-| Metric                      | Type    | Labels            | Meaning                        |
-|-----------------------------|---------|-------------------|--------------------------------|
-| `solti_runner_errors_total` | Counter | `runner`, `error` | Runner setup or cleanup errors |
-
-Task lifecycle metrics come from `PrometheusTaskvisorSubscriber` and taskvisor events.
-
-## Supervisor and Controller Metrics
-
-`PrometheusTaskvisorSubscriber` implements `taskvisor::Subscribe`.
-It watches taskvisor events and updates supervision metrics.
-
-| Metric                                            | Type      | Labels    | Meaning                                    |
-|---------------------------------------------------|-----------|-----------|--------------------------------------------|
-| `solti_taskvisor_attempts_in_flight`              | Gauge     | none      | Attempts currently running, best effort    |
-| `solti_taskvisor_task_restarts_total`             | Counter   | none      | Restarts where attempt > 1                 |
-| `solti_taskvisor_task_backoffs_total`             | Counter   | `source`  | Backoff events                             |
-| `solti_taskvisor_task_backoff_duration_seconds`   | Histogram | none      | Backoff delay                              |
-| `solti_taskvisor_task_final_outcomes_total`       | Counter   | `outcome` | Final task outcomes                        |
-| `solti_taskvisor_attempt_timeouts_total`          | Counter   | none      | Timeout events                             |
-| `solti_taskvisor_subscriber_overflows_total`      | Counter   | none      | Lost events in subscriber queues           |
-| `solti_taskvisor_subscriber_panics_total`         | Counter   | none      | Subscriber panics                          |
-| `solti_taskvisor_runtime_failures_total`          | Counter   | none      | Internal Taskvisor runtime failures        |
-| `solti_core_tasks_by_phase`                       | Gauge     | `phase`   | Pull-based phase snapshot, feature `state` |
-
-Controller metrics:
-
-| Metric                                                  | Type    | Labels   | Meaning                        |
-|---------------------------------------------------------|---------|----------|--------------------------------|
-| `solti_taskvisor_controller_submitted_events_total`     | Counter | none     | `ControllerSubmitted` events   |
-| `solti_taskvisor_controller_rejections_total`           | Counter | `reason` | Controller rejections by cause |
-
-`solti_taskvisor_attempts_in_flight` is event-based and best effort. If you need an authoritative current count, enable `state` and register `PrometheusCoreStateCollector`.
-
-The terminal `rejected` label is defensive. Current Taskvisor admission
-rejections use `solti_taskvisor_controller_rejections_total`; they do not emit `TaskFinished`.
-
-## API Metrics
-
-Enable `api` to use `PrometheusApiMetrics`.
-
-| Metric                               | Type      | Labels                                  | Meaning                    |
-|--------------------------------------|-----------|-----------------------------------------|----------------------------|
-| `solti_api_requests_total`           | Counter   | `transport`, `method`, `path`, `status` | Completed requests         |
-| `solti_api_request_duration_seconds` | Histogram | `transport`, `method`, `path`           | Request duration           |
-| `solti_api_in_flight_requests`       | Gauge     | `transport`                             | Current in-flight requests |
-
-`path` is bounded. HTTP uses templated routes such as `/apis/solti.io/v1/tasks/{name}`. gRPC uses method paths from the proto service.
-
-## Discovery Metrics
-
-Enable `discover` to use `PrometheusDiscoverMetrics`.
-
-| Metric                                          | Type      | Labels    | Meaning                    |
-|-------------------------------------------------|-----------|-----------|----------------------------|
-| `solti_discover_attempts_total`                 | Counter   | none      | Sync attempts              |
-| `solti_discover_outcomes_total`                 | Counter   | `outcome` | `success` or `failure`     |
-| `solti_discover_duration_seconds`               | Histogram | `outcome` | Sync call duration         |
-| `solti_discover_failures_total`                 | Counter   | `reason`  | Failure reason             |
-| `solti_discover_last_success_timestamp_seconds` | Gauge     | none      | UNIX time of last success  |
-| `solti_discover_holds_total`                    | Counter   | none      | Server-advised retry holds |
-| `solti_discover_hold_duration_seconds`          | Histogram | none      | Hold duration              |
-
-## Process Metrics
-
-Enable `process` to register Prometheus' standard process collector on Linux:
-
-- `process_cpu_seconds_total`
-- `process_resident_memory_bytes`
-- `process_virtual_memory_bytes`
-- `process_open_fds`
-- `process_max_fds`
-- `process_start_time_seconds`
-
-On non-Linux targets the function is a no-op. Without `process` the function is
-not part of the public API.
-
-## Event Mapping
-
-```text
-AttemptStarting       -> attempts_in_flight.inc()
-                          task_restarts.inc() if attempt > 1
-AttemptSucceeded      -> attempts_in_flight.dec()
-AttemptCanceled       -> attempts_in_flight.dec()
-AttemptFailed         -> attempts_in_flight.dec()
-AttemptTimedOut       -> attempts_in_flight.dec()
-                          attempt_timeouts.inc()
-BackoffScheduled      -> task_backoffs{source}.inc()
-                          task_backoff_duration.observe(delay)
-TaskFinished          -> task_final_outcomes{outcome}.inc()
-                          attempts_in_flight.dec() for force-abort/panic fallback
-SubscriberOverflow    -> subscriber_overflows.inc()
-SubscriberPanicked    -> subscriber_panics.inc()
-RuntimeFailure        -> runtime_failures.inc()
-ControllerSubmitted   -> controller_submitted_events.inc()
-ControllerRejected    -> controller_rejections{reason}.inc()
-```
-
-## Label Cardinality
-
-Prometheus labels stay low-cardinality and bounded.
-
-| Label       | Values                                                                                 |
-|-------------|----------------------------------------------------------------------------------------|
-| `runner`    | `subprocess`, `wasm`, `container`, or an application-defined stable label                    |
-| `outcome` (discovery) | `success`, `failure`                                                               |
-| `outcome` (task terminal) | Taskvisor `TaskOutcomeKind::as_label()` values or `unknown` |
-| `error`     | `cgroup_prepare_failed`, `backend_config_failed`, `spawn_failed`, `module_load_failed` |
-| `source`    | `failure`, `success`                                                                   |
-| `reason`    | bounded rejection and discovery reason labels                                         |
-| `transport` | `http`, `grpc`                                                                         |
-| `method`    | HTTP method or gRPC method name                                                        |
-| `path`      | templated HTTP route or gRPC method path                                               |
-| `status`    | HTTP status code or gRPC code number                                                   |
-
-## Feature Flags
-
-| Flag                     | Default | Effect                                                    |
-|--------------------------|---------|-----------------------------------------------------------|
-| `runner`                 | off     | Enables `PrometheusRunnerMetrics`                         |
-| `taskvisor`              | off     | Enables `PrometheusTaskvisorSubscriber` lifecycle metrics |
-| `taskvisor-controller`   | off     | Adds controller metrics and implies `taskvisor`           |
-| `api`                    | off     | Enables `PrometheusApiMetrics`                            |
-| `discover`               | off     | Enables `PrometheusDiscoverMetrics`                       |
-| `process`                | off     | Registers real `process_*` metrics on Linux               |
-| `server`                 | off     | Enables the supervised `/metrics` HTTP task               |
-| `state`                  | off     | Enables `PrometheusCoreStateCollector`                    |
-| `full`                   | off     | Enables every integration above                           |
-
-The base exports `Registry` and `register_build_info`. It does not pull any
-Solti crate or Taskvisor.
-
-## Notes
-
-- All collectors should share one `prometheus::Registry`.
-- `PrometheusTaskvisorSubscriber` uses `DEFAULT_TASKVISOR_QUEUE_CAPACITY` by default.
-- Durations passed in milliseconds are converted to seconds for histograms.
-- Full agent examples live in `examples/agentd-http` and `examples/agentd-grpc`.
-- If a collector is registered twice in the same registry, Prometheus returns `AlreadyReg`.
+Constructors and registration functions return `prometheus::Error`.
+Registering the same metric group twice in one registry returns `AlreadyReg`.
+`server` also validates the embedded revision and returns `solti_model::ModelError`.

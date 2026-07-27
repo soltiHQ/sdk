@@ -1,6 +1,15 @@
-//! # Supervisor state collector.
+//! # Core state metrics
 //!
-//! [`PrometheusCoreStateCollector`] exposes the current number of tasks per [`TaskPhase`] as `solti_core_tasks_by_phase{phase}`.
+//! [`PrometheusCoreStateCollector`] counts stored tasks by [`TaskPhase`].
+//! It reads [`TaskState`] when Prometheus collects the metric.
+//!
+//! Enable it with the `state` feature.
+//!
+//! ## Flow
+//!
+//! ```text
+//! TaskState ──► count_by_phase() ──► solti_core_tasks_by_phase ──► Registry
+//! ```
 
 use std::sync::Mutex;
 
@@ -12,9 +21,9 @@ use solti_model::TaskPhase;
 
 use crate::register::gauge_vec_unregistered;
 
-/// All phases we want to be represented as gauges, even at zero.
+/// Phases emitted as separate gauge series.
 ///
-/// Future variants are aggregated under `phase="unknown"` until mapped here.
+/// Other variants use `phase="unknown"`.
 const ALL_PHASES: &[TaskPhase] = &[
     TaskPhase::Pending,
     TaskPhase::Running,
@@ -39,27 +48,34 @@ fn phase_label(phase: TaskPhase) -> &'static str {
     }
 }
 
-/// Pull-based Prometheus collector for `solti_core_tasks_by_phase{phase}`.
+/// Pull-based metrics for the current `TaskState`.
 ///
-/// Register once with a shared [`prometheus::Registry`] alongside the other Solti collectors.
-/// Every known phase is emitted on each scrape. Empty phases return `0`.
-/// Future phases are counted as `unknown`.
+/// ## Metric
 ///
-/// Counts are recomputed from [`TaskState`] on every scrape.
-/// Unlike the event gauge `solti_taskvisor_attempts_in_flight`, this collector
-/// recomputes its values from resource state.
-/// The residual limitation is upstream: a `Running` count reflects the `AttemptStarting` events `TaskState` has observed.
-/// A start dropped under bus lag is undercounted until the entry's phase next changes (bounded, not cumulative).
+/// | Metric                      | Type  | Labels  | Description             |
+/// |-----------------------------|-------|---------|-------------------------|
+/// | `solti_core_tasks_by_phase` | Gauge | `phase` | Stored tasks by phase   |
 ///
-/// # Cost
+/// ## Collection
 ///
-/// `O(N)` per scrape where `N` is the current number of tasks in state:
-/// [`TaskState::count_by_phase`] tallies the phases under a single read lock without cloning any task
-/// (a clone would drag whole specs along, including script bodies).
+/// Every scrape recounts all tasks currently stored in [`TaskState`].
+/// Known phases are emitted even when their count is zero.
+/// Other phase variants are aggregated under `phase="unknown"`.
 ///
-/// With a typical scrape interval of 10-30s and a fleet of <10k tasks this is negligible.
+/// Terminal tasks remain visible while `TaskState` retains them.
 ///
-/// # Example
+/// ```text
+/// Pending   ─┐
+/// Running   ─┤
+/// Succeeded ─┤
+/// Failed    ─┼──► tasks_by_phase{phase}
+/// Timeout   ─┤
+/// Canceled  ─┤
+/// Exhausted ─┤
+/// other     ─┘    phase="unknown"
+/// ```
+///
+/// ## Example
 ///
 /// ```rust
 /// use solti_core::TaskState;
@@ -81,22 +97,13 @@ pub struct PrometheusCoreStateCollector {
 }
 
 impl PrometheusCoreStateCollector {
-    /// Create a new collector wired to `state`.
+    /// Creates a collector for one shared task state.
     ///
-    /// # Example
+    /// The collector is not registered by this method.
     ///
-    /// ```
-    /// use prometheus::core::Collector;
-    /// use solti_core::TaskState;
-    /// use solti_prometheus::PrometheusCoreStateCollector;
+    /// # Errors
     ///
-    /// # fn main() -> Result<(), prometheus::Error> {
-    /// let state = TaskState::new();
-    /// let collector = PrometheusCoreStateCollector::new(state)?;
-    ///
-    /// assert!(!collector.collect().is_empty());
-    /// # Ok(()) }
-    /// ```
+    /// Returns a Prometheus error when the gauge descriptor cannot be created.
     pub fn new(state: TaskState) -> Result<Self, prometheus::Error> {
         let gauge = gauge_vec_unregistered(
             "core",
@@ -152,7 +159,6 @@ mod tests {
     use super::*;
     use prometheus::Registry;
     use solti_model::{EmbeddedSpec, TaskId, TaskSpec, TaskWorkload};
-    use std::sync::Arc;
 
     fn spec() -> TaskSpec {
         TaskSpec::builder(
@@ -203,31 +209,12 @@ mod tests {
     }
 
     #[test]
-    fn collector_counts_pending_tasks() {
-        let state = TaskState::new();
-        state.seed_task(TaskId::new("t1").unwrap(), spec());
-        state.seed_task(TaskId::new("t2").unwrap(), spec());
-        state.seed_task(TaskId::new("t3").unwrap(), spec());
-
-        let collector = PrometheusCoreStateCollector::new(state).unwrap();
-        let families = collector.collect();
-
-        assert_eq!(
-            gauge_value(&families, "solti_core_tasks_by_phase", "pending"),
-            Some(3.0)
-        );
-        assert_eq!(
-            gauge_value(&families, "solti_core_tasks_by_phase", "running"),
-            Some(0.0)
-        );
-    }
-
-    #[test]
     fn collector_reflects_transitions() {
         let state = TaskState::new();
-        state.seed_task(TaskId::new("t1").unwrap(), spec());
+        let task_id = TaskId::new("t1").unwrap();
+        state.seed_task(task_id.clone(), spec());
         state.seed_task(TaskId::new("t2").unwrap(), spec());
-        state.seed_starting(&TaskId::new("t1").unwrap());
+        state.seed_starting(&task_id);
 
         let collector = PrometheusCoreStateCollector::new(state.clone()).unwrap();
         let families = collector.collect();
@@ -241,12 +228,7 @@ mod tests {
             Some(1.0)
         );
 
-        state.seed_finished(
-            &TaskId::new("t1").unwrap(),
-            TaskPhase::Succeeded,
-            None,
-            None,
-        );
+        state.seed_finished(&task_id, TaskPhase::Succeeded, None, None);
         let families = collector.collect();
         assert_eq!(
             gauge_value(&families, "solti_core_tasks_by_phase", "running"),
@@ -260,10 +242,11 @@ mod tests {
 
     #[test]
     fn collector_registers_into_registry_and_scrapes() {
-        let registry = Arc::new(Registry::new());
+        let registry = Registry::new();
         let state = TaskState::new();
-        state.seed_task(TaskId::new("alpha").unwrap(), spec());
-        state.seed_starting(&TaskId::new("alpha").unwrap());
+        let task_id = TaskId::new("alpha").unwrap();
+        state.seed_task(task_id.clone(), spec());
+        state.seed_starting(&task_id);
 
         let collector = PrometheusCoreStateCollector::new(state).unwrap();
         registry.register(Box::new(collector)).unwrap();

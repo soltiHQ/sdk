@@ -1,25 +1,53 @@
-//! Prometheus integrations for the Solti SDK.
+//! # solti-prometheus
 //!
-//! The crate owns no domain metrics contract. Each adapter implements the
-//! contract from its source crate and registers metrics into one shared
-//! [`Registry`]. All integrations are disabled by default.
+//! `solti-prometheus` connects Solti metrics contracts to one Prometheus [`Registry`].
+//! It does not define those contracts.
+//! Each adapter implements a trait from the crate that owns the observed behavior.
 //!
-//! ## Integrations
+//! All integrations are disabled by default.
+//! [`Registry`] and [`register_build_info`] are always available.
 //!
-//! | Feature                   | Source              | Public API                          |
-//! |---------------------------|---------------------|-------------------------------------|
-//! | `runner`                  | `solti-runner`      | `PrometheusRunnerMetrics`           |
-//! | `api`                     | `solti-api`         | `PrometheusApiMetrics`              |
-//! | `discover`                | `solti-discover`    | `PrometheusDiscoverMetrics`         |
-//! | `taskvisor`               | Taskvisor events    | `PrometheusTaskvisorSubscriber`     |
-//! | `taskvisor-controller`    | Controller events   | controller metrics on the subscriber|
-//! | `state`                   | `solti-core`        | `PrometheusCoreStateCollector`      |
-//! | `process`                 | current process     | `register_process_collector`        |
-//! | `server`                  | shared registry     | supervised `/metrics` task          |
+//! ## Data Flow
 //!
-//! `register_build_info` and [`Registry`] are always available.
+//! ```text
+//! solti-runner ─────► PrometheusRunnerMetrics ───────────┐
+//! solti-api ────────► PrometheusApiMetrics ──────────────┤
+//! solti-discover ───► PrometheusDiscoverMetrics ─────────┤
+//! Taskvisor events ─► PrometheusTaskvisorSubscriber ─────┤
+//! solti-core state ─► PrometheusCoreStateCollector ──────┤
+//! build / process ──► registration functions ────────────┤
+//!                                                        ▼
+//!                                               shared Registry
+//!                                                        │
+//!                                                        ▼
+//!                                                   GET /metrics
+//! ```
 //!
-//! ## Registry
+//! ## Choose an Integration
+//!
+//! | Feature                | Input              | Public API                       |
+//! |------------------------|--------------------|----------------------------------|
+//! | `api`                  | API metrics trait  | `PrometheusApiMetrics`           |
+//! | `discover`             | Discovery metrics  | `PrometheusDiscoverMetrics`      |
+//! | `process`              | Current process    | `register_process_collector`     |
+//! | `runner`               | Runner metrics     | `PrometheusRunnerMetrics`        |
+//! | `server`               | Shared registry    | `server`                         |
+//! | `state`                | `TaskState`        | `PrometheusCoreStateCollector`   |
+//! | `taskvisor`            | Taskvisor events   | `PrometheusTaskvisorSubscriber`  |
+//! | `taskvisor-controller` | Controller events  | Controller subscriber metrics    |
+//!
+//! The `full` feature enables every integration in the table.
+//!
+//! ## Registration
+//!
+//! Metrics adapters register their collectors as one group.
+//! A descriptor conflict rejects the complete group.
+//! It does not leave part of that group in the registry.
+//!
+//! The state collector is different.
+//! Construct it first, then register it as a [`prometheus::core::Collector`].
+//!
+//! ## Quick Start
 //!
 //! ```rust
 //! use solti_prometheus::{Registry, register_build_info};
@@ -34,12 +62,10 @@
 //! assert!(!registry.gather().is_empty());
 //! # Ok(()) }
 //! ```
-//!
-//! Each adapter registers its collectors as one group. A conflicting group is
-//! rejected without leaving part of that group in the registry.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 /// Compiles the runnable Rust code blocks in `README.md` as doctests.
 #[cfg(all(doctest, feature = "full"))]
@@ -58,16 +84,19 @@ mod register;
 #[cfg(feature = "taskvisor")]
 mod subscriber;
 #[cfg(feature = "taskvisor")]
+#[cfg_attr(docsrs, doc(cfg(feature = "taskvisor")))]
 pub use subscriber::{DEFAULT_TASKVISOR_QUEUE_CAPACITY, PrometheusTaskvisorSubscriber};
 
 #[cfg(feature = "process")]
 mod process;
 #[cfg(feature = "process")]
+#[cfg_attr(docsrs, doc(cfg(feature = "process")))]
 pub use process::register_process_collector;
 
 #[cfg(feature = "runner")]
 mod backend;
 #[cfg(feature = "runner")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runner")))]
 pub use backend::PrometheusRunnerMetrics;
 
 mod info;
@@ -76,21 +105,25 @@ pub use info::register_build_info;
 #[cfg(feature = "discover")]
 mod discover;
 #[cfg(feature = "discover")]
+#[cfg_attr(docsrs, doc(cfg(feature = "discover")))]
 pub use discover::PrometheusDiscoverMetrics;
 
 #[cfg(feature = "api")]
 mod api;
 #[cfg(feature = "api")]
+#[cfg_attr(docsrs, doc(cfg(feature = "api")))]
 pub use api::PrometheusApiMetrics;
 
 #[cfg(feature = "server")]
 mod server;
 #[cfg(feature = "server")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server")))]
 pub use server::{METRICS_SERVER_SLOT, server};
 
 #[cfg(feature = "state")]
 mod state;
 #[cfg(feature = "state")]
+#[cfg_attr(docsrs, doc(cfg(feature = "state")))]
 pub use state::PrometheusCoreStateCollector;
 
 pub use prometheus::Registry;
