@@ -51,7 +51,8 @@ impl TaskStatus {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when status fields or conditions are inconsistent.
+    /// Returns [`ModelError::Invalid`] when status fields are inconsistent.
+    /// This includes lifecycle fields, conditions, and generations.
     pub fn from_parts(
         observed_generation: u64,
         phase: TaskPhase,
@@ -198,7 +199,7 @@ impl TaskStatus {
             && reconciled.observed_generation() != self.observed_generation
         {
             return Err(ModelError::Invalid(
-                "status.conditions[type=Reconciled].observedGeneration must equal status.observedGeneration when reconciliation is complete"
+                "status.conditions[type=Reconciled].observedGeneration must equal status.observedGeneration when Reconciled is True or False"
                     .into(),
             ));
         }
@@ -207,7 +208,12 @@ impl TaskStatus {
                 "status.phase requires a Reconciled=True condition unless phase is pending".into(),
             ));
         }
-        Self::validate_execution_fields(self.phase, self.attempt, self.exit_code, &self.error)?;
+        Self::validate_execution_fields(
+            self.phase,
+            self.attempt,
+            self.exit_code,
+            self.error.as_deref(),
+        )?;
         Ok(())
     }
 
@@ -215,7 +221,7 @@ impl TaskStatus {
         phase: TaskPhase,
         attempt: u32,
         exit_code: Option<i32>,
-        error: &Option<String>,
+        error: Option<&str>,
     ) -> ModelResult<()> {
         match phase {
             TaskPhase::Pending => {
