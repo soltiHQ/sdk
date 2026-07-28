@@ -159,7 +159,7 @@ The builder applies:
 | Field            | Default                                       |
 |------------------|-----------------------------------------------|
 | `restart`        | `RestartPolicy::Never`                        |
-| `backoff`        | Full jitter, 1 s to 30 s, factor 2           |
+| `backoff`        | Full jitter, 1 s to 30 s, factor 2            |
 | `admission`      | `AdmissionPolicy::DropIfRunning`              |
 | `maxRetries`     | Absent, which means unlimited failure retries |
 | `runnerSelector` | Absent                                        |
@@ -170,13 +170,13 @@ Omit the field for an unlimited retry budget.
 
 ## Workloads
 
-| Variant       | Input                                              | Runner-routed |
-|---------------|----------------------------------------------------|---------------|
-| `Subprocess`  | Command or explicit interpreter and base64 script | Yes           |
-| `Container`   | OCI image, optional command, args, environment     | Yes           |
-| `Wasm`        | WASM module path, args, environment                | Yes           |
-| `Embedded`    | In-process implementation revision                 | No            |
-| `Extension`   | Application GVK and JSON object spec               | Yes           |
+| Variant       | Input                                               | Runner-routed |
+|---------------|-----------------------------------------------------|---------------|
+| `Subprocess`  | Command or explicit interpreter and base64 script   | Yes           |
+| `Container`   | OCI image, optional command, args, environment      | Yes           |
+| `Wasm`        | WASM module path, args, environment                 | Yes           |
+| `Embedded`    | In-process implementation revision                  | No            |
+| `Extension`   | Application GVK and JSON object spec                | Yes           |
 
 Built-in workloads use `apiVersion: solti.io/v1`.
 Their envelope and spec reject unknown fields.
@@ -214,11 +214,11 @@ The decoded limit is `MAX_SCRIPT_BODY_BYTES` (`2 MiB`).
 
 `Task::apply_desired` compares labels, annotations, and spec:
 
-| Result                    | Generation  | Status                      | Resource version |
-|---------------------------|-------------|-----------------------------|------------------|
-| `DesiredChange::None`     | Unchanged   | Unchanged                   | Unchanged        |
-| `DesiredChange::Metadata` | Unchanged   | Unchanged                   | Replaced         |
-| `DesiredChange::Spec`     | Advanced    | Pending for the new desired state | Replaced   |
+| Result                    | Generation  | Status                            | Resource version |
+|---------------------------|-------------|-----------------------------------|------------------|
+| `DesiredChange::None`     | Unchanged   | Unchanged                         | Unchanged        |
+| `DesiredChange::Metadata` | Unchanged   | Unchanged                         | Replaced         |
+| `DesiredChange::Spec`     | Advanced    | Pending for the new desired state | Replaced         |
 
 UID and creation time remain unchanged.
 Invalid desired state is rejected before mutation.
@@ -359,13 +359,13 @@ Unknown fields are rejected by resource, spec, capability, condition, run, query
 
 Some collection types allow temporary invalid states during construction:
 
-| Type                  | Required boundary check |
-|-----------------------|-------------------------|
-| `Labels`              | `validate()`            |
-| `Annotations`         | `validate()`            |
-| `LabelSelector`       | `validate()`            |
-| `SelectorRequirement` | `validate()`            |
-| `BackoffPolicy` literal | `validate()`          |
+| Type                    | Required boundary check |
+|-------------------------|-------------------------|
+| `Labels`                | `validate()`            |
+| `Annotations`           | `validate()`            |
+| `LabelSelector`         | `validate()`            |
+| `SelectorRequirement`   | `validate()`            |
+| `BackoffPolicy` literal | `validate()`            |
 
 Validated top-level APIs call these checks when the values enter a resource, query, or capability.
 `TaskEnv` stores key-value pairs without validating application-specific names or values.
