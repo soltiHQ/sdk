@@ -1,48 +1,47 @@
-//! Taskvisor to model phase crosswalk.
+//! # Runtime phase mapping
 //!
-//! This module is the single home for semantic mapping from Taskvisor's typed
-//! final outcomes and rejection kinds into [`TaskPhase`]. Both state paths use
-//! it:
+//! This module maps typed Taskvisor results to [`TaskPhase`].
+//! Both runtime state paths use the same crosswalk.
 //!
-//! - the best-effort event path maps `TaskFinished.outcome_kind` and typed
-//!   rejection events;
-//! - the reliable completion path maps [`taskvisor::TaskOutcome`].
+//! ```text
+//! TaskFinished event ──────┐
+//!                          ├──► phase, error, exit code
+//! direct TaskOutcome ──────┘
+//! ```
 //!
-//! Diagnostic `reason` text may be retained as an error message, but it never
-//! selects a phase.
+//! Diagnostic reason text may become an error message.
+//! It never selects a phase.
 //!
 //! ## Crosswalk
 //!
-//! | Taskvisor category                    | Model phase              | Why                                                        |
-//! |----------------------------------------|--------------------------|------------------------------------------------------------|
-//! | `TaskOutcomeKind::Completed`           | [`TaskPhase::Succeeded`] | The final attempt succeeded.                               |
-//! | `TaskOutcomeKind::Failed`              | [`TaskPhase::Exhausted`] | A retryable failure reached its policy stop condition.     |
-//! | `TaskOutcomeKind::Fatal`               | [`TaskPhase::Failed`]    | A permanent error stopped the task.                        |
-//! | `TaskOutcomeKind::Canceled`            | [`TaskPhase::Canceled`]  | The task stopped cooperatively.                            |
-//! | `TaskOutcomeKind::ForceAborted`        | [`TaskPhase::Canceled`]  | Cancellation completed through the runtime's abort path.   |
-//! | `TaskOutcomeKind::Panicked`            | [`TaskPhase::Failed`]    | The internal managed runner failed.                        |
-//! | cancel-like [`taskvisor::RejectionKind`] | [`TaskPhase::Canceled`] | Work was intentionally skipped or removed before running. |
+//! | Taskvisor category                             | Model phase              |
+//! |------------------------------------------------|--------------------------|
+//! | `TaskOutcomeKind::Completed`                   | [`TaskPhase::Succeeded`] |
+//! | `TaskOutcomeKind::Failed`                      | [`TaskPhase::Exhausted`] |
+//! | `TaskOutcomeKind::Fatal`                       | [`TaskPhase::Failed`]    |
+//! | `TaskOutcomeKind::Canceled`                    | [`TaskPhase::Canceled`]  |
+//! | `TaskOutcomeKind::ForceAborted`                | [`TaskPhase::Canceled`]  |
+//! | `TaskOutcomeKind::Panicked`                    | [`TaskPhase::Failed`]    |
+//! | `TaskOutcomeKind::Rejected` event              | [`TaskPhase::Failed`]    |
+//! | Cancel-like [`taskvisor::RejectionKind`]       | [`TaskPhase::Canceled`]  |
+//! | Other [`taskvisor::RejectionKind`]             | [`TaskPhase::Failed`]    |
+//! | Unknown future outcome                         | [`TaskPhase::Failed`]    |
 
 use solti_model::TaskPhase;
 use taskvisor::{RejectionKind, TaskOutcomeKind};
 
-/// SDK-owned diagnostic used for a force-aborted final outcome.
+/// Diagnostic for a force-aborted outcome.
 ///
-/// The value preserves the SDK's existing status payload without depending on
-/// Taskvisor's diagnostic `reason` strings.
+/// The value does not depend on Taskvisor reason text.
 pub(crate) const FORCE_ABORTED_ERROR: &str = "force_terminated_after_grace";
 
-/// SDK-owned diagnostic used when Taskvisor reports an internal runner panic.
-///
-/// The value preserves the SDK's existing status payload.
+/// Diagnostic for an internal Taskvisor runner panic.
 pub(crate) const TASK_RUNNER_PANICKED_ERROR: &str = "actor panicked";
 
-/// Classify a typed rejection into a terminal phase.
+/// Maps a typed rejection to a terminal phase.
 ///
-/// Applies to `ControllerRejected` / `TaskAddFailed` events and to
-/// [`taskvisor::TaskOutcome::Rejected`]. User- or shutdown-initiated removals
-/// and admission-policy skips are clean cancellation. Everything else is a
-/// failed submission.
+/// Queue removal, replacement, shutdown, and a busy slot map to cancellation.
+/// Other rejection kinds map to failure.
 pub(crate) fn phase_for_rejection(kind: RejectionKind) -> TaskPhase {
     match kind {
         RejectionKind::SlotBusy
@@ -53,11 +52,11 @@ pub(crate) fn phase_for_rejection(kind: RejectionKind) -> TaskPhase {
     }
 }
 
-/// Crosswalk a typed final outcome event into `(phase, error, exit_code)`.
+/// Maps a typed final event to phase details.
 ///
-/// `reason` is copied only for outcome categories that carry failure details.
-/// It is never parsed or compared. Unknown future categories degrade to
-/// [`TaskPhase::Failed`] with an SDK-owned diagnostic.
+/// Failure categories keep the supplied reason and exit code.
+/// The reason is not parsed.
+/// Unknown categories map to [`TaskPhase::Failed`].
 pub(crate) fn phase_for_outcome_kind(
     kind: TaskOutcomeKind,
     reason: Option<&str>,
@@ -90,10 +89,6 @@ pub(crate) fn phase_for_outcome_kind(
             Some(TASK_RUNNER_PANICKED_ERROR.to_string()),
             None,
         ),
-        // Rejected work normally uses ControllerRejected / TaskAddFailed, not
-        // TaskFinished. Without RejectionKind, failure is the conservative
-        // event-side classification. The direct outcome path below retains the
-        // precise typed rejection mapping.
         TaskOutcomeKind::Rejected => (
             TaskPhase::Failed,
             Some(reason.unwrap_or("task submission was rejected").to_string()),
@@ -107,11 +102,10 @@ pub(crate) fn phase_for_outcome_kind(
     }
 }
 
-/// Crosswalk a direct [`taskvisor::TaskOutcome`] into
-/// `(phase, error, exit_code)`.
+/// Maps a direct [`taskvisor::TaskOutcome`] to phase details.
 ///
-/// Rejected work delegates to [`phase_for_rejection`]. All other known
-/// variants share the same [`TaskOutcomeKind`] crosswalk as `TaskFinished`.
+/// Rejected work uses [`phase_for_rejection`].
+/// Other known outcomes use the event crosswalk.
 pub(crate) fn phase_for_outcome(
     outcome: &taskvisor::TaskOutcome,
 ) -> (TaskPhase, Option<String>, Option<i32>) {
@@ -137,26 +131,18 @@ mod tests {
     use taskvisor::TaskOutcome;
 
     #[test]
-    fn rejection_cancel_like_kinds_map_to_canceled() {
-        for kind in [
-            RejectionKind::RemovedFromQueue,
-            RejectionKind::SupersededByReplace,
-            RejectionKind::ControllerShuttingDown,
-            RejectionKind::SlotBusy,
+    fn rejection_kinds_have_an_explicit_crosswalk() {
+        for (kind, expected) in [
+            (RejectionKind::RemovedFromQueue, TaskPhase::Canceled),
+            (RejectionKind::SupersededByReplace, TaskPhase::Canceled),
+            (RejectionKind::ControllerShuttingDown, TaskPhase::Canceled),
+            (RejectionKind::SlotBusy, TaskPhase::Canceled),
+            (RejectionKind::QueueFull, TaskPhase::Failed),
+            (RejectionKind::AlreadyExists, TaskPhase::Failed),
+            (RejectionKind::BatchRejected, TaskPhase::Failed),
+            (RejectionKind::AdmissionFailed, TaskPhase::Failed),
         ] {
-            assert_eq!(phase_for_rejection(kind), TaskPhase::Canceled);
-        }
-    }
-
-    #[test]
-    fn rejection_failure_kinds_map_to_failed() {
-        for kind in [
-            RejectionKind::QueueFull,
-            RejectionKind::AlreadyExists,
-            RejectionKind::BatchRejected,
-            RejectionKind::AdmissionFailed,
-        ] {
-            assert_eq!(phase_for_rejection(kind), TaskPhase::Failed);
+            assert_eq!(phase_for_rejection(kind), expected);
         }
     }
 

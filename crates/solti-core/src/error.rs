@@ -1,4 +1,10 @@
-//! Error types.
+//! # Core errors
+//!
+//! [`CoreError`] covers desired writes, runner preparation, and Taskvisor operations.
+//! [`WriteConflict`] describes failed optimistic concurrency checks.
+//!
+//! Collection reads use [`CollectionError`](crate::CollectionError).
+//! Checked configuration uses [`ConfigError`](crate::ConfigError).
 
 use std::fmt;
 
@@ -7,22 +13,22 @@ use thiserror::Error;
 use solti_model::{TaskId, Uid};
 use solti_runner::RouterError;
 
-/// One failed resource write precondition.
+/// One failed write precondition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WritePreconditionViolation {
-    /// The current resource has a different UID.
+    /// The stored resource has a different UID.
     Uid {
-        /// UID required by the caller.
+        /// Required UID.
         expected: Uid,
-        /// UID stored on the current resource.
+        /// Stored UID.
         actual: Uid,
     },
-    /// The current resource has a different resource version.
+    /// The stored resource has a different resource version.
     ResourceVersion {
-        /// Resource version required by the caller.
+        /// Required resource version.
         expected: String,
-        /// Resource version stored on the current resource.
+        /// Stored resource version.
         actual: String,
     },
 }
@@ -41,7 +47,7 @@ impl fmt::Display for WritePreconditionViolation {
     }
 }
 
-/// Details of an optimistic-concurrency conflict.
+/// Optimistic concurrency conflict details.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriteConflict {
     name: TaskId,
@@ -54,12 +60,12 @@ impl WriteConflict {
         Self { name, violations }
     }
 
-    /// Conflicting task name.
+    /// Returns the conflicting task name.
     pub fn name(&self) -> &TaskId {
         &self.name
     }
 
-    /// Failed preconditions.
+    /// Returns every failed precondition.
     pub fn violations(&self) -> &[WritePreconditionViolation] {
         &self.violations
     }
@@ -84,9 +90,10 @@ impl fmt::Display for WriteConflict {
 
 impl std::error::Error for WriteConflict {}
 
-/// Error type returned by every fallible operation in solti-core.
+/// Error from a desired write, runner preparation, or Taskvisor operation.
 ///
-/// The enum is `#[non_exhaustive]`; match with a wildcard arm.
+/// This enum is non-exhaustive.
+/// Match it with a wildcard arm.
 ///
 /// ## Example
 ///
@@ -103,61 +110,62 @@ impl std::error::Error for WriteConflict {}
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CoreError {
-    /// The in-memory state store could not initialize its identity.
+    /// State could not initialize its resource-version identity.
     #[error("state initialization failed: {0}")]
     StateInitialization(#[source] solti_model::ModelError),
 
-    /// The supervisor has started shutting down and no longer accepts desired-state writes.
+    /// Shutdown has started.
+    ///
+    /// Desired-state writes are no longer accepted.
     #[error("supervisor is shutting down")]
     ShuttingDown,
 
-    /// A taskvisor runtime failure during submit, cancel, or shutdown.
+    /// A Taskvisor operation failed.
     ///
-    /// Carries the typed [`taskvisor::Error`] as the source; `op` is a stable
-    /// label for the failed operation, such as `"prepare"`, `"submit"`,
-    /// `"cancel"`, or `"shutdown"`.
+    /// `op` is a stable operation label.
+    /// Known labels are `"prepare"`, `"submit"`, `"cancel"`, and `"shutdown"`.
     #[error("supervisor {op} failed: {source}")]
     Supervisor {
-        /// The operation that failed.
+        /// Stable operation label.
         op: &'static str,
-        /// The underlying taskvisor error.
+        /// Taskvisor error.
         #[source]
         source: taskvisor::Error,
     },
 
-    /// A retained Task resource already owns this metadata.name.
+    /// A retained task already owns the name.
     #[error("task already exists: {0}")]
     AlreadyExists(String),
 
-    /// The referenced task does not exist.
+    /// The task does not exist or is hidden by an adapter predicate.
     #[error("task not found: {0}")]
     NotFound(String),
 
-    /// One or more write preconditions do not match the current resource.
+    /// Write preconditions do not match the stored task.
     #[error(transparent)]
     Conflict(WriteConflict),
 
-    /// A model-to-taskvisor policy mapping failure:
-    /// a `#[non_exhaustive]` model enum carried a variant with no taskvisor equivalent.
+    /// A model policy has no Taskvisor mapping.
     #[error("mapping error: {0}")]
     Mapping(String),
 
-    /// Runner routing or task construction failed.
-    /// Wraps [`solti_runner::RouterError`].
+    /// Runner selection or task construction failed.
+    ///
+    /// Contains the [`solti_runner::RouterError`].
     #[error("runner error: {0}")]
     Runner(#[from] RouterError),
 
-    /// The submitted spec failed validation.
-    /// Wraps [`solti_model::ModelError`].
+    /// The submitted model or workload path is invalid.
+    ///
+    /// Contains the [`solti_model::ModelError`].
     #[error("invalid spec: {0}")]
     InvalidSpec(#[from] solti_model::ModelError),
 }
 
 impl CoreError {
-    /// Wrap a taskvisor failure with the operation label.
+    /// Wraps a Taskvisor failure with an operation label.
     ///
-    /// Accepts both [`taskvisor::RuntimeError`] and [`taskvisor::ControllerError`]
-    /// through the umbrella [`taskvisor::Error`].
+    /// Accepts runtime and controller failures through [`taskvisor::Error`].
     pub(crate) fn supervisor(op: &'static str, e: impl Into<taskvisor::Error>) -> Self {
         Self::Supervisor {
             op,

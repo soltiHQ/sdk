@@ -1,7 +1,30 @@
-//! In-memory task state.
+//! # Task state
 //!
-//! [`TaskState`] stores tasks and execution runs in `Arc<RwLock<_>>`.
-//! It is updated from Taskvisor outcomes and cleaned by the retention worker.
+//! [`TaskState`] is the in-memory resource store of `solti-core`.
+//!
+//! ## Flow
+//!
+//! ```text
+//! desired writes ────────────────┐
+//! Taskvisor events ──────────────┤
+//! direct completion outcomes ────┤
+//!                                ▼
+//!                           TaskState
+//!                                ├──► Task reads
+//!                                ├──► TaskRun history
+//!                                ├──► list snapshots
+//!                                └──► Task watches
+//! ```
+//!
+//! Normal writes belong to [`SupervisorApi`](crate::SupervisorApi).
+//! Public `TaskState` methods provide shared read access.
+//!
+//! Each store has its own resource-version epoch.
+//! List continuations use retained change history.
+//! Watches use the same history.
+//! They can resume only while that history remains available.
+//! Retention limits that history by both count and serialized bytes.
+//! An oversized change is broadcast live but is not retained.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -33,7 +56,8 @@ use crate::{StateConfig, WriteConflict, WritePreconditionViolation, error::CoreE
 /// Shared in-memory task state.
 ///
 /// `TaskState` is usually obtained from [`SupervisorApi::state`](crate::SupervisorApi::state).
-/// Outside this crate it is a read handle: the supervisor owns the writes.
+/// Its clones share one store.
+/// The supervisor owns normal writes.
 ///
 /// ## Example
 ///
@@ -52,39 +76,40 @@ pub struct TaskState {
 }
 
 struct TaskStateInner {
-    /// Tasks indexed by TaskId.
+    /// Tasks indexed by model task name.
     tasks: HashMap<TaskId, Task>,
-    /// Index: slot -> list of task IDs in that slot.
+    /// Task names indexed by slot.
     by_slot: HashMap<Slot, Vec<TaskId>>,
-    /// Execution history: task_id -> ordered list of runs (oldest first).
+    /// Run history indexed by task name.
     runs: HashMap<TaskId, VecDeque<TaskRun>>,
-    /// Raw taskvisor identity -> exact resource incarnation and generation.
+    /// Taskvisor identity to exact resource generation.
     by_tv: HashMap<u64, RuntimeBinding>,
-    /// Resource name -> its current taskvisor binding.
+    /// Resource name to current Taskvisor binding.
     tv_of: HashMap<TaskId, RuntimeBinding>,
-    /// Highest terminal attempt already projected for each live Taskvisor binding.
-    /// Kept independently from user-visible run retention so duplicate runtime
-    /// events remain idempotent even after their TaskRun has been evicted.
+    /// Highest projected terminal attempt for each live binding.
+    ///
+    /// This survives visible run eviction.
+    /// Duplicate terminal events therefore remain idempotent.
     finished_attempt_by_tv: HashMap<u64, u32>,
-    /// Store incarnation embedded in every opaque resource version.
+    /// Store identity embedded in each resource version.
     resource_version_epoch: String,
-    /// Latest resource-version counter committed by this store incarnation.
+    /// Latest committed resource-version counter.
     resource_version: u64,
-    /// Retained Task changes used to resume watches and reconstruct list snapshots.
+    /// Changes retained for watches and list snapshots.
     watch_history: VecDeque<Arc<RawTaskChange>>,
-    /// Serialized Task payload bytes retained in `watch_history`.
+    /// Serialized bytes retained in change history.
     watch_history_bytes: usize,
-    /// Maximum serialized Task payload bytes retained in `watch_history`.
+    /// Maximum serialized change-history bytes.
     watch_history_byte_budget: usize,
-    /// Highest revision no longer available in `watch_history`.
+    /// Highest compacted revision.
     compacted_through: u64,
-    /// Maximum number of retained Task changes.
+    /// Maximum retained change count.
     watch_history_capacity: usize,
-    /// Non-blocking fan-out for live Task changes.
+    /// Live Task change broadcast.
     watch_tx: broadcast::Sender<Arc<RawTaskChange>>,
-    /// Internal retention clock for terminal resources.
+    /// Terminal transition time used by retention.
     terminal_since: HashMap<TaskId, SystemTime>,
-    /// Per-task run-history cap (oldest finished runs evicted past this).
+    /// Per-task completed run cap.
     max_runs_per_task: usize,
 }
 
@@ -113,38 +138,41 @@ type WatchPredicate = Arc<dyn Fn(&Task) -> bool + Send + Sync>;
 
 const WATCH_POLL_BUDGET: usize = 128;
 
-/// Error returned when a Task collection snapshot cannot be read or resumed.
+/// Error from a task collection snapshot.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum CollectionError {
-    /// The supplied resource version is malformed or points beyond this store.
+    /// The resource version is malformed or ahead of this store.
     #[error("invalid resourceVersion `{resource_version}`")]
     InvalidResourceVersion {
-        /// Resource version supplied by the caller.
+        /// Supplied resource version.
         resource_version: String,
     },
-    /// The supplied resource version belongs to another store incarnation or
-    /// has fallen out of retained collection history.
+    /// The resource version is foreign or compacted.
     #[error("resourceVersion `{resource_version}` has expired")]
     ResourceVersionExpired {
-        /// Resource version that can no longer be resumed.
+        /// Expired resource version.
         resource_version: String,
     },
-    /// A continuation was used with filters other than those of its first page.
+    /// Continuation filters differ from the first page.
     #[error("continuation filter does not match the query filter")]
     ContinuationFilterMismatch,
-    /// The continuation cursor is not present in its retained filtered snapshot.
+    /// The continuation task is absent from its filtered snapshot.
     #[error("continuation cursor `{name}` is not part of the retained snapshot")]
     ContinuationCursorNotFound {
-        /// Task name carried by the continuation cursor.
+        /// Missing task name.
         name: TaskId,
     },
 }
 
-/// Stream of filtered Task changes.
+/// Stream of filtered task changes.
 ///
-/// The stream ends when its owning supervisor shuts down. An
-/// [`CollectionError::ResourceVersionExpired`] item is terminal.
+/// Items are [`TaskWatchEvent`] values wrapped in [`Result`].
+/// The stream ends when its supervisor shuts down.
+///
+/// A compacted resume point produces [`CollectionError::ResourceVersionExpired`].
+/// That error is terminal.
+/// The stream ends after returning it.
 #[must_use = "streams do nothing unless polled"]
 pub struct TaskWatchSubscription {
     inner: Arc<RwLock<TaskStateInner>>,
@@ -284,7 +312,7 @@ impl Stream for TaskWatchSubscription {
     }
 }
 
-/// Exact resource incarnation and desired generation associated with one runtime.
+/// Exact resource identity and generation for one runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResourceGeneration {
     pub(crate) name: TaskId,
@@ -304,14 +332,14 @@ impl ResourceGeneration {
     }
 }
 
-/// Correlation between a Taskvisor submission and one exact Task generation.
+/// Binding between Taskvisor and one task generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeBinding {
     pub(crate) resource: ResourceGeneration,
     pub(crate) tv: taskvisor::TaskId,
 }
 
-/// Result of committing user-owned desired state.
+/// Result of a desired-state commit.
 #[derive(Clone, Debug)]
 pub(crate) struct DesiredCommit {
     pub(crate) task: Task,
@@ -319,12 +347,12 @@ pub(crate) struct DesiredCommit {
 }
 
 impl TaskState {
-    /// Create empty task state with the default per-task run-history cap.
+    /// Creates empty state with default retention settings.
     ///
-    /// Most applications use [`SupervisorApi::state`](crate::SupervisorApi::state) instead of constructing this directly.
+    /// Most applications use [`SupervisorApi::state`](crate::SupervisorApi::state).
     /// Use [`try_new`](Self::try_new) when initialization failure must be handled.
     ///
-    /// ## Panics
+    /// # Panics
     ///
     /// Panics when the resource-version epoch cannot be generated from OS entropy.
     ///
@@ -341,12 +369,11 @@ impl TaskState {
             .expect("OS entropy is required to create a TaskState resource-version epoch")
     }
 
-    /// Try to create empty task state with the default per-task run-history cap.
+    /// Tries to create empty state with default retention settings.
     ///
-    /// ## Errors
+    /// # Errors
     ///
-    /// Returns [`CoreError::StateInitialization`] when the resource-version epoch
-    /// cannot be generated from OS entropy.
+    /// Returns [`CoreError::StateInitialization`] when identity generation fails.
     pub fn try_new() -> Result<Self, CoreError> {
         Self::try_with_config(StateConfig::new())
     }
@@ -475,7 +502,7 @@ impl TaskState {
         }
     }
 
-    /// Register a manifest unconditionally for test fixtures.
+    /// Inserts a manifest for tests.
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn add_task(&self, manifest: TaskManifest) {
         let mut inner = self.inner.write();
@@ -493,7 +520,9 @@ impl TaskState {
         Self::record_change(&mut inner, revision, previous, Some(task));
     }
 
-    /// Create one desired resource. Every retained name conflicts, regardless of phase.
+    /// Creates one desired resource.
+    ///
+    /// Every retained name conflicts.
     pub(crate) fn create_desired(
         &self,
         manifest: &TaskManifest,
@@ -519,7 +548,9 @@ impl TaskState {
         })
     }
 
-    /// Apply a manifest by stable name, creating it when absent.
+    /// Applies a manifest by stable name.
+    ///
+    /// Missing state is created.
     #[cfg(test)]
     pub(crate) fn apply_desired(
         &self,
@@ -528,7 +559,7 @@ impl TaskState {
         self.apply_desired_with_preconditions(manifest, &WritePreconditions::new())
     }
 
-    /// Apply a manifest after checking the current resource identity and version.
+    /// Applies a manifest after checking write preconditions.
     pub(crate) fn apply_desired_with_preconditions(
         &self,
         manifest: &TaskManifest,
@@ -630,7 +661,7 @@ impl TaskState {
         }
     }
 
-    /// Bind a prepared Taskvisor submission to an exact resource generation.
+    /// Binds a Taskvisor submission to one resource generation.
     pub(crate) fn bind_tv(&self, resource: ResourceGeneration, tv: taskvisor::TaskId) -> bool {
         let mut inner = self.inner.write();
         let current = inner.tasks.get(&resource.name).is_some_and(|task| {
@@ -651,7 +682,7 @@ impl TaskState {
         true
     }
 
-    /// Return whether this exact resource incarnation and desired generation is current.
+    /// Returns whether a resource generation is current.
     pub(crate) fn is_current(&self, resource: &ResourceGeneration) -> bool {
         self.inner
             .read()
@@ -662,12 +693,12 @@ impl TaskState {
             })
     }
 
-    /// Resolve a Taskvisor identity to its exact resource generation.
+    /// Resolves a Taskvisor identity to its binding.
     pub(crate) fn resolve_tv(&self, tv: u64) -> Option<RuntimeBinding> {
         self.inner.read().by_tv.get(&tv).cloned()
     }
 
-    /// Current Taskvisor binding for a resource name.
+    /// Returns the current binding for a resource name.
     pub(crate) fn binding_for(&self, name: &TaskId) -> Option<RuntimeBinding> {
         self.inner.read().tv_of.get(name).cloned()
     }
@@ -694,10 +725,10 @@ impl TaskState {
         Some(binding)
     }
 
-    /// Delete a task **and** its run history. Returns `true` if the task existed.
+    /// Deletes a task and its run history.
     ///
-    /// This is the API-driven full removal. Reconciliation failures retain the
-    /// desired resource and therefore never call this method.
+    /// Returns `true` when the task existed.
+    /// Reconciliation failures do not use this path.
     pub(crate) fn delete_task(&self, id: &TaskId) -> bool {
         let mut inner = self.inner.write();
         inner.runs.remove(id);
@@ -727,7 +758,7 @@ impl TaskState {
         }
     }
 
-    /// Record an authoritative Taskvisor attempt start for one exact generation.
+    /// Records an authoritative attempt start.
     pub(crate) fn transition_attempt_starting(
         &self,
         binding: &RuntimeBinding,
@@ -757,8 +788,6 @@ impl TaskState {
                 run.generation() == binding.resource.generation && run.attempt() >= attempt
             })
         }) {
-            // A duplicate start, or a start delivered after a later attempt,
-            // must not reopen a terminal run or create stale active history.
             return false;
         }
         let updates_current_status = task.metadata().generation() == binding.resource.generation;
@@ -819,7 +848,7 @@ impl TaskState {
         true
     }
 
-    /// Close the exact attempt described by a Taskvisor attempt event.
+    /// Closes the attempt described by a Taskvisor event.
     pub(crate) fn transition_attempt_finished(
         &self,
         binding: &RuntimeBinding,
@@ -942,7 +971,9 @@ impl TaskState {
         changed
     }
 
-    /// Project a task-level final event without inventing an attempt number.
+    /// Projects a task-level final event.
+    ///
+    /// No attempt number is invented.
     pub(crate) fn transition_task_finished(
         &self,
         binding: &RuntimeBinding,
@@ -954,7 +985,7 @@ impl TaskState {
         Self::transition_task_finished_locked(&mut inner, binding, phase, error, exit_code, false)
     }
 
-    /// Mark a generation as accepted by the controller intake path.
+    /// Marks a generation as accepted by Taskvisor intake.
     pub(crate) fn mark_observed(&self, resource: &ResourceGeneration) -> bool {
         let mut inner = self.inner.write();
         let Some(task) = inner.tasks.get(&resource.name) else {
@@ -987,7 +1018,9 @@ impl TaskState {
         changed
     }
 
-    /// Retain desired state and record that realization failed.
+    /// Records a reconciliation failure.
+    ///
+    /// Desired state remains retained.
     pub(crate) fn mark_reconciliation_failed(
         &self,
         resource: &ResourceGeneration,
@@ -1067,8 +1100,6 @@ impl TaskState {
                 resource_version,
             )
         } else {
-            // TaskFinished has no attempt. Preserve the authoritative attempt
-            // already observed from Attempt* events and apply sticky semantics here.
             task.reconcile_finished(
                 binding.resource.generation,
                 phase,
@@ -1097,21 +1128,18 @@ impl TaskState {
         }
     }
 
-    /// Atomically finalize the entry bound to taskvisor identity `tv_raw`.
+    /// Finalizes the entry bound to a Taskvisor identity.
     ///
-    /// All checks and mutations happen under one write lock:
+    /// Binding checks and mutations use one write lock.
+    /// A stale waiter cannot touch a newer UID or generation.
+    /// Finalization always releases the exact binding.
     ///
-    /// 1. The binding must still be bidirectionally current: `by_tv[tv_raw]` resolves to an entry whose `tv_of` points back at `tv_raw`.
-    ///    A stale completion waiter can therefore never touch a newer UID or generation.
-    /// 2. The binding is released unconditionally: the waiter fires only once the managed task has fully terminated.
-    /// 3. A terminal event-derived phase normally stays sticky, except for the
-    ///    model's explicit `Failed` to `Exhausted`/`Timeout` refinement.
-    ///    `force` reconciles the resource with an authoritative task outcome;
-    ///    a concrete attempt `Timeout` is still preserved over the task's
-    ///    generic `Exhausted` disposition.
+    /// Event-derived terminal phases normally remain sticky.
+    /// The model permits `Failed` refinement to `Exhausted` or `Timeout`.
+    /// A concrete attempt timeout remains more specific than generic exhaustion.
     ///
-    /// Returns the bound entry's id so the caller can evict per-task resources
-    /// before releasing the shared lifecycle gate; `None` for a stale binding.
+    /// Returns the bound task name.
+    /// Returns `None` for a stale binding.
     pub(crate) fn finalize_if_bound(
         &self,
         tv_raw: u64,
@@ -1150,10 +1178,10 @@ impl TaskState {
         Some(binding.resource.name)
     }
 
-    /// List all retained runs for a task, oldest first.
+    /// Lists retained runs for a task.
     ///
-    /// Returns an empty list when the task is unknown or its run history has
-    /// already been swept.
+    /// Results are ordered by generation and attempt.
+    /// Unknown or swept history returns an empty list.
     pub fn list_runs(&self, id: &TaskId) -> Vec<TaskRun> {
         let inner = self.inner.read();
         let mut runs: Vec<TaskRun> = inner
@@ -1165,26 +1193,26 @@ impl TaskState {
         runs
     }
 
-    /// Return one task by id.
+    /// Returns one retained task by name.
     pub fn get(&self, id: &TaskId) -> Option<Task> {
         self.get_retained(id)
     }
 
-    /// Return one retained task including core-owned resources.
+    /// Returns one retained task for internal use.
     pub(crate) fn get_retained(&self, id: &TaskId) -> Option<Task> {
         let inner = self.inner.read();
         inner.tasks.get(id).cloned()
     }
 
-    /// Return `true` if a task entry currently exists for `id`.
+    /// Returns whether a task exists.
     ///
-    /// This is cheaper than [`get`](Self::get) because it does not clone the
-    /// task.
+    /// This is cheaper than [`get`](Self::get).
+    /// It does not clone the task.
     pub fn contains_task(&self, id: &TaskId) -> bool {
         self.inner.read().tasks.contains_key(id)
     }
 
-    /// List tasks in a specific slot.
+    /// Lists tasks in one slot.
     pub fn list_by_slot(&self, slot: &str) -> Vec<Task> {
         let inner = self.inner.read();
 
@@ -1199,13 +1227,13 @@ impl TaskState {
             .unwrap_or_default()
     }
 
-    /// List all tasks.
+    /// Lists all retained tasks.
     pub fn list_all(&self) -> Vec<Task> {
         let inner = self.inner.read();
         inner.tasks.values().cloned().collect()
     }
 
-    /// List tasks that match one phase.
+    /// Lists tasks in one phase.
     pub fn list_by_status(&self, phase: TaskPhase) -> Vec<Task> {
         let inner = self.inner.read();
         inner
@@ -1216,11 +1244,11 @@ impl TaskState {
             .collect()
     }
 
-    /// Count tasks per phase.
+    /// Counts tasks by phase.
     ///
-    /// This makes one read-lock pass and does not clone full [`Task`] values.
-    /// It is built for metrics collectors. Phases with no tasks are absent from
-    /// the map.
+    /// This uses one read-lock pass.
+    /// It does not clone [`Task`] values.
+    /// Empty phases are absent.
     ///
     /// ## Example
     ///
@@ -1239,11 +1267,13 @@ impl TaskState {
         counts
     }
 
-    /// Run a sweep pass.
+    /// Runs one retention sweep.
     ///
-    /// Two passes under a single write lock:
-    /// 1. Remove finished runs older than `run_ttl`.
-    /// 2. Remove terminal tasks that have no remaining runs and whose internal terminal timestamp is older than `task_ttl`.
+    /// The sweep removes expired finished runs.
+    /// It also removes expired unfinished runs without a binding.
+    /// Bound unfinished runs remain.
+    ///
+    /// A terminal task is removed after its run history is empty and its task TTL expires.
     ///
     /// Returns `(runs_removed, tasks_removed)` for observability.
     pub(crate) fn sweep(&self, config: &StateConfig) -> (usize, usize) {
@@ -1306,13 +1336,17 @@ impl TaskState {
         (runs_removed, tasks_removed)
     }
 
-    /// Query tasks with combined filters and snapshot-consistent pagination.
+    /// Queries tasks with snapshot-consistent pagination.
     ///
-    /// The first page captures the current collection version. A continuation
-    /// reads the same retained version even when the live collection changes.
+    /// The first page captures the collection resource version.
+    /// A continuation reads the same retained snapshot.
     ///
-    /// Embedded tasks are normal SDK resources here. Wire-level filtering belongs
-    /// to `solti-api`.
+    /// Embedded tasks are visible.
+    /// Transport filtering belongs to an adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] for an invalid or unavailable continuation snapshot.
     ///
     /// ## Example
     ///
@@ -1331,10 +1365,14 @@ impl TaskState {
         self.query_where(q, |_| true)
     }
 
-    /// Query tasks with an additional caller-owned visibility predicate.
+    /// Queries tasks through a caller predicate.
     ///
-    /// The predicate is evaluated before the page is cut. It must remain stable
-    /// for every continuation in the same snapshot.
+    /// The predicate runs before pagination.
+    /// It must stay stable across one continuation chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] for an invalid or unavailable continuation snapshot.
     pub fn query_where<F>(
         &self,
         q: &TaskQuery,
@@ -1457,11 +1495,15 @@ impl TaskState {
         Ok(snapshot)
     }
 
-    /// Watch Task resources selected by `filter`.
+    /// Watches tasks selected by a filter.
     ///
-    /// An absent resource version or `"0"` emits the current matching snapshot
-    /// as [`TaskWatchEvent::Added`] events before live changes. An exact opaque
-    /// resource version replays later retained changes before live changes.
+    /// No version or `"0"` emits the current sorted snapshot first.
+    /// Snapshot items are [`TaskWatchEvent::Added`].
+    /// An exact version replays later retained changes before live changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] when the supplied resource version cannot be resumed.
     pub fn watch(
         &self,
         filter: &TaskFilter,
@@ -1470,10 +1512,15 @@ impl TaskState {
         self.watch_where(filter, resource_version, |_| true)
     }
 
-    /// Watch Tasks with an additional caller-owned visibility predicate.
+    /// Watches tasks through a caller predicate.
     ///
-    /// The predicate participates in transition classification. A Task that
-    /// enters visibility is `Added`; one that leaves visibility is `Deleted`.
+    /// The predicate participates in transition classification.
+    /// Entering visibility is `Added`.
+    /// Leaving visibility is `Deleted`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] when the supplied resource version cannot be resumed.
     pub fn watch_where<F>(
         &self,
         filter: &TaskFilter,
@@ -1575,15 +1622,19 @@ impl Default for TaskState {
     }
 }
 
-/// Test-only fixtures for populating state from outside the crate.
+/// Test fixtures for direct state population.
 #[cfg(feature = "test-util")]
 impl TaskState {
-    /// Seed a task entry directly (test fixtures only).
+    /// Seeds a task directly.
     pub fn seed_task(&self, id: TaskId, spec: solti_model::TaskSpec) {
         self.add_task(TaskManifest::new(id, spec).expect("test fixture must be valid"));
     }
 
-    /// Transition a seeded task to `Running` (test fixtures only).
+    /// Moves a seeded task to `Running`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the task is missing or cannot start.
     pub fn seed_starting(&self, id: &TaskId) {
         let task = self.get(id).expect("seeded task must exist");
         let resource = ResourceGeneration::from_task(&task);
@@ -1593,7 +1644,11 @@ impl TaskState {
         assert!(self.transition_attempt_starting(&binding, 1));
     }
 
-    /// Transition a seeded task to a terminal phase (test fixtures only).
+    /// Moves a seeded task to a terminal phase.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the task is missing or the transition is invalid.
     pub fn seed_finished(
         &self,
         id: &TaskId,

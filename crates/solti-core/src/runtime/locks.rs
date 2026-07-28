@@ -1,4 +1,9 @@
-//! Per-resource operation locks.
+//! # Per-task locks
+//!
+//! [`TaskLocks`] serializes one operation class by task name.
+//! Different names remain independent.
+//! The map stores weak references.
+//! Stale entries are pruned when a new lock is created.
 
 use std::{
     collections::HashMap,
@@ -7,9 +12,10 @@ use std::{
 
 use solti_model::TaskId;
 
-/// Weak keyed async locks for one class of per-resource operations.
+/// Weak keyed locks for one operation class.
 ///
-/// Desired-state and runtime operations use distinct instances.
+/// Desired-state operations use one instance.
+/// Runtime operations use another instance.
 #[derive(Clone, Default)]
 pub(crate) struct TaskLocks {
     locks: Arc<parking_lot::Mutex<HashMap<TaskId, Weak<tokio::sync::Mutex<()>>>>>,

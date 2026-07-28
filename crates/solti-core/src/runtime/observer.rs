@@ -1,16 +1,29 @@
-//! # Runtime observer.
+//! # Runtime observer
 //!
-//! [`RuntimeObserver`] implements [`Subscribe`](taskvisor::Subscribe) and owns three responsibilities driven off taskvisor's lifecycle events:
-//! - project attempt events into [`TaskState`](crate::TaskState) transitions and `TaskRun` records;
-//! - project typed `TaskFinished` outcomes into the resource-level terminal phase;
-//! - drive per-run output announcements (`RunStarted` / `RunFinished`).
+//! [`RuntimeObserver`] projects Taskvisor lifecycle events into SDK state.
 //!
-//! This is the event path. It is fed by taskvisor's best-effort broadcast bus.
-//! The direct completion outcome repairs a dropped terminal event. For a
-//! registered task, `TaskRemoved` normally acts as a per-subscriber FIFO
-//! barrier before binding/output cleanup. The direct outcome finalizes after a
-//! bounded wait if that barrier is lost or delayed. Per-attempt detail
-//! remains best-effort.
+//! ## Flow
+//!
+//! ```text
+//! Taskvisor event queue
+//!       ▼
+//! RuntimeObserver
+//!       ├── attempt events ──► Task status and TaskRun
+//!       ├── TaskFinished ────► resource phase
+//!       └── attempt events ──► RunStarted and RunFinished output markers
+//!
+//! direct TaskOutcome
+//!       └──► authoritative finalization and cleanup
+//! ```
+//!
+//! Event delivery is best-effort.
+//! Attempt detail can be lost.
+//! The direct outcome still finalizes the resource.
+//!
+//! `TaskRemoved` normally acts as a FIFO barrier.
+//! It lets queued attempt events arrive before binding and output cleanup.
+//! Finalization waits for that barrier for at most one second.
+//! Subscriber overflow releases finalizations that are safe without the barrier.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -33,8 +46,9 @@ const RUNTIME_OBSERVER_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(2048).un
 const REMOVED_ID_CAPACITY: usize = 4096;
 const EVENT_BARRIER_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Serializes short state/output lifecycle commits across event, waiter, and
-/// management paths.
+/// Serializes short lifecycle commits.
+///
+/// Event, completion, and management paths share this gate.
 #[derive(Clone, Default)]
 struct LifecycleGate {
     inner: Arc<Mutex<()>>,
@@ -99,9 +113,11 @@ impl CompletionBarriers {
     }
 }
 
-/// Subscriber that updates TaskState from taskvisor events.
+/// Taskvisor subscriber that updates SDK state.
 ///
-/// ## Also
+/// It also publishes run boundary markers to the output hub.
+///
+/// ## See Also
 ///
 /// - [`TaskState`](crate::TaskState) stores the projected state.
 /// - [`SupervisorApiBuilder`](crate::SupervisorApiBuilder) installs this observer.
@@ -113,7 +129,7 @@ pub(crate) struct RuntimeObserver {
 }
 
 impl RuntimeObserver {
-    /// Create a runtime observer over shared task state and output hub.
+    /// Creates an observer over shared state and output.
     pub(crate) fn with_output_hub(state: TaskState, output_hub: Arc<OutputHub>) -> Self {
         Self {
             state,
@@ -123,9 +139,9 @@ impl RuntimeObserver {
         }
     }
 
-    /// Bind a prepared controller submission before it can publish events.
+    /// Binds a prepared submission before it can publish events.
     ///
-    /// Returns `false` when the resource UID or generation is no longer current.
+    /// Returns `false` for a stale UID or generation.
     pub(crate) fn bind(
         &self,
         resource: ResourceGeneration,
@@ -143,8 +159,9 @@ impl RuntimeObserver {
         true
     }
 
-    /// Release one exact failed intake binding and retain its desired generation
-    /// with a reconciliation failure status.
+    /// Releases a failed runtime intake binding.
+    ///
+    /// The desired resource remains with `Reconciled=False`.
     pub(crate) fn fail_bound_reconciliation(
         &self,
         binding: &RuntimeBinding,
@@ -165,12 +182,10 @@ impl RuntimeObserver {
         changed
     }
 
-    /// Finalize one current binding from the direct completion channel.
+    /// Finalizes a binding from the direct completion channel.
     ///
-    /// For registered tasks, `TaskRemoved` is used as a FIFO barrier so
-    /// earlier per-attempt events normally reach state before identity/output
-    /// cleanup. The direct outcome finalizes after a bounded wait when that
-    /// best-effort barrier is lost or delayed.
+    /// Registered tasks wait briefly for the `TaskRemoved` barrier.
+    /// Rejected tasks do not enter the registry and skip that wait.
     pub(crate) async fn finalize_from_outcome(
         &self,
         tv_raw: u64,
@@ -225,7 +240,7 @@ impl RuntimeObserver {
         }
     }
 
-    /// Finalize an unavailable outcome after identity cleanup was confirmed.
+    /// Finalizes an unavailable outcome after confirmed cleanup.
     pub(crate) async fn finalize_unavailable_after_cleanup(&self, tv_raw: u64, error: String) {
         self.finalize_with_event_barrier(
             tv_raw,
@@ -241,7 +256,7 @@ impl RuntimeObserver {
         .await;
     }
 
-    /// Preserve a waiter failure until a `TaskRemoved` barrier proves cleanup.
+    /// Preserves a waiter failure until `TaskRemoved` proves cleanup.
     pub(crate) fn finalize_unavailable(&self, tv_raw: u64, error: String) {
         let finalization = Finalization {
             phase: TaskPhase::Failed,
@@ -254,12 +269,11 @@ impl RuntimeObserver {
         self.register_finalization_locked(tv_raw, finalization, true);
     }
 
-    /// Settle the exact local binding after taskvisor confirmed identity cleanup.
+    /// Waits for finalization after Taskvisor confirms cleanup.
     ///
-    /// The tracked direct-completion task owns the authoritative final outcome.
-    /// Waiting for it here keeps cancel and immediate same-name resubmission
-    /// linearizable without replacing a delayed real outcome with a synthetic
-    /// phase.
+    /// The completion task owns the authoritative result.
+    /// Management waits instead of inventing a replacement result.
+    /// This keeps cancellation and same-name resubmission ordered.
     pub(crate) async fn settle_after_confirmed_cleanup(&self, tv: taskvisor::TaskId) {
         let tv_raw = tv.get();
         let mut notification = {
@@ -277,7 +291,7 @@ impl RuntimeObserver {
         }
     }
 
-    /// Delete a local resource after taskvisor cancellation/removal is settled.
+    /// Deletes local state after Taskvisor cleanup is settled.
     pub(crate) fn delete_after_cleanup(&self, id: &TaskId, tv: Option<taskvisor::TaskId>) -> bool {
         let _lifecycle = self.lifecycle_gate.lock();
         let removed = self.state.delete_task(id);
@@ -403,14 +417,14 @@ impl RuntimeObserver {
         barriers.notify_finalized(tv_raw);
     }
 
-    /// Resolve the task entry an event belongs to.
+    /// Resolves the binding for an event.
     fn resolve(&self, event: &Event) -> Option<RuntimeBinding> {
         self.state.resolve_tv(event.id?.get())
     }
 }
 
 impl RuntimeObserver {
-    /// Apply one event while the shared lifecycle gate is held.
+    /// Applies one event while holding the lifecycle gate.
     fn apply_event_locked(&self, event: &Event) {
         let Some(tv) = event.id else {
             return;
@@ -634,7 +648,10 @@ impl Subscribe for RuntimeObserver {
         "state-subscriber"
     }
 
-    /// Per-subscriber event-queue depth: `2048`, a deliberate 2x of taskvisor's `1024` default.
+    /// Returns the observer queue capacity.
+    ///
+    /// The capacity is `2048`.
+    /// This is twice Taskvisor's default subscriber capacity.
     fn queue_capacity(&self) -> NonZeroUsize {
         RUNTIME_OBSERVER_QUEUE_CAPACITY
     }
@@ -1106,6 +1123,12 @@ mod tests {
                 "queue_start_failed: shutting down",
                 TaskPhase::Failed,
             ),
+            (
+                "removed-rejection",
+                taskvisor::RejectionKind::RemovedFromQueue,
+                "removed_from_queue",
+                TaskPhase::Canceled,
+            ),
         ] {
             let (sub, state, id) = setup(name);
             let tv = state.tv_for(&id).expect("bound task");
@@ -1208,156 +1231,78 @@ mod tests {
     }
 
     #[test]
-    fn controller_rejection_becomes_sweepable_only_after_waiter_cleanup() {
+    fn terminal_events_become_sweepable_only_after_waiter_cleanup() {
         use crate::StateConfig;
         use std::time::Duration;
-
-        let state = TaskState::new();
-        let id = add_test_task(&state, "rej-reap");
-        let tv = taskvisor::TaskId::for_tests();
-        bind_test_task(&state, &id, tv);
-        let sub = RuntimeObserver::with_output_hub(
-            state.clone(),
-            Arc::new(OutputHub::new(OutputConfig::default())),
-        );
-
-        sub.on_event(
-            &Event::new(EventKind::ControllerRejected)
-                .with_task("slot")
-                .with_id(tv)
-                .with_rejection_kind(taskvisor::RejectionKind::QueueFull)
-                .with_reason("queue_full: 3/3"),
-        );
 
         let config = StateConfig::new()
             .with_run_ttl(Duration::ZERO)
             .with_task_ttl(Duration::ZERO);
-        let (_, removed) = state.sweep(&config);
-        assert_eq!(removed, 0, "a still-bound submission must not be swept");
 
-        assert_eq!(
-            state.finalize_if_bound(
-                tv.get(),
+        for (name, kind, phase, error, force) in [
+            (
+                "rej-reap",
+                EventKind::ControllerRejected,
                 TaskPhase::Failed,
                 Some("queue_full: 3/3".into()),
-                None,
                 true,
             ),
-            Some(id.clone()),
-        );
-        let (_, removed) = state.sweep(&config);
-        assert_eq!(removed, 1, "waiter cleanup makes the entry sweepable");
-        assert!(state.get(&id).is_none());
-    }
+            (
+                "exh-reap",
+                EventKind::TaskFinished,
+                TaskPhase::Exhausted,
+                None,
+                false,
+            ),
+            (
+                "dead-reap",
+                EventKind::TaskFinished,
+                TaskPhase::Failed,
+                None,
+                false,
+            ),
+        ] {
+            let state = TaskState::new();
+            let id = add_test_task(&state, name);
+            let tv = taskvisor::TaskId::for_tests();
+            let binding = bind_test_task(&state, &id, tv);
+            let sub = RuntimeObserver::with_output_hub(
+                state.clone(),
+                Arc::new(OutputHub::new(OutputConfig::default())),
+            );
+            let event = match (kind, phase) {
+                (EventKind::ControllerRejected, _) => Event::new(kind)
+                    .with_id(tv)
+                    .with_rejection_kind(taskvisor::RejectionKind::QueueFull)
+                    .with_reason("queue_full: 3/3"),
+                (_, TaskPhase::Exhausted) => {
+                    assert!(state.transition_attempt_starting(&binding, 1));
+                    Event::new(kind)
+                        .with_id(tv)
+                        .with_outcome_kind(TaskOutcomeKind::Failed)
+                        .with_reason("retry policy stopped after one retry")
+                }
+                (_, TaskPhase::Failed) => {
+                    assert!(state.transition_attempt_starting(&binding, 1));
+                    Event::new(kind)
+                        .with_id(tv)
+                        .with_outcome_kind(TaskOutcomeKind::Fatal)
+                        .with_reason("fatal error (no retry): boom")
+                }
+                _ => unreachable!("test table contains only terminal event cases"),
+            };
 
-    #[test]
-    fn task_finished_failed_becomes_sweepable_only_after_waiter_cleanup() {
-        use crate::StateConfig;
-        use std::time::Duration;
-
-        let state = TaskState::new();
-        let id = add_test_task(&state, "exh-reap");
-        let tv = taskvisor::TaskId::for_tests();
-        let binding = bind_test_task(&state, &id, tv);
-        assert!(state.transition_attempt_starting(&binding, 1));
-        let sub = RuntimeObserver::with_output_hub(
-            state.clone(),
-            Arc::new(OutputHub::new(OutputConfig::default())),
-        );
-
-        sub.on_event(
-            &Event::new(EventKind::TaskFinished)
-                .with_task("exh-reap")
-                .with_id(tv)
-                .with_outcome_kind(TaskOutcomeKind::Failed)
-                .with_reason("retry policy stopped after one retry"),
-        );
-        assert!(
-            state.tv_for(&id).is_some(),
-            "TaskFinished projects state but the direct outcome still owns the binding"
-        );
-
-        let config = StateConfig::new()
-            .with_run_ttl(Duration::ZERO)
-            .with_task_ttl(Duration::ZERO);
-        let (_, removed) = state.sweep(&config);
-        assert_eq!(removed, 0, "a still-bound task must not be reaped");
-
-        assert_eq!(
-            state.finalize_if_bound(tv.get(), TaskPhase::Exhausted, None, None, false),
-            Some(id.clone()),
-        );
-        let (_, removed) = state.sweep(&config);
-        assert_eq!(removed, 1, "waiter cleanup makes the entry sweepable");
-        assert!(state.get(&id).is_none());
-    }
-
-    #[test]
-    fn task_finished_fatal_becomes_sweepable_only_after_waiter_cleanup() {
-        use crate::StateConfig;
-        use std::time::Duration;
-
-        let state = TaskState::new();
-        let id = add_test_task(&state, "dead-reap");
-        let tv = taskvisor::TaskId::for_tests();
-        let binding = bind_test_task(&state, &id, tv);
-        assert!(state.transition_attempt_starting(&binding, 1));
-        let sub = RuntimeObserver::with_output_hub(
-            state.clone(),
-            Arc::new(OutputHub::new(OutputConfig::default())),
-        );
-
-        sub.on_event(
-            &Event::new(EventKind::TaskFinished)
-                .with_task("dead-reap")
-                .with_id(tv)
-                .with_outcome_kind(TaskOutcomeKind::Fatal)
-                .with_reason("fatal error (no retry): boom"),
-        );
-        assert!(
-            state.tv_for(&id).is_some(),
-            "TaskFinished must not take binding ownership from the direct outcome"
-        );
-
-        let config = StateConfig::new()
-            .with_run_ttl(Duration::ZERO)
-            .with_task_ttl(Duration::ZERO);
-        let (_, removed) = state.sweep(&config);
-        assert_eq!(removed, 0, "a still-bound task must not be reaped");
-
-        assert_eq!(
-            state.finalize_if_bound(tv.get(), TaskPhase::Failed, None, None, false),
-            Some(id.clone()),
-        );
-        let (_, removed) = state.sweep(&config);
-        assert_eq!(removed, 1, "waiter cleanup makes the entry sweepable");
-        assert!(state.get(&id).is_none());
-    }
-
-    #[test]
-    fn user_initiated_queue_removal_is_canceled_phase() {
-        let state = TaskState::new();
-        let id = add_test_task(&state, "victim");
-        let tv = taskvisor::TaskId::for_tests();
-        bind_test_task(&state, &id, tv);
-        let sub = RuntimeObserver::with_output_hub(
-            state.clone(),
-            Arc::new(OutputHub::new(OutputConfig::default())),
-        );
-
-        let ev = Event::new(EventKind::ControllerRejected)
-            .with_task("s")
-            .with_id(tv)
-            .with_rejection_kind(taskvisor::RejectionKind::RemovedFromQueue)
-            .with_reason("removed_from_queue");
-        sub.on_event(&ev);
-
-        let task = state.get(&id).expect("entry kept");
-        assert_eq!(
-            task.status().phase(),
-            TaskPhase::Canceled,
-            "user-initiated removal is a cancellation, not a failure"
-        );
+            sub.on_event(&event);
+            assert_eq!(state.get(&id).unwrap().status().phase(), phase);
+            assert!(state.tv_for(&id).is_some());
+            assert_eq!(state.sweep(&config).1, 0);
+            assert_eq!(
+                state.finalize_if_bound(tv.get(), phase, error, None, force),
+                Some(id.clone()),
+            );
+            assert_eq!(state.sweep(&config).1, 1);
+            assert!(state.get(&id).is_none());
+        }
     }
 
     #[test]
@@ -1372,36 +1317,35 @@ mod tests {
     }
 
     #[test]
-    fn task_finished_fatal_seals_phase_as_failed_with_exit_code() {
-        let (sub, state, id) = setup("fatal-task");
+    fn task_finished_fatal_preserves_optional_exit_code_and_waiter_cleanup_ownership() {
+        for (name, reason, exit_code) in [
+            ("fatal-task", "fatal error (no retry): boom", Some(137)),
+            (
+                "logical-fatal",
+                "fatal error (no retry): misconfigured",
+                None,
+            ),
+        ] {
+            let (sub, state, registry, id) = setup_with_output_hub(name);
+            let mut event = bound_event(&state, &id, EventKind::TaskFinished)
+                .with_outcome_kind(TaskOutcomeKind::Fatal)
+                .with_reason(reason);
+            if let Some(exit_code) = exit_code {
+                event = event.with_exit_code(exit_code);
+            }
 
-        let ev = bound_event(&state, &id, EventKind::TaskFinished)
-            .with_outcome_kind(TaskOutcomeKind::Fatal)
-            .with_reason("fatal error (no retry): boom")
-            .with_exit_code(137);
+            sub.on_event(&event);
 
-        sub.on_event(&ev);
-
-        let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().phase(), TaskPhase::Failed);
-        assert_eq!(task.status().exit_code(), Some(137));
-        assert_eq!(task.status().error(), Some("fatal error (no retry): boom"),);
-        assert!(task.status().phase().is_terminal());
-    }
-
-    #[test]
-    fn task_finished_fatal_with_no_exit_code_stores_none() {
-        let (sub, state, id) = setup("logical-fatal");
-
-        let ev = bound_event(&state, &id, EventKind::TaskFinished)
-            .with_outcome_kind(TaskOutcomeKind::Fatal)
-            .with_reason("fatal error (no retry): misconfigured");
-
-        sub.on_event(&ev);
-
-        let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().phase(), TaskPhase::Failed);
-        assert_eq!(task.status().exit_code(), None);
+            let task = state.get(&id).expect("task exists");
+            assert_eq!(task.status().phase(), TaskPhase::Failed);
+            assert_eq!(task.status().exit_code(), exit_code);
+            assert_eq!(task.status().error(), Some(reason));
+            assert!(task.status().phase().is_terminal());
+            assert!(
+                registry.subscribe_raw(&id).is_some(),
+                "the direct completion path owns terminal channel eviction"
+            );
+        }
     }
 
     #[test]
@@ -1647,19 +1591,6 @@ mod tests {
     }
 
     #[test]
-    fn attempt_failed_stays_failed() {
-        let (sub, state, id) = setup("plain-fail");
-
-        sub.on_event(
-            &bound_event(&state, &id, EventKind::AttemptFailed)
-                .with_attempt(1)
-                .with_reason("boom"),
-        );
-
-        assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Failed);
-    }
-
-    #[test]
     fn task_finished_canceled_maps_by_kind_not_reason() {
         let (sub, state, id) = setup("self-cancel");
 
@@ -1741,21 +1672,6 @@ mod tests {
         );
 
         assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Running);
-    }
-
-    #[test]
-    fn task_finished_fatal_waits_for_waiter_to_evict_channel() {
-        let (sub, state, registry, id) = setup_with_output_hub("dead-evict");
-
-        let ev = bound_event(&state, &id, EventKind::TaskFinished)
-            .with_outcome_kind(TaskOutcomeKind::Fatal)
-            .with_exit_code(137);
-        sub.on_event(&ev);
-
-        assert!(
-            registry.subscribe_raw(&id).is_some(),
-            "the direct completion path owns terminal channel eviction"
-        );
     }
 
     #[test]

@@ -1,0 +1,493 @@
+# solti-core source guide
+
+This document is a reading map for contributors.
+
+It shows which module owns each decision and how desired state reaches Taskvisor.
+The Rust source and its module-level documentation remain the source of truth.
+
+## Crate map
+
+`SupervisorApi` is the public lifecycle boundary.
+It coordinates state, reconciliation, output, and Taskvisor.
+
+```mermaid
+%%{init: {"flowchart": {"curve": "linear"}}}%%
+flowchart TB
+    Public["lib.rs<br/>public re-exports"]
+    Builder["supervisor/builder.rs<br/>construction"]
+    Api["supervisor/mod.rs<br/>public operations"]
+    State["state/mod.rs<br/>authoritative resources"]
+    Reconciler["runtime/reconciler.rs<br/>runtime intake"]
+    Observer["runtime/observer.rs<br/>event and outcome projection"]
+    Locks["runtime/locks.rs<br/>keyed operation locks"]
+    Output["output.rs<br/>live output channels"]
+    Map["map/<br/>Taskvisor mapping"]
+    Config["config.rs<br/>retention settings"]
+    Error["error.rs<br/>public errors"]
+
+    Public --> Builder
+    Public --> Api
+    Public --> State
+    Public --> Output
+    Public --> Config
+    Public --> Error
+
+    Builder --> Api
+    Api --> State
+    Api --> Reconciler
+    Api --> Locks
+    Reconciler --> State
+    Reconciler --> Observer
+    Reconciler --> Output
+    Reconciler --> Map
+    Observer --> State
+    Observer --> Output
+```
+
+The arrows show direct use.
+They do not represent ownership of model values.
+
+| Module                          | Owns                                                                   | Does not own                                      |
+|---------------------------------|------------------------------------------------------------------------|---------------------------------------------------|
+| `supervisor/builder.rs`         | Runtime assembly and public configuration                              | Desired-state writes or task execution            |
+| `supervisor/mod.rs`             | Public API operations, write scheduling, cancellation, shutdown        | Runner implementations or model validation        |
+| `state/mod.rs`                  | Tasks, runs, runtime bindings, resource versions, list and watch state | Taskvisor execution or durable persistence        |
+| `runtime/reconciler.rs`         | Runner preflight, replacement, binding, submission, completion waiters | Public collection queries                         |
+| `runtime/observer.rs`           | Taskvisor event projection and authoritative finalization              | Desired-state admission                           |
+| `runtime/locks.rs`              | Weak keyed locks for one operation class                               | Resource state                                    |
+| `output.rs`                     | Per-task live broadcast channels                                       | Output history or persistence                     |
+| `map/`                          | Typed Solti-to-Taskvisor policy and outcome mapping                    | Routing or runtime ownership                      |
+| `config.rs`                     | State retention and watch journal settings                             | Worker scheduling                                 |
+| `error.rs`                      | Public operation and write-conflict errors                             | Reconciliation status storage                     |
+
+## Runtime construction
+
+`SupervisorApiBuilder::start` assembles every runtime-owned component.
+
+```mermaid
+%%{init: {"flowchart": {"curve": "linear"}}}%%
+flowchart TB
+    Builder["SupervisorApiBuilder"]
+    Output["OutputHub"]
+    Router["RunnerRouter<br/>with OutputPublisher"]
+    State["TaskState"]
+    Observer["RuntimeObserver"]
+    Taskvisor["Taskvisor Supervisor"]
+    Handle["SupervisorHandle"]
+    Reconciler["Reconciler"]
+    Retention["Retention worker"]
+    Api["SupervisorApi"]
+
+    Builder --> Output
+    Output --> Router
+    Builder --> State
+    State --> Observer
+    Output --> Observer
+    Observer -->|installed subscriber| Taskvisor
+    Builder --> Taskvisor
+    Taskvisor --> Handle
+    Handle --> Reconciler
+    Router --> Reconciler
+    State --> Reconciler
+    Observer --> Reconciler
+    Output --> Reconciler
+    Reconciler --> Retention
+    Reconciler --> Api
+```
+
+The builder always installs the core observer.
+External Taskvisor subscribers are added beside it.
+
+The router receives the core-owned `OutputPublisher`.
+Runners can publish output without owning consumer subscriptions.
+
+`SupervisorApi` owns one `Reconciler`.
+The reconciler shares its dependencies with reconciliation and completion workers.
+
+## Desired-state writes
+
+Create and apply commit a complete `Task` before runtime work starts.
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant API as SupervisorApi
+    participant Lock as Desired operation lock
+    participant State as TaskState
+    participant Worker as Reconciliation worker
+
+    Caller->>API: create or apply TaskManifest
+    API->>API: verify routed or embedded path
+    API->>Lock: lock metadata.name
+    API->>API: reject writes after shutdown starts
+    API->>State: create or apply desired state
+    State-->>API: committed Task + reconcile decision
+    API->>Worker: schedule when required
+    API-->>Caller: committed Task
+```
+
+The desired operation lock serializes writes by task name.
+Different names remain independent.
+
+Create rejects every retained resource with the same name.
+Apply creates a missing resource only when preconditions are empty.
+
+Apply has four outcomes:
+
+| Change                            | Resource version | Generation | Reconciliation |
+|-----------------------------------|------------------|------------|----------------|
+| No change after success           | Unchanged        | Unchanged  | Not scheduled  |
+| Metadata only                     | Advanced         | Unchanged  | Not scheduled  |
+| Spec                              | Advanced         | Advanced   | Scheduled      |
+| No change with `Reconciled=False` | Advanced         | Unchanged  | Scheduled once |
+
+UID and resource-version preconditions are checked under the state write lock.
+A failed check does not consume a resource version.
+
+The spawn gate orders desired commits against shutdown.
+No reconciliation worker can be registered after shutdown closes the tracker.
+
+## Submission paths
+
+The manifest workload and runtime source must agree.
+
+```mermaid
+%%{init: {"flowchart": {"curve": "linear"}}}%%
+flowchart LR
+    Manifest["Committed Task"]
+    Source{"Submission path"}
+    Routed["Routed"]
+    Embedded["Embedded"]
+    Router["RunnerRouter<br/>GVK + selector"]
+    TaskRef["Caller TaskRef"]
+    Prepared["PreparedSubmission"]
+
+    Manifest --> Source
+    Source --> Routed
+    Source --> Embedded
+    Routed --> Router
+    Router --> Prepared
+    Embedded --> TaskRef
+    TaskRef --> Prepared
+```
+
+Routed methods reject `TaskWorkload::Embedded`.
+Embedded methods reject every routed workload.
+
+The router selects a runner by workload GVK and optional labels.
+The runner builds one Taskvisor `TaskRef`.
+
+Embedded submission receives the `TaskRef` from the caller.
+It bypasses runner routing.
+
+Both paths use the same policy mapping, runtime binding, submission, observation, and cleanup.
+
+## Reconciliation
+
+One reconciliation targets an exact resource UID and generation.
+`ResourceGeneration` also snapshots the workload GVK.
+
+```mermaid
+%%{init: {"flowchart": {"curve": "linear"}, "themeVariables": {"fontSize": "12px"}}}%%
+flowchart TB
+    Desired["Committed generation"]
+    Current1{"Still current?"}
+    Preflight["Runner build or embedded TaskRef<br/>policy mapping<br/>prepare submission"]
+    RuntimeLock["Runtime operation lock"]
+    Current2{"Still current?"}
+    Previous{"Previous binding?"}
+    Cancel["Cancel and settle previous runtime"]
+    Current3{"Still current?"}
+    Bind["Bind Taskvisor ID<br/>create output channel"]
+    Submit["submit_and_watch"]
+    Accepted["Reconciled=True<br/>completion waiter"]
+    Failed["Reconciled=False"]
+    Stale["Return current state"]
+
+    Desired --> Current1
+    Current1 -->|no| Stale
+    Current1 -->|yes| Preflight
+    Preflight -->|failure| Failed
+    Preflight --> RuntimeLock
+    RuntimeLock --> Current2
+    Current2 -->|no| Stale
+    Current2 -->|yes| Previous
+    Previous -->|yes| Cancel
+    Previous -->|no| Current3
+    Cancel -->|failure| Failed
+    Cancel --> Current3
+    Current3 -->|no| Stale
+    Current3 -->|yes| Bind
+    Bind -->|stale| Failed
+    Bind --> Submit
+    Submit -->|failure| Failed
+    Submit -->|accepted| Accepted
+```
+
+Preflight runs outside the runtime operation lock.
+Runner construction uses Tokio's blocking pool.
+Runner panics are contained and become `Reconciled=False`.
+
+The runtime operation lock serializes replacement, cancellation, deletion, and binding by name.
+It is separate from the desired operation lock.
+
+Reconciliation uses latest-wins semantics.
+A stale generation cannot acquire a new binding.
+
+A bound generation can submit while a newer apply commits.
+A later successful reconciliation replaces that runtime.
+Accepted side effects are not rolled back.
+
+The crate does not provide staged rollout or availability guarantees.
+
+## Runtime identity
+
+Model identity and Taskvisor identity are separate.
+
+```mermaid
+%%{init: {"flowchart": {"curve": "linear"}}}%%
+flowchart LR
+    Resource["Task<br/>name + UID + generation + workload GVK"]
+    Binding["RuntimeBinding"]
+    Runtime["Taskvisor TaskId"]
+    ByName["name to current binding"]
+    ByRuntime["Taskvisor ID to exact binding"]
+
+    Resource --> Binding
+    Runtime --> Binding
+    Binding --> ByName
+    Binding --> ByRuntime
+```
+
+`TaskState` keeps both indexes under one write lock.
+Binding a new generation removes the previous runtime index.
+
+Taskvisor events resolve through the runtime ID.
+State transitions then check the resource UID and generation.
+
+An old generation can close its own retained run.
+It cannot mutate the current generation's status.
+
+Deleting and recreating one name produces a new UID.
+Events for the old UID cannot mutate the new resource.
+
+## Events and final outcomes
+
+Taskvisor events and direct completion outcomes have different roles.
+
+```mermaid
+%%{init: {"flowchart": {"curve": "linear"}}}%%
+flowchart LR
+    Runtime["Taskvisor"]
+    Events["Best-effort subscriber events"]
+    Observer["RuntimeObserver"]
+    Attempt["Task status<br/>TaskRun detail<br/>output markers"]
+    Waiter["Direct TaskWaiter outcome"]
+    Final["Authoritative final state<br/>binding cleanup"]
+
+    Runtime -.-> Events
+    Events -.-> Observer
+    Observer -.-> Attempt
+    Runtime --> Waiter
+    Waiter --> Observer
+    Observer --> Final
+```
+
+Events provide attempt detail.
+They can be dropped by the bounded subscriber path.
+
+The direct `TaskWaiter` outcome owns final resource completion.
+It does not depend on terminal event delivery.
+It does not provide persistence across process termination.
+
+`TaskRemoved` is a FIFO barrier for queued attempt events.
+Finalization waits for that barrier for at most one second.
+Subscriber overflow releases finalizations that are safe without the barrier.
+
+The lifecycle gate serializes short event, completion, and management commits.
+It is not held while waiting for Taskvisor.
+
+Typed `TaskOutcomeKind` and `RejectionKind` values select terminal phases.
+Free-form reason text remains diagnostic.
+
+## State and collections
+
+`TaskStateInner` holds all authoritative in-memory indexes.
+
+| State                                  | Purpose                                             |
+|----------------------------------------|-----------------------------------------------------|
+| `tasks`                                | Current resources by model task name                |
+| `by_slot`                              | Task names grouped by slot                          |
+| `runs`                                 | Active and retained attempt history                 |
+| `by_tv` and `tv_of`                    | Bidirectional runtime bindings                      |
+| `finished_attempt_by_tv`               | Duplicate terminal event fencing                    |
+| `resource_version_epoch` and counter   | Store-local collection identity                     |
+| `watch_history`                        | Changes for snapshots, continuations, and replay    |
+| `compacted_through`                    | Oldest unavailable collection revision              |
+| `terminal_since`                       | Internal retention timestamps                       |
+
+One `RwLock` protects the complete state.
+A resource mutation and its change-journal entry happen under the same write lock.
+
+Resource versions contain a random store epoch and a monotonic revision.
+They are opaque outside `TaskState`.
+A version from another store is expired.
+
+### Snapshot pagination
+
+The first query page captures the current collection resource version.
+A continuation reconstructs that same snapshot from retained changes.
+
+Filtering runs before pagination.
+Items are ordered by task name.
+
+The continuation carries the filter, snapshot version, and last returned name.
+Changing the filter invalidates the continuation chain.
+
+### Watches
+
+No resource version or `"0"` emits a sorted `Added` snapshot.
+An exact retained version replays later changes before live delivery.
+
+List continuations and watches share one change journal.
+The journal is bounded by change count and serialized task bytes.
+
+An oversized change is delivered to current live subscribers.
+It is not retained for replay.
+Older resume points become compacted.
+
+Adapter predicates participate in collection semantics.
+They run before pagination.
+They also classify watch visibility changes as `Added`, `Modified`, or `Deleted`.
+
+Core does not hide embedded workloads.
+Transport visibility belongs to the adapter.
+
+## Runs and output
+
+Attempt events create and finish `TaskRun` values.
+Runs are ordered by generation and attempt when read.
+
+A run snapshots its workload GVK.
+Adapter filtering can therefore apply to historical generations.
+
+The output hub owns one bounded broadcast ring per bound task name.
+Runners receive an `OutputSink`.
+Consumers receive an `OutputSubscription`.
+
+Output is live-only and lossy.
+A slow subscriber receives `OutputEvent::Lagged` and continues.
+
+Terminal cleanup removes the channel from the hub.
+Existing subscribers close after every outstanding sink clone releases its sender.
+A stale sink cannot publish into a channel created later for the same model name.
+
+## Retention
+
+The retention worker runs inside the reconciler task tracker.
+It uses `StateConfig::sweep_interval`.
+
+One sweep:
+
+1. removes expired finished runs;
+2. removes expired unfinished runs without a runtime binding;
+3. enforces the completed-run cap while keeping active runs;
+4. removes terminal tasks after their run history is empty and `task_ttl` expires.
+
+A task with a runtime binding is never removed by retention.
+
+`max_runs_per_task = 0` keeps active runs and removes completed history.
+Zero `run_ttl` and `task_ttl` make eligible values removable on the next sweep.
+Zero `sweep_interval` is invalid.
+
+## Concurrency
+
+The crate uses three coordination layers.
+
+| Layer                    | Key or scope | Protects                                                         |
+|--------------------------|--------------|------------------------------------------------------------------|
+| Desired operation locks  | Task name    | Writes, adapter checks, cancellation, and deletion admission     |
+| Runtime operation locks  | Task name    | Binding, replacement, Taskvisor cancellation, and output binding |
+| Lifecycle gate           | Global       | Short event, completion, deletion, and cleanup state commits     |
+
+Both keyed lock maps store weak references.
+Stale entries are pruned when a new lock is created.
+
+When an operation needs both keyed locks, it acquires the desired operation lock first.
+Reconciliation acquires only the runtime operation lock.
+
+The spawn gate is separate.
+It orders reconciliation worker registration against shutdown.
+
+## Shutdown
+
+Explicit shutdown follows one ordered path.
+
+```mermaid
+%%{init: {"flowchart": {"curve": "linear"}}}%%
+flowchart LR
+    Start["shutdown"]
+    Fence["Set shutdown flag<br/>hold spawn gate"]
+    Watches["Close task watches"]
+    Retention["Cancel retention worker"]
+    Tracker["Close worker tracker"]
+    Runtime["Shutdown Taskvisor"]
+    Drain["Wait for reconciliation,<br/>completion, and retention workers"]
+    Result["Return Taskvisor shutdown result"]
+
+    Start --> Fence
+    Fence --> Watches
+    Watches --> Retention
+    Retention --> Tracker
+    Tracker --> Runtime
+    Runtime --> Drain
+    Drain --> Result
+```
+
+Desired writes fail with `CoreError::ShuttingDown` after the shutdown flag is set.
+Read methods remain available over retained state.
+
+Dropping `SupervisorApi` starts the same cleanup work on the captured Tokio runtime.
+Drop cannot await or return the cleanup result.
+Call `shutdown` when completion must be observed.
+
+## Where to make a change
+
+| Change                                      | Start here                                                                               | Verify here                                                |
+|---------------------------------------------|------------------------------------------------------------------------------------------|------------------------------------------------------------|
+| Public API or operation semantics           | [`src/supervisor/mod.rs`](src/supervisor/mod.rs), [`src/lib.rs`](src/lib.rs)             | supervisor tests and README doctests                       |
+| Builder setting or runtime assembly         | [`src/supervisor/builder.rs`](src/supervisor/builder.rs)                                 | builder tests                                              |
+| Desired write or precondition behavior      | [`src/state/mod.rs`](src/state/mod.rs), [`src/supervisor/mod.rs`](src/supervisor/mod.rs) | state and supervisor tests                                 |
+| Query, continuation, or watch semantics     | [`src/state/mod.rs`](src/state/mod.rs)                                                   | state collection tests                                     |
+| Runner routing or runtime intake            | [`src/runtime/reconciler.rs`](src/runtime/reconciler.rs)                                 | reconciler behavior in supervisor tests                    |
+| Event, outcome, or cleanup projection       | [`src/runtime/observer.rs`](src/runtime/observer.rs)                                     | observer tests and `tests/taskvisor_contract.rs`           |
+| Taskvisor policy or phase mapping           | [`src/map/`](src/map)                                                                    | mapper tests and `tests/taskvisor_contract.rs`             |
+| Live output channels                        | [`src/output.rs`](src/output.rs)                                                         | output tests                                               |
+| Retention defaults or validation            | [`src/config.rs`](src/config.rs)                                                         | config and sweep tests                                     |
+| Public errors                               | [`src/error.rs`](src/error.rs)                                                           | error tests and every affected API test                    |
+| User-facing usage                           | [`README.md`](README.md), [`src/lib.rs`](src/lib.rs)                                     | `cargo test -p solti-core --doc --all-features`            |
+
+## Invariants to preserve
+
+Before changing a coordination path, check these constraints in the owning module and its tests:
+
+1. A successful create or apply reports a desired-state commit.
+2. Runtime reconciliation remains asynchronous.
+3. Routed and embedded manifests use their matching submission paths.
+4. UID and generation fence every runtime binding and status transition.
+5. One model task name has at most one current runtime binding.
+6. Reconciliation failures stay in the `Reconciled` condition.
+7. Execution failures stay in terminal status and run diagnostics.
+8. Taskvisor events remain best-effort.
+9. Direct completion outcomes remain authoritative for finalization.
+10. Attempt numbers come from Taskvisor and are never synthesized as attempt zero.
+11. Typed outcome values select phases.
+12. Diagnostic text never acts as schema.
+13. Adapter predicates run before pagination and watch classification.
+14. Resource versions remain opaque and local to one state-store incarnation.
+15. Retention never removes a bound task.
+16. Output remains live-only and is not added to run history.
+17. Desired operation locks are acquired before runtime operation locks when both are needed.
+18. Shutdown prevents new reconciliation workers before waiting for the tracker.
+
+When a change crosses one of these boundaries, update the owning module documentation and the relevant diagram in this guide.

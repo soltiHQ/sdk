@@ -1,4 +1,34 @@
-//! Desired-state reconciliation with Taskvisor.
+//! # Desired-state reconciliation
+//!
+//! [`Reconciler`] turns one committed task generation into a Taskvisor submission.
+//!
+//! ## Flow
+//!
+//! ```text
+//! committed Task
+//!      │ current UID and generation
+//!      ▼
+//! build runner task or use embedded TaskRef
+//!      │
+//!      ▼
+//! map policies and prepare submission
+//!      ├── failure ──► Reconciled=False
+//!      ▼
+//! current fence ──► stop previous binding ──► bind ──► submit and watch
+//!                                                      ├── failure ──► Reconciled=False
+//!                                                      └── success ──► Reconciled=True
+//! ```
+//!
+//! Preflight runs outside the per-task runtime lock.
+//! The generation is checked before preflight, cleanup, and binding.
+//! A stale generation cannot acquire a new binding.
+//!
+//! A bound generation can submit while a newer apply commits.
+//! A later successful reconciliation replaces that runtime.
+//! Cleanup and binding failures also set `Reconciled=False`.
+//!
+//! Completion waiters provide the authoritative final outcome.
+//! The task tracker lets shutdown wait for every waiter and retention worker.
 
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -22,13 +52,15 @@ use crate::{
     state::{ResourceGeneration, RuntimeBinding, TaskState},
 };
 
-/// Source of the concrete Taskvisor task for one reconciliation.
+/// Executable source for one reconciliation.
 pub(crate) enum RuntimeSource {
+    /// Builds the task through the registered runner.
     Routed,
+    /// Uses a caller-owned Taskvisor task.
     Prebuilt(TaskRef),
 }
 
-/// Cloneable dependencies owned by reconciliation and completion workers.
+/// Dependencies shared by reconciliation and completion workers.
 #[derive(Clone)]
 pub(crate) struct Reconciler {
     pub(crate) output_hub: Arc<OutputHub>,

@@ -1,35 +1,40 @@
 [package]
 name = "solti-core"
-description = "Supervisor layer of the Solti SDK. It bridges the task model to the taskvisor runtime."
+
+description   = "Supervisor layer of the Solti SDK. It bridges the task model to the taskvisor runtime."
+keywords      = ["supervisor", "tasks", "async", "runtime", "tokio"]
+categories    = ["asynchronous", "concurrency"]
+documentation = "https://docs.rs/solti-core"
+readme        = "README.md"
 
 rust-version.workspace = true
-repository.workspace = true
-categories = ["asynchronous", "concurrency"]
-homepage.workspace = true
-keywords = ["supervisor", "tasks", "async", "runtime", "tokio"]
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+repository.workspace   = true
+homepage.workspace     = true
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+
+exclude = ["ARCHITECTURE.md"]
 
 [features]
 default   = []
 test-util = ["taskvisor/test-util"]
 
 [dependencies]
-taskvisor   = { workspace = true, features = ["controller"] }
-parking_lot = { workspace = true }
-serde_json  = { workspace = true }
-thiserror   = { workspace = true }
-tracing     = { workspace = true }
-tokio       = { workspace = true }
-tokio-stream = { workspace = true, features = ["sync"] }
-tokio-util  = { workspace = true }
-
 solti-model  = { workspace = true }
 solti-runner = { workspace = true }
 
+parking_lot  = { workspace = true }
+serde_json   = { workspace = true }
+taskvisor    = { workspace = true, features = ["controller"] }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+tokio        = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+tokio-util   = { workspace = true }
+
 [dev-dependencies]
-bytes      = { workspace = true }
+bytes     = { workspace = true }
 taskvisor = { workspace = true, features = ["test-util"] }
 
 [package.metadata.docs.rs]

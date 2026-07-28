@@ -1,4 +1,18 @@
-//! Build and start a [`SupervisorApi`].
+//! # Supervisor builder
+//!
+//! [`SupervisorApiBuilder`] assembles the core runtime.
+//!
+//! ```text
+//! RunnerRouter
+//!      ├── Taskvisor runtime settings
+//!      ├── controller settings
+//!      ├── external subscribers
+//!      ├── state retention
+//!      └── output capacity
+//!              │
+//!              ▼
+//!         SupervisorApi
+//! ```
 
 use std::sync::Arc;
 
@@ -8,10 +22,13 @@ use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 use super::SupervisorApi;
 use crate::{CoreError, OutputConfig, StateConfig};
 
-/// Builder for a live [`SupervisorApi`].
+/// Builder for [`SupervisorApi`].
 ///
-/// [`start`](Self::start) creates and starts the Taskvisor runtime, installs the
-/// state observer, and starts the internal retention worker.
+/// All settings have defaults.
+/// A [`RunnerRouter`] is always required.
+///
+/// [`start`](Self::start) starts Taskvisor.
+/// It also installs the state observer and retention worker.
 #[must_use]
 pub struct SupervisorApiBuilder {
     runtime_config: SupervisorConfig,
@@ -23,7 +40,7 @@ pub struct SupervisorApiBuilder {
 }
 
 impl SupervisorApiBuilder {
-    /// Create a builder with default runtime, controller, state, and output settings.
+    /// Creates a builder with default settings.
     pub fn new(router: RunnerRouter) -> Self {
         Self {
             runtime_config: SupervisorConfig::default(),
@@ -35,39 +52,44 @@ impl SupervisorApiBuilder {
         }
     }
 
-    /// Replace Taskvisor runtime settings.
+    /// Replaces Taskvisor runtime settings.
     pub fn with_runtime_config(mut self, runtime_config: SupervisorConfig) -> Self {
         self.runtime_config = runtime_config;
         self
     }
 
-    /// Replace Taskvisor controller settings.
+    /// Replaces Taskvisor controller settings.
     pub fn with_controller_config(mut self, controller_config: ControllerConfig) -> Self {
         self.controller_config = controller_config;
         self
     }
 
-    /// Replace external Taskvisor subscribers.
+    /// Replaces external Taskvisor subscribers.
     ///
-    /// The core state observer is installed separately and cannot be replaced.
+    /// The core observer is installed separately.
+    /// It cannot be replaced through this method.
     pub fn with_subscribers(mut self, subscribers: Vec<Arc<dyn Subscribe>>) -> Self {
         self.subscribers = subscribers;
         self
     }
 
-    /// Replace state retention settings.
+    /// Replaces state retention settings.
     pub fn with_state_config(mut self, state_config: StateConfig) -> Self {
         self.state_config = state_config;
         self
     }
 
-    /// Replace live-output settings.
+    /// Replaces live output settings.
     pub fn with_output_config(mut self, output_config: OutputConfig) -> Self {
         self.output_config = output_config;
         self
     }
 
-    /// Start the supervisor and every core-owned worker.
+    /// Starts the supervisor and core-owned workers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::StateInitialization`] when state identity creation fails.
     pub async fn start(self) -> Result<SupervisorApi, CoreError> {
         SupervisorApi::start(
             self.runtime_config,

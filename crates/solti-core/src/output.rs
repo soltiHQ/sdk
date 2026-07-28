@@ -1,4 +1,23 @@
-//! Core-owned live output hub and its public configuration/subscription ports.
+//! # Live task output
+//!
+//! Core owns task output channels.
+//! Runners receive only the publishing side.
+//! Consumers receive only [`OutputSubscription`].
+//!
+//! ## Flow
+//!
+//! ```text
+//! Runner
+//!    │ OutputSink
+//!    ▼
+//! per-task broadcast ring
+//!    │
+//!    ▼
+//! OutputSubscription
+//! ```
+//!
+//! Output is live-only and best-effort.
+//! It is not stored in task history.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -16,22 +35,25 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::ConfigError;
 
-/// Configuration for per-task live output channels.
+/// Per-task live output settings.
+///
+/// The default capacity is [`Self::DEFAULT_CAPACITY`].
+/// Capacity is measured in [`OutputEvent`] values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputConfig {
     capacity: NonZeroUsize,
 }
 
 impl OutputConfig {
-    /// Default number of events retained by each task's lossy live-output ring.
+    /// Default per-task event capacity.
     pub const DEFAULT_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 
-    /// Create output configuration with a per-task event capacity.
+    /// Creates settings with a non-zero event capacity.
     pub const fn new(capacity: NonZeroUsize) -> Self {
         Self { capacity }
     }
 
-    /// Create output configuration from a raw capacity.
+    /// Creates settings from a raw event capacity.
     ///
     /// # Errors
     ///
@@ -45,7 +67,7 @@ impl OutputConfig {
         Ok(Self::new(capacity))
     }
 
-    /// Return the configured per-task event capacity.
+    /// Returns the per-task event capacity.
     pub const fn capacity(self) -> NonZeroUsize {
         self.capacity
     }
@@ -57,13 +79,17 @@ impl Default for OutputConfig {
     }
 }
 
-/// Lossy, live-only stream of task output events.
+/// Live stream of one task's output events.
 ///
-/// When a consumer falls behind the configured ring capacity, the stream emits
-/// [`OutputEvent::Lagged`] and then continues with the newer retained events.
-/// Terminal cleanup prevents new subscriptions. An existing subscription
-/// closes after the hub evicts the channel and every outstanding runner sink
-/// releases its sender.
+/// The stream is lossy.
+/// A slow consumer receives [`OutputEvent::Lagged`].
+/// It then continues with newer events.
+///
+/// Terminal cleanup prevents new subscriptions.
+/// An existing subscription closes after every runner sink releases its sender.
+///
+/// The stream implements [`tokio_stream::Stream`].
+/// Its item type is [`OutputEvent`].
 pub struct OutputSubscription {
     inner: BroadcastStream<OutputEvent>,
 }
@@ -92,7 +118,7 @@ impl Stream for OutputSubscription {
     }
 }
 
-/// Concrete output hub owned exclusively by the supervisor layer.
+/// Core-owned output channel registry.
 pub(crate) struct OutputHub {
     channels: RwLock<HashMap<TaskId, broadcast::Sender<OutputEvent>>>,
     capacity: usize,
@@ -106,7 +132,9 @@ impl OutputHub {
         }
     }
 
-    /// Ensure a task channel exists and report whether this call created it.
+    /// Ensures that a task channel exists.
+    ///
+    /// Returns `true` when this call creates it.
     pub(crate) fn ensure_channel_if_absent(&self, task_id: TaskId) -> bool {
         let mut channels = self.channels.write();
         match channels.entry(task_id) {

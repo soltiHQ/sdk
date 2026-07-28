@@ -1,11 +1,16 @@
-//! Model to taskvisor mapping.
+//! # Runtime mapping
 //!
-//! Adapter layer between `solti-model` (public specs) and the taskvisor runtime.
+//! This module maps model policies to Taskvisor.
+//! Its [`phase`] module maps Taskvisor outcomes back to model phases.
 //!
-//! Two directions, one module tree:
-//! - this file maps model policies **into** taskvisor structures (submit path);
-//! - [`phase`] maps typed taskvisor outcome and rejection categories **back**
-//!   into model phases (state-reconstruction path, shared by both state paths).
+//! ```text
+//! TaskSpec policies ──► Taskvisor submission
+//!
+//! Taskvisor outcome ──► TaskPhase
+//! ```
+//!
+//! Typed values select behavior.
+//! Diagnostic strings are not parsed.
 
 pub(crate) mod phase;
 
@@ -19,7 +24,7 @@ use taskvisor::{AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy};
 
 use crate::error::CoreError;
 
-/// Convert a high-level admission policy from the public model into the controller admission policy used by taskvisor.
+/// Maps a model admission policy to Taskvisor.
 pub(crate) fn to_admission_policy(s: ModelAdmissionPolicy) -> Result<AdmissionPolicy, CoreError> {
     match s {
         ModelAdmissionPolicy::DropIfRunning => Ok(AdmissionPolicy::DropIfRunning),
@@ -31,7 +36,7 @@ pub(crate) fn to_admission_policy(s: ModelAdmissionPolicy) -> Result<AdmissionPo
     }
 }
 
-/// Convert a high-level jitter policy into the jitter policy used by taskvisor.
+/// Maps a model jitter policy to Taskvisor.
 pub(crate) fn to_jitter_policy(s: ModelJitterPolicy) -> Result<JitterPolicy, CoreError> {
     match s {
         ModelJitterPolicy::Decorrelated => Ok(JitterPolicy::RandomizedBand),
@@ -44,7 +49,7 @@ pub(crate) fn to_jitter_policy(s: ModelJitterPolicy) -> Result<JitterPolicy, Cor
     }
 }
 
-/// Convert a high-level restart policy into the restart policy used by taskvisor.
+/// Maps a model restart policy to Taskvisor.
 pub(crate) fn to_restart_policy(s: ModelRestartPolicy) -> Result<RestartPolicy, CoreError> {
     match s {
         ModelRestartPolicy::Always { interval_ms } => Ok(RestartPolicy::Always {
@@ -58,7 +63,7 @@ pub(crate) fn to_restart_policy(s: ModelRestartPolicy) -> Result<RestartPolicy, 
     }
 }
 
-/// Convert a high-level backoff policy into a backoff policy used by taskvisor.
+/// Maps a model backoff policy to Taskvisor.
 pub(crate) fn to_backoff_policy(s: &ModelBackoffPolicy) -> Result<BackoffPolicy, CoreError> {
     BackoffPolicy::new(
         Duration::from_millis(s.first_ms),

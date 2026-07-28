@@ -1,4 +1,16 @@
-//! Taskvisor runtime integration.
+//! # Taskvisor integration
+//!
+//! This module owns runtime reconciliation and event projection.
+//!
+//! ```text
+//! desired Task ──► Reconciler ──► Taskvisor
+//!                                    ▼
+//!                              RuntimeObserver
+//!                                    ▼
+//!                                 TaskState
+//! ```
+//!
+//! Per-task locks serialize conflicting management operations.
 
 mod locks;
 mod observer;

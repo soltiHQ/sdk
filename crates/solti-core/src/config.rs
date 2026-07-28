@@ -1,4 +1,18 @@
-//! Core configuration.
+//! # State retention
+//!
+//! [`StateConfig`] controls in-memory task, run, and collection history.
+//!
+//! ```text
+//! Taskvisor events
+//!       ▼
+//! TaskState
+//!       ├── TaskRun history ──► run TTL and per-task cap
+//!       ├── terminal Tasks ───► task TTL
+//!       └── Task changes ─────► count and byte limits
+//! ```
+//!
+//! The supervisor owns the retention worker.
+//! [`StateConfig::sweep_interval`] controls its cadence.
 
 use std::time::Duration;
 
@@ -11,25 +25,34 @@ const DEFAULT_TASK_TTL: Duration = Duration::from_secs(3_600);
 const DEFAULT_WATCH_HISTORY_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 const DEFAULT_WATCH_HISTORY_CAPACITY: usize = 4_096;
 
-/// Error from a checked core configuration setter.
+/// Error from checked core configuration.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum ConfigError {
-    /// A value that must be positive was zero.
+    /// A positive value was zero.
     #[error("{field} must be greater than zero")]
     #[non_exhaustive]
     Zero {
-        /// Stable configuration field name.
+        /// Stable field name.
         field: &'static str,
     },
 }
 
-/// In-memory state retention settings.
+/// In-memory retention settings.
 ///
-/// Finished runs are removed after [`run_ttl`](Self::run_ttl). A terminal task
-/// is removed after its run history is empty and [`task_ttl`](Self::task_ttl)
-/// has elapsed. The internal retention worker runs at
-/// [`sweep_interval`](Self::sweep_interval).
+/// | Value                                                                    | Default   |
+/// |--------------------------------------------------------------------------|-----------|
+/// | [`run_ttl`](Self::run_ttl)                                               | 1 hour    |
+/// | [`task_ttl`](Self::task_ttl)                                             | 1 hour    |
+/// | [`sweep_interval`](Self::sweep_interval)                                 | 5 minutes |
+/// | [`max_runs_per_task`](Self::max_runs_per_task)                           | 256       |
+/// | [`watch_history_capacity`](Self::watch_history_capacity)                 | 4096      |
+/// | [`watch_history_byte_budget`](Self::watch_history_byte_budget)           | 64 MiB    |
+///
+/// Finished runs expire after `run_ttl`.
+/// An unbound unfinished run can also expire after that age.
+/// A terminal task expires after its run history is empty and `task_ttl` has elapsed.
+/// A task with a runtime binding is not removed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use]
 pub struct StateConfig {
@@ -42,7 +65,7 @@ pub struct StateConfig {
 }
 
 impl StateConfig {
-    /// Create the default retention configuration.
+    /// Creates the default retention settings.
     pub const fn new() -> Self {
         Self {
             run_ttl: DEFAULT_RUN_TTL,
@@ -54,51 +77,60 @@ impl StateConfig {
         }
     }
 
-    /// Return how long finished runs are retained.
+    /// Returns the run retention age.
+    ///
+    /// This also applies to unfinished runs without a runtime binding.
     pub const fn run_ttl(&self) -> Duration {
         self.run_ttl
     }
 
-    /// Return how long terminal tasks are retained after their run history is empty.
+    /// Returns the terminal task retention age.
+    ///
+    /// The age starts at the internal terminal transition.
+    /// Retention waits until run history is empty.
     pub const fn task_ttl(&self) -> Duration {
         self.task_ttl
     }
 
-    /// Return how often the retention worker runs.
+    /// Returns the retention worker interval.
     pub const fn sweep_interval(&self) -> Duration {
         self.sweep_interval
     }
 
-    /// Return the per-task run-history cap.
+    /// Returns the per-task completed run cap.
     ///
     /// Zero keeps active runs and removes every finished run.
     pub const fn max_runs_per_task(&self) -> usize {
         self.max_runs_per_task
     }
 
-    /// Return the number of Task changes retained for collection replay.
+    /// Returns the retained Task change limit.
     pub const fn watch_history_capacity(&self) -> usize {
         self.watch_history_capacity
     }
 
-    /// Return the serialized Task payload budget for retained collection changes.
+    /// Returns the serialized Task payload budget for retained changes.
     pub const fn watch_history_byte_budget(&self) -> usize {
         self.watch_history_byte_budget
     }
 
-    /// Set how long finished runs are retained.
+    /// Sets the run retention age.
+    ///
+    /// Zero makes eligible runs removable on the next sweep.
     pub const fn with_run_ttl(mut self, run_ttl: Duration) -> Self {
         self.run_ttl = run_ttl;
         self
     }
 
-    /// Set how long terminal tasks are retained after their run history is empty.
+    /// Sets the terminal task retention age.
+    ///
+    /// Zero makes eligible tasks removable on the next sweep.
     pub const fn with_task_ttl(mut self, task_ttl: Duration) -> Self {
         self.task_ttl = task_ttl;
         self
     }
 
-    /// Set how often the retention worker runs.
+    /// Sets the retention worker interval.
     ///
     /// # Errors
     ///
@@ -116,16 +148,18 @@ impl StateConfig {
         Ok(self)
     }
 
-    /// Set the per-task run-history cap.
+    /// Sets the per-task completed run cap.
     ///
-    /// Zero disables completed run history. Active runs are never evicted by
-    /// this cap.
+    /// Zero disables completed run history.
+    /// Active runs are never evicted by this cap.
     pub const fn with_max_runs_per_task(mut self, max_runs_per_task: usize) -> Self {
         self.max_runs_per_task = max_runs_per_task;
         self
     }
 
-    /// Set the number of Task changes retained for watch replay and list snapshots.
+    /// Sets the retained Task change limit.
+    ///
+    /// Watches and list snapshots share this history.
     ///
     /// # Errors
     ///
@@ -143,7 +177,9 @@ impl StateConfig {
         Ok(self)
     }
 
-    /// Set the serialized Task payload budget for watch replay and list snapshots.
+    /// Sets the serialized Task payload budget for retained changes.
+    ///
+    /// Watches and list snapshots share this budget.
     ///
     /// # Errors
     ///
@@ -187,44 +223,34 @@ mod tests {
     }
 
     #[test]
-    fn zero_sweep_interval_is_rejected() {
-        assert_eq!(
-            StateConfig::new()
-                .try_with_sweep_interval(Duration::ZERO)
-                .unwrap_err(),
-            ConfigError::Zero {
-                field: "sweep_interval"
-            }
-        );
+    fn checked_fields_reject_zero() {
+        for (actual, field) in [
+            (
+                StateConfig::new()
+                    .try_with_sweep_interval(Duration::ZERO)
+                    .unwrap_err(),
+                "sweep_interval",
+            ),
+            (
+                StateConfig::new()
+                    .try_with_watch_history_capacity(0)
+                    .unwrap_err(),
+                "watch_history_capacity",
+            ),
+            (
+                StateConfig::new()
+                    .try_with_watch_history_byte_budget(0)
+                    .unwrap_err(),
+                "watch_history_byte_budget",
+            ),
+        ] {
+            assert_eq!(actual, ConfigError::Zero { field });
+        }
     }
 
     #[test]
     fn zero_run_cap_is_valid() {
         let config = StateConfig::new().with_max_runs_per_task(0);
         assert_eq!(config.max_runs_per_task(), 0);
-    }
-
-    #[test]
-    fn zero_watch_history_capacity_is_rejected() {
-        assert_eq!(
-            StateConfig::new()
-                .try_with_watch_history_capacity(0)
-                .unwrap_err(),
-            ConfigError::Zero {
-                field: "watch_history_capacity"
-            }
-        );
-    }
-
-    #[test]
-    fn zero_watch_history_byte_budget_is_rejected() {
-        assert_eq!(
-            StateConfig::new()
-                .try_with_watch_history_byte_budget(0)
-                .unwrap_err(),
-            ConfigError::Zero {
-                field: "watch_history_byte_budget"
-            }
-        );
     }
 }

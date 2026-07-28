@@ -1,13 +1,30 @@
-//! Kubernetes-style desired-state supervisor API.
+//! # Supervisor API
 //!
-//! [`SupervisorApi`] stores a complete [`Task`] resource first and reconciles
-//! that desired state with Taskvisor in an SDK-owned worker. Runtime events are
-//! correlated with one exact resource UID and generation.
+//! [`SupervisorApi`] is the main lifecycle boundary of `solti-core`.
+//! It commits a complete [`Task`] before runtime reconciliation.
 //!
-//! Reconciliation is latest-wins: a stale generation cannot bind or replace the
-//! current runtime. The controller does not provide staged-rollout or availability
-//! guarantees; side effects already accepted before a generation becomes stale
-//! are not rolled back.
+//! ## Write Flow
+//!
+//! ```text
+//! TaskManifest
+//!      │ validate and commit
+//!      ▼
+//! Task
+//!      │ schedule
+//!      ▼
+//! Reconciler ──► runner or embedded TaskRef ──► Taskvisor
+//! ```
+//!
+//! A successful write confirms the desired-state commit.
+//! Reconciliation continues in an SDK-owned worker.
+//!
+//! ## Runtime Rules
+//!
+//! - A stale generation cannot bind or replace the current runtime.
+//! - No staged rollout or availability guarantee is provided.
+//! - Resource identity is `metadata.name` plus UID.
+//! - Reconciliation is latest-wins by generation.
+//! - Accepted side effects are not rolled back.
 
 use std::{
     sync::{
@@ -41,7 +58,13 @@ use crate::{
 mod builder;
 pub use builder::SupervisorApiBuilder;
 
-/// High-level API over desired Task resources and the Taskvisor runtime.
+/// Desired-state API over Taskvisor.
+///
+/// The API owns shared state, reconciliation, output, and retention.
+/// Cloneable read access is available through [`state`](Self::state).
+///
+/// Dropping the API starts asynchronous cleanup.
+/// Call [`shutdown`](Self::shutdown) when cleanup must finish before continuing.
 pub struct SupervisorApi {
     reconciler: Reconciler,
     task_operations: TaskLocks,
@@ -55,7 +78,7 @@ enum WriteMode {
     Apply,
 }
 
-/// Desired-state commit together with an optional first-reconciliation acknowledgement.
+/// Desired-state commit and test-only reconciliation acknowledgement.
 struct ScheduledWrite {
     committed: Task,
     #[cfg(test)]
@@ -82,7 +105,7 @@ impl Drop for SupervisorApi {
 }
 
 impl SupervisorApi {
-    /// Create a builder for a supervisor API.
+    /// Creates a supervisor builder.
     pub fn builder(router: RunnerRouter) -> SupervisorApiBuilder {
         SupervisorApiBuilder::new(router)
     }
@@ -124,11 +147,16 @@ impl SupervisorApi {
         Ok(api)
     }
 
-    /// Create desired state and schedule reconciliation through the registered runner.
+    /// Creates a routed task resource.
     ///
-    /// A successful return confirms the in-memory desired-state commit, not runtime
-    /// realization. Routing or runtime failures are recorded later in `status`;
-    /// observe `status.conditions[type=Reconciled]` to track reconciliation.
+    /// The resource is committed before reconciliation.
+    /// Runtime failures are reported through the `Reconciled` condition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidSpec`] for invalid desired state or an embedded workload.
+    /// Returns [`CoreError::AlreadyExists`] when the name is retained.
+    /// Returns [`CoreError::ShuttingDown`] after shutdown starts.
     pub async fn create_task(&self, manifest: TaskManifest) -> Result<Task, CoreError> {
         Ok(self
             .write(
@@ -142,10 +170,16 @@ impl SupervisorApi {
             .committed)
     }
 
-    /// Commit desired state with a caller-supplied Taskvisor task and schedule reconciliation.
+    /// Creates an embedded task resource.
     ///
-    /// Runtime failures are reported asynchronously through the stored resource's
-    /// `Reconciled` condition.
+    /// The caller supplies the Taskvisor task.
+    /// Runtime failures are reported through the `Reconciled` condition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidSpec`] for invalid desired state or a routed workload.
+    /// Returns [`CoreError::AlreadyExists`] when the name is retained.
+    /// Returns [`CoreError::ShuttingDown`] after shutdown starts.
     pub async fn create_embedded_task(
         &self,
         manifest: TaskManifest,
@@ -163,21 +197,30 @@ impl SupervisorApi {
             .committed)
     }
 
-    /// Commit desired state and schedule reconciliation through the registered runner.
+    /// Applies a routed task resource.
     ///
-    /// A successful return confirms only the desired-state commit. Routing or
-    /// runtime failures are recorded later in the stored resource's `Reconciled`
-    /// condition. An identical apply schedules one manual retry only while that
-    /// condition is `False`.
+    /// A missing resource is created.
+    /// An identical resource retries only when `Reconciled=False`.
+    /// Runtime failures are reported through that condition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidSpec`] for invalid desired state or an embedded workload.
+    /// Returns [`CoreError::ShuttingDown`] after shutdown starts.
     pub async fn apply_task(&self, manifest: TaskManifest) -> Result<Task, CoreError> {
         self.apply_task_with_preconditions(manifest, WritePreconditions::new())
             .await
     }
 
-    /// Apply desired state after checking the current resource identity and version.
+    /// Applies a routed task after checking write preconditions.
     ///
-    /// Preconditions make this a conditional update. They prevent creation when
-    /// the resource is absent.
+    /// Non-empty preconditions prevent creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotFound`] when guarded state is missing.
+    /// Returns [`CoreError::Conflict`] when a guard does not match.
+    /// Returns the same validation and shutdown errors as [`Self::apply_task`].
     pub async fn apply_task_with_preconditions(
         &self,
         manifest: TaskManifest,
@@ -195,11 +238,16 @@ impl SupervisorApi {
             .committed)
     }
 
-    /// Apply desired state unless an existing resource is hidden by an adapter-owned policy.
+    /// Applies a routed task through an adapter visibility predicate.
     ///
-    /// An absent resource is created normally. The visibility check and desired
-    /// commit share the same per-name lock. An apply cannot replace a hidden
-    /// incarnation through a check-then-write race.
+    /// A missing resource is created when preconditions are empty.
+    /// A hidden resource is reported as missing.
+    /// The predicate and commit share one per-name lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotFound`] for a hidden resource.
+    /// Returns the same write errors as [`Self::apply_task_with_preconditions`].
     pub async fn apply_task_where<F>(
         &self,
         manifest: TaskManifest,
@@ -231,11 +279,16 @@ impl SupervisorApi {
             .committed)
     }
 
-    /// Commit desired state with a caller-supplied Taskvisor task and schedule reconciliation.
+    /// Applies an embedded task resource.
     ///
-    /// Runtime failures are reported asynchronously through the stored resource's
-    /// `Reconciled` condition. An identical apply schedules one manual retry only
-    /// while that condition is `False`.
+    /// A missing resource is created.
+    /// An identical resource retries only when `Reconciled=False`.
+    /// Runtime failures are reported through that condition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidSpec`] for invalid desired state or a routed workload.
+    /// Returns [`CoreError::ShuttingDown`] after shutdown starts.
     pub async fn apply_embedded_task(
         &self,
         manifest: TaskManifest,
@@ -245,7 +298,13 @@ impl SupervisorApi {
             .await
     }
 
-    /// Apply an embedded task after checking the current resource identity and version.
+    /// Applies an embedded task after checking write preconditions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotFound`] when guarded state is missing.
+    /// Returns [`CoreError::Conflict`] when a guard does not match.
+    /// Returns the same validation and shutdown errors as [`Self::apply_embedded_task`].
     pub async fn apply_embedded_task_with_preconditions(
         &self,
         manifest: TaskManifest,
@@ -273,8 +332,6 @@ impl SupervisorApi {
         ensure_output: bool,
     ) -> Result<ScheduledWrite, CoreError> {
         Self::ensure_runtime_contract(&manifest, &source)?;
-        // The stable resource address is metadata.name. TaskRef::name is only a
-        // runtime diagnostic label and is deliberately not consulted here.
         let name = manifest.name().clone();
         let operation = self.task_operations.lock(&name).await;
         self.write_locked(
@@ -302,8 +359,6 @@ impl SupervisorApi {
             return Err(CoreError::ShuttingDown);
         }
 
-        // Keep the tracker non-empty from desired-state commit through the
-        // tracked worker spawn. TaskTracker::close does not reject spawns.
         let registration = self.reconciler.tasks.token();
         let commit = match mode {
             WriteMode::Create => {
@@ -378,16 +433,18 @@ impl SupervisorApi {
         receiver
     }
 
-    /// Subscribe to one resource's lossy live output stream.
+    /// Subscribes to one task's live output.
+    ///
+    /// Returns `None` when no output channel exists.
     pub fn subscribe_output(&self, name: &TaskId) -> Option<OutputSubscription> {
         self.reconciler.output_hub.subscribe(name)
     }
 
-    /// Subscribe only when the current Task satisfies an adapter-owned predicate.
+    /// Subscribes through an adapter visibility predicate.
     ///
-    /// The predicate, current binding and output subscription are captured under
-    /// the desired-state and runtime per-name locks. The returned generation lets
-    /// the adapter discard any queued event from a different desired generation.
+    /// The predicate, runtime binding, and subscription use the same per-name locks.
+    /// The returned generation identifies the bound desired state.
+    /// Returns `None` for missing, hidden, or unbound state.
     pub async fn subscribe_output_where<F>(
         &self,
         name: &TaskId,
@@ -410,21 +467,28 @@ impl SupervisorApi {
         Some((resource.generation, subscription))
     }
 
-    /// Return one retained Task resource by metadata.name.
+    /// Returns one retained task by name.
     pub fn get_task(&self, name: &TaskId) -> Option<Task> {
         self.reconciler.state.get(name)
     }
 
-    /// Query retained Tasks with filters and snapshot-consistent pagination.
+    /// Queries retained tasks with snapshot-consistent pagination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] for an invalid or unavailable continuation snapshot.
     pub fn query_tasks(&self, query: &TaskQuery) -> Result<TaskPage<Task>, CollectionError> {
         self.reconciler.state.query(query)
     }
 
-    /// Query Tasks with an adapter-owned predicate applied before pagination.
+    /// Queries tasks through an adapter visibility predicate.
     ///
-    /// Core itself does not attach wire-visibility semantics to workloads. A
-    /// transport can use this method to hide unsupported workloads while still
-    /// receiving a consistent continuation and remaining-item count.
+    /// The predicate runs before pagination.
+    /// Core does not hide workload kinds by itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] for an invalid or unavailable continuation snapshot.
     pub fn query_tasks_where<F>(
         &self,
         query: &TaskQuery,
@@ -436,7 +500,11 @@ impl SupervisorApi {
         self.reconciler.state.query_where(query, predicate)
     }
 
-    /// Watch retained Task resources selected by `filter`.
+    /// Watches retained tasks selected by a filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] when the resource version cannot be resumed.
     pub fn watch_tasks(
         &self,
         filter: &TaskFilter,
@@ -445,7 +513,13 @@ impl SupervisorApi {
         self.reconciler.state.watch(filter, resource_version)
     }
 
-    /// Watch Tasks with an adapter-owned visibility predicate.
+    /// Watches tasks through an adapter visibility predicate.
+    ///
+    /// The predicate participates in `Added`, `Modified`, and `Deleted` classification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] when the resource version cannot be resumed.
     pub fn watch_tasks_where<F>(
         &self,
         filter: &TaskFilter,
@@ -460,16 +534,18 @@ impl SupervisorApi {
             .watch_where(filter, resource_version, predicate)
     }
 
-    /// List execution history for one resource, oldest generation and attempt first.
+    /// Lists retained runs for one task.
+    ///
+    /// Results are ordered by generation and attempt.
     pub fn list_task_runs(&self, name: &TaskId) -> Vec<TaskRun> {
         self.reconciler.state.list_runs(name)
     }
 
-    /// List runs visible under an adapter-owned workload-GVK predicate.
+    /// Lists runs through an adapter workload predicate.
     ///
-    /// Visibility is checked under the same per-name operation lock used by
-    /// apply and delete. An apply cannot change the workload between the
-    /// check and the run snapshot.
+    /// The visibility check and run snapshot share the write-operation lock.
+    /// Historical runs are filtered by their workload snapshot.
+    /// Returns `None` when the current task is missing or hidden.
     pub async fn list_task_runs_where<F>(&self, name: &TaskId, predicate: F) -> Option<Vec<TaskRun>>
     where
         F: Fn(&WorkloadTypeMeta) -> bool,
@@ -489,7 +565,7 @@ impl SupervisorApi {
         )
     }
 
-    /// Return a shared read handle for the in-memory resource store.
+    /// Returns a shared read handle.
     pub fn state(&self) -> TaskState {
         self.reconciler.state.clone()
     }
@@ -513,10 +589,15 @@ impl SupervisorApi {
         Ok(Some((binding, claimed)))
     }
 
-    /// Cancel the currently bound or queued Taskvisor realization while retaining desired state.
+    /// Cancels the current runtime while retaining desired state.
     ///
-    /// Before reconciliation creates a binding this is a no-op; it does not
-    /// create a hidden intent that suppresses later reconciliation.
+    /// A known task without a runtime binding is a no-op.
+    /// Cancellation does not suppress later reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotFound`] for an unknown task.
+    /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
     #[instrument(level = "debug", skip(self), fields(task = %name))]
     pub async fn cancel_task(&self, name: &TaskId) -> Result<(), CoreError> {
         let _operation = self.task_operations.lock(name).await;
@@ -536,15 +617,27 @@ impl SupervisorApi {
         Ok(())
     }
 
-    /// Delete a Task resource and its run history after stopping its realization.
-    /// Deleting a missing resource is an idempotent no-op.
+    /// Deletes a task and its run history.
+    ///
+    /// The current runtime is stopped first.
+    /// A missing task is an idempotent no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
     #[instrument(level = "debug", skip(self), fields(task = %name))]
     pub async fn delete_task(&self, name: &TaskId) -> Result<(), CoreError> {
         let _operation = self.task_operations.lock(name).await;
         self.delete_task_locked(name).await
     }
 
-    /// Delete a Task only when its identity and version match.
+    /// Deletes a task after checking write preconditions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotFound`] when the task is missing.
+    /// Returns [`CoreError::Conflict`] when a guard does not match.
+    /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
     pub async fn delete_task_with_preconditions(
         &self,
         name: &TaskId,
@@ -560,10 +653,15 @@ impl SupervisorApi {
         self.delete_task_locked(name).await
     }
 
-    /// Delete only when the current Task satisfies an adapter-owned predicate.
+    /// Deletes a task through an adapter visibility predicate.
     ///
-    /// A missing resource or one rejected by the predicate is reported as absent.
-    /// The unconditional [`delete_task`](Self::delete_task) remains idempotent.
+    /// Missing and hidden tasks are reported as missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotFound`] when the task is missing or hidden.
+    /// Returns [`CoreError::Conflict`] when a guard does not match.
+    /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
     pub async fn delete_task_where<F>(
         &self,
         name: &TaskId,
@@ -593,7 +691,14 @@ impl SupervisorApi {
         Ok(())
     }
 
-    /// Stop Taskvisor and wait for every SDK-owned reconciliation/completion worker.
+    /// Stops Taskvisor and waits for SDK-owned workers.
+    ///
+    /// Task watches close before runtime shutdown.
+    /// Reconciliation, completion, and retention workers are drained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Supervisor`] when Taskvisor shutdown fails.
     #[instrument(level = "info", skip(self))]
     pub async fn shutdown(&self) -> Result<(), CoreError> {
         info!("initiating graceful shutdown");
