@@ -324,7 +324,7 @@ impl Task {
             type_meta: TypeMeta::task(),
             metadata: object_meta,
             spec,
-            status: TaskStatus::pending_for(0, 1),
+            status: TaskStatus::pending(1)?,
         };
         task.validate()?;
         Ok(task)

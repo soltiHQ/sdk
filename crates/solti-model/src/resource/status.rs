@@ -23,16 +23,35 @@ pub struct TaskStatus {
 }
 
 impl TaskStatus {
-    /// Creates an unobserved pending status.
-    pub fn pending() -> Self {
-        Self::pending_for(0, 0)
+    /// Creates an unobserved pending status for a desired generation.
+    ///
+    /// `observedGeneration` starts at zero.
+    /// The `Reconciled` condition refers to `desired_generation`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when `desired_generation` is zero.
+    pub fn pending(desired_generation: u64) -> ModelResult<Self> {
+        if desired_generation == 0 {
+            return Err(ModelError::Invalid(
+                "desired generation must be greater than zero".into(),
+            ));
+        }
+        Ok(Self {
+            observed_generation: 0,
+            phase: TaskPhase::Pending,
+            exit_code: None,
+            error: None,
+            attempt: 0,
+            conditions: vec![TaskCondition::reconciled_unknown(desired_generation)],
+        })
     }
 
     /// Reconstructs status from serialized fields.
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when conditions are invalid or duplicated, or when the required `Reconciled` condition is missing.
+    /// Returns [`ModelError::Invalid`] when status fields or conditions are inconsistent.
     pub fn from_parts(
         observed_generation: u64,
         phase: TaskPhase,
@@ -51,17 +70,6 @@ impl TaskStatus {
         };
         status.validate()?;
         Ok(status)
-    }
-
-    pub(crate) fn pending_for(observed_generation: u64, desired_generation: u64) -> Self {
-        Self {
-            observed_generation,
-            phase: TaskPhase::Pending,
-            exit_code: None,
-            error: None,
-            attempt: 0,
-            conditions: vec![TaskCondition::reconciled_unknown(desired_generation)],
-        }
     }
 
     pub(crate) fn pending_after(&self, desired_generation: u64) -> Self {
@@ -173,6 +181,76 @@ impl TaskStatus {
                 "status.conditions must contain one Reconciled condition".into(),
             ));
         }
+        let reconciled = self.reconciled();
+        if reconciled.observed_generation() == 0 {
+            return Err(ModelError::Invalid(
+                "status.conditions[type=Reconciled].observedGeneration must be greater than zero"
+                    .into(),
+            ));
+        }
+        if reconciled.observed_generation() < self.observed_generation {
+            return Err(ModelError::Invalid(
+                "status.conditions[type=Reconciled].observedGeneration cannot be less than status.observedGeneration"
+                    .into(),
+            ));
+        }
+        if reconciled.status() != ConditionStatus::Unknown
+            && reconciled.observed_generation() != self.observed_generation
+        {
+            return Err(ModelError::Invalid(
+                "status.conditions[type=Reconciled].observedGeneration must equal status.observedGeneration when reconciliation is complete"
+                    .into(),
+            ));
+        }
+        if self.phase != TaskPhase::Pending && reconciled.status() != ConditionStatus::True {
+            return Err(ModelError::Invalid(
+                "status.phase requires a Reconciled=True condition unless phase is pending".into(),
+            ));
+        }
+        Self::validate_execution_fields(self.phase, self.attempt, self.exit_code, &self.error)?;
+        Ok(())
+    }
+
+    fn validate_execution_fields(
+        phase: TaskPhase,
+        attempt: u32,
+        exit_code: Option<i32>,
+        error: &Option<String>,
+    ) -> ModelResult<()> {
+        match phase {
+            TaskPhase::Pending => {
+                if attempt != 0 {
+                    return Err(ModelError::Invalid(
+                        "status.attempt must be zero while status.phase is pending".into(),
+                    ));
+                }
+                if exit_code.is_some() || error.is_some() {
+                    return Err(ModelError::Invalid(
+                        "status.exitCode and status.error must be absent while status.phase is pending"
+                            .into(),
+                    ));
+                }
+            }
+            TaskPhase::Running => {
+                if attempt == 0 {
+                    return Err(ModelError::Invalid(
+                        "status.attempt must be greater than zero while status.phase is running"
+                            .into(),
+                    ));
+                }
+                if exit_code.is_some() || error.is_some() {
+                    return Err(ModelError::Invalid(
+                        "status.exitCode and status.error must be absent while status.phase is running"
+                            .into(),
+                    ));
+                }
+            }
+            TaskPhase::Succeeded
+            | TaskPhase::Failed
+            | TaskPhase::Timeout
+            | TaskPhase::Canceled
+            | TaskPhase::Exhausted => {}
+        }
         Ok(())
     }
 
@@ -272,12 +350,15 @@ mod tests {
     }
 
     #[test]
-    fn pending_is_valid() {
-        let status = TaskStatus::pending();
+    fn pending_generation_is_explicit() {
+        let status = TaskStatus::pending(3).unwrap();
         assert_eq!(status.phase(), TaskPhase::Pending);
+        assert_eq!(status.observed_generation(), 0);
         assert_eq!(status.attempt(), 0);
         assert!(status.error().is_none());
         assert_eq!(status.reconciled().status(), ConditionStatus::Unknown);
+        assert_eq!(status.reconciled().observed_generation(), 3);
+        assert!(TaskStatus::pending(0).is_err());
     }
 
     #[test]
@@ -336,12 +417,104 @@ mod tests {
     }
 
     #[test]
+    fn status_rejects_inconsistent_phase_fields() {
+        let cases = [
+            (TaskPhase::Pending, 1, None, None),
+            (TaskPhase::Pending, 0, Some(0), None),
+            (TaskPhase::Pending, 0, None, Some("error".into())),
+            (TaskPhase::Running, 0, None, None),
+            (TaskPhase::Running, 1, Some(0), None),
+            (TaskPhase::Running, 1, None, Some("error".into())),
+        ];
+        for (phase, attempt, exit_code, error) in cases {
+            assert!(
+                TaskStatus::from_parts(
+                    1,
+                    phase,
+                    attempt,
+                    exit_code,
+                    error,
+                    vec![condition(
+                        TaskConditionType::reconciled(),
+                        ConditionStatus::True
+                    )],
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn status_enforces_reconciled_generation_contract() {
+        let reconciled = |status, observed_generation| {
+            TaskCondition::new(
+                TaskConditionType::reconciled(),
+                status,
+                observed_generation,
+                SystemTime::UNIX_EPOCH,
+                "Observed",
+                "observed state",
+            )
+            .unwrap()
+        };
+
+        assert!(
+            TaskStatus::from_parts(
+                1,
+                TaskPhase::Pending,
+                0,
+                None,
+                None,
+                vec![reconciled(ConditionStatus::Unknown, 2)],
+            )
+            .is_ok()
+        );
+        for (observed_generation, phase, condition_status, condition_generation) in [
+            (0, TaskPhase::Pending, ConditionStatus::Unknown, 0),
+            (2, TaskPhase::Pending, ConditionStatus::Unknown, 1),
+            (1, TaskPhase::Pending, ConditionStatus::True, 2),
+            (1, TaskPhase::Running, ConditionStatus::Unknown, 1),
+            (1, TaskPhase::Failed, ConditionStatus::False, 1),
+        ] {
+            assert!(
+                TaskStatus::from_parts(
+                    observed_generation,
+                    phase,
+                    if phase == TaskPhase::Running { 1 } else { 0 },
+                    None,
+                    None,
+                    vec![reconciled(condition_status, condition_generation)],
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_status_allows_an_unknown_attempt() {
+        let status = TaskStatus::from_parts(
+            1,
+            TaskPhase::Failed,
+            0,
+            None,
+            Some("submission failed before an attempt started".into()),
+            vec![condition(
+                TaskConditionType::reconciled(),
+                ConditionStatus::True,
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(status.attempt(), 0);
+    }
+
+    #[test]
     fn status_and_conditions_reject_unknown_fields() {
-        let mut status = serde_json::to_value(TaskStatus::pending()).unwrap();
+        let mut status = serde_json::to_value(TaskStatus::pending(1).unwrap()).unwrap();
         status["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<TaskStatus>(status).is_err());
 
-        let mut status = serde_json::to_value(TaskStatus::pending()).unwrap();
+        let mut status = serde_json::to_value(TaskStatus::pending(1).unwrap()).unwrap();
         status["conditions"][0]["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<TaskStatus>(status).is_err());
     }
