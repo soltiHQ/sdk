@@ -1,31 +1,57 @@
 //! # solti-runner
 //!
-//! Runner plugin interface for Solti tasks.
+//! Runner boundary for Solti workloads.
 //!
-//! This crate defines how a concrete backend turns a [`solti_model::Task`] into a [`taskvisor::TaskRef`].
+//! A runner converts a [`solti_model::Task`] into a [`taskvisor::TaskRef`].
+//! Taskvisor owns execution after that conversion.
 //!
-//! Use it when one agent binary needs one or more execution backends: subprocesses, containers, WASM modules, or your own runner.
+//! ## Start Here
 //!
-//! ## Core Model
+//! Use [`Runner`] to implement an execution backend.
+//! Use [`RunnerRouter`] to register and select backends.
+//! Use [`BuildContext`] to inject shared runner dependencies.
+//!
+//! ## Flow
 //!
 //! ```text
-//! Task
-//!   |
-//!   v
-//! RunnerRouter
-//!   |
-//!   | checks workload GVK
-//!   | checks runner labels, if the task spec has a selector
-//!   v
-//! Runner::build_task(task, RunId, BuildContext)
-//!   |
-//!   v
-//! taskvisor::TaskRef
+//! solti_model::Task
+//!         ▼
+//! RunnerRouter ── GVK + runnerSelector ──▶ Runner
+//!         │ allocates RunId                  │ builds
+//!         │                                  ▼
+//!         └────────────────────────────▶ taskvisor::TaskRef
 //! ```
 //!
-//! A [`Runner`] builds one executable task.
-//! A [`RunnerRouter`] chooses a runner for a spec.
-//! A [`BuildContext`] carries shared handles such as env, metrics, and output streaming.
+//! The router checks runners in registration order.
+//! The first matching runner is selected.
+//!
+//! [`solti_model::TaskWorkload::Embedded`] bypasses this flow.
+//! The router rejects it before runner selection.
+//!
+//! ## Registration
+//!
+//! Registration captures an immutable capability snapshot.
+//! The snapshot contains the runner name, labels, and supported workload GVKs.
+//! Routing and agent capability discovery use the same snapshot.
+//!
+//! ## Build Contract
+//!
+//! The router allocates a [`RunId`] for each build.
+//! The runner must use [`RunId::name`] as the returned `TaskRef` name.
+//! The router validates that name.
+//!
+//! Building does not start or supervise the task.
+//! The returned `TaskRef` may execute more than one attempt.
+//!
+//! ## Output and Metrics
+//!
+//! [`OutputPublisher`] creates attempt-scoped [`OutputSink`] values.
+//! Runners publish stdout and stderr chunks through those sinks.
+//! Channel ownership and subscriptions stay outside this crate.
+//!
+//! [`MetricsBackend`] records runner setup and cleanup errors.
+//! Task lifecycle metrics come from taskvisor events.
+//! [`NoOpMetrics`] is used by default.
 //!
 //! ## Main Types
 //!
@@ -41,7 +67,7 @@
 //!
 //! ## Quick Start
 //!
-//! Register a runner and let the router build the task:
+//! Register a runner and build a task:
 //!
 //! ```rust,no_run
 //! use std::sync::Arc;
@@ -68,24 +94,6 @@
 //! # Ok(task)
 //! # }
 //! ```
-//!
-//! ## Routing
-//!
-//! Runners are checked in registration order.
-//! The first runner whose GVK and labels match is used.
-//!
-//! [`solti_model::TaskWorkload::Embedded`] is not routed.
-//! Embedded tasks are already built as `TaskRef` values and should be submitted directly through `solti-core`.
-//!
-//! ## Output and Metrics
-//!
-//! [`OutputPublisher`] is the narrow producer port used to obtain an
-//! attempt-scoped [`OutputSink`]. Channel lifecycle and subscriptions belong to
-//! the composition layer, not to runners.
-//!
-//! [`MetricsBackend`] records runner-specific setup and cleanup errors.
-//! Task lifecycle metrics come from taskvisor events.
-//! The default backend is [`NoOpMetrics`]; production agents can use `solti-prometheus`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

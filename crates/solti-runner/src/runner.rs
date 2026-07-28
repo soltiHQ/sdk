@@ -1,10 +1,20 @@
 //! # Runner trait
 //!
-//! [`Runner`] is the plugin interface for task executors.
-//! Concrete runners implement this trait and are registered in a [`RunnerRouter`](crate::RunnerRouter).
+//! [`Runner`] is the plugin boundary for execution backends.
+//! Implementations are registered in [`RunnerRouter`](crate::RunnerRouter).
 //!
-//! A runner does not supervise the task.
-//! It only builds a `taskvisor::TaskRef` from a Solti [`Task`].
+//! ## Flow
+//!
+//! ```text
+//! Task + RunId + BuildContext
+//!              ▼
+//!            Runner
+//!              ▼
+//!       taskvisor::TaskRef
+//! ```
+//!
+//! The runner builds the task.
+//! Taskvisor supervises its execution.
 
 use solti_model::{Task, WorkloadTypeMeta};
 use taskvisor::TaskRef;
@@ -15,9 +25,17 @@ use crate::id::RunId;
 
 /// Plugin trait for task execution backends.
 ///
-/// A runner is responsible for:
-/// - declaring the workload GVKs it can handle;
-/// - building a concrete [`TaskRef`] that `taskvisor` can run.
+/// A runner declares a finite set of workload GVKs.
+/// It converts matching task resources into [`TaskRef`] values.
+///
+/// ## Contract
+///
+/// - [`build_task`](Self::build_task) must use the allocated [`RunId`] as the task name.
+/// - The router snapshots the name and workload GVKs during registration.
+/// - Building must not start or submit the task.
+/// - Attempt-scoped resources belong inside the task body.
+///
+/// A returned task may execute more than one attempt.
 ///
 /// ## Example
 ///
@@ -53,31 +71,32 @@ use crate::id::RunId;
 /// }
 /// ```
 ///
-/// ## Also
+/// ## See Also
 ///
-/// - [`RunnerRouter`](crate::RunnerRouter) selects a runner for a given task workload.
-/// - [`RunId`](crate::RunId) identifies the taskvisor runtime allocated by the router.
-/// - [`BuildContext`](crate::BuildContext) shared dependencies passed to [`build_task`](Self::build_task).
+/// - [`RunnerRouter`](crate::RunnerRouter)
+/// - [`BuildContext`](crate::BuildContext)
+/// - [`RunId`](crate::RunId)
 pub trait Runner: Send + Sync {
-    /// Return the runner name used in logs, metrics, and run ids.
+    /// Returns the runner name.
     ///
-    /// The name must remain stable for the lifetime of the runner.
+    /// The router validates and snapshots it during registration.
+    /// The snapshot is used for capabilities and run ids.
     fn name(&self) -> &str;
 
-    /// Return the finite set of workload GVKs handled by this runner.
+    /// Returns the workload GVKs handled by this runner.
     ///
     /// The router snapshots and validates this declaration during registration.
-    /// Routing and capability introspection use that same immutable snapshot.
-    /// Validate workload-specific desired state in
-    /// [`build_task`](Self::build_task).
+    /// Routing and capability introspection use the same snapshot.
     fn workload_types(&self) -> Vec<WorkloadTypeMeta>;
 
-    /// Build a concrete [`TaskRef`] for the given task resource.
+    /// Builds a [`TaskRef`] for a matching task resource.
     ///
-    /// [`BuildContext`] provides shared env, metrics, and output publishing.
-    /// Build may be followed by a rejected submission, and the returned task may
-    /// run more than once. Capture immutable configuration here; acquire
-    /// attempt-scoped resources, including output sinks, inside the task body.
+    /// [`BuildContext`] provides environment, metrics, and output publishing.
+    /// The returned task name must equal `run_id.name()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunnerError`] when the workload cannot be converted.
     fn build_task(
         &self,
         task: &Task,

@@ -1,15 +1,14 @@
-//! # Metrics backend trait and label types
+//! # Runner metrics
 //!
-//! [`MetricsBackend`] records runner backend errors.
-//! Concrete backends, such as `solti-prometheus`, implement this trait.
-//!
-//! See the [metrics module](super) for the convenience [`noop_metrics`](super::noop_metrics) constructor.
+//! [`MetricsBackend`] records runner setup and cleanup errors.
+//! [`RunnerType`] and [`RunnerErrorKind`] provide metric label values.
 
 use std::sync::Arc;
 
 /// Runner implementation type for metrics labeling.
 ///
-/// Passed to [`MetricsBackend`] methods so dashboards can slice metrics by runner backend.
+/// Built-in variants return fixed labels.
+/// [`Custom`](Self::Custom) returns its string unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RunnerType {
@@ -24,7 +23,7 @@ pub enum RunnerType {
 }
 
 impl RunnerType {
-    /// Return the stable label value for metrics.
+    /// Returns the metric label value.
     ///
     /// ## Example
     ///
@@ -46,7 +45,8 @@ impl RunnerType {
 
 /// Runner setup or teardown error kind for metrics labeling.
 ///
-/// Passed to [`MetricsBackend::record_runner_error`]; dashboards can use a bounded label instead of free-form error strings.
+/// Built-in variants return fixed labels.
+/// [`Custom`](Self::Custom) returns its string unchanged.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RunnerErrorKind {
@@ -63,7 +63,7 @@ pub enum RunnerErrorKind {
 }
 
 impl RunnerErrorKind {
-    /// Return the stable label value for metrics.
+    /// Returns the metric label value.
     ///
     /// ## Example
     ///
@@ -86,8 +86,16 @@ impl RunnerErrorKind {
 
 /// Backend metrics collection interface.
 ///
-/// Implementations record runner-specific setup and cleanup failures.
+/// Implementations record runner setup and cleanup failures.
 /// Task lifecycle metrics come from taskvisor events.
+///
+/// ```text
+/// runner failure
+///       ├── RunnerType
+///       └── RunnerErrorKind
+///                 ▼
+///       record_runner_error
+/// ```
 ///
 /// ## Example
 ///
@@ -111,19 +119,19 @@ impl RunnerErrorKind {
 /// assert_eq!(metrics.errors.load(Ordering::Relaxed), 1);
 /// ```
 ///
-/// ## Also
+/// ## See Also
 ///
-/// - [`NoOpMetrics`](super::NoOpMetrics): zero-size default backend.
-/// - [`crate::BuildContext::metrics`]: access the handle from within a runner.
-/// - `solti-prometheus::PrometheusRunnerMetrics` is a production Prometheus implementation.
+/// - [`NoOpMetrics`](super::NoOpMetrics)
+/// - [`crate::BuildContext::metrics`]
+/// - `solti-prometheus::PrometheusRunnerMetrics`
 pub trait MetricsBackend: Send + Sync + 'static {
-    /// Record a runner-specific error during task setup or cleanup.
+    /// Records a runner error during task setup or cleanup.
     fn record_runner_error(&self, runner_type: RunnerType, error_kind: RunnerErrorKind);
 }
 
 /// Shared handle to metrics backend.
 ///
-/// Stored in [`crate::BuildContext`] and cloned into each task.
+/// [`crate::BuildContext`] stores this handle.
 pub type MetricsHandle = Arc<dyn MetricsBackend>;
 
 #[cfg(test)]
@@ -131,29 +139,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runner_error_kind_as_label_maps_all_variants() {
-        assert_eq!(
-            RunnerErrorKind::CgroupPrepareFailed.as_label(),
-            "cgroup_prepare_failed"
-        );
-        assert_eq!(
-            RunnerErrorKind::BackendConfigFailed.as_label(),
-            "backend_config_failed"
-        );
-        assert_eq!(RunnerErrorKind::SpawnFailed.as_label(), "spawn_failed");
-        assert_eq!(
-            RunnerErrorKind::ModuleLoadFailed.as_label(),
-            "module_load_failed"
-        );
-        assert_eq!(
-            RunnerErrorKind::Custom("runtime_unavailable".into()).as_label(),
-            "runtime_unavailable"
-        );
-    }
+    fn metric_labels_are_stable_for_built_in_and_custom_variants() {
+        for (runner_type, expected) in [
+            (RunnerType::Subprocess, "subprocess"),
+            (RunnerType::Container, "container"),
+            (RunnerType::Wasm, "wasm"),
+            (RunnerType::Custom("image-resize".into()), "image-resize"),
+        ] {
+            assert_eq!(runner_type.as_label(), expected);
+        }
 
-    #[test]
-    fn custom_runner_type_preserves_label() {
-        let runner_type = RunnerType::Custom("image-resize".into());
-        assert_eq!(runner_type.as_label(), "image-resize");
+        for (error_kind, expected) in [
+            (
+                RunnerErrorKind::CgroupPrepareFailed,
+                "cgroup_prepare_failed",
+            ),
+            (
+                RunnerErrorKind::BackendConfigFailed,
+                "backend_config_failed",
+            ),
+            (RunnerErrorKind::SpawnFailed, "spawn_failed"),
+            (RunnerErrorKind::ModuleLoadFailed, "module_load_failed"),
+            (
+                RunnerErrorKind::Custom("runtime_unavailable".into()),
+                "runtime_unavailable",
+            ),
+        ] {
+            assert_eq!(error_kind.as_label(), expected);
+        }
     }
 }

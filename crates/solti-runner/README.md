@@ -1,65 +1,21 @@
 # solti-runner
 
-> Runner plugin interface for Solti tasks.
+`solti-runner` is the plugin boundary between execution backends and the supervisor.
 
-`solti-runner` sits between `solti-model` and `solti-core`.
-It does not run tasks by itself. It defines how a concrete backend, called a runner, turns a `Task` resource into a `taskvisor::TaskRef`.
+Implement `Runner` for a backend and register it in a `RunnerRouter`; the router routes each `Task` by workload GVK and optional labels, then builds a `taskvisor::TaskRef`.
+`solti-exec` implements `Runner` for subprocesses; `solti-core` consumes the router.
 
-Use it when you want one agent binary to support different execution backends: subprocesses, containers, WASM modules, or your own runner.
+The crate does not execute or supervise tasks; Taskvisor owns execution and lifecycle.
+The crate has no optional features.
 
-## The switch you stop writing
+## Quick start
 
-Without a router, each agent has to decide how to run a task:
-
-```rust,ignore
-match task.spec().workload() {
-    TaskWorkload::Subprocess(_) => build_subprocess_task(task)?,
-    TaskWorkload::Wasm(_) => build_wasm_task(task)?,
-    TaskWorkload::Container(_) => build_container_task(task)?,
-    TaskWorkload::Extension(_) => build_extension_task(task)?,
-    TaskWorkload::Embedded(_) => return Err("embedded tasks are already built"),
-}
-```
-
-With `solti-runner`, each backend implements `Runner`. The router picks the first matching runner:
-
-```rust,no_run
-use std::sync::Arc;
-use solti_runner::RunnerRouter;
-
-# use solti_runner::{BuildContext, RunId, Runner, RunnerError};
-# use solti_model::{Task, WorkloadTypeMeta, WORKLOAD_API_VERSION};
-# use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
-# struct MyRunner;
-# impl Runner for MyRunner {
-#     fn name(&self) -> &str { "my-runner" }
-#     fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-#         vec![WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").expect("built-in workload GVK")]
-#     }
-#     fn build_task(&self, _task: &Task, run_id: &RunId, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
-#         Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move { Ok::<(), TaskError>(()) }))
-#     }
-# }
-# fn wire(resource: &Task) -> Result<TaskRef, Box<dyn std::error::Error>> {
-let mut router = RunnerRouter::new();
-router.register(Arc::new(MyRunner))?;
-
-let task = router.build(resource)?;
-# Ok(task)
-# }
-```
-
-## Quick Start
-
-Implement `Runner`, register it, and ask the router to build a task:
+Implement `Runner`, register it, and build a Taskvisor task:
 
 ```rust,no_run
 use std::sync::Arc;
 
-use solti_model::{
-    Flag, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskSpec, TaskWorkload,
-    WorkloadTypeMeta, WORKLOAD_API_VERSION,
-};
+use solti_model::{Task, WorkloadTypeMeta, WORKLOAD_API_VERSION};
 use solti_runner::{BuildContext, RunId, Runner, RunnerError, RunnerRouter};
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 
@@ -89,174 +45,213 @@ impl Runner for EchoRunner {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Command {
-            command: "echo".into(),
-            args: vec!["hello".into()],
-        },
-        TaskEnv::default(),
-        None,
-        Flag::enabled(),
-    ));
-    let spec = TaskSpec::builder("hello", workload, 5_000u64).build()?;
-    let resource = Task::new("hello", spec)?;
-
+fn build(resource: &Task) -> Result<TaskRef, Box<dyn std::error::Error>> {
     let mut router = RunnerRouter::new();
     router.register(Arc::new(EchoRunner))?;
-
-    let task = router.build(&resource)?;
-    let _ = task;
-    Ok(())
+    Ok(router.build(resource)?)
 }
 ```
 
-In a real agent, `solti-exec` provides the subprocess runner. You only implement `Runner` when you build a new backend.
+The example declares the built-in `Subprocess` GVK.
+`solti-exec` provides its production implementation.
 
-## Why solti-runner?
+## What it does
 
-- **One plugin shape**: every backend implements the same `Runner` trait.
-- **Simple routing**: the first registered runner that declares the GVK is used.
-- **Label selection**: a task can ask for a runner with labels, such as `zone=eu` or `gpu=true`.
-- **Shared context**: runners receive env, metrics, and an output producer capability through `BuildContext`.
-- **Live output**: runners push stdout and stderr through attempt-scoped `OutputSink` values without gaining subscription or lifecycle control.
-- **Low-cardinality metrics**: metrics labels are enums, not free-form error strings.
+- shared environment, metrics, and output dependencies for every runner;
+- one plugin contract for built-in and application-defined backends;
+- deterministic routing by GVK, selector, and registration order;
+- validated capability metadata for control-plane discovery.
 
-## When to Use It
+## Inputs and outputs
 
-Use this crate when you write:
+| API                                   | Input                               | Output                                  |
+|---------------------------------------|-------------------------------------|-----------------------------------------|
+| `register`                            | `Arc<dyn Runner>`                   | Validated runner entry                  |
+| `register_with_labels`                | Runner and static `Labels`          | Labeled runner entry                    |
+| `pick`                                | `Task`                              | First matching `Runner`                 |
+| `build`                               | `Task`                              | `taskvisor::TaskRef`                    |
+| `capabilities`                        | Registered entries                  | Owned `AgentCapabilities` snapshot      |
+| `merge_env`                           | `TaskEnv` and `RunnerEnv`           | Sorted process environment              |
+| `OutputSink::stdout_line`             | `Bytes`                             | `OutputEvent::Chunk`                    |
+| `MetricsBackend::record_runner_error` | Runner and error labels             | Backend-specific metric update          |
 
-- a new runner backend;
-- an agent binary that registers several runners;
-- tests for routing behavior;
-- a metrics backend for task execution;
-- live-tail output support for a runner.
-
-Do not route `TaskWorkload::Embedded`. Embedded resources already come with a `TaskRef`; pass both to `SupervisorApi::create_embedded_task` or `SupervisorApi::apply_embedded_task`.
-
-## Core Model
+## Routing
 
 ```text
 Task
-  |
-  v
-RunnerRouter
-  |
-  | checks workload GVK
-  | checks runner labels, if the task spec has a selector
-  v
-Runner::build_task(task, RunId, BuildContext)
-  |
-  v
-taskvisor::TaskRef
+  │
+  ├── workload GVK ───────┐
+  └── runnerSelector ─────┤
+                          ▼
+                    RunnerRouter
+                          │ first match in registration order
+                          ▼
+        Runner::build_task(Task, RunId, BuildContext)
+                          │
+                          ▼
+                 taskvisor::TaskRef
 ```
 
-Runners are checked in registration order. If more than one runner matches, the first one wins.
-The router validates and snapshots every declaration during registration.
-`RunnerRouter::capabilities()` returns that same immutable routing metadata for discovery.
+Routing uses only workload GVK and `runnerSelector`.
+It does not inspect the workload payload.
 
-## Routing With Labels
+The router applies these rules in order:
 
-Register runners with labels:
+1. Reject `TaskWorkload::Embedded`.
+2. Keep runners that declared the exact `apiVersion` and `kind`.
+3. Apply `runnerSelector` to static runner labels when present.
+4. Select the first remaining runner in registration order.
 
-```rust,no_run
-use std::sync::Arc;
-use solti_model::Labels;
-use solti_runner::RunnerRouter;
+| Workload variation | Routing behavior                                         |
+|--------------------|----------------------------------------------------------|
+| Built-in workload  | A runner declares its built-in GVK                       |
+| Custom workload    | An `ExtensionWorkload` and runner share a custom GVK     |
+| Alternate backend  | Several runners share a GVK and labels select one        |
+| Embedded workload  | Bypasses the router because its `TaskRef` already exists |
 
-# use solti_runner::{BuildContext, RunId, RouterError, Runner, RunnerError};
-# use solti_model::{Task, WorkloadTypeMeta};
-# use taskvisor::TaskRef;
-# struct MyRunner;
-# impl Runner for MyRunner {
-#     fn name(&self) -> &str { "gpu-runner" }
-#     fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-#         vec![WorkloadTypeMeta::new(solti_model::WORKLOAD_API_VERSION, "Subprocess").expect("built-in workload GVK")]
-#     }
-#     fn build_task(&self, _task: &Task, _run_id: &RunId, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> { todo!() }
-# }
-let mut labels = Labels::new();
-labels.insert("gpu", "true");
+## Registration and capabilities
 
-let mut router = RunnerRouter::new();
-router.register_with_labels(Arc::new(MyRunner), labels)?;
-# Ok::<(), RouterError>(())
-```
+Registration validates and snapshots the runner declaration.
 
-If a task spec has a `LabelSelector`, the router only keeps runners whose labels match that selector.
+- Runner names are unique.
+- Runner names use Kubernetes label-value rules.
+- Static labels use Kubernetes label rules.
+- At least one workload GVK is required.
+- Duplicate workload GVKs are rejected.
+- The built-in `Embedded` GVK is rejected.
 
-## Output Streaming
+`RunnerRouter::capabilities()` returns an owned snapshot.
+Runner entries remain in routing priority order.
+Workload GVKs inside each entry use canonical order.
 
-`OutputPublisher` is the runner-facing producer port. A runner obtains an
-`OutputSink` inside each attempt and pushes lines into it:
+## Build contract
+
+`RunnerRouter::build` allocates a `RunId`.
+Its format is `{runner}-{slot}-{seq}`.
+The sequence comes from one process-global counter initialized to `1`.
+
+The router passes the resource, run ID, and `BuildContext` to `Runner::build_task`.
+The returned `TaskRef` must use the allocated run ID as its name.
+A mismatch returns `RouterError::RunIdMismatch`.
+
+`build_task` constructs a task but does not start it.
+Submission can still be rejected after construction.
+A returned task can run more than once under its Taskvisor restart policy.
+Attempt-scoped resources belong inside the task body.
+
+## Build context
+
+| Value              | Default                   | Replacement API                         |
+|--------------------|---------------------------|-----------------------------------------|
+| `RunnerEnv`        | Empty                     | `with_env`                              |
+| `MetricsHandle`    | `NoOpMetrics`             | `with_metrics`                          |
+| Output publisher   | Output disabled           | `with_output_publisher`                 |
+
+`RunnerRouter::with_context` installs one context for all registered runners.
+`RunnerRouter::with_output_publisher` replaces only the output producer.
+
+## Environment
+
+`merge_env` produces a `BTreeMap<String, String>`:
 
 ```rust
-use bytes::Bytes;
-use solti_model::TaskId;
-use solti_runner::BuildContext;
+use solti_model::TaskEnv;
+use solti_runner::{RunnerEnv, merge_env};
 
-let context = BuildContext::default();
-let task_id = TaskId::new("task-1").unwrap();
+let mut task = TaskEnv::new();
+task.push("PATH", "/task/bin");
+task.push("TASK_ONLY", "yes");
 
-if let Some(sink) = context.output_publisher().sink_for(&task_id, 1, 1) {
-    sink.stdout_line(Bytes::from_static(b"hello"));
-}
+let mut runner = RunnerEnv::new();
+runner.push("PATH", "/runner/bin");
+
+let merged = merge_env(&task, &runner);
+assert_eq!(merged["PATH"], "/runner/bin");
+assert_eq!(merged["TASK_ONLY"], "yes");
 ```
 
-`BuildContext::default()` uses a no-op publisher. `solti-core` replaces it with
-its private live-output hub when constructing `SupervisorApi`. A custom
-standalone composition can inject its own `OutputPublisher` with
-`BuildContext::with_output_publisher()`.
+Runner values override task values.
+Within each input, the last value for a key wins.
+The returned map is sorted by key.
 
-The producer call is synchronous and must remain non-blocking. The standard core
-implementation is lossy: slow consumers do not block runner execution.
+## Output
+
+```text
+runner attempt
+      │
+      ▼
+OutputPublisher::sink_for(task, generation, attempt)
+      │
+      ├── None ──► output disabled
+      └── OutputSink ──► stdout / stderr chunks ──► composition layer
+```
+
+`OutputSink` is a write-only producer:
+
+```rust
+use std::sync::mpsc;
+
+use bytes::Bytes;
+use solti_model::OutputEvent;
+use solti_runner::OutputSink;
+
+let (sender, receiver) = mpsc::channel();
+let sink = OutputSink::new(4, 2, move |event| {
+    sender.send(event).unwrap();
+});
+
+sink.stdout_line(Bytes::from_static(b"ready"));
+assert!(matches!(receiver.recv().unwrap(), OutputEvent::Chunk(_)));
+```
+
+- A sink belongs to one generation and attempt.
+- Stdout and stderr have independent sequences starting at `0`.
+- Clones share both sequence counters.
+- `Bytes` payloads are forwarded without conversion.
+- Publishing is synchronous.
+- The callback must not block runner execution.
+- Runners cannot subscribe to output or publish lifecycle markers.
 
 ## Metrics
 
-Runners record backend-specific failures through a `MetricsBackend`:
+Runners report backend setup and cleanup failures:
 
 ```rust
 use solti_runner::{RunnerErrorKind, RunnerType, noop_metrics};
 
 let metrics = noop_metrics();
-metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+metrics.record_runner_error(
+    RunnerType::Subprocess,
+    RunnerErrorKind::SpawnFailed,
+);
 ```
 
-The default backend is `NoOpMetrics`. Production agents can use `solti-prometheus`.
+`NoOpMetrics` is the default backend.
+`solti-prometheus` provides a Prometheus implementation.
+Task lifecycle metrics come from Taskvisor events.
 
-## Main Types
+Built-in metric variants use stable labels.
+`Custom` variants use the application-provided string unchanged.
+The application controls cardinality for custom labels.
 
-| Area          | Types                                            |
-|---------------|--------------------------------------------------|
-| Runner plugin | `Runner`, `RunnerRouter`                         |
-| Build data    | `BuildContext`                                   |
-| Output        | `OutputPublisher`, `OutputPublisherHandle`, `OutputSink` |
-| Run identity  | `RunId`, `make_run_id`                           |
-| Metrics       | `MetricsBackend`, `MetricsHandle`, `NoOpMetrics` |
-| Metric labels | `RunnerType`, `RunnerErrorKind`                  |
-| Errors        | `RouterError`, `RunnerError`                     |
+## Errors
 
-## Error Handling
+`RouterError` describes registration, selection, and construction failures:
 
-`RouterError` covers registration, routing, and runner invocation failures:
+| Variant             | Cause                                          |
+|---------------------|------------------------------------------------|
+| `DuplicateRunner`   | Runner name already registered                 |
+| `InvalidLabels`     | Static labels failed model validation          |
+| `InvalidCapability` | Runner name or workload declaration invalid    |
+| `EmbeddedWorkload`  | Embedded workload sent to the router           |
+| `NoRunner`          | No runner matched the GVK and selector         |
+| `Build`             | Selected runner returned `RunnerError`         |
+| `RunIdMismatch`     | Returned task used a different name            |
 
-| Variant            | Meaning                               |
-|--------------------|---------------------------------------|
-| `DuplicateRunner`  | Runner name is already registered     |
-| `InvalidLabels`    | Runner labels are invalid             |
-| `InvalidCapability`| Runner name or GVK declaration is invalid |
-| `EmbeddedWorkload` | Embedded workloads are not routed     |
-| `NoRunner`         | No runner matched the GVK and selector|
-| `Build`            | The selected runner failed            |
-| `RunIdMismatch`    | The returned task ignored its run id  |
+`RunnerError` is returned by a concrete runner:
 
-`RunnerError` covers workload validation and runner build failures.
-
-The enum is `#[non_exhaustive]`. Match it with a wildcard arm.
-
-## Notes
-
-- `RunId` is `{runner}-{slot}-{seq}`.
-- The `seq` is process-global and starts at `1`.
-- `OutputSink` sequence counters are attempt-scoped and independent for stdout and stderr.
-- `BuildContext::default()` uses empty env, `NoOpMetrics`, and a no-op output publisher.
+| Variant               | Cause                                      |
+|-----------------------|--------------------------------------------|
+| `UnsupportedWorkload` | Runner received an unsupported GVK         |
+| `InvalidSpec`         | Workload desired state is invalid          |
+| `Internal`            | Runner could not construct the task        |

@@ -1,16 +1,20 @@
 //! # Metrics collection
 //!
-//! Provides the [`MetricsBackend`] trait and a no-op default.
-//! Concrete backends, such as `solti-prometheus`, implement this trait.
+//! [`MetricsBackend`] is the runner metrics port.
+//! Runners record setup and cleanup failures through this port.
 //!
-//! ## Contents
+//! ## Flow
 //!
-//! - [`RunnerErrorKind`]: metric label enum: `CgroupPrepareFailed`, `BackendConfigFailed`, `SpawnFailed`, `ModuleLoadFailed`.
-//! - [`MetricsBackend`]: runner-specific error metrics.
-//! - [`MetricsHandle`]: `Arc<dyn MetricsBackend>`, cloneable shared handle.
-//! - [`RunnerType`]: built-in and application-defined runner labels.
-//! - [`noop_metrics`]: convenience constructor for `Arc<NoOpMetrics>`.
-//! - [`NoOpMetrics`]: zero-size backend that discards all records.
+//! ```text
+//! Runner
+//!    └── RunnerType + RunnerErrorKind
+//!                       ▼
+//!                MetricsBackend
+//! ```
+//!
+//! Task lifecycle metrics come from taskvisor events.
+//! [`NoOpMetrics`] is the default runner backend.
+//! `solti-prometheus` provides a Prometheus implementation.
 mod backend;
 pub use backend::{MetricsBackend, MetricsHandle, RunnerErrorKind, RunnerType};
 
@@ -19,7 +23,7 @@ pub use noop::NoOpMetrics;
 
 use std::sync::Arc;
 
-/// Create a no-op metrics handle.
+/// Creates a shared no-op metrics handle.
 ///
 /// ## Example
 ///

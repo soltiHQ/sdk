@@ -1,27 +1,30 @@
 [package]
 name = "solti-runner"
-description = "Runner plugin trait, routing, and execution metrics for the Solti task SDK."
+
+description   = "Runner plugin trait, routing, and execution metrics for the Solti task SDK."
+keywords      = ["runner", "plugin", "tasks", "async", "executor"]
+categories    = ["asynchronous", "concurrency"]
+documentation = "https://docs.rs/solti-runner"
+readme        = "README.md"
 
 rust-version.workspace = true
-repository.workspace = true
-categories = ["asynchronous", "concurrency"]
-homepage.workspace = true
-keywords = ["runner", "plugin", "tasks", "async", "executor"]
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+repository.workspace   = true
+homepage.workspace     = true
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
 
 [features]
 default = []
 
 [dependencies]
-bytes       = { workspace = true }
-serde       = { workspace = true }
-taskvisor   = { workspace = true }
-thiserror   = { workspace = true }
-tracing     = { workspace = true }
-
 solti-model = { workspace = true }
+
+bytes     = { workspace = true }
+serde     = { workspace = true }
+taskvisor = { workspace = true }
+thiserror = { workspace = true }
+tracing   = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -1,9 +1,22 @@
-//! Attempt-scoped task output producer capabilities.
+//! # Runner output
 //!
-//! Runners only produce stdout/stderr chunks. They do not own task output
-//! channels, subscriptions, run markers, or terminal cleanup. A composition
-//! layer injects an [`OutputPublisher`] through [`BuildContext`](crate::BuildContext),
-//! and each runner attempt obtains an [`OutputSink`] from that publisher.
+//! Runners publish stdout and stderr chunks.
+//! They do not own channels, subscriptions, or lifecycle events.
+//!
+//! ## Flow
+//!
+//! ```text
+//! BuildContext
+//!      ▼
+//! OutputPublisher ── task + generation + attempt ──▶ OutputSink
+//!                                                    │
+//!                                              stdout/stderr bytes
+//!                                                    ▼
+//!                                              OutputEvent::Chunk
+//! ```
+//!
+//! The composition layer provides [`OutputPublisher`].
+//! Runners request [`OutputSink`] values by task, generation, and attempt.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,19 +27,21 @@ use solti_model::{OutputChunk, OutputEvent, StreamKind, TaskId};
 
 /// Producer capability used by runners to obtain an attempt-scoped output sink.
 ///
-/// Implementations decide whether output is available for a task. Returning
-/// `None` disables live output for that attempt without affecting task
-/// execution. The trait intentionally exposes no subscription or lifecycle
-/// operations.
+/// Implementations decide whether output is enabled for an attempt.
+/// Returning `None` disables output without changing task execution.
+///
+/// This interface has no subscription or lifecycle operations.
 pub trait OutputPublisher: Send + Sync {
-    /// Return a sink for one task attempt, or `None` when output is disabled.
+    /// Returns a sink for one task attempt.
+    ///
+    /// Returns `None` when output is disabled.
     fn sink_for(&self, task_name: &TaskId, generation: u64, attempt: u32) -> Option<OutputSink>;
 }
 
 /// Shared output producer capability injected into runners.
 pub type OutputPublisherHandle = Arc<dyn OutputPublisher>;
 
-/// Return an output publisher that disables live output.
+/// Returns an output publisher that disables live output.
 pub fn noop_output_publisher() -> OutputPublisherHandle {
     Arc::new(NoOpOutputPublisher)
 }
@@ -42,10 +57,39 @@ impl OutputPublisher for NoOpOutputPublisher {
 
 /// Write-only output sink for one task attempt.
 ///
-/// The sink creates [`OutputEvent::Chunk`] values, assigns independent
-/// monotonic sequence numbers to stdout and stderr, and forwards each event to
-/// the callback supplied by the publisher implementation. Clones share the
-/// same per-stream counters.
+/// Each write creates [`OutputEvent::Chunk`].
+/// The chunk uses the sink generation and attempt.
+/// Its timestamp comes from [`SystemTime::now`].
+///
+/// Stdout and stderr have independent sequence counters.
+/// Both counters start at `0` and wrap on `u64` overflow.
+/// Cloned sinks share those counters.
+///
+/// The callback runs synchronously in the caller.
+/// It must not block runner execution.
+///
+/// ## Example
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use bytes::Bytes;
+/// use solti_model::OutputEvent;
+/// use solti_runner::OutputSink;
+///
+/// let events = Arc::new(Mutex::new(Vec::new()));
+/// let captured = Arc::clone(&events);
+/// let sink = OutputSink::new(4, 2, move |event| {
+///     captured.lock().unwrap().push(event);
+/// });
+///
+/// sink.stdout_line(Bytes::from_static(b"ready"));
+///
+/// assert!(matches!(
+///     &events.lock().unwrap()[0],
+///     OutputEvent::Chunk(_)
+/// ));
+/// ```
 #[derive(Clone)]
 pub struct OutputSink {
     generation: u64,
@@ -56,11 +100,10 @@ pub struct OutputSink {
 }
 
 impl OutputSink {
-    /// Build a sink for `attempt` using a synchronous event callback.
+    /// Creates a sink with a synchronous event callback.
     ///
     /// This constructor is intended for [`OutputPublisher`] implementations.
-    /// The callback must not block runner execution; live-output transports are
-    /// expected to be lossy or otherwise non-blocking.
+    /// The callback must not block runner execution.
     pub fn new<F>(generation: u64, attempt: u32, publish: F) -> Self
     where
         F: Fn(OutputEvent) + Send + Sync + 'static,
@@ -74,24 +117,24 @@ impl OutputSink {
         }
     }
 
-    /// Push one stdout line.
+    /// Publishes one stdout chunk.
     pub fn stdout_line(&self, line: Bytes) {
         let seq = self.seq_stdout.fetch_add(1, Ordering::Relaxed);
         self.push(StreamKind::Stdout, seq, line);
     }
 
-    /// Push one stderr line.
+    /// Publishes one stderr chunk.
     pub fn stderr_line(&self, line: Bytes) {
         let seq = self.seq_stderr.fetch_add(1, Ordering::Relaxed);
         self.push(StreamKind::Stderr, seq, line);
     }
 
-    /// Return the run attempt this sink belongs to.
+    /// Returns the attempt number.
     pub fn attempt(&self) -> u32 {
         self.attempt
     }
 
-    /// Return the desired-state generation this sink belongs to.
+    /// Returns the desired-state generation.
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -127,73 +170,42 @@ mod tests {
     }
 
     #[test]
-    fn sink_publishes_stdout_and_stderr_chunks() {
+    fn sink_emits_attempt_chunks_with_shared_per_stream_sequences() {
         let (sink, events) = recording_sink(2, 3);
-
-        sink.stdout_line(Bytes::from_static(b"hello"));
-        sink.stderr_line(Bytes::from_static(b"oops"));
-
-        let events = events.lock().unwrap();
-        let OutputEvent::Chunk(stdout) = &events[0] else {
-            panic!("expected stdout chunk");
-        };
-        assert_eq!(stdout.attempt, 3);
-        assert_eq!(stdout.generation, 2);
-        assert_eq!(stdout.stream, StreamKind::Stdout);
-        assert_eq!(stdout.seq, 0);
-        assert_eq!(&stdout.line[..], b"hello");
-
-        let OutputEvent::Chunk(stderr) = &events[1] else {
-            panic!("expected stderr chunk");
-        };
-        assert_eq!(stderr.attempt, 3);
-        assert_eq!(stderr.stream, StreamKind::Stderr);
-        assert_eq!(stderr.seq, 0);
-        assert_eq!(&stderr.line[..], b"oops");
-    }
-
-    #[test]
-    fn sink_clones_share_monotonic_counters_per_stream() {
-        let (sink, events) = recording_sink(1, 1);
         let clone = sink.clone();
+        let first = Bytes::from_static(b"hello");
+        let first_pointer = first.as_ptr();
 
-        sink.stdout_line(Bytes::from_static(b"a"));
-        clone.stdout_line(Bytes::from_static(b"b"));
-        clone.stderr_line(Bytes::from_static(b"c"));
-        sink.stderr_line(Bytes::from_static(b"d"));
+        sink.stdout_line(first);
+        clone.stdout_line(Bytes::from_static(b"again"));
+        clone.stderr_line(Bytes::from_static(b"oops"));
+        sink.stderr_line(Bytes::from_static(b"retry"));
 
         let events = events.lock().unwrap();
         let chunks = events
             .iter()
             .map(|event| match event {
-                OutputEvent::Chunk(chunk) => (chunk.stream, chunk.seq),
+                OutputEvent::Chunk(chunk) => {
+                    assert_eq!(chunk.generation, 2);
+                    assert_eq!(chunk.attempt, 3);
+                    (chunk.stream, chunk.seq, chunk.line.as_ref())
+                }
                 other => panic!("expected chunk, got {other:?}"),
             })
             .collect::<Vec<_>>();
         assert_eq!(
             chunks,
             vec![
-                (StreamKind::Stdout, 0),
-                (StreamKind::Stdout, 1),
-                (StreamKind::Stderr, 0),
-                (StreamKind::Stderr, 1),
+                (StreamKind::Stdout, 0, b"hello".as_slice()),
+                (StreamKind::Stdout, 1, b"again".as_slice()),
+                (StreamKind::Stderr, 0, b"oops".as_slice()),
+                (StreamKind::Stderr, 1, b"retry".as_slice()),
             ]
         );
-    }
-
-    #[test]
-    fn sink_forwards_bytes_without_copying_the_payload() {
-        let (sink, events) = recording_sink(1, 1);
-        let payload = Bytes::from_static(b"shared");
-        let pointer = payload.as_ptr();
-
-        sink.stdout_line(payload);
-
-        let events = events.lock().unwrap();
-        let OutputEvent::Chunk(chunk) = &events[0] else {
+        let OutputEvent::Chunk(first_chunk) = &events[0] else {
             panic!("expected chunk");
         };
-        assert_eq!(chunk.line.as_ptr(), pointer);
+        assert_eq!(first_chunk.line.as_ptr(), first_pointer);
     }
 
     #[test]

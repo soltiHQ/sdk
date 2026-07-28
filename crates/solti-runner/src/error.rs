@@ -1,4 +1,7 @@
 //! # Runner and router errors
+//!
+//! [`RunnerError`] belongs to one runner implementation.
+//! [`RouterError`] belongs to registration, selection, and task construction.
 
 use solti_model::ModelError;
 use thiserror::Error;
@@ -28,6 +31,9 @@ pub enum RunnerError {
 }
 
 /// Error returned by [`RunnerRouter`](crate::RunnerRouter).
+///
+/// Registration errors preserve the rejected runner name.
+/// Build errors preserve the selected runner error as their source.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RouterError {

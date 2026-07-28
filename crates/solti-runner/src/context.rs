@@ -1,9 +1,16 @@
 //! # Build context
 //!
-//! [`BuildContext`] carries shared dependencies injected into runners at
-//! task-build time.
+//! [`BuildContext`] carries dependencies shared by registered runners.
 //!
-//! See [`Runner::build_task`](crate::Runner::build_task) for usage.
+//! ## Flow
+//!
+//! ```text
+//! RunnerRouter
+//!      └── BuildContext ──▶ Runner::build_task
+//!               ├── environment
+//!               ├── metrics
+//!               └── output publisher
+//! ```
 
 use std::fmt;
 
@@ -11,25 +18,18 @@ use crate::RunnerEnv;
 use crate::metrics::MetricsHandle;
 use crate::output::{OutputPublisherHandle, noop_output_publisher};
 
-/// Shared build context passed to all runners.
+/// Dependencies passed to [`Runner::build_task`](crate::Runner::build_task).
 ///
-/// It carries:
-/// - a metrics handle,
-/// - runner environment variables,
-/// - an output producer capability for live stdout/stderr streaming.
-///
-/// Create it once at router setup time and pass it to [`RunnerRouter::with_context`](crate::RunnerRouter::with_context).
+/// Create the context when the router is assembled.
+/// [`RunnerRouter::with_context`](crate::RunnerRouter::with_context) installs it.
 ///
 /// ## Defaults
 ///
-/// - `env`: empty [`RunnerEnv`]
-/// - `metrics`: [`NoOpMetrics`](crate::NoOpMetrics)
-/// - `output_publisher`: a no-op publisher (live output disabled)
-///
-/// ## Also
-///
-/// - [`RunnerRouter::with_context`](crate::RunnerRouter::with_context) sets the context for all runners.
-/// - [`MetricsHandle`](crate::MetricsHandle) - `Arc<dyn MetricsBackend>`.
+/// | Dependency         | Default                              |
+/// |--------------------|--------------------------------------|
+/// | Environment        | Empty [`RunnerEnv`]                  |
+/// | Metrics            | [`NoOpMetrics`](crate::NoOpMetrics)  |
+/// | Output publisher   | No-op publisher                      |
 ///
 /// ## Example
 ///
@@ -42,6 +42,12 @@ use crate::output::{OutputPublisherHandle, noop_output_publisher};
 /// let ctx = BuildContext::new(env, noop_metrics());
 /// assert_eq!(ctx.env().get("PATH"), Some("/usr/bin"));
 /// ```
+///
+/// ## See Also
+///
+/// - [`RunnerRouter::with_context`](crate::RunnerRouter::with_context)
+/// - [`MetricsHandle`](crate::MetricsHandle)
+/// - [`OutputPublisherHandle`](crate::OutputPublisherHandle)
 #[derive(Clone)]
 pub struct BuildContext {
     output_publisher: OutputPublisherHandle,
@@ -50,18 +56,9 @@ pub struct BuildContext {
 }
 
 impl BuildContext {
-    /// Create a new build context with the given env and metrics.
+    /// Creates a context with the given environment and metrics.
     ///
-    /// Starts with a no-op output publisher.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_runner::{BuildContext, RunnerEnv, noop_metrics};
-    ///
-    /// let ctx = BuildContext::new(RunnerEnv::new(), noop_metrics());
-    /// assert_eq!(ctx.env().len(), 0);
-    /// ```
+    /// Output publishing is disabled until replaced.
     pub fn new(env: RunnerEnv, metrics: MetricsHandle) -> Self {
         Self {
             env,
@@ -70,88 +67,34 @@ impl BuildContext {
         }
     }
 
-    /// Get a reference to the shared environment.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// let ctx = solti_runner::BuildContext::default();
-    /// assert_eq!(ctx.env().len(), 0);
-    /// ```
+    /// Returns the shared runner environment.
     pub fn env(&self) -> &RunnerEnv {
         &self.env
     }
 
-    /// Get a clonable handle to the metrics backend.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_runner::{BuildContext, RunnerErrorKind, RunnerType};
-    ///
-    /// let ctx = BuildContext::default();
-    /// ctx.metrics().record_runner_error(
-    ///     RunnerType::Subprocess,
-    ///     RunnerErrorKind::SpawnFailed,
-    /// );
-    /// ```
+    /// Returns the shared metrics handle.
     pub fn metrics(&self) -> &MetricsHandle {
         &self.metrics
     }
 
-    /// Get the output producer capability injected into runners.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_runner::BuildContext;
-    ///
-    /// let ctx = BuildContext::default();
-    /// assert!(ctx.output_publisher()
-    ///     .sink_for(&solti_model::TaskId::new("task-1").unwrap(), 1, 1)
-    ///     .is_none());
-    /// ```
+    /// Returns the shared output publisher.
     pub fn output_publisher(&self) -> &OutputPublisherHandle {
         &self.output_publisher
     }
 
-    /// Replace the environment and return updated context.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_runner::{BuildContext, RunnerEnv};
-    ///
-    /// let mut env = RunnerEnv::new();
-    /// env.push("FOO", "bar");
-    ///
-    /// let ctx = BuildContext::default().with_env(env);
-    /// assert_eq!(ctx.env().get("FOO"), Some("bar"));
-    /// ```
+    /// Replaces the environment.
     pub fn with_env(mut self, env: RunnerEnv) -> Self {
         self.env = env;
         self
     }
 
-    /// Replace the metrics backend and return updated context.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use solti_runner::{BuildContext, RunnerErrorKind, RunnerType, noop_metrics};
-    ///
-    /// let ctx = BuildContext::default().with_metrics(noop_metrics());
-    /// ctx.metrics().record_runner_error(
-    ///     RunnerType::Subprocess,
-    ///     RunnerErrorKind::SpawnFailed,
-    /// );
-    /// ```
+    /// Replaces the metrics backend.
     pub fn with_metrics(mut self, metrics: MetricsHandle) -> Self {
         self.metrics = metrics;
         self
     }
 
-    /// Replace the output producer capability and return updated context.
+    /// Replaces the output publisher.
     pub fn with_output_publisher(mut self, publisher: OutputPublisherHandle) -> Self {
         self.output_publisher = publisher;
         self
@@ -179,14 +122,29 @@ impl fmt::Debug for BuildContext {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use super::BuildContext;
-    use crate::{OutputPublisher, OutputPublisherHandle, OutputSink};
+    use crate::{
+        MetricsBackend, MetricsHandle, OutputPublisher, OutputPublisherHandle, OutputSink,
+        RunnerEnv, RunnerErrorKind, RunnerType,
+    };
 
     use solti_model::TaskId;
 
-    use crate::RunnerEnv;
+    #[derive(Default)]
+    struct TestMetrics {
+        calls: AtomicUsize,
+    }
+
+    impl MetricsBackend for TestMetrics {
+        fn record_runner_error(&self, _runner_type: RunnerType, _error_kind: RunnerErrorKind) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     struct TestPublisher;
 
@@ -202,68 +160,9 @@ mod tests {
     }
 
     #[test]
-    fn default_build_context_has_empty_env_and_noop_metrics() {
+    fn default_context_has_empty_env_and_disables_output() {
         let ctx = BuildContext::default();
-        assert_eq!(ctx.env().len(), 0);
-    }
-
-    #[test]
-    fn new_uses_provided_env_and_metrics() {
-        let mut env = RunnerEnv::new();
-        env.push("FOO", "bar");
-        env.push("BAZ", "qux");
-
-        let metrics = crate::metrics::noop_metrics();
-        let ctx = BuildContext::new(env.clone(), metrics);
-
-        assert_eq!(ctx.env().len(), env.len());
-        assert_eq!(ctx.env().get("FOO"), Some("bar"));
-        assert_eq!(ctx.env().get("BAZ"), Some("qux"));
-    }
-
-    #[test]
-    fn with_env_replaces_existing_env() {
-        let mut env1 = RunnerEnv::new();
-        env1.push("FOO", "one");
-
-        let mut env2 = RunnerEnv::new();
-        env2.push("BAR", "two");
-
-        let metrics = crate::metrics::noop_metrics();
-        let ctx = BuildContext::new(env1, metrics).with_env(env2.clone());
-
-        assert_eq!(ctx.env().len(), env2.len());
-        assert!(ctx.env().get("FOO").is_none());
-        assert_eq!(ctx.env().get("BAR"), Some("two"));
-    }
-
-    #[test]
-    fn with_metrics_replaces_backend() {
-        let env = RunnerEnv::new();
-        let metrics1 = crate::metrics::noop_metrics();
-        let metrics2 = crate::metrics::noop_metrics();
-
-        let ctx = BuildContext::new(env, metrics1).with_metrics(metrics2);
-
-        ctx.metrics().record_runner_error(
-            crate::RunnerType::Subprocess,
-            crate::RunnerErrorKind::SpawnFailed,
-        );
-    }
-
-    #[test]
-    fn metrics_handle_can_be_cloned() {
-        let ctx = BuildContext::default();
-        let handle = ctx.metrics().clone();
-
-        handle.record_runner_error(
-            crate::RunnerType::Subprocess,
-            crate::RunnerErrorKind::SpawnFailed,
-        );
-    }
-    #[test]
-    fn default_build_context_disables_output() {
-        let ctx = BuildContext::default();
+        assert!(ctx.env().is_empty());
         assert!(
             ctx.output_publisher()
                 .sink_for(&TaskId::new("task").unwrap(), 1, 1)
@@ -272,24 +171,45 @@ mod tests {
     }
 
     #[test]
-    fn with_output_publisher_replaces_publisher() {
+    fn constructor_and_builders_replace_env_and_metrics() {
+        let mut initial_env = RunnerEnv::new();
+        initial_env.push("FOO", "one");
+        let initial_metrics = Arc::new(TestMetrics::default());
+        let initial_handle: MetricsHandle = initial_metrics.clone();
+        let ctx = BuildContext::new(initial_env, initial_handle);
+
+        ctx.metrics()
+            .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+        assert_eq!(initial_metrics.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(ctx.env().get("FOO"), Some("one"));
+
+        let mut replacement_env = RunnerEnv::new();
+        replacement_env.push("BAR", "two");
+        let replacement_metrics = Arc::new(TestMetrics::default());
+        let replacement_handle: MetricsHandle = replacement_metrics.clone();
+        let ctx = ctx
+            .with_env(replacement_env)
+            .with_metrics(replacement_handle);
+
+        ctx.metrics()
+            .record_runner_error(RunnerType::Wasm, RunnerErrorKind::ModuleLoadFailed);
+        assert_eq!(initial_metrics.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(replacement_metrics.calls.load(Ordering::Relaxed), 1);
+        assert!(ctx.env().get("FOO").is_none());
+        assert_eq!(ctx.env().get("BAR"), Some("two"));
+    }
+
+    #[test]
+    fn output_publisher_builder_exposes_attempt_sink() {
         let publisher: OutputPublisherHandle = Arc::new(TestPublisher);
         let ctx = BuildContext::default().with_output_publisher(Arc::clone(&publisher));
+        let sink = ctx
+            .output_publisher()
+            .sink_for(&TaskId::new("task").unwrap(), 3, 7)
+            .expect("enabled sink");
 
         assert!(Arc::ptr_eq(ctx.output_publisher(), &publisher));
-        assert_eq!(
-            ctx.output_publisher()
-                .sink_for(&TaskId::new("task").unwrap(), 3, 7)
-                .expect("enabled sink")
-                .attempt(),
-            7
-        );
-        assert_eq!(
-            ctx.output_publisher()
-                .sink_for(&TaskId::new("task").unwrap(), 3, 7)
-                .expect("enabled sink")
-                .generation(),
-            3
-        );
+        assert_eq!(sink.attempt(), 7);
+        assert_eq!(sink.generation(), 3);
     }
 }

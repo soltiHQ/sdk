@@ -1,26 +1,51 @@
-//! # Run identifier generation
+//! # Run identity
 //!
-//! [`RunId`] is the per-execution task name for taskvisor.
+//! [`RunId`] names one `TaskRef` built by a runner.
+//! It does not identify an individual execution attempt.
 //!
-//! It is formatted as `{runner}-{slot}-{seq}` and is unique per call.
-//! The sequence is a process-global counter.
+//! ## Flow
 //!
-//! A `RunId` is not the admission slot. The slot is stable.
-//! The run id names one concrete run instance.
+//! ```text
+//! runner + slot + process sequence
+//!               ▼
+//!       runner-slot-sequence
+//!               ▼
+//!        taskvisor TaskRef
+//! ```
+//!
+//! The slot comes from task desired state.
+//! The process sequence distinguishes separate allocations.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Global monotonically increasing sequence for run identifiers.
+/// Process-local sequence for run identifiers.
 ///
-/// Local to the current agent process.
+/// The first returned value is `1`.
+/// Atomic addition wraps on overflow.
 static RUN_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// Returns next numeric sequence value.
+/// Returns the next process-local sequence value.
 fn next_seq() -> u64 {
     RUN_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Result of [`make_run_id`]: a human-readable run id and the raw sequence number.
+/// Name allocated for one runner-built `TaskRef`.
+///
+/// The format is `{runner}-{slot}-{sequence}`.
+/// The sequence is local to the current process.
+/// It starts at `1` and wraps on `u64` overflow.
+///
+/// The allocator does not persist its counter across process restarts.
+/// It is unique within one process only until the sequence wraps.
+///
+/// ## Example
+///
+/// ```
+/// let id = solti_runner::make_run_id("subprocess", "slot-a");
+///
+/// assert!(id.name().starts_with("subprocess-slot-a-"));
+/// assert!(id.seq() >= 1);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunId {
     name: String,
@@ -28,57 +53,29 @@ pub struct RunId {
 }
 
 impl RunId {
-    /// Per-execution task name for taskvisor.
-    ///
-    /// Format: `{runner}-{slot}-{seq}`, unique per submission.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// let id = solti_runner::make_run_id("subprocess", "slot-a");
-    /// assert!(id.name().starts_with("subprocess-slot-a-"));
-    /// ```
+    /// Returns the allocated `TaskRef` name.
     #[inline]
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Raw sequence number (monotonically increasing per process).
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// let id = solti_runner::make_run_id("subprocess", "slot-a");
-    /// assert!(id.seq() >= 1);
-    /// ```
+    /// Returns the raw process-local sequence value.
     #[inline]
     pub fn seq(&self) -> u64 {
         self.seq
     }
 
-    /// Consume and return the name as an owned `String`.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// let id = solti_runner::make_run_id("subprocess", "slot-a");
-    /// let name = id.into_name();
-    ///
-    /// assert!(name.starts_with("subprocess-slot-a-"));
-    /// ```
+    /// Consumes the id and returns its name.
     #[inline]
     pub fn into_name(self) -> String {
         self.name
     }
 }
 
-/// Build the per-execution run id.
+/// Builds a run id from a runner name and task slot.
 ///
-/// The taskvisor task name is `{runner}-{slot}-{seq}` and unique per call.
-///
-/// - `runner` - runner name.
-/// - `slot` - logical task slot.
-/// - `seq` - per-process counter.
+/// This function joins both values with the next process sequence.
+/// It does not validate either input.
 ///
 /// ## Example
 ///
@@ -87,7 +84,7 @@ impl RunId {
 ///
 /// let id = make_run_id("subprocess", "my-slot");
 /// assert!(id.name().starts_with("subprocess-my-slot-"));
-/// assert!(id.seq() >= 1); // process-global counter starts at 1
+/// assert!(id.seq() >= 1);
 /// ```
 pub fn make_run_id(runner_name: &str, slot: &str) -> RunId {
     let seq = next_seq();
@@ -100,8 +97,18 @@ mod tests {
     use super::make_run_id;
 
     #[test]
-    fn accepts_valid_runner_and_slot_identity_characters() {
-        let id = make_run_id("Runner_A", "Build.Step_1");
-        assert!(id.name().starts_with("Runner_A-Build.Step_1-"));
+    fn run_id_preserves_identity_and_exposes_its_sequence() {
+        let first = make_run_id("Runner_A", "Build.Step_1");
+        let second = make_run_id("Runner_A", "Build.Step_1");
+
+        assert_eq!(
+            first.name(),
+            format!("Runner_A-Build.Step_1-{}", first.seq())
+        );
+        assert!(second.seq() > first.seq());
+        assert_eq!(
+            second.clone().into_name(),
+            format!("Runner_A-Build.Step_1-{}", second.seq())
+        );
     }
 }
