@@ -1,4 +1,7 @@
-//! Kubernetes-shaped resource metadata.
+//! # Resource metadata
+//!
+//! [`ObjectMeta`] contains server-owned identity and version fields.
+//! It also contains caller-owned labels and annotations.
 
 use std::{fmt, time::SystemTime};
 
@@ -17,7 +20,11 @@ const UID_ENTROPY_BYTES: usize = 16;
 pub struct Uid(String);
 
 impl Uid {
-    /// Validate and wrap an existing UID.
+    /// Wraps an existing UID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the value is empty.
     pub fn new(value: impl Into<String>) -> ModelResult<Self> {
         let value = value.into();
         if value.trim().is_empty() {
@@ -26,7 +33,11 @@ impl Uid {
         Ok(Self(value))
     }
 
-    /// Generate a fresh UID from OS entropy.
+    /// Generates a UID from 128 bits of operating system entropy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the entropy source is unavailable.
     pub fn generate() -> ModelResult<Self> {
         let mut bytes = [0_u8; UID_ENTROPY_BYTES];
         getrandom::fill(&mut bytes).map_err(|error| {
@@ -35,7 +46,7 @@ impl Uid {
         Ok(Self(URL_SAFE_NO_PAD.encode(bytes)))
     }
 
-    /// Borrow the opaque UID value.
+    /// Returns the opaque UID value.
     #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -60,9 +71,9 @@ impl<'de> Deserialize<'de> for Uid {
 
 /// Identity, concurrency version, generation and user metadata for a task.
 ///
-/// `name` is the stable address used by get/apply/delete operations. `uid`
-/// identifies the current incarnation. `resource_version` is intentionally an
-/// opaque string assigned by the state store; model code never parses it.
+/// `name` is the stable resource address.
+/// `uid` identifies one incarnation.
+/// `resource_version` is assigned by the state store and remains opaque.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObjectMeta {
@@ -79,15 +90,23 @@ pub struct ObjectMeta {
 }
 
 impl ObjectMeta {
-    /// Create metadata for a new named resource and generate its UID.
+    /// Creates metadata and generates a UID.
     ///
-    /// The initial generation is `1`. The state store assigns the first
-    /// resource version through [`Self::set_resource_version`].
+    /// The initial generation is `1`.
+    /// The state store assigns the first resource version through [`Self::set_resource_version`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the name is invalid or UID generation fails.
     pub fn new(name: TaskId) -> ModelResult<Self> {
         Self::with_uid(name, Uid::generate()?)
     }
 
-    /// Create metadata with an existing server-assigned UID.
+    /// Creates metadata with an existing UID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the name is invalid.
     pub fn with_uid(name: TaskId, uid: Uid) -> ModelResult<Self> {
         name.validate_format()?;
         Ok(Self {
@@ -143,9 +162,13 @@ impl ObjectMeta {
         &self.annotations
     }
 
-    /// Assign a new opaque state-store version.
+    /// Assigns an opaque state-store version.
     ///
     /// The value is stored verbatim and is never parsed by the model.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the value is empty.
     pub fn set_resource_version(&mut self, resource_version: impl Into<String>) -> ModelResult<()> {
         let resource_version = resource_version.into();
         if resource_version.trim().is_empty() {
@@ -279,33 +302,23 @@ mod tests {
     }
 
     #[test]
-    fn resource_version_is_stored_as_an_opaque_string() {
+    fn server_metadata_uses_kubernetes_fields_and_opaque_resource_version() {
         let mut meta = ObjectMeta::new(TaskId::new("task-a").unwrap()).unwrap();
         meta.set_resource_version("store/revision:0021").unwrap();
 
         assert_eq!(meta.resource_version(), "store/revision:0021");
-    }
-
-    #[test]
-    fn uid_deserialization_rejects_empty_values() {
         assert!(serde_json::from_str::<Uid>(r#"""#).is_err());
-    }
-
-    #[test]
-    fn serde_uses_kubernetes_field_names() {
-        let mut meta = ObjectMeta::new(TaskId::new("task-a").unwrap()).unwrap();
-        meta.set_resource_version("7").unwrap();
 
         let json = serde_json::to_value(&meta).unwrap();
         assert_eq!(json["name"], "task-a");
-        assert_eq!(json["resourceVersion"], "7");
+        assert_eq!(json["resourceVersion"], "store/revision:0021");
         assert_eq!(json["generation"], 1);
         assert!(json["creationTimestamp"].is_string());
         assert!(json.get("uid").is_some());
     }
 
     #[test]
-    fn creation_timestamp_uses_rfc3339_and_roundtrips_exact_milliseconds() {
+    fn creation_timestamp_uses_rfc3339_milliseconds_and_rejects_unix_numbers() {
         let mut meta = ObjectMeta::new(TaskId::new("task-a").unwrap()).unwrap();
         meta.set_resource_version("1").unwrap();
         let mut json = serde_json::to_value(meta).unwrap();
@@ -315,10 +328,7 @@ mod tests {
         let serialized = serde_json::to_value(back).unwrap();
 
         assert_eq!(serialized["creationTimestamp"], "2025-01-02T03:04:05.678Z");
-    }
 
-    #[test]
-    fn creation_timestamp_rejects_unix_milliseconds() {
         let meta = ObjectMeta::new(TaskId::new("task-a").unwrap()).unwrap();
         let mut json = serde_json::to_value(meta).unwrap();
         json["creationTimestamp"] = serde_json::json!(1_735_786_800_000_u64);

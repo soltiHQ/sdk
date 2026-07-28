@@ -1,4 +1,30 @@
-//! Kubernetes-shaped task resource and its state transitions.
+//! # Task resource
+//!
+//! [`TaskManifest`] is caller-owned desired state.
+//! [`Task`] is a stored resource with server metadata and status.
+//!
+//! ## Apply
+//!
+//! ```text
+//! identical desired state ──▶ DesiredChange::None
+//! labels or annotations   ──▶ DesiredChange::Metadata
+//! spec changed            ──▶ DesiredChange::Spec
+//!                              └─ generation increments
+//! ```
+//!
+//! ## Status Flow
+//!
+//! ```text
+//! Reconciled: Unknown        ── accepted     ────▶ True
+//!             False          ── manual retry ────▶ Unknown
+//!             Unknown | True ── failure      ────▶ False
+//!
+//! Pending ── attempt starts ──▶ Running ── attempt ends ──▶ terminal phase
+//! ```
+//!
+//! Generation is checked before attempt transitions.
+//! Stale generation updates are ignored.
+//! Repeating an identical update is a no-op.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,14 +51,14 @@ pub enum DesiredChange {
 }
 
 impl DesiredChange {
-    /// Return whether apply changed the resource.
+    /// Returns whether apply changed the resource.
     #[inline]
     pub fn is_changed(self) -> bool {
         !matches!(self, Self::None)
     }
 }
 
-/// Group/version and kind identifying a resource schema.
+/// Group/version and kind of resource schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TypeMeta {
@@ -42,8 +68,7 @@ pub struct TypeMeta {
 
 /// User-owned metadata accepted in a [`TaskManifest`].
 ///
-/// Runtime identity, resource version, generation, creation time and status are
-/// deliberately absent because the state store owns them.
+/// Runtime identity, resource version, generation, creation time and status are deliberately absent because the state store owns them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskManifestMeta {
@@ -55,7 +80,11 @@ pub struct TaskManifestMeta {
 }
 
 impl TaskManifestMeta {
-    /// Build user-owned metadata for a named Task manifest.
+    /// Creates user-owned metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when `name` is invalid.
     pub fn new(name: impl AsRef<str>) -> ModelResult<Self> {
         let metadata = Self {
             name: TaskId::new(name)?,
@@ -101,11 +130,10 @@ impl TaskManifestMeta {
     }
 }
 
-/// User-owned desired state accepted by create and apply operations.
+/// Caller-owned desired state for create and apply.
 ///
-/// Its serialized shape is `apiVersion`, `kind`, `metadata`, `spec`. Stored
-/// resources are represented by [`Task`] and additionally contain server-owned
-/// metadata and `status`.
+/// The serialized shape is `apiVersion`, `kind`, `metadata`, and `spec`.
+/// A stored [`Task`] adds server metadata and `status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(try_from = "raw::TaskManifestRaw")]
@@ -117,12 +145,20 @@ pub struct TaskManifest {
 }
 
 impl TaskManifest {
-    /// Build a Task manifest from its stable name and desired spec.
+    /// Creates a Task manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the name or spec is invalid.
     pub fn new(name: impl AsRef<str>, spec: TaskSpec) -> ModelResult<Self> {
         Self::from_parts(TypeMeta::task(), TaskManifestMeta::new(name)?, spec)
     }
 
-    /// Reconstruct a manifest from its serialized parts.
+    /// Reconstructs a manifest from serialized fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when GVK, metadata, or spec is invalid.
     pub fn from_parts(
         type_meta: TypeMeta,
         metadata: TaskManifestMeta,
@@ -137,21 +173,33 @@ impl TaskManifest {
         Ok(manifest)
     }
 
-    /// Attach labels to the manifest.
+    /// Sets manifest labels.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when a label is invalid.
     pub fn with_labels(mut self, labels: Labels) -> ModelResult<Self> {
         labels.validate()?;
         self.metadata = self.metadata.with_labels(labels);
         Ok(self)
     }
 
-    /// Attach annotations to the manifest.
+    /// Sets manifest annotations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when an annotation is invalid.
     pub fn with_annotations(mut self, annotations: Annotations) -> ModelResult<Self> {
         annotations.validate()?;
         self.metadata = self.metadata.with_annotations(annotations);
         Ok(self)
     }
 
-    /// Validate resource GVK, name and desired state.
+    /// Validates the manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when GVK, metadata, or spec is invalid.
     pub fn validate(&self) -> ModelResult<()> {
         self.type_meta.validate_task()?;
         self.metadata.validate()?;
@@ -188,7 +236,7 @@ impl TaskManifest {
         self.spec.slot()
     }
 
-    /// Destructure into type metadata, user-owned metadata and desired spec.
+    /// Returns the serialized manifest fields.
     pub fn into_parts(self) -> (TypeMeta, TaskManifestMeta, TaskSpec) {
         (self.type_meta, self.metadata, self.spec)
     }
@@ -234,11 +282,10 @@ impl TypeMeta {
     }
 }
 
-/// Declarative task resource.
+/// Stored Task resource.
 ///
 /// The serialized shape is `apiVersion`, `kind`, `metadata`, `spec`, `status`.
-/// The resource name is stable across apply operations; UID and creation time
-/// identify one incarnation and are preserved by [`Self::apply_desired`].
+/// Name, UID, and creation time are preserved by [`Self::apply_desired`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(try_from = "raw::TaskRaw")]
@@ -251,16 +298,23 @@ pub struct Task {
 }
 
 impl Task {
-    /// Create a new stored Task resource with server-owned defaults.
+    /// Creates a stored Task with server-owned defaults.
     ///
-    /// The UID and creation timestamp are generated, generation starts at `1`,
-    /// and status starts as unobserved `Pending`. The state store assigns the
-    /// initial resource version separately.
+    /// The UID and creation timestamp are generated, generation starts at `1`, and status starts as unobserved `Pending`.
+    /// The state store assigns the initial resource version separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the name or spec is invalid, or the entropy source is unavailable.
     pub fn new(name: impl AsRef<str>, spec: TaskSpec) -> ModelResult<Self> {
         Self::from_manifest(TaskManifest::new(name, spec)?)
     }
 
-    /// Materialize a new stored resource from user-owned desired state.
+    /// Creates a stored resource from a manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the manifest is invalid or the entropy source is unavailable.
     pub fn from_manifest(manifest: TaskManifest) -> ModelResult<Self> {
         manifest.validate()?;
         let (_, metadata, spec) = manifest.into_parts();
@@ -276,7 +330,11 @@ impl Task {
         Ok(task)
     }
 
-    /// Reconstruct a resource from persisted parts.
+    /// Reconstructs a resource from persisted fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when a resource invariant is violated.
     pub fn from_parts(
         type_meta: TypeMeta,
         metadata: ObjectMeta,
@@ -293,7 +351,11 @@ impl Task {
         Ok(task)
     }
 
-    /// Validate all resource-level invariants.
+    /// Validates the complete resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when GVK, metadata, spec, status, generation, or conditions are inconsistent.
     pub fn validate(&self) -> ModelResult<()> {
         self.type_meta.validate_task()?;
         self.metadata.name().validate_format()?;
@@ -347,7 +409,7 @@ impl Task {
         &self.status
     }
 
-    /// Destructure into type metadata, object metadata, spec and status.
+    /// Returns the serialized resource fields.
     pub fn into_parts(self) -> (TypeMeta, ObjectMeta, TaskSpec, TaskStatus) {
         (self.type_meta, self.metadata, self.spec, self.status)
     }
@@ -382,17 +444,28 @@ impl Task {
         &self.status.phase
     }
 
-    /// Assign the resource version produced by the state store.
+    /// Assigns a state-store resource version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the value is empty.
     pub fn set_resource_version(&mut self, resource_version: impl Into<String>) -> ModelResult<()> {
         self.metadata.set_resource_version(resource_version)
     }
 
-    /// Apply user-owned metadata and desired state to this named resource.
+    /// Applies caller-owned metadata and desired state.
     ///
-    /// UID and creation timestamp are preserved. Metadata-only changes leave
-    /// generation and status untouched. A spec change increments generation and
-    /// resets the phase and attempt for the new generation while retaining the
-    /// previous `observedGeneration` until reconciliation processes it.
+    /// UID and creation time are preserved.
+    /// Metadata-only changes preserve generation and status.
+    /// Spec changes increment generation and reset phase and attempt.
+    /// The previous `observedGeneration` is retained.
+    ///
+    /// Identical desired state returns [`DesiredChange::None`].
+    /// In that case, `resource_version` is not assigned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when metadata, spec, or a changed `resource_version` is invalid.
     pub fn apply_desired(
         &mut self,
         labels: Labels,
@@ -426,7 +499,14 @@ impl Task {
         })
     }
 
-    /// Mark the current desired-state generation as observed.
+    /// Marks the current generation as reconciled.
+    ///
+    /// Returns `true` when status changed.
+    /// Returns `false` when the same generation was already reconciled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when a changed `resource_version` is empty.
     pub fn mark_observed(&mut self, resource_version: impl Into<String>) -> ModelResult<bool> {
         let generation = self.metadata.generation();
         let condition = self.status.reconciled_required();
@@ -443,7 +523,14 @@ impl Task {
         Ok(true)
     }
 
-    /// Reschedule reconciliation for the current generation after a recorded failure.
+    /// Reschedules reconciliation after a recorded failure.
+    ///
+    /// Returns `false` when reconciliation is not failed.
+    /// A change resets phase, attempt, exit code, and lifecycle error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when a changed `resource_version` is empty.
     pub fn mark_reconciliation_pending(
         &mut self,
         resource_version: impl Into<String>,
@@ -461,11 +548,16 @@ impl Task {
         Ok(true)
     }
 
-    /// Record a failure to reconcile the current desired state.
+    /// Records a reconciliation failure.
     ///
-    /// This is used for controller failures outside the execution lifecycle,
-    /// including routing, runner build, runtime cleanup and intake. Desired state
-    /// is retained.
+    /// Desired state is retained.
+    /// Execution phase and diagnostics are reset.
+    ///
+    /// Returns `true` when status changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when reason, message, or a changed `resource_version` is invalid.
     pub fn mark_reconciliation_failed(
         &mut self,
         reason: impl Into<String>,
@@ -499,10 +591,15 @@ impl Task {
         Ok(true)
     }
 
-    /// Start an authoritative attempt for the current desired-state generation.
+    /// Records an authoritative attempt start.
     ///
-    /// A stale generation is ignored and returns `Ok(false)`. Attempt numbers
-    /// come from the execution source of truth and are never incremented locally.
+    /// A stale generation returns `false`.
+    /// An identical transition also returns `false`.
+    /// Attempt numbers come from the execution source of truth.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the current generation has attempt zero or a changed `resource_version` is empty.
     pub fn transition_starting(
         &mut self,
         generation: u64,
@@ -536,10 +633,15 @@ impl Task {
         Ok(true)
     }
 
-    /// Transition the current generation into a terminal attempt phase.
+    /// Records a terminal attempt phase.
     ///
-    /// Stale generations are ignored. Terminal phases are sticky, except that a
-    /// generic `Failed` may be refined to `Exhausted` or `Timeout`.
+    /// A stale generation or older attempt returns `false`.
+    /// Terminal phases are sticky.
+    /// `Failed` may be refined to `Exhausted` or `Timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the current generation has attempt zero, `phase` is not terminal, or a changed `resource_version` is empty.
     pub fn transition_finished(
         &mut self,
         generation: u64,
@@ -584,10 +686,14 @@ impl Task {
         Ok(true)
     }
 
-    /// Reconcile with an authoritative final lifecycle outcome.
+    /// Records an authoritative final lifecycle outcome.
     ///
-    /// Unlike [`Self::transition_finished`], this may replace a conflicting
-    /// terminal attempt phase. A stale generation is ignored.
+    /// Unlike [`Self::transition_finished`], this may replace a conflicting terminal attempt phase.
+    /// A stale generation or identical outcome returns `false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when `phase` is not terminal for the current generation or a changed `resource_version` is empty.
     pub fn reconcile_finished(
         &mut self,
         generation: u64,

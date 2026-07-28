@@ -1,4 +1,10 @@
-//! Agent capabilities advertised to a control plane.
+//! # Agent capabilities
+//!
+//! [`AgentCapabilities`] is an immutable runner capability snapshot.
+//! [`RunnerCapability`] describes one registered runner.
+//!
+//! Runner order is preserved.
+//! Workload GVKs inside each runner are stored in canonical order.
 
 use std::collections::HashSet;
 
@@ -39,14 +45,13 @@ impl<'de> Deserialize<'de> for RunnerCapability {
 }
 
 impl RunnerCapability {
-    /// Build and validate a registered runner capability.
+    /// Creates a registered runner capability.
     ///
     /// Workload types are stored in canonical GVK order.
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when the name or labels are invalid, no
-    /// workload is declared, a GVK is duplicated, or Embedded is declared.
+    /// Returns [`ModelError::Invalid`] when the name or labels are invalid, no workload is declared, a GVK is duplicated, or Embedded is declared.
     pub fn new(
         name: impl Into<String>,
         labels: Labels,
@@ -136,7 +141,7 @@ impl<'de> Deserialize<'de> for AgentCapabilities {
 }
 
 impl AgentCapabilities {
-    /// Build a capability snapshot in runner registration order.
+    /// Creates a capability snapshot in runner registration order.
     ///
     /// # Errors
     ///

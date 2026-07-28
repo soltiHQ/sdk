@@ -1,4 +1,6 @@
-//! Kubernetes-shaped task status conditions.
+//! # Task conditions
+//!
+//! [`TaskCondition`] records reconciliation state for one observed generation.
 
 use std::{fmt, time::SystemTime};
 
@@ -12,12 +14,16 @@ const CONDITION_TYPE_MAX_BYTES: usize = 316;
 const CONDITION_REASON_MAX_BYTES: usize = 1_024;
 const CONDITION_MESSAGE_MAX_BYTES: usize = 32_768;
 
-/// Stable and extensible type of a condition reported for a [`Task`](crate::Task).
+/// Stable and extensible type of condition reported for a [`Task`](crate::Task).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TaskConditionType(String);
 
 impl TaskConditionType {
-    /// Validate and create a condition type.
+    /// Creates a condition type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the value is too long or violates qualified-name rules.
     pub fn new(value: impl Into<String>) -> ModelResult<Self> {
         let value = value.into();
         if value.len() > CONDITION_TYPE_MAX_BYTES {
@@ -38,7 +44,7 @@ impl TaskConditionType {
         Self("Reconciled".into())
     }
 
-    /// Borrow the serialized condition type.
+    /// Returns the serialized condition type.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -72,7 +78,7 @@ impl<'de> Deserialize<'de> for TaskConditionType {
     }
 }
 
-/// Kubernetes-compatible three-valued condition status.
+/// Condition status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ConditionStatus {
@@ -99,7 +105,11 @@ pub struct TaskCondition {
 }
 
 impl TaskCondition {
-    /// Build a validated condition.
+    /// Creates a condition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the reason or message is invalid.
     pub fn new(
         condition_type: TaskConditionType,
         status: ConditionStatus,
@@ -162,7 +172,7 @@ impl TaskCondition {
         &self.message
     }
 
-    /// Destructure a condition into its wire fields.
+    /// Returns the serialized condition fields.
     pub fn into_parts(
         self,
     ) -> (

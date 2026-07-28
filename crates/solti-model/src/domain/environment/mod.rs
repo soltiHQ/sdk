@@ -1,7 +1,8 @@
-//! Task-provided environment variables.
+//! # Task environment
+//!
+//! [`TaskEnv`] stores ordered key-value pairs.
+//! Lookup uses the last matching value.
 
-// `#[macro_use]` must come before any module that uses the macro
-// (Rust resolves `macro_rules!` top-to-bottom within a module).
 #[macro_use]
 mod macros;
 

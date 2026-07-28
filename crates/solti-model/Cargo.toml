@@ -1,31 +1,31 @@
 [package]
 name = "solti-model"
-description = "Domain model types for the Solti task execution SDK: task specs, states, and identifiers."
+
+description   = "Domain model types for the Solti task execution SDK: task specs, states, and identifiers."
+keywords      = ["task", "model", "spec", "types", "domain"]
+categories    = ["data-structures"]
 documentation = "https://docs.rs/solti-model"
+readme        = "README.md"
 
 rust-version.workspace = true
-repository.workspace = true
-categories = ["data-structures"]
-homepage.workspace = true
-keywords = ["task", "model", "spec", "types", "domain"]
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+repository.workspace   = true
+homepage.workspace     = true
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
 
 [features]
 default = []
 
 [dependencies]
-base64    = { workspace = true }
-bytes     = { workspace = true }
-getrandom = { workspace = true }
-serde     = { workspace = true, features = ["rc"] }
+base64     = { workspace = true }
+bytes      = { workspace = true }
+getrandom  = { workspace = true }
+serde      = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
-subtle    = { workspace = true }
-thiserror = { workspace = true }
-time      = { workspace = true, features = ["formatting", "parsing"] }
-
-[dev-dependencies]
+subtle     = { workspace = true }
+thiserror  = { workspace = true }
+time       = { workspace = true, features = ["formatting", "parsing"] }
 
 [package.metadata.docs.rs]
 all-features = true

@@ -1,4 +1,4 @@
-//! Write preconditions.
+//! # Write preconditions
 //!
 //! [`WritePreconditions`] protects an apply or delete from a stale resource snapshot.
 
@@ -14,7 +14,7 @@ pub struct WritePreconditions {
 }
 
 impl WritePreconditions {
-    /// Create empty preconditions.
+    /// Creates empty preconditions.
     #[inline]
     pub const fn new() -> Self {
         Self {
@@ -23,7 +23,7 @@ impl WritePreconditions {
         }
     }
 
-    /// Capture the current resource identity and version.
+    /// Captures resource identity and version.
     ///
     /// # Errors
     ///
@@ -34,14 +34,14 @@ impl WritePreconditions {
             .with_resource_version(task.metadata().resource_version())
     }
 
-    /// Require the current resource incarnation to have this UID.
+    /// Requires this resource UID.
     #[inline]
     pub fn with_uid(mut self, uid: Uid) -> Self {
         self.uid = Some(uid);
         self
     }
 
-    /// Require the current resource to have this resource version.
+    /// Requires this resource version.
     ///
     /// # Errors
     ///
@@ -72,7 +72,7 @@ impl WritePreconditions {
         self.resource_version.as_deref()
     }
 
-    /// Return whether no checks were requested.
+    /// Returns whether no checks are set.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.uid.is_none() && self.resource_version.is_none()

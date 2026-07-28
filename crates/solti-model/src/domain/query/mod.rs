@@ -1,11 +1,12 @@
-//! Query and pagination types.
+//! # Task queries
 //!
 //! ```text
 //! TaskFilter -> TaskQuery -> state query -> TaskPage<T>
+//! ```
 //!
 //! Phase filters use OR semantics.
-//! An empty phase filter matches all phases.
-//! ```
+//! Filter groups use AND semantics.
+//! An empty phase filter matches every phase.
 
 mod task;
 pub use task::{

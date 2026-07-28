@@ -1,25 +1,22 @@
-//! Jitter strategy.
+//! # Jitter policy
 //!
-//! [`JitterPolicy`] adds randomness to backoff delays to prevent thundering-herd effects.
+//! [`JitterPolicy`] selects how retry delay randomness is applied.
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 use crate::error::{ModelError, ModelResult};
 
-/// Controls how random jitter is applied to backoff delays.
+/// Jitter applied to a backoff delay.
 ///
-/// Jitter spreads retries over time.
-/// This helps avoid many agents retrying at the same instant.
+/// | Variant        | Delay range                              |
+/// |----------------|------------------------------------------|
+/// | `None`         | `base`                                   |
+/// | `Full`         | `[0, base]`                              |
+/// | `Equal`        | `[base / 2, base]`                       |
+/// | `Decorrelated` | `[first, min(base * 3, max)]`            |
 ///
-/// | Variant        | Delay range                  | Collision resistance |
-/// |----------------|------------------------------|----------------------|
-/// | `None`         | exactly `base`               | none (deterministic) |
-/// | `Full`         | uniform `[0, base]`          | highest              |
-/// | `Equal`        | around half to full base     | moderate             |
-/// | `Decorrelated` | uniform `[first, min(base * 3, max)]` | high       |
-///
-/// The exact math is implemented in the backoff subsystem; this enum only selects the strategy.
+/// The execution layer applies the selected policy.
 ///
 /// ## Example
 ///
@@ -38,7 +35,7 @@ pub enum JitterPolicy {
     Full,
     /// No randomness applied. Backoff durations remain fixed.
     None,
-    /// Equal jitter: delay is sampled around the midpoint (`base / 2`), providing a balance between stability and randomness.
+    /// Equal jitter samples from `[base / 2, base]`.
     Equal,
     /// Memoryless randomized band: delay is sampled uniformly from
     /// `[first, min(base * 3, max)]`.

@@ -1,6 +1,8 @@
-//! Kubernetes-style label selector.
+//! # Label selector
 //!
-//! [`LabelSelector`] is shared by runner routing and resource queries.
+//! [`LabelSelector`] follows Kubernetes label selector syntax and matching rules.
+//! Struct construction and direct deserialization do not validate requirements.
+//! Call [`LabelSelector::validate`] at an input boundary.
 
 use std::{fmt, str::FromStr};
 
@@ -37,17 +39,17 @@ use crate::{Labels, ModelError, ModelResult};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LabelSelector {
-    /// Exact key=value pairs: sugar for `In` with a single value.
+    /// Exact key-value matches.
     #[serde(default, skip_serializing_if = "Labels::is_empty")]
     pub match_labels: Labels,
 
-    /// Set-based requirements, ANDed with `match_labels`.
+    /// Set-based requirements.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub match_expressions: Vec<SelectorRequirement>,
 }
 
 impl LabelSelector {
-    /// Create an empty selector.
+    /// Creates an empty selector.
     ///
     /// An empty selector matches every label set.
     ///
@@ -63,7 +65,7 @@ impl LabelSelector {
         Self::default()
     }
 
-    /// Selector from exact key=value pairs only.
+    /// Creates a selector from exact matches.
     ///
     /// ## Example
     ///
@@ -87,7 +89,7 @@ impl LabelSelector {
         }
     }
 
-    /// Selector from expressions only.
+    /// Creates a selector from expressions.
     ///
     /// ## Example
     ///
@@ -110,13 +112,17 @@ impl LabelSelector {
         }
     }
 
-    /// Return `true` if the selector has no requirements.
+    /// Returns whether the selector is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.match_labels.is_empty() && self.match_expressions.is_empty()
     }
 
-    /// Validate exact matches and set-based requirements as a Kubernetes label selector.
+    /// Validates the selector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when a key, value, or requirement is invalid.
     pub fn validate(&self) -> crate::ModelResult<()> {
         self.match_labels.validate()?;
         for requirement in &self.match_expressions {
@@ -125,11 +131,10 @@ impl LabelSelector {
         Ok(())
     }
 
-    /// Check whether `labels` satisfy all requirements of this selector.
+    /// Returns whether labels satisfy every requirement.
     ///
-    /// - Each `match_labels` entry requires an exact key=value match.
-    /// - Each `match_expressions` entry is evaluated per its operator.
-    /// - All requirements are ANDed.
+    /// `match_labels` and `match_expressions` are ANDed.
+    /// `NotIn` matches when the key is absent.
     ///
     /// ## Example
     ///
@@ -178,10 +183,13 @@ impl LabelSelector {
 impl FromStr for LabelSelector {
     type Err = ModelError;
 
-    /// Parse Kubernetes label-selector syntax.
+    /// Parses Kubernetes label selector syntax.
     ///
-    /// Supported requirements are `=`, `==`, `!=`, `in`, `notin`, key
-    /// existence and `!key` non-existence. Top-level commas mean AND.
+    /// Supported requirements are `=`, `==`, `!=`, `in`, `notin`, key existence and `!key` non-existence. Top-level commas mean AND.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the syntax or a requirement is invalid.
     fn from_str(value: &str) -> ModelResult<Self> {
         let value = trim_selector_whitespace(value);
         if value.is_empty() {
@@ -379,130 +387,109 @@ mod tests {
     use super::*;
 
     fn labels(pairs: &[(&str, &str)]) -> Labels {
-        let mut l = Labels::new();
-        for (k, v) in pairs {
-            l.insert(*k, *v);
+        let mut labels = Labels::new();
+        for (key, value) in pairs {
+            labels.insert(*key, *value);
         }
-        l
-    }
-
-    fn labels_of(pairs: &[(&str, &str)]) -> Labels {
-        labels(pairs)
+        labels
     }
 
     #[test]
-    fn empty_selector_matches_everything() {
-        let sel = LabelSelector::new();
-        assert!(sel.matches(&labels(&[])));
-        assert!(sel.matches(&labels(&[("a", "b")])));
+    fn empty_and_exact_label_matching() {
+        let empty = LabelSelector::new();
+        assert!(empty.is_empty());
+        assert!(empty.matches(&labels(&[])));
+        assert!(empty.matches(&labels(&[("a", "b")])));
+
+        let selector = LabelSelector::from_labels(labels(&[("zone", "eu")]));
+        assert!(!selector.is_empty());
+        assert!(selector.matches(&labels(&[("zone", "eu"), ("extra", "x")])));
+        assert!(!selector.matches(&labels(&[("zone", "us")])));
+        assert!(!selector.matches(&labels(&[])));
     }
 
     #[test]
-    fn match_labels_exact_hit() {
-        let sel = LabelSelector::from_labels(labels_of(&[("zone", "eu")]));
-        assert!(sel.matches(&labels(&[("zone", "eu"), ("extra", "x")])));
-    }
-
-    #[test]
-    fn match_labels_value_mismatch() {
-        let sel = LabelSelector::from_labels(labels_of(&[("zone", "eu")]));
-        assert!(!sel.matches(&labels(&[("zone", "us")])));
-    }
-
-    #[test]
-    fn match_labels_key_missing() {
-        let sel = LabelSelector::from_labels(labels_of(&[("zone", "eu")]));
-        assert!(!sel.matches(&labels(&[])));
-    }
-
-    #[test]
-    fn expr_in_matches() {
-        let sel = LabelSelector::from_expressions(vec![SelectorRequirement::r#in(
+    fn set_operators_follow_kubernetes_missing_key_semantics() {
+        let included = LabelSelector::from_expressions(vec![SelectorRequirement::r#in(
             "gpu",
             vec!["a100".into(), "h100".into()],
         )]);
-        assert!(sel.matches(&labels(&[("gpu", "a100")])));
-        assert!(sel.matches(&labels(&[("gpu", "h100")])));
-        assert!(!sel.matches(&labels(&[("gpu", "t4")])));
-        assert!(!sel.matches(&labels(&[])));
-    }
+        assert!(included.matches(&labels(&[("gpu", "a100")])));
+        assert!(included.matches(&labels(&[("gpu", "h100")])));
+        assert!(!included.matches(&labels(&[("gpu", "t4")])));
+        assert!(!included.matches(&labels(&[])));
 
-    #[test]
-    fn expr_not_in_matches() {
-        let sel = LabelSelector::from_expressions(vec![SelectorRequirement::not_in(
+        let excluded = LabelSelector::from_expressions(vec![SelectorRequirement::not_in(
             "tier",
             vec!["dev".into()],
         )]);
-        assert!(sel.matches(&labels(&[("tier", "prod")])));
-        assert!(!sel.matches(&labels(&[("tier", "dev")])));
-        assert!(sel.matches(&labels(&[])));
+        assert!(excluded.matches(&labels(&[("tier", "prod")])));
+        assert!(!excluded.matches(&labels(&[("tier", "dev")])));
+        assert!(excluded.matches(&labels(&[])));
+
+        assert!(
+            "tier!=frontend"
+                .parse::<LabelSelector>()
+                .unwrap()
+                .matches(&Labels::new())
+        );
+        assert!(
+            "tier notin (frontend)"
+                .parse::<LabelSelector>()
+                .unwrap()
+                .matches(&Labels::new())
+        );
     }
 
     #[test]
-    fn expr_exists_matches() {
-        let sel = LabelSelector::from_expressions(vec![SelectorRequirement::exists("gpu")]);
-        assert!(sel.matches(&labels(&[("gpu", "any")])));
-        assert!(!sel.matches(&labels(&[])));
-    }
+    fn existence_operators_match_presence() {
+        let exists = LabelSelector::from_expressions(vec![SelectorRequirement::exists("gpu")]);
+        assert!(exists.matches(&labels(&[("gpu", "any")])));
+        assert!(!exists.matches(&labels(&[])));
 
-    #[test]
-    fn expr_does_not_exist_matches() {
-        let sel =
+        let missing =
             LabelSelector::from_expressions(vec![SelectorRequirement::does_not_exist("tainted")]);
-        assert!(sel.matches(&labels(&[])));
-        assert!(!sel.matches(&labels(&[("tainted", "true")])));
+        assert!(missing.matches(&labels(&[])));
+        assert!(!missing.matches(&labels(&[("tainted", "true")])));
     }
 
     #[test]
-    fn labels_and_expressions_anded() {
-        let sel = LabelSelector {
-            match_labels: labels_of(&[("zone", "eu")]),
+    fn labels_and_expressions_are_anded() {
+        let selector = LabelSelector {
+            match_labels: labels(&[("zone", "eu")]),
             match_expressions: vec![SelectorRequirement::exists("gpu")],
         };
-        assert!(sel.matches(&labels(&[("zone", "eu"), ("gpu", "a100")])));
-        assert!(!sel.matches(&labels(&[("zone", "us"), ("gpu", "a100")])));
-        assert!(!sel.matches(&labels(&[("zone", "eu")])));
-    }
+        assert!(selector.matches(&labels(&[("zone", "eu"), ("gpu", "a100")])));
+        assert!(!selector.matches(&labels(&[("zone", "us"), ("gpu", "a100")])));
+        assert!(!selector.matches(&labels(&[("zone", "eu")])));
 
-    #[test]
-    fn multiple_expressions_anded() {
-        let sel = LabelSelector::from_expressions(vec![
+        let expressions = LabelSelector::from_expressions(vec![
             SelectorRequirement::r#in("tier", vec!["prod".into(), "staging".into()]),
             SelectorRequirement::does_not_exist("tainted"),
         ]);
-        assert!(sel.matches(&labels(&[("tier", "prod")])));
-        assert!(!sel.matches(&labels(&[("tier", "prod"), ("tainted", "true")])));
-        assert!(!sel.matches(&labels(&[("tier", "dev")])));
+        assert!(expressions.matches(&labels(&[("tier", "prod")])));
+        assert!(!expressions.matches(&labels(&[("tier", "prod"), ("tainted", "true")])));
+        assert!(!expressions.matches(&labels(&[("tier", "dev")])));
     }
 
     #[test]
-    fn serde_roundtrip() {
-        let sel = LabelSelector {
-            match_labels: labels_of(&[("zone", "eu")]),
+    fn serde_roundtrip_and_empty_shape_are_stable() {
+        let selector = LabelSelector {
+            match_labels: labels(&[("zone", "eu")]),
             match_expressions: vec![SelectorRequirement::exists("gpu")],
         };
-        let json = serde_json::to_string_pretty(&sel).unwrap();
+        let json = serde_json::to_string_pretty(&selector).unwrap();
         let back: LabelSelector = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, sel);
-    }
+        assert_eq!(back, selector);
 
-    #[test]
-    fn serde_empty_selector() {
-        let sel = LabelSelector::new();
-        let json = serde_json::to_string(&sel).unwrap();
+        let empty = LabelSelector::new();
+        let json = serde_json::to_string(&empty).unwrap();
         assert_eq!(json, "{}");
-        let back: LabelSelector = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, sel);
+        assert_eq!(serde_json::from_str::<LabelSelector>(&json).unwrap(), empty);
     }
 
     #[test]
-    fn is_empty() {
-        assert!(LabelSelector::new().is_empty());
-        assert!(!LabelSelector::from_labels(labels_of(&[("k", "v")])).is_empty());
-    }
-
-    #[test]
-    fn validate_checks_match_labels_and_expressions() {
+    fn validation_checks_labels_and_expressions() {
         let mut invalid = Labels::new();
         invalid.insert("bad key", "value");
         assert!(LabelSelector::from_labels(invalid).validate().is_err());
@@ -514,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_kubernetes_selector_syntax() {
+    fn parser_and_display_use_kubernetes_selector_syntax() {
         let selector: LabelSelector =
             "environment=production,tier in (frontend,backend),track!=canary,!tainted,gpu"
                 .parse()
@@ -532,19 +519,27 @@ mod tests {
             ("track", "stable"),
             ("gpu", "h100"),
         ])));
-    }
 
-    #[test]
-    fn parses_double_equality_and_empty_selector() {
         let selector: LabelSelector = "release==stable".parse().unwrap();
         assert!(selector.matches(&labels(&[("release", "stable")])));
         assert!("".parse::<LabelSelector>().unwrap().is_empty());
+
+        let rendered = LabelSelector {
+            match_labels: labels(&[("environment", "production")]),
+            match_expressions: vec![
+                SelectorRequirement::r#in("tier", vec!["frontend".into(), "backend".into()]),
+                SelectorRequirement::does_not_exist("tainted"),
+            ],
+        };
+        assert_eq!(
+            rendered.to_string(),
+            "environment=production,tier in (frontend,backend),!tainted"
+        );
     }
 
     #[test]
-    fn parses_empty_kubernetes_label_values() {
+    fn empty_values_roundtrip_and_match_kubernetes_semantics() {
         let selector: LabelSelector = "x in (foo,,baz),z notin ()".parse().unwrap();
-
         assert!(selector.matches(&labels(&[("x", ""), ("z", "value")])));
         assert!(!selector.matches(&labels(&[("x", "foo"), ("z", "")])));
         assert!(
@@ -553,10 +548,7 @@ mod tests {
                 .unwrap()
                 .matches(&labels(&[("key", "")]))
         );
-    }
 
-    #[test]
-    fn display_round_trips_empty_label_values() {
         for value in ["key=", "key in ()", "key in (foo,,baz)", "key notin ()"] {
             let selector: LabelSelector = value.parse().unwrap();
             let reparsed: LabelSelector = selector.to_string().parse().unwrap();
@@ -565,57 +557,15 @@ mod tests {
     }
 
     #[test]
-    fn parser_uses_kubernetes_ascii_whitespace() {
+    fn parser_accepts_ascii_whitespace_and_rejects_malformed_input() {
+        " \t\r\ntier\tin\n(frontend)\r\n"
+            .parse::<LabelSelector>()
+            .unwrap();
+
         for value in [
             "\u{00a0}tier in (frontend)",
             "tier\u{00a0}in (frontend)",
             "tier in (\u{00a0}frontend)",
-        ] {
-            assert!(
-                value.parse::<LabelSelector>().is_err(),
-                "selector must be rejected: {value:?}"
-            );
-        }
-
-        " \t\r\ntier\tin\n(frontend)\r\n"
-            .parse::<LabelSelector>()
-            .unwrap();
-    }
-
-    #[test]
-    fn negative_requirements_match_a_missing_key() {
-        assert!(
-            "tier!=frontend"
-                .parse::<LabelSelector>()
-                .unwrap()
-                .matches(&Labels::new())
-        );
-        assert!(
-            "tier notin (frontend)"
-                .parse::<LabelSelector>()
-                .unwrap()
-                .matches(&Labels::new())
-        );
-    }
-
-    #[test]
-    fn display_uses_kubernetes_selector_syntax() {
-        let selector = LabelSelector {
-            match_labels: labels_of(&[("environment", "production")]),
-            match_expressions: vec![
-                SelectorRequirement::r#in("tier", vec!["frontend".into(), "backend".into()]),
-                SelectorRequirement::does_not_exist("tainted"),
-            ],
-        };
-        assert_eq!(
-            selector.to_string(),
-            "environment=production,tier in (frontend,backend),!tainted"
-        );
-    }
-
-    #[test]
-    fn malformed_selector_is_rejected() {
-        for value in [
             ",environment=production",
             "environment=production,",
             "tier in (frontend",
@@ -626,7 +576,7 @@ mod tests {
         ] {
             assert!(
                 value.parse::<LabelSelector>().is_err(),
-                "selector must be rejected: {value}"
+                "selector must be rejected: {value:?}"
             );
         }
     }

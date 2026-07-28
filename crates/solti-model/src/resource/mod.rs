@@ -1,6 +1,7 @@
-//! Resource model.
+//! # Resource model
 //!
-//! A [`Task`] is the top-level resource. It has metadata, desired spec, and observed status.
+//! [`TaskManifest`] is caller-owned desired state.
+//! [`Task`] adds server-owned metadata and observed status.
 //!
 //! ```text
 //! Task

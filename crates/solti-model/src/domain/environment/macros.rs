@@ -18,31 +18,31 @@ macro_rules! env_newtype {
         $vis struct $ty(Vec<$crate::KeyValue>);
 
         impl $ty {
-            /// Create an empty environment.
+            /// Creates an empty environment.
             #[inline]
             pub fn new() -> Self {
                 Self(Vec::new())
             }
 
-            /// Return the number of key-value pairs.
+            /// Returns the number of entries.
             #[inline]
             pub fn len(&self) -> usize {
                 self.0.len()
             }
 
-            /// Returns `true` if the environment has no entries.
+            /// Returns whether the environment is empty.
             #[inline]
             pub fn is_empty(&self) -> bool {
                 self.0.is_empty()
             }
 
-            /// Iterate over all key-value pairs in insertion order.
+            /// Iterates over entries in insertion order.
             #[inline]
             pub fn iter(&self) -> impl Iterator<Item = &$crate::KeyValue> {
                 self.0.iter()
             }
 
-            /// Get the value for a key, returning the **last** matching entry (last-wins override semantics).
+            /// Returns the last value for a key.
             #[inline]
             pub fn get(&self, key: &str) -> Option<&str> {
                 self.0
@@ -52,7 +52,7 @@ macro_rules! env_newtype {
                     .map(|kv| kv.value())
             }
 
-            /// Append a key-value pair.
+            /// Appends a key-value pair.
             #[inline]
             pub fn push<K, V>(&mut self, key: K, value: V)
             where

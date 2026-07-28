@@ -1,4 +1,4 @@
-//! Lifecycle and concurrency policies for task execution.
+//! # Task policies
 //!
 //! | Type                | Controls                                     | Default               |
 //! |---------------------|----------------------------------------------|-----------------------|

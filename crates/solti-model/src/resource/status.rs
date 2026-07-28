@@ -1,4 +1,6 @@
-//! Task status.
+//! # Task status
+//!
+//! [`TaskStatus`] is observed reconciliation and execution state.
 
 use std::collections::HashSet;
 
@@ -21,12 +23,16 @@ pub struct TaskStatus {
 }
 
 impl TaskStatus {
-    /// Create initial pending status.
+    /// Creates an unobserved pending status.
     pub fn pending() -> Self {
         Self::pending_for(0, 0)
     }
 
-    /// Reconstruct and validate observed status fields.
+    /// Reconstructs status from serialized fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when conditions are invalid or duplicated, or when the required `Reconciled` condition is missing.
     pub fn from_parts(
         observed_generation: u64,
         phase: TaskPhase,
@@ -81,7 +87,9 @@ impl TaskStatus {
         self.phase
     }
 
-    /// Number of execution attempts.
+    /// Current attempt number.
+    ///
+    /// Zero means no attempt has started.
     pub fn attempt(&self) -> u32 {
         self.attempt
     }
@@ -96,12 +104,12 @@ impl TaskStatus {
         self.error.as_deref()
     }
 
-    /// All controller conditions.
+    /// All status conditions.
     pub fn conditions(&self) -> &[TaskCondition] {
         &self.conditions
     }
 
-    /// Destructure status into its wire fields.
+    /// Returns the serialized status fields.
     pub fn into_parts(
         self,
     ) -> (
@@ -122,14 +130,14 @@ impl TaskStatus {
         )
     }
 
-    /// Find a condition by type.
+    /// Returns a condition by type.
     pub fn condition(&self, condition_type: &crate::TaskConditionType) -> Option<&TaskCondition> {
         self.conditions
             .iter()
             .find(|condition| condition.condition_type() == condition_type)
     }
 
-    /// Return the required controller `Reconciled` condition.
+    /// Returns the required `Reconciled` condition.
     pub fn reconciled(&self) -> &TaskCondition {
         self.conditions
             .iter()
@@ -137,7 +145,7 @@ impl TaskStatus {
             .expect("validated TaskStatus has a Reconciled condition")
     }
 
-    /// Return whether the current generation ended in a reconciliation failure.
+    /// Returns whether reconciliation failed.
     pub fn reconciliation_failed(&self) -> bool {
         self.reconciled().status() == ConditionStatus::False
     }

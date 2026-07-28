@@ -1,4 +1,6 @@
-//! Task run record.
+//! # Task run
+//!
+//! [`TaskRun`] records one execution attempt.
 
 use std::time::SystemTime;
 
@@ -6,7 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ModelError, ModelResult, TaskPhase, WorkloadTypeMeta};
 
-/// Record of one task execution attempt.
+/// Record of one execution attempt.
+///
+/// An active run has phase `Running` and no finish fields.
+/// A finished run has a terminal phase and `finishedAt`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", try_from = "raw::TaskRunRaw")]
 pub struct TaskRun {
@@ -29,7 +34,11 @@ pub struct TaskRun {
 }
 
 impl TaskRun {
-    /// Create a run record for an attempt that just started.
+    /// Creates an active run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when generation or attempt is zero.
     pub fn starting(
         generation: u64,
         attempt: u32,
@@ -47,7 +56,11 @@ impl TaskRun {
         )
     }
 
-    /// Reconstruct and validate a run record.
+    /// Reconstructs a run from serialized fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when identity fields, phase, timestamps, or terminal diagnostics are inconsistent.
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         workload: WorkloadTypeMeta,
@@ -73,7 +86,11 @@ impl TaskRun {
         Ok(run)
     }
 
-    /// Close an active run with a terminal phase.
+    /// Finishes an active run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the run is already finished or `phase` is not terminal.
     pub fn finish(
         &mut self,
         phase: TaskPhase,
@@ -135,7 +152,7 @@ impl TaskRun {
         self.exit_code
     }
 
-    /// Destructure a run into its wire fields.
+    /// Returns the serialized run fields.
     #[allow(clippy::type_complexity)]
     pub fn into_parts(
         self,
@@ -161,7 +178,7 @@ impl TaskRun {
         )
     }
 
-    /// Return whether this run is still in progress.
+    /// Returns whether the run is active.
     pub fn is_active(&self) -> bool {
         self.phase == TaskPhase::Running
     }
@@ -261,24 +278,17 @@ mod tests {
     }
 
     #[test]
-    fn serde_rejects_inconsistent_run() {
+    fn serde_rejects_inconsistent_and_unknown_run_fields() {
         let run = TaskRun::starting(1, 1, workload()).unwrap();
         let mut json = serde_json::to_value(run).unwrap();
         json["attempt"] = serde_json::json!(0);
         assert!(serde_json::from_value::<TaskRun>(json).is_err());
-    }
 
-    #[test]
-    fn serde_rejects_unknown_fields() {
         let run = TaskRun::starting(1, 1, workload()).unwrap();
         let mut json = serde_json::to_value(run).unwrap();
         json["unexpected"] = serde_json::json!(true);
-
         assert!(serde_json::from_value::<TaskRun>(json).is_err());
-    }
 
-    #[test]
-    fn serde_rejects_finished_active_and_unfinished_terminal_runs() {
         let run = TaskRun::starting(1, 1, workload()).unwrap();
         let mut finished_active = serde_json::to_value(&run).unwrap();
         finished_active["finishedAt"] = serde_json::json!("2026-01-01T00:00:00Z");

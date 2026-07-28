@@ -1,8 +1,8 @@
-//! Task execution backend types.
+//! # Task workloads
 //!
-//! - [`SubprocessSpec`], [`ContainerSpec`], [`WasmSpec`] - per-variant configuration.
-//! - [`TaskWorkload`] - typed built-ins plus an open extension envelope.
-//! - [`SubprocessMode`] - execution strategy (command or script).
+//! [`TaskWorkload`] is the workload envelope.
+//! Built-in specs describe subprocess, container, WASM, and embedded execution.
+//! [`ExtensionWorkload`] carries an application-owned GVK and JSON spec.
 mod task;
 pub use task::{
     ContainerSpec, EmbeddedSpec, ExtensionWorkload, SubprocessSpec, TaskWorkload,

@@ -1,6 +1,6 @@
-//! Per-attempt timeout.
+//! # Attempt timeout
 //!
-//! [`Timeout`] is a validated wrapper over milliseconds, used in [`TaskSpec`](crate::TaskSpec).
+//! [`Timeout`] is a positive millisecond value used by [`TaskSpec`](crate::TaskSpec).
 
 use std::{fmt, num::NonZeroU64};
 
@@ -23,7 +23,11 @@ use crate::{ModelError, ModelResult};
 pub struct Timeout(NonZeroU64);
 
 impl Timeout {
-    /// Create a new timeout value.
+    /// Creates a timeout value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when `ms` is zero.
     ///
     /// ## Example
     ///
@@ -39,7 +43,7 @@ impl Timeout {
             .ok_or_else(|| ModelError::Invalid("timeout must be greater than zero".into()))
     }
 
-    /// Get the timeout in milliseconds.
+    /// Returns the timeout in milliseconds.
     ///
     /// ## Example
     ///
@@ -100,43 +104,23 @@ mod tests {
     use super::Timeout;
 
     #[test]
-    fn new_and_as_millis() {
-        let t = Timeout::new(3_000).unwrap();
-        assert_eq!(t.as_millis(), 3_000);
-    }
+    fn exposes_milliseconds_conversions_display_and_ordering() {
+        let timeout = Timeout::try_from(1_500).unwrap();
+        assert_eq!(timeout.as_millis(), 1_500);
+        assert_eq!(format!("{timeout}"), "1500ms");
+        assert_eq!(u64::from(timeout), 1_500);
 
-    #[test]
-    fn try_from_u64_and_into() {
-        let t = Timeout::try_from(5_000).unwrap();
-        let v: u64 = t.into();
-        assert_eq!(v, 5_000);
-    }
-
-    #[test]
-    fn display() {
-        let t = Timeout::new(1_500).unwrap();
-        assert_eq!(format!("{t}"), "1500ms");
-    }
-
-    #[test]
-    fn ordering() {
         let a = Timeout::new(100).unwrap();
         let b = Timeout::new(200).unwrap();
         assert!(a < b);
     }
 
     #[test]
-    fn serde_transparent() {
-        let t = Timeout::new(5_000).unwrap();
-        let json = serde_json::to_string(&t).unwrap();
+    fn serde_is_transparent_and_validated() {
+        let timeout = Timeout::new(5_000).unwrap();
+        let json = serde_json::to_string(&timeout).unwrap();
         assert_eq!(json, "5000");
-
-        let back: Timeout = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, t);
-    }
-
-    #[test]
-    fn zero_is_rejected() {
+        assert_eq!(serde_json::from_str::<Timeout>(&json).unwrap(), timeout);
         assert!(Timeout::new(0).is_err());
         assert!(serde_json::from_str::<Timeout>("0").is_err());
     }

@@ -1,24 +1,22 @@
-//! Restart policy.
+//! # Restart policy
 //!
-//! [`RestartPolicy`] controls when a task is restarted after completion or failure.
+//! [`RestartPolicy`] describes whether another attempt may be started.
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 use crate::error::{ModelError, ModelResult};
 
-/// Determines whether a task should restart after completion or failure.
+/// Policy for starting another attempt.
 ///
-/// | Variant     | Behaviour                                                    |
-/// |-------------|--------------------------------------------------------------|
-/// | `Never`     | Do not restart under any circumstances                       |
-/// | `OnFailure` | Restart only when the task ends with an error                |
-/// | `Always`    | Restart unconditionally (immediate or periodic via interval) |
+/// | Variant     | Meaning                              |
+/// |-------------|--------------------------------------|
+/// | `Never`     | Do not start another attempt         |
+/// | `OnFailure` | Restart after a retryable failure    |
+/// | `Always`    | Restart after any completed attempt  |
 ///
-/// `Always { interval_ms: None }` restarts immediately;
-/// `Always { interval_ms: Some(N) }` waits N ms between runs (periodic task).
-///
-/// Cancellation (via controller or shutdown) is **not** treated as failure and will not trigger a restart.
+/// `Always { interval_ms: None }` requests an immediate restart.
+/// `Always { interval_ms: Some(n) }` requests a delay of `n` milliseconds.
 ///
 /// ## Example
 ///
@@ -38,30 +36,21 @@ pub enum RestartPolicy {
     /// Never restart the task.
     #[default]
     Never,
-    /// Restart the task only if it failed (non-zero exit, error, panic, etc.).
+    /// Restart after a retryable failure.
     OnFailure,
-    /// Always restart after completion.
-    ///
-    /// - `interval_ms: None` - repeat as soon as possible after a successful run.
-    /// - `interval_ms: Some(n)` - wait `n` milliseconds between runs (periodic task).
-    /// - `Some(0)` means immediate repeat; prefer `None` for clarity.
-    ///
-    /// Use the immediate form for blocking tasks, such as a long-running service that should respawn as soon as it exits.
-    ///
-    /// For quick successful jobs that are meant to repeat, use `interval_ms: Some(n)`.
-    /// taskvisor protects instant success loops with a small internal floor, but `None` still means "run again immediately", not "run on a schedule".
+    /// Restart after every completed attempt.
     #[serde(rename_all = "camelCase")]
     Always {
-        /// Delay in milliseconds between runs. `None` (or `Some(0)`) restarts immediately.
+        /// Delay between attempts in milliseconds.
+        ///
+        /// `None` and `Some(0)` request an immediate restart.
         #[serde(skip_serializing_if = "Option::is_none")]
         interval_ms: Option<u64>,
     },
 }
 
 impl RestartPolicy {
-    /// Create an `Always` policy without an interval.
-    ///
-    /// This restarts immediately after a run finishes.
+    /// Creates an immediate `Always` policy.
     ///
     /// ## Example
     ///
@@ -77,7 +66,7 @@ impl RestartPolicy {
         RestartPolicy::Always { interval_ms: None }
     }
 
-    /// Create an `Always` policy with a periodic interval.
+    /// Creates a periodic `Always` policy.
     ///
     /// ## Example
     ///
@@ -141,79 +130,43 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
-    fn parse_never_and_empty() {
-        assert_eq!(RestartPolicy::from_str("").unwrap(), RestartPolicy::Never);
-        assert_eq!(
-            RestartPolicy::from_str("never").unwrap(),
-            RestartPolicy::Never
-        );
-        assert_eq!(
-            RestartPolicy::from_str("  NeVeR  ").unwrap(),
-            RestartPolicy::Never
-        );
+    fn parsing_accepts_policies_aliases_case_and_intervals() {
+        let cases = [
+            ("", RestartPolicy::Never),
+            ("never", RestartPolicy::Never),
+            ("  NeVeR  ", RestartPolicy::Never),
+            ("on-failure", RestartPolicy::OnFailure),
+            ("failure", RestartPolicy::OnFailure),
+            ("  Failure ", RestartPolicy::OnFailure),
+            ("always", RestartPolicy::Always { interval_ms: None }),
+            ("  ALWAYS  ", RestartPolicy::Always { interval_ms: None }),
+            ("always:", RestartPolicy::Always { interval_ms: None }),
+            ("always:   ", RestartPolicy::Always { interval_ms: None }),
+            (
+                "always:1000",
+                RestartPolicy::Always {
+                    interval_ms: Some(1_000),
+                },
+            ),
+            (
+                " Always:  60000 ",
+                RestartPolicy::Always {
+                    interval_ms: Some(60_000),
+                },
+            ),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(RestartPolicy::from_str(value).unwrap(), expected);
+        }
     }
 
     #[test]
-    fn parse_on_failure() {
-        assert_eq!(
-            RestartPolicy::from_str("on-failure").unwrap(),
-            RestartPolicy::OnFailure
-        );
-        assert_eq!(
-            RestartPolicy::from_str("failure").unwrap(),
-            RestartPolicy::OnFailure
-        );
-        assert_eq!(
-            RestartPolicy::from_str("  Failure ").unwrap(),
-            RestartPolicy::OnFailure
-        );
-    }
-
-    #[test]
-    fn parse_always_immediate() {
-        assert_eq!(
-            RestartPolicy::from_str("always").unwrap(),
-            RestartPolicy::Always { interval_ms: None }
-        );
-        assert_eq!(
-            RestartPolicy::from_str("  ALWAYS  ").unwrap(),
-            RestartPolicy::Always { interval_ms: None }
-        );
-        assert_eq!(
-            RestartPolicy::from_str("always:").unwrap(),
-            RestartPolicy::Always { interval_ms: None }
-        );
-        assert_eq!(
-            RestartPolicy::from_str("always:   ").unwrap(),
-            RestartPolicy::Always { interval_ms: None }
-        );
-    }
-
-    #[test]
-    fn parse_always_with_interval() {
-        assert_eq!(
-            RestartPolicy::from_str("always:1000").unwrap(),
-            RestartPolicy::Always {
-                interval_ms: Some(1000)
-            }
-        );
-        assert_eq!(
-            RestartPolicy::from_str(" Always:  60000 ").unwrap(),
-            RestartPolicy::Always {
-                interval_ms: Some(60000)
-            }
-        );
-    }
-
-    #[test]
-    fn parse_always_invalid_interval() {
-        let err = RestartPolicy::from_str("always:not-a-number").unwrap_err();
-        assert!(matches!(err, ModelError::UnknownRestart(_)));
-    }
-
-    #[test]
-    fn parse_unknown_head_fails() {
-        let err = RestartPolicy::from_str("random").unwrap_err();
-        assert!(matches!(err, ModelError::UnknownRestart(_)));
+    fn parsing_rejects_unknown_policy_and_invalid_interval() {
+        for value in ["always:not-a-number", "random"] {
+            assert!(matches!(
+                RestartPolicy::from_str(value),
+                Err(ModelError::UnknownRestart(_))
+            ));
+        }
     }
 }

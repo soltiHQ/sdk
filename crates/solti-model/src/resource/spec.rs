@@ -1,6 +1,6 @@
-//! Task specification.
+//! # Task spec
 //!
-//! [`TaskSpec`] defines desired state: what to run and how the supervisor should manage it.
+//! [`TaskSpec`] defines workload, slot, timeout, policies, and runner selection.
 
 use std::num::NonZeroU32;
 
@@ -13,7 +13,8 @@ use crate::{
 
 /// Desired state for a task.
 ///
-/// Build it with [`TaskSpec::builder`]. Fields are private so every spec goes through validation.
+/// Use [`TaskSpec::builder`] to construct it.
+/// Resource constructors validate the completed spec.
 ///
 /// ## Example
 ///
@@ -54,13 +55,13 @@ impl TaskSpec {
         &self.slot
     }
 
-    /// Execution backend used to run the task.
+    /// Workload desired state.
     #[inline]
     pub fn workload(&self) -> &TaskWorkload {
         &self.workload
     }
 
-    /// Hard timeout in milliseconds.
+    /// Per-attempt timeout.
     #[inline]
     pub fn timeout(&self) -> Timeout {
         self.timeout
@@ -84,11 +85,10 @@ impl TaskSpec {
         self.admission
     }
 
-    /// Maximum failure-driven retries per run.
+    /// Maximum consecutive failure retries.
     ///
-    /// `None` means unlimited, the default.
-    /// The invariant lives in the type: a zero budget is not representable.
-    /// Counts only failure retries (the counter resets on success); when the budget is exhausted the supervisor stops restarting the task.
+    /// `None` means unlimited.
+    /// Zero is not representable.
     #[inline]
     pub fn max_retries(&self) -> Option<NonZeroU32> {
         self.max_retries
@@ -102,7 +102,7 @@ impl TaskSpec {
 }
 
 impl TaskSpec {
-    /// Create a [`TaskSpecBuilder`] with the three required fields.
+    /// Creates a builder with the required fields.
     ///
     /// ```rust
     /// use solti_model::{TaskSpec, TaskWorkload, SubprocessSpec, SubprocessMode, RestartPolicy};
@@ -134,9 +134,10 @@ impl TaskSpec {
 }
 
 impl TaskSpec {
-    /// Attach a runner selector used by the router.
+    /// Sets a runner selector on an existing spec.
     ///
-    /// This is useful when a spec came from a stored value and a caller wants to add routing before submit.
+    /// This method does not validate `sel`.
+    /// Call [`Self::validate`] before using the result outside a validated resource.
     ///
     /// ## Example
     ///
@@ -160,9 +161,7 @@ impl TaskSpec {
         self
     }
 
-    /// Override the admission policy.
-    ///
-    /// Used by apply or upgrade paths that need to force [`AdmissionPolicy::Replace`] regardless of the original spec.
+    /// Sets the admission policy on an existing spec.
     ///
     /// ## Example
     ///
@@ -185,9 +184,11 @@ impl TaskSpec {
 }
 
 impl TaskSpec {
-    /// Validate the spec at the submit boundary.
+    /// Validates the complete spec.
     ///
-    /// Runs structural validation of shared and workload-specific fields.
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the slot, workload, backoff, or runner selector is invalid.
     ///
     /// ## Example
     ///
@@ -218,14 +219,7 @@ impl TaskSpec {
         self.validate_structural()
     }
 
-    /// Structural validation of all fields.
-    ///
-    /// Checks:
-    /// - `slot` is not empty
-    /// - `backoff` parameters are sane
-    /// - `timeout` is greater than zero
-    /// - workload-specific constraints (e.g. non-empty command)
-    /// - `runner_selector` requirements are structurally valid
+    /// Validates all structural fields.
     fn validate_structural(&self) -> ModelResult<()> {
         self.slot.validate_format()?;
         self.workload.validate()?;
@@ -239,11 +233,14 @@ impl TaskSpec {
 
 /// Builder for [`TaskSpec`].
 ///
-/// Required fields (`slot`, `workload`, `timeout`) are set in the constructor.
-/// Optional fields have sensible defaults:
+/// Required fields are set by [`TaskSpec::builder`].
+///
+/// Optional fields use these defaults:
+///
 /// - `backoff`: [`BackoffPolicy::default`] (full jitter, 1 second to 30 seconds, factor 2)
 /// - `admission`: [`AdmissionPolicy::DropIfRunning`]
 /// - `restart`: [`RestartPolicy::Never`]
+/// - `max_retries`: `None`
 /// - `runner_selector`: `None`
 ///
 /// ## Example
@@ -292,16 +289,16 @@ impl TaskSpecBuilder {
         }
     }
 
-    /// Set restart policy.
+    /// Sets the restart policy.
     #[must_use]
     pub fn restart(mut self, restart: RestartPolicy) -> Self {
         self.restart = restart;
         self
     }
 
-    /// Set the failure-retry budget. `None` means unlimited, the default.
+    /// Sets the failure-retry budget.
     ///
-    /// Mirrors taskvisor's signature: pass `NonZeroU32::new(n)` directly.
+    /// `None` means unlimited.
     ///
     /// ```rust
     /// # use solti_model::{EmbeddedSpec, TaskSpec, TaskWorkload};
@@ -319,31 +316,34 @@ impl TaskSpecBuilder {
         self
     }
 
-    /// Set backoff configuration.
+    /// Sets the backoff policy.
     #[must_use]
     pub fn backoff(mut self, backoff: BackoffPolicy) -> Self {
         self.backoff = backoff;
         self
     }
 
-    /// Set admission policy.
+    /// Sets the admission policy.
     #[must_use]
     pub fn admission(mut self, admission: AdmissionPolicy) -> Self {
         self.admission = admission;
         self
     }
 
-    /// Set runner selector.
+    /// Sets the runner selector.
     #[must_use]
     pub fn runner_selector(mut self, sel: LabelSelector) -> Self {
         self.runner_selector = Some(sel);
         self
     }
 
-    /// Build the [`TaskSpec`], validating structural invariants.
+    /// Builds and validates the spec.
     ///
-    /// Runner-specific routability is intentionally enforced by `solti-runner`,
-    /// not by the shared resource model.
+    /// Runner availability is not checked by this crate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when any structural field is invalid.
     ///
     /// ## Example
     ///
@@ -457,44 +457,28 @@ mod tests {
     }
 
     #[test]
-    fn valid_spec_passes() {
-        assert!(valid_spec().validate().is_ok());
+    fn builder_accepts_valid_specs_and_rejects_required_field_errors() {
+        valid_spec().validate().unwrap();
+
+        for (slot, timeout, field) in [("", 5_000_u64, "slot"), ("test", 0_u64, "timeout")] {
+            let error = TaskSpec::builder(slot, embedded(), timeout)
+                .build()
+                .unwrap_err();
+            assert!(error.to_string().contains(field), "got: {error}");
+        }
     }
 
     #[test]
-    fn builder_rejects_empty_slot() {
-        let err = TaskSpec::builder("", embedded(), 5_000u64)
-            .build()
-            .unwrap_err();
-        assert!(err.to_string().contains("slot"));
-    }
-
-    #[test]
-    fn builder_rejects_zero_timeout() {
-        let err = TaskSpec::builder("test", embedded(), 0u64)
-            .build()
-            .unwrap_err();
-        assert!(err.to_string().contains("timeout"));
-    }
-
-    #[test]
-    fn builder_allows_embedded_kind() {
+    fn embedded_workload_is_structurally_valid() {
         let spec = TaskSpec::builder("test", embedded(), 5_000u64)
             .build()
             .expect("Embedded is structurally valid");
         assert!(matches!(spec.workload(), TaskWorkload::Embedded(_)));
-    }
-
-    #[test]
-    fn validate_accepts_embedded_workload_as_structural_data() {
-        let spec = TaskSpec::builder("test", embedded(), 5_000u64)
-            .build()
-            .unwrap();
         spec.validate().unwrap();
     }
 
     #[test]
-    fn getters_return_expected_values() {
+    fn builder_and_override_methods_expose_expected_values() {
         let spec = TaskSpec::builder("my-slot", embedded(), 10_000u64)
             .restart(RestartPolicy::OnFailure)
             .admission(AdmissionPolicy::Replace)
@@ -505,62 +489,20 @@ mod tests {
         assert_eq!(spec.timeout().as_millis(), 10_000);
         assert_eq!(spec.restart(), RestartPolicy::OnFailure);
         assert_eq!(spec.admission(), AdmissionPolicy::Replace);
+        assert_eq!(
+            valid_spec()
+                .with_admission(AdmissionPolicy::Replace)
+                .admission(),
+            AdmissionPolicy::Replace
+        );
     }
 
     #[test]
-    fn with_admission_overrides_policy() {
-        let spec = valid_spec().with_admission(AdmissionPolicy::Replace);
-        assert_eq!(spec.admission(), AdmissionPolicy::Replace);
-    }
-
-    #[test]
-    fn serde_roundtrip() {
+    fn serde_roundtrip_and_unlimited_retry_shape_are_stable() {
         let spec = valid_spec();
         let json = serde_json::to_string(&spec).unwrap();
         let back: TaskSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back, spec);
-    }
-
-    #[test]
-    fn serde_rejects_empty_slot() {
-        let spec = valid_spec();
-        let mut json: serde_json::Value = serde_json::to_value(&spec).unwrap();
-        json["slot"] = serde_json::Value::String(String::new());
-
-        let err = serde_json::from_value::<TaskSpec>(json).unwrap_err();
-        assert!(err.to_string().contains("slot"), "error: {err}");
-    }
-
-    #[test]
-    fn serde_rejects_zero_timeout() {
-        let spec = valid_spec();
-        let mut json: serde_json::Value = serde_json::to_value(&spec).unwrap();
-        json["timeout"] = serde_json::json!(0);
-
-        let err = serde_json::from_value::<TaskSpec>(json).unwrap_err();
-        assert!(err.to_string().contains("timeout"), "error: {err}");
-    }
-
-    #[test]
-    fn serde_rejects_zero_max_retries() {
-        let spec = valid_spec();
-        let mut json: serde_json::Value = serde_json::to_value(&spec).unwrap();
-        json["maxRetries"] = serde_json::json!(0);
-
-        let err = serde_json::from_value::<TaskSpec>(json).unwrap_err();
-        assert!(err.to_string().contains("maxRetries"), "error: {err}");
-    }
-
-    #[test]
-    fn serde_rejects_unknown_fields() {
-        let mut json = serde_json::to_value(valid_spec()).unwrap();
-        json["unexpected"] = serde_json::json!(true);
-
-        assert!(serde_json::from_value::<TaskSpec>(json).is_err());
-    }
-
-    #[test]
-    fn unlimited_max_retries_is_omitted_from_json() {
         let json = serde_json::to_value(valid_spec()).unwrap();
         assert!(
             json.get("maxRetries").is_none(),
@@ -569,7 +511,25 @@ mod tests {
     }
 
     #[test]
-    fn max_retries_roundtrips_through_json() {
+    fn serde_validates_fields_and_rejects_unknown_fields() {
+        for (field, value, expected) in [
+            ("slot", serde_json::json!(""), "slot"),
+            ("timeout", serde_json::json!(0), "timeout"),
+            ("maxRetries", serde_json::json!(0), "maxRetries"),
+        ] {
+            let mut json = serde_json::to_value(valid_spec()).unwrap();
+            json[field] = value;
+            let error = serde_json::from_value::<TaskSpec>(json).unwrap_err();
+            assert!(error.to_string().contains(expected), "got: {error}");
+        }
+
+        let mut json = serde_json::to_value(valid_spec()).unwrap();
+        json["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<TaskSpec>(json).is_err());
+    }
+
+    #[test]
+    fn finite_retry_budget_roundtrips_through_json() {
         let spec = valid_spec();
         let mut json: serde_json::Value = serde_json::to_value(&spec).unwrap();
         json["maxRetries"] = serde_json::json!(3);

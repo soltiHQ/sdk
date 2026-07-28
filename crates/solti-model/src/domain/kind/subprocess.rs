@@ -1,6 +1,7 @@
-//! Subprocess execution specification.
+//! # Subprocess workload
 //!
-//! [`SubprocessSpec`] and [`SubprocessMode`] define how OS subprocess tasks are configured and validated.
+//! [`SubprocessMode`] selects a command or an interpreter-backed script.
+//! [`SubprocessSpec`] adds environment, working directory, and exit-code policy.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -8,19 +9,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ModelError, ModelResult};
 
-/// Maximum script body size (after base64 decode) accepted by the model.
+/// Maximum decoded script body size.
 pub const MAX_SCRIPT_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-/// Upper bound on the encoded length of a standard (padded) base64 string that decodes
-/// to at most `max_bytes` bytes: 4 output characters per full or partial 3-byte input group.
+/// Returns the largest padded base64 length for `max_bytes`.
 const fn max_encoded_len(max_bytes: usize) -> usize {
     max_bytes.div_ceil(3).saturating_mul(4)
 }
 
-/// Decode a base64 script body, enforcing `max_bytes` on the decoded size.
+/// Decodes a base64 script body.
 ///
-/// Bodies whose encoded length already exceeds [`max_encoded_len`] are rejected up front, before any decode buffer is allocated;
-/// oversized input cannot force a large allocation just to be refused.
+/// Encoded size is checked before allocation.
+/// Decoded size is limited by `max_bytes`.
 fn decode_script_body(body: &str, max_bytes: usize) -> ModelResult<Vec<u8>> {
     if body.is_empty() {
         return Err(ModelError::Invalid("script body cannot be empty".into()));
@@ -53,13 +53,10 @@ fn decode_script_body(body: &str, max_bytes: usize) -> ModelResult<Vec<u8>> {
 
 /// Execution strategy for a subprocess task.
 ///
-/// | Variant   | What it does                                                        |
-/// |-----------|---------------------------------------------------------------------|
-/// | `Command` | Direct binary execution via `execve(command, args)`                 |
-/// | `Script`  | Decoded script input for an explicitly selected interpreter        |
-///
-/// The built-in `solti-exec` runner materializes scripts into temporary files
-/// and invokes `interpreter temporary_file ...args`.
+/// | Variant   | Fields                              |
+/// |-----------|-------------------------------------|
+/// | `Command` | executable and arguments            |
+/// | `Script`  | interpreter, base64 body, arguments |
 ///
 /// ## Example
 ///
@@ -82,7 +79,7 @@ fn decode_script_body(body: &str, max_bytes: usize) -> ModelResult<Vec<u8>> {
 pub enum SubprocessMode {
     /// Direct binary execution.
     Command {
-        /// Binary to execute (e.g. `"ls"`, `"/usr/bin/python"`).
+        /// Executable name or path.
         command: String,
         /// Command-line arguments.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -92,7 +89,7 @@ pub enum SubprocessMode {
     Script {
         /// Interpreter executable name or path.
         interpreter: String,
-        /// Base64-encoded (standard alphabet) script body.
+        /// Standard padded base64 script body.
         body: String,
         /// Additional arguments passed after the script body.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -101,10 +98,13 @@ pub enum SubprocessMode {
 }
 
 impl SubprocessMode {
-    /// Decode the base64 script body to a UTF-8 string.
+    /// Decodes the script body as UTF-8.
     ///
-    /// Returns `Ok(body)` for the `Script` variant.
-    /// To use a different cap, call [`decode_body_with_limit`](Self::decode_body_with_limit).
+    /// Uses [`MAX_SCRIPT_BODY_BYTES`] as the decoded size limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] for command mode, invalid base64, non-UTF-8 data, an empty body, or an oversized body.
     ///
     /// ## Example
     ///
@@ -125,12 +125,13 @@ impl SubprocessMode {
         self.decode_body_with_limit(MAX_SCRIPT_BODY_BYTES)
     }
 
-    /// Decode the base64 script body with a custom decoded size limit.
+    /// Decodes the script body with a custom size limit.
     ///
-    /// [`decode_body`](Self::decode_body) applies the default [`MAX_SCRIPT_BODY_BYTES`];
-    /// pass an explicit `max_bytes` to tighten or relax the cap where needed.
+    /// Encoded size is checked before allocation.
     ///
-    /// Bodies whose encoded length already exceeds the maximum possible for `max_bytes` are rejected before any decoding takes place.
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] for command mode, invalid base64, non-UTF-8 data, an empty body, or a body larger than `max_bytes`.
     ///
     /// ## Example
     ///
@@ -161,12 +162,11 @@ impl SubprocessMode {
         }
     }
 
-    /// Validate the mode at the model level.
+    /// Validates the subprocess mode.
     ///
-    /// Checks:
-    /// - `Command`: command must not be empty.
-    /// - `Script`: interpreter and body must not be empty.
-    /// - `Script`: body must be valid base64 and decode to UTF-8.
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] for an empty command or interpreter, or for an invalid, non-UTF-8, or oversized script body.
     ///
     /// ## Example
     ///
@@ -215,155 +215,68 @@ mod tests {
         BASE64.encode(s.as_bytes())
     }
 
+    fn script(interpreter: &str, body: String) -> SubprocessMode {
+        SubprocessMode::Script {
+            interpreter: interpreter.into(),
+            body,
+            args: vec![],
+        }
+    }
+
     #[test]
-    fn command_valid() {
-        let mode = SubprocessMode::Command {
+    fn command_validation_accepts_content_and_rejects_empty_values() {
+        SubprocessMode::Command {
             command: "ls".into(),
             args: vec!["-la".into()],
-        };
-        assert!(mode.validate().is_ok());
+        }
+        .validate()
+        .unwrap();
+
+        for command in ["", "   "] {
+            let mode = SubprocessMode::Command {
+                command: command.into(),
+                args: vec![],
+            };
+            let error = mode.validate().unwrap_err();
+            assert!(
+                error.to_string().contains("command cannot be empty"),
+                "got: {error}"
+            );
+        }
     }
 
     #[test]
-    fn command_empty_fails() {
-        let mode = SubprocessMode::Command {
-            command: "".into(),
-            args: vec![],
-        };
-        let err = mode.validate().unwrap_err();
-        assert!(err.to_string().contains("command cannot be empty"));
+    fn script_validation_accepts_interpreters_and_rejects_invalid_fields() {
+        script("bash", encode("echo hello")).validate().unwrap();
+        script("ruby", encode("puts 'hello'")).validate().unwrap();
+
+        for (mode, expected) in [
+            (
+                script("", encode("echo hello")),
+                "interpreter cannot be empty",
+            ),
+            (script("bash", String::new()), "body cannot be empty"),
+            (
+                script("bash", "not-valid-base64!!!".into()),
+                "invalid base64",
+            ),
+            (
+                script("bash", BASE64.encode([0xFF, 0xFE, 0x80])),
+                "not valid UTF-8",
+            ),
+        ] {
+            let error = mode.validate().unwrap_err();
+            assert!(error.to_string().contains(expected), "got: {error}");
+        }
     }
 
     #[test]
-    fn command_whitespace_fails() {
-        let mode = SubprocessMode::Command {
-            command: "   ".into(),
-            args: vec![],
-        };
-        assert!(mode.validate().is_err());
-    }
-
-    #[test]
-    fn script_valid_bash() {
-        let mode = SubprocessMode::Script {
-            interpreter: "bash".into(),
-            body: encode("echo hello"),
-            args: vec![],
-        };
-        assert!(mode.validate().is_ok());
-    }
-
-    #[test]
-    fn script_empty_body_fails() {
-        let mode = SubprocessMode::Script {
-            interpreter: "bash".into(),
-            body: "".into(),
-            args: vec![],
-        };
-        let err = mode.validate().unwrap_err();
-        assert!(err.to_string().contains("body cannot be empty"));
-    }
-
-    #[test]
-    fn script_invalid_base64_fails() {
-        let mode = SubprocessMode::Script {
-            interpreter: "bash".into(),
-            body: "not-valid-base64!!!".into(),
-            args: vec![],
-        };
-        let err = mode.validate().unwrap_err();
-        assert!(err.to_string().contains("invalid base64"));
-    }
-
-    #[test]
-    fn script_non_utf8_body_fails() {
-        let non_utf8 = BASE64.encode([0xFF, 0xFE, 0x80]);
-        let mode = SubprocessMode::Script {
-            interpreter: "bash".into(),
-            body: non_utf8,
-            args: vec![],
-        };
-        let err = mode.validate().unwrap_err();
-        assert!(err.to_string().contains("not valid UTF-8"));
-    }
-
-    #[test]
-    fn script_interpreter_valid() {
-        let mode = SubprocessMode::Script {
-            interpreter: "ruby".into(),
-            body: encode("puts 'hello'"),
-            args: vec![],
-        };
-        assert!(mode.validate().is_ok());
-    }
-
-    #[test]
-    fn script_empty_interpreter_fails() {
-        let mode = SubprocessMode::Script {
-            interpreter: "".into(),
-            body: encode("puts 'hello'"),
-            args: vec![],
-        };
-        let err = mode.validate().unwrap_err();
-        assert!(err.to_string().contains("interpreter cannot be empty"));
-    }
-
-    #[test]
-    fn decode_body_returns_script() {
-        let mode = SubprocessMode::Script {
-            interpreter: "bash".into(),
-            body: encode("echo hello"),
-            args: vec![],
-        };
-        assert_eq!(mode.decode_body().unwrap(), "echo hello");
-    }
-
-    #[test]
-    fn decode_body_with_limit_rejects_over_limit() {
-        let mode = SubprocessMode::Script {
-            interpreter: "bash".into(),
-            body: encode("aaaaaaaaaa"),
-            args: vec![],
-        };
-        let err = mode
-            .decode_body_with_limit(5)
-            .expect_err("decoded body over the configured limit must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains('5') || msg.contains("maximum"),
-            "error should mention the limit, got: {msg}"
+    fn decode_body_returns_script_and_rejects_command_mode() {
+        assert_eq!(
+            script("bash", encode("echo hello")).decode_body().unwrap(),
+            "echo hello"
         );
-    }
 
-    #[test]
-    fn decode_body_with_limit_accepts_within_limit() {
-        let mode = SubprocessMode::Script {
-            interpreter: "bash".into(),
-            body: encode("echo hi"),
-            args: vec![],
-        };
-        assert_eq!(mode.decode_body_with_limit(64).unwrap(), "echo hi");
-    }
-
-    #[test]
-    fn decode_body_enforces_the_default_cap() {
-        let payload = "a".repeat(MAX_SCRIPT_BODY_BYTES + 1);
-        let mode = SubprocessMode::Script {
-            interpreter: "bash".into(),
-            body: BASE64.encode(payload.as_bytes()),
-            args: vec![],
-        };
-        let err = mode
-            .decode_body()
-            .expect_err("decode_body must enforce MAX_SCRIPT_BODY_BYTES by default");
-        assert!(
-            err.to_string().contains(&MAX_SCRIPT_BODY_BYTES.to_string()),
-            "error should mention the default limit"
-        );
-    }
-
-    #[test]
-    fn decode_body_errors_on_command_mode() {
         let mode = SubprocessMode::Command {
             command: "ls".into(),
             args: vec![],
@@ -372,131 +285,89 @@ mod tests {
     }
 
     #[test]
-    fn script_body_within_limit_is_accepted() {
-        let payload = "a".repeat(MAX_SCRIPT_BODY_BYTES);
-        let mode = SubprocessMode::Script {
-            interpreter: "bash".into(),
-            body: BASE64.encode(payload.as_bytes()),
-            args: vec![],
-        };
-        mode.validate()
-            .expect("body at exactly the limit must pass");
-    }
+    fn configurable_decode_limit_accepts_boundary_and_rejects_overflow() {
+        let exact = script("bash", encode("12345"));
+        assert_eq!(exact.decode_body_with_limit(5).unwrap(), "12345");
+        assert_eq!(exact.decode_body_with_limit(64).unwrap(), "12345");
 
-    #[test]
-    fn script_body_over_limit_is_rejected() {
-        let payload = "a".repeat(MAX_SCRIPT_BODY_BYTES + 1);
-        let mode = SubprocessMode::Script {
-            interpreter: "bash".into(),
-            body: BASE64.encode(payload.as_bytes()),
-            args: vec![],
-        };
-        let err = mode
-            .validate()
-            .expect_err("over-limit body must be rejected");
-        let msg = err.to_string();
+        let over = script("bash", encode("123456"));
+        let error = over.decode_body_with_limit(5).unwrap_err();
         assert!(
-            msg.contains(&MAX_SCRIPT_BODY_BYTES.to_string()),
-            "error should mention the limit, got: {msg}"
+            error.to_string().contains('5') || error.to_string().contains("maximum"),
+            "got: {error}"
         );
     }
 
     #[test]
-    fn encoded_body_at_threshold_reaches_decoded_size_check() {
+    fn default_limit_accepts_boundary_and_rejects_overflow() {
+        let payload = "a".repeat(MAX_SCRIPT_BODY_BYTES);
+        let exact = script("bash", BASE64.encode(payload.as_bytes()));
+        exact.validate().expect("body at the limit must pass");
+        assert_eq!(exact.decode_body().unwrap().len(), MAX_SCRIPT_BODY_BYTES);
+
+        let payload = "a".repeat(MAX_SCRIPT_BODY_BYTES + 1);
+        let over = script("bash", BASE64.encode(payload.as_bytes()));
+        for error in [
+            over.validate().unwrap_err(),
+            over.decode_body().unwrap_err(),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains(&MAX_SCRIPT_BODY_BYTES.to_string()),
+                "got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_size_precheck_has_an_exact_boundary() {
         let threshold = MAX_SCRIPT_BODY_BYTES.div_ceil(3) * 4;
-        let mode = SubprocessMode::Script {
-            interpreter: "bash".into(),
-            body: "A".repeat(threshold),
-            args: vec![],
-        };
-        let err = mode
+        let at_threshold = script("bash", "A".repeat(threshold));
+        let error = at_threshold
             .validate()
             .expect_err("decoded body over the limit must be rejected");
-        let msg = err.to_string();
         assert!(
-            msg.contains("(decoded)"),
-            "body at the encoded threshold must be rejected by the decoded-size check, got: {msg}"
+            error.to_string().contains("(decoded)"),
+            "decoded-size check must reject the boundary: {error}"
         );
-    }
 
-    #[test]
-    fn encoded_body_one_char_over_threshold_fails_before_decode() {
-        let threshold = MAX_SCRIPT_BODY_BYTES.div_ceil(3) * 4;
-        let mode = SubprocessMode::Script {
-            interpreter: "bash".into(),
-            body: "A".repeat(threshold + 1),
-            args: vec![],
-        };
-        let err = mode
+        let above_threshold = script("bash", "A".repeat(threshold + 1));
+        let error = above_threshold
             .validate()
             .expect_err("body over the encoded threshold must be rejected");
-        let msg = err.to_string();
         assert!(
-            msg.contains(&MAX_SCRIPT_BODY_BYTES.to_string()),
-            "error should mention the limit, got: {msg}"
+            error
+                .to_string()
+                .contains(&MAX_SCRIPT_BODY_BYTES.to_string()),
+            "got: {error}"
         );
         assert!(
-            !msg.contains("invalid base64"),
-            "the size pre-check must fire before base64 decoding, got: {msg}"
+            !error.to_string().contains("invalid base64"),
+            "precheck must run before decoding: {error}"
         );
     }
 
     #[test]
-    fn huge_encoded_body_is_rejected_without_decoding() {
-        let body = "A".repeat(100 * 1024 * 1024);
-        let mode = SubprocessMode::Script {
-            interpreter: "bash".into(),
-            body,
-            args: vec![],
-        };
-        let err = mode
-            .validate()
-            .expect_err("huge encoded body must be rejected");
-        assert!(err.to_string().contains(&MAX_SCRIPT_BODY_BYTES.to_string()));
-        let err = mode
-            .decode_body()
-            .expect_err("huge encoded body must be rejected");
-        assert!(err.to_string().contains(&MAX_SCRIPT_BODY_BYTES.to_string()));
+    fn serde_roundtrips_command_and_script_modes() {
+        for mode in [
+            SubprocessMode::Command {
+                command: "echo".into(),
+                args: vec!["hello".into()],
+            },
+            SubprocessMode::Script {
+                interpreter: "python3".into(),
+                body: encode("print('hello')"),
+                args: vec!["--verbose".into()],
+            },
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(serde_json::from_str::<SubprocessMode>(&json).unwrap(), mode);
+        }
     }
 
     #[test]
-    fn decode_body_with_limit_boundary() {
-        let script = |s: &str| SubprocessMode::Script {
-            interpreter: "bash".into(),
-            body: encode(s),
-            args: vec![],
-        };
-        assert_eq!(script("12345").decode_body_with_limit(5).unwrap(), "12345");
-        script("123456")
-            .decode_body_with_limit(5)
-            .expect_err("body one byte over the limit must be rejected");
-    }
-
-    #[test]
-    fn serde_roundtrip_command() {
-        let mode = SubprocessMode::Command {
-            command: "echo".into(),
-            args: vec!["hello".into()],
-        };
-        let json = serde_json::to_string(&mode).unwrap();
-        let back: SubprocessMode = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, mode);
-    }
-
-    #[test]
-    fn serde_roundtrip_script() {
-        let mode = SubprocessMode::Script {
-            interpreter: "python3".into(),
-            body: encode("print('hello')"),
-            args: vec!["--verbose".into()],
-        };
-        let json = serde_json::to_string(&mode).unwrap();
-        let back: SubprocessMode = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, mode);
-    }
-
-    #[test]
-    fn serde_command_empty_args_skipped() {
+    fn serde_omits_empty_command_args() {
         let mode = SubprocessMode::Command {
             command: "ls".into(),
             args: vec![],

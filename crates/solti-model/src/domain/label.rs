@@ -1,6 +1,8 @@
-//! Key-value metadata labels.
+//! # Labels
 //!
-//! [`Labels`] is an ordered map used for runner routing and task filtering.
+//! [`Labels`] is a key-sorted map with Kubernetes label validation.
+//! Insertion and direct deserialization do not validate entries.
+//! Call [`Labels::validate`] at an input boundary.
 
 use std::collections::BTreeMap;
 
@@ -29,7 +31,7 @@ use crate::{ModelResult, validation};
 pub struct Labels(BTreeMap<String, String>);
 
 impl Labels {
-    /// Create an empty set of labels.
+    /// Creates an empty label map.
     ///
     /// ## Example
     ///
@@ -44,19 +46,19 @@ impl Labels {
         Self(BTreeMap::new())
     }
 
-    /// Return the number of labels.
+    /// Returns the number of labels.
     #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// Return `true` if no labels are present.
+    /// Returns whether the map is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    /// Insert or overwrite a label.
+    /// Inserts or replaces a label.
     ///
     /// ## Example
     ///
@@ -78,19 +80,19 @@ impl Labels {
         self
     }
 
-    /// Get the value for a key, if present.
+    /// Returns the value for a key.
     #[inline]
     pub fn get(&self, key: &str) -> Option<&str> {
         self.0.get(key).map(|s| s.as_str())
     }
 
-    /// Check whether a key exists, regardless of its value.
+    /// Returns whether a key exists.
     #[inline]
     pub fn contains_key(&self, key: &str) -> bool {
         self.0.contains_key(key)
     }
 
-    /// Iterate through all labels as `(&str, &str)` pairs.
+    /// Iterates over labels in key order.
     ///
     /// ## Example
     ///
@@ -109,7 +111,11 @@ impl Labels {
         self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
 
-    /// Validate all entries using Kubernetes label key and value rules.
+    /// Validates every label.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ModelError::Invalid`].
     pub fn validate(&self) -> ModelResult<()> {
         for (key, value) in &self.0 {
             validation::validate_qualified_name("label key", key)?;
@@ -153,76 +159,42 @@ mod tests {
     use super::Labels;
 
     #[test]
-    fn new_is_empty() {
-        let labels = Labels::new();
+    fn insertion_lookup_overwrite_and_iteration_are_deterministic() {
+        let mut labels = Labels::new();
         assert!(labels.is_empty());
         assert_eq!(labels.len(), 0);
-        assert!(labels.get("any").is_none());
-    }
 
-    #[test]
-    fn insert_and_get() {
-        let mut labels = Labels::new();
-        labels.insert("region", "us-east-1");
-
-        assert!(!labels.is_empty());
-        assert_eq!(labels.len(), 1);
-        assert_eq!(labels.get("region"), Some("us-east-1"));
-        assert!(labels.get("zone").is_none());
-    }
-
-    #[test]
-    fn insert_overwrites() {
-        let mut labels = Labels::new();
+        labels.insert("z", "last").insert("a", "first");
         labels.insert("env", "dev");
         labels.insert("env", "prod");
 
+        assert_eq!(labels.len(), 3);
         assert_eq!(labels.get("env"), Some("prod"));
+        assert_eq!(
+            labels.iter().collect::<Vec<_>>(),
+            vec![("a", "first"), ("env", "prod"), ("z", "last")]
+        );
     }
 
     #[test]
-    fn insert_chaining() {
-        let mut labels = Labels::new();
-        labels.insert("a", "1").insert("b", "2");
-
-        assert_eq!(labels.get("a"), Some("1"));
-        assert_eq!(labels.get("b"), Some("2"));
-    }
-
-    #[test]
-    fn iter_returns_sorted_pairs() {
-        let mut labels = Labels::new();
-        labels.insert("z", "last");
-        labels.insert("a", "first");
-
-        let pairs: Vec<_> = labels.iter().collect();
-        assert_eq!(pairs, vec![("a", "first"), ("z", "last")]);
-    }
-
-    #[test]
-    fn serde_transparent_roundtrip() {
+    fn serde_is_transparent() {
         let mut labels = Labels::new();
         labels.insert("runner-tag", "prod");
 
         let json = serde_json::to_string(&labels).unwrap();
-        assert!(json.contains("\"runner-tag\":\"prod\""));
-
+        assert_eq!(json, r#"{"runner-tag":"prod"}"#);
         let back: Labels = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.get("runner-tag"), Some("prod"));
+        assert_eq!(back, labels);
     }
 
     #[test]
-    fn validate_accepts_kubernetes_qualified_labels() {
+    fn validation_uses_kubernetes_label_rules() {
         let mut labels = Labels::new();
         labels
             .insert("app.kubernetes.io/name", "solti_agent-1")
             .insert("empty", "");
-
         labels.validate().unwrap();
-    }
 
-    #[test]
-    fn validate_rejects_invalid_key_or_value() {
         let mut invalid_key = Labels::new();
         invalid_key.insert("example.io/bad key", "value");
         assert!(invalid_key.validate().is_err());

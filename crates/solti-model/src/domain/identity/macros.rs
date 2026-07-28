@@ -20,7 +20,11 @@ macro_rules! arc_str_newtype {
         $vis struct $ty(std::sync::Arc<str>);
 
         impl $ty {
-            /// Validate and create an identifier from a string slice.
+            /// Creates a validated identifier.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`crate::ModelError::Invalid`] when the value violates this identifier's format.
             #[inline]
             pub fn new(s: impl AsRef<str>) -> $crate::ModelResult<Self> {
                 let id = Self(std::sync::Arc::from(s.as_ref()));
@@ -28,13 +32,13 @@ macro_rules! arc_str_newtype {
                 Ok(id)
             }
 
-            /// Access the underlying string slice.
+            /// Returns the underlying string.
             #[inline]
             pub fn as_str(&self) -> &str {
                 &self.0
             }
 
-            /// Consume the wrapper, returning the underlying `Arc<str>`.
+            /// Returns the underlying `Arc<str>`.
             #[inline]
             pub fn into_inner(self) -> std::sync::Arc<str> {
                 self.0
@@ -99,9 +103,7 @@ macro_rules! arc_str_newtype {
         }
 
         impl<'de> serde::Deserialize<'de> for $ty {
-            /// Deserialization validates: every identity type must define
-            /// `validate_format`, and untrusted input cannot smuggle an id
-            /// past the charset rules (ids leak into filesystem and cgroup paths).
+            /// Deserializes and validates the identifier.
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
                 let s = String::deserialize(deserializer)?;
                 Self::new(s).map_err(serde::de::Error::custom)

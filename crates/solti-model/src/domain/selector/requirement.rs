@@ -1,6 +1,7 @@
-//! Selector requirement.
+//! # Selector requirement
 //!
-//! [`SelectorRequirement`] is a single label constraint used in [`LabelSelector`](crate::LabelSelector).
+//! [`SelectorRequirement`] is one constraint inside a [`LabelSelector`](crate::LabelSelector).
+//! Constructors set fields but do not validate them.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,18 +29,19 @@ pub struct SelectorRequirement {
     pub key: String,
     /// Comparison operator.
     pub operator: SelectorOperator,
-    /// Values for `In` / `NotIn`.
-    /// Must be empty for `Exists` / `DoesNotExist`.
+    /// Values used by `In` and `NotIn`.
+    ///
+    /// This must be empty for `Exists` and `DoesNotExist`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<String>,
 }
 
 impl SelectorRequirement {
-    /// Validate structural invariants.
+    /// Validates the requirement.
     ///
-    /// - `key` must not be empty
-    /// - `In`/`NotIn` must have non-empty `values`
-    /// - `Exists`/`DoesNotExist` must have empty `values`
+    /// # Errors
+    ///
+    /// Returns [`crate::ModelError::Invalid`].
     ///
     /// ## Example
     ///
@@ -77,7 +79,7 @@ impl SelectorRequirement {
         Ok(())
     }
 
-    /// Shorthand: require `key` to be in `values`.
+    /// Creates an `In` requirement.
     ///
     /// ## Example
     ///
@@ -96,7 +98,7 @@ impl SelectorRequirement {
         }
     }
 
-    /// Shorthand: require `key` to not be in `values`.
+    /// Creates a `NotIn` requirement.
     #[inline]
     pub fn not_in(key: impl Into<String>, values: Vec<String>) -> Self {
         Self {
@@ -106,7 +108,7 @@ impl SelectorRequirement {
         }
     }
 
-    /// Shorthand: require label key to exist.
+    /// Creates an `Exists` requirement.
     #[inline]
     pub fn exists(key: impl Into<String>) -> Self {
         Self {
@@ -116,7 +118,7 @@ impl SelectorRequirement {
         }
     }
 
-    /// Shorthand: require label key to not exist.
+    /// Creates a `DoesNotExist` requirement.
     #[inline]
     pub fn does_not_exist(key: impl Into<String>) -> Self {
         Self {
@@ -132,43 +134,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn in_constructor() {
-        let req = SelectorRequirement::r#in("gpu", vec!["a100".into(), "h100".into()]);
-        assert_eq!(req.key, "gpu");
-        assert_eq!(req.operator, SelectorOperator::In);
-        assert_eq!(req.values, vec!["a100", "h100"]);
+    fn constructors_set_operator_key_and_values() {
+        let included = SelectorRequirement::r#in("gpu", vec!["a100".into(), "h100".into()]);
+        assert_eq!(included.key, "gpu");
+        assert_eq!(included.operator, SelectorOperator::In);
+        assert_eq!(included.values, vec!["a100", "h100"]);
+
+        let excluded = SelectorRequirement::not_in("zone", vec!["us-west".into()]);
+        assert_eq!(excluded.key, "zone");
+        assert_eq!(excluded.operator, SelectorOperator::NotIn);
+        assert_eq!(excluded.values, vec!["us-west"]);
+
+        for (requirement, operator) in [
+            (SelectorRequirement::exists("gpu"), SelectorOperator::Exists),
+            (
+                SelectorRequirement::does_not_exist("tainted"),
+                SelectorOperator::DoesNotExist,
+            ),
+        ] {
+            assert_eq!(requirement.operator, operator);
+            assert!(requirement.values.is_empty());
+        }
     }
 
     #[test]
-    fn not_in_constructor() {
-        let req = SelectorRequirement::not_in("zone", vec!["us-west".into()]);
-        assert_eq!(req.operator, SelectorOperator::NotIn);
-    }
-
-    #[test]
-    fn exists_constructor() {
-        let req = SelectorRequirement::exists("gpu");
-        assert_eq!(req.operator, SelectorOperator::Exists);
-        assert!(req.values.is_empty());
-    }
-
-    #[test]
-    fn does_not_exist_constructor() {
-        let req = SelectorRequirement::does_not_exist("tainted");
-        assert_eq!(req.operator, SelectorOperator::DoesNotExist);
-        assert!(req.values.is_empty());
-    }
-
-    #[test]
-    fn serde_roundtrip() {
+    fn serde_roundtrip_and_empty_values_shape_are_stable() {
         let req = SelectorRequirement::r#in("tier", vec!["prod".into(), "staging".into()]);
         let json = serde_json::to_string(&req).unwrap();
         let back: SelectorRequirement = serde_json::from_str(&json).unwrap();
         assert_eq!(back, req);
-    }
 
-    #[test]
-    fn serde_skips_empty_values() {
         let req = SelectorRequirement::exists("gpu");
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -178,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_uses_kubernetes_label_rules() {
+    fn validation_uses_kubernetes_label_rules() {
         SelectorRequirement::r#in(
             "workloads.example.io/class",
             vec!["gpu_fast".into(), "".into()],

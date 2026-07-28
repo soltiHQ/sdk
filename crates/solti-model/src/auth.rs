@@ -1,10 +1,10 @@
-//! Authentication credentials.
+//! # Bearer token
 //!
-//! [`Token`] is a shared bearer secret used in both directions of agent and control-plane communication:
-//! - agent to control plane discovery: the agent presents it;
-//! - control plane to agent API: the agent verifies it.
+//! [`Token`] wraps one bearer secret.
+//! It can be created, generated, or loaded from an environment variable or file.
 //!
-//! One secret per agent is enough for both paths.
+//! This module does not choose an authentication topology.
+//! It does not persist or rotate secrets.
 
 use std::fmt;
 use std::path::Path;
@@ -21,10 +21,11 @@ const GENERATED_PREFIX: &str = "solti_agt_";
 /// Entropy of a generated token, in bytes (256 bits).
 const GENERATED_ENTROPY_BYTES: usize = 32;
 
-/// Bearer token shared between an agent and the control plane.
+/// Validated bearer token.
 ///
 /// `Debug` output is redacted.
-/// Use [`Self::verify`] for inbound checks and [`Self::expose`] only when building an outbound auth header.
+/// Use [`Self::verify`] for inbound checks.
+/// Use [`Self::expose`] only when the raw value is required.
 ///
 /// ## Example
 ///
@@ -41,7 +42,13 @@ const GENERATED_ENTROPY_BYTES: usize = 32;
 pub struct Token(String);
 
 impl Token {
-    /// Wrap a raw token. Surrounding whitespace is trimmed.
+    /// Wraps a raw token.
+    ///
+    /// Surrounding whitespace is trimmed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the trimmed value is empty.
     ///
     /// ## Example
     ///
@@ -55,10 +62,15 @@ impl Token {
         Self::checked(token.into())
     }
 
-    /// Generate a fresh random token.
+    /// Generates a random token.
     ///
-    /// The token has 256 bits of OS entropy, is base64url-encoded, and starts with `solti_agt_`.
-    /// This function does not persist it.
+    /// The token uses 256 bits from the operating system entropy source.
+    /// It uses unpadded base64url and starts with `solti_agt_`.
+    /// The token is not persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the entropy source is unavailable.
     ///
     /// ## Example
     ///
@@ -81,7 +93,11 @@ impl Token {
         )))
     }
 
-    /// Read the token from an environment variable.
+    /// Reads a token from an environment variable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the variable is absent or the value is empty.
     ///
     /// ## Example
     ///
@@ -97,7 +113,13 @@ impl Token {
         Self::checked(raw)
     }
 
-    /// Read the token from a file (trailing newline / whitespace trimmed).
+    /// Reads a token from a UTF-8 file.
+    ///
+    /// Surrounding whitespace is trimmed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the file cannot be read or the value is empty.
     ///
     /// ## Example
     ///
@@ -123,14 +145,14 @@ impl Token {
         Ok(Self(trimmed.to_string()))
     }
 
-    /// Borrow the raw token for outbound header construction.
+    /// Returns the raw token.
     ///
     /// Inbound verification should use [`Self::verify`].
     pub fn expose(&self) -> &str {
         &self.0
     }
 
-    /// Compare with a candidate presented by a caller.
+    /// Verifies a candidate value.
     ///
     /// The comparison is constant-time for equal-length strings.
     /// A length mismatch returns `false`.

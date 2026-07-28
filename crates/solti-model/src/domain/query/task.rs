@@ -1,6 +1,8 @@
-//! Task query builder.
+//! # Task query
 //!
-//! [`TaskFilter`], [`TaskQuery`] and [`TaskPage`] support task collections.
+//! [`TaskPage`] returns a snapshot page and optional continuation.
+//! [`TaskFilter`] selects task resources.
+//! [`TaskQuery`] adds pagination.
 
 use serde::{Deserialize, Serialize};
 
@@ -11,13 +13,12 @@ pub const DEFAULT_LIMIT: usize = 100;
 
 /// Hard cap on page size.
 ///
-/// [`TaskQuery::with_limit`] clamps values above this silently;
-/// Upstream transports should reject oversized limits explicitly if they expose a wire contract.
+/// [`TaskQuery::with_limit`] clamps larger values.
 pub const MAX_LIMIT: usize = 1000;
 
 /// Filters shared by task list and watch operations.
 ///
-/// An empty phase filter matches **all** phases.
+/// An empty phase filter matches every phase.
 /// Multiple [`with_phase`](Self::with_phase) calls accumulate with OR semantics.
 /// Slot, label and phase filters are ANDed.
 ///
@@ -48,8 +49,8 @@ pub struct TaskFilter {
 
 /// Position of the next page in one Task collection snapshot.
 ///
-/// The cursor is a domain value, not a wire token. Transport layers encode it
-/// into their own opaque continuation representation.
+/// The cursor is a domain value, not a wire token.
+/// Transport layers encode it into their own opaque continuation representation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     rename_all = "camelCase",
@@ -64,8 +65,8 @@ pub struct TaskContinuation {
 
 /// Query parameters for filtered, snapshot-consistent Task listing.
 ///
-/// Filtering is carried by [`TaskFilter`]. Pagination applies only to list
-/// operations.
+/// Filtering is carried by [`TaskFilter`].
+/// Pagination applies only to list operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskQuery {
     filter: TaskFilter,
@@ -83,21 +84,23 @@ impl Default for TaskQuery {
 /// One page from a Task collection snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskPage<T> {
-    /// Items on this page, at most [`TaskQuery::limit`] entries.
+    /// Items on this page.
     pub items: Vec<T>,
-    /// Opaque collection version captured with this page.
+    /// Opaque collection snapshot version.
     pub resource_version: String,
-    /// Cursor for the next page. `None` means this is the last page.
+    /// Cursor for the next page.
+    ///
+    /// `None` means this is the last page.
     pub continuation: Option<TaskContinuation>,
     /// Number of matching items after this page in the same snapshot.
     pub remaining_item_count: usize,
 }
 
 impl TaskContinuation {
-    /// Create a domain cursor decoded by a transport layer.
+    /// Creates a domain continuation.
     ///
-    /// The resource version remains opaque here. The state store validates that
-    /// it belongs to a retained snapshot when the query is executed.
+    /// The resource version remains opaque here.
+    /// The state store validates that it belongs to a retained snapshot when the query is executed.
     ///
     /// # Errors
     ///
@@ -185,7 +188,7 @@ mod raw {
 }
 
 impl TaskFilter {
-    /// Create an empty filter.
+    /// Creates an empty filter.
     #[inline]
     pub fn new() -> Self {
         Self::default()
@@ -198,7 +201,7 @@ impl TaskFilter {
         self
     }
 
-    /// Add a phase filter.
+    /// Adds a phase filter.
     ///
     /// Multiple calls accumulate with OR semantics.
     #[inline]
@@ -209,7 +212,7 @@ impl TaskFilter {
         self
     }
 
-    /// Add phase filters from an iterator.
+    /// Adds phase filters from an iterator.
     ///
     /// Values are deduplicated and retain OR semantics.
     pub fn with_phases(mut self, phases: impl IntoIterator<Item = TaskPhase>) -> Self {
@@ -222,6 +225,10 @@ impl TaskFilter {
     /// Filter by labels.
     ///
     /// Every selector requirement is ANDed. An empty selector matches all tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the selector is invalid.
     #[inline]
     pub fn with_label_selector(mut self, selector: LabelSelector) -> ModelResult<Self> {
         selector.validate()?;
@@ -246,7 +253,7 @@ impl TaskFilter {
             .with_phase(TaskPhase::Failed)
     }
 
-    /// Return whether a task passes every filter.
+    /// Returns whether a task passes every filter.
     #[inline]
     pub fn matches(&self, task: &Task) -> bool {
         self.slot.as_ref().is_none_or(|slot| slot == task.slot())
@@ -254,7 +261,7 @@ impl TaskFilter {
             && self.matches_labels(task.labels())
     }
 
-    /// Return `true` if the given phase passes the phase filter.
+    /// Returns whether a phase passes the phase filter.
     ///
     /// An empty filter matches all phases.
     #[inline]
@@ -262,7 +269,7 @@ impl TaskFilter {
         self.phases.is_empty() || self.phases.contains(phase)
     }
 
-    /// Return whether the labels pass the selector.
+    /// Returns whether labels pass the selector.
     #[inline]
     pub fn matches_labels(&self, labels: &Labels) -> bool {
         self.label_selector.matches(labels)
@@ -288,7 +295,7 @@ impl TaskFilter {
 }
 
 impl TaskQuery {
-    /// Create a new query with default pagination and without filters.
+    /// Creates an unfiltered query with default pagination.
     ///
     /// ## Example
     ///
@@ -304,7 +311,7 @@ impl TaskQuery {
         Self::from_filter(TaskFilter::new())
     }
 
-    /// Create a query from filters with default pagination.
+    /// Creates a query from filters.
     #[inline]
     pub fn from_filter(filter: TaskFilter) -> Self {
         Self {
@@ -321,7 +328,7 @@ impl TaskQuery {
         self
     }
 
-    /// Add a phase filter.
+    /// Adds a phase filter.
     ///
     /// Multiple calls accumulate with OR semantics.
     #[inline]
@@ -330,7 +337,7 @@ impl TaskQuery {
         self
     }
 
-    /// Add phase filters from an iterator.
+    /// Adds phase filters from an iterator.
     ///
     /// Values are deduplicated and retain OR semantics.
     #[inline]
@@ -342,6 +349,10 @@ impl TaskQuery {
     /// Filter by labels.
     ///
     /// Every selector requirement is ANDed. An empty selector matches all tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the selector is invalid.
     #[inline]
     pub fn with_label_selector(mut self, selector: LabelSelector) -> ModelResult<Self> {
         self.filter = self.filter.with_label_selector(selector)?;
@@ -362,7 +373,7 @@ impl TaskQuery {
         self
     }
 
-    /// Set page size.
+    /// Sets the page size.
     ///
     /// Zero selects [`DEFAULT_LIMIT`]. Values above [`MAX_LIMIT`] are capped.
     #[inline]
@@ -382,19 +393,19 @@ impl TaskQuery {
         self
     }
 
-    /// Return whether a task passes every filter.
+    /// Returns whether a task passes every filter.
     #[inline]
     pub fn matches(&self, task: &Task) -> bool {
         self.filter.matches(task)
     }
 
-    /// Return `true` if the given phase passes the phase filter.
+    /// Returns whether a phase passes the phase filter.
     #[inline]
     pub fn matches_phase(&self, phase: &TaskPhase) -> bool {
         self.filter.matches_phase(phase)
     }
 
-    /// Return whether the labels pass the selector.
+    /// Returns whether labels pass the selector.
     #[inline]
     pub fn matches_labels(&self, labels: &Labels) -> bool {
         self.filter.matches_labels(labels)
@@ -463,7 +474,7 @@ impl TaskWatchEvent {
         self.object().metadata().resource_version()
     }
 
-    /// Consume the event and return its resource.
+    /// Returns the event resource.
     #[inline]
     pub fn into_object(self) -> Task {
         match self {
@@ -486,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn phases_are_deduplicated_and_matched_with_or_semantics() {
+    fn filters_deduplicate_phases_and_match_with_or_semantics() {
         let query = TaskQuery::new()
             .with_phase(TaskPhase::Pending)
             .with_phase(TaskPhase::Running)
@@ -496,10 +507,7 @@ mod tests {
         assert!(query.matches_phase(&TaskPhase::Pending));
         assert!(query.matches_phase(&TaskPhase::Running));
         assert!(!query.matches_phase(&TaskPhase::Failed));
-    }
 
-    #[test]
-    fn empty_phase_and_label_filters_match_everything() {
         let query = TaskQuery::new();
         assert!(query.matches_phase(&TaskPhase::Failed));
         assert!(query.matches_labels(&labels(&[("environment", "production")])));
@@ -544,12 +552,8 @@ mod tests {
     }
 
     #[test]
-    fn zero_limit_uses_the_default() {
+    fn zero_limit_uses_default_and_continuation_requires_resource_version() {
         assert_eq!(TaskQuery::new().with_limit(0).limit(), DEFAULT_LIMIT);
-    }
-
-    #[test]
-    fn continuation_construction_rejects_empty_resource_version() {
         assert!(matches!(
             TaskContinuation::new("  ", TaskFilter::new(), TaskId::new("build-50").unwrap(),),
             Err(ModelError::Invalid(_))

@@ -1,33 +1,32 @@
-//! Model errors.
+//! # Model errors
+//!
+//! [`ModelError`] reports parsing and validation failures.
 
 use std::borrow::Cow;
 
 use thiserror::Error;
 
 /// Error type for parsing and validating model values.
-///
-/// The enum is `#[non_exhaustive]`. Callers should keep a wildcard arm when
-/// matching it.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ModelError {
-    /// Parsing an unrecognized admission-policy name (`AdmissionPolicy` `FromStr`).
+    /// Unknown admission policy name.
     #[error("unknown admission policy: {0}")]
     UnknownAdmission(String),
 
-    /// Parsing an unrecognized restart-policy name (`RestartPolicy` `FromStr`).
+    /// Unknown restart policy name.
     #[error("unknown restart policy: {0}")]
     UnknownRestart(String),
 
-    /// Parsing an unrecognized jitter-policy name (`JitterPolicy` `FromStr`).
+    /// Unknown jitter policy name.
     #[error("unknown jitter policy: {0}")]
     UnknownJitter(String),
 
-    /// Parsing an unrecognized phase name (`TaskPhase` `FromStr`).
+    /// Unknown task phase name.
     #[error("unknown task phase: {0}")]
     UnknownTaskPhase(String),
 
-    /// A structural or business-rule validation failure.
+    /// Invalid model value or state.
     #[error("invalid model: {0}")]
     Invalid(Cow<'static, str>),
 }

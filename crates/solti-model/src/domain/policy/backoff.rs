@@ -1,6 +1,8 @@
-//! Backoff policy.
+//! # Backoff policy
 //!
-//! [`BackoffPolicy`] controls retry delay growth: initial delay, max cap, factor, and jitter.
+//! [`BackoffPolicy`] configures retry delay growth and jitter.
+//! Direct deserialization validates fields.
+//! Struct literals must be checked with [`BackoffPolicy::validate`].
 
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
@@ -18,7 +20,8 @@ use crate::error::{ModelError, ModelResult};
 /// | `max_ms`   | `u64`          | `30_000`  | Maximum delay cap (ms)                |
 /// | `factor`   | `f64`          | `2.0`     | Exponential growth multiplier         |
 ///
-/// With `factor = 2.0`, delay grows like this: 1 s, 2 s, 4 s, 8 s, then up to the `max_ms` cap.
+/// Before jitter, factor `2.0` grows `1s, 2s, 4s, 8s`.
+/// Growth stops at `max_ms`.
 ///
 /// ## Example
 ///
@@ -77,12 +80,12 @@ mod raw {
 }
 
 impl BackoffPolicy {
-    /// Validate backoff parameters.
+    /// Validates backoff parameters.
     ///
-    /// Checks:
-    /// - `first_ms > 0`
-    /// - `max_ms >= first_ms`
-    /// - `factor >= 1.0` and finite
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when `first_ms` is zero,
+    /// `max_ms` is below `first_ms`, or `factor` is not finite or below `1.0`.
     ///
     /// ## Example
     ///
@@ -135,7 +138,7 @@ impl Hash for BackoffPolicy {
 }
 
 impl Default for BackoffPolicy {
-    /// Returns a sensible default: full jitter, 1s initial, 30s max, factor 2.
+    /// Returns full jitter, a 1-second initial delay, a 30-second cap, and factor `2.0`.
     fn default() -> Self {
         Self {
             jitter: super::JitterPolicy::Full,
@@ -151,73 +154,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_accepts_defaults() {
-        assert!(BackoffPolicy::default().validate().is_ok());
+    fn validation_accepts_defaults_and_rejects_invalid_fields() {
+        BackoffPolicy::default().validate().unwrap();
+
+        for invalid in [
+            BackoffPolicy {
+                first_ms: 0,
+                ..BackoffPolicy::default()
+            },
+            BackoffPolicy {
+                first_ms: 500,
+                max_ms: 100,
+                ..BackoffPolicy::default()
+            },
+            BackoffPolicy {
+                factor: 0.5,
+                ..BackoffPolicy::default()
+            },
+            BackoffPolicy {
+                factor: f64::NAN,
+                ..BackoffPolicy::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
     }
 
     #[test]
-    fn validate_rejects_zero_first_ms() {
-        let p = BackoffPolicy {
-            first_ms: 0,
-            ..BackoffPolicy::default()
-        };
-        assert!(p.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_max_smaller_than_first() {
-        let p = BackoffPolicy {
-            first_ms: 500,
-            max_ms: 100,
-            ..BackoffPolicy::default()
-        };
-        assert!(p.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_factor_below_one() {
-        let p = BackoffPolicy {
-            factor: 0.5,
-            ..BackoffPolicy::default()
-        };
-        assert!(p.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_nan_factor() {
-        let p = BackoffPolicy {
-            factor: f64::NAN,
-            ..BackoffPolicy::default()
-        };
-        assert!(p.validate().is_err());
-    }
-
-    #[test]
-    fn serde_roundtrip_accepts_valid() {
-        let p = BackoffPolicy::default();
-        let json = serde_json::to_string(&p).unwrap();
+    fn serde_roundtrip_accepts_valid_policy() {
+        let policy = BackoffPolicy::default();
+        let json = serde_json::to_string(&policy).unwrap();
         let back: BackoffPolicy = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, p);
+        assert_eq!(back, policy);
     }
 
     #[test]
-    fn serde_rejects_invalid_first_ms_on_deserialize() {
-        let json = r#"{"jitter":"full","firstMs":0,"maxMs":30000,"factor":2.0}"#;
-        let err = serde_json::from_str::<BackoffPolicy>(json).unwrap_err();
-        assert!(err.to_string().contains("first_ms"), "got: {err}");
-    }
-
-    #[test]
-    fn serde_rejects_inverted_max_on_deserialize() {
-        let json = r#"{"jitter":"full","firstMs":1000,"maxMs":500,"factor":2.0}"#;
-        let err = serde_json::from_str::<BackoffPolicy>(json).unwrap_err();
-        assert!(err.to_string().contains("max_ms"), "got: {err}");
-    }
-
-    #[test]
-    fn serde_rejects_factor_below_one_on_deserialize() {
-        let json = r#"{"jitter":"full","firstMs":1000,"maxMs":30000,"factor":0.5}"#;
-        let err = serde_json::from_str::<BackoffPolicy>(json).unwrap_err();
-        assert!(err.to_string().contains("factor"), "got: {err}");
+    fn serde_rejects_every_invalid_field() {
+        for (json, field) in [
+            (
+                r#"{"jitter":"full","firstMs":0,"maxMs":30000,"factor":2.0}"#,
+                "first_ms",
+            ),
+            (
+                r#"{"jitter":"full","firstMs":1000,"maxMs":500,"factor":2.0}"#,
+                "max_ms",
+            ),
+            (
+                r#"{"jitter":"full","firstMs":1000,"maxMs":30000,"factor":0.5}"#,
+                "factor",
+            ),
+        ] {
+            let error = serde_json::from_str::<BackoffPolicy>(json).unwrap_err();
+            assert!(error.to_string().contains(field), "got: {error}");
+        }
     }
 }

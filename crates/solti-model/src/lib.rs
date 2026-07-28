@@ -1,13 +1,41 @@
-//! Shared task model for Solti agents and control planes.
+//! # solti-model
 //!
-//! `solti-model` contains the data types that all Solti crates speak.
-//! It defines task specs, task status, ids, policies, runner selectors, environment variables, output events, and agent tokens.
+//! Shared resource model for Solti agents and control planes.
 //!
-//! Use it when you build a Solti API, runner, supervisor, control plane, or tool that reads or writes task data.
+//! This crate defines task resources, workloads, policies, selectors, queries,
+//! output events, capabilities, and bearer tokens.
+//! It does not execute tasks or own resource storage.
+//!
+//! ## Start Here
+//!
+//! Use [`TaskManifest`] for caller-owned desired state.
+//! Use [`Task`] for a stored resource with server metadata and status.
+//! Use [`TaskSpec`] to describe execution.
+//! Use [`TaskWorkload`] to select a built-in or extension workload.
+//!
+//! ## Resource Flow
+//!
+//! ```text
+//! caller
+//!   │ TaskManifest
+//!   ▼
+//! Task::from_manifest ── generates uid and creationTimestamp
+//!   │                   └─ starts generation at 1
+//!   ▼
+//! Task
+//!   ├── metadata: ObjectMeta
+//!   ├── spec:     TaskSpec
+//!   ├── status:   TaskStatus
+//!   │
+//!   └── state store assigns resourceVersion
+//! ```
+//!
+//! The model validates values and applies state transitions.
+//! Storage, reconciliation, execution, and transport stay in higher layers.
 //!
 //! ## Quick Start
 //!
-//! Build a task spec and validate it at the submit boundary:
+//! Build a task spec:
 //!
 //! ```rust
 //! use solti_model::{
@@ -28,11 +56,11 @@
 //!     .build()
 //!     .expect("valid spec");
 //!
-//! spec.validate().expect("submittable spec");
+//! spec.validate().expect("valid spec");
 //! assert_eq!(spec.slot().as_str(), "hello");
 //! ```
 //!
-//! Create a task resource from a spec:
+//! Create a stored task resource:
 //!
 //! ```rust
 //! use solti_model::{EmbeddedSpec, Task, TaskPhase, TaskSpec, TaskWorkload};
@@ -48,26 +76,10 @@
 //! assert_eq!(task.name().as_str(), "embedded-cleanup-1");
 //! ```
 //!
-//! The shared model accepts embedded workloads. Transport and runner layers own
-//! their separate admission and routability rules.
+//! [`TaskWorkload::Embedded`] is valid in the shared model.
+//! API and runner layers apply their own admission rules.
 //!
-//! ## What Ships
-//!
-//! | Area        | Main Types                                                                                         |
-//! |-------------|----------------------------------------------------------------------------------------------------|
-//! | Resource    | [`Task`], [`TaskSpec`], [`TaskStatus`], [`ObjectMeta`], [`TaskRun`]                                |
-//! | Identity    | [`Slot`], [`TaskId`], [`AgentId`]                                                                  |
-//! | Execution   | [`TaskWorkload`], [`ExtensionWorkload`], [`SubprocessSpec`], [`WasmSpec`], [`ContainerSpec`]       |
-//! | Policies    | [`RestartPolicy`], [`BackoffPolicy`], [`JitterPolicy`], [`AdmissionPolicy`], [`Timeout`]           |
-//! | Routing     | [`Labels`], [`LabelSelector`], [`SelectorRequirement`], [`SelectorOperator`]                      |
-//! | Capabilities| [`AgentCapabilities`], [`RunnerCapability`], [`WorkloadTypeMeta`]                                  |
-//! | Environment | [`TaskEnv`], [`KeyValue`]                                                                           |
-//! | Query       | [`TaskContinuation`], [`TaskFilter`], [`TaskQuery`], [`TaskPage`], [`TaskWatchEvent`]               |
-//! | Output      | [`OutputEvent`], [`OutputChunk`], [`StreamKind`]                                                   |
-//! | Auth        | [`Token`]                                                                                          |
-//! | Errors      | [`ModelError`], [`ModelResult`]                                                                    |
-//!
-//! ## Core Model
+//! ## Resource Model
 //!
 //! ```text
 //! Task
@@ -84,24 +96,22 @@
 //!   observed_generation, conditions, phase, attempt, exit_code, error
 //! ```
 //!
-//! [`TaskSpec`] says what should run. [`TaskStatus`] says what happened.
-//! [`ObjectMeta`] carries identity, version, and timestamps.
+//! [`TaskSpec`] is desired state.
+//! [`TaskStatus`] is observed state.
+//! [`ObjectMeta`] carries identity, versions, labels, annotations, and timestamps.
 //!
 //! ## Lifecycle
 //!
 //! ```text
-//! Pending -> Running -> attempt outcome: Succeeded | Failed | Timeout
-//!               ^                              |
-//!               +--------- restart policy -----+
-//!                                              |
-//!                                              +-> lifecycle disposition:
-//!                                                  Succeeded | Failed | Timeout |
-//!                                                  Exhausted | Canceled
+//! Pending ──▶ Running ──▶ Succeeded
+//!             ├────────▶ Failed
+//!             ├────────▶ Timeout
+//!             └────────▶ Canceled
+//!
+//! Failed | Timeout ── retry budget exhausted ──▶ Exhausted
 //! ```
 //!
 //! Terminal phases are `Succeeded`, `Failed`, `Timeout`, `Canceled`, and `Exhausted`.
-//! A terminal attempt phase may still be followed by another attempt according
-//! to the restart policy.
 //! See [`TaskPhase::is_terminal`].
 //!
 //! ## Task Workloads
@@ -114,10 +124,10 @@
 //! | `Container`  | OCI image              | yes              |
 //! | `Wasm`       | WASI module            | yes              |
 //! | `Embedded`   | In-process task        | no               |
-//! | `Extension`  | Application-defined    | by registered GVK |
+//! | `Extension`  | Application-defined    | yes              |
 //!
 //! Routable variants are consumed by `solti-runner`.
-//! Embedded tasks are submitted directly by `solti-core`.
+//! Embedded workloads bypass runner routing.
 //!
 //! ## Selectors
 //!
@@ -144,10 +154,26 @@
 //!
 //! ## Auth
 //!
-//! [`Token`] is the shared bearer secret between an agent and the control plane.
-//! Its `Debug` output is redacted, and [`Token::verify`] compares in constant time.
+//! [`Token`] wraps a bearer secret.
+//! Its `Debug` output is redacted.
+//! [`Token::verify`] uses a constant-time comparison for equal-length values.
 //!
-//! ## Also
+//! ## Main Types
+//!
+//! | Area         | Types                                                                                          |
+//! |--------------|------------------------------------------------------------------------------------------------|
+//! | Resource     | [`Task`], [`TaskManifest`], [`TaskSpec`], [`TaskStatus`], [`ObjectMeta`], [`TaskRun`]          |
+//! | Identity     | [`Slot`], [`TaskId`], [`AgentId`], [`Uid`]                                                     |
+//! | Workload     | [`TaskWorkload`], [`ExtensionWorkload`], [`SubprocessSpec`], [`WasmSpec`], [`ContainerSpec`]   |
+//! | Policies     | [`RestartPolicy`], [`BackoffPolicy`], [`JitterPolicy`], [`AdmissionPolicy`], [`Timeout`]       |
+//! | Selection    | [`Labels`], [`LabelSelector`], [`SelectorRequirement`], [`SelectorOperator`]                   |
+//! | Capabilities | [`AgentCapabilities`], [`RunnerCapability`], [`WorkloadTypeMeta`]                              |
+//! | Query        | [`TaskContinuation`], [`TaskFilter`], [`TaskQuery`], [`TaskPage`], [`TaskWatchEvent`]          |
+//! | Output       | [`OutputEvent`], [`OutputChunk`], [`StreamKind`]                                               |
+//! | Auth         | [`Token`]                                                                                      |
+//! | Errors       | [`ModelError`], [`ModelResult`]                                                                |
+//!
+//! ## See Also
 //!
 //! - `solti-runner` consumes [`TaskSpec`] and [`TaskWorkload`] to build executable tasks.
 //! - `solti-core` manages [`Task`] lifecycle and state transitions.

@@ -1,6 +1,9 @@
-//! Task-level environment variables.
+//! # Task environment
 //!
-//! [`TaskEnv`] is an ordered list of key-value pairs attached to a single task spec.
+//! [`TaskEnv`] is an ordered list attached to a task workload.
+//! Duplicate keys are preserved.
+//! Lookup uses the last matching value.
+//! Keys and values are stored without validation.
 
 env_newtype! {
     /// Environment variables passed to a task at submission time.
@@ -20,7 +23,7 @@ env_newtype! {
 }
 
 impl TaskEnv {
-    /// Create an environment containing a single key-value pair.
+    /// Creates an environment with one entry.
     ///
     /// ## Example
     ///
@@ -47,49 +50,37 @@ mod tests {
     use super::TaskEnv;
 
     #[test]
-    fn env_new_is_empty() {
-        let env = TaskEnv::new();
-
-        assert_eq!(env.len(), 0);
-        assert!(env.get("FOO").is_none());
-    }
-
-    #[test]
-    fn env_single_creates_one_entry() {
-        let env = TaskEnv::single("FOO", "bar");
-        let items: Vec<_> = env.iter().collect();
-
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].key(), "FOO");
-        assert_eq!(items[0].value(), "bar");
-        assert_eq!(env.get("FOO"), Some("bar"));
-    }
-
-    #[test]
-    fn env_push_and_override_last_wins() {
+    fn constructors_iteration_and_lookup_preserve_last_value() {
         let mut env = TaskEnv::new();
+        assert!(env.is_empty());
+
         env.push("FOO", "one");
         env.push("BAR", "x");
         env.push("FOO", "two");
 
+        assert_eq!(env.len(), 3);
+        assert_eq!(env.iter().next().unwrap().key(), "FOO");
         assert_eq!(env.get("FOO"), Some("two"));
         assert_eq!(env.get("BAR"), Some("x"));
         assert!(env.get("BAZ").is_none());
+
+        let single = TaskEnv::single("ONLY", "value");
+        assert_eq!(single.len(), 1);
+        assert_eq!(single.get("ONLY"), Some("value"));
     }
 
     #[test]
-    fn serde_transparent_roundtrip_json() {
+    fn serde_is_transparent_and_preserves_entries() {
         let mut env = TaskEnv::new();
         env.push("FOO", "bar");
         env.push("BAZ", "qux");
 
         let json = serde_json::to_string(&env).unwrap();
-        assert!(json.starts_with('['));
-        assert!(json.contains("\"key\":\"FOO\""));
-        assert!(json.contains("\"value\":\"bar\""));
-
+        assert_eq!(
+            json,
+            r#"[{"key":"FOO","value":"bar"},{"key":"BAZ","value":"qux"}]"#
+        );
         let back: TaskEnv = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.get("FOO"), Some("bar"));
-        assert_eq!(back.get("BAZ"), Some("qux"));
+        assert_eq!(back, env);
     }
 }

@@ -1,18 +1,15 @@
-//! Admission policy.
+//! # Admission policy
 //!
-//! [`AdmissionPolicy`] controls how a new submission targets a busy slot.
+//! [`AdmissionPolicy`] describes admission when a slot is busy.
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 use crate::error::{ModelError, ModelResult};
 
-/// Defines how the controller admits a new task into a slot.
+/// Admission behavior for a busy slot.
 ///
-/// A slot tracks at most one active owner or admission candidate. It remains busy
-/// during admission, while a registered owner is alive (including backoff or time
-/// between attempts), and while that owner is being removed. When a new submission
-/// arrives, this policy says what to do with it.
+/// A slot has at most one active owner or admission candidate.
 ///
 /// | Variant         | Behaviour                                                        |
 /// |-----------------|------------------------------------------------------------------|
@@ -32,13 +29,12 @@ use crate::error::{ModelError, ModelResult};
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum AdmissionPolicy {
-    /// Reject the new submission if the slot is busy in any lifecycle phase.
+    /// Reject the new submission while the slot is busy.
     #[default]
     DropIfRunning,
-    /// Request removal of the current owner and put the new submission next.
-    /// A later replacement supersedes a replacement that is still pending.
+    /// Removes the current owner and places the new submission next.
     Replace,
-    /// Append the submission to the bounded FIFO queue for this slot.
+    /// Append the submission to the slot FIFO queue.
     Queue,
 }
 
@@ -69,65 +65,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_drop_if_running_variants() {
-        assert_eq!(
-            "drop-if-running".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::DropIfRunning
-        );
-        assert_eq!(
-            "drop".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::DropIfRunning
-        );
-        assert_eq!(
-            "DROP".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::DropIfRunning
-        );
+    fn parsing_accepts_canonical_names_aliases_case_and_whitespace() {
+        let cases = [
+            ("", AdmissionPolicy::default()),
+            ("drop-if-running", AdmissionPolicy::DropIfRunning),
+            ("drop", AdmissionPolicy::DropIfRunning),
+            ("DROP", AdmissionPolicy::DropIfRunning),
+            ("queue", AdmissionPolicy::Queue),
+            ("add", AdmissionPolicy::Queue),
+            ("new", AdmissionPolicy::Queue),
+            ("  queue  ", AdmissionPolicy::Queue),
+            ("replace", AdmissionPolicy::Replace),
+            ("REPLACE", AdmissionPolicy::Replace),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(value.parse::<AdmissionPolicy>().unwrap(), expected);
+        }
     }
 
     #[test]
-    fn parse_queue_variants() {
-        assert_eq!(
-            "queue".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::Queue
-        );
-        assert_eq!(
-            "add".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::Queue
-        );
-        assert_eq!(
-            "new".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::Queue
-        );
-    }
-
-    #[test]
-    fn parse_replace() {
-        assert_eq!(
-            "replace".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::Replace
-        );
-        assert_eq!(
-            "REPLACE".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::Replace
-        );
-    }
-
-    #[test]
-    fn empty_string_maps_to_default() {
-        let parsed: AdmissionPolicy = "".parse().unwrap();
-        assert_eq!(parsed, AdmissionPolicy::default());
-    }
-
-    #[test]
-    fn whitespace_trimmed() {
-        assert_eq!(
-            "  queue  ".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::Queue
-        );
-    }
-
-    #[test]
-    fn unknown_value_fails() {
+    fn parsing_rejects_unknown_values() {
         assert!("foobar".parse::<AdmissionPolicy>().is_err());
     }
 }

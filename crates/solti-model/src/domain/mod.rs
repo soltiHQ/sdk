@@ -1,21 +1,21 @@
-//! Domain primitives for the solti task model.
+//! # Domain types
 //!
 //! ## Modules
 //!
-//! | Module          | Types                                                        | Purpose                                     |
-//! |-----------------|--------------------------------------------------------------|---------------------------------------------|
-//! | `policy/`       | [`RestartPolicy`], [`BackoffPolicy`], [`AdmissionPolicy`]    | Lifecycle and concurrency policies          |
-//! | `selector/`     | [`LabelSelector`], [`SelectorRequirement`]                  | K8s-style label selector for runner routing |
-//! | `environment/`  | [`TaskEnv`]                                                  | Task-provided environment variables         |
-//! | `query/`        | [`TaskContinuation`], [`TaskFilter`], [`TaskQuery`], [`TaskPage`] | Task filtering and collections          |
-//! | `identity/`     | [`AgentId`], [`Slot`], [`TaskId`]                            | Resource identity (`Arc<str>`)              |
-//! | `kind/`         | [`TaskWorkload`]                                             | Typed and extensible workload model         |
-//! | `label`         | [`Labels`]                                                   | Key-value metadata (`BTreeMap`)             |
-//! | `flag`          | [`Flag`]                                                     | Boolean toggle                              |
-//! | `kv`            | [`KeyValue`]                                                 | Generic key-value pair                      |
-//! | `phase`         | [`TaskPhase`]                                                | Task lifecycle state                        |
-//! | `timeout`       | [`Timeout`]                                                  | Milliseconds                                |
-//! | `capability`    | [`AgentCapabilities`], [`RunnerCapability`]                  | Agent execution capabilities               |
+//! | Module          | Types                                                             | Purpose                                     |
+//! |-----------------|-------------------------------------------------------------------|---------------------------------------------|
+//! | `policy/`       | [`RestartPolicy`], [`BackoffPolicy`], [`AdmissionPolicy`]         | Lifecycle and concurrency policies          |
+//! | `selector/`     | [`LabelSelector`], [`SelectorRequirement`]                        | Label selector for routing                  |
+//! | `environment/`  | [`TaskEnv`]                                                       | Task-provided environment variables         |
+//! | `query/`        | [`TaskContinuation`], [`TaskFilter`], [`TaskQuery`], [`TaskPage`] | Task filtering and collections              |
+//! | `identity/`     | [`AgentId`], [`Slot`], [`TaskId`]                                 | Resource identity (`Arc<str>`)              |
+//! | `kind/`         | [`TaskWorkload`]                                                  | Typed and extensible workload model         |
+//! | `label`         | [`Labels`]                                                        | Key-value metadata (`BTreeMap`)             |
+//! | `flag`          | [`Flag`]                                                          | Boolean toggle                              |
+//! | `kv`            | [`KeyValue`]                                                      | Generic key-value pair                      |
+//! | `phase`         | [`TaskPhase`]                                                     | Task lifecycle state                        |
+//! | `timeout`       | [`Timeout`]                                                       | Milliseconds                                |
+//! | `capability`    | [`AgentCapabilities`], [`RunnerCapability`]                       | Agent execution capabilities                |
 
 mod capability;
 pub use capability::{AgentCapabilities, RunnerCapability};
