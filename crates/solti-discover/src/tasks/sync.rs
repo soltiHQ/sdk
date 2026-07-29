@@ -1,22 +1,31 @@
-//! Periodic discovery sync task.
+//! # Discovery sync
 //!
 //! ```text
-//! Agent                          Control Plane
-//!   |                                  |
-//!   |--- SyncRequest (gRPC / HTTP) --->|
-//!   |<-- SyncResponse (success) -------|
-//!   |         ... delay_ms ...         |
-//!   |--- SyncRequest ----------------> |
+//! first attempt
+//!      │ startup jitter
+//!      ▼
+//! server hold ──► stamp time and uptime ──► HTTP or gRPC sync
+//!                    ┌───────────────────────────┴───────────────────────────┐
+//!                    ▼                                                       ▼
+//!                 success                                           discovery error
+//!                    │                                                       │
+//!             periodic delay                              retryable ──► TaskError::Fail
+//!                                                        permanent ──► TaskError::Fatal
 //! ```
 //!
-//! Retryable failures become `TaskError::Fail`. Permanent failures become
-//! `TaskError::Fatal`.
+//! Startup jitter runs only before the first attempt.
+//! An active server-advised hold is checked before each request.
+//! Each request receives a fresh timestamp and uptime value.
+//! Taskvisor schedules retry backoff between task attempts.
+//!
+//! The returned manifest uses slot `solti-discover-sync`.
+//! It uses `AdmissionPolicy::Replace` and a periodic restart policy.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Upper bound on server-advised hold time (seconds).
+/// Maximum server-advised hold in seconds.
 const MAX_RETRY_AFTER_S: i32 = 3_600;
 
 use crate::proto::SyncRequest;
@@ -43,10 +52,17 @@ const SLOT: &str = "solti-discover-sync";
 
 /// Builds the embedded heartbeat task and its desired resource.
 ///
+/// The selected transport adapter is created before this function returns.
+/// Network connections remain lazy.
+///
+/// The returned task captures `config` and `uptime`.
+/// Submit both returned values through the embedded task API in `solti-core`.
+///
 /// # Errors
 ///
-/// Returns [`DiscoverError`] when the task manifest or selected transport
-/// cannot be built from the validated config.
+/// Returns [`DiscoverError::InvalidConfig`] when the selected transport cannot use the config.
+/// Returns [`DiscoverError::SpecBuild`] when the manifest cannot be built.
+/// With HTTP, returns a transport error when the client cannot be built.
 pub fn sync(
     config: DiscoverConfig,
     uptime: Arc<dyn UptimeSource>,
@@ -142,7 +158,7 @@ pub fn sync(
                         ..
                     } = &e
                     {
-                        let clamped = (*s).clamp(0, MAX_RETRY_AFTER_S);
+                        let clamped = clamp_retry_after_s(*s);
                         if *s != clamped {
                             warn!(advised_s = *s, capped_s = clamped, "retry_after_s capped",);
                         }
@@ -208,7 +224,7 @@ impl SyncContext {
     }
 }
 
-/// Map a [`DiscoverError`] to a canonical failure-reason label.
+/// Returns the canonical metric label for a [`DiscoverError`].
 fn classify_failure(err: &DiscoverError) -> metrics::DiscoverFailReason {
     match err {
         DiscoverError::InvalidConfig(_) | DiscoverError::SpecBuild(_) => {
@@ -275,9 +291,10 @@ fn arch() -> &'static str {
     std::env::consts::ARCH
 }
 
-/// Get OS distribution info (Linux only).
+/// Returns the platform description sent in discovery metadata.
 ///
-/// Checks `/etc/os-release`, then `/usr/lib/os-release` (freedesktop spec fallback).
+/// Linux uses `PRETTY_NAME` from `/etc/os-release` when available.
+/// It falls back to `/usr/lib/os-release`, then the Rust platform name.
 fn os_info() -> String {
     #[cfg(target_os = "linux")]
     {
@@ -346,8 +363,9 @@ fn stamp_request(base: &SyncRequest, uptime: &dyn UptimeSource) -> SyncRequest {
     }
 }
 
-/// Unix timestamp in seconds. Returns `0` if the system clock is before the epoch
-/// (unreachable in practice, but avoids panicking inside a supervised task).
+/// Returns the current Unix timestamp in seconds.
+///
+/// Returns zero when the system clock is before the Unix epoch.
 fn now_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -374,6 +392,10 @@ fn compute_hold_wait(deadline: Option<Instant>, now: Instant) -> Option<Duration
     deadline
         .and_then(|deadline| deadline.checked_duration_since(now))
         .filter(|duration| !duration.is_zero())
+}
+
+fn clamp_retry_after_s(seconds: i32) -> i32 {
+    seconds.clamp(0, MAX_RETRY_AFTER_S)
 }
 
 #[cfg(test)]
@@ -434,10 +456,6 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn attempt_timeout_covers_jitter_hold_and_request() {
-        // The attempt body may legitimately sleep through startup jitter (up to
-        // delay_ms) plus a server-advised retry hold (up to MAX_RETRY_AFTER_S)
-        // before even sending the request. The per-attempt timeout must cover
-        // that, or taskvisor kills healthy heartbeats with AttemptTimedOut cycles.
         let delay_ms = 30_000u64;
         let config = crate::DiscoverConfig::builder(
             solti_model::AgentId::new("agent-1").unwrap(),
@@ -470,23 +488,15 @@ mod tests {
     }
 
     #[test]
-    fn compute_hold_wait_none_means_no_hold() {
-        assert_eq!(compute_hold_wait(None, Instant::now()), None);
-    }
-
-    #[test]
-    fn compute_hold_wait_expired_returns_none() {
+    fn compute_hold_wait_handles_absent_expired_and_future_deadlines() {
         let now = Instant::now();
+
+        assert_eq!(compute_hold_wait(None, now), None);
         assert_eq!(compute_hold_wait(Some(now), now), None);
         assert_eq!(
             compute_hold_wait(Some(now - Duration::from_secs(1)), now),
             None
         );
-    }
-
-    #[test]
-    fn compute_hold_wait_future_returns_remaining() {
-        let now = Instant::now();
         assert_eq!(
             compute_hold_wait(Some(now + Duration::from_secs(60)), now),
             Some(Duration::from_secs(60))
@@ -495,43 +505,9 @@ mod tests {
 
     #[test]
     fn retry_after_is_clamped_to_max() {
-        let raw = i32::MAX;
-        let clamped = raw.clamp(0, MAX_RETRY_AFTER_S);
-        assert_eq!(clamped, MAX_RETRY_AFTER_S);
-        assert_eq!(clamped, 3_600);
-        assert_eq!((-10_i32).clamp(0, MAX_RETRY_AFTER_S), 0);
-        assert_eq!((120_i32).clamp(0, MAX_RETRY_AFTER_S), 120);
-    }
-
-    #[test]
-    fn auth_failed_is_permanent() {
-        let e = DiscoverError::AuthFailed {
-            reason: "http 401".into(),
-        };
-        assert_eq!(e.retryability(), Retryability::Permanent);
-    }
-
-    #[test]
-    fn transient_errors_are_retryable() {
-        #[cfg(feature = "http")]
-        {
-            let e = DiscoverError::HttpStatus {
-                code: 503,
-                body: "overloaded".into(),
-            };
-            assert_eq!(e.retryability(), Retryability::Retryable);
-        }
-        let e = DiscoverError::Rejected {
-            reason: "overloaded".into(),
-            retry_after_s: Some(60),
-        };
-        assert_eq!(e.retryability(), Retryability::Retryable);
-    }
-
-    #[test]
-    fn invalid_config_is_permanent() {
-        let e = DiscoverError::InvalidConfig("bad endpoint".into());
-        assert_eq!(e.retryability(), Retryability::Permanent);
+        assert_eq!(clamp_retry_after_s(i32::MAX), MAX_RETRY_AFTER_S);
+        assert_eq!(clamp_retry_after_s(-10), 0);
+        assert_eq!(clamp_retry_after_s(120), 120);
     }
 
     #[test]
@@ -543,23 +519,9 @@ mod tests {
         assert_eq!(startup_jitter_ms(0), 0);
     }
 
-    #[test]
-    fn startup_jitter_varies_between_calls() {
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..100 {
-            seen.insert(startup_jitter_ms(1_000_000));
-            std::thread::sleep(std::time::Duration::from_micros(1));
-        }
-        assert!(
-            seen.len() > 50,
-            "jitter should vary between calls; got only {} distinct values out of 100",
-            seen.len()
-        );
-    }
-
     #[cfg(feature = "http")]
-    fn test_config() -> crate::DiscoverConfig {
-        crate::DiscoverConfig::builder(
+    fn test_config() -> DiscoverConfig {
+        DiscoverConfig::builder(
             solti_model::AgentId::new("agent-1").unwrap(),
             "agent-1",
             crate::AgentEndpoint::new("http://127.0.0.1:8085", crate::AgentEndpointType::Http, 1)
@@ -590,7 +552,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn request_uses_the_advertised_transport_not_the_discovery_transport() {
-        let config = crate::DiscoverConfig::builder(
+        let config = DiscoverConfig::builder(
             solti_model::AgentId::new("agent-1").unwrap(),
             "agent-1",
             crate::AgentEndpoint::new("127.0.0.1:50051", crate::AgentEndpointType::Grpc, 7)

@@ -1,7 +1,16 @@
-//! # Embedded discovery tasks.
+//! # Embedded discovery task
 //!
-//! Each factory returns a prebuilt runtime task and a complete desired Task resource.
+//! [`sync`] returns a complete desired resource and its prebuilt runtime task.
+//!
+//! ```text
+//! DiscoverConfig + UptimeSource
+//!             ▼
+//!           sync
+//!             ├──► TaskManifest
+//!             └──► taskvisor::TaskRef
+//! ```
 
 mod sync;
-mod transport;
 pub use sync::sync;
+
+mod transport;

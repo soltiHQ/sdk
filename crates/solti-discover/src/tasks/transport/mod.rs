@@ -1,4 +1,22 @@
-//! Transport selection and dispatch for discovery sync.
+//! # Discovery transport
+//!
+//! [`TransportAdapter`] owns exactly one selected transport.
+//!
+//! ```text
+//! DiscoverConfig.control_plane.transport
+//!                  ▼
+//!          TransportAdapter
+//!             ├──► HTTP adapter
+//!             └──► gRPC adapter
+//!                  ▼
+//!             SyncResponse
+//!                  │ validate_response
+//!                  ▼
+//!           Ok or DiscoverError
+//! ```
+//!
+//! Adapter construction validates transport-specific URI and authentication data.
+//! The transport client is reused across task attempts.
 
 #[cfg(feature = "grpc")]
 mod grpc;
@@ -14,7 +32,7 @@ use grpc::GrpcAdapter;
 #[cfg(feature = "http")]
 use http::HttpAdapter;
 
-/// The single transport adapter selected for one discovery task.
+/// Selected transport for one discovery task.
 pub(super) enum TransportAdapter {
     #[cfg(feature = "grpc")]
     Grpc(Box<GrpcAdapter>),
@@ -23,7 +41,7 @@ pub(super) enum TransportAdapter {
 }
 
 impl TransportAdapter {
-    /// Instantiate only the adapter selected by the validated configuration.
+    /// Creates only the adapter selected by the config.
     pub(super) fn from_config(config: &DiscoverConfig) -> Result<Self, DiscoverError> {
         match config.control_plane.transport {
             #[cfg(feature = "grpc")]
@@ -33,6 +51,7 @@ impl TransportAdapter {
         }
     }
 
+    /// Sends one request through the selected adapter.
     pub(super) async fn sync(&self, request: SyncRequest) -> Result<(), DiscoverError> {
         match self {
             #[cfg(feature = "grpc")]
@@ -42,6 +61,7 @@ impl TransportAdapter {
         }
     }
 
+    /// Returns whether the selected endpoint uses TLS.
     pub(super) fn is_secure(&self) -> bool {
         match self {
             #[cfg(feature = "grpc")]
@@ -52,10 +72,9 @@ impl TransportAdapter {
     }
 }
 
-/// Turn a `success=false` response into [`DiscoverError::Rejected`].
+/// Converts `success = false` into [`DiscoverError::Rejected`].
 ///
-/// `reason` is propagated verbatim from the control plane and remains
-/// untrusted server text.
+/// The rejection reason remains untrusted server text.
 fn validate_response(response: SyncResponse) -> Result<(), DiscoverError> {
     if response.success {
         return Ok(());
@@ -109,69 +128,36 @@ mod tests {
     }
 
     #[test]
-    fn validate_response_accepts_success() {
-        let response = SyncResponse {
-            success: true,
-            reason: String::new(),
-            retry_after_s: 0,
-        };
+    fn response_validation_preserves_the_wire_contract() {
+        assert!(
+            validate_response(SyncResponse {
+                success: true,
+                reason: String::new(),
+                retry_after_s: 0,
+            })
+            .is_ok()
+        );
 
-        assert!(validate_response(response).is_ok());
-    }
-
-    #[test]
-    fn validate_response_uses_default_reason() {
-        let response = SyncResponse {
-            success: false,
-            reason: String::new(),
-            retry_after_s: 0,
-        };
-
-        match validate_response(response) {
-            Err(DiscoverError::Rejected {
-                reason,
+        for (reason, retry_after_s, expected_reason, expected_retry_after_s) in [
+            ("", 0, "control plane returned success=false", None),
+            ("overloaded", 60, "overloaded", Some(60)),
+            ("bad", -5, "bad", None),
+        ] {
+            let result = validate_response(SyncResponse {
+                success: false,
+                reason: reason.into(),
                 retry_after_s,
-            }) => {
-                assert!(reason.contains("success=false"));
-                assert_eq!(retry_after_s, None);
+            });
+            match result {
+                Err(DiscoverError::Rejected {
+                    reason,
+                    retry_after_s,
+                }) => {
+                    assert_eq!(reason, expected_reason);
+                    assert_eq!(retry_after_s, expected_retry_after_s);
+                }
+                other => panic!("expected Rejected, got {other:?}"),
             }
-            other => panic!("expected Rejected, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn validate_response_preserves_positive_retry_hint() {
-        let response = SyncResponse {
-            success: false,
-            reason: "overloaded".into(),
-            retry_after_s: 60,
-        };
-
-        match validate_response(response) {
-            Err(DiscoverError::Rejected {
-                reason,
-                retry_after_s,
-            }) => {
-                assert_eq!(reason, "overloaded");
-                assert_eq!(retry_after_s, Some(60));
-            }
-            other => panic!("expected Rejected, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn validate_response_drops_non_positive_retry_hint() {
-        let response = SyncResponse {
-            success: false,
-            reason: "bad".into(),
-            retry_after_s: -5,
-        };
-
-        match validate_response(response) {
-            Err(DiscoverError::Rejected { retry_after_s, .. }) => {
-                assert_eq!(retry_after_s, None);
-            }
-            other => panic!("expected Rejected, got {other:?}"),
         }
     }
 }

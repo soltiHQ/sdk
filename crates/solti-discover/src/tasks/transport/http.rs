@@ -1,4 +1,18 @@
-//! HTTP discovery transport.
+//! # HTTP discovery
+//!
+//! ```text
+//! SyncRequest
+//!      │ POST /api/v1/discovery/sync
+//!      ▼
+//! reqwest client
+//!      ├── non-success status ──► bounded preview ──► DiscoverError
+//!      ▼
+//! bounded JSON body ──► SyncResponse ──► protocol validation
+//! ```
+//!
+//! One client is reused across task attempts.
+//! Redirects are disabled.
+//! HTTPS uses platform roots unless custom TLS is configured.
 
 use std::time::Duration;
 
@@ -16,6 +30,7 @@ const MAX_BODY_PREVIEW_BYTES: usize = 1_024;
 const MAX_RESPONSE_BODY_BYTES: u64 = 64 * 1_024;
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
+/// HTTP/JSON discovery adapter.
 pub(in crate::tasks) struct HttpAdapter {
     authorization: Option<HeaderValue>,
     client: reqwest::Client,
@@ -24,6 +39,7 @@ pub(in crate::tasks) struct HttpAdapter {
 }
 
 impl HttpAdapter {
+    /// Creates an adapter from the discovery config.
     pub(super) fn new(config: &DiscoverConfig) -> Result<Self, DiscoverError> {
         let url = sync_url(&config.control_plane.address)?;
         let secure = url.scheme() == "https";
@@ -43,6 +59,7 @@ impl HttpAdapter {
         })
     }
 
+    /// Sends one discovery request.
     pub(super) async fn sync(&self, request: SyncRequest) -> Result<(), DiscoverError> {
         let mut request = self.client.post(self.url.clone()).json(&request);
         if let Some(value) = &self.authorization {
@@ -75,11 +92,13 @@ impl HttpAdapter {
         validate_response(response)
     }
 
+    /// Returns whether the endpoint uses HTTPS.
     pub(super) fn is_secure(&self) -> bool {
         self.secure
     }
 }
 
+/// Builds the fixed discovery v1 URL.
 fn sync_url(endpoint: &str) -> Result<Url, DiscoverError> {
     let mut url = Url::parse(endpoint).map_err(|error| {
         DiscoverError::InvalidConfig(format!("invalid HTTP control-plane endpoint: {error}"))
@@ -101,6 +120,7 @@ fn sync_url(endpoint: &str) -> Result<Url, DiscoverError> {
     Ok(url)
 }
 
+/// Encodes an optional bearer token.
 fn authorization_header(token: Option<&Token>) -> Result<Option<HeaderValue>, DiscoverError> {
     token
         .map(|token| {
@@ -113,7 +133,7 @@ fn authorization_header(token: Option<&Token>) -> Result<Option<HeaderValue>, Di
         .transpose()
 }
 
-/// Builds one client for the lifetime of the sync task.
+/// Builds one client for all attempts of the sync task.
 ///
 /// Redirects are disabled to prevent forwarding credentials to another host.
 fn build_client(config: &DiscoverConfig) -> Result<reqwest::Client, DiscoverError> {
@@ -137,6 +157,7 @@ fn build_client(config: &DiscoverConfig) -> Result<reqwest::Client, DiscoverErro
     builder.build().map_err(DiscoverError::from)
 }
 
+/// Reads a bounded diagnostic body preview.
 async fn read_body_preview(mut response: reqwest::Response, max_bytes: usize) -> String {
     if response
         .content_length()
@@ -174,6 +195,7 @@ async fn read_body_preview(mut response: reqwest::Response, max_bytes: usize) ->
     preview
 }
 
+/// Reads a successful response body up to the supplied byte limit.
 async fn read_body_bounded(
     mut response: reqwest::Response,
     max_bytes: u64,
@@ -201,6 +223,7 @@ async fn read_body_bounded(
         .map_err(|error| DiscoverError::InvalidResponse(format!("response is not UTF-8: {error}")))
 }
 
+/// Truncates diagnostic response text without splitting UTF-8.
 fn truncate_body(body: &str) -> String {
     if body.len() <= MAX_BODY_PREVIEW_BYTES {
         return body.to_string();

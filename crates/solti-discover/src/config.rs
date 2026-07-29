@@ -1,4 +1,18 @@
-//! Discovery configuration.
+//! # Discovery configuration
+//!
+//! This module separates two endpoint roles.
+//!
+//! ```text
+//! Control plane ── calls ──► AgentEndpoint
+//!                             advertised agent API
+//!
+//! Discovery task ── syncs ──► ControlPlaneEndpoint
+//!                              outbound control-plane endpoint
+//! ```
+//!
+//! Transport-specific URI validation happens when [`sync`](crate::sync) creates the adapter.
+//! [`DiscoverConfig`] captures the complete embedded task intent.
+//! [`DiscoverConfigBuilder`] validates scalar settings.
 
 use std::collections::HashMap;
 
@@ -15,8 +29,8 @@ pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 
 /// Transport exposed by the agent API.
 ///
-/// This describes how the control plane reaches the agent. It is independent
-/// from [`DiscoveryTransport`], which describes the outbound sync connection.
+/// This controls the endpoint type sent to the control plane.
+/// It is independent of [`DiscoveryTransport`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentEndpointType {
     /// gRPC agent API.
@@ -26,6 +40,7 @@ pub enum AgentEndpointType {
 }
 
 impl AgentEndpointType {
+    /// Returns the discovery v1 wire value.
     pub(crate) fn as_proto(self) -> i32 {
         match self {
             Self::Grpc => EndpointType::Grpc as i32,
@@ -47,8 +62,9 @@ impl AgentEndpoint {
     ///
     /// # Errors
     ///
-    /// Returns [`DiscoverError::InvalidConfig`] when the address is empty or
-    /// `api_version` does not fit the discovery v1 wire field.
+    /// Returns [`DiscoverError::InvalidConfig`] when the address is empty.
+    /// Returns it when `api_version` exceeds the discovery v1 wire field.
+    /// Returns it when `api_version` is zero.
     pub fn new(
         address: impl Into<String>,
         endpoint_type: AgentEndpointType,
@@ -113,8 +129,8 @@ pub struct ControlPlaneEndpoint {
 impl ControlPlaneEndpoint {
     /// Creates a control-plane endpoint.
     ///
-    /// Transport-specific URI validation happens when the sync task creates
-    /// its adapter.
+    /// This constructor trims whitespace and trailing slashes.
+    /// The selected adapter validates the URI scheme.
     ///
     /// # Errors
     ///
@@ -145,6 +161,9 @@ impl ControlPlaneEndpoint {
 }
 
 /// Validated settings for the discovery sync task.
+///
+/// Build this value through [`Self::builder`].
+/// The task factory captures every field by value.
 #[derive(Debug, Clone)]
 pub struct DiscoverConfig {
     pub(crate) agent_id: AgentId,
@@ -168,8 +187,8 @@ pub struct DiscoverConfig {
 impl DiscoverConfig {
     /// Starts a discovery config builder.
     ///
-    /// `task_revision` identifies the complete captured runtime intent. Change
-    /// it whenever a config value used by the embedded task changes.
+    /// `task_revision` identifies the captured runtime intent.
+    /// Change it whenever a setting used by the embedded task changes.
     pub fn builder(
         agent_id: AgentId,
         name: impl Into<String>,
@@ -199,6 +218,17 @@ impl DiscoverConfig {
 }
 
 /// Builder for [`DiscoverConfig`].
+///
+/// | Setting              | Default                       |
+/// |----------------------|-------------------------------|
+/// | Metadata             | Empty                         |
+/// | Capabilities         | No runners                    |
+/// | Backoff              | Derived from `delay_ms`       |
+/// | Connect timeout      | 5 seconds                     |
+/// | Request timeout      | 30 seconds                    |
+/// | Metrics              | No-op backend                 |
+/// | Bearer token         | None                          |
+/// | Custom TLS           | None                          |
 #[derive(Debug, Clone)]
 pub struct DiscoverConfigBuilder {
     agent_id: AgentId,
@@ -263,9 +293,9 @@ impl DiscoverConfigBuilder {
 
     /// Sets custom server roots and an optional client identity.
     ///
-    /// The control-plane endpoint must use `https`. Without this setting, HTTP
-    /// uses platform roots. gRPC uses platform roots when the `tls` feature is
-    /// enabled.
+    /// The control-plane endpoint must use `https`.
+    /// HTTP uses platform roots when this setting is absent.
+    /// gRPC uses platform roots when this setting is absent and `tls` is enabled.
     #[cfg(feature = "tls")]
     pub fn with_tls(mut self, tls: solti_tls::ClientTlsConfig) -> Self {
         self.tls = Some(tls);
@@ -276,8 +306,9 @@ impl DiscoverConfigBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`DiscoverError::InvalidConfig`] when a required value is empty
-    /// or a duration cannot be represented by discovery v1.
+    /// Returns [`DiscoverError::InvalidConfig`] when a required string is empty.
+    /// Returns it when `delay_ms` cannot be represented by discovery v1.
+    /// Returns it when a duration is zero.
     pub fn build(self) -> Result<DiscoverConfig, DiscoverError> {
         let name = self.name.trim().to_string();
         if name.is_empty() {

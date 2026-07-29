@@ -1,15 +1,31 @@
-//! Discovery uptime sources.
+//! # Agent uptime
+//!
+//! [`UptimeSource`] supplies the value sent in each discovery request.
+//! The application chooses the uptime epoch.
+//!
+//! ```text
+//! application lifecycle boundary
+//!             │ creates
+//!             ▼
+//!       UptimeSource
+//!             │ read on every attempt
+//!             ▼
+//! SyncRequest.uptime_seconds
+//! ```
+//!
+//! [`MonotonicUptime`] starts its epoch at construction.
+//! Wall-clock changes do not affect it.
 
 use std::time::Instant;
 
 /// Supplies the monotonic elapsed time reported by discovery heartbeats.
 ///
-/// The composition root owns the epoch and passes the source to
-/// [`sync`](crate::sync). Custom implementations make heartbeat stamping
-/// deterministic in tests and allow a host to align the value with its own
-/// lifecycle definition.
+/// The composition root owns the epoch.
+/// It passes a shared source to [`sync`](crate::sync).
+///
+/// A closure returning `u64` also implements this trait.
 pub trait UptimeSource: Send + Sync + 'static {
-    /// Return elapsed whole seconds since the composition-owned epoch.
+    /// Returns elapsed whole seconds since the application-owned epoch.
     fn uptime_seconds(&self) -> u64;
 }
 
@@ -24,16 +40,17 @@ where
 
 /// Monotonic uptime clock starting at construction.
 ///
-/// Create it at the host's chosen agent-composition boundary, then share it
-/// with discovery through an [`std::sync::Arc`]. It is independent of wall
-/// clock adjustments and of `solti-core` supervisor construction.
+/// Create it at the chosen agent lifecycle boundary.
+/// Share it with discovery through [`std::sync::Arc`].
+///
+/// It is independent of `solti-core` construction.
 #[derive(Debug)]
 pub struct MonotonicUptime {
     started_at: Instant,
 }
 
 impl MonotonicUptime {
-    /// Start a new monotonic uptime clock.
+    /// Creates a monotonic uptime clock with a new epoch.
     pub fn new() -> Self {
         Self {
             started_at: Instant::now(),

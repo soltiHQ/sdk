@@ -1,15 +1,18 @@
 [package]
 name = "solti-discover"
-description = "Agent registration and heartbeat client for the Podium control plane."
+
+description   = "Agent registration and heartbeat client for the Podium control plane."
+keywords      = ["discovery", "heartbeat", "agent", "grpc", "http"]
+categories    = ["network-programming", "asynchronous"]
+documentation = "https://docs.rs/solti-discover"
+readme        = "README.md"
 
 rust-version.workspace = true
-repository.workspace = true
-categories = ["network-programming", "asynchronous"]
-keywords = ["discovery", "heartbeat", "agent", "grpc", "http"]
-homepage.workspace = true
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+repository.workspace   = true
+homepage.workspace     = true
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
 
 include = [
     "proto/**/*.proto",
@@ -54,6 +57,9 @@ http = [
 tls  = ["dep:solti-tls", "reqwest?/rustls-no-provider", "tonic?/tls-native-roots", "tonic?/tls-ring"]
 
 [dependencies]
+solti-model = { workspace = true, optional = true }
+solti-tls   = { workspace = true, optional = true }
+
 pbjson      = { workspace = true, optional = true }
 prost       = { workspace = true, optional = true }
 reqwest     = { workspace = true, features = ["json"], optional = true }
@@ -65,9 +71,6 @@ tokio       = { workspace = true, optional = true }
 tonic       = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
 tracing     = { workspace = true, optional = true }
-
-solti-model = { workspace = true, optional = true }
-solti-tls   = { workspace = true, optional = true }
 
 [build-dependencies]
 pbjson-build        = { workspace = true, optional = true }

@@ -1,4 +1,18 @@
-//! gRPC discovery transport.
+//! # gRPC discovery
+//!
+//! ```text
+//! SyncRequest
+//!      │ tonic Request
+//!      ▼
+//! lazy shared channel
+//!      │ DiscoverService.Sync
+//!      ▼
+//! SyncResponse ──► protocol validation
+//! ```
+//!
+//! Connection starts on the first sync attempt.
+//! A successful channel is reused.
+//! HTTPS requires the `tls` feature.
 
 use std::time::Duration;
 
@@ -11,6 +25,7 @@ use crate::proto::SyncRequest;
 use crate::proto::discover_service_client::DiscoverServiceClient;
 use crate::tasks::transport::validate_response;
 
+/// gRPC discovery adapter.
 pub(in crate::tasks) struct GrpcAdapter {
     authorization: Option<MetadataValue<Ascii>>,
     client: tokio::sync::OnceCell<DiscoverServiceClient<Channel>>,
@@ -19,6 +34,7 @@ pub(in crate::tasks) struct GrpcAdapter {
 }
 
 impl GrpcAdapter {
+    /// Creates an adapter from the discovery config.
     pub(super) fn new(config: &DiscoverConfig) -> Result<Self, DiscoverError> {
         #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
         let mut endpoint = Endpoint::from_shared(config.control_plane.address.clone())
@@ -71,6 +87,7 @@ impl GrpcAdapter {
         })
     }
 
+    /// Sends one discovery request.
     pub(super) async fn sync(&self, request: SyncRequest) -> Result<(), DiscoverError> {
         let client = self
             .client
@@ -97,11 +114,13 @@ impl GrpcAdapter {
         }
     }
 
+    /// Returns whether the endpoint uses HTTPS.
     pub(super) fn is_secure(&self) -> bool {
         self.secure
     }
 }
 
+/// Encodes an optional bearer token.
 fn authorization_metadata(
     token: Option<&solti_model::Token>,
 ) -> Result<Option<MetadataValue<Ascii>>, DiscoverError> {
@@ -116,6 +135,7 @@ fn authorization_metadata(
         .transpose()
 }
 
+/// Returns whether a gRPC status represents authentication failure.
 fn is_auth_status(code: tonic::Code) -> bool {
     matches!(
         code,
@@ -124,12 +144,14 @@ fn is_auth_status(code: tonic::Code) -> bool {
 }
 
 #[cfg(feature = "tls")]
+/// TLS source selected for one gRPC adapter.
 enum ClientTls<'a> {
     NativeRoots,
     Custom(&'a solti_tls::ClientTlsConfig),
 }
 
 #[cfg(feature = "tls")]
+/// Selects native roots or custom TLS.
 fn select_client_tls(config: &DiscoverConfig) -> ClientTls<'_> {
     match config.tls.as_ref() {
         Some(config) => ClientTls::Custom(config),
@@ -138,6 +160,7 @@ fn select_client_tls(config: &DiscoverConfig) -> ClientTls<'_> {
 }
 
 #[cfg(feature = "tls")]
+/// Builds tonic TLS settings.
 fn build_tonic_client_tls(
     config: ClientTls<'_>,
 ) -> Result<tonic::transport::ClientTlsConfig, DiscoverError> {
@@ -153,6 +176,7 @@ fn build_tonic_client_tls(
 }
 
 #[cfg(feature = "tls")]
+/// Converts loaded Solti TLS material into tonic settings.
 fn tonic_client_tls_from_loaded(
     config: &solti_tls::LoadedClientTlsConfig,
 ) -> tonic::transport::ClientTlsConfig {
@@ -170,6 +194,7 @@ fn tonic_client_tls_from_loaded(
 }
 
 #[cfg(feature = "tls")]
+/// Formats an error and every source in its chain.
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut messages = Vec::new();
     let mut current = Some(error);
