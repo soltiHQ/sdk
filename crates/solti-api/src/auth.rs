@@ -1,14 +1,13 @@
-//! # Bearer-credential helpers shared by the HTTP and gRPC transports.
+//! # Bearer Credentials
 //!
-//! Both transports gate requests on the same `Authorization: Bearer <token>` shape
-//! (HTTP header / gRPC `authorization` metadata). The header parsing and the
-//! parsing lives here so the two gates cannot drift apart.
+//! Shared parser for HTTP headers and gRPC metadata.
+//! Both transports accept the same `Bearer <token>` value.
 
-/// Extract the credential from an `Authorization` header / `authorization` metadata value,
-/// accepting the scheme case-insensitively.
+/// Extracts a bearer credential.
 ///
-/// The credential is returned verbatim after the first space. It is never trimmed and is
-/// matched byte-for-byte by `Token::verify`.
+/// The scheme comparison is case-insensitive.
+/// The value after the first space is returned without trimming.
+/// [`solti_model::Token::verify`] checks that value.
 pub(crate) fn bearer_value(header: &str) -> Option<&str> {
     let (scheme, token) = header.split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then_some(token)

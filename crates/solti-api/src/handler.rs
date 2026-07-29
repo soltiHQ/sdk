@@ -1,7 +1,17 @@
-//! # Handler trait.
+//! # Handler Boundary
 //!
-//! [`ApiHandler`] defines the transport-agnostic API surface.
-//! Implement this trait to plug custom logic (auth, rate limiting, metrics) between the wire layer and the supervisor.
+//! [`ApiHandler`] is the shared backend for HTTP and gRPC.
+//! It receives validated [`solti_model`] values.
+//! It returns domain values or [`ApiError`].
+//!
+//! ```text
+//! HTTP handlers ──┐
+//!                 ├──► ApiHandler ──► backend
+//! gRPC service ───┘
+//! ```
+//!
+//! Wire encoding stays outside the handler.
+//! A custom implementation can use another store or wrap another backend.
 
 use std::pin::Pin;
 
@@ -14,25 +24,27 @@ use tokio_stream::Stream;
 
 use crate::error::ApiError;
 
-/// Boxed stream of [`OutputEvent`]s — the wire-side surface of live task logs.
+/// Boxed live stream of task output events.
+///
+/// The stream item is [`OutputEvent`].
+/// Transport adapters encode each item for their wire format.
 pub type OutputEventStream = Pin<Box<dyn Stream<Item = OutputEvent> + Send + 'static>>;
 
-/// Boxed stream of Task resource changes.
+/// Boxed stream of task resource changes.
+///
+/// A stream item can contain a terminal [`ApiError`].
 pub type TaskWatchEventStream =
     Pin<Box<dyn Stream<Item = Result<TaskWatchEvent, ApiError>> + Send + 'static>>;
 
-/// Task execution API handler.
+/// Transport-independent task API.
 ///
-/// ## Also
+/// The trait covers desired writes, current reads, collection watches,
+/// run history, deletion, and live output.
 ///
-/// - `SupervisorApiAdapter` ready-to-use implementation (feature `core-adapter`).
-/// - [`ApiError`](crate::ApiError) error type returned by all methods.
+/// Implementations must not expose the built-in `Embedded` workload.
+/// Both transports check that boundary before encoding a response.
 ///
-/// This trait abstracts the backend implementation, allowing users to:
-/// - Use the provided `SupervisorApiAdapter` with feature `core-adapter`.
-/// - Implement custom handlers with additional logic (auth, rate limiting, etc.)
-///
-/// ## API surface
+/// ## Operations
 ///
 /// | Method             | HTTP                                         | gRPC             |
 /// |--------------------|----------------------------------------------|------------------|
@@ -44,39 +56,43 @@ pub type TaskWatchEventStream =
 /// | `list_task_runs`   | `GET    /apis/solti.io/v1/tasks/{name}/runs` | `ListTaskRuns`   |
 /// | `delete_task`      | `DELETE /apis/solti.io/v1/tasks/{name}`      | `DeleteTask`     |
 /// | `stream_task_logs` | `GET    /apis/solti.io/v1/tasks/{name}/logs` | `StreamTaskLogs` |
+///
+/// ## See Also
+///
+/// - `SupervisorApiAdapter` implements this trait for `solti-core`.
+/// - [`ApiError`] defines the shared transport error categories.
 #[async_trait]
 pub trait ApiHandler: Send + Sync + 'static {
-    /// Create a named Task resource.
+    /// Creates one named task resource.
     ///
-    /// The bundled `SupervisorApiAdapter` returns the committed desired resource
-    /// immediately. Runtime reconciliation continues in the background; clients
-    /// observe it through the `status.conditions[type=Reconciled]` condition.
+    /// The bundled adapter returns committed desired state immediately.
+    /// Reconciliation continues in the background.
+    /// Its result appears in `status.conditions[type=Reconciled]`.
     ///
     /// ## Errors
     ///
-    /// The bundled `SupervisorApiAdapter` returns:
+    /// The bundled adapter returns:
     ///
-    /// - [`ApiError::InvalidRequest`] when admission rejects the manifest;
-    /// - [`ApiError::AlreadyExists`] when a retained resource owns the same name;
-    /// - [`ApiError::Unavailable`] when shutdown has started.
+    /// - [`ApiError::InvalidRequest`] when the manifest is rejected.
+    /// - [`ApiError::AlreadyExists`] when the name is retained.
+    /// - [`ApiError::Unavailable`] after shutdown starts.
     ///
-    /// Runner, mapping, and Taskvisor reconciliation failures happen after the
-    /// desired-state commit and are recorded in the returned resource's later
-    /// `status`; they are not request errors.
-    ///
-    /// Custom implementations may return other variants, e.g. [`ApiError::Internal`].
+    /// Later reconciliation failures are status updates.
+    /// They are not create errors.
     async fn create_task(&self, manifest: TaskManifest) -> Result<Task, ApiError>;
 
-    /// Declaratively create or update the resource addressed by `metadata.name`.
+    /// Creates or updates the task addressed by `metadata.name`.
     ///
-    /// Empty preconditions preserve upsert semantics. Non-empty preconditions
-    /// require an existing matching resource.
+    /// Empty preconditions make this an upsert.
+    /// Any precondition requires an existing matching resource.
     ///
     /// ## Errors
     ///
-    /// Same categories as [`create_task`](Self::create_task), plus:
+    /// The bundled adapter can return the errors from
+    /// [`create_task`](Self::create_task).
+    /// It can also return:
     ///
-    /// - [`ApiError::TaskNotFound`] when conditional apply targets no resource;
+    /// - [`ApiError::TaskNotFound`] when conditional apply finds no task.
     /// - [`ApiError::Conflict`] when a precondition does not match.
     async fn apply_task(
         &self,
@@ -84,82 +100,86 @@ pub trait ApiHandler: Send + Sync + 'static {
         preconditions: WritePreconditions,
     ) -> Result<Task, ApiError>;
 
-    /// Get a current task resource by name.
+    /// Returns the current task resource with this name.
     ///
-    /// Returns `Ok(None)` when no task with this id is known.
+    /// `None` means that no public task has this name.
     ///
     /// ## Errors
     ///
-    /// The bundled `SupervisorApiAdapter` never fails here:
-    /// a missing task is `Ok(None)`. Custom implementations may return any [`ApiError`].
+    /// The bundled adapter does not return an error.
+    /// A custom implementation can return any [`ApiError`].
     async fn get_task(&self, name: &TaskId) -> Result<Option<Task>, ApiError>;
 
-    /// Query tasks with combined filters and snapshot-consistent continuation pagination.
+    /// Returns one filtered task page.
+    ///
+    /// The returned page must match the query filters and limit.
+    /// Its continuation must describe the same snapshot and filter.
+    /// The transports reject an inconsistent page as [`ApiError::Internal`].
     ///
     /// ## Errors
     ///
-    /// The bundled `SupervisorApiAdapter` returns [`ApiError::InvalidRequest`]
-    /// for an invalid continuation and [`ApiError::ResourceVersionExpired`]
-    /// when its snapshot is no longer retained.
-    /// Custom implementations may return any [`ApiError`].
+    /// The bundled adapter returns:
+    ///
+    /// - [`ApiError::InvalidRequest`] for an invalid continuation.
+    /// - [`ApiError::ResourceVersionExpired`] for a compacted snapshot.
     async fn query_tasks(&self, query: TaskQuery) -> Result<TaskPage<Task>, ApiError>;
 
-    /// Watch changes to tasks matching the filter.
+    /// Watches changes to tasks that match the filter.
     ///
-    /// An absent resource version or `"0"` starts with `Added` events for the
-    /// current matching resources. A specific version replays later retained
-    /// changes, then continues with live events.
+    /// With the bundled adapter, an absent resource version or `"0"` first
+    /// emits current matches as `Added`.
+    /// A specific version replays newer retained changes.
+    /// Both forms then continue with live changes.
     ///
     /// ## Errors
     ///
-    /// - [`ApiError::ResourceVersionExpired`]: the requested position is no
-    ///   longer retained.
+    /// The bundled adapter returns [`ApiError::ResourceVersionExpired`]
+    /// when the requested position is no longer retained.
     ///
-    /// Streams may later yield the same error when a subscriber falls behind
-    /// the retained history.
+    /// The stream can later yield the same error when it falls behind.
+    /// That error is terminal.
     async fn watch_tasks(
         &self,
         filter: TaskFilter,
         resource_version: Option<String>,
     ) -> Result<TaskWatchEventStream, ApiError>;
 
-    /// List execution history for a specific task (oldest first).
+    /// Lists one task's execution attempts from oldest to newest.
     ///
     /// ## Errors
     ///
-    /// - [`ApiError::TaskNotFound`]: the task is absent from the public API.
-    ///
-    /// Custom implementations may return any [`ApiError`].
+    /// The bundled adapter returns [`ApiError::TaskNotFound`]
+    /// when the task is not public or does not exist.
     async fn list_task_runs(&self, id: &TaskId) -> Result<Vec<TaskRun>, ApiError>;
 
-    /// Stop a task and purge its run history.
+    /// Stops and removes one task and its run history.
     ///
     /// ## Errors
     ///
-    /// - [`ApiError::TaskNotFound`]: the task is absent from the public API;
-    /// - [`ApiError::Conflict`]: a precondition does not match;
-    /// - [`ApiError::Internal`]: the supervisor failed to cancel the bound submission,
-    ///   whether registered or controller-queued (timeout or internal runtime failure).
+    /// The bundled adapter returns:
+    ///
+    /// - [`ApiError::TaskNotFound`] when the task is not public or does not exist.
+    /// - [`ApiError::Conflict`] when a precondition does not match.
+    /// - [`ApiError::Internal`] when runtime cancellation fails.
     async fn delete_task(
         &self,
         id: &TaskId,
         preconditions: WritePreconditions,
     ) -> Result<(), ApiError>;
 
-    /// Subscribe to the live-tail stream of stdout/stderr lines for a task.
+    /// Subscribes to one task's live output.
     ///
-    /// Returns a lossy, live-only [`OutputEventStream`] that yields
-    /// [`OutputEvent`]s in real time without persistence or replay. It can cover
-    /// subsequent runs of the task (multi-run merge); lifecycle boundary events
-    /// are best-effort observations, not ordering barriers for output chunks.
-    /// Terminal cleanup removes the core hub sender; an already-open stream
-    /// closes after any outstanding runner-owned output-sink clones are also
-    /// dropped.
+    /// The stream is lossy and has no replay.
+    /// It can cover later attempts of the same task generation.
+    /// Run boundary events are best-effort observations.
+    /// They are not ordering barriers for output chunks.
+    ///
+    /// The bundled adapter pins the stream to the generation visible
+    /// when this method is called.
     ///
     /// ## Errors
     ///
-    /// - [`ApiError::TaskNotFound`]: no live output channel exists for this id
-    ///   (bundled `SupervisorApiAdapter`).
-    ///
+    /// The bundled adapter returns [`ApiError::TaskNotFound`]
+    /// when no public live output channel exists for this task.
     async fn stream_task_logs(&self, id: &TaskId) -> Result<OutputEventStream, ApiError>;
 }

@@ -1,4 +1,6 @@
-//! Label selector protobuf conversion.
+//! # Selector Conversion
+//!
+//! Converts task labels and runner selectors in both directions.
 
 use std::collections::HashMap;
 

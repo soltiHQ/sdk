@@ -1,11 +1,11 @@
-//! # Domain/wire `TaskSpec` conversion.
+//! # Task Spec Conversion
 //!
-//! This module covers both directions:
+//! Converts task specs for the gRPC transport.
 //!
-//! | Direction     | Entry point              | Shape                                      |
-//! |---------------|--------------------------|--------------------------------------------|
-//! | Domain → wire | [`spec_to_proto`]       | resource responses                         |
-//! | Wire → domain | [`convert_task_spec`]   | create/apply manifests                     |
+//! | Direction     | Entry point            | Use                    |
+//! |---------------|------------------------|------------------------|
+//! | Domain → wire | [`spec_to_proto`]      | Resource responses     |
+//! | Wire → domain | [`convert_task_spec`]  | Create and apply input |
 
 use std::num::NonZeroU32;
 
@@ -23,7 +23,7 @@ pub(super) use super::selector::convert_labels;
 use super::selector::{convert_label_selector, selector_to_proto};
 use super::workload::{convert_task_workload, workload_to_proto};
 
-/// Build a wire [`proto_api::TaskSpec`] from a domain [`TaskSpec`].
+/// Converts a domain task spec into protobuf.
 pub(super) fn spec_to_proto(spec: &TaskSpec) -> Result<proto_api::TaskSpec, ApiError> {
     let (restart, restart_interval_ms) = restart_to_proto(spec.restart())?;
     Ok(proto_api::TaskSpec {
@@ -39,18 +39,21 @@ pub(super) fn spec_to_proto(spec: &TaskSpec) -> Result<proto_api::TaskSpec, ApiE
     })
 }
 
-/// Convert a wire [`proto_api::TaskSpec`] into a domain [`TaskSpec`].
+/// Converts a protobuf task spec into the domain model.
 ///
-/// Single validation gate for both transports: every submit/apply request passes through here.
+/// HTTP does not use this function.
+/// HTTP deserializes the model-owned CRD representation directly.
 ///
 /// ## Errors
 ///
-/// - [`ApiError::InvalidRequest`]: the wire spec is not a valid [`TaskSpec`]. Causes:
-///   - empty `slot`, `timeout_ms == 0`, or `max_retries == 0` (omit the field instead);
-///   - missing `kind`, kind variant, subprocess mode, or `backoff`;
-///   - `UNSPECIFIED` / out-of-range enum value (restart, admission, jitter, selector operator);
-///   - kind-specific field rejected (empty command, interpreter, script body, wasm module path, or container image);
-///   - the final `TaskSpec::build` validation failed (e.g. backoff `factor < 1.0`).
+/// Returns [`ApiError::InvalidRequest`] when:
+///
+/// - The slot or timeout is invalid.
+/// - The workload or backoff is absent.
+/// - `max_retries` is zero.
+/// - An enum or selector value is invalid.
+/// - Workload validation fails.
+/// - The final [`TaskSpec`] validation fails.
 pub fn convert_task_spec(spec: proto_api::TaskSpec) -> Result<TaskSpec, ApiError> {
     let slot: Slot = validate_slot(spec.slot)?;
 

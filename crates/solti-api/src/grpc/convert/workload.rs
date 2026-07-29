@@ -1,4 +1,7 @@
-//! Workload protobuf conversion.
+//! # Workload Conversion
+//!
+//! Converts built-in and extension workloads in both directions.
+//! Embedded workloads have no public protobuf representation.
 
 use solti_model::{
     ContainerSpec, ExtensionWorkload, Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskWorkload,

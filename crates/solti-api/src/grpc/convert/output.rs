@@ -1,6 +1,7 @@
-//! # `OutputEvent` domain → proto.
+//! # Output Conversion
 //!
-//! Maps [`solti_model::OutputEvent`] (in-process broadcast carrier) to the generated [`proto_api::StreamTaskLogsResponse`] for the `StreamTaskLogs` RPC.
+//! Converts live domain output into `StreamTaskLogsResponse`.
+//! Raw line bytes move directly into the protobuf message.
 
 use solti_model::{OutputChunk, OutputEvent, StreamKind};
 
@@ -9,7 +10,7 @@ use crate::proto_api;
 
 use super::time::system_time_to_ms;
 
-/// Convert one [`OutputEvent`] into its protobuf representation.
+/// Converts one domain output event into protobuf.
 pub(crate) fn output_event_to_proto(
     ev: OutputEvent,
 ) -> Result<proto_api::StreamTaskLogsResponse, ApiError> {
@@ -76,13 +77,15 @@ mod tests {
 
     #[test]
     fn chunk_maps_all_fields() {
+        let line = Bytes::from_static(b"error: boom");
+        let line_ptr = line.as_ptr();
         let ev = OutputEvent::Chunk(OutputChunk {
             generation: 2,
             attempt: 7,
             stream: StreamKind::Stderr,
             seq: 42,
             ts: UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
-            line: Bytes::from_static(b"error: boom"),
+            line,
         });
 
         let proto = output_event_to_proto(ev).unwrap();
@@ -97,42 +100,24 @@ mod tests {
         assert_eq!(chunk.seq, 42);
         assert_eq!(chunk.ts, 1_700_000_000_000);
         assert_eq!(&chunk.line[..], b"error: boom");
-    }
-
-    #[test]
-    fn chunk_forwards_line_without_byte_copy() {
-        let original = Bytes::from_static(b"shared-line");
-        let original_ptr = original.as_ptr();
-
-        let ev = OutputEvent::Chunk(OutputChunk {
-            generation: 1,
-            attempt: 1,
-            stream: StreamKind::Stdout,
-            seq: 0,
-            ts: UNIX_EPOCH,
-            line: original,
-        });
-
-        let proto = output_event_to_proto(ev).unwrap();
-        let chunk = match proto.kind.unwrap() {
-            proto_api::stream_task_logs_response::Kind::Chunk(c) => c,
-            other => panic!("expected Chunk, got {other:?}"),
-        };
         assert_eq!(
             chunk.line.as_ptr(),
-            original_ptr,
+            line_ptr,
             "line bytes must be forwarded zero-copy"
         );
     }
 
     #[test]
-    fn run_started_maps_attempt_and_ts() {
-        let ev = OutputEvent::RunStarted {
+    fn lifecycle_events_map_all_fields() {
+        match output_event_to_proto(OutputEvent::RunStarted {
             generation: 4,
             attempt: 3,
             started_at: UNIX_EPOCH + Duration::from_millis(1234),
-        };
-        match output_event_to_proto(ev).unwrap().kind.unwrap() {
+        })
+        .unwrap()
+        .kind
+        .unwrap()
+        {
             proto_api::stream_task_logs_response::Kind::RunStarted(r) => {
                 assert_eq!(r.attempt, 3);
                 assert_eq!(r.generation, 4);
@@ -140,17 +125,17 @@ mod tests {
             }
             other => panic!("expected RunStarted, got {other:?}"),
         }
-    }
 
-    #[test]
-    fn run_finished_carries_exit_code_and_ts() {
-        let ev = OutputEvent::RunFinished {
+        match output_event_to_proto(OutputEvent::RunFinished {
             generation: 5,
             attempt: 2,
             exit_code: Some(0),
             finished_at: UNIX_EPOCH + Duration::from_millis(2222),
-        };
-        match output_event_to_proto(ev).unwrap().kind.unwrap() {
+        })
+        .unwrap()
+        .kind
+        .unwrap()
+        {
             proto_api::stream_task_logs_response::Kind::RunFinished(r) => {
                 assert_eq!(r.attempt, 2);
                 assert_eq!(r.generation, 5);
@@ -159,12 +144,12 @@ mod tests {
             }
             other => panic!("expected RunFinished, got {other:?}"),
         }
-    }
 
-    #[test]
-    fn lagged_carries_skipped_count() {
-        let ev = OutputEvent::Lagged { skipped: 1500 };
-        match output_event_to_proto(ev).unwrap().kind.unwrap() {
+        match output_event_to_proto(OutputEvent::Lagged { skipped: 1500 })
+            .unwrap()
+            .kind
+            .unwrap()
+        {
             proto_api::stream_task_logs_response::Kind::Lagged(l) => {
                 assert_eq!(l.skipped, 1500);
             }

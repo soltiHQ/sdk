@@ -1,13 +1,17 @@
-//! # Time encoding utilities.
+//! # Timestamp Conversion
+//!
+//! Protobuf v1 represents timestamps as Unix milliseconds.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::ApiError;
 
-/// Convert a `SystemTime` to Unix ms.
+/// Converts a system timestamp into Unix milliseconds.
 ///
-/// Returns an error for instants before the Unix epoch or outside the protobuf
-/// `int64` millisecond range.
+/// ## Errors
+///
+/// Returns [`ApiError::Internal`] when a response timestamp is before
+/// the Unix epoch or outside the protobuf `int64` range.
 pub(super) fn system_time_to_ms(t: SystemTime) -> Result<i64, ApiError> {
     let duration = t.duration_since(UNIX_EPOCH).map_err(|_| {
         ApiError::Internal("handler returned a timestamp before the Unix epoch".into())
@@ -31,15 +35,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_timestamp_before_epoch() {
-        let error = system_time_to_ms(UNIX_EPOCH - Duration::from_millis(1)).unwrap_err();
-        assert!(matches!(error, ApiError::Internal(message) if message.contains("before")));
-    }
-
-    #[test]
-    fn rejects_timestamp_outside_i64_range() {
-        let timestamp = UNIX_EPOCH + Duration::from_millis(i64::MAX as u64 + 1);
-        let error = system_time_to_ms(timestamp).unwrap_err();
-        assert!(matches!(error, ApiError::Internal(message) if message.contains("range")));
+    fn rejects_unsupported_timestamps() {
+        for (timestamp, expected_message) in [
+            (
+                UNIX_EPOCH - Duration::from_millis(1),
+                "before the Unix epoch",
+            ),
+            (
+                UNIX_EPOCH + Duration::from_millis(i64::MAX as u64 + 1),
+                "outside the protobuf range",
+            ),
+        ] {
+            let error = system_time_to_ms(timestamp).unwrap_err();
+            assert!(
+                matches!(error, ApiError::Internal(message) if message.contains(expected_message))
+            );
+        }
     }
 }

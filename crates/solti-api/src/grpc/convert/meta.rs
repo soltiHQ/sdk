@@ -1,4 +1,6 @@
-//! # `ObjectMeta` domain to wire conversion.
+//! # Object Metadata Conversion
+//!
+//! Converts domain object metadata into protobuf response values.
 
 use solti_model::ObjectMeta;
 

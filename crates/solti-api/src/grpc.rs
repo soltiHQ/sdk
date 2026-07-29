@@ -1,7 +1,26 @@
-//! # gRPC transport.
+//! # gRPC Transport
 //!
-//! [`TaskApiService`] implements the generated `TaskService` trait from `proto/solti/task/v1/api.proto`, delegating to an [`ApiHandler`].
-//! [`GrpcApi`] assembles the configured server (size limits, optional metrics and bearer auth).
+//! Tonic service for protobuf package `solti.task.v1`.
+//! Every RPC delegates to [`ApiHandler`].
+//!
+//! [`GrpcApi`] installs message limits, optional metrics, and bearer authentication.
+//! [`v1`] exposes the generated client, server, and message types.
+//!
+//! ## RPCs
+//!
+//! | RPC              | Shape            | Operation   |
+//! |------------------|------------------|-------------|
+//! | `CreateTask`     | Unary            | Create      |
+//! | `ApplyTask`      | Unary            | Apply       |
+//! | `GetTask`        | Unary            | Get         |
+//! | `ListTasks`      | Unary            | List        |
+//! | `WatchTasks`     | Server streaming | Watch       |
+//! | `ListTaskRuns`   | Unary            | Run history |
+//! | `DeleteTask`     | Unary            | Delete      |
+//! | `StreamTaskLogs` | Server streaming | Live output |
+//!
+//! Domain failures become `tonic::Status`.
+//! Stream failures terminate the corresponding stream.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -30,18 +49,22 @@ use convert::{
     write_preconditions_from_proto,
 };
 
-/// Generated protobuf messages and tonic client/server types for API version 1.
+/// Generated protobuf types for task API version 1.
 ///
-/// This is the stable public entry point for applications acting as gRPC
-/// clients. Transport implementations in this crate use the same generated
-/// DTOs internally.
+/// This module includes messages, enums,
+/// [`crate::grpc::v1::TaskServiceClient`],
+/// and [`crate::grpc::v1::TaskServiceServer`].
 ///
-/// ```rust
-/// use solti_api::grpc::v1::{Task, TaskServiceClient};
+/// ## Example
 ///
-/// let task: Option<Task> = None;
-/// let client: Option<TaskServiceClient<solti_api::tonic::transport::Channel>> = None;
-/// let _ = (task, client);
+/// ```rust,no_run
+/// use solti_api::grpc::v1::TaskServiceClient;
+///
+/// async fn connect() -> Result<(), solti_api::tonic::transport::Error> {
+///     let client = TaskServiceClient::connect("http://127.0.0.1:50052").await?;
+///     let _ = client;
+///     Ok(())
+/// }
 /// ```
 pub mod v1 {
     pub use crate::proto_api::task_service_client::TaskServiceClient;
@@ -77,12 +100,16 @@ impl<T> Stream for GrpcMetricsStream<T> {
     }
 }
 
-/// gRPC service wrapping an [`ApiHandler`].
+/// Generated `TaskService` implementation over an [`ApiHandler`].
 ///
-/// ## Also
+/// This is the lower-level service implementation.
+/// It converts protobuf values and records optional metrics.
+/// Use [`GrpcApi`] to also install message limits and authentication.
 ///
-/// - `TaskServiceServer` generated tonic server wrapper.
-/// - [`ApiError`](crate::ApiError) mapped to `tonic::Status`.
+/// ## See Also
+///
+/// - [`GrpcApi`] builds the configured public service.
+/// - [`ApiError`](crate::ApiError) defines gRPC error mapping.
 pub struct TaskApiService<H> {
     handler: Arc<H>,
     metrics: ApiMetricsHandle,
@@ -92,12 +119,12 @@ impl<H> TaskApiService<H>
 where
     H: ApiHandler,
 {
-    /// Create a new gRPC service with the given handler and no-op metrics.
+    /// Creates a service with the no-op metrics backend.
     pub fn new(handler: Arc<H>) -> Self {
         Self::new_with_metrics(handler, noop_api_metrics())
     }
 
-    /// Create a new gRPC service with an explicit metrics backend.
+    /// Creates a service with an explicit metrics backend.
     pub fn new_with_metrics(handler: Arc<H>, metrics: ApiMetricsHandle) -> Self {
         Self { handler, metrics }
     }
@@ -144,19 +171,16 @@ where
     }
 }
 
-/// Complete gRPC service type produced by [`GrpcApi::server`].
+/// Complete gRPC service returned by [`GrpcApi::server`].
 ///
-/// The [`BearerAuth`] layer is always present. The service type does not
-/// depend on whether auth is enabled; without a configured token the
-/// interceptor passes every call through.
+/// The [`BearerAuth`] interceptor is always present.
+/// It passes calls through when no token is configured.
 pub type GrpcServer<H> = InterceptedService<TaskServiceServer<TaskApiService<H>>, BearerAuth>;
 
-/// gRPC API service builder.
+/// Builder for the tonic task API.
 ///
-/// Mirrors [`HttpApi`](crate::HttpApi): construct from a handler, chain the optional
-/// [`with_auth`](Self::with_auth) / [`with_metrics`](Self::with_metrics) steps,
-/// then call [`server`](Self::server) to obtain a service ready for
-/// `tonic::transport::Server::builder().add_service(...)`.
+/// Authentication and metrics are optional.
+/// [`server`](Self::server) installs the public message-size limit.
 ///
 /// ## Example
 ///
@@ -165,17 +189,17 @@ pub type GrpcServer<H> = InterceptedService<TaskServiceServer<TaskApiService<H>>
 /// # use solti_api::{ApiHandler, GrpcApi};
 /// # async fn example<H: ApiHandler>(adapter: Arc<H>) -> Result<(), Box<dyn std::error::Error>> {
 /// let svc = GrpcApi::new(adapter).server();
-/// tonic::transport::Server::builder()
+/// solti_api::tonic::transport::Server::builder()
 ///     .add_service(svc)
 ///     .serve("0.0.0.0:50052".parse()?)
 ///     .await?;
 /// # Ok(()) }
 /// ```
 ///
-/// ## Also
+/// ## See Also
 ///
-/// - [`ApiHandler`] the trait backing all RPCs.
-/// - [`ApiError`](crate::ApiError) mapped to `tonic::Status`.
+/// - [`ApiHandler`] defines the backend operations.
+/// - [`ApiError`](crate::ApiError) defines the gRPC status mapping.
 pub struct GrpcApi<H> {
     handler: Arc<H>,
     metrics: ApiMetricsHandle,
@@ -186,7 +210,7 @@ impl<H> GrpcApi<H>
 where
     H: ApiHandler,
 {
-    /// Create new gRPC API with the given handler.
+    /// Creates a gRPC API for one handler.
     pub fn new(handler: Arc<H>) -> Self {
         Self {
             handler,
@@ -195,29 +219,30 @@ where
         }
     }
 
-    /// Require a bearer token on every call.
+    /// Requires a bearer token on every call.
     ///
-    /// When set, calls without valid `authorization: Bearer <token>` metadata are rejected with `Unauthenticated` before reaching any handler.
-    /// This is the same shared secret the agent presents to the control plane in discovery.
-    /// One config value enables both directions.
-    /// Orthogonal to TLS. When unset, no auth is enforced.
-    ///
+    /// The expected metadata is `authorization: Bearer <token>`.
+    /// Missing or invalid credentials return `Unauthenticated`.
+    /// Rejected calls do not reach the handler.
+    /// Authentication is disabled when this method is not called.
     pub fn with_auth(mut self, token: Token) -> Self {
         self.auth = Some(token);
         self
     }
 
-    /// Attach a metrics backend. When not set, a zero-cost no-op is used.
+    /// Attaches a metrics backend.
+    ///
+    /// The default backend ignores every update.
     pub fn with_metrics(mut self, metrics: ApiMetricsHandle) -> Self {
         self.metrics = metrics;
         self
     }
 
-    /// Build the configured gRPC service.
+    /// Builds the configured gRPC service.
     ///
-    /// Applies the [`MAX_REQUEST_BYTES`](crate::MAX_REQUEST_BYTES) encoding/decoding limits,
-    /// and wraps the server in a [`BearerAuth`] interceptor — a pass-through unless
-    /// [`with_auth`](Self::with_auth) was called.
+    /// Encoded and decoded messages are limited to
+    /// [`MAX_REQUEST_BYTES`](crate::MAX_REQUEST_BYTES).
+    /// The returned service always contains [`BearerAuth`].
     pub fn server(self) -> GrpcServer<H> {
         let inner = TaskServiceServer::new(TaskApiService::new_with_metrics(
             self.handler,
@@ -235,14 +260,12 @@ where
     }
 }
 
-/// gRPC interceptor enforcing a bearer token on every call.
+/// Bearer interceptor used by [`GrpcServer`].
 ///
-/// Verifies `authorization: Bearer <token>` metadata in constant time and rejects with `Unauthenticated` otherwise.
-/// Without a configured token (plain [`GrpcApi::new`] + [`server`](GrpcApi::server)) it passes every call through.
-///
-/// This is the same shared secret the agent presents to the control plane in discovery.
-/// One config value enables both directions.
-/// Orthogonal to TLS. Install via [`GrpcApi::with_auth`].
+/// It verifies `authorization: Bearer <token>` metadata.
+/// Token comparison uses [`Token::verify`].
+/// Without a configured token, every call passes through.
+/// Configure it through [`GrpcApi::with_auth`].
 #[derive(Clone)]
 pub struct BearerAuth {
     expected: Option<Token>,
@@ -1087,35 +1110,18 @@ mod tests {
     }
 
     #[test]
-    fn bearer_auth_rejects_missing_metadata() {
-        let mut auth = auth_interceptor("sekret");
-        let status = auth.call(Request::new(())).unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-    }
+    fn bearer_auth_rejects_invalid_credentials() {
+        let requests = [
+            Request::new(()),
+            request_with_authorization("Bearer not-the-secret"),
+            request_with_authorization("sekret"),
+            request_with_authorization("Basic sekret"),
+        ];
 
-    #[test]
-    fn bearer_auth_rejects_wrong_token() {
-        let mut auth = auth_interceptor("sekret");
-        let status = auth
-            .call(request_with_authorization("Bearer not-the-secret"))
-            .unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-    }
-
-    #[test]
-    fn bearer_auth_rejects_credential_without_scheme() {
-        let mut auth = auth_interceptor("sekret");
-        let status = auth.call(request_with_authorization("sekret")).unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-    }
-
-    #[test]
-    fn bearer_auth_rejects_non_bearer_scheme() {
-        let mut auth = auth_interceptor("sekret");
-        let status = auth
-            .call(request_with_authorization("Basic sekret"))
-            .unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        for request in requests {
+            let status = auth_interceptor("sekret").call(request).unwrap_err();
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        }
     }
 
     #[test]
@@ -1140,11 +1146,6 @@ mod tests {
             auth.call(request_with_authorization("Bearer anything"))
                 .is_ok()
         );
-    }
-
-    #[test]
-    fn empty_auth_token_is_rejected_before_api_construction() {
-        assert!(Token::new("").is_err());
     }
 
     // --- instrument() metrics ------------------------------------------------

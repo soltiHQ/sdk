@@ -1,4 +1,6 @@
-//! Task condition conversion.
+//! # Condition Conversion
+//!
+//! Converts domain task conditions into protobuf response values.
 
 use solti_model::{ConditionStatus, TaskCondition};
 

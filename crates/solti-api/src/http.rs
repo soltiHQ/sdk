@@ -1,21 +1,35 @@
-//! # HTTP/JSON transport.
+//! # HTTP Transport
 //!
-//! Axum router exposing [`ApiHandler`] operations as Kubernetes-shaped JSON endpoints.
-//! All paths share the Kubernetes named-group prefix
-//! `/apis/solti.io/v<MAJOR>` where `MAJOR` is [`crate::API_VERSION`];
+//! Axum router for the model-owned CRD JSON representation.
+//! Every operation delegates to [`ApiHandler`].
 //!
-//! _the examples below show the current value (`v1`)_.
+//! The current API root is `/apis/solti.io/v1`.
 //!
-//! | Method | Endpoint                              | Handler             |
-//! |--------|---------------------------------------|---------------------|
-//! | POST   | `/apis/solti.io/v1/tasks`             | create              |
-//! | PUT    | `/apis/solti.io/v1/tasks/{name}`      | apply               |
-//! | GET    | `/apis/solti.io/v1/tasks`             | list (query params) |
-//! | GET    | `/apis/solti.io/v1/tasks?watch=true`  | watch               |
-//! | GET    | `/apis/solti.io/v1/tasks/{name}`      | get                 |
-//! | GET    | `/apis/solti.io/v1/tasks/{name}/runs` | list runs           |
-//! | GET    | `/apis/solti.io/v1/tasks/{name}/logs` | live-tail SSE       |
-//! | DELETE | `/apis/solti.io/v1/tasks/{name}`      | delete (stop+purge) |
+//! ## Routes
+//!
+//! | Method   | Path                                          | Operation   |
+//! |----------|-----------------------------------------------|-------------|
+//! | `POST`   | `/apis/solti.io/v1/tasks`                     | Create      |
+//! | `PUT`    | `/apis/solti.io/v1/tasks/{name}`              | Apply       |
+//! | `GET`    | `/apis/solti.io/v1/tasks/{name}`              | Get         |
+//! | `GET`    | `/apis/solti.io/v1/tasks`                     | List        |
+//! | `GET`    | `/apis/solti.io/v1/tasks?watch=true`          | Watch       |
+//! | `GET`    | `/apis/solti.io/v1/tasks/{name}/runs`         | Run history |
+//! | `GET`    | `/apis/solti.io/v1/tasks/{name}/logs`         | Live output |
+//! | `DELETE` | `/apis/solti.io/v1/tasks/{name}`              | Delete      |
+//!
+//! ## Wire Shapes
+//!
+//! Create and apply accept `TaskManifest` JSON.
+//! Resource reads return `Task` JSON.
+//! Lists return a Kubernetes-style `TaskList`.
+//! Errors return a Kubernetes-style `Status`.
+//!
+//! Watches emit newline-delimited JSON documents.
+//! Live output uses Server-Sent Events.
+//! Both streams remain open until their source ends or fails.
+//!
+//! Every request body is limited to [`crate::MAX_REQUEST_BYTES`].
 
 use std::{
     convert::Infallible,
@@ -61,7 +75,7 @@ use crate::{
 // module by its bare name — `use crate::api_url` would be redundant
 // (and warnings about unused imports broke a `cargo publish` on us).
 
-/// Wrapper around `axum::Json<T>` that maps `JsonRejection` into [`ApiError::InvalidRequest`].
+/// JSON extractor that maps axum rejections into [`ApiError`].
 pub(crate) struct ApiJson<T>(pub T);
 
 impl<T, S> FromRequest<S> for ApiJson<T>
@@ -79,7 +93,7 @@ where
     }
 }
 
-/// Wrapper around `axum::extract::Query<T>` that maps query decoding failures into [`ApiError`].
+/// Query extractor that maps axum rejections into [`ApiError`].
 pub(crate) struct ApiQuery<T>(pub T);
 
 impl<T, S> FromRequestParts<S> for ApiQuery<T>
@@ -97,8 +111,7 @@ where
     }
 }
 
-/// Wrapper around `axum::extract::Path<T>` that maps path decoding failures
-/// into the same structured error contract as every other extractor.
+/// Path extractor that maps axum rejections into [`ApiError`].
 pub(crate) struct ApiPath<T>(pub T);
 
 impl<T, S> FromRequestParts<S> for ApiPath<T>
@@ -169,12 +182,33 @@ async fn method_not_allowed(req: Request) -> Response {
     .into_response()
 }
 
-/// HTTP API service builder.
+/// Builder for the axum task API.
 ///
-/// ## Also
+/// Authentication and metrics are optional.
+/// [`router`](Self::router) installs the complete route set and request limit.
 ///
-/// - [`ApiHandler`](crate::ApiHandler) the trait backing all endpoints.
-/// - [`ApiError`](crate::ApiError) mapped to JSON + HTTP status codes.
+/// ## Example
+///
+/// ```rust,no_run
+/// use std::sync::Arc;
+///
+/// use solti_api::{ApiHandler, HttpApi};
+/// use solti_model::Token;
+///
+/// fn build<H: ApiHandler>(
+///     handler: Arc<H>,
+///     token: Token,
+/// ) -> solti_api::axum::Router {
+///     HttpApi::new(handler)
+///         .with_auth(token)
+///         .router()
+/// }
+/// ```
+///
+/// ## See Also
+///
+/// - [`ApiHandler`] defines the backend operations.
+/// - [`ApiError`] defines the HTTP `Status` mapping.
 pub struct HttpApi<H> {
     handler: Arc<H>,
     metrics: ApiMetricsHandle,
@@ -185,7 +219,7 @@ impl<H> HttpApi<H>
 where
     H: ApiHandler,
 {
-    /// Create new HTTP API with the given handler.
+    /// Creates an HTTP API for one handler.
     pub fn new(handler: Arc<H>) -> Self {
         Self {
             handler,
@@ -194,28 +228,30 @@ where
         }
     }
 
-    /// Require a bearer token on every request.
+    /// Requires a bearer token on every request.
     ///
-    /// When set, requests without a valid `Authorization: Bearer <token>` header are rejected with `401 Unauthorized` before reaching any handler.
-    /// This is the same shared secret the agent presents to the control plane in discovery.
-    /// One config value enables both directions.
-    /// Orthogonal to TLS. When unset, no auth is enforced.
-    ///
+    /// The expected header is `Authorization: Bearer <token>`.
+    /// Missing or invalid credentials return `401 Unauthorized`.
+    /// Rejected requests do not reach the handler.
+    /// Authentication is disabled when this method is not called.
     pub fn with_auth(mut self, token: Token) -> Self {
         self.auth = Some(token);
         self
     }
 
-    /// Attach a metrics backend. When not set, a no-op backend is used.
+    /// Attaches a metrics backend.
+    ///
+    /// The default backend ignores every update.
     pub fn with_metrics(mut self, metrics: ApiMetricsHandle) -> Self {
         self.metrics = metrics;
         self
     }
 
-    /// Build axum router with mounted endpoints.
+    /// Builds the configured axum router.
     ///
-    /// Applies a [`RequestBodyLimitLayer`] capped at [`MAX_REQUEST_BYTES`] bytes to every request,
-    /// and when [`with_auth`](Self::with_auth) is set a bearer-token gate that runs before any handler.
+    /// Every request body is limited to [`MAX_REQUEST_BYTES`].
+    /// Optional authentication runs before the handler.
+    /// Metrics include unmatched routes and authentication failures.
     pub fn router(self) -> Router {
         let mut router = Router::new()
             .route(api_url!("/tasks"), post(create_task::<H>))
@@ -245,8 +281,7 @@ where
     }
 }
 
-/// Axum middleware: reject requests lacking a valid `Authorization: Bearer` token.
-/// Installed only when [`HttpApi::with_auth`] is set.
+/// Enforces the configured bearer token.
 async fn require_bearer(State(expected): State<Token>, req: Request, next: Next) -> Response {
     let ok = req
         .headers()
@@ -705,8 +740,7 @@ where
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET /apis/solti.io/v1/tasks/{name}/logs` - Server-Sent Events stream of
-/// [`OutputEvent`]s (live tail of stdout/stderr + run boundary markers + lag signals).
+/// Streams task output as Server-Sent Events.
 async fn stream_task_logs<H>(
     State(handler): State<Arc<H>>,
     ApiPath(name): ApiPath<String>,

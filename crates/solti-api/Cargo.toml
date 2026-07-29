@@ -1,15 +1,18 @@
 [package]
 name = "solti-api"
-description = "HTTP/JSON and gRPC API layer for the Solti task supervisor SDK."
+
+description   = "HTTP/JSON and gRPC API layer for the Solti task supervisor SDK."
+keywords      = ["grpc", "http", "api", "tonic", "tasks"]
+categories    = ["network-programming", "web-programming"]
+documentation = "https://docs.rs/solti-api"
+readme        = "README.md"
 
 rust-version.workspace = true
-repository.workspace = true
-categories = ["network-programming", "web-programming"]
-homepage.workspace = true
-keywords = ["grpc", "http", "api", "tonic", "tasks"]
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+repository.workspace   = true
+homepage.workspace     = true
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
 
 include = [
     "proto/**/*.proto",
@@ -18,10 +21,6 @@ include = [
     "README.md",
     "build.rs",
 ]
-
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default      = []
@@ -49,6 +48,10 @@ http         = [
 ]
 
 [dependencies]
+solti-core  = { workspace = true, optional = true }
+solti-model = { workspace = true }
+solti-tls   = { workspace = true, optional = true }
+
 async-trait     = { workspace = true }
 tokio-stream    = { workspace = true }
 axum            = { workspace = true, optional = true }
@@ -62,10 +65,6 @@ tonic           = { workspace = true, optional = true }
 tonic-prost     = { workspace = true, optional = true }
 tower-http      = { workspace = true, features = ["limit"], optional = true }
 tracing         = { workspace = true, optional = true }
-
-solti-core      = { workspace = true, optional = true }
-solti-model     = { workspace = true }
-solti-tls       = { workspace = true, optional = true }
 
 [dev-dependencies]
 base64         = { workspace = true }
@@ -81,3 +80,7 @@ tower          = { workspace = true, features = ["util"] }
 [build-dependencies]
 protoc-bin-vendored = { workspace = true, optional = true }
 tonic-prost-build   = { workspace = true, optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

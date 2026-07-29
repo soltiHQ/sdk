@@ -1,4 +1,7 @@
-//! # `TaskRun` to `TaskRunInfo` conversion.
+//! # Run Conversion
+//!
+//! Converts domain run history into protobuf response values.
+//! Embedded run history has no public wire representation.
 
 use solti_model::TaskRun;
 

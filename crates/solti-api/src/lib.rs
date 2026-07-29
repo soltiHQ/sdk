@@ -1,20 +1,85 @@
-//! # solti-api - task management API.
+//! # solti-api
 //!
-//! Dual-transport API layer exposing task operations over gRPC and HTTP.
-//! HTTP uses the model-owned CRD JSON representation; gRPC uses versioned
-//! protobuf DTOs. Both delegate domain values to the same [`ApiHandler`].
+//! Public task transports for a Solti agent.
 //!
-//! | feature        | capability                                      |
+//! HTTP uses the model-owned CRD JSON representation.
+//! gRPC uses versioned protobuf messages.
+//! Both transports delegate domain operations to one [`ApiHandler`].
+//!
+//! This crate does not store or execute tasks.
+//!
+//! ## Start Here
+//!
+//! Use [`ApiHandler`] to define the transport-independent backend.
+//! Use `SupervisorApiAdapter` to connect that boundary to `solti-core`.
+//! Use `HttpApi` to build an axum router.
+//! Use `GrpcApi` to build a tonic service.
+//!
+//! ## Flow
+//!
+//! ```text
+//! HTTP CRD JSON ── parse and validate ──┐
+//!                                       ▼
+//!                                  ApiHandler
+//!                                       ▲
+//! gRPC v1 DTO ── convert and validate ──┘
+//!                                       │
+//!                                       └──► custom backend or solti-core
+//! ```
+//!
+//! The transports own wire validation, authentication, metrics, and error mapping.
+//! The handler owns task operations.
+//!
+//! ## Desired State
+//!
+//! The bundled adapter commits desired state before reconciliation finishes.
+//! A successful create or apply does not mean that execution has started.
+//! Clients observe reconciliation through `status.conditions[type=Reconciled]`.
+//!
+//! Apply is an upsert without write preconditions.
+//! Apply and delete can check `uid` and `resourceVersion`.
+//!
+//! ## Collections and Streams
+//!
+//! Lists use opaque continuation tokens.
+//! The bundled adapter provides snapshot-consistent pagination.
+//! Watches can resume from a retained resource version.
+//!
+//! Task output is live-only and lossy.
+//! It is not persisted or replayed.
+//! A slow subscriber receives a `Lagged` event.
+//!
+//! ## Workload Boundary
+//!
+//! The built-in `Embedded` workload is available only through the in-process SDK.
+//! HTTP and gRPC reject it.
+//! Extension workloads remain visible.
+//!
+//! ## Feature Flags
+//!
+//! | Feature        | Capability                                      |
 //! |----------------|-------------------------------------------------|
 //! | `core-adapter` | `SupervisorApiAdapter` for `solti-core`         |
-//! | `grpc`         | tonic gRPC server                               |
-//! | `grpc-tls`     | gRPC TLS adapter; implies `grpc`                |
-//! | `http`         | axum HTTP/JSON server                           |
+//! | `grpc`         | tonic gRPC service and generated v1 client      |
+//! | `grpc-tls`     | `solti-tls` adapter for tonic; implies `grpc`   |
+//! | `http`         | axum HTTP/JSON router                           |
 //!
-//! ## Quick start
+//! No feature is enabled by default.
 //!
-//! Build one [`ApiHandler`] and share it across both transports.
-//! The handler is `Arc`-wrapped once, then cloned into each server:
+//! ## Main Types
+//!
+//! | Area          | Types                                                   |
+//! |---------------|---------------------------------------------------------|
+//! | Handler       | [`ApiHandler`], [`ApiError`]                             |
+//! | Streams       | [`TaskWatchEventStream`], [`OutputEventStream`]          |
+//! | Metrics       | [`ApiMetricsBackend`], [`ApiMetricsHandle`], [`Transport`] |
+//! | HTTP          | `HttpApi`                                               |
+//! | gRPC          | `GrpcApi`, `grpc::v1`                                   |
+//! | Core adapter  | `SupervisorApiAdapter`                                  |
+//!
+//! ## Quick Start
+//!
+//! Build both transports from one handler:
 //!
 #![cfg_attr(
     all(feature = "core-adapter", feature = "grpc", feature = "http"),
@@ -28,18 +93,11 @@
 //! # use solti_api::{GrpcApi, HttpApi, SupervisorApiAdapter};
 //! # fn wire(supervisor: Arc<solti_core::SupervisorApi>) {
 //! let handler = Arc::new(SupervisorApiAdapter::new(supervisor));
-//! let grpc    = GrpcApi::new(handler.clone()).server();
-//! let http    = HttpApi::new(handler).router();
+//! let grpc = GrpcApi::new(handler.clone()).server();
+//! let http = HttpApi::new(handler).router();
 //! # let _ = (grpc, http);
 //! # }
 //! ```
-//!
-//! ## Also
-//!
-//! - [`ApiHandler`] transport-agnostic trait with 8 operations.
-//! - [`ApiError`] unified error type mapped to gRPC Status / HTTP JSON.
-//! - `SupervisorApiAdapter` optional adapter bridging to `SupervisorApi`
-//!   (feature `core-adapter`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -76,14 +134,16 @@ macro_rules! api_url {
     };
 }
 
-/// Current API protocol version.
+/// Current public API major version.
 pub const API_VERSION: u32 = solti_api_major!();
 
-/// Root path of the HTTP API's Kubernetes named group.
+/// Root path of the HTTP Kubernetes API group.
 #[cfg(feature = "http")]
 pub const HTTP_API_ROOT: &str = api_url!("");
 
-/// Maximum accepted request body / message size for both HTTP and gRPC transports. **4 MiB.**
+/// Maximum HTTP request body and gRPC message size.
+///
+/// The limit is 4 MiB.
 pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
 mod error;

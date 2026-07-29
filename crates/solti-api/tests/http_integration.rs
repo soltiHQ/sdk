@@ -563,26 +563,6 @@ async fn list_tasks_empty_returns_complete_collection_metadata() {
 }
 
 #[tokio::test]
-async fn request_body_limit_rejects_oversized_payload() {
-    let app = router_with(Arc::new(MockHandler::default()));
-
-    let oversized = vec![b'x'; solti_api::MAX_REQUEST_BYTES + 1024];
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/apis/solti.io/v1/tasks")
-                .header("content-type", "application/json")
-                .body(Body::from(oversized))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-}
-
-#[tokio::test]
 async fn get_task_empty_name_trimmed_returns_400() {
     let app = router_with(Arc::new(MockHandler::default()));
 

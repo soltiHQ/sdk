@@ -1,4 +1,14 @@
-//! Opaque Task list continuation tokens.
+//! # Continuation Tokens
+//!
+//! HTTP and gRPC expose opaque list continuation strings.
+//! The encoded payload contains the domain cursor, snapshot version, and filter.
+//!
+//! ```text
+//! TaskContinuation ── JSON envelope ── URL-safe base64 ──► wire token
+//! ```
+//!
+//! Decoding checks the envelope version.
+//! Page validation checks the handler result against the original request.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

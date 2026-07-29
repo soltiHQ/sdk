@@ -1,19 +1,31 @@
-//! # Protobuf/domain conversion.
+//! # Protobuf Conversion
 //!
-//! Two-way translation layer between [`solti_model`] domain types and generated protobuf wire types.
-//! Split by target type to keep each module short and focused.
+//! Translation between [`solti_model`] and generated gRPC messages.
 //!
-//! ## Module map
+//! ```text
+//! protobuf request ── validate ──► domain value ── ApiHandler
+//! protobuf response ◄──────────── domain value ◄─────┘
+//! ```
 //!
-//! | Module  | Content                                                    |
-//! |---------|------------------------------------------------------------|
-//! | `spec`  | `TaskSpec` domain ↔ wire, plus all nested policy helpers   |
-//! | `phase` | `TaskPhase` domain enum ↔ wire enum                        |
-//! | `time`  | `SystemTime` → Unix-ms helper                              |
-//! | `meta`  | `ObjectMeta` domain → wire                                 |
-//! | `run`   | `TaskRun` domain → wire                                    |
-//! | `task`  | `Task` domain → wire, `TaskPage` → `ListTasksResponse`     |
+//! Request conversion rejects invalid or unspecified wire values.
+//! Response conversion rejects domain variants without a v1 wire representation.
 //!
+//! ## Modules
+//!
+//! | Module          | Direction      | Values                              |
+//! |-----------------|----------------|-------------------------------------|
+//! | `task`          | Both           | Manifest, resource, page, watch     |
+//! | `spec`          | Both           | Task spec                           |
+//! | `workload`      | Both           | Built-in and extension workloads    |
+//! | `policy`        | Both           | Restart, backoff, admission         |
+//! | `selector`      | Both           | Labels and runner selector          |
+//! | `phase`         | Both           | Task phase                          |
+//! | `preconditions` | Request        | Conditional writes                  |
+//! | `condition`     | Response       | Reconciliation condition            |
+//! | `meta`          | Response       | Object metadata                     |
+//! | `run`           | Response       | Run history                         |
+//! | `output`        | Response       | Live output                         |
+//! | `time`          | Response       | Unix millisecond timestamps         |
 
 mod condition;
 mod meta;

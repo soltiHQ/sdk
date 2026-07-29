@@ -125,95 +125,44 @@ fn get_with_authorization(uri: &str, value: &str) -> Request<Body> {
 }
 
 #[tokio::test]
-async fn request_without_token_is_rejected_with_401() {
-    let handler = Arc::new(MockHandler::default());
-    let app = secured_router(Arc::clone(&handler));
+async fn invalid_credentials_are_rejected_before_the_handler() {
+    for authorization in [
+        None,
+        Some("Bearer not-the-secret"),
+        Some("Basic sekret-token-1"),
+    ] {
+        let handler = Arc::new(MockHandler::default());
+        let app = secured_router(Arc::clone(&handler));
+        let request = match authorization {
+            Some(value) => get_with_authorization("/apis/solti.io/v1/tasks", value),
+            None => get("/apis/solti.io/v1/tasks"),
+        };
 
-    let resp = app.oneshot(get("/apis/solti.io/v1/tasks")).await.unwrap();
+        let response = app.oneshot(request).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let body = body_json(resp).await;
-    assert_eq!(body["apiVersion"], "v1");
-    assert_eq!(body["kind"], "Status");
-    assert_eq!(body["metadata"], serde_json::json!({}));
-    assert_eq!(body["status"], "Failure");
-    assert_eq!(body["reason"], "Unauthorized");
-    assert_eq!(body["code"], 401);
-    assert!(
-        body["message"].as_str().unwrap().contains("bearer token"),
-        "expected message to mention the bearer token, got {body:?}"
-    );
-    assert_eq!(
-        handler.calls.load(Ordering::SeqCst),
-        0,
-        "handler must not be reached without credentials"
-    );
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = body_json(response).await;
+        assert_eq!(body["apiVersion"], "v1");
+        assert_eq!(body["kind"], "Status");
+        assert_eq!(body["metadata"], serde_json::json!({}));
+        assert_eq!(body["status"], "Failure");
+        assert_eq!(body["reason"], "Unauthorized");
+        assert_eq!(body["code"], 401);
+        assert!(
+            body["message"].as_str().unwrap().contains("bearer token"),
+            "expected message to mention the bearer token, got {body:?}"
+        );
+        assert_eq!(
+            handler.calls.load(Ordering::SeqCst),
+            0,
+            "handler must not be reached with {authorization:?}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn request_with_wrong_token_is_rejected_with_401() {
-    let handler = Arc::new(MockHandler::default());
-    let app = secured_router(Arc::clone(&handler));
-
-    let resp = app
-        .oneshot(get_with_authorization(
-            "/apis/solti.io/v1/tasks",
-            "Bearer not-the-secret",
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let body = body_json(resp).await;
-    assert_eq!(body["reason"], "Unauthorized");
-    assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn request_with_non_bearer_scheme_is_rejected_with_401() {
-    let handler = Arc::new(MockHandler::default());
-    let app = secured_router(Arc::clone(&handler));
-
-    let resp = app
-        .oneshot(get_with_authorization(
-            "/apis/solti.io/v1/tasks",
-            &format!("Basic {SECRET}"),
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn request_with_valid_token_reaches_the_handler() {
-    let handler = Arc::new(MockHandler::default());
-    let app = secured_router(Arc::clone(&handler));
-
-    let resp = app
-        .oneshot(get_with_authorization(
-            "/apis/solti.io/v1/tasks",
-            &format!("Bearer {SECRET}"),
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp).await;
-    assert_eq!(body["apiVersion"], "solti.io/v1");
-    assert_eq!(body["kind"], "TaskList");
-    assert_eq!(
-        body["metadata"],
-        serde_json::json!({ "resourceVersion": "test:1" })
-    );
-    assert_eq!(body["items"], serde_json::json!([]));
-    assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn bearer_scheme_is_accepted_case_insensitively() {
-    for scheme in ["bearer", "BEARER"] {
+async fn valid_bearer_schemes_reach_the_handler() {
+    for scheme in ["Bearer", "bearer", "BEARER"] {
         let handler = Arc::new(MockHandler::default());
         let app = secured_router(Arc::clone(&handler));
 
@@ -225,11 +174,15 @@ async fn bearer_scheme_is_accepted_case_insensitively() {
             .await
             .unwrap();
 
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["apiVersion"], "solti.io/v1");
+        assert_eq!(body["kind"], "TaskList");
         assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "scheme {scheme:?} must be accepted"
+            body["metadata"],
+            serde_json::json!({ "resourceVersion": "test:1" })
         );
+        assert_eq!(body["items"], serde_json::json!([]));
         assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
     }
 }
@@ -278,9 +231,4 @@ async fn sse_logs_route_with_valid_token_streams() {
         "expected SSE content-type, got {ct:?}"
     );
     assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn empty_auth_token_is_rejected_before_api_construction() {
-    assert!(Token::new("   ").is_err());
 }

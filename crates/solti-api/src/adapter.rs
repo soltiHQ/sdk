@@ -1,6 +1,20 @@
-//! # Supervisor adapter.
+//! # Supervisor Adapter
 //!
-//! [`SupervisorApiAdapter`] bridges [`SupervisorApi`](solti_core::SupervisorApi) to [`ApiHandler`].
+//! [`SupervisorApiAdapter`] connects [`solti_core::SupervisorApi`] to [`ApiHandler`].
+//!
+//! ```text
+//! wire transport
+//!      │ domain request
+//!      ▼
+//! SupervisorApiAdapter
+//!      ├── public workload guard
+//!      ├── core error mapping
+//!      └──► solti_core::SupervisorApi
+//! ```
+//!
+//! The adapter hides the built-in `Embedded` workload.
+//! It preserves extension workloads.
+//! It also pins output subscriptions to the visible task generation.
 
 use std::sync::Arc;
 
@@ -16,26 +30,32 @@ use crate::error::{ApiConflict, ApiError, ApiErrorCause};
 use crate::handler::{ApiHandler, OutputEventStream, TaskWatchEventStream};
 use crate::visibility::{manifest_is_visible, task_is_visible, workload_is_visible};
 
-/// Adapter that bridges [`SupervisorApi`] to [`ApiHandler`].
+/// [`ApiHandler`] implementation backed by [`SupervisorApi`].
 ///
-/// Ready-to-use implementation that directly delegates to `SupervisorApi`.
+/// Desired writes, reads, watches, history, deletion, and output
+/// delegate to the supervisor.
+/// Core errors are converted into [`ApiError`] categories.
 ///
-/// ## Also
+/// ## Visibility
 ///
-/// - [`ApiHandler`] the trait this adapter implements.
-/// - [`ApiError`] receives API-owned categories translated from [`CoreError`].
+/// Embedded tasks remain available through the in-process core API.
+/// They are absent through this adapter.
+///
+/// ## See Also
+///
+/// - [`ApiHandler`] defines the transport contract.
+/// - [`ApiError`] defines the mapped error categories.
 pub struct SupervisorApiAdapter {
     supervisor: Arc<SupervisorApi>,
 }
 
 impl SupervisorApiAdapter {
-    /// Create a new adapter wrapping the given supervisor.
+    /// Creates an adapter for a running supervisor.
     pub fn new(supervisor: Arc<SupervisorApi>) -> Self {
         Self { supervisor }
     }
 
-    /// Keep an opened wire stream pinned to the generation that was visible
-    /// when the subscription was created.
+    /// Checks whether an output event belongs to the opened generation.
     fn event_is_from_generation(event: &OutputEvent, generation: u64) -> bool {
         match event {
             OutputEvent::Chunk(chunk) => chunk.generation == generation,

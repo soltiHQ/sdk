@@ -1,4 +1,6 @@
-//! Execution policy protobuf conversion.
+//! # Policy Conversion
+//!
+//! Converts restart, backoff, jitter, and admission policies.
 
 use solti_model::{AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy};
 

@@ -23,7 +23,7 @@ use solti_model::{
     AdmissionPolicy, BackoffPolicy, EmbeddedSpec, Flag, JitterPolicy, Labels, OutputChunk,
     OutputEvent, RestartPolicy, StreamKind, SubprocessMode, SubprocessSpec, Task, TaskContinuation,
     TaskEnv, TaskFilter, TaskId, TaskManifest, TaskPage, TaskPhase, TaskQuery, TaskRun, TaskSpec,
-    TaskWatchEvent, TaskWorkload, Token, WorkloadTypeMeta, WritePreconditions,
+    TaskWatchEvent, TaskWorkload, WorkloadTypeMeta, WritePreconditions,
 };
 
 // ---------------------------------------------------------------------------
@@ -1440,47 +1440,4 @@ async fn slot_conflict_maps_to_409_already_exists() {
     assert_eq!(body["status"], "Failure");
     assert_eq!(body["reason"], "AlreadyExists");
     assert_eq!(body["code"], 409);
-}
-
-#[tokio::test]
-async fn missing_bearer_token_maps_to_401_unauthenticated() {
-    let app = HttpApi::new(Arc::new(WireMock::default()))
-        .with_auth(Token::new("secret-token").unwrap())
-        .router();
-
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/apis/solti.io/v1/tasks")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let body = body_json(resp).await;
-    assert_eq!(body["reason"], "Unauthorized");
-}
-
-#[tokio::test]
-async fn valid_bearer_token_passes_the_auth_gate() {
-    let app = HttpApi::new(Arc::new(WireMock::default()))
-        .with_auth(Token::new("secret-token").unwrap())
-        .router();
-
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/apis/solti.io/v1/tasks")
-                .header("authorization", "Bearer secret-token")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
 }

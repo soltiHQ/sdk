@@ -1,4 +1,7 @@
-//! Write precondition protobuf conversion.
+//! # Write Preconditions
+//!
+//! Converts optional protobuf preconditions into domain checks.
+//! An absent message means an unconditional write.
 
 use solti_model::{Uid, WritePreconditions};
 

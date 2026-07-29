@@ -1,4 +1,7 @@
-//! # Task resource conversion.
+//! # Task Conversion
+//!
+//! Converts create and apply manifests into domain desired state.
+//! Converts stored tasks, list pages, and watch events into protobuf responses.
 
 use solti_model::{Annotations, TASK_API_VERSION, TASK_KIND, Task, TaskManifest};
 
@@ -34,7 +37,7 @@ impl TryFrom<Task> for proto_api::Task {
     }
 }
 
-/// Convert a create/apply wire manifest into the domain desired state.
+/// Converts a create or apply manifest into domain desired state.
 pub(crate) fn task_manifest_from_proto(
     manifest: proto_api::TaskManifest,
 ) -> Result<TaskManifest, ApiError> {
@@ -69,7 +72,7 @@ pub(crate) fn task_manifest_from_proto(
     Ok(manifest)
 }
 
-/// Build a proto `ListTasksResponse` from a domain `TaskPage`.
+/// Converts one domain task page into a protobuf list response.
 pub(crate) fn tasks_page_to_proto(
     page: solti_model::TaskPage<solti_model::Task>,
 ) -> Result<proto_api::ListTasksResponse, ApiError> {
@@ -95,7 +98,7 @@ pub(crate) fn tasks_page_to_proto(
     })
 }
 
-/// Convert one domain Task watch event into its protobuf representation.
+/// Converts one domain watch event into protobuf.
 pub(crate) fn task_watch_event_to_proto(
     event: solti_model::TaskWatchEvent,
 ) -> Result<proto_api::WatchTasksResponse, ApiError> {

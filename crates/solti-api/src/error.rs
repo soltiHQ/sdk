@@ -1,10 +1,17 @@
-//! # API error types.
+//! # API Errors
+//!
+//! [`ApiError`] is the shared error contract for both transports.
+//! HTTP converts it into a Kubernetes-style `Status` resource.
+//! gRPC converts it into `tonic::Status`.
+//!
+//! Write conflicts carry structured [`ApiConflict`] details.
+//! Internal diagnostics are logged and hidden from wire clients.
 
 use std::fmt;
 
 use thiserror::Error;
 
-/// One machine-readable cause attached to an API error.
+/// One machine-readable cause of an API conflict.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiErrorCause {
     reason: String,
@@ -13,7 +20,7 @@ pub struct ApiErrorCause {
 }
 
 impl ApiErrorCause {
-    /// Create a cause with a stable reason and diagnostic message.
+    /// Creates a cause with a reason and readable message.
     pub fn new(reason: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
@@ -22,29 +29,31 @@ impl ApiErrorCause {
         }
     }
 
-    /// Attach the request field responsible for this cause.
+    /// Attaches the related request field.
     pub fn with_field(mut self, field: impl Into<String>) -> Self {
         self.field = Some(field.into());
         self
     }
 
-    /// Stable cause reason.
+    /// Returns the machine-readable reason.
     pub fn reason(&self) -> &str {
         &self.reason
     }
 
-    /// Related request field, when known.
+    /// Returns the related request field.
     pub fn field(&self) -> Option<&str> {
         self.field.as_deref()
     }
 
-    /// Human-readable diagnostic.
+    /// Returns the readable diagnostic.
     pub fn message(&self) -> &str {
         &self.message
     }
 }
 
-/// Structured optimistic-concurrency conflict.
+/// Structured optimistic concurrency conflict.
+///
+/// Each cause describes one failed write precondition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiConflict {
     name: String,
@@ -52,7 +61,7 @@ pub struct ApiConflict {
 }
 
 impl ApiConflict {
-    /// Create conflict details for one Task resource.
+    /// Creates conflict details for one task.
     pub fn new(name: impl Into<String>, causes: Vec<ApiErrorCause>) -> Self {
         Self {
             name: name.into(),
@@ -60,12 +69,12 @@ impl ApiConflict {
         }
     }
 
-    /// Conflicting resource name.
+    /// Returns the conflicting task name.
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Failed write preconditions.
+    /// Returns the failed preconditions.
     pub fn causes(&self) -> &[ApiErrorCause] {
         &self.causes
     }
@@ -92,66 +101,78 @@ impl fmt::Display for ApiConflict {
 
 impl std::error::Error for ApiConflict {}
 
-/// Unified error type for both API transports.
+/// Error returned by the handler or a transport boundary.
 ///
-/// Every handler and conversion failure becomes one of these variants.
-/// The transport layers map each variant to a wire response:
-/// gRPC via `From<ApiError> for tonic::Status`, HTTP via `axum::response::IntoResponse`
-/// (a Kubernetes-style `Status` resource).
+/// | Variant                    | HTTP  | gRPC                |
+/// |----------------------------|-------|---------------------|
+/// | `InvalidRequest`           | `400` | `InvalidArgument`   |
+/// | `Unauthenticated`          | `401` | `Unauthenticated`   |
+/// | `AlreadyExists`            | `409` | `AlreadyExists`     |
+/// | `Conflict`                 | `409` | `Aborted`           |
+/// | `TaskNotFound`, `NotFound` | `404` | `NotFound`          |
+/// | `MethodNotAllowed`         | `405` | `Unimplemented`     |
+/// | `UnsupportedMediaType`     | `415` | `InvalidArgument`   |
+/// | `PayloadTooLarge`          | `413` | `ResourceExhausted` |
+/// | `ResourceVersionExpired`   | `410` | `OutOfRange`        |
+/// | `Unavailable`              | `503` | `Unavailable`       |
+/// | `Internal`                 | `500` | `Internal`          |
+///
+/// This enum is non-exhaustive.
+/// Match it with a wildcard arm.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ApiError {
-    /// Request was syntactically or semantically invalid (bad field, malformed body, missing required value). → `400` / `InvalidArgument`.
+    /// The request is syntactically or semantically invalid.
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
-    /// Credential missing, malformed, or rejected. → `401` / `Unauthenticated`.
+    /// The bearer credential is missing, malformed, or rejected.
     #[error("unauthenticated: {0}")]
     Unauthenticated(String),
 
-    /// A retained Task resource already owns the requested name. → `409` / `AlreadyExists`.
+    /// A retained task already owns the requested name.
     #[error("task already exists: {0}")]
     AlreadyExists(String),
 
-    /// A write precondition did not match the current resource. → `409` / `Aborted`.
+    /// A write precondition does not match the current task.
     #[error(transparent)]
     Conflict(ApiConflict),
 
-    /// No task matched the requested name/id. → `404` / `NotFound`.
+    /// No public task has the requested name.
     #[error("task not found: {0}")]
     TaskNotFound(String),
 
-    /// No public resource or route matched the request. → `404` / `NotFound`.
+    /// No public resource or route matches the request.
     #[error("not found: {0}")]
     NotFound(String),
 
-    /// The resource exists, but does not support the requested method. → `405` / `Unimplemented`.
+    /// The resource does not support the requested method.
     #[error("method not allowed: {0}")]
     MethodNotAllowed(String),
 
-    /// Request media type is missing or unsupported. → `415` / `InvalidArgument`.
+    /// The request media type is missing or unsupported.
     #[error("unsupported media type: {0}")]
     UnsupportedMediaType(String),
 
-    /// Request body exceeded the configured limit. → `413` / `ResourceExhausted`.
+    /// The request body or message exceeds the configured limit.
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
 
-    /// The requested collection snapshot or watch position is no longer retained. → `410` / `OutOfRange`.
+    /// The requested list snapshot or watch position is no longer retained.
     #[error("resource version expired: {0}")]
     ResourceVersionExpired(String),
 
-    /// Service is temporarily unable to accept work. → `503` / `Unavailable`.
+    /// The service cannot currently accept work.
     #[error("service unavailable: {0}")]
     Unavailable(String),
 
-    /// Unexpected server-side failure with no more specific mapping. → `500` / `Internal`.
+    /// An unexpected server-side failure occurred.
     #[error("internal error: {0}")]
     Internal(String),
 }
 
 impl ApiError {
-    /// Short stable diagnostic label for this variant.
+    /// Returns the stable variant label.
     pub fn as_label(&self) -> &'static str {
         match self {
             ApiError::PayloadTooLarge(_) => "PayloadTooLarge",
@@ -385,50 +406,41 @@ mod tests {
 
     #[cfg(feature = "http")]
     #[test]
-    fn already_exists_maps_to_http_conflict() {
+    fn direct_errors_map_to_http_status_codes() {
         use axum::http::StatusCode;
         use axum::response::IntoResponse;
 
-        let response = ApiError::AlreadyExists("x".into()).into_response();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        for (error, expected) in [
+            (ApiError::AlreadyExists("x".into()), StatusCode::CONFLICT),
+            (
+                ApiError::ResourceVersionExpired("old revision".into()),
+                StatusCode::GONE,
+            ),
+            (ApiError::Conflict(conflict()), StatusCode::CONFLICT),
+            (
+                ApiError::Unavailable("x".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            assert_eq!(error.into_response().status(), expected);
+        }
     }
 
     #[cfg(feature = "grpc")]
     #[test]
-    fn already_exists_maps_to_grpc_already_exists() {
+    fn direct_errors_map_to_grpc_status_codes() {
         use tonic::Code;
 
-        let status = tonic::Status::from(ApiError::AlreadyExists("x".into()));
-        assert_eq!(status.code(), Code::AlreadyExists);
-    }
-
-    #[cfg(feature = "http")]
-    #[test]
-    fn expired_resource_version_maps_to_http_gone() {
-        use axum::http::StatusCode;
-        use axum::response::IntoResponse;
-
-        let response = ApiError::ResourceVersionExpired("old revision".into()).into_response();
-        assert_eq!(response.status(), StatusCode::GONE);
-    }
-
-    #[cfg(feature = "grpc")]
-    #[test]
-    fn expired_resource_version_maps_to_grpc_out_of_range() {
-        use tonic::Code;
-
-        let status = tonic::Status::from(ApiError::ResourceVersionExpired("old revision".into()));
-        assert_eq!(status.code(), Code::OutOfRange);
-    }
-
-    #[cfg(feature = "http")]
-    #[test]
-    fn conflict_maps_to_http_conflict() {
-        use axum::http::StatusCode;
-        use axum::response::IntoResponse;
-
-        let response = ApiError::Conflict(conflict()).into_response();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        for (error, expected) in [
+            (ApiError::AlreadyExists("x".into()), Code::AlreadyExists),
+            (
+                ApiError::ResourceVersionExpired("old revision".into()),
+                Code::OutOfRange,
+            ),
+            (ApiError::Unavailable("x".into()), Code::Unavailable),
+        ] {
+            assert_eq!(tonic::Status::from(error).code(), expected);
+        }
     }
 
     #[cfg(feature = "grpc")]
@@ -468,25 +480,6 @@ mod tests {
             "ResourceVersionMismatch"
         );
         assert_eq!(value["details"]["causes"][0]["field"], "resourceVersion");
-    }
-
-    #[cfg(feature = "http")]
-    #[test]
-    fn unavailable_maps_to_http_service_unavailable() {
-        use axum::http::StatusCode;
-        use axum::response::IntoResponse;
-
-        let response = ApiError::Unavailable("x".into()).into_response();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[cfg(feature = "grpc")]
-    #[test]
-    fn unavailable_maps_to_grpc_unavailable() {
-        use tonic::Code;
-
-        let status = tonic::Status::from(ApiError::Unavailable("x".into()));
-        assert_eq!(status.code(), Code::Unavailable);
     }
 
     #[cfg(feature = "grpc")]

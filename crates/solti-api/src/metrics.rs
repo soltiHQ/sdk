@@ -1,28 +1,36 @@
-//! # API metrics — HTTP + gRPC.
+//! # API Metrics
 //!
-//! Implement [`ApiMetricsBackend`] to record per-request metrics.
-//! The default is [`NoOpApiMetrics`] - zero-cost when no handle is wired in.
+//! HTTP and gRPC report through one [`ApiMetricsBackend`].
+//! Both transport builders use [`NoOpApiMetrics`] by default.
 //!
-//! Both transport builders accept the same backend through `with_metrics`.
+//! ```text
+//! HTTP request ──┐
+//!                ├──► ApiMetricsBackend
+//! gRPC call ─────┘
+//! ```
+//!
+//! Route labels are bounded.
+//! HTTP uses matched route templates.
+//! gRPC uses full service paths.
 
 use std::sync::Arc;
 
 #[cfg(any(feature = "grpc", feature = "http"))]
 use std::time::{Duration, Instant};
 
-/// Transport that served a request - the `transport` metric label.
+/// Transport that served an API request.
 ///
-/// A closed two-value set. This keeps label cardinality bounded by construction.
+/// This closed set keeps the transport label bounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
-    /// The axum HTTP/JSON transport (feature `http`).
+    /// Axum HTTP/JSON transport.
     Http,
-    /// The tonic gRPC transport (feature `grpc`).
+    /// Tonic gRPC transport.
     Grpc,
 }
 
 impl Transport {
-    /// Stable lowercase label value (`"http"` / `"grpc"`) for the metric series.
+    /// Returns the stable lowercase metric label.
     pub fn as_label(&self) -> &'static str {
         match self {
             Transport::Http => "http",
@@ -31,18 +39,22 @@ impl Transport {
     }
 }
 
-/// Metrics backend for the API layer.
+/// Receives API request lifecycle metrics.
 ///
 /// ## Labels
 ///
-/// - `transport`: `http` | `grpc`
-/// - `method`: HTTP method (`GET`, `POST`, ...) for HTTP, RPC method name (`CreateTask`, ...) for gRPC
-/// - `path`: templated route (`/apis/solti.io/v1/tasks/{name}`) for HTTP via `MatchedPath`, full RPC path (`/solti.task.v1.TaskService/CreateTask`) for gRPC
-/// - `status`: HTTP status code (200/404/500/...) for HTTP, gRPC code number for gRPC
+/// | Value       | HTTP                                  | gRPC                                      |
+/// |-------------|---------------------------------------|-------------------------------------------|
+/// | `method`    | Method such as `GET`                  | RPC name such as `CreateTask`             |
+/// | `path`      | Matched route template                | Full service and RPC path                 |
+/// | `status`    | Numeric HTTP status                   | Numeric tonic status code                 |
+/// | `transport` | [`Transport::Http`]                   | [`Transport::Grpc`]                       |
 ///
-/// Cardinality stays bounded because routes are a closed set per version and templated paths avoid per-resource-id explosion.
+/// `record_request` is called after normal completion or stream termination.
+/// It is not called when a request future or stream is dropped first.
+/// The in-flight decrement still occurs on drop.
 pub trait ApiMetricsBackend: Send + Sync + std::fmt::Debug {
-    /// Record a completed request.
+    /// Records one completed request or terminated stream.
     fn record_request(
         &self,
         _transport: Transport,
@@ -53,25 +65,28 @@ pub trait ApiMetricsBackend: Send + Sync + std::fmt::Debug {
     ) {
     }
 
-    /// Adjust the in-flight gauge by `delta` (+1 on entry, -1 on exit).
+    /// Adjusts the in-flight gauge.
+    ///
+    /// Entry uses `1`.
+    /// Completion, failure, cancellation, and drop use `-1`.
     fn record_in_flight_delta(&self, _transport: Transport, _delta: i64) {}
 }
 
-/// Zero-cost default implementation.
+/// Metrics backend that ignores every update.
 #[derive(Debug, Default)]
 pub struct NoOpApiMetrics;
 
 impl ApiMetricsBackend for NoOpApiMetrics {}
 
-/// Shareable handle used throughout this crate.
+/// Shared metrics backend handle.
 pub type ApiMetricsHandle = Arc<dyn ApiMetricsBackend>;
 
-/// Construct a no-op handle: convenient default.
+/// Creates a shared no-op metrics backend.
 pub fn noop_api_metrics() -> ApiMetricsHandle {
     Arc::new(NoOpApiMetrics)
 }
 
-/// Keeps the in-flight gauge balanced when a request future is cancelled.
+/// Keeps the in-flight gauge balanced across every exit path.
 #[cfg(any(feature = "grpc", feature = "http"))]
 pub(crate) struct InFlightGuard {
     metrics: ApiMetricsHandle,
@@ -180,12 +195,10 @@ impl tokio_stream::Stream for HttpMetricsStream {
     }
 }
 
-/// Axum middleware that records per-request HTTP metrics.
+/// Records HTTP request metrics around the next service.
 ///
-/// Uses [`axum::extract::MatchedPath`] to capture the route **template**
-/// (e.g. `/apis/solti.io/v1/tasks/{name}`) instead of the raw URL. Requests
-/// without a matched route use one stable fallback label, keeping `path`
-/// cardinality bounded.
+/// Matched routes use their template.
+/// Unmatched requests use the stable `<unmatched>` label.
 #[cfg(feature = "http")]
 pub(crate) async fn http_metrics_middleware(
     axum::extract::State(metrics): axum::extract::State<ApiMetricsHandle>,

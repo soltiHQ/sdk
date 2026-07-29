@@ -1,16 +1,28 @@
-//! # TLS adapters for the API transports.
+//! # gRPC TLS
 //!
-//! Bridges [`solti_tls::ServerTlsConfig`] to tonic's server TLS configuration.
-//! Available with the `grpc-tls` feature.
+//! Adapter from [`solti_tls::ServerTlsConfig`] to tonic.
+//! This module is available with feature `grpc-tls`.
+//!
+//! ```text
+//! certificate + private key + optional client roots
+//!                         │
+//!                         ▼
+//!            solti_tls::ServerTlsConfig
+//!                         │ validate and load
+//!                         ▼
+//!         tonic::transport::ServerTlsConfig
+//! ```
+//!
+//! Client roots enable mandatory client certificate authentication.
 //!
 //! ## Example
 //!
 //! ```rust,no_run
 //! # use std::sync::Arc;
-//! use solti_api::{GrpcApi, SupervisorApiAdapter, to_tonic_server_tls};
+//! use solti_api::{ApiHandler, GrpcApi, to_tonic_server_tls};
 //! use solti_tls::{ServerTlsConfig, TlsIdentity, TrustRoots};
 //!
-//! # async fn serve(adapter: Arc<SupervisorApiAdapter>) -> Result<(), Box<dyn std::error::Error>> {
+//! # async fn serve<H: ApiHandler>(handler: Arc<H>) -> Result<(), Box<dyn std::error::Error>> {
 //! let server_tls = ServerTlsConfig::new(TlsIdentity::from_pem_files(
 //!     "/etc/solti/tls/server.crt",
 //!     "/etc/solti/tls/server.key",
@@ -20,9 +32,9 @@
 //! ));
 //!
 //! let tls_cfg = to_tonic_server_tls(server_tls)?;
-//! tonic::transport::Server::builder()
+//! solti_api::tonic::transport::Server::builder()
 //!     .tls_config(tls_cfg)?
-//!     .add_service(GrpcApi::new(adapter).server())
+//!     .add_service(GrpcApi::new(handler).server())
 //!     .serve("0.0.0.0:50443".parse()?)
 //!     .await?;
 //! # Ok(()) }
@@ -31,19 +43,22 @@
 use solti_tls::{ServerTlsConfig, TlsError};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig as TonicServerTls};
 
-/// Convert [`solti_tls::ServerTlsConfig`] into [`tonic::transport::ServerTlsConfig`].
+/// Converts Solti server TLS settings into tonic settings.
 ///
-/// Loads the structured PEM material and feeds it to tonic's PEM constructors.
-/// mTLS is enabled when client-auth roots are present.
+/// The input is fully loaded and validated first.
+/// Client trust roots make client certificates mandatory.
 ///
 /// ## Errors
 ///
-/// - [`TlsError::ReadPem`]: a configured PEM file could not be read.
+/// Returns the loading and validation errors from
+/// [`ServerTlsConfig::load`](solti_tls::ServerTlsConfig::load).
 ///
-/// ## Notes on mTLS
+/// These include unreadable or invalid PEM, missing certificate or key blocks,
+/// invalid trust roots, and invalid certificate-key configuration.
 ///
-/// When client-auth roots are set, this helper sets `client_ca_root` on the tonic config,
-/// leaving `client_auth_optional` at its default (`false`) - i.e. **client cert is required**, matching `solti-tls`'s server semantics.
+/// ## Security
+///
+/// The returned tonic config owns a copy of the private-key PEM.
 pub fn to_tonic_server_tls(cfg: ServerTlsConfig) -> Result<TonicServerTls, TlsError> {
     let loaded = cfg.load()?;
     let identity = loaded.identity();
