@@ -279,8 +279,15 @@ Transport-specific variants are available only with their transport feature.
 `DiscoverError` is non-exhaustive.
 Keep a wildcard arm when matching it.
 
-## Protocol
+## Contracts
 
-See [Sync Protocol v1](sync_v1.md) for the wire fields and transport mapping.
+| Contract | Source                                                         |
+|----------|----------------------------------------------------------------|
+| Behavior | [Discovery protocol contract](CONTRACT.md)                     |
+| Wire     | [`solti.discover.v1`](proto/solti/discover/v1/discovery.proto) |
+
+Protobuf defines the gRPC service and shared request and response messages.
+`CONTRACT.md` defines the HTTP binding and behavior shared by both transports.
+
 The HTTP endpoint is always `POST /api/v1/discovery/sync`.
 Generated protobuf types remain internal.

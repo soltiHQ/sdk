@@ -1091,23 +1091,13 @@ impl TaskState {
             .tasks
             .get_mut(name)
             .expect("resource was checked under the same write lock");
-        let result = if force {
-            task.reconcile_finished(
-                binding.resource.generation,
-                phase,
-                error.clone(),
-                exit_code,
-                resource_version,
-            )
-        } else {
-            task.reconcile_finished(
-                binding.resource.generation,
-                phase,
-                error.clone(),
-                exit_code,
-                resource_version,
-            )
-        };
+        let result = task.reconcile_finished(
+            binding.resource.generation,
+            phase,
+            error.clone(),
+            exit_code,
+            resource_version,
+        );
         match result {
             Ok(changed) => {
                 inner.terminal_since.insert(name.clone(), SystemTime::now());

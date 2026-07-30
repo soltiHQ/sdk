@@ -16,7 +16,6 @@
 //!
 //! ```text
 //! agent identity + endpoint + capabilities
-//!                    │
 //!                    ▼
 //!             DiscoverConfig
 //!                    │ sync(config, uptime)
@@ -61,15 +60,15 @@
 //!
 //! ## Main Types
 //!
-//! | Area             | Types                                                       |
-//! |------------------|-------------------------------------------------------------|
-//! | Agent endpoint   | [`AgentEndpoint`], [`AgentEndpointType`]                    |
-//! | Control plane    | [`ControlPlaneEndpoint`], [`DiscoveryTransport`]            |
-//! | Configuration    | [`DiscoverConfig`], [`DiscoverConfigBuilder`]               |
-//! | Task factory     | [`sync`]                                                    |
-//! | Uptime           | [`UptimeSource`], [`MonotonicUptime`]                       |
-//! | Metrics          | [`DiscoverMetricsBackend`], [`DiscoverFailReason`]          |
-//! | Errors           | [`DiscoverError`], [`Retryability`]                         |
+//! | Area             | Types                                                           |
+//! |------------------|-----------------------------------------------------------------|
+//! | Agent endpoint   | [`AgentEndpoint`], [`AgentEndpointType`]                        |
+//! | Control plane    | [`ControlPlaneEndpoint`], [`DiscoveryTransport`]                |
+//! | Configuration    | [`DiscoverConfig`], [`DiscoverConfigBuilder`]                   |
+//! | Task factory     | [`sync`]                                                        |
+//! | Uptime           | [`UptimeSource`], [`MonotonicUptime`]                           |
+//! | Metrics          | [`DiscoverMetricsBackend`], [`DiscoverFailReason`]              |
+//! | Errors           | [`DiscoverError`], [`Retryability`]                             |
 //!
 //! ## Quick Start
 //!
@@ -118,8 +117,11 @@
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
-mod errors;
-pub use errors::{DiscoverError, Retryability};
+mod version;
+pub use version::{
+    DISCOVERY_GRPC_PACKAGE, DISCOVERY_GRPC_SERVICE, DISCOVERY_HTTP_SYNC_PATH,
+    DISCOVERY_PROTOCOL_VERSION,
+};
 
 mod metrics;
 pub use metrics::{
@@ -134,6 +136,9 @@ pub use config::{
     AgentEndpoint, AgentEndpointType, ControlPlaneEndpoint, DEFAULT_CONNECT_TIMEOUT_MS,
     DEFAULT_REQUEST_TIMEOUT_MS, DiscoverConfig, DiscoverConfigBuilder, DiscoveryTransport,
 };
+
+mod errors;
+pub use errors::{DiscoverError, Retryability};
 
 #[cfg(any(feature = "grpc", feature = "http"))]
 mod tasks;
@@ -158,11 +163,21 @@ mod generated {
         }
 
         pub(crate) mod discover {
-            pub(crate) mod v1 {
-                include!(concat!(env!("OUT_DIR"), "/solti.discover.v1.rs"));
+            pub(crate) mod wire {
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/solti.discover.v",
+                    env!("SOLTI_DISCOVERY_PROTOCOL_MAJOR"),
+                    ".rs"
+                ));
 
                 #[cfg(feature = "http")]
-                include!(concat!(env!("OUT_DIR"), "/solti.discover.v1.serde.rs"));
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/solti.discover.v",
+                    env!("SOLTI_DISCOVERY_PROTOCOL_MAJOR"),
+                    ".serde.rs"
+                ));
             }
         }
     }
@@ -171,4 +186,27 @@ mod generated {
 #[cfg(any(feature = "grpc", feature = "http"))]
 pub(crate) use generated::solti::agent::v1 as proto_agent;
 #[cfg(any(feature = "grpc", feature = "http"))]
-pub(crate) use generated::solti::discover::v1 as proto;
+pub(crate) use generated::solti::discover::wire as proto;
+
+#[cfg(test)]
+mod contract_identity_guard {
+    #[test]
+    fn discovery_contract_identity_is_consistent() {
+        assert_eq!(
+            super::DISCOVERY_PROTOCOL_VERSION.to_string(),
+            env!("SOLTI_DISCOVERY_PROTOCOL_MAJOR"),
+        );
+        assert_eq!(
+            super::DISCOVERY_GRPC_PACKAGE,
+            format!("solti.discover.v{}", super::DISCOVERY_PROTOCOL_VERSION),
+        );
+        assert_eq!(
+            super::DISCOVERY_GRPC_SERVICE,
+            format!("{}.DiscoverService", super::DISCOVERY_GRPC_PACKAGE),
+        );
+        assert_eq!(
+            super::DISCOVERY_HTTP_SYNC_PATH,
+            format!("/api/v{}/discovery/sync", super::DISCOVERY_PROTOCOL_VERSION),
+        );
+    }
+}

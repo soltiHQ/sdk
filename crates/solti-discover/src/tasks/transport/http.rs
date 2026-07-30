@@ -20,12 +20,12 @@ use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use solti_model::Token;
 
+use crate::DISCOVERY_HTTP_SYNC_PATH;
 use crate::config::DiscoverConfig;
 use crate::errors::DiscoverError;
 use crate::proto::{SyncRequest, SyncResponse};
 use crate::tasks::transport::validate_response;
 
-const DISCOVERY_SYNC_PATH: &str = "/api/v1/discovery/sync";
 const MAX_BODY_PREVIEW_BYTES: usize = 1_024;
 const MAX_RESPONSE_BODY_BYTES: u64 = 64 * 1_024;
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
@@ -115,7 +115,7 @@ fn sync_url(endpoint: &str) -> Result<Url, DiscoverError> {
     }
 
     let base_path = url.path().trim_end_matches('/');
-    let path = format!("{base_path}{DISCOVERY_SYNC_PATH}");
+    let path = format!("{base_path}{DISCOVERY_HTTP_SYNC_PATH}");
     url.set_path(&path);
     Ok(url)
 }

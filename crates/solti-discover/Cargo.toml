@@ -17,9 +17,8 @@ license.workspace      = true
 include = [
     "proto/**/*.proto",
     "src/**/*.rs",
-    "Cargo.toml",
+    "CONTRACT.md",
     "README.md",
-    "sync_v1.md",
     "build.rs",
 ]
 
@@ -27,6 +26,7 @@ include = [
 default = []
 grpc = [
     "dep:prost",
+    "dep:prost-reflect",
     "dep:protoc-bin-vendored",
     "dep:solti-model",
     "dep:taskvisor",
@@ -40,6 +40,7 @@ http = [
     "dep:pbjson",
     "dep:pbjson-build",
     "dep:prost",
+    "dep:prost-reflect",
     "dep:protoc-bin-vendored",
     "dep:reqwest",
     "dep:serde",
@@ -70,6 +71,7 @@ tracing     = { workspace = true, optional = true }
 
 [build-dependencies]
 pbjson-build        = { workspace = true, optional = true }
+prost-reflect       = { workspace = true, optional = true }
 protoc-bin-vendored = { workspace = true, optional = true }
 tonic-prost-build   = { workspace = true, optional = true }
 
