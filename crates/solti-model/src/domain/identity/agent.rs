@@ -10,6 +10,7 @@ use crate::error::ModelError;
 pub const AGENT_ID_MAX_LEN: usize = 128;
 
 arc_str_newtype! {
+    #[cfg_attr(feature = "schema", schemars(schema_with = "crate::schema::agent_id"))]
     /// Caller-provided identifier for a Solti agent.
     ///
     /// The model validates its format.

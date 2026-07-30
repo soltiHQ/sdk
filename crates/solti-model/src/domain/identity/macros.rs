@@ -15,8 +15,9 @@ macro_rules! arc_str_newtype {
         $(#[$meta:meta])*
         $vis:vis struct $ty:ident;
     ) => {
-        $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+        $(#[$meta])*
         $vis struct $ty(std::sync::Arc<str>);
 
         impl $ty {

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 /// assert!(!b);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(transparent)]
 pub struct Flag(bool);
 

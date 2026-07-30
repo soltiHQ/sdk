@@ -1,8 +1,8 @@
 use crate::{ModelError, ModelResult};
 
 pub(crate) const DNS1123_SUBDOMAIN_MAX_LEN: usize = 253;
-const DNS1035_LABEL_MAX_LEN: usize = 63;
-const QUALIFIED_NAME_MAX_LEN: usize = 63;
+pub(crate) const DNS1035_LABEL_MAX_LEN: usize = 63;
+pub(crate) const QUALIFIED_NAME_MAX_LEN: usize = 63;
 
 pub(crate) fn validate_dns1123_subdomain(field: &str, value: &str) -> ModelResult<()> {
     if value.is_empty() {

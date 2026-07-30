@@ -30,6 +30,7 @@ use crate::error::{ModelError, ModelResult};
 /// let _ = (retry_errors, service, periodic);
 /// ```
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum RestartPolicy {

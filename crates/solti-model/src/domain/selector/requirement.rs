@@ -36,6 +36,17 @@ pub struct SelectorRequirement {
     pub values: Vec<String>,
 }
 
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for SelectorRequirement {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SelectorRequirement".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        crate::schema::selector_requirement(generator)
+    }
+}
+
 impl SelectorRequirement {
     /// Validates the requirement.
     ///

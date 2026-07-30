@@ -26,6 +26,7 @@ use crate::error::{ModelError, ModelResult};
 /// assert_eq!("queue".parse::<AdmissionPolicy>().unwrap(), AdmissionPolicy::Queue);
 /// ```
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum AdmissionPolicy {

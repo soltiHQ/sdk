@@ -9,6 +9,7 @@ use crate::error::ModelError;
 pub const TASK_ID_MAX_LEN: usize = crate::validation::DNS1123_SUBDOMAIN_MAX_LEN;
 
 arc_str_newtype! {
+    #[cfg_attr(feature = "schema", schemars(schema_with = "crate::schema::task_id"))]
     /// Stable name used to address a task resource.
     ///
     /// Apply, get and delete operations address a task through this name.

@@ -33,8 +33,17 @@ use crate::{
     TaskId, TaskPhase, TaskSpec, TaskStatus, Uid,
 };
 
+macro_rules! task_api_major {
+    () => {
+        1
+    };
+}
+
+/// Major version of the built-in Task resource API.
+pub const TASK_API_VERSION_MAJOR: u32 = task_api_major!();
+
 /// API group and version of the built-in Task resource.
-pub const TASK_API_VERSION: &str = "solti.io/v1";
+pub const TASK_API_VERSION: &str = concat!("solti.io/v", task_api_major!());
 
 /// Kind of the built-in Task resource.
 pub const TASK_KIND: &str = "Task";
@@ -60,9 +69,15 @@ impl DesiredChange {
 
 /// Group/version and kind of resource schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TypeMeta {
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::task_api_version")
+    )]
     api_version: String,
+    #[cfg_attr(feature = "schema", schemars(schema_with = "crate::schema::task_kind"))]
     kind: String,
 }
 
@@ -70,6 +85,7 @@ pub struct TypeMeta {
 ///
 /// Runtime identity, resource version, generation, creation time and status are deliberately absent because the state store owns them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskManifestMeta {
     name: TaskId,
@@ -135,6 +151,8 @@ impl TaskManifestMeta {
 /// The serialized shape is `apiVersion`, `kind`, `metadata`, and `spec`.
 /// A stored [`Task`] adds server metadata and `status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(!try_from, deny_unknown_fields))]
 #[serde(rename_all = "camelCase")]
 #[serde(try_from = "raw::TaskManifestRaw")]
 pub struct TaskManifest {
@@ -287,6 +305,8 @@ impl TypeMeta {
 /// The serialized shape is `apiVersion`, `kind`, `metadata`, `spec`, `status`.
 /// Name, UID, and creation time are preserved by [`Self::apply_desired`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(!try_from, deny_unknown_fields))]
 #[serde(rename_all = "camelCase")]
 #[serde(try_from = "raw::TaskRaw")]
 pub struct Task {

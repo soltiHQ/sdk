@@ -16,6 +16,11 @@ const ANNOTATIONS_MAX_TOTAL_BYTES: usize = 256 * 1024;
 ///
 /// Annotations are kept distinct from labels because they are descriptive data, not selectors used for routing or filtering.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "schema",
+    schemars(schema_with = "crate::schema::annotations")
+)]
 #[serde(transparent)]
 pub struct Annotations(BTreeMap<String, String>);
 

@@ -18,6 +18,7 @@ flowchart TB
     Domain["domain/<br/>shared value types"]
     Auth["auth.rs<br/>bearer token"]
     Error["error.rs<br/>ModelError"]
+    Schema["schema.rs<br/>JSON Schema helpers"]
     Validation["validation.rs<br/>Kubernetes-compatible checks"]
 
     Resource --> Domain
@@ -26,6 +27,8 @@ flowchart TB
     Resource --> Validation
     Domain --> Error
     Domain --> Validation
+    Resource --> Schema
+    Domain --> Schema
     Auth --> Error
 
     Public --> Resource
@@ -40,22 +43,23 @@ They do not represent runtime ownership.
 `domain/query` is the only domain area that directly reads `Task`.
 It models collections over stored resources.
 
-| Module                         | Owns                                                                    | Does not own                                   |
-|--------------------------------|-------------------------------------------------------------------------|------------------------------------------------|
-| `resource/task.rs`             | Task GVK, manifest materialization, apply, lifecycle transitions        | Storage, reconciliation scheduling, execution  |
-| `resource/metadata.rs`         | UID, resource version, generation, creation timestamp                   | Persistence or version allocation              |
-| `resource/preconditions.rs`    | Optional UID and resource-version checks for writes                     | Evaluating a write against stored state        |
-| `resource/spec.rs`             | Required fields, defaults, structural spec validation                   | Runner availability                            |
-| `resource/status.rs`           | Status shape and cross-field invariants                                 | Event collection or retry scheduling           |
-| `resource/condition.rs`        | Extensible condition shape and `Reconciled` condition values            | Controller logic                               |
-| `resource/run.rs`              | One active or finished attempt record                                   | Run history storage                            |
-| `domain/kind/`                 | Built-in and extension workload envelopes                               | Workload execution                             |
-| `domain/selector/`             | Kubernetes-style label matching                                         | Runner registration                            |
-| `domain/query/`                | Filters, pagination domain values, watch event values                   | Snapshot retention or watch transport          |
-| `domain/capability.rs`         | Immutable runner capability snapshots                                   | Routing decisions                              |
-| `domain/output.rs`             | Live-output data and JSON encoding                                      | Channels, retention, subscriptions             |
-| `auth.rs`                      | Secret loading, generation, redaction, comparison                       | Authentication topology, persistence, rotation |
-| `validation.rs`                | Shared syntax checks                                                    | Product admission policy                       |
+| Module                      | Owns                                                             | Does not own                                   |
+|-----------------------------|------------------------------------------------------------------|------------------------------------------------|
+| `resource/task.rs`          | Task GVK, manifest materialization, apply, lifecycle transitions | Storage, reconciliation scheduling, execution  |
+| `resource/metadata.rs`      | UID, resource version, generation, creation timestamp            | Persistence or version allocation              |
+| `resource/preconditions.rs` | Optional UID and resource-version checks for writes              | Evaluating a write against stored state        |
+| `resource/spec.rs`          | Required fields, defaults, structural spec validation            | Runner availability                            |
+| `resource/status.rs`        | Status shape and cross-field invariants                          | Event collection or retry scheduling           |
+| `resource/condition.rs`     | Extensible condition shape and `Reconciled` condition values     | Controller logic                               |
+| `resource/run.rs`           | One active or finished attempt record                            | Run history storage                            |
+| `domain/kind/`              | Built-in and extension workload envelopes                        | Workload execution                             |
+| `domain/selector/`          | Kubernetes-style label matching                                  | Runner registration                            |
+| `domain/query/`             | Filters, pagination domain values, watch event values            | Snapshot retention or watch transport          |
+| `domain/capability.rs`      | Immutable runner capability snapshots                            | Routing decisions                              |
+| `domain/output.rs`          | Live-output data and JSON encoding                               | Channels, retention, subscriptions             |
+| `auth.rs`                   | Secret loading, generation, redaction, comparison                | Authentication topology, persistence, rotation |
+| `schema.rs`                 | JSON Schema shapes for custom wire encodings                     | OpenAPI routes or transport behavior           |
+| `validation.rs`             | Shared syntax checks                                             | Product admission policy                       |
 
 ## Resource ownership
 
@@ -297,6 +301,12 @@ Its direct deserialization validates automatically.
 
 `TaskEnv` deliberately stores application-owned key-value pairs without validation.
 Execution layers decide which names and values they support.
+
+The `schema` feature describes serialized structure.
+It also encodes local field constraints and lifecycle branches.
+
+Runtime validation remains authoritative for relationships that standard JSON Schema cannot express exactly.
+These include generation comparisons, uniqueness by condition type, backoff field ordering, and UTF-8 byte budgets.
 
 ## Queries and collections
 

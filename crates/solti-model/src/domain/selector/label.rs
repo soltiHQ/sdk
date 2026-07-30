@@ -37,6 +37,7 @@ use crate::{Labels, ModelError, ModelResult};
 /// assert!(selector.matches(&labels));
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LabelSelector {
     /// Exact key-value matches.

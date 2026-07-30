@@ -22,6 +22,17 @@ pub struct TaskStatus {
     pub(crate) conditions: Vec<TaskCondition>,
 }
 
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for TaskStatus {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TaskStatus".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        crate::schema::task_status(generator)
+    }
+}
+
 impl TaskStatus {
     /// Creates an unobserved pending status for a desired generation.
     ///

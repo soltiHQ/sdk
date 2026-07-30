@@ -14,6 +14,7 @@ macro_rules! env_newtype {
     ) => {
         $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
         #[serde(transparent)]
         $vis struct $ty(Vec<$crate::KeyValue>);
 

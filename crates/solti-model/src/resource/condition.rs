@@ -10,12 +10,17 @@ use crate::{ModelError, ModelResult, validation};
 
 use super::metadata::time_serde;
 
-const CONDITION_TYPE_MAX_BYTES: usize = 316;
-const CONDITION_REASON_MAX_BYTES: usize = 1_024;
+pub(crate) const CONDITION_TYPE_MAX_BYTES: usize = 316;
+pub(crate) const CONDITION_REASON_MAX_BYTES: usize = 1_024;
 const CONDITION_MESSAGE_MAX_BYTES: usize = 32_768;
 
 /// Stable and extensible type of condition reported for a [`Task`](crate::Task).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "schema",
+    schemars(schema_with = "crate::schema::condition_type")
+)]
 pub struct TaskConditionType(String);
 
 impl TaskConditionType {
@@ -80,6 +85,7 @@ impl<'de> Deserialize<'de> for TaskConditionType {
 
 /// Condition status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum ConditionStatus {
     /// The controller has not yet determined the outcome.
@@ -92,6 +98,8 @@ pub enum ConditionStatus {
 
 /// One observed condition for a Task resource.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(!try_from, deny_unknown_fields))]
 #[serde(rename_all = "camelCase", try_from = "raw::TaskConditionRaw")]
 pub struct TaskCondition {
     #[serde(rename = "type")]
@@ -99,8 +107,17 @@ pub struct TaskCondition {
     status: ConditionStatus,
     observed_generation: u64,
     #[serde(with = "super::metadata::rfc3339_time_serde")]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::rfc3339_time")
+    )]
     last_transition_time: SystemTime,
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::condition_reason")
+    )]
     reason: String,
+    #[cfg_attr(feature = "schema", schemars(length(max = 32_768)))]
     message: String,
 }
 

@@ -27,6 +27,7 @@ use crate::error::{ModelError, ModelResult};
 /// assert_eq!("".parse::<JitterPolicy>().unwrap(), JitterPolicy::Full);
 /// ```
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum JitterPolicy {

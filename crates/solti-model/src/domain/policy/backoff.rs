@@ -38,16 +38,21 @@ use crate::error::{ModelError, ModelResult};
 /// backoff.validate().unwrap();
 /// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(!try_from, deny_unknown_fields))]
 #[serde(rename_all = "camelCase")]
 #[serde(try_from = "raw::BackoffPolicyRaw")]
 pub struct BackoffPolicy {
     /// Jitter policy applied to each computed delay.
     pub jitter: super::JitterPolicy,
     /// Initial delay (ms) for exponential backoff.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub first_ms: u64,
     /// Maximum allowed delay (ms).
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub max_ms: u64,
     /// Exponential growth multiplier.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1.0)))]
     pub factor: f64,
 }
 

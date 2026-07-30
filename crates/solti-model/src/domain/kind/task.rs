@@ -25,9 +25,16 @@ pub const WORKLOAD_API_VERSION: &str = "solti.io/v1";
 
 /// Group/version and kind of one workload schema.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct WorkloadTypeMeta {
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::crd_api_version")
+    )]
     api_version: String,
+    #[cfg_attr(feature = "schema", schemars(schema_with = "crate::schema::crd_kind"))]
     kind: String,
 }
 
@@ -86,8 +93,14 @@ impl WorkloadTypeMeta {
 /// The revision participates in desired-state comparison.
 /// The runtime task handle is supplied separately by a higher layer.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct EmbeddedSpec {
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::non_empty_string")
+    )]
     revision: String,
 }
 
@@ -189,15 +202,69 @@ pub enum TaskWorkload {
     Extension(ExtensionWorkload),
 }
 
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for TaskWorkload {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TaskWorkload".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let subprocess =
+            workload_envelope_schema("Subprocess", generator.subschema_for::<SubprocessSpec>());
+        let wasm = workload_envelope_schema("Wasm", generator.subschema_for::<WasmSpec>());
+        let container =
+            workload_envelope_schema("Container", generator.subschema_for::<ContainerSpec>());
+        let embedded =
+            workload_envelope_schema("Embedded", generator.subschema_for::<EmbeddedSpec>());
+        let extension = generator.subschema_for::<ExtensionWorkload>();
+
+        schemars::json_schema!({
+            "description": "Kubernetes-style workload GVK and desired state.",
+            "oneOf": [subprocess, wasm, container, embedded, extension]
+        })
+    }
+}
+
+#[cfg(feature = "schema")]
+fn workload_envelope_schema(kind: &'static str, spec: schemars::Schema) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["apiVersion", "kind", "spec"],
+        "properties": {
+            "apiVersion": {
+                "type": "string",
+                "const": WORKLOAD_API_VERSION
+            },
+            "kind": {
+                "type": "string",
+                "const": kind
+            },
+            "spec": spec
+        }
+    })
+}
+
 /// GVK envelope for an application-provided workload.
 ///
 /// `spec` must be a JSON object.
 /// Its fields are owned by the application.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct ExtensionWorkload {
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::extension_api_version")
+    )]
     api_version: String,
+    #[cfg_attr(feature = "schema", schemars(schema_with = "crate::schema::crd_kind"))]
     kind: String,
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::json_object")
+    )]
     spec: Value,
 }
 
@@ -475,9 +542,9 @@ impl WasmSpec {
     /// let spec = WasmSpec::new(PathBuf::from("job.wasm"), vec![], TaskEnv::default());
     /// spec.validate().unwrap();
     /// ```
-    pub fn validate(&self) -> crate::error::ModelResult<()> {
+    pub fn validate(&self) -> ModelResult<()> {
         if self.module.as_os_str().is_empty() {
-            return Err(crate::error::ModelError::Invalid(
+            return Err(ModelError::Invalid(
                 "wasm module path cannot be empty".into(),
             ));
         }
@@ -534,9 +601,9 @@ impl ContainerSpec {
     /// let spec = ContainerSpec::new("redis:7".into(), None, vec![], TaskEnv::default());
     /// spec.validate().unwrap();
     /// ```
-    pub fn validate(&self) -> crate::error::ModelResult<()> {
+    pub fn validate(&self) -> ModelResult<()> {
         if self.image.trim().is_empty() {
-            return Err(crate::error::ModelError::Invalid(
+            return Err(ModelError::Invalid(
                 "container image cannot be empty".into(),
             ));
         }
@@ -746,6 +813,7 @@ mod tests {
 ///
 /// Common fields (`env`, `cwd`, `fail_on_non_zero`) apply to both modes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SubprocessSpec {
@@ -805,10 +873,15 @@ impl SubprocessSpec {
 
 /// Specification for WebAssembly module execution via a WASI-compatible runtime.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct WasmSpec {
     /// Path to the `.wasm` module.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::path_string")
+    )]
     pub module: PathBuf,
     /// Arguments passed to the WASI main entrypoint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -820,10 +893,15 @@ pub struct WasmSpec {
 
 /// Specification for OCI-compatible container execution.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ContainerSpec {
     /// Container image (e.g. `"nginx:latest"`, `"docker.io/library/redis:7"`).
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::non_empty_string")
+    )]
     pub image: String,
     /// Override container entrypoint.
     #[serde(skip_serializing_if = "Option::is_none")]

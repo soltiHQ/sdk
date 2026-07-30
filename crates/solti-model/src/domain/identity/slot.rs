@@ -10,6 +10,7 @@ use crate::error::ModelError;
 pub const SLOT_MAX_LEN: usize = 64;
 
 arc_str_newtype! {
+    #[cfg_attr(feature = "schema", schemars(schema_with = "crate::schema::slot"))]
     /// Logical identifier for a controller slot.
     ///
     /// A slot groups tasks that share a single execution lane.

@@ -16,6 +16,8 @@ const UID_ENTROPY_BYTES: usize = 16;
 ///
 /// A UID changes when a resource is deleted and recreated with the same name.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(schema_with = "crate::schema::uid"))]
 #[serde(transparent)]
 pub struct Uid(String);
 
@@ -75,13 +77,19 @@ impl<'de> Deserialize<'de> for Uid {
 /// `uid` identifies one incarnation.
 /// `resource_version` is assigned by the state store and remains opaque.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObjectMeta {
     name: TaskId,
     uid: Uid,
     resource_version: String,
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     generation: u64,
     #[serde(with = "rfc3339_time_serde")]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::rfc3339_time")
+    )]
     creation_timestamp: SystemTime,
     #[serde(default, skip_serializing_if = "Labels::is_empty")]
     labels: Labels,

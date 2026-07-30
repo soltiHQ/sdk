@@ -31,6 +31,8 @@ use crate::{
 /// assert_eq!(spec.timeout().as_millis(), 5_000);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(!try_from, deny_unknown_fields))]
 #[serde(rename_all = "camelCase")]
 #[serde(try_from = "raw::TaskSpecRaw")]
 pub struct TaskSpec {

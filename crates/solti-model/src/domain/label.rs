@@ -27,6 +27,8 @@ use crate::{ModelResult, validation};
 /// assert!(labels.contains_key("gpu"));
 /// ```
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(schema_with = "crate::schema::labels"))]
 #[serde(transparent)]
 pub struct Labels(BTreeMap<String, String>);
 

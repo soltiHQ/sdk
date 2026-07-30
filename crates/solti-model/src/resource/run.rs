@@ -33,6 +33,17 @@ pub struct TaskRun {
     exit_code: Option<i32>,
 }
 
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for TaskRun {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TaskRun".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        crate::schema::task_run(generator)
+    }
+}
+
 impl TaskRun {
     /// Creates an active run.
     ///

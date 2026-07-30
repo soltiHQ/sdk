@@ -17,6 +17,8 @@ mod annotations;
 pub use annotations::Annotations;
 
 mod condition;
+#[cfg(feature = "schema")]
+pub(crate) use condition::{CONDITION_REASON_MAX_BYTES, CONDITION_TYPE_MAX_BYTES};
 pub use condition::{ConditionStatus, TaskCondition, TaskConditionType};
 
 pub(crate) mod metadata;
@@ -30,7 +32,8 @@ pub use status::TaskStatus;
 
 mod task;
 pub use task::{
-    DesiredChange, TASK_API_VERSION, TASK_KIND, Task, TaskManifest, TaskManifestMeta, TypeMeta,
+    DesiredChange, TASK_API_VERSION, TASK_API_VERSION_MAJOR, TASK_KIND, Task, TaskManifest,
+    TaskManifestMeta, TypeMeta,
 };
 
 mod run;

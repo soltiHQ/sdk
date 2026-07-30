@@ -4,7 +4,9 @@
 
 It defines task resources, workloads, policies, selectors, capabilities, queries, output events, identities, and bearer tokens.
 It validates data but does not store, route, or execute tasks.
-The crate has no optional features.
+
+The default `schema` feature implements `schemars::JsonSchema` for resource, workload, selector, capability, and output types.
+Disable default features when schema generation is not needed.
 
 ## Choose an entry point
 
@@ -369,6 +371,12 @@ Some collection types allow temporary invalid states during construction:
 
 Validated top-level APIs call these checks when the values enter a resource, query, or capability.
 `TaskEnv` stores key-value pairs without validating application-specific names or values.
+
+JSON Schema describes the serialized structure.
+It covers resource GVKs, workload envelopes, selector rules, run lifecycle shapes, and capability shapes.
+
+Runtime validation remains authoritative for semantic rules that JSON Schema cannot express exactly.
+These include generation relationships, unique condition types, `maxMs >= firstMs`, and UTF-8 byte budgets.
 
 Important limits:
 

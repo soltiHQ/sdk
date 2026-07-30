@@ -33,6 +33,12 @@
 //! The model validates values and applies state transitions.
 //! Storage, reconciliation, execution, and transport stay in higher layers.
 //!
+//! ## Features
+//!
+//! The default `schema` feature implements `schemars::JsonSchema` for resource, workload, selector, capability, and output types.
+//! Disable default features when schema generation is not needed.
+//! Runtime validation remains authoritative for cross-field and byte-budget rules.
+//!
 //! ## Quick Start
 //!
 //! Build a task spec:
@@ -200,9 +206,10 @@ pub use domain::{
 
 mod resource;
 pub use resource::{
-    Annotations, ConditionStatus, DesiredChange, ObjectMeta, TASK_API_VERSION, TASK_KIND, Task,
-    TaskCondition, TaskConditionType, TaskManifest, TaskManifestMeta, TaskRun, TaskSpec,
-    TaskSpecBuilder, TaskStatus, TypeMeta, Uid, WritePreconditions,
+    Annotations, ConditionStatus, DesiredChange, ObjectMeta, TASK_API_VERSION,
+    TASK_API_VERSION_MAJOR, TASK_KIND, Task, TaskCondition, TaskConditionType, TaskManifest,
+    TaskManifestMeta, TaskRun, TaskSpec, TaskSpecBuilder, TaskStatus, TypeMeta, Uid,
+    WritePreconditions,
 };
 
 mod error;
@@ -212,3 +219,6 @@ mod auth;
 pub use auth::Token;
 
 mod validation;
+
+#[cfg(feature = "schema")]
+mod schema;

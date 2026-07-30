@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 /// assert_eq!(json, r#""stdout""#);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum StreamKind {
     /// Standard output (`stdout`).
@@ -80,6 +81,7 @@ pub enum StreamKind {
 /// assert!(json.contains(r#""type":"chunk""#));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum OutputEvent {
@@ -98,6 +100,10 @@ pub enum OutputEvent {
         attempt: u32,
         /// Wall-clock start time (unix milliseconds on the wire).
         #[serde(with = "crate::resource::metadata::time_serde")]
+        #[cfg_attr(
+            feature = "schema",
+            schemars(schema_with = "crate::schema::unix_millis")
+        )]
         started_at: SystemTime,
     },
 
@@ -117,6 +123,10 @@ pub enum OutputEvent {
         exit_code: Option<i32>,
         /// Wall-clock finish time (unix milliseconds on the wire).
         #[serde(with = "crate::resource::metadata::time_serde")]
+        #[cfg_attr(
+            feature = "schema",
+            schemars(schema_with = "crate::schema::unix_millis")
+        )]
         finished_at: SystemTime,
     },
 
@@ -148,6 +158,7 @@ pub enum OutputEvent {
 /// assert_eq!(chunk.seq, 7);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct OutputChunk {
     /// Desired-state generation this chunk belongs to.
@@ -166,11 +177,19 @@ pub struct OutputChunk {
     ///
     /// Serde encodes it as Unix milliseconds.
     #[serde(with = "crate::resource::metadata::time_serde")]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::unix_millis")
+    )]
     pub ts: SystemTime,
     /// Raw output bytes.
     ///
     /// Serde encodes them as standard padded base64.
     #[serde(with = "bytes_as_base64")]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::base64_bytes")
+    )]
     pub line: Bytes,
 }
 

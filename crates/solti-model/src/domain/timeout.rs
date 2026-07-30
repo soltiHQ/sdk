@@ -20,6 +20,8 @@ use crate::{ModelError, ModelResult};
 /// assert_eq!(format!("{timeout}"), "10000ms");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(transparent))]
 pub struct Timeout(NonZeroU64);
 
 impl Timeout {

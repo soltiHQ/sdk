@@ -18,10 +18,20 @@ const EMBEDDED_WORKLOAD_KIND: &str = "Embedded";
 ///
 /// Labels are the same static labels used by `runnerSelector`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct RunnerCapability {
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::runner_name")
+    )]
     name: String,
     labels: Labels,
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::runner_workload_types")
+    )]
     workload_types: Vec<WorkloadTypeMeta>,
 }
 
@@ -118,6 +128,8 @@ impl RunnerCapability {
 
 /// Immutable snapshot of agent execution capabilities.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCapabilities {
     runners: Vec<RunnerCapability>,

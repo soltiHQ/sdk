@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 /// assert_eq!(SelectorOperator::DoesNotExist.to_string(), "DoesNotExist");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum SelectorOperator {
     /// Label value must be one of `values`.

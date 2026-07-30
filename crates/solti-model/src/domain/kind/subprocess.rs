@@ -74,12 +74,17 @@ fn decode_script_body(body: &str, max_bytes: usize) -> ModelResult<Vec<u8>> {
 /// assert_eq!(mode.decode_body().unwrap(), "echo hello");
 /// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SubprocessMode {
     /// Direct binary execution.
     Command {
         /// Executable name or path.
+        #[cfg_attr(
+            feature = "schema",
+            schemars(schema_with = "crate::schema::non_empty_string")
+        )]
         command: String,
         /// Command-line arguments.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -88,8 +93,16 @@ pub enum SubprocessMode {
     /// Script execution via an explicit interpreter.
     Script {
         /// Interpreter executable name or path.
+        #[cfg_attr(
+            feature = "schema",
+            schemars(schema_with = "crate::schema::non_empty_string")
+        )]
         interpreter: String,
         /// Standard padded base64 script body.
+        #[cfg_attr(
+            feature = "schema",
+            schemars(schema_with = "crate::schema::script_body")
+        )]
         body: String,
         /// Additional arguments passed after the script body.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

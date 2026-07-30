@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 /// assert_eq!(kv.value(), "batch");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct KeyValue {
     /// Name of the variable or key.
