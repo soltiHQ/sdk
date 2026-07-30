@@ -277,7 +277,16 @@ history remains available through `TaskRun`.
 
 ## Development
 
-A fresh clone builds offline — no extra tooling or network access needed:
+Vendor the pinned protobuf contracts after a fresh checkout:
+
+```bash
+task proto/vendor
+```
+
+This step requires [Task](https://taskfile.dev), Docker, and network access.
+Cargo builds use only the resulting local files.
+
+Build and test the workspace:
 
 ```bash
 cargo build --workspace
@@ -296,16 +305,10 @@ cargo build -p solti-api      --features grpc-tls
 cargo build -p solti-discover --features http,tls
 ```
 
-The gRPC contract (`crates/solti-api/proto/`, `crates/solti-discover/proto/`) is vendored from
-[`soltiHQ/proto`](https://github.com/soltiHQ/proto) and committed. Builds never fetch it. To
-update the contract, install [go-task](https://taskfile.dev) and run:
-
-```bash
-task proto/vendor
-```
-
-The revision is pinned in [`Taskfile.yml`](Taskfile.yml) (`proto_ref` under the `proto/vendor`
-task) — bump it there, re-vendor, and commit the refreshed `.proto` files.
+The generated trees live under `crates/solti-api/proto/` and `crates/solti-discover/proto/`.
+They are ignored by Git.
+The revision is pinned in [`Taskfile.yml`](Taskfile.yml).
+Update `proto_ref` after publishing a compatible [`soltiHQ/proto`](https://github.com/soltiHQ/proto) tag.
 
 ## Dashboards
 
