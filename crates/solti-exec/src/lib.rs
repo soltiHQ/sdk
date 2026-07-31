@@ -1,15 +1,16 @@
 //! # solti-exec
 //!
-//! Execution backends for Solti workloads.
+//! Execution backends and host process controls for Solti workloads.
 //!
-//! The `subprocess` feature provides [`SubprocessRunner`](subprocess::SubprocessRunner).
-//! It converts a [`solti_model::Task`] into a reusable [`taskvisor::TaskRef`].
+//! The `host-process` feature provides policy and low-level process controls.
+//! The `subprocess` feature provides `SubprocessRunner`.
+//! It converts a `solti_model::Task` into a reusable `taskvisor::TaskRef`.
 //! Taskvisor owns execution after that conversion.
 //!
 //! ## Start Here
 //!
 //! 1. Enable the `subprocess` feature.
-//! 2. Create a [`solti_runner::RunnerRouter`].
+//! 2. Create a `solti_runner::RunnerRouter`.
 //! 3. Register a subprocess runner.
 //! 4. Build a Taskvisor task from a `Subprocess` resource.
 //!
@@ -38,23 +39,25 @@
 //!
 //! ## Commands and Scripts
 //!
-//! [`solti_model::SubprocessMode::Command`] starts an executable directly.
-//! [`solti_model::SubprocessMode::Script`] uses an explicit interpreter and a base64 body.
+//! `solti_model::SubprocessMode::Command` starts an executable directly.
+//! `solti_model::SubprocessMode::Script` uses an explicit interpreter and a base64 body.
 //! The script is written to a fresh temporary file for each attempt.
 //!
 //! ## Backend Controls
 //!
 //! | Area              | Configuration                                 |
 //! |-------------------|-----------------------------------------------|
-//! | Environment       | [`subprocess::EnvPolicy`]                     |
-//! | Working directory | [`subprocess::CwdPolicy`]                     |
-//! | Output            | [`subprocess::LogConfig`]                     |
-//! | POSIX limits      | [`RlimitConfig`]                              |
-//! | Linux cgroup v2   | [`CgroupLimits`], [`CpuMax`]                  |
-//! | Linux security    | [`SecurityConfig`], [`Namespaces`]            |
-//! | Linux seccomp     | [`SeccompPolicy`] with feature `seccomp`      |
+//! | Environment       | `subprocess::EnvPolicy`                       |
+//! | Working directory | `subprocess::CwdPolicy`                       |
+//! | Output            | `subprocess::LogConfig`                       |
+//! | Host process      | `host::HostProcessPolicy`                     |
+//! | POSIX limits      | `host::RlimitConfig`                          |
+//! | Linux cgroup v2   | `host::CgroupLimits`, `host::CpuMax`          |
+//! | Linux security    | `host::SecurityConfig`, `host::Namespaces`    |
+//! | Linux seccomp     | `host::SeccompPolicy` with feature `seccomp`  |
 //!
-//! Configure these controls through [`subprocess::SubprocessBackendConfig`].
+//! Build host controls through `host::HostProcessPolicy`.
+//! Pass that policy to `subprocess::SubprocessBackendConfig`.
 //! Invalid or unsupported controls are rejected when the runner is created.
 //!
 //! ## Quick Start
@@ -91,21 +94,25 @@
 //!
 //! ## Main Types
 //!
-//! | Area             | Types                                                       |
-//! |------------------|-------------------------------------------------------------|
-//! | Runner           | [`subprocess::SubprocessRunner`]                            |
-//! | Registration     | [`subprocess::register_subprocess_runner`]                  |
-//! | Backend settings | [`subprocess::SubprocessBackendConfig`]                     |
-//! | Environment      | [`subprocess::EnvPolicy`], [`subprocess::CwdPolicy`]        |
-//! | Output           | [`subprocess::LogConfig`]                                   |
-//! | Resources        | [`RlimitConfig`], [`CgroupLimits`], [`CpuMax`]              |
-//! | Security         | [`SecurityConfig`], [`Namespaces`], [`LinuxCapability`]     |
-//! | Errors           | [`ExecError`]                                               |
+//! | Area                | Types                                                       |
+//! |---------------------|-------------------------------------------------------------|
+//! | Host process policy | `host::HostProcessPolicy`                                   |
+//! | Host resources      | `host::RlimitConfig`, `host::CgroupLimits`                  |
+//! | Host security       | `host::SecurityConfig`, `host::LinuxCapability`             |
+//! | Runner              | `subprocess::SubprocessRunner`                              |
+//! | Registration        | `subprocess::register_subprocess_runner`                    |
+//! | Backend settings    | `subprocess::SubprocessBackendConfig`                       |
+//! | Environment         | `subprocess::EnvPolicy`, `subprocess::CwdPolicy`            |
+//! | Output              | `subprocess::LogConfig`                                     |
+//! | Errors              | `ExecError`                                                 |
 //!
 //! ## Feature Flags
 //!
-//! - `subprocess`: host subprocess runner.
-//! - `seccomp`: Linux syscall denylist. It enables `subprocess`.
+//! - `host-process`: host process policy and low-level controls.
+//! - `subprocess`: subprocess runner. It enables `host-process`.
+//! - `seccomp`: Linux syscall denylist. It enables `host-process`.
+//!
+//! Enable both `subprocess` and `seccomp` to filter subprocess attempts.
 //!
 //! No feature is enabled by default.
 
@@ -124,13 +131,9 @@ mod error;
 #[cfg_attr(docsrs, doc(cfg(feature = "subprocess")))]
 pub use error::ExecError;
 
-#[cfg(feature = "subprocess")]
-#[cfg_attr(docsrs, doc(cfg(feature = "subprocess")))]
-pub use utils::{
-    CgroupLimits, CpuMax, LinuxCapability, Namespaces, RlimitConfig, SeccompPolicy, SecurityConfig,
-};
+#[cfg(feature = "host-process")]
+#[cfg_attr(docsrs, doc(cfg(feature = "host-process")))]
+pub mod host;
 #[cfg(feature = "subprocess")]
 #[cfg_attr(docsrs, doc(cfg(feature = "subprocess")))]
 pub mod subprocess;
-#[cfg(feature = "subprocess")]
-pub(crate) mod utils;

@@ -48,7 +48,7 @@ Arrows point at the dependency; the graph has no cycles. The top row is entirely
 | [`solti`](crates/solti)                        | Optional umbrella with feature forwarding and namespaces      | recommended for binaries  |
 | [`solti-model`](crates/solti-model)            | Domain types: specs, policies, selectors, identifiers         | yes                       |
 | [`solti-runner`](crates/solti-runner)          | Runner plugin trait, GVK routing, optional label selectors    | yes                       |
-| [`solti-exec`](crates/solti-exec)              | Subprocess runner: POSIX rlimits; Linux cgroups and sandboxing | if you run subprocesses   |
+| [`solti-exec`](crates/solti-exec)              | Execution backends and host-process hardening controls         | if you execute workloads  |
 | [`solti-core`](crates/solti-core)              | Supervisor orchestration, in-memory state, retention           | yes                       |
 | [`solti-api`](crates/solti-api)                | HTTP/JSON and gRPC API layer (feature-gated)                  | if you need a network API |
 | [`solti-discover`](crates/solti-discover)      | Agent registration and heartbeat to Podium control-plane      | if managed by Podium      |
@@ -63,7 +63,7 @@ Each crate has its own README with a detailed reference.
 ### Prerequisites
 
 - Rust 2024 edition (1.90+)
-- Subprocess execution is cross-platform. Linux-specific sandbox controls include cgroups v2, capabilities, seccomp, and namespaces; strict enforcement of those controls requires Linux.
+- Subprocess execution is cross-platform. Linux adds cgroups v2, capabilities, seccomp, and namespaces. These controls provide hardening, not a complete sandbox.
 
 ### Minimal: run a task from code
 
@@ -247,7 +247,7 @@ Plug `server` into `tonic`/`axum-server`, or pass `client` to `DiscoverConfigBui
 
 **Runner routing**: runners declare supported workload GVKs; an optional runner selector filters matching runners by labels.
 
-**Subprocess isolation**: POSIX rlimits plus Linux cgroup v2 limits, capability dropping, seccomp, and namespaces.
+**Subprocess controls**: POSIX rlimits plus Linux cgroup v2 limits, capability dropping, seccomp, and namespaces.
 
 **Embedded tasks**: async Rust closures supervised next to subprocesses. Used internally for timezone sync, discovery heartbeat, and the metrics server.
 

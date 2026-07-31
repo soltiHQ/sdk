@@ -1,6 +1,7 @@
 # solti-exec
 
 `solti-exec` provides concrete execution backends for the Solti SDK.
+The `host-process` feature provides reusable policy and low-level process controls.
 The `subprocess` feature implements a runner for `solti.io/v1`, kind `Subprocess`.
 It turns a `Task` resource into a reusable Taskvisor task that starts one operating-system process per attempt.
 
@@ -54,16 +55,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - applies POSIX rlimits;
 - applies Linux cgroup, namespace, identity, capability, and seccomp controls;
 - reports backend preparation and spawn failures through runner metrics.
+- keeps host process controls separate from subprocess settings.
 
 ## Inputs and outputs
 
-| API or value                              | Input                                      | Output                                        |
-|-------------------------------------------|--------------------------------------------|-----------------------------------------------|
-| `register_subprocess_runner`              | Router and runner name                     | Registered default subprocess runner          |
-| `register_subprocess_runner_with_backend` | Router, runner name, and backend config    | Registered configured subprocess runner       |
-| `RunnerRouter::build`                     | `Task` with a `Subprocess` workload        | Reusable `taskvisor::TaskRef`                 |
-| `SubprocessBackendConfig`                 | Limits, security, environment, and logging | Runner-wide attempt settings                  |
-| One task attempt                          | Resolved command or script                 | Task result and optional stdout/stderr chunks |
+| API or value                              | Input                                   | Output                                        |
+|-------------------------------------------|-----------------------------------------|-----------------------------------------------|
+| `HostProcessPolicy`                       | Resource and process security controls  | Reusable host process policy                  |
+| `HostProcessPolicy::prepare`              | Declarative host policy                 | Validated `PreparedHostProcessPolicy`         |
+| `PreparedHostProcessPolicy`               | Optional attempt cgroup name            | `PreparedHostProcessAttempt`                  |
+| `PreparedHostProcessAttempt`              | `std::process::Command`                 | Hooks and owning `HostProcessGuard`           |
+| `register_subprocess_runner`              | Router and runner name                  | Registered default subprocess runner          |
+| `register_subprocess_runner_with_backend` | Router, runner name, and backend config | Registered configured subprocess runner       |
+| `RunnerRouter::build`                     | `Task` with a `Subprocess` workload     | Reusable `taskvisor::TaskRef`                 |
+| `SubprocessBackendConfig`                 | Host policy, environment, cwd, output   | Runner-wide attempt settings                  |
+| One task attempt                          | Resolved command or script              | Task result and optional stdout/stderr chunks |
 
 `SubprocessRunner` accepts only the exact built-in `Subprocess` GVK.
 Routing and runner selection remain owned by `solti-runner`.
@@ -82,7 +88,7 @@ Task { workload: Subprocess }
       taskvisor::TaskRef
               │ each attempt
               ▼
- environment + cwd + backend preparation
+ environment + cwd + HostProcessPolicy
               ▼
       operating-system process
          ├── stdout ──► tracing + OutputSink
@@ -183,14 +189,14 @@ use solti_exec::subprocess::{
     EnvPolicy, LogConfig, SubprocessBackendConfig,
     register_subprocess_runner_with_backend,
 };
-use solti_exec::{
-    CgroupLimits, CpuMax, LinuxCapability, RlimitConfig, SecurityConfig,
+use solti_exec::host::{
+    CgroupLimits, CpuMax, HostProcessPolicy, LinuxCapability, RlimitConfig,
+    SecurityConfig,
 };
 use solti_runner::RunnerRouter;
 
 fn configured() -> Result<(), solti_exec::ExecError> {
-    let backend = SubprocessBackendConfig::new()
-        .with_env_policy(EnvPolicy::Clear)
+    let host_process = HostProcessPolicy::new()
         .with_rlimits(RlimitConfig {
             max_open_files: Some(1024),
             max_file_size_bytes: Some(64 * 1024 * 1024),
@@ -209,7 +215,11 @@ fn configured() -> Result<(), solti_exec::ExecError> {
             keep_caps: vec![LinuxCapability::NetBindService],
             no_new_privs: true,
             ..Default::default()
-        })
+        });
+
+    let backend = SubprocessBackendConfig::new()
+        .with_host_process_policy(host_process)
+        .with_env_policy(EnvPolicy::Clear)
         .with_logger(LogConfig {
             max_line_length: 4096,
             max_line_bytes: 64 * 1024,
@@ -226,6 +236,34 @@ Configuration is validated when the runner is created.
 Configured controls are fail-closed.
 An unsupported or invalid control rejects the runner or fails the attempt.
 
+The default backend uses an empty `HostProcessPolicy`.
+It preserves the current trusted-workload behavior.
+An `Isolated` mode is not exposed until its security guarantees are implemented.
+
+`HostProcessPolicy` is independent of the subprocess workload format.
+Future process-based backends can translate it to their own execution model.
+It must not be applied unchanged to an OCI runtime process or an in-process WASM engine.
+
+## Custom process backends
+
+The low-level API does not depend on Tokio, Taskvisor, models, or runner routing:
+
+```text
+HostProcessPolicy::prepare
+              ▼
+PreparedHostProcessPolicy
+      ├── prepare_attempt
+      └── attempt.apply_to_command(std::process::Command)
+                         ▼
+                    spawn + wait
+                         ▼
+              HostProcessGuard::cleanup
+```
+
+The attempt token prevents configured cgroups from being skipped.
+The cgroup name must contain one normal path component.
+Keep the guard until the complete process scope has stopped.
+
 ## Resource and security controls
 
 | Control                         | Platform                 | Behavior                                               |
@@ -239,7 +277,7 @@ An unsupported or invalid control rejects the runner or fails the attempt.
 | `SeccompPolicy::BlockDangerous` | Linux, feature `seccomp` | Rejects a host-control syscall denylist with `EPERM`   |
 
 Cgroups are created below the process's current delegated cgroup.
-`with_cgroup_parent` selects another absolute cgroup v2 directory.
+`HostProcessPolicy::with_cgroup_parent` selects another absolute cgroup v2 directory.
 One child group is created per attempt.
 
 Rlimit requests above the current hard limit are clamped.
@@ -250,6 +288,9 @@ The retained capabilities must already be available to the agent process.
 
 `BlockDangerous` is a denylist.
 It is not a complete syscall allowlist.
+
+These controls provide host process hardening.
+They do not form a complete sandbox for untrusted code.
 
 ## Output
 
@@ -294,12 +335,15 @@ On other platforms, cancellation falls back to the child process.
 
 ## Features
 
-| Feature      | Default | Effect                                         |
-|--------------|---------|------------------------------------------------|
-| `subprocess` | Off     | Subprocess runner and host-process integration |
-| `seccomp`    | Off     | Linux seccomp denylist; implies `subprocess`   |
+| Feature        | Default | Effect                                         |
+|----------------|---------|------------------------------------------------|
+| `host-process` | Off     | Host process policy and low-level controls     |
+| `subprocess`   | Off     | Subprocess runner; implies `host-process`      |
+| `seccomp`      | Off     | Linux seccomp denylist; implies `host-process` |
 
-With no features, the crate exposes no execution backend.
+Enable both `subprocess` and `seccomp` to apply the filter to subprocess attempts.
+
+With no features, the crate exposes no policy or execution backend.
 
 ## Errors
 

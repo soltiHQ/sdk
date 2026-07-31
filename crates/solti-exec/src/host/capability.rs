@@ -62,7 +62,7 @@ impl LinuxCapability {
     /// Returns the kernel name without the `CAP_` prefix.
     ///
     /// ```
-    /// use solti_exec::LinuxCapability;
+    /// use solti_exec::host::LinuxCapability;
     ///
     /// assert_eq!(LinuxCapability::NetAdmin.name(), "NET_ADMIN");
     /// ```
@@ -97,7 +97,7 @@ impl LinuxCapability {
     /// Returns the value from `<linux/capability.h>`.
     ///
     /// This remains platform-independent for validation and tests.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(all(feature = "host-process", target_os = "linux"))]
     pub(crate) fn to_cap_value(self) -> u32 {
         match self {
             Self::Chown => 0,           // CAP_CHOWN

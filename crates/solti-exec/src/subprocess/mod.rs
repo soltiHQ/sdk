@@ -48,6 +48,7 @@ pub const LABEL_RUNNER_NAME: &str = "solti.io/runner-name";
 
 /// Registers a subprocess runner with default settings.
 ///
+/// The default uses an empty [`crate::host::HostProcessPolicy`].
 /// The runner receives label `solti.io/runner-name=<name>`.
 ///
 /// # Errors

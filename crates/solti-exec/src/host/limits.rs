@@ -28,12 +28,13 @@
 //! | `max_open_files`      | `RLIMIT_NOFILE` |
 //! | `max_file_size_bytes` | `RLIMIT_FSIZE`  |
 //! | `disable_core_dumps`  | `RLIMIT_CORE`   |
-use tokio::process::Command;
+#[cfg(feature = "host-process")]
+use std::process::Command;
 
-#[cfg(not(unix))]
+#[cfg(all(feature = "host-process", not(unix)))]
 use tracing::warn;
 
-/// POSIX limits applied to every subprocess attempt.
+/// POSIX limits applied to a host process.
 ///
 /// This type changes only soft limits.
 /// Values above the inherited hard limit are clamped.
@@ -65,7 +66,8 @@ impl RlimitConfig {
 }
 
 /// Attaches process limits to a command.
-pub fn attach_rlimits(cmd: &mut Command, config: &RlimitConfig) {
+#[cfg(feature = "host-process")]
+pub(crate) fn attach_rlimits(cmd: &mut Command, config: &RlimitConfig) {
     if config.is_empty() {
         return;
     }
@@ -76,6 +78,7 @@ pub fn attach_rlimits(cmd: &mut Command, config: &RlimitConfig) {
     }
     #[cfg(not(unix))]
     {
+        let _ = cmd;
         warn!(
             ?config,
             "rlimit-based process limits requested on a non-Unix OS; limits will be ignored"
@@ -83,16 +86,16 @@ pub fn attach_rlimits(cmd: &mut Command, config: &RlimitConfig) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "host-process", unix))]
 mod unix_impl {
     use super::RlimitConfig;
-    use crate::utils::log::{pre_exec_log, pre_exec_log_errno};
+    use crate::host::log::{pre_exec_log, pre_exec_log_errno};
 
     use std::io;
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Command;
 
-    use tokio::process::Command;
-
-    pub fn attach_rlimits(cmd: &mut Command, config: &RlimitConfig) {
+    pub(super) fn attach_rlimits(cmd: &mut Command, config: &RlimitConfig) {
         let max_file_size_bytes = config.max_file_size_bytes;
         let disable_core_dumps = config.disable_core_dumps;
         let max_open_files = config.max_open_files;
@@ -184,9 +187,32 @@ mod unix_impl {
             Ok(())
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn reduced_nofile_soft_limit_for_test() -> u64 {
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+
+        // SAFETY: `current` is a valid stack-local rlimit struct.
+        assert_eq!(unsafe { libc::getrlimit(NOFILE, &mut current) }, 0);
+
+        if current.rlim_cur == libc::RLIM_INFINITY {
+            return 64;
+        }
+        assert!(
+            current.rlim_cur > 3,
+            "RLIMIT_NOFILE is too low to run the test child"
+        );
+        current.rlim_cur - 1
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host-process", unix))]
+pub(crate) use unix_impl::reduced_nofile_soft_limit_for_test;
+
+#[cfg(all(test, feature = "host-process"))]
 mod tests {
     use super::*;
 
@@ -210,20 +236,5 @@ mod tests {
 
         let mut cmd = Command::new("sh");
         attach_rlimits(&mut cmd, &config);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn rlimits_can_be_applied() {
-        let config = RlimitConfig {
-            max_open_files: Some(512),
-            max_file_size_bytes: Some(1024 * 1024),
-            disable_core_dumps: true,
-        };
-
-        let mut cmd = Command::new("true");
-        attach_rlimits(&mut cmd, &config);
-
-        assert!(cmd.status().await.unwrap().success());
     }
 }

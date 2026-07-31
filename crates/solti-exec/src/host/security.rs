@@ -26,9 +26,12 @@
 //! A failed control prevents the child from starting.
 //! A non-empty policy is rejected on non-Linux platforms.
 
-use tokio::process::Command;
+#[cfg(feature = "host-process")]
+use std::process::Command;
 
-use crate::utils::LinuxCapability;
+#[cfg(feature = "host-process")]
+use crate::host::HostProcessError;
+use crate::host::LinuxCapability;
 
 /// Linux namespaces created for the child before `execve`.
 ///
@@ -54,7 +57,7 @@ impl Namespaces {
         !(self.mount || self.net || self.ipc || self.uts || self.cgroup)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "host-process", target_os = "linux"))]
     fn mask(&self) -> libc::c_int {
         let mut mask = 0;
         if self.mount {
@@ -85,12 +88,12 @@ pub enum SeccompPolicy {
     /// Rejects a fixed host-control syscall denylist with `EPERM`.
     ///
     /// Other syscalls remain allowed.
-    /// This variant requires feature `seccomp`.
+    /// Host process enforcement requires feature `seccomp`.
     /// It supports Linux on `x86_64` and `aarch64`.
     BlockDangerous,
 }
 
-/// Security policy for a subprocess.
+/// Security controls applied to a host process.
 ///
 /// Non-empty settings require Linux.
 /// A failed control prevents process start.
@@ -137,23 +140,24 @@ impl SecurityConfig {
             && self.seccomp == SeccompPolicy::Disabled
     }
 
-    pub(crate) fn validate(&self) -> Result<(), crate::ExecError> {
+    #[cfg(feature = "host-process")]
+    pub(crate) fn validate(&self) -> Result<(), HostProcessError> {
         if !self.keep_caps.is_empty() && !self.drop_all_caps {
-            return Err(crate::ExecError::InvalidRunnerConfig(
+            return Err(HostProcessError::InvalidConfig(
                 "security.keep_caps requires security.drop_all_caps".into(),
             ));
         }
 
         #[cfg(not(feature = "seccomp"))]
         if self.seccomp != SeccompPolicy::Disabled {
-            return Err(crate::ExecError::InvalidRunnerConfig(
+            return Err(HostProcessError::InvalidConfig(
                 "security.seccomp requires the `seccomp` feature".into(),
             ));
         }
 
         #[cfg(all(target_os = "linux", feature = "seccomp"))]
         if linux_impl::seccomp::build_program(&self.seccomp).is_err() {
-            return Err(crate::ExecError::InvalidRunnerConfig(
+            return Err(HostProcessError::InvalidConfig(
                 "security.seccomp cannot be compiled for this target".into(),
             ));
         }
@@ -162,6 +166,7 @@ impl SecurityConfig {
     }
 }
 
+#[cfg(feature = "host-process")]
 pub(crate) fn attach_security(cmd: &mut Command, config: &SecurityConfig) {
     if config.is_empty() {
         return;
@@ -174,14 +179,14 @@ pub(crate) fn attach_security(cmd: &mut Command, config: &SecurityConfig) {
     let _ = (cmd, config);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "host-process", target_os = "linux"))]
 mod linux_impl {
     use std::io;
-
-    use tokio::process::Command;
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Command;
 
     use super::{KeepMask, SecurityConfig};
-    use crate::utils::log::{pre_exec_log, pre_exec_log_errno};
+    use crate::host::log::{pre_exec_log, pre_exec_log_errno};
 
     const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
     const PR_CAP_AMBIENT: libc::c_int = 47;
@@ -413,7 +418,7 @@ mod linux_impl {
         use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
 
         use super::super::SeccompPolicy;
-        use crate::utils::log::pre_exec_log;
+        use crate::host::log::pre_exec_log;
 
         fn dangerous_syscalls() -> &'static [libc::c_long] {
             &[
@@ -501,13 +506,13 @@ mod linux_impl {
     }
 }
 
+#[cfg(all(feature = "host-process", target_os = "linux"))]
 #[derive(Clone, Copy)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct KeepMask {
     bits: [u32; 2],
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(all(feature = "host-process", target_os = "linux"))]
 impl KeepMask {
     fn from_caps(capabilities: &[LinuxCapability]) -> Self {
         let mut bits = [0; 2];
@@ -541,6 +546,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "host-process")]
     fn keep_capabilities_require_drop_policy() {
         let invalid = SecurityConfig {
             keep_caps: vec![LinuxCapability::NetBindService],
@@ -559,6 +565,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "host-process", target_os = "linux"))]
     fn keep_mask_maps_capability_numbers() {
         let mask = KeepMask::from_caps(&[
             LinuxCapability::Chown,
@@ -572,19 +579,19 @@ mod tests {
         assert!(!mask.is_set(64));
     }
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn no_new_privs_works_without_root() {
+    #[cfg(all(feature = "host-process", target_os = "linux"))]
+    #[test]
+    fn no_new_privs_works_without_root() {
         let config = SecurityConfig {
             no_new_privs: true,
             ..Default::default()
         };
         let mut command = Command::new("true");
         attach_security(&mut command, &config);
-        assert!(command.status().await.unwrap().success());
+        assert!(command.status().unwrap().success());
     }
 
-    #[cfg(not(feature = "seccomp"))]
+    #[cfg(all(feature = "host-process", not(feature = "seccomp")))]
     #[test]
     fn seccomp_requires_feature() {
         let config = SecurityConfig {
@@ -594,7 +601,7 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
-    #[cfg(all(target_os = "linux", feature = "seccomp"))]
+    #[cfg(all(feature = "host-process", target_os = "linux", feature = "seccomp"))]
     #[test]
     fn blocklist_compiles() {
         assert!(matches!(

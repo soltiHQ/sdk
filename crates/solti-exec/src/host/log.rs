@@ -12,11 +12,9 @@
 //! ```
 //!
 //! Writes are best-effort.
-//! Unix paths do not allocate.
-//! Other platforms use standard stderr writes.
+//! These functions do not allocate.
 
 /// Writes raw bytes to stderr on Unix.
-#[cfg(unix)]
 pub(crate) fn pre_exec_log(msg: &[u8]) {
     // SAFETY:
     // `libc::write` to STDERR_FILENO is async-signal-safe.
@@ -30,18 +28,9 @@ pub(crate) fn pre_exec_log(msg: &[u8]) {
     }
 }
 
-/// Writes raw bytes to stderr on other platforms.
-#[cfg(not(unix))]
-pub(crate) fn pre_exec_log(msg: &[u8]) {
-    use std::io::Write;
-
-    let _ = std::io::stderr().write_all(msg);
-}
-
 /// Writes `errno=<N>` and a newline to stderr on Unix.
 ///
 /// Integer conversion uses a stack buffer.
-#[cfg(unix)]
 pub(crate) fn pre_exec_log_errno(errno: i32) {
     let mut buf = [0u8; 32];
     let mut idx = buf.len();
@@ -87,13 +76,4 @@ pub(crate) fn pre_exec_log_errno(errno: i32) {
             nl.len(),
         );
     }
-}
-
-/// Writes `errno=<N>` and a newline to stderr on other platforms.
-#[cfg(not(unix))]
-pub(crate) fn pre_exec_log_errno(errno: i32) {
-    use std::io::Write;
-
-    let mut stderr = std::io::stderr();
-    let _ = write!(stderr, "errno={errno}\n");
 }

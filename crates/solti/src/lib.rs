@@ -44,8 +44,9 @@
 //! | Resource types and schemas   | `model`                 |
 //! | Runner registration          | `runner`                |
 //! | Desired-state supervision    | `core`                  |
+//! | Host process controls        | `exec-host-process`     |
 //! | Subprocess execution         | `exec-subprocess`       |
-//! | Seccomp subprocess controls  | `exec-seccomp`          |
+//! | Seccomp host process filter  | `exec-seccomp`          |
 //! | HTTP task API                | `api-http`              |
 //! | gRPC task API                | `api-grpc`              |
 //! | Core API adapter             | `api-core-adapter`      |
@@ -57,6 +58,9 @@
 //! | Prometheus integrations      | `prometheus-*`          |
 //! | Shared TLS types             | `tls`                   |
 //! | Taskvisor integrations       | `taskvisor-*`           |
+//!
+//! `exec-seccomp` enables the low-level host process filter.
+//! Combine it with `exec-subprocess` to filter subprocess attempts.
 //!
 //! `api-http` and `api-grpc` expose transports.
 //! They do not enable `solti-core`.

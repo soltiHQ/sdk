@@ -29,9 +29,16 @@ taskvisor-tracing            = ["taskvisor", "taskvisor/tracing"]
 runner = ["dep:solti-runner", "model", "taskvisor"]
 core   = ["dep:solti-core", "model", "runner", "taskvisor-controller"]
 
-exec            = ["dep:solti-exec"]
-exec-seccomp    = ["exec-subprocess", "solti-exec/seccomp"]
-exec-subprocess = ["exec", "model", "runner", "taskvisor", "solti-exec/subprocess"]
+exec              = ["dep:solti-exec"]
+exec-host-process = ["exec", "solti-exec/host-process"]
+exec-seccomp      = ["exec-host-process", "solti-exec/seccomp"]
+exec-subprocess   = [
+    "exec-host-process",
+    "model",
+    "runner",
+    "taskvisor",
+    "solti-exec/subprocess",
+]
 
 api              = ["dep:solti-api", "model"]
 api-core-adapter = ["api", "core", "solti-api/core-adapter"]
@@ -100,6 +107,7 @@ full = [
     "discover-http",
     "discover-tls",
     "exec-seccomp",
+    "exec-subprocess",
     "observe-journald",
     "observe-log-compat",
     "observe-timezone-sync",

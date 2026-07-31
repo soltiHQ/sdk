@@ -24,3 +24,14 @@ pub enum ExecError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
+
+impl From<crate::host::HostProcessError> for ExecError {
+    fn from(error: crate::host::HostProcessError) -> Self {
+        match error {
+            crate::host::HostProcessError::InvalidConfig(message) => {
+                Self::InvalidRunnerConfig(message)
+            }
+            crate::host::HostProcessError::Io(error) => Self::Io(error),
+        }
+    }
+}

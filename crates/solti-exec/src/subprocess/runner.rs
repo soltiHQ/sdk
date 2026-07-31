@@ -46,7 +46,7 @@ use solti_runner::{
 };
 
 use crate::subprocess::{
-    backend::SubprocessBackendConfig,
+    backend::{PreparedSubprocessBackendConfig, SubprocessBackendConfig},
     logger::{LogConfig, StreamKind, log_stream},
     task::SubprocessTaskConfig,
 };
@@ -80,7 +80,7 @@ pub struct SubprocessRunner {
     /// Runner name.
     name: String,
     /// Backend configuration applied to all tasks spawned by this runner.
-    config: Option<Arc<SubprocessBackendConfig>>,
+    config: Option<Arc<PreparedSubprocessBackendConfig>>,
 }
 
 /// Validates a runner name before it is used in labels and paths.
@@ -106,9 +106,15 @@ fn validate_runner_name(name: &str) -> Result<(), crate::ExecError> {
     }
 }
 
+/// Builds a cgroup name for one task build.
+fn build_cgroup_name(runner: &str, slot: &str, seq: u64, timestamp: u64) -> String {
+    format!("{runner}-{slot}-{seq:x}-{timestamp:x}")
+}
+
 impl SubprocessRunner {
     /// Creates a subprocess runner with default backend settings.
     ///
+    /// The default uses an empty [`crate::host::HostProcessPolicy`].
     /// `name` is used in run IDs, cgroup paths, and the automatic runner label.
     ///
     /// # Errors
@@ -290,12 +296,7 @@ impl Runner for SubprocessRunner {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or(StdDuration::from_secs(0))
                     .as_secs();
-                crate::utils::build_cgroup_name(
-                    &self.name,
-                    task.slot().as_str(),
-                    task_cfg.seq,
-                    timestamp,
-                )
+                build_cgroup_name(&self.name, task.slot().as_str(), task_cfg.seq, timestamp)
             })
         });
 
@@ -330,7 +331,7 @@ impl Runner for SubprocessRunner {
 
 /// Immutable execution context shared by all attempts.
 struct TaskExecContext {
-    runner_cfg: Option<Arc<SubprocessBackendConfig>>,
+    runner_cfg: Option<Arc<PreparedSubprocessBackendConfig>>,
     metrics: solti_runner::MetricsHandle,
     output_publisher: OutputPublisherHandle,
     task_cfg: SubprocessTaskConfig,
@@ -603,14 +604,30 @@ async fn materialize_script(
 async fn prepare_backend(
     ctx: &TaskExecContext,
     cgroup_name: Option<String>,
-) -> Result<Option<crate::utils::PreparedCgroup>, TaskError> {
-    let (Some(backend), Some(cgroup_name)) = (&ctx.runner_cfg, cgroup_name) else {
+) -> Result<Option<crate::host::PreparedHostProcessAttempt>, TaskError> {
+    let Some(backend) = &ctx.runner_cfg else {
         return Ok(None);
     };
+    if cgroup_name.is_none() {
+        return backend
+            .prepare_host_process_attempt(None)
+            .map(Some)
+            .map_err(|error| {
+                ctx.metrics.record_runner_error(
+                    RunnerType::Subprocess,
+                    RunnerErrorKind::CgroupPrepareFailed,
+                );
+                TaskError::fatal(format!("host process resource preparation failed: {error}"))
+            });
+    }
+
     let backend = Arc::clone(backend);
-    let prepared = tokio::task::spawn_blocking(move || backend.prepare_cgroups(&cgroup_name)).await;
+    let prepared = tokio::task::spawn_blocking(move || {
+        backend.prepare_host_process_attempt(cgroup_name.as_deref())
+    })
+    .await;
     match prepared {
-        Ok(Ok(prepared)) => Ok(prepared),
+        Ok(Ok(prepared)) => Ok(Some(prepared)),
         Ok(Err(crate::ExecError::Io(error))) => {
             ctx.metrics
                 .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::CgroupPrepareFailed);
@@ -637,10 +654,14 @@ async fn prepare_backend(
 fn apply_backend(
     cmd: &mut Command,
     ctx: &TaskExecContext,
-    prepared_cgroup: Option<crate::utils::PreparedCgroup>,
-) {
+    prepared: Option<crate::host::PreparedHostProcessAttempt>,
+) -> Option<crate::host::HostProcessGuard> {
     if let Some(backend_cfg) = &ctx.runner_cfg {
-        backend_cfg.apply_to_command(cmd, prepared_cgroup);
+        let prepared = prepared.expect("configured backend must have prepared host resources");
+        Some(backend_cfg.apply_to_command(cmd, prepared))
+    } else {
+        debug_assert!(prepared.is_none());
+        None
     }
 }
 
@@ -663,45 +684,53 @@ fn evaluate_exit(
 }
 
 /// Removes an attempt cgroup after completion or future drop.
-struct CgroupGuard(Option<PathBuf>);
+struct CgroupGuard(Option<crate::host::HostProcessGuard>);
 
 impl CgroupGuard {
-    fn new(path: Option<PathBuf>) -> Self {
-        Self(path)
+    fn new(guard: Option<crate::host::HostProcessGuard>) -> Self {
+        Self(guard)
     }
 
     async fn cleanup(mut self) {
-        if let Some(path) = self.0.clone() {
-            cleanup_cgroup(path).await;
-            self.0 = None;
+        if let Some(mut guard) = self.0.take() {
+            cleanup_host_process_guard(&mut guard).await;
         }
     }
 }
 
 impl Drop for CgroupGuard {
     fn drop(&mut self) {
-        let Some(path) = self.0.take() else {
+        let Some(mut guard) = self.0.take() else {
             return;
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(cleanup_cgroup(path));
-        } else if let Err(error) = crate::utils::cleanup_cgroup(&path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(cgroup = %path.display(), error = %error, "failed to remove cgroup");
+            handle.spawn(async move {
+                cleanup_host_process_guard(&mut guard).await;
+            });
+        } else {
+            let _ = guard.cleanup();
         }
     }
 }
 
-async fn cleanup_cgroup(path: PathBuf) {
+async fn cleanup_host_process_guard(guard: &mut crate::host::HostProcessGuard) {
+    let Some(path) = guard.cgroup_path().map(PathBuf::from) else {
+        return;
+    };
     const ATTEMPTS: usize = 10;
     for attempt in 0..ATTEMPTS {
         let current = path.clone();
         let result =
-            tokio::task::spawn_blocking(move || crate::utils::cleanup_cgroup(&current)).await;
+            tokio::task::spawn_blocking(move || crate::host::cleanup_cgroup(&current)).await;
         match result {
-            Ok(Ok(())) => return,
-            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Ok(Ok(())) => {
+                let _ = guard.cleanup();
+                return;
+            }
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                let _ = guard.cleanup();
+                return;
+            }
             Ok(Err(error)) if attempt + 1 == ATTEMPTS => {
                 warn!(cgroup = %path.display(), error = %error, "failed to remove cgroup");
                 return;
@@ -743,11 +772,7 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
         .cgroup_name
         .as_ref()
         .map(|base| format!("{base}-{attempt:x}"));
-    let prepared_cgroup = prepare_backend(&ctx, cgroup_name).await?;
-    let cgroup_path = prepared_cgroup
-        .as_ref()
-        .map(|prepared| prepared.path().to_path_buf());
-    let cgroup_guard = CgroupGuard::new(cgroup_path);
+    let prepared_host_process = prepare_backend(&ctx, cgroup_name).await?;
 
     // Script mode: write the body to a 0600 tempfile on a blocking thread.
     // The handle must outlive the child (the interpreter reads the file as it
@@ -758,7 +783,8 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
     };
 
     let mut cmd = build_command(&ctx, script_tempfile.as_ref().map(|t| t.path()));
-    apply_backend(&mut cmd, &ctx, prepared_cgroup);
+    let host_process_guard = apply_backend(&mut cmd, &ctx, prepared_host_process);
+    let cgroup_guard = CgroupGuard::new(host_process_guard);
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -852,6 +878,56 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cgroup_name_is_stable() {
+        assert_eq!(
+            build_cgroup_name("runner", "slot", 42, 1000),
+            "runner-slot-2a-3e8"
+        );
+    }
+
+    #[tokio::test]
+    async fn cgroup_guard_explicit_cleanup_removes_empty_group() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let path = parent.path().join("attempt");
+        std::fs::create_dir(&path).unwrap();
+        let host = crate::host::HostProcessGuard::for_test(path.clone());
+
+        CgroupGuard::new(Some(host)).cleanup().await;
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cgroup_guard_drop_removes_empty_group_without_runtime() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let path = parent.path().join("attempt");
+        std::fs::create_dir(&path).unwrap();
+        let host = crate::host::HostProcessGuard::for_test(path.clone());
+
+        drop(CgroupGuard::new(Some(host)));
+
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn cgroup_guard_drop_schedules_cleanup_inside_runtime() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let path = parent.path().join("attempt");
+        std::fs::create_dir(&path).unwrap();
+        let host = crate::host::HostProcessGuard::for_test(path.clone());
+
+        drop(CgroupGuard::new(Some(host)));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cgroup cleanup task did not finish");
+    }
 
     type SinkCalls = Arc<std::sync::Mutex<Vec<(solti_model::TaskId, u64, u32)>>>;
 
@@ -1106,7 +1182,7 @@ mod tests {
 
     fn ctx_with_backend(cfg: SubprocessBackendConfig) -> TaskExecContext {
         let mut ctx = make_exec_ctx();
-        ctx.runner_cfg = Some(Arc::new(cfg));
+        ctx.runner_cfg = Some(Arc::new(cfg.prepare().unwrap()));
         ctx
     }
 

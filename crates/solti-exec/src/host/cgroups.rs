@@ -5,10 +5,10 @@
 //! ## Flow
 //!
 //! ```text
-//! runner construction
+//! backend construction
 //!      └── resolve cgroup parent
 //!                 ▼
-//!            task attempt
+//!          execution attempt
 //!      ├── create child cgroup
 //!      ├── write configured limits
 //!      ├── join before execve
@@ -18,14 +18,17 @@
 //! An explicit parent must be an existing cgroup v2 directory.
 //! Without one, the current process cgroup is used.
 
+#[cfg(feature = "host-process")]
 use std::path::{Path, PathBuf};
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "host-process", target_os = "linux"))]
 use std::fs::File;
 
-use tokio::process::Command;
+#[cfg(feature = "host-process")]
+use std::process::Command;
 
-use crate::ExecError;
+#[cfg(feature = "host-process")]
+use super::HostProcessError;
 
 /// CPU bandwidth limit written to `cpu.max`.
 ///
@@ -50,7 +53,7 @@ impl Default for CpuMax {
     }
 }
 
-/// Resource limits applied to one subprocess attempt.
+/// Resource limits applied to one host process scope.
 ///
 /// This type requires Linux cgroup v2.
 /// At least one field must be set.
@@ -74,7 +77,8 @@ impl CgroupLimits {
     }
 }
 
-/// Cgroup prepared before the subprocess is forked.
+/// Cgroup prepared before the host process is forked.
+#[cfg(feature = "host-process")]
 pub(crate) struct PreparedCgroup {
     path: PathBuf,
     #[cfg(target_os = "linux")]
@@ -82,7 +86,9 @@ pub(crate) struct PreparedCgroup {
     cleanup_on_drop: bool,
 }
 
+#[cfg(feature = "host-process")]
 impl PreparedCgroup {
+    /// Returns the cgroup directory.
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -96,6 +102,7 @@ impl PreparedCgroup {
     }
 }
 
+#[cfg(feature = "host-process")]
 impl Drop for PreparedCgroup {
     fn drop(&mut self) {
         if self.cleanup_on_drop
@@ -112,7 +119,8 @@ impl Drop for PreparedCgroup {
 }
 
 /// Resolves an explicit parent or the current process cgroup.
-pub(crate) fn resolve_cgroup_parent(explicit: Option<&Path>) -> Result<PathBuf, ExecError> {
+#[cfg(feature = "host-process")]
+pub(crate) fn resolve_cgroup_parent(explicit: Option<&Path>) -> Result<PathBuf, HostProcessError> {
     #[cfg(target_os = "linux")]
     {
         linux_impl::resolve_parent(explicit)
@@ -120,7 +128,7 @@ pub(crate) fn resolve_cgroup_parent(explicit: Option<&Path>) -> Result<PathBuf, 
     #[cfg(not(target_os = "linux"))]
     {
         let _ = explicit;
-        Err(ExecError::InvalidRunnerConfig(format!(
+        Err(HostProcessError::InvalidConfig(format!(
             "cgroup v2 is not supported on {}",
             std::env::consts::OS
         )))
@@ -128,11 +136,12 @@ pub(crate) fn resolve_cgroup_parent(explicit: Option<&Path>) -> Result<PathBuf, 
 }
 
 /// Creates an attempt cgroup and applies its limits.
+#[cfg(feature = "host-process")]
 pub(crate) fn prepare_cgroup(
     parent: &Path,
     name: &str,
     limits: &CgroupLimits,
-) -> Result<PreparedCgroup, ExecError> {
+) -> Result<PreparedCgroup, HostProcessError> {
     #[cfg(target_os = "linux")]
     {
         linux_impl::prepare(parent, name, limits)
@@ -140,7 +149,7 @@ pub(crate) fn prepare_cgroup(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (parent, name, limits);
-        Err(ExecError::InvalidRunnerConfig(format!(
+        Err(HostProcessError::InvalidConfig(format!(
             "cgroup v2 is not supported on {}",
             std::env::consts::OS
         )))
@@ -148,6 +157,7 @@ pub(crate) fn prepare_cgroup(
 }
 
 /// Attaches cgroup membership to a command.
+#[cfg(feature = "host-process")]
 pub(crate) fn attach_cgroup(cmd: &mut Command, prepared: PreparedCgroup) {
     #[cfg(target_os = "linux")]
     {
@@ -160,35 +170,31 @@ pub(crate) fn attach_cgroup(cmd: &mut Command, prepared: PreparedCgroup) {
 }
 
 /// Removes an empty attempt cgroup.
+#[cfg(feature = "host-process")]
 pub(crate) fn cleanup_cgroup(path: &Path) -> std::io::Result<()> {
     std::fs::remove_dir(path)
 }
 
-/// Builds a cgroup name for one task build.
-pub(crate) fn build_cgroup_name(runner: &str, slot: &str, seq: u64, timestamp: u64) -> String {
-    format!("{runner}-{slot}-{seq:x}-{timestamp:x}")
-}
-
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "host-process", target_os = "linux"))]
 mod linux_impl {
     use std::fs::{self, OpenOptions};
     use std::io;
     use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt as _;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
-    use tokio::process::Command;
-
+    use super::super::HostProcessError;
     use super::{CgroupLimits, CpuMax, PreparedCgroup};
-    use crate::ExecError;
-    use crate::utils::log::{pre_exec_log, pre_exec_log_errno};
+    use crate::host::log::{pre_exec_log, pre_exec_log_errno};
 
     const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
-    pub(super) fn resolve_parent(explicit: Option<&Path>) -> Result<PathBuf, ExecError> {
+    pub(super) fn resolve_parent(explicit: Option<&Path>) -> Result<PathBuf, HostProcessError> {
         let parent = match explicit {
             Some(path) => {
                 if !path.is_absolute() {
-                    return Err(ExecError::InvalidRunnerConfig(format!(
+                    return Err(HostProcessError::InvalidConfig(format!(
                         "cgroup parent must be absolute: {}",
                         path.display()
                     )));
@@ -199,13 +205,13 @@ mod linux_impl {
         };
 
         let parent = parent.canonicalize().map_err(|e| {
-            ExecError::InvalidRunnerConfig(format!(
+            HostProcessError::InvalidConfig(format!(
                 "cgroup parent {} cannot be resolved: {e}",
                 parent.display()
             ))
         })?;
         if !parent.join("cgroup.procs").is_file() {
-            return Err(ExecError::InvalidRunnerConfig(format!(
+            return Err(HostProcessError::InvalidConfig(format!(
                 "{} is not a cgroup v2 directory",
                 parent.display()
             )));
@@ -213,8 +219,8 @@ mod linux_impl {
         Ok(parent)
     }
 
-    fn current_process_cgroup() -> Result<PathBuf, ExecError> {
-        let membership = fs::read_to_string("/proc/self/cgroup").map_err(ExecError::Io)?;
+    fn current_process_cgroup() -> Result<PathBuf, HostProcessError> {
+        let membership = fs::read_to_string("/proc/self/cgroup").map_err(HostProcessError::Io)?;
         let relative = membership
             .lines()
             .find_map(|line| {
@@ -225,7 +231,7 @@ mod linux_impl {
                 }
             })
             .ok_or_else(|| {
-                ExecError::InvalidRunnerConfig(
+                HostProcessError::InvalidConfig(
                     "cannot find unified cgroup v2 membership in /proc/self/cgroup".into(),
                 )
             })?;
@@ -237,9 +243,9 @@ mod linux_impl {
         parent: &Path,
         name: &str,
         limits: &CgroupLimits,
-    ) -> Result<PreparedCgroup, ExecError> {
+    ) -> Result<PreparedCgroup, HostProcessError> {
         let path = parent.join(name);
-        fs::create_dir(&path).map_err(ExecError::Io)?;
+        fs::create_dir(&path).map_err(HostProcessError::Io)?;
 
         let prepared = (|| -> io::Result<PreparedCgroup> {
             apply_limits(&path, limits)?;
@@ -263,7 +269,7 @@ mod linux_impl {
                         "failed to roll back cgroup setup",
                     );
                 }
-                Err(ExecError::Io(io::Error::new(
+                Err(HostProcessError::Io(io::Error::new(
                     source.kind(),
                     format!("failed to prepare cgroup {}: {source}", path.display()),
                 )))
@@ -360,19 +366,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cgroup_name_is_stable() {
-        assert_eq!(
-            build_cgroup_name("runner", "slot", 42, 1000),
-            "runner-slot-2a-3e8"
-        );
-    }
-
-    #[test]
     fn empty_limits_are_detected() {
         assert!(CgroupLimits::default().is_empty());
     }
 
     #[test]
+    #[cfg(feature = "host-process")]
     fn unused_prepared_cgroup_is_removed_on_drop() {
         let parent = tempfile::TempDir::new().unwrap();
         let path = parent.path().join("attempt");

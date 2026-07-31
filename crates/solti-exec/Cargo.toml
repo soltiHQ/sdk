@@ -1,6 +1,6 @@
 [package]
 name = "solti-exec"
-description = "Task execution backends for the Solti SDK. Runs task specs as OS subprocesses."
+description = "Execution backends and host process controls for the Solti SDK."
 
 rust-version.workspace = true
 repository.workspace = true
@@ -12,27 +12,25 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default    = []
-subprocess = [
+default      = []
+host-process = ["dep:libc", "dep:tracing"]
+seccomp      = ["host-process", "dep:seccompiler"]
+subprocess   = [
+    "host-process",
     "dep:bytes",
-    "dep:libc",
     "dep:solti-model",
     "dep:solti-runner",
     "dep:taskvisor",
     "dep:tempfile",
     "dep:thiserror",
     "dep:tokio",
-    "dep:tracing",
     "tokio/macros",
     "tokio/process",
     "tokio/time",
 ]
-# seccomp-bpf syscall filtering (Linux only; no-op elsewhere). Requires `subprocess`.
-seccomp    = ["subprocess", "dep:seccompiler"]
 
 [dependencies]
 bytes      = { workspace = true, optional = true }
-libc       = { workspace = true, optional = true }
 tempfile   = { workspace = true, optional = true }
 thiserror  = { workspace = true, optional = true }
 tracing    = { workspace = true, optional = true }
@@ -42,6 +40,9 @@ taskvisor  = { workspace = true, optional = true }
 solti-model  = { workspace = true, optional = true }
 solti-runner = { workspace = true, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true, optional = true }
+
 # seccompiler is Linux-only; keep it off the dependency tree on other platforms.
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = { workspace = true, optional = true }
@@ -49,6 +50,7 @@ seccompiler = { workspace = true, optional = true }
 [dev-dependencies]
 base64 = { workspace = true }
 taskvisor = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 
 [package.metadata.docs.rs]
