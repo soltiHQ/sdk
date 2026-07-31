@@ -3,6 +3,7 @@
 //! `solti` contains no runtime logic. Its features select component crates and
 //! expose them under owner-preserving namespaces such as [`model`], [`runner`],
 //! and [`core`]. All features are disabled by default.
+//! The `model` feature includes JSON Schema support from `solti-model`.
 //!
 //! ```toml
 //! [dependencies]

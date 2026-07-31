@@ -30,36 +30,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.90.0
-      # Vendored proto is committed to git, so no vendoring step is needed here.
-      - run: cargo +1.90.0 check --workspace --all-features
-
-  proto-drift:
-    name: proto-drift
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
-      - name: Re-vendor proto at the pinned ref
+      - name: Vendor proto
         uses: soltiHQ/actions/taskfile@be0b13df45cb3d522f4ed22dbdf3125a2032f252 # v1
         with:
           command: proto/vendor
-      # The committed proto must match what `task proto/vendor` produces at the
-      # pinned proto_ref; otherwise the pin is stale or the copy was hand-edited.
-      - name: Fail on drift against the committed proto
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # An empty listing means crates/*/proto/ is not tracked (e.g. still
-          # gitignored) and the drift check below would pass vacuously.
-          if [ -z "$(git ls-files -- 'crates/*/proto/')" ]; then
-            echo "::error::no committed files under crates/*/proto/ — vendored proto must be tracked in git"
-            exit 1
-          fi
-
-          drift=$(git status --porcelain -- 'crates/*/proto/')
-          if [ -n "$drift" ]; then
-            echo "::error::vendored proto drifted from the committed copy:"
-            printf '%s\n' "$drift"
-            git diff -- 'crates/*/proto/'
-            exit 1
-          fi
+      - run: cargo +1.90.0 check --workspace --all-features

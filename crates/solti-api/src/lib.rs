@@ -12,7 +12,8 @@
 //!
 //! Use [`ApiHandler`] to define the transport-independent backend.
 //! Use `SupervisorApiAdapter` to connect that boundary to `solti-core`.
-//! Use `HttpApi` to build an axum router.
+//! Use `HttpApi` to build a standalone axum router or mount documented routes
+//! into an application router.
 //! Use `GrpcApi` to build a tonic service.
 //!
 //! ## Flow
@@ -23,7 +24,6 @@
 //!                                  ApiHandler
 //!                                       ▲
 //! gRPC v1 DTO ── convert and validate ──┘
-//!                                       │
 //!                                       └──► custom backend or solti-core
 //! ```
 //!
@@ -60,7 +60,7 @@
 //! | Feature        | Capability                                      |
 //! |----------------|-------------------------------------------------|
 //! | `core-adapter` | `SupervisorApiAdapter` for `solti-core`         |
-//! | `grpc`         | tonic gRPC service and generated v1 client      |
+//! | `grpc`         | tonic gRPC service and generated current client |
 //! | `grpc-tls`     | `solti-tls` adapter for tonic; implies `grpc`   |
 //! | `http`         | axum HTTP/JSON router                           |
 //!
@@ -68,14 +68,14 @@
 //!
 //! ## Main Types
 //!
-//! | Area          | Types                                                   |
-//! |---------------|---------------------------------------------------------|
-//! | Handler       | [`ApiHandler`], [`ApiError`]                             |
-//! | Streams       | [`TaskWatchEventStream`], [`OutputEventStream`]          |
-//! | Metrics       | [`ApiMetricsBackend`], [`ApiMetricsHandle`], [`Transport`] |
-//! | HTTP          | `HttpApi`                                               |
-//! | gRPC          | `GrpcApi`, `grpc::v1`                                   |
-//! | Core adapter  | `SupervisorApiAdapter`                                  |
+//! | Area          | Types                                                       |
+//! |---------------|-------------------------------------------------------------|
+//! | Handler       | [`ApiHandler`], [`ApiError`]                                |
+//! | Streams       | [`TaskWatchEventStream`], [`OutputEventStream`]             |
+//! | Metrics       | [`ApiMetricsBackend`], [`ApiMetricsHandle`], [`Transport`]  |
+//! | HTTP          | `HttpApi`, `HttpApiParts`                                   |
+//! | gRPC          | `GrpcApi`, `grpc::wire`                                     |
+//! | Core adapter  | `SupervisorApiAdapter`                                      |
 //!
 //! ## Quick Start
 //!
@@ -94,8 +94,8 @@
 //! # fn wire(supervisor: Arc<solti_core::SupervisorApi>) {
 //! let handler = Arc::new(SupervisorApiAdapter::new(supervisor));
 //! let grpc = GrpcApi::new(handler.clone()).server();
-//! let http = HttpApi::new(handler).router();
-//! # let _ = (grpc, http);
+//! let http = HttpApi::new(handler).build();
+//! # let _ = (grpc, http.router, http.openapi);
 //! # }
 //! ```
 
@@ -115,30 +115,26 @@
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
-#[doc(hidden)]
-#[macro_export]
-macro_rules! solti_api_major {
-    () => {
-        1
-    };
-}
-
-/// Compose a compile-time Kubernetes named-group URL rooted at
-/// `/apis/solti.io/v<API_MAJOR>`.
-#[cfg(feature = "http")]
-#[doc(hidden)]
-#[macro_export]
+/// Compose a compile-time Kubernetes named-group URL rooted at `/apis/solti.io/v<API_MAJOR>`.
 macro_rules! api_url {
     ($path:literal) => {
-        concat!("/apis/solti.io/v", $crate::solti_api_major!(), $path)
+        concat!("/apis/solti.io/v", env!("SOLTI_API_MAJOR"), $path)
     };
 }
 
 /// Current public API major version.
-pub const API_VERSION: u32 = solti_api_major!();
+pub const API_VERSION: u32 = solti_model::TASK_API_VERSION_MAJOR;
+
+/// Current public API version name.
+pub const API_VERSION_NAME: &str = concat!("v", env!("SOLTI_API_MAJOR"));
+
+/// Current gRPC package exposed by the agent.
+pub const GRPC_API_PACKAGE: &str = concat!("solti.task.v", env!("SOLTI_API_MAJOR"));
+
+/// Current gRPC service exposed by the agent.
+pub const GRPC_API_SERVICE: &str = concat!("solti.task.v", env!("SOLTI_API_MAJOR"), ".TaskService");
 
 /// Root path of the HTTP Kubernetes API group.
-#[cfg(feature = "http")]
 pub const HTTP_API_ROOT: &str = api_url!("");
 
 /// Maximum HTTP request body and gRPC message size.
@@ -174,7 +170,7 @@ pub(crate) mod proto_api {
     include!(concat!(
         env!("OUT_DIR"),
         "/solti.task.v",
-        solti_api_major!(),
+        env!("SOLTI_API_MAJOR"),
         ".rs"
     ));
 }
@@ -201,10 +197,13 @@ pub use tonic;
 mod http;
 
 #[cfg(feature = "http")]
-pub use http::HttpApi;
+pub use http::{HttpApi, HttpApiParts};
 
 #[cfg(feature = "http")]
 pub use axum;
+
+#[cfg(feature = "http")]
+pub use aide;
 
 #[cfg(feature = "grpc-tls")]
 mod tls;
@@ -212,22 +211,20 @@ mod tls;
 #[cfg(feature = "grpc-tls")]
 pub use tls::to_tonic_server_tls;
 
-#[cfg(all(test, any(feature = "grpc", feature = "http")))]
-mod api_major_guard {
+#[cfg(test)]
+mod contract_identity_guard {
     #[test]
-    fn api_major_matches_build_rs() {
+    fn task_contract_identity_is_consistent() {
+        assert_eq!(super::API_VERSION.to_string(), env!("SOLTI_API_MAJOR"));
+        assert_eq!(super::API_VERSION_NAME, format!("v{}", super::API_VERSION));
         assert_eq!(
-            super::API_VERSION.to_string(),
-            env!("SOLTI_API_MAJOR"),
-            "lib.rs solti_api_major!() must match build.rs API_MAJOR",
+            super::GRPC_API_PACKAGE,
+            format!("solti.task.v{}", super::API_VERSION),
         );
-    }
-
-    #[cfg(feature = "http")]
-    #[test]
-    fn http_api_root_uses_the_current_named_group_version() {
-        assert_eq!(super::HTTP_API_ROOT, "/apis/solti.io/v1");
-        assert_eq!(super::api_url!("/tasks"), "/apis/solti.io/v1/tasks");
+        assert_eq!(
+            super::GRPC_API_SERVICE,
+            format!("{}.TaskService", super::GRPC_API_PACKAGE),
+        );
         assert_eq!(
             super::HTTP_API_ROOT.strip_prefix("/apis/"),
             Some(solti_model::TASK_API_VERSION),

@@ -15,9 +15,9 @@ edition.workspace      = true
 license.workspace      = true
 
 include = [
+    "CONTRACT.md",
     "proto/**/*.proto",
     "src/**/*.rs",
-    "Cargo.toml",
     "README.md",
     "build.rs",
 ]
@@ -28,6 +28,7 @@ core-adapter = ["dep:solti-core"]
 grpc         = [
     "dep:base64",
     "dep:prost",
+    "dep:prost-reflect",
     "dep:protoc-bin-vendored",
     "dep:serde",
     "dep:serde_json",
@@ -38,13 +39,16 @@ grpc         = [
 ]
 grpc-tls     = ["grpc", "dep:solti-tls", "tonic/tls-ring"]
 http         = [
+    "dep:aide",
     "dep:axum",
     "dep:base64",
     "dep:form_urlencoded",
+    "dep:schemars",
     "dep:serde",
     "dep:serde_json",
     "dep:tower-http",
     "dep:tracing",
+    "solti-model/schema",
 ]
 
 [dependencies]
@@ -54,10 +58,12 @@ solti-tls   = { workspace = true, optional = true }
 
 async-trait     = { workspace = true }
 tokio-stream    = { workspace = true }
+aide            = { workspace = true, features = ["axum", "axum-json", "axum-query"], optional = true }
 axum            = { workspace = true, optional = true }
 base64          = { workspace = true, optional = true }
 form_urlencoded = { workspace = true, optional = true }
 prost           = { workspace = true, optional = true }
+schemars        = { workspace = true, optional = true }
 serde           = { workspace = true, features = ["derive"], optional = true }
 serde_json      = { workspace = true, optional = true }
 thiserror       = { workspace = true }
@@ -72,13 +78,16 @@ bytes          = { workspace = true }
 http-body-util = { workspace = true }
 rcgen          = { workspace = true }
 serde_json     = { workspace = true }
-solti-runner    = { workspace = true }
+solti-model    = { workspace = true, features = ["schema"] }
+solti-runner   = { workspace = true }
 taskvisor      = { workspace = true }
 tokio          = { workspace = true, features = ["macros", "rt"] }
 tower          = { workspace = true, features = ["util"] }
 
 [build-dependencies]
+prost-reflect       = { workspace = true, optional = true }
 protoc-bin-vendored = { workspace = true, optional = true }
+solti-model         = { workspace = true }
 tonic-prost-build   = { workspace = true, optional = true }
 
 [package.metadata.docs.rs]

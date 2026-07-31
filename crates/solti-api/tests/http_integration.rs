@@ -16,7 +16,8 @@ use solti_api::{
     ApiError, ApiHandler, ApiMetricsBackend, HttpApi, TaskWatchEventStream, Transport,
 };
 use solti_model::{
-    Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun, WritePreconditions,
+    EmbeddedSpec, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun,
+    TaskWorkload, Token, WritePreconditions,
 };
 
 /// Scriptable mock. `Default` succeeds at everything with harmless fixtures;
@@ -165,6 +166,17 @@ async fn body_json(resp: axum::http::Response<Body>) -> Value {
     serde_json::from_slice(&bytes).expect("response body must be valid json")
 }
 
+fn contains_const(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(|value| contains_const(value, expected)),
+        Value::Object(values) => {
+            values.get("const").and_then(Value::as_str) == Some(expected)
+                || values.values().any(|value| contains_const(value, expected))
+        }
+        _ => false,
+    }
+}
+
 fn assert_status(body: &Value, reason: &str, code: u16) {
     assert_eq!(body["apiVersion"], "v1");
     assert_eq!(body["kind"], "Status");
@@ -173,6 +185,298 @@ fn assert_status(body: &Value, reason: &str, code: u16) {
     assert_eq!(body["reason"], reason);
     assert_eq!(body["code"], code);
     assert!(body["message"].is_string());
+}
+
+#[test]
+fn generated_openapi_describes_the_installed_task_routes() {
+    let parts = HttpApi::new(Arc::new(MockHandler::default())).build();
+    let document = serde_json::to_value(parts.openapi).unwrap();
+
+    assert_eq!(document["openapi"], "3.1.0");
+    assert_eq!(
+        document["jsonSchemaDialect"],
+        "https://json-schema.org/draft/2020-12/schema"
+    );
+    assert_eq!(document["info"]["version"], solti_api::API_VERSION_NAME);
+
+    let paths = &document["paths"];
+    let tasks = &paths["/apis/solti.io/v1/tasks"];
+    let task = &paths["/apis/solti.io/v1/tasks/{name}"];
+    let runs = &paths["/apis/solti.io/v1/tasks/{name}/runs"];
+    let logs = &paths["/apis/solti.io/v1/tasks/{name}/logs"];
+
+    assert_eq!(tasks["post"]["operationId"], "createTask");
+    assert_eq!(tasks["get"]["operationId"], "listOrWatchTasks");
+    assert_eq!(task["get"]["operationId"], "getTask");
+    assert_eq!(task["put"]["operationId"], "applyTask");
+    assert_eq!(task["delete"]["operationId"], "deleteTask");
+    assert_eq!(runs["get"]["operationId"], "listTaskRuns");
+    assert_eq!(logs["get"]["operationId"], "streamTaskLogs");
+
+    assert_eq!(
+        tasks["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/SoltiTaskManifest"
+    );
+    assert_eq!(
+        tasks["post"]["responses"]["400"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/HttpStatusResource"
+    );
+    assert!(tasks["post"]["responses"].get("200").is_none());
+    assert!(tasks["post"]["responses"].get("422").is_none());
+
+    let list_content = tasks["get"]["responses"]["200"]["content"]
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        list_content.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["application/json"]
+    );
+    let log_content = logs["get"]["responses"]["200"]["content"]
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        log_content.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["text/event-stream"]
+    );
+
+    let list_parameters = tasks["get"]["parameters"].as_array().unwrap();
+    for name in [
+        "slot",
+        "phase",
+        "labelSelector",
+        "limit",
+        "continue",
+        "resourceVersion",
+        "watch",
+    ] {
+        assert!(
+            list_parameters
+                .iter()
+                .any(|parameter| parameter["name"] == name),
+            "missing list parameter {name}"
+        );
+    }
+    for name in ["slot", "phase", "continue", "resourceVersion", "watch"] {
+        let parameter = list_parameters
+            .iter()
+            .find(|parameter| parameter["name"] == name)
+            .unwrap();
+        assert!(
+            parameter.get("required").is_none(),
+            "optional list parameter {name} is documented as required"
+        );
+    }
+    let slot = list_parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "slot")
+        .unwrap();
+    assert_eq!(slot["schema"]["$ref"], "#/components/schemas/Slot");
+    for name in ["continue", "resourceVersion"] {
+        let parameter = list_parameters
+            .iter()
+            .find(|parameter| parameter["name"] == name)
+            .unwrap();
+        assert_eq!(parameter["schema"]["minLength"], 1);
+        assert_eq!(parameter["schema"]["pattern"], "\\S");
+    }
+
+    let get_parameters = task["get"]["parameters"].as_array().unwrap();
+    let name = get_parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "name")
+        .unwrap();
+    assert_eq!(name["in"], "path");
+    assert_eq!(name["required"], true);
+    assert_eq!(name["schema"]["$ref"], "#/components/schemas/TaskId");
+    assert_eq!(
+        document["components"]["schemas"]["TaskId"]["pattern"],
+        "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*$"
+    );
+
+    let write_parameters = task["put"]["parameters"].as_array().unwrap();
+    let uid = write_parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "uid")
+        .unwrap();
+    assert!(uid.get("required").is_none());
+    assert_eq!(uid["schema"]["$ref"], "#/components/schemas/Uid");
+    let resource_version = write_parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "resourceVersion")
+        .unwrap();
+    assert!(resource_version.get("required").is_none());
+    assert_eq!(resource_version["schema"]["minLength"], 1);
+    assert_eq!(resource_version["schema"]["pattern"], "\\S");
+
+    let schemas = &document["components"]["schemas"];
+    assert!(schemas.get("SoltiTaskManifest").is_some());
+    assert!(schemas.get("SoltiTask").is_some());
+    assert!(schemas.get("HttpStatusResource").is_some());
+    assert!(schemas.get("EmbeddedSpec").is_none());
+    assert!(!contains_const(&schemas["SoltiTaskWorkload"], "Embedded"));
+    assert!(document.get("security").is_none());
+    assert_eq!(tasks["post"]["security"], serde_json::json!([{}]));
+    assert!(tasks["post"]["responses"].get("401").is_none());
+}
+
+#[test]
+fn generated_openapi_reflects_configured_authentication() {
+    let token = Token::new("test-secret").unwrap();
+    let document = serde_json::to_value(
+        HttpApi::new(Arc::new(MockHandler::default()))
+            .with_auth(token)
+            .build()
+            .openapi,
+    )
+    .unwrap();
+
+    let bearer = &document["components"]["securitySchemes"]["soltiTaskBearer"];
+    assert_eq!(bearer["type"], "http");
+    assert_eq!(bearer["scheme"], "bearer");
+    assert_eq!(
+        document["paths"]["/apis/solti.io/v1/tasks"]["post"]["security"],
+        serde_json::json!([{ "soltiTaskBearer": [] }])
+    );
+    assert!(document.get("security").is_none());
+    assert!(
+        document["paths"]["/apis/solti.io/v1/tasks"]["post"]["responses"]
+            .get("401")
+            .is_some()
+    );
+}
+
+#[derive(Clone)]
+struct ApplicationState {
+    revision: &'static str,
+}
+
+async fn application_route(
+    axum::extract::State(state): axum::extract::State<ApplicationState>,
+) -> axum::Json<TaskWorkload> {
+    axum::Json(TaskWorkload::Embedded(
+        EmbeddedSpec::new(state.revision).unwrap(),
+    ))
+}
+
+async fn application_not_found() -> (StatusCode, &'static str) {
+    (StatusCode::NOT_FOUND, "application not found")
+}
+
+#[tokio::test]
+async fn mount_preserves_application_state_schemas_and_runtime_perimeter() {
+    let mut openapi = solti_api::aide::openapi::OpenApi::default();
+    openapi.info.title = "Application API".into();
+    openapi.security.push(
+        [("applicationAuth".into(), Vec::new())]
+            .into_iter()
+            .collect(),
+    );
+    let app = solti_api::aide::axum::ApiRouter::<ApplicationState>::new()
+        .api_route(
+            "/application",
+            solti_api::aide::axum::routing::get_with(application_route, |operation| {
+                operation
+                    .id("getApplication")
+                    .response::<200, axum::Json<TaskWorkload>>()
+            }),
+        )
+        .fallback(application_not_found);
+    let app = HttpApi::new(Arc::new(MockHandler::default()))
+        .with_auth(Token::new("task-secret").unwrap())
+        .mount(app, &mut openapi)
+        .with_state(ApplicationState {
+            revision: "application-owned",
+        });
+    let router = app.finish_api(&mut openapi);
+    let document = serde_json::to_value(&openapi).unwrap();
+
+    assert_eq!(
+        document["paths"]["/application"]["get"]["operationId"],
+        "getApplication"
+    );
+    assert_eq!(document["info"]["title"], "Application API");
+    assert_eq!(
+        document["security"],
+        serde_json::json!([{ "applicationAuth": [] }])
+    );
+    assert!(contains_const(
+        &document["components"]["schemas"]["TaskWorkload"],
+        "Embedded"
+    ));
+    assert!(!contains_const(
+        &document["components"]["schemas"]["SoltiTaskWorkload"],
+        "Embedded"
+    ));
+    assert!(
+        document["paths"]["/application"]["get"]
+            .get("security")
+            .is_none()
+    );
+    assert_eq!(
+        document["paths"]["/apis/solti.io/v1/tasks"]["post"]["security"],
+        serde_json::json!([{ "soltiTaskBearer": [] }])
+    );
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/application")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(response).await,
+        serde_json::json!({
+            "apiVersion": "solti.io/v1",
+            "kind": "Embedded",
+            "spec": {
+                "revision": "application-owned"
+            }
+        })
+    );
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/application-missing")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.as_ref(), b"application not found");
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/apis/solti.io/v1/tasks")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/apis/solti.io/v1/missing")
+                .header("authorization", "Bearer task-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_status(&body_json(response).await, "NotFound", 404);
 }
 
 #[tokio::test]

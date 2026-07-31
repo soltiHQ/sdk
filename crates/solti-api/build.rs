@@ -7,7 +7,7 @@ use std::{
 };
 
 /// API major version on the build-script side.
-const API_MAJOR: u32 = 1;
+const API_MAJOR: u32 = solti_model::TASK_API_VERSION_MAJOR;
 
 #[cfg(feature = "grpc")]
 const PROTO_ROOT: &str = "proto";
@@ -39,15 +39,14 @@ fn build_grpc() -> Result<(), Box<dyn Error>> {
         .join(format!("v{API_MAJOR}"));
     if !major_dir.is_dir() {
         return Err(format!(
-            "expected proto directory '{}' for API major v{API_MAJOR}; \
-             either add the tree or update API_MAJOR in build.rs and \
-             solti_api_major! in lib.rs in lockstep",
+            "expected proto directory '{}' for Task resource API major v{API_MAJOR}; \
+             add the matching protobuf tree or update TASK_API_VERSION_MAJOR in solti-model",
             major_dir.display(),
         )
         .into());
     }
 
-    let protos = collect_proto_files(Path::new(PROTO_ROOT))?;
+    let protos = collect_proto_files(&major_dir)?;
     if protos.is_empty() {
         return Err(format!("no .proto files found under '{PROTO_ROOT}/'").into());
     }
@@ -55,11 +54,23 @@ fn build_grpc() -> Result<(), Box<dyn Error>> {
         println!("cargo:rerun-if-changed={}", p.display());
     }
 
+    let out_dir: PathBuf = env::var("OUT_DIR")?.into();
+    let descriptor_path = out_dir.join("solti_task_descriptor.bin");
+    let grpc_package = format!("solti.task.v{API_MAJOR}");
+
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .bytes(".solti.task.v1.OutputChunk.line")
+        .bytes(format!(".{grpc_package}.OutputChunk.line"))
+        .file_descriptor_set_path(&descriptor_path)
         .compile_protos(&protos, &[PathBuf::from(PROTO_ROOT)])?;
+
+    let descriptor = std::fs::read(&descriptor_path)?;
+    let pool = prost_reflect::DescriptorPool::decode(descriptor.as_slice())?;
+    let service = format!("{grpc_package}.TaskService");
+    if pool.get_service_by_name(&service).is_none() {
+        return Err(format!("protobuf descriptor has no service '{service}'").into());
+    }
 
     Ok(())
 }

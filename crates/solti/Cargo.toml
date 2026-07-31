@@ -14,7 +14,7 @@ license.workspace = true
 [features]
 default = []
 
-model = ["dep:solti-model"]
+model = ["dep:solti-model", "solti-model/schema"]
 tls = ["dep:solti-tls"]
 
 taskvisor = ["dep:taskvisor"]

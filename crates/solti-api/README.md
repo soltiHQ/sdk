@@ -15,19 +15,21 @@ Build both transports from one running supervisor:
 ```rust,no_run
 use std::sync::Arc;
 
-use solti_api::{GrpcApi, HttpApi, SupervisorApiAdapter};
+use solti_api::{GrpcApi, HttpApi, HttpApiParts, SupervisorApiAdapter};
 
 fn build_transports(supervisor: Arc<solti_core::SupervisorApi>) {
     let handler = Arc::new(SupervisorApiAdapter::new(supervisor));
 
-    let http = HttpApi::new(handler.clone()).router();
+    let HttpApiParts { router: http, openapi } =
+        HttpApi::new(handler.clone()).build();
     let grpc = GrpcApi::new(handler).server();
 
-    let _ = (http, grpc);
+    let _ = (http, openapi, grpc);
 }
 ```
 
-`HttpApi::router` returns an `axum::Router`.
+`HttpApi::build` returns the router and its OpenAPI document.
+`HttpApi::router` is the convenience method when the document is not needed.
 `GrpcApi::server` returns a service for `tonic::transport::Server`.
 The application owns listener addresses, startup, and shutdown.
 
@@ -42,15 +44,88 @@ The application owns listener addresses, startup, and shutdown.
 - hides in-process `Embedded` workloads from public transports;
 - enforces a 4 MiB request and message limit.
 
+## Contracts
+
+| Contract | Source                                             |
+|----------|----------------------------------------------------|
+| Behavior | [Task API contract](CONTRACT.md)                   |
+| HTTP     | OpenAPI produced from the mounted `HttpApi` routes |
+| gRPC     | [`solti.task.v1`](proto/solti/task/v1/api.proto)   |
+
+OpenAPI defines HTTP routes and CRD JSON shapes.
+Protobuf defines gRPC services and DTOs.
+`CONTRACT.md` defines behavior shared by both transports.
+
+`HttpApi::build` generates a standalone OpenAPI 3.1 document.
+It uses JSON Schema draft 2020-12.
+Configured bearer authentication is included on the task operations.
+
+Use `HttpApi::mount` when the binary also owns routes:
+
+```rust,no_run
+use std::sync::Arc;
+
+use solti_api::{
+    ApiHandler, HttpApi,
+    aide::{
+        axum::{ApiRouter, routing::get_with},
+        openapi::{Info, OpenApi},
+    },
+    axum::{Json, extract::State},
+};
+
+#[derive(Clone)]
+struct AppState {
+    ready: bool,
+}
+
+async fn health(State(state): State<AppState>) -> Json<bool> {
+    Json(state.ready)
+}
+
+fn build<H: ApiHandler>(handler: Arc<H>) -> (solti_api::axum::Router, OpenApi) {
+    let mut openapi = OpenApi {
+        info: Info {
+            title: "My Agent".into(),
+            version: "1.0.0".into(),
+            ..Info::default()
+        },
+        ..OpenApi::default()
+    };
+
+    let app = ApiRouter::<AppState>::new().api_route(
+        "/health",
+        get_with(health, |operation| operation.id("health")),
+    );
+    let app = HttpApi::new(handler).mount(app, &mut openapi);
+    let router = app
+        .with_state(AppState { ready: true })
+        .finish_api(&mut openapi);
+
+    (router, openapi)
+}
+```
+
+The application calls `finish_api` once.
+Its metadata, state, routes, and middleware remain application-owned.
+Task authentication, limits, metrics, and fallbacks apply only below `HTTP_API_ROOT`.
+Schema generation uses the Aide context selected by the application.
+
+The Task API schemas exclude the SDK-only `Embedded` workload.
+Other application schemas are not modified.
+The in-process model keeps it.
+
 ## Inputs and outputs
 
 | API or value             | Input                                      | Output                                      |
 |--------------------------|--------------------------------------------|---------------------------------------------|
 | `ApiHandler`             | Domain values from `solti-model`           | Domain results or `ApiError`                |
 | `SupervisorApiAdapter`   | `Arc<solti_core::SupervisorApi>`           | Ready `ApiHandler` implementation           |
-| `HttpApi::router`        | Handler, optional token and metrics        | `axum::Router`                              |
+| `HttpApi::build`         | Handler, optional token and metrics        | `HttpApiParts` with router and OpenAPI      |
+| `HttpApi::mount`         | Application `ApiRouter` and OpenAPI        | Router with the scoped Task API subtree     |
+| `HttpApi::router`        | Handler, optional token and metrics        | `axum::Router` without retained OpenAPI     |
 | `GrpcApi::server`        | Handler, optional token and metrics        | Tonic `GrpcServer` service                  |
-| `grpc::v1`               | Generated protobuf request and response    | Version 1 client and server types           |
+| `grpc::wire`             | Generated protobuf request and response    | Current client and server types             |
 | `to_tonic_server_tls`    | `solti_tls::ServerTlsConfig`               | Tonic server TLS config                     |
 | `ApiMetricsBackend`      | Transport request lifecycle                | Application-defined metric updates          |
 
@@ -63,7 +138,7 @@ Both are converted to the same domain values before `ApiHandler` is called.
 | Feature        | Default | Effect                                                |
 |----------------|---------|-------------------------------------------------------|
 | `core-adapter` | Off     | Enables `SupervisorApiAdapter`                        |
-| `grpc`         | Off     | Enables the tonic server and `grpc::v1`               |
+| `grpc`         | Off     | Enables the tonic server and `grpc::wire`             |
 | `grpc-tls`     | Off     | Enables the `solti-tls` tonic adapter; implies `grpc` |
 | `http`         | Off     | Enables the axum HTTP/JSON router                     |
 
@@ -74,16 +149,12 @@ Enable only the transports and adapters used by the agent binary.
 
 ```text
 HTTP request ── parse CRD JSON ──┐
-                                │
-                                ▼
+                                 ▼
                            ApiHandler
-                                │
-                                ├─ custom implementation
-                                │
-                                └─ SupervisorApiAdapter ── solti-core
-                                ▲
-                                │
-gRPC call ── convert v1 DTO ────┘
+                                 ├─ custom implementation
+                                 └─ SupervisorApiAdapter ── solti-core
+                                 ▲
+gRPC call ── convert v1 DTO ─────┘
 ```
 
 `ApiHandler` has eight operations:
@@ -166,7 +237,7 @@ Write `resourceVersion` is accepted only by apply and delete routes.
 ## gRPC
 
 The protobuf package is `solti.task.v1`.
-Generated public types are available under `solti_api::grpc::v1`.
+Generated public types are available under `solti_api::grpc::wire`.
 
 | RPC              | Shape            | Handler operation   |
 |------------------|------------------|---------------------|
@@ -182,7 +253,7 @@ Generated public types are available under `solti_api::grpc::v1`.
 Use the generated client directly:
 
 ```rust,no_run
-use solti_api::grpc::v1::{
+use solti_api::grpc::wire::{
     ListTasksRequest, TaskPhase, TaskServiceClient,
 };
 

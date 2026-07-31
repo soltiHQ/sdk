@@ -4,7 +4,7 @@
 //! Every RPC delegates to [`ApiHandler`].
 //!
 //! [`GrpcApi`] installs message limits, optional metrics, and bearer authentication.
-//! [`v1`] exposes the generated client, server, and message types.
+//! [`wire`] exposes the generated client, server, and message types.
 //!
 //! ## RPCs
 //!
@@ -33,6 +33,7 @@ use tracing::debug;
 
 use solti_model::{LabelSelector, TaskFilter, TaskQuery, Token};
 
+use crate::GRPC_API_SERVICE;
 use crate::auth::bearer_value;
 use crate::handler::ApiHandler;
 use crate::metrics::{
@@ -49,16 +50,14 @@ use convert::{
     write_preconditions_from_proto,
 };
 
-/// Generated protobuf types for task API version 1.
+/// Generated protobuf types for the current Task API.
 ///
-/// This module includes messages, enums,
-/// [`crate::grpc::v1::TaskServiceClient`],
-/// and [`crate::grpc::v1::TaskServiceServer`].
+/// This module includes messages, enums, [`crate::grpc::wire::TaskServiceClient`], and [`crate::grpc::wire::TaskServiceServer`].
 ///
 /// ## Example
 ///
 /// ```rust,no_run
-/// use solti_api::grpc::v1::TaskServiceClient;
+/// use solti_api::grpc::wire::TaskServiceClient;
 ///
 /// async fn connect() -> Result<(), solti_api::tonic::transport::Error> {
 ///     let client = TaskServiceClient::connect("http://127.0.0.1:50052").await?;
@@ -66,7 +65,7 @@ use convert::{
 ///     Ok(())
 /// }
 /// ```
-pub mod v1 {
+pub mod wire {
     pub use crate::proto_api::task_service_client::TaskServiceClient;
     pub use crate::proto_api::task_service_server::TaskServiceServer;
     pub use crate::proto_api::*;
@@ -133,7 +132,7 @@ where
     where
         F: Future<Output = Result<Response<T>, Status>>,
     {
-        let path = format!("/solti.task.v1.TaskService/{method}");
+        let path = format!("/{GRPC_API_SERVICE}/{method}");
         let mut request = RequestMetrics::enter(&self.metrics, Transport::Grpc, method, path);
         let result = fut.await;
         let status = match &result {
@@ -153,7 +152,7 @@ where
         F: Future<Output = Result<ServerStream<T>, Status>>,
         T: 'static,
     {
-        let path = format!("/solti.task.v1.TaskService/{method}");
+        let path = format!("/{GRPC_API_SERVICE}/{method}");
         let mut request = RequestMetrics::enter(&self.metrics, Transport::Grpc, method, path);
         match fut.await {
             Ok(stream) => {
@@ -1093,8 +1092,6 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
-    // --- BearerAuth interceptor ---------------------------------------------
-
     fn auth_interceptor(secret: &str) -> BearerAuth {
         BearerAuth {
             expected: Some(Token::new(secret).unwrap()),
@@ -1148,8 +1145,6 @@ mod tests {
         );
     }
 
-    // --- instrument() metrics ------------------------------------------------
-
     #[derive(Debug, Default)]
     struct GaugeProbe {
         in_flight: std::sync::atomic::AtomicI64,
@@ -1202,10 +1197,9 @@ mod tests {
             metrics,
         };
         let mut request = Request::new(());
-        request.extensions_mut().insert(tonic::GrpcMethod::new(
-            "solti.task.v1.TaskService",
-            "GetTask",
-        ));
+        request
+            .extensions_mut()
+            .insert(tonic::GrpcMethod::new(GRPC_API_SERVICE, "GetTask"));
 
         let status = auth.call(request).unwrap_err();
 
@@ -1288,8 +1282,6 @@ mod tests {
 
         let (probe, svc) = probed_service();
 
-        // Never-completing RPC body: models a handler still working when the
-        // client hangs up and tonic drops the whole future.
         let mut fut = Box::pin(svc.instrument(
             "Probe",
             std::future::pending::<Result<Response<()>, Status>>(),

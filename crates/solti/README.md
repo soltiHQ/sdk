@@ -24,5 +24,7 @@ solti = { version = "0.0.3", features = [
 ] }
 ```
 
+The `model` feature includes JSON Schema support from `solti-model`.
+
 `full` enables every production component integration. Direct dependencies on
 component crates remain supported.

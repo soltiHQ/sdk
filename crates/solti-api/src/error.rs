@@ -266,40 +266,111 @@ impl ApiError {
 }
 
 #[cfg(feature = "http")]
-#[derive(serde::Serialize)]
+#[derive(schemars::JsonSchema, serde::Serialize)]
+#[schemars(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HttpStatusResource {
+    #[schemars(schema_with = "http_status_api_version")]
     api_version: &'static str,
+    #[schemars(schema_with = "http_status_kind")]
     kind: &'static str,
     metadata: HttpStatusMeta,
+    #[schemars(schema_with = "http_status_value")]
     status: &'static str,
     message: String,
+    #[schemars(schema_with = "http_status_reason")]
     reason: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<HttpStatusDetails>,
+    #[schemars(range(min = 400, max = 599))]
     code: u16,
 }
 
 #[cfg(feature = "http")]
-#[derive(serde::Serialize)]
+#[derive(schemars::JsonSchema, serde::Serialize)]
+#[schemars(deny_unknown_fields)]
 struct HttpStatusMeta {}
 
 #[cfg(feature = "http")]
-#[derive(serde::Serialize)]
+#[derive(schemars::JsonSchema, serde::Serialize)]
+#[schemars(deny_unknown_fields)]
 struct HttpStatusDetails {
     name: String,
+    #[schemars(schema_with = "http_status_group")]
     group: &'static str,
+    #[schemars(schema_with = "http_status_task_kind")]
     kind: &'static str,
     causes: Vec<HttpStatusCause>,
 }
 
 #[cfg(feature = "http")]
-#[derive(serde::Serialize)]
+#[derive(schemars::JsonSchema, serde::Serialize)]
+#[schemars(deny_unknown_fields)]
 struct HttpStatusCause {
     reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     field: Option<String>,
     message: String,
+}
+
+#[cfg(feature = "http")]
+fn http_status_api_version(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "const": "v1"
+    })
+}
+
+#[cfg(feature = "http")]
+fn http_status_kind(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "const": "Status"
+    })
+}
+
+#[cfg(feature = "http")]
+fn http_status_value(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "const": "Failure"
+    })
+}
+
+#[cfg(feature = "http")]
+fn http_status_reason(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": [
+            "AlreadyExists",
+            "BadRequest",
+            "Conflict",
+            "Expired",
+            "InternalError",
+            "MethodNotAllowed",
+            "NotFound",
+            "RequestEntityTooLarge",
+            "ServiceUnavailable",
+            "Unauthorized",
+            "UnsupportedMediaType"
+        ]
+    })
+}
+
+#[cfg(feature = "http")]
+fn http_status_group(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "const": "solti.io"
+    })
+}
+
+#[cfg(feature = "http")]
+fn http_status_task_kind(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "const": "Task"
+    })
 }
 
 #[cfg(feature = "grpc")]
