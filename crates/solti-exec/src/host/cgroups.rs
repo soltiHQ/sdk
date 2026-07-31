@@ -177,9 +177,9 @@ pub(crate) fn cleanup_cgroup(path: &Path) -> std::io::Result<()> {
 
 #[cfg(all(feature = "host-process", target_os = "linux"))]
 mod linux_impl {
-    use std::fs::{self, OpenOptions};
+    use std::fs::{self, File, OpenOptions};
     use std::io;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd as _};
     use std::os::unix::process::CommandExt as _;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -252,6 +252,7 @@ mod linux_impl {
             let procs = OpenOptions::new()
                 .write(true)
                 .open(path.join("cgroup.procs"))?;
+            let procs = duplicate_child_fd(procs)?;
             Ok(PreparedCgroup {
                 path: path.clone(),
                 procs: Some(procs),
@@ -275,6 +276,22 @@ mod linux_impl {
                 )))
             }
         }
+    }
+
+    /// Moves an internal child descriptor outside the standard descriptor range.
+    ///
+    /// The standard library replaces descriptors `0..=2` while preparing child
+    /// stdio. A cgroup descriptor in that range would otherwise refer to a
+    /// different file by the time the `pre_exec` hook runs.
+    fn duplicate_child_fd(file: File) -> io::Result<File> {
+        // SAFETY: `file` owns a valid descriptor. `F_DUPFD_CLOEXEC` creates a
+        // second descriptor whose value is at least `3`.
+        let raw = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is a newly owned descriptor returned by `fcntl`.
+        Ok(unsafe { File::from_raw_fd(raw) })
     }
 
     fn apply_limits(path: &Path, limits: &CgroupLimits) -> io::Result<()> {
@@ -315,7 +332,12 @@ mod linux_impl {
         let pid = format_pid(pid, &mut buffer);
 
         // SAFETY: fd refers to cgroup.procs and pid is a valid byte slice.
-        let written = unsafe { libc::write(fd, pid.as_ptr().cast(), pid.len()) };
+        let written = loop {
+            let written = unsafe { libc::write(fd, pid.as_ptr().cast(), pid.len()) };
+            if written >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break written;
+            }
+        };
         if written == pid.len() as isize {
             return Ok(());
         }
@@ -323,7 +345,9 @@ mod linux_impl {
         let error = if written < 0 {
             io::Error::last_os_error()
         } else {
-            io::Error::new(io::ErrorKind::WriteZero, "short write to cgroup.procs")
+            // A cgroup membership write must consume the complete PID. Keep
+            // the post-fork error path allocation-free.
+            io::Error::from_raw_os_error(libc::EIO)
         };
         pre_exec_log(b"solti-exec: failed to join cgroup: ");
         if let Some(code) = error.raw_os_error() {
@@ -351,12 +375,25 @@ mod linux_impl {
 
     #[cfg(test)]
     mod tests {
-        use super::format_pid;
+        use std::os::fd::AsRawFd as _;
+
+        use super::{duplicate_child_fd, format_pid};
 
         #[test]
         fn formats_pid_for_cgroup_procs() {
             let mut buffer = [0u8; 24];
             assert_eq!(format_pid(42, &mut buffer), b"42\n");
+        }
+
+        #[test]
+        fn child_descriptor_is_above_the_standard_range() {
+            let file = tempfile::tempfile().unwrap();
+            let duplicated = duplicate_child_fd(file).unwrap();
+
+            assert!(duplicated.as_raw_fd() >= 3);
+            let flags = unsafe { libc::fcntl(duplicated.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
         }
     }
 }

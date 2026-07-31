@@ -25,15 +25,27 @@ mod error;
 #[cfg(feature = "host-process")]
 pub use error::HostProcessError;
 
+#[cfg(all(feature = "subprocess", unix))]
+mod fds;
+#[cfg(all(feature = "subprocess", unix))]
+pub(crate) use fds::attach_fd_cloexec;
+
 mod limits;
+#[cfg(feature = "host-process")]
+pub use limits::PreparedRlimits;
 pub use limits::RlimitConfig;
 #[cfg(feature = "host-process")]
 pub(crate) use limits::attach_rlimits;
 #[cfg(all(test, feature = "host-process", unix))]
-pub(crate) use limits::reduced_nofile_soft_limit_for_test;
+pub(crate) use limits::reduced_nofile_limit_for_test;
 
 #[cfg(all(feature = "host-process", unix))]
 pub(crate) mod log;
+
+mod process;
+pub use process::ProcessConfig;
+#[cfg(feature = "host-process")]
+pub(crate) use process::{PreparedProcessConfig, attach_process_config};
 
 mod policy;
 pub use policy::{
@@ -43,4 +55,4 @@ pub use policy::{
 mod security;
 #[cfg(feature = "host-process")]
 pub(crate) use security::attach_security;
-pub use security::{Namespaces, SeccompPolicy, SecurityConfig};
+pub use security::{Namespaces, ProcessCredentials, SeccompPolicy, SecurityConfig};

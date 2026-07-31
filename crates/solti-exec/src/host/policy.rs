@@ -29,17 +29,18 @@ use std::process::Command;
 #[cfg(feature = "host-process")]
 use tracing::{trace, warn};
 
-use super::{CgroupLimits, RlimitConfig, SecurityConfig};
+use super::{CgroupLimits, ProcessConfig, RlimitConfig, SecurityConfig};
 #[cfg(feature = "host-process")]
 use super::{
-    HostProcessError, PreparedCgroup, attach_cgroup, attach_rlimits, attach_security,
-    cleanup_cgroup, prepare_cgroup, resolve_cgroup_parent,
+    HostProcessError, PreparedCgroup, PreparedProcessConfig, PreparedRlimits, attach_cgroup,
+    attach_process_config, attach_rlimits, attach_security, cleanup_cgroup, prepare_cgroup,
+    resolve_cgroup_parent,
 };
 
 /// Declarative controls for a process started on the host.
 ///
 /// The default policy enables no control.
-/// Non-empty rlimits require Unix.
+/// Non-empty process state and rlimits require Unix.
 /// Cgroups and security controls require Linux.
 ///
 /// This policy describes host process hardening.
@@ -59,6 +60,8 @@ use super::{
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct HostProcessPolicy {
+    /// Unix process state.
+    process: Option<ProcessConfig>,
     /// POSIX rlimit-based resource limits.
     rlimits: Option<RlimitConfig>,
     /// Linux cgroup v2 resource limits.
@@ -73,6 +76,14 @@ impl HostProcessPolicy {
     /// Creates an empty host process policy.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets Unix process state.
+    ///
+    /// A non-empty configuration requires Unix.
+    pub fn with_process_config(mut self, process: ProcessConfig) -> Self {
+        self.process = Some(process);
+        self
     }
 
     /// Sets POSIX process limits.
@@ -107,10 +118,15 @@ impl HostProcessPolicy {
     ///
     /// A non-empty policy requires Linux.
     /// Host process enforcement requires feature `seccomp` to apply
-    /// [`super::SeccompPolicy::BlockDangerous`].
+    /// [`super::SeccompPolicy::DenyHostControl`].
     pub fn with_security(mut self, security: SecurityConfig) -> Self {
         self.security = Some(security);
         self
+    }
+
+    /// Returns configured Unix process state.
+    pub fn process_config(&self) -> Option<&ProcessConfig> {
+        self.process.as_ref()
     }
 
     /// Returns configured POSIX process limits.
@@ -137,7 +153,8 @@ impl HostProcessPolicy {
 
     /// Returns `true` when no host process control is configured.
     pub fn is_empty(&self) -> bool {
-        self.rlimits.as_ref().is_none_or(RlimitConfig::is_empty)
+        self.process.as_ref().is_none_or(ProcessConfig::is_empty)
+            && self.rlimits.as_ref().is_none_or(RlimitConfig::is_empty)
             && self.cgroups.is_none()
             && self.cgroup_parent.is_none()
             && self.security.as_ref().is_none_or(SecurityConfig::is_empty)
@@ -150,7 +167,7 @@ impl HostProcessPolicy {
     /// # Errors
     ///
     /// Returns [`HostProcessError::InvalidConfig`] for invalid or unsupported controls.
-    /// Returns [`HostProcessError::Io`] when current cgroup discovery fails.
+    /// Returns [`HostProcessError::Io`] when host resource preparation fails.
     #[cfg(feature = "host-process")]
     pub fn prepare(self) -> Result<PreparedHostProcessPolicy, HostProcessError> {
         if let Some(cgroups) = &self.cgroups {
@@ -184,6 +201,19 @@ impl HostProcessPolicy {
             )));
         }
 
+        let process = self
+            .process
+            .as_ref()
+            .filter(|process| !process.is_empty())
+            .map(ProcessConfig::prepare)
+            .transpose()?;
+
+        let rlimits = self
+            .rlimits
+            .as_ref()
+            .map(RlimitConfig::prepare)
+            .transpose()?;
+
         let cgroup_parent = match (self.cgroups.as_ref(), self.cgroup_parent.as_deref()) {
             (Some(_), explicit) => Some(resolve_cgroup_parent(explicit)?),
             (None, Some(_)) => {
@@ -196,7 +226,8 @@ impl HostProcessPolicy {
 
         Ok(PreparedHostProcessPolicy {
             controls: Arc::new(HostProcessControls {
-                rlimits: self.rlimits,
+                process,
+                rlimits,
                 security: self.security,
             }),
             cgroups: self.cgroups,
@@ -207,7 +238,8 @@ impl HostProcessPolicy {
 
 #[derive(Debug)]
 struct HostProcessControls {
-    rlimits: Option<RlimitConfig>,
+    process: Option<PreparedProcessConfig>,
+    rlimits: Option<PreparedRlimits>,
     security: Option<SecurityConfig>,
 }
 
@@ -296,6 +328,22 @@ impl Drop for HostProcessGuard {
 
 #[cfg(feature = "host-process")]
 impl PreparedHostProcessPolicy {
+    /// Returns `true` when subprocesses create a new Unix session.
+    #[cfg(feature = "subprocess")]
+    pub(crate) fn starts_new_session(&self) -> bool {
+        self.controls
+            .process
+            .as_ref()
+            .is_some_and(PreparedProcessConfig::starts_new_session)
+    }
+
+    /// Returns resolved POSIX process limit ceilings.
+    ///
+    /// Requested values above inherited hard limits are clamped here.
+    pub fn rlimits(&self) -> Option<&PreparedRlimits> {
+        self.controls.rlimits.as_ref()
+    }
+
     /// Returns `true` when cgroup limits are configured.
     pub fn has_cgroups(&self) -> bool {
         self.cgroups.is_some()
@@ -352,6 +400,10 @@ impl PreparedHostProcessAttempt {
                 .map(|prepared| prepared.path().to_path_buf()),
         };
 
+        if let Some(process) = &controls.process {
+            trace!(?process, "attaching host process state");
+            attach_process_config(command, process);
+        }
         if let Some(rlimits) = &controls.rlimits {
             trace!(?rlimits, "attaching host process rlimits");
             attach_rlimits(command, rlimits);
@@ -431,6 +483,10 @@ mod tests {
     #[test]
     fn policy_components_are_available_to_backends() {
         let policy = HostProcessPolicy::new()
+            .with_process_config(ProcessConfig {
+                reset_signals: true,
+                ..Default::default()
+            })
             .with_rlimits(RlimitConfig {
                 max_open_files: Some(128),
                 ..Default::default()
@@ -445,6 +501,11 @@ mod tests {
                 ..Default::default()
             });
 
+        assert!(
+            policy
+                .process_config()
+                .is_some_and(|process| process.reset_signals)
+        );
         assert_eq!(
             policy.rlimits().and_then(|limits| limits.max_open_files),
             Some(128)
@@ -531,7 +592,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prepared_policy_applies_rlimits_to_a_process() {
-        let requested = crate::host::reduced_nofile_soft_limit_for_test();
+        let requested = crate::host::reduced_nofile_limit_for_test();
         let policy = HostProcessPolicy::new()
             .with_rlimits(RlimitConfig {
                 max_open_files: Some(requested),
@@ -539,6 +600,10 @@ mod tests {
             })
             .prepare()
             .unwrap();
+        assert_eq!(
+            policy.rlimits().and_then(PreparedRlimits::max_open_files),
+            Some(requested)
+        );
         let attempt = policy.prepare_attempt(None).unwrap();
         let mut command = Command::new("sh");
         command.arg("-c").arg("ulimit -n");

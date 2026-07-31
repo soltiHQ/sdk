@@ -11,7 +11,11 @@
 //!   ▼
 //! reduce capability bounding set
 //!   ▼
-//! set gid and uid
+//! set supplementary groups
+//!   ▼
+//! set real, effective, and saved gid
+//!   ▼
+//! set real, effective, and saved uid
 //!   ▼
 //! set effective and ambient capabilities
 //!   ▼
@@ -87,10 +91,44 @@ pub enum SeccompPolicy {
     Disabled,
     /// Rejects a fixed host-control syscall denylist with `EPERM`.
     ///
-    /// Other syscalls remain allowed.
+    /// The default action remains `Allow`.
+    /// This policy is not a syscall sandbox.
+    /// It always enables `no_new_privs` before installing the filter.
     /// Host process enforcement requires feature `seccomp`.
-    /// It supports Linux on `x86_64` and `aarch64`.
-    BlockDangerous,
+    /// It supports Linux on LP64 `x86_64` and little-endian `aarch64`.
+    DenyHostControl,
+}
+
+/// Exact Linux credentials applied before `execve`.
+///
+/// The user and group IDs are applied to the real, effective, and saved slots.
+/// Supplementary groups are replaced by the provided list.
+/// Empty supplementary groups clear the inherited list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessCredentials {
+    /// Real, effective, and saved user ID.
+    pub uid: u32,
+    /// Real, effective, and saved group ID.
+    pub gid: u32,
+    /// Exact supplementary group list.
+    pub supplementary_groups: Vec<u32>,
+}
+
+impl ProcessCredentials {
+    /// Creates credentials with no supplementary groups.
+    pub fn new(uid: u32, gid: u32) -> Self {
+        Self {
+            uid,
+            gid,
+            supplementary_groups: Vec::new(),
+        }
+    }
+
+    /// Replaces the supplementary group list.
+    pub fn with_supplementary_groups(mut self, supplementary_groups: impl Into<Vec<u32>>) -> Self {
+        self.supplementary_groups = supplementary_groups.into();
+        self
+    }
 }
 
 /// Security controls applied to a host process.
@@ -98,14 +136,13 @@ pub enum SeccompPolicy {
 /// Non-empty settings require Linux.
 /// A failed control prevents process start.
 ///
-/// | Field           | Effect                                                |
-/// |-----------------|-------------------------------------------------------|
-/// | `namespaces`    | Creates selected Linux namespaces                     |
-/// | `run_as_gid`    | Clears supplementary groups and changes group id      |
-/// | `run_as_uid`    | Clears supplementary groups and changes user id       |
-/// | `drop_all_caps` | Removes capabilities not listed in `keep_caps`        |
-/// | `no_new_privs`  | Prevents privilege gain through `execve`              |
-/// | `seccomp`       | Installs the selected syscall policy                  |
+/// | Field           | Effect                                                   |
+/// |-----------------|----------------------------------------------------------|
+/// | `namespaces`    | Creates selected Linux namespaces                        |
+/// | `credentials`   | Replaces user, group, and supplementary group IDs         |
+/// | `drop_all_caps` | Removes capabilities not listed in `keep_caps`           |
+/// | `no_new_privs`  | Prevents privilege gain through `execve`                 |
+/// | `seccomp`       | Installs the selected syscall policy                     |
 ///
 /// `keep_caps` requires `drop_all_caps`.
 /// Requested capabilities must already be available to the agent process.
@@ -116,11 +153,14 @@ pub struct SecurityConfig {
     /// Capabilities retained by [`Self::drop_all_caps`].
     pub keep_caps: Vec<LinuxCapability>,
     /// Prevents privilege gain through `execve`.
+    ///
+    /// `false` does not clear an inherited setting.
+    /// [`SeccompPolicy::DenyHostControl`] enables it regardless of this field.
     pub no_new_privs: bool,
-    /// Clears supplementary groups and changes to this group id.
-    pub run_as_gid: Option<u32>,
-    /// Clears supplementary groups and changes to this user id.
-    pub run_as_uid: Option<u32>,
+    /// Exact credentials applied to the process.
+    ///
+    /// `None` preserves inherited credentials.
+    pub credentials: Option<ProcessCredentials>,
     /// Namespaces created before identity and capability changes.
     pub namespaces: Namespaces,
     /// Syscall policy installed immediately before `execve`.
@@ -134,10 +174,17 @@ impl SecurityConfig {
         !self.drop_all_caps
             && self.keep_caps.is_empty()
             && !self.no_new_privs
-            && self.run_as_uid.is_none()
-            && self.run_as_gid.is_none()
+            && self.credentials.is_none()
             && self.namespaces.is_empty()
             && self.seccomp == SeccompPolicy::Disabled
+    }
+
+    /// Returns whether this policy explicitly establishes `no_new_privs`.
+    ///
+    /// Seccomp filter installation requires this setting.
+    /// A `false` result does not mean that an inherited setting is cleared.
+    pub fn effective_no_new_privs(&self) -> bool {
+        self.no_new_privs || self.seccomp != SeccompPolicy::Disabled
     }
 
     #[cfg(feature = "host-process")]
@@ -146,6 +193,10 @@ impl SecurityConfig {
             return Err(HostProcessError::InvalidConfig(
                 "security.keep_caps requires security.drop_all_caps".into(),
             ));
+        }
+
+        if let Some(credentials) = &self.credentials {
+            validate_credentials(credentials)?;
         }
 
         #[cfg(not(feature = "seccomp"))]
@@ -167,6 +218,44 @@ impl SecurityConfig {
 }
 
 #[cfg(feature = "host-process")]
+fn validate_credentials(credentials: &ProcessCredentials) -> Result<(), HostProcessError> {
+    if credentials.uid == u32::MAX {
+        return Err(HostProcessError::InvalidConfig(
+            "security.credentials.uid cannot be the unchanged-ID sentinel".into(),
+        ));
+    }
+    if credentials.gid == u32::MAX {
+        return Err(HostProcessError::InvalidConfig(
+            "security.credentials.gid cannot be the unchanged-ID sentinel".into(),
+        ));
+    }
+    if credentials.supplementary_groups.contains(&u32::MAX) {
+        return Err(HostProcessError::InvalidConfig(
+            "security.credentials.supplementary_groups cannot contain the unchanged-ID sentinel"
+                .into(),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if credentials.supplementary_groups.len() > libc::c_int::MAX as usize {
+            return Err(HostProcessError::InvalidConfig(
+                "security.credentials.supplementary_groups is too large".into(),
+            ));
+        }
+        // SAFETY: `sysconf` reads one process-wide numeric limit.
+        let max = unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) };
+        if max >= 0 && credentials.supplementary_groups.len() > max as usize {
+            return Err(HostProcessError::InvalidConfig(format!(
+                "security.credentials.supplementary_groups exceeds NGROUPS_MAX ({max})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "host-process")]
 pub(crate) fn attach_security(cmd: &mut Command, config: &SecurityConfig) {
     if config.is_empty() {
         return;
@@ -185,7 +274,7 @@ mod linux_impl {
     use std::os::unix::process::CommandExt as _;
     use std::process::Command;
 
-    use super::{KeepMask, SecurityConfig};
+    use super::{KeepMask, ProcessCredentials, SecurityConfig};
     use crate::host::log::{pre_exec_log, pre_exec_log_errno};
 
     const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
@@ -196,15 +285,66 @@ mod linux_impl {
     const PR_CAPBSET_DROP: libc::c_int = 24;
     const PR_SET_KEEPCAPS: libc::c_int = 8;
     const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
+    const PR_GET_NO_NEW_PRIVS: libc::c_int = 39;
     const CAP_LAST_CAP: u32 = 63;
+
+    #[cfg(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc"))]
+    const SYS_SETGROUPS: libc::c_long = libc::SYS_setgroups32;
+    #[cfg(not(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc")))]
+    const SYS_SETGROUPS: libc::c_long = libc::SYS_setgroups;
+    #[cfg(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc"))]
+    const SYS_GETGROUPS: libc::c_long = libc::SYS_getgroups32;
+    #[cfg(not(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc")))]
+    const SYS_GETGROUPS: libc::c_long = libc::SYS_getgroups;
+    #[cfg(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc"))]
+    const SYS_SETRESGID: libc::c_long = libc::SYS_setresgid32;
+    #[cfg(not(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc")))]
+    const SYS_SETRESGID: libc::c_long = libc::SYS_setresgid;
+    #[cfg(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc"))]
+    const SYS_GETRESGID: libc::c_long = libc::SYS_getresgid32;
+    #[cfg(not(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc")))]
+    const SYS_GETRESGID: libc::c_long = libc::SYS_getresgid;
+    #[cfg(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc"))]
+    const SYS_SETRESUID: libc::c_long = libc::SYS_setresuid32;
+    #[cfg(not(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc")))]
+    const SYS_SETRESUID: libc::c_long = libc::SYS_setresuid;
+    #[cfg(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc"))]
+    const SYS_GETRESUID: libc::c_long = libc::SYS_getresuid32;
+    #[cfg(not(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc")))]
+    const SYS_GETRESUID: libc::c_long = libc::SYS_getresuid;
+
+    struct PreparedCredentials {
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+        supplementary_groups: Vec<libc::gid_t>,
+        observed_groups: Vec<libc::gid_t>,
+        group_count: libc::c_int,
+    }
+
+    impl From<&ProcessCredentials> for PreparedCredentials {
+        fn from(credentials: &ProcessCredentials) -> Self {
+            let mut supplementary_groups = credentials
+                .supplementary_groups
+                .iter()
+                .map(|&gid| gid as libc::gid_t)
+                .collect::<Vec<_>>();
+            supplementary_groups.sort_unstable();
+            Self {
+                uid: credentials.uid as libc::uid_t,
+                gid: credentials.gid as libc::gid_t,
+                observed_groups: vec![0; supplementary_groups.len()],
+                group_count: supplementary_groups.len() as libc::c_int,
+                supplementary_groups,
+            }
+        }
+    }
 
     pub(super) fn attach(cmd: &mut Command, config: &SecurityConfig) {
         let keep_mask = KeepMask::from_caps(&config.keep_caps);
         let drop_all_caps = config.drop_all_caps;
-        let no_new_privs = config.no_new_privs;
+        let no_new_privs = config.effective_no_new_privs();
         let namespace_mask = config.namespaces.mask();
-        let run_as_gid = config.run_as_gid;
-        let run_as_uid = config.run_as_uid;
+        let mut credentials = config.credentials.as_ref().map(PreparedCredentials::from);
 
         #[cfg(feature = "seccomp")]
         let seccomp_program = seccomp::build_program(&config.seccomp);
@@ -219,12 +359,14 @@ mod linux_impl {
 
                 if drop_all_caps {
                     drop_bounding_capabilities(keep_mask)?;
-                    if run_as_uid.is_some() && !keep_mask.is_empty() {
+                    if credentials.is_some() && !keep_mask.is_empty() {
                         keep_capabilities_across_uid_change()?;
                     }
                 }
 
-                drop_privileges(run_as_gid, run_as_uid)?;
+                if let Some(credentials) = &mut credentials {
+                    apply_credentials(credentials)?;
+                }
 
                 if drop_all_caps {
                     drop_capabilities_batch(keep_mask)?;
@@ -306,28 +448,87 @@ mod linux_impl {
         Ok(())
     }
 
-    fn drop_privileges(gid: Option<u32>, uid: Option<u32>) -> io::Result<()> {
-        if gid.is_some() || uid.is_some() {
-            // SAFETY: count zero with a null list clears supplementary groups.
-            if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
-                return logged_last_error(b"solti-exec: setgroups failed: ");
-            }
+    fn apply_credentials(credentials: &mut PreparedCredentials) -> io::Result<()> {
+        let groups = &credentials.supplementary_groups;
+        let groups_ptr = if groups.is_empty() {
+            std::ptr::null()
+        } else {
+            groups.as_ptr()
+        };
+
+        // SAFETY: the list is immutable storage prepared before `fork`.
+        if unsafe { libc::syscall(SYS_SETGROUPS, groups.len(), groups_ptr) } != 0 {
+            return logged_last_error(b"solti-exec: setgroups failed: ");
+        }
+        verify_supplementary_groups(credentials)?;
+
+        let gid = credentials.gid;
+        // SAFETY: all three ids are validated concrete group IDs.
+        if unsafe { libc::syscall(SYS_SETRESGID, gid, gid, gid) } != 0 {
+            return logged_last_error(b"solti-exec: setresgid failed: ");
+        }
+        verify_group_ids(gid)?;
+
+        let uid = credentials.uid;
+        // SAFETY: all three ids are validated concrete user IDs.
+        if unsafe { libc::syscall(SYS_SETRESUID, uid, uid, uid) } != 0 {
+            return logged_last_error(b"solti-exec: setresuid failed: ");
+        }
+        verify_user_ids(uid)
+    }
+
+    fn verify_supplementary_groups(credentials: &mut PreparedCredentials) -> io::Result<()> {
+        let observed_ptr = if credentials.observed_groups.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            credentials.observed_groups.as_mut_ptr()
+        };
+        // SAFETY: the output buffer was allocated to `group_count` elements before `fork`.
+        let count = unsafe { libc::syscall(SYS_GETGROUPS, credentials.group_count, observed_ptr) };
+        if count < 0 {
+            return logged_last_error(b"solti-exec: getgroups failed: ");
+        }
+        if count != libc::c_long::from(credentials.group_count) {
+            pre_exec_log(b"solti-exec: supplementary group count verification failed\n");
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
         }
 
-        if let Some(gid) = gid {
-            // SAFETY: `setgid` receives a scalar id.
-            if unsafe { libc::setgid(gid as libc::gid_t) } != 0 {
-                return logged_last_error(b"solti-exec: setgid failed: ");
-            }
+        // The buffer was allocated in the parent. `sort_unstable` is in-place.
+        credentials.observed_groups.sort_unstable();
+        if credentials.observed_groups != credentials.supplementary_groups {
+            pre_exec_log(b"solti-exec: supplementary group verification failed\n");
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
         }
+        Ok(())
+    }
 
-        if let Some(uid) = uid {
-            // SAFETY: `setuid` receives a scalar id.
-            if unsafe { libc::setuid(uid as libc::uid_t) } != 0 {
-                return logged_last_error(b"solti-exec: setuid failed: ");
-            }
+    fn verify_group_ids(expected: libc::gid_t) -> io::Result<()> {
+        let mut real = 0;
+        let mut effective = 0;
+        let mut saved = 0;
+        // SAFETY: all output pointers refer to stack-local group IDs.
+        if unsafe { libc::syscall(SYS_GETRESGID, &mut real, &mut effective, &mut saved) } != 0 {
+            return logged_last_error(b"solti-exec: getresgid failed: ");
         }
+        if [real, effective, saved] != [expected; 3] {
+            pre_exec_log(b"solti-exec: group credential verification failed\n");
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
+        Ok(())
+    }
 
+    fn verify_user_ids(expected: libc::uid_t) -> io::Result<()> {
+        let mut real = 0;
+        let mut effective = 0;
+        let mut saved = 0;
+        // SAFETY: all output pointers refer to stack-local user IDs.
+        if unsafe { libc::syscall(SYS_GETRESUID, &mut real, &mut effective, &mut saved) } != 0 {
+            return logged_last_error(b"solti-exec: getresuid failed: ");
+        }
+        if [real, effective, saved] != [expected; 3] {
+            pre_exec_log(b"solti-exec: user credential verification failed\n");
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
         Ok(())
     }
 
@@ -394,6 +595,15 @@ mod linux_impl {
         if unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
             return logged_last_error(b"solti-exec: PR_SET_NO_NEW_PRIVS failed: ");
         }
+        // SAFETY: `prctl` receives scalar arguments only.
+        let state = unsafe { libc::prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+        if state < 0 {
+            return logged_last_error(b"solti-exec: PR_GET_NO_NEW_PRIVS failed: ");
+        }
+        if state != 1 {
+            pre_exec_log(b"solti-exec: no_new_privs verification failed\n");
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
         Ok(())
     }
 
@@ -423,9 +633,25 @@ mod linux_impl {
         fn dangerous_syscalls() -> &'static [libc::c_long] {
             &[
                 libc::SYS_ptrace,
+                libc::SYS_process_vm_readv,
+                libc::SYS_process_vm_writev,
+                libc::SYS_process_madvise,
+                libc::SYS_pidfd_getfd,
+                libc::SYS_kcmp,
                 libc::SYS_mount,
                 libc::SYS_umount2,
                 libc::SYS_pivot_root,
+                libc::SYS_open_tree,
+                libc::SYS_move_mount,
+                libc::SYS_fsopen,
+                libc::SYS_fsconfig,
+                libc::SYS_fsmount,
+                libc::SYS_fspick,
+                libc::SYS_mount_setattr,
+                libc::SYS_name_to_handle_at,
+                libc::SYS_open_by_handle_at,
+                libc::SYS_quotactl,
+                libc::SYS_quotactl_fd,
                 libc::SYS_kexec_load,
                 libc::SYS_kexec_file_load,
                 libc::SYS_init_module,
@@ -436,32 +662,57 @@ mod linux_impl {
                 libc::SYS_swapon,
                 libc::SYS_swapoff,
                 libc::SYS_reboot,
+                libc::SYS_sethostname,
+                libc::SYS_setdomainname,
+                libc::SYS_settimeofday,
+                libc::SYS_clock_settime,
+                libc::SYS_adjtimex,
+                libc::SYS_clock_adjtime,
                 libc::SYS_setns,
                 libc::SYS_acct,
+                libc::SYS_syslog,
+                libc::SYS_fanotify_init,
+                libc::SYS_lookup_dcookie,
+                libc::SYS_vhangup,
                 libc::SYS_add_key,
                 libc::SYS_keyctl,
                 libc::SYS_request_key,
+                #[cfg(target_arch = "x86_64")]
+                libc::SYS_iopl,
+                #[cfg(target_arch = "x86_64")]
+                libc::SYS_ioperm,
             ]
         }
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         const ARCH: Option<TargetArch> = Some(TargetArch::x86_64);
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            target_pointer_width = "64"
+        ))]
         const ARCH: Option<TargetArch> = Some(TargetArch::aarch64);
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(not(any(
+            all(target_arch = "x86_64", target_pointer_width = "64"),
+            all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                target_pointer_width = "64"
+            )
+        )))]
         const ARCH: Option<TargetArch> = None;
 
         pub(crate) fn build_program(policy: &SeccompPolicy) -> Result<Option<BpfProgram>, ()> {
             match policy {
                 SeccompPolicy::Disabled => Ok(None),
-                SeccompPolicy::BlockDangerous => {
+                SeccompPolicy::DenyHostControl => {
                     let architecture = ARCH.ok_or(())?;
-                    build_blocklist(architecture).map(Some).map_err(|_| ())
+                    build_denylist(architecture).map(Some).map_err(|_| ())
                 }
             }
         }
 
-        fn build_blocklist(
+        fn build_denylist(
             architecture: TargetArch,
         ) -> Result<BpfProgram, Box<dyn std::error::Error>> {
             let mut rules = BTreeMap::new();
@@ -469,13 +720,65 @@ mod linux_impl {
                 #[allow(clippy::useless_conversion)]
                 rules.insert(i64::from(syscall), Vec::new());
             }
+            #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+            // Linux before 5.4 accepted these confused x32 syscall numbers
+            // without X32_SYSCALL_BIT. They are reserved on newer kernels.
+            for syscall in 512..=547 {
+                rules.insert(syscall, Vec::new());
+            }
             let filter = SeccompFilter::new(
                 rules,
                 SeccompAction::Allow,
                 SeccompAction::Errno(libc::EPERM as u32),
                 architecture,
             )?;
-            Ok(filter.try_into()?)
+            let mut program = filter.try_into()?;
+            #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+            deny_x32_abi(&mut program)?;
+            Ok(program)
+        }
+
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+        fn deny_x32_abi(program: &mut BpfProgram) -> io::Result<()> {
+            const SYSCALL_LOAD_INDEX: usize = 3;
+            const FIRST_RULE_INDEX: usize = 4;
+            const BPF_LOAD_WORD_ABSOLUTE: u16 = 0x20;
+            const BPF_JUMP_GREATER_OR_EQUAL: u16 = 0x35;
+            const BPF_RETURN_CONSTANT: u16 = 0x06;
+            const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+
+            let syscall_load = program
+                .get(SYSCALL_LOAD_INDEX)
+                .ok_or_else(|| io::Error::other("seccomp program has no syscall-number load"))?;
+            if syscall_load.code != BPF_LOAD_WORD_ABSOLUTE
+                || syscall_load.jt != 0
+                || syscall_load.jf != 0
+                || syscall_load.k != 0
+            {
+                return Err(io::Error::other(
+                    "seccomp program has an unexpected syscall-number load",
+                ));
+            }
+
+            program.insert(
+                FIRST_RULE_INDEX,
+                seccompiler::sock_filter {
+                    code: BPF_JUMP_GREATER_OR_EQUAL,
+                    jt: 0,
+                    jf: 1,
+                    k: X32_SYSCALL_BIT,
+                },
+            );
+            program.insert(
+                FIRST_RULE_INDEX + 1,
+                seccompiler::sock_filter {
+                    code: BPF_RETURN_CONSTANT,
+                    jt: 0,
+                    jf: 0,
+                    k: u32::from(SeccompAction::Errno(libc::EPERM as u32)),
+                },
+            );
+            Ok(())
         }
 
         pub(super) fn install(program: &BpfProgram) -> io::Result<()> {
@@ -483,6 +786,52 @@ mod linux_impl {
                 pre_exec_log(b"solti-exec: seccomp installation failed\n");
                 io::Error::from_raw_os_error(libc::EPERM)
             })
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn denylist_contains_expected_host_control_groups() {
+                for syscall in [
+                    libc::SYS_mount,
+                    libc::SYS_umount2,
+                    libc::SYS_pivot_root,
+                    libc::SYS_open_tree,
+                    libc::SYS_move_mount,
+                    libc::SYS_fsopen,
+                    libc::SYS_fsconfig,
+                    libc::SYS_fsmount,
+                    libc::SYS_fspick,
+                    libc::SYS_mount_setattr,
+                    libc::SYS_sethostname,
+                    libc::SYS_clock_settime,
+                    libc::SYS_open_by_handle_at,
+                    libc::SYS_process_vm_writev,
+                    libc::SYS_pidfd_getfd,
+                ] {
+                    assert!(dangerous_syscalls().contains(&syscall));
+                }
+            }
+
+            #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+            #[test]
+            fn denylist_rejects_the_x32_abi_before_syscall_rules() {
+                let program = build_program(&SeccompPolicy::DenyHostControl)
+                    .unwrap()
+                    .unwrap();
+                let guard = &program[4..6];
+
+                assert_eq!(guard[0].code, 0x35);
+                assert_eq!((guard[0].jt, guard[0].jf), (0, 1));
+                assert_eq!(guard[0].k, 0x4000_0000);
+                assert_eq!(guard[1].code, 0x06);
+                assert_eq!(
+                    guard[1].k,
+                    u32::from(SeccompAction::Errno(libc::EPERM as u32))
+                );
+            }
         }
     }
 
@@ -546,6 +895,25 @@ mod tests {
     }
 
     #[test]
+    fn process_credentials_require_both_primary_ids() {
+        let credentials =
+            ProcessCredentials::new(1000, 1001).with_supplementary_groups(vec![10, 20]);
+        assert_eq!(credentials.uid, 1000);
+        assert_eq!(credentials.gid, 1001);
+        assert_eq!(credentials.supplementary_groups, [10, 20]);
+    }
+
+    #[test]
+    fn seccomp_explicitly_enables_no_new_privs() {
+        let config = SecurityConfig {
+            seccomp: SeccompPolicy::DenyHostControl,
+            ..Default::default()
+        };
+        assert!(config.effective_no_new_privs());
+        assert!(!SecurityConfig::default().effective_no_new_privs());
+    }
+
+    #[test]
     #[cfg(feature = "host-process")]
     fn keep_capabilities_require_drop_policy() {
         let invalid = SecurityConfig {
@@ -562,6 +930,23 @@ mod tests {
             ..Default::default()
         };
         assert!(valid.validate().is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "host-process")]
+    fn unchanged_id_sentinels_are_rejected() {
+        for credentials in [
+            ProcessCredentials::new(u32::MAX, 1000),
+            ProcessCredentials::new(1000, u32::MAX),
+            ProcessCredentials::new(1000, 1000).with_supplementary_groups(vec![u32::MAX]),
+        ] {
+            let config = SecurityConfig {
+                credentials: Some(credentials),
+                ..Default::default()
+            };
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("unchanged-ID sentinel"), "got: {error}");
+        }
     }
 
     #[test]
@@ -595,7 +980,7 @@ mod tests {
     #[test]
     fn seccomp_requires_feature() {
         let config = SecurityConfig {
-            seccomp: SeccompPolicy::BlockDangerous,
+            seccomp: SeccompPolicy::DenyHostControl,
             ..Default::default()
         };
         assert!(config.validate().is_err());
@@ -603,9 +988,9 @@ mod tests {
 
     #[cfg(all(feature = "host-process", target_os = "linux", feature = "seccomp"))]
     #[test]
-    fn blocklist_compiles() {
+    fn denylist_compiles() {
         assert!(matches!(
-            linux_impl::seccomp::build_program(&SeccompPolicy::BlockDangerous),
+            linux_impl::seccomp::build_program(&SeccompPolicy::DenyHostControl),
             Ok(Some(_))
         ));
     }

@@ -9,14 +9,14 @@
 //! ```text
 //! start attempt
 //!      ▼
-//! output sink + cgroup + script file
+//! output sink + optional cgroup + optional script descriptor
 //!      ▼
 //! process group
 //!   ├── stdout/stderr ──► tracing + output sink
 //!   ├── exit ───────────► evaluate exit policy
 //!   └── cancellation ───► kill process group
 //!      ▼
-//! remove script file and cgroup
+//! release attempt-scoped resources
 //! ```
 //!
 //! On Unix, cancellation and future drop kill the complete process group.
@@ -24,7 +24,6 @@
 //! Other platforms stop the leader process.
 
 use std::{
-    io::Write as _,
     path::PathBuf,
     process::Stdio,
     sync::{
@@ -35,7 +34,6 @@ use std::{
 };
 
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
-use tempfile::NamedTempFile;
 use tokio::process::Command;
 use tracing::{debug, trace, warn};
 
@@ -47,7 +45,9 @@ use solti_runner::{
 
 use crate::subprocess::{
     backend::{PreparedSubprocessBackendConfig, SubprocessBackendConfig},
+    boundary::PinnedCwd,
     logger::{LogConfig, StreamKind, log_stream},
+    script::AnonymousScript,
     task::SubprocessTaskConfig,
 };
 
@@ -80,7 +80,7 @@ pub struct SubprocessRunner {
     /// Runner name.
     name: String,
     /// Backend configuration applied to all tasks spawned by this runner.
-    config: Option<Arc<PreparedSubprocessBackendConfig>>,
+    config: Arc<PreparedSubprocessBackendConfig>,
 }
 
 /// Validates a runner name before it is used in labels and paths.
@@ -123,7 +123,11 @@ impl SubprocessRunner {
     pub fn new(name: impl Into<String>) -> Result<Self, crate::ExecError> {
         let name = name.into();
         validate_runner_name(&name)?;
-        Ok(Self { name, config: None })
+        let config = SubprocessBackendConfig::new().prepare()?;
+        Ok(Self {
+            name,
+            config: Arc::new(config),
+        })
     }
 
     /// Creates a subprocess runner with explicit backend settings.
@@ -133,7 +137,7 @@ impl SubprocessRunner {
     /// # Errors
     ///
     /// Returns [`crate::ExecError::InvalidRunnerConfig`] for invalid settings.
-    /// Returns [`crate::ExecError::Io`] when current cgroup discovery fails.
+    /// Returns [`crate::ExecError::Io`] when host resource preparation fails.
     pub fn with_config(
         name: impl Into<String>,
         config: SubprocessBackendConfig,
@@ -143,7 +147,7 @@ impl SubprocessRunner {
         let config = config.prepare()?;
         Ok(Self {
             name,
-            config: Some(Arc::new(config)),
+            config: Arc::new(config),
         })
     }
 
@@ -155,7 +159,7 @@ impl SubprocessRunner {
         task: &Task,
         run_id: &RunId,
         ctx: &BuildContext,
-    ) -> Result<(SubprocessTaskConfig, Option<Arc<str>>), RunnerError> {
+    ) -> Result<BuiltSubprocessTask, RunnerError> {
         let spec = task.spec();
         let (cfg, script_body) = match spec.workload() {
             TaskWorkload::Subprocess(SubprocessSpec {
@@ -165,11 +169,7 @@ impl SubprocessRunner {
                 fail_on_non_zero,
                 ..
             }) => {
-                let max_body = self
-                    .config
-                    .as_ref()
-                    .map(|c| c.max_script_body_bytes())
-                    .unwrap_or(solti_model::MAX_SCRIPT_BODY_BYTES);
+                let max_body = self.config.max_script_body_bytes();
                 let Resolved {
                     command,
                     args,
@@ -195,18 +195,21 @@ impl SubprocessRunner {
             }
         };
         cfg.validate().map_err(RunnerError::InvalidSpec)?;
-        if let Some(backend) = self.config.as_ref() {
-            backend
-                .check_cwd(cfg.cwd.as_deref())
-                .map_err(RunnerError::InvalidSpec)?;
-        }
-        Ok((cfg, script_body))
+        let pinned_cwd = self
+            .config
+            .pin_cwd(cfg.cwd.as_deref())
+            .map_err(RunnerError::InvalidSpec)?;
+        Ok(BuiltSubprocessTask {
+            task: cfg,
+            script_body,
+            pinned_cwd,
+        })
     }
 
     /// Resolves a subprocess mode into a command and arguments.
     ///
     /// Script bodies are decoded and checked here.
-    /// File creation remains attempt-scoped.
+    /// Script transport remains attempt-scoped.
     fn resolve_mode(
         mode: &solti_model::SubprocessMode,
         max_script_body_bytes: usize,
@@ -246,8 +249,15 @@ struct Resolved {
     /// Decoded script body.
     ///
     /// Command mode stores `None`.
-    /// Script mode writes the body to a temporary file for each attempt.
+    /// Script mode creates anonymous backing storage for each attempt.
     script_body: Option<Arc<str>>,
+}
+
+/// Immutable subprocess settings resolved while a task is built.
+struct BuiltSubprocessTask {
+    task: SubprocessTaskConfig,
+    script_body: Option<Arc<str>>,
+    pinned_cwd: Option<PinnedCwd>,
 }
 
 impl Runner for SubprocessRunner {
@@ -265,7 +275,8 @@ impl Runner for SubprocessRunner {
     /// Builds a reusable [`TaskRef`] from a subprocess resource.
     ///
     /// This method resolves the mode, environment, and working directory.
-    /// It does not create a script file, cgroup, or process.
+    /// It pins an explicit working directory.
+    /// It does not create script backing storage, a cgroup, or a process.
     /// Runner environment values from [`BuildContext`] override task values.
     /// Output and metrics also come from that context.
     ///
@@ -280,7 +291,11 @@ impl Runner for SubprocessRunner {
         run_id: &RunId,
         ctx: &BuildContext,
     ) -> Result<TaskRef, RunnerError> {
-        let (task_cfg, script_body) = self.build_task_config(task, run_id, ctx)?;
+        let BuiltSubprocessTask {
+            task: task_cfg,
+            script_body,
+            pinned_cwd,
+        } = self.build_task_config(task, run_id, ctx)?;
 
         trace!(
             resource = %task.name(),
@@ -290,25 +305,19 @@ impl Runner for SubprocessRunner {
             "building subprocess task",
         );
 
-        let cgroup_name = self.config.as_ref().and_then(|cfg| {
-            cfg.has_cgroups().then(|| {
-                let timestamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or(StdDuration::from_secs(0))
-                    .as_secs();
-                build_cgroup_name(&self.name, task.slot().as_str(), task_cfg.seq, timestamp)
-            })
+        let cgroup_name = self.config.has_cgroups().then(|| {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(StdDuration::from_secs(0))
+                .as_secs();
+            build_cgroup_name(&self.name, task.slot().as_str(), task_cfg.seq, timestamp)
         });
 
-        let log_cfg = self
-            .config
-            .as_ref()
-            .map(|c| *c.log_config())
-            .unwrap_or_default();
+        let log_cfg = *self.config.log_config();
 
         let exec_ctx = Arc::new(TaskExecContext {
             task_cfg,
-            runner_cfg: self.config.clone(),
+            runner_cfg: Arc::clone(&self.config),
             cgroup_name,
             metrics: ctx.metrics().clone(),
             log_cfg,
@@ -318,6 +327,7 @@ impl Runner for SubprocessRunner {
             resource_name: task.name().clone(),
 
             script_body,
+            pinned_cwd,
         });
 
         let run_id = exec_ctx.task_cfg.run_id.to_string();
@@ -331,7 +341,7 @@ impl Runner for SubprocessRunner {
 
 /// Immutable execution context shared by all attempts.
 struct TaskExecContext {
-    runner_cfg: Option<Arc<PreparedSubprocessBackendConfig>>,
+    runner_cfg: Arc<PreparedSubprocessBackendConfig>,
     metrics: solti_runner::MetricsHandle,
     output_publisher: OutputPublisherHandle,
     task_cfg: SubprocessTaskConfig,
@@ -343,8 +353,10 @@ struct TaskExecContext {
 
     /// Decoded script body.
     ///
-    /// Script mode materializes a fresh file for every attempt.
+    /// Script mode materializes fresh anonymous backing storage for every attempt.
     script_body: Option<Arc<str>>,
+    /// Directory handle resolved while the task was built.
+    pinned_cwd: Option<PinnedCwd>,
 }
 
 /// Builds the operating-system command for one attempt.
@@ -356,29 +368,22 @@ fn build_command(ctx: &TaskExecContext, script_path: Option<&std::path::Path>) -
         cmd.arg(path);
     }
     cmd.args(&ctx.task_cfg.args);
-    if let Some(cwd) = &ctx.task_cfg.cwd {
-        cmd.current_dir(cwd);
+    if let Some(cwd) = &ctx.pinned_cwd {
+        cwd.attach_to_command(&mut cmd);
     }
     apply_env_policy(&mut cmd, ctx);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    // Put the child into its own process group (pgid = child's pid).
-    //
-    // Why:
-    // `child.kill()` delivers SIGKILL to the single pid only.
-    // Scripts routinely fork background children (`sleep 100 &`, `nc -l &`, any daemonized helper);
-    // without a process group those children survive the cancel and become zombies orphaned to PID 1.
-    //
-    // By spawning with `setpgid(0, 0)` via `process_group(0)` we ensure that `kill(-pgid, SIGKILL)` in the cancel path reaps the whole subtree at once.
+    // A dedicated group lets cancellation target the leader and descendants.
+    // `setsid` already makes the child its session and group leader.
     #[cfg(unix)]
-    cmd.process_group(0);
+    if !ctx.runner_cfg.starts_new_session() {
+        cmd.process_group(0);
+    }
 
-    // Last-ditch safety:
-    // if the `run_subprocess` future is dropped before reaching either the `wait` or the `kill` branch
-    // (panic inside log streams, supervisor panic, future aborted by `tokio::select!` sibling),
-    // tokio should kill the child on Drop rather than leaving it orphaned.
+    // Kill the leader if the attempt future is dropped before supervision runs.
     cmd.kill_on_drop(true);
 
     cmd
@@ -395,12 +400,7 @@ fn build_command(ctx: &TaskExecContext, script_path: Option<&std::path::Path>) -
 fn apply_env_policy(cmd: &mut Command, ctx: &TaskExecContext) {
     use crate::subprocess::backend::{EnvPolicy, SAFE_DEFAULT_PATH};
 
-    let default_policy = EnvPolicy::default();
-    let policy = ctx
-        .runner_cfg
-        .as_ref()
-        .map(|c| c.env_policy())
-        .unwrap_or(&default_policy);
+    let policy = ctx.runner_cfg.env_policy();
 
     let task_sets_path = ctx.task_cfg.env.contains_key("PATH");
 
@@ -432,8 +432,8 @@ fn apply_env_policy(cmd: &mut Command, ctx: &TaskExecContext) {
 
 /// Kills an active Unix process group when the attempt future is dropped.
 ///
-/// Taskvisor timeouts and forced aborts can drop the future before cooperative cancellation runs.
-/// The guard remains armed until the child is reaped.
+/// Taskvisor can drop the future before cooperative cancellation runs.
+/// The guard remains armed until descendant cleanup finishes.
 struct ProcessGroupGuard {
     /// Process group id while the guard is armed.
     pgid: Option<i32>,
@@ -486,7 +486,7 @@ async fn kill_process_group(child: &mut tokio::process::Child, run_id: &str) {
             // SAFETY:
             // `libc::kill` has no memory preconditions.
             // The negative pid is the killpg idiom (targets the whole group, not a single process);
-            // `pid` is the live child's id (group leader via `process_group(0)`).
+            // `pid` is the live child's id and the process-group leader.
             // On a non-ESRCH error we fall back to the single-pid `child.kill()`.
             let rc = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
             if rc != 0 {
@@ -547,41 +547,14 @@ fn task_io_error(context: &str, source: std::io::Error) -> TaskError {
     }
 }
 
-/// Creates a script temporary file and writes its body.
-///
-/// Unix files use mode `0600`.
-fn write_script_tempfile(
-    dir: &std::path::Path,
-    body: &str,
-) -> Result<NamedTempFile, std::io::Error> {
-    let mut tmp = NamedTempFile::with_prefix_in("solti-script-", dir)
-        .map_err(|e| io_with_context("failed to create script tempfile", e))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        tmp.as_file()
-            .set_permissions(perms)
-            .map_err(|e| io_with_context("failed to chmod 0600 script tempfile", e))?;
-    }
-
-    tmp.write_all(body.as_bytes())
-        .map_err(|e| io_with_context("failed to write script body", e))?;
-
-    Ok(tmp)
-}
-
-/// Writes one attempt's script file outside the async runtime.
+/// Creates one attempt's anonymous script transport outside the async runtime.
 ///
 /// A creation or write failure ends the attempt.
 async fn materialize_script(
     ctx: &TaskExecContext,
     body: Arc<str>,
-) -> Result<NamedTempFile, TaskError> {
-    let written =
-        tokio::task::spawn_blocking(move || write_script_tempfile(&std::env::temp_dir(), &body))
-            .await;
+) -> Result<AnonymousScript, TaskError> {
+    let written = tokio::task::spawn_blocking(move || AnonymousScript::create(&body)).await;
 
     match written {
         Ok(Ok(file)) => Ok(file),
@@ -600,25 +573,18 @@ async fn materialize_script(
     }
 }
 
-/// Prepares the attempt cgroup outside the async runtime.
+/// Prepares host process resources outside the async runtime.
 async fn prepare_backend(
     ctx: &TaskExecContext,
     cgroup_name: Option<String>,
-) -> Result<Option<crate::host::PreparedHostProcessAttempt>, TaskError> {
-    let Some(backend) = &ctx.runner_cfg else {
-        return Ok(None);
-    };
+) -> Result<crate::host::PreparedHostProcessAttempt, TaskError> {
+    let backend = &ctx.runner_cfg;
     if cgroup_name.is_none() {
-        return backend
-            .prepare_host_process_attempt(None)
-            .map(Some)
-            .map_err(|error| {
-                ctx.metrics.record_runner_error(
-                    RunnerType::Subprocess,
-                    RunnerErrorKind::CgroupPrepareFailed,
-                );
-                TaskError::fatal(format!("host process resource preparation failed: {error}"))
-            });
+        return backend.prepare_host_process_attempt(None).map_err(|error| {
+            ctx.metrics
+                .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::CgroupPrepareFailed);
+            TaskError::fatal(format!("host process resource preparation failed: {error}"))
+        });
     }
 
     let backend = Arc::clone(backend);
@@ -627,7 +593,7 @@ async fn prepare_backend(
     })
     .await;
     match prepared {
-        Ok(Ok(prepared)) => Ok(Some(prepared)),
+        Ok(Ok(prepared)) => Ok(prepared),
         Ok(Err(crate::ExecError::Io(error))) => {
             ctx.metrics
                 .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::CgroupPrepareFailed);
@@ -650,19 +616,43 @@ async fn prepare_backend(
     }
 }
 
-/// Attaches rlimits, cgroup membership, and security controls.
+/// Attaches process state, rlimits, cgroup membership, and security controls.
 fn apply_backend(
     cmd: &mut Command,
     ctx: &TaskExecContext,
-    prepared: Option<crate::host::PreparedHostProcessAttempt>,
-) -> Option<crate::host::HostProcessGuard> {
-    if let Some(backend_cfg) = &ctx.runner_cfg {
-        let prepared = prepared.expect("configured backend must have prepared host resources");
-        Some(backend_cfg.apply_to_command(cmd, prepared))
-    } else {
-        debug_assert!(prepared.is_none());
-        None
+    prepared: crate::host::PreparedHostProcessAttempt,
+) -> crate::host::HostProcessGuard {
+    ctx.runner_cfg.apply_to_command(cmd, prepared)
+}
+
+/// Attaches the subprocess descriptor passlist.
+///
+/// The script descriptor is attempt-local.
+/// The backend passlist contains descriptors owned by the runner.
+#[cfg(unix)]
+fn apply_fd_boundary(
+    cmd: &mut Command,
+    ctx: &TaskExecContext,
+    script: Option<&AnonymousScript>,
+) -> Result<(), TaskError> {
+    let mut passed_fds = ctx.runner_cfg.passed_fds();
+    if let Some(script) = script {
+        passed_fds.push(script.as_raw_fd());
     }
+    crate::host::attach_fd_cloexec(cmd.as_std_mut(), &passed_fds).map_err(|error| {
+        ctx.metrics
+            .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+        task_io_error("child file descriptor preparation failed", error)
+    })
+}
+
+#[cfg(not(unix))]
+fn apply_fd_boundary(
+    _cmd: &mut Command,
+    _ctx: &TaskExecContext,
+    _script: Option<&AnonymousScript>,
+) -> Result<(), TaskError> {
+    Ok(())
 }
 
 /// Maps process exit status to the task result.
@@ -687,8 +677,8 @@ fn evaluate_exit(
 struct CgroupGuard(Option<crate::host::HostProcessGuard>);
 
 impl CgroupGuard {
-    fn new(guard: Option<crate::host::HostProcessGuard>) -> Self {
-        Self(guard)
+    fn new(guard: crate::host::HostProcessGuard) -> Self {
+        Self(Some(guard))
     }
 
     async fn cleanup(mut self) {
@@ -774,15 +764,15 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
         .map(|base| format!("{base}-{attempt:x}"));
     let prepared_host_process = prepare_backend(&ctx, cgroup_name).await?;
 
-    // Script mode: write the body to a 0600 tempfile on a blocking thread.
-    // The handle must outlive the child (the interpreter reads the file as it
-    // executes); it is dropped — and the file unlinked — when this attempt ends.
-    let script_tempfile = match &ctx.script_body {
+    // Script mode: prepare anonymous attempt-local backing storage.
+    // The descriptor remains owned until the attempt ends.
+    let script = match &ctx.script_body {
         Some(body) => Some(materialize_script(&ctx, Arc::clone(body)).await?),
         None => None,
     };
 
-    let mut cmd = build_command(&ctx, script_tempfile.as_ref().map(|t| t.path()));
+    let mut cmd = build_command(&ctx, script.as_ref().map(AnonymousScript::argument_path));
+    apply_fd_boundary(&mut cmd, &ctx, script.as_ref())?;
     let host_process_guard = apply_backend(&mut cmd, &ctx, prepared_host_process);
     let cgroup_guard = CgroupGuard::new(host_process_guard);
 
@@ -894,7 +884,7 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         let host = crate::host::HostProcessGuard::for_test(path.clone());
 
-        CgroupGuard::new(Some(host)).cleanup().await;
+        CgroupGuard::new(host).cleanup().await;
 
         assert!(!path.exists());
     }
@@ -906,7 +896,7 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         let host = crate::host::HostProcessGuard::for_test(path.clone());
 
-        drop(CgroupGuard::new(Some(host)));
+        drop(CgroupGuard::new(host));
 
         assert!(!path.exists());
     }
@@ -918,7 +908,7 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         let host = crate::host::HostProcessGuard::for_test(path.clone());
 
-        drop(CgroupGuard::new(Some(host)));
+        drop(CgroupGuard::new(host));
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while path.exists() {
@@ -1112,7 +1102,7 @@ mod tests {
     fn make_exec_ctx() -> TaskExecContext {
         TaskExecContext {
             task_cfg: make_task_cfg(),
-            runner_cfg: None,
+            runner_cfg: Arc::new(SubprocessBackendConfig::new().prepare().unwrap()),
             cgroup_name: None,
             metrics: solti_runner::noop_metrics(),
             log_cfg: LogConfig::default(),
@@ -1121,6 +1111,7 @@ mod tests {
             generation: 1,
             resource_name: solti_model::TaskId::new("test-resource").unwrap(),
             script_body: None,
+            pinned_cwd: None,
         }
     }
 
@@ -1132,6 +1123,53 @@ mod tests {
         assert_eq!(std_cmd.get_program(), "echo");
         let args: Vec<_> = std_cmd.get_args().collect();
         assert_eq!(args, vec!["hello"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_inherits_only_explicitly_passed_fd() {
+        use std::os::fd::AsRawFd as _;
+
+        let denied_file = tempfile::tempfile().unwrap();
+        let denied_fd = denied_file.as_raw_fd();
+        let mut denied_ctx = make_exec_ctx();
+        denied_ctx.task_cfg.command = "test".into();
+        denied_ctx.task_cfg.args = vec!["-e".into(), format!("/dev/fd/{denied_fd}")];
+        let mut denied = build_command(&denied_ctx, None);
+        apply_fd_boundary(&mut denied, &denied_ctx, None).unwrap();
+        assert!(!denied.as_std_mut().status().unwrap().success());
+
+        let passed_file = tempfile::tempfile().unwrap();
+        let passed_fd = passed_file.as_raw_fd();
+        let mut passed_ctx =
+            ctx_with_backend(SubprocessBackendConfig::new().with_passed_fd(passed_file.into()));
+        passed_ctx.task_cfg.command = "test".into();
+        passed_ctx.task_cfg.args = vec!["-e".into(), format!("/dev/fd/{passed_fd}")];
+        let mut passed = build_command(&passed_ctx, None);
+        apply_fd_boundary(&mut passed, &passed_ctx, None).unwrap();
+        assert!(passed.as_std_mut().status().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn new_session_policy_does_not_also_request_process_group() {
+        use crate::host::{HostProcessPolicy, ProcessConfig};
+
+        let mut ctx = ctx_with_backend(SubprocessBackendConfig::new().with_host_process_policy(
+            HostProcessPolicy::new().with_process_config(ProcessConfig {
+                new_session: true,
+                ..Default::default()
+            }),
+        ));
+        ctx.task_cfg.command = "sh".into();
+        ctx.task_cfg.args = vec!["-c".into(), "exit 0".into()];
+
+        let prepared = ctx.runner_cfg.prepare_host_process_attempt(None).unwrap();
+        let mut command = build_command(&ctx, None);
+        apply_fd_boundary(&mut command, &ctx, None).unwrap();
+        let _guard = apply_backend(&mut command, &ctx, prepared);
+
+        assert!(command.status().await.unwrap().success());
     }
 
     #[test]
@@ -1182,7 +1220,7 @@ mod tests {
 
     fn ctx_with_backend(cfg: SubprocessBackendConfig) -> TaskExecContext {
         let mut ctx = make_exec_ctx();
-        ctx.runner_cfg = Some(Arc::new(cfg.prepare().unwrap()));
+        ctx.runner_cfg = Arc::new(cfg.prepare().unwrap());
         ctx
     }
 
@@ -1336,14 +1374,56 @@ mod tests {
         });
         assert!(
             found,
-            "script output must reach the registry (tempfile materialized at run time, extra args preserved)"
+            "script output must reach the registry (anonymous transport created at run time, extra args preserved)"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires root with only CAP_SETUID and CAP_SETGID"]
+    async fn script_task_runs_after_exact_credential_change() {
+        use crate::host::{HostProcessPolicy, LinuxCapability, ProcessCredentials, SecurityConfig};
+
+        assert_eq!(unsafe { libc::geteuid() }, 0, "test requires root");
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let effective = status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .map(str::trim)
+            .and_then(|value| u64::from_str_radix(value, 16).ok())
+            .expect("CapEff is missing from /proc/self/status");
+        let has =
+            |capability: LinuxCapability| effective & (1_u64 << capability.to_cap_value()) != 0;
+        assert!(has(LinuxCapability::SetUid), "CAP_SETUID is required");
+        assert!(has(LinuxCapability::SetGid), "CAP_SETGID is required");
+        assert!(!has(LinuxCapability::Chown), "CAP_CHOWN must be absent");
+        assert!(!has(LinuxCapability::FOwner), "CAP_FOWNER must be absent");
+        if let Ok(setgroups) = std::fs::read_to_string("/proc/self/setgroups") {
+            assert_ne!(setgroups.trim(), "deny", "setgroups must be permitted");
+        }
+
+        let backend = SubprocessBackendConfig::new().with_host_process_policy(
+            HostProcessPolicy::new().with_security(SecurityConfig {
+                credentials: Some(ProcessCredentials::new(65_534, 65_534)),
+                ..Default::default()
+            }),
+        );
+        let runner = SubprocessRunner::with_config("credential-test", backend).unwrap();
+        let build = BuildContext::default();
+        let cancel = TaskContext::detached();
+
+        let script = mk_script_spec("script-credentials", b"exit 0", &[]);
+        let script_ref = build_with_run_id(&runner, &script, &build).unwrap();
+        script_ref
+            .spawn(cancel)
+            .await
+            .expect("sealed script must remain readable after changing credentials");
     }
 
     #[tokio::test]
     async fn script_task_can_be_spawned_repeatedly() {
-        // The tempfile is materialized per attempt; a retry after the first
-        // attempt (and its tempfile) is gone must still find its script.
+        // Anonymous backing storage is materialized per attempt.
+        // A retry must receive a fresh descriptor with the same body.
         let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_script_spec("script-retry", b"exit 0", &[]);
         let task_ref = build_with_run_id(&runner, &spec, &BuildContext::default()).unwrap();
@@ -1372,7 +1452,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_mode_script_defers_tempfile_to_run_time() {
+    fn resolve_mode_script_defers_transport_to_run_time() {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -1386,7 +1466,7 @@ mod tests {
         assert_eq!(
             r.args,
             vec!["extra"],
-            "resolve must not touch the disk: the tempfile path is prepended at spawn time"
+            "resolve must not create backing storage: the descriptor path is prepended at spawn time"
         );
 
         let body = r.script_body.expect("Script mode must carry the body");
@@ -1407,37 +1487,6 @@ mod tests {
         assert_eq!(r.command, "ruby");
         assert!(r.args.is_empty());
         assert!(r.script_body.is_some());
-    }
-
-    #[test]
-    fn write_script_tempfile_writes_body_with_0600() {
-        let tmp = write_script_tempfile(&std::env::temp_dir(), "echo hello")
-            .expect("tempfile must be written");
-        let written = std::fs::read_to_string(tmp.path()).expect("tempfile readable");
-        assert_eq!(written, "echo hello");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::metadata(tmp.path()).unwrap().permissions();
-            assert_eq!(
-                perms.mode() & 0o777,
-                0o600,
-                "tempfile must be chmod 0600 (may carry secrets)"
-            );
-        }
-    }
-
-    #[test]
-    fn write_script_tempfile_fails_loudly_on_bad_dir() {
-        let parent = tempfile::TempDir::new().unwrap();
-        let bogus = parent.path().join("missing");
-        let err = write_script_tempfile(&bogus, "echo hello")
-            .expect_err("nonexistent dir must fail tempfile creation");
-        assert!(
-            err.to_string().contains("failed to create script tempfile"),
-            "got: {err}"
-        );
     }
 
     #[cfg(unix)]
@@ -1650,7 +1699,7 @@ mod tests {
             args: vec![],
         };
         let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES)
-            .expect("200 KiB script must resolve via tempfile transport");
+            .expect("200 KiB script must resolve via descriptor transport");
         assert_eq!(r.command, "bash");
         assert!(r.args.is_empty());
         let body = r

@@ -48,13 +48,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - registers a runner for the built-in `Subprocess` workload GVK;
 - executes commands directly;
-- decodes scripts and materializes one temporary file per attempt;
-- applies environment and working-directory policies;
+- decodes scripts and creates attempt-scoped script transport;
+- applies environment and pinned working-directory policies;
+- enforces an explicit file descriptor passlist on Linux;
+- applies a bounded descriptor snapshot on other Unix platforms;
 - streams stdout and stderr to tracing and the runner output sink;
 - stops subprocesses on cancellation, timeout, or dropped task futures;
 - applies POSIX rlimits;
 - applies Linux cgroup, namespace, identity, capability, and seccomp controls;
-- reports backend preparation and spawn failures through runner metrics.
+- reports backend preparation and spawn failures through runner metrics;
 - keeps host process controls separate from subprocess settings.
 
 ## Inputs and outputs
@@ -88,7 +90,7 @@ Task { workload: Subprocess }
       taskvisor::TaskRef
               │ each attempt
               ▼
- environment + cwd + HostProcessPolicy
+ environment + pinned cwd + HostProcessPolicy
               ▼
       operating-system process
          ├── stdout ──► tracing + OutputSink
@@ -96,7 +98,7 @@ Task { workload: Subprocess }
          └── exit / cancel / dropped future
                          ▼
                 cleanup process group,
-                script file, and cgroup
+                script transport, and cgroup
 ```
 
 Attempt-scoped resources are created inside the Taskvisor task.
@@ -131,10 +133,21 @@ let mode = SubprocessMode::Script {
 ```
 
 The runner decodes and validates the script while building the task.
-It writes a fresh temporary file for every attempt.
-On Unix, the file mode is `0600`.
+It creates fresh backing storage for every attempt.
+
+Linux uses a sealed anonymous `memfd`.
+The interpreter opens it through `/proc/self/fd`.
+The final descriptor mode is `0444`.
+Read access is published only after sealing.
+This keeps script mode usable after an exact credential change.
+The interpreter cannot open the script when procfs does not expose that path.
+Other Unix platforms use an unlinked file with mode `0600`.
+The interpreter opens it through `/dev/fd`.
+The interpreter cannot open the script when that descriptor filesystem is unavailable.
+Non-Unix platforms use a named temporary file.
+
 The interpreter receives the file path before the configured arguments.
-The file is removed when the attempt ends.
+The backing storage is released when the attempt ends.
 
 The model hard limit is `MAX_SCRIPT_BODY_BYTES` after decoding.
 `SubprocessBackendConfig::with_max_script_body_bytes` can lower that limit.
@@ -177,8 +190,36 @@ Roots are canonicalized when the runner is created.
 The workload directory is canonicalized when the task is built.
 This resolves symlinks and `..` before comparison.
 
+Every Unix path component is then opened without following symlinks.
+The child enters the directory through the pinned descriptor.
+Replacing the path after task construction cannot redirect the child.
+
 The policy checks only the starting directory.
 It does not confine file access after the process starts.
+
+## File descriptors
+
+Linux children inherit only standard streams and explicit passlist entries.
+`SubprocessBackendConfig::with_passed_fd` adds an owned descriptor to that passlist.
+The descriptor number is preserved.
+
+Linux applies `close_range(CLOSE_RANGE_CLOEXEC)` to every descriptor from `3` upwards.
+Process spawn fails when the running kernel does not support that operation.
+
+Other Unix platforms inspect `/dev/fd` before process creation.
+Descriptors opened concurrently after that snapshot must already use close-on-exec.
+Process spawn fails when `/dev/fd` is unavailable.
+
+## Process state
+
+`ProcessConfig` contains optional Unix process normalization:
+
+- `reset_signals` resets catchable signal dispositions and clears the signal mask;
+- `new_session` creates a new session and process group with `setsid`;
+- `umask` sets the file creation mask.
+
+An empty `ProcessConfig` adds no process-state hook.
+The subprocess runner still creates a dedicated process group on Unix.
 
 ## Backend configuration
 
@@ -190,13 +231,18 @@ use solti_exec::subprocess::{
     register_subprocess_runner_with_backend,
 };
 use solti_exec::host::{
-    CgroupLimits, CpuMax, HostProcessPolicy, LinuxCapability, RlimitConfig,
-    SecurityConfig,
+    CgroupLimits, CpuMax, HostProcessPolicy, LinuxCapability, ProcessConfig,
+    ProcessCredentials, RlimitConfig, SeccompPolicy, SecurityConfig,
 };
 use solti_runner::RunnerRouter;
 
 fn configured() -> Result<(), solti_exec::ExecError> {
     let host_process = HostProcessPolicy::new()
+        .with_process_config(ProcessConfig {
+            reset_signals: true,
+            new_session: true,
+            umask: Some(0o077),
+        })
         .with_rlimits(RlimitConfig {
             max_open_files: Some(1024),
             max_file_size_bytes: Some(64 * 1024 * 1024),
@@ -213,7 +259,8 @@ fn configured() -> Result<(), solti_exec::ExecError> {
         .with_security(SecurityConfig {
             drop_all_caps: true,
             keep_caps: vec![LinuxCapability::NetBindService],
-            no_new_privs: true,
+            credentials: Some(ProcessCredentials::new(1000, 1000)),
+            seccomp: SeccompPolicy::DenyHostControl,
             ..Default::default()
         });
 
@@ -235,10 +282,14 @@ fn configured() -> Result<(), solti_exec::ExecError> {
 Configuration is validated when the runner is created.
 Configured controls are fail-closed.
 An unsupported or invalid control rejects the runner or fails the attempt.
+The example requires features `subprocess` and `seccomp`.
 
 The default backend uses an empty `HostProcessPolicy`.
-It preserves the current trusted-workload behavior.
-An `Isolated` mode is not exposed until its security guarantees are implemented.
+It does not enable optional rlimit, cgroup, credential, namespace, capability, or seccomp controls.
+
+The subprocess backend still clears the environment by default.
+On Unix, it pins an explicit working directory and restricts descriptor inheritance.
+It also gives every attempt a dedicated process group or session.
 
 `HostProcessPolicy` is independent of the subprocess workload format.
 Future process-based backends can translate it to their own execution model.
@@ -266,27 +317,38 @@ Keep the guard until the complete process scope has stopped.
 
 ## Resource and security controls
 
-| Control                         | Platform                 | Behavior                                               |
-|---------------------------------|--------------------------|--------------------------------------------------------|
-| `RlimitConfig`                  | Unix                     | Sets soft `NOFILE`, `FSIZE`, and `CORE` limits         |
-| `CgroupLimits`                  | Linux cgroup v2          | Limits CPU, memory, and process count per attempt      |
-| `Namespaces`                    | Linux                    | Creates mount, network, IPC, UTS, or cgroup namespaces |
-| UID and GID                     | Linux                    | Clears supplementary groups, then changes identity     |
-| Linux capabilities              | Linux                    | Drops the bounding set and keeps explicit capabilities |
-| `no_new_privs`                  | Linux                    | Prevents privilege gain through `execve`               |
-| `SeccompPolicy::BlockDangerous` | Linux, feature `seccomp` | Rejects a host-control syscall denylist with `EPERM`   |
+| Control                            | Platform                 | Behavior                                               |
+|------------------------------------|--------------------------|--------------------------------------------------------|
+| `ProcessConfig`                    | Unix                     | Resets signal state, creates a session, or sets umask  |
+| `RlimitConfig`                     | Unix                     | Sets hard `NOFILE`, `FSIZE`, and `CORE` ceilings       |
+| `CgroupLimits`                     | Linux cgroup v2          | Limits CPU, memory, and process count per attempt      |
+| `Namespaces`                       | Linux                    | Creates mount, network, IPC, UTS, or cgroup namespaces |
+| `ProcessCredentials`               | Linux                    | Replaces all user, group, and supplementary IDs        |
+| Linux capabilities                 | Linux                    | Drops the bounding set and keeps explicit capabilities |
+| `no_new_privs`                     | Linux                    | Prevents privilege gain through `execve`               |
+| `SeccompPolicy::DenyHostControl`   | Linux, feature `seccomp` | Rejects a host-control syscall denylist with `EPERM`   |
 
 Cgroups are created below the process's current delegated cgroup.
 `HostProcessPolicy::with_cgroup_parent` selects another absolute cgroup v2 directory.
 One child group is created per attempt.
 
 Rlimit requests above the current hard limit are clamped.
-The hard limit is not changed.
+The resulting value becomes both the soft and hard limit.
+`PreparedHostProcessPolicy::rlimits` exposes the resolved ceilings.
+A Linux child retaining `CAP_SYS_RESOURCE` can raise a hard limit again.
+
+`ProcessCredentials` sets the real, effective, and saved user and group IDs.
+Its supplementary group list is exact.
+An empty list clears inherited supplementary groups.
 
 `keep_caps` requires `drop_all_caps = true`.
 The retained capabilities must already be available to the agent process.
 
-`BlockDangerous` is a denylist.
+`DenyHostControl` enables `no_new_privs` before installing its filter.
+It rejects host-control operations such as mounts, namespace entry, kernel module loading, BPF, and ptrace.
+On LP64 `x86_64`, it also rejects the x32 syscall ABI.
+
+`DenyHostControl` is a denylist.
 It is not a complete syscall allowlist.
 
 These controls provide host process hardening.

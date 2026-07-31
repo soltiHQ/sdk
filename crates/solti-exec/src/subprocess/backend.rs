@@ -13,16 +13,23 @@
 //!                 │
 //!                 ▼
 //!          each task attempt
-//!      ├── build environment and cwd
-//!      ├── prepare cgroup
-//!      ├── attach rlimits and security
+//!      ├── build environment
+//!      ├── use pinned cwd
+//!      ├── prepare host resources
+//!      ├── attach process controls
 //!      └── stream output
 //! ```
 //!
 //! Configuration setters do not perform validation.
 //! [`SubprocessRunner::with_config`](super::SubprocessRunner::with_config) validates the complete configuration.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+#[cfg(unix)]
+use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 
 use solti_model::MAX_SCRIPT_BODY_BYTES;
 use tokio::process::Command;
@@ -31,6 +38,7 @@ use crate::ExecError::InvalidRunnerConfig;
 use crate::host::{
     HostProcessGuard, HostProcessPolicy, PreparedHostProcessAttempt, PreparedHostProcessPolicy,
 };
+use crate::subprocess::boundary::PinnedCwd;
 use crate::subprocess::logger::LogConfig;
 
 /// Minimal `PATH` used for a cleared environment.
@@ -71,7 +79,8 @@ pub enum EnvPolicy {
 
 /// Where a task is allowed to set its working directory.
 ///
-/// [`Roots`](Self::Roots) checks the starting directory at build time.
+/// An explicit directory is opened and pinned at build time.
+/// [`Roots`](Self::Roots) also checks it against pinned roots.
 /// This policy does not restrict later file access.
 #[derive(Debug, Clone, Default)]
 pub enum CwdPolicy {
@@ -86,67 +95,96 @@ pub enum CwdPolicy {
 }
 
 impl CwdPolicy {
-    fn prepare(&mut self) -> Result<(), crate::ExecError> {
-        let CwdPolicy::Roots(roots) = self else {
-            return Ok(());
-        };
-        if roots.is_empty() {
-            return Err(InvalidRunnerConfig(
-                "cwd roots policy requires at least one root".into(),
-            ));
-        }
+    fn prepare(self) -> Result<PreparedCwdPolicy, crate::ExecError> {
+        match self {
+            CwdPolicy::Unrestricted => Ok(PreparedCwdPolicy::Unrestricted),
+            CwdPolicy::Roots(roots) => {
+                if roots.is_empty() {
+                    return Err(InvalidRunnerConfig(
+                        "cwd roots policy requires at least one root".into(),
+                    ));
+                }
 
-        let mut prepared = Vec::with_capacity(roots.len());
-        for root in roots.iter() {
-            let real = root.canonicalize().map_err(|e| {
-                InvalidRunnerConfig(format!(
-                    "cwd root {} cannot be resolved: {e}",
-                    root.display()
-                ))
-            })?;
-            if !real.is_dir() {
-                return Err(InvalidRunnerConfig(format!(
-                    "cwd root {} is not a directory",
-                    real.display()
-                )));
+                let mut prepared = Vec::with_capacity(roots.len());
+                for root in roots {
+                    let real = resolve_directory(&root, "cwd root").map_err(InvalidRunnerConfig)?;
+                    let directory = PinnedCwd::open_absolute(&real).map_err(|error| {
+                        InvalidRunnerConfig(format!(
+                            "cwd root {} cannot be pinned: {error}",
+                            real.display()
+                        ))
+                    })?;
+                    prepared.push(PreparedCwdRoot {
+                        path: real,
+                        directory,
+                    });
+                }
+                prepared.sort_by(|left, right| left.path.cmp(&right.path));
+                prepared.dedup_by(|left, right| left.path == right.path);
+                Ok(PreparedCwdPolicy::Roots(prepared))
             }
-            prepared.push(real);
         }
-        prepared.sort();
-        prepared.dedup();
-        *roots = prepared;
-        Ok(())
     }
+}
 
-    /// Checks a task working directory against the policy.
-    ///
-    /// Canonicalization resolves symlinks and `..` before root comparison.
-    fn check(&self, cwd: Option<&Path>) -> Result<(), String> {
-        let CwdPolicy::Roots(roots) = self else {
-            return Ok(());
-        };
+#[derive(Debug)]
+enum PreparedCwdPolicy {
+    Unrestricted,
+    Roots(Vec<PreparedCwdRoot>),
+}
+
+#[derive(Debug)]
+struct PreparedCwdRoot {
+    path: PathBuf,
+    directory: PinnedCwd,
+}
+
+impl PreparedCwdPolicy {
+    /// Resolves, validates, and pins a task working directory.
+    fn pin(&self, cwd: Option<&Path>) -> Result<Option<PinnedCwd>, String> {
         let Some(cwd) = cwd else {
-            return Err(
-                "cwd is required under a Roots policy; a task may not inherit the agent's cwd"
-                    .into(),
-            );
+            return match self {
+                Self::Unrestricted => Ok(None),
+                Self::Roots(_) => Err(
+                    "cwd is required under a Roots policy; a task may not inherit the agent's cwd"
+                        .into(),
+                ),
+            };
         };
 
-        let real = cwd
-            .canonicalize()
-            .map_err(|e| format!("cwd {} cannot be resolved: {e}", cwd.display()))?;
-        if !real.is_dir() {
-            return Err(format!("cwd {} is not a directory", real.display()));
+        let real = resolve_directory(cwd, "cwd")?;
+        match self {
+            Self::Unrestricted => PinnedCwd::open_absolute(&real)
+                .map(Some)
+                .map_err(|error| format!("cwd {} cannot be pinned: {error}", real.display())),
+            Self::Roots(roots) => {
+                let root = roots
+                    .iter()
+                    .filter(|root| real.starts_with(&root.path))
+                    .max_by_key(|root| root.path.components().count())
+                    .ok_or_else(|| {
+                        format!("cwd {} is outside the allowed roots", real.display())
+                    })?;
+                let relative = real
+                    .strip_prefix(&root.path)
+                    .map_err(|_| format!("cwd {} is outside the allowed roots", real.display()))?;
+                root.directory
+                    .open_beneath(relative)
+                    .map(Some)
+                    .map_err(|error| format!("cwd {} cannot be pinned: {error}", real.display()))
+            }
         }
-        let allowed = roots.iter().any(|root| real.starts_with(root));
-        if !allowed {
-            return Err(format!(
-                "cwd {} is outside the allowed roots",
-                real.display()
-            ));
-        }
-        Ok(())
     }
+}
+
+fn resolve_directory(path: &Path, field: &str) -> Result<PathBuf, String> {
+    let real = path
+        .canonicalize()
+        .map_err(|error| format!("{field} {} cannot be resolved: {error}", path.display()))?;
+    if !real.is_dir() {
+        return Err(format!("{field} {} is not a directory", real.display()));
+    }
+    Ok(real)
 }
 
 /// Environment, working-directory, output, and script settings for a runner.
@@ -158,6 +196,7 @@ impl CwdPolicy {
 /// | Working directory        | [`CwdPolicy::Unrestricted`]      |
 /// | Output logging           | [`LogConfig::default`]           |
 /// | Decoded script body      | [`MAX_SCRIPT_BODY_BYTES`]        |
+/// | Extra inherited FDs      | Empty                            |
 ///
 /// ## Example
 ///
@@ -191,6 +230,9 @@ pub struct SubprocessBackendConfig {
     logger: LogConfig,
     /// Maximum decoded script size.
     max_script_body_bytes: Option<usize>,
+    /// Owned descriptors explicitly inherited by every subprocess.
+    #[cfg(unix)]
+    passed_fds: Vec<Arc<OwnedFd>>,
 }
 
 impl SubprocessBackendConfig {
@@ -237,9 +279,23 @@ impl SubprocessBackendConfig {
         self
     }
 
+    /// Adds one owned file descriptor to the child passlist.
+    ///
+    /// The runner keeps the descriptor open at the same number.
+    /// Descriptors `0`, `1`, and `2` are managed as standard streams.
+    /// They are rejected when the runner is created.
+    /// Linux marks every other open descriptor close-on-exec.
+    /// Other Unix platforms apply the bounded snapshot described by the crate README.
+    #[cfg(unix)]
+    #[cfg_attr(docsrs, doc(cfg(unix)))]
+    pub fn with_passed_fd(mut self, fd: OwnedFd) -> Self {
+        self.passed_fds.push(Arc::new(fd));
+        self
+    }
+
     /// Validates and normalizes the complete configuration.
-    pub(crate) fn prepare(mut self) -> Result<PreparedSubprocessBackendConfig, crate::ExecError> {
-        self.cwd_policy.prepare()?;
+    pub(crate) fn prepare(self) -> Result<PreparedSubprocessBackendConfig, crate::ExecError> {
+        let cwd_policy = self.cwd_policy.prepare()?;
 
         if let EnvPolicy::Allowlist(keys) = &self.env_policy {
             for key in keys {
@@ -264,14 +320,25 @@ impl SubprocessBackendConfig {
                 "max_script_body_bytes must be in 1..={MAX_SCRIPT_BODY_BYTES}, got {max}"
             )));
         }
+        #[cfg(unix)]
+        for fd in &self.passed_fds {
+            if fd.as_raw_fd() < 3 {
+                return Err(InvalidRunnerConfig(format!(
+                    "passed file descriptor must be at least 3, got {}",
+                    fd.as_raw_fd()
+                )));
+            }
+        }
         let host_process_policy = self.host_process_policy.prepare()?;
 
         Ok(PreparedSubprocessBackendConfig {
             host_process_policy,
             env_policy: self.env_policy,
-            cwd_policy: self.cwd_policy,
+            cwd_policy,
             logger: self.logger,
             max_script_body_bytes: self.max_script_body_bytes,
+            #[cfg(unix)]
+            passed_fds: self.passed_fds,
         })
     }
 }
@@ -281,15 +348,23 @@ impl SubprocessBackendConfig {
 pub(crate) struct PreparedSubprocessBackendConfig {
     host_process_policy: PreparedHostProcessPolicy,
     env_policy: EnvPolicy,
-    cwd_policy: CwdPolicy,
+    cwd_policy: PreparedCwdPolicy,
     logger: LogConfig,
     max_script_body_bytes: Option<usize>,
+    #[cfg(unix)]
+    passed_fds: Vec<Arc<OwnedFd>>,
 }
 
 impl PreparedSubprocessBackendConfig {
-    /// Validates a task working directory against the configured policy.
-    pub(crate) fn check_cwd(&self, cwd: Option<&Path>) -> Result<(), String> {
-        self.cwd_policy.check(cwd)
+    /// Resolves, validates, and pins a task working directory.
+    pub(crate) fn pin_cwd(&self, cwd: Option<&Path>) -> Result<Option<PinnedCwd>, String> {
+        self.cwd_policy.pin(cwd)
+    }
+
+    /// Returns the descriptors explicitly inherited by every subprocess.
+    #[cfg(unix)]
+    pub(crate) fn passed_fds(&self) -> Vec<RawFd> {
+        self.passed_fds.iter().map(|fd| fd.as_raw_fd()).collect()
     }
 
     /// Returns the effective decoded script limit.
@@ -312,6 +387,11 @@ impl PreparedSubprocessBackendConfig {
         self.host_process_policy.has_cgroups()
     }
 
+    /// Returns `true` when subprocesses create a new Unix session.
+    pub(crate) fn starts_new_session(&self) -> bool {
+        self.host_process_policy.starts_new_session()
+    }
+
     /// Prepares host process resources for one attempt.
     ///
     /// This must run before [`apply_to_command`](Self::apply_to_command).
@@ -326,7 +406,7 @@ impl PreparedSubprocessBackendConfig {
 
     /// Attaches configured controls to a command.
     ///
-    /// The hooks apply rlimits, cgroup membership, and security before `execve`.
+    /// The hooks apply process state, rlimits, cgroup membership, and security.
     /// The cgroup must already be prepared.
     pub(crate) fn apply_to_command(
         &self,
@@ -375,7 +455,7 @@ mod tests {
     async fn host_process_policy_is_applied_to_spawned_command() {
         use crate::host::{HostProcessPolicy, RlimitConfig};
 
-        let requested = crate::host::reduced_nofile_soft_limit_for_test();
+        let requested = crate::host::reduced_nofile_limit_for_test();
         let config = SubprocessBackendConfig::new()
             .with_host_process_policy(HostProcessPolicy::new().with_rlimits(RlimitConfig {
                 max_open_files: Some(requested),
@@ -439,13 +519,21 @@ mod tests {
     }
 
     #[test]
-    fn cwd_unrestricted_allows_anything() {
+    fn cwd_unrestricted_allows_inherited_or_existing_directory() {
         let cfg = SubprocessBackendConfig::new().prepare().unwrap();
-        assert!(cfg.check_cwd(None).is_ok());
-        assert!(
-            cfg.check_cwd(Some(Path::new("/nonexistent/anywhere")))
-                .is_ok()
-        );
+        assert!(cfg.pin_cwd(None).unwrap().is_none());
+
+        let cwd = tempfile::TempDir::new().unwrap();
+        assert!(cfg.pin_cwd(Some(cwd.path())).unwrap().is_some());
+    }
+
+    #[test]
+    fn cwd_unrestricted_rejects_nonexistent_directory() {
+        let cfg = SubprocessBackendConfig::new().prepare().unwrap();
+        let error = cfg
+            .pin_cwd(Some(Path::new("/nonexistent/solti-cwd")))
+            .unwrap_err();
+        assert!(error.contains("cannot be resolved"), "got: {error}");
     }
 
     #[test]
@@ -459,8 +547,8 @@ mod tests {
             .prepare()
             .unwrap();
 
-        assert!(cfg.check_cwd(Some(&sub)).is_ok());
-        assert!(cfg.check_cwd(Some(root.path())).is_ok());
+        assert!(cfg.pin_cwd(Some(&sub)).unwrap().is_some());
+        assert!(cfg.pin_cwd(Some(root.path())).unwrap().is_some());
     }
 
     #[test]
@@ -471,7 +559,7 @@ mod tests {
             .prepare()
             .unwrap();
 
-        let err = cfg.check_cwd(None).unwrap_err().to_string();
+        let err = cfg.pin_cwd(None).unwrap_err().to_string();
         assert!(err.contains("cwd is required"), "got: {err}");
     }
 
@@ -485,7 +573,7 @@ mod tests {
             .prepare()
             .unwrap();
 
-        let err = cfg.check_cwd(Some(other.path())).unwrap_err().to_string();
+        let err = cfg.pin_cwd(Some(other.path())).unwrap_err().to_string();
         assert!(err.contains("outside the allowed roots"), "got: {err}");
     }
 
@@ -498,7 +586,7 @@ mod tests {
             .unwrap();
 
         let missing = root.path().join("does-not-exist");
-        let err = cfg.check_cwd(Some(&missing)).unwrap_err().to_string();
+        let err = cfg.pin_cwd(Some(&missing)).unwrap_err().to_string();
         assert!(err.contains("cannot be resolved"), "got: {err}");
     }
 
@@ -518,7 +606,7 @@ mod tests {
             .unwrap();
 
         let escape = root.join("..").join("outside");
-        let err = cfg.check_cwd(Some(&escape)).unwrap_err().to_string();
+        let err = cfg.pin_cwd(Some(&escape)).unwrap_err().to_string();
         assert!(err.contains("outside the allowed roots"), "got: {err}");
     }
 
@@ -528,5 +616,20 @@ mod tests {
             .with_cwd_policy(CwdPolicy::Roots(vec![PathBuf::from("/missing/solti-root")]));
         let error = config.prepare().unwrap_err().to_string();
         assert!(error.contains("cannot be resolved"), "got: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passed_fd_is_owned_by_prepared_backend() {
+        use std::os::fd::AsRawFd as _;
+
+        let file = tempfile::tempfile().unwrap();
+        let expected = file.as_raw_fd();
+        let cfg = SubprocessBackendConfig::new()
+            .with_passed_fd(file.into())
+            .prepare()
+            .unwrap();
+
+        assert_eq!(cfg.passed_fds(), vec![expected]);
     }
 }

@@ -35,26 +35,30 @@
 //! ```
 //!
 //! Building does not start the process.
-//! Attempt-scoped files, cgroups, output sinks, and processes are created when Taskvisor runs the task.
+//! Script transport, cgroups, output sinks, and processes are attempt-scoped.
 //!
 //! ## Commands and Scripts
 //!
 //! `solti_model::SubprocessMode::Command` starts an executable directly.
 //! `solti_model::SubprocessMode::Script` uses an explicit interpreter and a base64 body.
-//! The script is written to a fresh temporary file for each attempt.
+//! Each attempt transports the script through fresh backing storage.
+//! Unix uses an anonymous descriptor.
+//! Linux seals that descriptor before process creation.
 //!
 //! ## Backend Controls
 //!
-//! | Area              | Configuration                                 |
-//! |-------------------|-----------------------------------------------|
-//! | Environment       | `subprocess::EnvPolicy`                       |
-//! | Working directory | `subprocess::CwdPolicy`                       |
-//! | Output            | `subprocess::LogConfig`                       |
-//! | Host process      | `host::HostProcessPolicy`                     |
-//! | POSIX limits      | `host::RlimitConfig`                          |
-//! | Linux cgroup v2   | `host::CgroupLimits`, `host::CpuMax`          |
-//! | Linux security    | `host::SecurityConfig`, `host::Namespaces`    |
-//! | Linux seccomp     | `host::SeccompPolicy` with feature `seccomp`  |
+//! | Area              | Configuration                                      |
+//! |-------------------|----------------------------------------------------|
+//! | Environment       | `subprocess::EnvPolicy`                            |
+//! | Working directory | `subprocess::CwdPolicy`                            |
+//! | Output            | `subprocess::LogConfig`                            |
+//! | Host process      | `host::HostProcessPolicy`                          |
+//! | Process state     | `host::ProcessConfig`                              |
+//! | POSIX limits      | `host::RlimitConfig`                               |
+//! | Linux cgroup v2   | `host::CgroupLimits`, `host::CpuMax`               |
+//! | Linux credentials | `host::ProcessCredentials`                         |
+//! | Linux security    | `host::SecurityConfig`, `host::Namespaces`         |
+//! | Linux seccomp     | `host::SeccompPolicy` with feature `seccomp`       |
 //!
 //! Build host controls through `host::HostProcessPolicy`.
 //! Pass that policy to `subprocess::SubprocessBackendConfig`.
@@ -94,17 +98,18 @@
 //!
 //! ## Main Types
 //!
-//! | Area                | Types                                                       |
-//! |---------------------|-------------------------------------------------------------|
-//! | Host process policy | `host::HostProcessPolicy`                                   |
-//! | Host resources      | `host::RlimitConfig`, `host::CgroupLimits`                  |
-//! | Host security       | `host::SecurityConfig`, `host::LinuxCapability`             |
-//! | Runner              | `subprocess::SubprocessRunner`                              |
-//! | Registration        | `subprocess::register_subprocess_runner`                    |
-//! | Backend settings    | `subprocess::SubprocessBackendConfig`                       |
-//! | Environment         | `subprocess::EnvPolicy`, `subprocess::CwdPolicy`            |
-//! | Output              | `subprocess::LogConfig`                                     |
-//! | Errors              | `ExecError`                                                 |
+//! | Area                | Types                                                     |
+//! |---------------------|-----------------------------------------------------------|
+//! | Host process policy | `host::HostProcessPolicy`                                 |
+//! | Host process state  | `host::ProcessConfig`                                     |
+//! | Host resources      | `host::RlimitConfig`, `host::CgroupLimits`                |
+//! | Host security       | `host::SecurityConfig`, `host::ProcessCredentials`        |
+//! | Runner              | `subprocess::SubprocessRunner`                            |
+//! | Registration        | `subprocess::register_subprocess_runner`                  |
+//! | Backend settings    | `subprocess::SubprocessBackendConfig`                     |
+//! | Environment         | `subprocess::EnvPolicy`, `subprocess::CwdPolicy`          |
+//! | Output              | `subprocess::LogConfig`                                   |
+//! | Errors              | `ExecError`                                               |
 //!
 //! ## Feature Flags
 //!

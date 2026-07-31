@@ -16,7 +16,9 @@
 //!                           └──► exit/cancel
 //! ```
 //!
-//! Each attempt owns its process, output readers, script file, and optional cgroup.
+//! Each attempt owns its process and output readers.
+//! Script attempts also own an anonymous script descriptor.
+//! A configured cgroup is attempt-scoped.
 //! Unix attempts use a dedicated process group.
 //! The runner removes attempt-scoped resources after completion.
 //!
@@ -28,10 +30,14 @@
 mod backend;
 pub use backend::{CwdPolicy, EnvPolicy, SubprocessBackendConfig};
 
+mod boundary;
+
 mod task;
 
 mod logger;
 pub use logger::LogConfig;
+
+mod script;
 
 mod runner;
 pub use runner::SubprocessRunner;
@@ -70,7 +76,7 @@ pub fn register_subprocess_runner(
 /// # Errors
 ///
 /// Returns [`ExecError::InvalidRunnerConfig`] when `name` or `backend` is invalid.
-/// Returns [`ExecError::Io`] when current cgroup discovery fails.
+/// Returns [`ExecError::Io`] when host resource preparation fails.
 /// Returns [`ExecError::Router`] when the router rejects registration.
 pub fn register_subprocess_runner_with_backend(
     router: &mut RunnerRouter,
