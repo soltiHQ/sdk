@@ -1,22 +1,27 @@
-//! Execute subprocess workloads.
+//! # Subprocess execution
 //!
-//! [`SubprocessRunner`] resolves one resource into a reusable task function.
-//! Mutable attempt state is created only when taskvisor starts an attempt.
+//! [`SubprocessRunner`] converts a `Subprocess` resource into a Taskvisor task.
+//! It resolves immutable settings during the build.
+//! It creates operating-system resources inside each attempt.
 //!
 //! ## Attempt Lifecycle
 //!
 //! ```text
-//! allocate attempt
-//!       ▼
-//! prepare cgroup and script
-//!       ▼
-//! spawn one process group
-//!       ├──► stream stdout and stderr
-//!       ├──► wait for exit
-//!       └──► cancel or drop ──► kill process group
-//!       ▼
-//! stop remaining descendants and clean up cgroup
+//! start attempt
+//!      ▼
+//! output sink + cgroup + script file
+//!      ▼
+//! process group
+//!   ├── stdout/stderr ──► tracing + output sink
+//!   ├── exit ───────────► evaluate exit policy
+//!   └── cancellation ───► kill process group
+//!      ▼
+//! remove script file and cgroup
 //! ```
+//!
+//! On Unix, cancellation and future drop kill the complete process group.
+//! On Unix, normal completion also stops descendants left by the leader.
+//! Other platforms stop the leader process.
 
 use std::{
     io::Write as _,
@@ -48,11 +53,29 @@ use crate::subprocess::{
 
 /// Runner that executes [`TaskWorkload::Subprocess`] as OS subprocesses.
 ///
-/// ## Also
+/// The runner declares the built-in `solti.io/v1`, kind `Subprocess` workload.
+/// Its name becomes part of run IDs and the automatic runner label.
 ///
-/// - [`SubprocessBackendConfig`] rlimits, cgroups, security applied to spawned processes.
-/// - [`register_subprocess_runner`](super::register_subprocess_runner) registration helper.
-/// - [`solti_runner::Runner`] trait this type implements.
+/// ## Attempt Results
+///
+/// | Event                                  | Result                       |
+/// |----------------------------------------|------------------------------|
+/// | Exit code `0`                          | Success                      |
+/// | Non-zero with `fail_on_non_zero`       | Retryable failure            |
+/// | Non-zero without `fail_on_non_zero`    | Success                      |
+/// | Cooperative cancellation               | `TaskError::Canceled`        |
+/// | Permanent operating-system error       | Fatal failure                |
+/// | Other operating-system error           | Retryable failure            |
+///
+/// On Unix, one attempt owns one process group.
+/// The runner waits up to five seconds for output pipes after the leader exits.
+/// It then stops remaining descendants.
+///
+/// ## See Also
+///
+/// - [`SubprocessBackendConfig`]
+/// - [`register_subprocess_runner`](super::register_subprocess_runner)
+/// - [`solti_runner::Runner`]
 pub struct SubprocessRunner {
     /// Runner name.
     name: String,
@@ -60,9 +83,9 @@ pub struct SubprocessRunner {
     config: Option<Arc<SubprocessBackendConfig>>,
 }
 
-/// Validate a runner name before it is embedded into run IDs and cgroup paths.
+/// Validates a runner name before it is used in labels and paths.
 ///
-/// The name is used as a Kubernetes label value and as part of cgroup names.
+/// The accepted syntax matches a Kubernetes label value.
 fn validate_runner_name(name: &str) -> Result<(), crate::ExecError> {
     let edge_is_alphanumeric = name
         .as_bytes()
@@ -84,21 +107,27 @@ fn validate_runner_name(name: &str) -> Result<(), crate::ExecError> {
 }
 
 impl SubprocessRunner {
-    /// Create a subprocess runner with default settings.
+    /// Creates a subprocess runner with default backend settings.
     ///
-    /// `name` is embedded into run IDs, cgroup paths, and the automatic runner label.
+    /// `name` is used in run IDs, cgroup paths, and the automatic runner label.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ExecError::InvalidRunnerConfig`] for an invalid name.
     pub fn new(name: impl Into<String>) -> Result<Self, crate::ExecError> {
         let name = name.into();
         validate_runner_name(&name)?;
         Ok(Self { name, config: None })
     }
 
-    /// Create a subprocess runner with explicit backend configuration.
+    /// Creates a subprocess runner with explicit backend settings.
     ///
-    /// ## Errors
+    /// Configuration paths are resolved during this call.
     ///
-    /// - [`ExecError::InvalidRunnerConfig`](crate::ExecError::InvalidRunnerConfig):
-    ///   `name` is not a Kubernetes label value or `config` is invalid.
+    /// # Errors
+    ///
+    /// Returns [`crate::ExecError::InvalidRunnerConfig`] for invalid settings.
+    /// Returns [`crate::ExecError::Io`] when current cgroup discovery fails.
     pub fn with_config(
         name: impl Into<String>,
         config: SubprocessBackendConfig,
@@ -112,9 +141,9 @@ impl SubprocessRunner {
         })
     }
 
-    /// Build task configuration from a [`Task`] resource.
+    /// Builds immutable task settings from a resource.
     ///
-    /// Returns the fully resolved config.
+    /// The returned settings are reused by every attempt.
     fn build_task_config(
         &self,
         task: &Task,
@@ -168,21 +197,10 @@ impl SubprocessRunner {
         Ok((cfg, script_body))
     }
 
-    /// Resolve [`SubprocessMode`](solti_model::SubprocessMode) into a command + args pair ready for `execve`.
+    /// Resolves a subprocess mode into a command and arguments.
     ///
-    /// ## Script transport
-    ///
-    /// For `Script` mode the body is decoded (and size-checked) here, but the
-    /// tempfile is **not** written yet: `build_task` runs on the async submit
-    /// path. Disk I/O is deferred to
-    /// [`materialize_script`] inside the task body, where it runs on a blocking
-    /// thread per attempt. The interpreter is then invoked with the tempfile
-    /// path: *not* with `-c "<inline>"`.
-    ///
-    /// ## Limits
-    ///
-    /// - The inline form is limited to `MAX_ARG_STRLEN` (128 KiB on Linux);
-    /// - The tempfile form supports scripts up to [`MAX_SCRIPT_BODY_BYTES`](solti_model::MAX_SCRIPT_BODY_BYTES) (2 MiB).
+    /// Script bodies are decoded and checked here.
+    /// File creation remains attempt-scoped.
     fn resolve_mode(
         mode: &solti_model::SubprocessMode,
         max_script_body_bytes: usize,
@@ -213,16 +231,16 @@ impl SubprocessRunner {
     }
 }
 
-/// Output of [`SubprocessRunner::resolve_mode`].
+/// Subprocess mode resolved during task construction.
 #[derive(Debug)]
 struct Resolved {
     command: String,
     args: Vec<String>,
 
-    /// Decoded script body for `Script` mode; `None` for `Command`.
+    /// Decoded script body.
     ///
-    /// Written to a tempfile by [`materialize_script`] when the task runs;
-    /// the tempfile path is prepended to `args` at spawn time.
+    /// Command mode stores `None`.
+    /// Script mode writes the body to a temporary file for each attempt.
     script_body: Option<Arc<str>>,
 }
 
@@ -238,21 +256,18 @@ impl Runner for SubprocessRunner {
         ]
     }
 
-    /// Turn a [`TaskWorkload::Subprocess`] resource into a runnable [`TaskRef`].
+    /// Builds a reusable [`TaskRef`] from a subprocess resource.
     ///
-    /// Resolves the subprocess mode, merges the environment, and captures the
-    /// resolved config in a closure that spawns the OS process when the task runs.
+    /// This method resolves the mode, environment, and working directory.
+    /// It does not create a script file, cgroup, or process.
+    /// Runner environment values from [`BuildContext`] override task values.
+    /// Output and metrics also come from that context.
     ///
-    /// ## Errors
+    /// # Errors
     ///
-    /// - [`RunnerError::UnsupportedWorkload`]: the task workload is not [`TaskWorkload::Subprocess`].
-    /// - [`RunnerError::InvalidSpec`]: the command is empty, or the script body is
-    ///   not valid base64 or exceeds the configured size limit.
-    ///
-    /// The script tempfile is written inside the task body (per attempt); an I/O
-    /// failure there fails the run with a fatal `TaskError`, not a build error.
-    /// The output sink is also acquired inside each attempt from the producer
-    /// capability injected through [`BuildContext`].
+    /// Returns [`RunnerError::UnsupportedWorkload`] for another workload kind.
+    /// Returns [`RunnerError::InvalidSpec`] when resolved process settings are invalid.
+    /// This includes script decoding, script limits, environment values, and working-directory policy.
     fn build_task(
         &self,
         task: &Task,
@@ -313,7 +328,7 @@ impl Runner for SubprocessRunner {
     }
 }
 
-/// Shared context for subprocess task execution.
+/// Immutable execution context shared by all attempts.
 struct TaskExecContext {
     runner_cfg: Option<Arc<SubprocessBackendConfig>>,
     metrics: solti_runner::MetricsHandle,
@@ -325,18 +340,15 @@ struct TaskExecContext {
     generation: u64,
     resource_name: solti_model::TaskId,
 
-    /// Decoded script body for `Script` mode; `None` for `Command`.
+    /// Decoded script body.
     ///
-    /// Materialized into a fresh 0600 tempfile on every attempt by
-    /// [`materialize_script`]; the tempfile is unlinked when the attempt ends.
+    /// Script mode materializes a fresh file for every attempt.
     script_body: Option<Arc<str>>,
 }
 
-/// Build the OS command from task configuration.
+/// Builds the operating-system command for one attempt.
 ///
-/// `script_path` is the materialized script tempfile for `Script` mode; it is
-/// prepended to the task args so the interpreter receives it as its first
-/// argument. `None` for `Command` mode.
+/// Script mode inserts `script_path` before the configured arguments.
 fn build_command(ctx: &TaskExecContext, script_path: Option<&std::path::Path>) -> Command {
     let mut cmd = Command::new(&ctx.task_cfg.command);
     if let Some(path) = script_path {
@@ -371,10 +383,12 @@ fn build_command(ctx: &TaskExecContext, script_path: Option<&std::path::Path>) -
     cmd
 }
 
-/// Build the child's environment per the backend [`EnvPolicy`].
+/// Builds the child environment from the configured [`EnvPolicy`].
 ///
-/// Task variables are applied last and take precedence.
-/// `Clear` and `Allowlist` add a [safe `PATH`] when the task does not set one.
+/// Merged task and runner variables are applied last.
+/// They take precedence over the selected parent policy.
+/// `Clear` adds a [safe `PATH`] when the merged values do not set one.
+/// `Allowlist` also requires that the allowlist does not name `PATH`.
 ///
 /// [safe `PATH`]: crate::subprocess::backend::SAFE_DEFAULT_PATH
 fn apply_env_policy(cmd: &mut Command, ctx: &TaskExecContext) {
@@ -415,20 +429,12 @@ fn apply_env_policy(cmd: &mut Command, ctx: &TaskExecContext) {
     }
 }
 
-/// Drop-safe reaper for the child's process group.
+/// Kills an active Unix process group when the attempt future is dropped.
 ///
-/// taskvisor enforces the per-attempt timeout via `tokio::time::timeout` and force-abort
-/// via `JoinHandle::abort`; **both drop the `run_subprocess` future** without ever polling
-/// the cooperative `cancel.cancelled()` branch. `kill_on_drop(true)` only SIGKILLs the
-/// leader pid, leaving any forked grandchildren (the process group) orphaned to PID 1.
-///
-/// This guard captures the child's pgid right after spawn and, on `Drop`, sends
-/// `kill(-pgid, SIGKILL)` to the whole group. It is [`disarm`](Self::disarm)ed once the
-/// child has been reaped on a normal/explicit-kill path. It therefore never targets a
-/// recycled pgid — it fires **only** when the future is dropped mid-flight.
+/// Taskvisor timeouts and forced aborts can drop the future before cooperative cancellation runs.
+/// The guard remains armed until the child is reaped.
 struct ProcessGroupGuard {
-    /// `Some(pgid)` while armed; `None` once the group is reaped. On Unix `pgid == child pid`
-    /// because the child is spawned with `process_group(0)`.
+    /// Process group id while the guard is armed.
     pgid: Option<i32>,
     run_id: Arc<str>,
 }
@@ -438,7 +444,7 @@ impl ProcessGroupGuard {
         Self { pgid, run_id }
     }
 
-    /// Disarm after the child has been waited on (group already reaped).
+    /// Disarms the guard after process-group cleanup.
     fn disarm(&mut self) {
         self.pgid = None;
     }
@@ -467,11 +473,9 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
-/// Kill of the entire process group led by `child`.
+/// Kills the complete process group led by `child`.
 ///
-/// On Unix: `killpg(pid, SIGKILL)` via `libc::kill(-pid, SIGKILL)`
-///
-/// On other platforms: falls back to `child.kill()` (single PID only).
+/// Other platforms fall back to the leader process.
 async fn kill_process_group(child: &mut tokio::process::Child, run_id: &str) {
     #[cfg(unix)]
     {
@@ -503,7 +507,7 @@ async fn kill_process_group(child: &mut tokio::process::Child, run_id: &str) {
     }
 }
 
-/// Create a 0600 script tempfile and write its body.
+/// Adds operation context to an I/O error.
 fn io_with_context(context: &str, source: std::io::Error) -> std::io::Error {
     std::io::Error::new(source.kind(), format!("{context}: {source}"))
 }
@@ -542,6 +546,9 @@ fn task_io_error(context: &str, source: std::io::Error) -> TaskError {
     }
 }
 
+/// Creates a script temporary file and writes its body.
+///
+/// Unix files use mode `0600`.
 fn write_script_tempfile(
     dir: &std::path::Path,
     body: &str,
@@ -564,10 +571,9 @@ fn write_script_tempfile(
     Ok(tmp)
 }
 
-/// Materialize the decoded script body into a tempfile, off the async runtime.
+/// Writes one attempt's script file outside the async runtime.
 ///
-/// Called once per attempt from [`run_subprocess`]; the disk I/O (create +
-/// File I/O runs through `spawn_blocking`. A write failure ends the attempt.
+/// A creation or write failure ends the attempt.
 async fn materialize_script(
     ctx: &TaskExecContext,
     body: Arc<str>,
@@ -593,7 +599,7 @@ async fn materialize_script(
     }
 }
 
-/// Prepare backend resources (cgroup directories) before spawn.
+/// Prepares the attempt cgroup outside the async runtime.
 async fn prepare_backend(
     ctx: &TaskExecContext,
     cgroup_name: Option<String>,
@@ -627,7 +633,7 @@ async fn prepare_backend(
     }
 }
 
-/// Apply backend configuration (rlimits, cgroup join, security) to the command.
+/// Attaches rlimits, cgroup membership, and security controls.
 fn apply_backend(
     cmd: &mut Command,
     ctx: &TaskExecContext,
@@ -638,7 +644,7 @@ fn apply_backend(
     }
 }
 
-/// Evaluate subprocess exit status.
+/// Maps process exit status to the task result.
 fn evaluate_exit(
     status: std::process::ExitStatus,
     task_cfg: &SubprocessTaskConfig,
@@ -656,7 +662,7 @@ fn evaluate_exit(
     }
 }
 
-/// Cgroup cleanup that also survives a dropped task future.
+/// Removes an attempt cgroup after completion or future drop.
 struct CgroupGuard(Option<PathBuf>);
 
 impl CgroupGuard {
@@ -712,9 +718,12 @@ async fn cleanup_cgroup(path: PathBuf) {
     }
 }
 
+#[cfg(not(test))]
 const LOG_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const LOG_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Execute a subprocess task with cancellation support, metrics, and cleanup.
+/// Executes one subprocess attempt.
 async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Result<(), TaskError> {
     let attempt = ctx.attempt.fetch_add(1, Ordering::Relaxed) + 1;
     let sink = ctx
@@ -891,6 +900,44 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    async fn wait_for_recorded_pid(marker: &std::path::Path) -> Option<i32> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(value) = std::fs::read_to_string(marker)
+                    && let Some(line) = value.trim().lines().next()
+                    && let Ok(pid) = line.parse()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .ok()
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_gone(pid: i32) {
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if unsafe { libc::kill(pid, 0) } != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+
+        if !stopped {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            panic!("descendant process {pid} survived cleanup");
+        }
+    }
+
     fn mk_backoff() -> solti_model::BackoffPolicy {
         solti_model::BackoffPolicy {
             jitter: solti_model::JitterPolicy::Equal,
@@ -1045,18 +1092,6 @@ mod tests {
         assert_eq!(args, vec!["/tmp/solti-script-x", "hello"]);
     }
 
-    #[test]
-    fn build_command_sets_env() {
-        let mut ctx = make_exec_ctx();
-        ctx.task_cfg.env.insert("FOO".into(), "bar".into());
-        let cmd = build_command(&ctx, None);
-        let envs: Vec<_> = cmd.as_std().get_envs().collect();
-        assert!(
-            envs.iter()
-                .any(|(k, v)| *k == "FOO" && *v == Some(std::ffi::OsStr::new("bar")))
-        );
-    }
-
     fn env_of(cmd: &Command) -> std::collections::HashMap<String, Option<String>> {
         cmd.as_std()
             .get_envs()
@@ -1136,20 +1171,19 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_exit_success() {
+    fn evaluate_exit_respects_fail_on_non_zero() {
         use std::process::Command as StdCommand;
-        let status = StdCommand::new("true").status().unwrap();
-        let cfg = make_task_cfg();
-        assert!(evaluate_exit(status, &cfg).is_ok());
-    }
 
-    #[test]
-    fn evaluate_exit_non_zero_with_fail_flag() {
-        use std::process::Command as StdCommand;
-        let status = StdCommand::new("false").status().unwrap();
+        let success = StdCommand::new("true").status().unwrap();
+        let failed = StdCommand::new("false").status().unwrap();
         let mut cfg = make_task_cfg();
+        assert!(evaluate_exit(success, &cfg).is_ok());
+
+        cfg.fail_on_non_zero = solti_model::Flag::disabled();
+        assert!(evaluate_exit(failed, &cfg).is_ok());
+
         cfg.fail_on_non_zero = solti_model::Flag::enabled();
-        let result = evaluate_exit(status, &cfg);
+        let result = evaluate_exit(failed, &cfg);
         assert!(result.is_err());
         match result.unwrap_err() {
             TaskError::Fail {
@@ -1160,15 +1194,6 @@ mod tests {
             }
             other => panic!("expected TaskError::Fail, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn evaluate_exit_non_zero_without_fail_flag() {
-        use std::process::Command as StdCommand;
-        let status = StdCommand::new("false").status().unwrap();
-        let mut cfg = make_task_cfg();
-        cfg.fail_on_non_zero = solti_model::Flag::disabled();
-        assert!(evaluate_exit(status, &cfg).is_ok());
     }
 
     #[test]
@@ -1210,29 +1235,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn workload_types_excludes_embedded() {
-        let runner = SubprocessRunner::new("test").unwrap();
-        let task = mk_embedded_spec("s");
-        assert!(
-            !runner
-                .workload_types()
-                .contains(&task.spec().workload().type_meta())
-        );
-    }
-
-    #[test]
-    fn build_task_returns_task_ref_for_script_mode() {
-        let runner = SubprocessRunner::new("test-runner").unwrap();
-        let spec = mk_script_spec("test-slot", b"echo hello", &[]);
-        let result = build_with_run_id(&runner, &spec, &BuildContext::default());
-        assert!(result.is_ok());
-    }
-
     #[tokio::test]
     async fn script_task_runs_and_streams_output() {
         use solti_model::OutputEvent;
-        use std::time::Duration;
 
         let (ctx, rx, _calls) = recording_output_context();
 
@@ -1245,20 +1250,14 @@ mod tests {
             .await
             .expect("script task must succeed");
 
-        let mut found = false;
-        for _ in 0..100 {
-            if let Ok(OutputEvent::Chunk(c)) = rx.try_recv() {
-                if std::str::from_utf8(&c.line)
-                    .unwrap_or_default()
-                    .contains("hello-script")
-                {
-                    found = true;
-                    break;
-                }
-            } else {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
+        let found = rx.try_iter().any(|event| {
+            let OutputEvent::Chunk(chunk) = event else {
+                return false;
+            };
+            std::str::from_utf8(&chunk.line)
+                .unwrap_or_default()
+                .contains("hello-script")
+        });
         assert!(
             found,
             "script output must reach the registry (tempfile materialized at run time, extra args preserved)"
@@ -1355,7 +1354,8 @@ mod tests {
 
     #[test]
     fn write_script_tempfile_fails_loudly_on_bad_dir() {
-        let bogus = std::env::temp_dir().join("solti-definitely-missing-dir-xyz");
+        let parent = tempfile::TempDir::new().unwrap();
+        let bogus = parent.path().join("missing");
         let err = write_script_tempfile(&bogus, "echo hello")
             .expect_err("nonexistent dir must fail tempfile creation");
         assert!(
@@ -1364,36 +1364,19 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn materialize_script_writes_tempfile_off_the_runtime() {
-        let ctx = make_exec_ctx();
-        let tmp = materialize_script(&ctx, Arc::from("echo hi"))
-            .await
-            .expect("materialization must succeed");
-        let written = std::fs::read_to_string(tmp.path()).unwrap();
-        assert_eq!(written, "echo hi");
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn cancel_reaps_forked_grandchildren() {
         use std::process::Stdio;
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::time::Duration;
         use tokio::process::Command as TokioCommand;
-        use tokio::time::timeout;
 
-        static N: AtomicU32 = AtomicU32::new(0);
-        let marker = std::env::temp_dir().join(format!(
-            "solti-exec-pgid-test-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::SeqCst)
-        ));
+        let marker_dir = tempfile::TempDir::new().unwrap();
+        let marker = marker_dir.path().join("pid");
         let marker_str = marker.to_string_lossy().to_string();
 
         let script = format!(
             r#"
-            (sleep 60 & echo $! > {marker}) &
+            (sleep 60 & echo $! > "{marker}") &
             wait
             "#,
             marker = marker_str
@@ -1407,51 +1390,22 @@ mod tests {
         cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn().expect("bash must spawn");
-
-        let grandchild_pid: i32 = {
-            let mut attempts = 0;
-            loop {
-                if let Ok(s) = std::fs::read_to_string(&marker)
-                    && let Some(line) = s.trim().lines().next()
-                    && let Ok(pid) = line.parse::<i32>()
-                {
-                    break pid;
-                }
-                attempts += 1;
-                if attempts > 50 {
-                    panic!("grandchild never reported its pid via marker");
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        };
-
-        let alive = unsafe { libc::kill(grandchild_pid, 0) };
-        assert_eq!(alive, 0, "grandchild must be alive before cancel");
-
-        kill_process_group(&mut child, "test").await;
-        let _ = timeout(Duration::from_secs(2), child.wait()).await;
-
-        let mut caught = false;
-        for _ in 0..50 {
-            let rc = unsafe { libc::kill(grandchild_pid, 0) };
-            if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                caught = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        let _ = std::fs::remove_file(&marker);
-
-        if !caught {
-            unsafe { libc::kill(grandchild_pid, libc::SIGKILL) };
-            panic!(
-                "grandchild PID {} survived cancel — process-group kill did not reach it",
-                grandchild_pid
+        let grandchild_pid = wait_for_recorded_pid(&marker).await;
+        if let Some(pid) = grandchild_pid {
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                0,
+                "grandchild must be alive before cancel"
             );
         }
+
+        kill_process_group(&mut child, "test").await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+        let grandchild_pid = grandchild_pid.expect("grandchild did not report its pid");
+        assert_process_gone(grandchild_pid).await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn dropping_the_future_kills_the_whole_process_group() {
         // taskvisor enforces a per-attempt timeout via `tokio::time::timeout` and
@@ -1459,64 +1413,25 @@ mod tests {
         // polling the cooperative `cancel.cancelled()` branch. `kill_on_drop(true)`
         // only SIGKILLs the leader pid; forked grandchildren would be orphaned.
         // The subtree must still be reaped on drop.
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        static N: AtomicU32 = AtomicU32::new(0);
-        let marker = std::env::temp_dir().join(format!(
-            "solti-exec-droppgid-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::SeqCst)
-        ));
+        let marker_dir = tempfile::TempDir::new().unwrap();
+        let marker = marker_dir.path().join("pid");
         let marker_str = marker.to_string_lossy().to_string();
 
         // Fork a long-lived grandchild, record its pid, then block forever.
-        let script = format!(r#"(sleep 60 & echo $! > {marker_str}) ; sleep 60"#);
+        let script = format!(r#"(sleep 60 & echo $! > "{marker_str}") ; sleep 60"#);
 
         let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_subprocess_spec_with_args("drop-slot", "bash", &["-c", &script]);
         let task_ref = build_with_run_id(&runner, &spec, &BuildContext::default()).unwrap();
 
-        // Run, then DROP the future via timeout — exactly what taskvisor does.
         let cancel = TaskContext::detached();
-        let _ = timeout(Duration::from_millis(500), task_ref.spawn(cancel)).await;
+        let handle = tokio::spawn(async move { task_ref.spawn(cancel).await });
+        let grandchild_pid = wait_for_recorded_pid(&marker).await;
 
-        let grandchild_pid: i32 = {
-            let mut attempts = 0;
-            loop {
-                if let Ok(s) = std::fs::read_to_string(&marker)
-                    && let Some(line) = s.trim().lines().next()
-                    && let Ok(pid) = line.parse::<i32>()
-                {
-                    break pid;
-                }
-                attempts += 1;
-                if attempts > 50 {
-                    panic!("grandchild never reported its pid via marker");
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        };
-
-        let mut caught = false;
-        for _ in 0..50 {
-            let rc = unsafe { libc::kill(grandchild_pid, 0) };
-            if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                caught = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        let _ = std::fs::remove_file(&marker);
-
-        if !caught {
-            unsafe { libc::kill(grandchild_pid, libc::SIGKILL) };
-            panic!(
-                "grandchild PID {grandchild_pid} survived the dropped future — the process subtree was orphaned"
-            );
-        }
+        handle.abort();
+        let _ = handle.await;
+        let grandchild_pid = grandchild_pid.expect("grandchild did not report its pid");
+        assert_process_gone(grandchild_pid).await;
     }
 
     #[test]
@@ -1534,7 +1449,6 @@ mod tests {
     #[tokio::test]
     async fn subprocess_streams_stdout_into_output_publisher() {
         use solti_model::OutputEvent;
-        use std::time::Duration;
 
         let (ctx, rx, calls) = recording_output_context();
 
@@ -1544,20 +1458,19 @@ mod tests {
         let cancel = TaskContext::detached();
         task_ref.spawn(cancel).await.expect("echo must succeed");
 
-        let mut found_line = None;
-        for _ in 0..100 {
-            if let Ok(OutputEvent::Chunk(c)) = rx.try_recv() {
-                let line_text = std::str::from_utf8(&c.line).unwrap_or_default();
-                if line_text.contains("hello-stream") {
-                    found_line = Some(c);
-                    break;
+        let chunk = rx
+            .try_iter()
+            .find_map(|event| match event {
+                OutputEvent::Chunk(chunk)
+                    if std::str::from_utf8(&chunk.line)
+                        .unwrap_or_default()
+                        .contains("hello-stream") =>
+                {
+                    Some(chunk)
                 }
-            } else {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-
-        let chunk = found_line.expect("expected to receive 'hello-stream' line");
+                _ => None,
+            })
+            .expect("expected to receive 'hello-stream' line");
         assert_eq!(chunk.attempt, 1);
         assert_eq!(chunk.generation, 1);
         assert_eq!(chunk.stream, solti_model::StreamKind::Stdout);
@@ -1571,7 +1484,6 @@ mod tests {
     #[tokio::test]
     async fn subprocess_attempt_counter_increments_on_each_spawn() {
         use solti_model::OutputEvent;
-        use std::time::Duration;
 
         let (ctx, rx, _calls) = recording_output_context();
         let runner = SubprocessRunner::new("test-runner").unwrap();
@@ -1581,18 +1493,14 @@ mod tests {
         task_ref.spawn(ctx.clone()).await.unwrap();
         task_ref.spawn(ctx).await.unwrap();
 
-        let mut attempts = std::collections::BTreeSet::new();
-        for _ in 0..200 {
-            match rx.try_recv() {
-                Ok(OutputEvent::Chunk(c)) => {
-                    attempts.insert(c.attempt);
-                }
-                Ok(_) => {}
-                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
-            }
-        }
-        assert!(attempts.contains(&1), "attempt 1 missing: {attempts:?}");
-        assert!(attempts.contains(&2), "attempt 2 missing: {attempts:?}");
+        let attempts: std::collections::BTreeSet<_> = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                OutputEvent::Chunk(chunk) => Some(chunk.attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attempts, std::collections::BTreeSet::from([1, 2]));
     }
 
     #[tokio::test]
@@ -1615,44 +1523,27 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn run_subprocess_does_not_hang_on_daemonized_grandchild_holding_pipe() {
-        use std::time::{Duration, Instant};
-
+    async fn daemonized_grandchild_cannot_hold_output_open() {
         let runner = SubprocessRunner::new("hang-runner").unwrap();
         let spec = mk_subprocess_spec_with_args("hang-slot", "sh", &["-c", "sleep 30 & exit 0"]);
         let task_ref = build_with_run_id(&runner, &spec, &BuildContext::default()).unwrap();
 
-        let started = Instant::now();
         let ctx = TaskContext::detached();
-        let res = tokio::time::timeout(Duration::from_secs(20), task_ref.spawn(ctx)).await;
-
-        assert!(
-            res.is_ok(),
-            "run_subprocess hung past the bounded log-drain grace (daemonized grandchild)"
-        );
-        res.unwrap().expect("leader exited 0; task should succeed");
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "run_subprocess took too long: {:?}",
-            started.elapsed()
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), task_ref.spawn(ctx))
+            .await
+            .expect("output drain must be bounded")
+            .expect("leader exited successfully");
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn successful_task_kills_descendants_with_detached_output() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::time::Duration;
-
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let marker = std::env::temp_dir().join(format!(
-            "solti-exec-detached-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let marker_dir = tempfile::TempDir::new().unwrap();
+        let marker = marker_dir.path().join("pid");
         let script = format!(
-            "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > {}; exit 0",
+            "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > \"{}\"; exit 0",
             marker.display()
         );
 
@@ -1661,27 +1552,10 @@ mod tests {
         let task = build_with_run_id(&runner, &spec, &BuildContext::default()).unwrap();
         task.spawn(TaskContext::detached()).await.unwrap();
 
-        let pid = std::fs::read_to_string(&marker)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
-        let mut stopped = false;
-        for _ in 0..50 {
-            if unsafe { libc::kill(pid, 0) } != 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
-                stopped = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let _ = std::fs::remove_file(marker);
-
-        if !stopped {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            panic!("descendant {pid} survived successful task completion");
-        }
+        let pid = wait_for_recorded_pid(&marker)
+            .await
+            .expect("descendant did not report its pid");
+        assert_process_gone(pid).await;
     }
 
     #[test]

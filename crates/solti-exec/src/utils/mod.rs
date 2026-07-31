@@ -1,7 +1,8 @@
-//! Process limits and Linux security used by the subprocess backend.
+//! # Process controls
 //!
-//! Configuration is prepared in the parent. Child hooks perform only the
-//! syscalls required between `fork` and `execve`.
+//! This module implements rlimits, cgroup v2, and Linux security.
+//! Configuration is prepared before process creation.
+//! Child hooks apply the final controls between `fork` and `execve`.
 
 mod cgroups;
 pub use cgroups::{CgroupLimits, CpuMax};

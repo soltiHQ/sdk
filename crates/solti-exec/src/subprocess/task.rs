@@ -1,7 +1,7 @@
-//! Resolved configuration for one subprocess task.
+//! # Resolved subprocess task
 //!
-//! The runner builds this value from the resource and [`BuildContext`](solti_runner::BuildContext).
-//! Attempts reuse it without reading mutable model state.
+//! The runner resolves a resource and [`BuildContext`](solti_runner::BuildContext) into immutable settings.
+//! Every attempt reuses those settings.
 
 use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Arc};
 
@@ -9,36 +9,31 @@ use solti_model::Flag;
 
 use crate::subprocess::backend::validate_env_name;
 
-/// Subprocess configuration - fully resolved per-task parameters.
-///
-/// ## Also
-///
-/// - [`SubprocessRunner`](super::SubprocessRunner) produces this config in `build_task`.
-/// - [`SubprocessBackendConfig`](super::SubprocessBackendConfig) runner-level settings applied at spawn.
+/// Immutable settings for one subprocess task.
 #[derive(Debug, Clone)]
 pub(crate) struct SubprocessTaskConfig {
-    /// End-to-End log identifier.
+    /// Taskvisor run identifier.
     pub(crate) run_id: Arc<str>,
-    /// Raw sequence number from run id generation (used for cgroup naming).
+    /// Run sequence used in cgroup names.
     pub(crate) seq: u64,
-    /// Command to execute (e.g. `"ls"`, `"/usr/bin/python"`).
+    /// Executable name or path.
     pub(crate) command: String,
     /// Command-line arguments passed to the command.
     pub(crate) args: Vec<String>,
-    /// Environment from the resource and build context.
+    /// Merged task and runner environment.
     pub(crate) env: BTreeMap<String, String>,
-    /// Working directory for the subprocess.
+    /// Initial working directory.
     ///
     /// If `None`, the subprocess inherits the parent process working directory.
     pub(crate) cwd: Option<PathBuf>,
-    /// Whether non-zero exit codes should be treated as task failures.
+    /// Whether a non-zero exit is a retryable task failure.
     pub(crate) fail_on_non_zero: Flag,
 }
 
 impl SubprocessTaskConfig {
-    /// Validate the configuration before spawning a subprocess.
+    /// Validates values passed to the operating system.
     ///
-    /// Rejects empty commands and values that cannot be passed to `execve`.
+    /// Empty commands and embedded NUL bytes are rejected.
     pub fn validate(&self) -> Result<(), String> {
         if self.command.trim().is_empty() {
             return Err("subprocess command is empty".into());

@@ -1,39 +1,21 @@
-//! # Log: async-signal-safe logging for `pre_exec` hooks.
+//! # Pre-exec logging
 //!
-//! Provides two helpers that can be called **between `fork()` and `execve()`** where only async-signal-safe functions are allowed.
+//! Unix `pre_exec` hooks can use only async-signal-safe operations.
+//! These helpers write diagnostics directly to stderr.
 //!
-//! ## API
+//! ## Flow
 //!
-//! | Function              | What it writes           | Heap? |
-//! |-----------------------|--------------------------|-------|
-//! | [`pre_exec_log`]      | raw `&[u8]` to stderr    | no    |
-//! | [`pre_exec_log_errno`]| `errno=<N>\n` to stderr  | no    |
-//!
-//! ## How it works
 //! ```text
-//! pre_exec_log(b"solti-exec: capget failed: ")
-//!     │
-//!     ├──► Unix:
-//!     │     └──► libc::write(STDERR_FILENO, ptr, len)
-//!     │          one syscall, no heap, no locks
-//!     │
-//!     └──► non-Unix:
-//!           └──► std::io::stderr().write_all(msg)
-//!
-//! pre_exec_log_errno(errno)
-//!     │
-//!     ├──► inline stack-only int→ASCII into a `[u8; 32]` buffer
-//!     │     └──► handles 0, negative (via `unsigned_abs`), multi-digit
-//!     │
-//!     └──► write "errno=" + digits + "\n" via 3 × libc::write
+//! pre_exec hook
+//!      ├── message ──► libc::write(stderr)
+//!      └── errno ────► stack conversion ──► libc::write(stderr)
 //! ```
 //!
-//! ## Rules
-//! - **Zero heap allocation**: all buffers are stack-local `[u8; N]`
-//! - Return values from `libc::write` are intentionally ignored (best-effort)
-//! - Non-Unix: falls back to `std::io::stderr` (safe, pre_exec doesn't exist there)
+//! Writes are best-effort.
+//! Unix paths do not allocate.
+//! Other platforms use standard stderr writes.
 
-/// Write a raw `&[u8]` message to stderr (async-signal-safe on Unix).
+/// Writes raw bytes to stderr on Unix.
 #[cfg(unix)]
 pub(crate) fn pre_exec_log(msg: &[u8]) {
     // SAFETY:
@@ -48,7 +30,7 @@ pub(crate) fn pre_exec_log(msg: &[u8]) {
     }
 }
 
-/// Write a raw `&[u8]` message to stderr (non-Unix fallback).
+/// Writes raw bytes to stderr on other platforms.
 #[cfg(not(unix))]
 pub(crate) fn pre_exec_log(msg: &[u8]) {
     use std::io::Write;
@@ -56,9 +38,9 @@ pub(crate) fn pre_exec_log(msg: &[u8]) {
     let _ = std::io::stderr().write_all(msg);
 }
 
-/// Write `errno=<N>\n` to stderr (async-signal-safe on Unix).
+/// Writes `errno=<N>` and a newline to stderr on Unix.
 ///
-/// Uses a stack-local `[u8; 32]` buffer for int→ASCII conversion.
+/// Integer conversion uses a stack buffer.
 #[cfg(unix)]
 pub(crate) fn pre_exec_log_errno(errno: i32) {
     let mut buf = [0u8; 32];
@@ -107,7 +89,7 @@ pub(crate) fn pre_exec_log_errno(errno: i32) {
     }
 }
 
-/// Write `errno=<N>\n` to stderr (non-Unix fallback).
+/// Writes `errno=<N>` and a newline to stderr on other platforms.
 #[cfg(not(unix))]
 pub(crate) fn pre_exec_log_errno(errno: i32) {
     use std::io::Write;

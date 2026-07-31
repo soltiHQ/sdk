@@ -1,24 +1,49 @@
-//! Linux process security used by the subprocess backend.
+//! # Linux process security
 //!
-//! Configured controls are fail-closed. A child is not started when a requested
-//! namespace, identity, capability, or seccomp control cannot be applied.
+//! [`SecurityConfig`] applies process controls before `execve`.
+//!
+//! ## Enabled Control Order
+//!
+//! ```text
+//! fork
+//!   ▼
+//! create namespaces
+//!   ▼
+//! reduce capability bounding set
+//!   ▼
+//! set gid and uid
+//!   ▼
+//! set effective and ambient capabilities
+//!   ▼
+//! no_new_privs
+//!   ▼
+//! seccomp
+//!   ▼
+//! execve
+//! ```
+//!
+//! Configured controls are fail-closed.
+//! A failed control prevents the child from starting.
+//! A non-empty policy is rejected on non-Linux platforms.
 
 use tokio::process::Command;
 
 use crate::utils::LinuxCapability;
 
 /// Linux namespaces created for the child before `execve`.
+///
+/// PID and user namespaces are not configured by this type.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Namespaces {
-    /// Isolate mount propagation.
+    /// Creates a mount namespace and makes mount propagation private.
     pub mount: bool,
-    /// Isolate the network stack.
+    /// Creates a network namespace.
     pub net: bool,
-    /// Isolate System V IPC and POSIX message queues.
+    /// Creates an IPC namespace.
     pub ipc: bool,
-    /// Isolate hostname and domain name.
+    /// Creates a UTS namespace.
     pub uts: bool,
-    /// Virtualize the cgroup root.
+    /// Creates a cgroup namespace.
     pub cgroup: bool,
 }
 
@@ -51,32 +76,51 @@ impl Namespaces {
     }
 }
 
-/// seccomp-bpf policy applied before `execve`.
+/// Seccomp policy applied before `execve`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SeccompPolicy {
-    /// Do not install a syscall filter.
+    /// Does not install a syscall filter.
     #[default]
     Disabled,
-    /// Allow syscalls by default and reject known host-control syscalls with `EPERM`.
+    /// Rejects a fixed host-control syscall denylist with `EPERM`.
+    ///
+    /// Other syscalls remain allowed.
+    /// This variant requires feature `seccomp`.
+    /// It supports Linux on `x86_64` and `aarch64`.
     BlockDangerous,
 }
 
 /// Security policy for a subprocess.
+///
+/// Non-empty settings require Linux.
+/// A failed control prevents process start.
+///
+/// | Field           | Effect                                                |
+/// |-----------------|-------------------------------------------------------|
+/// | `namespaces`    | Creates selected Linux namespaces                     |
+/// | `run_as_gid`    | Clears supplementary groups and changes group id      |
+/// | `run_as_uid`    | Clears supplementary groups and changes user id       |
+/// | `drop_all_caps` | Removes capabilities not listed in `keep_caps`        |
+/// | `no_new_privs`  | Prevents privilege gain through `execve`              |
+/// | `seccomp`       | Installs the selected syscall policy                  |
+///
+/// `keep_caps` requires `drop_all_caps`.
+/// Requested capabilities must already be available to the agent process.
 #[derive(Debug, Clone, Default)]
 pub struct SecurityConfig {
-    /// Drop every Linux capability except entries in [`Self::keep_caps`].
+    /// Drops every Linux capability not listed in [`Self::keep_caps`].
     pub drop_all_caps: bool,
-    /// Capabilities retained when [`Self::drop_all_caps`] is enabled.
+    /// Capabilities retained by [`Self::drop_all_caps`].
     pub keep_caps: Vec<LinuxCapability>,
-    /// Prevent the child from gaining privileges through `execve`.
+    /// Prevents privilege gain through `execve`.
     pub no_new_privs: bool,
-    /// Clear supplementary groups and switch to this group id.
+    /// Clears supplementary groups and changes to this group id.
     pub run_as_gid: Option<u32>,
-    /// Clear supplementary groups and switch to this user id.
+    /// Clears supplementary groups and changes to this user id.
     pub run_as_uid: Option<u32>,
-    /// Namespaces created before the identity and capability changes.
+    /// Namespaces created before identity and capability changes.
     pub namespaces: Namespaces,
-    /// Syscall filter installed immediately before `execve`.
+    /// Syscall policy installed immediately before `execve`.
     pub seccomp: SeccompPolicy,
 }
 
@@ -498,11 +542,20 @@ mod tests {
 
     #[test]
     fn keep_capabilities_require_drop_policy() {
-        let config = SecurityConfig {
+        let invalid = SecurityConfig {
             keep_caps: vec![LinuxCapability::NetBindService],
             ..Default::default()
         };
-        assert!(config.validate().is_err());
+        let error = invalid.validate().unwrap_err().to_string();
+        assert!(error.contains("keep_caps"));
+        assert!(error.contains("drop_all_caps"));
+
+        let valid = SecurityConfig {
+            drop_all_caps: true,
+            keep_caps: vec![LinuxCapability::NetBindService],
+            ..Default::default()
+        };
+        assert!(valid.validate().is_ok());
     }
 
     #[test]
@@ -517,16 +570,6 @@ mod tests {
         assert!(mask.is_set(21));
         assert!(!mask.is_set(1));
         assert!(!mask.is_set(64));
-    }
-
-    #[test]
-    fn namespace_policy_has_no_pid_namespace_flag() {
-        let namespaces = Namespaces {
-            mount: true,
-            net: true,
-            ..Default::default()
-        };
-        assert!(!namespaces.is_empty());
     }
 
     #[cfg(target_os = "linux")]

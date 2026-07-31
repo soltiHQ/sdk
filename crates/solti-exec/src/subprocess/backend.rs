@@ -1,7 +1,26 @@
-//! Runner-wide subprocess settings.
+//! # Subprocess backend
 //!
-//! [`SubprocessBackendConfig`] collects rlimits, cgroup v2, security, logging,
-//! and environment settings applied to every subprocess spawned by a runner.
+//! [`SubprocessBackendConfig`] contains settings shared by one runner.
+//! Each spawned process receives those settings.
+//!
+//! ## Flow
+//!
+//! ```text
+//! SubprocessBackendConfig
+//!      │ runner construction
+//!      ├── validate platform and values
+//!      └── resolve cwd roots and cgroup parent
+//!                 │
+//!                 ▼
+//!          each task attempt
+//!      ├── build environment and cwd
+//!      ├── prepare cgroup
+//!      ├── attach rlimits and security
+//!      └── stream output
+//! ```
+//!
+//! Configuration setters do not perform validation.
+//! [`SubprocessRunner::with_config`](super::SubprocessRunner::with_config) validates the complete configuration.
 
 use std::path::{Path, PathBuf};
 
@@ -15,8 +34,7 @@ use crate::subprocess::logger::LogConfig;
 use crate::utils::{CgroupLimits, PreparedCgroup, RlimitConfig, SecurityConfig};
 use crate::utils::{attach_cgroup, attach_rlimits, attach_security};
 
-/// Minimal `PATH` injected when the environment is cleared and the task did not
-/// set its own. Without it, a bare command name (`echo`) would fail to resolve.
+/// Minimal `PATH` used for a cleared environment.
 pub(crate) const SAFE_DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 pub(crate) fn validate_env_name(name: &str) -> Result<(), String> {
@@ -34,27 +52,37 @@ pub(crate) fn validate_env_name(name: &str) -> Result<(), String> {
 /// How the child process's environment is built.
 ///
 /// The default is [`Clear`](Self::Clear).
+/// Task and runner values are applied after this policy.
+/// Runner values win on duplicate keys.
 #[derive(Debug, Clone, Default)]
 pub enum EnvPolicy {
-    /// Inherit the process environment, then apply task variables.
+    /// Inherit the agent environment.
     Inherit,
-    /// Use task variables and a safe default `PATH` only.
+    /// Clear the agent environment.
+    ///
+    /// A safe `PATH` is added when the merged task environment does not set one.
     #[default]
     Clear,
-    /// Pass only the named process variables, task variables, and `PATH`.
+    /// Copy only the named variables from the agent environment.
+    ///
+    /// A safe `PATH` is added when the allowlist does not name `PATH` and the merged values do not set it.
+    /// Invalid environment names are rejected when the runner is created.
     Allowlist(Vec<String>),
 }
 
 /// Where a task is allowed to set its working directory.
 ///
 /// [`Roots`](Self::Roots) checks the starting directory at build time.
-/// It does not restrict files the process can open after it starts.
+/// This policy does not restrict later file access.
 #[derive(Debug, Clone, Default)]
 pub enum CwdPolicy {
-    /// Allow any `cwd` in the task spec.
+    /// Accept any task working directory.
     #[default]
     Unrestricted,
-    /// Require `cwd` to resolve inside one of these directories.
+    /// Require an explicit task working directory under one of these roots.
+    ///
+    /// Roots are canonicalized when the runner is created.
+    /// The task directory is canonicalized when the task is built.
     Roots(Vec<PathBuf>),
 }
 
@@ -91,12 +119,9 @@ impl CwdPolicy {
         Ok(())
     }
 
-    /// Check a task-provided `cwd` against the policy.
+    /// Checks a task working directory against the policy.
     ///
-    /// Under [`Unrestricted`](Self::Unrestricted) anything is allowed. Under
-    /// [`Roots`](Self::Roots) the `cwd` is required and is canonicalized first,
-    /// which resolves symlinks and `..` so a crafted path cannot traverse out
-    /// of an allowed root at validation time.
+    /// Canonicalization resolves symlinks and `..` before root comparison.
     fn check(&self, cwd: Option<&Path>) -> Result<(), String> {
         let CwdPolicy::Roots(roots) = self else {
             return Ok(());
@@ -126,6 +151,38 @@ impl CwdPolicy {
 }
 
 /// Resource, security, environment, and output settings for a runner.
+///
+/// | Setting                  | Default                          |
+/// |--------------------------|----------------------------------|
+/// | POSIX rlimits            | Disabled                         |
+/// | Linux cgroup v2          | Disabled                         |
+/// | Linux security           | Disabled                         |
+/// | Environment              | [`EnvPolicy::Clear`]             |
+/// | Working directory        | [`CwdPolicy::Unrestricted`]      |
+/// | Output logging           | [`LogConfig::default`]           |
+/// | Decoded script body      | [`MAX_SCRIPT_BODY_BYTES`]        |
+///
+/// Non-empty rlimits require Unix.
+/// Cgroups and security controls require Linux.
+///
+/// ## Example
+///
+/// ```rust
+/// use solti_exec::subprocess::{EnvPolicy, LogConfig, SubprocessBackendConfig};
+///
+/// let backend = SubprocessBackendConfig::new()
+///     .with_env_policy(EnvPolicy::Clear)
+///     .with_logger(LogConfig {
+///         max_line_length: 2048,
+///         ..Default::default()
+///     })
+///     .with_max_script_body_bytes(256 * 1024);
+/// ```
+///
+/// ## See Also
+///
+/// - [`SubprocessRunner::with_config`](super::SubprocessRunner::with_config)
+/// - [`register_subprocess_runner_with_backend`](super::register_subprocess_runner_with_backend)
 #[derive(Debug, Clone, Default)]
 pub struct SubprocessBackendConfig {
     /// POSIX rlimit-based resource limits.
@@ -136,103 +193,113 @@ pub struct SubprocessBackendConfig {
     cgroup_parent: Option<PathBuf>,
     /// Security hardening.
     security: Option<SecurityConfig>,
-    /// How the child environment is built. Default [`EnvPolicy::Clear`].
+    /// How the child environment is built.
     env_policy: EnvPolicy,
-    /// Where a task may set its working directory. Default [`CwdPolicy::Unrestricted`].
+    /// Where a task may set its working directory.
     cwd_policy: CwdPolicy,
     /// Subprocess output logging configuration.
     logger: LogConfig,
-    /// Maximum decoded script-body size for `Script`-mode subprocesses.
-    /// `None` uses the model default [`MAX_SCRIPT_BODY_BYTES`].
+    /// Maximum decoded script size.
     max_script_body_bytes: Option<usize>,
 }
 
 impl SubprocessBackendConfig {
-    /// Create an empty backend config (no limits).
+    /// Creates the default backend configuration.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Set rlimits.
+    /// Sets POSIX process limits.
+    ///
+    /// A non-empty configuration requires Unix.
     pub fn with_rlimits(mut self, rlimits: RlimitConfig) -> Self {
         self.rlimits = Some(rlimits);
         self
     }
 
-    /// Set cgroup limits.
+    /// Sets Linux cgroup v2 limits.
+    ///
+    /// This setting requires Linux.
+    /// At least one limit field is required.
+    /// Explicit numeric values must be greater than zero.
     pub fn with_cgroups(mut self, cgroups: CgroupLimits) -> Self {
         self.cgroups = Some(cgroups);
         self
     }
 
-    /// Set the cgroup v2 parent directory.
+    /// Sets the cgroup v2 parent directory.
     ///
-    /// When omitted, the runner creates child groups under the process's current
-    /// delegated cgroup.
+    /// The path must be absolute and identify an existing cgroup v2 directory.
+    /// Without this setting, the current process cgroup is used.
+    ///
+    /// This setting requires [`with_cgroups`](Self::with_cgroups).
     pub fn with_cgroup_parent(mut self, parent: impl Into<PathBuf>) -> Self {
         self.cgroup_parent = Some(parent.into());
         self
     }
 
-    /// Set security hardening.
+    /// Sets Linux process security controls.
+    ///
+    /// A non-empty policy requires Linux.
+    /// [`SeccompPolicy::BlockDangerous`](crate::SeccompPolicy::BlockDangerous) also requires feature `seccomp`.
     pub fn with_security(mut self, security: SecurityConfig) -> Self {
         self.security = Some(security);
         self
     }
 
-    /// Set the environment policy for spawned children.
+    /// Sets the child environment policy.
     pub fn with_env_policy(mut self, policy: EnvPolicy) -> Self {
         self.env_policy = policy;
         self
     }
 
-    /// Restrict where a task may set its working directory (default
-    /// [`CwdPolicy::Unrestricted`]).
+    /// Sets the task working-directory policy.
     ///
-    /// Use [`CwdPolicy::Roots`] to confine tasks to a set of directories; a spec
-    /// whose `cwd` escapes them is rejected at build time.
+    /// [`CwdPolicy::Roots`] rejects a task outside the configured roots.
     pub fn with_cwd_policy(mut self, policy: CwdPolicy) -> Self {
         self.cwd_policy = policy;
         self
     }
 
-    /// Validate a task-provided `cwd` against the configured [`CwdPolicy`].
+    /// Validates a task working directory against the configured policy.
     pub(crate) fn check_cwd(&self, cwd: Option<&Path>) -> Result<(), String> {
         self.cwd_policy.check(cwd)
     }
 
-    /// Set logger configuration.
+    /// Sets subprocess output configuration.
+    ///
+    /// Both size limits must be greater than zero.
     pub fn with_logger(mut self, config: LogConfig) -> Self {
         self.logger = config;
         self
     }
 
-    /// Tighten the maximum decoded script-body size (default [`MAX_SCRIPT_BODY_BYTES`]).
+    /// Sets the maximum decoded script size.
     ///
-    /// Applies to `Script`-mode subprocesses: a body whose decoded size exceeds this is rejected at build time.
-    /// Zero and values above the hard 2 MiB model limit are rejected when the
-    /// runner config is validated.
+    /// The value must be between `1` and [`MAX_SCRIPT_BODY_BYTES`].
+    /// It can lower the model limit but cannot raise it.
+    /// Oversized scripts are rejected when the task is built.
     pub fn with_max_script_body_bytes(mut self, max: usize) -> Self {
         self.max_script_body_bytes = Some(max);
         self
     }
 
-    /// Effective maximum decoded script-body size (falls back to [`MAX_SCRIPT_BODY_BYTES`]).
+    /// Returns the effective decoded script limit.
     pub(crate) fn max_script_body_bytes(&self) -> usize {
         self.max_script_body_bytes.unwrap_or(MAX_SCRIPT_BODY_BYTES)
     }
 
-    /// Environment policy applied to a child.
+    /// Returns the child environment policy.
     pub(crate) fn env_policy(&self) -> &EnvPolicy {
         &self.env_policy
     }
 
-    /// Get log configuration.
+    /// Returns subprocess output configuration.
     pub(crate) fn log_config(&self) -> &LogConfig {
         &self.logger
     }
 
-    /// Validate and normalize the configuration once at runner construction.
+    /// Validates and normalizes the complete configuration.
     pub(crate) fn prepare(mut self) -> Result<Self, crate::ExecError> {
         self.cwd_policy.prepare()?;
 
@@ -304,14 +371,14 @@ impl SubprocessBackendConfig {
         Ok(self)
     }
 
-    /// Check if cgroup limits are configured.
+    /// Returns `true` when cgroup limits are configured.
     pub(crate) fn has_cgroups(&self) -> bool {
         self.cgroups.is_some()
     }
 
-    /// Prepare cgroup directory and write limit files (before spawn).
+    /// Creates the attempt cgroup and writes its limits.
     ///
-    /// Must be called before `apply_to_command`.
+    /// This must run before [`apply_to_command`](Self::apply_to_command).
     pub(crate) fn prepare_cgroups(
         &self,
         cgroup_name: &str,
@@ -331,14 +398,10 @@ impl SubprocessBackendConfig {
         }
     }
 
-    /// Apply all configured backend features to a `tokio::process::Command`.
+    /// Attaches configured controls to a command.
     ///
-    /// This method mutates the command by attaching pre_exec hooks for:
-    /// - cgroups (join only — directory must be created via [`prepare_cgroups`] first)
-    /// - security policies
-    /// - rlimits
-    ///
-    /// Call this immediately before spawning the subprocess.
+    /// The hooks apply rlimits, cgroup membership, and security before `execve`.
+    /// The cgroup must already be prepared.
     pub(crate) fn apply_to_command(
         &self,
         cmd: &mut Command,
@@ -392,90 +455,108 @@ fn validate_cgroup_limits(cgroups: &CgroupLimits) -> Result<(), crate::ExecError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::{CpuMax, LinuxCapability};
+    use crate::utils::CpuMax;
 
     #[test]
-    fn cpu_period_zero_rejected() {
-        let limits = CgroupLimits {
-            cpu: Some(CpuMax {
-                quota: Some(50_000),
-                period: 0,
-            }),
-            ..Default::default()
-        };
-        let err = validate_cgroup_limits(&limits).unwrap_err().to_string();
-        assert!(err.contains("period"), "expected period error, got: {err}");
+    fn invalid_cgroup_limits_are_rejected() {
+        let cases = [
+            ("empty", CgroupLimits::default(), "at least one limit"),
+            (
+                "zero CPU period",
+                CgroupLimits {
+                    cpu: Some(CpuMax {
+                        quota: Some(50_000),
+                        period: 0,
+                    }),
+                    ..Default::default()
+                },
+                "period",
+            ),
+            (
+                "zero CPU quota",
+                CgroupLimits {
+                    cpu: Some(CpuMax {
+                        quota: Some(0),
+                        period: 100_000,
+                    }),
+                    ..Default::default()
+                },
+                "quota",
+            ),
+            (
+                "zero memory",
+                CgroupLimits {
+                    memory: Some(0),
+                    ..Default::default()
+                },
+                "memory",
+            ),
+            (
+                "zero process count",
+                CgroupLimits {
+                    pids: Some(0),
+                    ..Default::default()
+                },
+                "pids",
+            ),
+        ];
+
+        for (case, limits, expected) in cases {
+            let error = validate_cgroup_limits(&limits).unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "{case}: expected {expected:?}, got {error:?}"
+            );
+        }
     }
 
     #[test]
-    fn cpu_quota_zero_rejected() {
-        let limits = CgroupLimits {
-            cpu: Some(CpuMax {
-                quota: Some(0),
-                period: 100_000,
-            }),
-            ..Default::default()
-        };
-        let err = validate_cgroup_limits(&limits).unwrap_err().to_string();
-        assert!(err.contains("quota"), "expected quota error, got: {err}");
-    }
-
-    #[test]
-    fn cpu_quota_may_exceed_period() {
-        let limits = CgroupLimits {
-            cpu: Some(CpuMax {
+    fn valid_cpu_limits_are_accepted() {
+        for cpu in [
+            CpuMax {
                 quota: Some(200_000),
                 period: 100_000,
-            }),
-            ..Default::default()
-        };
-        assert!(validate_cgroup_limits(&limits).is_ok());
-    }
-
-    #[test]
-    fn cpu_unlimited_quota_is_valid() {
-        let limits = CgroupLimits {
-            cpu: Some(CpuMax {
+            },
+            CpuMax {
                 quota: None,
                 period: 100_000,
-            }),
-            ..Default::default()
-        };
-        assert!(validate_cgroup_limits(&limits).is_ok());
+            },
+        ] {
+            let limits = CgroupLimits {
+                cpu: Some(cpu),
+                ..Default::default()
+            };
+            assert!(validate_cgroup_limits(&limits).is_ok());
+        }
     }
 
     #[test]
-    fn max_line_bytes_zero_rejected() {
-        let cfg = SubprocessBackendConfig::new().with_logger(LogConfig {
-            max_line_bytes: 0,
-            ..LogConfig::default()
-        });
-        let err = cfg.prepare().unwrap_err().to_string();
-        assert!(err.contains("max_line_bytes"), "got: {err}");
-    }
+    fn invalid_log_limits_are_rejected() {
+        let cases = [
+            (
+                LogConfig {
+                    max_line_length: 0,
+                    ..LogConfig::default()
+                },
+                "max_line_length",
+            ),
+            (
+                LogConfig {
+                    max_line_bytes: 0,
+                    ..LogConfig::default()
+                },
+                "max_line_bytes",
+            ),
+        ];
 
-    #[test]
-    fn keep_caps_without_drop_all_caps_rejected() {
-        let security = SecurityConfig {
-            drop_all_caps: false,
-            keep_caps: vec![LinuxCapability::NetBindService],
-            ..Default::default()
-        };
-        let err = security.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("keep_caps") && err.contains("drop_all_caps"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn keep_caps_with_drop_all_caps_is_valid() {
-        let security = SecurityConfig {
-            drop_all_caps: true,
-            keep_caps: vec![LinuxCapability::NetBindService],
-            ..Default::default()
-        };
-        assert!(security.validate().is_ok());
+        for (logger, expected) in cases {
+            let error = SubprocessBackendConfig::new()
+                .with_logger(logger)
+                .prepare()
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "got {error:?}");
+        }
     }
 
     #[test]
@@ -497,18 +578,15 @@ mod tests {
     }
 
     #[test]
-    fn max_script_body_bytes_zero_rejected() {
-        let cfg = SubprocessBackendConfig::new().with_max_script_body_bytes(0);
-        let err = cfg.prepare().unwrap_err().to_string();
-        assert!(err.contains("max_script_body_bytes"), "got: {err}");
-    }
-
-    #[test]
-    fn max_script_body_bytes_above_hard_limit_rejected() {
-        let cfg =
-            SubprocessBackendConfig::new().with_max_script_body_bytes(MAX_SCRIPT_BODY_BYTES + 1);
-        let err = cfg.prepare().unwrap_err().to_string();
-        assert!(err.contains("1..="), "got: {err}");
+    fn invalid_script_body_limits_are_rejected() {
+        for max in [0, MAX_SCRIPT_BODY_BYTES + 1] {
+            let error = SubprocessBackendConfig::new()
+                .with_max_script_body_bytes(max)
+                .prepare()
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("1..="), "limit {max}: got {error:?}");
+        }
     }
 
     #[test]

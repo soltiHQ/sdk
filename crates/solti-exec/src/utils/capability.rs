@@ -1,90 +1,71 @@
-//! # Capability: Linux capability identifiers.
+//! # Linux capabilities
 //!
-//! [`LinuxCapability`] enumerates the most commonly used Linux capabilities with their kernel constant values from `<linux/capability.h>`.
-//!
-//! ## API
-//!
-//! | Method             | Returns                        | Platform           |
-//! |--------------------|--------------------------------|--------------------|
-//! | [`name()`]         | `&'static str` (`"NET_ADMIN"`) | any                |
-//! | [`to_cap_value()`] | `u32` (kernel number)          | any (`pub(crate)`) |
-//!
-//! ## Cap values (reference)
-//! ```text
-//!  0 CHOWN            10 NET_BIND_SERVICE  21 SYS_ADMIN
-//!  1 DAC_OVERRIDE     12 NET_ADMIN         22 SYS_BOOT
-//!  2 DAC_READ_SEARCH  13 NET_RAW           23 SYS_NICE
-//!  3 FOWNER           18 SYS_CHROOT        24 SYS_RESOURCE
-//!  4 FSETID           19 SYS_PTRACE        25 SYS_TIME
-//!  5 KILL             27 MKNOD             29 AUDIT_WRITE
-//!  6 SETGID           30 AUDIT_CONTROL     31 SETFCAP
-//!  7 SETUID
-//!  8 SETPCAP
-//! ```
-//!
-//! ## Rules
-//! - Values match `<linux/capability.h>` from Linux 6.x
-//!
-//! ## Also
-//!
-//! - [`SecurityConfig`](super::SecurityConfig) uses `LinuxCapability` in the keep list.
+//! [`LinuxCapability`] identifies capabilities retained by [`SecurityConfig`](super::SecurityConfig).
+//! It does not grant capabilities that the agent process does not have.
 
 /// Linux process capability.
 ///
-/// Covers the most commonly used capabilities.
+/// The enum contains the capabilities supported by this crate.
+/// It is non-exhaustive to permit additions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum LinuxCapability {
-    /// `CAP_CHOWN`: Make arbitrary changes to file UIDs and GIDs
+    /// Changes file owners and groups (`CAP_CHOWN`).
     Chown,
-    /// `CAP_DAC_OVERRIDE`: Bypass file read, write, and execute permission checks
+    /// Bypasses discretionary file access checks (`CAP_DAC_OVERRIDE`).
     DacOverride,
-    /// `CAP_DAC_READ_SEARCH`: Bypass file read permission checks and directory read/execute checks
+    /// Bypasses file read and directory search checks (`CAP_DAC_READ_SEARCH`).
     DacReadSearch,
-    /// `CAP_FOWNER`: Bypass permission checks on operations that normally require the filesystem UID
+    /// Bypasses checks that require the file owner (`CAP_FOWNER`).
     FOwner,
-    /// `CAP_FSETID`: Don't clear set-user-ID and set-group-ID mode bits
+    /// Preserves set-user-ID and set-group-ID bits (`CAP_FSETID`).
     FSetId,
-    /// `CAP_KILL`: Bypass permission checks for sending signals
+    /// Bypasses signal permission checks (`CAP_KILL`).
     Kill,
-    /// `CAP_SETGID`: Make arbitrary manipulations of process GIDs and supplementary GID list
+    /// Changes process group ids (`CAP_SETGID`).
     SetGid,
-    /// `CAP_SETUID`: Make arbitrary manipulations of process UIDs
+    /// Changes process user ids (`CAP_SETUID`).
     SetUid,
-    /// `CAP_SETPCAP`: Modify process capabilities
+    /// Changes process capabilities (`CAP_SETPCAP`).
     SetPCap,
-    /// `CAP_NET_BIND_SERVICE`: Bind a socket to privileged ports (port numbers less than 1024)
+    /// Binds sockets to privileged ports (`CAP_NET_BIND_SERVICE`).
     NetBindService,
-    /// `CAP_NET_RAW`: Use RAW and PACKET sockets; bind to any address for transparent proxying
+    /// Uses raw and packet sockets (`CAP_NET_RAW`).
     NetRaw,
-    /// `CAP_NET_ADMIN`: Perform various network-related operations
+    /// Performs network administration (`CAP_NET_ADMIN`).
     NetAdmin,
-    /// `CAP_SYS_CHROOT`: Use chroot()
+    /// Changes the process root directory (`CAP_SYS_CHROOT`).
     SysChroot,
-    /// `CAP_SYS_PTRACE`: Trace arbitrary processes using ptrace()
+    /// Traces arbitrary processes (`CAP_SYS_PTRACE`).
     SysPtrace,
-    /// `CAP_SYS_ADMIN`: Perform a range of system administration operations
+    /// Performs system administration operations (`CAP_SYS_ADMIN`).
     SysAdmin,
-    /// `CAP_SYS_BOOT`: Use reboot() and kexec_load()
+    /// Reboots the system or loads a new kernel (`CAP_SYS_BOOT`).
     SysBoot,
-    /// `CAP_SYS_NICE`: Raise process nice value and change the nice value for arbitrary processes
+    /// Changes process scheduling and priority (`CAP_SYS_NICE`).
     SysNice,
-    /// `CAP_SYS_RESOURCE`: Override resource limits
+    /// Overrides resource limits (`CAP_SYS_RESOURCE`).
     SysResource,
-    /// `CAP_SYS_TIME`: Set system clock; set real-time (hardware) clock
+    /// Sets system and hardware clocks (`CAP_SYS_TIME`).
     SysTime,
-    /// `CAP_MKNOD`: Create special files using mknod()
+    /// Creates special files (`CAP_MKNOD`).
     MkNod,
-    /// `CAP_AUDIT_WRITE`: Write records to kernel auditing log
+    /// Writes kernel audit records (`CAP_AUDIT_WRITE`).
     AuditWrite,
-    /// `CAP_AUDIT_CONTROL`: Enable and disable kernel auditing
+    /// Controls kernel auditing (`CAP_AUDIT_CONTROL`).
     AuditControl,
-    /// `CAP_SETFCAP`: Set file capabilities
+    /// Sets file capabilities (`CAP_SETFCAP`).
     SetFCap,
 }
 
 impl LinuxCapability {
-    /// Kernel-style capability name (e.g. `"NET_ADMIN"`, `"SYS_PTRACE"`).
+    /// Returns the kernel name without the `CAP_` prefix.
+    ///
+    /// ```
+    /// use solti_exec::LinuxCapability;
+    ///
+    /// assert_eq!(LinuxCapability::NetAdmin.name(), "NET_ADMIN");
+    /// ```
     pub fn name(self) -> &'static str {
         match self {
             Self::Chown => "CHOWN",
@@ -113,9 +94,9 @@ impl LinuxCapability {
         }
     }
 
-    /// Numeric value as in `<linux/capability.h>`.
+    /// Returns the value from `<linux/capability.h>`.
     ///
-    /// Platform-independent so that `KeepMask` can be unit-tested on any OS.
+    /// This remains platform-independent for validation and tests.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn to_cap_value(self) -> u32 {
         match self {

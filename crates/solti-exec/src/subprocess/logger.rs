@@ -1,36 +1,27 @@
-//! # Logger: subprocess output stream processing.
+//! # Subprocess output
 //!
-//! Captures stdout/stderr from a spawned subprocess, truncates long lines, and emits them via `tracing` at configurable log levels.
+//! Stdout and stderr are read as separate line streams.
+//! Each line is sent to `tracing` and an optional [`OutputSink`].
 //!
-//! ## How it fits
+//! ## Flow
+//!
 //! ```text
-//! run_subprocess()
-//!     ├──► child.stdout.take() ──► tokio::spawn(log_stream(Stdout))
-//!     └──► child.stderr.take() ──► tokio::spawn(log_stream(Stderr))
-//!
-//! log_stream(reader, run_id, stream_kind, config)
-//!     └──► for each line:
-//!           ├──► truncate_line(line, max_chars)
-//!           │     ├──► short? → Cow::Borrowed (zero alloc)
-//!           │     └──► long?  → Cow::Owned("prefix... (truncated N bytes)")
-//!           │
-//!           ├──► sanitize_line(line) — tracing copy only, sink gets it untouched
-//!           │     ├──► clean? → Cow::Borrowed (zero alloc)
-//!           │     └──► control bytes? → Cow::Owned with \xNN escapes
-//!           │
-//!           └──► emit via tracing:
-//!                 ├──► stdout + stdout_info  → info!
-//!                 ├──► stderr + stderr_warn  → warn!
-//!                 └──► otherwise             → debug!
+//! stdout/stderr bytes
+//!         ▼
+//! byte limit ──► drain remaining bytes in the line
+//!         ▼
+//! lossy UTF-8 decoding
+//!         ▼
+//! character limit
+//!      ┌──┴────────────────┐
+//!      ▼                   ▼
+//! tracing copy         OutputSink
+//! control bytes        decoded line
+//! are escaped
 //! ```
 //!
-//! ## Configuration
-//!
-//! | Field             | Default | What it does                       |
-//! |-------------------|---------|------------------------------------|
-//! | `max_line_length` | 4096    | truncate lines beyond this (chars) |
-//! | `stdout_info`     | true    | log stdout at INFO (else DEBUG)    |
-//! | `stderr_warn`     | true    | log stderr at WARN (else DEBUG)    |
+//! Invalid UTF-8 uses replacement characters.
+//! Control characters except tab are escaped only in the tracing copy.
 
 use std::borrow::Cow;
 
@@ -41,19 +32,32 @@ use tracing::{debug, info, warn};
 
 /// Configuration for subprocess output logging.
 ///
-/// ## Also
+/// ## Defaults
 ///
-/// - [`SubprocessBackendConfig`](super::SubprocessBackendConfig) carries `LogConfig` as a field.
-/// - `log_stream` async function that reads + truncates + emits lines.
+/// | Field             | Default | Meaning                                  |
+/// |-------------------|---------|------------------------------------------|
+/// | `max_line_length` | `4096`  | Unicode scalar values retained           |
+/// | `max_line_bytes`  | `65536` | Input bytes retained before draining     |
+/// | `stdout_info`     | `true`  | Use `INFO` instead of `DEBUG` for stdout |
+/// | `stderr_warn`     | `true`  | Use `WARN` instead of `DEBUG` for stderr |
+///
+/// Both size limits must be greater than zero.
+/// They are validated when the runner is created.
 #[derive(Debug, Clone, Copy)]
 pub struct LogConfig {
-    /// Max line length (in Unicode chars) before truncation of the emitted line.
+    /// Maximum emitted line length in Unicode scalar values.
     pub max_line_length: usize,
-    /// Hard byte cap per line; bytes past it are drained until next `\n`.
+    /// Maximum retained input bytes per line.
+    ///
+    /// Remaining bytes are drained through the next newline.
     pub max_line_bytes: usize,
-    /// Log stdout at INFO level (`false` = DEBUG).
+    /// Logs stdout at `INFO`.
+    ///
+    /// `false` uses `DEBUG`.
     pub stdout_info: bool,
-    /// Log stderr at WARN level (`false` = DEBUG).
+    /// Logs stderr at `WARN`.
+    ///
+    /// `false` uses `DEBUG`.
     pub stderr_warn: bool,
 }
 
@@ -68,7 +72,7 @@ impl Default for LogConfig {
     }
 }
 
-/// Subprocess output stream kind.
+/// Captured subprocess stream.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum StreamKind {
     Stdout,
@@ -91,7 +95,7 @@ impl StreamKind {
     }
 }
 
-/// Log subprocess output stream line-by-line with truncation.
+/// Reads, limits, and publishes one subprocess stream.
 pub(crate) async fn log_stream<R>(
     reader: R,
     run_id: &str,
@@ -222,17 +226,12 @@ pub(crate) async fn log_stream<R>(
     );
 }
 
-/// Escape control characters for safe `tracing` output.
+/// Escapes control characters for tracing output.
 ///
-/// Untrusted subprocess output may contain ANSI escape sequences, carriage
-/// returns, or other control bytes that can corrupt the operator terminal,
-/// forge log lines, or break log parsers. Every C0 control character except
-/// `\t`, plus DEL (0x7F), is replaced with a readable `\xNN` hex escape
-/// (e.g. ESC becomes the four literal characters `\x1b`).
+/// Every ASCII control character except tab becomes a `\xNN` sequence.
 ///
-/// Returns `Cow::Borrowed` when the line is already clean (zero-alloc for the
-/// common case). Only the copy emitted via `tracing` is sanitized; the
-/// [`OutputSink`] broadcast path receives the line bytes untouched.
+/// Clean lines are returned without allocation.
+/// The output sink receives the unsanitized limited line.
 pub(crate) fn sanitize_line(line: &str) -> Cow<'_, str> {
     fn needs_escape(c: char) -> bool {
         c.is_ascii_control() && c != '\t'
@@ -258,10 +257,10 @@ pub(crate) fn sanitize_line(line: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Truncate line by Unicode scalar count, safe for UTF-8.
+/// Truncates a line by Unicode scalar count.
 ///
-/// Returns `Cow::Borrowed` when no truncation is needed (zero-alloc for the common case).
-/// Reports truncated bytes (O(1)) instead of chars to avoid scanning the entire tail.
+/// Short lines are returned without allocation.
+/// The suffix reports the number of removed bytes.
 pub(crate) fn truncate_line(line: &str, max_chars: usize) -> Cow<'_, str> {
     match line.char_indices().nth(max_chars) {
         None => Cow::Borrowed(line),

@@ -1,4 +1,22 @@
-//! Linux cgroup v2 limits for subprocess attempts.
+//! # Linux cgroup v2
+//!
+//! [`CgroupLimits`] controls CPU, memory, processes, and threads for one attempt.
+//!
+//! ## Flow
+//!
+//! ```text
+//! runner construction
+//!      └── resolve cgroup parent
+//!                 ▼
+//!            task attempt
+//!      ├── create child cgroup
+//!      ├── write configured limits
+//!      ├── join before execve
+//!      └── remove after process cleanup
+//! ```
+//!
+//! An explicit parent must be an existing cgroup v2 directory.
+//! Without one, the current process cgroup is used.
 
 use std::path::{Path, PathBuf};
 
@@ -10,11 +28,16 @@ use tokio::process::Command;
 use crate::ExecError;
 
 /// CPU bandwidth limit written to `cpu.max`.
+///
+/// The default represents `max 100000`.
+/// A zero period or zero quota is invalid.
 #[derive(Debug, Clone, Copy)]
 pub struct CpuMax {
-    /// CPU quota in microseconds per period. `None` means unlimited.
+    /// CPU time allowed per period, in microseconds.
+    ///
+    /// `None` means no quota.
     pub quota: Option<u64>,
-    /// Period in microseconds.
+    /// Accounting period in microseconds.
     pub period: u64,
 }
 
@@ -28,13 +51,18 @@ impl Default for CpuMax {
 }
 
 /// Resource limits applied to one subprocess attempt.
+///
+/// This type requires Linux cgroup v2.
+/// At least one field must be set.
+/// CPU periods and explicit quotas must be greater than zero.
+/// Memory and process limits must be greater than zero.
 #[derive(Debug, Clone, Default)]
 pub struct CgroupLimits {
     /// CPU bandwidth limit.
     pub cpu: Option<CpuMax>,
-    /// Memory limit in bytes.
+    /// Maximum memory in bytes.
     pub memory: Option<u64>,
-    /// Maximum number of processes.
+    /// Maximum number of processes and threads in the cgroup.
     pub pids: Option<u64>,
 }
 
@@ -46,7 +74,7 @@ impl CgroupLimits {
     }
 }
 
-/// Cgroup prepared in the parent before the subprocess is forked.
+/// Cgroup prepared before the subprocess is forked.
 pub(crate) struct PreparedCgroup {
     path: PathBuf,
     #[cfg(target_os = "linux")]
@@ -83,7 +111,7 @@ impl Drop for PreparedCgroup {
     }
 }
 
-/// Resolve an explicit parent or the process's current delegated cgroup.
+/// Resolves an explicit parent or the current process cgroup.
 pub(crate) fn resolve_cgroup_parent(explicit: Option<&Path>) -> Result<PathBuf, ExecError> {
     #[cfg(target_os = "linux")]
     {
@@ -99,7 +127,7 @@ pub(crate) fn resolve_cgroup_parent(explicit: Option<&Path>) -> Result<PathBuf, 
     }
 }
 
-/// Create a cgroup and apply every configured limit.
+/// Creates an attempt cgroup and applies its limits.
 pub(crate) fn prepare_cgroup(
     parent: &Path,
     name: &str,
@@ -119,7 +147,7 @@ pub(crate) fn prepare_cgroup(
     }
 }
 
-/// Attach the prepared cgroup join to a command.
+/// Attaches cgroup membership to a command.
 pub(crate) fn attach_cgroup(cmd: &mut Command, prepared: PreparedCgroup) {
     #[cfg(target_os = "linux")]
     {
@@ -131,12 +159,12 @@ pub(crate) fn attach_cgroup(cmd: &mut Command, prepared: PreparedCgroup) {
     }
 }
 
-/// Remove one empty cgroup directory.
+/// Removes an empty attempt cgroup.
 pub(crate) fn cleanup_cgroup(path: &Path) -> std::io::Result<()> {
     std::fs::remove_dir(path)
 }
 
-/// Build a unique cgroup name for one attempt.
+/// Builds a cgroup name for one task build.
 pub(crate) fn build_cgroup_name(runner: &str, slot: &str, seq: u64, timestamp: u64) -> String {
     format!("{runner}-{slot}-{seq:x}-{timestamp:x}")
 }
