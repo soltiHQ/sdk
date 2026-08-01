@@ -11,20 +11,22 @@
 //!      ▼
 //! output sink + optional cgroup + optional script descriptor
 //!      ▼
-//! process group
+//! process domain
 //!   ├── stdout/stderr ──► tracing + output sink
-//!   ├── exit ───────────► evaluate exit policy
-//!   └── cancellation ───► kill process group
+//!   ├── exit ───────────► cgroup + process group + leader
+//!   └── cancellation ───► cgroup + process group + leader
 //!      ▼
 //! release attempt-scoped resources
 //! ```
 //!
-//! On Unix, cancellation and future drop kill the complete process group.
-//! On Unix, normal completion also stops descendants left by the leader.
+//! On Unix, each attempt owns a session and process group.
+//! Termination signals the dedicated process group and a running leader.
+//! A configured cgroup is terminated too.
+//! Normal completion applies the same boundary before leader reap.
 //! Other platforms stop the leader process.
 
 use std::{
-    path::PathBuf,
+    fmt,
     process::Stdio,
     sync::{
         Arc,
@@ -46,6 +48,7 @@ use solti_runner::{
 use crate::subprocess::{
     backend::{PreparedSubprocessBackendConfig, SubprocessBackendConfig},
     boundary::PinnedCwd,
+    domain::{ActiveProcessDomain, prepare_drop_finalizer},
     logger::{LogConfig, StreamKind, log_stream},
     script::AnonymousScript,
     task::SubprocessTaskConfig,
@@ -64,12 +67,18 @@ use crate::subprocess::{
 /// | Non-zero with `fail_on_non_zero`       | Retryable failure            |
 /// | Non-zero without `fail_on_non_zero`    | Success                      |
 /// | Cooperative cancellation               | `TaskError::Canceled`        |
+/// | Process-domain lifecycle error          | Fatal failure                |
 /// | Permanent operating-system error       | Fatal failure                |
 /// | Other operating-system error           | Retryable failure            |
 ///
-/// On Unix, one attempt owns one process group.
+/// On Unix, one attempt owns one session and process group.
 /// The runner waits up to five seconds for output pipes after the leader exits.
-/// It then stops remaining descendants.
+/// It then signals descendants that remain inside its cgroup or process group.
+///
+/// The runner owns the wait status of every child it starts.
+/// A dropped task future moves the child and host domain to one reaper worker.
+/// The worker does not depend on the attempt's Tokio runtime.
+/// The embedding process must not reap arbitrary children or enable automatic `SIGCHLD` reaping.
 ///
 /// ## See Also
 ///
@@ -376,17 +385,30 @@ fn build_command(ctx: &TaskExecContext, script_path: Option<&std::path::Path>) -
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    // A dedicated group lets cancellation target the leader and descendants.
-    // `setsid` already makes the child its session and group leader.
+    // A dedicated session prevents the workload from joining the agent's
+    // process group. `setsid` also makes the child its group leader.
     #[cfg(unix)]
     if !ctx.runner_cfg.starts_new_session() {
-        cmd.process_group(0);
+        attach_attempt_session(&mut cmd);
     }
 
-    // Kill the leader if the attempt future is dropped before supervision runs.
-    cmd.kill_on_drop(true);
-
     cmd
+}
+
+#[cfg(unix)]
+fn attach_attempt_session(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: `setsid` is async-signal-safe and the hook captures no storage.
+    unsafe {
+        command.as_std_mut().pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
 }
 
 /// Builds the child environment from the configured [`EnvPolicy`].
@@ -430,84 +452,6 @@ fn apply_env_policy(cmd: &mut Command, ctx: &TaskExecContext) {
     }
 }
 
-/// Kills an active Unix process group when the attempt future is dropped.
-///
-/// Taskvisor can drop the future before cooperative cancellation runs.
-/// The guard remains armed until descendant cleanup finishes.
-struct ProcessGroupGuard {
-    /// Process group id while the guard is armed.
-    pgid: Option<i32>,
-    run_id: Arc<str>,
-}
-
-impl ProcessGroupGuard {
-    fn new(pgid: Option<i32>, run_id: Arc<str>) -> Self {
-        Self { pgid, run_id }
-    }
-
-    /// Disarms the guard after process-group cleanup.
-    fn disarm(&mut self) {
-        self.pgid = None;
-    }
-
-    fn kill(&self) {
-        #[cfg(unix)]
-        if let Some(pgid) = self.pgid {
-            let rc = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-            if rc != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    warn!(
-                        task = %self.run_id,
-                        error = %error,
-                        "failed to kill subprocess group",
-                    );
-                }
-            }
-        }
-    }
-}
-
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
-
-/// Kills the complete process group led by `child`.
-///
-/// Other platforms fall back to the leader process.
-async fn kill_process_group(child: &mut tokio::process::Child, run_id: &str) {
-    #[cfg(unix)]
-    {
-        // `child.id()` is `None` only once the child has already been reaped —
-        // nothing to kill in that case.
-        if let Some(pid) = child.id() {
-            // SAFETY:
-            // `libc::kill` has no memory preconditions.
-            // The negative pid is the killpg idiom (targets the whole group, not a single process);
-            // `pid` is the live child's id and the process-group leader.
-            // On a non-ESRCH error we fall back to the single-pid `child.kill()`.
-            let rc = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::ESRCH) {
-                    warn!(
-                        task = %run_id,
-                        error = %err,
-                        "killpg failed; falling back to single-pid kill",
-                    );
-                    let _ = child.kill().await;
-                }
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill().await;
-    }
-}
-
 /// Adds operation context to an I/O error.
 fn io_with_context(context: &str, source: std::io::Error) -> std::io::Error {
     std::io::Error::new(source.kind(), format!("{context}: {source}"))
@@ -544,6 +488,42 @@ fn task_io_error(context: &str, source: std::io::Error) -> TaskError {
         TaskError::fatal_from(error)
     } else {
         TaskError::fail_from(error)
+    }
+}
+
+/// Failures that make starting another attempt unsafe.
+#[derive(Debug, Default)]
+struct ProcessLifecycleError {
+    failures: Vec<(&'static str, std::io::Error)>,
+}
+
+impl ProcessLifecycleError {
+    fn push(&mut self, operation: &'static str, error: std::io::Error) {
+        self.failures.push((operation, error));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.failures.is_empty()
+    }
+}
+
+impl fmt::Display for ProcessLifecycleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, (operation, error)) in self.failures.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("; ")?;
+            }
+            write!(formatter, "{operation} failed: {error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ProcessLifecycleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.failures
+            .first()
+            .map(|(_, error)| error as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -621,7 +601,7 @@ fn apply_backend(
     cmd: &mut Command,
     ctx: &TaskExecContext,
     prepared: crate::host::PreparedHostProcessAttempt,
-) -> crate::host::HostProcessGuard {
+) -> crate::host::AttemptProcessDomain {
     ctx.runner_cfg.apply_to_command(cmd, prepared)
 }
 
@@ -673,74 +653,26 @@ fn evaluate_exit(
     }
 }
 
-/// Removes an attempt cgroup after completion or future drop.
-struct CgroupGuard(Option<crate::host::HostProcessGuard>);
-
-impl CgroupGuard {
-    fn new(guard: crate::host::HostProcessGuard) -> Self {
-        Self(Some(guard))
-    }
-
-    async fn cleanup(mut self) {
-        if let Some(mut guard) = self.0.take() {
-            cleanup_host_process_guard(&mut guard).await;
-        }
-    }
-}
-
-impl Drop for CgroupGuard {
-    fn drop(&mut self) {
-        let Some(mut guard) = self.0.take() else {
-            return;
-        };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                cleanup_host_process_guard(&mut guard).await;
-            });
-        } else {
-            let _ = guard.cleanup();
-        }
-    }
-}
-
-async fn cleanup_host_process_guard(guard: &mut crate::host::HostProcessGuard) {
-    let Some(path) = guard.cgroup_path().map(PathBuf::from) else {
-        return;
-    };
-    const ATTEMPTS: usize = 10;
-    for attempt in 0..ATTEMPTS {
-        let current = path.clone();
-        let result =
-            tokio::task::spawn_blocking(move || crate::host::cleanup_cgroup(&current)).await;
-        match result {
-            Ok(Ok(())) => {
-                let _ = guard.cleanup();
-                return;
-            }
-            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                let _ = guard.cleanup();
-                return;
-            }
-            Ok(Err(error)) if attempt + 1 == ATTEMPTS => {
-                warn!(cgroup = %path.display(), error = %error, "failed to remove cgroup");
-                return;
-            }
-            Err(error) => {
-                warn!(cgroup = %path.display(), error = %error, "cgroup cleanup worker failed");
-                return;
-            }
-            Ok(Err(_)) => {
-                tokio::time::sleep(std::time::Duration::from_millis(10 * (attempt as u64 + 1)))
-                    .await;
-            }
-        }
-    }
-}
-
 #[cfg(not(test))]
 const LOG_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
 const LOG_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+
+enum AttemptCompletion {
+    LeaderExited(std::io::Result<()>),
+    Canceled,
+}
+
+async fn drain_output_tasks(
+    stdout: &mut tokio::task::JoinHandle<()>,
+    stderr: &mut tokio::task::JoinHandle<()>,
+) -> bool {
+    tokio::time::timeout(LOG_DRAIN_GRACE, async {
+        let _ = tokio::join!(stdout, stderr);
+    })
+    .await
+    .is_ok()
+}
 
 /// Executes one subprocess attempt.
 async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Result<(), TaskError> {
@@ -748,6 +680,20 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
     let sink = ctx
         .output_publisher
         .sink_for(&ctx.resource_name, ctx.generation, attempt);
+    let drop_finalizer = prepare_drop_finalizer().map_err(|error| {
+        ctx.metrics.record_runner_error(
+            RunnerType::Subprocess,
+            RunnerErrorKind::Custom("drop_finalizer_unavailable".into()),
+        );
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            TaskError::fatal_from(io_with_context(
+                "subprocess drop finalizer is unavailable",
+                error,
+            ))
+        } else {
+            task_io_error("subprocess drop finalizer is unavailable", error)
+        }
+    })?;
 
     // Args and cwd are not logged: task arguments routinely carry tokens and
     // other secrets. Only the command name and the argument count are recorded.
@@ -773,10 +719,9 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
 
     let mut cmd = build_command(&ctx, script.as_ref().map(AnonymousScript::argument_path));
     apply_fd_boundary(&mut cmd, &ctx, script.as_ref())?;
-    let host_process_guard = apply_backend(&mut cmd, &ctx, prepared_host_process);
-    let cgroup_guard = CgroupGuard::new(host_process_guard);
+    let host_process_domain = apply_backend(&mut cmd, &ctx, prepared_host_process);
 
-    let mut child = match cmd.spawn() {
+    let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             ctx.metrics
@@ -784,16 +729,17 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
             return Err(task_io_error("spawn failed", e));
         }
     };
-    let mut pg_guard = ProcessGroupGuard::new(
-        child.id().map(|pid| pid as i32),
+    let mut process = ActiveProcessDomain::new(
+        child,
+        host_process_domain,
         Arc::clone(&ctx.task_cfg.run_id),
+        drop_finalizer,
     );
 
     let log_cfg = ctx.log_cfg;
 
-    let stdout = child
-        .stdout
-        .take()
+    let stdout = process
+        .take_stdout()
         .ok_or_else(|| TaskError::fatal("failed to capture stdout"))?;
     let run_id_stdout = Arc::clone(&ctx.task_cfg.run_id);
     let sink_stdout = sink.clone();
@@ -808,9 +754,8 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
         .await;
     });
 
-    let stderr = child
-        .stderr
-        .take()
+    let stderr = process
+        .take_stderr()
         .ok_or_else(|| TaskError::fatal("failed to capture stderr"))?;
     let run_id_stderr = Arc::clone(&ctx.task_cfg.run_id);
     let sink_stderr = sink.clone();
@@ -825,44 +770,108 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
         .await;
     });
 
-    let result = tokio::select! {
+    let completion = tokio::select! {
         biased;
-        res = child.wait() => {
-            match res {
-                Ok(status) => evaluate_exit(status, &ctx.task_cfg),
-                Err(error) => Err(task_io_error("wait failed", error)),
-            }
-        }
+        result = process.observe_exit() => AttemptCompletion::LeaderExited(result),
         _ = cancel.cancelled() => {
             debug!(
                 task = %ctx.task_cfg.run_id,
-                "cancellation requested; killing subprocess group",
+                "cancellation requested; terminating subprocess domain",
             );
-            kill_process_group(&mut child, &ctx.task_cfg.run_id).await;
-            let _ = child.wait().await;
-            Err(TaskError::Canceled)
+            AttemptCompletion::Canceled
         }
     };
 
-    let drained = tokio::time::timeout(LOG_DRAIN_GRACE, async {
-        let _ = tokio::join!(&mut stdout_task, &mut stderr_task);
-    })
-    .await;
-    if drained.is_err() {
-        pg_guard.kill();
+    let drained_before_termination = matches!(completion, AttemptCompletion::LeaderExited(Ok(())));
+    let mut output_drained = false;
+    if drained_before_termination {
+        output_drained = drain_output_tasks(&mut stdout_task, &mut stderr_task).await;
+    }
+
+    let termination_error = process.terminate().err();
+    if let Some(error) = termination_error.as_ref() {
+        warn!(
+            task = %ctx.task_cfg.run_id,
+            error = %error,
+            "subprocess domain termination reported an error",
+        );
+    }
+
+    let leader_status = if process.leader_can_be_reaped() {
+        Some(process.reap().await)
+    } else {
+        None
+    };
+
+    if !drained_before_termination {
+        output_drained = drain_output_tasks(&mut stdout_task, &mut stderr_task).await;
+    }
+    if !output_drained {
         stdout_task.abort();
         stderr_task.abort();
         warn!(
             task = %ctx.task_cfg.run_id,
-            "subprocess output drain timed out after leader exit; killed lingering process group",
+            "subprocess output drain timed out after domain termination",
         );
     }
-    // The task owns its entire process group. Descendants must not outlive the
-    // leader even when they detached their standard streams.
-    pg_guard.kill();
-    pg_guard.disarm();
-    cgroup_guard.cleanup().await;
-    result
+
+    let cleanup_error = if leader_status.as_ref().is_some_and(Result::is_ok) {
+        process.cleanup().await.err()
+    } else {
+        None
+    };
+    if let Some(error) = cleanup_error.as_ref() {
+        warn!(
+            task = %ctx.task_cfg.run_id,
+            cgroup = ?process.cgroup_path(),
+            error = %error,
+            "failed to clean up subprocess domain",
+        );
+    }
+
+    let (canceled, observation_error) = match completion {
+        AttemptCompletion::Canceled => (true, None),
+        AttemptCompletion::LeaderExited(Ok(())) => (false, None),
+        AttemptCompletion::LeaderExited(Err(error)) => (false, Some(error)),
+    };
+    let (exit_status, reap_error) = match leader_status {
+        Some(Ok(status)) => (Some(status), None),
+        Some(Err(error)) => (None, Some(error)),
+        None => (None, None),
+    };
+
+    let mut lifecycle_error = ProcessLifecycleError::default();
+    if let Some(error) = termination_error {
+        lifecycle_error.push("process domain termination", error);
+    }
+    if let Some(error) = reap_error {
+        lifecycle_error.push("leader reap", error);
+    }
+    if let Some(error) = cleanup_error {
+        lifecycle_error.push("process domain cleanup", error);
+    }
+    if !lifecycle_error.is_empty() {
+        if let Some(error) = observation_error {
+            lifecycle_error
+                .failures
+                .insert(0, ("exit observation", error));
+        }
+        return Err(TaskError::fatal_from(lifecycle_error));
+    }
+
+    if let Some(error) = observation_error {
+        return Err(task_io_error("exit observation failed", error));
+    }
+    if canceled {
+        return Err(TaskError::Canceled);
+    }
+
+    match exit_status {
+        Some(status) => evaluate_exit(status, &ctx.task_cfg),
+        None => Err(TaskError::fatal(
+            "leader exit was observed without an available wait status",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -870,53 +879,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn process_lifecycle_errors_are_fatal_and_complete() {
+        let mut lifecycle = ProcessLifecycleError::default();
+        lifecycle.push(
+            "process domain termination",
+            std::io::Error::other("termination error"),
+        );
+        lifecycle.push(
+            "leader reap",
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "reap error"),
+        );
+        lifecycle.push(
+            "process domain cleanup",
+            std::io::Error::other("cleanup error"),
+        );
+
+        let error = TaskError::fatal_from(lifecycle);
+        match error {
+            TaskError::Fatal { reason, .. } => assert_eq!(
+                reason,
+                "process domain termination failed: termination error; leader reap failed: reap error; process domain cleanup failed: cleanup error"
+            ),
+            other => panic!("expected fatal lifecycle error, got {other}"),
+        }
+    }
+
+    #[test]
     fn cgroup_name_is_stable() {
         assert_eq!(
             build_cgroup_name("runner", "slot", 42, 1000),
             "runner-slot-2a-3e8"
         );
-    }
-
-    #[tokio::test]
-    async fn cgroup_guard_explicit_cleanup_removes_empty_group() {
-        let parent = tempfile::TempDir::new().unwrap();
-        let path = parent.path().join("attempt");
-        std::fs::create_dir(&path).unwrap();
-        let host = crate::host::HostProcessGuard::for_test(path.clone());
-
-        CgroupGuard::new(host).cleanup().await;
-
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn cgroup_guard_drop_removes_empty_group_without_runtime() {
-        let parent = tempfile::TempDir::new().unwrap();
-        let path = parent.path().join("attempt");
-        std::fs::create_dir(&path).unwrap();
-        let host = crate::host::HostProcessGuard::for_test(path.clone());
-
-        drop(CgroupGuard::new(host));
-
-        assert!(!path.exists());
-    }
-
-    #[tokio::test]
-    async fn cgroup_guard_drop_schedules_cleanup_inside_runtime() {
-        let parent = tempfile::TempDir::new().unwrap();
-        let path = parent.path().join("attempt");
-        std::fs::create_dir(&path).unwrap();
-        let host = crate::host::HostProcessGuard::for_test(path.clone());
-
-        drop(CgroupGuard::new(host));
-
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while path.exists() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cgroup cleanup task did not finish");
     }
 
     type SinkCalls = Arc<std::sync::Mutex<Vec<(solti_model::TaskId, u64, u32)>>>;
@@ -1123,6 +1116,23 @@ mod tests {
         assert_eq!(std_cmd.get_program(), "echo");
         let args: Vec<_> = std_cmd.get_args().collect();
         assert_eq!(args, vec!["hello"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_subprocess_owns_a_session() {
+        let mut ctx = make_exec_ctx();
+        ctx.task_cfg.command = "sleep".into();
+        ctx.task_cfg.args = vec!["30".into()];
+        let mut command = build_command(&ctx, None);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id().unwrap() as libc::pid_t;
+
+        // SAFETY: `getsid` only reads process metadata for a numeric pid.
+        assert_eq!(unsafe { libc::getsid(pid) }, pid);
+
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
     }
 
     #[cfg(unix)]
@@ -1405,6 +1415,7 @@ mod tests {
         let backend = SubprocessBackendConfig::new().with_host_process_policy(
             HostProcessPolicy::new().with_security(SecurityConfig {
                 credentials: Some(ProcessCredentials::new(65_534, 65_534)),
+                no_new_privs: true,
                 ..Default::default()
             }),
         );
@@ -1512,9 +1523,20 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         cmd.process_group(0);
-        cmd.kill_on_drop(true);
 
-        let mut child = cmd.spawn().expect("bash must spawn");
+        let host = crate::host::HostProcessPolicy::new()
+            .prepare()
+            .unwrap()
+            .prepare_attempt(None)
+            .unwrap()
+            .apply_to_command(cmd.as_std_mut());
+        let child = cmd.spawn().expect("bash must spawn");
+        let mut process = ActiveProcessDomain::new(
+            child,
+            host,
+            Arc::from("test"),
+            prepare_drop_finalizer().unwrap(),
+        );
         let grandchild_pid = wait_for_recorded_pid(&marker).await;
         if let Some(pid) = grandchild_pid {
             assert_eq!(
@@ -1524,8 +1546,8 @@ mod tests {
             );
         }
 
-        kill_process_group(&mut child, "test").await;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+        process.terminate().unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), process.reap()).await;
         let grandchild_pid = grandchild_pid.expect("grandchild did not report its pid");
         assert_process_gone(grandchild_pid).await;
     }
@@ -1535,15 +1557,18 @@ mod tests {
     async fn dropping_the_future_kills_the_whole_process_group() {
         // taskvisor enforces a per-attempt timeout via `tokio::time::timeout` and
         // force-abort via `JoinHandle::abort` — both DROP the task future without ever
-        // polling the cooperative `cancel.cancelled()` branch. `kill_on_drop(true)`
-        // only SIGKILLs the leader pid; forked grandchildren would be orphaned.
-        // The subtree must still be reaped on drop.
+        // polling the cooperative `cancel.cancelled()` branch.
+        // The active process domain must still stop the process group on drop.
         let marker_dir = tempfile::TempDir::new().unwrap();
-        let marker = marker_dir.path().join("pid");
-        let marker_str = marker.to_string_lossy().to_string();
+        let leader_marker = marker_dir.path().join("leader.pid");
+        let descendant_marker = marker_dir.path().join("descendant.pid");
+        let leader_marker = leader_marker.to_string_lossy().to_string();
+        let descendant_marker = descendant_marker.to_string_lossy().to_string();
 
-        // Fork a long-lived grandchild, record its pid, then block forever.
-        let script = format!(r#"(sleep 60 & echo $! > "{marker_str}") ; sleep 60"#);
+        // Record both identities before blocking on a long-lived descendant.
+        let script = format!(
+            r#"echo $$ > "{leader_marker}"; (sleep 60 & echo $! > "{descendant_marker}"); sleep 60"#
+        );
 
         let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_subprocess_spec_with_args("drop-slot", "bash", &["-c", &script]);
@@ -1551,12 +1576,13 @@ mod tests {
 
         let cancel = TaskContext::detached();
         let handle = tokio::spawn(async move { task_ref.spawn(cancel).await });
-        let grandchild_pid = wait_for_recorded_pid(&marker).await;
+        let leader_pid = wait_for_recorded_pid(std::path::Path::new(&leader_marker)).await;
+        let descendant_pid = wait_for_recorded_pid(std::path::Path::new(&descendant_marker)).await;
 
         handle.abort();
         let _ = handle.await;
-        let grandchild_pid = grandchild_pid.expect("grandchild did not report its pid");
-        assert_process_gone(grandchild_pid).await;
+        assert_process_gone(leader_pid.expect("leader did not report its pid")).await;
+        assert_process_gone(descendant_pid.expect("descendant did not report its pid")).await;
     }
 
     #[test]

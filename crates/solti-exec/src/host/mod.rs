@@ -14,11 +14,12 @@ mod capability;
 pub use capability::LinuxCapability;
 
 mod cgroups;
-pub use cgroups::{CgroupLimits, CpuMax};
 #[cfg(feature = "host-process")]
 pub(crate) use cgroups::{
-    PreparedCgroup, attach_cgroup, cleanup_cgroup, prepare_cgroup, resolve_cgroup_parent,
+    CgroupDomain, PreparedCgroup, PreparedCgroupParent, attach_cgroup, prepare_cgroup,
+    resolve_cgroup_parent,
 };
+pub use cgroups::{CgroupLimits, CpuMax, DomainTermination};
 
 #[cfg(feature = "host-process")]
 mod error;
@@ -49,7 +50,7 @@ pub(crate) use process::{PreparedProcessConfig, attach_process_config};
 
 mod policy;
 pub use policy::{
-    HostProcessGuard, HostProcessPolicy, PreparedHostProcessAttempt, PreparedHostProcessPolicy,
+    AttemptProcessDomain, HostProcessPolicy, PreparedHostProcessAttempt, PreparedHostProcessPolicy,
 };
 
 mod security;

@@ -36,7 +36,7 @@ use tokio::process::Command;
 
 use crate::ExecError::InvalidRunnerConfig;
 use crate::host::{
-    HostProcessGuard, HostProcessPolicy, PreparedHostProcessAttempt, PreparedHostProcessPolicy,
+    AttemptProcessDomain, HostProcessPolicy, PreparedHostProcessAttempt, PreparedHostProcessPolicy,
 };
 use crate::subprocess::boundary::PinnedCwd;
 use crate::subprocess::logger::LogConfig;
@@ -412,7 +412,7 @@ impl PreparedSubprocessBackendConfig {
         &self,
         cmd: &mut Command,
         attempt: PreparedHostProcessAttempt,
-    ) -> HostProcessGuard {
+    ) -> AttemptProcessDomain {
         attempt.apply_to_command(cmd.as_std_mut())
     }
 }

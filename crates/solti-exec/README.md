@@ -66,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `HostProcessPolicy`                       | Resource and process security controls  | Reusable host process policy                  |
 | `HostProcessPolicy::prepare`              | Declarative host policy                 | Validated `PreparedHostProcessPolicy`         |
 | `PreparedHostProcessPolicy`               | Optional attempt cgroup name            | `PreparedHostProcessAttempt`                  |
-| `PreparedHostProcessAttempt`              | `std::process::Command`                 | Hooks and owning `HostProcessGuard`           |
+| `PreparedHostProcessAttempt`              | `std::process::Command`                 | Hooks and owning `AttemptProcessDomain`       |
 | `register_subprocess_runner`              | Router and runner name                  | Registered default subprocess runner          |
 | `register_subprocess_runner_with_backend` | Router, runner name, and backend config | Registered configured subprocess runner       |
 | `RunnerRouter::build`                     | `Task` with a `Subprocess` workload     | Reusable `taskvisor::TaskRef`                 |
@@ -97,8 +97,12 @@ Task { workload: Subprocess }
          ├── stderr ──► tracing + OutputSink
          └── exit / cancel / dropped future
                          ▼
-                cleanup process group,
-                script transport, and cgroup
+               terminate process domain
+                         ▼
+                    wait / reap
+                         ▼
+                cleanup script transport
+                    and cgroup
 ```
 
 Attempt-scoped resources are created inside the Taskvisor task.
@@ -259,6 +263,7 @@ fn configured() -> Result<(), solti_exec::ExecError> {
         .with_security(SecurityConfig {
             drop_all_caps: true,
             keep_caps: vec![LinuxCapability::NetBindService],
+            no_new_privs: true,
             credentials: Some(ProcessCredentials::new(1000, 1000)),
             seccomp: SeccompPolicy::DenyHostControl,
             ..Default::default()
@@ -285,11 +290,12 @@ An unsupported or invalid control rejects the runner or fails the attempt.
 The example requires features `subprocess` and `seccomp`.
 
 The default backend uses an empty `HostProcessPolicy`.
-It does not enable optional rlimit, cgroup, credential, namespace, capability, or seccomp controls.
+It does not create a cgroup.
+It does not enable optional rlimit, credential, namespace, capability, or seccomp controls.
 
 The subprocess backend still clears the environment by default.
 On Unix, it pins an explicit working directory and restricts descriptor inheritance.
-It also gives every attempt a dedicated process group or session.
+It also gives every attempt a dedicated session and process group.
 
 `HostProcessPolicy` is independent of the subprocess workload format.
 Future process-based backends can translate it to their own execution model.
@@ -306,14 +312,21 @@ PreparedHostProcessPolicy
       ├── prepare_attempt
       └── attempt.apply_to_command(std::process::Command)
                          ▼
-                    spawn + wait
+                        spawn
                          ▼
-              HostProcessGuard::cleanup
+         terminate backend process boundary
+                         +
+          AttemptProcessDomain::terminate_tree
+                         ▼
+                     wait / reap
+                         ▼
+             AttemptProcessDomain::cleanup
 ```
 
 The attempt token prevents configured cgroups from being skipped.
 The cgroup name must contain one normal path component.
-Keep the guard until the complete process scope has stopped.
+Keep the process domain until cleanup finishes.
+The backend remains responsible for its process-specific termination boundary.
 
 ## Resource and security controls
 
@@ -328,9 +341,20 @@ Keep the guard until the complete process scope has stopped.
 | `no_new_privs`                     | Linux                    | Prevents privilege gain through `execve`               |
 | `SeccompPolicy::DenyHostControl`   | Linux, feature `seccomp` | Rejects a host-control syscall denylist with `EPERM`   |
 
-Cgroups are created below the process's current delegated cgroup.
+The subprocess runner creates a session for every Unix attempt.
+`ProcessConfig::new_session` provides the same primitive to custom process backends.
+
+Cgroups are created below the process's current cgroup v2 directory.
+The current directory is resolved through `/proc/self/cgroup` and the active cgroup2 mount.
 `HostProcessPolicy::with_cgroup_parent` selects another absolute cgroup v2 directory.
 One child group is created per attempt.
+The parent, attempt directory, and control files are pinned before process creation.
+Its `cgroup.max.depth` is set to zero before process creation.
+Configured cgroups use `cgroup.kill` when the running kernel provides it.
+Unix attempts also signal the dedicated process group before reaping the leader.
+Without `cgroup.kill`, the process group is the only attempt-wide primitive.
+`AttemptProcessDomain::cleanup` requires `cgroup.events` to report `populated 0`.
+It refuses to remove a pathname that no longer identifies the owned cgroup.
 
 Rlimit requests above the current hard limit are clamped.
 The resulting value becomes both the soft and hard limit.
@@ -340,11 +364,14 @@ A Linux child retaining `CAP_SYS_RESOURCE` can raise a hard limit again.
 `ProcessCredentials` sets the real, effective, and saved user and group IDs.
 Its supplementary group list is exact.
 An empty list clears inherited supplementary groups.
+Credentials require explicit `no_new_privs = true`.
 
 `keep_caps` requires `drop_all_caps = true`.
+Capability dropping requires explicit `no_new_privs = true`.
 The retained capabilities must already be available to the agent process.
 
 `DenyHostControl` enables `no_new_privs` before installing its filter.
+This implicit setting does not replace the explicit credential and capability contract.
 It rejects host-control operations such as mounts, namespace entry, kernel module loading, BPF, and ptrace.
 On LP64 `x86_64`, it also rejects the x32 syscall ABI.
 
@@ -353,6 +380,9 @@ It is not a complete syscall allowlist.
 
 These controls provide host process hardening.
 They do not form a complete sandbox for untrusted code.
+The delegated cgroup parent must not be writable by workloads.
+A workload that can write its parent `cgroup.procs` can leave the attempt cgroup.
+Concurrent parent mutations also invalidate cleanup ownership.
 
 ## Output
 
@@ -372,8 +402,9 @@ Invalid UTF-8 is replaced during line decoding.
 Child stdin is null.
 Stdout and stderr are always piped.
 
-After the leader exits, the runner waits up to five seconds for both pipes to close.
-It then kills a process group that still holds them open.
+After leader exit is observed, the runner waits up to five seconds for both pipes to close.
+It then terminates the cgroup and process-group boundaries before reaping the leader.
+A running leader receives its own termination request too.
 
 The default `BuildContext` disables live output.
 `solti-core` installs the standard output publisher.
@@ -386,12 +417,26 @@ The default `BuildContext` disables live output.
 | Non-zero with `fail_on_non_zero = true`    | Retryable failure with the exit code             |
 | Non-zero with `fail_on_non_zero = false`   | Success                                          |
 | Cooperative cancellation                   | `TaskError::Canceled`                            |
+| Process-domain lifecycle error             | Fatal failure                                    |
 | Permanent spawn or materialization error   | Fatal failure                                    |
 | Other operating-system I/O error           | Retryable failure                                |
 
-On Unix, every attempt owns a process group.
-Cancellation and dropped task futures kill the complete group.
-Normal completion also stops remaining descendants.
+On Unix, every attempt owns a session and process group.
+A configured cgroup uses `cgroup.kill` when it is available.
+The runner signals the dedicated process group and a running leader before reap.
+Normal completion applies the same cleanup.
+Termination, reap, and cleanup errors are fatal.
+Without `cgroup.kill`, only the process-group boundary remains.
+That boundary cannot reach descendants that enter another process group or session.
+
+The runner owns the wait status of every child it starts.
+Before process creation, it prepares one Tokio-independent reaper worker.
+A dropped runner future moves the child and host domain to that worker.
+The worker reaps the leader before cgroup cleanup.
+The dropped future does not wait for process exit.
+The embedding process must not call process-wide `waitpid` for arbitrary children.
+It must not configure automatic `SIGCHLD` reaping.
+If wait ownership is lost, the attempt fails and releases its numeric process identity.
 
 On other platforms, cancellation falls back to the child process.
 

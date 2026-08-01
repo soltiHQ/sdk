@@ -145,10 +145,13 @@ impl ProcessCredentials {
 /// | `seccomp`       | Installs the selected syscall policy                     |
 ///
 /// `keep_caps` requires `drop_all_caps`.
+/// Credentials and capability dropping require `no_new_privs = true`.
 /// Requested capabilities must already be available to the agent process.
 #[derive(Debug, Clone, Default)]
 pub struct SecurityConfig {
     /// Drops every Linux capability not listed in [`Self::keep_caps`].
+    ///
+    /// This setting requires [`Self::no_new_privs`].
     pub drop_all_caps: bool,
     /// Capabilities retained by [`Self::drop_all_caps`].
     pub keep_caps: Vec<LinuxCapability>,
@@ -156,10 +159,13 @@ pub struct SecurityConfig {
     ///
     /// `false` does not clear an inherited setting.
     /// [`SeccompPolicy::DenyHostControl`] enables it regardless of this field.
+    /// That implicit setting does not satisfy the explicit requirement of
+    /// [`Self::credentials`] or [`Self::drop_all_caps`].
     pub no_new_privs: bool,
     /// Exact credentials applied to the process.
     ///
     /// `None` preserves inherited credentials.
+    /// A configured value requires [`Self::no_new_privs`].
     pub credentials: Option<ProcessCredentials>,
     /// Namespaces created before identity and capability changes.
     pub namespaces: Namespaces,
@@ -179,7 +185,7 @@ impl SecurityConfig {
             && self.seccomp == SeccompPolicy::Disabled
     }
 
-    /// Returns whether this policy explicitly establishes `no_new_privs`.
+    /// Returns whether this policy establishes `no_new_privs`.
     ///
     /// Seccomp filter installation requires this setting.
     /// A `false` result does not mean that an inherited setting is cleared.
@@ -197,6 +203,17 @@ impl SecurityConfig {
 
         if let Some(credentials) = &self.credentials {
             validate_credentials(credentials)?;
+        }
+
+        if self.credentials.is_some() && !self.no_new_privs {
+            return Err(HostProcessError::InvalidConfig(
+                "security.credentials requires security.no_new_privs = true".into(),
+            ));
+        }
+        if self.drop_all_caps && !self.no_new_privs {
+            return Err(HostProcessError::InvalidConfig(
+                "security.drop_all_caps requires security.no_new_privs = true".into(),
+            ));
         }
 
         #[cfg(not(feature = "seccomp"))]
@@ -808,7 +825,9 @@ mod linux_impl {
                     libc::SYS_sethostname,
                     libc::SYS_clock_settime,
                     libc::SYS_open_by_handle_at,
+                    libc::SYS_process_vm_readv,
                     libc::SYS_process_vm_writev,
+                    libc::SYS_process_madvise,
                     libc::SYS_pidfd_getfd,
                 ] {
                     assert!(dangerous_syscalls().contains(&syscall));
@@ -927,6 +946,38 @@ mod tests {
         let valid = SecurityConfig {
             drop_all_caps: true,
             keep_caps: vec![LinuxCapability::NetBindService],
+            no_new_privs: true,
+            ..Default::default()
+        };
+        assert!(valid.validate().is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "host-process")]
+    fn credentials_and_capability_drop_require_explicit_no_new_privs() {
+        for config in [
+            SecurityConfig {
+                credentials: Some(ProcessCredentials::new(1000, 1000)),
+                ..Default::default()
+            },
+            SecurityConfig {
+                drop_all_caps: true,
+                ..Default::default()
+            },
+            SecurityConfig {
+                credentials: Some(ProcessCredentials::new(1000, 1000)),
+                seccomp: SeccompPolicy::DenyHostControl,
+                ..Default::default()
+            },
+        ] {
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("no_new_privs = true"), "got: {error}");
+        }
+
+        let valid = SecurityConfig {
+            credentials: Some(ProcessCredentials::new(1000, 1000)),
+            drop_all_caps: true,
+            no_new_privs: true,
             ..Default::default()
         };
         assert!(valid.validate().is_ok());

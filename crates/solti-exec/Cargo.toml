@@ -26,6 +26,7 @@ subprocess   = [
     "dep:tokio",
     "tokio/macros",
     "tokio/process",
+    "tokio/signal",
     "tokio/time",
 ]
 

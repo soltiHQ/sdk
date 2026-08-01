@@ -31,7 +31,7 @@
 //!         ▼
 //! operating-system process
 //!    ├── stdout/stderr ──► tracing + OutputSink
-//!    └── exit/cancel ────► TaskError
+//!    └── exit/cancel ────► terminate tree ──► wait/reap ──► cleanup
 //! ```
 //!
 //! Building does not start the process.
@@ -63,6 +63,17 @@
 //! Build host controls through `host::HostProcessPolicy`.
 //! Pass that policy to `subprocess::SubprocessBackendConfig`.
 //! Invalid or unsupported controls are rejected when the runner is created.
+//! Applying a prepared attempt returns `host::AttemptProcessDomain`.
+//! A custom backend owns its process-specific termination boundary.
+//! It handles the cgroup termination result, waits and reaps, then cleans up the domain.
+//!
+//! An empty policy creates no cgroup.
+//! A configured attempt sets `cgroup.max.depth` to zero before process creation.
+//! A configured cgroup uses `cgroup.kill` when the running kernel provides it.
+//! Unix subprocess attempts own a session and process group.
+//! They signal the process group and a running leader before reap.
+//! Without `cgroup.kill`, only the process-group boundary remains.
+//! That boundary cannot reach descendants that enter another process group or session.
 //!
 //! ## Quick Start
 //!
@@ -100,7 +111,7 @@
 //!
 //! | Area                | Types                                                     |
 //! |---------------------|-----------------------------------------------------------|
-//! | Host process policy | `host::HostProcessPolicy`                                 |
+//! | Host process policy | `host::HostProcessPolicy`, `host::AttemptProcessDomain`   |
 //! | Host process state  | `host::ProcessConfig`                                     |
 //! | Host resources      | `host::RlimitConfig`, `host::CgroupLimits`                |
 //! | Host security       | `host::SecurityConfig`, `host::ProcessCredentials`        |

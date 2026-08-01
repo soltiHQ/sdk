@@ -32,6 +32,8 @@ pub use backend::{CwdPolicy, EnvPolicy, SubprocessBackendConfig};
 
 mod boundary;
 
+mod domain;
+
 mod task;
 
 mod logger;

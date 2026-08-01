@@ -15,7 +15,7 @@
 //!        │ each attempt
 //!        ├── prepare attempt resources
 //!        ├── attach child hooks
-//!        └── return cleanup guard
+//!        └── return attempt process domain
 //! ```
 
 use std::{
@@ -29,11 +29,13 @@ use std::process::Command;
 #[cfg(feature = "host-process")]
 use tracing::{trace, warn};
 
-use super::{CgroupLimits, ProcessConfig, RlimitConfig, SecurityConfig};
+use super::{
+    CgroupDomain, CgroupLimits, DomainTermination, ProcessConfig, RlimitConfig, SecurityConfig,
+};
 #[cfg(feature = "host-process")]
 use super::{
-    HostProcessError, PreparedCgroup, PreparedProcessConfig, PreparedRlimits, attach_cgroup,
-    attach_process_config, attach_rlimits, attach_security, cleanup_cgroup, prepare_cgroup,
+    HostProcessError, PreparedCgroup, PreparedCgroupParent, PreparedProcessConfig, PreparedRlimits,
+    attach_cgroup, attach_process_config, attach_rlimits, attach_security, prepare_cgroup,
     resolve_cgroup_parent,
 };
 
@@ -107,6 +109,7 @@ impl HostProcessPolicy {
     ///
     /// The path must be absolute and identify an existing cgroup v2 directory.
     /// Without this setting, the current process cgroup is used.
+    /// Workloads must not have write access to the selected parent.
     ///
     /// This setting requires [`with_cgroups`](Self::with_cgroups).
     pub fn with_cgroup_parent(mut self, parent: impl Into<PathBuf>) -> Self {
@@ -249,7 +252,7 @@ struct HostProcessControls {
 pub struct PreparedHostProcessPolicy {
     controls: Arc<HostProcessControls>,
     cgroups: Option<CgroupLimits>,
-    cgroup_parent: Option<PathBuf>,
+    cgroup_parent: Option<PreparedCgroupParent>,
 }
 
 /// Attempt resources prepared before process creation.
@@ -262,22 +265,56 @@ pub struct PreparedHostProcessAttempt {
     cgroup: Option<PreparedCgroup>,
 }
 
-/// Owns resources attached to one host process attempt.
+/// Owns cgroup resources attached to one host process attempt.
 ///
-/// Keep this guard until the complete process scope has stopped.
+/// Keep this value until the attached process scope has stopped.
+/// Call [`terminate_tree`](Self::terminate_tree) to request cgroup subtree termination.
 /// Call [`cleanup`](Self::cleanup) after that point.
-/// Drop performs one best-effort cleanup attempt.
-#[must_use = "the host process guard must be held until the process scope stops"]
-pub struct HostProcessGuard {
-    cgroup_path: Option<PathBuf>,
+/// Drop performs synchronous termination and one best-effort cleanup attempt.
+#[must_use = "the attempt process domain must be held until the process scope stops"]
+#[derive(Debug)]
+pub struct AttemptProcessDomain {
+    cgroup: Option<CgroupDomain>,
 }
 
-impl HostProcessGuard {
+impl AttemptProcessDomain {
     /// Returns the attempt cgroup directory.
     ///
     /// `None` means that the policy has no cgroup limits.
     pub fn cgroup_path(&self) -> Option<&Path> {
-        self.cgroup_path.as_deref()
+        self.cgroup.as_ref().and_then(CgroupDomain::path)
+    }
+
+    /// Requests termination of the configured cgroup subtree.
+    ///
+    /// This method is idempotent.
+    /// A cgroup-backed domain writes once to its pinned `cgroup.kill` descriptor.
+    /// A successful result confirms the request, not process exit.
+    /// A domain without `cgroup.kill` returns [`DomainTermination::Unavailable`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the termination request fails.
+    pub fn terminate_tree(&mut self) -> io::Result<DomainTermination> {
+        match self.cgroup.as_mut() {
+            Some(cgroup) => cgroup.terminate_tree(),
+            None => Ok(DomainTermination::Unavailable),
+        }
+    }
+
+    /// Returns whether the configured cgroup contains live processes.
+    ///
+    /// `None` means that the policy has no cgroup.
+    /// The result includes descendant cgroups.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when `cgroup.events` cannot be read or parsed.
+    pub fn cgroup_populated(&self) -> io::Result<Option<bool>> {
+        match self.cgroup.as_ref() {
+            Some(cgroup) => cgroup.is_populated(),
+            None => Ok(None),
+        }
     }
 
     /// Removes owned resources after the process scope has stopped.
@@ -286,43 +323,48 @@ impl HostProcessGuard {
     ///
     /// # Errors
     ///
-    /// Returns an I/O error when an owned cgroup cannot be removed.
+    /// Returns an I/O error when the cgroup is populated, no longer identifies
+    /// the owned directory, or cannot be removed.
     pub fn cleanup(&mut self) -> io::Result<()> {
-        let Some(path) = self.cgroup_path.as_deref() else {
-            return Ok(());
-        };
-        match cleanup_cgroup(path) {
-            Ok(()) => {
-                self.cgroup_path = None;
-                Ok(())
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.cgroup_path = None;
-                Ok(())
-            }
-            Err(error) => Err(error),
+        if let Some(cgroup) = self.cgroup.as_mut() {
+            cgroup.cleanup()?;
         }
+        Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(cgroup_path: PathBuf) -> Self {
         Self {
-            cgroup_path: Some(cgroup_path),
+            cgroup: Some(CgroupDomain::for_test(cgroup_path)),
         }
     }
 }
 
-impl Drop for HostProcessGuard {
+impl Drop for AttemptProcessDomain {
     fn drop(&mut self) {
-        if let Err(error) = self.cleanup()
-            && let Some(path) = self.cgroup_path.as_deref()
-        {
+        let termination = self.terminate_tree();
+        #[cfg(feature = "host-process")]
+        if let Err(error) = termination {
             warn!(
-                cgroup = %path.display(),
+                cgroup = ?self.cgroup_path(),
+                error = %error,
+                "failed to terminate host process domain",
+            );
+        }
+        #[cfg(not(feature = "host-process"))]
+        let _ = termination;
+
+        let cleanup = self.cleanup();
+        #[cfg(feature = "host-process")]
+        if let Err(error) = cleanup {
+            warn!(
+                cgroup = ?self.cgroup_path(),
                 error = %error,
                 "failed to clean up host process cgroup",
             );
         }
+        #[cfg(not(feature = "host-process"))]
+        let _ = cleanup;
     }
 }
 
@@ -368,7 +410,7 @@ impl PreparedHostProcessPolicy {
                 trace!(?cgroups, group = name, "preparing host process cgroup");
                 let parent = self
                     .cgroup_parent
-                    .as_deref()
+                    .as_ref()
                     .expect("prepared cgroup policy must have a parent");
                 Some(prepare_cgroup(parent, name, cgroups)?)
             }
@@ -391,14 +433,10 @@ impl PreparedHostProcessAttempt {
     /// Attaches enabled controls to a process command.
     ///
     /// This token is consumed.
-    /// The returned guard owns resources that require post-process cleanup.
-    pub fn apply_to_command(self, command: &mut Command) -> HostProcessGuard {
+    /// The returned domain owns resources that require post-process cleanup.
+    pub fn apply_to_command(self, command: &mut Command) -> AttemptProcessDomain {
         let Self { controls, cgroup } = self;
-        let guard = HostProcessGuard {
-            cgroup_path: cgroup
-                .as_ref()
-                .map(|prepared| prepared.path().to_path_buf()),
-        };
+        let mut domain = AttemptProcessDomain { cgroup: None };
 
         if let Some(process) = &controls.process {
             trace!(?process, "attaching host process state");
@@ -413,21 +451,22 @@ impl PreparedHostProcessAttempt {
                 cgroup = %prepared.path().display(),
                 "attaching host process cgroup",
             );
-            attach_cgroup(command, prepared);
+            domain.cgroup = Some(attach_cgroup(command, prepared));
         }
         if let Some(security) = &controls.security {
             trace!(?security, "attaching host process security controls");
             attach_security(command, security);
         }
 
-        guard
+        domain
     }
 }
 
 fn validate_cgroup_name(name: &str) -> Result<(), HostProcessError> {
     let mut components = Path::new(name).components();
-    let valid =
-        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+    let valid = !name.as_bytes().contains(&0)
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none();
     if valid {
         Ok(())
     } else {
@@ -478,6 +517,21 @@ mod tests {
     #[test]
     fn default_policy_is_empty() {
         assert!(HostProcessPolicy::new().is_empty());
+    }
+
+    #[test]
+    fn cgroup_name_is_one_safe_component() {
+        assert!(validate_cgroup_name("attempt-1").is_ok());
+        for name in [
+            "",
+            ".",
+            "..",
+            "nested/attempt",
+            "/attempt",
+            "attempt\0other",
+        ] {
+            assert!(validate_cgroup_name(name).is_err(), "accepted {name:?}");
+        }
     }
 
     #[test]
@@ -608,7 +662,7 @@ mod tests {
         let mut command = Command::new("sh");
         command.arg("-c").arg("ulimit -n");
 
-        let _guard = attempt.apply_to_command(&mut command);
+        let _domain = attempt.apply_to_command(&mut command);
         let output = command.output().unwrap();
 
         assert!(output.status.success());
@@ -631,18 +685,33 @@ mod tests {
     }
 
     #[test]
-    fn host_process_guard_owns_cgroup_cleanup() {
+    fn attempt_process_domain_owns_cgroup_cleanup() {
         let parent = tempfile::TempDir::new().unwrap();
         let path = parent.path().join("attempt");
         std::fs::create_dir(&path).unwrap();
-        let mut guard = HostProcessGuard::for_test(path.clone());
+        let mut domain = AttemptProcessDomain::for_test(path.clone());
 
-        assert_eq!(guard.cgroup_path(), Some(path.as_path()));
-        guard.cleanup().unwrap();
-        guard.cleanup().unwrap();
+        assert_eq!(domain.cgroup_path(), Some(path.as_path()));
+        assert_eq!(
+            domain.terminate_tree().unwrap(),
+            DomainTermination::Unavailable
+        );
+        domain.cleanup().unwrap();
+        domain.cleanup().unwrap();
 
-        assert!(guard.cgroup_path().is_none());
+        assert!(domain.cgroup_path().is_none());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn process_domain_without_cgroups_has_no_tree_termination() {
+        let mut domain = AttemptProcessDomain { cgroup: None };
+        assert_eq!(domain.cgroup_populated().unwrap(), None);
+        assert_eq!(
+            domain.terminate_tree().unwrap(),
+            DomainTermination::Unavailable
+        );
+        domain.cleanup().unwrap();
     }
 
     #[test]
