@@ -24,6 +24,10 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::isolation::CgroupLimits;
+#[cfg(target_os = "linux")]
+use crate::isolation::CpuMax;
+
 #[cfg(all(feature = "host-process", unix))]
 use std::fs::File;
 #[cfg(all(test, feature = "host-process"))]
@@ -46,45 +50,6 @@ pub enum DomainTermination {
     Unavailable,
 }
 
-/// CPU bandwidth limit written to `cpu.max`.
-///
-/// The default represents `max 100000`.
-/// A zero period or zero quota is invalid.
-#[derive(Debug, Clone, Copy)]
-pub struct CpuMax {
-    /// CPU time allowed per period, in microseconds.
-    ///
-    /// `None` means no quota.
-    pub quota: Option<u64>,
-    /// Accounting period in microseconds.
-    pub period: u64,
-}
-
-impl Default for CpuMax {
-    fn default() -> Self {
-        Self {
-            quota: None,
-            period: 100_000,
-        }
-    }
-}
-
-/// Resource limits applied to one host process scope.
-///
-/// This type requires Linux cgroup v2.
-/// At least one field must be set.
-/// CPU periods and explicit quotas must be greater than zero.
-/// Memory and process limits must be greater than zero.
-#[derive(Debug, Clone, Default)]
-pub struct CgroupLimits {
-    /// CPU bandwidth limit.
-    pub cpu: Option<CpuMax>,
-    /// Maximum memory in bytes.
-    pub memory: Option<u64>,
-    /// Maximum number of processes and threads in the cgroup.
-    pub pids: Option<u64>,
-}
-
 /// Resolved and pinned cgroup v2 parent.
 #[cfg(feature = "host-process")]
 #[derive(Debug)]
@@ -93,14 +58,6 @@ pub(crate) struct PreparedCgroupParent {
     path: PathBuf,
     #[cfg(target_os = "linux")]
     directory: File,
-}
-
-impl CgroupLimits {
-    /// Returns `true` when no limit is configured.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.cpu.is_none() && self.memory.is_none() && self.pids.is_none()
-    }
 }
 
 /// Cgroup prepared before the host process is forked.

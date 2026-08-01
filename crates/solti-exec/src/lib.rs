@@ -4,38 +4,42 @@
 //!
 //! The `host-process` feature provides policy and low-level process controls.
 //! The `subprocess` feature provides `SubprocessRunner`.
-//! It converts a `solti_model::Task` into a reusable `taskvisor::TaskRef`.
-//! Taskvisor owns execution after that conversion.
+//! The `container` feature provides an engine-neutral `ContainerRunner`.
+//! The `containerd` feature provides its native containerd 2.x engine.
+//! Both runners convert `solti_model::Task` resources into reusable `taskvisor::TaskRef` values.
+//! Taskvisor owns execution after conversion.
 //!
 //! ## Start Here
 //!
-//! 1. Enable the `subprocess` feature.
+//! 1. Enable one execution backend.
 //! 2. Create a `solti_runner::RunnerRouter`.
-//! 3. Register a subprocess runner.
-//! 4. Build a Taskvisor task from a `Subprocess` resource.
+//! 3. Register its runner.
+//! 4. Build a Taskvisor task from the matching workload resource.
 //!
 //! ## Flow
 //!
 //! ```text
-//! solti_model::Task
-//!         │ Subprocess workload
-//!         ▼
-//!   RunnerRouter
-//!         │ GVK + runnerSelector
-//!         ▼
-//! SubprocessRunner
-//!         │ builds
-//!         ▼
-//! taskvisor::TaskRef
-//!         │ each attempt
-//!         ▼
-//! operating-system process
-//!    ├── stdout/stderr ──► tracing + OutputSink
-//!    └── exit/cancel ────► terminate tree ──► wait/reap ──► cleanup
+//!                    solti_model::Task
+//!                            │ GVK + runnerSelector
+//!                            ▼
+//!                      RunnerRouter
+//!                       ├──────────┐
+//!          Subprocess workload    Container workload
+//!                       ▼          ▼
+//!              SubprocessRunner  ContainerRunner
+//!                       │          │ ContainerEngine
+//!                       ▼          ▼
+//!              operating-system  native containerd 2.x
+//!                    process      container task
+//!                       └────┬─────┘
+//!                            ▼
+//!                 tracing + OutputSink
+//!                            ▼
+//!                 terminate, wait, cleanup
 //! ```
 //!
-//! Building does not start the process.
-//! Script transport, cgroups, output sinks, and processes are attempt-scoped.
+//! Building performs no process or engine I/O.
+//! Runtime resources and output streams are attempt-scoped.
 //!
 //! ## Commands and Scripts
 //!
@@ -59,6 +63,9 @@
 //! | Linux credentials | `host::ProcessCredentials`                         |
 //! | Linux security    | `host::SecurityConfig`, `host::Namespaces`         |
 //! | Linux seccomp     | `host::SeccompPolicy` with feature `seccomp`       |
+//! | Container process | `container::ContainerProcessPolicy`                |
+//! | Container engine  | `container::ContainerEngine`                       |
+//! | Native containerd | `container::containerd::ContainerdConfig`          |
 //!
 //! Build host controls through `host::HostProcessPolicy`.
 //! Pass that policy to `subprocess::SubprocessBackendConfig`.
@@ -75,7 +82,7 @@
 //! Without `cgroup.kill`, only the process-group boundary remains.
 //! That boundary cannot reach descendants that enter another process group or session.
 //!
-//! ## Quick Start
+//! ## Subprocess Quick Start
 //!
 //! ```rust,no_run
 //! # #[cfg(feature = "subprocess")]
@@ -120,6 +127,9 @@
 //! | Backend settings    | `subprocess::SubprocessBackendConfig`                     |
 //! | Environment         | `subprocess::EnvPolicy`, `subprocess::CwdPolicy`          |
 //! | Output              | `subprocess::LogConfig`                                   |
+//! | Container runner    | `container::ContainerRunner`                              |
+//! | Container boundary  | `container::ContainerEngine`, `container::ContainerAttempt` |
+//! | Containerd 2.x      | `container::containerd::ContainerdEngine`                 |
 //! | Errors              | `ExecError`                                               |
 //!
 //! ## Feature Flags
@@ -127,8 +137,12 @@
 //! - `host-process`: host process policy and low-level controls.
 //! - `subprocess`: subprocess runner. It enables `host-process`.
 //! - `seccomp`: Linux syscall denylist. It enables `host-process`.
+//! - `container`: engine-neutral container runner.
+//! - `containerd`: native containerd 2.x engine. It enables `container`.
 //!
 //! Enable both `subprocess` and `seccomp` to filter subprocess attempts.
+//! Containerd execution requires Linux and an explicit containerd 2.x Unix socket.
+//! The adapter does not use CRI or configure container networking.
 //!
 //! No feature is enabled by default.
 
@@ -141,11 +155,23 @@
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
-#[cfg(feature = "subprocess")]
+#[cfg(any(feature = "subprocess", feature = "container"))]
 mod error;
-#[cfg(feature = "subprocess")]
-#[cfg_attr(docsrs, doc(cfg(feature = "subprocess")))]
+#[cfg(any(feature = "subprocess", feature = "container"))]
 pub use error::ExecError;
+
+#[cfg(any(feature = "subprocess", feature = "container"))]
+mod output;
+#[cfg(any(feature = "subprocess", feature = "container"))]
+mod registration;
+
+#[cfg(feature = "container")]
+#[cfg_attr(docsrs, doc(cfg(feature = "container")))]
+pub mod container;
+
+#[cfg(any(feature = "container", feature = "host-process"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "container", feature = "host-process"))))]
+pub mod isolation;
 
 #[cfg(feature = "host-process")]
 #[cfg_attr(docsrs, doc(cfg(feature = "host-process")))]

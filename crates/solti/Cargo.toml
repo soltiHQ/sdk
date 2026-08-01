@@ -30,6 +30,8 @@ runner = ["dep:solti-runner", "model", "taskvisor"]
 core   = ["dep:solti-core", "model", "runner", "taskvisor-controller"]
 
 exec              = ["dep:solti-exec"]
+exec-container    = ["exec", "model", "runner", "taskvisor", "solti-exec/container"]
+exec-containerd   = ["exec-container", "solti-exec/containerd"]
 exec-host-process = ["exec", "solti-exec/host-process"]
 exec-seccomp      = ["exec-host-process", "solti-exec/seccomp"]
 exec-subprocess   = [
@@ -106,6 +108,7 @@ full = [
     "discover-grpc",
     "discover-http",
     "discover-tls",
+    "exec-containerd",
     "exec-seccomp",
     "exec-subprocess",
     "observe-journald",

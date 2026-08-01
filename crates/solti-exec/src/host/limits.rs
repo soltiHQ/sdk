@@ -37,38 +37,9 @@ use std::process::Command;
 
 #[cfg(feature = "host-process")]
 use crate::host::HostProcessError;
-
-/// POSIX limit ceilings applied to a host process.
-///
-/// Each value sets both the soft and hard limit.
-/// Values above the inherited hard limit are clamped.
-/// A Linux process retaining `CAP_SYS_RESOURCE` can raise the hard limit again.
-/// Non-empty settings require Unix.
-#[derive(Debug, Clone, Default)]
-pub struct RlimitConfig {
-    /// Maximum number of open file descriptors (`RLIMIT_NOFILE`).
-    ///
-    /// `None` preserves the inherited limits.
-    pub max_open_files: Option<u64>,
-    /// Maximum size of created files in bytes (`RLIMIT_FSIZE`).
-    ///
-    /// `None` preserves the inherited limits.
-    pub max_file_size_bytes: Option<u64>,
-    /// Sets both core-file size limits to zero.
-    ///
-    /// `false` preserves the inherited limits.
-    pub disable_core_dumps: bool,
-}
+use crate::isolation::RlimitConfig;
 
 impl RlimitConfig {
-    /// Returns `true` when no limit is configured.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.max_open_files.is_none()
-            && self.max_file_size_bytes.is_none()
-            && !self.disable_core_dumps
-    }
-
     #[cfg(feature = "host-process")]
     pub(crate) fn prepare(&self) -> Result<PreparedRlimits, HostProcessError> {
         #[cfg(unix)]

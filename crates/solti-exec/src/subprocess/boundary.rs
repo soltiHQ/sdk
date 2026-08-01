@@ -69,6 +69,8 @@ impl PinnedCwd {
             use std::os::{fd::AsRawFd as _, unix::process::CommandExt as _};
 
             let pinned = std::sync::Arc::clone(&self.fd);
+            // SAFETY: `pinned` keeps the directory descriptor valid for the hook.
+            // `fchdir` is async-signal-safe, and the error path only reads `errno`.
             unsafe {
                 command.as_std_mut().pre_exec(move || {
                     let fd = pinned.as_raw_fd();
@@ -144,6 +146,8 @@ mod unix {
     fn open_at(parent: RawFd, name: &Path) -> io::Result<OwnedFd> {
         let name = CString::new(name.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cwd path contains NUL"))?;
+        // SAFETY: `parent` is either `AT_FDCWD` or a live directory descriptor.
+        // `name` is NUL-terminated and remains alive for the call.
         let raw = unsafe {
             libc::openat(
                 parent,
@@ -154,6 +158,7 @@ mod unix {
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: successful `openat` returned a new descriptor not owned elsewhere.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         if raw >= 3 {
             return Ok(fd);
@@ -165,10 +170,12 @@ mod unix {
     }
 
     fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
+        // SAFETY: `fd` remains live, and `F_DUPFD_CLOEXEC` expects an integer minimum.
         let raw = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: successful `F_DUPFD_CLOEXEC` returned a new descriptor not owned elsewhere.
         Ok(unsafe { OwnedFd::from_raw_fd(raw) })
     }
 

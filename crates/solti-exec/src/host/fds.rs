@@ -26,6 +26,9 @@ pub(crate) fn attach_fd_cloexec(command: &mut Command, passed_fds: &[RawFd]) -> 
                 format!("passed file descriptor must be at least 3, got {fd}"),
             ));
         }
+        // SAFETY:
+        // `F_GETFD` takes no third argument and dereferences no memory.
+        // An invalid descriptor is reported through the return value.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         if flags < 0 {
             let error = io::Error::last_os_error();
@@ -41,6 +44,9 @@ pub(crate) fn attach_fd_cloexec(command: &mut Command, passed_fds: &[RawFd]) -> 
     #[cfg(target_os = "linux")]
     let inherited_fds = Vec::new();
 
+    // SAFETY:
+    // both descriptor lists are allocated before `fork`.
+    // The hook uses only descriptor syscalls and inline OS errors.
     unsafe {
         command.pre_exec(move || {
             mark_all_close_on_exec(&inherited_fds)?;
@@ -56,6 +62,8 @@ pub(crate) fn attach_fd_cloexec(command: &mut Command, passed_fds: &[RawFd]) -> 
 /// Marks the complete non-standard descriptor range close-on-exec.
 #[cfg(target_os = "linux")]
 fn mark_all_close_on_exec(_inherited_fds: &[RawFd]) -> io::Result<()> {
+    // SAFETY:
+    // `close_range` receives only integer arguments and accesses no Rust memory.
     let result = unsafe {
         libc::syscall(
             libc::SYS_close_range,
@@ -75,12 +83,16 @@ fn mark_all_close_on_exec(_inherited_fds: &[RawFd]) -> io::Result<()> {
 fn mark_all_close_on_exec(inherited_fds: &[RawFd]) -> io::Result<()> {
     // macOS does not provide `close_range(CLOSE_RANGE_CLOEXEC)`.
     // The bounded snapshot is collected in the parent before `fork`.
-    // Descriptors concurrently opened after that snapshot must be created with
-    // `O_CLOEXEC`; the platform has no child-safe close-on-exec range primitive.
+    //
+    // Descriptors concurrently opened after that snapshot must be created with `O_CLOEXEC`;
+    // the platform has no child-safe close-on-exec range primitive.
     for &fd in inherited_fds {
         if fd < 3 {
             continue;
         }
+        // SAFETY:
+        // `F_GETFD` takes no third argument and dereferences no memory.
+        // A stale descriptor is reported through the return value.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         if flags < 0 {
             let error = io::Error::last_os_error();
@@ -89,10 +101,13 @@ fn mark_all_close_on_exec(inherited_fds: &[RawFd]) -> io::Result<()> {
             }
             return Err(error);
         }
-        if flags & libc::FD_CLOEXEC == 0
-            && unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
-        {
-            return Err(io::Error::last_os_error());
+        if flags & libc::FD_CLOEXEC == 0 {
+            // SAFETY:
+            // `F_SETFD` expects the integer flag value supplied here.
+            // A stale descriptor is reported through the return value.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
     }
     Ok(())
@@ -120,14 +135,20 @@ fn discover_open_fds() -> io::Result<Vec<RawFd>> {
 
 /// Makes one validated descriptor survive `execve`.
 fn clear_close_on_exec(fd: RawFd) -> io::Result<()> {
+    // SAFETY:
+    // `F_GETFD` takes no third argument and dereferences no memory.
+    // An invalid descriptor is reported through the return value.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
-    if flags & libc::FD_CLOEXEC != 0
-        && unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0
-    {
-        return Err(io::Error::last_os_error());
+    if flags & libc::FD_CLOEXEC != 0 {
+        // SAFETY:
+        // `F_SETFD` expects the integer flag value supplied here.
+        // An invalid descriptor is reported through the return value.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(())
 }

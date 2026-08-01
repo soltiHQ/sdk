@@ -36,8 +36,7 @@ mod domain;
 
 mod task;
 
-mod logger;
-pub use logger::LogConfig;
+pub use crate::output::LogConfig;
 
 mod script;
 
@@ -50,9 +49,7 @@ use solti_model::Labels;
 use solti_runner::{Runner, RunnerRouter};
 
 use crate::ExecError;
-
-/// Runner label used by `runnerSelector`.
-pub const LABEL_RUNNER_NAME: &str = "solti.io/runner-name";
+pub use crate::registration::LABEL_RUNNER_NAME;
 
 /// Registers a subprocess runner with default settings.
 ///
@@ -78,8 +75,8 @@ pub fn register_subprocess_runner(
 /// # Errors
 ///
 /// Returns [`ExecError::InvalidRunnerConfig`] when `name` or `backend` is invalid.
-/// Returns [`ExecError::Io`] when host resource preparation fails.
 /// Returns [`ExecError::Router`] when the router rejects registration.
+/// Returns [`ExecError::Io`] when host resource preparation fails.
 pub fn register_subprocess_runner_with_backend(
     router: &mut RunnerRouter,
     name: impl Into<String>,

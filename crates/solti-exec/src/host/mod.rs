@@ -11,15 +11,16 @@
 //! They do not form a complete sandbox for untrusted code.
 
 mod capability;
-pub use capability::LinuxCapability;
+pub use crate::isolation::LinuxCapability;
 
 mod cgroups;
+pub use crate::isolation::{CgroupLimits, CpuMax};
+pub use cgroups::DomainTermination;
 #[cfg(feature = "host-process")]
 pub(crate) use cgroups::{
     CgroupDomain, PreparedCgroup, PreparedCgroupParent, attach_cgroup, prepare_cgroup,
     resolve_cgroup_parent,
 };
-pub use cgroups::{CgroupLimits, CpuMax, DomainTermination};
 
 #[cfg(feature = "host-process")]
 mod error;
@@ -32,9 +33,9 @@ mod fds;
 pub(crate) use fds::attach_fd_cloexec;
 
 mod limits;
+pub use crate::isolation::RlimitConfig;
 #[cfg(feature = "host-process")]
 pub use limits::PreparedRlimits;
-pub use limits::RlimitConfig;
 #[cfg(feature = "host-process")]
 pub(crate) use limits::attach_rlimits;
 #[cfg(all(test, feature = "host-process", unix))]
@@ -54,6 +55,7 @@ pub use policy::{
 };
 
 mod security;
+pub use crate::isolation::{ProcessCredentials, SeccompPolicy};
 #[cfg(feature = "host-process")]
 pub(crate) use security::attach_security;
-pub use security::{Namespaces, ProcessCredentials, SeccompPolicy, SecurityConfig};
+pub use security::{Namespaces, SecurityConfig};

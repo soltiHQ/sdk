@@ -49,9 +49,12 @@ use crate::subprocess::{
     backend::{PreparedSubprocessBackendConfig, SubprocessBackendConfig},
     boundary::PinnedCwd,
     domain::{ActiveProcessDomain, prepare_drop_finalizer},
-    logger::{LogConfig, StreamKind, log_stream},
     script::AnonymousScript,
     task::SubprocessTaskConfig,
+};
+use crate::{
+    output::{LogConfig, StreamKind, log_stream},
+    registration::validate_runner_name,
 };
 
 /// Runner that executes [`TaskWorkload::Subprocess`] as OS subprocesses.
@@ -90,29 +93,6 @@ pub struct SubprocessRunner {
     name: String,
     /// Backend configuration applied to all tasks spawned by this runner.
     config: Arc<PreparedSubprocessBackendConfig>,
-}
-
-/// Validates a runner name before it is used in labels and paths.
-///
-/// The accepted syntax matches a Kubernetes label value.
-fn validate_runner_name(name: &str) -> Result<(), crate::ExecError> {
-    let edge_is_alphanumeric = name
-        .as_bytes()
-        .first()
-        .zip(name.as_bytes().last())
-        .is_some_and(|(first, last)| first.is_ascii_alphanumeric() && last.is_ascii_alphanumeric());
-    let ok = name.len() <= 63
-        && edge_is_alphanumeric
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
-    if ok {
-        Ok(())
-    } else {
-        Err(crate::ExecError::InvalidRunnerConfig(format!(
-            "invalid runner name {name:?}: must be a Kubernetes label value of 1..=63 ASCII characters"
-        )))
-    }
 }
 
 /// Builds a cgroup name for one task build.

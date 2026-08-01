@@ -24,6 +24,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "host-process")]
 use super::HostProcessError;
+#[cfg(feature = "host-process")]
+use crate::isolation::validate_umask;
 
 /// Unix process state applied before `execve`.
 ///
@@ -53,10 +55,8 @@ impl ProcessConfig {
 
     #[cfg(feature = "host-process")]
     pub(crate) fn prepare(&self) -> Result<PreparedProcessConfig, HostProcessError> {
-        if self.umask.is_some_and(|mask| mask & !0o777 != 0) {
-            return Err(HostProcessError::InvalidConfig(
-                "process.umask may contain only permission bits 0o000..=0o777".into(),
-            ));
+        if let Some(mask) = self.umask {
+            validate_umask(mask).map_err(HostProcessError::InvalidConfig)?;
         }
 
         #[cfg(unix)]
@@ -132,8 +132,6 @@ mod unix_impl {
 
     pub(super) fn valid_signal_numbers() -> Result<Vec<libc::c_int>, super::HostProcessError> {
         let mut signals = Vec::new();
-        // `sigset_t` must represent every signal on the target.
-        // Its bit width is a portable upper bound for probing `sigaction`.
         let signal_number_bound = libc::c_int::try_from(
             std::mem::size_of::<libc::sigset_t>() * libc::c_char::BITS as usize,
         )
@@ -144,7 +142,8 @@ mod unix_impl {
             }
 
             let mut current = std::mem::MaybeUninit::<libc::sigaction>::uninit();
-            // SAFETY: a null action queries one signal disposition into
+            // SAFETY:
+            // a null action queries one signal disposition into
             // `current` without changing process state.
             let result = unsafe { libc::sigaction(signal, std::ptr::null(), current.as_mut_ptr()) };
             if result == 0 {
@@ -165,7 +164,8 @@ mod unix_impl {
         let new_session = prepared.new_session;
         let umask = prepared.umask;
 
-        // SAFETY: all captured storage is prepared before `fork`.
+        // SAFETY:
+        // all captured storage is prepared before `fork`.
         // The hook calls process-control functions without allocation.
         unsafe {
             command.pre_exec(move || {
@@ -184,8 +184,8 @@ mod unix_impl {
     }
 
     fn reset_signal_state(signals: &[libc::c_int]) -> io::Result<()> {
-        // SAFETY: a zeroed action with SIG_DFL and an empty mask is a valid
-        // default disposition on supported Unix targets.
+        // SAFETY:
+        // a zeroed action with SIG_DFL and an empty mask is a valid default disposition on supported Unix targets.
         let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
         action.sa_sigaction = libc::SIG_DFL;
         if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
@@ -193,8 +193,9 @@ mod unix_impl {
         }
 
         for &signal in signals {
-            // SAFETY: signal numbers were queried in the parent. `action`
-            // contains a default disposition and an empty mask.
+            // SAFETY:
+            // signal numbers were queried in the parent.
+            // `action` contains a default disposition and an empty mask.
             if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
                 return logged_last_error(b"solti-exec: sigaction reset failed: ");
             }
@@ -205,7 +206,8 @@ mod unix_impl {
         if unsafe { libc::sigemptyset(&mut empty) } != 0 {
             return logged_last_error(b"solti-exec: sigemptyset failed: ");
         }
-        // SAFETY: `empty` is a valid empty signal set.
+        // SAFETY:
+        // `empty` is a valid empty signal set.
         if unsafe { libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) } != 0 {
             return logged_last_error(b"solti-exec: signal mask reset failed: ");
         }
@@ -314,9 +316,6 @@ mod tests {
         let mut command = Command::new("sh");
         command.arg("-c").arg("kill -TERM $$; exit 97");
 
-        // Install inherited state in the child without mutating the parallel
-        // test process. The policy hook is registered afterwards and must
-        // replace both settings.
         unsafe {
             command.pre_exec(|| {
                 let mut action = std::mem::zeroed::<libc::sigaction>();

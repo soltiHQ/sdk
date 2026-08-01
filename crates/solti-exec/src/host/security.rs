@@ -35,7 +35,9 @@ use std::process::Command;
 
 #[cfg(feature = "host-process")]
 use crate::host::HostProcessError;
-use crate::host::LinuxCapability;
+#[cfg(feature = "host-process")]
+use crate::isolation::validate_credentials as validate_credential_values;
+use crate::isolation::{LinuxCapability, ProcessCredentials, SeccompPolicy};
 
 /// Linux namespaces created for the child before `execve`.
 ///
@@ -83,54 +85,6 @@ impl Namespaces {
     }
 }
 
-/// Seccomp policy applied before `execve`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum SeccompPolicy {
-    /// Does not install a syscall filter.
-    #[default]
-    Disabled,
-    /// Rejects a fixed host-control syscall denylist with `EPERM`.
-    ///
-    /// The default action remains `Allow`.
-    /// This policy is not a syscall sandbox.
-    /// It always enables `no_new_privs` before installing the filter.
-    /// Host process enforcement requires feature `seccomp`.
-    /// It supports Linux on LP64 `x86_64` and little-endian `aarch64`.
-    DenyHostControl,
-}
-
-/// Exact Linux credentials applied before `execve`.
-///
-/// The user and group IDs are applied to the real, effective, and saved slots.
-/// Supplementary groups are replaced by the provided list.
-/// Empty supplementary groups clear the inherited list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProcessCredentials {
-    /// Real, effective, and saved user ID.
-    pub uid: u32,
-    /// Real, effective, and saved group ID.
-    pub gid: u32,
-    /// Exact supplementary group list.
-    pub supplementary_groups: Vec<u32>,
-}
-
-impl ProcessCredentials {
-    /// Creates credentials with no supplementary groups.
-    pub fn new(uid: u32, gid: u32) -> Self {
-        Self {
-            uid,
-            gid,
-            supplementary_groups: Vec::new(),
-        }
-    }
-
-    /// Replaces the supplementary group list.
-    pub fn with_supplementary_groups(mut self, supplementary_groups: impl Into<Vec<u32>>) -> Self {
-        self.supplementary_groups = supplementary_groups.into();
-        self
-    }
-}
-
 /// Security controls applied to a host process.
 ///
 /// Non-empty settings require Linux.
@@ -159,8 +113,7 @@ pub struct SecurityConfig {
     ///
     /// `false` does not clear an inherited setting.
     /// [`SeccompPolicy::DenyHostControl`] enables it regardless of this field.
-    /// That implicit setting does not satisfy the explicit requirement of
-    /// [`Self::credentials`] or [`Self::drop_all_caps`].
+    /// That implicit setting does not satisfy the explicit requirement of [`Self::credentials`] or [`Self::drop_all_caps`].
     pub no_new_privs: bool,
     /// Exact credentials applied to the process.
     ///
@@ -236,22 +189,7 @@ impl SecurityConfig {
 
 #[cfg(feature = "host-process")]
 fn validate_credentials(credentials: &ProcessCredentials) -> Result<(), HostProcessError> {
-    if credentials.uid == u32::MAX {
-        return Err(HostProcessError::InvalidConfig(
-            "security.credentials.uid cannot be the unchanged-ID sentinel".into(),
-        ));
-    }
-    if credentials.gid == u32::MAX {
-        return Err(HostProcessError::InvalidConfig(
-            "security.credentials.gid cannot be the unchanged-ID sentinel".into(),
-        ));
-    }
-    if credentials.supplementary_groups.contains(&u32::MAX) {
-        return Err(HostProcessError::InvalidConfig(
-            "security.credentials.supplementary_groups cannot contain the unchanged-ID sentinel"
-                .into(),
-        ));
-    }
+    validate_credential_values(credentials).map_err(HostProcessError::InvalidConfig)?;
 
     #[cfg(target_os = "linux")]
     {
@@ -260,7 +198,8 @@ fn validate_credentials(credentials: &ProcessCredentials) -> Result<(), HostProc
                 "security.credentials.supplementary_groups is too large".into(),
             ));
         }
-        // SAFETY: `sysconf` reads one process-wide numeric limit.
+        // SAFETY:
+        // `sysconf` reads one process-wide numeric limit.
         let max = unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) };
         if max >= 0 && credentials.supplementary_groups.len() > max as usize {
             return Err(HostProcessError::InvalidConfig(format!(
@@ -409,14 +348,16 @@ mod linux_impl {
     }
 
     fn apply_namespaces(mask: libc::c_int) -> io::Result<()> {
-        // SAFETY: `unshare` accepts a scalar mask.
+        // SAFETY:
+        // `unshare` accepts a scalar mask.
         if unsafe { libc::unshare(mask) } != 0 {
             return logged_last_error(b"solti-exec: unshare failed: ");
         }
 
         if mask & libc::CLONE_NEWNS != 0 {
             let root = b"/\0";
-            // SAFETY: all pointers are either null or point to a static C string.
+            // SAFETY:
+            // all pointers are either null or point to a static C string.
             let result = unsafe {
                 libc::mount(
                     std::ptr::null(),
@@ -436,7 +377,8 @@ mod linux_impl {
 
     fn drop_bounding_capabilities(keep_mask: KeepMask) -> io::Result<()> {
         for capability in 0..=CAP_LAST_CAP {
-            // SAFETY: `prctl` receives scalar arguments only.
+            // SAFETY:
+            // `prctl` receives scalar arguments only.
             let present = unsafe { libc::prctl(PR_CAPBSET_READ, capability, 0, 0, 0) };
             if present < 0 {
                 let error = io::Error::last_os_error();
@@ -448,7 +390,8 @@ mod linux_impl {
             }
 
             if present == 1 && !keep_mask.is_set(capability) {
-                // SAFETY: `prctl` receives scalar arguments only.
+                // SAFETY:
+                // `prctl` receives scalar arguments only.
                 if unsafe { libc::prctl(PR_CAPBSET_DROP, capability, 0, 0, 0) } != 0 {
                     return logged_last_error(b"solti-exec: capability bounding-set drop failed: ");
                 }
@@ -458,7 +401,8 @@ mod linux_impl {
     }
 
     fn keep_capabilities_across_uid_change() -> io::Result<()> {
-        // SAFETY: `prctl` receives scalar arguments only.
+        // SAFETY:
+        // `prctl` receives scalar arguments only.
         if unsafe { libc::prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) } != 0 {
             return logged_last_error(b"solti-exec: PR_SET_KEEPCAPS failed: ");
         }
@@ -473,21 +417,24 @@ mod linux_impl {
             groups.as_ptr()
         };
 
-        // SAFETY: the list is immutable storage prepared before `fork`.
+        // SAFETY:
+        // the list is immutable storage prepared before `fork`.
         if unsafe { libc::syscall(SYS_SETGROUPS, groups.len(), groups_ptr) } != 0 {
             return logged_last_error(b"solti-exec: setgroups failed: ");
         }
         verify_supplementary_groups(credentials)?;
 
         let gid = credentials.gid;
-        // SAFETY: all three ids are validated concrete group IDs.
+        // SAFETY:
+        // all three ids are validated concrete group IDs.
         if unsafe { libc::syscall(SYS_SETRESGID, gid, gid, gid) } != 0 {
             return logged_last_error(b"solti-exec: setresgid failed: ");
         }
         verify_group_ids(gid)?;
 
         let uid = credentials.uid;
-        // SAFETY: all three ids are validated concrete user IDs.
+        // SAFETY:
+        // all three ids are validated concrete user IDs.
         if unsafe { libc::syscall(SYS_SETRESUID, uid, uid, uid) } != 0 {
             return logged_last_error(b"solti-exec: setresuid failed: ");
         }
@@ -500,7 +447,8 @@ mod linux_impl {
         } else {
             credentials.observed_groups.as_mut_ptr()
         };
-        // SAFETY: the output buffer was allocated to `group_count` elements before `fork`.
+        // SAFETY:
+        // the output buffer was allocated to `group_count` elements before `fork`.
         let count = unsafe { libc::syscall(SYS_GETGROUPS, credentials.group_count, observed_ptr) };
         if count < 0 {
             return logged_last_error(b"solti-exec: getgroups failed: ");
@@ -523,7 +471,8 @@ mod linux_impl {
         let mut real = 0;
         let mut effective = 0;
         let mut saved = 0;
-        // SAFETY: all output pointers refer to stack-local group IDs.
+        // SAFETY:
+        // all output pointers refer to stack-local group IDs.
         if unsafe { libc::syscall(SYS_GETRESGID, &mut real, &mut effective, &mut saved) } != 0 {
             return logged_last_error(b"solti-exec: getresgid failed: ");
         }
@@ -538,7 +487,8 @@ mod linux_impl {
         let mut real = 0;
         let mut effective = 0;
         let mut saved = 0;
-        // SAFETY: all output pointers refer to stack-local user IDs.
+        // SAFETY:
+        // all output pointers refer to stack-local user IDs.
         if unsafe { libc::syscall(SYS_GETRESUID, &mut real, &mut effective, &mut saved) } != 0 {
             return logged_last_error(b"solti-exec: getresuid failed: ");
         }
@@ -558,7 +508,8 @@ mod linux_impl {
         };
         let mut data = [CapUserData::default(); 2];
 
-        // SAFETY: the structs match Linux capability ABI version 3.
+        // SAFETY:
+        // the structs match Linux capability ABI version 3.
         if unsafe { capget(&mut header, data.as_mut_ptr()) } != 0 {
             return logged_last_error(b"solti-exec: capget failed: ");
         }
@@ -573,7 +524,8 @@ mod linux_impl {
             entry.inheritable = allowed;
         }
 
-        // SAFETY: the structs match Linux capability ABI version 3.
+        // SAFETY:
+        // the structs match Linux capability ABI version 3.
         if unsafe { capset(&mut header, data.as_ptr()) } != 0 {
             return logged_last_error(b"solti-exec: capset failed: ");
         }
@@ -588,7 +540,8 @@ mod linux_impl {
     }
 
     fn clear_ambient_capabilities() -> io::Result<()> {
-        // SAFETY: `prctl` receives scalar arguments only.
+        // SAFETY:
+        // `prctl` receives scalar arguments only.
         if unsafe { libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) } != 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::EINVAL) {
@@ -600,7 +553,8 @@ mod linux_impl {
     }
 
     fn raise_ambient_capability(capability: u32) -> io::Result<()> {
-        // SAFETY: `prctl` receives scalar arguments only.
+        // SAFETY:
+        // `prctl` receives scalar arguments only.
         if unsafe { libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, capability, 0, 0) } != 0 {
             return logged_last_error(b"solti-exec: raise ambient capability failed: ");
         }
@@ -608,11 +562,13 @@ mod linux_impl {
     }
 
     fn apply_no_new_privs() -> io::Result<()> {
-        // SAFETY: `prctl` receives scalar arguments only.
+        // SAFETY:
+        // `prctl` receives scalar arguments only.
         if unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
             return logged_last_error(b"solti-exec: PR_SET_NO_NEW_PRIVS failed: ");
         }
-        // SAFETY: `prctl` receives scalar arguments only.
+        // SAFETY:
+        // `prctl` receives scalar arguments only.
         let state = unsafe { libc::prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
         if state < 0 {
             return logged_last_error(b"solti-exec: PR_GET_NO_NEW_PRIVS failed: ");
@@ -646,60 +602,7 @@ mod linux_impl {
 
         use super::super::SeccompPolicy;
         use crate::host::log::pre_exec_log;
-
-        fn dangerous_syscalls() -> &'static [libc::c_long] {
-            &[
-                libc::SYS_ptrace,
-                libc::SYS_process_vm_readv,
-                libc::SYS_process_vm_writev,
-                libc::SYS_process_madvise,
-                libc::SYS_pidfd_getfd,
-                libc::SYS_kcmp,
-                libc::SYS_mount,
-                libc::SYS_umount2,
-                libc::SYS_pivot_root,
-                libc::SYS_open_tree,
-                libc::SYS_move_mount,
-                libc::SYS_fsopen,
-                libc::SYS_fsconfig,
-                libc::SYS_fsmount,
-                libc::SYS_fspick,
-                libc::SYS_mount_setattr,
-                libc::SYS_name_to_handle_at,
-                libc::SYS_open_by_handle_at,
-                libc::SYS_quotactl,
-                libc::SYS_quotactl_fd,
-                libc::SYS_kexec_load,
-                libc::SYS_kexec_file_load,
-                libc::SYS_init_module,
-                libc::SYS_finit_module,
-                libc::SYS_delete_module,
-                libc::SYS_bpf,
-                libc::SYS_perf_event_open,
-                libc::SYS_swapon,
-                libc::SYS_swapoff,
-                libc::SYS_reboot,
-                libc::SYS_sethostname,
-                libc::SYS_setdomainname,
-                libc::SYS_settimeofday,
-                libc::SYS_clock_settime,
-                libc::SYS_adjtimex,
-                libc::SYS_clock_adjtime,
-                libc::SYS_setns,
-                libc::SYS_acct,
-                libc::SYS_syslog,
-                libc::SYS_fanotify_init,
-                libc::SYS_lookup_dcookie,
-                libc::SYS_vhangup,
-                libc::SYS_add_key,
-                libc::SYS_keyctl,
-                libc::SYS_request_key,
-                #[cfg(target_arch = "x86_64")]
-                libc::SYS_iopl,
-                #[cfg(target_arch = "x86_64")]
-                libc::SYS_ioperm,
-            ]
-        }
+        use crate::isolation::deny_host_control_syscalls;
 
         #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         const ARCH: Option<TargetArch> = Some(TargetArch::x86_64);
@@ -733,13 +636,11 @@ mod linux_impl {
             architecture: TargetArch,
         ) -> Result<BpfProgram, Box<dyn std::error::Error>> {
             let mut rules = BTreeMap::new();
-            for &syscall in dangerous_syscalls() {
+            for syscall in deny_host_control_syscalls() {
                 #[allow(clippy::useless_conversion)]
-                rules.insert(i64::from(syscall), Vec::new());
+                rules.insert(i64::from(syscall.number()), Vec::new());
             }
             #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-            // Linux before 5.4 accepted these confused x32 syscall numbers
-            // without X32_SYSCALL_BIT. They are reserved on newer kernels.
             for syscall in 512..=547 {
                 rules.insert(syscall, Vec::new());
             }
@@ -830,7 +731,11 @@ mod linux_impl {
                     libc::SYS_process_madvise,
                     libc::SYS_pidfd_getfd,
                 ] {
-                    assert!(dangerous_syscalls().contains(&syscall));
+                    assert!(
+                        deny_host_control_syscalls()
+                            .iter()
+                            .any(|denied| denied.number() == syscall)
+                    );
                 }
             }
 

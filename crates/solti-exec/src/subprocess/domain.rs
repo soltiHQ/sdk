@@ -383,7 +383,7 @@ fn macos_group_contains_only_leader(pgid: libc::pid_t) -> io::Result<bool> {
         return Ok(false);
     }
 
-    let count = returned as usize / std::mem::size_of::<libc::pid_t>();
+    let count = returned as usize / size_of::<libc::pid_t>();
     let mut saw_leader = false;
     for pid in pids.into_iter().take(count).filter(|pid| *pid != 0) {
         if pid != pgid {
@@ -470,10 +470,9 @@ static DROP_FINALIZER: OnceLock<Mutex<Option<DropFinalizer>>> = OnceLock::new();
 /// Starts the Tokio-independent drop finalizer before process creation.
 pub(super) fn prepare_drop_finalizer() -> io::Result<DropFinalizerHandle> {
     let finalizer = DROP_FINALIZER.get_or_init(|| Mutex::new(None));
-    let mut finalizer = match finalizer.lock() {
-        Ok(finalizer) => finalizer,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut finalizer = finalizer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(finalizer) = finalizer.as_ref() {
         if finalizer.thread.is_finished() || !finalizer.state.healthy.load(Ordering::Acquire) {
             return Err(io::Error::new(
@@ -887,8 +886,8 @@ fn combine_errors(
 #[cfg(unix)]
 fn exited_without_reaping(pid: libc::pid_t) -> io::Result<bool> {
     loop {
-        // SAFETY: zero is a valid initial representation for `siginfo_t` passed
-        // to `waitid`. The kernel initializes it before a reported state change.
+        // SAFETY: zero is a valid initial representation for `siginfo_t` passed to `waitid`.
+        // The kernel initializes it before a reported state change.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: `pid` names a child and `info` points to writable storage.
         let result = unsafe {

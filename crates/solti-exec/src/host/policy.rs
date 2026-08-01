@@ -38,6 +38,7 @@ use super::{
     attach_cgroup, attach_process_config, attach_rlimits, attach_security, prepare_cgroup,
     resolve_cgroup_parent,
 };
+use crate::isolation::validate_cgroup_limits;
 
 /// Declarative controls for a process started on the host.
 ///
@@ -120,8 +121,7 @@ impl HostProcessPolicy {
     /// Sets Linux process security controls.
     ///
     /// A non-empty policy requires Linux.
-    /// Host process enforcement requires feature `seccomp` to apply
-    /// [`super::SeccompPolicy::DenyHostControl`].
+    /// Host process enforcement requires feature `seccomp` to apply [`super::SeccompPolicy::DenyHostControl`].
     pub fn with_security(mut self, security: SecurityConfig) -> Self {
         self.security = Some(security);
         self
@@ -174,7 +174,7 @@ impl HostProcessPolicy {
     #[cfg(feature = "host-process")]
     pub fn prepare(self) -> Result<PreparedHostProcessPolicy, HostProcessError> {
         if let Some(cgroups) = &self.cgroups {
-            validate_cgroup_limits(cgroups)?;
+            validate_cgroup_limits(cgroups).map_err(HostProcessError::InvalidConfig)?;
         }
         if let Some(security) = &self.security {
             security.validate()?;
@@ -323,8 +323,7 @@ impl AttemptProcessDomain {
     ///
     /// # Errors
     ///
-    /// Returns an I/O error when the cgroup is populated, no longer identifies
-    /// the owned directory, or cannot be removed.
+    /// Returns an I/O error when the cgroup is populated, no longer identifies the owned directory, or cannot be removed.
     pub fn cleanup(&mut self) -> io::Result<()> {
         if let Some(cgroup) = self.cgroup.as_mut() {
             cgroup.cleanup()?;
@@ -477,37 +476,6 @@ fn validate_cgroup_name(name: &str) -> Result<(), HostProcessError> {
 }
 
 #[cfg(feature = "host-process")]
-fn validate_cgroup_limits(cgroups: &CgroupLimits) -> Result<(), HostProcessError> {
-    if cgroups.is_empty() {
-        return Err(HostProcessError::InvalidConfig(
-            "cgroups configuration must contain at least one limit".into(),
-        ));
-    }
-    if let Some(cpu) = &cgroups.cpu {
-        if cpu.period == 0 {
-            return Err(HostProcessError::InvalidConfig(
-                "cgroups.cpu.period cannot be zero".into(),
-            ));
-        }
-        if cpu.quota == Some(0) {
-            return Err(HostProcessError::InvalidConfig(
-                "cgroups.cpu.quota cannot be zero".into(),
-            ));
-        }
-    }
-    if cgroups.memory == Some(0) {
-        return Err(HostProcessError::InvalidConfig(
-            "cgroups.memory cannot be zero".into(),
-        ));
-    }
-    if cgroups.pids == Some(0) {
-        return Err(HostProcessError::InvalidConfig(
-            "cgroups.pids cannot be zero".into(),
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

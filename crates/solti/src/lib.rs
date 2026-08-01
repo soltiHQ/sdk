@@ -46,6 +46,8 @@
 //! | Desired-state supervision    | `core`                  |
 //! | Host process controls        | `exec-host-process`     |
 //! | Subprocess execution         | `exec-subprocess`       |
+//! | Container engine boundary    | `exec-container`        |
+//! | Native containerd 2.x        | `exec-containerd`       |
 //! | Seccomp host process filter  | `exec-seccomp`          |
 //! | HTTP task API                | `api-http`              |
 //! | gRPC task API                | `api-grpc`              |
@@ -61,6 +63,8 @@
 //!
 //! `exec-seccomp` enables the low-level host process filter.
 //! Combine it with `exec-subprocess` to filter subprocess attempts.
+//! `exec-container` exposes the engine-neutral container runner.
+//! `exec-containerd` adds the native containerd 2.x adapter.
 //!
 //! `api-http` and `api-grpc` expose transports.
 //! They do not enable `solti-core`.

@@ -1,4 +1,4 @@
-//! # Subprocess output
+//! # Workload output
 //!
 //! Stdout and stderr are read as separate line streams.
 //! Each line is sent to `tracing` and an optional [`OutputSink`].
@@ -30,7 +30,7 @@ use solti_runner::OutputSink;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tracing::{debug, info, warn};
 
-/// Configuration for subprocess output logging.
+/// Configuration for workload output logging.
 ///
 /// ## Defaults
 ///
@@ -72,7 +72,7 @@ impl Default for LogConfig {
     }
 }
 
-/// Captured subprocess stream.
+/// Captured workload stream.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum StreamKind {
     Stdout,
@@ -95,7 +95,7 @@ impl StreamKind {
     }
 }
 
-/// Reads, limits, and publishes one subprocess stream.
+/// Reads, limits, and publishes one workload stream.
 pub(crate) async fn log_stream<R>(
     reader: R,
     run_id: &str,
@@ -126,7 +126,7 @@ pub(crate) async fn log_stream<R>(
                     stream = %stream_name,
                     error = %e,
                     line_num = line_count,
-                    "error while reading subprocess stream"
+                    "error while reading workload stream"
                 );
                 break;
             }

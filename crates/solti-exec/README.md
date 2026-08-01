@@ -1,14 +1,18 @@
 # solti-exec
 
 `solti-exec` provides concrete execution backends for the Solti SDK.
-The `host-process` feature provides reusable policy and low-level process controls.
-The `subprocess` feature implements a runner for `solti.io/v1`, kind `Subprocess`.
-It turns a `Task` resource into a reusable Taskvisor task that starts one operating-system process per attempt.
 
-Use this crate when an agent executes commands or scripts on its host.
+- `host-process` feature provides reusable policy and low-level process controls.
+- `subprocess` feature implements a runner for `solti.io/v1`, kind `Subprocess`.
+- `container` feature implements an engine-neutral runner for `solti.io/v1`, kind `Container`.
+- `containerd` feature provides its native containerd 2.x engine.
+
+Use this crate when an agent executes host processes or OCI containers.
 The crate does not schedule tasks, store resources, or expose a network API.
 
-## Quick start
+> It does not discover or start engine daemons.
+
+## Subprocess quick start
 
 Register the default subprocess runner, then build a Taskvisor task through `RunnerRouter`:
 
@@ -44,7 +48,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 `RunnerRouter::build` constructs the task but does not start it.
 `solti-core` submits the returned task to Taskvisor during reconciliation.
 
+## Containerd quick start
+
+Connect to one explicit containerd 2.x endpoint, then register its runner:
+
+```rust,no_run
+# #[cfg(feature = "containerd")]
+# {
+use std::sync::Arc;
+
+use solti_exec::container::{
+    containerd::{ContainerNetwork, ContainerdConfig, ContainerdEngine},
+    register_container_runner,
+};
+use solti_runner::RunnerRouter;
+
+async fn configure() -> Result<RunnerRouter, Box<dyn std::error::Error>> {
+    let settings = ContainerdConfig::new(
+        "/run/containerd/containerd.sock",
+        "solti",
+        "overlayfs",
+        "io.containerd.runc.v2",
+    )
+    .with_network(ContainerNetwork::None);
+
+    let engine = Arc::new(ContainerdEngine::connect(settings).await?);
+    let mut router = RunnerRouter::new();
+    register_container_runner(&mut router, "containerd", engine)?;
+    Ok(router)
+}
+# }
+```
+
+`connect` probes the configured endpoint.
+It requires containerd major version 2.
+It also validates the selected snapshotter, platform, and OCI runtime.
+Control RPCs use a 30-second deadline by default.
+Image pull and unpack use a 10-minute deadline by default.
+`ContainerdConfig` can override both deadlines and the cleanup window.
+The workload wait has no deadline.
+
+Building a container task performs no engine I/O.
+Each attempt resolves and unpacks the image.
+It creates a snapshot, container, and task.
+It arms wait before start, streams output, waits, and requests cleanup of owned resources.
+The same Taskvisor task can run more than once.
+Retryable cleanup failures are retried on the same attempt.
+A cleanup retry does not execute the workload again.
+Permanent cleanup failures stop retry immediately.
+The retries share a 30-second window by default.
+Exhausted cleanup is a fatal attempt failure.
+
 ## What it does
+
+### Subprocess
 
 - registers a runner for the built-in `Subprocess` workload GVK;
 - executes commands directly;
@@ -59,6 +116,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - reports backend preparation and spawn failures through runner metrics;
 - keeps host process controls separate from subprocess settings.
 
+### Container
+
+- provides an engine-neutral lifecycle for `Container` workloads;
+- implements that lifecycle against native containerd 2.x services;
+- renders an OCI runtime specification from the image, task, and runner policy;
+- captures container stdout and stderr through private attempt-scoped FIFOs;
+- removes only resources whose ownership is confirmed for the current attempt.
+
 ## Inputs and outputs
 
 | API or value                              | Input                                   | Output                                        |
@@ -72,11 +137,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `RunnerRouter::build`                     | `Task` with a `Subprocess` workload     | Reusable `taskvisor::TaskRef`                 |
 | `SubprocessBackendConfig`                 | Host policy, environment, cwd, output   | Runner-wide attempt settings                  |
 | One task attempt                          | Resolved command or script              | Task result and optional stdout/stderr chunks |
+| `ContainerProcessPolicy`                  | OCI process and resource controls       | Engine-neutral container process policy       |
+| `ContainerdConfig`                        | Socket, namespace, plugins, and network | Native containerd adapter settings            |
+| `ContainerdEngine::connect`               | `ContainerdConfig`                      | Connected and probed containerd 2.x engine    |
+| `register_container_runner`               | Router, runner name, and engine         | Registered `Container` runner                 |
+| One container attempt                     | Image, process overrides, and policy    | Task result and optional stdout/stderr chunks |
 
 `SubprocessRunner` accepts only the exact built-in `Subprocess` GVK.
+`ContainerRunner` accepts only the exact built-in `Container` GVK.
 Routing and runner selection remain owned by `solti-runner`.
 
-## Execution flow
+## Subprocess execution flow
 
 ```text
 Task { workload: Subprocess }
@@ -107,6 +178,62 @@ Task { workload: Subprocess }
 
 Attempt-scoped resources are created inside the Taskvisor task.
 The same `TaskRef` can therefore run more than once under a restart policy.
+
+## Containerd execution flow
+
+```text
+Task { workload: Container }
+              │ exact GVK and optional runnerSelector
+              ▼
+         RunnerRouter
+              ▼
+       ContainerRunner
+              │ each attempt
+              ▼
+     ContainerEngine
+              ▼
+  native containerd 2.x
+     ├── pull and unpack image
+     ├── prepare snapshot
+     ├── create container and task
+     ├── stream stdout and stderr
+     ├── start and wait
+     └── delete task, container, snapshot, and local I/O
+```
+
+The native adapter supports Linux containers on Linux.
+It talks directly to containerd over the configured Unix socket.
+It does not use CRI.
+
+The `container` feature does not select an engine.
+The final binary passes an `Arc<dyn ContainerEngine>` when it registers a runner.
+`create_attempt` returns one stopped attempt with exit observation already armed.
+Engine implementations must make `terminate` and `cleanup` idempotent.
+They may clean only resources whose ownership is confirmed for that attempt.
+
+`ContainerNetwork::None` creates an OCI network namespace.
+The adapter does not configure an external interface, address, route, DNS, or NAT.
+`ContainerNetwork::Host` omits that namespace and shares the host network namespace.
+It does not add host `/etc/hosts` or `/etc/resolv.conf` mounts.
+It does not change the OCI capability sets.
+The native adapter's base capability set includes `CAP_NET_RAW`.
+`ContainerProcessPolicy::with_capabilities` replaces that set when the final binary needs a narrower policy.
+There is no CNI or bridge integration.
+
+The task command overrides the image entrypoint.
+Non-empty task arguments override the image command.
+Task and runner environment values override image values.
+Image users are accepted as exact `UID:GID` values.
+Named users and numeric users without a group require explicit runner credentials.
+The adapter does not create a user namespace.
+
+The I/O root must be visible at the same path to the SDK process and containerd.
+The adapter creates private `0700` attempt directories and `0600` FIFOs below it.
+On Linux, every root path component must be a real directory owned by root or the effective UID.
+Group-writable and world-writable components must have the sticky bit.
+
+The upstream `containerd-client` dependency compiles its protocol bindings during the build.
+Building the `containerd` feature therefore requires a usable `protoc` through `PROTOC` or `PATH`.
 
 ## Commands and scripts
 
@@ -442,13 +569,17 @@ On other platforms, cancellation falls back to the child process.
 
 ## Features
 
-| Feature        | Default | Effect                                         |
-|----------------|---------|------------------------------------------------|
-| `host-process` | Off     | Host process policy and low-level controls     |
-| `subprocess`   | Off     | Subprocess runner; implies `host-process`      |
-| `seccomp`      | Off     | Linux seccomp denylist; implies `host-process` |
+| Feature        | Default | Effect                                            |
+|----------------|---------|---------------------------------------------------|
+| `container`    | Off     | Engine-neutral container runner                   |
+| `containerd`   | Off     | Native containerd 2.x engine; implies `container` |
+| `host-process` | Off     | Host process policy and low-level controls        |
+| `subprocess`   | Off     | Subprocess runner; implies `host-process`         |
+| `seccomp`      | Off     | Linux seccomp denylist; implies `host-process`    |
 
 Enable both `subprocess` and `seccomp` to apply the filter to subprocess attempts.
+The container runner passes `SeccompPolicy` to its engine.
+The native containerd engine renders `Disabled` and `DenyHostControl` into the OCI specification.
 
 With no features, the crate exposes no policy or execution backend.
 
@@ -468,3 +599,7 @@ Attempt failures use `taskvisor::TaskError`.
 Runner names use Kubernetes label-value rules.
 Registration adds `solti.io/runner-name=<name>` to the runner labels.
 Duplicate names are rejected by `RunnerRouter`.
+
+## Contributor guide
+
+See the [solti-exec source guide](https://github.com/soltiHQ/sdk/blob/main/crates/solti-exec/ARCHITECTURE.md) for module ownership, execution flows, resource ownership, and invariants.

@@ -26,5 +26,9 @@ solti = { version = "0.0.3", features = [
 
 The `model` feature includes JSON Schema support from `solti-model`.
 
+`exec-container` exposes the engine-neutral container runner.
+`exec-containerd` adds the native containerd 2.x engine.
+It does not add CRI or container network provisioning.
+
 `full` enables every production component integration. Direct dependencies on
 component crates remain supported.

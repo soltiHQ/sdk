@@ -1,8 +1,4 @@
 //! # Execution errors
-//!
-//! [`ExecError`] covers runner construction and registration.
-//! Workload build errors use [`solti_runner::RunnerError`].
-//! Attempt failures use [`taskvisor::TaskError`].
 
 use thiserror::Error;
 
@@ -25,6 +21,7 @@ pub enum ExecError {
     Io(#[from] std::io::Error),
 }
 
+#[cfg(feature = "host-process")]
 impl From<crate::host::HostProcessError> for ExecError {
     fn from(error: crate::host::HostProcessError) -> Self {
         match error {

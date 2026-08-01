@@ -10,7 +10,6 @@
 //!      │ runner construction
 //!      ├── validate platform and values
 //!      └── resolve cwd roots and cgroup parent
-//!                 │
 //!                 ▼
 //!          each task attempt
 //!      ├── build environment
@@ -38,8 +37,8 @@ use crate::ExecError::InvalidRunnerConfig;
 use crate::host::{
     AttemptProcessDomain, HostProcessPolicy, PreparedHostProcessAttempt, PreparedHostProcessPolicy,
 };
+use crate::output::LogConfig;
 use crate::subprocess::boundary::PinnedCwd;
-use crate::subprocess::logger::LogConfig;
 
 /// Minimal `PATH` used for a cleared environment.
 pub(crate) const SAFE_DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
@@ -273,6 +272,7 @@ impl SubprocessBackendConfig {
     ///
     /// The value must be between `1` and [`MAX_SCRIPT_BODY_BYTES`].
     /// It can lower the model limit but cannot raise it.
+    ///
     /// Oversized scripts are rejected when the task is built.
     pub fn with_max_script_body_bytes(mut self, max: usize) -> Self {
         self.max_script_body_bytes = Some(max);
@@ -284,6 +284,7 @@ impl SubprocessBackendConfig {
     /// The runner keeps the descriptor open at the same number.
     /// Descriptors `0`, `1`, and `2` are managed as standard streams.
     /// They are rejected when the runner is created.
+    ///
     /// Linux marks every other open descriptor close-on-exec.
     /// Other Unix platforms apply the bounded snapshot described by the crate README.
     #[cfg(unix)]

@@ -38,8 +38,6 @@ impl AnonymousScript {
             #[cfg(target_os = "linux")]
             {
                 linux::seal(&file)?;
-                // The interpreter may reopen the descriptor after changing UID.
-                // Publish read access only after the contents are immutable.
                 file.set_permissions(std::fs::Permissions::from_mode(0o444))?;
             }
 
