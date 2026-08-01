@@ -116,21 +116,21 @@
 //!
 //! ## Main Types
 //!
-//! | Area                | Types                                                     |
-//! |---------------------|-----------------------------------------------------------|
-//! | Host process policy | `host::HostProcessPolicy`, `host::AttemptProcessDomain`   |
-//! | Host process state  | `host::ProcessConfig`                                     |
-//! | Host resources      | `host::RlimitConfig`, `host::CgroupLimits`                |
-//! | Host security       | `host::SecurityConfig`, `host::ProcessCredentials`        |
-//! | Runner              | `subprocess::SubprocessRunner`                            |
-//! | Registration        | `subprocess::register_subprocess_runner`                  |
-//! | Backend settings    | `subprocess::SubprocessBackendConfig`                     |
-//! | Environment         | `subprocess::EnvPolicy`, `subprocess::CwdPolicy`          |
-//! | Output              | `subprocess::LogConfig`                                   |
-//! | Container runner    | `container::ContainerRunner`                              |
+//! | Area                | Types                                                       |
+//! |---------------------|-------------------------------------------------------------|
+//! | Host process policy | `host::HostProcessPolicy`, `host::AttemptProcessDomain`     |
+//! | Host process state  | `host::ProcessConfig`                                       |
+//! | Host resources      | `host::RlimitConfig`, `host::CgroupLimits`                  |
+//! | Host security       | `host::SecurityConfig`, `host::ProcessCredentials`          |
+//! | Runner              | `subprocess::SubprocessRunner`                              |
+//! | Registration        | `subprocess::register_subprocess_runner`                    |
+//! | Backend settings    | `subprocess::SubprocessBackendConfig`                       |
+//! | Environment         | `subprocess::EnvPolicy`, `subprocess::CwdPolicy`            |
+//! | Output              | `subprocess::LogConfig`                                     |
+//! | Container runner    | `container::ContainerRunner`                                |
 //! | Container boundary  | `container::ContainerEngine`, `container::ContainerAttempt` |
-//! | Containerd 2.x      | `container::containerd::ContainerdEngine`                 |
-//! | Errors              | `ExecError`                                               |
+//! | Containerd 2.x      | `container::containerd::ContainerdEngine`                   |
+//! | Errors              | `ExecError`                                                 |
 //!
 //! ## Feature Flags
 //!
