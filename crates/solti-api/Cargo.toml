@@ -16,6 +16,7 @@ license.workspace      = true
 
 include = [
     "CONTRACT.md",
+    "examples/**/*.rs",
     "proto/**/*.proto",
     "src/**/*.rs",
     "README.md",
@@ -81,8 +82,21 @@ serde_json     = { workspace = true }
 solti-model    = { workspace = true, features = ["schema"] }
 solti-runner   = { workspace = true }
 taskvisor      = { workspace = true }
-tokio          = { workspace = true, features = ["macros", "rt"] }
+tokio          = { workspace = true, features = ["macros", "net", "rt", "sync"] }
+tokio-stream   = { workspace = true, features = ["net"] }
 tower          = { workspace = true, features = ["util"] }
+
+[[example]]
+name              = "core_adapter"
+required-features = ["core-adapter"]
+
+[[example]]
+name              = "grpc_contract"
+required-features = ["grpc"]
+
+[[example]]
+name              = "http_contract"
+required-features = ["http"]
 
 [build-dependencies]
 prost-reflect       = { workspace = true, optional = true }

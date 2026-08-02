@@ -150,6 +150,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Examples
+
+### Internal examples
+
+These examples use no other Solti crate.
+They stop at the `solti-tls` public boundary and its transport outputs.
+They generate development certificates at runtime and require no external files.
+Each example starts with a text flow diagram, then explains setup, validation, and result stages.
+
+Start with PEM sources and validation:
+
+```bash
+cargo run -p solti-tls --example pem_sources
+```
+
+| Example                                           | What it shows                                                 |
+|---------------------------------------------------|---------------------------------------------------------------|
+| [pem_sources.rs](examples/pem_sources.rs)         | Memory and file sources, validated PEM, and typed errors.     |
+| [tls_round_trip.rs](examples/tls_round_trip.rs)   | Server identity, client trust roots, ALPN, and one handshake. |
+| [mtls_round_trip.rs](examples/mtls_round_trip.rs) | Mandatory client identity and mutual authentication.          |
+
+`solti-tls` has no optional features.
+All three examples use its default feature set.
+
+### Full examples
+
+Application-level compositions live in the [`solti` examples](https://github.com/soltiHQ/sdk/tree/main/crates/solti/examples).
+They combine component crates and own the complete binary lifecycle.
+
 ## Specific behavior
 
 - In-memory private keys and loaded private-key PEM are redacted in `Debug` and zeroized when their final crate-owned buffer is dropped.

@@ -53,6 +53,14 @@ tracing    = { workspace = true, optional = true }
 [dev-dependencies]
 solti-core = { workspace = true, features = ["test-util"] }
 
+[[example]]
+name              = "adapter_metrics"
+required-features = ["api", "discover", "runner"]
+
+[[example]]
+name              = "metrics_server"
+required-features = ["server"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

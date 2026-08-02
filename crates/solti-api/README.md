@@ -448,3 +448,38 @@ HTTP errors use a Kubernetes-style `Status` body.
 Write conflicts include machine-readable causes.
 gRPC write conflicts encode `WriteConflictDetails` in status details.
 Internal diagnostic messages are logged and hidden from clients.
+
+## Examples
+
+### Internal examples
+
+These examples exercise the public transport and adapter contracts.
+They do not assemble discovery, observability, or concrete execution backends.
+Each example starts with a text flow diagram, then explains its request, conversion, and result.
+
+Start with the HTTP/JSON contract:
+
+```bash
+cargo run -p solti-api --example http_contract --features http
+```
+
+| Example                                         | Features       | What it shows                                                          |
+|-------------------------------------------------|----------------|------------------------------------------------------------------------|
+| [http_contract.rs](examples/http_contract.rs)   | `http`         | Authentication, CRD JSON, generated OpenAPI, and Server-Sent Events.   |
+| [grpc_contract.rs](examples/grpc_contract.rs)   | `grpc`         | Generated client, bearer metadata, unary calls, and server streaming.  |
+| [core_adapter.rs](examples/core_adapter.rs)     | `core-adapter` | Public workload filtering between `ApiHandler` and `solti-core`.       |
+
+Run the remaining examples explicitly:
+
+```bash
+cargo run -p solti-api --example grpc_contract --features grpc
+cargo run -p solti-api --example core_adapter --features core-adapter
+```
+
+The gRPC example binds one loopback listener.
+No request leaves the local machine.
+
+### Full examples
+
+Application-level compositions live in the [`solti` examples](https://github.com/soltiHQ/sdk/tree/main/crates/solti/examples).
+They combine the API transports with concrete runners, core supervision, discovery, and observability.

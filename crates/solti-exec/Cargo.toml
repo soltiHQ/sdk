@@ -99,6 +99,30 @@ taskvisor = { workspace = true, features = ["test-util"] }
 tempfile  = { workspace = true }
 tokio     = { workspace = true, features = ["rt", "macros", "test-util"] }
 
+[[example]]
+name              = "container"
+required-features = ["containerd"]
+
+[[example]]
+name              = "containerd_config"
+required-features = ["containerd"]
+
+[[example]]
+name              = "custom_container_engine"
+required-features = ["container"]
+
+[[example]]
+name              = "host_process_policy"
+required-features = ["host-process"]
+
+[[example]]
+name              = "subprocess_command"
+required-features = ["subprocess"]
+
+[[example]]
+name              = "subprocess_script"
+required-features = ["subprocess"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

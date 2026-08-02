@@ -181,6 +181,39 @@ A detection failure returns a retryable task error.
 | `log-compat`    | Off     | Forwards `log` records into `tracing`       |
 | `timezone-sync` | Off     | Exposes the supervised offset refresh task  |
 
+## Examples
+
+### Internal examples
+
+These examples stay inside the `solti-observe` responsibility.
+Text and JSON are separate executables because each process can install only one global subscriber.
+The timezone example stops at the returned manifest and `TaskRef`; it does not start a supervisor.
+Each example starts with a text flow diagram, then explains its configuration, emitted events, and result.
+
+Start with human-readable text output:
+
+```bash
+cargo run -p solti-observe --example text_logging
+```
+
+| Example                                       | Features        | What it shows                                                      |
+|-----------------------------------------------|-----------------|--------------------------------------------------------------------|
+| [text_logging.rs](examples/text_logging.rs)   | default         | Text setup, filtering, targets, and structured fields.             |
+| [json_logging.rs](examples/json_logging.rs)   | default         | Serde configuration, defaults, filtering, and JSON output.         |
+| [timezone_sync.rs](examples/timezone_sync.rs) | `timezone-sync` | Embedded refresh manifest, `TaskRef`, schedule, and retry policy.  |
+
+Run the remaining examples explicitly:
+
+```bash
+cargo run -p solti-observe --example json_logging
+cargo run -p solti-observe --example timezone_sync --features timezone-sync
+```
+
+### Full examples
+
+Application-level compositions live in the [`solti` examples](https://github.com/soltiHQ/sdk/tree/main/crates/solti/examples).
+They combine component crates and own the complete binary lifecycle.
+
 ## Specific behavior
 
 - Parsing `journald` with the feature on a non-Linux target returns `JournaldNotSupported`.

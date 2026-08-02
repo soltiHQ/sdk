@@ -28,6 +28,28 @@ use tokio_stream::StreamExt;
 
 type ExampleResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+const FLOW: &str = r#"
+solti-core: collection snapshots and watches
+
+  alpha + beta + gamma
+           │ TaskQuery(limit=2)
+           ▼
+  page 1: alpha, beta ──► opaque continuation ──► page 2: gamma
+           │                                      ▲
+           └── snapshot resource version ─────────┘
+
+  live state: delete gamma
+           └──► page 2 still reads gamma from the captured snapshot
+
+  watch filter: environment=production
+           ├── development ──► production ──► Added
+           ├── production metadata change ──► Modified
+           └── production ──► development ──► Deleted
+
+  Watch event kinds describe visibility through the filter.
+  They do not describe resource existence alone.
+"#;
+
 /// Creates labels used by the watch scenario.
 fn labels(environment: &str, revision: Option<&str>) -> Labels {
     let mut labels = Labels::new();
@@ -101,7 +123,7 @@ fn show_event(expected: &str, event: TaskWatchEvent) -> ExampleResult {
     }
 
     println!(
-        "watch: {actual} {} at {}",
+        "[watch] {actual}: task={} resourceVersion={}.",
         task.name(),
         task.metadata().resource_version(),
     );
@@ -110,11 +132,17 @@ fn show_event(expected: &str, event: TaskWatchEvent) -> ExampleResult {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExampleResult {
+    println!("{FLOW}");
+    println!(
+        "[purpose] Read a stable paginated snapshot, then observe filter-relative watch transitions."
+    );
+
     let api = SupervisorApi::builder(RunnerRouter::new()).start().await?;
 
     for name in ["alpha", "beta", "gamma"] {
         create_task(&api, name, Labels::new()).await?;
     }
+    println!("[setup] Created alpha, beta, and gamma in the in-memory supervisor.");
 
     let query = TaskQuery::new().with_limit(2);
     let first = api.query_tasks(&query)?;
@@ -124,7 +152,7 @@ async fn main() -> ExampleResult {
         .map(|task| task.name().as_str())
         .collect();
     println!(
-        "page 1 at {}: {first_names:?}; remaining={}",
+        "[snapshot] Page 1: resourceVersion={}, tasks={first_names:?}, remaining={}.",
         first.resource_version, first.remaining_item_count,
     );
 
@@ -134,7 +162,7 @@ async fn main() -> ExampleResult {
     let snapshot_version = first.resource_version;
 
     api.delete_task(&TaskId::new("gamma")?).await?;
-    println!("live state: gamma deleted");
+    println!("[live-state] Deleted gamma after page 1 was captured.");
 
     let second = api.query_tasks(
         &TaskQuery::new()
@@ -146,9 +174,15 @@ async fn main() -> ExampleResult {
         .iter()
         .map(|task| task.name().as_str())
         .collect();
-    println!("page 2 at {}: {second_names:?}", second.resource_version,);
+    println!(
+        "[snapshot] Page 2: resourceVersion={}, tasks={second_names:?}.",
+        second.resource_version,
+    );
     assert_eq!(second.resource_version, snapshot_version);
     assert_eq!(second_names, ["gamma"]);
+    println!(
+        "[snapshot] Both pages use one resource version; the live deletion does not alter page 2."
+    );
 
     let before_create = api.query_tasks(&TaskQuery::new())?.resource_version;
     let mut completion_watch = api.watch_tasks(&TaskFilter::new(), Some(before_create.as_str()))?;
@@ -169,6 +203,9 @@ async fn main() -> ExampleResult {
     let selector = "environment=production".parse::<LabelSelector>()?;
     let filter = TaskFilter::new().with_label_selector(selector)?;
     let mut watch = api.watch_tasks(&filter, Some(baseline.as_str()))?;
+    println!(
+        "[watch] Started after resourceVersion={baseline} with filter environment=production."
+    );
 
     let current = api
         .get_task(watched.name())
@@ -201,5 +238,8 @@ async fn main() -> ExampleResult {
     show_event("Deleted", next_event(&mut watch).await?)?;
 
     api.shutdown().await?;
+    println!(
+        "\nResult: pagination remained snapshot-consistent and the watch reported Added, Modified, and Deleted as filter visibility changed."
+    );
     Ok(())
 }

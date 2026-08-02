@@ -174,6 +174,39 @@ It uses `AdmissionPolicy::Replace` in the `solti-metrics-server` slot.
 It restarts after exit and backs off from 1 to 30 seconds after failure.
 The embedded revision includes the listen address.
 
+## Examples
+
+### Internal examples
+
+These examples stay inside the `solti-prometheus` responsibility.
+Feature examples use source-crate traits because those traits form the public adapter contracts.
+The server example stops at the returned manifest and `TaskRef`; it does not start a supervisor.
+Each example starts with a text flow diagram, then explains its inputs, observations, and result.
+
+Start with the application-owned registry:
+
+```bash
+cargo run -p solti-prometheus --example shared_registry
+```
+
+| Example                                           | Features              | What it shows                                                     |
+|---------------------------------------------------|-----------------------|-------------------------------------------------------------------|
+| [shared_registry.rs](examples/shared_registry.rs) | default               | Build information, gathering, encoding, and registration errors.  |
+| [adapter_metrics.rs](examples/adapter_metrics.rs) | `api,discover,runner` | Several Solti metrics contracts sharing one registry.             |
+| [metrics_server.rs](examples/metrics_server.rs)   | `server`              | Embedded manifest, `TaskRef`, revision, and the runtime boundary. |
+
+Run the feature examples explicitly:
+
+```bash
+cargo run -p solti-prometheus --example adapter_metrics --features api,discover,runner
+cargo run -p solti-prometheus --example metrics_server --features server
+```
+
+### Full examples
+
+Application-level compositions live in the [`solti` examples](https://github.com/soltiHQ/sdk/tree/main/crates/solti/examples).
+They combine component crates and own the complete binary lifecycle.
+
 ## Specific behavior
 
 - `solti_taskvisor_attempts_in_flight` follows a best-effort event stream and can drift after dropped events.

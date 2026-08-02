@@ -383,19 +383,35 @@ Checked configuration uses `ConfigError`.
 
 ## Examples
 
-From a cloned repository checkout, run the lifecycle example with:
+### Internal examples
+
+These examples exercise only desired state, reconciliation, collections, and live output.
+They do not expose a network API, perform discovery, or add durable storage.
+Each example starts with a text flow diagram, then explains its inputs, transitions, and result.
+
+Start with a routed workload and its live output:
+
+```bash
+cargo run -p solti-core --example routed_output
+```
+
+| Example                                                 | What it shows                                                                 |
+|---------------------------------------------------------|-------------------------------------------------------------------------------|
+| [routed_output.rs](examples/routed_output.rs)           | Runner reconciliation, desired-state commit, live output, and final status.   |
+| [embedded_lifecycle.rs](examples/embedded_lifecycle.rs) | Embedded revisions, generation replacement, cancellation, and run history.    |
+| [collections.rs](examples/collections.rs)               | Snapshot-consistent pagination and filter-relative task watch event kinds.    |
+
+Run the remaining examples explicitly:
 
 ```bash
 cargo run -p solti-core --example embedded_lifecycle
+cargo run -p solti-core --example collections
 ```
 
-Run `embedded_lifecycle` first.
-Then use `collections` for list and watch semantics.
+### Full examples
 
-| Example                                                 | What it shows                                                      |
-|---------------------------------------------------------|--------------------------------------------------------------------|
-| [embedded_lifecycle.rs](examples/embedded_lifecycle.rs) | Reconciliation, generation changes, cancellation, and run history. |
-| [collections.rs](examples/collections.rs)               | Snapshot pagination and filter-relative task watches.              |
+Application-level compositions live in the [`solti` examples](https://github.com/soltiHQ/sdk/tree/main/crates/solti/examples).
+They combine core with concrete execution runners, discovery, observability, and the agent API.
 
 ## Contributor guide
 

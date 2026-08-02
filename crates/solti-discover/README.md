@@ -279,6 +279,41 @@ Transport-specific variants are available only with their transport feature.
 `DiscoverError` is non-exhaustive.
 Keep a wildcard arm when matching it.
 
+## Examples
+
+### Internal examples
+
+These examples exercise only the discovery client, generated task, and direct transport contracts.
+They do not run the agent API, persist registration state, or submit work to `solti-core`.
+Each example starts with a text flow diagram, then explains its inputs, wire interaction, and result.
+
+Start with a self-contained HTTP heartbeat:
+
+```bash
+cargo run -p solti-discover --example http_sync --features http
+```
+
+| Example                                     | Features       | What it shows                                                         |
+|---------------------------------------------|----------------|-----------------------------------------------------------------------|
+| [http_sync.rs](examples/http_sync.rs)       | `http`         | Full HTTP request, capabilities, authentication, uptime, and metrics. |
+| [grpc_sync.rs](examples/grpc_sync.rs)       | `grpc`         | gRPC task construction, lazy connection, and optional real sync.      |
+| [retryability.rs](examples/retryability.rs) | `http`, `grpc` | Retryable and permanent HTTP, gRPC, and protocol failures.            |
+
+Run the remaining examples explicitly:
+
+```bash
+cargo run -p solti-discover --example grpc_sync --features grpc
+cargo run -p solti-discover --example retryability --features http,grpc
+```
+
+The gRPC example performs no network operation by default.
+Pass `--send` only when `SOLTI_DISCOVERY_GRPC_ENDPOINT` points to a compatible control plane.
+
+### Full examples
+
+Application-level compositions live in the [`solti` examples](https://github.com/soltiHQ/sdk/tree/main/crates/solti/examples).
+They combine discovery with runner registration, reconciliation, supervision, and the agent API.
+
 ## Contracts
 
 | Contract | Source                                                         |

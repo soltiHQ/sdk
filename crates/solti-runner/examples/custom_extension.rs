@@ -28,6 +28,30 @@ use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 const API_VERSION: &str = "media.example.io/v1";
 const KIND: &str = "ImageResize";
 
+const FLOW: &str = r#"
+solti-runner: custom workload routing
+
+  resize-cpu + accelerator=cpu ─┐
+                                ├──► register ──► RunnerRouter
+  resize-gpu + accelerator=gpu ─┘                     │
+                                                      ├──► capability snapshot
+  Task                                                │
+    ├── GVK: media.example.io/v1, ImageResize ────────┤
+    └── runnerSelector: accelerator=gpu ──────────────┤
+                                                      │ first matching runner
+                                                      ▼
+                                                resize-gpu
+                                                      │ Task + RunId + BuildContext
+                                                      ▼
+                                            Runner::build_task
+                                                      │ validate application spec
+                                                      ▼
+                                             taskvisor::TaskRef
+
+  Routing reads only the GVK and selector.
+  Building validates the payload and creates a task; it does not start it.
+"#;
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ImageResizeSpec {
@@ -105,6 +129,13 @@ fn labels(accelerator: &str) -> Labels {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("{FLOW}");
+    println!(
+        "[purpose] Add an application-owned workload and choose between backends without changing solti-runner."
+    );
+
+    println!("[registration] Register CPU and GPU runners for the same custom GVK.");
+    println!("[registration] Runner names, labels, and GVK declarations are validated here.");
     let mut router = RunnerRouter::new();
     router.register_with_labels(
         Arc::new(ImageResizeRunner {
@@ -122,12 +153,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let capabilities = router.capabilities();
-    println!("Registered capabilities:");
+    println!("[capabilities] The immutable discovery snapshot advertises:");
     for runner in capabilities.runners() {
         let workload = &runner.workload_types()[0];
         let accelerator = runner.labels().get("accelerator").unwrap_or("unknown");
         println!(
-            "  {}: {}/{} accelerator={accelerator}",
+            "      runner={} apiVersion={} kind={} accelerator={accelerator}",
             runner.name(),
             workload.api_version(),
             workload.kind(),
@@ -146,14 +177,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .runner_selector(LabelSelector::from_labels(labels("gpu")))
         .build()?;
     let task = Task::new("resize-cover", spec)?;
+    println!(
+        "[resource] Task resize-cover requests apiVersion={API_VERSION}, kind={KIND}, selector accelerator=gpu."
+    );
 
     let selected = router.pick(&task)?;
-    println!("Selected runner: {}", selected.name());
+    println!(
+        "[routing] Exact GVK and selector matching chooses runner={}.",
+        selected.name(),
+    );
     assert_eq!(selected.name(), "resize-gpu");
 
     let task_ref = router.build(&task)?;
-    println!("Built TaskRef: {}", task_ref.name());
+    println!("[build] The runner validates source and width.");
+    println!(
+        "[build] The returned TaskRef uses the allocated RunId: {}.",
+        task_ref.name(),
+    );
     assert!(task_ref.name().starts_with("resize-gpu-image-resize-"));
+
+    println!(
+        "\nResult: routing and construction succeeded; the TaskRef was not submitted or executed."
+    );
 
     Ok(())
 }

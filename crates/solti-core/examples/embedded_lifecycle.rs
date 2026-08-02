@@ -33,6 +33,36 @@ use tokio_stream::StreamExt;
 
 type ExampleResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+const FLOW: &str = r#"
+solti-core: embedded desired-state lifecycle
+
+  TaskManifest revision v1 + application TaskRef v1
+                         │ create_embedded_task
+                         ▼
+                  Task generation 1
+                  Reconciled=Unknown
+                         │ reconcile
+                         ▼
+                  Taskvisor runtime v1
+                  Reconciled=True, Running
+                         │
+  TaskManifest revision v2 + application TaskRef v2
+                         │ apply_embedded_task
+                         ▼
+                  Task generation 2
+                  Reconciled=Unknown
+                         │ cancel v1, bind v2
+                         ▼
+                  Taskvisor runtime v2
+                  Reconciled=True, Running
+                         │ complete
+                         ▼
+                  Succeeded + TaskRun history
+
+  The write commits desired state before reconciliation finishes.
+  A changed embedded revision advances the generation.
+"#;
+
 /// Builds one embedded desired-state revision.
 fn manifest(revision: &str) -> ExampleResult<TaskManifest> {
     let workload = TaskWorkload::Embedded(EmbeddedSpec::new(revision)?);
@@ -82,8 +112,14 @@ async fn wait_for_task(
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExampleResult {
+    println!("{FLOW}");
+    println!(
+        "[purpose] Replace one application-owned runtime and observe desired state, reconciliation, and retained runs."
+    );
+
     let api = SupervisorApi::builder(RunnerRouter::new()).start().await?;
     let mut watch = api.watch_tasks(&TaskFilter::new(), Some("0"))?;
+    println!("[setup] Started an in-memory supervisor and a task watch from resource version 0.");
 
     let v1_started = Arc::new(Notify::new());
     let v1_release = Arc::new(Notify::new());
@@ -102,7 +138,7 @@ async fn main() -> ExampleResult {
     let name = committed.name().clone();
 
     println!(
-        "commit: generation={}, observedGeneration={}, Reconciled={:?}",
+        "[create] Desired state committed: generation={}, observedGeneration={}, Reconciled={:?}.",
         committed.metadata().generation(),
         committed.status().observed_generation(),
         committed.status().reconciled().status(),
@@ -121,7 +157,7 @@ async fn main() -> ExampleResult {
     })
     .await?;
     println!(
-        "runtime: generation={} phase={} Reconciled={:?}",
+        "[reconcile] Runtime v1 accepted: generation={}, phase={}, Reconciled={:?}.",
         running_v1.metadata().generation(),
         running_v1.phase(),
         running_v1.status().reconciled().status(),
@@ -143,7 +179,7 @@ async fn main() -> ExampleResult {
         .await?;
 
     println!(
-        "apply: generation={} observedGeneration={} Reconciled={:?}",
+        "[apply] Revision changed: generation={}, observedGeneration={}, Reconciled={:?}.",
         applied.metadata().generation(),
         applied.status().observed_generation(),
         applied.status().reconciled().status(),
@@ -155,7 +191,7 @@ async fn main() -> ExampleResult {
     );
 
     v1_cancelled.notified().await;
-    println!("generation 1 observed cooperative cancellation");
+    println!("[replace] Runtime v1 observed cooperative cancellation.");
 
     v2_started.notified().await;
     let running_v2 = wait_for_task(&mut watch, |task| {
@@ -166,7 +202,7 @@ async fn main() -> ExampleResult {
     })
     .await?;
     println!(
-        "runtime: generation={} phase={} Reconciled={:?}",
+        "[reconcile] Runtime v2 accepted: generation={}, phase={}, Reconciled={:?}.",
         running_v2.metadata().generation(),
         running_v2.phase(),
         running_v2.status().reconciled().status(),
@@ -180,15 +216,15 @@ async fn main() -> ExampleResult {
     })
     .await?;
     println!(
-        "finished: generation={} phase={}",
+        "[complete] Current runtime finished: generation={}, phase={}.",
         finished.metadata().generation(),
         finished.phase(),
     );
 
-    println!("runs:");
+    println!("[history] Retained attempts, ordered by generation and attempt:");
     for run in api.list_task_runs(&name) {
         println!(
-            "  generation={} attempt={} phase={}",
+            "      generation={} attempt={} phase={}",
             run.generation(),
             run.attempt(),
             run.phase(),
@@ -196,5 +232,8 @@ async fn main() -> ExampleResult {
     }
 
     api.shutdown().await?;
+    println!(
+        "\nResult: generation 2 replaced generation 1, the old runtime stopped cooperatively, and the current desired state succeeded."
+    );
     Ok(())
 }

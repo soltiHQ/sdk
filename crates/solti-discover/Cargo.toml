@@ -15,6 +15,7 @@ edition.workspace      = true
 license.workspace      = true
 
 include = [
+    "examples/**/*.rs",
     "proto/**/*.proto",
     "src/**/*.rs",
     "CONTRACT.md",
@@ -76,7 +77,20 @@ protoc-bin-vendored = { workspace = true, optional = true }
 tonic-prost-build   = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
+taskvisor = { workspace = true, features = ["test-util"] }
+tokio     = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
+
+[[example]]
+name              = "grpc_sync"
+required-features = ["grpc"]
+
+[[example]]
+name              = "http_sync"
+required-features = ["http"]
+
+[[example]]
+name              = "retryability"
+required-features = ["grpc", "http"]
 
 [package.metadata.docs.rs]
 all-features = true

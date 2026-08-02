@@ -600,6 +600,50 @@ Runner names use Kubernetes label-value rules.
 Registration adds `solti.io/runner-name=<name>` to the runner labels.
 Duplicate names are rejected by `RunnerRouter`.
 
+## Examples
+
+### Internal examples
+
+These examples exercise only `solti-exec` backends and their direct contracts.
+They do not schedule tasks, persist resources, or expose a network API.
+Each example starts with a text flow diagram, then explains its inputs, lifecycle, and result.
+
+Start with one real subprocess command:
+
+```bash
+cargo run -p solti-exec --example subprocess_command --features subprocess
+```
+
+| Example                                                           | Features       | What it shows                                                        |
+|-------------------------------------------------------------------|----------------|----------------------------------------------------------------------|
+| [subprocess_command.rs](examples/subprocess_command.rs)           | `subprocess`   | Routing, environment, cwd, output, execution, and cleanup.           |
+| [subprocess_script.rs](examples/subprocess_script.rs)             | `subprocess`   | Script decoding, reusable tasks, and attempt-scoped transport.       |
+| [container.rs](examples/container.rs)                             | `containerd`   | One real native container attempt, output, and owned cleanup.        |
+| [host_process_policy.rs](examples/host_process_policy.rs)         | `host-process` | Low-level preparation, attachment, wait ownership, and cleanup.      |
+| [custom_container_engine.rs](examples/custom_container_engine.rs) | `container`    | Custom engine contract, process policy, output, and lifecycle order. |
+| [containerd_config.rs](examples/containerd_config.rs)             | `containerd`   | Native adapter configuration, network modes, and explicit connect.   |
+
+Run the remaining examples explicitly:
+
+```bash
+cargo run -p solti-exec --example subprocess_script --features subprocess
+cargo run -p solti-exec --example container --features containerd
+cargo run -p solti-exec --example host_process_policy --features host-process
+cargo run -p solti-exec --example custom_container_engine --features container
+cargo run -p solti-exec --example containerd_config --features containerd
+```
+
+The native container example requires Linux, containerd 2.x, its configured plugins, and a cached or reachable image.
+Its endpoint and runtime values can be overridden through the environment variables printed by the example.
+
+The `containerd_config` example does not contact a daemon by default.
+Pass `--connect` only when its configured socket and a compatible containerd 2.x daemon are available.
+
+### Full examples
+
+Application-level compositions live in the [`solti` examples](https://github.com/soltiHQ/sdk/tree/main/crates/solti/examples).
+They combine component crates and own routing, reconciliation, supervision, and API lifecycle.
+
 ## Contributor guide
 
 See the [solti-exec source guide](https://github.com/soltiHQ/sdk/blob/main/crates/solti-exec/ARCHITECTURE.md) for module ownership, execution flows, resource ownership, and invariants.

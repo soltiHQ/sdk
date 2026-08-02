@@ -398,14 +398,37 @@ Use a fallback match arm.
 
 ## Examples
 
-[`task_manifest_schema`](examples/task_manifest_schema.rs) builds a real `TaskManifest` and generates its JSON Schema.
-It runs runtime model validation and validates the serialized manifest against the generated schema.
+### Internal examples
 
-Run it from the workspace root:
+These examples use only `solti-model` data contracts and their direct serialization tools.
+They do not store, route, reconcile, or execute tasks.
+Each example starts with a text flow diagram, then explains its inputs, transitions, and result.
+
+Start with caller-owned desired state:
 
 ```bash
+cargo run -p solti-model --example task_manifest
+```
+
+| Example                                                     | Features | What it shows                                                      |
+|-------------------------------------------------------------|----------|--------------------------------------------------------------------|
+| [task_manifest.rs](examples/task_manifest.rs)               | default  | Desired state, policies, serialized shape, and strict fields.      |
+| [task_lifecycle.rs](examples/task_lifecycle.rs)             | default  | Generation, reconciliation, execution status, and apply semantics. |
+| [task_query.rs](examples/task_query.rs)                     | default  | Filters, selector semantics, page limits, and continuation values. |
+| [task_manifest_schema.rs](examples/task_manifest_schema.rs) | `schema` | Runtime validation and generated JSON Schema agreement.            |
+
+Run the remaining examples explicitly:
+
+```bash
+cargo run -p solti-model --example task_lifecycle
+cargo run -p solti-model --example task_query
 cargo run -p solti-model --example task_manifest_schema
 ```
+
+### Full examples
+
+Application-level compositions live in the [`solti` examples](https://github.com/soltiHQ/sdk/tree/main/crates/solti/examples).
+They combine component crates and own storage, routing, reconciliation, and execution.
 
 ## Contributor guide
 

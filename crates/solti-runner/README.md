@@ -258,11 +258,28 @@ The application controls cardinality for custom labels.
 
 ## Examples
 
-[`custom_extension`](examples/custom_extension.rs) registers two runners for one application GVK.
-It selects a runner by static labels, reads the capability snapshot, and builds a correctly named `TaskRef`.
+### Internal examples
 
-Run it from the workspace root:
+These examples stay inside the `solti-runner` responsibility.
+`solti-model` and Taskvisor appear because their types form the public `Runner` contract.
+No higher or sibling Solti crate is used.
+Each example starts with a text flow diagram, then explains its inputs, decisions, and result.
+
+Start with a custom runner and application-owned workload:
 
 ```bash
 cargo run -p solti-runner --example custom_extension
 ```
+
+| Example                                             | What it shows                                                      |
+|-----------------------------------------------------|--------------------------------------------------------------------|
+| [custom_extension.rs](examples/custom_extension.rs) | Custom GVK, runner selection, capabilities, and allocated `RunId`. |
+| [build_context.rs](examples/build_context.rs)       | Environment merge, metrics port, and attempt-scoped output events. |
+
+`solti-runner` has no optional features.
+Both examples use its default feature set.
+
+### Full examples
+
+[`subprocess.rs`](https://github.com/soltiHQ/sdk/blob/main/crates/solti/examples/subprocess.rs) composes a runner with `solti-exec` and `solti-core`.
+The complete catalog lives in the [`solti` examples](https://github.com/soltiHQ/sdk/tree/main/crates/solti/examples).

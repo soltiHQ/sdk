@@ -42,6 +42,10 @@ tracing-subscriber = { workspace = true, default-features = false, features = ["
 serde_json = { workspace = true }
 tokio      = { workspace = true, features = ["rt", "rt-multi-thread"] }
 
+[[example]]
+name              = "timezone_sync"
+required-features = ["timezone-sync"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
