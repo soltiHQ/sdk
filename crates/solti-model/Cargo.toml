@@ -34,6 +34,10 @@ time       = { workspace = true, features = ["formatting", "parsing"] }
 [dev-dependencies]
 jsonschema = { workspace = true }
 
+[[example]]
+name              = "task_manifest_schema"
+required-features = ["schema"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

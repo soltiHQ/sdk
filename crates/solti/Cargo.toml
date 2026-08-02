@@ -133,6 +133,19 @@ solti-tls        = { workspace = true, optional = true }
 
 taskvisor = { workspace = true, optional = true }
 
+[dev-dependencies]
+serde_json   = { workspace = true }
+tokio        = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "time"] }
+tokio-stream = { workspace = true }
+
+[[example]]
+name              = "subprocess"
+required-features = ["core", "exec-subprocess"]
+
+[[example]]
+name              = "http_agent"
+required-features = ["api-core-adapter", "api-http", "exec-subprocess"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

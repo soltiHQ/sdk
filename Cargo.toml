@@ -10,11 +10,6 @@ members = [
     "crates/solti-api",
     "crates/solti-tls",
     "crates/solti",
-
-    "examples/agentd-http",
-    "examples/agentd-grpc",
-    "examples/tls-roundtrip",
-    "examples/podium",
 ]
 resolver = "2"
 

@@ -32,3 +32,20 @@ It does not add CRI or container network provisioning.
 
 `full` enables every production component integration. Direct dependencies on
 component crates remain supported.
+
+## Examples
+
+Run one subprocess through the router and core supervisor:
+
+```bash
+cargo run -p solti --example subprocess --features core,exec-subprocess
+```
+
+Run a minimal HTTP agent on `127.0.0.1:8085`:
+
+```bash
+cargo run -p solti --example http_agent --features api-core-adapter,api-http,exec-subprocess
+```
+
+The HTTP example serves the generated OpenAPI document at `/openapi.json`.
+It stops the server and supervised tasks after Ctrl-C.

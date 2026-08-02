@@ -396,6 +396,17 @@ Dedicated variants cover unknown admission, restart, jitter, and phase names.
 `ModelError` and most public enums are non-exhaustive.
 Use a fallback match arm.
 
+## Examples
+
+[`task_manifest_schema`](examples/task_manifest_schema.rs) builds a real `TaskManifest` and generates its JSON Schema.
+It runs runtime model validation and validates the serialized manifest against the generated schema.
+
+Run it from the workspace root:
+
+```bash
+cargo run -p solti-model --example task_manifest_schema
+```
+
 ## Contributor guide
 
 See the [solti-model source guide](https://github.com/soltiHQ/sdk/blob/main/crates/solti-model/ARCHITECTURE.md) for module ownership, data flow, invariants, and change locations.

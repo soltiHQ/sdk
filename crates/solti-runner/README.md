@@ -255,3 +255,14 @@ The application controls cardinality for custom labels.
 | `UnsupportedWorkload` | Runner received an unsupported GVK         |
 | `InvalidSpec`         | Workload desired state is invalid          |
 | `Internal`            | Runner could not construct the task        |
+
+## Examples
+
+[`custom_extension`](examples/custom_extension.rs) registers two runners for one application GVK.
+It selects a runner by static labels, reads the capability snapshot, and builds a correctly named `TaskRef`.
+
+Run it from the workspace root:
+
+```bash
+cargo run -p solti-runner --example custom_extension
+```

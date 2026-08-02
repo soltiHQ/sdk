@@ -208,8 +208,6 @@ let (manifest, task_ref) = solti_discover::sync(config, uptime)?;
 supervisor.create_embedded_task(manifest, task_ref).await?;
 ```
 
-See [`examples/agentd-http`](examples/agentd-http) and [`examples/agentd-grpc`](examples/agentd-grpc) for full reference agents - one per transport.
-
 ### With TLS / mTLS
 
 Enable `grpc-tls` on `solti-api` (gRPC server) and/or `tls` on
@@ -237,7 +235,44 @@ let client = ClientTlsConfig::new(TrustRoots::from_pem_file(
 ));
 ```
 
-Plug `server` into `tonic`/`axum-server`, or pass `client` to `DiscoverConfigBuilder::with_tls(...)`. End-to-end demo: [`examples/tls-roundtrip`](examples/tls-roundtrip).
+Plug `server` into `tonic`/`axum-server`, or pass `client` to `DiscoverConfigBuilder::with_tls(...)`.
+
+## Examples
+
+From a cloned repository checkout, run the smallest end-to-end flow with:
+
+```bash
+cargo run -p solti --example subprocess --features core,exec-subprocess
+```
+
+Choose the shortest path for your use case:
+
+- New to the SDK: `subprocess` → `http_agent`.
+- Building an integration: `task_manifest_schema` → `custom_extension`.
+- Working on the supervisor: `embedded_lifecycle` → `collections`.
+
+The full catalog follows.
+
+### Build an agent
+
+| Example                                             | What it shows                                    |
+|-----------------------------------------------------|--------------------------------------------------|
+| [subprocess.rs](crates/solti/examples/subprocess.rs) | Run and observe one supervised subprocess.       |
+| [http_agent.rs](crates/solti/examples/http_agent.rs) | Serve the task API from a composed agent binary. |
+
+### Extend the SDK
+
+| Example                                                                       | What it shows                                      |
+|-------------------------------------------------------------------------------|----------------------------------------------------|
+| [task_manifest_schema.rs](crates/solti-model/examples/task_manifest_schema.rs) | Build, validate, and describe a task manifest.     |
+| [custom_extension.rs](crates/solti-runner/examples/custom_extension.rs)        | Route an application-defined workload to a runner. |
+
+### Work with supervisor state
+
+| Example                                                                 | What it shows                                         |
+|-------------------------------------------------------------------------|-------------------------------------------------------|
+| [embedded_lifecycle.rs](crates/solti-core/examples/embedded_lifecycle.rs) | Apply embedded revisions and observe reconciliation. |
+| [collections.rs](crates/solti-core/examples/collections.rs)              | List and watch task resources consistently.          |
 
 ## Key features
 
@@ -292,12 +327,6 @@ Build and test the workspace:
 cargo build --workspace
 cargo test --workspace
 
-# Reference agents
-cargo run -p agentd-http     # HTTP transport, :8085
-cargo run -p agentd-grpc     # gRPC transport, :50052
-cargo run -p tls-roundtrip   # mTLS demo (HTTPS :18443 + gRPC :18444)
-cargo run -p podium -- --config examples/podium/config.toml   # config-driven Podium agent
-
 # Feature-gated builds
 cargo build -p solti-api      --features http
 cargo build -p solti-api      --features grpc
@@ -324,7 +353,7 @@ Found a bug? Have an idea? [Open an issue](https://github.com/soltiHQ/sdk/issues
 
 <div>
   <a href="https://docs.rs/solti-core/latest/solti_core/"><img alt="API Docs" src="https://img.shields.io/badge/API%20Docs-4d76ae?style=for-the-badge&logo=rust&logoColor=white"></a>
-  <a href="./examples/"><img alt="Examples" src="https://img.shields.io/badge/Examples-2ea44f?style=for-the-badge&logo=github&logoColor=white"></a>
+  <a href="#examples"><img alt="Examples" src="https://img.shields.io/badge/Examples-2ea44f?style=for-the-badge&logo=github&logoColor=white"></a>
   <a href="https://github.com/soltiHQ/dashboards"><img alt="Dashboards" src="https://img.shields.io/badge/Dashboards-f46800?style=for-the-badge&logo=grafana&logoColor=white"></a>
   <a href="https://github.com/soltiHQ/taskvisor"><img alt="Taskvisor" src="https://img.shields.io/badge/Taskvisor-2c3e50?style=for-the-badge&logo=rust&logoColor=white"></a>
 </div>

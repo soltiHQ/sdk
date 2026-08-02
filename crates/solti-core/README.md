@@ -381,6 +381,22 @@ Keep a wildcard arm when matching it.
 Collection reads use `CollectionError`.
 Checked configuration uses `ConfigError`.
 
+## Examples
+
+From a cloned repository checkout, run the lifecycle example with:
+
+```bash
+cargo run -p solti-core --example embedded_lifecycle
+```
+
+Run `embedded_lifecycle` first.
+Then use `collections` for list and watch semantics.
+
+| Example                                                 | What it shows                                                      |
+|---------------------------------------------------------|--------------------------------------------------------------------|
+| [embedded_lifecycle.rs](examples/embedded_lifecycle.rs) | Reconciliation, generation changes, cancellation, and run history. |
+| [collections.rs](examples/collections.rs)               | Snapshot pagination and filter-relative task watches.              |
+
 ## Contributor guide
 
 See the [solti-core source guide](https://github.com/soltiHQ/sdk/blob/main/crates/solti-core/ARCHITECTURE.md) for module ownership, runtime flows, concurrency, and invariants.
