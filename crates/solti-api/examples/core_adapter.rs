@@ -32,7 +32,6 @@ solti-api: SupervisorApiAdapter visibility boundary
                          │ create_embedded_task
                          ▼
                     solti-core state
-                         │
              ┌───────────┴────────────┐
              ▼                        ▼
        direct core read        SupervisorApiAdapter

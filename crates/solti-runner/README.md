@@ -281,5 +281,5 @@ Both examples use its default feature set.
 
 ### Full examples
 
-[`subprocess.rs`](https://github.com/soltiHQ/sdk/blob/main/crates/solti/examples/subprocess.rs) composes a runner with `solti-exec` and `solti-core`.
+[`task_subprocess.rs`](https://github.com/soltiHQ/sdk/blob/main/crates/solti/examples/task_subprocess.rs) composes a runner with `solti-exec` and `solti-core`.
 The complete catalog lives in the [`solti` examples](https://github.com/soltiHQ/sdk/tree/main/crates/solti/examples).

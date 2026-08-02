@@ -47,9 +47,7 @@ solti-api: gRPC transport
             ▼
   tonic TaskService (solti.task.v1)
             ├──► authentication + message limit + conversion
-            │
             └──► ApiHandler ──► application backend
-                         │
                          ├──► unary ListTasksResponse
                          └──► StreamTaskLogsResponse oneof stream
 

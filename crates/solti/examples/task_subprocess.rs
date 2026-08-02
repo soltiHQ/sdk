@@ -1,4 +1,4 @@
-//! # Subprocess: run one routed workload
+//! # Subprocess task: run one routed workload
 //!
 //! This example runs the example binary itself as a subprocess.
 //! It does not invoke a shell or another executable.
@@ -14,7 +14,26 @@
 //! The child waits for the parent to subscribe before it writes output.
 //! Timeouts below are failure bounds, not synchronization delays.
 //!
-//! Run with `cargo run -p solti --example subprocess --features core,exec-subprocess`.
+//! ```text
+//! Subprocess manifest
+//!      │ create_task
+//!      ▼
+//! SupervisorApi ──► committed desired state ──► reconciliation
+//!                                                   │ GVK routing
+//!                                                   ▼
+//!                                            RunnerRouter
+//!                                                   ▼
+//!                                         subprocess runner
+//!                                                   │ spawn this binary
+//!                                                   ▼
+//!                                                child
+//!                                         stdout + stderr
+//!                     OutputSubscription ◄──────────┤
+//!                     task watch         ◄──────────┤
+//!                     run history        ◄──────────┘
+//! ```
+//!
+//! Run with `cargo run -p solti --example task_subprocess --features core,exec-subprocess`.
 
 use std::{env, io, time::Duration};
 
@@ -50,6 +69,18 @@ async fn main() -> Result<(), ExampleError> {
         return child(&address).await;
     }
 
+    println!(
+        r#"
+solti: one supervised subprocess
+
+  manifest ──► core ──► router ──► subprocess runner ──► child process
+                 ├──► task watch                           ├──► stdout
+                 ├──► live output ◄────────────────────────┤
+                 └──► run history                          └──► stderr
+"#
+    );
+    println!("[purpose] Execute one routed workload and observe its complete resource lifecycle.");
+
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let child_address = listener.local_addr()?;
     let command = env::current_exe()?
@@ -59,6 +90,7 @@ async fn main() -> Result<(), ExampleError> {
 
     let mut router = RunnerRouter::new();
     register_subprocess_runner(&mut router, "default")?;
+    println!("[runner] Registered the built-in Subprocess GVK as runner=default.");
 
     let supervisor = SupervisorApi::builder(router).start().await?;
     let run_result = run(&supervisor, listener, child_address.to_string(), command).await;
@@ -66,7 +98,10 @@ async fn main() -> Result<(), ExampleError> {
 
     run_result?;
     shutdown_result?;
-    println!("supervisor stopped");
+    println!("[shutdown] Supervisor and SDK-owned workers stopped.");
+    println!(
+        "\nResult: one routed subprocess completed with live output, terminal state, and retained history."
+    );
     Ok(())
 }
 
