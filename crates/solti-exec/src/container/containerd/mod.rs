@@ -35,8 +35,8 @@
 //! The mode belongs to [`ContainerdConfig`] and therefore applies to one registered runner.
 
 mod image;
-mod spec;
 mod io;
+mod spec;
 
 mod config;
 pub use config::{ContainerNetwork, ContainerPlatform, ContainerdConfig};
