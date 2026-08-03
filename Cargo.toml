@@ -13,6 +13,27 @@ members = [
 ]
 resolver = "2"
 
+[workspace.metadata.ci]
+clippy-matrix = [
+    { package = "solti", features = ["api-core-adapter", "api-grpc-tls", "exec-subprocess"] },
+    { package = "solti", features = ["api-core-adapter", "api-http", "discover-http", "exec-subprocess"] },
+    { package = "solti", features = ["core", "exec-containerd"] },
+    { package = "solti-api", features = ["grpc"] },
+    { package = "solti-api", features = ["grpc-tls"] },
+    { package = "solti-api", features = ["http"] },
+    { package = "solti-discover", features = ["grpc"] },
+    { package = "solti-discover", features = ["grpc", "tls"] },
+    { package = "solti-discover", features = ["http"] },
+    { package = "solti-discover", features = ["http", "tls"] },
+    { package = "solti-exec", features = ["container"] },
+    { package = "solti-exec", features = ["containerd"] },
+    { package = "solti-exec", features = ["host-process"] },
+    { package = "solti-exec", features = ["seccomp"] },
+    { package = "solti-exec", features = ["subprocess"] },
+    { package = "solti-observe", features = ["full"] },
+    { package = "solti-prometheus", features = ["full"] },
+]
+
 [workspace.package]
 version      = "0.0.3"
 edition      = "2024"

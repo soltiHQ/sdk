@@ -17,6 +17,7 @@ pub enum SeccompPolicy {
 #[cfg(any(feature = "containerd", all(feature = "seccomp", target_os = "linux")))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DeniedSyscall {
+    #[cfg(feature = "containerd")]
     name: &'static str,
     #[cfg(all(feature = "seccomp", target_os = "linux"))]
     number: libc::c_long,
@@ -43,6 +44,7 @@ macro_rules! define_deny_host_control_syscalls {
                 $(
                     $(#[$attribute])*
                     DeniedSyscall {
+                        #[cfg(feature = "containerd")]
                         name: $name,
                         #[cfg(all(feature = "seccomp", target_os = "linux"))]
                         number: $number,

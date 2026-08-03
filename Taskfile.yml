@@ -38,10 +38,12 @@ tasks:
         vars: { CHECK_ARGS: '--workspace --all-targets --all-features --locked' }
 
   ci/clippy:
-    desc: "Run 'cargo clippy' for one feature set. FEATURE = none|all|<feature-name> (default: all)."
+    desc: "Run 'cargo clippy' for one workspace or package feature set. FEATURE = none|all|<features> (default: all)."
     deps: [proto/vendor]
     vars:
+      CRATE: '{{.CRATE | default ""}}'
       FEATURE: '{{.FEATURE | default "all"}}'
+      PACKAGE_FLAGS: '{{if .CRATE}}-p {{.CRATE}}{{else}}--workspace{{end}}'
       FEATURE_FLAGS:
         sh: |
           case "{{.FEATURE}}" in
@@ -51,7 +53,7 @@ tasks:
           esac
     cmds:
       - task: rust:clippy
-        vars: { CLIPPY_ARGS: '--workspace --all-targets {{.FEATURE_FLAGS}} --locked -- -D warnings' }
+        vars: { CLIPPY_ARGS: '{{.PACKAGE_FLAGS}} --all-targets {{.FEATURE_FLAGS}} --locked -- -D warnings' }
 
   ci/test:
     desc: Run 'cargo test' (all targets, all features).
@@ -115,7 +117,7 @@ tasks:
           PUBLISH_ARGS: '--all-features --allow-dirty --locked'
 
   ci/docs:
-    desc: Run 'rustdoc' for the SDK workspace. Fails on broken doc links in any feature config.
+    desc: Run 'rustdoc' for the SDK workspace.
     deps: [proto/vendor]
     cmds:
       - RUSTDOCFLAGS="-D warnings" cargo doc --workspace --locked --no-deps
