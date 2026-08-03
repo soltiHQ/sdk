@@ -1,8 +1,8 @@
 # Publishable workspace crates, in dependency (topological) order.
 #
 # Source of truth for release crate order:
-#   .github/workflows/.crates.yml - exposes the crate list to release jobs
-#   .github/workflows/release.yml - publishes crates sequentially via soltiHQ/actions/cargo-publish
+#   .github/workflows/release.yml passes this file to the shared workspace release workflow.
+#   soltiHQ/actions validates the list and publishes crates sequentially.
 #
 # Dependency layout - required + optional (because publish runs with `--all-features`):
 #   solti-model       - no internal deps
@@ -17,10 +17,10 @@
 #                       solti-tls (`tls` feature)
 #   solti-prometheus  - optional: solti-runner, taskvisor (default features), solti-model,
 #                       solti-core, solti-api, solti-discover
-#   solti             - optional façade over every SDK crate; publish last
+#   solti             - optional umbrella over every SDK crate; publish last
 #
 # When adding a publishable crate, insert it at its correct topological position.
-# Dry-run / docs matrix consumers don't care about order, but release.yml publishes sequentially and depends on it.
+# Release publication depends on this order.
 
 solti-model
 solti-tls

@@ -18,20 +18,7 @@ jobs:
     name: ci
     uses: soltiHQ/actions/.github/workflows/rust-ci.yml@v1
     with:
+      workspace: true
       # Workspace: the publish dry-run legitimately fails on cross-crate
       # version bumps until the dependency crates are published.
       preflight-required: false
-
-  msrv:
-    name: msrv
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.90.0
-      - name: Vendor proto
-        uses: soltiHQ/actions/taskfile@be0b13df45cb3d522f4ed22dbdf3125a2032f252 # v1
-        with:
-          command: proto/vendor
-      - run: cargo +1.90.0 check --workspace --all-features
