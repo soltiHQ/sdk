@@ -120,8 +120,10 @@ tasks:
     desc: Run 'rustdoc' for the SDK workspace.
     deps: [proto/vendor]
     cmds:
-      - RUSTDOCFLAGS="-D warnings" cargo doc --workspace --locked --no-deps
-      - RUSTDOCFLAGS="-D warnings" cargo doc --workspace --locked --no-deps --all-features
+      - task: rust:doc
+        vars: { DOC_ARGS: '--workspace --locked --no-deps' }
+      - task: rust:doc
+        vars: { DOC_ARGS: '--workspace --locked --no-deps --all-features' }
       - for:
           var: publish_crates
         task: rust:docs
