@@ -1,7 +1,7 @@
 # Publishable workspace crates, in dependency (topological) order.
 #
 # Source of truth for release crate order:
-#   .github/workflows/release.yml passes this file to the shared workspace release workflow.
+#   .github/workflows/tag-publish.yml passes this file to the shared workspace release workflow.
 #   soltiHQ/actions validates the list and publishes crates sequentially.
 #
 # Dependency layout - required + optional (because publish runs with `--all-features`):
