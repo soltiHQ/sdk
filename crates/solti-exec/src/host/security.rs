@@ -650,7 +650,9 @@ mod linux_impl {
                 SeccompAction::Errno(libc::EPERM as u32),
                 architecture,
             )?;
-            let mut program = filter.try_into()?;
+            let program = filter.try_into()?;
+            #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+            let mut program = program;
             #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
             deny_x32_abi(&mut program)?;
             Ok(program)

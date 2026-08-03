@@ -19,6 +19,3 @@ jobs:
     uses: soltiHQ/actions/.github/workflows/rust-ci.yml@v1
     with:
       workspace: true
-      # Workspace: the publish dry-run legitimately fails on cross-crate
-      # version bumps until the dependency crates are published.
-      preflight-required: false

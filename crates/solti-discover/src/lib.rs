@@ -7,10 +7,10 @@
 //!
 //! ## Start Here
 //!
-//! Use [`ControlPlaneEndpoint`] for the outbound discovery connection.
-//! Use [`DiscoverConfig`] to capture the complete task intent.
-//! Use [`AgentEndpoint`] for the API exposed by the agent.
-//! Use [`sync`] to create the manifest and Taskvisor task.
+//! Use `ControlPlaneEndpoint` for the outbound discovery connection.
+//! Use `DiscoverConfig` to capture the complete task intent.
+//! Use `AgentEndpoint` for the API exposed by the agent.
+//! Use `sync` to create the manifest and Taskvisor task.
 //!
 //! ## Flow
 //!
@@ -62,11 +62,11 @@
 //!
 //! | Area             | Types                                                           |
 //! |------------------|-----------------------------------------------------------------|
-//! | Agent endpoint   | [`AgentEndpoint`], [`AgentEndpointType`]                        |
-//! | Control plane    | [`ControlPlaneEndpoint`], [`DiscoveryTransport`]                |
-//! | Configuration    | [`DiscoverConfig`], [`DiscoverConfigBuilder`]                   |
-//! | Task factory     | [`sync`]                                                        |
-//! | Uptime           | [`UptimeSource`], [`MonotonicUptime`]                           |
+//! | Agent endpoint   | `AgentEndpoint`, `AgentEndpointType`                            |
+//! | Control plane    | `ControlPlaneEndpoint`, `DiscoveryTransport`                    |
+//! | Configuration    | `DiscoverConfig`, `DiscoverConfigBuilder`                       |
+//! | Task factory     | `sync`                                                          |
+//! | Uptime           | `UptimeSource`, `MonotonicUptime`                               |
 //! | Metrics          | [`DiscoverMetricsBackend`], [`DiscoverFailReason`]              |
 //! | Errors           | [`DiscoverError`], [`Retryability`]                             |
 //!

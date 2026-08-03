@@ -17,4 +17,3 @@ jobs:
     uses: soltiHQ/actions/.github/workflows/rust-ci.yml@v1
     with:
       workspace: true
-      preflight-required: false
