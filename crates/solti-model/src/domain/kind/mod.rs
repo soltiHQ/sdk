@@ -1,14 +1,13 @@
-//! Task execution backend types.
+//! # Task workloads
 //!
-//! - [`SubprocessSpec`], [`ContainerSpec`], [`WasmSpec`] - per-variant configuration.
-//! - [`TaskKind`] - enum selecting the runtime backend and its parameters.
-//! - [`Runtime`] - script interpreter for subprocess script execution.
-//! - [`SubprocessMode`] - execution strategy (command or script).
+//! [`TaskWorkload`] is the workload envelope.
+//! Built-in specs describe subprocess, container, WASM, and embedded execution.
+//! [`ExtensionWorkload`] carries an application-owned GVK and JSON spec.
 mod task;
-pub use task::{ContainerSpec, SubprocessSpec, TaskKind, WasmSpec};
-
-mod runtime;
-pub use runtime::Runtime;
+pub use task::{
+    ContainerSpec, EmbeddedSpec, ExtensionWorkload, SubprocessSpec, TaskWorkload,
+    WORKLOAD_API_VERSION, WasmSpec, WorkloadTypeMeta,
+};
 
 mod subprocess;
 pub use subprocess::{MAX_SCRIPT_BODY_BYTES, SubprocessMode};

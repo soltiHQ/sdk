@@ -1,40 +1,66 @@
 [package]
 name = "solti-prometheus"
-description = "Solti SDK Prometheus metrics."
+
+description   = "Prometheus metrics and exporter endpoint for the Solti task supervisor SDK."
+keywords      = ["prometheus", "metrics", "monitoring", "exporter", "tasks"]
+categories    = ["development-tools::profiling"]
 documentation = "https://docs.rs/solti-prometheus"
+readme        = "README.md"
 
 rust-version.workspace = true
-repository.workspace = true
-categories.workspace = true
-homepage.workspace = true
-keywords.workspace = true
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+repository.workspace   = true
+homepage.workspace     = true
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
 
 [features]
-default  = []
-api      = ["dep:solti-api"]
-discover = ["dep:solti-discover"]
-process  = ["prometheus/process"]
-server   = ["dep:axum", "dep:tokio", "dep:tokio-util", "dep:solti-model"]
-state    = ["dep:solti-core", "dep:solti-model"]
+default = []
+
+api                  = ["dep:itoa", "dep:solti-api"]
+discover             = ["dep:solti-discover"]
+process              = ["prometheus/process"]
+runner               = ["dep:solti-runner"]
+server               = ["dep:axum", "dep:solti-model", "dep:taskvisor", "dep:tokio", "dep:tracing"]
+state                = ["dep:solti-core", "dep:solti-model"]
+taskvisor            = ["dep:taskvisor"]
+taskvisor-controller = ["taskvisor", "taskvisor/controller"]
+
+full = [
+    "api",
+    "discover",
+    "process",
+    "runner",
+    "server",
+    "state",
+    "taskvisor-controller",
+]
 
 [dependencies]
-prometheus = { workspace = true }
-taskvisor  = { workspace = true, features = ["controller"] }
-tracing    = { workspace = true }
-itoa       = { workspace = true }
-
-axum       = { workspace = true, optional = true }
-tokio      = { workspace = true, optional = true, features = ["net", "rt"] }
-tokio-util = { workspace = true, optional = true }
-
-solti-runner   = { workspace = true }
-solti-model    = { workspace = true, optional = true }
-solti-discover = { workspace = true, optional = true }
 solti-api      = { workspace = true, optional = true }
 solti-core     = { workspace = true, optional = true }
+solti-discover = { workspace = true, optional = true }
+solti-model    = { workspace = true, optional = true }
+solti-runner   = { workspace = true, optional = true }
+
+axum       = { workspace = true, optional = true }
+itoa       = { workspace = true, optional = true }
+prometheus = { workspace = true }
+taskvisor  = { workspace = true, optional = true }
+tokio      = { workspace = true, optional = true, features = ["net", "rt"] }
+tracing    = { workspace = true, optional = true }
+
+[dev-dependencies]
+solti-core = { workspace = true, features = ["test-util"] }
+
+[[example]]
+name              = "adapter_metrics"
+required-features = ["api", "discover", "runner"]
+
+[[example]]
+name              = "metrics_server"
+required-features = ["server"]
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

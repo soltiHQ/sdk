@@ -1,183 +1,435 @@
 # solti-model
-Domain model for the solti task execution system.
 
-Defines core resource types: `Task`, `TaskSpec`, `TaskStatus`, `ObjectMeta`, and all supporting domain primitives (phases, policies, selectors, identity newtypes).
+`solti-model` is the shared data contract for Solti agents, APIs, runners, and control planes.
 
-## Architecture
-```text
- ┌──────────────────────────────────────────────────────────┐
- │                      Task                                │
- │                                                          │
- │  ObjectMeta            TaskSpec            TaskStatus    │
- │  ├─ id: TaskId         ├─ slot: Slot       ├─ phase      │
- │  ├─ resource_version   ├─ kind: TaskKind   ├─ attempt    │
- │  ├─ created_at         ├─ timeout          ├─ exit_code  │
- │  └─ updated_at         ├─ restart          └─ error      │
- │                        ├─ backoff                        │
- │                        ├─ admission                      │
- │                        ├─ runner_selector                │
- │                        └─ labels                         │
- └──────────────────────────────────────────────────────────┘
+It defines task resources, workloads, policies, selectors, capabilities, queries, output events, identities, and bearer tokens.
+It validates data but does not store, route, or execute tasks.
+
+The default `schema` feature implements `schemars::JsonSchema` for resource, workload, selector, capability, and output types.
+Disable default features when schema generation is not needed.
+
+## Choose an entry point
+
+| Goal                              | Start with                                      |
+|-----------------------------------|-------------------------------------------------|
+| Submit or apply desired state     | `TaskManifest`                                  |
+| Describe task execution           | `TaskSpec` and `TaskWorkload`                   |
+| Work with a stored resource       | `Task`                                          |
+| Guard a write against stale state | `WritePreconditions`                            |
+| Record one execution attempt      | `TaskRun`                                       |
+| Filter or paginate tasks          | `TaskFilter`, `TaskQuery`, `TaskContinuation`   |
+| Match runner labels               | `LabelSelector`                                 |
+| Advertise agent capabilities      | `RunnerCapability`, `AgentCapabilities`         |
+| Read live output                  | `OutputEvent`                                   |
+| Load or verify a bearer secret    | `Token`                                         |
+
+## Quick start
+
+Build caller-owned desired state:
+
+```rust
+use solti_model::{
+    Flag, Labels, SubprocessMode, SubprocessSpec, TaskEnv, TaskManifest,
+    TaskSpec, TaskWorkload,
+};
+
+let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+    SubprocessMode::Command {
+        command: "echo".into(),
+        args: vec!["hello".into()],
+    },
+    TaskEnv::default(),
+    None,
+    Flag::enabled(),
+));
+
+let spec = TaskSpec::builder("jobs", workload, 5_000_u64)
+    .build()
+    .expect("valid task spec");
+
+let mut labels = Labels::new();
+labels.insert("app.kubernetes.io/name", "hello");
+
+let manifest = TaskManifest::new("hello-1", spec)
+    .unwrap()
+    .with_labels(labels)
+    .unwrap();
+
+assert_eq!(manifest.name().as_str(), "hello-1");
+assert_eq!(manifest.slot().as_str(), "jobs");
 ```
 
-## Resource model
+`TaskManifest` contains only caller-owned fields.
+Use it at create and apply boundaries.
 
-| Section      | Type         | Responsibility                                                |
-|--------------|--------------|---------------------------------------------------------------|
-| **metadata** | `ObjectMeta` | Identity, `resource_version`, timestamps                      |
-| **spec**     | `TaskSpec`   | Desired state (private fields; build via `TaskSpec::builder`) |
-| **status**   | `TaskStatus` | Observed state: phase, attempt count, exit code, error        |
+## Resource types
 
-## Task lifecycle
-```text
- Pending ──► Running ──► Succeeded
-               │
-               ├──► Failed ──► (restart) ──► Running
-               ├──► Timeout
-               ├──► Canceled
-               └──► Exhausted (max retries reached)
+```mermaid
+%%{init: {"flowchart": {"curve": "linear"}}}%%
+flowchart LR
+    Caller["Caller"]
+    Manifest["TaskManifest<br/>desired state"]
+    Store["State store"]
+    Task["Task<br/>stored resource"]
+    Controller["Controller"]
+
+    Caller -->|creates or applies| Manifest
+    Manifest -->|materializes| Store
+    Store --> Task
+    Controller -->|updates status| Task
 ```
 
-Terminal phases: `Succeeded`, `Failed`, `Timeout`, `Canceled`, `Exhausted`.
+`TaskManifest` contains:
 
-## Task kinds
+- `apiVersion` and `kind`;
+- `metadata.name`;
+- labels and annotations;
+- `spec`.
 
-| Variant      | Backend                        | Routable |
-|--------------|--------------------------------|----------|
-| `Subprocess` | OS process (`command`, `args`) | yes      |
-| `Container`  | OCI container image            | yes      |
-| `Wasm`       | WASI module (`.wasm`)          | yes      |
-| `Embedded`   | In-process `TaskRef`           | no       |
+`Task` adds:
 
-`Embedded` tasks are submitted directly via `SupervisorApi::submit_with_task`.
-Routable variants go through `RunnerRouter::pick()`.
+- `metadata.uid`;
+- `metadata.resourceVersion`;
+- `metadata.generation`;
+- `metadata.creationTimestamp`;
+- `status`.
 
-`Subprocess` has two execution strategies (see `SubprocessMode`):
-- **Command**: `execve(command, args)` directly.
-- **Script**: interpreter + script body. The body is **base64-encoded, UTF-8**, capped at `MAX_SCRIPT_BODY_BYTES` (2 MiB after decode). Interpreters: `Bash`, `Python`, `Node`, `Custom { command, flag }`.
+Both use `apiVersion: solti.io/v1` and `kind: Task`.
+`TaskManifest` rejects server-owned metadata and status.
 
-## Policies
+Use `Task::from_manifest` when implementing a state store:
 
-| Type              | Controls                                                 |
-|-------------------|----------------------------------------------------------|
-| `RestartPolicy`   | When to restart: `Never`, `OnFailure`, `Always`          |
-| `BackoffPolicy`   | Delay between retries: initial, max, factor, jitter      |
-| `JitterPolicy`    | Jitter strategy: `None`, `Full`, `Equal`, `Decorrelated` |
-| `AdmissionPolicy` | Duplicate handling: `DropIfRunning`, `Replace`, `Queue`  |
+```rust
+use solti_model::{EmbeddedSpec, Task, TaskManifest, TaskSpec, TaskWorkload};
 
-## Runner selector
-```text
- TaskSpec.runner_selector
- ┌──────────────────────────────────────────────────────┐
- │  match_labels:      { "zone": "eu" }                 │
- │  match_expressions: [ {key:"gpu", op:Exists} ]       │
- └──────────────────────────┬───────────────────────────┘
-                            │  ALL requirements ANDed
-                            ▼
- RunnerRouter::pick()
- ┌──────────────────────────────────────────────────────┐
- │  Runner A  labels: {"zone":"us","gpu":"a100"}  ✗     │
- │  Runner B  labels: {"zone":"eu","gpu":"h100"}  ✓     │
- │  Runner C  labels: {"zone":"eu"}               ✗     │
- └──────────────────────────────────────────────────────┘
+let workload = TaskWorkload::Embedded(
+    EmbeddedSpec::new("cleanup-v1").unwrap(),
+);
+let spec = TaskSpec::builder("maintenance", workload, 5_000_u64)
+    .build()
+    .unwrap();
+let manifest = TaskManifest::new("cleanup", spec).unwrap();
+let task = Task::from_manifest(manifest).unwrap();
+
+assert_eq!(task.metadata().generation(), 1);
+assert_eq!(task.status().observed_generation(), 0);
+assert!(task.metadata().resource_version().is_empty());
 ```
 
-Operators: `In`, `NotIn`, `Exists`, `DoesNotExist`.
+The model generates the UID and creation timestamp.
+The state store assigns the resource version.
 
-## Key types
+## Guard writes
 
-| Type               | Description                                                              |
-|--------------------|--------------------------------------------------------------------------|
-| `Task`             | K8s-style aggregate: metadata + spec + status                            |
-| `TaskSpec`         | Desired state (private fields, build via builder)                        |
-| `TaskSpecBuilder`  | Validated builder for `TaskSpec`                                         |
-| `TaskStatus`       | Observed state: phase, attempt, exit code, error                         |
-| `ObjectMeta`       | Identity, versioning, timestamps                                         |
-| `TaskRun`          | Per-attempt execution record with start/finish times                     |
-| `TaskPhase`        | Lifecycle phase enum (7 variants)                                        |
-| `TaskKind`         | Execution backend: Subprocess, Wasm, Container, Embedded                 |
-| `Slot`             | Logical execution lane (newtype over `Arc<str>`)                         |
-| `TaskId`           | Unique task identifier (newtype over `Arc<str>`)                         |
-| `AgentId`          | Agent identifier (newtype over `Arc<str>`)                               |
-| `Token`            | Shared agent↔CP bearer secret (redacted `Debug`, constant-time `verify`) |
-| `Timeout`          | Per-attempt timeout in milliseconds                                      |
-| `Labels`           | Key-value metadata for routing and filtering                             |
-| `TaskEnv`          | Ordered environment variables for task execution                         |
-| `RunnerEnv`        | Ordered environment variables for runner injection                       |
-| `Flag`             | Boolean toggle with `enabled()`/`disabled()` constructors                |
-| `RunnerSelector`   | Label selector for runner routing                                        |
-| `TaskQuery`        | Builder for filtered, paginated task listing                             |
-| `TaskPage`         | Paginated query result                                                   |
-| `OutputChunk`      | One stdout/stderr line from a task attempt                               |
-| `OutputEvent`      | Tagged enum: `Chunk` / `RunStarted` / `RunFinished` / `Lagged`           |
-| `StreamKind`       | `Stdout` or `Stderr` discriminator carried by `OutputChunk`              |
+`WritePreconditions` protects an apply or delete from a stale resource snapshot.
 
-## Size limits
+Use `WritePreconditions::from_task` to capture both UID and resource version:
 
-Exposed as `pub const` so downstream layers (API, CP, UI) share one source of truth.
+```rust
+use solti_model::{
+    EmbeddedSpec, Task, TaskSpec, TaskWorkload, WritePreconditions,
+};
 
-| Constant                | Value   | Enforced by                         |
-|-------------------------|---------|-------------------------------------|
-| `MAX_SCRIPT_BODY_BYTES` | 2 MiB   | `SubprocessMode::Script::validate`  |
-| `SLOT_MAX_LEN`          | 64      | `Slot::validate_format`             |
-| `TASK_ID_MAX_LEN`       | 256     | `TaskId::validate_format`           |
-| `AGENT_ID_MAX_LEN`      | 128     | `AgentId::validate_format`          |
+let workload = TaskWorkload::Embedded(EmbeddedSpec::new("v1").unwrap());
+let spec = TaskSpec::builder("jobs", workload, 1_000_u64)
+    .build()
+    .unwrap();
+let mut task = Task::new("cleanup", spec).unwrap();
+task.set_resource_version("7").unwrap();
 
-## Identity rules
+let preconditions = WritePreconditions::from_task(&task).unwrap();
 
-`Slot`, `TaskId`, `AgentId` allow `[A-Za-z0-9._-]` only, reject `.` and `..`.
-No whitespace, no path separators, no non-ASCII: these values reach cgroup paths, tempfile names, `execve` argv, and log fields, where anything else misbehaves. 
-Validation runs at `TaskSpec::validate` / submit time.
-
-## Authentication
-
-`Token` is the shared bearer secret used in **both** directions of agent ⇄ control-plane communication:
-- agent → CP discovery: the agent presents it (`solti-discover`);
-- CP → agent API: the agent verifies inbound calls against it (`solti-api`).
-
-One secret per agent enables auth symmetrically from a single config value. 
-It rides in the transport (`Authorization: Bearer <token>` / gRPC `authorization` metadata), never in a message body. 
-`Debug` is redacted; `verify()` compares in constant time. 
-Orthogonal to TLS - both can be enabled independently.
-
-Construct via `Token::new` (literal), `Token::from_env` / `Token::from_file` (readers), or `Token::generate()` (fresh 256-bit OS-random, prefixed `solti_agt_`). 
-`generate()` performs **no** persistence - the SDK is a library and does not decide where the secret lives; the agent binary owns that (file, vault, k8s secret). 
-The zero-ops flow lives in the agent: "read from my store; if absent, `generate()` then persist".
-
-## Versioning
-
-`ObjectMeta.resource_version` is a monotonic counter bumped on every change
-(spec or status) for optimistic concurrency control.
-
-## Construction
-```text
-let spec = TaskSpec::builder("my-slot", kind, 5_000u64)
-    .restart(RestartPolicy::OnFailure)
-    .backoff(BackoffPolicy { jitter: JitterPolicy::Equal, first_ms: 1_000, max_ms: 30_000, factor: 2.0 })
-    .build()?;
-
-spec.validate()?;  // submit-boundary validation (rejects Embedded)
+assert_eq!(preconditions.uid(), Some(task.uid()));
+assert_eq!(preconditions.resource_version(), Some("7"));
 ```
 
-## Error model
-```text
- Variant             When
- ───────             ────
- UnknownAdmission    unknown admission policy string
- UnknownRestart      unknown restart policy string
- UnknownJitter       unknown jitter policy string
- UnknownTaskPhase    unknown task phase string
- Invalid             structural validation failure (empty slot, bad backoff, etc.)
+The model captures the expected values.
+The state store or API enforces them against the current resource.
+
+## Task specification
+
+`TaskSpec::builder` requires:
+
+| Field      | Meaning                        |
+|------------|--------------------------------|
+| `slot`     | Admission and concurrency lane |
+| `workload` | Executable desired state       |
+| `timeout`  | Positive attempt timeout in ms |
+
+The builder applies:
+
+| Field            | Default                                       |
+|------------------|-----------------------------------------------|
+| `restart`        | `RestartPolicy::Never`                        |
+| `backoff`        | Full jitter, 1 s to 30 s, factor 2            |
+| `admission`      | `AdmissionPolicy::DropIfRunning`              |
+| `maxRetries`     | Absent, which means unlimited failure retries |
+| `runnerSelector` | Absent                                        |
+
+`maxRetries` counts retries after the first failed attempt.
+Zero is invalid.
+Omit the field for an unlimited retry budget.
+
+## Workloads
+
+| Variant       | Input                                               | Runner-routed |
+|---------------|-----------------------------------------------------|---------------|
+| `Subprocess`  | Command or explicit interpreter and base64 script   | Yes           |
+| `Container`   | OCI image, optional command, args, environment      | Yes           |
+| `Wasm`        | WASM module path, args, environment                 | Yes           |
+| `Embedded`    | In-process implementation revision                  | No            |
+| `Extension`   | Application GVK and JSON object spec                | Yes           |
+
+Built-in workloads use `apiVersion: solti.io/v1`.
+Their envelope and spec reject unknown fields.
+
+Use `ExtensionWorkload` for an application-defined runner:
+
+```rust
+use solti_model::{ExtensionWorkload, TaskWorkload};
+
+let workload = TaskWorkload::Extension(
+    ExtensionWorkload::new(
+        "media.example.io/v1",
+        "ImageResize",
+        serde_json::json!({
+            "width": 1280,
+            "format": "webp"
+        }),
+    )
+    .unwrap(),
+);
+
+assert_eq!(workload.api_version(), "media.example.io/v1");
+assert_eq!(workload.kind(), "ImageResize");
 ```
 
-## Notes
-- `TaskSpec` fields are private — use `TaskSpec::builder()` for construction and `serde` for deserialization.
-- Deserialization goes through `#[serde(try_from = "TaskSpecRaw")]` which validates on parse.
-- `BackoffPolicy` is **also** validated on deserialize via its own `try_from` raw; zero `first_ms`, inverted `max_ms`, or non-finite/`<1.0` `factor` are rejected at parse time.
-- Identity newtypes (`Slot`, `TaskId`, `AgentId`) wrap `Arc<str>` via `arc_str_newtype!`; environment newtypes (`TaskEnv`, `RunnerEnv`) wrap `Vec<KeyValue>` via `env_newtype!`. Both macros keep parallel types in lockstep.
-- `BackoffPolicy` implements `Eq`/`Hash` via `f64::to_bits()` for the `factor` field.
-- `TaskPhase`, `RestartPolicy`, `AdmissionPolicy`, `JitterPolicy` all implement `FromStr` for CLI/config parsing.
-- `Labels` is backed by `BTreeMap<String, String>` for deterministic iteration order.
-- Most types derive `Serialize`/`Deserialize` with `camelCase` field renaming. The one exception is `SelectorOperator`, which serializes as PascalCase (`In`, `NotIn`, `Exists`, `DoesNotExist`) to match the Kubernetes `LabelSelectorOperator` convention.
-- `TaskKind`, `TaskPhase`, `RestartPolicy`, `AdmissionPolicy`, `JitterPolicy`, `SelectorOperator` are `#[non_exhaustive]` — adding new variants is a non-breaking change.
-- Pagination constants for list endpoints: `DEFAULT_LIMIT = 100`, `MAX_LIMIT = 1000` (re-exported as `pub const` so downstream API layers share one source of truth).
+Extension `spec` must be a JSON object.
+The `solti.io` API group is reserved for built-in workloads.
+`solti-runner` owns runner selection and runner-specific validation.
+
+Subprocess script bodies use standard base64.
+Decoded content must be UTF-8.
+The decoded limit is `MAX_SCRIPT_BODY_BYTES` (`2 MiB`).
+
+## Apply desired state
+
+`Task::apply_desired` compares labels, annotations, and spec:
+
+| Result                    | Generation  | Status                            | Resource version |
+|---------------------------|-------------|-----------------------------------|------------------|
+| `DesiredChange::None`     | Unchanged   | Unchanged                         | Unchanged        |
+| `DesiredChange::Metadata` | Unchanged   | Unchanged                         | Replaced         |
+| `DesiredChange::Spec`     | Advanced    | Pending for the new desired state | Replaced         |
+
+UID and creation time remain unchanged.
+Invalid desired state is rejected before mutation.
+
+Execution status transitions take an authoritative generation.
+Stale generations are ignored.
+Attempt numbers come from the execution source of truth.
+
+## Read status
+
+`TaskStatus` combines execution state and reconciliation state.
+
+Use:
+
+- `phase()` for the current lifecycle phase;
+- `attempt()` for the latest observed attempt;
+- `observed_generation()` for the latest processed generation;
+- `reconciled()` for the required `Reconciled` condition;
+- `error()` and `exit_code()` for terminal diagnostics.
+
+`Pending` may mean that reconciliation is scheduled, failed, or accepted before execution starts.
+Inspect the `Reconciled` condition to distinguish these states.
+
+Terminal phases are `Succeeded`, `Failed`, `Timeout`, `Canceled`, and `Exhausted`.
+A terminal status can have attempt zero when no attempt event was observed.
+
+## Select labels
+
+`LabelSelector` uses Kubernetes selector syntax:
+
+```rust
+use solti_model::{LabelSelector, Labels};
+
+let selector: LabelSelector =
+    "environment=production,tier in (frontend,backend),!tainted"
+        .parse()
+        .unwrap();
+
+let mut labels = Labels::new();
+labels.insert("environment", "production");
+labels.insert("tier", "frontend");
+
+assert!(selector.matches(&labels));
+```
+
+Requirements are ANDed.
+`In` requires the key to exist.
+`NotIn` and `!=` also match a missing key.
+
+## Query tasks
+
+`TaskFilter` contains slot, phase, and label filters.
+Phases use OR semantics.
+Slot, phase, and label filters are ANDed.
+
+`TaskQuery` adds list pagination:
+
+```rust
+use solti_model::{LabelSelector, Slot, TaskQuery, DEFAULT_LIMIT};
+
+let selector: LabelSelector = "environment=production".parse().unwrap();
+let query = TaskQuery::new()
+    .with_slot(Slot::new("jobs").unwrap())
+    .with_active()
+    .with_label_selector(selector)
+    .unwrap();
+
+assert_eq!(query.limit(), DEFAULT_LIMIT);
+```
+
+The default limit is `100`.
+The maximum limit is `1000`.
+Zero selects the default.
+Larger values are capped.
+
+`TaskContinuation` carries the snapshot resource version, the fixed filter, and the last task name.
+It is a domain value.
+Transport layers encode it into their own opaque wire token.
+
+## Advertise capabilities
+
+`RunnerCapability` contains:
+
+- the registered runner name;
+- static labels used by `runnerSelector`;
+- supported workload GVKs.
+
+Construction rejects empty declarations, duplicate GVKs, and the built-in `Embedded` GVK.
+Workload GVKs are stored in canonical order.
+
+`AgentCapabilities` preserves runner registration order.
+It rejects duplicate runner names.
+
+## Consume output
+
+`OutputEvent` is the shared live-output data contract:
+
+```text
+{"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"aGk="}
+{"type":"runStarted","generation":2,"attempt":1,"startedAt":1700}
+{"type":"runFinished","generation":2,"attempt":1,"exitCode":0,"finishedAt":1701}
+{"type":"lagged","skipped":42}
+```
+
+Timestamps are Unix milliseconds.
+Chunk bytes use standard padded base64.
+They can contain non-UTF-8 data.
+
+The model does not publish, retain, or subscribe to output.
+`solti-api` maps the domain events to its separate protobuf shape.
+
+## Use bearer tokens
+
+`Token` wraps one bearer secret:
+
+```rust
+use solti_model::Token;
+
+let token = Token::new("secret").unwrap();
+
+assert!(token.verify("secret"));
+assert!(!token.verify("other"));
+assert_eq!(format!("{token:?}"), "Token(***redacted***)");
+```
+
+`Token::generate` uses 256 bits of OS entropy and the `solti_agt_` prefix.
+`Token::from_env` and `Token::from_file` load an existing value.
+Generation does not persist the token.
+`Debug` never exposes it.
+
+The model does not choose an authentication topology.
+It does not persist or rotate secrets.
+
+## Validation and serde
+
+Top-level constructors and deserializers validate their completed values.
+Unknown fields are rejected by resource, spec, capability, condition, run, query, and built-in workload shapes.
+
+Some collection types allow temporary invalid states during construction:
+
+| Type                    | Required boundary check |
+|-------------------------|-------------------------|
+| `Labels`                | `validate()`            |
+| `Annotations`           | `validate()`            |
+| `LabelSelector`         | `validate()`            |
+| `SelectorRequirement`   | `validate()`            |
+| `BackoffPolicy` literal | `validate()`            |
+
+Validated top-level APIs call these checks when the values enter a resource, query, or capability.
+`TaskEnv` stores key-value pairs without validating application-specific names or values.
+
+JSON Schema describes the serialized structure.
+It covers resource GVKs, workload envelopes, selector rules, run lifecycle shapes, and capability shapes.
+
+Runtime validation remains authoritative for semantic rules that JSON Schema cannot express exactly.
+These include generation relationships, unique condition types, `maxMs >= firstMs`, and UTF-8 byte budgets.
+
+Important limits:
+
+- `TaskId`: Kubernetes DNS-1123 subdomain, `253` bytes;
+- `Slot`: `[A-Za-z0-9._-]`, `64` bytes;
+- `AgentId`: `[A-Za-z0-9._-]`, `128` bytes;
+- annotations: qualified keys, `256 KiB` total key and value bytes;
+- workload GVK: CRD-compatible `apiVersion` and `kind`;
+- `creationTimestamp`: RFC 3339 with millisecond precision.
+
+## Errors
+
+Constructors and validation return `ModelResult<T>`.
+`ModelError::Invalid` covers structural and invariant failures.
+Dedicated variants cover unknown admission, restart, jitter, and phase names.
+
+`ModelError` and most public enums are non-exhaustive.
+Use a fallback match arm.
+
+## Examples
+
+### Internal examples
+
+These examples use only `solti-model` data contracts and their direct serialization tools.
+They do not store, route, reconcile, or execute tasks.
+Each example starts with a text flow diagram, then explains its inputs, transitions, and result.
+
+Start with caller-owned desired state:
+
+```bash
+cargo run -p solti-model --example task_manifest
+```
+
+| Example                                                     | Features | What it shows                                                      |
+|-------------------------------------------------------------|----------|--------------------------------------------------------------------|
+| [task_manifest.rs](examples/task_manifest.rs)               | default  | Desired state, policies, serialized shape, and strict fields.      |
+| [task_lifecycle.rs](examples/task_lifecycle.rs)             | default  | Generation, reconciliation, execution status, and apply semantics. |
+| [task_query.rs](examples/task_query.rs)                     | default  | Filters, selector semantics, page limits, and continuation values. |
+| [task_manifest_schema.rs](examples/task_manifest_schema.rs) | `schema` | Runtime validation and generated JSON Schema agreement.            |
+
+Run the remaining examples explicitly:
+
+```bash
+cargo run -p solti-model --example task_lifecycle
+cargo run -p solti-model --example task_query
+cargo run -p solti-model --example task_manifest_schema
+```
+
+### Full examples
+
+Application-level compositions live in the [`solti` examples](https://github.com/soltiHQ/sdk/tree/main/crates/solti/examples).
+They combine component crates and own storage, routing, reconciliation, and execution.
+
+## Contributor guide
+
+See the [solti-model source guide](https://github.com/soltiHQ/sdk/blob/main/crates/solti-model/ARCHITECTURE.md) for module ownership, data flow, invariants, and change locations.

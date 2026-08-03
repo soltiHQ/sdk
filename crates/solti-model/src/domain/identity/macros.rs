@@ -15,48 +15,43 @@ macro_rules! arc_str_newtype {
         $(#[$meta:meta])*
         $vis:vis struct $ty:ident;
     ) => {
-        $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+        $(#[$meta])*
         $vis struct $ty(std::sync::Arc<str>);
 
         impl $ty {
-            /// Create a new identifier from a string slice.
+            /// Creates a validated identifier.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`crate::ModelError::Invalid`] when the value violates this identifier's format.
             #[inline]
-            pub fn new(s: &str) -> Self {
-                Self(std::sync::Arc::from(s))
+            pub fn new(s: impl AsRef<str>) -> $crate::ModelResult<Self> {
+                let id = Self(std::sync::Arc::from(s.as_ref()));
+                id.validate_format()?;
+                Ok(id)
             }
 
-            /// Access the underlying string slice.
+            /// Returns the underlying string.
             #[inline]
             pub fn as_str(&self) -> &str {
                 &self.0
             }
 
-            /// Consume the wrapper, returning the underlying `Arc<str>`.
+            /// Returns the underlying `Arc<str>`.
             #[inline]
             pub fn into_inner(self) -> std::sync::Arc<str> {
                 self.0
             }
         }
 
-        impl From<String> for $ty {
-            #[inline]
-            fn from(s: String) -> Self {
-                Self(std::sync::Arc::from(s))
-            }
-        }
+        impl std::str::FromStr for $ty {
+            type Err = $crate::ModelError;
 
-        impl From<&str> for $ty {
             #[inline]
-            fn from(s: &str) -> Self {
-                Self(std::sync::Arc::from(s))
-            }
-        }
-
-        impl From<std::sync::Arc<str>> for $ty {
-            #[inline]
-            fn from(s: std::sync::Arc<str>) -> Self {
-                Self(s)
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Self::new(s)
             }
         }
 
@@ -109,8 +104,10 @@ macro_rules! arc_str_newtype {
         }
 
         impl<'de> serde::Deserialize<'de> for $ty {
+            /// Deserializes and validates the identifier.
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                String::deserialize(deserializer).map(|s| Self(std::sync::Arc::from(s)))
+                let s = String::deserialize(deserializer)?;
+                Self::new(s).map_err(serde::de::Error::custom)
             }
         }
     };

@@ -1,24 +1,26 @@
 [package]
 name = "solti-tls"
-description = "Solti SDK shared TLS / mTLS configuration."
+
+description   = "Shared TLS and mTLS configuration for Solti network crates, based on rustls."
+keywords      = ["tls", "rustls", "mtls", "certificate", "pem"]
+categories    = ["network-programming", "cryptography"]
 documentation = "https://docs.rs/solti-tls"
+readme        = "README.md"
 
 rust-version.workspace = true
-repository.workspace = true
-categories.workspace = true
-homepage.workspace = true
-keywords.workspace = true
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+repository.workspace   = true
+homepage.workspace     = true
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
 
 [features]
 default = []
 
 [dependencies]
-rustls         = { workspace = true }
-rustls-pemfile = { workspace = true }
-thiserror      = { workspace = true }
+rustls    = { workspace = true }
+thiserror = { workspace = true }
+zeroize   = { workspace = true }
 
 [dev-dependencies]
 rcgen        = { workspace = true }
@@ -28,3 +30,4 @@ tokio-rustls = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

@@ -1,69 +1,180 @@
-//! # HTTP/JSON transport.
+//! # HTTP Transport
 //!
-//! Axum router exposing [`ApiHandler`] operations as REST-shaped JSON endpoints.
-//! All paths share the `/api/v<MAJOR>` prefix where `MAJOR` is [`crate::API_VERSION`];
+//! Axum router for the model-owned CRD JSON representation.
+//! Every operation delegates to [`ApiHandler`].
 //!
-//! _the examples below show the current value (`v1`)_.
+//! The current API root is `/apis/solti.io/v1`.
 //!
-//! | Method | Endpoint                    | Handler                   |
-//! |--------|-----------------------------|---------------------------|
-//! | POST   | `/api/v1/tasks`             | submit                    |
-//! | PUT    | `/api/v1/tasks`             | apply (supersede/install) |
-//! | GET    | `/api/v1/tasks`             | list (query params)       |
-//! | GET    | `/api/v1/tasks/{id}`        | get status                |
-//! | GET    | `/api/v1/tasks/{id}/runs`   | list runs                 |
-//! | GET    | `/api/v1/tasks/{id}/logs`   | live-tail SSE stream      |
-//! | DELETE | `/api/v1/tasks/{id}`        | delete (stop+purge)       |
+//! ## Routes
+//!
+//! | Method   | Path                                          | Operation   |
+//! |----------|-----------------------------------------------|-------------|
+//! | `POST`   | `/apis/solti.io/v1/tasks`                     | Create      |
+//! | `PUT`    | `/apis/solti.io/v1/tasks/{name}`              | Apply       |
+//! | `GET`    | `/apis/solti.io/v1/tasks/{name}`              | Get         |
+//! | `GET`    | `/apis/solti.io/v1/tasks`                     | List        |
+//! | `GET`    | `/apis/solti.io/v1/tasks?watch=true`          | Watch       |
+//! | `GET`    | `/apis/solti.io/v1/tasks/{name}/runs`         | Run history |
+//! | `GET`    | `/apis/solti.io/v1/tasks/{name}/logs`         | Live output |
+//! | `DELETE` | `/apis/solti.io/v1/tasks/{name}`              | Delete      |
+//!
+//! ## Wire Shapes
+//!
+//! Create and apply accept `TaskManifest` JSON.
+//! Resource reads return `Task` JSON.
+//! Lists return a Kubernetes-style `TaskList`.
+//! Errors return a Kubernetes-style `Status`.
+//!
+//! Watches emit newline-delimited JSON documents.
+//! Live output uses Server-Sent Events.
+//! Both streams remain open until their source ends or fails.
+//!
+//! Every request body is limited to [`crate::MAX_REQUEST_BYTES`].
 
-use std::sync::Arc;
+use std::{
+    convert::Infallible,
+    num::NonZeroU32,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use std::convert::Infallible;
-
+use aide::{
+    NoApi,
+    axum::{
+        ApiRouter,
+        routing::{get_with, post_with},
+    },
+    generate::GenContext,
+    openapi::{
+        Info, MediaType, OpenApi, ReferenceOr, Response as ApiResponse, SchemaObject,
+        SecurityScheme, Tag,
+    },
+    operation::{OperationInput, OperationOutput},
+    transform::TransformOperation,
+};
 use axum::{
     Json, Router,
-    extract::{FromRequest, Path, Query, Request, State, rejection::JsonRejection},
-    http::StatusCode,
+    body::Body,
+    extract::{
+        DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, RawQuery, Request, State,
+        rejection::{JsonRejection, PathRejection, QueryRejection},
+    },
+    handler::HandlerWithoutStateExt,
+    http::{HeaderValue, StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{
-        IntoResponse, Response,
+        IntoResponse, NoContent, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{delete, get, post, put},
 };
-use serde::{Deserialize, de::DeserializeOwned};
-use solti_model::{OutputEvent, TaskId, TaskPhase, TaskQuery, Token};
-use tokio_stream::StreamExt;
+use schemars::{JsonSchema, Schema, generate::SchemaSettings};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use solti_model::{
+    AdmissionPolicy, BackoffPolicy, ContainerSpec, ExtensionWorkload, LabelSelector, ObjectMeta,
+    OutputEvent, RestartPolicy, Slot, SubprocessSpec, TASK_API_VERSION, Task, TaskFilter, TaskId,
+    TaskManifest, TaskManifestMeta, TaskPhase, TaskQuery, TaskRun, TaskStatus, TaskWatchEvent,
+    Timeout, Token, TypeMeta, Uid, WORKLOAD_API_VERSION, WasmSpec, WritePreconditions,
+};
+use tokio_stream::{Stream, StreamExt};
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::debug;
 
 use crate::{
-    MAX_REQUEST_BYTES,
-    convert::{self, tasks_page_to_proto},
-    error::ApiError,
-    handler::ApiHandler,
-    proto_api,
-    validate::{clamp_list_limit, non_empty_id},
+    API_VERSION, API_VERSION_NAME, GRPC_API_PACKAGE, HTTP_API_ROOT, MAX_REQUEST_BYTES,
+    auth::bearer_value,
+    error::{ApiError, HttpStatusResource},
+    handler::{ApiHandler, TaskWatchEventStream},
+    metrics::{ApiMetricsHandle, StreamingResponse, http_metrics_middleware, noop_api_metrics},
+    validate::{parse_list_limit, parse_task_id, validate_slot},
+    visibility::{manifest_is_visible, run_is_visible, task_is_visible},
 };
-// `api_url!` is `#[macro_export]`, so it's already accessible in this
-// module by its bare name — `use crate::api_url` would be redundant
-// (and warnings about unused imports broke a `cargo publish` on us).
 
-/// Wrapper around `axum::Json<T>` that maps `JsonRejection` into [`ApiError::InvalidRequest`].
-pub(crate) struct ApiJson<T>(pub T);
+const HTTP_BEARER_SCHEME: &str = "soltiTaskBearer";
 
-impl<T, S> FromRequest<S> for ApiJson<T>
+/// Task manifest extractor with the public HTTP schema.
+struct TaskManifestJson(TaskManifest);
+
+impl<S> FromRequest<S> for TaskManifestJson
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let Json(value) = axum::Json::<TaskManifest>::from_request(req, state)
+            .await
+            .map_err(map_json_rejection)?;
+        Ok(Self(value))
+    }
+}
+
+impl OperationInput for TaskManifestJson {
+    fn operation_input(context: &mut GenContext, operation: &mut aide::openapi::Operation) {
+        <Json<HttpTaskManifestSchema> as OperationInput>::operation_input(context, operation);
+    }
+}
+
+/// Query extractor that maps axum rejections into [`ApiError`].
+pub(crate) struct ApiQuery<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for ApiQuery<T>
 where
     T: DeserializeOwned,
     S: Send + Sync,
 {
     type Rejection = ApiError;
 
-    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let Json(value) = axum::Json::<T>::from_request(req, state)
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Query(value) = Query::<T>::from_request_parts(parts, state)
             .await
-            .map_err(map_json_rejection)?;
-        Ok(ApiJson(value))
+            .map_err(map_query_rejection)?;
+        Ok(ApiQuery(value))
     }
+}
+
+impl<T> OperationInput for ApiQuery<T>
+where
+    T: JsonSchema,
+{
+    fn operation_input(context: &mut GenContext, operation: &mut aide::openapi::Operation) {
+        <Query<T> as OperationInput>::operation_input(context, operation);
+    }
+}
+
+/// Path extractor that maps axum rejections into [`ApiError`].
+pub(crate) struct ApiPath<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for ApiPath<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Path(value) = Path::<T>::from_request_parts(parts, state)
+            .await
+            .map_err(map_path_rejection)?;
+        Ok(ApiPath(value))
+    }
+}
+
+impl<T> OperationInput for ApiPath<T>
+where
+    T: JsonSchema,
+{
+    fn operation_input(context: &mut GenContext, operation: &mut aide::openapi::Operation) {
+        <Path<T> as OperationInput>::operation_input(context, operation);
+    }
+}
+
+fn map_path_rejection(rejection: PathRejection) -> ApiError {
+    ApiError::InvalidRequest(rejection.body_text())
+}
+
+fn map_query_rejection(rejection: QueryRejection) -> ApiError {
+    ApiError::InvalidRequest(rejection.body_text())
 }
 
 fn map_json_rejection(rej: JsonRejection) -> ApiError {
@@ -72,6 +183,9 @@ fn map_json_rejection(rej: JsonRejection) -> ApiError {
             "request body exceeds the maximum of {} bytes",
             MAX_REQUEST_BYTES
         ));
+    }
+    if rej.status() == StatusCode::UNSUPPORTED_MEDIA_TYPE {
+        return ApiError::UnsupportedMediaType(rej.body_text());
     }
 
     let msg = rej.body_text();
@@ -86,26 +200,72 @@ fn map_json_rejection(rej: JsonRejection) -> ApiError {
 async fn map_413_envelope(req: Request, next: Next) -> Response {
     let resp = next.run(req).await;
     if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        let body = serde_json::json!({
-            "error": "PayloadTooLarge",
-            "message": format!(
-                "request body exceeds the maximum of {} bytes",
-                MAX_REQUEST_BYTES
-            ),
-        });
-        return (StatusCode::PAYLOAD_TOO_LARGE, Json(body)).into_response();
+        return ApiError::PayloadTooLarge(format!(
+            "request body exceeds the maximum of {} bytes",
+            MAX_REQUEST_BYTES
+        ))
+        .into_response();
     }
     resp
 }
 
-/// HTTP API service builder.
+async fn route_not_found(req: Request) -> Response {
+    ApiError::NotFound(format!("no API route for `{}`", req.uri().path())).into_response()
+}
+
+async fn method_not_allowed(req: Request) -> Response {
+    ApiError::MethodNotAllowed(format!(
+        "method {} is not allowed for `{}`",
+        req.method(),
+        req.uri().path()
+    ))
+    .into_response()
+}
+
+/// Standalone runtime router and its generated OpenAPI contract.
 ///
-/// ## Also
+/// The document describes the exact routes installed on [`router`](Self::router).
+/// It is generated in memory and is not written to the source tree.
+pub struct HttpApiParts {
+    /// Configured task API router.
+    pub router: Router,
+
+    /// OpenAPI 3.1 document for the configured router.
+    pub openapi: OpenApi,
+}
+
+/// Builder for the axum task API.
 ///
-/// - [`ApiHandler`](crate::ApiHandler) the trait backing all endpoints.
-/// - [`ApiError`](crate::ApiError) mapped to JSON + HTTP status codes.
+/// Authentication and metrics are optional.
+/// [`build`](Self::build) returns a standalone router and OpenAPI document.
+/// [`mount`](Self::mount) adds the documented task subtree to an application router.
+/// [`router`](Self::router) returns only the router.
+///
+/// ## Example
+///
+/// ```rust,no_run
+/// use std::sync::Arc;
+///
+/// use solti_api::{ApiHandler, HttpApi};
+/// use solti_model::Token;
+///
+/// fn build<H: ApiHandler>(
+///     handler: Arc<H>,
+///     token: Token,
+/// ) -> solti_api::axum::Router {
+///     HttpApi::new(handler)
+///         .with_auth(token)
+///         .router()
+/// }
+/// ```
+///
+/// ## See Also
+///
+/// - [`ApiHandler`] defines the backend operations.
+/// - [`ApiError`] defines the HTTP `Status` mapping.
 pub struct HttpApi<H> {
     handler: Arc<H>,
+    metrics: ApiMetricsHandle,
     auth: Option<Token>,
 }
 
@@ -113,51 +273,286 @@ impl<H> HttpApi<H>
 where
     H: ApiHandler,
 {
-    /// Create new HTTP API with the given handler.
+    /// Creates an HTTP API for one handler.
     pub fn new(handler: Arc<H>) -> Self {
         Self {
             handler,
+            metrics: noop_api_metrics(),
             auth: None,
         }
     }
 
-    /// Require a bearer token on every request.
+    /// Requires a bearer token on every request.
     ///
-    /// When set, requests without a valid `Authorization: Bearer <token>` header are rejected with `401 Unauthorized` before reaching any handler .
-    /// This is the same shared secret the agent presents to the control plane in discovery, one config value enables both directions.
-    /// Orthogonal to TLS. When unset, no auth is enforced.
+    /// The expected header is `Authorization: Bearer <token>`.
+    /// Missing or invalid credentials return `401 Unauthorized`.
+    /// Rejected requests do not reach the handler.
+    /// Authentication is disabled when this method is not called.
     pub fn with_auth(mut self, token: Token) -> Self {
         self.auth = Some(token);
         self
     }
 
-    /// Build axum router with mounted endpoints.
+    /// Attaches a metrics backend.
     ///
-    /// Applies a [`RequestBodyLimitLayer`] capped at [`MAX_REQUEST_BYTES`] bytes to every request,
-    /// and when [`with_auth`](Self::with_auth) is set a bearer-token gate that runs before any handler.
-    pub fn router(self) -> Router {
-        let mut router = Router::new()
-            .route(api_url!("/tasks"), post(submit_task::<H>))
-            .route(api_url!("/tasks"), put(apply_task::<H>))
-            .route(api_url!("/tasks"), get(list_tasks::<H>))
-            .route(api_url!("/tasks/{id}"), get(get_task_status::<H>))
-            .route(api_url!("/tasks/{id}"), delete(delete_task::<H>))
-            .route(api_url!("/tasks/{id}/runs"), get(list_task_runs::<H>))
-            .route(api_url!("/tasks/{id}/logs"), get(stream_task_logs::<H>))
+    /// The default backend ignores every update.
+    pub fn with_metrics(mut self, metrics: ApiMetricsHandle) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Builds a standalone router and its OpenAPI document.
+    ///
+    /// Every request body is limited to [`MAX_REQUEST_BYTES`].
+    /// Optional authentication runs before the handler.
+    /// Metrics include unmatched task API routes and authentication failures.
+    pub fn build(self) -> HttpApiParts {
+        configure_standalone_openapi_generation();
+
+        let mut openapi = standalone_openapi_document();
+        let router = self
+            .mount(ApiRouter::new(), &mut openapi)
+            .fallback(route_not_found)
+            .finish_api(&mut openapi);
+
+        HttpApiParts { router, openapi }
+    }
+
+    /// Mounts the documented task API into an application router.
+    ///
+    /// The task routes are mounted at [`HTTP_API_ROOT`].
+    /// Their handler state, authentication, limits, metrics, and fallbacks stay inside that route subtree.
+    ///
+    /// The caller owns the final [`OpenApi`] document.
+    /// Call [`ApiRouter::finish_api`] once after every documented service has been mounted.
+    pub fn mount<S>(self, app: ApiRouter<S>, openapi: &mut OpenApi) -> ApiRouter<S>
+    where
+        S: Clone + Send + Sync + 'static,
+    {
+        let auth_enabled = self.auth.is_some();
+        document_task_api(openapi, auth_enabled);
+
+        let mut router = documented_router::<H>(auth_enabled)
+            .fallback(route_not_found)
+            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
             .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
             .layer(middleware::from_fn(map_413_envelope));
 
-        // Added last → outermost → runs first: reject unauthenticated requests before any work happens.
         if let Some(token) = self.auth {
             router = router.layer(middleware::from_fn_with_state(token, require_bearer));
         }
 
-        router.with_state(self.handler)
+        router = router.layer(middleware::from_fn_with_state(
+            self.metrics,
+            http_metrics_middleware,
+        ));
+
+        app.nest_api_service(HTTP_API_ROOT, router.with_state(self.handler))
+    }
+
+    /// Builds only the configured axum router.
+    ///
+    /// Use [`build`](Self::build) when the OpenAPI document is needed.
+    pub fn router(self) -> Router {
+        self.build().router
     }
 }
 
-/// Axum middleware: reject requests lacking a valid `Authorization: Bearer` token.
-/// Installed only when [`HttpApi::with_auth`] is set.
+fn configure_standalone_openapi_generation() {
+    aide::generate::reset_context();
+    aide::generate::in_context(|context| {
+        let settings = SchemaSettings::draft2020_12().with(|settings| {
+            settings.inline_subschemas = false;
+            settings.definitions_path = "#/components/schemas/".into();
+            settings.meta_schema = None;
+        });
+        context.schema = settings.into_generator();
+    });
+}
+
+fn documented_router<H>(auth_enabled: bool) -> ApiRouter<Arc<H>>
+where
+    H: ApiHandler,
+{
+    let tasks = post_with(create_task_route::<H>, move |operation| {
+        let operation = operation
+            .id("createTask")
+            .tag("tasks")
+            .summary("Create a task")
+            .description(
+                "Commits new desired state. See CONTRACT.md for reconciliation semantics.",
+            )
+            .response::<201, Json<HttpTaskSchema>>()
+            .response::<400, ApiError>()
+            .response::<409, ApiError>()
+            .response::<413, ApiError>()
+            .response::<415, ApiError>();
+        document_common_errors(document_auth(operation, auth_enabled))
+    })
+    .get_with(list_tasks_route::<H>, move |operation| {
+        let operation = operation
+            .id("listOrWatchTasks")
+            .tag("tasks")
+            .summary("List or watch tasks")
+            .description(
+                "Returns one TaskList unless watch is true. Watch mode emits newline-delimited TaskWatchDocument values. See CONTRACT.md for pagination and resume semantics.",
+            )
+            .input::<Query<ListTasksParams>>()
+            .response::<200, ListOrWatchResponse>()
+            .response::<400, ApiError>()
+            .response::<410, ApiError>();
+        document_common_errors(document_auth(operation, auth_enabled))
+    })
+    .fallback_service(method_not_allowed.into_service());
+
+    let task = get_with(get_task_route::<H>, move |operation| {
+        let operation = operation
+            .id("getTask")
+            .tag("tasks")
+            .summary("Get a task")
+            .response::<200, Json<HttpTaskSchema>>()
+            .response::<400, ApiError>()
+            .response::<404, ApiError>();
+        document_common_errors(document_auth(operation, auth_enabled))
+    })
+    .put_with(apply_task_route::<H>, move |operation| {
+        let operation = operation
+            .id("applyTask")
+            .tag("tasks")
+            .summary("Apply desired task state")
+            .description(
+                "Creates or updates one task. See CONTRACT.md for preconditions and commit semantics.",
+            )
+            .response::<200, Json<HttpTaskSchema>>()
+            .response::<400, ApiError>()
+            .response::<404, ApiError>()
+            .response::<409, ApiError>()
+            .response::<413, ApiError>()
+            .response::<415, ApiError>();
+        document_common_errors(document_auth(operation, auth_enabled))
+    })
+    .delete_with(delete_task_route::<H>, move |operation| {
+        let operation = operation
+            .id("deleteTask")
+            .tag("tasks")
+            .summary("Delete a task")
+            .description("Stops the task and removes its retained history.")
+            .response::<204, NoContent>()
+            .response::<400, ApiError>()
+            .response::<404, ApiError>()
+            .response::<409, ApiError>();
+        document_common_errors(document_auth(operation, auth_enabled))
+    })
+    .fallback_service(method_not_allowed.into_service());
+
+    let runs = get_with(list_task_runs_route::<H>, move |operation| {
+        let operation = operation
+            .id("listTaskRuns")
+            .tag("tasks")
+            .summary("List retained task runs")
+            .response::<200, Json<TaskRunList>>()
+            .response::<400, ApiError>()
+            .response::<404, ApiError>();
+        document_common_errors(document_auth(operation, auth_enabled))
+    })
+    .fallback_service(method_not_allowed.into_service());
+
+    let logs = get_with(stream_task_logs_route::<H>, move |operation| {
+        let operation = operation
+            .id("streamTaskLogs")
+            .tag("tasks")
+            .summary("Stream live task output")
+            .description(
+                "Returns Server-Sent Events. See CONTRACT.md for event names, payloads, and delivery semantics.",
+            )
+            .response::<200, TaskLogStreamResponse>()
+            .response::<400, ApiError>()
+            .response::<404, ApiError>();
+        document_common_errors(document_auth(operation, auth_enabled))
+    })
+    .fallback_service(method_not_allowed.into_service());
+
+    ApiRouter::new()
+        .api_route("/tasks", tasks)
+        .api_route("/tasks/{name}", task)
+        .api_route("/tasks/{name}/runs", runs)
+        .api_route("/tasks/{name}/logs", logs)
+}
+
+fn document_auth<'a>(
+    operation: TransformOperation<'a>,
+    auth_enabled: bool,
+) -> TransformOperation<'a> {
+    if auth_enabled {
+        operation
+            .security_requirement(HTTP_BEARER_SCHEME)
+            .response::<401, ApiError>()
+    } else {
+        operation.security_requirement_multi(std::iter::empty::<&str>())
+    }
+}
+
+fn document_common_errors(operation: TransformOperation<'_>) -> TransformOperation<'_> {
+    operation
+        .response::<500, ApiError>()
+        .response::<503, ApiError>()
+}
+
+fn standalone_openapi_document() -> OpenApi {
+    OpenApi {
+        info: Info {
+            title: "Solti Task API".into(),
+            summary: Some("Public task transport exposed by one Solti agent.".into()),
+            description: Some(
+                "OpenAPI describes HTTP shapes and operations. CONTRACT.md defines behavioral semantics."
+                    .into(),
+            ),
+            version: API_VERSION_NAME.into(),
+            ..Info::default()
+        },
+        json_schema_dialect: Some("https://json-schema.org/draft/2020-12/schema".into()),
+        ..OpenApi::default()
+    }
+}
+
+fn document_task_api(openapi: &mut OpenApi, auth_enabled: bool) {
+    openapi
+        .extensions
+        .insert("x-solti-task-api-version".into(), API_VERSION.into());
+    openapi.extensions.insert(
+        "x-solti-resource-api-version".into(),
+        TASK_API_VERSION.into(),
+    );
+    openapi
+        .extensions
+        .insert("x-solti-http-api-root".into(), HTTP_API_ROOT.into());
+    openapi
+        .extensions
+        .insert("x-solti-grpc-package".into(), GRPC_API_PACKAGE.into());
+
+    if !openapi.tags.iter().any(|tag| tag.name == "tasks") {
+        openapi.tags.push(Tag {
+            name: "tasks".into(),
+            description: Some("Desired task state, observations, history, and live output.".into()),
+            ..Tag::default()
+        });
+    }
+
+    if auth_enabled {
+        let components = openapi.components.get_or_insert_default();
+        components.security_schemes.insert(
+            HTTP_BEARER_SCHEME.into(),
+            ReferenceOr::Item(SecurityScheme::Http {
+                scheme: "bearer".into(),
+                bearer_format: None,
+                description: Some("Token configured by HttpApi::with_auth.".into()),
+                extensions: Default::default(),
+            }),
+        );
+    }
+}
+
+/// Enforces the configured bearer token.
 async fn require_bearer(State(expected): State<Token>, req: Request, next: Next) -> Response {
     let ok = req
         .headers()
@@ -174,159 +569,852 @@ async fn require_bearer(State(expected): State<Token>, req: Request, next: Next)
     }
 }
 
-/// Extract the credential from an `Authorization` header value, accepting the scheme case-insensitively.
-fn bearer_value(header: &str) -> Option<&str> {
-    let (scheme, token) = header.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("bearer").then_some(token)
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, JsonSchema)]
+#[schemars(rename = "ListTasksQuery", deny_unknown_fields)]
 struct ListTasksParams {
+    /// Match one slot.
+    #[schemars(with = "Option<Slot>")]
     slot: Option<String>,
-    status: Option<String>,
+
+    /// Match any supplied phase.
+    #[schemars(rename = "phase", with = "Option<Vec<TaskPhase>>")]
+    phases: Vec<String>,
+
+    /// Match a Kubernetes-style label selector.
+    #[schemars(rename = "labelSelector")]
+    label_selector: Option<String>,
+
+    /// Page size.
+    ///
+    /// Omitted or zero means 100.
+    /// The maximum is 1000.
+    #[schemars(range(max = 1000))]
     limit: Option<u32>,
-    offset: Option<u32>,
+
+    /// Opaque continuation token returned by a previous page.
+    #[schemars(rename = "continue", with = "Option<NonEmptyStringSchema>")]
+    continuation: Option<String>,
+
+    /// Opaque watch start position.
+    #[schemars(rename = "resourceVersion", with = "Option<NonEmptyStringSchema>")]
+    resource_version: Option<String>,
+
+    /// Select watch mode.
+    #[schemars(with = "Option<WatchQuerySchema>")]
+    watch: Option<bool>,
 }
 
-async fn submit_task<H>(
-    State(handler): State<Arc<H>>,
-    ApiJson(req): ApiJson<proto_api::SubmitTaskRequest>,
-) -> Result<impl IntoResponse, ApiError>
+fn parse_list_tasks_params(raw_query: Option<&str>) -> Result<ListTasksParams, ApiError> {
+    let mut params = ListTasksParams::default();
+    for (key, value) in form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes()) {
+        match key.as_ref() {
+            "slot" => set_query_param(&mut params.slot, "slot", value.into_owned())?,
+            "phase" => params.phases.push(value.into_owned()),
+            "labelSelector" => set_query_param(
+                &mut params.label_selector,
+                "labelSelector",
+                value.into_owned(),
+            )?,
+            "limit" => {
+                let value = parse_u32_query_param("limit", &value)?;
+                set_query_param(&mut params.limit, "limit", value)?;
+            }
+            "continue" => {
+                set_query_param(&mut params.continuation, "continue", value.into_owned())?
+            }
+            "resourceVersion" => set_query_param(
+                &mut params.resource_version,
+                "resourceVersion",
+                value.into_owned(),
+            )?,
+            "watch" => {
+                let value = parse_watch_query_param(&value)?;
+                set_query_param(&mut params.watch, "watch", value)?;
+            }
+            other => {
+                return Err(ApiError::InvalidRequest(format!(
+                    "unknown query parameter `{other}`"
+                )));
+            }
+        }
+    }
+    Ok(params)
+}
+
+fn parse_watch_query_param(value: &str) -> Result<bool, ApiError> {
+    match value {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(ApiError::InvalidRequest(
+            "query parameter `watch` must be one of: true, false, 1, 0".into(),
+        )),
+    }
+}
+
+fn set_query_param<T>(target: &mut Option<T>, name: &str, value: T) -> Result<(), ApiError> {
+    if target.replace(value).is_some() {
+        return Err(ApiError::InvalidRequest(format!(
+            "query parameter `{name}` must not be repeated"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_u32_query_param(name: &str, value: &str) -> Result<u32, ApiError> {
+    value.parse().map_err(|_| {
+        ApiError::InvalidRequest(format!(
+            "query parameter `{name}` must be an unsigned 32-bit integer"
+        ))
+    })
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WriteParams {
+    /// Require the current resource UID.
+    #[schemars(with = "Option<Uid>")]
+    uid: Option<String>,
+
+    /// Require the current opaque resource version.
+    #[schemars(with = "Option<NonEmptyStringSchema>")]
+    resource_version: Option<String>,
+}
+
+fn parse_write_preconditions(params: WriteParams) -> Result<WritePreconditions, ApiError> {
+    let mut preconditions = WritePreconditions::new();
+    if let Some(uid) = params.uid {
+        preconditions = preconditions.with_uid(
+            Uid::new(uid)
+                .map_err(|error| ApiError::InvalidRequest(format!("invalid uid: {error}")))?,
+        );
+    }
+    if let Some(resource_version) = params.resource_version {
+        preconditions = preconditions
+            .with_resource_version(resource_version)
+            .map_err(|error| {
+                ApiError::InvalidRequest(format!("invalid resourceVersion: {error}"))
+            })?;
+    }
+    Ok(preconditions)
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+struct TaskPath {
+    /// Stable task name.
+    #[schemars(with = "TaskId")]
+    name: String,
+}
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[schemars(
+    rename = "SoltiTaskSpec",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
+struct HttpTaskSpecSchema {
+    slot: Slot,
+    workload: HttpTaskWorkloadSchema,
+    timeout: Timeout,
+    restart: RestartPolicy,
+    backoff: BackoffPolicy,
+    admission: AdmissionPolicy,
+    max_retries: Option<NonZeroU32>,
+    runner_selector: Option<LabelSelector>,
+}
+
+struct HttpTaskWorkloadSchema;
+
+impl JsonSchema for HttpTaskWorkloadSchema {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SoltiTaskWorkload".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> Schema {
+        let subprocess = http_workload_envelope_schema(
+            "Subprocess",
+            generator.subschema_for::<SubprocessSpec>(),
+        );
+        let wasm = http_workload_envelope_schema("Wasm", generator.subschema_for::<WasmSpec>());
+        let container =
+            http_workload_envelope_schema("Container", generator.subschema_for::<ContainerSpec>());
+        let extension = generator.subschema_for::<ExtensionWorkload>();
+
+        schemars::json_schema!({
+            "description": "Public workload GVK and desired state. Embedded is in-process only.",
+            "oneOf": [subprocess, wasm, container, extension]
+        })
+    }
+}
+
+fn http_workload_envelope_schema(kind: &'static str, spec: Schema) -> Schema {
+    schemars::json_schema!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["apiVersion", "kind", "spec"],
+        "properties": {
+            "apiVersion": {
+                "type": "string",
+                "const": WORKLOAD_API_VERSION
+            },
+            "kind": {
+                "type": "string",
+                "const": kind
+            },
+            "spec": spec
+        }
+    })
+}
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[schemars(
+    rename = "SoltiTaskManifest",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
+struct HttpTaskManifestSchema {
+    #[schemars(flatten)]
+    type_meta: TypeMeta,
+    metadata: TaskManifestMeta,
+    spec: HttpTaskSpecSchema,
+}
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[schemars(rename = "SoltiTask", rename_all = "camelCase", deny_unknown_fields)]
+struct HttpTaskSchema {
+    #[schemars(flatten)]
+    type_meta: TypeMeta,
+    metadata: ObjectMeta,
+    spec: HttpTaskSpecSchema,
+    status: TaskStatus,
+}
+
+#[derive(Debug, JsonSchema, Serialize)]
+#[schemars(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct ListMeta {
+    /// Collection version shared by every page in one snapshot.
+    resource_version: String,
+
+    /// Opaque continuation token.
+    #[serde(rename = "continue", skip_serializing_if = "Option::is_none")]
+    continuation: Option<String>,
+
+    /// Remaining items after this page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remaining_item_count: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskList {
+    api_version: &'static str,
+
+    kind: &'static str,
+
+    metadata: ListMeta,
+    items: Vec<Task>,
+}
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[schemars(
+    rename = "SoltiTaskList",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
+struct HttpTaskListSchema {
+    #[schemars(schema_with = "task_api_version")]
+    api_version: &'static str,
+
+    #[schemars(schema_with = "task_list_kind")]
+    kind: &'static str,
+
+    metadata: ListMeta,
+    items: Vec<HttpTaskSchema>,
+}
+
+#[derive(Debug, JsonSchema, Serialize)]
+#[schemars(deny_unknown_fields)]
+struct TaskRunList {
+    runs: Vec<TaskRun>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "object")]
+enum TaskWatchDocument {
+    #[serde(rename = "ADDED")]
+    Added(Task),
+    #[serde(rename = "MODIFIED")]
+    Modified(Task),
+    #[serde(rename = "DELETED")]
+    Deleted(Task),
+    #[serde(rename = "ERROR")]
+    Error(HttpStatusResource),
+}
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[schemars(rename = "SoltiTaskWatchDocument", tag = "type", content = "object")]
+enum HttpTaskWatchDocumentSchema {
+    #[schemars(rename = "ADDED")]
+    Added(HttpTaskSchema),
+    #[schemars(rename = "MODIFIED")]
+    Modified(HttpTaskSchema),
+    #[schemars(rename = "DELETED")]
+    Deleted(HttpTaskSchema),
+    #[schemars(rename = "ERROR")]
+    Error(HttpStatusResource),
+}
+
+struct ListOrWatchResponse;
+
+impl OperationOutput for ListOrWatchResponse {
+    type Inner = serde_json::Value;
+
+    fn operation_response(
+        context: &mut GenContext,
+        _operation: &mut aide::openapi::Operation,
+    ) -> Option<ApiResponse> {
+        let list = context.schema.subschema_for::<HttpTaskListSchema>();
+        let watch_document = context
+            .schema
+            .subschema_for::<HttpTaskWatchDocumentSchema>();
+        Some(ApiResponse {
+            description: "A TaskList, or a newline-delimited sequence of TaskWatchDocument values when watch is true.".into(),
+            content: [(
+                "application/json".into(),
+                media_type(schemars::json_schema!({
+                    "description": "List and watch share one HTTP media type. See CONTRACT.md for stream framing.",
+                    "oneOf": [list, watch_document]
+                })),
+            )]
+            .into_iter()
+            .collect(),
+            ..ApiResponse::default()
+        })
+    }
+}
+
+struct TaskLogStreamResponse;
+
+impl OperationOutput for TaskLogStreamResponse {
+    type Inner = serde_json::Value;
+
+    fn operation_response(
+        context: &mut GenContext,
+        _operation: &mut aide::openapi::Operation,
+    ) -> Option<ApiResponse> {
+        Some(ApiResponse {
+            description:
+                "Server-Sent Events. Each data field is JSON matching OutputEvent. See CONTRACT.md for framing and delivery semantics."
+                    .into(),
+            content: [(
+                "text/event-stream".into(),
+                media_type(context.schema.subschema_for::<OutputEvent>()),
+            )]
+            .into_iter()
+            .collect(),
+            ..ApiResponse::default()
+        })
+    }
+}
+
+impl OperationOutput for ApiError {
+    type Inner = serde_json::Value;
+
+    fn operation_response(
+        context: &mut GenContext,
+        _operation: &mut aide::openapi::Operation,
+    ) -> Option<ApiResponse> {
+        Some(json_response::<HttpStatusResource>(
+            context,
+            "Kubernetes-style Status failure.",
+        ))
+    }
+}
+
+fn json_response<T>(context: &mut GenContext, description: &str) -> ApiResponse
+where
+    T: JsonSchema,
+{
+    ApiResponse {
+        description: description.into(),
+        content: [(
+            "application/json".into(),
+            media_type(context.schema.subschema_for::<T>()),
+        )]
+        .into_iter()
+        .collect(),
+        ..ApiResponse::default()
+    }
+}
+
+fn media_type(schema: Schema) -> MediaType {
+    MediaType {
+        schema: Some(SchemaObject {
+            json_schema: schema,
+            example: None,
+            external_docs: None,
+        }),
+        ..MediaType::default()
+    }
+}
+
+struct WatchQuerySchema;
+
+impl JsonSchema for WatchQuerySchema {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "WatchQuery".into()
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "oneOf": [
+                {
+                    "type": "boolean"
+                },
+                {
+                    "type": "string",
+                    "enum": ["0", "1"]
+                }
+            ]
+        })
+    }
+}
+
+struct NonEmptyStringSchema;
+
+impl JsonSchema for NonEmptyStringSchema {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "NonEmptyString".into()
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+        })
+    }
+}
+
+fn task_api_version(_generator: &mut schemars::SchemaGenerator) -> Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "const": TASK_API_VERSION
+    })
+}
+
+fn task_list_kind(_generator: &mut schemars::SchemaGenerator) -> Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "const": "TaskList"
+    })
+}
+
+struct TaskWatchBodyStream {
+    source: TaskWatchEventStream,
+    terminated: bool,
+}
+
+impl TaskWatchBodyStream {
+    fn new(source: TaskWatchEventStream) -> Self {
+        Self {
+            source,
+            terminated: false,
+        }
+    }
+}
+
+impl Stream for TaskWatchBodyStream {
+    type Item = Result<Vec<u8>, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.terminated {
+            return Poll::Ready(None);
+        }
+
+        match self.source.as_mut().poll_next(context) {
+            Poll::Ready(Some(event)) => {
+                let event = event.and_then(public_watch_event);
+                self.terminated = event.is_err();
+                Poll::Ready(Some(Ok(encode_watch_document(event))))
+            }
+            Poll::Ready(None) => {
+                self.terminated = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn reject_embedded_manifest(manifest: &TaskManifest) -> Result<(), ApiError> {
+    if !manifest_is_visible(manifest) {
+        return Err(ApiError::InvalidRequest(
+            "Embedded workloads are available only through the in-process SDK".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn public_task(task: Task) -> Result<Task, ApiError> {
+    if !task_is_visible(&task) {
+        return Err(ApiError::Internal(
+            "handler returned an Embedded workload through the public HTTP API".into(),
+        ));
+    }
+    Ok(task)
+}
+
+fn build_task_filter(
+    slot: Option<String>,
+    phases: Vec<String>,
+    label_selector: Option<String>,
+) -> Result<TaskFilter, ApiError> {
+    let mut filter = TaskFilter::new();
+
+    if let Some(slot) = slot {
+        filter = filter.with_slot(validate_slot(slot)?);
+    }
+
+    for phase_str in phases {
+        let phase = phase_str.parse::<TaskPhase>().map_err(|_| {
+            ApiError::InvalidRequest(format!(
+                "invalid phase: '{phase_str}' (valid: pending, running, succeeded, failed, timeout, canceled, exhausted)"
+            ))
+        })?;
+        filter = filter.with_phase(phase);
+    }
+
+    if let Some(label_selector) = label_selector {
+        let selector = label_selector
+            .parse::<LabelSelector>()
+            .map_err(|error| ApiError::InvalidRequest(format!("invalid labelSelector: {error}")))?;
+        filter = filter
+            .with_label_selector(selector)
+            .map_err(|error| ApiError::InvalidRequest(error.to_string()))?;
+    }
+
+    Ok(filter)
+}
+
+fn public_watch_event(event: TaskWatchEvent) -> Result<TaskWatchEvent, ApiError> {
+    if !task_is_visible(event.object()) {
+        return Err(ApiError::Internal(
+            "handler returned an Embedded workload through the public HTTP watch".into(),
+        ));
+    }
+    Ok(event)
+}
+
+fn encode_watch_document(event: Result<TaskWatchEvent, ApiError>) -> Vec<u8> {
+    let document = match event {
+        Ok(TaskWatchEvent::Added(task)) => TaskWatchDocument::Added(task),
+        Ok(TaskWatchEvent::Modified(task)) => TaskWatchDocument::Modified(task),
+        Ok(TaskWatchEvent::Deleted(task)) => TaskWatchDocument::Deleted(task),
+        Err(error) => {
+            let (_, status) = error.into_http_status();
+            TaskWatchDocument::Error(status)
+        }
+    };
+
+    match serde_json::to_vec(&document) {
+        Ok(mut bytes) => {
+            bytes.push(b'\n');
+            bytes
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to serialize HTTP task watch event");
+            br#"{"type":"ERROR","object":{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Failure","message":"internal server error","reason":"InternalError","code":500}}
+"#
+            .to_vec()
+        }
+    }
+}
+
+async fn create_task_route<H>(
+    state: State<Arc<H>>,
+    manifest: TaskManifestJson,
+) -> NoApi<Result<(StatusCode, Json<Task>), ApiError>>
 where
     H: ApiHandler,
 {
-    let spec = req
-        .spec
-        .ok_or_else(|| ApiError::InvalidRequest("missing spec".into()))?;
-    let spec = convert::convert_create_spec(spec)?;
+    NoApi(create_task(state, manifest).await)
+}
 
-    debug!(slot = %spec.slot(), kind = ?spec.kind(), "submitting task");
-    let task_id = handler.submit_task(spec).await?;
+async fn apply_task_route<H>(
+    state: State<Arc<H>>,
+    path: ApiPath<TaskPath>,
+    query: ApiQuery<WriteParams>,
+    manifest: TaskManifestJson,
+) -> NoApi<Result<Json<Task>, ApiError>>
+where
+    H: ApiHandler,
+{
+    NoApi(apply_task(state, path, query, manifest).await)
+}
 
-    let response = proto_api::SubmitTaskResponse {
-        task_id: task_id.to_string(),
-    };
-    Ok((StatusCode::CREATED, Json(response)))
+async fn get_task_route<H>(
+    state: State<Arc<H>>,
+    path: ApiPath<TaskPath>,
+) -> NoApi<Result<Json<Task>, ApiError>>
+where
+    H: ApiHandler,
+{
+    NoApi(get_task(state, path).await)
+}
+
+async fn list_tasks_route<H>(
+    state: State<Arc<H>>,
+    query: RawQuery,
+) -> NoApi<Result<Response, ApiError>>
+where
+    H: ApiHandler,
+{
+    NoApi(list_tasks(state, query).await)
+}
+
+async fn list_task_runs_route<H>(
+    state: State<Arc<H>>,
+    path: ApiPath<TaskPath>,
+) -> NoApi<Result<Json<TaskRunList>, ApiError>>
+where
+    H: ApiHandler,
+{
+    NoApi(list_task_runs(state, path).await)
+}
+
+async fn delete_task_route<H>(
+    state: State<Arc<H>>,
+    path: ApiPath<TaskPath>,
+    query: ApiQuery<WriteParams>,
+) -> NoApi<Result<NoContent, ApiError>>
+where
+    H: ApiHandler,
+{
+    NoApi(delete_task(state, path, query).await)
+}
+
+async fn stream_task_logs_route<H>(
+    state: State<Arc<H>>,
+    path: ApiPath<TaskPath>,
+) -> NoApi<Result<Response, ApiError>>
+where
+    H: ApiHandler,
+{
+    NoApi(stream_task_logs(state, path).await)
+}
+
+async fn create_task<H>(
+    State(handler): State<Arc<H>>,
+    TaskManifestJson(manifest): TaskManifestJson,
+) -> Result<(StatusCode, Json<Task>), ApiError>
+where
+    H: ApiHandler,
+{
+    reject_embedded_manifest(&manifest)?;
+    debug!(name = %manifest.name(), "creating task");
+    let task = public_task(handler.create_task(manifest).await?)?;
+    Ok((StatusCode::CREATED, Json(task)))
 }
 
 async fn apply_task<H>(
     State(handler): State<Arc<H>>,
-    ApiJson(req): ApiJson<proto_api::ApplyTaskRequest>,
-) -> Result<impl IntoResponse, ApiError>
+    ApiPath(TaskPath { name: path_name }): ApiPath<TaskPath>,
+    ApiQuery(params): ApiQuery<WriteParams>,
+    TaskManifestJson(manifest): TaskManifestJson,
+) -> Result<Json<Task>, ApiError>
 where
     H: ApiHandler,
 {
-    let spec = req
-        .spec
-        .ok_or_else(|| ApiError::InvalidRequest("missing spec".into()))?;
-    let spec = convert::convert_create_spec(spec)?;
-
-    debug!(slot = %spec.slot(), kind = ?spec.kind(), "applying task");
-    let task_id = handler.apply_task(spec).await?;
-
-    let response = proto_api::ApplyTaskResponse {
-        task_id: task_id.to_string(),
-    };
-    Ok((StatusCode::OK, Json(response)))
+    let path_name = parse_task_id("task name", path_name)?;
+    reject_embedded_manifest(&manifest)?;
+    if manifest.name() != &path_name {
+        return Err(ApiError::InvalidRequest(format!(
+            "path task name `{path_name}` does not match metadata.name `{}`",
+            manifest.name()
+        )));
+    }
+    let preconditions = parse_write_preconditions(params)?;
+    debug!(name = %manifest.name(), "applying task");
+    let task = public_task(handler.apply_task(manifest, preconditions).await?)?;
+    Ok(Json(task))
 }
 
-async fn get_task_status<H>(
+async fn get_task<H>(
     State(handler): State<Arc<H>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, ApiError>
+    ApiPath(TaskPath { name }): ApiPath<TaskPath>,
+) -> Result<Json<Task>, ApiError>
 where
     H: ApiHandler,
 {
-    non_empty_id("task_id", &id)?;
+    let name = parse_task_id("task name", name)?;
+    debug!(%name, "getting task");
+    let task = handler
+        .get_task(&name)
+        .await?
+        .ok_or_else(|| ApiError::TaskNotFound(name.to_string()))?;
 
-    let task_id = TaskId::from(id);
-    debug!(%task_id, "getting task status");
-    let task = handler.get_task_status(&task_id).await?;
-
-    let task = task.map(proto_api::TaskData::try_from).transpose()?;
-    Ok(Json(proto_api::GetTaskStatusResponse { task }))
+    Ok(Json(public_task(task)?))
 }
 
 async fn list_tasks<H>(
     State(handler): State<Arc<H>>,
-    Query(params): Query<ListTasksParams>,
-) -> Result<impl IntoResponse, ApiError>
+    RawQuery(raw_query): RawQuery,
+) -> Result<Response, ApiError>
 where
     H: ApiHandler,
 {
-    let mut query = TaskQuery::new();
+    let ListTasksParams {
+        slot,
+        phases,
+        label_selector,
+        limit,
+        continuation,
+        resource_version,
+        watch,
+    } = parse_list_tasks_params(raw_query.as_deref())?;
+    let filter = build_task_filter(slot, phases, label_selector)?;
 
-    if let Some(slot) = params.slot {
-        non_empty_id("slot", &slot)?;
-        query = query.with_slot(slot);
+    if watch.unwrap_or(false) {
+        if limit.is_some() || continuation.is_some() {
+            return Err(ApiError::InvalidRequest(
+                "query parameters `limit` and `continue` are not supported for watch".into(),
+            ));
+        }
+        if resource_version
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(ApiError::InvalidRequest(
+                "query parameter `resourceVersion` must not be empty".into(),
+            ));
+        }
+
+        let stream = handler.watch_tasks(filter, resource_version).await?;
+        let body_stream = TaskWatchBodyStream::new(stream);
+        let mut response = Body::from_stream(body_stream).into_response();
+        response.extensions_mut().insert(StreamingResponse);
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return Ok(response);
     }
 
-    if let Some(status_str) = params.status {
-        let status = status_str.parse::<TaskPhase>().map_err(|_| {
-            ApiError::InvalidRequest(format!(
-                "invalid status: '{status_str}' (valid: pending, running, succeeded, failed, timeout, canceled, exhausted)"
-            ))
-        })?;
-        query = query.with_status(status);
+    if resource_version.is_some() {
+        return Err(ApiError::InvalidRequest(
+            "query parameter `resourceVersion` requires `watch=true`".into(),
+        ));
     }
 
-    query = query.with_limit(clamp_list_limit(params.limit.unwrap_or(0)));
-    if let Some(offset) = params.offset {
-        query = query.with_offset(offset as usize);
+    let mut query = TaskQuery::from_filter(filter);
+    query = query.with_limit(parse_list_limit(limit.unwrap_or(0))?);
+    if let Some(token) = continuation {
+        if token.is_empty() {
+            return Err(ApiError::InvalidRequest(
+                "query parameter `continue` must not be empty".into(),
+            ));
+        }
+        query = query.with_continuation(crate::continuation::decode(&token)?);
     }
 
+    let page_filter = query.filter().clone();
+    let page_limit = query.limit();
     let page = handler.query_tasks(query).await?;
-    debug!(count = page.items.len(), total = page.total, "tasks listed");
+    crate::continuation::validate_page(&page, &page_filter, page_limit)?;
+    debug!(
+        count = page.items.len(),
+        remaining = page.remaining_item_count,
+        "tasks listed"
+    );
 
-    Ok(Json(tasks_page_to_proto(page)?))
+    for task in &page.items {
+        if !task_is_visible(task) {
+            return Err(ApiError::Internal(
+                "handler returned an Embedded workload through the public HTTP API".into(),
+            ));
+        }
+    }
+
+    let continuation = page
+        .continuation
+        .map(crate::continuation::encode)
+        .transpose()?;
+    Ok(Json(TaskList {
+        api_version: TASK_API_VERSION,
+        kind: "TaskList",
+        metadata: ListMeta {
+            resource_version: page.resource_version,
+            continuation,
+            remaining_item_count: (page.remaining_item_count > 0)
+                .then_some(page.remaining_item_count),
+        },
+        items: page.items,
+    })
+    .into_response())
 }
 
 async fn list_task_runs<H>(
     State(handler): State<Arc<H>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, ApiError>
+    ApiPath(TaskPath { name }): ApiPath<TaskPath>,
+) -> Result<Json<TaskRunList>, ApiError>
 where
     H: ApiHandler,
 {
-    non_empty_id("task_id", &id)?;
-
-    let task_id = TaskId::from(id);
-    debug!(%task_id, "listing task runs");
-    let runs = handler.list_task_runs(&task_id).await?;
-    let runs = runs.into_iter().map(proto_api::TaskRunInfo::from).collect();
-
-    Ok(Json(proto_api::ListTaskRunsResponse { runs }))
+    let name = parse_task_id("task name", name)?;
+    debug!(%name, "listing task runs");
+    let runs = handler.list_task_runs(&name).await?;
+    if runs.iter().any(|run| !run_is_visible(run)) {
+        return Err(ApiError::Internal(
+            "handler returned Embedded run history through the public HTTP API".into(),
+        ));
+    }
+    Ok(Json(TaskRunList { runs }))
 }
 
 async fn delete_task<H>(
     State(handler): State<Arc<H>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, ApiError>
+    ApiPath(TaskPath { name }): ApiPath<TaskPath>,
+    ApiQuery(params): ApiQuery<WriteParams>,
+) -> Result<NoContent, ApiError>
 where
     H: ApiHandler,
 {
-    non_empty_id("task_id", &id)?;
+    let name = parse_task_id("task name", name)?;
+    let preconditions = parse_write_preconditions(params)?;
+    handler.delete_task(&name, preconditions).await?;
+    debug!(%name, "task deleted");
 
-    let task_id = TaskId::from(id);
-    handler.delete_task(&task_id).await?;
-    debug!(%task_id, "task deleted");
-
-    Ok(StatusCode::NO_CONTENT)
+    Ok(NoContent)
 }
 
-/// `GET /tasks/{id}/logs` - Server-Sent Events stream of [`OutputEvent`]s (live tail of stdout/stderr + run boundary markers + lag signals).
+/// Streams task output as Server-Sent Events.
 async fn stream_task_logs<H>(
     State(handler): State<Arc<H>>,
-    Path(id): Path<String>,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError>
+    ApiPath(TaskPath { name }): ApiPath<TaskPath>,
+) -> Result<Response, ApiError>
 where
     H: ApiHandler,
 {
-    non_empty_id("task_id", &id)?;
-
-    let task_id = TaskId::from(id);
-    debug!(%task_id, "subscribing to task log stream");
-    let stream = handler.stream_task_logs(&task_id).await?;
+    let name = parse_task_id("task name", name)?;
+    debug!(%name, "subscribing to task log stream");
+    let stream = handler.stream_task_logs(&name).await?;
 
     let sse_stream = stream.map(|ev| {
         let name = match &ev {
@@ -334,26 +1422,16 @@ where
             OutputEvent::RunStarted { .. } => "run-started",
             OutputEvent::RunFinished { .. } => "run-finished",
             OutputEvent::Lagged { .. } => "lagged",
+            _ => "unknown",
         };
-        let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
-        Ok(Event::default().event(name).data(data))
+        let data = serde_json::to_string(&ev).map_err(|error| {
+            ApiError::Internal(format!("failed to serialize output event: {error}"))
+        })?;
+        Ok::<Event, ApiError>(Event::default().event(name).data(data))
     });
-    Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::bearer_value;
-
-    #[test]
-    fn bearer_value_accepts_scheme_case_insensitively() {
-        assert_eq!(bearer_value("Bearer tok"), Some("tok"));
-        assert_eq!(bearer_value("bearer tok"), Some("tok"));
-        assert_eq!(bearer_value("BEARER tok"), Some("tok"));
-        assert_eq!(bearer_value("BeArEr tok"), Some("tok"));
-        assert_eq!(bearer_value("Bearer a b"), Some("a b"));
-        assert_eq!(bearer_value("Basic tok"), None);
-        assert_eq!(bearer_value("tok"), None);
-        assert_eq!(bearer_value(""), None);
-    }
+    let mut response = Sse::new(sse_stream)
+        .keep_alive(KeepAlive::default())
+        .into_response();
+    response.extensions_mut().insert(StreamingResponse);
+    Ok(response)
 }

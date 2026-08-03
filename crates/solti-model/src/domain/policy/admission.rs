@@ -1,32 +1,41 @@
-//! # Admission policy.
+//! # Admission policy
 //!
-//! [`AdmissionPolicy`] controls how duplicate task submissions are handled.
+//! [`AdmissionPolicy`] describes admission when a slot is busy.
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 use crate::error::{ModelError, ModelResult};
 
-/// Defines how the controller admits a new task into a slot.
+/// Admission behavior for a busy slot.
 ///
-/// A slot may only run one task at a time.
-/// When a new task arrives, the controller applies the selected policy to determine what to do if the slot is already occupied.
+/// A slot has at most one active owner or admission candidate.
 ///
-/// | Variant         | Behaviour                                              |
-/// |-----------------|--------------------------------------------------------|
-/// | `DropIfRunning` | Ignore the new task, return success without scheduling |
-/// | `Replace`       | Cancel the running task, schedule the new one          |
-/// | `Queue`         | Enqueue the new task, run when slot becomes free       |
+/// | Variant         | Behaviour                                                        |
+/// |-----------------|------------------------------------------------------------------|
+/// | `DropIfRunning` | Reject the new submission while the slot is busy                 |
+/// | `Replace`       | Request owner removal and make the new submission next           |
+/// | `Queue`         | Append to the bounded FIFO queue and admit when the slot is free  |
+///
+/// ## Example
+///
+/// ```
+/// use solti_model::AdmissionPolicy;
+///
+/// assert_eq!("replace".parse::<AdmissionPolicy>().unwrap(), AdmissionPolicy::Replace);
+/// assert_eq!("queue".parse::<AdmissionPolicy>().unwrap(), AdmissionPolicy::Queue);
+/// ```
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum AdmissionPolicy {
-    /// If the slot already has a running task, ignore the new one.
+    /// Reject the new submission while the slot is busy.
     #[default]
     DropIfRunning,
-    /// Cancel the currently running task in the slot and replace it with the newly submitted task.
+    /// Removes the current owner and places the new submission next.
     Replace,
-    /// Enqueue the new task to be executed after the current one completes.
+    /// Append the submission to the slot FIFO queue.
     Queue,
 }
 
@@ -57,65 +66,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_drop_if_running_variants() {
-        assert_eq!(
-            "drop-if-running".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::DropIfRunning
-        );
-        assert_eq!(
-            "drop".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::DropIfRunning
-        );
-        assert_eq!(
-            "DROP".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::DropIfRunning
-        );
+    fn parsing_accepts_canonical_names_aliases_case_and_whitespace() {
+        let cases = [
+            ("", AdmissionPolicy::default()),
+            ("drop-if-running", AdmissionPolicy::DropIfRunning),
+            ("drop", AdmissionPolicy::DropIfRunning),
+            ("DROP", AdmissionPolicy::DropIfRunning),
+            ("queue", AdmissionPolicy::Queue),
+            ("add", AdmissionPolicy::Queue),
+            ("new", AdmissionPolicy::Queue),
+            ("  queue  ", AdmissionPolicy::Queue),
+            ("replace", AdmissionPolicy::Replace),
+            ("REPLACE", AdmissionPolicy::Replace),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(value.parse::<AdmissionPolicy>().unwrap(), expected);
+        }
     }
 
     #[test]
-    fn parse_queue_variants() {
-        assert_eq!(
-            "queue".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::Queue
-        );
-        assert_eq!(
-            "add".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::Queue
-        );
-        assert_eq!(
-            "new".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::Queue
-        );
-    }
-
-    #[test]
-    fn parse_replace() {
-        assert_eq!(
-            "replace".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::Replace
-        );
-        assert_eq!(
-            "REPLACE".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::Replace
-        );
-    }
-
-    #[test]
-    fn empty_string_maps_to_default() {
-        let parsed: AdmissionPolicy = "".parse().unwrap();
-        assert_eq!(parsed, AdmissionPolicy::default());
-    }
-
-    #[test]
-    fn whitespace_trimmed() {
-        assert_eq!(
-            "  queue  ".parse::<AdmissionPolicy>().unwrap(),
-            AdmissionPolicy::Queue
-        );
-    }
-
-    #[test]
-    fn unknown_value_fails() {
+    fn parsing_rejects_unknown_values() {
         assert!("foobar".parse::<AdmissionPolicy>().is_err());
     }
 }

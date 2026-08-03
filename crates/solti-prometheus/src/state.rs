@@ -1,21 +1,29 @@
-//! # Supervisor state collector.
+//! # Core state metrics
 //!
-//! [`PrometheusStateCollector`] is a `prometheus::core::Collector` that exposes
-//! the current number of tasks per [`TaskPhase`] as `solti_sv_tasks_by_phase{phase}`.
+//! [`PrometheusCoreStateCollector`] counts stored tasks by [`TaskPhase`].
+//! It reads [`TaskState`] when Prometheus collects the metric.
+//!
+//! Enable it with the `state` feature.
+//!
+//! ## Flow
+//!
+//! ```text
+//! TaskState ──► count_by_phase() ──► solti_core_tasks_by_phase ──► Registry
+//! ```
+
+use std::sync::Mutex;
 
 use prometheus::GaugeVec;
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::MetricFamily;
 use solti_core::TaskState;
 use solti_model::TaskPhase;
-use std::collections::HashMap;
 
-use crate::register::Sub;
+use crate::register::gauge_vec_unregistered;
 
-/// All phases we want to be represented as gauges, even at zero.
+/// Phases emitted as separate gauge series.
 ///
-/// Kept in code (not derived) because [`TaskPhase`] is `#[non_exhaustive]`:
-/// adding a variant upstream should be a conscious decision here too.
+/// Other variants use `phase="unknown"`.
 const ALL_PHASES: &[TaskPhase] = &[
     TaskPhase::Pending,
     TaskPhase::Running,
@@ -40,82 +48,108 @@ fn phase_label(phase: TaskPhase) -> &'static str {
     }
 }
 
-/// Pull-based Prometheus collector for `solti_sv_tasks_by_phase{phase}`.
+/// Pull-based metrics for the current `TaskState`.
 ///
-/// Register once with a shared [`prometheus::Registry`] alongside the other solti
-/// collectors. On each scrape, all phases from [`TaskPhase`] are emitted; empty
-/// phases return `0` so dashboards can rely on a stable label set.
+/// ## Metric
 ///
-/// Counts are recomputed from [`TaskState`] every scrape, so unlike the
-/// event-gauge `solti_sv_tasks_in_flight` this self-corrects and never accrues
-/// drift. The residual limitation is upstream: a `Running` count reflects the
-/// `TaskStarting` events `TaskState` has observed, so a start dropped under bus
-/// lag is undercounted until the entry's phase next changes (bounded, not
-/// cumulative).
+/// | Metric                      | Type  | Labels  | Description             |
+/// |-----------------------------|-------|---------|-------------------------|
+/// | `solti_core_tasks_by_phase` | Gauge | `phase` | Stored tasks by phase   |
 ///
-/// ## Cost
+/// ## Collection
 ///
-/// `O(N)` per scrape where `N` is the current number of tasks in state.
-/// With a typical scrape interval of 10–30s and a fleet of <10k tasks this is
-/// negligible. If it ever becomes hot, the natural next step is to maintain
-/// phase counters inside [`TaskState`] directly.
+/// Every scrape recounts all tasks currently stored in [`TaskState`].
+/// Known phases are emitted even when their count is zero.
+/// Other phase variants are aggregated under `phase="unknown"`.
+///
+/// Terminal tasks remain visible while `TaskState` retains them.
+///
+/// ```text
+/// Pending   ─┐
+/// Running   ─┤
+/// Succeeded ─┤
+/// Failed    ─┼──► tasks_by_phase{phase}
+/// Timeout   ─┤
+/// Canceled  ─┤
+/// Exhausted ─┤
+/// other     ─┘    phase="unknown"
+/// ```
 ///
 /// ## Example
 ///
-/// ```text
-/// use std::sync::Arc;
-/// use solti_prometheus::{PrometheusStateCollector, Registry};
+/// ```rust
+/// use solti_core::TaskState;
+/// use solti_prometheus::{PrometheusCoreStateCollector, Registry};
 ///
-/// let registry = Arc::new(Registry::new());
-/// let collector = PrometheusStateCollector::new(supervisor_api.state())?;
+/// # fn main() -> Result<(), prometheus::Error> {
+/// let registry = Registry::new();
+/// // In an agent, take the supervisor's shared state instead of a fresh one.
+/// let state = TaskState::new();
+/// let collector = PrometheusCoreStateCollector::new(state)?;
 /// registry.register(Box::new(collector))?;
+/// # Ok(())
+/// # }
 /// ```
-pub struct PrometheusStateCollector {
+pub struct PrometheusCoreStateCollector {
     state: TaskState,
     gauge: GaugeVec,
+    collect_lock: Mutex<()>,
 }
 
-impl PrometheusStateCollector {
-    /// Create a new collector wired to `state`. The collector holds a cheap
-    /// `Arc` clone of [`TaskState`] and will always observe the most recent
-    /// mutations made by the supervisor's state subscriber.
+impl PrometheusCoreStateCollector {
+    /// Creates a collector for one shared task state.
+    ///
+    /// The collector is not registered by this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Prometheus error when the gauge descriptor cannot be created.
     pub fn new(state: TaskState) -> Result<Self, prometheus::Error> {
-        // We piggy-back on the existing `Sub` helper only for namespace/subsystem —
-        // the gauge is *not* registered into a registry here, the caller does that
-        // when they register the collector itself.
-        let gauge = Sub::gauge_vec_unregistered(
-            "sv",
+        let gauge = gauge_vec_unregistered(
+            "core",
             "tasks_by_phase",
             "Current number of tasks per phase (snapshot at scrape time)",
             &["phase"],
         )?;
-        Ok(Self { state, gauge })
+        Ok(Self {
+            state,
+            gauge,
+            collect_lock: Mutex::new(()),
+        })
     }
 }
 
-impl std::fmt::Debug for PrometheusStateCollector {
+impl std::fmt::Debug for PrometheusCoreStateCollector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PrometheusStateCollector").finish()
+        f.debug_struct("PrometheusCoreStateCollector").finish()
     }
 }
 
-impl Collector for PrometheusStateCollector {
+impl Collector for PrometheusCoreStateCollector {
     fn desc(&self) -> Vec<&Desc> {
         self.gauge.desc()
     }
 
     fn collect(&self) -> Vec<MetricFamily> {
-        let tasks = self.state.list_all();
-        let mut counts: HashMap<TaskPhase, u64> = HashMap::with_capacity(ALL_PHASES.len());
-        for task in &tasks {
-            *counts.entry(task.status().phase).or_insert(0) += 1;
-        }
+        let _collect = self
+            .collect_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let counts = self.state.count_by_phase();
         for phase in ALL_PHASES {
             let count = counts.get(phase).copied().unwrap_or(0);
             self.gauge
                 .with_label_values(&[phase_label(*phase)])
                 .set(count as f64);
         }
+        let unknown = counts
+            .iter()
+            .filter(|(phase, _)| !ALL_PHASES.contains(phase))
+            .map(|(_, count)| count)
+            .sum::<usize>();
+        self.gauge
+            .with_label_values(&["unknown"])
+            .set(unknown as f64);
         self.gauge.collect()
     }
 }
@@ -124,13 +158,16 @@ impl Collector for PrometheusStateCollector {
 mod tests {
     use super::*;
     use prometheus::Registry;
-    use solti_model::{TaskId, TaskKind, TaskSpec};
-    use std::sync::Arc;
+    use solti_model::{EmbeddedSpec, TaskId, TaskSpec, TaskWorkload};
 
     fn spec() -> TaskSpec {
-        TaskSpec::builder("slot", TaskKind::Embedded, 5_000_u64)
-            .build()
-            .expect("valid spec")
+        TaskSpec::builder(
+            "slot",
+            TaskWorkload::Embedded(EmbeddedSpec::new("prometheus-test-v1").unwrap()),
+            5_000_u64,
+        )
+        .build()
+        .expect("valid spec")
     }
 
     fn gauge_value(families: &[MetricFamily], name: &str, phase: &str) -> Option<f64> {
@@ -150,7 +187,7 @@ mod tests {
     #[test]
     fn collector_returns_zero_for_all_phases_when_empty() {
         let state = TaskState::new();
-        let collector = PrometheusStateCollector::new(state).unwrap();
+        let collector = PrometheusCoreStateCollector::new(state).unwrap();
 
         let families = collector.collect();
         for phase in [
@@ -161,9 +198,10 @@ mod tests {
             "timeout",
             "canceled",
             "exhausted",
+            "unknown",
         ] {
             assert_eq!(
-                gauge_value(&families, "solti_sv_tasks_by_phase", phase),
+                gauge_value(&families, "solti_core_tasks_by_phase", phase),
                 Some(0.0),
                 "phase {phase} must be zero on empty state",
             );
@@ -171,74 +209,55 @@ mod tests {
     }
 
     #[test]
-    fn collector_counts_pending_tasks() {
-        let state = TaskState::new();
-        state.add_task(TaskId::from("t1"), spec());
-        state.add_task(TaskId::from("t2"), spec());
-        state.add_task(TaskId::from("t3"), spec());
-
-        let collector = PrometheusStateCollector::new(state).unwrap();
-        let families = collector.collect();
-
-        assert_eq!(
-            gauge_value(&families, "solti_sv_tasks_by_phase", "pending"),
-            Some(3.0)
-        );
-        assert_eq!(
-            gauge_value(&families, "solti_sv_tasks_by_phase", "running"),
-            Some(0.0)
-        );
-    }
-
-    #[test]
     fn collector_reflects_transitions() {
         let state = TaskState::new();
-        state.add_task(TaskId::from("t1"), spec());
-        state.add_task(TaskId::from("t2"), spec());
-        state.transition_starting(&TaskId::from("t1"));
+        let task_id = TaskId::new("t1").unwrap();
+        state.seed_task(task_id.clone(), spec());
+        state.seed_task(TaskId::new("t2").unwrap(), spec());
+        state.seed_starting(&task_id);
 
-        let collector = PrometheusStateCollector::new(state.clone()).unwrap();
+        let collector = PrometheusCoreStateCollector::new(state.clone()).unwrap();
         let families = collector.collect();
 
         assert_eq!(
-            gauge_value(&families, "solti_sv_tasks_by_phase", "pending"),
+            gauge_value(&families, "solti_core_tasks_by_phase", "pending"),
             Some(1.0)
         );
         assert_eq!(
-            gauge_value(&families, "solti_sv_tasks_by_phase", "running"),
+            gauge_value(&families, "solti_core_tasks_by_phase", "running"),
             Some(1.0)
         );
 
-        // Finish the running task, rescrape — expected phase counts move.
-        state.transition_finished(&TaskId::from("t1"), TaskPhase::Succeeded, None, None);
+        state.seed_finished(&task_id, TaskPhase::Succeeded, None, None);
         let families = collector.collect();
         assert_eq!(
-            gauge_value(&families, "solti_sv_tasks_by_phase", "running"),
+            gauge_value(&families, "solti_core_tasks_by_phase", "running"),
             Some(0.0)
         );
         assert_eq!(
-            gauge_value(&families, "solti_sv_tasks_by_phase", "succeeded"),
+            gauge_value(&families, "solti_core_tasks_by_phase", "succeeded"),
             Some(1.0)
         );
     }
 
     #[test]
     fn collector_registers_into_registry_and_scrapes() {
-        let registry = Arc::new(Registry::new());
+        let registry = Registry::new();
         let state = TaskState::new();
-        state.add_task(TaskId::from("alpha"), spec());
-        state.transition_starting(&TaskId::from("alpha"));
+        let task_id = TaskId::new("alpha").unwrap();
+        state.seed_task(task_id.clone(), spec());
+        state.seed_starting(&task_id);
 
-        let collector = PrometheusStateCollector::new(state).unwrap();
+        let collector = PrometheusCoreStateCollector::new(state).unwrap();
         registry.register(Box::new(collector)).unwrap();
 
         let families = registry.gather();
         assert_eq!(
-            gauge_value(&families, "solti_sv_tasks_by_phase", "running"),
+            gauge_value(&families, "solti_core_tasks_by_phase", "running"),
             Some(1.0)
         );
         assert_eq!(
-            gauge_value(&families, "solti_sv_tasks_by_phase", "pending"),
+            gauge_value(&families, "solti_core_tasks_by_phase", "pending"),
             Some(0.0)
         );
     }

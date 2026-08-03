@@ -1,110 +1,120 @@
 //! # solti-tls
 //!
-//! Shared TLS / mTLS configuration for Solti network-facing crates.
+//! Shared TLS and mTLS configuration for Solti transports.
+//! It loads PEM and uses `rustls` to check the configuration material.
+//! Callers own connections and application protocols.
 //!
-//! Builders hold *intent*, a [`PemSource`] - filesystem path or in-memory PEM bytes for each cert/key.
-//! Defer all I/O and parsing to [`ServerTlsConfig::into_rustls_config`] / [`ClientTlsConfig::into_rustls_config`], which produce a ready [`rustls::ServerConfig`] / [`rustls::ClientConfig`].
+//! ## Start Here
 //!
-//! ## Architecture
+//! 1. Create a [`TlsIdentity`] from a certificate chain and private key.
+//! 2. Create [`ServerTlsConfig`] or [`ClientTlsConfig`].
+//! 3. Enable mutual TLS when needed; use [`ServerTlsConfig::require_client_auth`] and [`ClientTlsConfig::with_identity`].
+//! 4. Build `rustls` or load validated PEM for an adapter.
+//!
+//! ## Flow
 //!
 //! ```text
-//!   ┌──────────────────────┐        ┌──────────────────────┐
-//!   │  PemSource::Path     │        │  PemSource::Bytes    │   intent: where PEM lives
-//!   │  (read at I/O time)  │        │  (in-memory buffer)  │
-//!   └──────────┬───────────┘        └──────────┬───────────┘
-//!              └───────────────┬───────────────┘
-//!                              ▼
-//!         ┌───────────────────────────────────────────────┐
-//!         │  ServerTlsConfig / ClientTlsConfig            │   built via *Builder
-//!         │   cert · key · client_ca/ca · alpn            │   (pure, cloneable intent)
-//!         └───────────────────────┬───────────────────────┘
-//!                                 │ into_rustls_config()
-//!                                 │   1. ensure_default_provider()  (install ring once)
-//!                                 │   2. PemSource::read()          (I/O happens here)
-//!                                 │   3. load_certs_from_pem / load_key_from_pem
-//!                                 │   4. RootCertStore + (mTLS) WebPki*Verifier
-//!                                 │   5. apply ALPN
-//!                                 ▼
-//!         ┌───────────────────────────────────────────────┐
-//!         │  rustls::ServerConfig / rustls::ClientConfig  │
-//!         └───────────────────────────────────────────────┘
+//! PemSource + PrivateKeySource ──► TlsIdentity ─┐
+//!                                               ├──► ServerTlsConfig / ClientTlsConfig
+//! PemSource ─────────────────────► TrustRoots ──┘               │
+//!                                                               ├──► into_rustls_config()
+//!                                                               │         └──► rustls config
+//!                                                               └──► load()
+//!                                                                         └──► validated PEM
 //! ```
 //!
-//! No I/O, provider install, or parsing happens until `into_rustls_config()` is called; the builders are pure intent.
+//! ## Client and Server
 //!
-//! ## Features
+//! | Side                | Required material                        | Optional mTLS material                |
+//! |---------------------|------------------------------------------|---------------------------------------|
+//! | [`ServerTlsConfig`] | Server [`TlsIdentity`]                   | [`TrustRoots`] used to verify clients |
+//! | [`ClientTlsConfig`] | [`TrustRoots`] used to verify the server | Client [`TlsIdentity`]                |
 //!
-//! | Area            | Description                                                         | Key types                                       |
-//! |-----------------|---------------------------------------------------------------------|-------------------------------------------------|
-//! | **PEM sources** | Path-on-disk or in-memory bytes; read lazily at config-build time.  | [`PemSource`]                                   |
-//! | **Server TLS**  | Server cert/key, optional client-CA (mTLS), ALPN.                   | [`ServerTlsConfig`], [`ServerTlsConfigBuilder`] |
-//! | **Client TLS**  | Trust roots (CA), optional client cert/key (mTLS), ALPN.            | [`ClientTlsConfig`], [`ClientTlsConfigBuilder`] |
-//! | **Parsing**     | Pure PEM→DER helpers for certs and the first private key.           | [`load_certs_from_pem`], [`load_key_from_pem`]  |
-//! | **Provider**    | Idempotent process-wide installation of the `ring` crypto provider. | [`ensure_default_provider`]                     |
-//! | **Errors**      | One `#[non_exhaustive]` enum across I/O, parse, and `rustls`.       | [`TlsError`]                                    |
+//! ## Loading
 //!
-//! ## Security model
+//! Constructors do not read files.
+//! File sources are read by `load()` or `into_rustls_config()`.
+//! Both methods validate the material with `rustls`.
 //!
-//! **What IS verified**
-//! - *Server chain*: a client built from [`ClientTlsConfig`] verifies the server's certificate chains to the CA bundle you pass to `ca(..)` (`rustls`' `WebPkiServerVerifier`).
-//!   Trust roots come **only** from your PEM - there is no OS / `rustls-native-certs` trust integration.
-//! - *Client chain (mTLS)*: when `require_client_ca(..)` is set, the server demands and verifies a client cert chaining to that CA.
-//!   Client auth is then **mandatory**: connections without a valid client cert are rejected at the handshake.
+//! `load()` returns the original PEM after validation.
+//! `into_rustls_config()` returns the built `rustls` configuration.
+//! [`TlsError`] reports the failed stage.
 //!
-//! **What is NOT verified here (the caller's responsibility)**
-//! - *Hostname / SAN*: `into_rustls_config()` does not check the server hostname.
-//!   SAN/identity matching happens when you call `TlsConnector::connect(server_name, ..)`: you must pass the correct [`ServerName`](rustls::pki_types::ServerName).
-//!   A wrong or placeholder name silently disables identity checking even though the chain still validates.
-//! - *Revocation*: no OCSP / CRL / stapling; a revoked-but-unexpired cert is accepted.
-//!   Short cert lifetimes are the intended mitigation.
-//! - *TLS versions & suites*: `rustls` safe defaults only (the workspace enables TLS 1.2 + 1.3); no explicit minimum-version or cipher policy.
-//! - *Crypto provider*: `ring` is installed via [`ensure_default_provider`]; `aws-lc-rs` is not selectable (install your own provider first if needed).
+//! ## ALPN
 //!
-//! ## Example
+//! - `into_rustls_config()` leaves `alpn_protocols` empty.
+//! - HTTP, gRPC, or another transport sets ALPN.
 //!
-//! ```rust
-//! use solti_tls::ServerTlsConfig;
+//! ## Quick Start
+//!
+//! ```rust,no_run
+//! use solti_tls::{ServerTlsConfig, TlsIdentity, TrustRoots};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! // Use real PEM files in production; placeholder bytes keep this hermetic.
-//! let cfg = ServerTlsConfig::builder()
-//!     .cert_pem_bytes(b"-----BEGIN CERTIFICATE-----\n...".to_vec())
-//!     .key_pem_bytes(b"-----BEGIN PRIVATE KEY-----\n...".to_vec())
-//!     .with_alpn(["h2"])              // gRPC; ["h2", "http/1.1"] for HTTP
-//!     .build()?;                      // validates required fields, no I/O yet
+//! let identity = TlsIdentity::from_pem_files(
+//!     "/etc/solti/tls/server.crt",
+//!     "/etc/solti/tls/server.key",
+//! );
+//! let server = ServerTlsConfig::new(identity)
+//!     .require_client_auth(TrustRoots::from_pem_file(
+//!         "/etc/solti/tls/clients-ca.crt",
+//!     ));
 //!
-//! assert_eq!(cfg.alpn, vec![b"h2".to_vec()]);
-//! // cfg.into_rustls_config()? would now read + parse the PEM into a
-//! // rustls::ServerConfig (requires real cert/key material).
-//! # Ok(()) }
+//! let mut rustls = server.into_rustls_config()?;
+//! rustls.alpn_protocols = vec![b"h2".to_vec()];
+//! # Ok(())
+//! # }
 //! ```
 //!
-//! ## Also
-//! - [`ServerTlsConfig`] / [`ClientTlsConfig`] - the two entry points.
-//! - [`PemSource`] - path-vs-bytes intent shared by both.
-//! - [`TlsError`] - every failure mode of `build` / `into_rustls_config`.
+//! ## Main Types
+//!
+//! | Type                      | Purpose                                         |
+//! |---------------------------|-------------------------------------------------|
+//! | [`TlsIdentity`]           | Certificate chain and private key               |
+//! | [`TrustRoots`]            | Certificates used to verify the other side      |
+//! | [`ServerTlsConfig`]       | Server TLS and mTLS settings                    |
+//! | [`ClientTlsConfig`]       | Client TLS and mTLS settings                    |
+//! | [`LoadedTlsIdentity`]     | Loaded identity PEM for an adapter              |
+//! | [`LoadedServerTlsConfig`] | Loaded server PEM for an adapter                |
+//! | [`LoadedClientTlsConfig`] | Loaded client PEM for an adapter                |
+//! | [`PemSource`]             | Certificate or trust-root PEM source            |
+//! | [`PrivateKeySource`]      | Private-key PEM source                          |
+//! | [`TlsError`]              | Loading and validation errors                   |
+//!
+//! ## Security
+//!
+//! - `into_rustls_config()` does not check a server name; `rustls` checks it during the client handshake.
+//! - [`ClientTlsConfig`] trusts only the configured roots; operating-system roots are not added.
+//! - [`ServerTlsConfig::require_client_auth`] makes client certificates mandatory.
+//! - A TLS library or adapter may keep its own copy of a private key.
+//! - Private-key buffers owned by this crate are zeroized on drop.
+//! - OCSP and CRL checks are not configured.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
-/// Compiles the runnable Rust code blocks in `README.md` as doctests.
 #[cfg(doctest)]
+/// Compiles runnable Rust code blocks in `README.md` as doctests.
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
-mod error;
-pub use error::TlsError;
-
-mod source;
-pub use source::PemSource;
-
-mod provider;
-pub use provider::ensure_default_provider;
-
-mod pem;
-pub use pem::{load_certs_from_pem, load_key_from_pem};
+mod client;
+pub use client::{ClientTlsConfig, LoadedClientTlsConfig};
 
 mod server;
-pub use server::{ServerTlsConfig, ServerTlsConfigBuilder};
+pub use server::{LoadedServerTlsConfig, ServerTlsConfig};
 
-mod client;
-pub use client::{ClientTlsConfig, ClientTlsConfigBuilder};
+mod identity;
+pub use identity::{LoadedTlsIdentity, TlsIdentity};
+
+mod source;
+pub use source::{PemSource, PrivateKeySource};
+
+mod error;
+pub use error::{PemRole, TlsError};
+
+mod roots;
+pub use roots::TrustRoots;
+
+mod pem;
+mod provider;

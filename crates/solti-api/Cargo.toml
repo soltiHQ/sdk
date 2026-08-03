@@ -1,63 +1,109 @@
 [package]
 name = "solti-api"
-description = "Solti SDK HTTP/JSON and gRPC API layer."
+
+description   = "HTTP/JSON and gRPC API layer for the Solti task supervisor SDK."
+keywords      = ["grpc", "http", "api", "tonic", "tasks"]
+categories    = ["network-programming", "web-programming"]
+documentation = "https://docs.rs/solti-api"
+readme        = "README.md"
 
 rust-version.workspace = true
-repository.workspace = true
-categories.workspace = true
-homepage.workspace = true
-keywords.workspace = true
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+repository.workspace   = true
+homepage.workspace     = true
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
 
 include = [
+    "CONTRACT.md",
+    "examples/**/*.rs",
     "proto/**/*.proto",
     "src/**/*.rs",
-    "Cargo.toml",
     "README.md",
     "build.rs",
 ]
 
-[package.metadata.docs.rs]
-all-features = true
-
 [features]
-default = []
-grpc    = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
-http    = ["dep:axum", "dep:pbjson", "dep:prost", "dep:serde_json", "dep:tower-http"]
-# `tls` only has effect on the gRPC transport (the `tls` module is gated on
-# `grpc`), so it implies `grpc` — enabling it alone would otherwise pull
-# `solti-tls` in without compiling anything that uses it.
-tls     = ["grpc", "dep:solti-tls", "tonic/tls-ring"]
+default      = []
+core-adapter = ["dep:solti-core"]
+grpc         = [
+    "dep:base64",
+    "dep:prost",
+    "dep:prost-reflect",
+    "dep:protoc-bin-vendored",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tonic",
+    "dep:tonic-prost",
+    "dep:tonic-prost-build",
+    "dep:tracing",
+]
+grpc-tls     = ["grpc", "dep:solti-tls", "tonic/tls-ring"]
+http         = [
+    "dep:aide",
+    "dep:axum",
+    "dep:base64",
+    "dep:form_urlencoded",
+    "dep:schemars",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tower-http",
+    "dep:tracing",
+    "solti-model/schema",
+]
 
 [dependencies]
-async-trait  = { workspace = true }
-tokio-stream = { workspace = true, features = ["sync"] }
-axum         = { workspace = true, optional = true }
-pbjson       = { workspace = true, optional = true }
-prost        = { workspace = true, optional = true }
-serde        = { workspace = true, features = ["derive"] }
-serde_json   = { workspace = true, optional = true }
-thiserror    = { workspace = true }
-tonic        = { workspace = true, optional = true }
-tonic-prost  = { workspace = true, optional = true }
-tower-http   = { workspace = true, features = ["limit"], optional = true }
-tracing      = { workspace = true }
-
-solti-core  = { workspace = true }
+solti-core  = { workspace = true, optional = true }
 solti-model = { workspace = true }
-solti-tls  = { workspace = true, optional = true }
+solti-tls   = { workspace = true, optional = true }
+
+async-trait     = { workspace = true }
+tokio-stream    = { workspace = true }
+aide            = { workspace = true, features = ["axum", "axum-json", "axum-query"], optional = true }
+axum            = { workspace = true, optional = true }
+base64          = { workspace = true, optional = true }
+form_urlencoded = { workspace = true, optional = true }
+prost           = { workspace = true, optional = true }
+schemars        = { workspace = true, optional = true }
+serde           = { workspace = true, features = ["derive"], optional = true }
+serde_json      = { workspace = true, optional = true }
+thiserror       = { workspace = true }
+tonic           = { workspace = true, optional = true }
+tonic-prost     = { workspace = true, optional = true }
+tower-http      = { workspace = true, features = ["limit"], optional = true }
+tracing         = { workspace = true, optional = true }
 
 [dev-dependencies]
 base64         = { workspace = true }
 bytes          = { workspace = true }
 http-body-util = { workspace = true }
 rcgen          = { workspace = true }
-tokio          = { workspace = true, features = ["macros", "rt"] }
+serde_json     = { workspace = true }
+solti-model    = { workspace = true, features = ["schema"] }
+solti-runner   = { workspace = true }
+taskvisor      = { workspace = true }
+tokio          = { workspace = true, features = ["macros", "net", "rt", "sync"] }
+tokio-stream   = { workspace = true, features = ["net"] }
 tower          = { workspace = true, features = ["util"] }
 
+[[example]]
+name              = "core_adapter"
+required-features = ["core-adapter"]
+
+[[example]]
+name              = "grpc_contract"
+required-features = ["grpc"]
+
+[[example]]
+name              = "http_contract"
+required-features = ["http"]
+
 [build-dependencies]
-pbjson-build        = { workspace = true }
-protoc-bin-vendored = { workspace = true }
-tonic-prost-build   = { workspace = true }
+prost-reflect       = { workspace = true, optional = true }
+protoc-bin-vendored = { workspace = true, optional = true }
+solti-model         = { workspace = true }
+tonic-prost-build   = { workspace = true, optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

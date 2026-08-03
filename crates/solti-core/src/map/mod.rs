@@ -1,7 +1,18 @@
-//! # Policy mapping.
+//! # Runtime mapping
 //!
-//! Adapter layer between `solti-model` (public specs) and the taskvisor runtime.
-//! Maps high-level API types into taskvisor's internal execution structures.
+//! This module maps model policies to Taskvisor.
+//! Its [`phase`] module maps Taskvisor outcomes back to model phases.
+//!
+//! ```text
+//! TaskSpec policies ──► Taskvisor submission
+//!
+//! Taskvisor outcome ──► TaskPhase
+//! ```
+//!
+//! Typed values select behavior.
+//! Diagnostic strings are not parsed.
+
+pub(crate) mod phase;
 
 use std::time::Duration;
 
@@ -13,7 +24,7 @@ use taskvisor::{AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy};
 
 use crate::error::CoreError;
 
-/// Convert a high-level admission policy from the public model into the controller admission policy used by taskvisor.
+/// Maps a model admission policy to Taskvisor.
 pub(crate) fn to_admission_policy(s: ModelAdmissionPolicy) -> Result<AdmissionPolicy, CoreError> {
     match s {
         ModelAdmissionPolicy::DropIfRunning => Ok(AdmissionPolicy::DropIfRunning),
@@ -25,10 +36,10 @@ pub(crate) fn to_admission_policy(s: ModelAdmissionPolicy) -> Result<AdmissionPo
     }
 }
 
-/// Convert a high-level jitter policy into the jitter policy used by taskvisor.
+/// Maps a model jitter policy to Taskvisor.
 pub(crate) fn to_jitter_policy(s: ModelJitterPolicy) -> Result<JitterPolicy, CoreError> {
     match s {
-        ModelJitterPolicy::Decorrelated => Ok(JitterPolicy::Decorrelated),
+        ModelJitterPolicy::Decorrelated => Ok(JitterPolicy::RandomizedBand),
         ModelJitterPolicy::Equal => Ok(JitterPolicy::Equal),
         ModelJitterPolicy::Full => Ok(JitterPolicy::Full),
         ModelJitterPolicy::None => Ok(JitterPolicy::None),
@@ -38,7 +49,7 @@ pub(crate) fn to_jitter_policy(s: ModelJitterPolicy) -> Result<JitterPolicy, Cor
     }
 }
 
-/// Convert a high-level restart policy into the restart policy used by taskvisor.
+/// Maps a model restart policy to Taskvisor.
 pub(crate) fn to_restart_policy(s: ModelRestartPolicy) -> Result<RestartPolicy, CoreError> {
     match s {
         ModelRestartPolicy::Always { interval_ms } => Ok(RestartPolicy::Always {
@@ -52,14 +63,15 @@ pub(crate) fn to_restart_policy(s: ModelRestartPolicy) -> Result<RestartPolicy, 
     }
 }
 
-/// Convert a high-level backoff policy into a backoff policy used by taskvisor.
+/// Maps a model backoff policy to Taskvisor.
 pub(crate) fn to_backoff_policy(s: &ModelBackoffPolicy) -> Result<BackoffPolicy, CoreError> {
-    Ok(BackoffPolicy {
-        first: Duration::from_millis(s.first_ms),
-        max: Duration::from_millis(s.max_ms),
-        jitter: to_jitter_policy(s.jitter)?,
-        factor: s.factor,
-    })
+    BackoffPolicy::new(
+        Duration::from_millis(s.first_ms),
+        Duration::from_millis(s.max_ms),
+        s.factor,
+        to_jitter_policy(s.jitter)?,
+    )
+    .map_err(|e| CoreError::Mapping(format!("invalid backoff policy: {e}")))
 }
 
 #[cfg(test)]
@@ -86,7 +98,7 @@ mod tests {
     fn jitter_policy_maps_every_variant() {
         assert_eq!(
             to_jitter_policy(ModelJitterPolicy::Decorrelated).unwrap(),
-            JitterPolicy::Decorrelated
+            JitterPolicy::RandomizedBand
         );
         assert_eq!(
             to_jitter_policy(ModelJitterPolicy::Equal).unwrap(),
@@ -104,7 +116,6 @@ mod tests {
 
     #[test]
     fn restart_policy_maps_every_variant() {
-        // taskvisor::RestartPolicy is not PartialEq, so match structurally.
         assert!(matches!(
             to_restart_policy(ModelRestartPolicy::Never).unwrap(),
             RestartPolicy::Never
@@ -135,9 +146,9 @@ mod tests {
             factor: 2.0,
         };
         let tv = to_backoff_policy(&model).unwrap();
-        assert_eq!(tv.first, Duration::from_millis(100));
-        assert_eq!(tv.max, Duration::from_millis(5_000));
-        assert_eq!(tv.jitter, JitterPolicy::Equal);
-        assert_eq!(tv.factor, 2.0);
+        assert_eq!(tv.first(), Duration::from_millis(100));
+        assert_eq!(tv.max(), Duration::from_millis(5_000));
+        assert_eq!(tv.jitter(), JitterPolicy::Equal);
+        assert_eq!(tv.factor(), 2.0);
     }
 }

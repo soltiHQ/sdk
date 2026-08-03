@@ -1,16 +1,15 @@
-//! # Metrics backend trait and label types.
+//! # Runner metrics
 //!
-//! [`MetricsBackend`] is the abstraction for collecting task execution metrics.
-//! Concrete backends (e.g. `solti-prometheus`) implement this trait.
-//!
-//! See the [metrics module](super) for the convenience [`noop_metrics`](super::noop_metrics) constructor.
+//! [`MetricsBackend`] records runner setup and cleanup errors.
+//! [`RunnerType`] and [`RunnerErrorKind`] provide metric label values.
 
 use std::sync::Arc;
 
 /// Runner implementation type for metrics labeling.
 ///
-/// Passed to [`MetricsBackend`] methods so dashboards can slice metrics by runner backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Built-in variants return fixed labels.
+/// [`Custom`](Self::Custom) returns its string unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RunnerType {
     /// OS subprocess runner.
@@ -19,112 +18,120 @@ pub enum RunnerType {
     Container,
     /// WebAssembly runner.
     Wasm,
+    /// Application-defined runner label.
+    Custom(String),
 }
 
 impl RunnerType {
-    /// Return label value for metrics.
+    /// Returns the metric label value.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_runner::RunnerType;
+    ///
+    /// assert_eq!(RunnerType::Subprocess.as_label(), "subprocess");
+    /// ```
     #[inline]
-    pub fn as_label(self) -> &'static str {
+    pub fn as_label(&self) -> &str {
         match self {
             Self::Subprocess => "subprocess",
             Self::Container => "container",
             Self::Wasm => "wasm",
+            Self::Custom(label) => label,
         }
     }
 }
 
-/// Runner setup/teardown error kind for metrics labeling.
+/// Runner setup or teardown error kind for metrics labeling.
 ///
-/// Passed to [`MetricsBackend::record_runner_error`] so dashboards can slice errors by a bounded, low-cardinality label rather than free-form strings.
+/// Built-in variants return fixed labels.
+/// [`Custom`](Self::Custom) returns its string unchanged.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RunnerErrorKind {
     /// cgroup v2 preparation (creation / attribute write) failed.
     CgroupPrepareFailed,
-    /// Applying runner-specific configuration to the task command failed (rlimits, capabilities, namespaces, …).
+    /// Applying runner-specific configuration to the task command failed.
     BackendConfigFailed,
     /// Spawning the child process or actor failed.
     SpawnFailed,
     /// Loading the runner module (WASM / container image) failed.
     ModuleLoadFailed,
+    /// Application-defined stable error label.
+    Custom(String),
 }
 
 impl RunnerErrorKind {
-    /// Return label value for metrics.
+    /// Returns the metric label value.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_runner::RunnerErrorKind;
+    ///
+    /// assert_eq!(RunnerErrorKind::SpawnFailed.as_label(), "spawn_failed");
+    /// ```
     #[inline]
-    pub fn as_label(self) -> &'static str {
+    pub fn as_label(&self) -> &str {
         match self {
             Self::CgroupPrepareFailed => "cgroup_prepare_failed",
             Self::BackendConfigFailed => "backend_config_failed",
             Self::SpawnFailed => "spawn_failed",
             Self::ModuleLoadFailed => "module_load_failed",
-        }
-    }
-}
-
-/// Task execution outcome for metrics classification.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MetricOutcome {
-    /// Task completed successfully.
-    Success,
-    /// Task failed.
-    Failure,
-    /// Task canceled.
-    Canceled,
-    /// Task timeout.
-    Timeout,
-}
-
-impl MetricOutcome {
-    /// Return label value for metrics.
-    #[inline]
-    pub fn as_label(&self) -> &'static str {
-        match self {
-            MetricOutcome::Success => "success",
-            MetricOutcome::Failure => "failure",
-            MetricOutcome::Canceled => "canceled",
-            MetricOutcome::Timeout => "timeout",
+            Self::Custom(label) => label,
         }
     }
 }
 
 /// Backend metrics collection interface.
 ///
-/// This trait abstracts metrics collection across different backends.
-/// Implementations are injected via [`crate::BuildContext`] and used by all runners.
+/// Implementations record runner setup and cleanup failures.
+/// Task lifecycle metrics come from taskvisor events.
 ///
-/// ## Also
+/// ```text
+/// runner failure
+///       ├── RunnerType
+///       └── RunnerErrorKind
+///                 ▼
+///       record_runner_error
+/// ```
 ///
-/// - [`NoOpMetrics`](super::NoOpMetrics): zero-size default backend.
-/// - [`crate::BuildContext::metrics`]: access the handle from within a runner.
-/// - `solti-prometheus::PrometheusMetrics` is a production Prometheus implementation.
+/// ## Example
+///
+/// ```
+/// use std::sync::atomic::{AtomicU64, Ordering};
+/// use solti_runner::{MetricsBackend, RunnerErrorKind, RunnerType};
+///
+/// #[derive(Default)]
+/// struct Counter {
+///     errors: AtomicU64,
+/// }
+///
+/// impl MetricsBackend for Counter {
+///     fn record_runner_error(&self, _runner_type: RunnerType, _error_kind: RunnerErrorKind) {
+///         self.errors.fetch_add(1, Ordering::Relaxed);
+///     }
+/// }
+///
+/// let metrics = Counter::default();
+/// metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+/// assert_eq!(metrics.errors.load(Ordering::Relaxed), 1);
+/// ```
+///
+/// ## See Also
+///
+/// - [`NoOpMetrics`](super::NoOpMetrics)
+/// - [`crate::BuildContext::metrics`]
+/// - `solti-prometheus::PrometheusRunnerMetrics`
 pub trait MetricsBackend: Send + Sync + 'static {
-    /// Record task spawn event.
-    ///
-    /// Called when a task is submitted and starts executing.
-    fn record_task_started(&self, runner_type: RunnerType);
-
-    /// Record task completion with outcome and duration.
-    ///
-    /// Called when task exits (success, failure, timeout, cancel).
-    fn record_task_completed(
-        &self,
-        runner_type: RunnerType,
-        outcome: MetricOutcome,
-        duration_ms: u64,
-    );
-
-    /// Record runner-specific error during task setup/teardown.
-    ///
-    /// Called when runner fails to spawn/cleanup a task.
-    /// This is separate from task failures (which are `record_task_completed` with `Failure`).
+    /// Records a runner error during task setup or cleanup.
     fn record_runner_error(&self, runner_type: RunnerType, error_kind: RunnerErrorKind);
 }
 
 /// Shared handle to metrics backend.
 ///
-/// Stored in [`crate::BuildContext`] and cloned into each task.
+/// [`crate::BuildContext`] stores this handle.
 pub type MetricsHandle = Arc<dyn MetricsBackend>;
 
 #[cfg(test)]
@@ -132,19 +139,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runner_error_kind_as_label_maps_all_variants() {
-        assert_eq!(
-            RunnerErrorKind::CgroupPrepareFailed.as_label(),
-            "cgroup_prepare_failed"
-        );
-        assert_eq!(
-            RunnerErrorKind::BackendConfigFailed.as_label(),
-            "backend_config_failed"
-        );
-        assert_eq!(RunnerErrorKind::SpawnFailed.as_label(), "spawn_failed");
-        assert_eq!(
-            RunnerErrorKind::ModuleLoadFailed.as_label(),
-            "module_load_failed"
-        );
+    fn metric_labels_are_stable_for_built_in_and_custom_variants() {
+        for (runner_type, expected) in [
+            (RunnerType::Subprocess, "subprocess"),
+            (RunnerType::Container, "container"),
+            (RunnerType::Wasm, "wasm"),
+            (RunnerType::Custom("image-resize".into()), "image-resize"),
+        ] {
+            assert_eq!(runner_type.as_label(), expected);
+        }
+
+        for (error_kind, expected) in [
+            (
+                RunnerErrorKind::CgroupPrepareFailed,
+                "cgroup_prepare_failed",
+            ),
+            (
+                RunnerErrorKind::BackendConfigFailed,
+                "backend_config_failed",
+            ),
+            (RunnerErrorKind::SpawnFailed, "spawn_failed"),
+            (RunnerErrorKind::ModuleLoadFailed, "module_load_failed"),
+            (
+                RunnerErrorKind::Custom("runtime_unavailable".into()),
+                "runtime_unavailable",
+            ),
+        ] {
+            assert_eq!(error_kind.as_label(), expected);
+        }
     }
 }

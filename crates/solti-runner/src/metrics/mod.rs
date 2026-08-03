@@ -1,26 +1,38 @@
-//! # Metrics collection abstraction.
+//! # Metrics collection
 //!
-//! Provides [`MetricsBackend`] trait and a zero-cost [`NoOpMetrics`] default.
-//! Concrete backends (e.g. `solti-prometheus`) implement the trait; the active backend is injected via [`BuildContext`](crate::BuildContext).
+//! [`MetricsBackend`] is the runner metrics port.
+//! Runners record setup and cleanup failures through this port.
 //!
-//! ## Contents
+//! ## Flow
 //!
-//! - [`RunnerErrorKind`]: metric label enum: `CgroupPrepareFailed`, `BackendConfigFailed`, `SpawnFailed`, `ModuleLoadFailed`.
-//! - [`MetricsBackend`]: trait with `record_task_started`, `record_task_completed`, `record_runner_error`.
-//! - [`MetricOutcome`]: metric label enum: `Success`, `Failure`, `Canceled`, `Timeout`.
-//! - [`NoOpMetrics`]: zero-size backend (`#[inline(always)]`, compiles to nothing).
-//! - [`MetricsHandle`]: `Arc<dyn MetricsBackend>`, cloneable shared handle.
-//! - [`RunnerType`]: metric label enum: `Subprocess`, `Wasm`, `Container`.
-//! - [`noop_metrics`]: convenience constructor for `Arc<NoOpMetrics>`.
+//! ```text
+//! Runner
+//!    └── RunnerType + RunnerErrorKind
+//!                       ▼
+//!                MetricsBackend
+//! ```
+//!
+//! Task lifecycle metrics come from taskvisor events.
+//! [`NoOpMetrics`] is the default runner backend.
+//! `solti-prometheus` provides a Prometheus implementation.
 mod backend;
-pub use backend::{MetricOutcome, MetricsBackend, MetricsHandle, RunnerErrorKind, RunnerType};
+pub use backend::{MetricsBackend, MetricsHandle, RunnerErrorKind, RunnerType};
 
 mod noop;
 pub use noop::NoOpMetrics;
 
 use std::sync::Arc;
 
-/// Create a no-op metrics handle.
+/// Creates a shared no-op metrics handle.
+///
+/// ## Example
+///
+/// ```
+/// use solti_runner::{RunnerErrorKind, RunnerType, noop_metrics};
+///
+/// let metrics = noop_metrics();
+/// metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+/// ```
 #[inline]
 pub fn noop_metrics() -> MetricsHandle {
     Arc::new(NoOpMetrics)

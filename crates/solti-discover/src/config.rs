@@ -1,106 +1,215 @@
-//! # Discovery configuration.
+//! # Discovery configuration
 //!
-//! [`DiscoverConfig`] captures agent identity, control-plane endpoint, transport choice, and sync interval.
-//! Construct via [`DiscoverConfig::builder`] - all fields validated on `build()`.
+//! This module separates two endpoint roles.
+//!
+//! ```text
+//! Control plane ── calls ──► AgentEndpoint
+//!                             advertised agent API
+//!
+//! Discovery task ── syncs ──► ControlPlaneEndpoint
+//!                              outbound control-plane endpoint
+//! ```
+//!
+//! Transport-specific URI validation happens when [`sync`](crate::sync) creates the adapter.
+//! [`DiscoverConfig`] captures the complete embedded task intent.
+//! [`DiscoverConfigBuilder`] validates scalar settings.
 
 use std::collections::HashMap;
 
-use solti_model::{AgentId, BackoffPolicy, Token};
-
-#[cfg(any(feature = "grpc", feature = "http"))]
-use crate::proto::EndpointType;
+use solti_model::{AgentCapabilities, AgentId, BackoffPolicy, Token};
 
 use crate::errors::DiscoverError;
 use crate::metrics::{DiscoverMetricsHandle, noop_discover_metrics};
+use crate::proto::EndpointType;
 
 /// Default connect timeout in milliseconds.
 pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
 /// Default request timeout in milliseconds.
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 
-/// Transport protocol for the sync RPC.
+/// Transport exposed by the agent API.
 ///
-/// Variants are gated by crate features - a crate built without any transport feature exposes an empty enum (and no `sync` factory).
-///
-/// ## Also
-///
-/// - [`DiscoverConfig`] uses this to select gRPC or HTTP path.
-/// - `proto::EndpointType` is the wire-level equivalent.
-#[derive(Clone, Debug)]
-pub enum DiscoveryTransport {
-    #[cfg(feature = "grpc")]
+/// This controls the endpoint type sent to the control plane.
+/// It is independent of [`DiscoveryTransport`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentEndpointType {
+    /// gRPC agent API.
     Grpc,
-    #[cfg(feature = "http")]
+    /// HTTP agent API.
     Http,
 }
 
-impl DiscoveryTransport {
-    #[cfg(any(feature = "grpc", feature = "http"))]
-    pub(crate) fn as_proto(&self) -> i32 {
+impl AgentEndpointType {
+    /// Returns the discovery v1 wire value.
+    pub(crate) fn as_proto(self) -> i32 {
         match self {
-            #[cfg(feature = "grpc")]
-            DiscoveryTransport::Grpc => EndpointType::Grpc as i32,
-            #[cfg(feature = "http")]
-            DiscoveryTransport::Http => EndpointType::Http as i32,
+            Self::Grpc => EndpointType::Grpc as i32,
+            Self::Http => EndpointType::Http as i32,
         }
     }
 }
 
-/// Agent discovery settings.
+/// Agent API endpoint advertised to the control plane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEndpoint {
+    pub(crate) address: String,
+    pub(crate) endpoint_type: AgentEndpointType,
+    pub(crate) api_version: i32,
+}
+
+impl AgentEndpoint {
+    /// Creates an advertised agent endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiscoverError::InvalidConfig`] when the address is empty.
+    /// Returns it when `api_version` exceeds the discovery v1 wire field.
+    /// Returns it when `api_version` is zero.
+    pub fn new(
+        address: impl Into<String>,
+        endpoint_type: AgentEndpointType,
+        api_version: u32,
+    ) -> Result<Self, DiscoverError> {
+        let address = address.into().trim().to_string();
+        if address.is_empty() {
+            return Err(DiscoverError::InvalidConfig(
+                "agent endpoint must not be empty".into(),
+            ));
+        }
+        if api_version == 0 {
+            return Err(DiscoverError::InvalidConfig(
+                "agent API version must be greater than zero".into(),
+            ));
+        }
+        let api_version = i32::try_from(api_version).map_err(|_| {
+            DiscoverError::InvalidConfig("agent API version exceeds the wire range".into())
+        })?;
+
+        Ok(Self {
+            address,
+            endpoint_type,
+            api_version,
+        })
+    }
+
+    /// Returns the advertised address.
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// Returns the advertised transport.
+    pub fn endpoint_type(&self) -> AgentEndpointType {
+        self.endpoint_type
+    }
+
+    /// Returns the advertised agent API version.
+    pub fn api_version(&self) -> u32 {
+        self.api_version as u32
+    }
+}
+
+/// Transport used by the agent to sync with the control plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiscoveryTransport {
+    /// Sync over gRPC.
+    #[cfg(feature = "grpc")]
+    Grpc,
+    /// Sync over HTTP/JSON.
+    #[cfg(feature = "http")]
+    Http,
+}
+
+/// Control-plane endpoint used for discovery sync.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlPlaneEndpoint {
+    pub(crate) address: String,
+    pub(crate) transport: DiscoveryTransport,
+}
+
+impl ControlPlaneEndpoint {
+    /// Creates a control-plane endpoint.
+    ///
+    /// This constructor trims whitespace and trailing slashes.
+    /// The selected adapter validates the URI scheme.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiscoverError::InvalidConfig`] when the address is empty.
+    pub fn new(
+        address: impl Into<String>,
+        transport: DiscoveryTransport,
+    ) -> Result<Self, DiscoverError> {
+        let address = address.into().trim().trim_end_matches('/').to_string();
+        if address.is_empty() {
+            return Err(DiscoverError::InvalidConfig(
+                "control-plane endpoint must not be empty".into(),
+            ));
+        }
+
+        Ok(Self { address, transport })
+    }
+
+    /// Returns the control-plane address.
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// Returns the outbound discovery transport.
+    pub fn transport(&self) -> DiscoveryTransport {
+        self.transport
+    }
+}
+
+/// Validated settings for the discovery sync task.
 ///
-/// Construct via [`DiscoverConfig::builder`].
-/// All invariants are enforced at build time.
-///
-/// ## Also
-///
-/// - [`DiscoveryTransport`] selects gRPC or HTTP.
-/// - [`DiscoverError`] failure modes during sync.
-/// - [`sync`](crate::sync) consumes this config to produce `(TaskRef, TaskSpec)`.
+/// Build this value through [`Self::builder`].
+/// The task factory captures every field by value.
 #[derive(Debug, Clone)]
 pub struct DiscoverConfig {
     pub(crate) agent_id: AgentId,
     pub(crate) name: String,
-    pub(crate) agent_endpoint: String,
-    pub(crate) control_plane_endpoint: String,
-    pub(crate) transport: DiscoveryTransport,
+    pub(crate) agent_endpoint: AgentEndpoint,
+    pub(crate) control_plane: ControlPlaneEndpoint,
     pub(crate) delay_ms: u64,
-    pub(crate) api_version: u32,
+    pub(crate) heartbeat_interval_s: i32,
     pub(crate) metadata: HashMap<String, String>,
-    pub(crate) capabilities: Vec<String>,
+    pub(crate) capabilities: AgentCapabilities,
     pub(crate) token: Option<Token>,
     pub(crate) backoff: Option<BackoffPolicy>,
     pub(crate) connect_timeout_ms: u64,
     pub(crate) request_timeout_ms: u64,
+    pub(crate) task_revision: String,
     pub(crate) metrics: DiscoverMetricsHandle,
     #[cfg(feature = "tls")]
     pub(crate) tls: Option<solti_tls::ClientTlsConfig>,
 }
 
 impl DiscoverConfig {
-    /// Start a builder for `DiscoverConfig`.
+    /// Starts a discovery config builder.
+    ///
+    /// `task_revision` identifies the captured runtime intent.
+    /// Change it whenever a setting used by the embedded task changes.
     pub fn builder(
         agent_id: AgentId,
         name: impl Into<String>,
-        agent_endpoint: impl Into<String>,
-        control_plane_endpoint: impl Into<String>,
-        transport: DiscoveryTransport,
+        agent_endpoint: AgentEndpoint,
+        control_plane: ControlPlaneEndpoint,
         delay_ms: u64,
-        api_version: u32,
+        task_revision: impl Into<String>,
     ) -> DiscoverConfigBuilder {
         DiscoverConfigBuilder {
             agent_id,
             name: name.into(),
-            agent_endpoint: agent_endpoint.into(),
-            control_plane_endpoint: control_plane_endpoint.into(),
-            transport,
+            agent_endpoint,
+            control_plane,
             delay_ms,
-            api_version,
             metadata: HashMap::new(),
-            capabilities: Vec::new(),
+            capabilities: AgentCapabilities::default(),
             token: None,
             backoff: None,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
+            task_revision: task_revision.into(),
             metrics: noop_discover_metrics(),
             #[cfg(feature = "tls")]
             tls: None,
@@ -108,156 +217,211 @@ impl DiscoverConfig {
     }
 }
 
-/// Validated builder for [`DiscoverConfig`].
+/// Builder for [`DiscoverConfig`].
+///
+/// | Setting              | Default                       |
+/// |----------------------|-------------------------------|
+/// | Metadata             | Empty                         |
+/// | Capabilities         | No runners                    |
+/// | Backoff              | Derived from `delay_ms`       |
+/// | Connect timeout      | 5 seconds                     |
+/// | Request timeout      | 30 seconds                    |
+/// | Metrics              | No-op backend                 |
+/// | Bearer token         | None                          |
+/// | Custom TLS           | None                          |
 #[derive(Debug, Clone)]
 pub struct DiscoverConfigBuilder {
     agent_id: AgentId,
     name: String,
-    agent_endpoint: String,
-    control_plane_endpoint: String,
-    transport: DiscoveryTransport,
+    agent_endpoint: AgentEndpoint,
+    control_plane: ControlPlaneEndpoint,
     delay_ms: u64,
-    api_version: u32,
     metadata: HashMap<String, String>,
-    capabilities: Vec<String>,
+    capabilities: AgentCapabilities,
     token: Option<Token>,
     backoff: Option<BackoffPolicy>,
     connect_timeout_ms: u64,
     request_timeout_ms: u64,
+    task_revision: String,
     metrics: DiscoverMetricsHandle,
     #[cfg(feature = "tls")]
     tls: Option<solti_tls::ClientTlsConfig>,
 }
 
 impl DiscoverConfigBuilder {
-    /// Attach user metadata sent with every sync.
+    /// Sets metadata sent with every sync.
     pub fn metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = metadata;
         self
     }
 
-    /// Declare agent capabilities (see `proto/v1/sync.proto` for known values).
-    pub fn capabilities(mut self, capabilities: Vec<String>) -> Self {
+    /// Sets the registered runner capabilities sent with every sync.
+    pub fn capabilities(mut self, capabilities: AgentCapabilities) -> Self {
         self.capabilities = capabilities;
         self
     }
 
-    /// Override the default backoff policy.
-    ///
-    /// Default (when not set): equal jitter, `first_ms = delay_ms/2`, `max_ms = delay_ms*3`, factor 2.0.
+    /// Overrides the default retry backoff.
     pub fn backoff(mut self, backoff: BackoffPolicy) -> Self {
         self.backoff = Some(backoff);
         self
     }
 
-    /// Transport-level connect timeout (ms).
+    /// Sets the transport connect timeout in milliseconds.
     pub fn connect_timeout_ms(mut self, ms: u64) -> Self {
         self.connect_timeout_ms = ms;
         self
     }
 
-    /// End-to-end request timeout (ms).
+    /// Sets the request timeout in milliseconds.
     pub fn request_timeout_ms(mut self, ms: u64) -> Self {
         self.request_timeout_ms = ms;
         self
     }
 
-    /// Attach a metrics backend. When not set, a zero-cost no-op is used.
+    /// Sets the metrics backend.
     pub fn with_metrics(mut self, metrics: DiscoverMetricsHandle) -> Self {
         self.metrics = metrics;
         self
     }
 
-    /// Attach a bearer token presented to the control plane on every sync.
-    ///
-    /// Transport-agnostic:
-    ///  - HTTP sends it as `Authorization: Bearer <token>`,
-    ///  - gRPC sends the same value as `authorization` metadata.
+    /// Sets the bearer token sent with every sync.
     pub fn with_token(mut self, token: Token) -> Self {
         self.token = Some(token);
         self
     }
 
-    /// Enable TLS / mTLS for the sync transport.
+    /// Sets custom server roots and an optional client identity.
     ///
-    /// Both gRPC and HTTP transports honour this configuration:
-    /// the control-plane endpoint must be reachable over `https://` (HTTP) or use `https://`/`tls://` semantics in `tonic` (gRPC).
-    ///
-    /// Available with the `tls` feature.
+    /// The control-plane endpoint must use `https`.
+    /// HTTP uses platform roots when this setting is absent.
+    /// gRPC uses platform roots when this setting is absent and `tls` is enabled.
     #[cfg(feature = "tls")]
     pub fn with_tls(mut self, tls: solti_tls::ClientTlsConfig) -> Self {
         self.tls = Some(tls);
         self
     }
 
-    /// Validate and produce a [`DiscoverConfig`].
+    /// Validates and builds the config.
     ///
-    /// Rejects empty strings, zero intervals and zero timeouts.
-    /// Trims trailing `/` from `control_plane_endpoint`.
+    /// # Errors
+    ///
+    /// Returns [`DiscoverError::InvalidConfig`] when a required string is empty.
+    /// Returns it when `delay_ms` cannot be represented by discovery v1.
+    /// Returns it when a duration is zero.
     pub fn build(self) -> Result<DiscoverConfig, DiscoverError> {
-        if self.name.is_empty() {
+        let name = self.name.trim().to_string();
+        if name.is_empty() {
             return Err(DiscoverError::InvalidConfig(
                 "name must not be empty".into(),
             ));
         }
-        if self.agent_endpoint.is_empty() {
-            return Err(DiscoverError::InvalidConfig(
-                "agent_endpoint must not be empty".into(),
-            ));
-        }
-        if self.control_plane_endpoint.is_empty() {
-            return Err(DiscoverError::InvalidConfig(
-                "control_plane_endpoint must not be empty".into(),
-            ));
-        }
         if self.delay_ms == 0 {
-            return Err(DiscoverError::InvalidConfig("delay_ms must be > 0".into()));
-        }
-        if self.api_version == 0 {
             return Err(DiscoverError::InvalidConfig(
-                "api_version must be > 0".into(),
+                "delay_ms must be greater than zero".into(),
             ));
         }
         if self.connect_timeout_ms == 0 {
             return Err(DiscoverError::InvalidConfig(
-                "connect_timeout_ms must be > 0".into(),
+                "connect_timeout_ms must be greater than zero".into(),
             ));
         }
         if self.request_timeout_ms == 0 {
             return Err(DiscoverError::InvalidConfig(
-                "request_timeout_ms must be > 0".into(),
+                "request_timeout_ms must be greater than zero".into(),
             ));
         }
-        if let Some(token) = &self.token
-            && token.is_empty()
-        {
+        let task_revision = self.task_revision.trim().to_string();
+        if task_revision.is_empty() {
             return Err(DiscoverError::InvalidConfig(
-                "token must not be empty".into(),
+                "task_revision must not be empty".into(),
             ));
         }
-
-        let control_plane_endpoint = self
-            .control_plane_endpoint
-            .trim_end_matches('/')
-            .to_string();
+        let heartbeat_interval_s = i32::try_from(self.delay_ms.div_ceil(1_000)).map_err(|_| {
+            DiscoverError::InvalidConfig("delay_ms exceeds the discovery v1 wire range".into())
+        })?;
 
         Ok(DiscoverConfig {
             agent_id: self.agent_id,
-            name: self.name,
+            name,
             agent_endpoint: self.agent_endpoint,
-            control_plane_endpoint,
-            transport: self.transport,
+            control_plane: self.control_plane,
             delay_ms: self.delay_ms,
-            api_version: self.api_version,
+            heartbeat_interval_s,
             metadata: self.metadata,
             capabilities: self.capabilities,
             token: self.token,
             backoff: self.backoff,
             connect_timeout_ms: self.connect_timeout_ms,
             request_timeout_ms: self.request_timeout_ms,
+            task_revision,
             metrics: self.metrics,
             #[cfg(feature = "tls")]
             tls: self.tls,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "http")]
+    fn config(delay_ms: u64) -> Result<DiscoverConfig, DiscoverError> {
+        DiscoverConfig::builder(
+            AgentId::new("agent-1").unwrap(),
+            "agent-1",
+            AgentEndpoint::new("http://127.0.0.1:8085", AgentEndpointType::Http, 1)?,
+            ControlPlaneEndpoint::new("http://127.0.0.1:9000", DiscoveryTransport::Http)?,
+            delay_ms,
+            "test@1",
+        )
+        .build()
+    }
+
+    #[test]
+    fn advertised_transport_is_independent_from_compiled_discovery_transport() {
+        let grpc = AgentEndpoint::new("127.0.0.1:50051", AgentEndpointType::Grpc, 1).unwrap();
+        let http = AgentEndpoint::new("http://127.0.0.1:8085", AgentEndpointType::Http, 1).unwrap();
+
+        assert_eq!(grpc.endpoint_type(), AgentEndpointType::Grpc);
+        assert_eq!(http.endpoint_type(), AgentEndpointType::Http);
+    }
+
+    #[test]
+    fn agent_api_version_must_fit_wire_type() {
+        assert!(AgentEndpoint::new("127.0.0.1:8085", AgentEndpointType::Http, 0).is_err());
+        assert!(
+            AgentEndpoint::new(
+                "127.0.0.1:8085",
+                AgentEndpointType::Http,
+                i32::MAX as u32 + 1,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn heartbeat_interval_rounds_up() {
+        assert_eq!(config(1).unwrap().heartbeat_interval_s, 1);
+        assert_eq!(config(1_000).unwrap().heartbeat_interval_s, 1);
+        assert_eq!(config(1_001).unwrap().heartbeat_interval_s, 2);
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn runtime_revision_is_required() {
+        let result = DiscoverConfig::builder(
+            AgentId::new("agent-1").unwrap(),
+            "agent-1",
+            AgentEndpoint::new("127.0.0.1:8085", AgentEndpointType::Http, 1).unwrap(),
+            ControlPlaneEndpoint::new("http://127.0.0.1:9000", DiscoveryTransport::Http).unwrap(),
+            1_000,
+            " ",
+        )
+        .build();
+
+        assert!(matches!(result, Err(DiscoverError::InvalidConfig(_))));
     }
 }

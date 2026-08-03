@@ -1,102 +1,125 @@
 //! # solti-observe
 //!
-//! Observability primitives for the solti task execution system.
+//! Shared logging configuration for Solti binaries.
+//! It validates settings and installs one global [`tracing`] subscriber.
 //!
-//! This crate wires [`tracing`] into solti, covering three concerns:
+//! ## Start Here
 //!
-//! 1. **Logger initialization** - [`init_logger`] installs a global tracing
-//!    subscriber configured via [`LoggerConfig`] (format, level filter,
-//!    timezone, color).
-//! 2. **Event logging** - `TracingEventSubscriber` (feature `subscriber`)
-//!    maps every `taskvisor` supervision event to a structured tracing call
-//!    at the appropriate severity level.
-//! 3. **Timezone sync** - `timezone_sync` (feature `timezone-sync`) is a
-//!    periodic task that re-detects the local UTC offset so log timestamps
-//!    stay correct across DST transitions.
+//! 1. Create a [`LoggerConfig`].
+//! 2. Choose a [`LoggerFormat`], [`LoggerLevel`], and [`LoggerTimeZone`].
+//! 3. Call [`init_logger`] once near process start.
+//! 4. Emit records through `tracing`.
 //!
-//! ## Architecture
+//! ## Flow
 //!
 //! ```text
-//!  main()
-//!  ├─ init_local_offset()              // before tokio runtime
-//!  └─ tokio::Runtime::new()
-//!      └─ async_main()
-//!          ├─ init_logger(&cfg)        // installs global tracing subscriber
-//!          │   ├─ Text  → fmt::Layer (colored, RFC 3339 timestamps)
-//!          │   ├─ Json  → fmt::Layer::json()
-//!          │   └─ Journald → tracing_journald::layer() (Linux only)
-//!          │
-//!          ├─ TracingEventSubscriber   // feature: subscriber
-//!          │   └─ on_event() → trace!/debug!/info!/warn!/error!
-//!          │
-//!          └─ timezone_sync()          // feature: timezone-sync
-//!              └─ periodic re-detection of local UTC offset
-//!  ```
+//! config file ──► LoggerConfig ──► init_logger()
+//!                                      │
+//!                    ┌─────────────────┼──────────────────┐
+//!                    ▼                 ▼                  ▼
+//!                  text              JSON             journald
+//!                    │                 │                  │
+//!                    └─────────────────┴──────────────────┘
+//!                                      │
+//!                                      ▼
+//!                              global subscriber
+//! ```
 //!
-//! ## Public API
+//! Journald uses its native record fields and the configured level filter.
+//! Text and JSON use the configured timestamp and target settings.
+//! Text can also use ANSI colors.
 //!
-//! | Item                                     | Feature         | Description                                              |
-//! |------------------------------------------|-----------------|----------------------------------------------------------|
-//! | [`LoggerConfig`]                         | -               | Logger configuration (format, level, timezone, color)    |
-//! | [`init_logger`]                          | -               | Install global tracing subscriber                        |
-//! | [`init_local_offset`]                    | -               | Detect local UTC offset (call before tokio runtime)      |
-//! | [`LoggerFormat`]                         | -               | Output format: `Text` / `Json` / `Journald`              |
-//! | [`LoggerLevel`]                          | -               | Validated `EnvFilter` expression wrapper                 |
-//! | [`LoggerTimeZone`]                       | -               | Timestamp timezone: `Utc` / `Local`                      |
-//! | [`LoggerError`]                          | -               | Error type for logger initialization                     |
-//! | `TracingEventSubscriber`               | `subscriber`    | Logs `taskvisor` events via tracing                    |
-//! | `timezone_sync`                        | `timezone-sync` | Periodic task that re-detects the local UTC offset       |
-//!
-//! ## Feature flags
-//!
-//! | Flag            | Default | Dependencies                        | Effect                                        |
-//! |-----------------|---------|-------------------------------------|-----------------------------------------------|
-//! | `subscriber`    | off     | `taskvisor`, `async-trait`          | Enables `TracingEventSubscriber`            |
-//! | `timezone-sync` | off     | `taskvisor`, `tokio-util`, `solti-model` | Enables `timezone_sync` periodic task  |
-//!
-//! ## Quick start
+//! ## Quick Start
 //!
 //! ```rust,no_run
-//! use solti_observe::{LoggerConfig, LoggerLevel, init_local_offset, init_logger};
+//! use solti_observe::{LoggerConfig, LoggerLevel, init_logger};
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // 1) Must be called before spawning threads (tokio runtime).
-//!     init_local_offset();
+//!     let config = LoggerConfig {
+//!         level: LoggerLevel::new("taskvisor=debug,info")?,
+//!         ..Default::default()
+//!     };
 //!
-//!     tokio::runtime::Runtime::new()?.block_on(async {
-//!         // 2) Initialize logger
-//!         let cfg = LoggerConfig {
-//!             level: LoggerLevel::new("info")?,
-//!             ..Default::default()
-//!         };
-//!         init_logger(&cfg)?;
-//!
-//!         tracing::info!("ready");
-//!         Ok(())
-//!     })
+//!     init_logger(&config)?;
+//!     tracing::info!("agent ready");
+//!     Ok(())
 //! }
 //! ```
 //!
-//! ## Local timezone support
+//! Only one global installation can succeed.
 //!
-//! On most Unix platforms, detecting the local UTC offset requires reading `/etc/localtime`,
-//! which is unsafe in multi-threaded processes.
+//! ## Formats
 //!
-//! To workaround this:
-//! 1. Call [`init_local_offset`] in `main()` **before** `tokio::runtime::Runtime::new()`.
-//! 2. Optionally submit the `timezone_sync` task to periodically re-detect
-//!    the offset (handles DST transitions in long-running daemons).
+//! | Format                       | Feature    | Output                         |
+//! |------------------------------|------------|--------------------------------|
+//! | [`Text`](LoggerFormat::Text) | Always     | Human-readable lines           |
+//! | [`Json`](LoggerFormat::Json) | Always     | Structured JSON                |
+//! | `Journald`                   | `journald` | Native systemd journal records |
 //!
-//! If [`init_local_offset`] is not called, timestamps fall back to UTC with a warning printed to stderr on first use.
+//! Text output uses ANSI colors only when requested and stdout is a terminal.
+//! Journald initialization is available only on Linux.
+//! JSON output never uses ANSI colors.
 //!
-//! ## Also
+//! ## Filtering
 //!
-//! - [`tracing`] the underlying structured logging framework.
-//! - `taskvisor::Subscribe` trait that `TracingEventSubscriber` implements.
-//! - `solti-prometheus` is a complementary metrics subscriber for the same event stream.
-//! - See `examples/http-server` for a complete integration example.
+//! [`LoggerLevel`] validates a `tracing_subscriber::EnvFilter` expression.
+//! It preserves the original string for configuration round trips.
+//!
+//! ## Local Time
+//!
+//! UTC is the default.
+//! Text and JSON output can use the current local UTC offset:
+//!
+//! ```rust,no_run
+//! use solti_observe::{LoggerConfig, LoggerError, LoggerTimeZone, init_logger};
+//!
+//! # fn main() -> Result<(), LoggerError> {
+//! init_logger(&LoggerConfig {
+//!     timezone: LoggerTimeZone::Local,
+//!     ..Default::default()
+//! })?;
+//! # Ok(()) }
+//! ```
+//!
+//! [`init_logger`] detects the local offset first.
+//! It then installs the text or JSON subscriber.
+//! It returns [`LoggerError::LocalOffsetUnavailable`] when detection fails.
+//! It does not replace a requested local timezone with UTC.
+//!
+//! The offset stays cached after initialization.
+//! Feature `timezone-sync` adds a supervised task that refreshes it.
+//!
+//! ## Timezone Refresh
+//!
+//! ```text
+//! current system offset ──► timezone_sync task ──► atomic offset cache
+//!                                                       ▼
+//!                                                  text / JSON timer
+//! ```
+//!
+//! The task runs hourly after success.
+//! Failed detection uses exponential retry backoff.
+//!
+//! ## Feature Flags
+//!
+//! - `journald`: native journald output.
+//! - `log-compat`: forwards records from the `log` facade into `tracing`.
+//! - `timezone-sync`: supervised local-offset refresh task.
+//! - `full`: enables every optional integration.
+//!
+//! ## Main Types
+//!
+//! | Type               | Purpose                               |
+//! |--------------------|---------------------------------------|
+//! | [`LoggerConfig`]   | Complete serializable logger settings |
+//! | [`LoggerFormat`]   | Output backend selection              |
+//! | [`LoggerLevel`]    | Validated event filter                |
+//! | [`LoggerTimeZone`] | UTC or cached local timestamps        |
+//! | [`LoggerError`]    | Validation and initialization errors  |
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 /// Compiles the runnable Rust code blocks in `README.md` as doctests.
 #[cfg(doctest)]
@@ -105,16 +128,10 @@ struct ReadmeDoctests;
 
 mod logger;
 pub use logger::{
-    LoggerConfig, LoggerError, LoggerFormat, LoggerLevel, LoggerTimeZone, init_local_offset,
-    init_logger,
+    LoggerConfig, LoggerError, LoggerFormat, LoggerLevel, LoggerTimeZone, init_logger,
 };
 
-// Periodic task that re-detects the local UTC offset.
-// Enable with: `--features timezone-sync`
+/// Builds the periodic timezone refresh task.
 #[cfg(feature = "timezone-sync")]
+#[cfg_attr(docsrs, doc(cfg(feature = "timezone-sync")))]
 pub use logger::timezone_sync;
-
-#[cfg(feature = "subscriber")]
-mod subscriber;
-#[cfg(feature = "subscriber")]
-pub use subscriber::{TracingEventSubscriber, View, log_event};

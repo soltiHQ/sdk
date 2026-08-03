@@ -1,0 +1,26 @@
+name: Tag publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: tag-publish-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions: {
+  contents: write,
+  actions: write
+}
+
+jobs:
+  release:
+    name: release
+    uses: soltiHQ/actions/.github/workflows/rust-workspace-release.yml@v1
+    with:
+      crates-file: .github/crates.txt
+      prepare-task: proto/vendor
+      allow-dirty: true
+    secrets:
+      crates-io-token: ${{ secrets.CRATES_IO_TOKEN }}

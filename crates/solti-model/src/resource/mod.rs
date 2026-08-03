@@ -1,41 +1,40 @@
-//! K8s-style resource model.
+//! # Resource model
+//!
+//! [`TaskManifest`] is caller-owned desired state.
+//! [`Task`] adds server-owned metadata and observed status.
 //!
 //! ```text
-//!  ┌─────────────────────────────────────────────────────────┐
-//!  │                      Task                               │
-//!  │                                                         │
-//!  │  ObjectMeta            TaskSpec          TaskStatus     │
-//!  │  ├─ id: TaskId         ├─ slot            ├─ phase      │
-//!  │  ├─ resource_version   ├─ kind            ├─ attempt    │
-//!  │  ├─ created_at         ├─ timeout         ├─ error      │
-//!  │  └─ updated_at         ├─ restart         └─ exit_code  │
-//!  │                        ├─ backoff                       │
-//!  │                        ├─ admission                     │
-//!  │                        ├─ runner_selector               │
-//!  │                        └─ labels                        │
-//!  └─────────────────────────────────────────────────────────┘
+//! Task
+//!   metadata: ObjectMeta
+//!   spec:     TaskSpec
+//!   status:   TaskStatus
 //! ```
-//!
-//! | Type                | Role                                                |
-//! |---------------------|-----------------------------------------------------|
-//! | [`Task`]            | Top-level resource = metadata + spec + status       |
-//! | [`ObjectMeta`]      | Identity, versioning, timestamps                    |
-//! | [`TaskSpec`]        | Desired state - what to run, how to supervise       |
-//! | [`TaskSpecBuilder`] | Validated builder for [`TaskSpec`]                  |
-//! | [`TaskRun`]         | Record of a single task execution attempt           |
-//! | [`TaskStatus`]      | Observed state - phase, attempt count, last error   |
 
 mod spec;
 pub use spec::{TaskSpec, TaskSpecBuilder};
 
+mod annotations;
+pub use annotations::Annotations;
+
+mod condition;
+#[cfg(feature = "schema")]
+pub(crate) use condition::{CONDITION_REASON_MAX_BYTES, CONDITION_TYPE_MAX_BYTES};
+pub use condition::{ConditionStatus, TaskCondition, TaskConditionType};
+
 pub(crate) mod metadata;
-pub use metadata::ObjectMeta;
+pub use metadata::{ObjectMeta, Uid};
+
+mod preconditions;
+pub use preconditions::WritePreconditions;
 
 mod status;
 pub use status::TaskStatus;
 
 mod task;
-pub use task::Task;
+pub use task::{
+    DesiredChange, TASK_API_VERSION, TASK_API_VERSION_MAJOR, TASK_KIND, Task, TaskManifest,
+    TaskManifestMeta, TypeMeta,
+};
 
 mod run;
 pub use run::TaskRun;

@@ -1,54 +1,58 @@
+//! # Logger configuration
+//!
+//! [`LoggerConfig`] contains every setting used during logger installation.
+//! Serde fills omitted fields from [`Default`].
+//!
+//! ```text
+//! serialized config ──► LoggerConfig ──► init_logger
+//! ```
+
 use serde::{Deserialize, Serialize};
 use std::io::IsTerminal;
 
 use crate::logger::object::{LoggerFormat, LoggerLevel, LoggerTimeZone};
 
-/// Logger configuration passed to [`crate::init_logger`].
-///
-/// ```rust
-/// use solti_observe::LoggerConfig;
-///
-/// // Empty JSON → all defaults
-/// let cfg: LoggerConfig = serde_json::from_str("{}").unwrap();
-/// assert_eq!(cfg.format, solti_observe::LoggerFormat::Text);
-///
-/// // Override only what you need
-/// let cfg: LoggerConfig = serde_json::from_str(r#"{"level":"debug"}"#).unwrap();
-/// assert_eq!(cfg.level.as_str(), "debug");
-/// ```
+/// Complete settings passed to [`crate::init_logger`].
 ///
 /// ## Defaults
 ///
-/// | Field          | Default | Description                                |
-/// |----------------|---------|--------------------------------------------|
-/// | `format`       | `Text`  | Human-readable colored output              |
-/// | `level`        | `info`  | `tracing_subscriber::EnvFilter` expression |
-/// | `tz`           | `Utc`   | Timestamp timezone                         |
-/// | `with_targets` | `true`  | Include module/target names in output      |
-/// | `use_color`    | `true`  | Colored output (auto-disabled if not TTY)  |
+/// | Field          | Default | Used by                                |
+/// |----------------|---------|----------------------------------------|
+/// | `format`       | `Text`  | Backend selection                      |
+/// | `level`        | `info`  | Every backend                          |
+/// | `timezone`     | `Utc`   | Text and JSON timestamps               |
+/// | `with_targets` | `true`  | Text and JSON event targets            |
+/// | `use_color`    | `true`  | Text output on an interactive terminal |
 ///
-/// ## Also
+/// Missing Serde fields use these defaults.
 ///
-/// - [`init_logger`](crate::init_logger) consumes this config to install the global subscriber.
-/// - [`LoggerTimeZone`] timezone variants and the `init_local_offset` requirement.
-/// - [`LoggerFormat`] output format variants and their backends.
-/// - [`LoggerLevel`] validated filter expression syntax.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// ## Example
+///
+/// ```rust
+/// use solti_observe::{LoggerConfig, LoggerFormat};
+///
+/// let cfg: LoggerConfig = serde_json::from_str("{}").unwrap();
+/// assert_eq!(cfg.format, LoggerFormat::Text);
+///
+/// let cfg: LoggerConfig = serde_json::from_str(r#"{"level":"debug"}"#).unwrap();
+/// assert_eq!(cfg.level.as_str(), "debug");
+/// ```
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoggerConfig {
-    /// Output format: [`LoggerFormat::Text`], [`LoggerFormat::Json`], or [`LoggerFormat::Journald`].
+    /// Output backend.
     pub format: LoggerFormat,
-    /// Log level filter expression (e.g. `"info"`, `"solti_exec=trace,info"`).
+    /// Validated event filter.
     ///
-    /// Validated on construction: see [`LoggerLevel`] for syntax.
+    /// See [`LoggerLevel`] for accepted expressions.
     pub level: LoggerLevel,
-    /// Timestamp timezone: [`LoggerTimeZone::Utc`] or [`LoggerTimeZone::Local`].
-    pub tz: LoggerTimeZone,
-    /// Whether to include module/target names in log output.
+    /// Timestamp timezone for text and JSON logs.
+    pub timezone: LoggerTimeZone,
+    /// Whether text and JSON logs include the event target.
     pub with_targets: bool,
     /// Whether to use colored output.
     ///
-    /// Actual color usage also depends on stdout being a terminal - see [`should_use_color`](Self::should_use_color).
+    /// Colors are used only for text written to an interactive terminal.
     pub use_color: bool,
 }
 
@@ -57,7 +61,7 @@ impl Default for LoggerConfig {
         Self {
             format: LoggerFormat::default(),
             level: LoggerLevel::default(),
-            tz: LoggerTimeZone::default(),
+            timezone: LoggerTimeZone::default(),
             with_targets: true,
             use_color: true,
         }
@@ -65,23 +69,11 @@ impl Default for LoggerConfig {
 }
 
 impl LoggerConfig {
-    /// Determines whether colored output should be used.
+    /// Returns whether text output should use ANSI colors.
     ///
-    /// Color is enabled only if:
-    /// `use_color` config is `true` AND stdout is a terminal.
-    ///
-    /// This method should be called during logger initialization, not during
-    /// config parsing, to ensure accurate terminal detection.
-    ///
-    /// # Examples
-    /// ```rust
-    /// use solti_observe::LoggerConfig;
-    ///
-    /// let config = LoggerConfig::default();
-    /// let should_use_color = config.should_use_color();
-    /// // Returns true only if stdout is currently a terminal
-    /// ```
-    pub fn should_use_color(&self) -> bool {
+    /// Color is enabled only when `use_color` is `true` and stdout is a terminal.
+    /// JSON logs ignore colors.
+    pub(crate) fn should_use_color(&self) -> bool {
         self.use_color && std::io::stdout().is_terminal()
     }
 }
@@ -95,7 +87,7 @@ mod tests {
         let config = LoggerConfig::default();
 
         assert_eq!(config.format, LoggerFormat::Text);
-        assert_eq!(config.tz, LoggerTimeZone::Utc);
+        assert_eq!(config.timezone, LoggerTimeZone::Utc);
         assert_eq!(config.level.as_str(), "info");
         assert!(config.with_targets);
         assert!(config.use_color);
@@ -105,7 +97,7 @@ mod tests {
     fn serde_roundtrip() {
         let config = LoggerConfig {
             format: LoggerFormat::Json,
-            tz: LoggerTimeZone::Local,
+            timezone: LoggerTimeZone::Local,
             level: "debug".parse().unwrap(),
             with_targets: false,
             use_color: false,
@@ -118,28 +110,17 @@ mod tests {
         assert_eq!(config.with_targets, parsed.with_targets);
         assert_eq!(config.use_color, parsed.use_color);
         assert_eq!(config.format, parsed.format);
-        assert_eq!(config.tz, parsed.tz);
+        assert_eq!(config.timezone, parsed.timezone);
     }
 
     #[test]
-    fn serde_uses_defaults_for_missing_fields() {
-        let json = r#"{}"#;
-        let config: LoggerConfig = serde_json::from_str(json).unwrap();
-
-        assert_eq!(config.level.as_str(), LoggerLevel::default().as_str());
-        assert_eq!(config.format, LoggerFormat::default());
-        assert_eq!(config.tz, LoggerTimeZone::default());
-        assert!(config.with_targets);
-        assert!(config.use_color);
-    }
-
-    #[test]
-    fn partial_deserialization() {
+    fn serde_applies_defaults_to_missing_fields() {
         let json = r#"{"format": "json", "level": "debug"}"#;
         let config: LoggerConfig = serde_json::from_str(json).unwrap();
 
         assert_eq!(config.format, LoggerFormat::Json);
         assert_eq!(config.level.as_str(), "debug");
+        assert_eq!(config.timezone, LoggerTimeZone::Utc);
         assert!(config.with_targets);
         assert!(config.use_color);
     }

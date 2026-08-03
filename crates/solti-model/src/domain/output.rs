@@ -1,12 +1,44 @@
-//! Output streaming types for live tail of task stdout/stderr.
+//! # Task output
+//!
+//! [`OutputEvent`] is the shared live-output event.
+//! [`OutputChunk`] carries one binary stdout or stderr chunk.
+//!
+//! This module defines data and serde encoding only.
+//! Publishers, channels, retention, and subscriptions belong to higher layers.
+//!
+//! ## Serde Contract
+//!
+//! Events use a flat `type` tag.
+//! Timestamps use Unix milliseconds.
+//! Chunk bytes use standard padded base64.
+//!
+//! ```text
+//! OutputEvent
+//!   ├── chunk       ──▶ generation, attempt, stream, seq, ts, line
+//!   ├── runStarted  ──▶ generation, attempt, startedAt
+//!   ├── runFinished ──▶ generation, attempt, exitCode, finishedAt
+//!   └── lagged      ──▶ skipped
+//! ```
+//!
+//! `solti-api` maps the same domain events to the separate protobuf shape.
 
 use std::time::SystemTime;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-/// Which standard stream a chunk came from.
+/// Standard stream that produced a chunk.
+///
+/// ## Example
+///
+/// ```
+/// use solti_model::StreamKind;
+///
+/// let json = serde_json::to_string(&StreamKind::Stdout).unwrap();
+/// assert_eq!(json, r#""stdout""#);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum StreamKind {
     /// Standard output (`stdout`).
@@ -15,70 +47,155 @@ pub enum StreamKind {
     Stderr,
 }
 
-/// One event in the live-tail stream of a task.
+/// Event in a task live-output stream.
 ///
-/// Carries either an output line, a run boundary marker, or a backpressure signal.
-/// Wire format is JSON-tagged on `type`:
+/// Run markers are the best effort.
+/// They are not ordering barriers for chunks.
+///
+/// ## JSON Shape
 ///
 /// ```text
-/// {"type":"chunk","attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"..."}
-/// {"type":"runStarted","attempt":1,"startedAt":1700}
-/// {"type":"runFinished","attempt":1,"exitCode":0,"finishedAt":1701}
+/// {"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"aGVsbG8="}
+/// {"type":"runStarted","generation":2,"attempt":1,"startedAt":1700}
+/// {"type":"runFinished","generation":2,"attempt":1,"exitCode":0,"finishedAt":1701}
 /// {"type":"lagged","skipped":42}
 /// ```
+///
+/// ## Example
+///
+/// ```
+/// use bytes::Bytes;
+/// use solti_model::{OutputChunk, OutputEvent, StreamKind};
+/// use std::time::SystemTime;
+///
+/// let event = OutputEvent::Chunk(OutputChunk {
+///     generation: 2,
+///     attempt: 1,
+///     stream: StreamKind::Stdout,
+///     seq: 0,
+///     ts: SystemTime::UNIX_EPOCH,
+///     line: Bytes::from_static(b"hello"),
+/// });
+///
+/// let json = serde_json::to_string(&event).unwrap();
+/// assert!(json.contains(r#""type":"chunk""#));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum OutputEvent {
-    /// One line of stdout/stderr from the currently active run.
+    /// Carries stdout or stderr bytes from one run.
     Chunk(OutputChunk),
 
-    /// A new run attempt has started; sequence numbers reset from this point on.
+    /// Reports that a run attempt started.
+    ///
+    /// This marker is not an ordering barrier for chunks.
+    /// Use each chunk's `generation`, `attempt`, `stream`, and `seq` fields for grouping and ordering.
     #[serde(rename_all = "camelCase")]
     RunStarted {
+        /// Desired-state generation executed by this run.
+        generation: u64,
+        /// Attempt number of the run that just started.
         attempt: u32,
+        /// Wall-clock start time (unix milliseconds on the wire).
         #[serde(with = "crate::resource::metadata::time_serde")]
+        #[cfg_attr(
+            feature = "schema",
+            schemars(schema_with = "crate::schema::unix_millis")
+        )]
         started_at: SystemTime,
     },
 
-    /// The current run finished. Consumers can stop accumulating chunks for this attempt.
+    /// Reports that a run attempt finished.
+    ///
+    /// This marker is not an ordering barrier: chunks for the same generation and attempt may still be observed after it.
     #[serde(rename_all = "camelCase")]
     RunFinished {
+        /// Desired-state generation executed by this run.
+        generation: u64,
+        /// Attempt number of the run that finished.
         attempt: u32,
+        /// Process exit code.
+        ///
+        /// `None` means no exit code was available.
         #[serde(skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
+        /// Wall-clock finish time (unix milliseconds on the wire).
         #[serde(with = "crate::resource::metadata::time_serde")]
+        #[cfg_attr(
+            feature = "schema",
+            schemars(schema_with = "crate::schema::unix_millis")
+        )]
         finished_at: SystemTime,
     },
 
-    /// Subscriber fell behind the broadcast ring window.
-    Lagged { skipped: u64 },
+    /// Reports events lost before the next delivered event.
+    Lagged {
+        /// Number of lost events.
+        skipped: u64,
+    },
 }
 
-/// One line of output from a single task-run attempt.
+/// Output bytes from one task run.
 ///
-/// Carried through `tokio::sync::broadcast` channels in-process;
-/// sent to clients via SSE / gRPC server-stream.
+/// ## Example
+///
+/// ```
+/// use bytes::Bytes;
+/// use solti_model::{OutputChunk, StreamKind};
+/// use std::time::SystemTime;
+///
+/// let chunk = OutputChunk {
+///     generation: 2,
+///     attempt: 1,
+///     stream: StreamKind::Stderr,
+///     seq: 7,
+///     ts: SystemTime::UNIX_EPOCH,
+///     line: Bytes::from_static(b"warning"),
+/// };
+///
+/// assert_eq!(chunk.seq, 7);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct OutputChunk {
-    /// Which attempt of the task this chunk belongs to (matches [`TaskRun::attempt`]).
+    /// Desired-state generation this chunk belongs to.
+    pub generation: u64,
+    /// Attempt that produced this chunk.
     ///
     /// [`TaskRun::attempt`]: crate::TaskRun::attempt
     pub attempt: u32,
-    /// stdout or stderr.
+    /// Standard stream that produced the chunk.
     pub stream: StreamKind,
-    /// Monotonic sequence number within this attempt; resets on next run.
+    /// Sequence number within this generation, attempt, and stream.
+    ///
+    /// Producers define allocation and reset behavior.
     pub seq: u64,
-    /// Wall-clock time the line was read by the agent (unix milliseconds on the wire).
+    /// Wall-clock event time.
+    ///
+    /// Serde encodes it as Unix milliseconds.
     #[serde(with = "crate::resource::metadata::time_serde")]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::unix_millis")
+    )]
     pub ts: SystemTime,
-    /// One line, already truncated/cleaned by the runner.
-    #[serde(with = "bytes_as_utf8_string")]
+    /// Raw output bytes.
+    ///
+    /// Serde encodes them as standard padded base64.
+    #[serde(with = "bytes_as_base64")]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::base64_bytes")
+    )]
     pub line: Bytes,
 }
 
-/// Serde adapter: serialize `Bytes` as a UTF-8 string in JSON, deserialize from a JSON string back into `Bytes`.
-mod bytes_as_utf8_string {
+/// Serde adapter for exact binary round trips through JSON.
+mod bytes_as_base64 {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use bytes::Bytes;
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -86,8 +203,7 @@ mod bytes_as_utf8_string {
     where
         S: Serializer,
     {
-        let txt = std::str::from_utf8(b).map_err(serde::ser::Error::custom)?;
-        s.serialize_str(txt)
+        s.serialize_str(&STANDARD.encode(b))
     }
 
     pub(super) fn deserialize<'de, D>(d: D) -> Result<Bytes, D::Error>
@@ -95,7 +211,10 @@ mod bytes_as_utf8_string {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(d)?;
-        Ok(Bytes::from(s))
+        STANDARD
+            .decode(s)
+            .map(Bytes::from)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -106,117 +225,51 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
-    fn stream_kind_stdout_serializes_to_lowercase() {
-        let json = serde_json::to_string(&StreamKind::Stdout).unwrap();
-        assert_eq!(json, "\"stdout\"");
+    fn wire_shape_is_pinned_for_every_event() {
+        let cases = [
+            (
+                OutputEvent::Chunk(OutputChunk {
+                    generation: 2,
+                    attempt: 1,
+                    stream: StreamKind::Stdout,
+                    seq: 0,
+                    ts: UNIX_EPOCH + Duration::from_millis(1_700),
+                    line: Bytes::from_static(b"hi"),
+                }),
+                r#"{"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"aGk="}"#,
+            ),
+            (
+                OutputEvent::RunStarted {
+                    generation: 4,
+                    attempt: 2,
+                    started_at: UNIX_EPOCH + Duration::from_millis(1_234),
+                },
+                r#"{"type":"runStarted","generation":4,"attempt":2,"startedAt":1234}"#,
+            ),
+            (
+                OutputEvent::RunFinished {
+                    generation: 4,
+                    attempt: 2,
+                    exit_code: Some(0),
+                    finished_at: UNIX_EPOCH + Duration::from_millis(2_222),
+                },
+                r#"{"type":"runFinished","generation":4,"attempt":2,"exitCode":0,"finishedAt":2222}"#,
+            ),
+            (
+                OutputEvent::Lagged { skipped: 42 },
+                r#"{"type":"lagged","skipped":42}"#,
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(serde_json::to_string(&event).unwrap(), expected);
+        }
     }
 
     #[test]
-    fn output_chunk_roundtrips_through_json() {
-        let chunk = OutputChunk {
-            attempt: 7,
-            stream: StreamKind::Stderr,
-            seq: 42,
-            ts: UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
-            line: Bytes::from_static(b"compiling foo..."),
-        };
-
-        let json = serde_json::to_string(&chunk).unwrap();
-        let back: OutputChunk = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(back, chunk);
-    }
-
-    #[test]
-    fn output_chunk_serializes_ts_as_unix_milliseconds() {
-        let chunk = OutputChunk {
-            attempt: 1,
-            stream: StreamKind::Stdout,
-            seq: 0,
-            ts: UNIX_EPOCH + Duration::from_millis(1234),
-            line: Bytes::from_static(b"x"),
-        };
-
-        let json = serde_json::to_string(&chunk).unwrap();
-        assert!(
-            json.contains(r#""ts":1234"#),
-            "ts must serialize as unix milliseconds; got {json}"
-        );
-    }
-
-    #[test]
-    fn output_chunk_serializes_line_as_utf8_string_not_array() {
-        let chunk = OutputChunk {
-            attempt: 1,
-            stream: StreamKind::Stdout,
-            seq: 0,
-            ts: UNIX_EPOCH,
-            line: Bytes::from_static(b"hello"),
-        };
-        let json = serde_json::to_string(&chunk).unwrap();
-        assert!(
-            json.contains(r#""line":"hello""#),
-            "line must serialize as JSON string, not byte array; got {json}"
-        );
-    }
-
-    #[test]
-    fn output_event_chunk_inlines_chunk_fields() {
-        let event = OutputEvent::Chunk(OutputChunk {
-            attempt: 3,
-            stream: StreamKind::Stdout,
-            seq: 5,
-            ts: UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
-            line: Bytes::from_static(b"hello"),
-        });
-        let json = serde_json::to_string(&event).unwrap();
-
-        assert!(json.contains(r#""type":"chunk""#), "missing tag in {json}");
-        assert!(json.contains(r#""attempt":3"#), "{json}");
-        assert!(json.contains(r#""stream":"stdout""#), "{json}");
-        assert!(json.contains(r#""line":"hello""#), "{json}");
-    }
-
-    #[test]
-    fn output_event_run_started_carries_attempt_and_ts() {
-        let event = OutputEvent::RunStarted {
-            attempt: 2,
-            started_at: UNIX_EPOCH + Duration::from_millis(1234),
-        };
-        let json = serde_json::to_string(&event).unwrap();
-
-        assert!(json.contains(r#""type":"runStarted""#), "{json}");
-        assert!(json.contains(r#""attempt":2"#), "{json}");
-        assert!(json.contains(r#""startedAt":1234"#), "{json}");
-    }
-
-    #[test]
-    fn output_event_run_finished_carries_exit_code() {
-        let event = OutputEvent::RunFinished {
-            attempt: 2,
-            exit_code: Some(0),
-            finished_at: UNIX_EPOCH + Duration::from_millis(2222),
-        };
-        let json = serde_json::to_string(&event).unwrap();
-
-        assert!(json.contains(r#""type":"runFinished""#), "{json}");
-        assert!(json.contains(r#""exitCode":0"#), "{json}");
-        assert!(json.contains(r#""finishedAt":2222"#), "{json}");
-    }
-
-    #[test]
-    fn output_event_lagged_carries_skipped_count() {
-        let event = OutputEvent::Lagged { skipped: 1500 };
-        let json = serde_json::to_string(&event).unwrap();
-
-        assert!(json.contains(r#""type":"lagged""#), "{json}");
-        assert!(json.contains(r#""skipped":1500"#), "{json}");
-    }
-
-    #[test]
-    fn output_event_roundtrips_through_json() {
+    fn every_event_roundtrips_through_json() {
         let cases = [
             OutputEvent::Chunk(OutputChunk {
+                generation: 2,
                 attempt: 1,
                 stream: StreamKind::Stderr,
                 seq: 0,
@@ -224,10 +277,12 @@ mod tests {
                 line: Bytes::from_static(b"warning"),
             }),
             OutputEvent::RunStarted {
+                generation: 2,
                 attempt: 1,
                 started_at: UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
             },
             OutputEvent::RunFinished {
+                generation: 2,
                 attempt: 1,
                 exit_code: Some(42),
                 finished_at: UNIX_EPOCH + Duration::from_millis(1_700_000_001_000),
@@ -243,37 +298,19 @@ mod tests {
     }
 
     #[test]
-    fn output_chunk_uses_camel_case_keys() {
+    fn binary_chunk_roundtrips_exactly_as_base64() {
         let chunk = OutputChunk {
-            attempt: 2,
-            stream: StreamKind::Stdout,
-            seq: 9,
-            ts: UNIX_EPOCH,
-            line: Bytes::from_static(b"hi"),
-        };
-
-        let json = serde_json::to_string(&chunk).unwrap();
-        for key in [
-            r#""attempt":"#,
-            r#""stream":"#,
-            r#""seq":"#,
-            r#""ts":"#,
-            r#""line":"#,
-        ] {
-            assert!(json.contains(key), "missing key {key} in {json}");
-        }
-    }
-
-    #[test]
-    fn output_chunk_clone_is_refcount_bump() {
-        let original = OutputChunk {
+            generation: 1,
             attempt: 1,
             stream: StreamKind::Stdout,
             seq: 0,
             ts: UNIX_EPOCH,
-            line: Bytes::from_static(b"shared-line"),
+            line: Bytes::from_static(&[b'h', b'i', 0xFF, 0xFE]),
         };
-        let cloned = original.clone();
-        assert_eq!(original.line.as_ptr(), cloned.line.as_ptr());
+
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(json.contains(r#""line":"aGn//g==""#), "{json}");
+        let decoded: OutputChunk = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, chunk);
     }
 }

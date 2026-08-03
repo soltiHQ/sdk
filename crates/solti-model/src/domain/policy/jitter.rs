@@ -1,25 +1,33 @@
-//! # Jitter strategy.
+//! # Jitter policy
 //!
-//! [`JitterPolicy`] adds randomness to backoff delays to prevent thundering-herd effects.
+//! [`JitterPolicy`] selects how retry delay randomness is applied.
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 use crate::error::{ModelError, ModelResult};
 
-/// Controls how random jitter is applied to backoff delays.
+/// Jitter applied to a backoff delay.
 ///
-/// Jitter distributes retries over time, preventing synchronized "retry storms" when many tasks fail simultaneously.
+/// | Variant        | Delay range                              |
+/// |----------------|------------------------------------------|
+/// | `None`         | `base`                                   |
+/// | `Full`         | `[0, base]`                              |
+/// | `Equal`        | `[base / 2, base]`                       |
+/// | `Decorrelated` | `[first, min(base * 3, max)]`            |
 ///
-/// | Variant        | Delay range                  | Collision resistance |
-/// |----------------|------------------------------|----------------------|
-/// | `None`         | exactly `base`               | none (deterministic) |
-/// | `Full`         | uniform `[0, base]`          | highest              |
-/// | `Equal`        | `base/2 ± rand(base/2)`      | moderate             |
-/// | `Decorrelated` | `min(max, rand(base * 3))`   | high                 |
+/// The execution layer applies the selected policy.
 ///
-/// The exact math is implemented in the backoff subsystem; this enum only selects the strategy.
+/// ## Example
+///
+/// ```
+/// use solti_model::JitterPolicy;
+///
+/// assert_eq!("equal".parse::<JitterPolicy>().unwrap(), JitterPolicy::Equal);
+/// assert_eq!("".parse::<JitterPolicy>().unwrap(), JitterPolicy::Full);
+/// ```
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum JitterPolicy {
@@ -28,9 +36,10 @@ pub enum JitterPolicy {
     Full,
     /// No randomness applied. Backoff durations remain fixed.
     None,
-    /// Equal jitter: delay is sampled around the midpoint (`base / 2`), providing a balance between stability and randomness.
+    /// Equal jitter samples from `[base / 2, base]`.
     Equal,
-    /// Decorrelated jitter: delay is sampled from `min(max, rand(base * 3))`.
+    /// Memoryless randomized band: delay is sampled uniformly from
+    /// `[first, min(base * 3, max)]`.
     Decorrelated,
 }
 

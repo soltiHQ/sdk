@@ -1,27 +1,42 @@
-//! Build-time identity exposed as `solti_build_info` gauge (value always `1`).
+//! # Build information
 //!
-//! Labels carry the identity fields — dashboards and alerts use them to pin
-//! observations to a specific build. Typical labels:
+//! [`register_build_info`] exposes build identity as one gauge.
+//! The metric is always available.
 //!
-//!  - `version`
-//!  - `git_sha`
-//!  - `rustc`
-//!  - `built_at`
+//! ## Flow
+//!
+//! ```text
+//! constant labels ──► solti_build_info = 1 ──► Registry
+//! ```
 
 use prometheus::{IntGauge, Opts, Registry};
 
-/// Register a `solti_build_info{labels...}` gauge with value `1`.
+/// Registers a `solti_build_info{labels...}` gauge with value `1`.
 ///
-/// Labels are set as *constant* labels: they live on the metric descriptor and never change during process lifetime.
+/// Labels are stored as constant descriptor labels.
+/// The registered value does not change.
+///
+/// Labels can include `version`, `git_sha`, `rustc`, and `built_at`.
 ///
 /// ## Example
 ///
-/// ```text
-/// solti_prometheus::register_build_info(&registry, &[
+/// ```rust
+/// use solti_prometheus::{Registry, register_build_info};
+///
+/// # fn main() -> Result<(), prometheus::Error> {
+/// let registry = Registry::new();
+/// register_build_info(&registry, &[
 ///     ("version", env!("CARGO_PKG_VERSION")),
-///     ("rustc",   "1.90.0"),
+///     ("rustc", "1.90.0"),
 /// ])?;
+/// # Ok(())
+/// # }
 /// ```
+///
+/// # Errors
+///
+/// Returns a Prometheus error when a label or descriptor is invalid.
+/// A descriptor conflict returns [`prometheus::Error::AlreadyReg`].
 pub fn register_build_info(
     registry: &Registry,
     labels: &[(&str, &str)],

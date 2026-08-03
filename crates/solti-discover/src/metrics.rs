@@ -1,59 +1,113 @@
-//! Metrics interface for the discovery heartbeat task.
+//! # Discovery metrics
 //!
-//! Implement [`DiscoverMetricsBackend`] to record discovery lifecycle events.
+//! [`DiscoverMetricsBackend`] receives discovery lifecycle measurements.
+//! The default backend discards them.
+//!
+//! ```text
+//! sync attempt
+//!      ├──► record_attempt
+//!      ├──► record_success(duration)
+//!      ├──► record_failure(duration, reason)
+//!      └──► record_hold(seconds)
+//! ```
+//!
+//! [`DiscoverFailReason`] keeps failure label cardinality bounded.
+//! Transport error text is never used as a metric label.
 
 use std::sync::Arc;
 
-/// Canonical `outcome` label values (success / failure categorization).
+/// Canonical `outcome` label value for a successful sync attempt.
 pub const OUTCOME_SUCCESS: &str = "success";
-/// See [`OUTCOME_SUCCESS`].
+/// Canonical `outcome` label value for a failed sync attempt.
 pub const OUTCOME_FAILURE: &str = "failure";
 
-/// Canonical `reason` label values for heartbeat failures.
+/// Canonical `reason` label for heartbeat failures.
 ///
-/// Use these constants as `&'static str` inputs to
-/// [`DiscoverMetricsBackend::record_failure`] so label cardinality stays bounded.
-pub const FAIL_CONNECT: &str = "connect";
-/// Transport / network timeout.
-pub const FAIL_TIMEOUT: &str = "timeout";
-/// Server returned a 4xx-equivalent (client-side problem: bad request, not-found, already-exists, ...).
-pub const FAIL_REJECTED_CLIENT: &str = "rejected_client";
-/// Server returned a 5xx-equivalent (server-side problem: internal, unavailable, ...).
-pub const FAIL_REJECTED_SERVER: &str = "rejected_server";
-/// Response body couldn't be decoded.
-pub const FAIL_PARSE: &str = "parse";
-/// Authentication rejected.
-pub const FAIL_AUTH: &str = "auth";
-/// Anything else.
-pub const FAIL_OTHER: &str = "other";
+/// The set remains bounded regardless of transport error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DiscoverFailReason {
+    /// Connection could not be established.
+    Connect,
+    /// Transport operation timed out.
+    Timeout,
+    /// Control plane returned a client-side failure.
+    RejectedClient,
+    /// Control plane returned a server-side failure.
+    RejectedServer,
+    /// Response body could not be decoded.
+    Parse,
+    /// Authentication was rejected.
+    Auth,
+    /// Failure has no more specific category.
+    Other,
+}
+
+impl DiscoverFailReason {
+    /// Returns the stable metric label.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            DiscoverFailReason::RejectedClient => "rejected_client",
+            DiscoverFailReason::RejectedServer => "rejected_server",
+            DiscoverFailReason::Connect => "connect",
+            DiscoverFailReason::Timeout => "timeout",
+            DiscoverFailReason::Parse => "parse",
+            DiscoverFailReason::Other => "other",
+            DiscoverFailReason::Auth => "auth",
+        }
+    }
+}
 
 /// Metrics backend for the discovery heartbeat task.
 ///
-/// All methods have empty default bodies so integrators can override only the hooks they care about.
+/// Every method has an empty default body.
+/// Implementations can override only the required hooks.
 pub trait DiscoverMetricsBackend: Send + Sync + std::fmt::Debug {
-    /// Called once per sync attempt before the network call starts.
+    /// Records one transport attempt.
     fn record_attempt(&self) {}
 
-    /// Called when a sync attempt succeeds.
+    /// Records a successful transport attempt in milliseconds.
     fn record_success(&self, _duration_ms: u64) {}
 
-    /// Called when a sync attempt fails, with the canonical reason label.
-    fn record_failure(&self, _duration_ms: u64, _reason: &'static str) {}
+    /// Records a failed transport attempt in milliseconds.
+    fn record_failure(&self, _duration_ms: u64, _reason: DiscoverFailReason) {}
 
-    /// Called when the server advised a retry hold (`retry_after_s`), with the clamped value in seconds.
+    /// Records a clamped server-advised hold in seconds.
     fn record_hold(&self, _duration_s: u64) {}
 }
 
-/// Zero-cost default implementation that discards all events.
+/// No-op metrics backend.
 #[derive(Debug, Default)]
 pub struct NoOpDiscoverMetrics;
 
 impl DiscoverMetricsBackend for NoOpDiscoverMetrics {}
 
-/// Shareable handle used throughout this crate.
+/// Shared discovery metrics backend.
 pub type DiscoverMetricsHandle = Arc<dyn DiscoverMetricsBackend>;
 
-/// Construct a no-op handle - convenient default for `DiscoverConfig` (feature `grpc`/`http`).
+/// Creates a no-op metrics handle.
 pub fn noop_discover_metrics() -> DiscoverMetricsHandle {
     Arc::new(NoOpDiscoverMetrics)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discover_fail_reason_as_label_maps_all_variants() {
+        assert_eq!(DiscoverFailReason::Connect.as_label(), "connect");
+        assert_eq!(DiscoverFailReason::Timeout.as_label(), "timeout");
+        assert_eq!(
+            DiscoverFailReason::RejectedClient.as_label(),
+            "rejected_client"
+        );
+        assert_eq!(
+            DiscoverFailReason::RejectedServer.as_label(),
+            "rejected_server"
+        );
+        assert_eq!(DiscoverFailReason::Parse.as_label(), "parse");
+        assert_eq!(DiscoverFailReason::Auth.as_label(), "auth");
+        assert_eq!(DiscoverFailReason::Other.as_label(), "other");
+    }
 }

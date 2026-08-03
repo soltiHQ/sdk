@@ -1,33 +1,112 @@
-//! # TLS configuration error type.
+//! # TLS errors
+//!
+//! [`TlsError`] keeps failures grouped by loading and validation stage.
+//! [`PemRole`] identifies the purpose of affected PEM.
 
+use std::path::PathBuf;
+
+/// The purpose of PEM material in TLS settings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PemRole {
+    /// Certificate chain presented by a server.
+    ServerCertificate,
+    /// Private key used by a server.
+    ServerPrivateKey,
+    /// Roots used by a client to verify a server.
+    ServerTrustRoots,
+    /// Certificate chain presented by a client during mutual TLS.
+    ClientCertificate,
+    /// Private key used by a client during mutual TLS.
+    ClientPrivateKey,
+    /// Roots used by a server to verify mutual TLS clients.
+    ClientTrustRoots,
+}
+
+impl std::fmt::Display for PemRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ServerCertificate => "server certificate chain",
+            Self::ServerPrivateKey => "server private key",
+            Self::ServerTrustRoots => "server trust roots",
+            Self::ClientCertificate => "client certificate chain",
+            Self::ClientPrivateKey => "client private key",
+            Self::ClientTrustRoots => "client trust roots",
+        })
+    }
+}
+
+/// Errors returned while loading and validating TLS material.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TlsError {
-    /// Reading a [`PemSource::Path`](crate::PemSource::Path) from disk failed.
-    /// The underlying [`std::io::Error`] is the source.
-    #[error("PEM I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    /// Reading a configured PEM file failed.
+    #[error("failed to read {role} PEM from {path}: {source}")]
+    ReadPem {
+        /// Purpose of the PEM input.
+        role: PemRole,
+        /// Exact file that could not be read.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
 
-    /// The PEM parsed but contained no `CERTIFICATE` blocks where at least one was required (a cert chain or a CA bundle).
-    #[error("no certificates found in PEM")]
-    NoCertificates,
+    /// A PEM block was syntactically invalid for its role.
+    #[error("invalid {role} PEM: {source}")]
+    InvalidPem {
+        /// Purpose of the PEM input.
+        role: PemRole,
+        /// Underlying PEM parser error.
+        #[source]
+        source: rustls::pki_types::pem::Error,
+    },
 
-    /// The PEM parsed but contained no private key (`PKCS#8`, `PKCS#1`, or `SEC1`).
-    #[error("no private key found in PEM")]
-    NoPrivateKey,
+    /// A certificate or trust-root input contained no certificate blocks.
+    #[error("no certificates found in {role} PEM")]
+    NoCertificates {
+        /// Purpose of the PEM input.
+        role: PemRole,
+    },
 
-    /// A required builder field was absent at `build()` time, or a paired field was supplied alone (e.g. a client cert without its key).
-    /// Carries the field name (`"cert"`, `"key"`, `"ca"`, `"client_cert"`, `"client_key"`).
-    #[error("missing required field: {0}")]
-    MissingField(&'static str),
+    /// A private-key input contained no supported key block.
+    #[error("no private key found in {role} PEM")]
+    NoPrivateKey {
+        /// Purpose of the PEM input.
+        role: PemRole,
+    },
 
-    /// `rustls` rejected the assembled configuration - most commonly a certificate/key mismatch caught by `with_single_cert`.
-    /// The [`rustls::Error`] is the source.
-    #[error("rustls error: {0}")]
-    Rustls(#[from] rustls::Error),
+    /// A private-key input contained more than one key.
+    #[error("multiple private keys found in {role} PEM")]
+    MultiplePrivateKeys {
+        /// Purpose of the PEM input.
+        role: PemRole,
+    },
 
-    /// Building the mTLS client-certificate verifier failed - e.g. an empty trust anchor set or an invalid CRL.
-    /// The structured [`rustls::server::VerifierBuilderError`] is preserved as the source.
-    #[error("client verifier build failed: {0}")]
-    ClientVerifier(#[from] rustls::server::VerifierBuilderError),
+    /// A certificate could not be added to the rustls trust store for its role.
+    #[error("invalid certificate in {role}: {source}")]
+    InvalidCertificate {
+        /// Purpose of the certificate input.
+        role: PemRole,
+        /// Underlying rustls error.
+        #[source]
+        source: rustls::Error,
+    },
+
+    /// rustls rejected a certificate/private-key identity.
+    #[error("failed to configure {context}: {source}")]
+    Configuration {
+        /// Identity named in the error message.
+        context: &'static str,
+        /// Underlying rustls error.
+        #[source]
+        source: rustls::Error,
+    },
+
+    /// Building the mandatory mutual TLS client verifier failed.
+    #[error("failed to build client certificate verifier: {source}")]
+    ClientVerifier {
+        /// Underlying verifier builder error.
+        #[source]
+        source: rustls::server::VerifierBuilderError,
+    },
 }

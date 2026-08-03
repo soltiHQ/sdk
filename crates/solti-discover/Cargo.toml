@@ -1,52 +1,97 @@
 [package]
 name = "solti-discover"
-description = "Solti SDK agent-registration and heartbeat client for the Podium control-plane."
+
+description   = "Agent registration and heartbeat client for the Podium control plane."
+keywords      = ["discovery", "heartbeat", "agent", "grpc", "http"]
+categories    = ["network-programming", "asynchronous"]
+documentation = "https://docs.rs/solti-discover"
+readme        = "README.md"
 
 rust-version.workspace = true
-repository.workspace = true
-categories.workspace = true
-keywords.workspace = true
-homepage.workspace = true
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+repository.workspace   = true
+homepage.workspace     = true
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
 
 include = [
+    "examples/**/*.rs",
     "proto/**/*.proto",
     "src/**/*.rs",
-    "Cargo.toml",
+    "CONTRACT.md",
     "README.md",
     "build.rs",
 ]
 
-[package.metadata.docs.rs]
-all-features = true
-
 [features]
 default = []
-grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
-http = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:prost", "dep:pbjson"]
-tls  = ["dep:solti-tls", "tonic?/tls-ring", "reqwest?/rustls-no-provider", ]
+grpc = [
+    "dep:prost",
+    "dep:prost-reflect",
+    "dep:protoc-bin-vendored",
+    "dep:solti-model",
+    "dep:taskvisor",
+    "dep:tokio",
+    "dep:tonic",
+    "dep:tonic-prost",
+    "dep:tonic-prost-build",
+    "dep:tracing",
+]
+http = [
+    "dep:pbjson",
+    "dep:pbjson-build",
+    "dep:prost",
+    "dep:prost-reflect",
+    "dep:protoc-bin-vendored",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:solti-model",
+    "dep:taskvisor",
+    "dep:tokio",
+    "dep:tonic-prost-build",
+    "dep:tracing",
+]
+tls  = ["dep:solti-tls", "reqwest?/rustls-no-provider", "tonic?/tls-native-roots", "tonic?/tls-ring"]
 
 [dependencies]
+solti-model = { workspace = true, optional = true }
+solti-tls   = { workspace = true, optional = true }
+
 pbjson      = { workspace = true, optional = true }
 prost       = { workspace = true, optional = true }
 reqwest     = { workspace = true, features = ["json"], optional = true }
 serde       = { workspace = true, optional = true }
 serde_json  = { workspace = true, optional = true }
-taskvisor   = { workspace = true }
+taskvisor   = { workspace = true, optional = true }
 thiserror   = { workspace = true }
-tokio       = { workspace = true }
-tokio-util  = { workspace = true }
+tokio       = { workspace = true, optional = true }
 tonic       = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
-tracing     = { workspace = true }
-
-solti-core  = { workspace = true }
-solti-model = { workspace = true }
-solti-tls   = { workspace = true, optional = true }
+tracing     = { workspace = true, optional = true }
 
 [build-dependencies]
-pbjson-build        = { workspace = true }
-protoc-bin-vendored = { workspace = true }
-tonic-prost-build   = { workspace = true }
+pbjson-build        = { workspace = true, optional = true }
+prost-reflect       = { workspace = true, optional = true }
+protoc-bin-vendored = { workspace = true, optional = true }
+tonic-prost-build   = { workspace = true, optional = true }
+
+[dev-dependencies]
+taskvisor = { workspace = true, features = ["test-util"] }
+tokio     = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
+
+[[example]]
+name              = "grpc_sync"
+required-features = ["grpc"]
+
+[[example]]
+name              = "http_sync"
+required-features = ["http"]
+
+[[example]]
+name              = "retryability"
+required-features = ["grpc", "http"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

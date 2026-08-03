@@ -1,6 +1,16 @@
-//! # Embedded discovery tasks.
+//! # Embedded discovery task
 //!
-//! Each function returns `(TaskRef, TaskSpec)` ready for `SupervisorApi::submit_with_task`.
+//! [`sync`] returns a complete desired resource and its prebuilt runtime task.
+//!
+//! ```text
+//! DiscoverConfig + UptimeSource
+//!             ▼
+//!           sync
+//!             ├──► TaskManifest
+//!             └──► taskvisor::TaskRef
+//! ```
 
 mod sync;
 pub use sync::sync;
+
+mod transport;

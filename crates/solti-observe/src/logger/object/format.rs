@@ -1,6 +1,12 @@
-//! # Output format value object ([`LoggerFormat`]).
+//! # Log formats
 //!
-//! Parses and represents the log output backend: `text`, `json`, or `journald`.
+//! [`LoggerFormat`] selects the backend installed by [`crate::init_logger`].
+//!
+//! ```text
+//! text ─────┐
+//! JSON ─────┼──► LoggerFormat ──► logger backend
+//! journald ─┘
+//! ```
 
 use std::{fmt, str::FromStr};
 
@@ -8,38 +14,46 @@ use serde::{Deserialize, Serialize, Serializer};
 
 use crate::logger::LoggerError;
 
-/// Output format for the logger.
+/// Output backend for the logger.
 ///
-/// Determines which [`tracing_subscriber`] layer [`crate::init_logger`] installs.
+/// Parsing trims surrounding whitespace and ignores ASCII case.
+/// `journal` is an alias for `journald`.
 ///
-/// ## Variants
+/// ## Formats
 ///
-/// | Variant    | Backend                          | Use case                         |
-/// |------------|----------------------------------|----------------------------------|
-/// | `Text`     | `tracing_subscriber::fmt`        | Local development, human reading |
-/// | `Json`     | `tracing_subscriber::fmt::json`  | Log aggregation (ELK, Loki)      |
-/// | `Journald` | `tracing_journald`               | systemd services (Linux only)    |
+/// | Variant    | Backend                         | Feature    |
+/// |------------|---------------------------------|------------|
+/// | `Text`     | `tracing_subscriber::fmt`       | Always     |
+/// | `Json`     | `tracing_subscriber::fmt::json` | Always     |
+/// | `Journald` | `tracing_journald`              | `journald` |
 ///
-/// ## Parsing
+/// Parsing journald without its feature returns [`LoggerError::JournaldNotEnabled`].
+/// Parsing it with the feature on a non-Linux target returns `LoggerError::JournaldNotSupported`.
 ///
-/// Supports case-insensitive [`FromStr`] and serde deserialization:
+/// Serialization uses canonical lowercase names.
 ///
-/// ```rust
+/// ## Example
+///
+/// ```
 /// use solti_observe::LoggerFormat;
 ///
-/// let fmt: LoggerFormat = "json".parse().unwrap();
-/// assert_eq!(fmt, LoggerFormat::Json);
+/// let format: LoggerFormat = " JSON ".parse().unwrap();
+/// assert_eq!(format, LoggerFormat::Json);
+/// assert_eq!(format.to_string(), "json");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LoggerFormat {
-    /// Text logs with optional ANSI colors (default).
+    /// Text logs with optional ANSI colors.
     Text,
-    /// Structured JSON logs (ANSI colors always disabled).
+    /// Structured JSON logs.
     Json,
-    /// systemd-journald output (Linux only).
+    /// systemd-journald output.
     ///
-    /// Parsing or deserializing this variant on non-Linux returns an error.
+    /// Available with feature `journald`.
+    /// Initialization is supported on Linux.
+    #[cfg(feature = "journald")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "journald")))]
     Journald,
 }
 
@@ -58,13 +72,17 @@ impl FromStr for LoggerFormat {
             "text" => Ok(Self::Text),
             "json" => Ok(Self::Json),
             "journald" | "journal" => {
-                #[cfg(target_os = "linux")]
+                #[cfg(all(feature = "journald", target_os = "linux"))]
                 {
                     Ok(Self::Journald)
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(all(feature = "journald", not(target_os = "linux")))]
                 {
                     Err(LoggerError::JournaldNotSupported)
+                }
+                #[cfg(not(feature = "journald"))]
+                {
+                    Err(LoggerError::JournaldNotEnabled)
                 }
             }
             _ => Err(LoggerError::InvalidFormat(s.to_string())),
@@ -77,6 +95,7 @@ impl fmt::Display for LoggerFormat {
         let s = match self {
             LoggerFormat::Text => "text",
             LoggerFormat::Json => "json",
+            #[cfg(feature = "journald")]
             LoggerFormat::Journald => "journald",
         };
         f.write_str(s)
@@ -113,24 +132,43 @@ mod tests {
     }
 
     #[test]
-    fn parses_basic_formats_case_insensitive() {
-        assert_eq!(LoggerFormat::from_str("text").unwrap(), LoggerFormat::Text);
-        assert_eq!(LoggerFormat::from_str("TEXT").unwrap(), LoggerFormat::Text);
-        assert_eq!(LoggerFormat::from_str("json").unwrap(), LoggerFormat::Json);
-        assert_eq!(LoggerFormat::from_str("JsOn").unwrap(), LoggerFormat::Json);
+    fn basic_formats_parse_case_insensitively_and_display_canonically() {
+        for (lowercase, mixed_case, expected) in [
+            ("text", "TEXT", LoggerFormat::Text),
+            ("json", "JsOn", LoggerFormat::Json),
+        ] {
+            assert_eq!(LoggerFormat::from_str(lowercase).unwrap(), expected);
+            assert_eq!(LoggerFormat::from_str(mixed_case).unwrap(), expected);
+            assert_eq!(expected.to_string(), lowercase);
+        }
     }
 
     #[test]
-    fn journald_behavior_is_platform_specific() {
-        #[cfg(target_os = "linux")]
+    fn journald_parse_and_serde_are_platform_specific() {
+        #[cfg(all(feature = "journald", target_os = "linux"))]
         {
-            assert!(LoggerFormat::from_str("journald").is_ok());
+            assert_eq!(
+                LoggerFormat::from_str("journald").unwrap(),
+                LoggerFormat::Journald
+            );
+            assert_eq!(
+                serde_json::from_str::<LoggerFormat>(r#""journald""#).unwrap(),
+                LoggerFormat::Journald
+            );
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(feature = "journald", not(target_os = "linux")))]
         {
             let err = LoggerFormat::from_str("journald").unwrap_err();
             assert!(matches!(err, LoggerError::JournaldNotSupported));
+            assert!(serde_json::from_str::<LoggerFormat>(r#""journald""#).is_err());
+        }
+
+        #[cfg(not(feature = "journald"))]
+        {
+            let err = LoggerFormat::from_str("journald").unwrap_err();
+            assert!(matches!(err, LoggerError::JournaldNotEnabled));
+            assert!(serde_json::from_str::<LoggerFormat>(r#""journald""#).is_err());
         }
     }
 
@@ -148,47 +186,16 @@ mod tests {
     }
 
     #[test]
-    fn display_returns_canonical_names() {
-        assert_eq!(LoggerFormat::Text.to_string(), "text");
-        assert_eq!(LoggerFormat::Json.to_string(), "json");
-        assert_eq!(LoggerFormat::Journald.to_string(), "journald");
-    }
-
-    #[test]
-    fn serde_roundtrip() {
-        for fmt in [LoggerFormat::Text, LoggerFormat::Json] {
-            let json = serde_json::to_string(&fmt).unwrap();
-            let parsed: LoggerFormat = serde_json::from_str(&json).unwrap();
-            assert_eq!(fmt, parsed, "serde roundtrip failed for {fmt:?}");
-        }
-    }
-
-    #[test]
-    fn serde_platform_checks() {
-        let json = r#""journald""#;
-
-        #[cfg(target_os = "linux")]
-        {
-            let parsed: LoggerFormat = serde_json::from_str(json).unwrap();
-            assert_eq!(parsed, LoggerFormat::Journald);
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            let err = serde_json::from_str::<LoggerFormat>(json);
-            assert!(
-                err.is_err(),
-                "Journald deserialization should fail on non-Linux"
+    fn serde_uses_canonical_output_and_case_insensitive_input() {
+        for (format, canonical, uppercase) in [
+            (LoggerFormat::Text, r#""text""#, r#""TEXT""#),
+            (LoggerFormat::Json, r#""json""#, r#""JSON""#),
+        ] {
+            assert_eq!(serde_json::to_string(&format).unwrap(), canonical);
+            assert_eq!(
+                serde_json::from_str::<LoggerFormat>(uppercase).unwrap(),
+                format
             );
-        }
-    }
-
-    #[test]
-    fn serde_accepts_case_insensitive_input() {
-        for input in ["text", "TEXT", "Text"] {
-            let json = format!(r#""{input}""#);
-            let parsed: LoggerFormat = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed, LoggerFormat::Text);
         }
     }
 }

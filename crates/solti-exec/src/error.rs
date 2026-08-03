@@ -1,30 +1,34 @@
-//! # Error types.
+//! # Execution errors
 
 use thiserror::Error;
 
+/// Errors returned by runner registration and backend configuration.
+///
+/// Match with a wildcard arm because this enum is non-exhaustive.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ExecError {
-    /// A runner with this name is already registered in the router.
-    #[error("duplicate runner detected: runner with name '{name}' is already registered")]
-    DuplicateRunner {
-        /// The conflicting runner name.
-        name: String,
-    },
+    /// The runner router rejected registration.
+    #[error(transparent)]
+    Router(#[from] solti_runner::RouterError),
 
-    /// Backend configuration failed validation (zero limits, fail-open security policy, unenforceable confinement, …).
+    /// The runner name or backend configuration is invalid.
     #[error("invalid runner configuration: {0}")]
     InvalidRunnerConfig(String),
 
-    /// The task spec was malformed (e.g. an empty command).
-    #[error("invalid specification: {0}")]
-    InvalidSpec(String),
-
-    /// An unexpected internal error. Reserved as a forward-compatibility escape hatch; not constructed on any current path.
-    #[error("internal error: {0}")]
-    Internal(String),
-
-    /// An OS-level I/O failure (spawn, cgroup/tempfile setup, …).
+    /// An operating-system resource could not be read or prepared.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+#[cfg(feature = "host-process")]
+impl From<crate::host::HostProcessError> for ExecError {
+    fn from(error: crate::host::HostProcessError) -> Self {
+        match error {
+            crate::host::HostProcessError::InvalidConfig(message) => {
+                Self::InvalidRunnerConfig(message)
+            }
+            crate::host::HostProcessError::Io(error) => Self::Io(error),
+        }
+    }
 }

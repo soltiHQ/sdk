@@ -1,6 +1,7 @@
-//! # Execution slot.
+//! # Execution slot
 //!
-//! [`Slot`] is the logical execution lane name (newtype over `Arc<str>`).
+//! [`Slot`] is a logical concurrency key.
+//! It accepts `[A-Za-z0-9._-]` and is limited to [`SLOT_MAX_LEN`] bytes.
 
 use super::validate_identity;
 use crate::error::ModelError;
@@ -9,38 +10,39 @@ use crate::error::ModelError;
 pub const SLOT_MAX_LEN: usize = 64;
 
 arc_str_newtype! {
+    #[cfg_attr(feature = "schema", schemars(schema_with = "crate::schema::slot"))]
     /// Logical identifier for a controller slot.
     ///
     /// A slot groups tasks that share a single execution lane.
-    ///
-    /// ```text
-    ///  Slot: "build-pipeline"         Slot: "deploy"
-    ///  ┌───────────────────────┐      ┌────────────────────────┐
-    ///  │  TaskId: sub-build-1  │      │  TaskId: sub-deploy-1  │
-    ///  │  TaskId: sub-build-2  │      │  TaskId: sub-deploy-2  │
-    ///  │  TaskId: sub-build-3  │      │  TaskId: sub-deploy-3  │
-    ///  │        ...            │      │        ...             │
-    ///  └───────────────────────┘      └────────────────────────┘
-    ///         one lane                        one lane
-    ///     (one at a time)                  (one at a time)
-    /// ```
+    /// Controllers use slots for admission policy and queue behavior.
     ///
     /// ```rust
     /// use solti_model::Slot;
     ///
-    /// let slot = Slot::new("build-pipeline");
+    /// let slot = Slot::new("build-pipeline").unwrap();
     /// assert_eq!(slot.as_str(), "build-pipeline");
     ///
-    /// let slot: Slot = "deploy".into();
+    /// let slot = Slot::new("deploy").unwrap();
     /// assert_eq!(format!("{slot}"), "deploy");
     /// ```
     pub struct Slot;
 }
 
 impl Slot {
-    /// Validate that the slot name is safe to use across the SDK.
+    /// Validates the slot.
     ///
-    /// See `validate_identity` (module-private) for the exact rules.
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the value is empty, too long, equal to `"."` or `".."`, or contains a byte outside `[A-Za-z0-9._-]`.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::Slot;
+    ///
+    /// assert!(Slot::new("build.frontend").is_ok());
+    /// assert!(Slot::new("build/frontend").is_err());
+    /// ```
     pub fn validate_format(&self) -> Result<(), ModelError> {
         validate_identity("slot", self.as_str(), SLOT_MAX_LEN)
     }
@@ -52,70 +54,37 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn new_and_as_str() {
-        let slot = Slot::new("my-slot");
-        assert_eq!(slot.as_str(), "my-slot");
-    }
+    fn exposes_string_conversions_and_shares_clones() {
+        let slot = Slot::new("shared").unwrap();
+        let parsed: Slot = "shared".parse().unwrap();
 
-    #[test]
-    fn from_str_and_string() {
-        let a: Slot = "abc".into();
-        let b: Slot = String::from("abc").into();
-        assert_eq!(a, b);
-    }
+        assert_eq!(slot.as_str(), "shared");
+        assert_eq!(format!("{slot}"), "shared");
+        assert_eq!(slot, *"shared");
+        assert_eq!(slot, parsed);
 
-    #[test]
-    fn display() {
-        let slot = Slot::new("demo");
-        assert_eq!(format!("{slot}"), "demo");
-    }
-
-    #[test]
-    fn partial_eq_with_str() {
-        let slot = Slot::new("test");
-        assert_eq!(slot, *"test");
-    }
-
-    #[test]
-    fn serde_transparent() {
-        let slot = Slot::new("build");
-        let json = serde_json::to_string(&slot).unwrap();
-        assert_eq!(json, "\"build\"");
-
-        let back: Slot = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, slot);
-    }
-
-    #[test]
-    fn into_inner() {
-        let slot = Slot::new("owned");
-        let s: Arc<str> = slot.into_inner();
-        assert_eq!(&*s, "owned");
-    }
-
-    #[test]
-    fn clone_is_cheap() {
-        let slot = Slot::new("shared");
         let cloned = slot.clone();
         let a: Arc<str> = slot.into_inner();
         let b: Arc<str> = cloned.into_inner();
+        assert_eq!(&*a, "shared");
         assert!(Arc::ptr_eq(&a, &b));
     }
 
     #[test]
-    fn validate_format_accepts_valid() {
-        Slot::new("build.frontend").validate_format().unwrap();
-        Slot::new("build").validate_format().unwrap();
-        Slot::new("a").validate_format().unwrap();
+    fn serde_is_transparent() {
+        let slot = Slot::new("build").unwrap();
+        let json = serde_json::to_string(&slot).unwrap();
+        assert_eq!(json, "\"build\"");
+        assert_eq!(serde_json::from_str::<Slot>(&json).unwrap(), slot);
     }
 
     #[test]
-    fn validate_format_rejects_invalid() {
-        assert!(Slot::new("build/frontend").validate_format().is_err());
-        assert!(Slot::new("с кириллицей").validate_format().is_err());
-        assert!(Slot::new("with space").validate_format().is_err());
-        assert!(Slot::new("a\nb").validate_format().is_err());
-        assert!(Slot::new(".").validate_format().is_err());
-        assert!(Slot::new("").validate_format().is_err());
+    fn validation_accepts_safe_values_and_rejects_unsafe_values() {
+        for valid in ["build.frontend", "build", "a"] {
+            Slot::new(valid).unwrap();
+        }
+        for invalid in ["build/frontend", "é", "with space", "a\nb", ".", ""] {
+            assert!(Slot::new(invalid).is_err(), "must reject {invalid:?}");
+        }
     }
 }

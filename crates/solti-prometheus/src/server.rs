@@ -1,10 +1,22 @@
-//! # Embedded metrics HTTP server (feature `server`).
+//! # Metrics server
 //!
-//! [`server`] builds a supervised axum task that serves `/metrics` (Prometheus text exposition, `text/plain; version=0.0.4`) from a shared [`Registry`].
-//! Bind/serve failures are retried under supervisor backoff; shutdown is cooperative via the task's `CancellationToken`.
-//! The task runs under [`AdmissionPolicy::Replace`] in the [`METRICS_SERVER_SLOT`] slot.
+//! [`server`] builds an embedded task for a Prometheus endpoint.
+//! The task reads one shared [`Registry`].
 //!
-//! See the [crate root](crate) for the namespace/architecture overview.
+//! Enable it with the `server` feature.
+//!
+//! ## Flow
+//!
+//! ```text
+//! Registry + address + revision
+//!              ▼
+//!          server()
+//!              ├──► TaskManifest
+//!              └──► TaskRef ──► bind address ──► GET /metrics
+//! ```
+//!
+//! `server()` does not bind the address.
+//! Binding starts when Taskvisor runs the returned task.
 
 use std::sync::Arc;
 
@@ -17,60 +29,103 @@ use axum::{
 };
 use prometheus::{Encoder, Registry, TextEncoder};
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind, TaskSpec,
+    AdmissionPolicy, BackoffPolicy, EmbeddedSpec, JitterPolicy, RestartPolicy, TaskManifest,
+    TaskSpec, TaskWorkload,
 };
-use taskvisor::{TaskError, TaskFn, TaskRef};
-use tokio_util::sync::CancellationToken;
+use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tracing::{debug, error, info};
 
-/// Logical slot name for the metrics server task.
+/// Slot used by the embedded metrics server.
+///
+/// ## Example
+///
+/// ```
+/// assert_eq!(solti_prometheus::METRICS_SERVER_SLOT, "solti-metrics-server");
+/// ```
 pub const METRICS_SERVER_SLOT: &str = "solti-metrics-server";
 
-/// Per-attempt timeout in milliseconds (effectively infinite — long-running server).
+/// Per-attempt timeout used by the task specification.
 const METRICS_SERVER_TIMEOUT_MS: u64 = u64::MAX;
 
 /// Prometheus text exposition content-type (format version 0.0.4).
 const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// Initial backoff delay on failure (ms).
+/// Initial backoff delay on failure in milliseconds.
 const BACKOFF_FIRST_MS: u64 = 1_000;
 
-/// Maximum backoff delay on repeated failures (ms).
+/// Maximum backoff delay on repeated failures in milliseconds.
 const BACKOFF_MAX_MS: u64 = 30_000;
 
 /// Backoff multiplier per consecutive failure.
 const BACKOFF_FACTOR: f64 = 2.0;
 
-/// Builds the metrics HTTP server task and its supervision specification.
+/// Builds a supervised metrics-server task.
 ///
-/// Serves `/metrics` (Prometheus text exposition format) from the given shared [`Registry`].
-/// The task runs under supervisor control so bind and serve errors are retried with backoff;
-/// graceful shutdown is propagated via [`CancellationToken`].
+/// The returned [`TaskManifest`] and [`TaskRef`] form one embedded task.
+/// Submit both through the `solti-core` embedded-task API.
 ///
-/// ## Scheduling
+/// ## Runtime Flow
 ///
-/// | Scenario      | Delay           | Strategy                              |
-/// |---------------|-----------------|---------------------------------------|
-/// | Success       | Immediate       | Always restart (server runs forever)  |
-/// | Failure       | 1 s → 30 s      | Exponential backoff with equal jitter |
-/// | Duplicate     | Replaces        | [`AdmissionPolicy::Replace`]          |
+/// ```text
+/// Taskvisor attempt
+///       │
+///       ├── bind failure ─────────────► TaskError::Fail
+///       ├── serve failure ────────────► TaskError::Fail
+///       ├── cancellation ─────────────► graceful shutdown
+///       └── GET /metrics ──► gather ──► Prometheus text
+/// ```
+///
+/// ## Task Settings
+///
+/// | Setting         | Value                                      |
+/// |-----------------|--------------------------------------------|
+/// | Slot            | [`METRICS_SERVER_SLOT`]                    |
+/// | Workload        | Embedded                                   |
+/// | Restart         | Always, without an interval                |
+/// | Failure backoff | 1s to 30s, factor `2`, equal jitter        |
+/// | Admission       | [`AdmissionPolicy::Replace`]               |
+/// | Attempt timeout | `u64::MAX` milliseconds                    |
+///
+/// The composed embedded revision contains the caller revision and listen address.
+/// Changing either value changes the revision.
 ///
 /// ## Example
 ///
-/// ```text
+/// ```rust,no_run
 /// use std::sync::Arc;
 /// use solti_prometheus::{Registry, server};
 ///
 /// let registry = Arc::new(Registry::new());
 /// // ... register collectors into `registry` ...
 ///
-/// let (task, spec) = server(registry.clone(), "0.0.0.0:9090");
-/// supervisor.submit_with_task(task, &spec).await?;
+/// let (manifest, task_ref) = server(
+///     registry.clone(),
+///     "0.0.0.0:9090",
+///     "my-agent@v1",
+/// )?;
+/// // Submit to a running supervisor:
+/// // supervisor.create_embedded_task(manifest, task_ref).await?;
+/// # let _ = (manifest, task_ref);
+/// # Ok::<(), solti_model::ModelError>(())
 /// ```
-pub fn server(registry: Arc<Registry>, addr: impl Into<String>) -> (TaskRef, TaskSpec) {
+///
+/// # Errors
+///
+/// Returns [`solti_model::ModelError`] when the caller revision is invalid.
+/// It also returns this error when the composed task specification is invalid.
+///
+/// Address parsing and binding happen inside the task.
+/// A bind failure becomes a retryable [`TaskError`].
+pub fn server(
+    registry: Arc<Registry>,
+    addr: impl Into<String>,
+    revision: impl Into<String>,
+) -> Result<(TaskManifest, TaskRef), solti_model::ModelError> {
     let addr: String = addr.into();
+    let caller_revision = EmbeddedSpec::new(revision)?;
+    let revision = format!("{}|addr={addr}", caller_revision.revision());
 
-    let task: TaskRef = TaskFn::arc(METRICS_SERVER_SLOT, move |ctx: CancellationToken| {
+    let task: TaskRef = TaskFn::arc(METRICS_SERVER_SLOT, move |ctx: TaskContext| {
         let addr = addr.clone();
         let registry = registry.clone();
         async move {
@@ -82,13 +137,9 @@ pub fn server(registry: Arc<Registry>, addr: impl Into<String>) -> (TaskRef, Tas
                 .route("/metrics", get(metrics_handler))
                 .with_state(registry);
 
-            let listener =
-                tokio::net::TcpListener::bind(&addr)
-                    .await
-                    .map_err(|e| TaskError::Fail {
-                        reason: format!("metrics listener bind failed on {addr}: {e}"),
-                        exit_code: None,
-                    })?;
+            let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+                TaskError::fail(format!("metrics listener bind failed on {addr}: {e}"))
+            })?;
             debug!(addr = %addr, "metrics server started");
             info!("metrics http://{addr}/metrics");
 
@@ -102,13 +153,10 @@ pub fn server(registry: Arc<Registry>, addr: impl Into<String>) -> (TaskRef, Tas
                 return Err(TaskError::Canceled);
             }
 
-            Err(TaskError::Fail {
-                reason: match serve_result {
-                    Ok(()) => "metrics server exited unexpectedly".to_string(),
-                    Err(e) => format!("metrics server error: {e}"),
-                },
-                exit_code: None,
-            })
+            Err(TaskError::fail(match serve_result {
+                Ok(()) => "metrics server exited unexpectedly".to_string(),
+                Err(e) => format!("metrics server error: {e}"),
+            }))
         }
     });
 
@@ -118,18 +166,20 @@ pub fn server(registry: Arc<Registry>, addr: impl Into<String>) -> (TaskRef, Tas
         max_ms: BACKOFF_MAX_MS,
         factor: BACKOFF_FACTOR,
     };
+    let embedded = EmbeddedSpec::new(revision)?;
     let spec = TaskSpec::builder(
         METRICS_SERVER_SLOT,
-        TaskKind::Embedded,
+        TaskWorkload::Embedded(embedded),
         METRICS_SERVER_TIMEOUT_MS,
     )
     .restart(RestartPolicy::always())
     .backoff(backoff)
     .admission(AdmissionPolicy::Replace)
-    .build()
-    .expect("metrics server spec must be valid");
+    .build()?;
 
-    (task, spec)
+    let manifest = TaskManifest::new(METRICS_SERVER_SLOT, spec)?;
+
+    Ok((manifest, task))
 }
 
 async fn metrics_handler(State(registry): State<Arc<Registry>>) -> axum::response::Response {
@@ -141,5 +191,30 @@ async fn metrics_handler(State(registry): State<Arc<Registry>>) -> axum::respons
             error!("metrics encode error: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_revision_covers_caller_state_and_listen_address() {
+        let (manifest, _) = server(
+            Arc::new(Registry::new()),
+            "127.0.0.1:9090",
+            "agent-registry-v2",
+        )
+        .unwrap();
+        let TaskWorkload::Embedded(embedded) = manifest.spec().workload() else {
+            panic!("metrics server must use an Embedded workload");
+        };
+
+        assert_eq!(embedded.revision(), "agent-registry-v2|addr=127.0.0.1:9090");
+    }
+
+    #[test]
+    fn server_rejects_an_empty_caller_revision() {
+        assert!(server(Arc::new(Registry::new()), "127.0.0.1:9090", "  ").is_err());
     }
 }

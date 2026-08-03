@@ -1,23 +1,31 @@
-//! # Supervisor API.
+//! # Supervisor API
 //!
-//! High-level API over taskvisor `Supervisor` used by solti-core.
+//! [`SupervisorApi`] is the main lifecycle boundary of `solti-core`.
+//! It commits a complete [`Task`] before runtime reconciliation.
 //!
-//! Responsibilities:
-//! - owns a [`Supervisor`] instance and runs its event loop in the background;
-//! - uses [`RunnerRouter`] to build concrete tasks from [`TaskSpec`];
-//! - maps model-level specs / policies into controller specs and submits them.
+//! ## Write Flow
 //!
-//! ## Two-plane state reconstruction (invariant)
+//! ```text
+//! TaskManifest
+//!      │ validate and commit
+//!      ▼
+//! Task
+//!      │ schedule
+//!      ▼
+//! Reconciler ──► runner or embedded TaskRef ──► Taskvisor
+//! ```
 //!
-//! Task state is rebuilt from two planes with **disjoint authority**:
+//! A successful write confirms the desired-state commit.
+//! Reconciliation continues in an SDK-owned worker.
 //!
-//! - The **event plane** (`StateSubscriber`, fed by taskvisor's *lossy* broadcast bus) is authoritative for per-attempt detail: phase transitions, `TaskRun` records, and output announcements.
-//! - The **completion plane** (`finalize_from_outcome`, fed by the *guaranteed* per-submission `TaskWaiter` oneshot) is authoritative **only** for terminal
-//!   liveness - it ensures a run still reaches a terminal phase when its terminal event was dropped under bus lag.
+//! ## Runtime Rules
 //!
-//! The backstop must therefore stay a **no-op on already-terminal entries** (enforced here and by `Task::transition_finished`'s sticky-terminal guard).
-//! It can never demote a richer event-derived phase.
-//! Both planes classify a rejection the same way (see [`reasons`]) so they never disagree on the final phase.
+//! - A stale generation cannot bind or replace the current runtime.
+//! - No staged rollout or availability guarantee is provided.
+//! - Resource identity is `metadata.name` plus UID.
+//! - Reconciliation is latest-wins by generation.
+//! - Accepted side effects are not rolled back.
+
 use std::{
     sync::{
         Arc,
@@ -26,1051 +34,1812 @@ use std::{
     time::Duration,
 };
 
-use solti_model::{Task, TaskId, TaskPage, TaskPhase, TaskQuery, TaskRun, TaskSpec};
-use taskvisor::{
-    ControllerConfig, ControllerSpec, Subscribe, Supervisor, SupervisorConfig, SupervisorHandle,
-    TaskRef, TaskSpec as TvTaskSpec,
+use solti_model::{
+    ModelError, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun, TaskWorkload,
+    WorkloadTypeMeta, WritePreconditions,
 };
+use solti_runner::RunnerRouter;
+use taskvisor::{ControllerConfig, Subscribe, Supervisor, SupervisorConfig, TaskRef};
+use tokio::sync::oneshot;
+use tokio_util::task::task_tracker::TaskTrackerToken;
 use tracing::{debug, info, instrument};
 
-use solti_runner::{OutputRegistry, RunnerRouter};
-
-use crate::system::init_uptime;
 use crate::{
+    StateConfig,
     error::CoreError,
-    map::{to_admission_policy, to_backoff_policy, to_restart_policy},
-    reasons,
-    state::{StateConfig, StateSubscriber, TaskState, state_sweep},
+    output::{OutputConfig, OutputHub, OutputSubscription},
+    runtime::{Reconciler, RuntimeObserver, RuntimeSource, TaskLocks},
+    state::{
+        CollectionError, DesiredCommit, ResourceGeneration, RuntimeBinding, TaskState,
+        TaskWatchSubscription,
+    },
 };
 
-/// Thin wrapper around taskvisor [`Supervisor`] with a runner router.
+mod builder;
+pub use builder::SupervisorApiBuilder;
+
+/// Desired-state API over Taskvisor.
 ///
-/// This type is responsible for:
-/// - constructing and running the supervisor;
-/// - selecting a concrete runner for each [`TaskSpec`];
-/// - mapping model-level specs into controller specs and submitting them.
+/// The API owns shared state, reconciliation, output, and retention.
+/// Cloneable read access is available through [`state`](Self::state).
 ///
-/// ## Also
-///
-/// - [`CoreError`] error type returned by all methods.
-/// - [`StateConfig`] configures sweep TTLs and interval (defaults are sane).
-/// - [`solti_runner::RunnerRouter`] picks a runner for each submitted spec.
+/// Dropping the API starts asynchronous cleanup.
+/// Call [`shutdown`](Self::shutdown) when cleanup must finish before continuing.
 pub struct SupervisorApi {
-    output_registry: Arc<OutputRegistry>,
-    handle: SupervisorHandle,
-    router: RunnerRouter,
-    state: TaskState,
-    grace: Duration,
+    reconciler: Reconciler,
+    task_operations: TaskLocks,
+    spawn_gate: parking_lot::Mutex<()>,
     shutdown_started: AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+enum WriteMode {
+    Create,
+    Apply,
+}
+
+/// Desired-state commit and test-only reconciliation acknowledgement.
+struct ScheduledWrite {
+    committed: Task,
+    #[cfg(test)]
+    reconciliation: Option<oneshot::Receiver<Task>>,
 }
 
 impl Drop for SupervisorApi {
     fn drop(&mut self) {
+        let _gate = self.spawn_gate.lock();
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
         }
-        let handle = self.handle.clone();
-        match tokio::runtime::Handle::try_current() {
-            Ok(rt) => {
-                rt.spawn(async move {
-                    let _ = handle.shutdown().await;
-                });
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "SupervisorApi dropped without shutdown() and outside a Tokio runtime; \
-                     the taskvisor runtime may leak — call SupervisorApi::shutdown().await",
-                );
-            }
-        }
+        self.reconciler.state.close_watches();
+        self.reconciler.retention_stop.cancel();
+        self.reconciler.tasks.close();
+        let handle = self.reconciler.handle.clone();
+        let tasks = self.reconciler.tasks.clone();
+        let task = self.reconciler.runtime.spawn(async move {
+            let _ = handle.shutdown().await;
+            tasks.wait().await;
+        });
+        drop(task);
     }
 }
 
 impl SupervisorApi {
-    /// Create a supervisor with explicit configs and start its run loop in the background.
-    ///
-    /// - `sup_cfg`      - supervisor configuration;
-    /// - `ctrl_cfg`     - controller configuration;
-    /// - `subscribers`  - event subscribers to attach to the supervisor;
-    /// - `router`       - runner router [`solti_model::TaskKind`];
-    /// - `state_cfg`    - sweep TTLs and interval ([`StateConfig::default()`] is usually fine).
-    ///
-    /// The supervisor event loop is started via [`Supervisor::serve()`] which returns a [`SupervisorHandle`] for dynamic task management.
-    ///
-    /// A periodic sweep task is automatically submitted to prevent unbounded memory growth.
-    /// It removes completed runs and terminal tasks that exceed their configured TTLs.
-    pub async fn new(
+    /// Creates a supervisor builder.
+    pub fn builder(router: RunnerRouter) -> SupervisorApiBuilder {
+        SupervisorApiBuilder::new(router)
+    }
+
+    async fn start(
         sup_cfg: SupervisorConfig,
         ctrl_cfg: ControllerConfig,
         subscribers: Vec<Arc<dyn Subscribe>>,
         router: RunnerRouter,
         state_cfg: StateConfig,
+        output_config: OutputConfig,
     ) -> Result<Self, CoreError> {
-        Self::new_with_output_registry(
-            sup_cfg,
-            ctrl_cfg,
-            subscribers,
-            router,
-            state_cfg,
-            Arc::new(OutputRegistry::default()),
-        )
-        .await
-    }
-
-    /// Same as [`SupervisorApi::new`], but lets the caller pass a shared [`OutputRegistry`].
-    pub async fn new_with_output_registry(
-        sup_cfg: SupervisorConfig,
-        ctrl_cfg: ControllerConfig,
-        mut subscribers: Vec<Arc<dyn Subscribe>>,
-        router: RunnerRouter,
-        state_cfg: StateConfig,
-        output_registry: Arc<OutputRegistry>,
-    ) -> Result<Self, CoreError> {
-        let state = TaskState::new();
-        state.set_max_runs_per_task(state_cfg.max_runs_per_task);
-        subscribers.push(Arc::new(StateSubscriber::with_output_registry(
+        let mut subscribers = subscribers;
+        let output_hub = Arc::new(OutputHub::new(output_config));
+        let router = router.with_output_publisher(output_hub.clone());
+        let state = TaskState::try_with_config(state_cfg)?;
+        let observer = Arc::new(RuntimeObserver::with_output_hub(
             state.clone(),
-            Arc::clone(&output_registry),
-        )));
+            Arc::clone(&output_hub),
+        ));
+        subscribers.push(observer.clone());
 
-        let grace = sup_cfg.grace;
-        let sup = Supervisor::builder(sup_cfg)
+        let grace = sup_cfg.grace();
+        let supervisor = Supervisor::builder(sup_cfg)
             .with_subscribers(subscribers)
             .with_controller(ctrl_cfg)
             .build();
-
-        let handle = sup.serve();
-        init_uptime();
-
+        let handle = supervisor.serve();
+        let reconciler = Reconciler::new(output_hub, handle, router, state, observer, grace);
         let api = Self {
-            handle,
-            router,
-            state,
-            output_registry,
-            grace,
+            reconciler,
+            task_operations: TaskLocks::default(),
+            spawn_gate: parking_lot::Mutex::new(()),
             shutdown_started: AtomicBool::new(false),
         };
 
-        let (task, spec) = state_sweep(api.state.clone(), state_cfg);
-        api.submit_with_task(task, &spec).await?;
-        info!("supervisor is ready (sweep active)");
-
+        api.reconciler.spawn_retention_worker(state_cfg);
+        info!("supervisor is ready");
         Ok(api)
     }
 
-    /// Get a shared handle to the output registry for live-tail subscriptions.
-    pub fn output_registry(&self) -> &Arc<OutputRegistry> {
-        &self.output_registry
+    /// Creates a routed task resource.
+    ///
+    /// The resource is committed before reconciliation.
+    /// Runtime failures are reported through the `Reconciled` condition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidSpec`] for invalid desired state or an embedded workload.
+    /// Returns [`CoreError::AlreadyExists`] when the name is retained.
+    /// Returns [`CoreError::ShuttingDown`] after shutdown starts.
+    pub async fn create_task(&self, manifest: TaskManifest) -> Result<Task, CoreError> {
+        Ok(self
+            .write(
+                manifest,
+                RuntimeSource::Routed,
+                WriteMode::Create,
+                WritePreconditions::new(),
+                true,
+            )
+            .await?
+            .committed)
     }
 
-    /// Get task information by ID.
-    pub fn get_task(&self, id: &TaskId) -> Option<Task> {
-        self.state.get(id)
+    /// Creates an embedded task resource.
+    ///
+    /// The caller supplies the Taskvisor task.
+    /// Runtime failures are reported through the `Reconciled` condition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidSpec`] for invalid desired state or a routed workload.
+    /// Returns [`CoreError::AlreadyExists`] when the name is retained.
+    /// Returns [`CoreError::ShuttingDown`] after shutdown starts.
+    pub async fn create_embedded_task(
+        &self,
+        manifest: TaskManifest,
+        task_ref: TaskRef,
+    ) -> Result<Task, CoreError> {
+        Ok(self
+            .write(
+                manifest,
+                RuntimeSource::Prebuilt(task_ref),
+                WriteMode::Create,
+                WritePreconditions::new(),
+                true,
+            )
+            .await?
+            .committed)
     }
 
-    /// List all tasks in a specific slot.
-    pub fn list_tasks_by_slot(&self, slot: &str) -> Vec<Task> {
-        self.state.list_by_slot(slot)
+    /// Applies a routed task resource.
+    ///
+    /// A missing resource is created.
+    /// An identical resource retries only when `Reconciled=False`.
+    /// Runtime failures are reported through that condition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidSpec`] for invalid desired state or an embedded workload.
+    /// Returns [`CoreError::ShuttingDown`] after shutdown starts.
+    pub async fn apply_task(&self, manifest: TaskManifest) -> Result<Task, CoreError> {
+        self.apply_task_with_preconditions(manifest, WritePreconditions::new())
+            .await
     }
 
-    /// List all tasks.
-    pub fn list_all_tasks(&self) -> Vec<Task> {
-        self.state.list_all()
+    /// Applies a routed task after checking write preconditions.
+    ///
+    /// Non-empty preconditions prevent creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotFound`] when guarded state is missing.
+    /// Returns [`CoreError::Conflict`] when a guard does not match.
+    /// Returns the same validation and shutdown errors as [`Self::apply_task`].
+    pub async fn apply_task_with_preconditions(
+        &self,
+        manifest: TaskManifest,
+        preconditions: WritePreconditions,
+    ) -> Result<Task, CoreError> {
+        Ok(self
+            .write(
+                manifest,
+                RuntimeSource::Routed,
+                WriteMode::Apply,
+                preconditions,
+                true,
+            )
+            .await?
+            .committed)
     }
 
-    /// List tasks by phase.
-    pub fn list_tasks_by_status(&self, phase: TaskPhase) -> Vec<Task> {
-        self.state.list_by_status(phase)
+    /// Applies a routed task through an adapter visibility predicate.
+    ///
+    /// A missing resource is created when preconditions are empty.
+    /// A hidden resource is reported as missing.
+    /// The predicate and commit share one per-name lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotFound`] for a hidden resource.
+    /// Returns the same write errors as [`Self::apply_task_with_preconditions`].
+    pub async fn apply_task_where<F>(
+        &self,
+        manifest: TaskManifest,
+        preconditions: WritePreconditions,
+        predicate: F,
+    ) -> Result<Task, CoreError>
+    where
+        F: Fn(&Task) -> bool,
+    {
+        let name = manifest.name().clone();
+        let operation = self.task_operations.lock(&name).await;
+        if self
+            .reconciler
+            .state
+            .get_retained(&name)
+            .is_some_and(|task| !predicate(&task))
+        {
+            return Err(CoreError::NotFound(name.to_string()));
+        }
+        Ok(self
+            .write_locked(
+                manifest,
+                RuntimeSource::Routed,
+                WriteMode::Apply,
+                &preconditions,
+                true,
+                operation,
+            )?
+            .committed)
     }
 
-    /// Query tasks with combined filters and pagination.
-    pub fn query_tasks(&self, query: &TaskQuery) -> TaskPage<Task> {
-        self.state.query(query)
+    /// Applies an embedded task resource.
+    ///
+    /// A missing resource is created.
+    /// An identical resource retries only when `Reconciled=False`.
+    /// Runtime failures are reported through that condition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidSpec`] for invalid desired state or a routed workload.
+    /// Returns [`CoreError::ShuttingDown`] after shutdown starts.
+    pub async fn apply_embedded_task(
+        &self,
+        manifest: TaskManifest,
+        task_ref: TaskRef,
+    ) -> Result<Task, CoreError> {
+        self.apply_embedded_task_with_preconditions(manifest, task_ref, WritePreconditions::new())
+            .await
     }
 
-    /// List execution history for a specific task (oldest first).
-    pub fn list_task_runs(&self, id: &TaskId) -> Vec<TaskRun> {
-        self.state.list_runs(id)
+    /// Applies an embedded task after checking write preconditions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotFound`] when guarded state is missing.
+    /// Returns [`CoreError::Conflict`] when a guard does not match.
+    /// Returns the same validation and shutdown errors as [`Self::apply_embedded_task`].
+    pub async fn apply_embedded_task_with_preconditions(
+        &self,
+        manifest: TaskManifest,
+        task_ref: TaskRef,
+        preconditions: WritePreconditions,
+    ) -> Result<Task, CoreError> {
+        Ok(self
+            .write(
+                manifest,
+                RuntimeSource::Prebuilt(task_ref),
+                WriteMode::Apply,
+                preconditions,
+                true,
+            )
+            .await?
+            .committed)
     }
 
-    /// Stop a task (running **or** still queued in its slot) and purge its run history.
-    #[instrument(level = "debug", skip(self), fields(task_id = %id))]
-    pub async fn delete_task(&self, id: &TaskId) -> Result<(), CoreError> {
-        debug!("deleting task: {}", id);
+    async fn write(
+        &self,
+        manifest: TaskManifest,
+        source: RuntimeSource,
+        mode: WriteMode,
+        preconditions: WritePreconditions,
+        ensure_output: bool,
+    ) -> Result<ScheduledWrite, CoreError> {
+        Self::ensure_runtime_contract(&manifest, &source)?;
+        let name = manifest.name().clone();
+        let operation = self.task_operations.lock(&name).await;
+        self.write_locked(
+            manifest,
+            source,
+            mode,
+            &preconditions,
+            ensure_output,
+            operation,
+        )
+    }
 
-        let was_cancelled = self.cancel_bound(id).await?;
-        let had_local = self.state.delete_task(id);
+    fn write_locked(
+        &self,
+        manifest: TaskManifest,
+        source: RuntimeSource,
+        mode: WriteMode,
+        preconditions: &WritePreconditions,
+        ensure_output: bool,
+        _operation: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<ScheduledWrite, CoreError> {
+        Self::ensure_runtime_contract(&manifest, &source)?;
+        let _spawn = self.spawn_gate.lock();
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return Err(CoreError::ShuttingDown);
+        }
 
-        if !was_cancelled && !had_local {
-            debug!("delete_task: no such task in supervisor or state; idempotent no-op");
+        let registration = self.reconciler.tasks.token();
+        let commit = match mode {
+            WriteMode::Create => {
+                debug_assert!(preconditions.is_empty());
+                self.reconciler.state.create_desired(&manifest)?
+            }
+            WriteMode::Apply => self
+                .reconciler
+                .state
+                .apply_desired_with_preconditions(&manifest, preconditions)?,
+        };
+        if !commit.reconcile {
+            drop(registration);
+            return Ok(ScheduledWrite {
+                committed: commit.task,
+                #[cfg(test)]
+                reconciliation: None,
+            });
+        }
+
+        let committed = commit.task.clone();
+        let reconciliation = self.spawn_reconciliation(commit, source, ensure_output, registration);
+        #[cfg(not(test))]
+        drop(reconciliation);
+        Ok(ScheduledWrite {
+            committed,
+            #[cfg(test)]
+            reconciliation: Some(reconciliation),
+        })
+    }
+
+    fn ensure_runtime_contract(
+        manifest: &TaskManifest,
+        source: &RuntimeSource,
+    ) -> Result<(), CoreError> {
+        let embedded = matches!(manifest.spec().workload(), TaskWorkload::Embedded(_));
+        match (source, embedded) {
+            (RuntimeSource::Prebuilt(_), true) | (RuntimeSource::Routed, false) => Ok(()),
+            (RuntimeSource::Prebuilt(_), false) => {
+                Err(CoreError::InvalidSpec(ModelError::Invalid(
+                    "a caller-supplied TaskRef requires spec.workload kind Embedded".into(),
+                )))
+            }
+            (RuntimeSource::Routed, true) => Err(CoreError::InvalidSpec(ModelError::Invalid(
+                "spec.workload kind Embedded requires create_embedded_task() or apply_embedded_task()"
+                    .into(),
+            ))),
+        }
+    }
+
+    fn spawn_reconciliation(
+        &self,
+        commit: DesiredCommit,
+        source: RuntimeSource,
+        ensure_output: bool,
+        registration: TaskTrackerToken,
+    ) -> oneshot::Receiver<Task> {
+        let reconciler = self.reconciler.clone();
+        let runtime = reconciler.runtime.clone();
+        let (sender, receiver) = oneshot::channel();
+        let worker = self.reconciler.tasks.spawn_on(
+            async move {
+                let _registration = registration;
+                let task = reconciler
+                    .reconcile(commit.task, source, ensure_output)
+                    .await;
+                let _ = sender.send(task);
+            },
+            &runtime,
+        );
+        drop(worker);
+        receiver
+    }
+
+    /// Subscribes to one task's live output.
+    ///
+    /// Returns `None` when no output channel exists.
+    pub fn subscribe_output(&self, name: &TaskId) -> Option<OutputSubscription> {
+        self.reconciler.output_hub.subscribe(name)
+    }
+
+    /// Subscribes through an adapter visibility predicate.
+    ///
+    /// The predicate, runtime binding, and subscription use the same per-name locks.
+    /// The returned generation identifies the bound desired state.
+    /// Returns `None` for missing, hidden, or unbound state.
+    pub async fn subscribe_output_where<F>(
+        &self,
+        name: &TaskId,
+        predicate: F,
+    ) -> Option<(u64, OutputSubscription)>
+    where
+        F: Fn(&Task) -> bool,
+    {
+        let _operation = self.task_operations.lock(name).await;
+        let _runtime_operation = self.reconciler.runtime_operations.lock(name).await;
+        let task = self.reconciler.state.get_retained(name)?;
+        if !predicate(&task) {
+            return None;
+        }
+        let resource = ResourceGeneration::from_task(&task);
+        if self.reconciler.state.binding_for(name)?.resource != resource {
+            return None;
+        }
+        let subscription = self.reconciler.output_hub.subscribe(name)?;
+        Some((resource.generation, subscription))
+    }
+
+    /// Returns one retained task by name.
+    pub fn get_task(&self, name: &TaskId) -> Option<Task> {
+        self.reconciler.state.get(name)
+    }
+
+    /// Queries retained tasks with snapshot-consistent pagination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] for an invalid or unavailable continuation snapshot.
+    pub fn query_tasks(&self, query: &TaskQuery) -> Result<TaskPage<Task>, CollectionError> {
+        self.reconciler.state.query(query)
+    }
+
+    /// Queries tasks through an adapter visibility predicate.
+    ///
+    /// The predicate runs before pagination.
+    /// Core does not hide workload kinds by itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] for an invalid or unavailable continuation snapshot.
+    pub fn query_tasks_where<F>(
+        &self,
+        query: &TaskQuery,
+        predicate: F,
+    ) -> Result<TaskPage<Task>, CollectionError>
+    where
+        F: Fn(&Task) -> bool,
+    {
+        self.reconciler.state.query_where(query, predicate)
+    }
+
+    /// Watches retained tasks selected by a filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] when the resource version cannot be resumed.
+    pub fn watch_tasks(
+        &self,
+        filter: &TaskFilter,
+        resource_version: Option<&str>,
+    ) -> Result<TaskWatchSubscription, CollectionError> {
+        self.reconciler.state.watch(filter, resource_version)
+    }
+
+    /// Watches tasks through an adapter visibility predicate.
+    ///
+    /// The predicate participates in `Added`, `Modified`, and `Deleted` classification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] when the resource version cannot be resumed.
+    pub fn watch_tasks_where<F>(
+        &self,
+        filter: &TaskFilter,
+        resource_version: Option<&str>,
+        predicate: F,
+    ) -> Result<TaskWatchSubscription, CollectionError>
+    where
+        F: Fn(&Task) -> bool + Send + Sync + 'static,
+    {
+        self.reconciler
+            .state
+            .watch_where(filter, resource_version, predicate)
+    }
+
+    /// Lists retained runs for one task.
+    ///
+    /// Results are ordered by generation and attempt.
+    pub fn list_task_runs(&self, name: &TaskId) -> Vec<TaskRun> {
+        self.reconciler.state.list_runs(name)
+    }
+
+    /// Lists runs through an adapter workload predicate.
+    ///
+    /// The visibility check and run snapshot share the write-operation lock.
+    /// Historical runs are filtered by their workload snapshot.
+    /// Returns `None` when the current task is missing or hidden.
+    pub async fn list_task_runs_where<F>(&self, name: &TaskId, predicate: F) -> Option<Vec<TaskRun>>
+    where
+        F: Fn(&WorkloadTypeMeta) -> bool,
+    {
+        let _operation = self.task_operations.lock(name).await;
+        let task = self.reconciler.state.get_retained(name)?;
+        if !predicate(&task.spec().workload().type_meta()) {
+            return None;
+        }
+        Some(
+            self.reconciler
+                .state
+                .list_runs(name)
+                .into_iter()
+                .filter(|run| predicate(run.workload()))
+                .collect(),
+        )
+    }
+
+    /// Returns a shared read handle.
+    pub fn state(&self) -> TaskState {
+        self.reconciler.state.clone()
+    }
+
+    async fn cancel_bound(
+        &self,
+        name: &TaskId,
+    ) -> Result<Option<(RuntimeBinding, bool)>, CoreError> {
+        let Some(binding) = self.reconciler.state.binding_for(name) else {
+            return Ok(None);
+        };
+        let claimed = self
+            .reconciler
+            .handle
+            .cancel_with_timeout(
+                binding.tv,
+                self.reconciler.grace.saturating_add(Duration::from_secs(1)),
+            )
+            .await
+            .map_err(|error| CoreError::supervisor("cancel", error))?;
+        Ok(Some((binding, claimed)))
+    }
+
+    /// Cancels the current runtime while retaining desired state.
+    ///
+    /// A known task without a runtime binding is a no-op.
+    /// Cancellation does not suppress later reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotFound`] for an unknown task.
+    /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
+    #[instrument(level = "debug", skip(self), fields(task = %name))]
+    pub async fn cancel_task(&self, name: &TaskId) -> Result<(), CoreError> {
+        let _operation = self.task_operations.lock(name).await;
+        let _runtime_operation = self.reconciler.runtime_operations.lock(name).await;
+        let was_known = self.reconciler.state.contains_task(name);
+        let cancellation = self.cancel_bound(name).await?;
+        let claimed = cancellation.as_ref().is_some_and(|(_, claimed)| *claimed);
+        if let Some((binding, _)) = cancellation {
+            self.reconciler
+                .observer
+                .settle_after_confirmed_cleanup(binding.tv)
+                .await;
+        }
+        if !claimed && !was_known {
+            return Err(CoreError::NotFound(name.to_string()));
         }
         Ok(())
     }
 
-    /// Cancel the taskvisor run bound to `id`, covering both running and queued tasks.
+    /// Deletes a task and its run history.
     ///
-    /// - Running: cooperative cancel confirmed by `TaskRemoved`.
-    /// - Queued (not in the registry): `remove(id)` lets the controller purge the spec from its slot queue.
-    async fn cancel_bound(&self, id: &TaskId) -> Result<bool, CoreError> {
-        let Some(tv) = self.state.tv_for(id) else {
-            return self
-                .handle
-                .cancel_by_label(id.as_str())
-                .await
-                .map_err(|e| CoreError::Supervisor(format!("cancel failed: {}", e)));
-        };
-        let tv = taskvisor::TaskId::from_raw(tv);
-
-        let cancelled = self
-            .handle
-            .cancel_with_timeout(tv, self.grace + Duration::from_secs(1))
-            .await
-            .map_err(|e| CoreError::Supervisor(format!("cancel failed: {}", e)))?;
-        if cancelled {
-            return Ok(true);
-        }
-
-        self.handle
-            .remove(tv)
-            .map_err(|e| CoreError::Supervisor(format!("remove failed: {}", e)))?;
-        Ok(false)
+    /// The current runtime is stopped first.
+    /// A missing task is an idempotent no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
+    #[instrument(level = "debug", skip(self), fields(task = %name))]
+    pub async fn delete_task(&self, name: &TaskId) -> Result<(), CoreError> {
+        let _operation = self.task_operations.lock(name).await;
+        self.delete_task_locked(name).await
     }
 
-    /// Get a clone of the underlying supervisor handle.
-    pub fn handle(&self) -> SupervisorHandle {
-        self.handle.clone()
-    }
-
-    /// Get a clone of the shared [`TaskState`].
+    /// Deletes a task after checking write preconditions.
     ///
-    /// The clone is cheap (`Arc<RwLock<_>>` inside) and reflects live state: later mutations on the original are visible through the clone.
-    /// Intended for read-only consumers like metric collectors (e.g. `solti_prometheus::PrometheusStateCollector`).
-    pub fn state(&self) -> TaskState {
-        self.state.clone()
-    }
-
-    /// Build and submit a task described by [`TaskSpec`].
+    /// # Errors
     ///
-    /// Steps:
-    /// 1. Ask the [`RunnerRouter`] to pick a runner and build a [`TaskRef`].
-    /// 2. Delegate to [`SupervisorApi::submit_with_task`].
-    ///
-    /// This is the primary entrypoint for tasks that are fully described by the public [`solti_model::TaskKind`] model.
-    #[instrument(level = "debug", skip(self, spec), fields(slot = %spec.slot(), kind = ?spec.kind()))]
-    pub async fn submit(&self, spec: &TaskSpec) -> Result<TaskId, CoreError> {
-        spec.validate()?;
-
-        let task = self.router.build(spec)?;
-        self.submit_with_task(task, spec).await
-    }
-
-    /// Submit a pre-built task together with its spec.
-    ///
-    /// This API is intended for in-process / code-defined tasks (with `TaskKind::Embedded`).
-    ///
-    /// The caller is responsible for constructing the [`TaskRef`];
-    /// the spec controls timeout, restart, backoff and admission behavior.
-    #[instrument(level = "debug", skip(self, task, spec), fields(slot = %spec.slot()))]
-    pub async fn submit_with_task(
+    /// Returns [`CoreError::NotFound`] when the task is missing.
+    /// Returns [`CoreError::Conflict`] when a guard does not match.
+    /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
+    pub async fn delete_task_with_preconditions(
         &self,
-        task: TaskRef,
-        spec: &TaskSpec,
-    ) -> Result<TaskId, CoreError> {
-        let task_id = TaskId::from(task.name());
-        task_id.validate_format()?;
-
-        let task_spec = TvTaskSpec::new(
-            task,
-            to_restart_policy(spec.restart())?,
-            to_backoff_policy(spec.backoff())?,
-            Some(Duration::from_millis(spec.timeout().as_millis())),
-        )
-        .with_max_retries(spec.max_retries())
-        .with_slot(spec.slot().as_str());
-        let controller_spec =
-            ControllerSpec::new(to_admission_policy(spec.admission())?, task_spec);
-
-        self.state.reserve(task_id.clone(), spec.clone())?;
-
-        debug!("submitting pre-built task via controller");
-        match self.handle.submit_and_watch(controller_spec).await {
-            Ok((tv_id, waiter)) => {
-                self.state.bind_tv(&task_id, tv_id.get());
-
-                let state = self.state.clone();
-                let output_registry = Arc::clone(&self.output_registry);
-                let tv_raw = tv_id.get();
-                tokio::spawn(async move {
-                    if let Ok(outcome) = waiter.wait().await {
-                        Self::finalize_from_outcome(&state, &output_registry, tv_raw, &outcome);
-                    }
-                });
-
-                Ok(task_id)
-            }
-            Err(e) => {
-                self.unwind_provisional_submit(&task_id);
-                Err(CoreError::Supervisor(e.to_string()))
-            }
-        }
+        name: &TaskId,
+        preconditions: WritePreconditions,
+    ) -> Result<(), CoreError> {
+        let _operation = self.task_operations.lock(name).await;
+        let task = self
+            .reconciler
+            .state
+            .get_retained(name)
+            .ok_or_else(|| CoreError::NotFound(name.to_string()))?;
+        TaskState::check_write_preconditions(&task, &preconditions)?;
+        self.delete_task_locked(name).await
     }
 
-    /// Backstop finalization of a state entry from taskvisor's guaranteed [`TaskOutcome`].
+    /// Deletes a task through an adapter visibility predicate.
     ///
-    /// Idempotent and event-friendly: resolves the run identity, and acts **only** if the entry exists and is not already in a terminal phase.
-    /// A `Rejected` outcome (the submission never ran) drops the provisional entry.
-    fn finalize_from_outcome(
-        state: &TaskState,
-        output_registry: &OutputRegistry,
-        tv_raw: u64,
-        outcome: &taskvisor::TaskOutcome,
-    ) {
-        use taskvisor::TaskOutcome;
-
-        let Some(model_id) = state.resolve_tv(tv_raw) else {
-            return;
+    /// Missing and hidden tasks are reported as missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotFound`] when the task is missing or hidden.
+    /// Returns [`CoreError::Conflict`] when a guard does not match.
+    /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
+    pub async fn delete_task_where<F>(
+        &self,
+        name: &TaskId,
+        preconditions: WritePreconditions,
+        predicate: F,
+    ) -> Result<(), CoreError>
+    where
+        F: Fn(&Task) -> bool,
+    {
+        let _operation = self.task_operations.lock(name).await;
+        let Some(task) = self.reconciler.state.get_retained(name) else {
+            return Err(CoreError::NotFound(name.to_string()));
         };
-
-        if let TaskOutcome::Rejected { reason } = outcome {
-            let phase = match reason.as_ref() {
-                reasons::REMOVED_FROM_QUEUE
-                | reasons::SUPERSEDED_BY_REPLACE
-                | reasons::CONTROLLER_SHUTTING_DOWN => TaskPhase::Canceled,
-                _ => TaskPhase::Failed,
-            };
-            state.transition_finished(&model_id, phase, Some(reason.to_string()), None);
-            output_registry.evict(&model_id);
-            state.unbind(&model_id);
-            return;
+        if !predicate(&task) {
+            return Err(CoreError::NotFound(name.to_string()));
         }
-
-        if state
-            .get(&model_id)
-            .is_none_or(|t| t.status().phase.is_terminal())
-        {
-            return;
-        }
-
-        let (phase, error, exit_code) = match outcome {
-            TaskOutcome::Completed => (TaskPhase::Succeeded, None, None),
-            TaskOutcome::Failed { reason, exit_code } => {
-                (TaskPhase::Exhausted, Some(reason.to_string()), *exit_code)
-            }
-            TaskOutcome::Fatal { reason, exit_code } => {
-                (TaskPhase::Failed, Some(reason.to_string()), *exit_code)
-            }
-            TaskOutcome::Canceled => (TaskPhase::Canceled, None, None),
-            TaskOutcome::ForceAborted => (
-                TaskPhase::Canceled,
-                Some("force_terminated_after_grace".to_string()),
-                None,
-            ),
-            TaskOutcome::Panicked => (TaskPhase::Failed, Some("actor panicked".to_string()), None),
-            _ => (
-                TaskPhase::Failed,
-                Some("unknown task outcome".to_string()),
-                None,
-            ),
-        };
-        state.transition_finished(&model_id, phase, error, exit_code);
-        output_registry.evict(&model_id);
-        state.unbind(&model_id);
+        TaskState::check_write_preconditions(&task, &preconditions)?;
+        self.delete_task_locked(name).await
     }
 
-    /// Roll back resources reserved by [`submit_with_task`] before `handle.submit`.
-    fn unwind_provisional_submit(&self, task_id: &TaskId) {
-        self.state.unregister_task(task_id);
-        self.output_registry.evict(task_id);
+    async fn delete_task_locked(&self, name: &TaskId) -> Result<(), CoreError> {
+        let _runtime_operation = self.reconciler.runtime_operations.lock(name).await;
+        debug!(task = %name, "deleting task resource");
+        let cancellation = self.cancel_bound(name).await?;
+        let tv = cancellation.as_ref().map(|(binding, _)| binding.tv);
+        self.reconciler.observer.delete_after_cleanup(name, tv);
+        Ok(())
     }
 
-    /// Gracefully shut down the supervisor: cancel all tasks and wait for completion.
+    /// Stops Taskvisor and waits for SDK-owned workers.
+    ///
+    /// Task watches close before runtime shutdown.
+    /// Reconciliation, completion, and retention workers are drained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Supervisor`] when Taskvisor shutdown fails.
     #[instrument(level = "info", skip(self))]
-    pub async fn shutdown(self) -> Result<(), CoreError> {
+    pub async fn shutdown(&self) -> Result<(), CoreError> {
         info!("initiating graceful shutdown");
-        let res = self
+        {
+            let _spawn = self.spawn_gate.lock();
+            if !self.shutdown_started.swap(true, Ordering::AcqRel) {
+                self.reconciler.state.close_watches();
+                self.reconciler.retention_stop.cancel();
+                self.reconciler.tasks.close();
+            }
+        }
+        let result = self
+            .reconciler
             .handle
             .clone()
             .shutdown()
             .await
-            .map_err(|e| CoreError::Supervisor(e.to_string()));
-        self.shutdown_started.store(true, Ordering::Release);
-        res
-    }
-
-    /// Cancel a task by ID (in-process Rust API), running or still queued.
-    #[instrument(level = "debug", skip(self), fields(task_id = %id))]
-    pub async fn cancel_task(&self, id: &TaskId) -> Result<(), CoreError> {
-        debug!("cancelling task: {}", id);
-
-        let was_running = self.cancel_bound(id).await?;
-        if !was_running && self.state.get(id).is_none() {
-            return Err(CoreError::NotFound(id.to_string()));
-        }
-
-        debug!("task cancellation issued: {}", id);
-        Ok(())
+            .map_err(|error| CoreError::supervisor("shutdown", error));
+        self.reconciler.tasks.wait().await;
+        result
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use parking_lot::{Condvar, Mutex};
+    use solti_model::{
+        AdmissionPolicy, ConditionStatus, EmbeddedSpec, Flag, Labels, Slot, SubprocessMode,
+        SubprocessSpec, TaskEnv, TaskPhase, TaskSpec, TaskWorkload, WORKLOAD_API_VERSION,
+        WorkloadTypeMeta,
+    };
+    use solti_runner::{BuildContext, RunId, Runner, RunnerError};
+    use taskvisor::{TaskContext, TaskError, TaskFn};
+    use tokio_stream::StreamExt;
+
     use super::*;
 
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use solti_model::{AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy, TaskKind};
-    use solti_runner::OutputRegistry;
-    use taskvisor::{TaskError, TaskFn};
-    use tokio_util::sync::CancellationToken;
-
-    fn mk_backoff() -> BackoffPolicy {
-        BackoffPolicy {
-            jitter: JitterPolicy::Equal,
-            first_ms: 1_000,
-            max_ms: 5_000,
-            factor: 2.0,
-        }
-    }
-
-    #[tokio::test]
-    async fn max_retries_budget_reaches_taskvisor() {
-        let api = SupervisorApi::new(
-            SupervisorConfig::default(),
-            ControllerConfig::default(),
-            Vec::new(),
-            RunnerRouter::new(),
-            StateConfig::default(),
-        )
-        .await
-        .expect("SupervisorApi::new");
-
-        let task: TaskRef = TaskFn::arc("budget-task", |_ctx: CancellationToken| async move {
-            Err::<(), TaskError>(TaskError::Fail {
-                reason: "always fails".into(),
-                exit_code: None,
-            })
-        });
-
-        let spec = TaskSpec::builder("budget-slot", TaskKind::Embedded, 5_000_u64)
-            .restart(RestartPolicy::OnFailure)
-            .backoff(solti_model::BackoffPolicy {
-                jitter: solti_model::JitterPolicy::None,
-                first_ms: 1,
-                max_ms: 1,
-                factor: 1.0,
-            })
-            .max_retries(2)
-            .admission(AdmissionPolicy::DropIfRunning)
+    fn embedded_with_revision(name: &str, timeout_ms: u64, revision: &str) -> TaskManifest {
+        TaskManifest::new(
+            name,
+            TaskSpec::builder(
+                "embedded-slot",
+                TaskWorkload::Embedded(EmbeddedSpec::new(revision).unwrap()),
+                timeout_ms,
+            )
             .build()
-            .expect("valid spec");
+            .unwrap(),
+        )
+        .unwrap()
+    }
 
-        let task_id = api.submit_with_task(task, &spec).await.expect("submit ok");
+    fn embedded(name: &str, timeout_ms: u64) -> TaskManifest {
+        embedded_with_revision(name, timeout_ms, "test-v1")
+    }
 
-        let mut settled = false;
-        for _ in 0..200 {
-            let runs = api.list_task_runs(&task_id);
-            if runs.len() >= 3 && runs.iter().all(|r| !r.is_active()) {
-                settled = true;
-                break;
+    fn routed(name: &str, timeout_ms: u64) -> TaskManifest {
+        let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+            SubprocessMode::Command {
+                command: "true".into(),
+                args: vec![],
+            },
+            TaskEnv::default(),
+            None,
+            Flag::enabled(),
+        ));
+        TaskManifest::new(
+            name,
+            TaskSpec::builder("routed-slot", workload, timeout_ms)
+                .build()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn subprocess_workload_types() -> Vec<WorkloadTypeMeta> {
+        vec![
+            WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess")
+                .expect("built-in workload GVK"),
+        ]
+    }
+
+    fn retention_slot(name: &str) -> TaskManifest {
+        TaskManifest::new(
+            name,
+            TaskSpec::builder(
+                "solti-state-sweep",
+                TaskWorkload::Embedded(EmbeddedSpec::new("test-v1").unwrap()),
+                1_000_u64,
+            )
+            .admission(AdmissionPolicy::Replace)
+            .build()
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn immediate_task(name: &str) -> TaskRef {
+        TaskFn::arc(
+            name,
+            |_ctx: TaskContext| async move { Ok::<(), TaskError>(()) },
+        )
+    }
+
+    fn cancellable_task(name: &str) -> TaskRef {
+        TaskFn::arc(name, |ctx: TaskContext| async move {
+            ctx.cancelled().await;
+            Err::<(), TaskError>(TaskError::Canceled)
+        })
+    }
+
+    async fn api(router: RunnerRouter) -> SupervisorApi {
+        SupervisorApi::builder(router).start().await.unwrap()
+    }
+
+    async fn wait_for_task(
+        api: &SupervisorApi,
+        name: &TaskId,
+        predicate: impl Fn(&Task) -> bool,
+    ) -> Task {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(task) = api.get_task(name)
+                    && predicate(&task)
+                {
+                    return task;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(settled, "task must stop retrying after its budget");
+        })
+        .await
+        .expect("task state did not converge")
+    }
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let runs = api.list_task_runs(&task_id);
-        assert_eq!(
-            runs.len(),
-            3,
-            "retry budget of 2 means exactly 3 attempts, got {}",
-            runs.len()
-        );
-        assert!(runs.iter().all(|r| r.phase == TaskPhase::Failed));
+    async fn wait_for_observed(api: &SupervisorApi, name: &TaskId, generation: u64) -> Task {
+        wait_for_task(api, name, |task| {
+            task.status().observed_generation() == generation
+        })
+        .await
+    }
+
+    async fn wait_for_reconciled(
+        api: &SupervisorApi,
+        name: &TaskId,
+        generation: u64,
+        status: ConditionStatus,
+    ) -> Task {
+        wait_for_task(api, name, |task| {
+            let condition = task.status().reconciled();
+            condition.observed_generation() == generation && condition.status() == status
+        })
+        .await
+    }
+
+    async fn wait_for_binding(
+        api: &SupervisorApi,
+        name: &TaskId,
+        generation: u64,
+    ) -> RuntimeBinding {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(binding) = api.reconciler.state.binding_for(name)
+                    && binding.resource.generation == generation
+                {
+                    return binding;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime binding did not converge")
+    }
+
+    struct RecordingRunner {
+        seen: Arc<Mutex<Vec<(TaskId, u64, String)>>>,
+    }
+
+    impl Runner for RecordingRunner {
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+            subprocess_workload_types()
+        }
+
+        fn build_task(
+            &self,
+            task: &Task,
+            run_id: &RunId,
+            _ctx: &BuildContext,
+        ) -> Result<TaskRef, RunnerError> {
+            self.seen.lock().push((
+                task.name().clone(),
+                task.metadata().generation(),
+                task.metadata().resource_version().to_string(),
+            ));
+            Ok(immediate_task(run_id.name()))
+        }
     }
 
     #[tokio::test]
-    async fn fresh_supervisor_lists_no_internal_tasks() {
-        let api = SupervisorApi::new(
-            SupervisorConfig::default(),
-            ControllerConfig::default(),
-            Vec::new(),
-            RunnerRouter::new(),
-            StateConfig::default(),
+    async fn stale_generation_is_rejected_before_runner_build() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(RecordingRunner {
+                seen: Arc::clone(&seen),
+            }))
+            .unwrap();
+        let api = api(router).await;
+        let stale = api
+            .reconciler
+            .state
+            .create_desired(&routed("stale-before-build", 1_000))
+            .unwrap()
+            .task;
+        let current = api
+            .reconciler
+            .state
+            .apply_desired(&routed("stale-before-build", 2_000))
+            .unwrap()
+            .task;
+
+        let returned = api
+            .reconciler
+            .reconcile(stale, RuntimeSource::Routed, true)
+            .await;
+
+        assert_eq!(returned, current);
+        assert!(seen.lock().is_empty());
+        assert!(
+            api.reconciler
+                .state
+                .binding_for(&TaskId::new("stale-before-build").unwrap())
+                .is_none()
+        );
+        api.reconciler
+            .state
+            .delete_task(&TaskId::new("stale-before-build").unwrap());
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn all_four_resource_write_paths_accept_desired_manifests() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(RecordingRunner {
+                seen: Arc::clone(&seen),
+            }))
+            .unwrap();
+        let api = api(router).await;
+
+        let created = api
+            .create_task(routed("routed-resource", 1_000))
+            .await
+            .unwrap();
+        assert_eq!(created.name().as_str(), "routed-resource");
+        assert!(!created.metadata().resource_version().is_empty());
+        assert_eq!(created.status().phase(), TaskPhase::Pending);
+        assert_eq!(created.status().observed_generation(), 0);
+        wait_for_observed(&api, created.name(), 1).await;
+
+        let mut labels = Labels::new();
+        labels.insert("team", "platform");
+        let metadata_apply = TaskManifest::new("routed-resource", created.spec().clone())
+            .unwrap()
+            .with_labels(labels.clone())
+            .unwrap();
+        let applied = api.apply_task(metadata_apply).await.unwrap();
+        assert_eq!(applied.metadata().generation(), 1);
+        assert_eq!(applied.metadata().labels(), &labels);
+
+        let applied = api
+            .apply_task(routed("routed-resource", 2_000))
+            .await
+            .unwrap();
+        assert_eq!(applied.metadata().generation(), 2);
+        assert_eq!(applied.status().phase(), TaskPhase::Pending);
+        assert_eq!(applied.status().observed_generation(), 1);
+        wait_for_observed(&api, applied.name(), 2).await;
+
+        let embedded_created = api
+            .create_embedded_task(
+                embedded("embedded-resource", 1_000),
+                immediate_task("unrelated-runtime-name"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(embedded_created.name().as_str(), "embedded-resource");
+        assert_eq!(embedded_created.status().phase(), TaskPhase::Pending);
+        wait_for_observed(&api, embedded_created.name(), 1).await;
+        assert!(
+            api.get_task(&TaskId::new("unrelated-runtime-name").unwrap())
+                .is_none()
+        );
+
+        let embedded_applied = api
+            .apply_embedded_task(
+                embedded("embedded-resource", 2_000),
+                immediate_task("another-runtime-name"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(embedded_applied.metadata().generation(), 2);
+        assert_eq!(embedded_applied.status().phase(), TaskPhase::Pending);
+        wait_for_observed(&api, embedded_applied.name(), 2).await;
+
+        {
+            let seen = seen.lock();
+            assert_eq!(seen.len(), 2, "metadata-only apply must not rebuild");
+            assert_eq!(seen[0].0.as_str(), "routed-resource");
+            assert_eq!(seen[0].1, 1);
+            assert!(!seen[0].2.is_empty(), "runner receives the stored Task");
+            assert_eq!(seen[1].1, 2);
+        }
+
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn embedded_revision_controls_reconciliation_generation() {
+        let api = api(RunnerRouter::new()).await;
+        let first = api
+            .create_embedded_task(
+                embedded_with_revision("embedded-revision", 10_000, "v1"),
+                cancellable_task("runtime-v1"),
+            )
+            .await
+            .unwrap();
+        let first_binding = wait_for_binding(&api, first.name(), 1).await;
+
+        let unchanged = api
+            .apply_embedded_task(
+                embedded_with_revision("embedded-revision", 10_000, "v1"),
+                cancellable_task("unused-runtime"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unchanged.metadata().generation(), 1);
+        assert_eq!(
+            api.reconciler.state.binding_for(first.name()),
+            Some(first_binding.clone()),
+            "an unchanged manifest must not replace its runtime"
+        );
+
+        let changed = api
+            .apply_embedded_task(
+                embedded_with_revision("embedded-revision", 10_000, "v2"),
+                cancellable_task("runtime-v2"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed.metadata().generation(), 2);
+        assert_eq!(changed.status().phase(), TaskPhase::Pending);
+        let changed_binding = wait_for_binding(&api, changed.name(), 2).await;
+        assert_ne!(
+            changed_binding, first_binding,
+            "a spec generation must receive a distinct runtime binding"
+        );
+
+        api.delete_task(changed.name()).await.unwrap();
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_source_must_match_the_declared_workload_before_commit() {
+        let api = api(RunnerRouter::new()).await;
+
+        let prebuilt_routed = api
+            .create_embedded_task(
+                routed("prebuilt-routed", 1_000),
+                immediate_task("arbitrary-runtime"),
+            )
+            .await;
+        assert!(matches!(prebuilt_routed, Err(CoreError::InvalidSpec(_))));
+        assert!(
+            api.get_task(&TaskId::new("prebuilt-routed").unwrap())
+                .is_none()
+        );
+
+        let routed_embedded = api.create_task(embedded("routed-embedded", 1_000)).await;
+        assert!(matches!(routed_embedded, Err(CoreError::InvalidSpec(_))));
+        assert!(
+            api.get_task(&TaskId::new("routed-embedded").unwrap())
+                .is_none()
+        );
+
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_worker_does_not_reserve_a_resource_name_or_slot() {
+        let api = api(RunnerRouter::new()).await;
+        let sweep_name = TaskId::new("solti-state-sweep").unwrap();
+        assert!(api.get_task(&sweep_name).is_none());
+
+        api.create_embedded_task(
+            embedded(sweep_name.as_str(), 1_000),
+            immediate_task("former-sweep-name"),
         )
         .await
-        .expect("SupervisorApi::new");
+        .unwrap();
+        api.create_embedded_task(
+            retention_slot("former-sweep-slot"),
+            immediate_task("former-sweep-slot-runtime"),
+        )
+        .await
+        .unwrap();
+
+        assert!(api.get_task(&sweep_name).is_some());
+        assert_eq!(
+            api.query_tasks(&TaskQuery::new().with_slot(Slot::new("solti-state-sweep").unwrap()))
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_worker_removes_expired_terminal_resources() {
+        let config = StateConfig::new()
+            .with_run_ttl(Duration::ZERO)
+            .with_task_ttl(Duration::ZERO)
+            .try_with_sweep_interval(Duration::from_millis(1))
+            .unwrap();
+        let api = SupervisorApi::builder(RunnerRouter::new())
+            .with_state_config(config)
+            .start()
+            .await
+            .unwrap();
+        let task = api
+            .create_embedded_task(
+                embedded("retained-briefly", 1_000),
+                immediate_task("retained-briefly-runtime"),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while api.get_task(task.name()).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retention worker did not remove the terminal resource");
+
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn conditional_reads_and_delete_share_the_resource_operation_lock() {
+        let api = api(RunnerRouter::new()).await;
+        let task = api
+            .create_embedded_task(
+                embedded("conditional", 10_000),
+                cancellable_task("conditional-runtime"),
+            )
+            .await
+            .unwrap();
+        wait_for_binding(&api, task.name(), task.metadata().generation()).await;
 
         assert!(
-            api.list_all_tasks().is_empty(),
-            "the embedded sweep task must not appear in list_all_tasks()"
+            api.list_task_runs_where(task.name(), |_| false)
+                .await
+                .is_none()
         );
+        assert!(
+            api.list_task_runs_where(task.name(), |_| true)
+                .await
+                .is_some()
+        );
+        assert!(
+            api.subscribe_output_where(task.name(), |_| false)
+                .await
+                .is_none()
+        );
+        let (generation, _subscription) = api
+            .subscribe_output_where(task.name(), |_| true)
+            .await
+            .expect("current bound generation has an output channel");
+        assert_eq!(generation, task.metadata().generation());
+
+        assert!(matches!(
+            api.delete_task_where(task.name(), WritePreconditions::new(), |_| false)
+                .await,
+            Err(CoreError::NotFound(_))
+        ));
+        assert!(api.get_task(task.name()).is_some());
+        assert!(matches!(
+            api.delete_task_where(
+                &TaskId::new("missing").unwrap(),
+                WritePreconditions::new(),
+                |_| true,
+            )
+            .await,
+            Err(CoreError::NotFound(_))
+        ));
+        api.delete_task_where(task.name(), WritePreconditions::new(), |_| true)
+            .await
+            .unwrap();
+        assert!(api.get_task(task.name()).is_none());
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checked_delete_rejects_stale_uid_before_removing_the_resource() {
+        let api = api(RunnerRouter::new()).await;
+        let task = api
+            .create_task(routed("checked-delete", 1_000))
+            .await
+            .unwrap();
+        let stale = WritePreconditions::new().with_uid(solti_model::Uid::new("stale-uid").unwrap());
+
+        let error = api
+            .delete_task_with_preconditions(task.name(), stale)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, CoreError::Conflict(_)));
+        assert!(api.get_task(task.name()).is_some());
+
+        let current = api.get_task(task.name()).unwrap();
+        let matching = WritePreconditions::new().with_uid(current.uid().clone());
+        api.delete_task_with_preconditions(task.name(), matching)
+            .await
+            .unwrap();
+        assert!(api.get_task(task.name()).is_none());
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn conditional_run_listing_filters_each_historical_workload_snapshot() {
+        let api = api(RunnerRouter::new()).await;
+        let state = &api.reconciler.state;
+        let first = state
+            .create_desired(&embedded("run-visibility", 1_000))
+            .unwrap()
+            .task;
+        let old_resource = ResourceGeneration::from_task(&first);
+        let old_tv = taskvisor::TaskId::for_tests();
+        assert!(state.bind_tv(old_resource.clone(), old_tv));
+        let old_binding = RuntimeBinding {
+            resource: old_resource,
+            tv: old_tv,
+        };
+        assert!(state.transition_attempt_finished(
+            &old_binding,
+            1,
+            TaskPhase::Succeeded,
+            None,
+            Some(0),
+        ));
+
+        let current = state
+            .apply_desired(&routed("run-visibility", 1_000))
+            .unwrap()
+            .task;
+        let current_resource = ResourceGeneration::from_task(&current);
+        let current_tv = taskvisor::TaskId::for_tests();
+        assert!(state.bind_tv(current_resource.clone(), current_tv));
+        assert!(state.transition_attempt_starting(
+            &RuntimeBinding {
+                resource: current_resource,
+                tv: current_tv,
+            },
+            1,
+        ));
+
+        let visible = api
+            .list_task_runs_where(current.name(), |gvk| gvk.kind() != "Embedded")
+            .await
+            .expect("the current parent is visible");
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].generation(), 2);
+        assert_eq!(visible[0].workload().kind(), "Subprocess");
+
+        state.delete_task(current.name());
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn conditional_apply_cannot_replace_a_hidden_existing_resource() {
+        let api = api(RunnerRouter::new()).await;
+        let embedded = api
+            .create_embedded_task(
+                embedded("hidden-apply", 10_000),
+                cancellable_task("hidden-runtime"),
+            )
+            .await
+            .unwrap();
+
+        let result = api
+            .apply_task_where(
+                routed("hidden-apply", 1_000),
+                WritePreconditions::new(),
+                |current| !matches!(current.spec().workload(), TaskWorkload::Embedded(_)),
+            )
+            .await;
+
+        assert!(matches!(result, Err(CoreError::NotFound(_))));
+        assert_eq!(api.get_task(embedded.name()), Some(embedded.clone()));
+
+        let created = api
+            .apply_task_where(
+                routed("new-visible", 1_000),
+                WritePreconditions::new(),
+                |_| panic!("predicate must not run for an absent resource"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.name().as_str(), "new-visible");
+
+        api.delete_task(embedded.name()).await.unwrap();
+        api.delete_task(created.name()).await.unwrap();
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preflight_failure_is_retained_in_reconciled_condition() {
+        let api = api(RunnerRouter::new()).await;
+
+        let task = api
+            .create_task(routed("no-runner", 1_000))
+            .await
+            .expect("valid desired state is retained");
+
+        assert_eq!(task.status().phase(), TaskPhase::Pending);
+        assert_eq!(task.status().observed_generation(), 0);
+        let failed = wait_for_reconciled(&api, task.name(), 1, ConditionStatus::False).await;
+        assert_eq!(failed.status().phase(), TaskPhase::Pending);
+        assert_eq!(failed.status().attempt(), 0);
+        assert!(failed.status().error().is_none());
+        assert_eq!(failed.status().reconciled().reason(), "RunnerNotFound");
+        assert!(
+            failed
+                .status()
+                .reconciled()
+                .message()
+                .contains("no runner matches")
+        );
+        assert_eq!(api.get_task(task.name()), Some(failed));
+        api.shutdown().await.unwrap();
+    }
+
+    struct PanicRunner;
+
+    impl Runner for PanicRunner {
+        fn name(&self) -> &str {
+            "panic"
+        }
+
+        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+            subprocess_workload_types()
+        }
+
+        fn build_task(
+            &self,
+            _task: &Task,
+            _run_id: &RunId,
+            _ctx: &BuildContext,
+        ) -> Result<TaskRef, RunnerError> {
+            panic!("runner build panic")
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_panic_is_contained_as_reconciliation_failure() {
+        let mut router = RunnerRouter::new();
+        router.register(Arc::new(PanicRunner)).unwrap();
+        let api = api(router).await;
+
+        let task = api
+            .create_task(routed("panic-contained", 1_000))
+            .await
+            .expect("desired state remains queryable");
+
+        assert_eq!(task.status().phase(), TaskPhase::Pending);
+        assert_eq!(task.status().observed_generation(), 0);
+        let failed = wait_for_reconciled(&api, task.name(), 1, ConditionStatus::False).await;
+        assert_eq!(failed.status().phase(), TaskPhase::Pending);
+        assert_eq!(failed.status().attempt(), 0);
+        assert!(failed.status().error().is_none());
+        assert_eq!(failed.status().reconciled().reason(), "RunnerBuildPanicked");
         assert_eq!(
-            api.query_tasks(&solti_model::TaskQuery::new()).total,
-            0,
-            "the embedded sweep task must not appear in a slot-less query"
+            failed.status().reconciled().message(),
+            "reconciliation preflight panicked"
         );
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_new_generation_does_not_cancel_the_old_runtime() {
+        let api = api(RunnerRouter::new()).await;
+        let first = api
+            .create_embedded_task(embedded("upgrade", 10_000), cancellable_task("old-runtime"))
+            .await
+            .unwrap();
+        let previous = wait_for_binding(&api, first.name(), 1).await;
+
+        let failed = api.apply_task(routed("upgrade", 2_000)).await.unwrap();
+        assert_eq!(failed.metadata().generation(), 2);
+        assert_eq!(failed.status().phase(), TaskPhase::Pending);
+        assert_eq!(failed.status().observed_generation(), 1);
+        let failed = wait_for_reconciled(&api, failed.name(), 2, ConditionStatus::False).await;
+        assert_eq!(failed.status().phase(), TaskPhase::Pending);
+        assert_eq!(failed.status().reconciled().reason(), "RunnerNotFound");
+        assert_eq!(
+            api.reconciler.state.binding_for(first.name()),
+            Some(previous),
+            "preflight runs before cancellation"
+        );
+
+        api.delete_task(failed.name()).await.unwrap();
+        api.shutdown().await.unwrap();
+    }
+
+    struct BuildGate {
+        started: AtomicBool,
+        open: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl BuildGate {
+        fn new() -> Self {
+            Self {
+                started: AtomicBool::new(false),
+                open: Mutex::new(false),
+                changed: Condvar::new(),
+            }
+        }
+
+        fn release(&self) {
+            *self.open.lock() = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct FailOnceBlockingRunner {
+        builds: Arc<AtomicUsize>,
+        retry_gate: Arc<BuildGate>,
+    }
+
+    impl Runner for FailOnceBlockingRunner {
+        fn name(&self) -> &str {
+            "fail-once-blocking"
+        }
+
+        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+            subprocess_workload_types()
+        }
+
+        fn build_task(
+            &self,
+            _task: &Task,
+            run_id: &RunId,
+            _ctx: &BuildContext,
+        ) -> Result<TaskRef, RunnerError> {
+            let build = self.builds.fetch_add(1, Ordering::AcqRel);
+            if build == 0 {
+                return Err(RunnerError::Internal("transient build failure".into()));
+            }
+            if build == 1 {
+                self.retry_gate.started.store(true, Ordering::Release);
+                let mut open = self.retry_gate.open.lock();
+                while !*open {
+                    self.retry_gate.changed.wait(&mut open);
+                }
+            }
+            Ok(immediate_task(run_id.name()))
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_same_name_submits_yield_one_ok_one_already_exists() {
-        let api = Arc::new(
-            SupervisorApi::new(
-                SupervisorConfig::default(),
-                ControllerConfig::default(),
-                Vec::new(),
-                RunnerRouter::new(),
-                StateConfig::default(),
+    async fn identical_apply_retries_once_only_while_reconciled_is_false() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let retry_gate = Arc::new(BuildGate::new());
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(FailOnceBlockingRunner {
+                builds: Arc::clone(&builds),
+                retry_gate: Arc::clone(&retry_gate),
+            }))
+            .unwrap();
+        let api = api(router).await;
+        let manifest = routed("manual-retry", 1_000);
+
+        let created = api.create_task(manifest.clone()).await.unwrap();
+        let failed = wait_for_reconciled(&api, created.name(), 1, ConditionStatus::False).await;
+        assert_eq!(failed.status().reconciled().reason(), "RunnerBuildFailed");
+
+        let retry = api.apply_task(manifest.clone()).await.unwrap();
+        assert_eq!(retry.metadata().generation(), 1);
+        assert_eq!(
+            retry.status().reconciled().status(),
+            ConditionStatus::Unknown
+        );
+        wait_for_build(&retry_gate).await;
+
+        let duplicate = api.apply_task(manifest).await.unwrap();
+        assert_eq!(duplicate.metadata().generation(), 1);
+        assert_eq!(duplicate, retry);
+        assert_eq!(builds.load(Ordering::Acquire), 2);
+
+        retry_gate.release();
+        wait_for_reconciled(&api, created.name(), 1, ConditionStatus::True).await;
+        assert_eq!(builds.load(Ordering::Acquire), 2);
+        api.shutdown().await.unwrap();
+    }
+
+    async fn wait_for_build(gate: &BuildGate) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !gate.started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reconciliation worker did not reach runner build");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conditional_delete_cannot_delete_a_generation_applied_after_its_predicate() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut router = RunnerRouter::new();
+        router.register(Arc::new(RecordingRunner { seen })).unwrap();
+        let api = Arc::new(api(router).await);
+        let first = api
+            .create_task(routed("visibility-race", 1_000))
+            .await
+            .unwrap();
+        let first_uid = first.uid().clone();
+        let name = first.name().clone();
+        let gate = Arc::new(BuildGate::new());
+
+        let deletion = {
+            let api = Arc::clone(&api);
+            let name = name.clone();
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                api.delete_task_where(&name, WritePreconditions::new(), move |task| {
+                    assert!(matches!(
+                        task.spec().workload(),
+                        TaskWorkload::Subprocess(_)
+                    ));
+                    gate.started.store(true, Ordering::Release);
+                    let mut open = gate.open.lock();
+                    while !*open {
+                        gate.changed.wait(&mut open);
+                    }
+                    true
+                })
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !gate.started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delete predicate started");
+
+        let apply = {
+            let api = Arc::clone(&api);
+            let name = name.clone();
+            tokio::spawn(async move {
+                api.apply_embedded_task(
+                    embedded(name.as_str(), 2_000),
+                    immediate_task("hidden-runtime"),
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !apply.is_finished(),
+            "apply must wait while delete owns the predicate snapshot"
+        );
+
+        gate.release();
+        deletion.await.unwrap().unwrap();
+        let replacement = apply.await.unwrap().unwrap();
+        assert_ne!(replacement.uid(), &first_uid);
+        assert!(matches!(
+            replacement.spec().workload(),
+            TaskWorkload::Embedded(_)
+        ));
+        let stored = api.get_task(&name).expect("replacement remains stored");
+        assert_eq!(stored.uid(), replacement.uid());
+        assert_eq!(
+            stored.metadata().generation(),
+            replacement.metadata().generation()
+        );
+        assert_eq!(stored.spec(), replacement.spec());
+        api.shutdown().await.unwrap();
+    }
+
+    struct BlockingRunner {
+        gate: Arc<BuildGate>,
+        runtime_started: Arc<AtomicBool>,
+    }
+
+    impl Runner for BlockingRunner {
+        fn name(&self) -> &str {
+            "blocking"
+        }
+
+        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+            subprocess_workload_types()
+        }
+
+        fn build_task(
+            &self,
+            _task: &Task,
+            run_id: &RunId,
+            _ctx: &BuildContext,
+        ) -> Result<TaskRef, RunnerError> {
+            self.gate.started.store(true, Ordering::Release);
+            let mut open = self.gate.open.lock();
+            while !*open {
+                self.gate.changed.wait(&mut open);
+            }
+            let runtime_started = Arc::clone(&self.runtime_started);
+            Ok(TaskFn::arc(run_id.name(), move |_ctx: TaskContext| {
+                runtime_started.store(true, Ordering::Release);
+                async move { Ok::<(), TaskError>(()) }
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn desired_commit_returns_before_blocked_reconciliation() {
+        let gate = Arc::new(BuildGate::new());
+        let runtime_started = Arc::new(AtomicBool::new(false));
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(BlockingRunner {
+                gate: Arc::clone(&gate),
+                runtime_started: Arc::clone(&runtime_started),
+            }))
+            .unwrap();
+        let api = api(router).await;
+        let name = TaskId::new("detached-request").unwrap();
+
+        let committed = tokio::time::timeout(
+            Duration::from_millis(250),
+            api.create_task(routed("detached-request", 1_000)),
+        )
+        .await
+        .expect("desired commit must not wait for runner build")
+        .unwrap();
+        assert_eq!(committed.status().phase(), TaskPhase::Pending);
+        assert_eq!(committed.status().observed_generation(), 0);
+        assert_eq!(api.get_task(&name), Some(committed));
+
+        wait_for_build(&gate).await;
+        assert!(!runtime_started.load(Ordering::Acquire));
+        gate.release();
+        wait_for_observed(&api, &name, 1).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !runtime_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("submitted runtime did not start");
+        api.shutdown().await.unwrap();
+    }
+
+    struct FirstBuildBlockingRunner {
+        gate: Arc<BuildGate>,
+        builds: AtomicUsize,
+    }
+
+    impl Runner for FirstBuildBlockingRunner {
+        fn name(&self) -> &str {
+            "first-build-blocking"
+        }
+
+        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+            subprocess_workload_types()
+        }
+
+        fn build_task(
+            &self,
+            _task: &Task,
+            run_id: &RunId,
+            _ctx: &BuildContext,
+        ) -> Result<TaskRef, RunnerError> {
+            if self.builds.fetch_add(1, Ordering::AcqRel) == 0 {
+                self.gate.started.store(true, Ordering::Release);
+                let mut open = self.gate.open.lock();
+                while !*open {
+                    self.gate.changed.wait(&mut open);
+                }
+            }
+            Ok(cancellable_task(run_id.name()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn newer_apply_reconciles_while_previous_preflight_is_blocked() {
+        let gate = Arc::new(BuildGate::new());
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(FirstBuildBlockingRunner {
+                gate: Arc::clone(&gate),
+                builds: AtomicUsize::new(0),
+            }))
+            .unwrap();
+        let api = api(router).await;
+        let name = TaskId::new("latest-generation-wins").unwrap();
+
+        let first = api
+            .write(
+                routed(name.as_str(), 1_000),
+                RuntimeSource::Routed,
+                WriteMode::Create,
+                WritePreconditions::new(),
+                true,
             )
             .await
-            .expect("SupervisorApi::new"),
-        );
+            .unwrap();
+        let first_done = first
+            .reconciliation
+            .expect("a created spec schedules reconciliation");
+        wait_for_build(&gate).await;
 
-        fn long_task() -> TaskRef {
-            TaskFn::arc("dup-name", |ctx: CancellationToken| async move {
-                while !ctx.is_cancelled() {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                Ok::<(), TaskError>(())
-            })
-        }
-        let spec = TaskSpec::builder("dup-slot", TaskKind::Embedded, 60_000_u64)
-            .restart(RestartPolicy::Never)
-            .backoff(mk_backoff())
-            .admission(AdmissionPolicy::DropIfRunning)
-            .build()
-            .expect("spec builds");
+        let second = tokio::time::timeout(
+            Duration::from_millis(250),
+            api.apply_task(routed(name.as_str(), 2_000)),
+        )
+        .await
+        .expect("a newer desired commit must not wait for the old preflight")
+        .unwrap();
+        assert_eq!(second.metadata().generation(), 2);
+        assert_eq!(second.status().phase(), TaskPhase::Pending);
 
-        let a = {
-            let api = Arc::clone(&api);
-            let spec = spec.clone();
-            tokio::spawn(async move { api.submit_with_task(long_task(), &spec).await })
-        };
-        let b = {
-            let api = Arc::clone(&api);
-            let spec = spec.clone();
-            tokio::spawn(async move { api.submit_with_task(long_task(), &spec).await })
-        };
-        let ra = a.await.unwrap();
-        let rb = b.await.unwrap();
-
-        let oks = [&ra, &rb].iter().filter(|r| r.is_ok()).count();
-        let already = [&ra, &rb]
-            .iter()
-            .filter(|r| matches!(r, Err(CoreError::AlreadyExists(_))))
-            .count();
+        let second_binding = wait_for_binding(&api, &name, 2).await;
+        wait_for_observed(&api, &name, 2).await;
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(2), first_done)
+            .await
+            .expect("stale reconciliation did not finish")
+            .expect("stale reconciliation acknowledgement dropped");
         assert_eq!(
-            oks, 1,
-            "exactly one same-name submit may win the reservation"
+            api.reconciler.state.binding_for(&name),
+            Some(second_binding),
+            "stale generation must not cancel or replace the current runtime"
         );
-        assert_eq!(
-            already, 1,
-            "the racing submit must be rejected as AlreadyExists, not orphan a binding"
-        );
+        api.delete_task(&name).await.unwrap();
+        api.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn submit_with_task_succeeds_for_simple_task() {
-        let router = RunnerRouter::new();
-        let api = SupervisorApi::new(
-            SupervisorConfig::default(),
-            ControllerConfig::default(),
-            Vec::new(),
-            router,
-            StateConfig::default(),
-        )
-        .await
-        .expect("failed to create SupervisorApi");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_during_blocked_preflight_prevents_late_runtime_submission() {
+        let gate = Arc::new(BuildGate::new());
+        let runtime_started = Arc::new(AtomicBool::new(false));
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(BlockingRunner {
+                gate: Arc::clone(&gate),
+                runtime_started: Arc::clone(&runtime_started),
+            }))
+            .unwrap();
+        let api = api(router).await;
+        let name = TaskId::new("delete-before-bind").unwrap();
 
-        let task: TaskRef = TaskFn::arc("test-task", |_ctx: CancellationToken| async move {
-            Ok::<(), TaskError>(())
-        });
-
-        let spec = TaskSpec::builder("test-slot", TaskKind::Embedded, 1_000_u64)
-            .restart(RestartPolicy::Never)
-            .backoff(mk_backoff())
-            .admission(AdmissionPolicy::DropIfRunning)
-            .build()
-            .expect("valid spec");
-
-        let res = api.submit_with_task(task, &spec).await;
-        match res {
-            Ok(task_id) => {
-                assert!(!task_id.as_str().is_empty());
-                assert!(task_id.as_str().contains("test-task"));
-            }
-            Err(e) => panic!("expected Ok(TaskId), got error: {e:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn delete_task_stops_running_task_and_wipes_state() {
-        let router = RunnerRouter::new();
-        let api = SupervisorApi::new(
-            SupervisorConfig::default(),
-            ControllerConfig::default(),
-            Vec::new(),
-            router,
-            StateConfig::default(),
-        )
-        .await
-        .expect("SupervisorApi::new");
-
-        let cancelled_observed = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&cancelled_observed);
-        let task: TaskRef = TaskFn::arc("kill-me", move |ctx: CancellationToken| {
-            let flag = Arc::clone(&flag);
-            async move {
-                while !ctx.is_cancelled() {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                flag.store(true, Ordering::SeqCst);
-                Ok::<(), TaskError>(())
-            }
-        });
-
-        let spec = TaskSpec::builder("slot-delete", TaskKind::Embedded, 60_000_u64)
-            .restart(RestartPolicy::Never)
-            .backoff(mk_backoff())
-            .admission(AdmissionPolicy::Replace)
-            .build()
-            .expect("spec builds");
-
-        let task_id = api
-            .submit_with_task(task, &spec)
+        let scheduled = api
+            .write(
+                routed(name.as_str(), 1_000),
+                RuntimeSource::Routed,
+                WriteMode::Create,
+                WritePreconditions::new(),
+                true,
+            )
             .await
-            .expect("submit_with_task");
+            .unwrap();
+        let reconciliation = scheduled
+            .reconciliation
+            .expect("a created spec schedules reconciliation");
+        wait_for_build(&gate).await;
 
-        let handle = api.handle();
-        let mut alive = false;
-        for _ in 0..100 {
-            if handle.is_alive(task_id.as_str()).await {
-                alive = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            alive,
-            "task body must reach Running state before we try to delete"
-        );
-
-        api.delete_task(&task_id)
+        tokio::time::timeout(Duration::from_millis(250), api.delete_task(&name))
             .await
-            .expect("delete_task must Ok");
+            .expect("delete must not wait for runner preflight")
+            .unwrap();
+        assert!(api.get_task(&name).is_none());
 
-        assert!(
-            api.get_task(&task_id).is_none(),
-            "state must be wiped after delete"
-        );
-        assert!(
-            api.list_task_runs(&task_id).is_empty(),
-            "run history must be purged by delete"
-        );
-
-        for _ in 0..100 {
-            if cancelled_observed.load(Ordering::SeqCst) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            cancelled_observed.load(Ordering::SeqCst),
-            "task body must observe the cancel token — delete must cancel, not just wipe state"
-        );
-    }
-
-    #[tokio::test]
-    async fn dropping_api_without_shutdown_cancels_running_tasks() {
-        let api = SupervisorApi::new(
-            SupervisorConfig::default(),
-            ControllerConfig::default(),
-            Vec::new(),
-            RunnerRouter::new(),
-            StateConfig::default(),
-        )
-        .await
-        .expect("SupervisorApi::new");
-
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&cancelled);
-        let task: TaskRef = TaskFn::arc("drop-cancel", move |ctx: CancellationToken| {
-            let flag = Arc::clone(&flag);
-            async move {
-                while !ctx.is_cancelled() {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                flag.store(true, Ordering::SeqCst);
-                Ok::<(), TaskError>(())
-            }
-        });
-        let spec = TaskSpec::builder("drop-slot", TaskKind::Embedded, 60_000_u64)
-            .restart(RestartPolicy::Never)
-            .backoff(mk_backoff())
-            .admission(AdmissionPolicy::Replace)
-            .build()
-            .expect("spec builds");
-
-        api.submit_with_task(task, &spec)
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(2), reconciliation)
             .await
-            .expect("submit_with_task");
-
-        let handle = api.handle();
-        for _ in 0..200 {
-            if handle.is_alive("drop-cancel").await {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        drop(api);
-
-        let mut observed = false;
-        for _ in 0..200 {
-            if cancelled.load(Ordering::SeqCst) {
-                observed = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+            .expect("stale reconciliation did not finish")
+            .expect("stale reconciliation acknowledgement dropped");
+        assert!(api.get_task(&name).is_none());
+        assert!(api.reconciler.state.binding_for(&name).is_none());
         assert!(
-            observed,
-            "dropping SupervisorApi without shutdown() must cancel running tasks (best-effort), not leak them"
+            !runtime_started.load(Ordering::Acquire),
+            "a deleted resource must not be submitted after preflight"
         );
+
+        api.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn submitting_an_active_duplicate_name_returns_already_exists() {
-        let api = SupervisorApi::new(
-            SupervisorConfig::default(),
-            ControllerConfig::default(),
-            Vec::new(),
-            RunnerRouter::new(),
-            StateConfig::default(),
-        )
-        .await
-        .expect("SupervisorApi::new");
+    async fn shutdown_started_rejects_desired_writes_without_committing_them() {
+        let api = api(RunnerRouter::new()).await;
+        api.shutdown().await.unwrap();
 
-        let long = |name: &'static str| -> TaskRef {
-            TaskFn::arc(name, |ctx: CancellationToken| async move {
-                ctx.cancelled().await;
-                Ok::<(), TaskError>(())
-            })
-        };
-        let spec = TaskSpec::builder("dup-slot", TaskKind::Embedded, 60_000_u64)
-            .restart(RestartPolicy::Never)
-            .backoff(mk_backoff())
-            .admission(AdmissionPolicy::Replace)
-            .build()
-            .expect("spec builds");
-
-        let id = api
-            .submit_with_task(long("dup-name"), &spec)
+        let error = api
+            .create_embedded_task(
+                embedded("too-late", 1_000),
+                immediate_task("too-late-runtime"),
+            )
             .await
-            .expect("first submit ok");
-
-        let handle = api.handle();
-        for _ in 0..200 {
-            if handle.is_alive(id.as_str()).await {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        let err = api
-            .submit_with_task(long("dup-name"), &spec)
-            .await
-            .expect_err("duplicate active name must be rejected");
-        assert!(
-            matches!(err, CoreError::AlreadyExists(_)),
-            "expected AlreadyExists, got {err:?}"
-        );
-
-        let _ = api.shutdown().await;
+            .unwrap_err();
+        assert!(matches!(error, CoreError::ShuttingDown));
+        assert!(api.get_task(&TaskId::new("too-late").unwrap()).is_none());
     }
 
     #[tokio::test]
-    async fn submit_with_task_rejects_malformed_task_name() {
-        let api = SupervisorApi::new(
-            SupervisorConfig::default(),
-            ControllerConfig::default(),
-            Vec::new(),
-            RunnerRouter::new(),
-            StateConfig::default(),
-        )
-        .await
-        .expect("SupervisorApi::new");
+    async fn shutdown_and_drop_close_task_watches() {
+        let shutdown_api = api(RunnerRouter::new()).await;
+        let mut shutdown_watch = shutdown_api
+            .watch_tasks(&TaskFilter::new(), Some("0"))
+            .unwrap();
+        shutdown_api.shutdown().await.unwrap();
+        assert!(shutdown_watch.next().await.is_none());
 
-        let task: TaskRef = TaskFn::arc(
-            "bad name with spaces",
-            |_ctx: CancellationToken| async move { Ok::<(), TaskError>(()) },
-        );
-        let spec = TaskSpec::builder("ok-slot", TaskKind::Embedded, 1_000_u64)
-            .restart(RestartPolicy::Never)
-            .backoff(mk_backoff())
-            .admission(AdmissionPolicy::DropIfRunning)
-            .build()
-            .expect("spec builds");
-
-        let err = api
-            .submit_with_task(task, &spec)
-            .await
-            .expect_err("malformed task name must be rejected");
-        assert!(
-            matches!(err, CoreError::InvalidSpec(_)),
-            "expected InvalidSpec, got {err:?}"
-        );
-
-        let _ = api.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn cancel_missing_task_returns_not_found() {
-        let api = SupervisorApi::new(
-            SupervisorConfig::default(),
-            ControllerConfig::default(),
-            Vec::new(),
-            RunnerRouter::new(),
-            StateConfig::default(),
-        )
-        .await
-        .expect("SupervisorApi::new");
-
-        let err = api
-            .cancel_task(&TaskId::from("never-existed"))
-            .await
-            .expect_err("cancel on missing must error");
-        assert!(
-            matches!(err, CoreError::NotFound(_)),
-            "expected NotFound, got {err:?}"
-        );
-
-        let _ = api.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn delete_task_is_idempotent_on_missing() {
-        let router = RunnerRouter::new();
-        let api = SupervisorApi::new(
-            SupervisorConfig::default(),
-            ControllerConfig::default(),
-            Vec::new(),
-            router,
-            StateConfig::default(),
-        )
-        .await
-        .expect("SupervisorApi::new");
-
-        let missing = TaskId::from("never-submitted");
-        api.delete_task(&missing)
-            .await
-            .expect("delete on missing id must be Ok");
-    }
-
-    #[tokio::test]
-    async fn submit_rejects_taskkind_embedded() {
-        let router = RunnerRouter::new();
-        let api = SupervisorApi::new(
-            SupervisorConfig::default(),
-            ControllerConfig::default(),
-            Vec::new(),
-            router,
-            StateConfig::default(),
-        )
-        .await
-        .expect("failed to create SupervisorApi");
-
-        let spec = TaskSpec::builder("test-slot-none", TaskKind::Embedded, 1_000_u64)
-            .restart(RestartPolicy::Never)
-            .backoff(mk_backoff())
-            .admission(AdmissionPolicy::DropIfRunning)
-            .build()
-            .expect("valid spec");
-        let res = api.submit(&spec).await;
-
-        match res {
-            Err(CoreError::InvalidSpec(e)) => {
-                assert!(e.to_string().contains("TaskKind::Embedded"));
-            }
-            Ok(_) => panic!("expected error for TaskKind::Embedded, got Ok(TaskId)"),
-            Err(e) => panic!("expected CoreError::InvalidSpec, got {e:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn supervisor_api_default_new_creates_empty_output_registry() {
-        let router = RunnerRouter::new();
-        let api = SupervisorApi::new(
-            SupervisorConfig::default(),
-            ControllerConfig::default(),
-            Vec::new(),
-            router,
-            StateConfig::default(),
-        )
-        .await
-        .expect("SupervisorApi::new");
-
-        assert_eq!(api.output_registry().active_channels(), 0);
-    }
-
-    #[tokio::test]
-    async fn supervisor_api_with_provided_registry_shares_arc() {
-        let router = RunnerRouter::new();
-        let registry = Arc::new(OutputRegistry::new(64));
-        registry.ensure_channel(TaskId::from("seeded"));
-
-        let api = SupervisorApi::new_with_output_registry(
-            SupervisorConfig::default(),
-            ControllerConfig::default(),
-            Vec::new(),
-            router,
-            StateConfig::default(),
-            Arc::clone(&registry),
-        )
-        .await
-        .expect("SupervisorApi::new_with_output_registry");
-
-        assert!(Arc::ptr_eq(api.output_registry(), &registry));
-        assert_eq!(api.output_registry().active_channels(), 1);
-    }
-
-    #[tokio::test]
-    async fn unwind_provisional_submit_drops_state_entry_and_output_channel() {
-        let registry = Arc::new(OutputRegistry::default());
-        let router = RunnerRouter::new();
-        let api = SupervisorApi::new_with_output_registry(
-            SupervisorConfig::default(),
-            ControllerConfig::default(),
-            Vec::new(),
-            router,
-            StateConfig::default(),
-            Arc::clone(&registry),
-        )
-        .await
-        .expect("SupervisorApi::new_with_output_registry");
-
-        let ghost = TaskId::from("orphan-on-submit-fail");
-
-        registry.ensure_channel(ghost.clone());
-        let spec = TaskSpec::builder("ghost-slot", TaskKind::Embedded, 1_000_u64)
-            .restart(RestartPolicy::Never)
-            .backoff(mk_backoff())
-            .admission(AdmissionPolicy::DropIfRunning)
-            .build()
-            .expect("valid spec");
-        api.state.add_task(ghost.clone(), spec);
-
-        let channels_before = registry.active_channels();
-        assert!(channels_before >= 1, "channel must exist before unwind");
-        assert!(api.get_task(&ghost).is_some(), "state entry must exist");
-
-        api.unwind_provisional_submit(&ghost);
-        assert_eq!(
-            registry.active_channels(),
-            channels_before - 1,
-            "unwind must drop exactly the ghost task's channel"
-        );
-        assert!(
-            api.get_task(&ghost).is_none(),
-            "state entry must be gone after unwind"
-        );
-    }
-
-    use taskvisor::TaskOutcome;
-
-    fn bound_running_state(name: &str, tv: u64) -> (TaskState, TaskId) {
-        let state = TaskState::new();
-        let id = TaskId::from(name);
-        let spec = TaskSpec::builder(name, TaskKind::Embedded, 5_000_u64)
-            .build()
-            .expect("valid spec");
-        state.add_task(id.clone(), spec);
-        state.bind_tv(&id, tv);
-        state.transition_starting(&id);
-        (state, id)
-    }
-
-    #[test]
-    fn backstop_finalizes_a_lost_terminal_outcome() {
-        let (state, id) = bound_running_state("lost-1", 101);
-        let registry = OutputRegistry::default();
-
-        SupervisorApi::finalize_from_outcome(&state, &registry, 101, &TaskOutcome::Completed);
-
-        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Succeeded);
-    }
-
-    #[test]
-    fn backstop_evicts_output_channel_on_terminal_outcome() {
-        let (state, id) = bound_running_state("leak-1", 201);
-        let registry = OutputRegistry::default();
-        registry.ensure_channel(id.clone());
-        assert!(registry.subscribe(&id).is_some(), "channel exists before");
-
-        SupervisorApi::finalize_from_outcome(&state, &registry, 201, &TaskOutcome::Completed);
-
-        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Succeeded);
-        assert!(
-            registry.subscribe(&id).is_none(),
-            "the backstop must evict the output channel on a terminal outcome"
-        );
-    }
-
-    #[test]
-    fn backstop_is_noop_when_events_already_finalized() {
-        let (state, id) = bound_running_state("done-1", 102);
-        let registry = OutputRegistry::default();
-        state.transition_finished(&id, TaskPhase::Failed, Some("boom".into()), Some(1));
-
-        SupervisorApi::finalize_from_outcome(&state, &registry, 102, &TaskOutcome::Completed);
-
-        assert_eq!(
-            state.get(&id).unwrap().status().phase,
-            TaskPhase::Failed,
-            "an already-terminal entry must be left untouched"
-        );
-    }
-
-    #[test]
-    fn backstop_rejected_finalizes_entry_consistently_with_event_path() {
-        let (state, id) = bound_running_state("rej-1", 103);
-        let registry = OutputRegistry::default();
-        registry.ensure_channel(id.clone());
-
-        SupervisorApi::finalize_from_outcome(
-            &state,
-            &registry,
-            103,
-            &TaskOutcome::Rejected {
-                reason: "dropped: slot busy (running)".into(),
-            },
-        );
-
-        let task = state.get(&id).expect("rejected entry stays observable");
-        assert_eq!(task.status().phase, TaskPhase::Failed);
-        assert!(registry.subscribe(&id).is_none(), "output channel evicted");
-    }
-
-    #[test]
-    fn backstop_rejected_user_drop_is_canceled() {
-        let (state, id) = bound_running_state("rej-2", 104);
-        let registry = OutputRegistry::default();
-
-        SupervisorApi::finalize_from_outcome(
-            &state,
-            &registry,
-            104,
-            &TaskOutcome::Rejected {
-                reason: "removed_from_queue".into(),
-            },
-        );
-
-        assert_eq!(state.get(&id).unwrap().status().phase, TaskPhase::Canceled);
-    }
-
-    #[test]
-    fn backstop_noop_for_unknown_run_id() {
-        let state = TaskState::new();
-        let registry = OutputRegistry::default();
-        SupervisorApi::finalize_from_outcome(&state, &registry, 999, &TaskOutcome::Completed);
+        let dropped_api = api(RunnerRouter::new()).await;
+        let mut dropped_watch = dropped_api
+            .watch_tasks(&TaskFilter::new(), Some("0"))
+            .unwrap();
+        drop(dropped_api);
+        assert!(dropped_watch.next().await.is_none());
     }
 }

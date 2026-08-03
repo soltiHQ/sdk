@@ -1,49 +1,53 @@
-//! # Task specification.
+//! # Task spec
 //!
-//! [`TaskSpec`] defines the desired state; constructed via [`TaskSpecBuilder`].
+//! [`TaskSpec`] defines workload, slot, timeout, policies, and runner selection.
+
+use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AdmissionPolicy, BackoffPolicy, Labels, RestartPolicy, RunnerSelector, Slot, TaskKind, Timeout,
+    AdmissionPolicy, BackoffPolicy, LabelSelector, RestartPolicy, Slot, TaskWorkload, Timeout,
     error::{ModelError, ModelResult},
 };
 
-/// Desired state specification.
+/// Desired state for a task.
 ///
-/// `TaskSpec` describes *what* should be run and *how* it should be managed by the runtime.
+/// Use [`TaskSpec::builder`] to construct it.
+/// Resource constructors validate the completed spec.
 ///
-/// Fields cover:
-/// - logical grouping (`slot`)
-/// - execution backend (`kind`)
-/// - concurrency control (`admission`)
-/// - lifecycle policies (`timeout`, `restart`, `backoff`)
+/// ## Example
 ///
-/// ## Also
+/// ```
+/// use solti_model::{EmbeddedSpec, RestartPolicy, TaskSpec, TaskWorkload};
 ///
-/// - [`TaskSpecBuilder`] validated builder (via [`TaskSpec::builder`]).
-/// - [`TaskKind`] execution backend variants.
-/// - [`RestartPolicy`] / [`BackoffPolicy`] lifecycle policies.
-/// - [`AdmissionPolicy`] duplicate handling.
-/// - [`RunnerSelector`] label-based runner routing.
+/// let workload = TaskWorkload::Embedded(EmbeddedSpec::new("v1").unwrap());
+/// let spec = TaskSpec::builder("daily-cleanup", workload, 5_000u64)
+///     .restart(RestartPolicy::periodic(60_000))
+///     .build()
+///     .unwrap();
+///
+/// assert_eq!(spec.slot().as_str(), "daily-cleanup");
+/// assert_eq!(spec.timeout().as_millis(), 5_000);
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(!try_from, deny_unknown_fields))]
 #[serde(rename_all = "camelCase")]
 #[serde(try_from = "raw::TaskSpecRaw")]
 pub struct TaskSpec {
     slot: Slot,
-    kind: TaskKind,
+    workload: TaskWorkload,
 
     timeout: Timeout,
     restart: RestartPolicy,
     backoff: BackoffPolicy,
     admission: AdmissionPolicy,
-    #[serde(default)]
-    max_retries: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_retries: Option<NonZeroU32>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    runner_selector: Option<RunnerSelector>,
-    #[serde(default, skip_serializing_if = "Labels::is_empty")]
-    labels: Labels,
+    runner_selector: Option<LabelSelector>,
 }
 
 impl TaskSpec {
@@ -53,13 +57,13 @@ impl TaskSpec {
         &self.slot
     }
 
-    /// Execution backend used to run the task.
+    /// Workload desired state.
     #[inline]
-    pub fn kind(&self) -> &TaskKind {
-        &self.kind
+    pub fn workload(&self) -> &TaskWorkload {
+        &self.workload
     }
 
-    /// Hard timeout in milliseconds.
+    /// Per-attempt timeout.
     #[inline]
     pub fn timeout(&self) -> Timeout {
         self.timeout
@@ -83,45 +87,39 @@ impl TaskSpec {
         self.admission
     }
 
-    /// Maximum failure-driven retries per run (`0` = unlimited, the default).
+    /// Maximum consecutive failure retries.
     ///
-    /// Counts only failure retries (the counter resets on success); when the
-    /// budget is exhausted the supervisor stops restarting the task.
+    /// `None` means unlimited.
+    /// Zero is not representable.
     #[inline]
-    pub fn max_retries(&self) -> u32 {
+    pub fn max_retries(&self) -> Option<NonZeroU32> {
         self.max_retries
     }
 
-    /// Label selector for runner routing (if present).
+    /// Label selector for runner routing, if present.
     #[inline]
-    pub fn runner_selector(&self) -> Option<&RunnerSelector> {
+    pub fn runner_selector(&self) -> Option<&LabelSelector> {
         self.runner_selector.as_ref()
-    }
-
-    /// Metadata labels for routing / scheduling / observability.
-    #[inline]
-    pub fn labels(&self) -> &Labels {
-        &self.labels
     }
 }
 
 impl TaskSpec {
-    /// Create a [`TaskSpecBuilder`] with the three required fields.
+    /// Creates a builder with the required fields.
     ///
     /// ```rust
-    /// use solti_model::{TaskSpec, TaskKind, SubprocessSpec, SubprocessMode, RestartPolicy};
+    /// use solti_model::{TaskSpec, TaskWorkload, SubprocessSpec, SubprocessMode, RestartPolicy};
     ///
     /// let spec = TaskSpec::builder(
     ///     "my-slot",
-    ///     TaskKind::Subprocess(SubprocessSpec {
-    ///         mode: SubprocessMode::Command {
+    ///     TaskWorkload::Subprocess(SubprocessSpec::new(
+    ///         SubprocessMode::Command {
     ///             command: "echo".into(),
     ///             args: vec!["hello".into()],
     ///         },
-    ///         env: Default::default(),
-    ///         cwd: None,
-    ///         fail_on_non_zero: Default::default(),
-    ///     }),
+    ///         Default::default(),
+    ///         None,
+    ///         Default::default(),
+    ///     )),
     ///     5_000u64,
     /// )
     /// .restart(RestartPolicy::OnFailure)
@@ -129,25 +127,57 @@ impl TaskSpec {
     /// .expect("valid spec");
     /// ```
     pub fn builder(
-        slot: impl Into<Slot>,
-        kind: TaskKind,
-        timeout: impl Into<Timeout>,
+        slot: impl AsRef<str>,
+        workload: TaskWorkload,
+        timeout: impl Into<u64>,
     ) -> TaskSpecBuilder {
-        TaskSpecBuilder::new(slot, kind, timeout)
+        TaskSpecBuilder::new(slot, workload, timeout)
     }
 }
 
 impl TaskSpec {
-    /// Attach a runner selector used by the router (consuming builder-style).
+    /// Sets a runner selector on an existing spec.
+    ///
+    /// This method does not validate `sel`.
+    /// Call [`Self::validate`] before using the result outside a validated resource.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{EmbeddedSpec, Labels, LabelSelector, TaskSpec, TaskWorkload};
+    ///
+    /// let mut labels = Labels::new();
+    /// labels.insert("zone", "eu");
+    ///
+    /// let workload = TaskWorkload::Embedded(EmbeddedSpec::new("v1").unwrap());
+    /// let spec = TaskSpec::builder("build", workload, 1_000u64)
+    ///     .build()
+    ///     .unwrap()
+    ///     .with_runner_selector(LabelSelector::from_labels(labels));
+    ///
+    /// assert!(spec.runner_selector().is_some());
+    /// ```
     #[inline]
-    pub fn with_runner_selector(mut self, sel: RunnerSelector) -> Self {
+    pub fn with_runner_selector(mut self, sel: LabelSelector) -> Self {
         self.runner_selector = Some(sel);
         self
     }
 
-    /// Override the admission policy (consuming builder-style).
+    /// Sets the admission policy on an existing spec.
     ///
-    /// Used by the apply/upgrade path to force [`AdmissionPolicy::Replace`] regardless of the spec's declared admission.
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{AdmissionPolicy, EmbeddedSpec, TaskSpec, TaskWorkload};
+    ///
+    /// let workload = TaskWorkload::Embedded(EmbeddedSpec::new("v1").unwrap());
+    /// let spec = TaskSpec::builder("agent", workload, 1_000u64)
+    ///     .build()
+    ///     .unwrap()
+    ///     .with_admission(AdmissionPolicy::Replace);
+    ///
+    /// assert_eq!(spec.admission(), AdmissionPolicy::Replace);
+    /// ```
     #[inline]
     pub fn with_admission(mut self, admission: AdmissionPolicy) -> Self {
         self.admission = admission;
@@ -156,159 +186,192 @@ impl TaskSpec {
 }
 
 impl TaskSpec {
-    /// Validate the spec at the **submit boundary**.
+    /// Validates the complete spec.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the slot, workload, backoff, or runner selector is invalid.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{
+    ///     Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskSpec, TaskWorkload,
+    /// };
+    ///
+    /// let spec = TaskSpec::builder(
+    ///     "hello",
+    ///     TaskWorkload::Subprocess(SubprocessSpec::new(
+    ///         SubprocessMode::Command {
+    ///             command: "echo".into(),
+    ///             args: vec!["hello".into()],
+    ///         },
+    ///         TaskEnv::default(),
+    ///         None,
+    ///         Flag::enabled(),
+    ///     )),
+    ///     1_000u64,
+    /// )
+    /// .build()
+    /// .unwrap();
+    ///
+    /// spec.validate().unwrap();
+    /// ```
     pub fn validate(&self) -> ModelResult<()> {
-        self.validate_structural()?;
-        if matches!(self.kind, TaskKind::Embedded) {
-            return Err(ModelError::Invalid(
-                "TaskKind::Embedded cannot be submitted via runner; use submit_with_task".into(),
-            ));
-        }
-        Ok(())
+        self.validate_structural()
     }
 
-    /// Structural validation of all fields.
-    ///
-    /// Checks:
-    /// - `slot` is not empty
-    /// - `timeout` is greater than zero
-    /// - `kind` specific constraints (e.g. non-empty command)
-    /// - `backoff` parameters are sane
-    /// - `runner_selector` requirements are structurally valid
+    /// Validates all structural fields.
     fn validate_structural(&self) -> ModelResult<()> {
         self.slot.validate_format()?;
-        if self.timeout.as_millis() == 0 {
-            return Err(ModelError::Invalid(
-                "timeout must be greater than zero".into(),
-            ));
-        }
-        self.kind.validate()?;
+        self.workload.validate()?;
         self.backoff.validate()?;
         if let Some(ref sel) = self.runner_selector {
-            for req in &sel.match_expressions {
-                req.validate()?;
-            }
+            sel.validate()?;
         }
         Ok(())
     }
 }
 
-/// Builder for [`TaskSpec`] that validates structural invariants on [`build`](TaskSpecBuilder::build).
+/// Builder for [`TaskSpec`].
 ///
-/// Required fields (`slot`, `kind`, `timeout`) are set in the constructor.
-/// Optional fields have sensible defaults:
-/// - `backoff`: [`BackoffPolicy::default`] (full jitter, 1 s → 30 s, factor 2)
+/// Required fields are set by [`TaskSpec::builder`].
+///
+/// Optional fields use these defaults:
+///
+/// - `backoff`: [`BackoffPolicy::default`] (full jitter, 1 second to 30 seconds, factor 2)
 /// - `admission`: [`AdmissionPolicy::DropIfRunning`]
 /// - `restart`: [`RestartPolicy::Never`]
+/// - `max_retries`: `None`
 /// - `runner_selector`: `None`
-/// - `labels`: empty
 ///
-/// ## Also
+/// ## Example
 ///
-/// - [`TaskSpec::builder`] entry point.
-/// - [`TaskSpec::validate`] submit-boundary validation (rejects `Embedded`).
+/// ```
+/// use solti_model::{AdmissionPolicy, EmbeddedSpec, RestartPolicy, TaskSpec, TaskWorkload};
+///
+/// let workload = TaskWorkload::Embedded(EmbeddedSpec::new("v1").unwrap());
+/// let spec = TaskSpec::builder("service", workload, 5_000u64)
+///     .restart(RestartPolicy::always())
+///     .admission(AdmissionPolicy::Replace)
+///     .build()
+///     .unwrap();
+///
+/// assert_eq!(spec.restart(), RestartPolicy::always());
+/// assert_eq!(spec.admission(), AdmissionPolicy::Replace);
+/// ```
 pub struct TaskSpecBuilder {
-    runner_selector: Option<RunnerSelector>,
+    runner_selector: Option<LabelSelector>,
 
-    kind: TaskKind,
-    slot: Slot,
+    workload: TaskWorkload,
+    slot: String,
 
     backoff: BackoffPolicy,
     restart: RestartPolicy,
-    timeout: Timeout,
-    max_retries: u32,
+    timeout_ms: u64,
+    max_retries: Option<NonZeroU32>,
 
     admission: AdmissionPolicy,
-    labels: Labels,
 }
 
 impl TaskSpecBuilder {
-    fn new(slot: impl Into<Slot>, kind: TaskKind, timeout: impl Into<Timeout>) -> Self {
+    fn new(slot: impl AsRef<str>, workload: TaskWorkload, timeout: impl Into<u64>) -> Self {
         Self {
             runner_selector: None,
 
-            kind,
-            slot: slot.into(),
+            workload,
+            slot: slot.as_ref().to_owned(),
 
             restart: RestartPolicy::default(),
             backoff: BackoffPolicy::default(),
-            timeout: timeout.into(),
+            timeout_ms: timeout.into(),
 
             admission: AdmissionPolicy::default(),
-            max_retries: 0,
-            labels: Labels::new(),
+            max_retries: None,
         }
     }
 
-    /// Set restart policy.
+    /// Sets the restart policy.
     #[must_use]
     pub fn restart(mut self, restart: RestartPolicy) -> Self {
         self.restart = restart;
         self
     }
 
-    /// Set the failure-retry budget (`0` = unlimited, the default).
+    /// Sets the failure-retry budget.
+    ///
+    /// `None` means unlimited.
+    ///
+    /// ```rust
+    /// # use solti_model::{EmbeddedSpec, TaskSpec, TaskWorkload};
+    /// # use std::num::NonZeroU32;
+    /// let workload = TaskWorkload::Embedded(EmbeddedSpec::new("v1").unwrap());
+    /// let spec = TaskSpec::builder("s", workload, 1_000u64)
+    ///     .max_retries(NonZeroU32::new(3))
+    ///     .build()
+    ///     .expect("valid spec");
+    /// assert_eq!(spec.max_retries().map(NonZeroU32::get), Some(3));
+    /// ```
     #[must_use]
-    pub fn max_retries(mut self, max_retries: u32) -> Self {
-        self.max_retries = max_retries;
+    pub fn max_retries(mut self, max_retries: impl Into<Option<NonZeroU32>>) -> Self {
+        self.max_retries = max_retries.into();
         self
     }
 
-    /// Set backoff configuration.
+    /// Sets the backoff policy.
     #[must_use]
     pub fn backoff(mut self, backoff: BackoffPolicy) -> Self {
         self.backoff = backoff;
         self
     }
 
-    /// Set admission policy.
+    /// Sets the admission policy.
     #[must_use]
     pub fn admission(mut self, admission: AdmissionPolicy) -> Self {
         self.admission = admission;
         self
     }
 
-    /// Set runner selector.
+    /// Sets the runner selector.
     #[must_use]
-    pub fn runner_selector(mut self, sel: RunnerSelector) -> Self {
+    pub fn runner_selector(mut self, sel: LabelSelector) -> Self {
         self.runner_selector = Some(sel);
         self
     }
 
-    /// Set metadata labels.
-    #[must_use]
-    pub fn labels(mut self, labels: Labels) -> Self {
-        self.labels = labels;
-        self
-    }
-
-    /// Build the [`TaskSpec`], validating structural invariants.
+    /// Builds and validates the spec.
     ///
-    /// This checks everything **except** the [`TaskKind::Embedded`] business rule
-    /// (which is enforced at the submit boundary by [`TaskSpec::validate`]).
+    /// Runner availability is not checked by this crate.
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] if:
-    /// - `slot` is empty
-    /// - `timeout` is zero
-    /// - `kind` fails kind-specific validation
-    /// - `backoff` parameters are invalid
-    /// - `runner_selector` requirements are invalid
+    /// Returns [`ModelError::Invalid`] when any structural field is invalid.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{EmbeddedSpec, TaskSpec, TaskWorkload};
+    ///
+    /// let workload = TaskWorkload::Embedded(EmbeddedSpec::new("v1").unwrap());
+    /// let err = TaskSpec::builder("", workload, 1_000u64)
+    ///     .build()
+    ///     .unwrap_err();
+    ///
+    /// assert!(err.to_string().contains("slot"));
+    /// ```
     pub fn build(self) -> ModelResult<TaskSpec> {
         let spec = TaskSpec {
             runner_selector: self.runner_selector,
 
-            kind: self.kind,
-            slot: self.slot,
+            workload: self.workload,
+            slot: Slot::new(self.slot)?,
 
             restart: self.restart,
             backoff: self.backoff,
-            timeout: self.timeout,
+            timeout: Timeout::new(self.timeout_ms)?,
 
             admission: self.admission,
             max_retries: self.max_retries,
-            labels: self.labels,
         };
         spec.validate_structural()?;
         Ok(spec)
@@ -319,31 +382,40 @@ mod raw {
     use super::*;
 
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
     pub(super) struct TaskSpecRaw {
         slot: Slot,
-        kind: TaskKind,
+        workload: TaskWorkload,
         timeout: Timeout,
         restart: RestartPolicy,
         backoff: BackoffPolicy,
         admission: AdmissionPolicy,
         #[serde(default)]
-        max_retries: u32,
+        max_retries: Option<u32>,
 
         #[serde(default)]
-        labels: Labels,
-        #[serde(default)]
-        runner_selector: Option<RunnerSelector>,
+        runner_selector: Option<LabelSelector>,
     }
 
     impl TryFrom<TaskSpecRaw> for TaskSpec {
         type Error = ModelError;
 
         fn try_from(r: TaskSpecRaw) -> Result<Self, Self::Error> {
+            let max_retries = match r.max_retries {
+                None => None,
+                Some(0) => {
+                    return Err(ModelError::Invalid(
+                        "maxRetries: 0 is not allowed; omit the field for an unlimited budget"
+                            .into(),
+                    ));
+                }
+                Some(n) => NonZeroU32::new(n),
+            };
+
             let spec = Self {
                 runner_selector: r.runner_selector,
 
-                kind: r.kind,
+                workload: r.workload,
                 slot: r.slot,
 
                 restart: r.restart,
@@ -351,8 +423,7 @@ mod raw {
                 timeout: r.timeout,
 
                 admission: r.admission,
-                max_retries: r.max_retries,
-                labels: r.labels,
+                max_retries,
             };
             spec.validate_structural()?;
             Ok(spec)
@@ -363,12 +434,16 @@ mod raw {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Flag, SubprocessMode, SubprocessSpec, TaskEnv};
+    use crate::{EmbeddedSpec, Flag, SubprocessMode, SubprocessSpec, TaskEnv};
+
+    fn embedded() -> TaskWorkload {
+        TaskWorkload::Embedded(EmbeddedSpec::new("test-v1").unwrap())
+    }
 
     fn valid_spec() -> TaskSpec {
         TaskSpec::builder(
             "test",
-            TaskKind::Subprocess(SubprocessSpec {
+            TaskWorkload::Subprocess(SubprocessSpec {
                 mode: SubprocessMode::Command {
                     command: "echo".into(),
                     args: vec![],
@@ -384,46 +459,29 @@ mod tests {
     }
 
     #[test]
-    fn valid_spec_passes() {
-        assert!(valid_spec().validate().is_ok());
+    fn builder_accepts_valid_specs_and_rejects_required_field_errors() {
+        valid_spec().validate().unwrap();
+
+        for (slot, timeout, field) in [("", 5_000_u64, "slot"), ("test", 0_u64, "timeout")] {
+            let error = TaskSpec::builder(slot, embedded(), timeout)
+                .build()
+                .unwrap_err();
+            assert!(error.to_string().contains(field), "got: {error}");
+        }
     }
 
     #[test]
-    fn builder_rejects_empty_slot() {
-        let err = TaskSpec::builder("", TaskKind::Embedded, 5_000u64)
-            .build()
-            .unwrap_err();
-        assert!(err.to_string().contains("slot"));
-    }
-
-    #[test]
-    fn builder_rejects_zero_timeout() {
-        let err = TaskSpec::builder("test", TaskKind::Embedded, 0u64)
-            .build()
-            .unwrap_err();
-        assert!(err.to_string().contains("timeout"));
-    }
-
-    #[test]
-    fn builder_allows_embedded_kind() {
-        let spec = TaskSpec::builder("test", TaskKind::Embedded, 5_000u64)
+    fn embedded_workload_is_structurally_valid() {
+        let spec = TaskSpec::builder("test", embedded(), 5_000u64)
             .build()
             .expect("Embedded is structurally valid");
-        assert!(matches!(spec.kind(), TaskKind::Embedded));
+        assert!(matches!(spec.workload(), TaskWorkload::Embedded(_)));
+        spec.validate().unwrap();
     }
 
     #[test]
-    fn validate_rejects_embedded_kind() {
-        let spec = TaskSpec::builder("test", TaskKind::Embedded, 5_000u64)
-            .build()
-            .unwrap();
-        let err = spec.validate().unwrap_err();
-        assert!(err.to_string().contains("TaskKind::Embedded"));
-    }
-
-    #[test]
-    fn getters_return_expected_values() {
-        let spec = TaskSpec::builder("my-slot", TaskKind::Embedded, 10_000u64)
+    fn builder_and_override_methods_expose_expected_values() {
+        let spec = TaskSpec::builder("my-slot", embedded(), 10_000u64)
             .restart(RestartPolicy::OnFailure)
             .admission(AdmissionPolicy::Replace)
             .build()
@@ -433,39 +491,52 @@ mod tests {
         assert_eq!(spec.timeout().as_millis(), 10_000);
         assert_eq!(spec.restart(), RestartPolicy::OnFailure);
         assert_eq!(spec.admission(), AdmissionPolicy::Replace);
+        assert_eq!(
+            valid_spec()
+                .with_admission(AdmissionPolicy::Replace)
+                .admission(),
+            AdmissionPolicy::Replace
+        );
     }
 
     #[test]
-    fn with_admission_overrides_policy() {
-        let spec = valid_spec().with_admission(AdmissionPolicy::Replace);
-        assert_eq!(spec.admission(), AdmissionPolicy::Replace);
-    }
-
-    #[test]
-    fn serde_roundtrip() {
+    fn serde_roundtrip_and_unlimited_retry_shape_are_stable() {
         let spec = valid_spec();
         let json = serde_json::to_string(&spec).unwrap();
         let back: TaskSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back, spec);
+        let json = serde_json::to_value(valid_spec()).unwrap();
+        assert!(
+            json.get("maxRetries").is_none(),
+            "unlimited budget must serialize as an absent field"
+        );
     }
 
     #[test]
-    fn serde_rejects_empty_slot() {
-        let spec = valid_spec();
-        let mut json: serde_json::Value = serde_json::to_value(&spec).unwrap();
-        json["slot"] = serde_json::Value::String(String::new());
+    fn serde_validates_fields_and_rejects_unknown_fields() {
+        for (field, value, expected) in [
+            ("slot", serde_json::json!(""), "slot"),
+            ("timeout", serde_json::json!(0), "timeout"),
+            ("maxRetries", serde_json::json!(0), "maxRetries"),
+        ] {
+            let mut json = serde_json::to_value(valid_spec()).unwrap();
+            json[field] = value;
+            let error = serde_json::from_value::<TaskSpec>(json).unwrap_err();
+            assert!(error.to_string().contains(expected), "got: {error}");
+        }
 
-        let err = serde_json::from_value::<TaskSpec>(json).unwrap_err();
-        assert!(err.to_string().contains("slot"), "error: {err}");
+        let mut json = serde_json::to_value(valid_spec()).unwrap();
+        json["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<TaskSpec>(json).is_err());
     }
 
     #[test]
-    fn serde_rejects_zero_timeout() {
+    fn finite_retry_budget_roundtrips_through_json() {
         let spec = valid_spec();
         let mut json: serde_json::Value = serde_json::to_value(&spec).unwrap();
-        json["timeout"] = serde_json::json!(0);
+        json["maxRetries"] = serde_json::json!(3);
 
-        let err = serde_json::from_value::<TaskSpec>(json).unwrap_err();
-        assert!(err.to_string().contains("timeout"), "error: {err}");
+        let back: TaskSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(back.max_retries().map(NonZeroU32::get), Some(3));
     }
 }

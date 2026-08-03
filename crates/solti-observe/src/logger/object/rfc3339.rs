@@ -1,56 +1,62 @@
-//! # RFC 3339 timestamp formatter ([`LoggerRfc3339`]) for `tracing-subscriber`.
+//! # RFC 3339 timestamps
 //!
-//! Injected by [`init_logger`](crate::init_logger). On each log line it reads the cached local offset and degrades to `<invalid-time>` rather than erroring.
+//! The logger injects [`Rfc3339Timer`] into `tracing-subscriber`.
+//! It formats timestamps in UTC or with the cached local offset.
+//!
+//! ```text
+//! current UTC time + selected offset ──► RFC 3339 timestamp
+//! ```
+//!
+//! A formatting failure writes `<invalid-time>`.
 
 use std::fmt;
 
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use tracing_subscriber::fmt::{format::Writer, time::FormatTime};
 
-use crate::logger::object::timezone::{LoggerTimeZone, get_or_detect_local_offset};
+use crate::logger::object::timezone::{LoggerTimeZone, local_offset};
 
-/// RFC 3339 timestamp formatter for [`tracing_subscriber`] that respects the configured [`LoggerTimeZone`].
-///
-/// Implements [`FormatTime`](tracing_subscriber::fmt::time::FormatTime) and is injected into the `fmt::Layer` by [`crate::init_logger`].
-///
-/// ## Behaviour
-///
-/// | Timezone                  | Offset source                 | Example output                 |
-/// |---------------------------|-------------------------------|--------------------------------|
-/// | [`LoggerTimeZone::Utc`]   | Always `+00:00`               | `2025-01-15T10:30:00+00:00`    |
-/// | [`LoggerTimeZone::Local`] | Cached local offset (per-call)| `2025-01-15T13:30:00+03:00`    |
-///
-/// In `Local` mode the cached offset is read on **every** call, so DST changes picked up
-/// by [`timezone_sync`](crate::timezone_sync) are reflected without restarting the logger.
-///
-/// ## Also
-///
-/// - [`init_local_offset`](crate::init_local_offset) - must be called before tokio for `Local` mode.
-/// - [`LoggerTimeZone`] - timezone configuration.
+/// RFC 3339 timestamp formatter used by the text and JSON loggers.
 #[derive(Debug, Clone, Copy)]
-pub struct LoggerRfc3339 {
+pub(crate) struct Rfc3339Timer {
     tz: LoggerTimeZone,
 }
 
-impl LoggerRfc3339 {
-    /// Create a formatter for the given timezone setting.
-    pub fn new(tz: LoggerTimeZone) -> Self {
+impl Rfc3339Timer {
+    /// Creates a formatter for one timezone setting.
+    pub(crate) fn new(tz: LoggerTimeZone) -> Self {
         Self { tz }
     }
 }
 
-impl FormatTime for LoggerRfc3339 {
+impl FormatTime for Rfc3339Timer {
     fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
         let offset = match self.tz {
             LoggerTimeZone::Utc => UtcOffset::UTC,
-            LoggerTimeZone::Local => get_or_detect_local_offset(),
+            LoggerTimeZone::Local => local_offset(),
         };
 
         let ts = OffsetDateTime::now_utc().to_offset(offset);
 
         match ts.format(&Rfc3339) {
-            Ok(s) => write!(w, "{s} "),
-            Err(_) => write!(w, "<invalid-time> "),
+            Ok(s) => w.write_str(&s),
+            Err(_) => w.write_str("<invalid-time>"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utc_timestamp_has_no_embedded_separator() {
+        let timer = Rfc3339Timer::new(LoggerTimeZone::Utc);
+        let mut rendered = String::new();
+
+        timer.format_time(&mut Writer::new(&mut rendered)).unwrap();
+
+        assert_eq!(rendered.trim(), rendered);
+        assert!(rendered.ends_with('Z') || rendered.ends_with("+00:00"));
     }
 }

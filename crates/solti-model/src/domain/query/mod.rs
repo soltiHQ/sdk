@@ -1,16 +1,14 @@
-//! Query and pagination types.
+//! # Task queries
 //!
 //! ```text
-//!  TaskQuery
-//!  ┌───────────────────────────────────────────┐
-//!  │  status: Vec<TaskPhase>   OR semantics    │
-//!  │  slot:   Option<Slot>     filter by lane  │
-//!  │  limit:  usize            page size       │
-//!  │  offset: usize            skip N          │
-//!  └────────────────┬──────────────────────────┘
-//!                   ▼
-//!  TaskPage<T> { items: Vec<T>, total: usize }
+//! TaskFilter -> TaskQuery -> state query -> TaskPage<T>
 //! ```
+//!
+//! Phase filters use OR semantics.
+//! Filter groups use AND semantics.
+//! An empty phase filter matches every phase.
 
 mod task;
-pub use task::{DEFAULT_LIMIT, MAX_LIMIT, TaskPage, TaskQuery};
+pub use task::{
+    DEFAULT_LIMIT, MAX_LIMIT, TaskContinuation, TaskFilter, TaskPage, TaskQuery, TaskWatchEvent,
+};

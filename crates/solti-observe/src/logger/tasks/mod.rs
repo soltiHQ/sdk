@@ -1,6 +1,6 @@
-//! # Optional periodic tasks.
+//! # Supervised logger tasks
 //!
-//! - [`timezone_sync`] (feature `timezone-sync`) re-detects local UTC offset.
+//! `timezone_sync` builds the optional local-offset refresh task.
 
 #[cfg(feature = "timezone-sync")]
 mod timezone_sync;

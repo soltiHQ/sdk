@@ -1,25 +1,29 @@
-//! Domain primitives for the solti task model.
+//! # Domain types
 //!
 //! ## Modules
 //!
-//! | Module          | Types                                                        | Purpose                                     |
-//! |-----------------|--------------------------------------------------------------|---------------------------------------------|
-//! | `policy/`       | [`RestartPolicy`], [`BackoffPolicy`], [`AdmissionPolicy`]    | Lifecycle and concurrency policies          |
-//! | `selector/`     | [`RunnerSelector`], [`SelectorRequirement`]                  | K8s-style label selector for runner routing |
-//! | `environment/`  | [`TaskEnv`], [`RunnerEnv`], [`merge_env`]                    | Env-var handling with runner-wins merge     |
-//! | `query/`        | [`TaskQuery`], [`TaskPage`]                                  | Filtered, paginated task listing            |
-//! | `identity/`     | [`AgentId`], [`Slot`], [`TaskId`]                            | Resource identity (`Arc<str>`)              |
-//! | `kind/`         | [`TaskKind`]                                                 | Execution backend enum                      |
-//! | `label`         | [`Labels`]                                                   | Key-value metadata (`BTreeMap`)             |
-//! | `flag`          | [`Flag`]                                                     | Boolean toggle                              |
-//! | `kv`            | [`KeyValue`]                                                 | Generic key-value pair                      |
-//! | `phase`         | [`TaskPhase`]                                                | Task lifecycle state                        |
-//! | `timeout`       | [`Timeout`]                                                  | Milliseconds                                |
+//! | Module          | Types                                                             | Purpose                                     |
+//! |-----------------|-------------------------------------------------------------------|---------------------------------------------|
+//! | `policy/`       | [`RestartPolicy`], [`BackoffPolicy`], [`AdmissionPolicy`]         | Lifecycle and concurrency policies          |
+//! | `selector/`     | [`LabelSelector`], [`SelectorRequirement`]                        | Label selector for routing                  |
+//! | `environment/`  | [`TaskEnv`]                                                       | Task-provided environment variables         |
+//! | `query/`        | [`TaskContinuation`], [`TaskFilter`], [`TaskQuery`], [`TaskPage`] | Task filtering and collections              |
+//! | `identity/`     | [`AgentId`], [`Slot`], [`TaskId`]                                 | Resource identity (`Arc<str>`)              |
+//! | `kind/`         | [`TaskWorkload`]                                                  | Typed and extensible workload model         |
+//! | `label`         | [`Labels`]                                                        | Key-value metadata (`BTreeMap`)             |
+//! | `flag`          | [`Flag`]                                                          | Boolean toggle                              |
+//! | `kv`            | [`KeyValue`]                                                      | Generic key-value pair                      |
+//! | `phase`         | [`TaskPhase`]                                                     | Task lifecycle state                        |
+//! | `timeout`       | [`Timeout`]                                                       | Milliseconds                                |
+//! | `capability`    | [`AgentCapabilities`], [`RunnerCapability`]                       | Agent execution capabilities                |
+
+mod capability;
+pub use capability::{AgentCapabilities, RunnerCapability};
 
 mod kind;
 pub use kind::{
-    ContainerSpec, MAX_SCRIPT_BODY_BYTES, Runtime, SubprocessMode, SubprocessSpec, TaskKind,
-    WasmSpec,
+    ContainerSpec, EmbeddedSpec, ExtensionWorkload, MAX_SCRIPT_BODY_BYTES, SubprocessMode,
+    SubprocessSpec, TaskWorkload, WORKLOAD_API_VERSION, WasmSpec, WorkloadTypeMeta,
 };
 
 mod identity;
@@ -29,13 +33,15 @@ mod policy;
 pub use policy::{AdmissionPolicy, BackoffPolicy, JitterPolicy, RestartPolicy};
 
 mod selector;
-pub use selector::{RunnerSelector, SelectorOperator, SelectorRequirement};
+pub use selector::{LabelSelector, SelectorOperator, SelectorRequirement};
 
 mod environment;
-pub use environment::{RunnerEnv, TaskEnv, merge as merge_env};
+pub use environment::TaskEnv;
 
 mod query;
-pub use query::{DEFAULT_LIMIT, MAX_LIMIT, TaskPage, TaskQuery};
+pub use query::{
+    DEFAULT_LIMIT, MAX_LIMIT, TaskContinuation, TaskFilter, TaskPage, TaskQuery, TaskWatchEvent,
+};
 
 mod label;
 pub use label::{Labels, LabelsIter};

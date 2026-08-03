@@ -1,30 +1,43 @@
 [package]
 name = "solti-model"
-description = "Solti SDK domain model."
+
+description   = "Domain model types for the Solti task execution SDK: task specs, states, and identifiers."
+keywords      = ["task", "model", "spec", "types", "domain"]
+categories    = ["data-structures"]
 documentation = "https://docs.rs/solti-model"
+readme        = "README.md"
 
 rust-version.workspace = true
-repository.workspace = true
-categories.workspace = true
-homepage.workspace = true
-keywords.workspace = true
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+repository.workspace   = true
+homepage.workspace     = true
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+
+exclude = ["ARCHITECTURE.md"]
 
 [features]
-default = []
+default = ["schema"]
+schema  = ["dep:schemars"]
 
 [dependencies]
-base64    = { workspace = true }
-bytes     = { workspace = true }
-getrandom = { workspace = true }
-serde     = { workspace = true, features = ["rc"] }
-subtle    = { workspace = true }
-thiserror = { workspace = true }
+base64     = { workspace = true }
+bytes      = { workspace = true }
+getrandom  = { workspace = true }
+schemars   = { workspace = true, optional = true }
+serde      = { workspace = true, features = ["rc"] }
+serde_json = { workspace = true }
+subtle     = { workspace = true }
+thiserror  = { workspace = true }
+time       = { workspace = true, features = ["formatting", "parsing"] }
 
 [dev-dependencies]
-serde_json = { workspace = true }
+jsonschema = { workspace = true }
+
+[[example]]
+name              = "task_manifest_schema"
+required-features = ["schema"]
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

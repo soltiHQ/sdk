@@ -1,45 +1,106 @@
-//! # Runner trait.
+//! # Runner trait
 //!
-//! [`Runner`] is the plugin interface for task executors.
-//! Concrete runners implement this trait and are registered in the [`RunnerRouter`](crate::RunnerRouter).
+//! [`Runner`] is the plugin boundary for execution backends.
+//! Implementations are registered in [`RunnerRouter`](crate::RunnerRouter).
 //!
-//! See the [crate root](crate) for architecture overview and routing rules.
+//! ## Flow
+//!
+//! ```text
+//! Task + RunId + BuildContext
+//!              ▼
+//!            Runner
+//!              ▼
+//!       taskvisor::TaskRef
+//! ```
+//!
+//! The runner builds the task.
+//! Taskvisor supervises its execution.
 
-use solti_model::TaskSpec;
+use solti_model::{Task, WorkloadTypeMeta};
 use taskvisor::TaskRef;
 
 use crate::context::BuildContext;
 use crate::error::RunnerError;
-use crate::id::{RunId, make_run_id};
+use crate::id::RunId;
 
-/// Generic task runner used by the core layer.
+/// Plugin trait for task execution backends.
 ///
-/// A runner is responsible for:
-/// - deciding whether it can handle a given [`TaskSpec`] (`supports`)
-/// - building a concrete [`TaskRef`] that the supervisor can execute (`build_task`)
+/// A runner declares a finite set of workload GVKs.
+/// It converts matching task resources into [`TaskRef`] values.
 ///
-/// ## Also
+/// ## Contract
 ///
-/// - [`RunnerRouter`](crate::RunnerRouter) selects a runner for a given spec.
-/// - [`RunId`](crate::RunId) is a default id format produced by [`build_run_id`](Self::build_run_id).
-/// - [`BuildContext`](crate::BuildContext) shared dependencies passed to [`build_task`](Self::build_task).
+/// - [`build_task`](Self::build_task) must use the allocated [`RunId`] as the task name.
+/// - The router snapshots the name and workload GVKs during registration.
+/// - Building must not start or submit the task.
+/// - Attempt-scoped resources belong inside the task body.
+///
+/// A returned task may execute more than one attempt.
+///
+/// ## Example
+///
+/// ```rust,no_run
+/// use solti_model::{Task, WorkloadTypeMeta, WORKLOAD_API_VERSION};
+/// use solti_runner::{BuildContext, Runner, RunnerError};
+/// use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
+///
+/// struct MyRunner;
+///
+/// impl Runner for MyRunner {
+///     fn name(&self) -> &str {
+///         "my-runner"
+///     }
+///
+///     fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+///         vec![
+///             WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess")
+///                 .expect("built-in workload GVK"),
+///         ]
+///     }
+///
+///     fn build_task(
+///         &self,
+///         _task: &Task,
+///         run_id: &solti_runner::RunId,
+///         _ctx: &BuildContext,
+///     ) -> Result<TaskRef, RunnerError> {
+///         Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move {
+///             Ok::<(), TaskError>(())
+///         }))
+///     }
+/// }
+/// ```
+///
+/// ## See Also
+///
+/// - [`RunnerRouter`](crate::RunnerRouter)
+/// - [`BuildContext`](crate::BuildContext)
+/// - [`RunId`](crate::RunId)
 pub trait Runner: Send + Sync {
-    /// Runner name used in logs and diagnostics.
-    fn name(&self) -> &'static str;
-
-    /// Returns `true` if this runner can handle the given spec.
-    fn supports(&self, spec: &TaskSpec) -> bool;
-
-    /// Build a concrete [`TaskRef`] for the given spec.
+    /// Returns the runner name.
     ///
-    /// The provided [`BuildContext`] carries shared dependencies injected at router setup time.
-    /// Slot is extracted from `spec.slot`.
-    fn build_task(&self, spec: &TaskSpec, ctx: &BuildContext) -> Result<TaskRef, RunnerError>;
+    /// The router validates and snapshots it during registration.
+    /// The snapshot is used for capabilities and run ids.
+    fn name(&self) -> &str;
 
-    /// Builds a default run id for a given slot.
+    /// Returns the workload GVKs handled by this runner.
     ///
-    /// Runners may override this if they need custom id format, otherwise the core helper is used.
-    fn build_run_id(&self, slot: &str) -> RunId {
-        make_run_id(self.name(), slot)
-    }
+    /// The router snapshots and validates this declaration during registration.
+    /// Routing and capability introspection use the same snapshot.
+    fn workload_types(&self) -> Vec<WorkloadTypeMeta>;
+
+    /// Builds a [`TaskRef`] for a matching task resource.
+    ///
+    /// [`BuildContext`] provides environment, metrics, and output publishing.
+    /// The returned task name must equal `run_id.name()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunnerError`] when the workload cannot be converted.
+    fn build_task(
+        &self,
+        task: &Task,
+        run_id: &RunId,
+        ctx: &BuildContext,
+    ) -> Result<TaskRef, RunnerError>;
 }

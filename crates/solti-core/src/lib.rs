@@ -1,51 +1,118 @@
-//! # solti-core - orchestration layer.
+//! # solti-core
 //!
-//! Bridges [`solti-model`](solti_model) (public API types) with the [`taskvisor`] runtime.
-//! Provides [`SupervisorApi`]: the main entry point for submitting, querying, and cancelling tasks.
+//! Desired-state supervisor for the Solti SDK.
 //!
-//! ## Architecture
+//! This crate connects [`solti_model`] resources and [`solti_runner`] backends.
+//! [`taskvisor`] executes the resulting tasks.
+//! It stores tasks in memory and reconciles their desired state.
 //!
-//! ```text
-//!  submit(spec) ─► spec.validate() ─► RunnerRouter::build(spec) ─► TaskRef
-//!                                                                     │
-//!                                       submit_with_task(task, spec) ◄┘
-//!                                         ├─ reserve(id, spec)            (provisional state entry)
-//!                                         ├─ map policies ─► ControllerSpec
-//!                                         └─ handle.submit_and_watch ─► (tv_id, TaskWaiter)
-//!                                              ├─ bind_tv(id, tv_id)
-//!                                              └─ spawn backstop: TaskWaiter ─► finalize_from_outcome
+//! ## Start Here
 //!
-//!  taskvisor events (lossy bus) ─► StateSubscriber ─► TaskState      (phases + runs)
-//!                                                  └─► OutputRegistry (live-tail)
-//! ```
+//! Use [`SupervisorApi`] to create, apply, read, cancel, and delete tasks.
+//! Use [`SupervisorApiBuilder`] to configure the runtime and retention.
+//! Use [`TaskState`] for shared read access.
+//! Use [`OutputSubscription`] for live task output.
 //!
-//! ## Responsibilities
-//!
-//! | Component            | What it does                                                 |
-//! |----------------------|--------------------------------------------------------------|
-//! | [`SupervisorApi`]    | High-level facade: submit, query, cancel, sweep              |
-//! | `TaskState`          | In-memory task + run storage (`Arc<RwLock>`)                 |
-//! | `StateSubscriber`    | Wires taskvisor events into `TaskState`                      |
-//! | `state_sweep`        | Embedded periodic task sweeping expired state (auto-started) |
-//! | `map`                | Policy adapter: `solti-model` → `taskvisor` enums            |
-//!
-//! ## Quick start
+//! ## Flow
 //!
 //! ```text
-//! let api = SupervisorApi::new(sup_cfg, ctrl_cfg, subscribers, router, StateConfig::default()).await?;
-//!
-//! let task_id = api.submit(&spec).await?;
-//! let task    = api.get_task(&task_id);
-//! let runs    = api.list_task_runs(&task_id);
+//! TaskManifest
+//!      │ commit desired state
+//!      ▼
+//! TaskState
+//!      │ reconcile
+//!      ▼
+//! RunnerRouter or embedded TaskRef
+//!      │
+//!      ▼
+//! Taskvisor
+//!      ├── best-effort events ──► status, runs, live output
+//!      └── direct outcome ──────► authoritative final state
 //! ```
 //!
-//! ## Also
+//! Desired state is committed before runner construction and runtime intake.
+//! A successful write does not mean that execution has started.
+//! The `Reconciled` condition reports the reconciliation result.
 //!
-//! - [`solti_model::TaskSpec`] input spec submitted via [`SupervisorApi::submit`].
-//! - [`taskvisor::Supervisor`] underlying runtime that manages actor lifecycle.
-//! - [`solti_runner::RunnerRouter`] picks a runner for each `TaskKind`.
-
+//! ## Submission Paths
+//!
+//! [`SupervisorApi::create_task`] and [`SupervisorApi::apply_task`] route a workload.
+//! [`solti_runner::RunnerRouter`] selects the runner by GVK and optional labels.
+//!
+//! [`SupervisorApi::create_embedded_task`] creates embedded state.
+//! [`SupervisorApi::apply_embedded_task`] applies embedded state.
+//! Both accept a caller-owned [`taskvisor::TaskRef`].
+//! Embedded tasks bypass runner routing.
+//!
+//! The manifest workload and submission path must agree.
+//! Routed methods reject embedded workloads.
+//! Embedded methods reject routed workloads.
+//!
+//! ## Reconciliation
+//!
+//! Reconciliation uses latest-wins semantics.
+//! A stale UID or generation cannot replace the current runtime.
+//! Accepted side effects are not rolled back when a newer generation arrives.
+//! This crate does not provide staged rollout or availability guarantees.
+//!
+//! Task state has two runtime inputs.
+//! Taskvisor events provide attempt detail.
+//! The direct completion outcome provides the final task result.
+//! It can finalize a task when a terminal event is lost.
+//!
+//! Typed outcome and rejection kinds select terminal phases.
+//! Free-form reason text remains diagnostic.
+//! It is never parsed as schema.
+//!
+//! ## Collections and Output
+//!
+//! [`TaskState`] stores current tasks and retained [`solti_model::TaskRun`] values.
+//! Queries use snapshot-consistent pagination.
+//! Watches replay retained changes before switching to live updates.
+//!
+//! Output is live-only and lossy.
+//! A slow consumer receives [`solti_model::OutputEvent::Lagged`].
+//! Output history is not persisted.
+//!
+//! ## Main Types
+//!
+//! | Area           | Types                                                  |
+//! |----------------|--------------------------------------------------------|
+//! | Runtime API    | [`SupervisorApi`], [`SupervisorApiBuilder`]            |
+//! | State          | [`TaskState`], [`TaskWatchSubscription`]               |
+//! | Output         | [`OutputConfig`], [`OutputSubscription`]               |
+//! | Retention      | [`StateConfig`], [`ConfigError`]                       |
+//! | Writes         | [`WriteConflict`], [`WritePreconditionViolation`]      |
+//! | Errors         | [`CoreError`], [`CollectionError`]                     |
+//! | Runner routing | [`solti_runner::RunnerRouter`]                         |
+//!
+//! ## Quick Start
+//!
+//! ```rust,no_run
+//! use solti_core::{CoreError, SupervisorApi};
+//! use solti_model::{EmbeddedSpec, TaskManifest, TaskSpec, TaskWorkload};
+//! use solti_runner::RunnerRouter;
+//! use taskvisor::{TaskContext, TaskError, TaskFn};
+//!
+//! async fn run() -> Result<(), CoreError> {
+//!     let api = SupervisorApi::builder(RunnerRouter::new()).start().await?;
+//!
+//!     let task_ref = TaskFn::arc("cleanup-runtime", |_ctx: TaskContext| async move {
+//!         Ok::<(), TaskError>(())
+//!     });
+//!     let workload = TaskWorkload::Embedded(EmbeddedSpec::new("cleanup-v1")?);
+//!     let spec = TaskSpec::builder("maintenance", workload, 5_000_u64).build()?;
+//!     let manifest = TaskManifest::new("cleanup", spec)?;
+//!     let name = manifest.name().clone();
+//!
+//!     api.create_embedded_task(manifest, task_ref).await?;
+//!     assert!(api.get_task(&name).is_some());
+//!
+//!     api.shutdown().await
+//! }
+//! ```
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 /// Compiles the runnable Rust code blocks in `README.md` as doctests.
 #[cfg(doctest)]
@@ -53,17 +120,20 @@
 struct ReadmeDoctests;
 
 mod error;
-pub use error::CoreError;
+pub use error::{CoreError, WriteConflict, WritePreconditionViolation};
 
-pub mod reasons;
+mod config;
+pub use config::{ConfigError, StateConfig};
 
 mod map;
 
-mod system;
-pub use system::uptime_seconds;
+mod output;
+pub use output::{OutputConfig, OutputSubscription};
 
-pub mod supervisor;
-pub use supervisor::SupervisorApi;
+mod runtime;
+
+mod supervisor;
+pub use supervisor::{SupervisorApi, SupervisorApiBuilder};
 
 mod state;
-pub use state::{StateConfig, TaskState};
+pub use state::{CollectionError, TaskState, TaskWatchSubscription};

@@ -1,6 +1,6 @@
-//! # Task lifecycle phases.
+//! # Task phase
 //!
-//! [`TaskPhase`] represents the current state of a task in the supervision lifecycle.
+//! [`TaskPhase`] is the current lifecycle state recorded in [`TaskStatus`](crate::TaskStatus).
 
 use std::fmt;
 use std::str::FromStr;
@@ -9,32 +9,37 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ModelError, ModelResult};
 
-/// Current execution phase of a single task attempt.
+/// Current execution phase of a task.
 ///
-/// Phases describe the state of the **current attempt**.
+/// Phases describe the state visible on [`TaskStatus`](crate::TaskStatus).
 ///
-/// ## Also
+/// ## Example
 ///
-/// - [`RestartPolicy`](crate::RestartPolicy) governs what happens after a terminal phase.
-/// - [`TaskStatus`](crate::TaskStatus) carries the current phase.
-/// - [`TaskPhase::is_terminal`] checks for final states.
+/// ```
+/// use solti_model::TaskPhase;
+///
+/// let phase: TaskPhase = "running".parse().unwrap();
+/// assert!(phase.is_active());
+/// assert_eq!(phase.to_string(), "running");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum TaskPhase {
-    /// Task is queued or waiting to start.
+    /// Desired state is waiting for execution.
     Pending,
-    /// Task is currently executing.
+    /// An attempt is executing.
     Running,
-    /// Task completed successfully.
+    /// An attempt completed successfully.
     Succeeded,
     /// Attempt failed with an error.
     Failed,
-    /// Task exceeded its timeout limit.
+    /// An attempt exceeded its timeout.
     Timeout,
-    /// Task was explicitly canceled.
+    /// Execution was canceled.
     Canceled,
-    /// Task exhausted its restart budget and will not retry.
+    /// Failure retry budget was exhausted.
     Exhausted,
 }
 
@@ -55,7 +60,13 @@ impl fmt::Display for TaskPhase {
 impl FromStr for TaskPhase {
     type Err = ModelError;
 
-    /// Parse a phase name (case-insensitive, trimmed). Accepts the same camelCase form produced by [`fmt::Display`] / serde.
+    /// Parses a phase name.
+    ///
+    /// Parsing trims whitespace and ignores ASCII case.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::UnknownTaskPhase`] for an unknown value.
     fn from_str(s: &str) -> ModelResult<Self> {
         let trimmed = s.trim();
         match trimmed.to_ascii_lowercase().as_str() {
@@ -72,10 +83,19 @@ impl FromStr for TaskPhase {
 }
 
 impl TaskPhase {
-    /// Returns `true` if the current attempt has reached a final state.
+    /// Returns whether the phase is terminal.
     ///
-    /// A terminal phase means this attempt will not transition further.
-    /// The supervisor may still start a **new** attempt based on the [`RestartPolicy`](crate::RestartPolicy).
+    /// A later attempt may still start under [`RestartPolicy`](crate::RestartPolicy).
+    /// Resource reconciliation may also refine or replace a terminal outcome.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::TaskPhase;
+    ///
+    /// assert!(TaskPhase::Succeeded.is_terminal());
+    /// assert!(!TaskPhase::Running.is_terminal());
+    /// ```
     #[inline]
     pub fn is_terminal(&self) -> bool {
         matches!(
@@ -88,7 +108,16 @@ impl TaskPhase {
         )
     }
 
-    /// Returns `true` if the task is still active (pending or running).
+    /// Returns whether the phase is pending or running.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::TaskPhase;
+    ///
+    /// assert!(TaskPhase::Pending.is_active());
+    /// assert!(!TaskPhase::Failed.is_active());
+    /// ```
     #[inline]
     pub fn is_active(&self) -> bool {
         matches!(self, TaskPhase::Pending | TaskPhase::Running)
@@ -100,38 +129,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn terminal_states() {
-        assert!(TaskPhase::Succeeded.is_terminal());
-        assert!(TaskPhase::Failed.is_terminal());
-        assert!(TaskPhase::Timeout.is_terminal());
-        assert!(TaskPhase::Canceled.is_terminal());
-        assert!(TaskPhase::Exhausted.is_terminal());
-
-        assert!(!TaskPhase::Pending.is_terminal());
-        assert!(!TaskPhase::Running.is_terminal());
+    fn active_and_terminal_classification_covers_every_phase() {
+        for phase in [TaskPhase::Pending, TaskPhase::Running] {
+            assert!(phase.is_active());
+            assert!(!phase.is_terminal());
+        }
+        for phase in [
+            TaskPhase::Succeeded,
+            TaskPhase::Failed,
+            TaskPhase::Timeout,
+            TaskPhase::Canceled,
+            TaskPhase::Exhausted,
+        ] {
+            assert!(!phase.is_active());
+            assert!(phase.is_terminal());
+        }
     }
 
     #[test]
-    fn active_states() {
-        assert!(TaskPhase::Pending.is_active());
-        assert!(TaskPhase::Running.is_active());
-
-        assert!(!TaskPhase::Succeeded.is_active());
-        assert!(!TaskPhase::Failed.is_active());
-    }
-
-    #[test]
-    fn serde_roundtrip() {
-        let status = TaskPhase::Running;
-        let json = serde_json::to_string(&status).unwrap();
-        assert_eq!(json, r#""running""#);
-
-        let back: TaskPhase = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, status);
-    }
-
-    #[test]
-    fn from_str_all_variants() {
+    fn display_parse_and_serde_roundtrip_every_phase() {
         let cases = [
             ("pending", TaskPhase::Pending),
             ("running", TaskPhase::Running),
@@ -141,38 +157,21 @@ mod tests {
             ("canceled", TaskPhase::Canceled),
             ("exhausted", TaskPhase::Exhausted),
         ];
-        for (s, expected) in cases {
-            assert_eq!(s.parse::<TaskPhase>().unwrap(), expected);
+        for (wire, phase) in cases {
+            assert_eq!(phase.to_string(), wire);
+            assert_eq!(wire.parse::<TaskPhase>().unwrap(), phase);
+            let json = serde_json::to_string(&phase).unwrap();
+            assert_eq!(serde_json::from_str::<TaskPhase>(&json).unwrap(), phase);
         }
     }
 
     #[test]
-    fn from_str_is_case_insensitive_and_trims() {
+    fn parsing_normalizes_case_and_whitespace_and_rejects_unknown_values() {
         assert_eq!("RUNNING".parse::<TaskPhase>().unwrap(), TaskPhase::Running);
         assert_eq!(
             "  Succeeded  ".parse::<TaskPhase>().unwrap(),
             TaskPhase::Succeeded
         );
-    }
-
-    #[test]
-    fn from_str_roundtrips_display() {
-        for phase in [
-            TaskPhase::Pending,
-            TaskPhase::Running,
-            TaskPhase::Succeeded,
-            TaskPhase::Failed,
-            TaskPhase::Timeout,
-            TaskPhase::Canceled,
-            TaskPhase::Exhausted,
-        ] {
-            let rendered = phase.to_string();
-            assert_eq!(rendered.parse::<TaskPhase>().unwrap(), phase);
-        }
-    }
-
-    #[test]
-    fn from_str_unknown_errors() {
         let err = "bogus".parse::<TaskPhase>().unwrap_err();
         assert!(matches!(err, ModelError::UnknownTaskPhase(_)));
     }

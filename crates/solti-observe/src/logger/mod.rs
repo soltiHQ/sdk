@@ -1,8 +1,10 @@
-//! # Logger initialization and configuration.
+//! # Logger initialization
 //!
-//! This module contains the backend logger.
+//! [`init_logger`] installs one global subscriber from [`LoggerConfig`].
 //!
-//! See [`init_logger`] for the entry point.
+//! ```text
+//! LoggerConfig ──► backend selection ──► global tracing subscriber
+//! ```
 
 mod config;
 pub use config::LoggerConfig;
@@ -15,45 +17,60 @@ pub use object::LoggerFormat;
 
 mod object;
 pub use object::LoggerLevel;
-pub use object::{LoggerTimeZone, init_local_offset};
+pub use object::LoggerTimeZone;
 
 mod tasks;
 
 #[cfg(feature = "timezone-sync")]
 pub use tasks::timezone_sync;
 
-/// Initializes the global tracing subscriber based on the given [`LoggerConfig`].
+/// Installs the global tracing subscriber.
 ///
-/// Dispatches to the appropriate backend based on [`LoggerConfig::format`]:
+/// The selected backend comes from [`LoggerConfig::format`]:
 ///
-/// | Format                    | Backend                         | Notes                        |
-/// |---------------------------|---------------------------------|------------------------------|
-/// | [`LoggerFormat::Text`]    | `tracing_subscriber::fmt`       | Colored, human-readable      |
-/// | [`LoggerFormat::Json`]    | `tracing_subscriber::fmt::json` | Structured, machine-readable |
-/// | [`LoggerFormat::Journald`]| `tracing_journald`              | Linux only                   |
+/// | Format                 | Backend                         | Configuration used               |
+/// |------------------------|---------------------------------|----------------------------------|
+/// | [`LoggerFormat::Text`] | `tracing_subscriber::fmt`       | Level, timezone, targets, colors |
+/// | [`LoggerFormat::Json`] | `tracing_subscriber::fmt::json` | Level, timezone, targets         |
+/// | `Journald`             | `tracing_journald`              | Level                            |
 ///
-/// Once initialized, all `tracing` macros (`info!`, `debug!`, etc.) will use this configuration.
-/// Can only be called **once** per process - subsequent calls return [`LoggerError::AlreadyInitialized`].
+/// The function can succeed only once for the process-global subscriber.
+/// A later global installation returns an initialization error.
 ///
-/// ## Local timezone
+/// ## Local Time
 ///
-/// When using [`LoggerTimeZone::Local`], call [`init_local_offset`] in `main()` **before** spawning the tokio runtime.
-/// See the [crate-level docs](crate#local-timezone-support) for details.
+/// Text and JSON initialize the cached local offset for [`LoggerTimeZone::Local`].
+/// Detection happens before the global subscriber is installed.
+/// Journald does not use this setting.
 ///
-/// ## Examples
+/// The detected offset stays in a process-global cache.
+/// Feature `timezone-sync` provides the refresh task.
 ///
-/// ```rust
-/// use solti_observe::{LoggerConfig, init_logger};
+/// ## Example
 ///
-/// let config = LoggerConfig::default();
-/// init_logger(&config).expect("Failed to initialize logger");
+/// ```rust,no_run
+/// use solti_observe::{LoggerConfig, LoggerLevel, init_logger};
 ///
-/// tracing::info!("Logger initialized successfully");
+/// # fn main() -> Result<(), solti_observe::LoggerError> {
+/// let config = LoggerConfig {
+///     level: LoggerLevel::new("taskvisor=debug,info")?,
+///     ..Default::default()
+/// };
+///
+/// init_logger(&config)?;
+/// tracing::info!("logger ready");
+/// # Ok(()) }
 /// ```
+///
+/// # Errors
+///
+/// Returns [`LoggerError`] when backend setup fails.
+/// This includes local offset detection, journald connection, and global installation.
 pub fn init_logger(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     match cfg.format {
         LoggerFormat::Text => log::logger_text(cfg),
         LoggerFormat::Json => log::logger_json(cfg),
+        #[cfg(feature = "journald")]
         LoggerFormat::Journald => log::logger_journald(cfg),
     }
 }

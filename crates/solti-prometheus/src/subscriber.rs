@@ -1,165 +1,211 @@
-//! # Supervision-level Prometheus metrics.
+//! # Taskvisor metrics
 //!
-//! [`PrometheusSubscriber`] implements [`Subscribe`] and translates [`taskvisor`] events into Prometheus counters, gauges, and histograms.
+//! [`PrometheusTaskvisorSubscriber`] implements [`Subscribe`].
+//! It translates lifecycle events into Prometheus metrics.
 //!
-//! See the [crate root](crate) for architecture and namespace overview.
+//! Enable it with the `taskvisor` feature.
+//!
+//! ## Flow
+//!
+//! ```text
+//! Taskvisor runtime
+//!       │ best-effort Event
+//!       ▼
+//! subscriber queue
+//!       │
+//!       ▼
+//! PrometheusTaskvisorSubscriber ──► Registry
+//! ```
 
-use std::sync::Arc;
+use std::num::NonZeroUsize;
 
-use prometheus::{Counter, CounterVec, Gauge, Histogram, HistogramVec, Registry};
-use taskvisor::{BackoffSource, Event, EventKind, Subscribe};
+use prometheus::{Counter, CounterVec, Gauge, Histogram, Registry};
+#[cfg(feature = "taskvisor-controller")]
+use taskvisor::RejectionKind;
+use taskvisor::{Event, EventKind, Subscribe, TaskOutcomeKind};
 
-use crate::register::{Sub, ms_to_secs};
+use crate::register::{MetricGroup, ms_to_secs};
 
-/// Default subscriber queue capacity.
-pub const DEFAULT_QUEUE_CAPACITY: usize = 2048;
+/// Default capacity of the Taskvisor subscriber queue.
+pub const DEFAULT_TASKVISOR_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(2048).unwrap();
 
-/// Prometheus subscriber for supervision-level metrics.
+/// Prometheus metrics from Taskvisor lifecycle events.
 ///
-/// Implements [`Subscribe`] and captures metrics from the [`taskvisor`] event stream.
-/// Must share a [`Registry`] with [`crate::PrometheusMetrics`] for a unified `/metrics` endpoint.
+/// ## Metrics
 ///
-/// ## Event → metric mapping
+/// | Metric                                          | Type      | Labels    |
+/// |-------------------------------------------------|-----------|-----------|
+/// | `solti_taskvisor_attempts_in_flight`            | Gauge     | -         |
+/// | `solti_taskvisor_task_restarts_total`           | Counter   | -         |
+/// | `solti_taskvisor_task_backoffs_total`           | Counter   | `source`  |
+/// | `solti_taskvisor_task_backoff_duration_seconds` | Histogram | -         |
+/// | `solti_taskvisor_task_final_outcomes_total`     | Counter   | `outcome` |
+/// | `solti_taskvisor_attempt_timeouts_total`        | Counter   | -         |
+/// | `solti_taskvisor_subscriber_overflows_total`    | Counter   | -         |
+/// | `solti_taskvisor_subscriber_panics_total`       | Counter   | -         |
+/// | `solti_taskvisor_runtime_failures_total`        | Counter   | -         |
+///
+/// The `taskvisor-controller` feature adds:
+///
+/// | Metric                                              | Type    | Labels   |
+/// |-----------------------------------------------------|---------|----------|
+/// | `solti_taskvisor_controller_submitted_events_total` | Counter | -        |
+/// | `solti_taskvisor_controller_rejections_total`       | Counter | `reason` |
+///
+/// ## Event Mapping
 ///
 /// ```text
-/// TaskStarting        → tasks_in_flight.inc()
-///                       + task_restarts.inc()  (if attempt > 1)
-/// TaskStopped         → tasks_in_flight.dec()
-/// TaskFailed          → tasks_in_flight.dec()
-/// TimeoutHit          → task_timeouts.inc()
-/// BackoffScheduled    → task_backoff_count{source}.inc()
-///                       + task_backoff_duration.observe(delay)
-/// ActorExhausted      → task_terminal{reason}.inc()   (reason="completed" if the reason is policy_exhausted_success, else "exhausted")
-///                       + attempts_to_finalize{outcome}.observe(attempt)
-/// ActorDead           → task_terminal{reason="fatal"}.inc()
-///                       + attempts_to_finalize{outcome="fatal"}.observe(attempt)
-/// SubscriberOverflow  → subscriber_overflow.inc() + tracing::warn
-/// SubscriberPanicked  → subscriber_panicked.inc() + tracing::warn
-/// ControllerSubmitted → controller_submissions.inc()
-/// ControllerRejected  → controller_rejections{reason}.inc()  (reason classified from Event.reason)
+/// AttemptStarting ─────────────► in_flight + 1
+///      attempt > 1 ────────────► restarts + 1
+///
+/// AttemptSucceeded ─┐
+/// AttemptCanceled ──┼──────────► in_flight - 1
+/// AttemptFailed ────┤
+/// AttemptTimedOut ──┘             timeouts + 1
+///
+/// BackoffScheduled ─────────────► backoffs{source}
+///      delay_ms present ────────► backoff_duration
+///
+/// TaskFinished ─────────────────► final_outcomes{outcome}
+///
+/// SubscriberOverflow ───────────► subscriber_overflows
+/// SubscriberPanicked ───────────► subscriber_panics
+/// RuntimeFailure ───────────────► runtime_failures
+///
+/// taskvisor-controller:
+///   ControllerSubmitted ────────► controller_submitted_events
+///   ControllerRejected ─────────► controller_rejections{reason}
 /// ```
 ///
-/// ## Supervision metrics (`solti_sv_*`)
-///
-/// | Metric                                   | Type      | Labels   | Description                  |
-/// |------------------------------------------|-----------|----------|------------------------------|
-/// | `solti_sv_tasks_in_flight`               | Gauge     | -        | Currently executing tasks    |
-/// | `solti_sv_task_restarts_total`           | Counter   | -        | Restarts (attempt > 1)       |
-/// | `solti_sv_task_backoff_count_total`      | Counter   | `source` | Backoff events               |
-/// | `solti_sv_task_backoff_duration_seconds` | Histogram | -        | Backoff delay duration       |
-/// | `solti_sv_task_terminal_total`           | Counter   | `reason` | Terminal task states         |
-/// | `solti_sv_attempts_to_finalize`          | Histogram | `outcome`| Attempts when task left loop |
-/// | `solti_sv_task_timeouts_total`           | Counter   | -        | Timeout events               |
-/// | `solti_sv_subscriber_overflow_total`     | Counter   | -        | Queue overflow (lost events) |
-/// | `solti_sv_subscriber_panicked_total`     | Counter   | -        | Subscriber panics            |
-///
-/// ## Controller metrics (`solti_ctrl_*`)
-///
-/// | Metric                         | Type      | Labels   | Description                             |
-/// |--------------------------------|-----------|----------|-----------------------------------------|
-/// | `solti_ctrl_submissions_total` | Counter   | -        | Controller submissions                  |
-/// | `solti_ctrl_rejections_total`  | CounterVec| `reason` | Controller rejections grouped by cause  |
+/// `TaskFinished` with `ForceAborted` or `Panicked` also repairs the in-flight gauge.
+/// Those outcomes can end an attempt without an attempt-level terminal event.
+/// Other Taskvisor events do not change metrics.
 ///
 /// ## Labels
 ///
-/// | Label    | Values                                                                                                                           | Source                                                       |
-/// |----------|----------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------|
-/// | `source` | `failure`, `success`                                                                                                             | [`BackoffSource`] on the event                               |
-/// | `reason` (terminal)   | `completed`, `exhausted`, `fatal`                                                                                   | Terminal event kind (`completed` = policy_exhausted_success) |
-/// | `outcome` (attempts)  | `completed`, `exhausted`, `fatal`                                                                                   | Attempts-to-finalize histogram                               |
-/// | `reason` (rejection)  | `slot_full`, `slot_busy`, `superseded`, `removed`, `shutting_down`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` | Classified from `Event.reason` by `classify_rejection_reason` (private)         |
+/// `source`, `outcome`, and controller `reason` use Taskvisor's typed labels.
+/// Missing typed values use `unknown`.
+/// Free-form diagnostic text is never used as a label.
 ///
-/// ## Notes
+/// ## Rules
 ///
-/// - `tasks_in_flight` is **best-effort**. It is derived from taskvisor's lossy
-///   broadcast bus (inc on `TaskStarting`, dec on the per-attempt terminal), so a
-///   dropped event under sustained bus lag makes it drift and it does not
-///   self-heal. It is guarded against going negative (a terminal without a
-///   preceding start is a no-op). For an **authoritative**, self-correcting count
-///   that is recomputed from `TaskState` on every scrape, use the pull-based
-///   `PrometheusStateCollector` (`state` feature): `solti_sv_tasks_by_phase{phase="running"}`.
-/// - [`queue_capacity`](Subscribe::queue_capacity) defaults to [`DEFAULT_QUEUE_CAPACITY`].
-/// - Backoff duration is converted from milliseconds to seconds before observation.
+/// Taskvisor events are best-effort.
+/// A slow subscriber may miss events.
+/// The in-flight gauge can therefore drift.
+/// The decrement path checks the current value before changing the gauge.
 ///
-/// ## Also
+/// Use `PrometheusCoreStateCollector` for a pull-based task-phase snapshot.
 ///
-/// - [`PrometheusMetrics`](crate::PrometheusMetrics) is a runner-level metrics, complementary to this subscriber.
-/// - [`Event`](taskvisor::Event) and [`EventKind`](taskvisor::EventKind): event structure and classification.
-pub struct PrometheusSubscriber {
-    tasks_in_flight: Gauge,
+/// ## Example
+///
+/// ```
+/// use solti_prometheus::{PrometheusTaskvisorSubscriber, Registry};
+/// use taskvisor::{Event, EventKind, Subscribe};
+///
+/// # fn main() -> Result<(), prometheus::Error> {
+/// let registry = Registry::new();
+/// let subscriber = PrometheusTaskvisorSubscriber::new(&registry)?;
+///
+/// subscriber.on_event(
+///     &Event::new(EventKind::AttemptStarting).with_attempt(1),
+/// );
+///
+/// assert!(!registry.gather().is_empty());
+/// # Ok(()) }
+/// ```
+pub struct PrometheusTaskvisorSubscriber {
+    attempts_in_flight: Gauge,
     task_restarts: Counter,
-    task_backoff_count: CounterVec,
+    task_backoffs: CounterVec,
     task_backoff_duration: Histogram,
-    task_terminal: CounterVec,
-    attempts_to_finalize: HistogramVec,
-    task_timeouts: Counter,
-    subscriber_overflow: Counter,
-    subscriber_panicked: Counter,
-    controller_submissions: Counter,
+    task_final_outcomes: CounterVec,
+    attempt_timeouts: Counter,
+    subscriber_overflows: Counter,
+    subscriber_panics: Counter,
+    runtime_failures: Counter,
+    #[cfg(feature = "taskvisor-controller")]
+    controller_submitted_events: Counter,
+    #[cfg(feature = "taskvisor-controller")]
     controller_rejections: CounterVec,
-    queue_capacity: usize,
+    queue_capacity: NonZeroUsize,
 }
 
-/// Map a free-form `ControllerRejected` reason string to a bounded, low-cardinality metric label.
-///
-/// The raw `reason` on [`taskvisor::Event`] can embed error messages, queue depths, and other unbounded content, which would explode Prometheus cardinality if used directly as a label.
-/// This classifier collapses known prefixes produced by taskvisor's controller into a small set:
-///
-/// [`slot_full`, `slot_busy`, `superseded`, `removed`, `shutting_down`, `add_failed`, `remove_failed`, `queue_failed`, `recovery_failed`, `bus_lagged`, `controller_exited`, `other`, `unknown` ].
-fn classify_rejection_reason(reason: Option<&str>) -> &'static str {
-    let Some(r) = reason else {
-        return "unknown";
-    };
-    if r.starts_with("queue_full") {
-        "slot_full"
-    } else if r.starts_with("dropped: slot busy") {
-        "slot_busy"
-    } else if r.starts_with("superseded_by_replace") {
-        "superseded"
-    } else if r.starts_with("removed_from_queue") {
-        "removed"
-    } else if r.starts_with("controller_shutting_down") {
-        "shutting_down"
-    } else if r.starts_with("add_failed") {
-        "add_failed"
-    } else if r.starts_with("remove_failed") {
-        "remove_failed"
-    } else if r.starts_with("queue_start_failed") {
-        "queue_failed"
-    } else if r.starts_with("recovery_remove_failed") {
-        "recovery_failed"
-    } else if r.starts_with("bus_lagged") {
-        "bus_lagged"
-    } else if r.starts_with("controller_loop_exited") {
-        "controller_exited"
-    } else {
-        "other"
-    }
+#[cfg(feature = "taskvisor-controller")]
+/// Returns Taskvisor's stable rejection label.
+fn rejection_label(kind: Option<RejectionKind>) -> &'static str {
+    kind.as_ref()
+        .map(RejectionKind::as_label)
+        .unwrap_or("unknown")
 }
 
-impl PrometheusSubscriber {
-    /// Create a new subscriber with the default event-bus queue capacity ([`DEFAULT_QUEUE_CAPACITY`]).
-    pub fn new(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
-        Self::with_queue_capacity(registry, DEFAULT_QUEUE_CAPACITY)
+/// Returns Taskvisor's stable final outcome label.
+fn terminal_outcome_label(kind: Option<TaskOutcomeKind>) -> &'static str {
+    kind.map(TaskOutcomeKind::as_label).unwrap_or("unknown")
+}
+
+impl PrometheusTaskvisorSubscriber {
+    fn decrement_in_flight(&self) {
+        if self.attempts_in_flight.get() > 0.0 {
+            self.attempts_in_flight.dec();
+        }
     }
 
-    /// Create a new subscriber with a specific event-bus queue capacity.
+    /// Creates and registers a subscriber with the default queue capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Prometheus error when the metric group cannot be created or registered.
+    /// A descriptor conflict returns [`prometheus::Error::AlreadyReg`].
+    pub fn new(registry: &Registry) -> Result<Self, prometheus::Error> {
+        Self::with_queue_capacity(registry, DEFAULT_TASKVISOR_QUEUE_CAPACITY)
+    }
+
+    /// Creates and registers a subscriber with a specific queue capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Prometheus error when the metric group cannot be created or registered.
+    /// A descriptor conflict returns [`prometheus::Error::AlreadyReg`].
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use std::num::NonZeroUsize;
+    /// use solti_prometheus::{PrometheusTaskvisorSubscriber, Registry};
+    /// use taskvisor::Subscribe;
+    ///
+    /// # fn main() -> Result<(), prometheus::Error> {
+    /// let registry = Registry::new();
+    /// let capacity = NonZeroUsize::new(4096).unwrap();
+    /// let subscriber = PrometheusTaskvisorSubscriber::with_queue_capacity(&registry, capacity)?;
+    ///
+    /// assert_eq!(subscriber.queue_capacity().get(), 4096);
+    /// # Ok(()) }
+    /// ```
     pub fn with_queue_capacity(
-        registry: Arc<Registry>,
-        queue_capacity: usize,
+        registry: &Registry,
+        queue_capacity: NonZeroUsize,
     ) -> Result<Self, prometheus::Error> {
-        let sv = Sub::new(&registry, "sv");
-        let ctrl = Sub::new(&registry, "ctrl");
+        let mut metrics = MetricGroup::new();
 
-        let tasks_in_flight = sv.gauge("tasks_in_flight", "Number of tasks currently executing")?;
-        let task_restarts =
-            sv.counter("task_restarts_total", "Total task restarts (attempt > 1)")?;
-        let task_backoff_count = sv.counter_vec(
-            "task_backoff_count_total",
+        let attempts_in_flight = metrics.gauge(
+            "taskvisor",
+            "attempts_in_flight",
+            "Number of task attempts currently executing",
+        )?;
+        let task_restarts = metrics.counter(
+            "taskvisor",
+            "task_restarts_total",
+            "Total task restarts (attempt > 1)",
+        )?;
+        let task_backoffs = metrics.counter_vec(
+            "taskvisor",
+            "task_backoffs_total",
             "Total backoff events",
             &["source"],
         )?;
-        let task_backoff_duration = sv.histogram(
+        let task_backoff_duration = metrics.histogram(
+            "taskvisor",
             "task_backoff_duration_seconds",
             "Backoff delay duration in seconds",
             vec![
@@ -167,163 +213,156 @@ impl PrometheusSubscriber {
                 3600.0,
             ],
         )?;
-        let task_terminal = sv.counter_vec(
-            "task_terminal_total",
-            "Total terminal task states",
-            &["reason"],
-        )?;
-        let attempts_to_finalize = sv.histogram_vec(
-            "attempts_to_finalize",
-            "Number of attempts observed when a task leaves the supervision loop",
-            vec![1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0],
+        let task_final_outcomes = metrics.counter_vec(
+            "taskvisor",
+            "task_final_outcomes_total",
+            "Total final task outcomes",
             &["outcome"],
         )?;
-        let task_timeouts = sv.counter("task_timeouts_total", "Total task timeout events")?;
-        let subscriber_overflow = sv.counter(
-            "subscriber_overflow_total",
+        let attempt_timeouts = metrics.counter(
+            "taskvisor",
+            "attempt_timeouts_total",
+            "Total attempt timeout events",
+        )?;
+        let subscriber_overflows = metrics.counter(
+            "taskvisor",
+            "subscriber_overflows_total",
             "Total subscriber queue overflow events (events lost)",
         )?;
-        let subscriber_panicked =
-            sv.counter("subscriber_panicked_total", "Total subscriber panic events")?;
+        let subscriber_panics = metrics.counter(
+            "taskvisor",
+            "subscriber_panics_total",
+            "Total subscriber panic events",
+        )?;
+        let runtime_failures = metrics.counter(
+            "taskvisor",
+            "runtime_failures_total",
+            "Total internal taskvisor runtime failure events",
+        )?;
 
-        let controller_submissions =
-            ctrl.counter("submissions_total", "Total controller submissions")?;
-        let controller_rejections = ctrl.counter_vec(
+        #[cfg(feature = "taskvisor-controller")]
+        let controller_submitted_events = metrics.counter(
+            "taskvisor_controller",
+            "submitted_events_total",
+            "Total ControllerSubmitted events",
+        )?;
+        #[cfg(feature = "taskvisor-controller")]
+        let controller_rejections = metrics.counter_vec(
+            "taskvisor_controller",
             "rejections_total",
             "Total controller rejections grouped by cause",
             &["reason"],
         )?;
+        metrics.register(registry)?;
 
         Ok(Self {
-            tasks_in_flight,
+            attempts_in_flight,
             task_restarts,
-            task_backoff_count,
+            task_backoffs,
             task_backoff_duration,
-            task_terminal,
-            attempts_to_finalize,
-            task_timeouts,
-            subscriber_overflow,
-            subscriber_panicked,
-            controller_submissions,
+            task_final_outcomes,
+            attempt_timeouts,
+            subscriber_overflows,
+            subscriber_panics,
+            runtime_failures,
+            #[cfg(feature = "taskvisor-controller")]
+            controller_submitted_events,
+            #[cfg(feature = "taskvisor-controller")]
             controller_rejections,
             queue_capacity,
         })
     }
 }
 
-impl std::fmt::Debug for PrometheusSubscriber {
+impl std::fmt::Debug for PrometheusTaskvisorSubscriber {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PrometheusSubscriber").finish()
+        f.debug_struct("PrometheusTaskvisorSubscriber").finish()
     }
 }
 
-impl Subscribe for PrometheusSubscriber {
-    /// Translates a [`taskvisor`] event into prometheus metric updates.
+impl Subscribe for PrometheusTaskvisorSubscriber {
+    /// Translates a Taskvisor event into Prometheus metric updates.
     fn on_event(&self, event: &Event) {
         match event.kind {
-            EventKind::TaskStarting => {
-                self.tasks_in_flight.inc();
+            EventKind::AttemptStarting => {
+                self.attempts_in_flight.inc();
                 if event.attempt.unwrap_or(1) > 1 {
                     self.task_restarts.inc();
                 }
             }
-            EventKind::TaskStopped | EventKind::TaskCanceled | EventKind::TaskFailed => {
-                if self.tasks_in_flight.get() > 0.0 {
-                    self.tasks_in_flight.dec();
-                }
+            EventKind::AttemptSucceeded | EventKind::AttemptCanceled | EventKind::AttemptFailed => {
+                self.decrement_in_flight();
             }
-            EventKind::TimeoutHit => {
-                self.task_timeouts.inc();
+            EventKind::AttemptTimedOut => {
+                self.decrement_in_flight();
+                self.attempt_timeouts.inc();
             }
             EventKind::SubscriberOverflow => {
-                tracing::warn!(
-                    task = event.task.as_deref().unwrap_or("unknown"),
-                    "subscriber queue overflow: events are being dropped"
-                );
-                self.subscriber_overflow.inc();
+                self.subscriber_overflows.inc();
             }
             EventKind::SubscriberPanicked => {
-                tracing::warn!(
-                    task = event.task.as_deref().unwrap_or("unknown"),
-                    reason = event.reason.as_deref().unwrap_or("unknown"),
-                    "subscriber panicked while processing an event"
-                );
-                self.subscriber_panicked.inc();
+                self.subscriber_panics.inc();
+            }
+            EventKind::RuntimeFailure => {
+                self.runtime_failures.inc();
             }
             EventKind::BackoffScheduled => {
-                let source = match event.backoff_source {
-                    Some(BackoffSource::Failure) => "failure",
-                    Some(BackoffSource::Success) => "success",
-                    None => "unknown",
-                };
-                self.task_backoff_count.with_label_values(&[source]).inc();
+                let source = event
+                    .backoff_source
+                    .as_ref()
+                    .map(taskvisor::BackoffSource::as_label)
+                    .unwrap_or("unknown");
+                self.task_backoffs.with_label_values(&[source]).inc();
 
                 if let Some(delay_ms) = event.delay_ms {
                     self.task_backoff_duration
                         .observe(ms_to_secs(delay_ms.into()));
                 }
             }
-            EventKind::ActorExhausted => {
-                // Success under OnFailure/Never is the normal way a task ends,
-                // not retry exhaustion: keep the two distinguishable.
-                // NB: the literal mirrors `solti_core::reasons::POLICY_EXHAUSTED_SUCCESS`
-                // (the canonical, CI-pinned list); solti-prometheus does not depend
-                // on solti-core unconditionally, so it is duplicated here.
-                let label = if event.reason.as_deref() == Some("policy_exhausted_success") {
-                    "completed"
-                } else {
-                    "exhausted"
-                };
-                self.task_terminal.with_label_values(&[label]).inc();
-                self.attempts_to_finalize
-                    .with_label_values(&[label])
-                    .observe(f64::from(event.attempt.unwrap_or(1)));
+            EventKind::TaskFinished => {
+                let label = terminal_outcome_label(event.outcome_kind);
+                self.task_final_outcomes.with_label_values(&[label]).inc();
+
+                if matches!(
+                    event.outcome_kind,
+                    Some(TaskOutcomeKind::ForceAborted | TaskOutcomeKind::Panicked)
+                ) {
+                    self.decrement_in_flight();
+                }
             }
-            EventKind::ActorDead => {
-                self.task_terminal.with_label_values(&["fatal"]).inc();
-                self.attempts_to_finalize
-                    .with_label_values(&["fatal"])
-                    .observe(f64::from(event.attempt.unwrap_or(1)));
-            }
+            #[cfg(feature = "taskvisor-controller")]
             EventKind::ControllerSubmitted => {
-                self.controller_submissions.inc();
+                self.controller_submitted_events.inc();
             }
+            #[cfg(feature = "taskvisor-controller")]
             EventKind::ControllerRejected => {
-                let reason = classify_rejection_reason(event.reason.as_deref());
+                let reason = rejection_label(event.rejection_kind);
                 self.controller_rejections
                     .with_label_values(&[reason])
                     .inc();
             }
-            // A force-aborted attempt never publishes its own terminal event:
-            // compensate the in-flight gauge from the removal notification.
-            EventKind::TaskRemoved => {
-                if event.reason.as_deref() == Some("force_terminated_after_grace")
-                    && self.tasks_in_flight.get() > 0.0
-                {
-                    self.tasks_in_flight.dec();
-                }
-            }
+            EventKind::TaskRemoved => {}
             EventKind::TaskAdded
             | EventKind::TaskAddFailed
             | EventKind::TaskAddRequested
             | EventKind::TaskRemoveRequested
             | EventKind::ShutdownRequested
             | EventKind::AllStoppedWithinGrace
-            | EventKind::GraceExceeded
-            | EventKind::ControllerSlotTransition => {}
+            | EventKind::GraceExceeded => {}
+            #[cfg(feature = "taskvisor-controller")]
+            EventKind::ControllerSlotTransition => {}
 
-            // `EventKind` is #[non_exhaustive]: ignore variants added in future taskvisor releases.
             _ => {}
         }
     }
 
-    /// Returns `"prometheus"`
+    /// Returns `"prometheus-taskvisor"`.
     fn name(&self) -> &'static str {
-        "prometheus"
+        "prometheus-taskvisor"
     }
 
-    /// Returns the per-subscriber queue capacity configured via [`PrometheusSubscriber::new`] or [`PrometheusSubscriber::with_queue_capacity`].
-    fn queue_capacity(&self) -> usize {
+    /// Returns the per-subscriber queue capacity configured at construction.
+    fn queue_capacity(&self) -> NonZeroUsize {
         self.queue_capacity
     }
 }
@@ -331,15 +370,18 @@ impl Subscribe for PrometheusSubscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "runner")]
     use prometheus::Encoder;
+    #[cfg(feature = "runner")]
     use solti_runner::MetricsBackend;
     use std::time::Duration;
 
-    fn new_subscriber() -> PrometheusSubscriber {
-        let registry = Arc::new(Registry::new());
-        PrometheusSubscriber::new(registry).unwrap()
+    fn new_subscriber() -> PrometheusTaskvisorSubscriber {
+        let registry = Registry::new();
+        PrometheusTaskvisorSubscriber::new(&registry).unwrap()
     }
 
+    #[cfg(feature = "runner")]
     fn metrics_text(registry: &Registry) -> String {
         let encoder = prometheus::TextEncoder::new();
         let families = registry.gather();
@@ -349,160 +391,73 @@ mod tests {
     }
 
     #[test]
-    fn task_starting_increments_in_flight() {
+    fn attempt_lifecycle_updates_in_flight_and_restarts() {
         let sub = new_subscriber();
 
         sub.on_event(
-            &Event::new(EventKind::TaskStarting)
+            &Event::new(EventKind::AttemptStarting)
                 .with_task("t")
                 .with_attempt(1),
         );
 
-        assert_eq!(sub.tasks_in_flight.get(), 1.0);
+        assert_eq!(sub.attempts_in_flight.get(), 1.0);
+        assert_eq!(sub.task_restarts.get(), 0.0);
+        sub.on_event(&Event::new(EventKind::AttemptSucceeded).with_task("t"));
+        assert_eq!(sub.attempts_in_flight.get(), 0.0);
+
+        sub.on_event(
+            &Event::new(EventKind::AttemptStarting)
+                .with_task("t")
+                .with_attempt(2),
+        );
+        assert_eq!(sub.attempts_in_flight.get(), 1.0);
+        assert_eq!(sub.task_restarts.get(), 1.0);
     }
 
     #[test]
-    fn task_stopped_decrements_in_flight() {
+    fn canceled_and_failed_attempts_decrement_in_flight() {
         let sub = new_subscriber();
 
-        sub.on_event(
-            &Event::new(EventKind::TaskStarting)
-                .with_task("t")
-                .with_attempt(1),
-        );
-        sub.on_event(&Event::new(EventKind::TaskStopped).with_task("t"));
-
-        assert_eq!(sub.tasks_in_flight.get(), 0.0);
+        for terminal in [EventKind::AttemptCanceled, EventKind::AttemptFailed] {
+            sub.on_event(
+                &Event::new(EventKind::AttemptStarting)
+                    .with_task("t")
+                    .with_attempt(1),
+            );
+            sub.on_event(&Event::new(terminal).with_task("t"));
+            assert_eq!(sub.attempts_in_flight.get(), 0.0);
+        }
     }
 
     #[test]
-    fn task_canceled_decrements_in_flight() {
+    fn task_finished_uses_typed_outcome_labels_and_unknown_fallback() {
         let sub = new_subscriber();
 
         sub.on_event(
-            &Event::new(EventKind::TaskStarting)
+            &Event::new(EventKind::TaskFinished)
                 .with_task("t")
-                .with_attempt(1),
+                .with_outcome_kind(TaskOutcomeKind::Completed)
+                .with_reason("diagnostic text must not select the label"),
         );
-        sub.on_event(&Event::new(EventKind::TaskCanceled).with_task("t"));
-
-        assert_eq!(sub.tasks_in_flight.get(), 0.0);
-    }
-
-    #[test]
-    fn force_terminated_removal_decrements_in_flight() {
-        let sub = new_subscriber();
-
-        // A force-aborted attempt never publishes its own terminal event:
-        // the only signal is TaskRemoved("force_terminated_after_grace").
-        sub.on_event(
-            &Event::new(EventKind::TaskStarting)
-                .with_task("t")
-                .with_attempt(1),
-        );
-        sub.on_event(
-            &Event::new(EventKind::TaskRemoved)
-                .with_task("t")
-                .with_reason("force_terminated_after_grace"),
-        );
+        sub.on_event(&Event::new(EventKind::TaskFinished).with_task("t2"));
 
         assert_eq!(
-            sub.tasks_in_flight.get(),
-            0.0,
-            "force-terminated tasks must not leak the in-flight gauge"
-        );
-    }
-
-    #[test]
-    fn exhausted_after_success_is_labelled_completed() {
-        let sub = new_subscriber();
-
-        sub.on_event(
-            &Event::new(EventKind::ActorExhausted)
-                .with_task("t")
-                .with_attempt(1)
-                .with_reason("policy_exhausted_success"),
-        );
-        sub.on_event(
-            &Event::new(EventKind::ActorExhausted)
-                .with_task("t2")
-                .with_attempt(5)
-                .with_reason("max_retries_exceeded(5/5): boom"),
-        );
-
-        assert_eq!(
-            sub.task_terminal.with_label_values(&["completed"]).get(),
+            sub.task_final_outcomes
+                .with_label_values(&["outcome_completed"])
+                .get(),
             1.0,
-            "normal one-shot completion must not be counted as exhaustion"
+            "completed outcome must retain Taskvisor's label"
         );
         assert_eq!(
-            sub.task_terminal.with_label_values(&["exhausted"]).get(),
+            sub.task_final_outcomes
+                .with_label_values(&["unknown"])
+                .get(),
             1.0
         );
     }
 
     #[test]
-    fn classifier_recognizes_taskvisor_03_reasons() {
-        assert_eq!(
-            classify_rejection_reason(Some("superseded_by_replace")),
-            "superseded"
-        );
-        assert_eq!(
-            classify_rejection_reason(Some("removed_from_queue")),
-            "removed"
-        );
-        assert_eq!(
-            classify_rejection_reason(Some("controller_shutting_down")),
-            "shutting_down"
-        );
-    }
-
-    #[test]
-    fn task_failed_decrements_in_flight() {
-        let sub = new_subscriber();
-
-        sub.on_event(
-            &Event::new(EventKind::TaskStarting)
-                .with_task("t")
-                .with_attempt(1),
-        );
-        sub.on_event(
-            &Event::new(EventKind::TaskFailed)
-                .with_task("t")
-                .with_reason("boom"),
-        );
-
-        assert_eq!(sub.tasks_in_flight.get(), 0.0);
-    }
-
-    #[test]
-    fn first_attempt_is_not_a_restart() {
-        let sub = new_subscriber();
-
-        sub.on_event(
-            &Event::new(EventKind::TaskStarting)
-                .with_task("t")
-                .with_attempt(1),
-        );
-
-        assert_eq!(sub.task_restarts.get(), 0.0);
-    }
-
-    #[test]
-    fn second_attempt_is_a_restart() {
-        let sub = new_subscriber();
-
-        sub.on_event(
-            &Event::new(EventKind::TaskStarting)
-                .with_task("t")
-                .with_attempt(2),
-        );
-
-        assert_eq!(sub.task_restarts.get(), 1.0);
-    }
-
-    #[test]
-    fn backoff_failure_increments_counter() {
+    fn backoff_records_source_and_duration() {
         let sub = new_subscriber();
 
         sub.on_event(
@@ -511,17 +466,6 @@ mod tests {
                 .with_delay(Duration::from_secs(5))
                 .with_backoff_failure(),
         );
-
-        assert_eq!(
-            sub.task_backoff_count.with_label_values(&["failure"]).get(),
-            1.0
-        );
-    }
-
-    #[test]
-    fn backoff_success_increments_counter() {
-        let sub = new_subscriber();
-
         sub.on_event(
             &Event::new(EventKind::BackoffScheduled)
                 .with_task("t")
@@ -529,107 +473,68 @@ mod tests {
                 .with_backoff_success(),
         );
 
-        assert_eq!(
-            sub.task_backoff_count.with_label_values(&["success"]).get(),
-            1.0
-        );
+        assert_eq!(sub.task_backoffs.with_label_values(&["failure"]).get(), 1.0);
+        assert_eq!(sub.task_backoffs.with_label_values(&["success"]).get(), 1.0);
+        assert_eq!(sub.task_backoff_duration.get_sample_count(), 2);
+        assert_eq!(sub.task_backoff_duration.get_sample_sum(), 15.0);
     }
 
     #[test]
-    fn timeout_hit_increments_counter() {
+    fn attempt_timed_out_is_terminal_and_increments_timeout_counter() {
         let sub = new_subscriber();
 
         sub.on_event(
-            &Event::new(EventKind::TimeoutHit)
+            &Event::new(EventKind::AttemptStarting)
+                .with_task("t")
+                .with_attempt(1),
+        );
+        sub.on_event(
+            &Event::new(EventKind::AttemptTimedOut)
                 .with_task("t")
                 .with_timeout(Duration::from_secs(30)),
         );
 
-        assert_eq!(sub.task_timeouts.get(), 1.0);
+        assert_eq!(sub.attempt_timeouts.get(), 1.0);
+        assert_eq!(sub.attempts_in_flight.get(), 0.0);
     }
 
     #[test]
-    fn actor_exhausted_increments_terminal() {
+    fn force_aborted_and_panicked_tasks_repair_in_flight() {
         let sub = new_subscriber();
 
-        sub.on_event(
-            &Event::new(EventKind::ActorExhausted)
-                .with_task("t")
-                .with_reason("policy done"),
-        );
-
-        assert_eq!(
-            sub.task_terminal.with_label_values(&["exhausted"]).get(),
-            1.0
-        );
-    }
-
-    #[test]
-    fn actor_exhausted_observes_attempts_to_finalize() {
-        let sub = new_subscriber();
-
-        sub.on_event(
-            &Event::new(EventKind::ActorExhausted)
-                .with_task("t")
-                .with_attempt(3),
-        );
-
-        let h = sub.attempts_to_finalize.with_label_values(&["exhausted"]);
-        assert_eq!(h.get_sample_count(), 1);
-        assert_eq!(h.get_sample_sum(), 3.0);
-    }
-
-    #[test]
-    fn actor_dead_observes_attempts_to_finalize() {
-        let sub = new_subscriber();
-
-        sub.on_event(
-            &Event::new(EventKind::ActorDead)
-                .with_task("t")
-                .with_attempt(7)
-                .with_reason("fatal"),
-        );
-
-        let h = sub.attempts_to_finalize.with_label_values(&["fatal"]);
-        assert_eq!(h.get_sample_count(), 1);
-        assert_eq!(h.get_sample_sum(), 7.0);
-    }
-
-    #[test]
-    fn actor_exhausted_without_attempt_observes_one() {
-        let sub = new_subscriber();
-
-        sub.on_event(&Event::new(EventKind::ActorExhausted).with_task("t"));
-
-        let h = sub.attempts_to_finalize.with_label_values(&["exhausted"]);
-        assert_eq!(h.get_sample_count(), 1);
-        assert_eq!(h.get_sample_sum(), 1.0);
-    }
-
-    #[test]
-    fn actor_dead_increments_terminal() {
-        let sub = new_subscriber();
-
-        sub.on_event(
-            &Event::new(EventKind::ActorDead)
-                .with_task("t")
-                .with_reason("fatal error"),
-        );
-
-        assert_eq!(sub.task_terminal.with_label_values(&["fatal"]).get(), 1.0);
+        for (outcome, label) in [
+            (TaskOutcomeKind::ForceAborted, "outcome_force_aborted"),
+            (TaskOutcomeKind::Panicked, "outcome_panicked"),
+        ] {
+            sub.on_event(
+                &Event::new(EventKind::AttemptStarting)
+                    .with_task("t")
+                    .with_attempt(1),
+            );
+            sub.on_event(
+                &Event::new(EventKind::TaskFinished)
+                    .with_task("t")
+                    .with_outcome_kind(outcome),
+            );
+            assert_eq!(sub.attempts_in_flight.get(), 0.0);
+            assert_eq!(
+                sub.task_final_outcomes.with_label_values(&[label]).get(),
+                1.0
+            );
+        }
     }
 
     #[test]
     fn in_flight_does_not_go_negative() {
         let sub = new_subscriber();
 
-        sub.on_event(&Event::new(EventKind::TaskStopped).with_task("t"));
+        sub.on_event(&Event::new(EventKind::AttemptSucceeded).with_task("t"));
 
-        assert_eq!(sub.tasks_in_flight.get(), 0.0);
+        assert_eq!(sub.attempts_in_flight.get(), 0.0);
     }
 
     #[test]
-    fn subscriber_overflow_increments_counter() {
+    fn internal_events_increment_separate_counters() {
         let sub = new_subscriber();
 
         sub.on_event(
@@ -638,161 +543,82 @@ mod tests {
                 .with_reason("queue full"),
         );
 
-        assert_eq!(sub.subscriber_overflow.get(), 1.0);
-    }
-
-    #[test]
-    fn subscriber_panicked_increments_counter() {
-        let sub = new_subscriber();
-
         sub.on_event(
             &Event::new(EventKind::SubscriberPanicked)
                 .with_task("t")
                 .with_reason("boom"),
         );
+        sub.on_event(
+            &Event::new(EventKind::RuntimeFailure)
+                .with_task("registry")
+                .with_reason("listener join failed"),
+        );
 
-        assert_eq!(sub.subscriber_panicked.get(), 1.0);
+        assert_eq!(sub.subscriber_overflows.get(), 1.0);
+        assert_eq!(sub.subscriber_panics.get(), 1.0);
+        assert_eq!(sub.runtime_failures.get(), 1.0);
     }
 
+    #[cfg(feature = "taskvisor-controller")]
     #[test]
-    fn controller_submitted_increments_counter() {
+    fn controller_events_update_their_metrics() {
         let sub = new_subscriber();
 
         sub.on_event(&Event::new(EventKind::ControllerSubmitted).with_task("t"));
-
-        assert_eq!(sub.controller_submissions.get(), 1.0);
-    }
-
-    #[test]
-    fn controller_rejected_without_reason_labels_as_unknown() {
-        let sub = new_subscriber();
-
         sub.on_event(&Event::new(EventKind::ControllerRejected).with_task("t"));
+        sub.on_event(
+            &Event::new(EventKind::ControllerRejected)
+                .with_task("t")
+                .with_rejection_kind(RejectionKind::QueueFull)
+                .with_reason("queue_full: 1/1"),
+        );
 
+        assert_eq!(sub.controller_submitted_events.get(), 1.0);
         assert_eq!(
             sub.controller_rejections
                 .with_label_values(&["unknown"])
                 .get(),
             1.0
         );
-    }
-
-    #[test]
-    fn controller_rejected_slot_full_reason() {
-        let sub = new_subscriber();
-
-        sub.on_event(
-            &Event::new(EventKind::ControllerRejected)
-                .with_task("t")
-                // taskvisor emits `queue_full: {len}/{max}` (controller/core.rs).
-                .with_reason("queue_full: 1/1"),
-        );
-
         assert_eq!(
             sub.controller_rejections
-                .with_label_values(&["slot_full"])
+                .with_label_values(&["queue_full"])
                 .get(),
             1.0
         );
     }
 
     #[test]
-    fn controller_rejected_slot_busy_reason() {
+    fn queue_capacity_supports_default_and_override() {
         let sub = new_subscriber();
+        assert_eq!(sub.queue_capacity(), DEFAULT_TASKVISOR_QUEUE_CAPACITY);
 
-        sub.on_event(
-            &Event::new(EventKind::ControllerRejected)
-                .with_task("t")
-                .with_reason("dropped: slot busy (status=Running)"),
-        );
-
-        assert_eq!(
-            sub.controller_rejections
-                .with_label_values(&["slot_busy"])
-                .get(),
-            1.0
-        );
+        let registry = Registry::new();
+        let capacity = NonZeroUsize::new(4096).unwrap();
+        let sub = PrometheusTaskvisorSubscriber::with_queue_capacity(&registry, capacity).unwrap();
+        assert_eq!(sub.queue_capacity().get(), 4096);
     }
 
-    #[test]
-    fn classify_rejection_reason_recognizes_known_prefixes() {
-        assert_eq!(
-            // taskvisor emits `queue_full: {len}/{max}` (controller/core.rs).
-            classify_rejection_reason(Some("queue_full: 1/1")),
-            "slot_full"
-        );
-        assert_eq!(
-            classify_rejection_reason(Some("dropped: slot busy (status=Running)")),
-            "slot_busy"
-        );
-        assert_eq!(
-            classify_rejection_reason(Some("add_failed: something")),
-            "add_failed"
-        );
-        assert_eq!(
-            classify_rejection_reason(Some("remove_failed: boom")),
-            "remove_failed"
-        );
-        assert_eq!(
-            classify_rejection_reason(Some("queue_start_failed: oom")),
-            "queue_failed"
-        );
-        assert_eq!(
-            // taskvisor 0.3 emits `recovery_remove_failed: {e}` (controller/core.rs).
-            classify_rejection_reason(Some("recovery_remove_failed: net")),
-            "recovery_failed"
-        );
-        assert_eq!(
-            classify_rejection_reason(Some("bus_lagged: missed 1 events, recovering slots")),
-            "bus_lagged"
-        );
-        assert_eq!(
-            classify_rejection_reason(Some("controller_loop_exited: channel closed")),
-            "controller_exited"
-        );
-    }
-
-    #[test]
-    fn classify_rejection_reason_none_is_unknown() {
-        assert_eq!(classify_rejection_reason(None), "unknown");
-    }
-
-    #[test]
-    fn classify_rejection_reason_unrecognized_is_other() {
-        assert_eq!(classify_rejection_reason(Some("something weird")), "other");
-        assert_eq!(classify_rejection_reason(Some("")), "other");
-    }
-
-    #[test]
-    fn queue_capacity_defaults_to_2048() {
-        let sub = new_subscriber();
-        assert_eq!(sub.queue_capacity(), DEFAULT_QUEUE_CAPACITY);
-        assert_eq!(sub.queue_capacity(), 2048);
-    }
-
-    #[test]
-    fn queue_capacity_is_overridable_via_constructor() {
-        let registry = Arc::new(Registry::new());
-        let sub = PrometheusSubscriber::with_queue_capacity(registry, 4096).unwrap();
-        assert_eq!(sub.queue_capacity(), 4096);
-    }
-
+    #[cfg(feature = "runner")]
     #[test]
     fn shared_registry_with_backend() {
-        let registry = Arc::new(Registry::new());
+        let registry = Registry::new();
 
-        let backend = crate::PrometheusMetrics::new(registry.clone()).unwrap();
-        let sub = PrometheusSubscriber::new(registry.clone()).unwrap();
+        let backend = crate::PrometheusRunnerMetrics::new(&registry).unwrap();
+        let sub = PrometheusTaskvisorSubscriber::new(&registry).unwrap();
 
-        backend.record_task_started(solti_runner::RunnerType::Subprocess);
+        backend.record_runner_error(
+            solti_runner::RunnerType::Subprocess,
+            solti_runner::RunnerErrorKind::SpawnFailed,
+        );
         sub.on_event(
-            &Event::new(EventKind::TaskStarting)
+            &Event::new(EventKind::AttemptStarting)
                 .with_task("t")
                 .with_attempt(1),
         );
 
         let text = metrics_text(&registry);
-        assert!(text.contains("solti_runner_tasks_started_total"));
-        assert!(text.contains("solti_sv_tasks_in_flight"));
+        assert!(text.contains("solti_runner_errors_total"));
+        assert!(text.contains("solti_taskvisor_attempts_in_flight"));
     }
 }

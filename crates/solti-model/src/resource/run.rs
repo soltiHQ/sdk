@@ -1,118 +1,274 @@
-//! # Task run record.
+//! # Task run
 //!
-//! [`TaskRun`] captures a single execution attempt with start/finish times and outcome.
+//! [`TaskRun`] records one execution attempt.
 
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::TaskPhase;
+use crate::{ModelError, ModelResult, TaskPhase, WorkloadTypeMeta};
 
-/// Record of a single task execution attempt.
+/// Record of one execution attempt.
 ///
-/// Each time the supervisor starts a task, a new `TaskRun` is created.
-/// When the attempt finishes (success, failure, timeout, etc.), the run is closed with the terminal phase and timestamp.
-///
-/// Runs are associated with a [`Task`](crate::Task) via its [`TaskId`](crate::TaskId) and ordered by attempt number.
-///
-/// ## Also
-///
-/// - [`Task`](crate::Task) parent resource.
-/// - [`TaskPhase`] phase values stored in `phase` field.
-///
-/// # Lifecycle
-///
-/// ```text
-///   TaskStarting  ──►  TaskRun { phase: Running, finished_at: None }
-///        │
-///        ├──► TaskStopped    ──► phase = Succeeded, finished_at = Some(now)
-///        ├──► TaskFailed     ──► phase = Failed,    finished_at = Some(now)
-///        ├──► TimeoutHit     ──► phase = Timeout,   finished_at = Some(now)
-///        └──► ActorExhausted ──► phase = Exhausted, finished_at = Some(now)
-/// ```
+/// An active run has phase `Running` and no finish fields.
+/// A finished run has a terminal phase and `finishedAt`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", try_from = "raw::TaskRunRaw")]
 pub struct TaskRun {
-    /// Attempt number (1-based, matches the task's attempt counter after increment).
-    pub attempt: u32,
-    /// Phase this run ended in (or `Running` if still active).
-    pub phase: TaskPhase,
-    /// When the run started.
-    #[serde(with = "super::metadata::time_serde")]
-    pub started_at: SystemTime,
-    /// When the run finished (`None` while still running).
+    workload: WorkloadTypeMeta,
+    generation: u64,
+    attempt: u32,
+    phase: TaskPhase,
+    #[serde(with = "super::metadata::rfc3339_time_serde")]
+    started_at: SystemTime,
     #[serde(
         skip_serializing_if = "Option::is_none",
-        with = "option_time_serde",
+        with = "super::metadata::rfc3339_time_serde::option",
         default
     )]
-    pub finished_at: Option<SystemTime>,
-    /// Error message (present when phase is Failed/Timeout/Exhausted).
+    finished_at: Option<SystemTime>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// Process exit code (Subprocess/Container only).
+    error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
+    exit_code: Option<i32>,
+}
+
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for TaskRun {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TaskRun".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        crate::schema::task_run(generator)
+    }
 }
 
 impl TaskRun {
-    /// Create a new run record for an attempt that just started.
-    pub fn starting(attempt: u32) -> Self {
-        Self {
+    /// Creates an active run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when generation or attempt is zero.
+    pub fn starting(
+        generation: u64,
+        attempt: u32,
+        workload: WorkloadTypeMeta,
+    ) -> ModelResult<Self> {
+        Self::from_parts(
+            workload,
+            generation,
             attempt,
-            phase: TaskPhase::Running,
-            started_at: SystemTime::now(),
-            finished_at: None,
-            error: None,
-            exit_code: None,
-        }
+            TaskPhase::Running,
+            super::metadata::time_serde::now(),
+            None,
+            None,
+            None,
+        )
     }
 
-    /// Close the run with a terminal phase.
-    pub fn finish(&mut self, phase: TaskPhase, error: Option<String>, exit_code: Option<i32>) {
-        self.finished_at = Some(SystemTime::now());
+    /// Reconstructs a run from serialized fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when identity fields, phase, timestamps, or terminal diagnostics are inconsistent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        workload: WorkloadTypeMeta,
+        generation: u64,
+        attempt: u32,
+        phase: TaskPhase,
+        started_at: SystemTime,
+        finished_at: Option<SystemTime>,
+        error: Option<String>,
+        exit_code: Option<i32>,
+    ) -> ModelResult<Self> {
+        let run = Self {
+            workload,
+            generation,
+            attempt,
+            phase,
+            started_at,
+            finished_at,
+            error,
+            exit_code,
+        };
+        run.validate()?;
+        Ok(run)
+    }
+
+    /// Finishes an active run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the run is already finished or `phase` is not terminal.
+    pub fn finish(
+        &mut self,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+    ) -> ModelResult<()> {
+        if !self.is_active() {
+            return Err(ModelError::Invalid("task run is already finished".into()));
+        }
+        if !phase.is_terminal() {
+            return Err(ModelError::Invalid(
+                format!("task run requires a terminal phase, got {phase}").into(),
+            ));
+        }
+        self.finished_at = Some(super::metadata::time_serde::now());
         self.phase = phase;
         self.error = error;
         self.exit_code = exit_code;
+        Ok(())
     }
 
-    /// Whether this run is still in progress.
+    /// Workload GVK executed by this run.
+    pub fn workload(&self) -> &WorkloadTypeMeta {
+        &self.workload
+    }
+
+    /// Desired-state generation executed by this run.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// One-based attempt number.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// Current or terminal run phase.
+    pub fn phase(&self) -> TaskPhase {
+        self.phase
+    }
+
+    /// Time when the run started.
+    pub fn started_at(&self) -> SystemTime {
+        self.started_at
+    }
+
+    /// Time when the run finished.
+    pub fn finished_at(&self) -> Option<SystemTime> {
+        self.finished_at
+    }
+
+    /// Terminal diagnostic, when available.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Process exit code, when available.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
+
+    /// Returns the serialized run fields.
+    #[allow(clippy::type_complexity)]
+    pub fn into_parts(
+        self,
+    ) -> (
+        WorkloadTypeMeta,
+        u64,
+        u32,
+        TaskPhase,
+        SystemTime,
+        Option<SystemTime>,
+        Option<String>,
+        Option<i32>,
+    ) {
+        (
+            self.workload,
+            self.generation,
+            self.attempt,
+            self.phase,
+            self.started_at,
+            self.finished_at,
+            self.error,
+            self.exit_code,
+        )
+    }
+
+    /// Returns whether the run is active.
     pub fn is_active(&self) -> bool {
-        self.finished_at.is_none()
+        self.phase == TaskPhase::Running
+    }
+
+    fn validate(&self) -> ModelResult<()> {
+        if self.generation == 0 {
+            return Err(ModelError::Invalid(
+                "task run generation must be greater than zero".into(),
+            ));
+        }
+        if self.attempt == 0 {
+            return Err(ModelError::Invalid(
+                "task run attempt must be greater than zero".into(),
+            ));
+        }
+        match self.phase {
+            TaskPhase::Running if self.finished_at.is_none() => {
+                if self.error.is_some() || self.exit_code.is_some() {
+                    return Err(ModelError::Invalid(
+                        "active task run cannot contain terminal diagnostics".into(),
+                    ));
+                }
+            }
+            phase if phase.is_terminal() && self.finished_at.is_some() => {}
+            TaskPhase::Running => {
+                return Err(ModelError::Invalid(
+                    "active task run cannot have finishedAt".into(),
+                ));
+            }
+            phase if phase.is_terminal() => {
+                return Err(ModelError::Invalid(
+                    "terminal task run requires finishedAt".into(),
+                ));
+            }
+            _ => {
+                return Err(ModelError::Invalid(
+                    "task run phase must be Running or terminal".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
-mod option_time_serde {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::time::{SystemTime, UNIX_EPOCH};
+mod raw {
+    use super::*;
 
-    pub fn serialize<S>(time: &Option<SystemTime>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match time {
-            Some(t) => {
-                let since_epoch = t
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(serde::ser::Error::custom)?;
-                let ms = since_epoch.as_secs() * 1_000 + u64::from(since_epoch.subsec_millis());
-                ms.serialize(serializer)
-            }
-            None => serializer.serialize_none(),
-        }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub(super) struct TaskRunRaw {
+        workload: WorkloadTypeMeta,
+        generation: u64,
+        attempt: u32,
+        phase: TaskPhase,
+        #[serde(with = "super::super::metadata::rfc3339_time_serde")]
+        started_at: SystemTime,
+        #[serde(default, with = "super::super::metadata::rfc3339_time_serde::option")]
+        finished_at: Option<SystemTime>,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        exit_code: Option<i32>,
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<SystemTime>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let opt: Option<u64> = Option::deserialize(deserializer)?;
-        opt.map(|ms| {
-            UNIX_EPOCH
-                .checked_add(std::time::Duration::from_millis(ms))
-                .ok_or_else(|| <D::Error as serde::de::Error>::custom("timestamp out of range"))
-        })
-        .transpose()
+    impl TryFrom<TaskRunRaw> for TaskRun {
+        type Error = ModelError;
+
+        fn try_from(raw: TaskRunRaw) -> Result<Self, Self::Error> {
+            TaskRun::from_parts(
+                raw.workload,
+                raw.generation,
+                raw.attempt,
+                raw.phase,
+                raw.started_at,
+                raw.finished_at,
+                raw.error,
+                raw.exit_code,
+            )
+        }
     }
 }
 
@@ -120,70 +276,37 @@ mod option_time_serde {
 mod tests {
     use super::*;
 
-    #[test]
-    fn starting_creates_running_run() {
-        let run = TaskRun::starting(1);
-        assert_eq!(run.attempt, 1);
-        assert_eq!(run.phase, TaskPhase::Running);
-        assert!(run.is_active());
-        assert!(run.finished_at.is_none());
-        assert!(run.error.is_none());
-        assert!(run.exit_code.is_none());
+    fn workload() -> WorkloadTypeMeta {
+        WorkloadTypeMeta::new("example.io/v1", "Example").unwrap()
     }
 
     #[test]
-    fn finish_closes_run() {
-        let mut run = TaskRun::starting(2);
-        run.finish(TaskPhase::Failed, Some("boom".into()), Some(1));
-
-        assert!(!run.is_active());
-        assert!(run.finished_at.is_some());
-        assert_eq!(run.phase, TaskPhase::Failed);
-        assert_eq!(run.error.as_deref(), Some("boom"));
-        assert_eq!(run.exit_code, Some(1));
+    fn finish_requires_terminal_phase_and_active_run() {
+        let mut run = TaskRun::starting(1, 1, workload()).unwrap();
+        assert!(run.finish(TaskPhase::Running, None, None).is_err());
+        run.finish(TaskPhase::Succeeded, None, Some(0)).unwrap();
+        assert!(run.finish(TaskPhase::Failed, None, Some(1)).is_err());
     }
 
     #[test]
-    fn finish_succeeded_no_error() {
-        let mut run = TaskRun::starting(1);
-        run.finish(TaskPhase::Succeeded, None, None);
+    fn serde_rejects_inconsistent_and_unknown_run_fields() {
+        let run = TaskRun::starting(1, 1, workload()).unwrap();
+        let mut json = serde_json::to_value(run).unwrap();
+        json["attempt"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<TaskRun>(json).is_err());
 
-        assert!(!run.is_active());
-        assert_eq!(run.phase, TaskPhase::Succeeded);
-        assert!(run.error.is_none());
-        assert!(run.exit_code.is_none());
-    }
+        let run = TaskRun::starting(1, 1, workload()).unwrap();
+        let mut json = serde_json::to_value(run).unwrap();
+        json["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<TaskRun>(json).is_err());
 
-    #[test]
-    fn serde_roundtrip_active() {
-        let run = TaskRun::starting(3);
-        let json = serde_json::to_string(&run).unwrap();
-        let back: TaskRun = serde_json::from_str(&json).unwrap();
+        let run = TaskRun::starting(1, 1, workload()).unwrap();
+        let mut finished_active = serde_json::to_value(&run).unwrap();
+        finished_active["finishedAt"] = serde_json::json!("2026-01-01T00:00:00Z");
+        assert!(serde_json::from_value::<TaskRun>(finished_active).is_err());
 
-        assert_eq!(back.attempt, 3);
-        assert_eq!(back.phase, TaskPhase::Running);
-        assert!(back.finished_at.is_none());
-    }
-
-    #[test]
-    fn serde_roundtrip_finished() {
-        let mut run = TaskRun::starting(1);
-        run.finish(TaskPhase::Timeout, Some("timeout".into()), None);
-
-        let json = serde_json::to_string(&run).unwrap();
-        let back: TaskRun = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(back.phase, TaskPhase::Timeout);
-        assert!(back.finished_at.is_some());
-        assert_eq!(back.error.as_deref(), Some("timeout"));
-    }
-
-    #[test]
-    fn serde_skips_none_fields() {
-        let run = TaskRun::starting(1);
-        let json = serde_json::to_string(&run).unwrap();
-        assert!(!json.contains("finishedAt"));
-        assert!(!json.contains("error"));
-        assert!(!json.contains("exitCode"));
+        let mut unfinished_terminal = serde_json::to_value(run).unwrap();
+        unfinished_terminal["phase"] = serde_json::json!("succeeded");
+        assert!(serde_json::from_value::<TaskRun>(unfinished_terminal).is_err());
     }
 }

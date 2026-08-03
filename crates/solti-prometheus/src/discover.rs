@@ -1,21 +1,28 @@
-//! # Discovery-heartbeat Prometheus metrics (feature `discover`).
+//! # Discovery metrics
 //!
-//! [`PrometheusDiscoverMetrics`] implements [`solti_discover::DiscoverMetricsBackend`], exposing `solti_discover_*`
-//! attempt / outcome / duration / failure / hold metrics for the control-plane discovery heartbeat.
+//! [`PrometheusDiscoverMetrics`] implements [`DiscoverMetricsBackend`].
+//! It records control-plane heartbeat attempts and retry holds.
 //!
-//! See the [crate root](crate) for architecture and namespace overview.
+//! Enable it with the `discover` feature.
+//!
+//! ## Flow
+//!
+//! ```text
+//! Discovery task ──► DiscoverMetricsBackend ──► PrometheusDiscoverMetrics ──► Registry
+//! ```
 
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use prometheus::{Counter, CounterVec, Gauge, Histogram, HistogramVec, Registry};
-use solti_discover::{DiscoverMetricsBackend, OUTCOME_FAILURE, OUTCOME_SUCCESS};
+use solti_discover::{
+    DiscoverFailReason, DiscoverMetricsBackend, OUTCOME_FAILURE, OUTCOME_SUCCESS,
+};
 
-use crate::register::{Sub, ms_to_secs};
+use crate::register::{MetricGroup, ms_to_secs};
 
-/// Prometheus implementation of [`DiscoverMetricsBackend`].
+/// Prometheus discovery metrics.
 ///
-/// ## Metrics (`solti_discover_*`)
+/// ## Metrics
 ///
 /// | Metric                                          | Type      | Labels    | Description                         |
 /// |-------------------------------------------------|-----------|-----------|-------------------------------------|
@@ -26,6 +33,55 @@ use crate::register::{Sub, ms_to_secs};
 /// | `solti_discover_last_success_timestamp_seconds` | Gauge     | -         | UNIX time of last successful sync   |
 /// | `solti_discover_holds_total`                    | Counter   | -         | Server-advised retry holds received |
 /// | `solti_discover_hold_duration_seconds`          | Histogram | -         | Duration of advised holds           |
+///
+/// ## Event Mapping
+///
+/// ```text
+/// record_attempt()
+///   └──► attempts_total
+///
+/// record_success(duration_ms)
+///   ├──► outcomes_total{outcome="success"}
+///   ├──► duration_seconds{outcome="success"}
+///   └──► last_success_timestamp_seconds
+///
+/// record_failure(duration_ms, reason)
+///   ├──► outcomes_total{outcome="failure"}
+///   ├──► duration_seconds{outcome="failure"}
+///   └──► failures_total{reason}
+///
+/// record_hold(duration_s)
+///   ├──► holds_total
+///   └──► hold_duration_seconds
+/// ```
+///
+/// ## Rules
+///
+/// - Failure labels come from [`DiscoverFailReason::as_label`].
+/// - Attempt durations enter the backend in milliseconds.
+/// - Hold duration already enters the backend in seconds.
+/// - A success records the current UNIX timestamp.
+/// - A clock value before the UNIX epoch records `0`.
+/// - Duration histograms export seconds.
+///
+/// ## Example
+///
+/// ```
+/// use solti_discover::{DiscoverFailReason, DiscoverMetricsBackend};
+/// use solti_prometheus::{PrometheusDiscoverMetrics, Registry};
+///
+/// # fn main() -> Result<(), prometheus::Error> {
+/// let registry = Registry::new();
+/// let metrics = PrometheusDiscoverMetrics::new(&registry)?;
+///
+/// metrics.record_attempt();
+/// metrics.record_success(25);
+/// metrics.record_failure(50, DiscoverFailReason::Timeout);
+/// metrics.record_hold(10);
+///
+/// assert!(!registry.gather().is_empty());
+/// # Ok(()) }
+/// ```
 pub struct PrometheusDiscoverMetrics {
     attempts_total: Counter,
     outcomes_total: CounterVec,
@@ -37,37 +93,58 @@ pub struct PrometheusDiscoverMetrics {
 }
 
 impl PrometheusDiscoverMetrics {
-    /// Register all discovery metrics into `registry`.
-    pub fn new(registry: Arc<Registry>) -> Result<Self, prometheus::Error> {
-        let r = Sub::new(&registry, "discover");
+    /// Creates a discovery metrics backend and registers its collectors.
+    ///
+    /// The returned backend updates the collectors in `registry`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Prometheus error when the metric group cannot be created or registered.
+    /// A descriptor conflict returns [`prometheus::Error::AlreadyReg`].
+    pub fn new(registry: &Registry) -> Result<Self, prometheus::Error> {
+        let mut metrics = MetricGroup::new();
 
-        let attempts_total = r.counter("attempts_total", "Total discovery heartbeat attempts")?;
-        let outcomes_total = r.counter_vec(
+        let attempts_total = metrics.counter(
+            "discover",
+            "attempts_total",
+            "Total discovery heartbeat attempts",
+        )?;
+        let outcomes_total = metrics.counter_vec(
+            "discover",
             "outcomes_total",
             "Discovery heartbeat outcomes",
             &["outcome"],
         )?;
-        let duration_seconds = r.histogram_vec(
+        let duration_seconds = metrics.histogram_vec(
+            "discover",
             "duration_seconds",
             "Discovery heartbeat call duration",
             vec![0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0],
             &["outcome"],
         )?;
-        let failures_total = r.counter_vec(
+        let failures_total = metrics.counter_vec(
+            "discover",
             "failures_total",
             "Discovery heartbeat failures grouped by reason",
             &["reason"],
         )?;
-        let last_success_ts = r.gauge(
+        let last_success_ts = metrics.gauge(
+            "discover",
             "last_success_timestamp_seconds",
             "UNIX timestamp of the last successful heartbeat",
         )?;
-        let holds_total = r.counter("holds_total", "Server-advised retry holds observed")?;
-        let hold_duration_seconds = r.histogram(
+        let holds_total = metrics.counter(
+            "discover",
+            "holds_total",
+            "Server-advised retry holds observed",
+        )?;
+        let hold_duration_seconds = metrics.histogram(
+            "discover",
             "hold_duration_seconds",
             "Duration of server-advised retry holds",
             vec![1.0, 5.0, 15.0, 30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0],
         )?;
+        metrics.register(registry)?;
 
         Ok(Self {
             attempts_total,
@@ -106,14 +183,16 @@ impl DiscoverMetricsBackend for PrometheusDiscoverMetrics {
         self.last_success_ts.set(ts);
     }
 
-    fn record_failure(&self, duration_ms: u64, reason: &'static str) {
+    fn record_failure(&self, duration_ms: u64, reason: DiscoverFailReason) {
         self.outcomes_total
             .with_label_values(&[OUTCOME_FAILURE])
             .inc();
         self.duration_seconds
             .with_label_values(&[OUTCOME_FAILURE])
             .observe(ms_to_secs(duration_ms));
-        self.failures_total.with_label_values(&[reason]).inc();
+        self.failures_total
+            .with_label_values(&[reason.as_label()])
+            .inc();
     }
 
     fn record_hold(&self, duration_s: u64) {

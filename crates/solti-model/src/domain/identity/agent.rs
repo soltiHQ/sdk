@@ -1,6 +1,7 @@
-//! # Agent identifier.
+//! # Agent identity
 //!
-//! [`AgentId`] identifies an agent instance in multi-agent deployments.
+//! [`AgentId`] identifies one agent.
+//! It accepts `[A-Za-z0-9._-]` and is limited to [`AGENT_ID_MAX_LEN`] bytes.
 
 use super::validate_identity;
 use crate::error::ModelError;
@@ -9,29 +10,41 @@ use crate::error::ModelError;
 pub const AGENT_ID_MAX_LEN: usize = 128;
 
 arc_str_newtype! {
-    /// Unique identifier for a solti agent instance.
+    #[cfg_attr(feature = "schema", schemars(schema_with = "crate::schema::agent_id"))]
+    /// Caller-provided identifier for a Solti agent.
     ///
-    /// Represents the identity of a running agent process.
-    /// The caller is responsible for providing a meaningful ID (e.g. UUID, hostname, pod name).
+    /// The model validates its format.
+    /// The caller owns assignment and uniqueness.
     ///
     /// ```rust
     /// use solti_model::AgentId;
     ///
     /// // From a UUID
-    /// let id = AgentId::new("550e8400-e29b-41d4-a716-446655440000");
+    /// let id = AgentId::new("550e8400-e29b-41d4-a716-446655440000").unwrap();
     /// assert_eq!(id.as_str(), "550e8400-e29b-41d4-a716-446655440000");
     ///
     /// // From a Kubernetes pod name
-    /// let id: AgentId = "worker-pod-7b9f4".into();
+    /// let id = AgentId::new("worker-pod-7b9f4").unwrap();
     /// assert_eq!(format!("{id}"), "worker-pod-7b9f4");
     /// ```
     pub struct AgentId;
 }
 
 impl AgentId {
-    /// Validate that the agent id is safe to use across the SDK and the wire protocol.
+    /// Validates the agent id.
     ///
-    /// See `validate_identity` (module-private) for the exact rules.
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the value is empty, too long, equal to `"."` or `".."`, or contains a byte outside `[A-Za-z0-9._-]`.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::AgentId;
+    ///
+    /// assert!(AgentId::new("worker-pod-7b9f4").is_ok());
+    /// assert!(AgentId::new("worker/pod").is_err());
+    /// ```
     pub fn validate_format(&self) -> Result<(), ModelError> {
         validate_identity("agent_id", self.as_str(), AGENT_ID_MAX_LEN)
     }
@@ -43,43 +56,20 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn agent_id_from_string() {
-        let id = AgentId::from("my-agent-001");
-        assert_eq!(id.as_str(), "my-agent-001");
-    }
-
-    #[test]
-    fn agent_id_display() {
-        let id = AgentId::new("worker-pod-7b9f4");
-        assert_eq!(format!("{}", id), "worker-pod-7b9f4");
-    }
-
-    #[test]
-    fn agent_id_serde_transparent() {
-        let id = AgentId::from("550e8400-e29b-41d4-a716-446655440000");
-        let json = serde_json::to_string(&id).unwrap();
-        assert_eq!(json, r#""550e8400-e29b-41d4-a716-446655440000""#);
-
-        let back: AgentId = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, id);
-    }
-
-    #[test]
-    fn agent_id_hash_equality() {
+    fn exposes_string_identity_hashing_and_shared_clones() {
         use std::collections::HashSet;
 
+        let id = AgentId::new("agent-a").unwrap();
+        assert_eq!(id.as_str(), "agent-a");
+        assert_eq!(format!("{id}"), "agent-a");
+        assert_eq!(id, *"agent-a");
+
         let mut set = HashSet::new();
-        set.insert(AgentId::from("agent-a"));
-        set.insert(AgentId::from("agent-b"));
-        set.insert(AgentId::from("agent-a"));
-
+        set.insert(id.clone());
+        set.insert(AgentId::new("agent-b").unwrap());
+        set.insert(AgentId::new("agent-a").unwrap());
         assert_eq!(set.len(), 2);
-        assert!(set.contains(&AgentId::from("agent-a")));
-    }
 
-    #[test]
-    fn clone_is_cheap() {
-        let id = AgentId::new("shared-agent");
         let cloned = id.clone();
         let a: Arc<str> = id.into_inner();
         let b: Arc<str> = cloned.into_inner();
@@ -87,33 +77,24 @@ mod tests {
     }
 
     #[test]
-    fn partial_eq_with_str() {
-        let id = AgentId::new("test-agent");
-        assert_eq!(id, *"test-agent");
+    fn serde_is_transparent() {
+        let id = AgentId::new("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, r#""550e8400-e29b-41d4-a716-446655440000""#);
+        assert_eq!(serde_json::from_str::<AgentId>(&json).unwrap(), id);
     }
 
     #[test]
-    fn into_inner() {
-        let id = AgentId::new("owned");
-        let s: Arc<str> = id.into_inner();
-        assert_eq!(&*s, "owned");
-    }
-
-    #[test]
-    fn validate_format_accepts_valid() {
-        AgentId::new("550e8400-e29b-41d4-a716-446655440000")
-            .validate_format()
-            .unwrap();
-        AgentId::new("worker-pod-7b9f4").validate_format().unwrap();
-        AgentId::new("agent.eu-west-1.01")
-            .validate_format()
-            .unwrap();
-    }
-
-    #[test]
-    fn validate_format_rejects_invalid() {
-        assert!(AgentId::new("").validate_format().is_err());
-        assert!(AgentId::new("agent with space").validate_format().is_err());
-        assert!(AgentId::new("agent/path").validate_format().is_err());
+    fn validation_accepts_safe_values_and_rejects_unsafe_values() {
+        for valid in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "worker-pod-7b9f4",
+            "agent.eu-west-1.01",
+        ] {
+            AgentId::new(valid).unwrap();
+        }
+        for invalid in ["", "agent with space", "agent/path"] {
+            assert!(AgentId::new(invalid).is_err(), "must reject {invalid:?}");
+        }
     }
 }

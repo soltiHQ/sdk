@@ -1,11 +1,24 @@
-//! # Generic key-value pair.
+//! # Key-value pair
 //!
-//! [`KeyValue`] is used for environment variables and other ordered pair collections.
+//! [`KeyValue`] stores one ordered key-value entry.
+//! It does not apply key or value format validation.
 
 use serde::{Deserialize, Serialize};
 
-/// Key–value pair used for environment variables or generic metadata.
+/// Key-value pair used for environment variables or generic metadata.
+///
+/// ## Example
+///
+/// ```
+/// use solti_model::KeyValue;
+///
+/// let kv = KeyValue::new("APP_MODE", "batch");
+/// assert_eq!(kv.key(), "APP_MODE");
+/// assert_eq!(kv.value(), "batch");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct KeyValue {
     /// Name of the variable or key.
     key: String,
@@ -14,7 +27,7 @@ pub struct KeyValue {
 }
 
 impl KeyValue {
-    /// Create a new key–value pair.
+    /// Creates a key-value pair.
     #[inline]
     pub fn new<K, V>(key: K, value: V) -> Self
     where
@@ -27,13 +40,13 @@ impl KeyValue {
         }
     }
 
-    /// Get the key.
+    /// Returns the key.
     #[inline]
     pub fn key(&self) -> &str {
         &self.key
     }
 
-    /// Get the value.
+    /// Returns the value.
     #[inline]
     pub fn value(&self) -> &str {
         &self.value
@@ -62,46 +75,24 @@ mod tests {
     use super::KeyValue;
 
     #[test]
-    fn new_sets_key_and_value() {
-        let kv = KeyValue::new("FOO", "bar");
-        assert_eq!(kv.key(), "FOO");
-        assert_eq!(kv.value(), "bar");
+    fn constructors_and_equality_preserve_key_and_value() {
+        let expected = KeyValue::new("FOO", "bar");
+        let from_str: KeyValue = ("FOO", "bar").into();
+        let from_string: KeyValue = (String::from("FOO"), String::from("bar")).into();
+
+        assert_eq!(expected.key(), "FOO");
+        assert_eq!(expected.value(), "bar");
+        assert_eq!(from_str, expected);
+        assert_eq!(from_string, expected);
+        assert_ne!(KeyValue::new("FOO", "baz"), expected);
     }
 
     #[test]
-    fn from_str_tuple_creates_keyvalue() {
-        let kv: KeyValue = ("FOO", "bar").into();
-        assert_eq!(kv.key(), "FOO");
-        assert_eq!(kv.value(), "bar");
-    }
-
-    #[test]
-    fn from_string_tuple_creates_keyvalue() {
-        let kv: KeyValue = (String::from("FOO"), String::from("bar")).into();
-        assert_eq!(kv.key(), "FOO");
-        assert_eq!(kv.value(), "bar");
-    }
-
-    #[test]
-    fn equality_works_for_same_key_and_value() {
-        let a = KeyValue::new("FOO", "bar");
-        let b = KeyValue::new("FOO", "bar");
-        let c = KeyValue::new("FOO", "baz");
-
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn serde_roundtrip_json() {
+    fn serde_roundtrip_preserves_fields() {
         let kv = KeyValue::new("FOO", "bar");
         let json = serde_json::to_string(&kv).unwrap();
-
-        assert!(json.contains("\"key\":\"FOO\""));
-        assert!(json.contains("\"value\":\"bar\""));
-
+        assert_eq!(json, r#"{"key":"FOO","value":"bar"}"#);
         let back: KeyValue = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.key(), "FOO");
-        assert_eq!(back.value(), "bar");
+        assert_eq!(back, kv);
     }
 }

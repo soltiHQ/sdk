@@ -1,41 +1,44 @@
-//! # Subprocess: OS process runner for `TaskKind::Subprocess`.
+//! # Subprocess runner
 //!
-//! Executes tasks by spawning child OS processes with optional backend hardening (rlimits, cgroups, security capabilities).
+//! [`SubprocessRunner`] executes [`TaskWorkload::Subprocess`](solti_model::TaskWorkload::Subprocess) resources.
+//! It supports command and script modes.
 //!
-//! ## Modules
+//! ## Flow
 //!
-//! | Module      | What it does                                            |
-//! |-------------|---------------------------------------------------------|
-//! | `runner`    | [`SubprocessRunner`]: `Runner` trait impl + execution   |
-//! | `backend`   | [`SubprocessBackendConfig`]: rlimits, cgroups, security |
-//! | `task`      | [`SubprocessTaskConfig`]: resolved runtime config       |
-//! | `logger`    | [`LogConfig`] + stream capture, truncation, tracing     |
-//!
-//! ## Quick start
 //! ```text
-//! register_subprocess_runner(&mut router, "my-runner")
-//!     ├──► creates SubprocessRunner::new("my-runner")
-//!     ├──► attaches label "runner-name" = "my-runner"
-//!     └──► registers in RunnerRouter
-//!
-//! register_subprocess_runner_with_backend(&mut router, "secure", backend)
-//!     ├──► validates SubprocessBackendConfig
-//!     ├──► creates SubprocessRunner::with_config("secure", backend)
-//!     ├──► attaches label "runner-name" = "secure"
-//!     └──► registers in RunnerRouter
+//! Task ──► SubprocessRunner ──► TaskRef
+//!                                  │ each attempt
+//!                                  ▼
+//!                          prepare backend
+//!                                  ▼
+//!                          spawn process
+//!                           ├──► stdout/stderr
+//!                           └──► exit/cancel
 //! ```
 //!
-//! ## Registration guard
-//! - Duplicate runner names are rejected via `router.contains_label()` check
-//! - Returns `ExecError::DuplicateRunner` if a runner with the same name exists
+//! Each attempt owns its process and output readers.
+//! Script attempts also own an anonymous script descriptor.
+//! A configured cgroup is attempt-scoped.
+//! Unix attempts use a dedicated process group.
+//! The runner removes attempt-scoped resources after completion.
+//!
+//! ## Registration
+//!
+//! [`register_subprocess_runner`] uses default backend settings.
+//! [`register_subprocess_runner_with_backend`] accepts explicit settings.
+//! Both helpers add [`LABEL_RUNNER_NAME`] to the registered runner labels.
 mod backend;
-pub use backend::SubprocessBackendConfig;
+pub use backend::{CwdPolicy, EnvPolicy, SubprocessBackendConfig};
+
+mod boundary;
+
+mod domain;
 
 mod task;
-pub use task::SubprocessTaskConfig;
 
-mod logger;
-pub use logger::LogConfig;
+pub use crate::output::LogConfig;
+
+mod script;
 
 mod runner;
 pub use runner::SubprocessRunner;
@@ -43,46 +46,54 @@ pub use runner::SubprocessRunner;
 use std::sync::Arc;
 
 use solti_model::Labels;
-use solti_runner::RunnerRouter;
+use solti_runner::{Runner, RunnerRouter};
 
 use crate::ExecError;
+pub use crate::registration::LABEL_RUNNER_NAME;
 
-/// Well-known label key used to identify a runner by name.
-pub const LABEL_RUNNER_NAME: &str = "runner-name";
-
-/// Register a subprocess runner with default settings.
+/// Registers a subprocess runner with default settings.
+///
+/// The default uses an empty [`crate::host::HostProcessPolicy`].
+/// The runner receives label `solti.io/runner-name=<name>`.
+///
+/// # Errors
+///
+/// Returns [`ExecError::InvalidRunnerConfig`] when `name` is invalid.
+/// Returns [`ExecError::Router`] when the router rejects registration.
 pub fn register_subprocess_runner(
     router: &mut RunnerRouter,
-    name: &'static str,
+    name: impl Into<String>,
 ) -> Result<(), ExecError> {
-    register_runner_inner(router, name, Arc::new(SubprocessRunner::new(name)))
+    register_runner_inner(router, Arc::new(SubprocessRunner::new(name)?))
 }
 
-/// Register a subprocess runner with explicit runner configuration.
+/// Registers a subprocess runner with explicit backend settings.
+///
+/// The backend is validated before registration.
+/// The runner receives label `solti.io/runner-name=<name>`.
+///
+/// # Errors
+///
+/// Returns [`ExecError::InvalidRunnerConfig`] when `name` or `backend` is invalid.
+/// Returns [`ExecError::Router`] when the router rejects registration.
+/// Returns [`ExecError::Io`] when host resource preparation fails.
 pub fn register_subprocess_runner_with_backend(
     router: &mut RunnerRouter,
-    name: &'static str,
+    name: impl Into<String>,
     backend: SubprocessBackendConfig,
 ) -> Result<(), ExecError> {
     register_runner_inner(
         router,
-        name,
         Arc::new(SubprocessRunner::with_config(name, backend)?),
     )
 }
 
 fn register_runner_inner(
     router: &mut RunnerRouter,
-    name: &'static str,
     runner: Arc<SubprocessRunner>,
 ) -> Result<(), ExecError> {
-    if router.contains_label(LABEL_RUNNER_NAME, name) {
-        return Err(ExecError::DuplicateRunner {
-            name: name.to_string(),
-        });
-    }
     let mut labels = Labels::new();
-    labels.insert(LABEL_RUNNER_NAME, name);
-    router.register_with_labels(runner, labels);
+    labels.insert(LABEL_RUNNER_NAME, runner.name());
+    router.register_with_labels(runner, labels)?;
     Ok(())
 }

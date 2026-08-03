@@ -1,11 +1,11 @@
-//! Lifecycle and concurrency policies for task execution.
+//! # Task policies
 //!
-//! | Type               | Controls                                          | Default         |
-//! |--------------------|---------------------------------------------------|-----------------|
-//! | [`AdmissionPolicy`]| What happens when a slot is already occupied      | `DropIfRunning` |
-//! | [`RestartPolicy`]  | Whether/when a task is restarted after completion | `Never`         |
-//! | [`BackoffPolicy`]  | Exponential delay between restart attempts        | 1 s → 30 s × 2  |
-//! | [`JitterPolicy`]   | Randomness applied to backoff delays              | `Full`          |
+//! | Type                | Controls                                     | Default               |
+//! |---------------------|----------------------------------------------|-----------------------|
+//! | [`AdmissionPolicy`] | What happens when a slot is already occupied | `DropIfRunning`       |
+//! | [`RestartPolicy`]   | Whether a task restarts after completion     | `Never`               |
+//! | [`BackoffPolicy`]   | Delay between failure retries                | 1 s to 30 s, factor 2 |
+//! | [`JitterPolicy`]    | Randomness applied to backoff delays         | `Full`                |
 
 mod admission;
 pub use admission::AdmissionPolicy;
