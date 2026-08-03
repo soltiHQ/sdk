@@ -24,16 +24,16 @@ It must validate desired state, select a runtime, reconcile changes, supervise a
 
 Solti separates those responsibilities:
 
-| Concern                  | SDK boundary                                                   |
-|--------------------------|----------------------------------------------------------------|
-| Resource contract        | Kubernetes-shaped `Task`, metadata, spec, status, and watches  |
-| Workload selection       | GVK routing plus optional runner label selectors               |
-| Desired state            | Asynchronous latest-wins reconciliation                        |
-| Attempt lifecycle        | Taskvisor restart, timeout, cancellation, and admission        |
-| Execution                | Subprocess, native containerd 2.x, or application-owned runner |
-| Public API               | HTTP/JSON or gRPC                                               |
-| Agent registration       | Outbound HTTP or gRPC discovery                                |
-| Operations               | TLS, logging, Prometheus, and live output                       |
+| Concern            | SDK boundary                                                   |
+|--------------------|----------------------------------------------------------------|
+| Resource contract  | Kubernetes-shaped `Task`, metadata, spec, status, and watches  |
+| Workload selection | GVK routing plus optional runner label selectors               |
+| Desired state      | Asynchronous latest-wins reconciliation                        |
+| Attempt lifecycle  | Taskvisor restart, timeout, cancellation, and admission        |
+| Execution          | Subprocess, native containerd 2.x, or application-owned runner |
+| Public API         | HTTP/JSON or gRPC                                              |
+| Agent registration | Outbound HTTP or gRPC discovery                                |
+| Operations         | TLS, logging, Prometheus, and live output                      |
 
 Each layer has a direct crate.
 The umbrella crate only forwards features and namespaces.
@@ -176,18 +176,18 @@ It does not run the agent API or depend on core.
 
 ## Crates
 
-| Crate                                         | Owns                                                                  |
-|-----------------------------------------------|-----------------------------------------------------------------------|
-| [`solti`](crates/solti)                       | Umbrella feature forwarding and canonical namespaces                 |
-| [`solti-model`](crates/solti-model)           | Resources, workloads, policies, selectors, capabilities, and tokens  |
-| [`solti-runner`](crates/solti-runner)         | Runner contract, GVK routing, selectors, and execution context        |
-| [`solti-core`](crates/solti-core)             | Desired state, reconciliation, watches, history, and live output      |
-| [`solti-exec`](crates/solti-exec)             | Execution backends and host-process controls                          |
-| [`solti-api`](crates/solti-api)               | HTTP/JSON and gRPC Task APIs                                          |
-| [`solti-discover`](crates/solti-discover)     | Agent registration and heartbeat client                              |
-| [`solti-tls`](crates/solti-tls)               | TLS and mTLS identities, trust roots, and rustls configuration        |
-| [`solti-observe`](crates/solti-observe)       | Structured logging and supervised timezone refresh                   |
-| [`solti-prometheus`](crates/solti-prometheus) | Metrics adapters, collectors, and exporter endpoint                   |
+| Crate                                         | Owns                                                                |
+|-----------------------------------------------|---------------------------------------------------------------------|
+| [`solti`](crates/solti)                       | Umbrella feature forwarding and canonical namespaces                |
+| [`solti-model`](crates/solti-model)           | Resources, workloads, policies, selectors, capabilities, and tokens |
+| [`solti-runner`](crates/solti-runner)         | Runner contract, GVK routing, selectors, and execution context      |
+| [`solti-core`](crates/solti-core)             | Desired state, reconciliation, watches, history, and live output    |
+| [`solti-exec`](crates/solti-exec)             | Execution backends and host-process controls                        |
+| [`solti-api`](crates/solti-api)               | HTTP/JSON and gRPC Task APIs                                        |
+| [`solti-discover`](crates/solti-discover)     | Agent registration and heartbeat client                             |
+| [`solti-tls`](crates/solti-tls)               | TLS and mTLS identities, trust roots, and rustls configuration      |
+| [`solti-observe`](crates/solti-observe)       | Structured logging and supervised timezone refresh                  |
+| [`solti-prometheus`](crates/solti-prometheus) | Metrics adapters, collectors, and exporter endpoint                 |
 
 Depend on one component crate when one boundary is enough.
 Use `solti` when a binary composes several components.
@@ -240,10 +240,10 @@ Core retains bounded `TaskRun` history separately from the current Task status.
 | Apply       | Create or update desired state                       |
 | Get         | Read one Task                                        |
 | List        | Filter and paginate a stable collection snapshot     |
-| Watch       | Stream retained changes and then live changes         |
+| Watch       | Stream retained changes and then live changes        |
 | Run history | Read retained attempts                               |
-| Logs        | Stream live stdout and stderr                         |
-| Delete      | Stop the runtime and remove the Task and its history  |
+| Logs        | Stream live stdout and stderr                        |
+| Delete      | Stop the runtime and remove the Task and its history |
 
 HTTP uses the fixed root `/apis/solti.io/v1` in the current `solti-api` release.
 `HttpApi::build` returns the router and its generated OpenAPI 3.1 document.
@@ -297,30 +297,30 @@ Bearer authentication and TLS are independent.
 
 > Native containerd execution is Linux-only. macOS can build the adapter and inspect its configuration, but it cannot start a native container attempt.
 
-| Runtime path                | Current platform contract                                  | Isolation boundary                                  |
-|-----------------------------|------------------------------------------------------------|-----------------------------------------------------|
-| `Embedded`                  | Application's supported Tokio targets                      | Same process; no operating-system isolation         |
-| `Subprocess`                | Linux and macOS                                            | Child process; Unix session and process group        |
-| Non-Unix subprocess path    | Implementation exists; Windows is not currently supported | Child process only                                   |
-| Custom container engine     | Defined by the application adapter                         | Defined by that engine                               |
-| Native containerd 2.x       | Linux host and Linux container images                      | OCI runtime plus containerd task lifecycle           |
+| Runtime path             | Current platform contract                                 | Isolation boundary                            |
+|--------------------------|-----------------------------------------------------------|-----------------------------------------------|
+| `Embedded`               | Application's supported Tokio targets                     | Same process; no operating-system isolation   |
+| `Subprocess`             | Linux and macOS                                           | Child process; Unix session and process group |
+| Non-Unix subprocess path | Implementation exists; Windows is not currently supported | Child process only                            |
+| Custom container engine  | Defined by the application adapter                        | Defined by that engine                        |
+| Native containerd 2.x    | Linux host and Linux container images                     | OCI runtime plus containerd task lifecycle    |
 
 ### Host-process controls
 
 The subprocess path always validates configuration before runner registration.
 Configured controls fail closed when the current platform cannot enforce them.
 
-| Control                                      | Platform |
-|----------------------------------------------|----------|
-| Session, process group, signal reset, umask  | Unix     |
-| `RLIMIT_NOFILE`, `RLIMIT_FSIZE`, core dumps  | Unix     |
-| Pinned working directory                     | Unix     |
-| Explicit descriptor passlist                 | Linux    |
-| Descriptor snapshot and close-on-exec checks | Other Unix |
-| cgroup v2 CPU, memory, and process limits    | Linux    |
-| Mount, network, IPC, UTS, and cgroup namespaces | Linux |
-| UID, GID, supplementary groups, capabilities | Linux   |
-| `no_new_privs` and seccomp denylist          | Linux    |
+| Control                                         | Platform   |
+|-------------------------------------------------|------------|
+| Session, process group, signal reset, umask     | Unix       |
+| `RLIMIT_NOFILE`, `RLIMIT_FSIZE`, core dumps     | Unix       |
+| Pinned working directory                        | Unix       |
+| Explicit descriptor passlist                    | Linux      |
+| Descriptor snapshot and close-on-exec checks    | Other Unix |
+| cgroup v2 CPU, memory, and process limits       | Linux      |
+| Mount, network, IPC, UTS, and cgroup namespaces | Linux      |
+| UID, GID, supplementary groups, capabilities    | Linux      |
+| `no_new_privs` and seccomp denylist             | Linux      |
 
 The default subprocess backend does not enable optional resource or security controls.
 It clears the inherited environment, pins the working directory on Unix, restricts descriptor inheritance, and owns child cleanup.
@@ -379,33 +379,33 @@ Add authorization and sandbox policy at the binary or service boundary.
 
 All umbrella features are off by default.
 
-| Feature or family              | Adds                                                                  |
-|--------------------------------|-----------------------------------------------------------------------|
-| `model`                        | `solti-model` with JSON Schema support                                |
-| `runner`                       | Runner contract, model, and Taskvisor                                 |
-| `core`                         | Desired-state supervisor and Taskvisor controller                     |
-| `exec`                         | Base `solti-exec` namespace                                           |
-| `exec-host-process`            | Low-level host-process policy                                         |
-| `exec-subprocess`              | Subprocess runner and required lower layers                           |
-| `exec-container`               | Engine-neutral container runner                                      |
-| `exec-containerd`              | Native containerd 2.x adapter                                         |
-| `exec-seccomp`                 | Linux host-process seccomp renderer                                   |
-| `api`                          | API handler and model boundary                                        |
-| `api-http`, `api-grpc`         | HTTP or gRPC transport                                                |
-| `api-core-adapter`             | Adapter from the API handler to `SupervisorApi`                       |
-| `api-grpc-tls`                 | Shared TLS conversion for tonic                                       |
-| `discover`                     | Base discovery contracts                                              |
-| `discover-http`, `discover-grpc` | Outbound discovery transport                                       |
-| `discover-tls`                 | Custom roots or mTLS for discovery                                    |
-| `observe`                      | Logging configuration                                                 |
-| `observe-*`                    | Journald, log compatibility, or timezone refresh                      |
-| `prometheus-base`              | Prometheus namespace and base contracts                               |
-| `prometheus`                   | Runner and Taskvisor-controller metrics bundle                        |
-| `prometheus-*`                 | API, discovery, process, server, state, runner, or Taskvisor adapters |
-| `prometheus-full`              | Every Prometheus adapter                                              |
-| `taskvisor-*`                  | Forwarded Taskvisor integrations                                      |
-| `tls`                          | Shared TLS and mTLS types                                              |
-| `full`                         | Complete standard integration set                                     |
+| Feature or family                | Adds                                                                  |
+|----------------------------------|-----------------------------------------------------------------------|
+| `model`                          | `solti-model` with JSON Schema support                                |
+| `runner`                         | Runner contract, model, and Taskvisor                                 |
+| `core`                           | Desired-state supervisor and Taskvisor controller                     |
+| `exec`                           | Base `solti-exec` namespace                                           |
+| `exec-host-process`              | Low-level host-process policy                                         |
+| `exec-subprocess`                | Subprocess runner and required lower layers                           |
+| `exec-container`                 | Engine-neutral container runner                                       |
+| `exec-containerd`                | Native containerd 2.x adapter                                         |
+| `exec-seccomp`                   | Linux host-process seccomp renderer                                   |
+| `api`                            | API handler and model boundary                                        |
+| `api-http`, `api-grpc`           | HTTP or gRPC transport                                                |
+| `api-core-adapter`               | Adapter from the API handler to `SupervisorApi`                       |
+| `api-grpc-tls`                   | Shared TLS conversion for tonic                                       |
+| `discover`                       | Base discovery contracts                                              |
+| `discover-http`, `discover-grpc` | Outbound discovery transport                                          |
+| `discover-tls`                   | Custom roots or mTLS for discovery                                    |
+| `observe`                        | Logging configuration                                                 |
+| `observe-*`                      | Journald, log compatibility, or timezone refresh                      |
+| `prometheus-base`                | Prometheus namespace and base contracts                               |
+| `prometheus`                     | Runner and Taskvisor-controller metrics bundle                        |
+| `prometheus-*`                   | API, discovery, process, server, state, runner, or Taskvisor adapters |
+| `prometheus-full`                | Every Prometheus adapter                                              |
+| `taskvisor-*`                    | Forwarded Taskvisor integrations                                      |
+| `tls`                            | Shared TLS and mTLS types                                             |
+| `full`                           | Complete standard integration set                                     |
 
 `exec-seccomp` provides the filter implementation.
 Combine it with `exec-subprocess` to apply the filter to subprocess attempts.
@@ -433,27 +433,27 @@ Names identify the boundary:
 
 ### Task lifecycle
 
-| Example                                                                     | Features                   | Result                                                  |
-|-----------------------------------------------------------------------------|----------------------------|---------------------------------------------------------|
-| [task_subprocess.rs](crates/solti/examples/task_subprocess.rs)             | `core,exec-subprocess`     | Output, reconciliation, terminal status, and history    |
-| [task_custom_workload.rs](crates/solti/examples/task_custom_workload.rs)   | `core`                     | Application-owned `TcpProbe` GVK and runner             |
-| [task_containerd.rs](crates/solti/examples/task_containerd.rs)             | `core,exec-containerd`     | Native containerd 2.x attempt; Linux runtime required   |
+| Example                                                                  | Features               | Result                                                |
+|--------------------------------------------------------------------------|------------------------|-------------------------------------------------------|
+| [task_subprocess.rs](crates/solti/examples/task_subprocess.rs)           | `core,exec-subprocess` | Output, reconciliation, terminal status, and history  |
+| [task_custom_workload.rs](crates/solti/examples/task_custom_workload.rs) | `core`                 | Application-owned `TcpProbe` GVK and runner           |
+| [task_containerd.rs](crates/solti/examples/task_containerd.rs)           | `core,exec-containerd` | Native containerd 2.x attempt; Linux runtime required |
 
 ### Agent boundaries
 
-| Example                                                                       | Features                                                   | Result                                                |
-|-------------------------------------------------------------------------------|------------------------------------------------------------|-------------------------------------------------------|
-| [agent_http.rs](crates/solti/examples/agent_http.rs)                         | `api-core-adapter,api-http,exec-subprocess`                | HTTP Task API, OpenAPI, and runnable `curl` calls     |
-| [agent_grpc.rs](crates/solti/examples/agent_grpc.rs)                         | `api-core-adapter,api-grpc,exec-subprocess`                | gRPC Task API, bearer auth, and `grpcurl` calls       |
-| [agent_grpc_mtls.rs](crates/solti/examples/agent_grpc_mtls.rs)               | `api-core-adapter,api-grpc-tls,exec-subprocess`            | Anonymous rejection and authenticated mTLS client    |
-| [agent_http_discovery.rs](crates/solti/examples/agent_http_discovery.rs)     | `api-core-adapter,api-http,discover-http,exec-subprocess`  | Inbound Task API and outbound discovery heartbeat    |
+| Example                                                                  | Features                                                  | Result                                            |
+|--------------------------------------------------------------------------|-----------------------------------------------------------|---------------------------------------------------|
+| [agent_http.rs](crates/solti/examples/agent_http.rs)                     | `api-core-adapter,api-http,exec-subprocess`               | HTTP Task API, OpenAPI, and runnable `curl` calls |
+| [agent_grpc.rs](crates/solti/examples/agent_grpc.rs)                     | `api-core-adapter,api-grpc,exec-subprocess`               | gRPC Task API, bearer auth, and `grpcurl` calls   |
+| [agent_grpc_mtls.rs](crates/solti/examples/agent_grpc_mtls.rs)           | `api-core-adapter,api-grpc-tls,exec-subprocess`           | Anonymous rejection and authenticated mTLS client |
+| [agent_http_discovery.rs](crates/solti/examples/agent_http_discovery.rs) | `api-core-adapter,api-http,discover-http,exec-subprocess` | Inbound Task API and outbound discovery heartbeat |
 
 ### Operations
 
-| Example                                                                       | Features                                              | Result                                             |
-|-------------------------------------------------------------------------------|-------------------------------------------------------|----------------------------------------------------|
-| [operations_prometheus.rs](crates/solti/examples/operations_prometheus.rs)   | `core,exec-subprocess,prometheus,prometheus-server,prometheus-state` | Supervised `/metrics` with real runtime samples |
-| [operations_observe.rs](crates/solti/examples/operations_observe.rs)         | `core,exec-subprocess,observe-timezone-sync`          | Logging and supervised timezone maintenance        |
+| Example                                                                    | Features                                                             | Result                                          |
+|----------------------------------------------------------------------------|----------------------------------------------------------------------|-------------------------------------------------|
+| [operations_prometheus.rs](crates/solti/examples/operations_prometheus.rs) | `core,exec-subprocess,prometheus,prometheus-server,prometheus-state` | Supervised `/metrics` with real runtime samples |
+| [operations_observe.rs](crates/solti/examples/operations_observe.rs)       | `core,exec-subprocess,observe-timezone-sync`                         | Logging and supervised timezone maintenance     |
 
 `agent_http` and `agent_grpc` remain active until Ctrl-C.
 They print commands that can be run from a second terminal.
@@ -490,7 +490,12 @@ Component crates are published before the `solti` umbrella crate.
 ## Contributing
 
 Issues and pull requests are welcome.
-Start with the relevant crate README and architecture guide, then read the [contributing guide](https://github.com/soltiHQ/.github/blob/main/CONTRIBUTING.md) before a large change.
+Start with the relevant crate README.
+
+Read the architecture guides before changing the [model](crates/solti-model/ARCHITECTURE.md), [core](crates/solti-core/ARCHITECTURE.md), or [execution](crates/solti-exec/ARCHITECTURE.md) boundaries.
+Read the [Task API contract](crates/solti-api/CONTRACT.md) or [discovery contract](crates/solti-discover/CONTRACT.md) before changing wire behavior.
+
+Read the [contributing guide](https://github.com/soltiHQ/.github/blob/main/CONTRIBUTING.md) before a large change.
 
 If Solti helps your project, a GitHub star helps other Rust developers find it.
 

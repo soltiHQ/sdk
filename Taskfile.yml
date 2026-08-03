@@ -3,8 +3,6 @@ version: '3'
 includes:
   rust:
     taskfile: https://raw.githubusercontent.com/soltiHQ/actions/v1/taskfiles/rust/Taskfile.yml
-    vars:
-      image_patch: "-2"
   helpers:
     taskfile: https://raw.githubusercontent.com/soltiHQ/actions/v1/taskfiles/helpers/Taskfile.yml
 
