@@ -359,7 +359,9 @@ Keep these boundaries explicit:
 - Core stores Tasks, runs, watch history, and runtime bindings in memory.
 - Process restart loses all core state.
 - Live output is bounded and lossy.
-- Output is not persisted or replayed.
+- Core does not persist or replay output by itself.
+- Optional core hooks can forward task, run, and output events to an
+  application-owned store.
 - A slow output subscriber receives `Lagged` after events are dropped.
 - Watch history is bounded by change count and serialized Task bytes.
 - A watch can resume only while its resource version remains retained.
@@ -372,7 +374,9 @@ Keep these boundaries explicit:
 - The SDK contains no durable log sink.
 - The SDK contains no control-plane server.
 
-Use an external store when tasks or logs must survive process termination.
+Use the persistence hooks with an external store when tasks or logs must
+survive process termination. The application owns delivery retries and its
+restart recovery flow. The SDK does not load persisted state at startup.
 Add authorization and sandbox policy at the binary or service boundary.
 
 ## Feature flags

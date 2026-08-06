@@ -26,7 +26,7 @@ use std::task::{Context, Poll};
 use std::time::SystemTime;
 
 use parking_lot::RwLock;
-use solti_model::{OutputEvent, TaskId};
+use solti_model::{OutputEvent, TaskId, Uid};
 use solti_runner::{OutputPublisher, OutputSink};
 use tokio::sync::broadcast;
 use tokio_stream::Stream;
@@ -34,6 +34,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::ConfigError;
+use crate::persistence::{TaskOutputEvent, TaskOutputSinkHandle, publish_output_event};
 
 /// Per-task live output settings.
 ///
@@ -120,26 +121,44 @@ impl Stream for OutputSubscription {
 
 /// Core-owned output channel registry.
 pub(crate) struct OutputHub {
-    channels: RwLock<HashMap<TaskId, broadcast::Sender<OutputEvent>>>,
+    channels: RwLock<HashMap<TaskId, OutputChannel>>,
     capacity: usize,
+    event_sink: Option<TaskOutputSinkHandle>,
+}
+
+struct OutputChannel {
+    task_uid: Uid,
+    sender: broadcast::Sender<OutputEvent>,
 }
 
 impl OutputHub {
+    #[cfg(test)]
     pub(crate) fn new(config: OutputConfig) -> Self {
+        Self::with_sink(config, None)
+    }
+
+    pub(crate) fn with_sink(
+        config: OutputConfig,
+        event_sink: Option<TaskOutputSinkHandle>,
+    ) -> Self {
         Self {
             channels: RwLock::new(HashMap::new()),
             capacity: config.capacity().get(),
+            event_sink,
         }
     }
 
     /// Ensures that a task channel exists.
     ///
     /// Returns `true` when this call creates it.
-    pub(crate) fn ensure_channel_if_absent(&self, task_id: TaskId) -> bool {
+    pub(crate) fn ensure_channel_if_absent(&self, task_id: TaskId, task_uid: Uid) -> bool {
         let mut channels = self.channels.write();
         match channels.entry(task_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(broadcast::channel(self.capacity).0);
+                entry.insert(OutputChannel {
+                    task_uid,
+                    sender: broadcast::channel(self.capacity).0,
+                });
                 true
             }
             std::collections::hash_map::Entry::Occupied(_) => false,
@@ -147,15 +166,17 @@ impl OutputHub {
     }
 
     #[cfg(test)]
-    pub(crate) fn ensure_channel(&self, task_id: TaskId) {
-        self.ensure_channel_if_absent(task_id);
+    pub(crate) fn ensure_channel(&self, task_id: TaskId) -> Uid {
+        let task_uid = Uid::new(format!("test-{task_id}")).expect("test UID");
+        self.ensure_channel_if_absent(task_id, task_uid.clone());
+        task_uid
     }
 
     pub(crate) fn subscribe(&self, task_id: &TaskId) -> Option<OutputSubscription> {
         self.channels
             .read()
             .get(task_id)
-            .map(|sender| OutputSubscription::new(sender.subscribe()))
+            .map(|channel| OutputSubscription::new(channel.sender.subscribe()))
     }
 
     #[cfg(test)]
@@ -166,12 +187,19 @@ impl OutputHub {
         self.channels
             .read()
             .get(task_id)
-            .map(broadcast::Sender::subscribe)
+            .map(|channel| channel.sender.subscribe())
     }
 
-    pub(crate) fn announce_run_started(&self, task_id: &TaskId, generation: u64, attempt: u32) {
+    pub(crate) fn announce_run_started(
+        &self,
+        task_id: &TaskId,
+        task_uid: &Uid,
+        generation: u64,
+        attempt: u32,
+    ) {
         self.send(
             task_id,
+            task_uid,
             OutputEvent::RunStarted {
                 generation,
                 attempt,
@@ -183,12 +211,14 @@ impl OutputHub {
     pub(crate) fn announce_run_finished(
         &self,
         task_id: &TaskId,
+        task_uid: &Uid,
         generation: u64,
         attempt: u32,
         exit_code: Option<i32>,
     ) {
         self.send(
             task_id,
+            task_uid,
             OutputEvent::RunFinished {
                 generation,
                 attempt,
@@ -198,10 +228,19 @@ impl OutputHub {
         );
     }
 
-    fn send(&self, task_id: &TaskId, event: OutputEvent) {
-        if let Some(sender) = self.channels.read().get(task_id) {
-            let _ = sender.send(event);
+    fn send(&self, task_id: &TaskId, task_uid: &Uid, event: OutputEvent) {
+        if let Some(sender) = self
+            .channels
+            .read()
+            .get(task_id)
+            .map(|channel| channel.sender.clone())
+        {
+            let _ = sender.send(event.clone());
         }
+        publish_output_event(
+            self.event_sink.as_ref(),
+            TaskOutputEvent::new(task_id.clone(), task_uid.clone(), event),
+        );
     }
 
     pub(crate) fn evict(&self, task_id: &TaskId) {
@@ -216,24 +255,46 @@ impl OutputHub {
 
 impl OutputPublisher for OutputHub {
     fn sink_for(&self, task_id: &TaskId, generation: u64, attempt: u32) -> Option<OutputSink> {
-        let sender = self.channels.read().get(task_id)?.clone();
+        let channels = self.channels.read();
+        let channel = channels.get(task_id)?;
+        let sender = channel.sender.clone();
+        let task_uid = channel.task_uid.clone();
+        drop(channels);
+        let event_sink = self.event_sink.clone();
+        let task_id = task_id.clone();
         Some(OutputSink::new(generation, attempt, move |event| {
-            let _ = sender.send(event);
+            let _ = sender.send(event.clone());
+            publish_output_event(
+                event_sink.as_ref(),
+                TaskOutputEvent::new(task_id.clone(), task_uid.clone(), event),
+            );
         }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use bytes::Bytes;
-    use solti_model::{OutputEvent, TaskId};
+    use solti_model::{OutputEvent, TaskId, Uid};
     use solti_runner::OutputPublisher;
     use tokio_stream::StreamExt;
 
     use super::{ConfigError, OutputConfig, OutputHub};
+    use crate::{TaskOutputEvent, TaskOutputSink, TaskOutputSinkHandle};
+
+    #[derive(Default)]
+    struct RecordingOutputSink {
+        events: Mutex<Vec<TaskOutputEvent>>,
+    }
+
+    impl TaskOutputSink for RecordingOutputSink {
+        fn on_event(&self, event: &TaskOutputEvent) {
+            self.events.lock().unwrap().push(event.clone());
+        }
+    }
 
     #[test]
     fn config_preserves_default_and_rejects_zero() {
@@ -264,15 +325,15 @@ mod tests {
     async fn attempts_share_one_stream_with_run_markers() {
         let hub = OutputHub::new(OutputConfig::try_new(16).unwrap());
         let task_id = TaskId::new("retrying").unwrap();
-        assert!(hub.ensure_channel_if_absent(task_id.clone()));
+        let task_uid = hub.ensure_channel(task_id.clone());
         let mut output = hub.subscribe(&task_id).expect("output subscription");
 
-        hub.announce_run_started(&task_id, 1, 1);
+        hub.announce_run_started(&task_id, &task_uid, 1, 1);
         hub.sink_for(&task_id, 1, 1)
             .expect("attempt one sink")
             .stdout_line(Bytes::from_static(b"one"));
-        hub.announce_run_finished(&task_id, 1, 1, Some(1));
-        hub.announce_run_started(&task_id, 1, 2);
+        hub.announce_run_finished(&task_id, &task_uid, 1, 1, Some(1));
+        hub.announce_run_started(&task_id, &task_uid, 1, 2);
         hub.sink_for(&task_id, 1, 2)
             .expect("attempt two sink")
             .stderr_line(Bytes::from_static(b"two"));
@@ -312,11 +373,76 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn external_sink_receives_run_markers_and_first_chunk() {
+        let recording = Arc::new(RecordingOutputSink::default());
+        let sink: TaskOutputSinkHandle = recording.clone();
+        let hub = OutputHub::with_sink(OutputConfig::try_new(16).unwrap(), Some(sink));
+        let task_id = TaskId::new("persisted-output").unwrap();
+        let task_uid = hub.ensure_channel(task_id.clone());
+
+        hub.announce_run_started(&task_id, &task_uid, 1, 1);
+        hub.sink_for(&task_id, 1, 1)
+            .expect("attempt sink")
+            .stdout_line(Bytes::from_static(b"first"));
+        hub.announce_run_finished(&task_id, &task_uid, 1, 1, Some(0));
+
+        let events = recording.events.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|event| event.task() == &task_id));
+        assert!(events.iter().all(|event| event.task_uid() == &task_uid));
+        assert!(matches!(
+            events[0].event(),
+            OutputEvent::RunStarted {
+                generation: 1,
+                attempt: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[1].event(),
+            OutputEvent::Chunk(chunk) if &chunk.line[..] == b"first"
+        ));
+        assert!(matches!(
+            events[2].event(),
+            OutputEvent::RunFinished {
+                generation: 1,
+                attempt: 1,
+                exit_code: Some(0),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stale_output_keeps_the_original_task_uid() {
+        let recording = Arc::new(RecordingOutputSink::default());
+        let sink: TaskOutputSinkHandle = recording.clone();
+        let hub = OutputHub::with_sink(OutputConfig::try_new(16).unwrap(), Some(sink));
+        let task_id = TaskId::new("recreated-output").unwrap();
+        let old_uid = Uid::new("old-output-incarnation").unwrap();
+        let new_uid = Uid::new("new-output-incarnation").unwrap();
+
+        assert!(hub.ensure_channel_if_absent(task_id.clone(), old_uid.clone()));
+        let stale_sink = hub.sink_for(&task_id, 1, 1).expect("old sink");
+        hub.evict(&task_id);
+        assert!(hub.ensure_channel_if_absent(task_id.clone(), new_uid.clone()));
+        let current_sink = hub.sink_for(&task_id, 1, 1).expect("new sink");
+
+        stale_sink.stdout_line(Bytes::from_static(b"old"));
+        current_sink.stdout_line(Bytes::from_static(b"new"));
+
+        let events = recording.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].task_uid(), &old_uid);
+        assert_eq!(events[1].task_uid(), &new_uid);
+    }
+
     #[tokio::test]
     async fn subscription_reports_lag_and_continues() {
         let hub = OutputHub::new(OutputConfig::try_new(1).unwrap());
         let task_id = TaskId::new("lagged").unwrap();
-        hub.ensure_channel_if_absent(task_id.clone());
+        hub.ensure_channel(task_id.clone());
         let mut output = hub.subscribe(&task_id).expect("output subscription");
         let sink = hub.sink_for(&task_id, 1, 1).expect("sink");
 
@@ -337,7 +463,7 @@ mod tests {
     async fn terminal_evict_waits_for_outstanding_sink_clones() {
         let hub = OutputHub::new(OutputConfig::try_new(8).unwrap());
         let task_id = TaskId::new("closing").unwrap();
-        hub.ensure_channel_if_absent(task_id.clone());
+        hub.ensure_channel(task_id.clone());
         let mut output = hub.subscribe(&task_id).expect("output subscription");
         let sink = hub.sink_for(&task_id, 1, 1).expect("sink");
         let outstanding = sink.clone();
@@ -362,12 +488,12 @@ mod tests {
     async fn stale_sink_cannot_publish_into_a_reused_task_id() {
         let hub = Arc::new(OutputHub::new(OutputConfig::try_new(8).unwrap()));
         let task_id = TaskId::new("reused").unwrap();
-        hub.ensure_channel_if_absent(task_id.clone());
+        hub.ensure_channel(task_id.clone());
         let mut old_output = hub.subscribe(&task_id).expect("old subscription");
         let stale_sink = hub.sink_for(&task_id, 1, 1).expect("old sink");
 
         hub.evict(&task_id);
-        hub.ensure_channel_if_absent(task_id.clone());
+        hub.ensure_channel(task_id.clone());
         let mut new_output = hub.subscribe(&task_id).expect("new subscription");
 
         stale_sink.stdout_line(Bytes::from_static(b"stale"));

@@ -333,6 +333,65 @@ async fn configured() -> Result<(), Box<dyn std::error::Error>> {
 The builder also accepts Taskvisor runtime configuration, controller configuration, and external Taskvisor subscribers.
 The core state observer is always installed.
 
+## Persistence hooks
+
+Core can forward committed task state changes and task output to optional application-owned sinks.
+
+The hooks are storage-neutral. 
+They do not add a database, replace the in-memory `TaskState`, retry delivery, or make state durable by themselves.
+They are write-side notifications; core does not load persisted state during startup.
+
+Callbacks run synchronously on core and runner paths. 
+They must return quickly, must not call back into core, and should normally forward cloned events to an application-owned worker:
+
+```rust,no_run
+use std::sync::{Arc, mpsc};
+
+use solti_core::{
+    SupervisorApi, TaskOutputEvent, TaskOutputSink, TaskStateEvent, TaskStateSink,
+};
+use solti_runner::RunnerRouter;
+
+struct StateForwarder(mpsc::Sender<TaskStateEvent>);
+
+impl TaskStateSink for StateForwarder {
+    fn on_event(&self, event: &TaskStateEvent) {
+        let _ = self.0.send(event.clone());
+    }
+}
+
+struct OutputForwarder(mpsc::Sender<TaskOutputEvent>);
+
+impl TaskOutputSink for OutputForwarder {
+    fn on_event(&self, event: &TaskOutputEvent) {
+        let _ = self.0.send(event.clone());
+    }
+}
+
+async fn persistent_agent() -> Result<(), Box<dyn std::error::Error>> {
+    let (state_tx, _state_rx) = mpsc::channel();
+    let (output_tx, _output_rx) = mpsc::channel();
+
+    let api = SupervisorApi::builder(RunnerRouter::new())
+        .with_state_sink(Arc::new(StateForwarder(state_tx)))
+        .with_output_sink(Arc::new(OutputForwarder(output_tx)))
+        .start()
+        .await?;
+
+    api.shutdown().await?;
+    Ok(())
+}
+```
+
+`TaskStateEvent` reports task create, apply, status, delete, and run start or finish changes. 
+Run events carry the task name and UID. 
+Run retention does not emit delete events.
+
+`TaskOutputSink` is installed before runners start and receives the same published chunks and run markers as the live output path, including the first published event. 
+Each event carries the task name and UID, so a late event from a deleted task cannot be confused with a recreated task using the same name.
+Subscriber-local `Lagged` notifications are not persisted.
+Sink panics are caught and logged. The sink owns database errors, retries, queue limits, and shutdown draining.
+
 ## Shutdown
 
 Call `shutdown()` when cleanup must finish before the application continues.
@@ -348,11 +407,12 @@ It does not provide an awaitable result.
 - `metadata.name` is the stable task address; Taskvisor IDs remain internal.
 - Resource versions are opaque and belong to one `TaskState` incarnation.
 - `TaskState` clones share the same in-memory store.
-- Core does not persist tasks, runs, output, or watch history.
+- Core does not persist tasks, runs, output, or watch history by itself.
+- Optional persistence hooks can forward task, run, and output events to an application-owned store.
 - Core does not hide embedded or extension workloads.
 - Adapter predicates run before pagination and watch event classification.
 - Retention never removes a task with a runtime binding.
-- Output is live-only and may report `OutputEvent::Lagged`.
+- The built-in output subscription is live-only and may report `OutputEvent::Lagged`.
 - A watch can resume after lag only while its resource version remains retained.
 - Dropping `SupervisorApi` starts cleanup but cannot report its result.
 
@@ -364,13 +424,13 @@ Public write and lifecycle methods return `CoreError`:
 |-----------------------|----------------------------------------------------------|
 | `StateInitialization` | The state resource-version identity could not initialize |
 | `ShuttingDown`        | A desired-state write started after shutdown             |
-| `Supervisor`          | Taskvisor prepare, submit, cancel, or shutdown failed     |
-| `AlreadyExists`       | Create found a retained resource with the same name       |
-| `NotFound`            | A required resource does not exist or is hidden           |
-| `Conflict`            | UID or resource-version preconditions failed              |
-| `Mapping`             | A model policy has no Taskvisor mapping                   |
-| `Runner`              | Runner selection or task construction failed              |
-| `InvalidSpec`         | The submitted model or workload path is invalid           |
+| `Supervisor`          | Taskvisor prepare, submit, cancel, or shutdown failed    |
+| `AlreadyExists`       | Create found a retained resource with the same name      |
+| `NotFound`            | A required resource does not exist or is hidden          |
+| `Conflict`            | UID or resource-version preconditions failed             |
+| `Mapping`             | A model policy has no Taskvisor mapping                  |
+| `Runner`              | Runner selection or task construction failed             |
+| `InvalidSpec`         | The submitted model or workload path is invalid          |
 
 Create and apply do not return asynchronous reconciliation failures.
 Runner, mapping, prepare, and submit failures set `Reconciled=False`.

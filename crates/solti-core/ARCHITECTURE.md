@@ -21,6 +21,7 @@ flowchart TB
     Observer["runtime/observer.rs<br/>event and outcome projection"]
     Locks["runtime/locks.rs<br/>keyed operation locks"]
     Output["output.rs<br/>live output channels"]
+    Persistence["persistence.rs<br/>external event sinks"]
     Map["map/<br/>Taskvisor mapping"]
     Config["config.rs<br/>retention settings"]
     Error["error.rs<br/>public errors"]
@@ -29,6 +30,7 @@ flowchart TB
     Public --> Api
     Public --> State
     Public --> Output
+    Public --> Persistence
     Public --> Config
     Public --> Error
 
@@ -42,23 +44,26 @@ flowchart TB
     Reconciler --> Map
     Observer --> State
     Observer --> Output
+    State --> Persistence
+    Output --> Persistence
 ```
 
 The arrows show direct use.
 They do not represent ownership of model values.
 
-| Module                          | Owns                                                                   | Does not own                                      |
-|---------------------------------|------------------------------------------------------------------------|---------------------------------------------------|
-| `supervisor/builder.rs`         | Runtime assembly and public configuration                              | Desired-state writes or task execution            |
-| `supervisor/mod.rs`             | Public API operations, write scheduling, cancellation, shutdown        | Runner implementations or model validation        |
-| `state/mod.rs`                  | Tasks, runs, runtime bindings, resource versions, list and watch state | Taskvisor execution or durable persistence        |
-| `runtime/reconciler.rs`         | Runner preflight, replacement, binding, submission, completion waiters | Public collection queries                         |
-| `runtime/observer.rs`           | Taskvisor event projection and authoritative finalization              | Desired-state admission                           |
-| `runtime/locks.rs`              | Weak keyed locks for one operation class                               | Resource state                                    |
-| `output.rs`                     | Per-task live broadcast channels                                       | Output history or persistence                     |
-| `map/`                          | Typed Solti-to-Taskvisor policy and outcome mapping                    | Routing or runtime ownership                      |
-| `config.rs`                     | State retention and watch journal settings                             | Worker scheduling                                 |
-| `error.rs`                      | Public operation and write-conflict errors                             | Reconciliation status storage                     |
+| Module                  | Owns                                                                   | Does not own                               |
+|-------------------------|------------------------------------------------------------------------|--------------------------------------------|
+| `supervisor/builder.rs` | Runtime assembly and public configuration                              | Desired-state writes or task execution     |
+| `supervisor/mod.rs`     | Public API operations, write scheduling, cancellation, shutdown        | Runner implementations or model validation |
+| `state/mod.rs`          | Tasks, runs, runtime bindings, resource versions, list and watch state | Taskvisor execution or durable persistence |
+| `runtime/reconciler.rs` | Runner preflight, replacement, binding, submission, completion waiters | Public collection queries                  |
+| `runtime/observer.rs`   | Taskvisor event projection and authoritative finalization              | Desired-state admission                    |
+| `runtime/locks.rs`      | Weak keyed locks for one operation class                               | Resource state                             |
+| `output.rs`             | Per-task live broadcast channels                                       | Output history or persistence              |
+| `persistence.rs`        | Optional task-state and output event sink contracts                    | Storage, retries, or recovery              |
+| `map/`                  | Typed Solti-to-Taskvisor policy and outcome mapping                    | Routing or runtime ownership               |
+| `config.rs`             | State retention and watch journal settings                             | Worker scheduling                          |
+| `error.rs`              | Public operation and write-conflict errors                             | Reconciliation status storage              |
 
 ## Runtime construction
 
@@ -69,6 +74,7 @@ They do not represent ownership of model values.
 flowchart TB
     Builder["SupervisorApiBuilder"]
     Output["OutputHub"]
+    Sinks["Optional persistence sinks"]
     Router["RunnerRouter<br/>with OutputPublisher"]
     State["TaskState"]
     Observer["RuntimeObserver"]
@@ -79,8 +85,11 @@ flowchart TB
     Api["SupervisorApi"]
 
     Builder --> Output
+    Builder --> Sinks
+    Sinks --> Output
     Output --> Router
     Builder --> State
+    Sinks --> State
     State --> Observer
     Output --> Observer
     Observer -->|installed subscriber| Taskvisor
@@ -329,6 +338,11 @@ Free-form reason text remains diagnostic.
 One `RwLock` protects the complete state.
 A resource mutation and its change-journal entry happen under the same write lock.
 
+An optional state sink receives the committed task snapshot or run value on that same synchronous path. 
+Run events carry both task name and resource UID.
+The sink must forward work and return quickly. 
+Hooks do not hydrate the store during startup.
+
 Resource versions contain a random store epoch and a monotonic revision.
 They are opaque outside `TaskState`.
 A version from another store is expired.
@@ -377,6 +391,11 @@ Consumers receive an `OutputSubscription`.
 
 Output is live-only and lossy.
 A slow subscriber receives `OutputEvent::Lagged` and continues.
+
+An optional output sink receives published chunks and run markers, including the first event. 
+The event carries both task name and resource UID so output from different incarnations stays distinguishable. 
+Its callback is synchronous and has no SDK-owned retry or durability guarantee. 
+Subscriber-local `Lagged` notifications are not sent to the sink.
 
 Terminal cleanup removes the channel from the hub.
 Existing subscribers close after every outstanding sink clone releases its sender.
@@ -453,19 +472,20 @@ Call `shutdown` when completion must be observed.
 
 ## Where to make a change
 
-| Change                                      | Start here                                                                               | Verify here                                                |
-|---------------------------------------------|------------------------------------------------------------------------------------------|------------------------------------------------------------|
-| Public API or operation semantics           | [`src/supervisor/mod.rs`](src/supervisor/mod.rs), [`src/lib.rs`](src/lib.rs)             | supervisor tests and README doctests                       |
-| Builder setting or runtime assembly         | [`src/supervisor/builder.rs`](src/supervisor/builder.rs)                                 | builder tests                                              |
-| Desired write or precondition behavior      | [`src/state/mod.rs`](src/state/mod.rs), [`src/supervisor/mod.rs`](src/supervisor/mod.rs) | state and supervisor tests                                 |
-| Query, continuation, or watch semantics     | [`src/state/mod.rs`](src/state/mod.rs)                                                   | state collection tests                                     |
-| Runner routing or runtime intake            | [`src/runtime/reconciler.rs`](src/runtime/reconciler.rs)                                 | reconciler behavior in supervisor tests                    |
-| Event, outcome, or cleanup projection       | [`src/runtime/observer.rs`](src/runtime/observer.rs)                                     | observer tests and `tests/taskvisor_contract.rs`           |
-| Taskvisor policy or phase mapping           | [`src/map/`](src/map)                                                                    | mapper tests and `tests/taskvisor_contract.rs`             |
-| Live output channels                        | [`src/output.rs`](src/output.rs)                                                         | output tests                                               |
-| Retention defaults or validation            | [`src/config.rs`](src/config.rs)                                                         | config and sweep tests                                     |
-| Public errors                               | [`src/error.rs`](src/error.rs)                                                           | error tests and every affected API test                    |
-| User-facing usage                           | [`README.md`](README.md), [`src/lib.rs`](src/lib.rs)                                     | `cargo test -p solti-core --doc --all-features`            |
+| Change                                  | Start here                                                                                                           | Verify here                                      |
+|-----------------------------------------|----------------------------------------------------------------------------------------------------------------------|--------------------------------------------------|
+| Public API or operation semantics       | [`src/supervisor/mod.rs`](src/supervisor/mod.rs), [`src/lib.rs`](src/lib.rs)                                         | supervisor tests and README doctests             |
+| Builder setting or runtime assembly     | [`src/supervisor/builder.rs`](src/supervisor/builder.rs)                                                             | builder tests                                    |
+| Desired write or precondition behavior  | [`src/state/mod.rs`](src/state/mod.rs), [`src/supervisor/mod.rs`](src/supervisor/mod.rs)                             | state and supervisor tests                       |
+| Query, continuation, or watch semantics | [`src/state/mod.rs`](src/state/mod.rs)                                                                               | state collection tests                           |
+| Runner routing or runtime intake        | [`src/runtime/reconciler.rs`](src/runtime/reconciler.rs)                                                             | reconciler behavior in supervisor tests          |
+| Event, outcome, or cleanup projection   | [`src/runtime/observer.rs`](src/runtime/observer.rs)                                                                 | observer tests and `tests/taskvisor_contract.rs` |
+| Taskvisor policy or phase mapping       | [`src/map/`](src/map)                                                                                                | mapper tests and `tests/taskvisor_contract.rs`   |
+| Live output channels                    | [`src/output.rs`](src/output.rs)                                                                                     | output tests                                     |
+| Persistence sink contracts              | [`src/persistence.rs`](src/persistence.rs), [`src/state/mod.rs`](src/state/mod.rs), [`src/output.rs`](src/output.rs) | persistence, state, and output tests             |
+| Retention defaults or validation        | [`src/config.rs`](src/config.rs)                                                                                     | config and sweep tests                           |
+| Public errors                           | [`src/error.rs`](src/error.rs)                                                                                       | error tests and every affected API test          |
+| User-facing usage                       | [`README.md`](README.md), [`src/lib.rs`](src/lib.rs)                                                                 | `cargo test -p solti-core --doc --all-features`  |
 
 ## Invariants to preserve
 
@@ -486,7 +506,7 @@ Before changing a coordination path, check these constraints in the owning modul
 13. Adapter predicates run before pagination and watch classification.
 14. Resource versions remain opaque and local to one state-store incarnation.
 15. Retention never removes a bound task.
-16. Output remains live-only and is not added to run history.
+16. Built-in output remains live-only and is not added to run history.
 17. Desired operation locks are acquired before runtime operation locks when both are needed.
 18. Shutdown prevents new reconciliation workers before waiting for the tracker.
 

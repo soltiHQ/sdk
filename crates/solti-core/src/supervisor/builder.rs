@@ -20,7 +20,8 @@ use solti_runner::RunnerRouter;
 use taskvisor::{ControllerConfig, Subscribe, SupervisorConfig};
 
 use super::SupervisorApi;
-use crate::{CoreError, OutputConfig, StateConfig};
+use crate::persistence::PersistenceSinks;
+use crate::{CoreError, OutputConfig, StateConfig, TaskOutputSinkHandle, TaskStateSinkHandle};
 
 /// Builder for [`SupervisorApi`].
 ///
@@ -37,6 +38,8 @@ pub struct SupervisorApiBuilder {
     router: RunnerRouter,
     state_config: StateConfig,
     output_config: OutputConfig,
+    state_sink: Option<TaskStateSinkHandle>,
+    output_sink: Option<TaskOutputSinkHandle>,
 }
 
 impl SupervisorApiBuilder {
@@ -49,6 +52,8 @@ impl SupervisorApiBuilder {
             router,
             state_config: StateConfig::default(),
             output_config: OutputConfig::default(),
+            state_sink: None,
+            output_sink: None,
         }
     }
 
@@ -85,6 +90,23 @@ impl SupervisorApiBuilder {
         self
     }
 
+    /// Installs a synchronous task state persistence hook.
+    ///
+    /// The sink must return quickly and should forward events to an application-owned storage worker.
+    pub fn with_state_sink(mut self, sink: TaskStateSinkHandle) -> Self {
+        self.state_sink = Some(sink);
+        self
+    }
+
+    /// Installs a synchronous task output persistence hook.
+    ///
+    /// The sink receives output from the first event.
+    /// It must return quickly and should forward events to an application-owned storage worker.
+    pub fn with_output_sink(mut self, sink: TaskOutputSinkHandle) -> Self {
+        self.output_sink = Some(sink);
+        self
+    }
+
     /// Starts the supervisor and core-owned workers.
     ///
     /// # Errors
@@ -98,6 +120,10 @@ impl SupervisorApiBuilder {
             self.router,
             self.state_config,
             self.output_config,
+            PersistenceSinks {
+                state: self.state_sink,
+                output: self.output_sink,
+            },
         )
         .await
     }
