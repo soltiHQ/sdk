@@ -13,15 +13,14 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 use solti_api::{
-    ApiError, ApiHandler, ApiMetricsBackend, HttpApi, TaskWatchEventStream, Transport,
+    ApiAuthorizer, ApiError, ApiHandler, ApiMetricsBackend, AuthorizationRequest, HttpApi,
+    TaskWatchEventStream, Transport,
 };
 use solti_model::{
     EmbeddedSpec, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun,
     TaskWorkload, Token, WritePreconditions,
 };
 
-/// Scriptable mock. `Default` succeeds at everything with harmless fixtures;
-/// flip a flag to exercise the error branches.
 #[derive(Default)]
 struct MockHandler {
     submit_calls: AtomicUsize,
@@ -343,6 +342,43 @@ fn generated_openapi_reflects_configured_authentication() {
             .get("401")
             .is_some()
     );
+}
+
+struct AllowAuthorizer;
+
+#[async_trait]
+impl ApiAuthorizer for AllowAuthorizer {
+    async fn authorize(&self, _request: AuthorizationRequest<'_>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn generated_openapi_reflects_configured_authorization() {
+    let document = serde_json::to_value(
+        HttpApi::new(Arc::new(MockHandler::default()))
+            .with_authorizer(Arc::new(AllowAuthorizer))
+            .build()
+            .openapi,
+    )
+    .unwrap();
+
+    for (path, method) in [
+        ("/apis/solti.io/v1/tasks", "post"),
+        ("/apis/solti.io/v1/tasks", "get"),
+        ("/apis/solti.io/v1/tasks/{name}", "get"),
+        ("/apis/solti.io/v1/tasks/{name}", "put"),
+        ("/apis/solti.io/v1/tasks/{name}", "delete"),
+        ("/apis/solti.io/v1/tasks/{name}/runs", "get"),
+        ("/apis/solti.io/v1/tasks/{name}/logs", "get"),
+    ] {
+        assert!(
+            document["paths"][path][method]["responses"]
+                .get("403")
+                .is_some(),
+            "{method} {path} must document authorization denial"
+        );
+    }
 }
 
 #[derive(Clone)]

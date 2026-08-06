@@ -16,7 +16,10 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use solti_api::{ApiError, ApiHandler, HttpApi, TaskWatchEventStream};
+use solti_api::{
+    ApiAuthenticator, ApiAuthorizer, ApiError, ApiHandler, ApiIdentity, AuthenticationRequest,
+    AuthorizationRequest, HttpApi, TaskOperation, TaskTarget, TaskWatchEventStream, Transport,
+};
 use solti_model::{
     Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun, Token, WritePreconditions,
 };
@@ -231,4 +234,102 @@ async fn sse_logs_route_with_valid_token_streams() {
         "expected SSE content-type, got {ct:?}"
     );
     assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+}
+
+struct SubjectAuthenticator;
+
+#[async_trait]
+impl ApiAuthenticator for SubjectAuthenticator {
+    async fn authenticate(
+        &self,
+        request: AuthenticationRequest<'_>,
+    ) -> Result<ApiIdentity, ApiError> {
+        if request.transport() == Transport::Http
+            && request.bearer_credential() == Some("subject-token")
+        {
+            Ok(ApiIdentity::for_subject("user-7").with_attribute("team", "runtime"))
+        } else {
+            Err(ApiError::Unauthenticated("credential rejected".into()))
+        }
+    }
+}
+
+#[derive(Default)]
+struct RecordingAuthorizer {
+    checks: std::sync::Mutex<Vec<(Option<String>, TaskOperation, String)>>,
+}
+
+#[async_trait]
+impl ApiAuthorizer for RecordingAuthorizer {
+    async fn authorize(&self, request: AuthorizationRequest<'_>) -> Result<(), ApiError> {
+        let target = match request.target() {
+            TaskTarget::Collection => "collection".to_owned(),
+            TaskTarget::Task(task) => task.to_string(),
+            TaskTarget::Manifest(manifest) => manifest.name().to_string(),
+            _ => "unknown".to_owned(),
+        };
+        self.checks.lock().unwrap().push((
+            request
+                .identity()
+                .and_then(ApiIdentity::subject)
+                .map(str::to_owned),
+            request.operation(),
+            target,
+        ));
+        if request.operation() == TaskOperation::StreamLogs {
+            Err(ApiError::Forbidden("log access denied".into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[tokio::test]
+async fn custom_access_hooks_propagate_identity_and_return_forbidden() {
+    let handler = Arc::new(MockHandler::default());
+    let recording = Arc::new(RecordingAuthorizer::default());
+    let app = HttpApi::new(Arc::clone(&handler))
+        .with_authenticator(Arc::new(SubjectAuthenticator))
+        .with_authorizer(recording.clone())
+        .router();
+
+    let listed = app
+        .clone()
+        .oneshot(get_with_authorization(
+            "/apis/solti.io/v1/tasks",
+            "Bearer subject-token",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+
+    let denied = app
+        .oneshot(get_with_authorization(
+            "/apis/solti.io/v1/tasks/task-a/logs",
+            "Bearer subject-token",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let body = body_json(denied).await;
+    assert_eq!(body["reason"], "Forbidden");
+    assert_eq!(body["code"], 403);
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+
+    assert_eq!(
+        *recording.checks.lock().unwrap(),
+        vec![
+            (
+                Some("user-7".to_owned()),
+                TaskOperation::List,
+                "collection".to_owned(),
+            ),
+            (
+                Some("user-7".to_owned()),
+                TaskOperation::StreamLogs,
+                "task-a".to_owned(),
+            ),
+        ]
+    );
 }

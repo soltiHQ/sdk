@@ -54,7 +54,7 @@ use aide::{
     transform::TransformOperation,
 };
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Body,
     extract::{
         DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, RawQuery, Request, State,
@@ -81,8 +81,10 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tracing::debug;
 
 use crate::{
-    API_VERSION, API_VERSION_NAME, GRPC_API_PACKAGE, HTTP_API_ROOT, MAX_REQUEST_BYTES,
-    auth::bearer_value,
+    API_VERSION, API_VERSION_NAME, ApiAuthenticatorHandle, ApiAuthorizerHandle, ApiIdentity,
+    AuthenticationRequest, AuthorizationRequest, GRPC_API_PACKAGE, HTTP_API_ROOT,
+    MAX_REQUEST_BYTES, TaskOperation, TaskTarget, Transport,
+    auth::{StaticBearerAuthenticator, bearer_value},
     error::{ApiError, HttpStatusResource},
     handler::{ApiHandler, TaskWatchEventStream},
     metrics::{ApiMetricsHandle, StreamingResponse, http_metrics_middleware, noop_api_metrics},
@@ -236,7 +238,7 @@ pub struct HttpApiParts {
 
 /// Builder for the axum task API.
 ///
-/// Authentication and metrics are optional.
+/// Authentication, authorization, and metrics are optional.
 /// [`build`](Self::build) returns a standalone router and OpenAPI document.
 /// [`mount`](Self::mount) adds the documented task subtree to an application router.
 /// [`router`](Self::router) returns only the router.
@@ -266,7 +268,8 @@ pub struct HttpApiParts {
 pub struct HttpApi<H> {
     handler: Arc<H>,
     metrics: ApiMetricsHandle,
-    auth: Option<Token>,
+    authenticator: Option<ApiAuthenticatorHandle>,
+    authorizer: Option<ApiAuthorizerHandle>,
 }
 
 impl<H> HttpApi<H>
@@ -278,7 +281,8 @@ where
         Self {
             handler,
             metrics: noop_api_metrics(),
-            auth: None,
+            authenticator: None,
+            authorizer: None,
         }
     }
 
@@ -289,7 +293,23 @@ where
     /// Rejected requests do not reach the handler.
     /// Authentication is disabled when this method is not called.
     pub fn with_auth(mut self, token: Token) -> Self {
-        self.auth = Some(token);
+        self.authenticator = Some(Arc::new(StaticBearerAuthenticator::new(token)));
+        self
+    }
+
+    /// Installs an application-owned bearer authenticator.
+    ///
+    /// It receives every request before body extraction and returns the [`ApiIdentity`] used by the optional authorizer.
+    pub fn with_authenticator(mut self, authenticator: ApiAuthenticatorHandle) -> Self {
+        self.authenticator = Some(authenticator);
+        self
+    }
+
+    /// Installs an application-owned Task API authorization policy.
+    ///
+    /// The policy runs after wire validation and before the handler operation.
+    pub fn with_authorizer(mut self, authorizer: ApiAuthorizerHandle) -> Self {
+        self.authorizer = Some(authorizer);
         self
     }
 
@@ -304,7 +324,8 @@ where
     /// Builds a standalone router and its OpenAPI document.
     ///
     /// Every request body is limited to [`MAX_REQUEST_BYTES`].
-    /// Optional authentication runs before the handler.
+    /// Optional authentication runs before body extraction.
+    /// Optional authorization runs after validation and before the handler.
     /// Metrics include unmatched task API routes and authentication failures.
     pub fn build(self) -> HttpApiParts {
         configure_standalone_openapi_generation();
@@ -321,7 +342,7 @@ where
     /// Mounts the documented task API into an application router.
     ///
     /// The task routes are mounted at [`HTTP_API_ROOT`].
-    /// Their handler state, authentication, limits, metrics, and fallbacks stay inside that route subtree.
+    /// Their handler state, access control, limits, metrics, and fallbacks stay inside that route subtree.
     ///
     /// The caller owns the final [`OpenApi`] document.
     /// Call [`ApiRouter::finish_api`] once after every documented service has been mounted.
@@ -329,17 +350,24 @@ where
     where
         S: Clone + Send + Sync + 'static,
     {
-        let auth_enabled = self.auth.is_some();
+        let auth_enabled = self.authenticator.is_some();
+        let authorization_enabled = self.authorizer.is_some();
         document_task_api(openapi, auth_enabled);
 
-        let mut router = documented_router::<H>(auth_enabled)
+        let mut router = documented_router::<H>(auth_enabled, authorization_enabled)
             .fallback(route_not_found)
             .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
             .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
-            .layer(middleware::from_fn(map_413_envelope));
+            .layer(middleware::from_fn(map_413_envelope))
+            .layer(Extension(HttpAccessControl {
+                authorizer: self.authorizer,
+            }));
 
-        if let Some(token) = self.auth {
-            router = router.layer(middleware::from_fn_with_state(token, require_bearer));
+        if let Some(authenticator) = self.authenticator {
+            router = router.layer(middleware::from_fn_with_state(
+                authenticator,
+                authenticate_bearer,
+            ));
         }
 
         router = router.layer(middleware::from_fn_with_state(
@@ -370,7 +398,7 @@ fn configure_standalone_openapi_generation() {
     });
 }
 
-fn documented_router<H>(auth_enabled: bool) -> ApiRouter<Arc<H>>
+fn documented_router<H>(auth_enabled: bool, authorization_enabled: bool) -> ApiRouter<Arc<H>>
 where
     H: ApiHandler,
 {
@@ -387,7 +415,11 @@ where
             .response::<409, ApiError>()
             .response::<413, ApiError>()
             .response::<415, ApiError>();
-        document_common_errors(document_auth(operation, auth_enabled))
+        document_common_errors(document_access(
+            operation,
+            auth_enabled,
+            authorization_enabled,
+        ))
     })
     .get_with(list_tasks_route::<H>, move |operation| {
         let operation = operation
@@ -401,7 +433,11 @@ where
             .response::<200, ListOrWatchResponse>()
             .response::<400, ApiError>()
             .response::<410, ApiError>();
-        document_common_errors(document_auth(operation, auth_enabled))
+        document_common_errors(document_access(
+            operation,
+            auth_enabled,
+            authorization_enabled,
+        ))
     })
     .fallback_service(method_not_allowed.into_service());
 
@@ -413,7 +449,11 @@ where
             .response::<200, Json<HttpTaskSchema>>()
             .response::<400, ApiError>()
             .response::<404, ApiError>();
-        document_common_errors(document_auth(operation, auth_enabled))
+        document_common_errors(document_access(
+            operation,
+            auth_enabled,
+            authorization_enabled,
+        ))
     })
     .put_with(apply_task_route::<H>, move |operation| {
         let operation = operation
@@ -429,7 +469,11 @@ where
             .response::<409, ApiError>()
             .response::<413, ApiError>()
             .response::<415, ApiError>();
-        document_common_errors(document_auth(operation, auth_enabled))
+        document_common_errors(document_access(
+            operation,
+            auth_enabled,
+            authorization_enabled,
+        ))
     })
     .delete_with(delete_task_route::<H>, move |operation| {
         let operation = operation
@@ -441,7 +485,11 @@ where
             .response::<400, ApiError>()
             .response::<404, ApiError>()
             .response::<409, ApiError>();
-        document_common_errors(document_auth(operation, auth_enabled))
+        document_common_errors(document_access(
+            operation,
+            auth_enabled,
+            authorization_enabled,
+        ))
     })
     .fallback_service(method_not_allowed.into_service());
 
@@ -453,7 +501,11 @@ where
             .response::<200, Json<TaskRunList>>()
             .response::<400, ApiError>()
             .response::<404, ApiError>();
-        document_common_errors(document_auth(operation, auth_enabled))
+        document_common_errors(document_access(
+            operation,
+            auth_enabled,
+            authorization_enabled,
+        ))
     })
     .fallback_service(method_not_allowed.into_service());
 
@@ -468,7 +520,11 @@ where
             .response::<200, TaskLogStreamResponse>()
             .response::<400, ApiError>()
             .response::<404, ApiError>();
-        document_common_errors(document_auth(operation, auth_enabled))
+        document_common_errors(document_access(
+            operation,
+            auth_enabled,
+            authorization_enabled,
+        ))
     })
     .fallback_service(method_not_allowed.into_service());
 
@@ -489,6 +545,19 @@ fn document_auth<'a>(
             .response::<401, ApiError>()
     } else {
         operation.security_requirement_multi(std::iter::empty::<&str>())
+    }
+}
+
+fn document_access<'a>(
+    operation: TransformOperation<'a>,
+    auth_enabled: bool,
+    authorization_enabled: bool,
+) -> TransformOperation<'a> {
+    let operation = document_auth(operation, auth_enabled);
+    if authorization_enabled {
+        operation.response::<403, ApiError>()
+    } else {
+        operation
     }
 }
 
@@ -545,27 +614,57 @@ fn document_task_api(openapi: &mut OpenApi, auth_enabled: bool) {
             ReferenceOr::Item(SecurityScheme::Http {
                 scheme: "bearer".into(),
                 bearer_format: None,
-                description: Some("Token configured by HttpApi::with_auth.".into()),
+                description: Some(
+                    "Bearer credential configured by the Task API authenticator.".into(),
+                ),
                 extensions: Default::default(),
             }),
         );
     }
 }
 
-/// Enforces the configured bearer token.
-async fn require_bearer(State(expected): State<Token>, req: Request, next: Next) -> Response {
-    let ok = req
+#[derive(Clone)]
+struct HttpAccessControl {
+    authorizer: Option<ApiAuthorizerHandle>,
+}
+
+impl HttpAccessControl {
+    async fn authorize(
+        &self,
+        identity: Option<&ApiIdentity>,
+        operation: TaskOperation,
+        target: TaskTarget<'_>,
+    ) -> Result<(), ApiError> {
+        let Some(authorizer) = &self.authorizer else {
+            return Ok(());
+        };
+        authorizer
+            .authorize(AuthorizationRequest::new(identity, operation, target))
+            .await
+    }
+}
+
+/// Runs the configured bearer authenticator and installs its identity.
+async fn authenticate_bearer(
+    State(authenticator): State<ApiAuthenticatorHandle>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let credential = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(bearer_value)
-        .map(|presented| expected.verify(presented))
-        .unwrap_or(false);
+        .and_then(bearer_value);
 
-    if ok {
-        next.run(req).await
-    } else {
-        ApiError::Unauthenticated("missing or invalid bearer token".into()).into_response()
+    match authenticator
+        .authenticate(AuthenticationRequest::new(Transport::Http, credential))
+        .await
+    {
+        Ok(identity) => {
+            req.extensions_mut().insert(identity);
+            next.run(req).await
+        }
+        Err(error) => error.into_response(),
     }
 }
 
@@ -1149,16 +1248,20 @@ fn encode_watch_document(event: Result<TaskWatchEvent, ApiError>) -> Vec<u8> {
 
 async fn create_task_route<H>(
     state: State<Arc<H>>,
+    Extension(access): Extension<HttpAccessControl>,
+    identity: Option<Extension<ApiIdentity>>,
     manifest: TaskManifestJson,
 ) -> NoApi<Result<(StatusCode, Json<Task>), ApiError>>
 where
     H: ApiHandler,
 {
-    NoApi(create_task(state, manifest).await)
+    NoApi(create_task(state, &access, identity.as_deref(), manifest).await)
 }
 
 async fn apply_task_route<H>(
     state: State<Arc<H>>,
+    Extension(access): Extension<HttpAccessControl>,
+    identity: Option<Extension<ApiIdentity>>,
     path: ApiPath<TaskPath>,
     query: ApiQuery<WriteParams>,
     manifest: TaskManifestJson,
@@ -1166,68 +1269,87 @@ async fn apply_task_route<H>(
 where
     H: ApiHandler,
 {
-    NoApi(apply_task(state, path, query, manifest).await)
+    NoApi(apply_task(state, &access, identity.as_deref(), path, query, manifest).await)
 }
 
 async fn get_task_route<H>(
     state: State<Arc<H>>,
+    Extension(access): Extension<HttpAccessControl>,
+    identity: Option<Extension<ApiIdentity>>,
     path: ApiPath<TaskPath>,
 ) -> NoApi<Result<Json<Task>, ApiError>>
 where
     H: ApiHandler,
 {
-    NoApi(get_task(state, path).await)
+    NoApi(get_task(state, &access, identity.as_deref(), path).await)
 }
 
 async fn list_tasks_route<H>(
     state: State<Arc<H>>,
+    Extension(access): Extension<HttpAccessControl>,
+    identity: Option<Extension<ApiIdentity>>,
     query: RawQuery,
 ) -> NoApi<Result<Response, ApiError>>
 where
     H: ApiHandler,
 {
-    NoApi(list_tasks(state, query).await)
+    NoApi(list_tasks(state, &access, identity.as_deref(), query).await)
 }
 
 async fn list_task_runs_route<H>(
     state: State<Arc<H>>,
+    Extension(access): Extension<HttpAccessControl>,
+    identity: Option<Extension<ApiIdentity>>,
     path: ApiPath<TaskPath>,
 ) -> NoApi<Result<Json<TaskRunList>, ApiError>>
 where
     H: ApiHandler,
 {
-    NoApi(list_task_runs(state, path).await)
+    NoApi(list_task_runs(state, &access, identity.as_deref(), path).await)
 }
 
 async fn delete_task_route<H>(
     state: State<Arc<H>>,
+    Extension(access): Extension<HttpAccessControl>,
+    identity: Option<Extension<ApiIdentity>>,
     path: ApiPath<TaskPath>,
     query: ApiQuery<WriteParams>,
 ) -> NoApi<Result<NoContent, ApiError>>
 where
     H: ApiHandler,
 {
-    NoApi(delete_task(state, path, query).await)
+    NoApi(delete_task(state, &access, identity.as_deref(), path, query).await)
 }
 
 async fn stream_task_logs_route<H>(
     state: State<Arc<H>>,
+    Extension(access): Extension<HttpAccessControl>,
+    identity: Option<Extension<ApiIdentity>>,
     path: ApiPath<TaskPath>,
 ) -> NoApi<Result<Response, ApiError>>
 where
     H: ApiHandler,
 {
-    NoApi(stream_task_logs(state, path).await)
+    NoApi(stream_task_logs(state, &access, identity.as_deref(), path).await)
 }
 
 async fn create_task<H>(
     State(handler): State<Arc<H>>,
+    access: &HttpAccessControl,
+    identity: Option<&ApiIdentity>,
     TaskManifestJson(manifest): TaskManifestJson,
 ) -> Result<(StatusCode, Json<Task>), ApiError>
 where
     H: ApiHandler,
 {
     reject_embedded_manifest(&manifest)?;
+    access
+        .authorize(
+            identity,
+            TaskOperation::Create,
+            TaskTarget::Manifest(&manifest),
+        )
+        .await?;
     debug!(name = %manifest.name(), "creating task");
     let task = public_task(handler.create_task(manifest).await?)?;
     Ok((StatusCode::CREATED, Json(task)))
@@ -1235,6 +1357,8 @@ where
 
 async fn apply_task<H>(
     State(handler): State<Arc<H>>,
+    access: &HttpAccessControl,
+    identity: Option<&ApiIdentity>,
     ApiPath(TaskPath { name: path_name }): ApiPath<TaskPath>,
     ApiQuery(params): ApiQuery<WriteParams>,
     TaskManifestJson(manifest): TaskManifestJson,
@@ -1251,6 +1375,13 @@ where
         )));
     }
     let preconditions = parse_write_preconditions(params)?;
+    access
+        .authorize(
+            identity,
+            TaskOperation::Apply,
+            TaskTarget::Manifest(&manifest),
+        )
+        .await?;
     debug!(name = %manifest.name(), "applying task");
     let task = public_task(handler.apply_task(manifest, preconditions).await?)?;
     Ok(Json(task))
@@ -1258,12 +1389,17 @@ where
 
 async fn get_task<H>(
     State(handler): State<Arc<H>>,
+    access: &HttpAccessControl,
+    identity: Option<&ApiIdentity>,
     ApiPath(TaskPath { name }): ApiPath<TaskPath>,
 ) -> Result<Json<Task>, ApiError>
 where
     H: ApiHandler,
 {
     let name = parse_task_id("task name", name)?;
+    access
+        .authorize(identity, TaskOperation::Get, TaskTarget::Task(&name))
+        .await?;
     debug!(%name, "getting task");
     let task = handler
         .get_task(&name)
@@ -1275,6 +1411,8 @@ where
 
 async fn list_tasks<H>(
     State(handler): State<Arc<H>>,
+    access: &HttpAccessControl,
+    identity: Option<&ApiIdentity>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, ApiError>
 where
@@ -1306,6 +1444,9 @@ where
             ));
         }
 
+        access
+            .authorize(identity, TaskOperation::Watch, TaskTarget::Collection)
+            .await?;
         let stream = handler.watch_tasks(filter, resource_version).await?;
         let body_stream = TaskWatchBodyStream::new(stream);
         let mut response = Body::from_stream(body_stream).into_response();
@@ -1336,6 +1477,9 @@ where
 
     let page_filter = query.filter().clone();
     let page_limit = query.limit();
+    access
+        .authorize(identity, TaskOperation::List, TaskTarget::Collection)
+        .await?;
     let page = handler.query_tasks(query).await?;
     crate::continuation::validate_page(&page, &page_filter, page_limit)?;
     debug!(
@@ -1372,12 +1516,17 @@ where
 
 async fn list_task_runs<H>(
     State(handler): State<Arc<H>>,
+    access: &HttpAccessControl,
+    identity: Option<&ApiIdentity>,
     ApiPath(TaskPath { name }): ApiPath<TaskPath>,
 ) -> Result<Json<TaskRunList>, ApiError>
 where
     H: ApiHandler,
 {
     let name = parse_task_id("task name", name)?;
+    access
+        .authorize(identity, TaskOperation::ListRuns, TaskTarget::Task(&name))
+        .await?;
     debug!(%name, "listing task runs");
     let runs = handler.list_task_runs(&name).await?;
     if runs.iter().any(|run| !run_is_visible(run)) {
@@ -1390,6 +1539,8 @@ where
 
 async fn delete_task<H>(
     State(handler): State<Arc<H>>,
+    access: &HttpAccessControl,
+    identity: Option<&ApiIdentity>,
     ApiPath(TaskPath { name }): ApiPath<TaskPath>,
     ApiQuery(params): ApiQuery<WriteParams>,
 ) -> Result<NoContent, ApiError>
@@ -1398,6 +1549,9 @@ where
 {
     let name = parse_task_id("task name", name)?;
     let preconditions = parse_write_preconditions(params)?;
+    access
+        .authorize(identity, TaskOperation::Delete, TaskTarget::Task(&name))
+        .await?;
     handler.delete_task(&name, preconditions).await?;
     debug!(%name, "task deleted");
 
@@ -1407,12 +1561,17 @@ where
 /// Streams task output as Server-Sent Events.
 async fn stream_task_logs<H>(
     State(handler): State<Arc<H>>,
+    access: &HttpAccessControl,
+    identity: Option<&ApiIdentity>,
     ApiPath(TaskPath { name }): ApiPath<TaskPath>,
 ) -> Result<Response, ApiError>
 where
     H: ApiHandler,
 {
     let name = parse_task_id("task name", name)?;
+    access
+        .authorize(identity, TaskOperation::StreamLogs, TaskTarget::Task(&name))
+        .await?;
     debug!(%name, "subscribing to task log stream");
     let stream = handler.stream_task_logs(&name).await?;
 

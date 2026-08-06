@@ -44,7 +44,7 @@ One agent server does not host multiple Task API majors.
 `solti-api` owns public transport behavior.
 It does not store or execute tasks.
 
-The HTTP task subtree owns its handler state, authentication, limits, metrics, and fallbacks.
+The HTTP task subtree owns its handler state, access-control hooks, limits, metrics, and fallbacks.
 Application routes keep their own state and perimeter.
 
 ```text
@@ -549,9 +549,10 @@ Extension workload specs contain one UTF-8 JSON object in `RawExtension.raw`.
 
 Encoded and decoded messages are limited to 4 MiB.
 
-## Authentication
+## Authentication and authorization
 
-Authentication is disabled unless the application configures a token.
+Task API authentication is disabled unless the application configures a static
+token or an `ApiAuthenticator`.
 
 HTTP uses:
 
@@ -565,6 +566,20 @@ The `Bearer` scheme comparison is case-insensitive.
 Missing, malformed, or rejected credentials return HTTP `401`.
 gRPC returns `Unauthenticated`.
 
+Applications can replace static token verification with `ApiAuthenticator`.
+The authenticator receives the bearer credential and returns an `ApiIdentity`.
+Identity subjects and attributes are application-owned.
+
+Applications can install `ApiAuthorizer` independently. 
+It receives the identity, Task operation, and validated target before the handler operation.
+A policy denial returns HTTP `403` or gRPC `PermissionDenied`.
+
+List and Watch use a collection target. 
+The hook does not filter collection items or stream events. 
+Tenant or row-level visibility requires a separate scoped-handler design. 
+Stream authorization is checked when the stream opens.
+Solti does not define users, roles, tenants, RBAC rules, or policy storage.
+
 TLS is configured separately.
 The application hosting the HTTP router owns HTTP TLS.
 The optional `grpc-tls` feature converts `solti-tls` server settings for tonic.
@@ -577,6 +592,7 @@ Both transports use the same error categories.
 |------------------------------|------------------------------|---------------------|
 | Invalid request              | `400 Bad Request`            | `InvalidArgument`   |
 | Missing or invalid token     | `401 Unauthorized`           | `Unauthenticated`   |
+| Authorization policy denial  | `403 Forbidden`              | `PermissionDenied`  |
 | Existing create target       | `409 Conflict`               | `AlreadyExists`     |
 | Failed write precondition    | `409 Conflict`               | `Aborted`           |
 | Unknown resource or route    | `404 Not Found`              | `NotFound`          |
