@@ -1,8 +1,4 @@
 //! Auth (bearer-token) integration tests for the HTTP transport.
-//!
-//! Covers the perimeter installed by [`HttpApi::with_auth`]: every route —
-//! including the SSE log stream — must reject requests without a valid
-//! `Authorization: Bearer <token>` header before any handler work happens.
 
 #![cfg(feature = "http")]
 
@@ -26,8 +22,6 @@ use solti_model::{
 
 const SECRET: &str = "sekret-token-1";
 
-/// Minimal mock: succeeds at everything with empty fixtures and counts calls,
-/// so tests can assert the auth gate rejected a request before any work ran.
 #[derive(Default)]
 struct MockHandler {
     calls: AtomicUsize,
