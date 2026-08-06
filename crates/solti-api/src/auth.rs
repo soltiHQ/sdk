@@ -9,7 +9,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
-#[cfg(any(feature = "http", test))]
+#[cfg(any(feature = "http", all(test, feature = "grpc")))]
 use solti_model::Token;
 use solti_model::{TaskId, TaskManifest};
 
@@ -213,19 +213,19 @@ pub trait ApiAuthorizer: Send + Sync + 'static {
 /// Shared authorizer handle accepted by both transport builders.
 pub type ApiAuthorizerHandle = Arc<dyn ApiAuthorizer>;
 
-#[cfg(any(feature = "http", test))]
+#[cfg(any(feature = "http", all(test, feature = "grpc")))]
 pub(crate) struct StaticBearerAuthenticator {
     expected: Token,
 }
 
-#[cfg(any(feature = "http", test))]
+#[cfg(any(feature = "http", all(test, feature = "grpc")))]
 impl StaticBearerAuthenticator {
     pub(crate) fn new(expected: Token) -> Self {
         Self { expected }
     }
 }
 
-#[cfg(any(feature = "http", test))]
+#[cfg(any(feature = "http", all(test, feature = "grpc")))]
 #[async_trait]
 impl ApiAuthenticator for StaticBearerAuthenticator {
     async fn authenticate(
