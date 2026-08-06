@@ -48,6 +48,7 @@ use crate::{
     StateConfig,
     error::CoreError,
     output::{OutputConfig, OutputHub, OutputSubscription},
+    persistence::PersistenceSinks,
     runtime::{Reconciler, RuntimeObserver, RuntimeSource, TaskLocks},
     state::{
         CollectionError, DesiredCommit, ResourceGeneration, RuntimeBinding, TaskState,
@@ -117,11 +118,12 @@ impl SupervisorApi {
         router: RunnerRouter,
         state_cfg: StateConfig,
         output_config: OutputConfig,
+        persistence: PersistenceSinks,
     ) -> Result<Self, CoreError> {
         let mut subscribers = subscribers;
-        let output_hub = Arc::new(OutputHub::new(output_config));
+        let output_hub = Arc::new(OutputHub::with_sink(output_config, persistence.output));
         let router = router.with_output_publisher(output_hub.clone());
-        let state = TaskState::try_with_config(state_cfg)?;
+        let state = TaskState::try_with_config_and_sink(state_cfg, persistence.state)?;
         let observer = Arc::new(RuntimeObserver::with_output_hub(
             state.clone(),
             Arc::clone(&output_hub),

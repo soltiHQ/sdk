@@ -150,11 +150,12 @@ impl RuntimeObserver {
     ) -> bool {
         let _lifecycle = self.lifecycle_gate.lock();
         let task_id = resource.name.clone();
+        let task_uid = resource.uid.clone();
         if !self.state.bind_tv(resource, tv) {
             return false;
         }
         if ensure_output {
-            self.output_hub.ensure_channel_if_absent(task_id);
+            self.output_hub.ensure_channel_if_absent(task_id, task_uid);
         }
         true
     }
@@ -456,6 +457,7 @@ impl RuntimeObserver {
                 if self.state.transition_attempt_starting(&binding, attempt) {
                     self.output_hub.announce_run_started(
                         task_id,
+                        &binding.resource.uid,
                         binding.resource.generation,
                         attempt,
                     );
@@ -478,6 +480,7 @@ impl RuntimeObserver {
                 ) {
                     self.output_hub.announce_run_finished(
                         task_id,
+                        &binding.resource.uid,
                         binding.resource.generation,
                         attempt,
                         None,
@@ -501,6 +504,7 @@ impl RuntimeObserver {
                 ) {
                     self.output_hub.announce_run_finished(
                         task_id,
+                        &binding.resource.uid,
                         binding.resource.generation,
                         attempt,
                         None,
@@ -534,6 +538,7 @@ impl RuntimeObserver {
                 ) {
                     self.output_hub.announce_run_finished(
                         task_id,
+                        &binding.resource.uid,
                         binding.resource.generation,
                         attempt,
                         event.exit_code,
@@ -561,6 +566,7 @@ impl RuntimeObserver {
                 ) {
                     self.output_hub.announce_run_finished(
                         task_id,
+                        &binding.resource.uid,
                         binding.resource.generation,
                         attempt,
                         None,

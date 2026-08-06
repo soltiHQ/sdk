@@ -81,6 +81,7 @@
 //! | Runtime API    | [`SupervisorApi`], [`SupervisorApiBuilder`]            |
 //! | State          | [`TaskState`], [`TaskWatchSubscription`]               |
 //! | Output         | [`OutputConfig`], [`OutputSubscription`]               |
+//! | Persistence    | [`TaskStateSink`], [`TaskOutputSink`]                  |
 //! | Retention      | [`StateConfig`], [`ConfigError`]                       |
 //! | Writes         | [`WriteConflict`], [`WritePreconditionViolation`]      |
 //! | Errors         | [`CoreError`], [`CollectionError`]                     |
@@ -129,6 +130,12 @@ mod map;
 
 mod output;
 pub use output::{OutputConfig, OutputSubscription};
+
+mod persistence;
+pub use persistence::{
+    TaskOutputEvent, TaskOutputSink, TaskOutputSinkHandle, TaskStateEvent, TaskStateSink,
+    TaskStateSinkHandle,
+};
 
 mod runtime;
 

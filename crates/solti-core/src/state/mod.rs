@@ -51,6 +51,7 @@ use solti_model::{
     TaskPhase, TaskQuery, TaskRun, TaskWatchEvent, Uid, WorkloadTypeMeta, WritePreconditions,
 };
 
+use crate::persistence::{TaskStateEvent, TaskStateSinkHandle, publish_state_event};
 use crate::{StateConfig, WriteConflict, WritePreconditionViolation, error::CoreError};
 
 /// Shared in-memory task state.
@@ -73,6 +74,7 @@ use crate::{StateConfig, WriteConflict, WritePreconditionViolation, error::CoreE
 pub struct TaskState {
     inner: Arc<RwLock<TaskStateInner>>,
     watch_stop: CancellationToken,
+    event_sink: Option<TaskStateSinkHandle>,
 }
 
 struct TaskStateInner {
@@ -379,13 +381,29 @@ impl TaskState {
     }
 
     pub(crate) fn try_with_config(config: StateConfig) -> Result<Self, CoreError> {
+        Self::try_with_config_and_sink(config, None)
+    }
+
+    pub(crate) fn try_with_config_and_sink(
+        config: StateConfig,
+        event_sink: Option<TaskStateSinkHandle>,
+    ) -> Result<Self, CoreError> {
         let epoch = Uid::generate()
             .map_err(CoreError::StateInitialization)?
             .to_string();
-        Ok(Self::with_epoch(config, epoch))
+        Ok(Self::with_epoch_and_sink(config, epoch, event_sink))
     }
 
+    #[cfg(test)]
     fn with_epoch(config: StateConfig, epoch: String) -> Self {
+        Self::with_epoch_and_sink(config, epoch, None)
+    }
+
+    fn with_epoch_and_sink(
+        config: StateConfig,
+        epoch: String,
+        event_sink: Option<TaskStateSinkHandle>,
+    ) -> Self {
         let (watch_tx, _) = broadcast::channel(config.watch_history_capacity());
         Self {
             inner: Arc::new(RwLock::new(TaskStateInner {
@@ -407,6 +425,7 @@ impl TaskState {
                 max_runs_per_task: config.max_runs_per_task(),
             })),
             watch_stop: CancellationToken::new(),
+            event_sink,
         }
     }
 
@@ -441,6 +460,7 @@ impl TaskState {
     }
 
     fn record_change(
+        &self,
         inner: &mut TaskStateInner,
         revision: u64,
         previous: Option<Task>,
@@ -449,6 +469,14 @@ impl TaskState {
         if previous == current {
             return;
         }
+        let persistence_event = TaskStateEvent::TaskChanged {
+            resource_version: Self::format_resource_version(
+                &inner.resource_version_epoch,
+                revision,
+            ),
+            previous: previous.clone().map(Arc::new),
+            current: current.clone().map(Arc::new),
+        };
         let serialized_bytes =
             Self::serialized_task_payload_bytes(previous.as_ref(), current.as_ref());
         let change = Arc::new(RawTaskChange {
@@ -484,6 +512,18 @@ impl TaskState {
         }
 
         let _ = inner.watch_tx.send(change);
+        publish_state_event(self.event_sink.as_ref(), persistence_event);
+    }
+
+    fn record_run_change(&self, task: &TaskId, task_uid: &Uid, run: &TaskRun) {
+        publish_state_event(
+            self.event_sink.as_ref(),
+            TaskStateEvent::RunChanged {
+                task: task.clone(),
+                task_uid: task_uid.clone(),
+                run: run.clone(),
+            },
+        );
     }
 
     fn index_task(inner: &mut TaskStateInner, task: &Task) {
@@ -517,7 +557,7 @@ impl TaskState {
             .expect("store resource version must be valid");
         Self::index_task(&mut inner, &task);
         inner.tasks.insert(name, task.clone());
-        Self::record_change(&mut inner, revision, previous, Some(task));
+        self.record_change(&mut inner, revision, previous, Some(task));
     }
 
     /// Creates one desired resource.
@@ -541,7 +581,7 @@ impl TaskState {
         Self::index_task(&mut inner, &task);
         inner.terminal_since.remove(&name);
         inner.tasks.insert(name, task.clone());
-        Self::record_change(&mut inner, revision, None, Some(task.clone()));
+        self.record_change(&mut inner, revision, None, Some(task.clone()));
         Ok(DesiredCommit {
             task,
             reconcile: true,
@@ -623,7 +663,7 @@ impl TaskState {
         if change == DesiredChange::Spec || retry {
             inner.terminal_since.remove(&name);
         }
-        Self::record_change(&mut inner, revision, Some(previous), Some(task.clone()));
+        self.record_change(&mut inner, revision, Some(previous), Some(task.clone()));
         Ok(DesiredCommit {
             task,
             reconcile: change == DesiredChange::Spec || retry,
@@ -738,7 +778,7 @@ impl TaskState {
         if let Some(task) = inner.tasks.remove(id) {
             Self::unindex_task(&mut inner, &task);
             let (revision, _) = Self::next_resource_version(&mut inner);
-            Self::record_change(&mut inner, revision, Some(task), None);
+            self.record_change(&mut inner, revision, Some(task), None);
             true
         } else {
             false
@@ -820,6 +860,7 @@ impl TaskState {
 
         let max_runs = inner.max_runs_per_task;
         let runs = inner.runs.entry(name.clone()).or_default();
+        let mut run_changes = Vec::new();
         for run in runs.iter_mut().filter(|run| {
             run.is_active()
                 && run.generation() == binding.resource.generation
@@ -831,19 +872,23 @@ impl TaskState {
                 None,
             )
             .expect("an active run accepts a terminal phase");
+            run_changes.push(run.clone());
         }
-        runs.push_back(
-            TaskRun::starting(
-                binding.resource.generation,
-                attempt,
-                binding.resource.workload.clone(),
-            )
-            .expect("validated resource generation and attempt create a run"),
-        );
+        let run = TaskRun::starting(
+            binding.resource.generation,
+            attempt,
+            binding.resource.workload.clone(),
+        )
+        .expect("validated resource generation and attempt create a run");
+        run_changes.push(run.clone());
+        runs.push_back(run);
 
         Self::enforce_run_cap(runs, max_runs);
         if let Some((revision, previous, current)) = task_change {
-            Self::record_change(&mut inner, revision, Some(previous), Some(current));
+            self.record_change(&mut inner, revision, Some(previous), Some(current));
+        }
+        for run in &run_changes {
+            self.record_run_change(name, &binding.resource.uid, run);
         }
         true
     }
@@ -880,8 +925,9 @@ impl TaskState {
             && attempt >= task.status().attempt();
 
         let max_runs = inner.max_runs_per_task;
-        let (run_error, run_exit_code, run_changed) = {
+        let (run_error, run_exit_code, run_changed, run_changes) = {
             let runs = inner.runs.entry(name.clone()).or_default();
+            let mut run_changes = Vec::new();
             for previous in runs.iter_mut().filter(|run| {
                 run.is_active()
                     && run.generation() == binding.resource.generation
@@ -896,6 +942,7 @@ impl TaskState {
                         None,
                     )
                     .expect("an active run accepts a terminal phase");
+                run_changes.push(previous.clone());
             }
             let run = if let Some(index) = runs.iter().position(|run| {
                 run.generation() == binding.resource.generation && run.attempt() == attempt
@@ -916,8 +963,14 @@ impl TaskState {
             if run_changed {
                 run.finish(phase, error, exit_code)
                     .expect("terminal phase closes an active run");
+                run_changes.push(run.clone());
             }
-            let diagnostics = (run.error().map(str::to_owned), run.exit_code(), run_changed);
+            let diagnostics = (
+                run.error().map(str::to_owned),
+                run.exit_code(),
+                run_changed,
+                run_changes,
+            );
             Self::enforce_run_cap(runs, max_runs);
             diagnostics
         };
@@ -966,7 +1019,10 @@ impl TaskState {
             inner.finished_attempt_by_tv.insert(tv_raw, attempt);
         }
         if let Some((revision, previous, current)) = task_change {
-            Self::record_change(&mut inner, revision, Some(previous), Some(current));
+            self.record_change(&mut inner, revision, Some(previous), Some(current));
+        }
+        for run in &run_changes {
+            self.record_run_change(name, &binding.resource.uid, run);
         }
         changed
     }
@@ -982,7 +1038,7 @@ impl TaskState {
         exit_code: Option<i32>,
     ) -> bool {
         let mut inner = self.inner.write();
-        Self::transition_task_finished_locked(&mut inner, binding, phase, error, exit_code, false)
+        self.transition_task_finished_locked(&mut inner, binding, phase, error, exit_code, false)
     }
 
     /// Marks a generation as accepted by Taskvisor intake.
@@ -1013,7 +1069,7 @@ impl TaskState {
                 .get(&resource.name)
                 .expect("resource was checked under the same write lock")
                 .clone();
-            Self::record_change(&mut inner, revision, Some(previous), Some(current));
+            self.record_change(&mut inner, revision, Some(previous), Some(current));
         }
         changed
     }
@@ -1053,12 +1109,13 @@ impl TaskState {
                 .get(&resource.name)
                 .expect("resource was checked under the same write lock")
                 .clone();
-            Self::record_change(&mut inner, revision, Some(previous), Some(current));
+            self.record_change(&mut inner, revision, Some(previous), Some(current));
         }
         changed
     }
 
     fn transition_task_finished_locked(
+        &self,
         inner: &mut TaskStateInner,
         binding: &RuntimeBinding,
         phase: TaskPhase,
@@ -1107,7 +1164,7 @@ impl TaskState {
                         .get(name)
                         .expect("resource was checked under the same write lock")
                         .clone();
-                    Self::record_change(inner, revision, Some(previous), Some(current));
+                    self.record_change(inner, revision, Some(previous), Some(current));
                 }
                 true
             }
@@ -1155,6 +1212,7 @@ impl TaskState {
         inner.by_tv.remove(&tv_raw);
         inner.finished_attempt_by_tv.remove(&tv_raw);
 
+        let mut run_change = None;
         if let Some(runs) = inner.runs.get_mut(&binding.resource.name)
             && let Some(run) = runs
                 .iter_mut()
@@ -1163,8 +1221,12 @@ impl TaskState {
         {
             run.finish(phase, error.clone(), exit_code)
                 .expect("terminal phase closes an active run");
+            run_change = Some(run.clone());
         }
-        Self::transition_task_finished_locked(&mut inner, &binding, phase, error, exit_code, force);
+        self.transition_task_finished_locked(&mut inner, &binding, phase, error, exit_code, force);
+        if let Some(run) = run_change.as_ref() {
+            self.record_run_change(&binding.resource.name, &binding.resource.uid, run);
+        }
         Some(binding.resource.name)
     }
 
@@ -1315,7 +1377,7 @@ impl TaskState {
                 Self::unindex_task(&mut inner, &task);
                 inner.terminal_since.remove(id);
                 let (revision, _) = Self::next_resource_version(&mut inner);
-                Self::record_change(&mut inner, revision, Some(task), None);
+                self.record_change(&mut inner, revision, Some(task), None);
                 tasks_removed += 1;
             }
         }
@@ -1719,7 +1781,7 @@ mod tests {
         let mut inner = state.inner.write();
         let (revision, resource_version) = TaskState::next_resource_version(&mut inner);
         assert_eq!(task.metadata().resource_version(), resource_version);
-        TaskState::record_change(&mut inner, revision, None, Some(task));
+        state.record_change(&mut inner, revision, None, Some(task));
     }
 
     fn bind(state: &TaskState, name: &TaskId) -> RuntimeBinding {
@@ -1735,6 +1797,79 @@ mod tests {
         let state = TaskState::try_new().expect("OS entropy is available");
 
         assert!(state.list_all().is_empty());
+    }
+
+    #[derive(Default)]
+    struct RecordingStateSink {
+        events: std::sync::Mutex<Vec<TaskStateEvent>>,
+    }
+
+    impl crate::TaskStateSink for RecordingStateSink {
+        fn on_event(&self, event: &TaskStateEvent) {
+            self.events.lock().unwrap().push(event.clone());
+        }
+    }
+
+    #[test]
+    fn state_sink_receives_task_and_run_lifecycle() {
+        let recording = Arc::new(RecordingStateSink::default());
+        let sink: crate::TaskStateSinkHandle = recording.clone();
+        let state = TaskState::with_epoch_and_sink(
+            StateConfig::default(),
+            "sink-epoch".to_string(),
+            Some(sink),
+        );
+
+        let created = create(&state, "sink-task");
+        let name = created.name().clone();
+
+        let mut desired = manifest("sink-task", "slot", 2_000);
+        let mut annotations = Annotations::new();
+        annotations.insert("example.io/revision", "two");
+        desired = desired.with_annotations(annotations).unwrap();
+        state.apply_desired(&desired).expect("apply");
+
+        let binding = bind(&state, &name);
+        assert!(state.mark_observed(&binding.resource));
+        assert!(state.transition_attempt_starting(&binding, 1));
+        assert!(state.transition_attempt_finished(
+            &binding,
+            1,
+            TaskPhase::Succeeded,
+            None,
+            Some(0),
+        ));
+        assert!(state.delete_task(&name));
+
+        let events = recording.events.lock().unwrap();
+        let task_changes = events
+            .iter()
+            .filter(|event| matches!(event, TaskStateEvent::TaskChanged { .. }))
+            .count();
+        let runs: Vec<&TaskRun> = events
+            .iter()
+            .filter_map(|event| match event {
+                TaskStateEvent::RunChanged {
+                    task,
+                    task_uid,
+                    run,
+                } if task == &name && task_uid == created.uid() => Some(run),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(task_changes, 6);
+        assert_eq!(runs.len(), 2);
+        assert!(runs[0].is_active());
+        assert_eq!(runs[1].phase(), TaskPhase::Succeeded);
+        assert!(matches!(
+            events.last(),
+            Some(TaskStateEvent::TaskChanged {
+                previous: Some(task),
+                current: None,
+                ..
+            }) if task.name() == &name
+        ));
     }
 
     #[test]
