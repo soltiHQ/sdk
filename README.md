@@ -254,7 +254,8 @@ Generated server and client types are available from the crate.
 Each SDK binary serves the API version compiled into its selected `solti-api` version.
 A control plane that manages different binary generations must route each advertised version to its matching contract.
 
-Bearer authentication is disabled until the binary calls `with_auth`.
+Bearer authentication is disabled until the binary calls `with_auth` or `with_authenticator`. 
+An optional `with_authorizer` policy runs before each validated Task API operation.
 The HTTP and gRPC boundaries enforce a 4 MiB request or message limit.
 
 Read the complete route, message, pagination, watch, and error contract in [`solti-api/CONTRACT.md`](crates/solti-api/CONTRACT.md).
@@ -281,8 +282,9 @@ Read the versioned wire contract in [`solti-discover/CONTRACT.md`](crates/solti-
 `solti-api` can verify it on every route and RPC.
 `solti-discover` can send it with every heartbeat.
 
-The token is authentication only.
-The SDK does not provide users, tenants, RBAC, policy evaluation, secret rotation, or secret persistence.
+The static token is authentication only. 
+`solti-api` also exposes application hooks for bearer authentication and operation-level authorization. 
+The SDK does not provide users, tenants, RBAC rules, tenant filtering, policy storage, secret rotation, or secret persistence.
 
 `solti-tls` separates server identity, client identity, and trust roots.
 It supports TLS and mandatory client-certificate authentication.
@@ -368,7 +370,7 @@ Keep these boundaries explicit:
 - Snapshot pagination is consistent only while its continuation remains valid.
 - Reconciliation is latest-wins and has no staged availability guarantee.
 - Discovery registration state is not persisted.
-- Bearer authentication does not provide authorization or tenant isolation.
+- Static bearer authentication alone does not provide authorization or tenant isolation.
 - Host-process controls are hardening, not a complete untrusted-code sandbox.
 - The native container adapter provides no CRI or CNI implementation.
 - The SDK contains no durable log sink.
@@ -377,7 +379,7 @@ Keep these boundaries explicit:
 Use the persistence hooks with an external store when tasks or logs must
 survive process termination. The application owns delivery retries and its
 restart recovery flow. The SDK does not load persisted state at startup.
-Add authorization and sandbox policy at the binary or service boundary.
+Install application authorization and sandbox policy at the binary or service boundary.
 
 ## Feature flags
 

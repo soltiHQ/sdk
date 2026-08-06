@@ -3,7 +3,7 @@
 //! Tonic service for protobuf package `solti.task.v1`.
 //! Every RPC delegates to [`ApiHandler`].
 //!
-//! [`GrpcApi`] installs message limits, optional metrics, and bearer authentication.
+//! [`GrpcApi`] installs message limits, optional metrics, and access-control hooks.
 //! [`wire`] exposes the generated client, server, and message types.
 //!
 //! ## RPCs
@@ -33,7 +33,8 @@ use tracing::debug;
 
 use solti_model::{LabelSelector, TaskFilter, TaskQuery, Token};
 
-use crate::GRPC_API_SERVICE;
+#[cfg(test)]
+use crate::auth::StaticBearerAuthenticator;
 use crate::auth::bearer_value;
 use crate::handler::ApiHandler;
 use crate::metrics::{
@@ -43,6 +44,10 @@ use crate::proto_api::{
     self, task_service_server::TaskService, task_service_server::TaskServiceServer,
 };
 use crate::validate::{parse_list_limit, parse_task_id, validate_slot};
+use crate::{
+    ApiAuthenticatorHandle, ApiAuthorizerHandle, ApiIdentity, AuthenticationRequest,
+    AuthorizationRequest, GRPC_API_SERVICE, TaskOperation, TaskTarget,
+};
 
 mod convert;
 use convert::{
@@ -103,7 +108,7 @@ impl<T> Stream for GrpcMetricsStream<T> {
 ///
 /// This is the lower-level service implementation.
 /// It converts protobuf values and records optional metrics.
-/// Use [`GrpcApi`] to also install message limits and authentication.
+/// Use [`GrpcApi`] to also install message limits and access control.
 ///
 /// ## See Also
 ///
@@ -112,6 +117,8 @@ impl<T> Stream for GrpcMetricsStream<T> {
 pub struct TaskApiService<H> {
     handler: Arc<H>,
     metrics: ApiMetricsHandle,
+    authenticator: Option<ApiAuthenticatorHandle>,
+    authorizer: Option<ApiAuthorizerHandle>,
 }
 
 impl<H> TaskApiService<H>
@@ -125,7 +132,52 @@ where
 
     /// Creates a service with an explicit metrics backend.
     pub fn new_with_metrics(handler: Arc<H>, metrics: ApiMetricsHandle) -> Self {
-        Self { handler, metrics }
+        Self::new_with_access(handler, metrics, None, None)
+    }
+
+    fn new_with_access(
+        handler: Arc<H>,
+        metrics: ApiMetricsHandle,
+        authenticator: Option<ApiAuthenticatorHandle>,
+        authorizer: Option<ApiAuthorizerHandle>,
+    ) -> Self {
+        Self {
+            handler,
+            metrics,
+            authenticator,
+            authorizer,
+        }
+    }
+
+    async fn authenticate<T>(&self, request: &Request<T>) -> Result<Option<ApiIdentity>, Status> {
+        let Some(authenticator) = &self.authenticator else {
+            return Ok(request.extensions().get::<ApiIdentity>().cloned());
+        };
+        let credential = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(bearer_value);
+        authenticator
+            .authenticate(AuthenticationRequest::new(Transport::Grpc, credential))
+            .await
+            .map(Some)
+            .map_err(Status::from)
+    }
+
+    async fn authorize(
+        &self,
+        identity: Option<&ApiIdentity>,
+        operation: TaskOperation,
+        target: TaskTarget<'_>,
+    ) -> Result<(), Status> {
+        let Some(authorizer) = &self.authorizer else {
+            return Ok(());
+        };
+        authorizer
+            .authorize(AuthorizationRequest::new(identity, operation, target))
+            .await
+            .map_err(Status::from)
     }
 
     async fn instrument<F, T>(&self, method: &'static str, fut: F) -> Result<Response<T>, Status>
@@ -172,13 +224,13 @@ where
 
 /// Complete gRPC service returned by [`GrpcApi::server`].
 ///
-/// The [`BearerAuth`] interceptor is always present.
-/// It passes calls through when no token is configured.
+/// The [`BearerAuth`] interceptor remains present for the built-in static token.
+/// Custom authenticators run inside [`TaskApiService`].
 pub type GrpcServer<H> = InterceptedService<TaskServiceServer<TaskApiService<H>>, BearerAuth>;
 
 /// Builder for the tonic task API.
 ///
-/// Authentication and metrics are optional.
+/// Authentication, authorization, and metrics are optional.
 /// [`server`](Self::server) installs the public message-size limit.
 ///
 /// ## Example
@@ -203,6 +255,8 @@ pub struct GrpcApi<H> {
     handler: Arc<H>,
     metrics: ApiMetricsHandle,
     auth: Option<Token>,
+    authenticator: Option<ApiAuthenticatorHandle>,
+    authorizer: Option<ApiAuthorizerHandle>,
 }
 
 impl<H> GrpcApi<H>
@@ -215,6 +269,8 @@ where
             handler,
             metrics: noop_api_metrics(),
             auth: None,
+            authenticator: None,
+            authorizer: None,
         }
     }
 
@@ -226,6 +282,24 @@ where
     /// Authentication is disabled when this method is not called.
     pub fn with_auth(mut self, token: Token) -> Self {
         self.auth = Some(token);
+        self.authenticator = None;
+        self
+    }
+
+    /// Installs an application-owned bearer authenticator.
+    ///
+    /// It returns the [`ApiIdentity`] used by the optional authorizer.
+    pub fn with_authenticator(mut self, authenticator: ApiAuthenticatorHandle) -> Self {
+        self.auth = None;
+        self.authenticator = Some(authenticator);
+        self
+    }
+
+    /// Installs an application-owned Task API authorization policy.
+    ///
+    /// The policy runs after wire validation and before the handler operation.
+    pub fn with_authorizer(mut self, authorizer: ApiAuthorizerHandle) -> Self {
+        self.authorizer = Some(authorizer);
         self
     }
 
@@ -239,13 +313,13 @@ where
 
     /// Builds the configured gRPC service.
     ///
-    /// Encoded and decoded messages are limited to
-    /// [`MAX_REQUEST_BYTES`](crate::MAX_REQUEST_BYTES).
-    /// The returned service always contains [`BearerAuth`].
+    /// Encoded and decoded messages are limited to [`MAX_REQUEST_BYTES`](crate::MAX_REQUEST_BYTES).
     pub fn server(self) -> GrpcServer<H> {
-        let inner = TaskServiceServer::new(TaskApiService::new_with_metrics(
+        let inner = TaskServiceServer::new(TaskApiService::new_with_access(
             self.handler,
             Arc::clone(&self.metrics),
+            self.authenticator,
+            self.authorizer,
         ))
         .max_decoding_message_size(crate::MAX_REQUEST_BYTES)
         .max_encoding_message_size(crate::MAX_REQUEST_BYTES);
@@ -259,12 +333,10 @@ where
     }
 }
 
-/// Bearer interceptor used by [`GrpcServer`].
+/// Bearer interceptor used by [`GrpcServer`] for [`GrpcApi::with_auth`].
 ///
-/// It verifies `authorization: Bearer <token>` metadata.
-/// Token comparison uses [`Token::verify`].
+/// A valid static token installs an authenticated identity without an individual subject.
 /// Without a configured token, every call passes through.
-/// Configure it through [`GrpcApi::with_auth`].
 #[derive(Clone)]
 pub struct BearerAuth {
     expected: Option<Token>,
@@ -272,19 +344,22 @@ pub struct BearerAuth {
 }
 
 impl Interceptor for BearerAuth {
-    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
         let Some(expected) = &self.expected else {
             return Ok(request);
         };
-        let ok = request
+        let valid = request
             .metadata()
             .get("authorization")
-            .and_then(|v| v.to_str().ok())
+            .and_then(|value| value.to_str().ok())
             .and_then(bearer_value)
             .map(|presented| expected.verify(presented))
             .unwrap_or(false);
 
-        if ok {
+        if valid {
+            request
+                .extensions_mut()
+                .insert(ApiIdentity::authenticated());
             Ok(request)
         } else {
             record_auth_failure(&self.metrics, &request);
@@ -351,12 +426,19 @@ where
         request: Request<proto_api::CreateTaskRequest>,
     ) -> Result<Response<proto_api::CreateTaskResponse>, Status> {
         self.instrument("CreateTask", async move {
+            let identity = self.authenticate(&request).await?;
             let req = request.into_inner();
 
             let manifest = req
                 .manifest
                 .ok_or_else(|| Status::invalid_argument("missing manifest"))?;
             let manifest = convert::task_manifest_from_proto(manifest).map_err(Status::from)?;
+            self.authorize(
+                identity.as_ref(),
+                TaskOperation::Create,
+                TaskTarget::Manifest(&manifest),
+            )
+            .await?;
             debug!(name = %manifest.name(), "grpc: creating task");
             let task = self
                 .handler
@@ -377,6 +459,7 @@ where
         request: Request<proto_api::ApplyTaskRequest>,
     ) -> Result<Response<proto_api::ApplyTaskResponse>, Status> {
         self.instrument("ApplyTask", async move {
+            let identity = self.authenticate(&request).await?;
             let req = request.into_inner();
 
             let manifest = req
@@ -385,6 +468,12 @@ where
             let manifest = convert::task_manifest_from_proto(manifest).map_err(Status::from)?;
             let preconditions =
                 write_preconditions_from_proto(req.preconditions).map_err(Status::from)?;
+            self.authorize(
+                identity.as_ref(),
+                TaskOperation::Apply,
+                TaskTarget::Manifest(&manifest),
+            )
+            .await?;
             debug!(name = %manifest.name(), "grpc: applying task");
             let task = self
                 .handler
@@ -405,9 +494,16 @@ where
         request: Request<proto_api::GetTaskRequest>,
     ) -> Result<Response<proto_api::GetTaskResponse>, Status> {
         self.instrument("GetTask", async move {
+            let identity = self.authenticate(&request).await?;
             let req = request.into_inner();
 
             let task_id = parse_task_id("task name", req.name).map_err(Status::from)?;
+            self.authorize(
+                identity.as_ref(),
+                TaskOperation::Get,
+                TaskTarget::Task(&task_id),
+            )
+            .await?;
             debug!(%task_id, "grpc: getting task status");
 
             let task = self
@@ -431,6 +527,7 @@ where
         request: Request<proto_api::ListTasksRequest>,
     ) -> Result<Response<proto_api::ListTasksResponse>, Status> {
         self.instrument("ListTasks", async move {
+            let identity = self.authenticate(&request).await?;
             let req = request.into_inner();
 
             let filter = task_filter_from_wire(req.slot, req.phases, req.label_selector)
@@ -443,6 +540,13 @@ where
                     crate::continuation::decode(&req.r#continue).map_err(Status::from)?,
                 );
             }
+
+            self.authorize(
+                identity.as_ref(),
+                TaskOperation::List,
+                TaskTarget::Collection,
+            )
+            .await?;
 
             let page_filter = query.filter().clone();
             let page_limit = query.limit();
@@ -474,6 +578,7 @@ where
         request: Request<proto_api::WatchTasksRequest>,
     ) -> Result<Response<Self::WatchTasksStream>, Status> {
         self.instrument_stream("WatchTasks", async move {
+            let identity = self.authenticate(&request).await?;
             let req = request.into_inner();
             let filter = task_filter_from_wire(req.slot, req.phases, req.label_selector)
                 .map_err(Status::from)?;
@@ -486,6 +591,13 @@ where
                     "resource_version must not be empty",
                 ));
             }
+
+            self.authorize(
+                identity.as_ref(),
+                TaskOperation::Watch,
+                TaskTarget::Collection,
+            )
+            .await?;
 
             let domain_stream = self
                 .handler
@@ -507,9 +619,16 @@ where
         request: Request<proto_api::ListTaskRunsRequest>,
     ) -> Result<Response<proto_api::ListTaskRunsResponse>, Status> {
         self.instrument("ListTaskRuns", async move {
+            let identity = self.authenticate(&request).await?;
             let req = request.into_inner();
 
             let task_id = parse_task_id("task name", req.name).map_err(Status::from)?;
+            self.authorize(
+                identity.as_ref(),
+                TaskOperation::ListRuns,
+                TaskTarget::Task(&task_id),
+            )
+            .await?;
             debug!(%task_id, "grpc: listing task runs");
 
             let runs = self
@@ -534,11 +653,18 @@ where
         request: Request<proto_api::DeleteTaskRequest>,
     ) -> Result<Response<proto_api::DeleteTaskResponse>, Status> {
         self.instrument("DeleteTask", async move {
+            let identity = self.authenticate(&request).await?;
             let req = request.into_inner();
 
             let task_id = parse_task_id("task name", req.name).map_err(Status::from)?;
             let preconditions =
                 write_preconditions_from_proto(req.preconditions).map_err(Status::from)?;
+            self.authorize(
+                identity.as_ref(),
+                TaskOperation::Delete,
+                TaskTarget::Task(&task_id),
+            )
+            .await?;
             debug!(%task_id, "grpc: deleting task");
 
             self.handler
@@ -560,8 +686,15 @@ where
         request: Request<proto_api::StreamTaskLogsRequest>,
     ) -> Result<Response<Self::StreamTaskLogsStream>, Status> {
         self.instrument_stream("StreamTaskLogs", async move {
+            let identity = self.authenticate(&request).await?;
             let req = request.into_inner();
             let task_id = parse_task_id("task name", req.name).map_err(Status::from)?;
+            self.authorize(
+                identity.as_ref(),
+                TaskOperation::StreamLogs,
+                TaskTarget::Task(&task_id),
+            )
+            .await?;
             debug!(%task_id, "grpc: subscribing to task log stream");
 
             let domain_stream = self
@@ -1092,56 +1225,181 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
-    fn auth_interceptor(secret: &str) -> BearerAuth {
-        BearerAuth {
-            expected: Some(Token::new(secret).unwrap()),
-            metrics: noop_api_metrics(),
-        }
+    fn authenticated_service(secret: &str) -> TaskApiService<StreamMock> {
+        let authenticator: ApiAuthenticatorHandle =
+            Arc::new(StaticBearerAuthenticator::new(Token::new(secret).unwrap()));
+        TaskApiService::new_with_access(
+            Arc::new(StreamMock::default()),
+            noop_api_metrics(),
+            Some(authenticator),
+            None,
+        )
     }
 
-    fn request_with_authorization(value: &str) -> Request<()> {
-        let mut req = Request::new(());
-        req.metadata_mut()
-            .insert("authorization", value.parse().expect("ascii metadata"));
+    fn list_request_with_authorization(
+        value: Option<&str>,
+    ) -> Request<proto_api::ListTasksRequest> {
+        let mut req = Request::new(proto_api::ListTasksRequest::default());
+        if let Some(value) = value {
+            req.metadata_mut()
+                .insert("authorization", value.parse().expect("ascii metadata"));
+        }
         req
     }
 
-    #[test]
-    fn bearer_auth_rejects_invalid_credentials() {
-        let requests = [
-            Request::new(()),
-            request_with_authorization("Bearer not-the-secret"),
-            request_with_authorization("sekret"),
-            request_with_authorization("Basic sekret"),
+    #[tokio::test]
+    async fn bearer_auth_rejects_invalid_credentials() {
+        let headers = [
+            None,
+            Some("Bearer not-the-secret"),
+            Some("sekret"),
+            Some("Basic sekret"),
         ];
 
-        for request in requests {
-            let status = auth_interceptor("sekret").call(request).unwrap_err();
+        for header in headers {
+            let status = authenticated_service("sekret")
+                .list_tasks(list_request_with_authorization(header))
+                .await
+                .unwrap_err();
             assert_eq!(status.code(), tonic::Code::Unauthenticated);
         }
     }
 
-    #[test]
-    fn bearer_auth_accepts_valid_token_scheme_case_insensitively() {
+    #[tokio::test]
+    async fn bearer_auth_accepts_valid_token_scheme_case_insensitively() {
         for header in ["Bearer sekret", "bearer sekret", "BEARER sekret"] {
-            let mut auth = auth_interceptor("sekret");
             assert!(
-                auth.call(request_with_authorization(header)).is_ok(),
+                authenticated_service("sekret")
+                    .list_tasks(list_request_with_authorization(Some(header)))
+                    .await
+                    .is_ok(),
                 "header {header:?} must pass"
             );
         }
     }
 
+    #[tokio::test]
+    async fn bearer_auth_passes_through_when_no_authenticator_is_configured() {
+        let svc = service();
+        assert!(
+            svc.list_tasks(list_request_with_authorization(None))
+                .await
+                .is_ok()
+        );
+        assert!(
+            svc.list_tasks(list_request_with_authorization(Some("Bearer anything")))
+                .await
+                .is_ok()
+        );
+    }
+
     #[test]
-    fn bearer_auth_passes_through_when_no_token_configured() {
+    fn static_bearer_interceptor_installs_an_authenticated_identity() {
         let mut auth = BearerAuth {
-            expected: None,
+            expected: Some(Token::new("sekret").unwrap()),
             metrics: noop_api_metrics(),
         };
-        assert!(auth.call(Request::new(())).is_ok());
-        assert!(
-            auth.call(request_with_authorization("Bearer anything"))
-                .is_ok()
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("authorization", "Bearer sekret".parse().unwrap());
+
+        let request = auth.call(request).unwrap();
+        let identity = request.extensions().get::<ApiIdentity>().unwrap();
+        assert_eq!(identity.subject(), None);
+    }
+
+    struct SubjectAuthenticator;
+
+    #[async_trait]
+    impl crate::ApiAuthenticator for SubjectAuthenticator {
+        async fn authenticate(
+            &self,
+            request: AuthenticationRequest<'_>,
+        ) -> Result<ApiIdentity, ApiError> {
+            if request.transport() == Transport::Grpc
+                && request.bearer_credential() == Some("subject-token")
+            {
+                Ok(ApiIdentity::for_subject("user-7").with_attribute("team", "runtime"))
+            } else {
+                Err(ApiError::Unauthenticated("credential rejected".into()))
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAuthorizer {
+        checks: std::sync::Mutex<Vec<(Option<String>, TaskOperation, String)>>,
+    }
+
+    #[async_trait]
+    impl crate::ApiAuthorizer for RecordingAuthorizer {
+        async fn authorize(&self, request: AuthorizationRequest<'_>) -> Result<(), ApiError> {
+            let target = match request.target() {
+                TaskTarget::Collection => "collection".to_owned(),
+                TaskTarget::Task(task) => task.to_string(),
+                TaskTarget::Manifest(manifest) => manifest.name().to_string(),
+            };
+            self.checks.lock().unwrap().push((
+                request
+                    .identity()
+                    .and_then(ApiIdentity::subject)
+                    .map(str::to_owned),
+                request.operation(),
+                target,
+            ));
+            if request.operation() == TaskOperation::StreamLogs {
+                Err(ApiError::Forbidden("log access denied".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_access_hooks_propagate_identity_and_deny_before_handler() {
+        let authenticator: ApiAuthenticatorHandle = Arc::new(SubjectAuthenticator);
+        let recording = Arc::new(RecordingAuthorizer::default());
+        let authorizer: ApiAuthorizerHandle = recording.clone();
+        let service = TaskApiService::new_with_access(
+            Arc::new(StreamMock::default()),
+            noop_api_metrics(),
+            Some(authenticator),
+            Some(authorizer),
+        );
+
+        service
+            .list_tasks(list_request_with_authorization(Some(
+                "Bearer subject-token",
+            )))
+            .await
+            .unwrap();
+
+        let mut logs = Request::new(proto_api::StreamTaskLogsRequest {
+            name: "task-a".into(),
+        });
+        logs.metadata_mut()
+            .insert("authorization", "Bearer subject-token".parse().unwrap());
+        let status = match service.stream_task_logs(logs).await {
+            Err(status) => status,
+            Ok(_) => panic!("authorization must deny the log stream"),
+        };
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+
+        assert_eq!(
+            *recording.checks.lock().unwrap(),
+            vec![
+                (
+                    Some("user-7".to_owned()),
+                    TaskOperation::List,
+                    "collection".to_owned(),
+                ),
+                (
+                    Some("user-7".to_owned()),
+                    TaskOperation::StreamLogs,
+                    "task-a".to_owned(),
+                ),
+            ]
         );
     }
 
@@ -1186,22 +1444,26 @@ mod tests {
         )
     }
 
-    #[test]
-    fn rejected_auth_is_recorded_and_balances_gauge() {
+    #[tokio::test]
+    async fn rejected_auth_is_recorded_and_balances_gauge() {
         use std::sync::atomic::Ordering;
 
         let probe = Arc::new(GaugeProbe::default());
         let metrics: ApiMetricsHandle = probe.clone();
-        let mut auth = BearerAuth {
-            expected: Some(Token::new("secret").unwrap()),
+        let authenticator: ApiAuthenticatorHandle = Arc::new(StaticBearerAuthenticator::new(
+            Token::new("secret").unwrap(),
+        ));
+        let service = TaskApiService::new_with_access(
+            Arc::new(StreamMock::default()),
             metrics,
-        };
-        let mut request = Request::new(());
-        request
-            .extensions_mut()
-            .insert(tonic::GrpcMethod::new(GRPC_API_SERVICE, "GetTask"));
+            Some(authenticator),
+            None,
+        );
 
-        let status = auth.call(request).unwrap_err();
+        let status = service
+            .list_tasks(list_request_with_authorization(None))
+            .await
+            .unwrap_err();
 
         assert_eq!(status.code(), tonic::Code::Unauthenticated);
         assert_eq!(probe.completed.load(Ordering::SeqCst), 1);

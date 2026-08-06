@@ -357,9 +357,9 @@ They also reject an `Embedded` value returned by a custom handler.
 Extension workloads remain public.
 Their GVK and JSON object are preserved across both transports.
 
-## Authentication
+## Authentication and authorization
 
-Authentication is disabled until `with_auth` is called.
+Task API authentication is disabled until `with_auth` or `with_authenticator` is called.
 
 ```rust,no_run
 use std::sync::Arc;
@@ -378,6 +378,60 @@ HTTP expects `Authorization: Bearer <token>`.
 gRPC expects the same value in `authorization` metadata.
 The scheme is case-insensitive.
 An invalid credential is rejected before the handler.
+
+`with_auth` is the static shared-token convenience path. 
+A valid token creates an authenticated identity without an individual subject. 
+Use`with_authenticator` to validate application credentials and return an `ApiIdentity` with a subject and application-owned attributes.
+
+Both transports also accept an `ApiAuthorizer`:
+
+```rust,no_run
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use solti_api::{
+    ApiAuthorizer, ApiError, ApiHandler, AuthorizationRequest, HttpApi, TaskOperation,
+};
+use solti_model::Token;
+
+struct ReadOnlyPolicy;
+
+#[async_trait]
+impl ApiAuthorizer for ReadOnlyPolicy {
+    async fn authorize(&self, request: AuthorizationRequest<'_>) -> Result<(), ApiError> {
+        if matches!(
+            request.operation(),
+            TaskOperation::Get
+                | TaskOperation::List
+                | TaskOperation::Watch
+                | TaskOperation::ListRuns
+                | TaskOperation::StreamLogs
+        ) {
+            Ok(())
+        } else {
+            Err(ApiError::Forbidden("read-only identity".into()))
+        }
+    }
+}
+
+fn read_only_router<H: ApiHandler>(handler: Arc<H>) -> solti_api::axum::Router {
+    HttpApi::new(handler)
+        .with_auth(Token::new("agent-secret").expect("valid token"))
+        .with_authorizer(Arc::new(ReadOnlyPolicy))
+        .router()
+}
+```
+
+The authorizer receives the identity, exact `TaskOperation`, and either a validated manifest, one task name, or the Task collection. 
+A normal denial uses `ApiError::Forbidden`, which maps to HTTP `403` and gRPC `PermissionDenied`.
+
+List and Watch authorization covers the collection operation. 
+The hook does not filter returned items or watch events. 
+Tenant or row-level visibility needs a separate scoped-handler design outside this hook.
+Stream authorization is checked when the stream is opened, not for every event.
+
+If no Task API authenticator is configured, application middleware can insert an `ApiIdentity` into request extensions before the Task API runs. 
+Solti does not define users, roles, tenants, RBAC rules, or policy storage.
 
 ## TLS
 
@@ -433,6 +487,7 @@ Streaming requests remain in flight until the body ends, fails, or is dropped.
 |---------------------------|------------------------------|---------------------|
 | `InvalidRequest`          | `400 Bad Request`            | `InvalidArgument`   |
 | `Unauthenticated`         | `401 Unauthorized`           | `Unauthenticated`   |
+| `Forbidden`               | `403 Forbidden`              | `PermissionDenied`  |
 | `AlreadyExists`           | `409 Conflict`               | `AlreadyExists`     |
 | `Conflict`                | `409 Conflict`               | `Aborted`           |
 | `TaskNotFound`            | `404 Not Found`              | `NotFound`          |

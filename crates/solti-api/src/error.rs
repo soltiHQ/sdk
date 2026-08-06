@@ -107,6 +107,7 @@ impl std::error::Error for ApiConflict {}
 /// |----------------------------|-------|---------------------|
 /// | `InvalidRequest`           | `400` | `InvalidArgument`   |
 /// | `Unauthenticated`          | `401` | `Unauthenticated`   |
+/// | `Forbidden`                | `403` | `PermissionDenied`  |
 /// | `AlreadyExists`            | `409` | `AlreadyExists`     |
 /// | `Conflict`                 | `409` | `Aborted`           |
 /// | `TaskNotFound`, `NotFound` | `404` | `NotFound`          |
@@ -129,6 +130,10 @@ pub enum ApiError {
     /// The bearer credential is missing, malformed, or rejected.
     #[error("unauthenticated: {0}")]
     Unauthenticated(String),
+
+    /// The authenticated identity cannot perform this operation.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 
     /// A retained task already owns the requested name.
     #[error("task already exists: {0}")]
@@ -178,6 +183,7 @@ impl ApiError {
             ApiError::PayloadTooLarge(_) => "PayloadTooLarge",
             ApiError::InvalidRequest(_) => "InvalidRequest",
             ApiError::Unauthenticated(_) => "Unauthenticated",
+            ApiError::Forbidden(_) => "Forbidden",
             ApiError::AlreadyExists(_) => "AlreadyExists",
             ApiError::Conflict(_) => "Conflict",
             ApiError::TaskNotFound(_) => "TaskNotFound",
@@ -195,6 +201,7 @@ impl ApiError {
         match self {
             ApiError::InvalidRequest(_) => "BadRequest",
             ApiError::Unauthenticated(_) => "Unauthorized",
+            ApiError::Forbidden(_) => "Forbidden",
             ApiError::AlreadyExists(_) => "AlreadyExists",
             ApiError::Conflict(_) => "Conflict",
             ApiError::TaskNotFound(_) => "NotFound",
@@ -216,6 +223,7 @@ impl ApiError {
         let (status, message, details) = match self {
             ApiError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg, None),
             ApiError::Unauthenticated(msg) => (StatusCode::UNAUTHORIZED, msg, None),
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg, None),
             ApiError::AlreadyExists(msg) => (StatusCode::CONFLICT, msg, None),
             ApiError::Conflict(conflict) => {
                 let details = HttpStatusDetails {
@@ -346,6 +354,7 @@ fn http_status_reason(_generator: &mut schemars::SchemaGenerator) -> schemars::S
             "BadRequest",
             "Conflict",
             "Expired",
+            "Forbidden",
             "InternalError",
             "MethodNotAllowed",
             "NotFound",
@@ -380,6 +389,7 @@ impl From<ApiError> for tonic::Status {
             ApiError::PayloadTooLarge(msg) => tonic::Status::resource_exhausted(msg),
             ApiError::InvalidRequest(msg) => tonic::Status::invalid_argument(msg),
             ApiError::Unauthenticated(msg) => tonic::Status::unauthenticated(msg),
+            ApiError::Forbidden(msg) => tonic::Status::permission_denied(msg),
             ApiError::AlreadyExists(msg) => tonic::Status::already_exists(msg),
             ApiError::Conflict(conflict) => {
                 use prost::Message as _;
@@ -452,6 +462,7 @@ mod tests {
         let cases = [
             (ApiError::InvalidRequest("x".into()), "InvalidRequest"),
             (ApiError::Unauthenticated("x".into()), "Unauthenticated"),
+            (ApiError::Forbidden("x".into()), "Forbidden"),
             (ApiError::AlreadyExists("x".into()), "AlreadyExists"),
             (ApiError::Conflict(conflict()), "Conflict"),
             (ApiError::TaskNotFound("x".into()), "TaskNotFound"),
@@ -483,6 +494,7 @@ mod tests {
 
         for (error, expected) in [
             (ApiError::AlreadyExists("x".into()), StatusCode::CONFLICT),
+            (ApiError::Forbidden("x".into()), StatusCode::FORBIDDEN),
             (
                 ApiError::ResourceVersionExpired("old revision".into()),
                 StatusCode::GONE,
@@ -504,6 +516,7 @@ mod tests {
 
         for (error, expected) in [
             (ApiError::AlreadyExists("x".into()), Code::AlreadyExists),
+            (ApiError::Forbidden("x".into()), Code::PermissionDenied),
             (
                 ApiError::ResourceVersionExpired("old revision".into()),
                 Code::OutOfRange,

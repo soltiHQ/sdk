@@ -21,13 +21,15 @@
 //! ```text
 //! HTTP CRD JSON ── parse and validate ──┐
 //!                                       ▼
+//!                           authentication + authorization
+//!                                       ▼
 //!                                  ApiHandler
 //!                                       ▲
 //! gRPC v1 DTO ── convert and validate ──┘
 //!                                       └──► custom backend or solti-core
 //! ```
 //!
-//! The transports own wire validation, authentication, metrics, and error mapping.
+//! The transports own wire validation, access-control hooks, metrics, and error mapping.
 //! The handler owns task operations.
 //!
 //! ## Desired State
@@ -68,14 +70,15 @@
 //!
 //! ## Main Types
 //!
-//! | Area          | Types                                                       |
-//! |---------------|-------------------------------------------------------------|
-//! | Handler       | [`ApiHandler`], [`ApiError`]                                |
-//! | Streams       | [`TaskWatchEventStream`], [`OutputEventStream`]             |
-//! | Metrics       | [`ApiMetricsBackend`], [`ApiMetricsHandle`], [`Transport`]  |
-//! | HTTP          | `HttpApi`, `HttpApiParts`                                   |
-//! | gRPC          | `GrpcApi`, `grpc::wire`                                     |
-//! | Core adapter  | `SupervisorApiAdapter`                                      |
+//! | Area          | Types                                                        |
+//! |---------------|--------------------------------------------------------------|
+//! | Handler       | [`ApiHandler`], [`ApiError`]                                 |
+//! | Access        | [`ApiAuthenticator`], [`ApiAuthorizer`], [`ApiIdentity`]     |
+//! | Streams       | [`TaskWatchEventStream`], [`OutputEventStream`]              |
+//! | Metrics       | [`ApiMetricsBackend`], [`ApiMetricsHandle`], [`Transport`]   |
+//! | HTTP          | `HttpApi`, `HttpApiParts`                                    |
+//! | gRPC          | `GrpcApi`, `grpc::wire`                                      |
+//! | Core adapter  | `SupervisorApiAdapter`                                       |
 //!
 //! ## Quick Start
 //!
@@ -145,6 +148,12 @@ pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 mod error;
 pub use error::{ApiConflict, ApiError, ApiErrorCause};
 
+mod auth;
+pub use auth::{
+    ApiAuthenticator, ApiAuthenticatorHandle, ApiAuthorizer, ApiAuthorizerHandle, ApiIdentity,
+    AuthenticationRequest, AuthorizationRequest, TaskOperation, TaskTarget,
+};
+
 mod handler;
 pub use handler::{ApiHandler, OutputEventStream, TaskWatchEventStream};
 
@@ -174,9 +183,6 @@ pub(crate) mod proto_api {
         ".rs"
     ));
 }
-
-#[cfg(any(feature = "grpc", feature = "http"))]
-mod auth;
 
 #[cfg(any(feature = "grpc", feature = "http"))]
 mod validate;
