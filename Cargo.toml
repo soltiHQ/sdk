@@ -23,7 +23,7 @@ clippy-matrix = [
     { package = "solti-api", features = ["grpc"] },
     { package = "solti-api", features = ["grpc-tls"] },
     { package = "solti-api", features = ["http"] },
-    { package = "solti-chain", features = [] },
+    { package = "solti-chain", features = ["schema"] },
     { package = "solti-discover", features = ["grpc"] },
     { package = "solti-discover", features = ["grpc", "tls"] },
     { package = "solti-discover", features = ["http"] },
