@@ -3,7 +3,7 @@
 `solti-chain` adds a conditional chain workload to the Solti task SDK.
 
 A chain is one Solti `Task` with several nested workload steps.
-Only one step runs at a time.
+Only one-step runs at a time.
 Each step can select one next step after success and one after failure.
 
 Taskvisor owns timeout, restart, backoff, admission, cancellation, status, history, and output for the whole chain.

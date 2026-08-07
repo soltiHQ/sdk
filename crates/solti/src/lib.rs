@@ -76,9 +76,9 @@
 //! They do not select the task API exposed by the agent.
 //!
 //! `model` includes the `solti-model/schema` feature.
-//! `chain` runs nested workloads sequentially inside one outer Task. Exactly
-//! one step is active at a time; steps do not receive independent Task
-//! lifecycle policies, status, or history.
+//! `chain` runs nested workloads sequentially inside one outer Task.
+//!
+//! Exactly one step is active at a time; steps do not receive independent Task lifecycle policies, status, or history.
 //! The `full` feature enables the complete standard integration set.
 //!
 //! ## Namespaces
