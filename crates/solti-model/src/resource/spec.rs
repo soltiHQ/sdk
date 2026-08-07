@@ -136,6 +136,18 @@ impl TaskSpec {
 }
 
 impl TaskSpec {
+    /// Replaces the workload on an existing spec.
+    ///
+    /// This method does not validate `workload`.
+    /// Call [`Self::validate`] before using the result outside a validated resource.
+    ///
+    /// This is useful for composite runners that derive an execution view from an existing task while preserving its lifecycle policies.
+    #[inline]
+    pub fn with_workload(mut self, workload: TaskWorkload) -> Self {
+        self.workload = workload;
+        self
+    }
+
     /// Sets a runner selector on an existing spec.
     ///
     /// This method does not validate `sel`.
@@ -160,6 +172,16 @@ impl TaskSpec {
     #[inline]
     pub fn with_runner_selector(mut self, sel: LabelSelector) -> Self {
         self.runner_selector = Some(sel);
+        self
+    }
+
+    /// Removes the runner selector from an existing spec.
+    ///
+    /// Composite runners can use this before applying a step-local selector.
+    /// The selector that chose the composite runner is not inherited by a nested workload.
+    #[inline]
+    pub fn without_runner_selector(mut self) -> Self {
+        self.runner_selector = None;
         self
     }
 
@@ -497,6 +519,16 @@ mod tests {
                 .admission(),
             AdmissionPolicy::Replace
         );
+
+        let mut labels = crate::Labels::new();
+        labels.insert("runtime", "nested");
+        let selector = LabelSelector::from_labels(labels);
+        let replaced = valid_spec()
+            .with_runner_selector(selector)
+            .with_workload(embedded())
+            .without_runner_selector();
+        assert!(matches!(replaced.workload(), TaskWorkload::Embedded(_)));
+        assert!(replaced.runner_selector().is_none());
     }
 
     #[test]

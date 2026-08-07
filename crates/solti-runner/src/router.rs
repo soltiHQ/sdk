@@ -1,6 +1,7 @@
 //! # Runner router
 //!
 //! [`RunnerRouter`] owns runner registration and selection.
+//! [`RunnerCatalog`] is a cloneable, immutable snapshot for runner composition.
 //!
 //! ## Flow
 //!
@@ -30,11 +31,48 @@ use crate::runner::Runner;
 use crate::{context::BuildContext, id::make_run_id, output::OutputPublisherHandle};
 
 /// Single runner entry with optional static labels used for routing.
+#[derive(Clone)]
 struct RunnerEntry {
     /// Concrete runner implementation.
     runner: Arc<dyn Runner>,
     /// Immutable routing and discovery metadata captured at registration.
     capability: RunnerCapability,
+}
+
+/// Cloneable, immutable snapshot of runner registrations.
+///
+/// A catalog preserves the runners, capability labels, and registration order captured by [`RunnerRouter::catalog`].
+/// Later router registrations do not change an existing catalog.
+///
+/// Composing runners use [`build`](Self::build) to route an inner task with an explicitly provided [`BuildContext`].
+/// Selection, [`RunId`](crate::RunId) allocation, and returned task-name validation are identical to [`RunnerRouter::build`].
+#[derive(Clone)]
+pub struct RunnerCatalog {
+    runners: Arc<[RunnerEntry]>,
+}
+
+impl RunnerCatalog {
+    /// Selects a snapshotted runner and builds a [`TaskRef`].
+    ///
+    /// The provided context is passed to the selected runner.
+    /// The catalog allocates one [`RunId`](crate::RunId), and the returned task name must equal [`RunId::name`](crate::RunId::name).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouterError`] when selection or task construction fails.
+    /// Returns [`RouterError::RunIdMismatch`] when the task name is incorrect.
+    #[instrument(
+        level = "debug",
+        skip(self, task, ctx),
+        fields(
+            task = %task.name(),
+            api_version = task.spec().workload().api_version(),
+            kind = task.spec().workload().kind()
+        )
+    )]
+    pub fn build(&self, task: &Task, ctx: &BuildContext) -> Result<TaskRef, RouterError> {
+        build_from_entries(&self.runners, task, ctx)
+    }
 }
 
 /// Router that selects a [`Runner`] for a [`Task`].
@@ -80,6 +118,17 @@ impl RunnerRouter {
     pub fn with_output_publisher(mut self, publisher: OutputPublisherHandle) -> Self {
         self.ctx = self.ctx.with_output_publisher(publisher);
         self
+    }
+
+    /// Captures the current runner registrations for composition.
+    ///
+    /// The returned [`RunnerCatalog`] is immutable and cheap to clone.
+    /// It preserves capability labels and routing priority at the time of this call.
+    /// Runners registered afterward are visible to this router but not to the catalog.
+    pub fn catalog(&self) -> RunnerCatalog {
+        RunnerCatalog {
+            runners: self.runners.clone().into(),
+        }
     }
 
     /// Registers a runner without labels.
@@ -162,37 +211,7 @@ impl RunnerRouter {
     /// Returns [`RouterError::EmbeddedWorkload`] for embedded workloads.
     /// Returns [`RouterError::NoRunner`] when no registration matches.
     pub fn pick(&self, task: &Task) -> Result<&dyn Runner, RouterError> {
-        Ok(self.pick_entry(task)?.runner.as_ref())
-    }
-
-    fn pick_entry(&self, task: &Task) -> Result<&RunnerEntry, RouterError> {
-        let selector = task.spec().runner_selector();
-        let workload = task.spec().workload();
-        if matches!(workload, TaskWorkload::Embedded(_)) {
-            return Err(RouterError::EmbeddedWorkload);
-        }
-        let workload_type = workload.type_meta();
-
-        let mut matching = self.runners.iter().filter(|entry| {
-            entry.capability.workload_types().contains(&workload_type)
-                && selector.is_none_or(|sel| sel.matches(entry.capability.labels()))
-        });
-
-        let first = matching.next().ok_or_else(|| RouterError::NoRunner {
-            api_version: workload_type.api_version().to_owned(),
-            kind: workload_type.kind().to_owned(),
-        })?;
-        if matching.next().is_some() {
-            debug!(
-                task = %task.name(),
-                slot = %task.slot(),
-                api_version = workload.api_version(),
-                kind = workload.kind(),
-                runner = first.capability.name(),
-                "multiple runners match this spec; using the first registered (registration order is significant)"
-            );
-        }
-        Ok(first)
+        Ok(pick_entry(&self.runners, task)?.runner.as_ref())
     }
 
     /// Builds a [`TaskRef`] with the selected runner.
@@ -215,32 +234,70 @@ impl RunnerRouter {
         )
     )]
     pub fn build(&self, task: &Task) -> Result<TaskRef, RouterError> {
-        trace!(task = ?task, "router received task");
-
-        let entry = self.pick_entry(task)?;
-        let runner = entry.runner.as_ref();
-        let runner_name = entry.capability.name().to_owned();
-        let run_id = make_run_id(&runner_name, task.slot().as_str());
-        let task_ref = runner
-            .build_task(task, &run_id, &self.ctx)
-            .map_err(|source| RouterError::Build {
-                runner: runner_name.clone(),
-                source,
-            })?;
-        if task_ref.name() != run_id.name() {
-            return Err(RouterError::RunIdMismatch {
-                runner: runner_name,
-                expected: run_id.into_name(),
-                actual: task_ref.name().to_owned(),
-            });
-        }
-        debug!(
-            runner = runner_name,
-            run_id = task_ref.name(),
-            "runner built task successfully"
-        );
-        Ok(task_ref)
+        build_from_entries(&self.runners, task, &self.ctx)
     }
+}
+
+fn pick_entry<'a>(runners: &'a [RunnerEntry], task: &Task) -> Result<&'a RunnerEntry, RouterError> {
+    let selector = task.spec().runner_selector();
+    let workload = task.spec().workload();
+    if matches!(workload, TaskWorkload::Embedded(_)) {
+        return Err(RouterError::EmbeddedWorkload);
+    }
+    let workload_type = workload.type_meta();
+
+    let mut matching = runners.iter().filter(|entry| {
+        entry.capability.workload_types().contains(&workload_type)
+            && selector.is_none_or(|sel| sel.matches(entry.capability.labels()))
+    });
+
+    let first = matching.next().ok_or_else(|| RouterError::NoRunner {
+        api_version: workload_type.api_version().to_owned(),
+        kind: workload_type.kind().to_owned(),
+    })?;
+    if matching.next().is_some() {
+        debug!(
+            task = %task.name(),
+            slot = %task.slot(),
+            api_version = workload.api_version(),
+            kind = workload.kind(),
+            runner = first.capability.name(),
+            "multiple runners match this spec; using the first registered (registration order is significant)"
+        );
+    }
+    Ok(first)
+}
+
+fn build_from_entries(
+    runners: &[RunnerEntry],
+    task: &Task,
+    ctx: &BuildContext,
+) -> Result<TaskRef, RouterError> {
+    trace!(task = ?task, "router received task");
+
+    let entry = pick_entry(runners, task)?;
+    let runner = entry.runner.as_ref();
+    let runner_name = entry.capability.name().to_owned();
+    let run_id = make_run_id(&runner_name, task.slot().as_str());
+    let task_ref = runner
+        .build_task(task, &run_id, ctx)
+        .map_err(|source| RouterError::Build {
+            runner: runner_name.clone(),
+            source,
+        })?;
+    if task_ref.name() != run_id.name() {
+        return Err(RouterError::RunIdMismatch {
+            runner: runner_name,
+            expected: run_id.into_name(),
+            actual: task_ref.name().to_owned(),
+        });
+    }
+    debug!(
+        runner = runner_name,
+        run_id = task_ref.name(),
+        "runner built task successfully"
+    );
+    Ok(task_ref)
 }
 
 #[cfg(test)]
@@ -328,6 +385,7 @@ mod tests {
     #[test]
     fn embedded_workloads_are_not_routed_by_pick_or_build() {
         let router = RunnerRouter::new();
+        let catalog = router.catalog();
         let task = mk_task(TaskWorkload::Embedded(
             EmbeddedSpec::new("test-revision").expect("valid embedded revision"),
         ));
@@ -338,6 +396,10 @@ mod tests {
         ));
         assert!(matches!(
             router.build(&task),
+            Err(RouterError::EmbeddedWorkload)
+        ));
+        assert!(matches!(
+            catalog.build(&task, &BuildContext::default()),
             Err(RouterError::EmbeddedWorkload)
         ));
     }
@@ -427,6 +489,120 @@ mod tests {
 
         let task = router.build(&subprocess_task()).unwrap();
         assert!(task.name().starts_with("context-test-slot-"));
+    }
+
+    #[test]
+    fn catalog_is_a_cloneable_snapshot_with_explicit_context_and_exact_routing() {
+        struct CatalogOutput;
+
+        impl OutputPublisher for CatalogOutput {
+            fn sink_for(
+                &self,
+                _task_name: &TaskId,
+                generation: u64,
+                attempt: u32,
+            ) -> Option<OutputSink> {
+                Some(OutputSink::new(generation, attempt, |_| {}))
+            }
+        }
+
+        struct CatalogContextRunner {
+            name: &'static str,
+        }
+
+        impl Runner for CatalogContextRunner {
+            fn name(&self) -> &str {
+                self.name
+            }
+
+            fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+                vec![workload_type(
+                    solti_model::WORKLOAD_API_VERSION,
+                    "Subprocess",
+                )]
+            }
+
+            fn build_task(
+                &self,
+                _task: &Task,
+                run_id: &RunId,
+                ctx: &BuildContext,
+            ) -> Result<TaskRef, RunnerError> {
+                if ctx.env().get("CATALOG_CONTEXT") != Some("provided") {
+                    return Err(RunnerError::Internal(
+                        "catalog did not pass the explicit context".into(),
+                    ));
+                }
+                if ctx
+                    .output_publisher()
+                    .sink_for(&TaskId::new("test-task").unwrap(), 2, 1)
+                    .is_none()
+                {
+                    return Err(RunnerError::Internal(
+                        "catalog did not pass the explicit output publisher".into(),
+                    ));
+                }
+                Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move {
+                    Ok::<(), TaskError>(())
+                }))
+            }
+        }
+
+        let mut router = RunnerRouter::new();
+        for (name, zone) in [
+            ("catalog-eu", "eu"),
+            ("catalog-us-first", "us"),
+            ("catalog-us-second", "us"),
+        ] {
+            let mut labels = Labels::new();
+            labels.insert("zone", zone);
+            router
+                .register_with_labels(Arc::new(CatalogContextRunner { name }), labels)
+                .unwrap();
+        }
+
+        let catalog = router.catalog();
+        router
+            .register(Arc::new(DeclaredRunner {
+                name: "registered-later",
+                workload_types: vec![workload_type("tasks.example.io/v1", "ImageResize")],
+            }))
+            .unwrap();
+
+        let mut match_labels = Labels::new();
+        match_labels.insert("zone", "us");
+        let (_, metadata, spec, status) = subprocess_task().into_parts();
+        let selected_task = Task::from_parts(
+            solti_model::TypeMeta::task(),
+            metadata,
+            spec.with_runner_selector(LabelSelector::from_labels(match_labels)),
+            status,
+        )
+        .unwrap();
+        let mut env = RunnerEnv::new();
+        env.push("CATALOG_CONTEXT", "provided");
+        let explicit_ctx = BuildContext::default()
+            .with_env(env)
+            .with_output_publisher(Arc::new(CatalogOutput));
+
+        let cloned_catalog = catalog.clone();
+        drop(catalog);
+        let built = cloned_catalog.build(&selected_task, &explicit_ctx).unwrap();
+        assert!(built.name().starts_with("catalog-us-first-test-slot-"));
+
+        let later_task = mk_task(TaskWorkload::Extension(
+            solti_model::ExtensionWorkload::new(
+                "tasks.example.io/v1",
+                "ImageResize",
+                serde_json::json!({ "width": 1280 }),
+            )
+            .unwrap(),
+        ));
+        assert!(matches!(
+            cloned_catalog.build(&later_task, &explicit_ctx),
+            Err(RouterError::NoRunner { .. })
+        ));
+        assert!(router.build(&later_task).is_ok());
     }
 
     #[test]
@@ -649,8 +825,14 @@ mod tests {
 
         let mut router = RunnerRouter::new();
         router.register(Arc::new(WrongNameRunner)).unwrap();
+        let catalog = router.catalog();
 
         match router.build(&subprocess_task()) {
+            Err(RouterError::RunIdMismatch { .. }) => {}
+            Err(error) => panic!("expected RunIdMismatch, got {error:?}"),
+            Ok(_) => panic!("expected RunIdMismatch, got Ok(..)"),
+        }
+        match catalog.build(&subprocess_task(), &BuildContext::default()) {
             Err(RouterError::RunIdMismatch { .. }) => {}
             Err(error) => panic!("expected RunIdMismatch, got {error:?}"),
             Ok(_) => panic!("expected RunIdMismatch, got Ok(..)"),

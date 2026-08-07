@@ -9,6 +9,7 @@
 //!
 //! Use [`Runner`] to implement an execution backend.
 //! Use [`RunnerRouter`] to register and select backends.
+//! Use [`RunnerCatalog`] to give a composing runner an immutable registration snapshot.
 //! Use [`BuildContext`] to inject shared runner dependencies.
 //!
 //! ## Flow
@@ -33,6 +34,7 @@
 //! Registration captures an immutable capability snapshot.
 //! The snapshot contains the runner name, labels, and supported workload GVKs.
 //! Routing and agent capability discovery use the same snapshot.
+//! [`RunnerRouter::catalog`] additionally captures the registered runner handles and their routing order for composition.
 //!
 //! ## Build Contract
 //!
@@ -57,7 +59,7 @@
 //!
 //! | Area          | Types                                                  |
 //! |---------------|--------------------------------------------------------|
-//! | Runner plugin | [`Runner`], [`RunnerRouter`]                           |
+//! | Runner plugin | [`Runner`], [`RunnerRouter`], [`RunnerCatalog`]        |
 //! | Build data    | [`BuildContext`]                                       |
 //! | Output        | [`OutputPublisher`], [`OutputSink`]                    |
 //! | Run identity  | [`RunId`], [`make_run_id`]                             |
@@ -116,7 +118,7 @@ mod environment;
 pub use environment::{RunnerEnv, merge_env};
 
 mod router;
-pub use router::RunnerRouter;
+pub use router::{RunnerCatalog, RunnerRouter};
 
 mod id;
 pub use id::{RunId, make_run_id};

@@ -68,6 +68,8 @@ The example declares the built-in `Subprocess` GVK.
 |---------------------------------------|-------------------------------------|-----------------------------------------|
 | `register`                            | `Arc<dyn Runner>`                   | Validated runner entry                  |
 | `register_with_labels`                | Runner and static `Labels`          | Labeled runner entry                    |
+| `catalog`                             | Current runner registrations        | Immutable, cloneable `RunnerCatalog`    |
+| `RunnerCatalog::build`                | `Task` and explicit `BuildContext`  | `taskvisor::TaskRef`                    |
 | `pick`                                | `Task`                              | First matching `Runner`                 |
 | `build`                               | `Task`                              | `taskvisor::TaskRef`                    |
 | `capabilities`                        | Registered entries                  | Owned `AgentCapabilities` snapshot      |
@@ -123,6 +125,22 @@ Registration validates and snapshots the runner declaration.
 `RunnerRouter::capabilities()` returns an owned snapshot.
 Runner entries remain in routing priority order.
 Workload GVKs inside each entry use canonical order.
+
+## Runner composition
+
+`RunnerRouter::catalog()` captures the current registrations, including their labels and routing priority. 
+The catalog is immutable and cheap to clone. 
+Later registrations do not change it.
+
+Take the catalog before registering a composing runner such as `ChainRunner`:
+
+```rust,ignore
+let inner_runners = router.catalog();
+router.register(Arc::new(ChainRunner::new("chain", inner_runners)))?;
+```
+
+The composing runner calls `RunnerCatalog::build` for each inner task and provides the `BuildContext` explicitly. 
+Catalog builds use the same exact GVK and selector routing, registration order, `RunId` allocation, and returned-name validation as `RunnerRouter::build`.
 
 ## Build contract
 

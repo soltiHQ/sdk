@@ -25,6 +25,7 @@
 //!        solti
 //!          ├── model ─────────────► solti-model + JSON Schema
 //!          ├── runner ────────────► solti-runner + model + taskvisor
+//!          ├── chain ─────────────► solti-chain + runner
 //!          ├── core ──────────────► solti-core + runner + taskvisor/controller
 //!          ├── exec-* ────────────► solti-exec integrations
 //!          ├── api-* ─────────────► solti-api transports and adapters
@@ -43,6 +44,7 @@
 //! |------------------------------|-------------------------|
 //! | Resource types and schemas   | `model`                 |
 //! | Runner registration          | `runner`                |
+//! | Conditional workload chain   | `chain`                 |
 //! | Desired-state supervision    | `core`                  |
 //! | Host process controls        | `exec-host-process`     |
 //! | Subprocess execution         | `exec-subprocess`       |
@@ -74,6 +76,9 @@
 //! They do not select the task API exposed by the agent.
 //!
 //! `model` includes the `solti-model/schema` feature.
+//! `chain` runs nested workloads sequentially inside one outer Task. Exactly
+//! one step is active at a time; steps do not receive independent Task
+//! lifecycle policies, status, or history.
 //! The `full` feature enables the complete standard integration set.
 //!
 //! ## Namespaces
@@ -81,6 +86,7 @@
 //! | Namespace      | Component crate       |
 //! |----------------|-----------------------|
 //! | `api`          | `solti-api`           |
+//! | `chain`        | `solti-chain`         |
 //! | `core`         | `solti-core`          |
 //! | `discover`     | `solti-discover`      |
 //! | `exec`         | `solti-exec`          |
@@ -100,7 +106,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! solti = { version = "0.0.3", features = [
+//! solti = { version = "0.0.4", features = [
 //!     "api-core-adapter",
 //!     "api-http",
 //!     "exec-subprocess",
@@ -137,6 +143,11 @@ struct ReadmeDoctests;
 #[cfg(feature = "api")]
 #[cfg_attr(docsrs, doc(cfg(feature = "api")))]
 pub use solti_api as api;
+
+/// Conditional composite workloads from `solti-chain`.
+#[cfg(feature = "chain")]
+#[cfg_attr(docsrs, doc(cfg(feature = "chain")))]
+pub use solti_chain as chain;
 
 /// Desired-state supervisor types from `solti-core`.
 #[cfg(feature = "core")]

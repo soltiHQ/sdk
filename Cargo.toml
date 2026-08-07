@@ -2,6 +2,7 @@
 members = [
     "crates/solti",
     "crates/solti-api",
+    "crates/solti-chain",
     "crates/solti-core",
     "crates/solti-discover",
     "crates/solti-exec",
@@ -17,10 +18,12 @@ resolver = "2"
 clippy-matrix = [
     { package = "solti", features = ["api-core-adapter", "api-grpc-tls", "exec-subprocess"] },
     { package = "solti", features = ["api-core-adapter", "api-http", "discover-http", "exec-subprocess"] },
+    { package = "solti", features = ["chain", "core", "exec-subprocess"] },
     { package = "solti", features = ["core", "exec-containerd"] },
     { package = "solti-api", features = ["grpc"] },
     { package = "solti-api", features = ["grpc-tls"] },
     { package = "solti-api", features = ["http"] },
+    { package = "solti-chain", features = [] },
     { package = "solti-discover", features = ["grpc"] },
     { package = "solti-discover", features = ["grpc", "tls"] },
     { package = "solti-discover", features = ["http"] },
@@ -79,6 +82,7 @@ serde_json          = "1.0.151"
 sha2                = "0.11.0"
 solti               = { path = "crates/solti",            version = "0.0.4", default-features = false }
 solti-api           = { path = "crates/solti-api",        version = "0.0.4", default-features = false }
+solti-chain         = { path = "crates/solti-chain",      version = "0.0.4", default-features = false }
 solti-core          = { path = "crates/solti-core",       version = "0.0.4", default-features = false }
 solti-discover      = { path = "crates/solti-discover",   version = "0.0.4", default-features = false }
 solti-exec          = { path = "crates/solti-exec",       version = "0.0.4", default-features = false }
