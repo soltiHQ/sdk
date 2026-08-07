@@ -19,16 +19,13 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 use solti_api::{ApiError, ApiHandler, HttpApi, OutputEventStream, TaskWatchEventStream};
+use solti_chain::{ChainSpec, FailureMode};
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, EmbeddedSpec, Flag, JitterPolicy, Labels, OutputChunk,
     OutputEvent, RestartPolicy, StreamKind, SubprocessMode, SubprocessSpec, Task, TaskContinuation,
     TaskEnv, TaskFilter, TaskId, TaskManifest, TaskPage, TaskPhase, TaskQuery, TaskRun, TaskSpec,
     TaskWatchEvent, TaskWorkload, WorkloadTypeMeta, WritePreconditions,
 };
-
-// ---------------------------------------------------------------------------
-// CRD-shaped request bodies.
-// ---------------------------------------------------------------------------
 
 const CREATE_COMMAND_BODY: &str = r#"{
   "apiVersion": "solti.io/v1",
@@ -97,7 +94,6 @@ const CREATE_SCRIPT_BODY: &str = r#"{
   }
 }"#;
 
-/// A script with an explicitly selected interpreter.
 const CREATE_CUSTOM_INTERPRETER_BODY: &str = r#"{
   "apiVersion": "solti.io/v1",
   "kind": "Task",
@@ -185,6 +181,68 @@ const CREATE_EXTENSION_BODY: &str = r#"{
   }
 }"#;
 
+const CREATE_CHAIN_BODY: &str = r#"{
+  "apiVersion": "solti.io/v1",
+  "kind": "Task",
+  "metadata": { "name": "task-chain-1" },
+  "spec": {
+    "slot": "chain-job",
+    "workload": {
+      "apiVersion": "chain.solti.io/v1alpha1",
+      "kind": "Chain",
+      "spec": {
+        "entry": "task1",
+        "steps": [
+          {
+            "name": "task1",
+            "workload": {
+              "apiVersion": "steps.example.io/v1",
+              "kind": "Step",
+              "spec": { "id": "task1", "outcome": "success" }
+            },
+            "onSuccess": "task2"
+          },
+          {
+            "name": "task2",
+            "workload": {
+              "apiVersion": "steps.example.io/v1",
+              "kind": "Step",
+              "spec": { "id": "task2", "outcome": "success" }
+            },
+            "onSuccess": "task3"
+          },
+          {
+            "name": "task3",
+            "workload": {
+              "apiVersion": "steps.example.io/v1",
+              "kind": "Step",
+              "spec": { "id": "task3", "outcome": "failure" }
+            },
+            "onFailure": { "next": "task4", "mode": "recover" }
+          },
+          {
+            "name": "task4",
+            "workload": {
+              "apiVersion": "steps.example.io/v1",
+              "kind": "Step",
+              "spec": { "id": "task4", "outcome": "success" }
+            }
+          }
+        ]
+      }
+    },
+    "timeout": 30000,
+    "restart": { "type": "never" },
+    "backoff": {
+      "jitter": "full",
+      "firstMs": 1000,
+      "maxMs": 10000,
+      "factor": 2.0
+    },
+    "admission": "dropIfRunning"
+  }
+}"#;
+
 const CREATE_EMBEDDED_BODY: &str = r#"{
   "apiVersion": "solti.io/v1",
   "kind": "Task",
@@ -208,11 +266,6 @@ const CREATE_EMBEDDED_BODY: &str = r#"{
   }
 }"#;
 
-// ---------------------------------------------------------------------------
-// Mock handler with fixtures matching the documented response examples.
-// ---------------------------------------------------------------------------
-
-/// Task fixture used to pin the public resource shape.
 fn fixture_task() -> Task {
     let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
         SubprocessMode::Command {
@@ -259,7 +312,6 @@ fn embedded_task() -> Task {
     Task::new("embedded-task", spec).unwrap()
 }
 
-/// Run fixtures used to pin the public history shape.
 fn fixture_runs() -> Vec<TaskRun> {
     let workload = WorkloadTypeMeta::new("solti.io/v1", "Subprocess").unwrap();
     let failed = TaskRun::from_parts(
@@ -438,7 +490,6 @@ impl ApiHandler for WireMock {
     }
 
     async fn stream_task_logs(&self, _id: &TaskId) -> Result<OutputEventStream, ApiError> {
-        // Fixtures pinning the SSE event contract.
         let events = vec![
             OutputEvent::RunStarted {
                 generation: 1,
@@ -486,10 +537,6 @@ fn post_json(uri: &str, body: &str) -> Request<Body> {
         .body(Body::from(body.to_string()))
         .unwrap()
 }
-
-// ---------------------------------------------------------------------------
-// CRD request bodies must deserialize through solti-model.
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn create_command_resource_is_accepted() {
@@ -560,6 +607,34 @@ async fn create_extension_workload_is_accepted_and_returned_unchanged() {
 }
 
 #[tokio::test]
+async fn create_chain_workload_is_accepted_and_returned_unchanged() {
+    let app = router_with(Arc::new(WireMock::default()));
+    let request: Value = serde_json::from_str(CREATE_CHAIN_BODY).unwrap();
+
+    let resp = app
+        .oneshot(post_json("/apis/solti.io/v1/tasks", CREATE_CHAIN_BODY))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = body_json(resp).await;
+    assert_eq!(body["metadata"]["name"], "task-chain-1");
+    assert_eq!(
+        body["spec"]["workload"], request["spec"]["workload"],
+        "HTTP must preserve the complete Chain extension workload"
+    );
+
+    let workload: TaskWorkload = serde_json::from_value(body["spec"]["workload"].clone()).unwrap();
+    let chain = ChainSpec::from_workload(&workload).unwrap();
+    assert_eq!(chain.entry().as_str(), "task1");
+    assert_eq!(chain.steps().len(), 4);
+    assert_eq!(
+        chain.step("task3").unwrap().on_failure().unwrap().mode(),
+        FailureMode::Recover
+    );
+}
+
+#[tokio::test]
 async fn create_embedded_workload_is_rejected_before_the_handler() {
     let handler = Arc::new(WireMock::default());
     let app = router_with(Arc::clone(&handler));
@@ -592,8 +667,6 @@ async fn create_rejects_proto_json_string_timeout() {
 
 #[tokio::test]
 async fn create_rejects_removed_task_spec_fields() {
-    // Removed TaskSpec fields (`kind`, `timeout`) are not part of the current
-    // CRD resource contract and must be rejected.
     let app = router_with(Arc::new(WireMock::default()));
     let legacy = r#"{
       "apiVersion": "solti.io/v1",
@@ -802,10 +875,6 @@ async fn apply_rejects_path_and_metadata_name_mismatch() {
     assert_eq!(body_json(response).await["reason"], "BadRequest");
     assert_eq!(*handler.last_admission.lock().unwrap(), None);
 }
-
-// ---------------------------------------------------------------------------
-// Documented response shapes must match what the transport actually emits.
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn get_task_response_matches_crd_shape() {
@@ -1414,10 +1483,6 @@ async fn sse_preserves_non_utf8_output_as_base64() {
     assert!(body.contains(r#""line":"aGn//g==""#), "{body}");
     assert!(!body.contains('\u{FFFD}'), "{body}");
 }
-
-// ---------------------------------------------------------------------------
-// Documented error mappings.
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn slot_conflict_maps_to_409_already_exists() {

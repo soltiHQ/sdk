@@ -2491,6 +2491,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "solti-chain",
  "solti-core",
  "solti-model",
  "solti-runner",

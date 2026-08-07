@@ -9,8 +9,8 @@ Exactly one-step runs at a time and selects at most one next step through `onSuc
 The outer Task owns timeout, restart, backoff, admission, cancellation, status, history, and output. 
 A retry starts again from `entry`; completed side effects are not rolled back.
 
-The outer Task carries Chain as a regular extension workload. 
-Place this JSON at `spec.workload` in a request sent through the existing Task API:
+The outer Task carries Chain as a regular extension workload.
+For the HTTP API, place this JSON at `Task.spec.workload`:
 
 ```json
 {
@@ -49,6 +49,9 @@ Place this JSON at `spec.workload` in a request sent through the existing Task A
   }
 }
 ```
+
+For gRPC, use `TaskWorkload` with the same `api_version` and `kind`, select its `extension` field, and put the UTF-8 JSON bytes of the inner Chain `spec` object in `ExtensionTask.spec.raw`. 
+Generated protobuf clients pass those bytes directly; protobuf JSON represents them as base64.
 
 ```rust,no_run
 use solti_chain::{ChainSpec, ChainStep, FailureMode, register_chain_runner};

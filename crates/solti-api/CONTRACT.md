@@ -85,6 +85,14 @@ Their `spec` must be a JSON object.
 Built-in workload specs reject unknown fields.
 Extension workload fields are owned by the application.
 
+`chain.solti.io/v1alpha1`, kind `Chain`, uses this extension boundary. 
+HTTP places the Chain object directly in `Task.spec.workload.spec`. 
+gRPC places the UTF-8 JSON bytes of that same Chain spec in `ExtensionTask.spec.raw`.
+
+The transports validate the extension GVK and require an object payload. 
+The Chain runner validates its entry, steps, transitions, reachability, and acyclicity when core reconciles the Task. 
+Chain remains one outer Task, existing Task status, run history, and output messages require no extra fields.
+
 The built-in `solti.io/v1` `Embedded` workload is SDK-only.
 HTTP and gRPC reject it as input.
 `SupervisorApiAdapter` also hides it from reads, watches, history, deletion, and output.
@@ -546,6 +554,8 @@ The complete service method prefix is:
 Resource and live-output timestamps are Unix milliseconds.
 Output chunks contain raw protobuf bytes.
 Extension workload specs contain one UTF-8 JSON object in `RawExtension.raw`.
+For a Chain workload, `TaskWorkload.api_version` is `chain.solti.io/v1alpha1`, `kind` is `Chain`, and `RawExtension.raw` contains the serialized `ChainSpec` object. 
+Protobuf JSON represents those bytes as base64; generated clients pass the UTF-8 bytes directly.
 
 Encoded and decoded messages are limited to 4 MiB.
 
