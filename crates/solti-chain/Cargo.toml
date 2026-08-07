@@ -1,0 +1,40 @@
+[package]
+name = "solti-chain"
+
+description   = "Conditional composite workload runner for the Solti task SDK."
+keywords      = ["task", "workflow", "chain", "orchestration", "model"]
+categories    = ["asynchronous", "concurrency"]
+documentation = "https://docs.rs/solti-chain"
+readme        = "README.md"
+
+rust-version.workspace = true
+repository.workspace   = true
+homepage.workspace     = true
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+
+[features]
+default = ["schema"]
+schema  = ["dep:schemars", "solti-model/schema"]
+
+[dependencies]
+bytes        = { workspace = true }
+parking_lot  = { workspace = true }
+schemars     = { workspace = true, optional = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+solti-model  = { workspace = true, default-features = false }
+solti-runner = { workspace = true }
+taskvisor    = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+
+[dev-dependencies]
+jsonschema = { workspace = true }
+taskvisor  = { workspace = true, features = ["test-util", "tokio-util-interop"] }
+tokio      = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

@@ -105,10 +105,11 @@ pub fn convert_task_spec(spec: proto_api::TaskSpec) -> Result<TaskSpec, ApiError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solti_chain::{CHAIN_API_VERSION, CHAIN_KIND, ChainSpec, ChainStep, FailureMode};
     use solti_model::{
-        AdmissionPolicy, ContainerSpec, ExtensionWorkload, JitterPolicy, RestartPolicy,
-        SelectorOperator, SubprocessMode, SubprocessSpec, TaskWorkload, WORKLOAD_API_VERSION,
-        WasmSpec,
+        AdmissionPolicy, ContainerSpec, ExtensionWorkload, Flag, JitterPolicy, RestartPolicy,
+        SelectorOperator, SubprocessMode, SubprocessSpec, TaskEnv, TaskWorkload,
+        WORKLOAD_API_VERSION, WasmSpec,
     };
     use std::collections::HashMap;
 
@@ -371,6 +372,57 @@ mod tests {
         assert_eq!(extension.api_version(), "workloads.example.io/v1");
         assert_eq!(extension.kind(), "DatabaseBackup");
         assert_eq!(extension.spec(), &expected);
+    }
+
+    #[test]
+    fn chain_workload_round_trips_through_raw_extension() {
+        let subprocess = |command: &str| {
+            TaskWorkload::Subprocess(SubprocessSpec::new(
+                SubprocessMode::Command {
+                    command: command.to_owned(),
+                    args: vec!["--verbose".to_owned()],
+                },
+                TaskEnv::default(),
+                None,
+                Flag::enabled(),
+            ))
+        };
+        let expected = ChainSpec::new(
+            "prepare",
+            vec![
+                ChainStep::new("prepare", subprocess("prepare"))
+                    .unwrap()
+                    .with_on_success("run")
+                    .unwrap(),
+                ChainStep::new("run", subprocess("run"))
+                    .unwrap()
+                    .with_on_failure("recover", FailureMode::Recover)
+                    .unwrap(),
+                ChainStep::new("recover", subprocess("recover")).unwrap(),
+            ],
+        )
+        .unwrap();
+        let workload = expected.clone().into_workload().unwrap();
+
+        let proto = workload_to_proto(&workload).unwrap();
+        assert_eq!(proto.api_version, CHAIN_API_VERSION);
+        assert_eq!(proto.kind, CHAIN_KIND);
+        let Some(proto_api::task_workload::Spec::Extension(extension)) = proto.spec.as_ref() else {
+            panic!("expected Chain to use ExtensionTask");
+        };
+        let raw = extension
+            .spec
+            .as_ref()
+            .expect("expected Chain to use RawExtension");
+        let raw_json: serde_json::Value = serde_json::from_slice(&raw.raw).unwrap();
+        assert_eq!(raw_json["entry"], "prepare");
+        assert_eq!(raw_json["steps"][0]["workload"]["kind"], "Subprocess");
+        assert_eq!(raw_json["steps"][1]["onFailure"]["next"], "recover");
+        assert_eq!(raw_json["steps"][1]["onFailure"]["mode"], "recover");
+
+        let converted = convert_task_workload(proto).unwrap();
+        let actual = ChainSpec::from_workload(&converted).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -357,6 +357,18 @@ They also reject an `Embedded` value returned by a custom handler.
 Extension workloads remain public.
 Their GVK and JSON object are preserved across both transports.
 
+Chain is transported through this extension contract:
+
+| Transport | Chain encoding |
+|-----------|----------------|
+| HTTP | `Task.spec.workload` uses `apiVersion: chain.solti.io/v1alpha1`, `kind: Chain`, and the Chain object in `spec` |
+| gRPC | `TaskWorkload` uses the same GVK and carries the serialized Chain spec in `ExtensionTask.spec.raw` |
+
+The API does not create separate resources for Chain steps. Status, run
+history, and live output continue to describe the one outer Task. Chain graph
+validation happens when the registered Chain runner builds the workload during
+core reconciliation.
+
 ## Authentication and authorization
 
 Task API authentication is disabled until `with_auth` or `with_authenticator` is called.

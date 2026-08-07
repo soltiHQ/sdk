@@ -27,6 +27,7 @@ taskvisor-tokio-util-interop = ["taskvisor", "taskvisor/tokio-util-interop"]
 taskvisor-tracing            = ["taskvisor", "taskvisor/tracing"]
 
 runner = ["dep:solti-runner", "model", "taskvisor"]
+chain  = ["dep:solti-chain", "runner", "solti-chain/schema"]
 core   = ["dep:solti-core", "model", "runner", "taskvisor-controller"]
 
 exec              = ["dep:solti-exec"]
@@ -105,6 +106,7 @@ full = [
     "api-core-adapter",
     "api-grpc-tls",
     "api-http",
+    "chain",
     "discover-grpc",
     "discover-http",
     "discover-tls",
@@ -122,6 +124,7 @@ full = [
 
 [dependencies]
 solti-api        = { workspace = true, optional = true }
+solti-chain      = { workspace = true, optional = true }
 solti-core       = { workspace = true, optional = true }
 solti-discover   = { workspace = true, optional = true }
 solti-exec       = { workspace = true, optional = true }
@@ -170,6 +173,10 @@ required-features = [
     "prometheus-server",
     "prometheus-state",
 ]
+
+[[example]]
+name              = "task_chain"
+required-features = ["chain", "core", "exec-subprocess"]
 
 [[example]]
 name              = "task_containerd"

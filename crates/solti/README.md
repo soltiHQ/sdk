@@ -6,6 +6,7 @@ Thin façade over the modular Solti SDK.
 exposes each crate through its canonical namespace:
 
 ```rust,ignore
+use solti::chain::ChainSpec;
 use solti::core::SupervisorApi;
 use solti::model::TaskSpec;
 use solti::runner::RunnerRouter;
@@ -16,15 +17,21 @@ Default features are empty. Enable only the capabilities used by the binary:
 
 ```toml
 [dependencies]
-solti = { version = "0.0.3", features = [
+solti = { version = "0.0.4", features = [
     "api-core-adapter",
     "api-http",
+    "chain",
     "core",
     "exec-subprocess",
 ] }
 ```
 
 The `model` feature includes JSON Schema support from `solti-model`.
+
+The `chain` feature exposes `solti::chain`. A Chain is one Task whose nested
+workloads run sequentially, with exactly one active step. The outer Task owns
+restart, timeout, cancellation, status, and history; steps do not have separate
+Task lifecycles or per-step policies.
 
 `exec-container` exposes the engine-neutral container runner.
 `exec-containerd` adds the native containerd 2.x engine.
@@ -52,6 +59,7 @@ They do not expose an HTTP or gRPC server.
 
 | Example                                                         | Composition                               | Result                                                    |
 |-----------------------------------------------------------------|-------------------------------------------|-----------------------------------------------------------|
+| [`task_chain.rs`](examples/task_chain.rs)                       | model + runner + chain + core + exec      | Runs conditional steps and recovers a failed path         |
 | [`task_subprocess.rs`](examples/task_subprocess.rs)             | model + runner + core + exec              | Runs a subprocess and observes output, state, and history |
 | [`task_custom_workload.rs`](examples/task_custom_workload.rs)   | model + runner + core + Taskvisor         | Adds and executes an application-owned `TcpProbe` GVK     |
 | [`task_containerd.rs`](examples/task_containerd.rs)             | model + runner + core + exec + containerd | Supervises one native containerd 2.x workload             |
@@ -61,6 +69,13 @@ Start with the local subprocess lifecycle:
 ```bash
 cargo run -p solti --example task_subprocess \
   --features core,exec-subprocess
+```
+
+Run a conditional chain with a recovered failure:
+
+```bash
+cargo run -p solti --example task_chain \
+  --features chain,core,exec-subprocess
 ```
 
 Then inspect an application-defined workload:

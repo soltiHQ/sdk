@@ -9,6 +9,7 @@
 #   solti-tls         - no internal deps
 #   solti-observe     - optional: solti-model, taskvisor
 #   solti-runner      - solti-model, taskvisor (base)
+#   solti-chain       - solti-model, solti-runner, taskvisor
 #   solti-exec        - optional: solti-model, solti-runner, taskvisor (`subprocess` feature)
 #   solti-core        - solti-model, solti-runner, taskvisor (`controller` feature)
 #   solti-api         - solti-model; optional: solti-core (`core-adapter`),
@@ -26,6 +27,7 @@ solti-model
 solti-tls
 solti-observe
 solti-runner
+solti-chain
 solti-exec
 solti-core
 solti-api

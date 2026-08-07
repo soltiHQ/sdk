@@ -2458,6 +2458,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solti-api",
+ "solti-chain",
  "solti-core",
  "solti-discover",
  "solti-exec",
@@ -2490,6 +2491,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "solti-chain",
  "solti-core",
  "solti-model",
  "solti-runner",
@@ -2503,6 +2505,24 @@ dependencies = [
  "tonic-prost-build",
  "tower",
  "tower-http 0.7.0",
+ "tracing",
+]
+
+[[package]]
+name = "solti-chain"
+version = "0.0.4"
+dependencies = [
+ "bytes",
+ "jsonschema",
+ "parking_lot",
+ "schemars",
+ "serde",
+ "serde_json",
+ "solti-model",
+ "solti-runner",
+ "taskvisor",
+ "thiserror 2.0.19",
+ "tokio",
  "tracing",
 ]
 

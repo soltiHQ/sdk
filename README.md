@@ -141,6 +141,7 @@ Higher-level features enable their required lower layers.
 |------------------------------------|-------------------------------------------------------------------------|
 | Resource types and JSON Schema     | `model`                                                                 |
 | Custom runner registration         | `runner`                                                                |
+| Conditional sequential workloads   | `chain`                                                                 |
 | In-process desired-state runtime   | `core`                                                                  |
 | Subprocess task runtime            | `core`, `exec-subprocess`                                               |
 | Native containerd task runtime     | `core`, `exec-containerd`                                               |
@@ -181,6 +182,7 @@ It does not run the agent API or depend on core.
 | [`solti`](crates/solti)                       | Umbrella feature forwarding and canonical namespaces                |
 | [`solti-model`](crates/solti-model)           | Resources, workloads, policies, selectors, capabilities, and tokens |
 | [`solti-runner`](crates/solti-runner)         | Runner contract, GVK routing, selectors, and execution context      |
+| [`solti-chain`](crates/solti-chain)           | Conditional sequential composition of nested workloads              |
 | [`solti-core`](crates/solti-core)             | Desired state, reconciliation, watches, history, and live output    |
 | [`solti-exec`](crates/solti-exec)             | Execution backends and host-process controls                        |
 | [`solti-api`](crates/solti-api)               | HTTP/JSON and gRPC Task APIs                                        |
@@ -208,6 +210,19 @@ Runner routing uses workload GVK and an optional Kubernetes-style label selector
 
 `Embedded` carries an in-process `TaskRef` supplied by the binary.
 It bypasses runner routing and has no HTTP or gRPC representation.
+
+### Conditional chains
+
+The optional `solti-chain` runner represents a Chain as one ordinary Task.
+Its steps are nested workloads, and exactly one step is active at a time. 
+Each successful or failed step may select one next step.
+
+Chain uses a regular extension workload under `Task.spec.workload`.
+Existing HTTP and gRPC Task operations carry it without a new resource API.
+
+The outer Task owns timeout, restart, backoff, admission, cancellation, status, history, and output. 
+Steps are not child Task resources and do not have independent lifecycle policies. 
+Restarting the outer Task starts the chain again from its entry step.
 
 ## Reconciliation and execution
 
@@ -439,11 +454,12 @@ Names identify the boundary:
 
 ### Task lifecycle
 
-| Example                                                                  | Features               | Result                                                |
-|--------------------------------------------------------------------------|------------------------|-------------------------------------------------------|
-| [task_subprocess.rs](crates/solti/examples/task_subprocess.rs)           | `core,exec-subprocess` | Output, reconciliation, terminal status, and history  |
-| [task_custom_workload.rs](crates/solti/examples/task_custom_workload.rs) | `core`                 | Application-owned `TcpProbe` GVK and runner           |
-| [task_containerd.rs](crates/solti/examples/task_containerd.rs)           | `core,exec-containerd` | Native containerd 2.x attempt; Linux runtime required |
+| Example                                                                  | Features                       | Result                                                |
+|--------------------------------------------------------------------------|--------------------------------|-------------------------------------------------------|
+| [task_chain.rs](crates/solti/examples/task_chain.rs)                     | `chain,core,exec-subprocess`   | Conditional steps with failure recovery               |
+| [task_subprocess.rs](crates/solti/examples/task_subprocess.rs)           | `core,exec-subprocess`         | Output, reconciliation, terminal status, and history  |
+| [task_custom_workload.rs](crates/solti/examples/task_custom_workload.rs) | `core`                         | Application-owned `TcpProbe` GVK and runner           |
+| [task_containerd.rs](crates/solti/examples/task_containerd.rs)           | `core,exec-containerd`         | Native containerd 2.x attempt; Linux runtime required |
 
 ### Agent boundaries
 

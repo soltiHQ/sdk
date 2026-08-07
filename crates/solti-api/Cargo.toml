@@ -79,6 +79,7 @@ bytes          = { workspace = true }
 http-body-util = { workspace = true }
 rcgen          = { workspace = true }
 serde_json     = { workspace = true }
+solti-chain    = { workspace = true }
 solti-model    = { workspace = true, features = ["schema"] }
 solti-runner   = { workspace = true }
 taskvisor      = { workspace = true }
