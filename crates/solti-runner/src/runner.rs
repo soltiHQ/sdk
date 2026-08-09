@@ -33,9 +33,13 @@ use crate::id::RunId;
 /// - [`build_task`](Self::build_task) must use the allocated [`RunId`] as the task name.
 /// - The router snapshots the name and workload GVKs during registration.
 /// - Building must not start or submit the task.
+/// - Building is synchronous and must finish without unbounded waits.
 /// - Attempt-scoped resources belong inside the task body.
 ///
 /// A returned task may execute more than one attempt.
+/// A supervisor may stop awaiting a build during shutdown. Rust cannot forcibly
+/// stop synchronous code that is already running, so implementations must bound
+/// their own blocking work and must not rely on the build result being observed.
 ///
 /// ## Example
 ///

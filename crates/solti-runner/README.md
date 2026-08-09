@@ -153,6 +153,9 @@ The returned `TaskRef` must use the allocated run ID as its name.
 A mismatch returns `RouterError::RunIdMismatch`.
 
 `build_task` constructs a task but does not start it.
+It is synchronous and must finish without unbounded waits.
+The supervisor may stop awaiting it during shutdown, but Rust cannot forcibly stop
+an already-running synchronous call; runners must bound their own blocking work.
 Submission can still be rejected after construction.
 A returned task can run more than once under its Taskvisor restart policy.
 Attempt-scoped resources belong inside the task body.

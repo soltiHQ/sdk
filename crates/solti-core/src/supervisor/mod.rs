@@ -94,6 +94,7 @@ impl Drop for SupervisorApi {
         }
         self.reconciler.state.close_watches();
         self.reconciler.retention_stop.cancel();
+        self.reconciler.preflight_stop.cancel();
         self.reconciler.tasks.close();
         let handle = self.reconciler.handle.clone();
         let tasks = self.reconciler.tasks.clone();
@@ -709,6 +710,7 @@ impl SupervisorApi {
             if !self.shutdown_started.swap(true, Ordering::AcqRel) {
                 self.reconciler.state.close_watches();
                 self.reconciler.retention_stop.cancel();
+                self.reconciler.preflight_stop.cancel();
                 self.reconciler.tasks.close();
             }
         }
@@ -1607,6 +1609,7 @@ mod tests {
 
     struct BlockingRunner {
         gate: Arc<BuildGate>,
+        build_finished: Arc<AtomicBool>,
         runtime_started: Arc<AtomicBool>,
     }
 
@@ -1631,6 +1634,7 @@ mod tests {
                 self.gate.changed.wait(&mut open);
             }
             let runtime_started = Arc::clone(&self.runtime_started);
+            self.build_finished.store(true, Ordering::Release);
             Ok(TaskFn::arc(run_id.name(), move |_ctx: TaskContext| {
                 runtime_started.store(true, Ordering::Release);
                 async move { Ok::<(), TaskError>(()) }
@@ -1646,6 +1650,7 @@ mod tests {
         router
             .register(Arc::new(BlockingRunner {
                 gate: Arc::clone(&gate),
+                build_finished: Arc::new(AtomicBool::new(false)),
                 runtime_started: Arc::clone(&runtime_started),
             }))
             .unwrap();
@@ -1675,6 +1680,45 @@ mod tests {
         .await
         .expect("submitted runtime did not start");
         api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_stops_waiting_for_blocked_runner_build() {
+        let gate = Arc::new(BuildGate::new());
+        let build_finished = Arc::new(AtomicBool::new(false));
+        let runtime_started = Arc::new(AtomicBool::new(false));
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(BlockingRunner {
+                gate: Arc::clone(&gate),
+                build_finished: Arc::clone(&build_finished),
+                runtime_started: Arc::clone(&runtime_started),
+            }))
+            .unwrap();
+        let api = api(router).await;
+        let name = TaskId::new("shutdown-blocked-build").unwrap();
+
+        api.create_task(routed(name.as_str(), 1_000)).await.unwrap();
+        wait_for_build(&gate).await;
+
+        let shutdown = tokio::time::timeout(Duration::from_secs(1), api.shutdown()).await;
+        gate.release();
+        shutdown
+            .expect("shutdown must not wait for a blocked runner build")
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !build_finished.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached runner build did not return after its gate opened");
+        assert!(api.reconciler.state.binding_for(&name).is_none());
+        assert!(
+            !runtime_started.load(Ordering::Acquire),
+            "a late runner build result must not be submitted after shutdown"
+        );
     }
 
     struct FirstBuildBlockingRunner {
@@ -1770,6 +1814,7 @@ mod tests {
         router
             .register(Arc::new(BlockingRunner {
                 gate: Arc::clone(&gate),
+                build_finished: Arc::new(AtomicBool::new(false)),
                 runtime_started: Arc::clone(&runtime_started),
             }))
             .unwrap();
