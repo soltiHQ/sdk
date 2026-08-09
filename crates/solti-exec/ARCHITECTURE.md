@@ -44,25 +44,25 @@ flowchart TB
 The arrows show direct use.
 They do not represent runtime ownership.
 
-| Module                          | Owns                                                                  | Does not own                                      |
-|---------------------------------|-----------------------------------------------------------------------|---------------------------------------------------|
-| `lib.rs`                        | Feature-gated exports and crate-level documentation                   | Routing, scheduling, or task state                |
-| `isolation/`                    | Shared capability, credential, resource, and seccomp values           | Native enforcement                                |
-| `host/`                         | Host policy preparation, child hooks, cgroups, and process domains    | Workload resolution or process supervision        |
-| `subprocess/backend.rs`         | Environment, cwd, output, script, descriptor, and host settings       | Attempt lifecycle                                 |
-| `subprocess/task.rs`            | Immutable settings resolved for one reusable Taskvisor task           | Attempt-scoped operating-system resources         |
-| `subprocess/boundary.rs`        | Pinned working-directory handles                                      | Filesystem confinement after process start        |
-| `subprocess/script.rs`          | Attempt-scoped script transport                                       | Interpreter selection                             |
-| `subprocess/runner.rs`          | Workload conversion and subprocess attempt orchestration              | Router selection or restart policy                |
-| `subprocess/domain.rs`          | Child, process-group identity, host domain, reap, and drop finalizer   | Task result policy                                |
-| `container/engine.rs`           | Engine and attempt contracts                                          | A concrete engine protocol                        |
-| `container/runner.rs`           | Workload conversion and engine-neutral attempt orchestration          | Image, snapshot, or runtime implementation        |
-| `container/policy.rs`           | Engine-neutral container process policy                               | OCI or host-process enforcement                   |
-| `container/oci.rs`              | Translation of container process policy into OCI fields               | Base OCI specification                            |
-| `container/containerd/`         | Containerd probe, image, spec, attempt I/O, ownership, and cleanup     | Daemon lifecycle, CRI, CNI, or foreign resources  |
-| `output.rs`                     | Bounded line decoding, tracing, and `OutputSink` publication           | Output retention or subscriptions                 |
-| `registration.rs`               | Runner-name validation and the standard runner label                  | GVK and selector routing                          |
-| `error.rs`                      | Registration and backend-construction errors                          | Attempt failure policy                            |
+| Module                   | Owns                                                                 | Does not own                                     |
+|--------------------------|----------------------------------------------------------------------|--------------------------------------------------|
+| `lib.rs`                 | Feature-gated exports and crate-level documentation                  | Routing, scheduling, or task state               |
+| `isolation/`             | Shared capability, credential, resource, and seccomp values          | Native enforcement                               |
+| `host/`                  | Host policy preparation, child hooks, cgroups, and process domains   | Workload resolution or process supervision       |
+| `subprocess/backend.rs`  | Environment, cwd, output, script, descriptor, and host settings      | Attempt lifecycle                                |
+| `subprocess/task.rs`     | Immutable settings resolved for one reusable Taskvisor task          | Attempt-scoped operating-system resources        |
+| `subprocess/boundary.rs` | Pinned working-directory handles                                     | Filesystem confinement after process start       |
+| `subprocess/script.rs`   | Attempt-scoped script transport                                      | Interpreter selection                            |
+| `subprocess/runner.rs`   | Workload conversion and subprocess attempt orchestration             | Router selection or restart policy               |
+| `subprocess/domain.rs`   | Child, process-group identity, host domain, reap, and drop finalizer | Task result policy                               |
+| `container/engine.rs`    | Engine and attempt contracts                                         | A concrete engine protocol                       |
+| `container/runner.rs`    | Workload conversion and engine-neutral attempt orchestration         | Image, snapshot, or runtime implementation       |
+| `container/policy.rs`    | Engine-neutral container process policy                              | OCI or host-process enforcement                  |
+| `container/oci.rs`       | Translation of container process policy into OCI fields              | Base OCI specification                           |
+| `container/containerd/`  | Containerd probe, image, spec, attempt I/O, ownership, and cleanup   | Daemon lifecycle, CRI, CNI, or foreign resources |
+| `output.rs`              | Bounded line decoding, tracing, and `OutputSink` publication         | Output retention or subscriptions                |
+| `registration.rs`        | Runner-name validation and the standard runner label                 | GVK and selector routing                         |
+| `error.rs`               | Registration and backend-construction errors                         | Attempt failure policy                           |
 
 ## Feature boundaries
 
@@ -342,9 +342,6 @@ Exit observation must be armed before the attempt is returned.
 Cleanup may remove only attempt-owned resources.
 Completed cleanup steps remain completed across retries.
 
-The runner executes the lifecycle in a worker task.
-Closing its cancellation channel makes the worker terminate and clean the attempt.
-
 Retryable create, start, and wait errors become retryable Taskvisor failures.
 Permanent errors become fatal Taskvisor failures.
 Termination and cleanup errors are always fatal.
@@ -527,12 +524,12 @@ It does not retain output.
 
 Each layer owns one error contract.
 
-| Boundary                           | Error                              | Meaning                                      |
-|------------------------------------|------------------------------------|----------------------------------------------|
-| Registration and runner setup      | `ExecError`                        | Invalid config, router rejection, or host I/O |
-| Workload build                     | `solti_runner::RunnerError`        | Invalid or unsupported workload              |
-| Container engine operation         | `ContainerEngineError`             | Retryable or permanent engine failure        |
-| Attempt execution                  | `taskvisor::TaskError`             | Success, retryable, fatal, or canceled result |
+| Boundary                      | Error                       | Meaning                                       |
+|-------------------------------|-----------------------------|-----------------------------------------------|
+| Registration and runner setup | `ExecError`                 | Invalid config, router rejection, or host I/O |
+| Workload build                | `solti_runner::RunnerError` | Invalid or unsupported workload               |
+| Container engine operation    | `ContainerEngineError`      | Retryable or permanent engine failure         |
+| Attempt execution             | `taskvisor::TaskError`      | Success, retryable, fatal, or canceled result |
 
 Diagnostic text does not select retry policy.
 Typed error classes and operating-system error kinds do.
@@ -542,57 +539,24 @@ They cannot be hidden by cancellation or an earlier execution result.
 
 ## Where to make a change
 
-| Change                                  | Start here                                                                                                                       | Verify here                                      |
-|-----------------------------------------|----------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------|
-| Public exports or feature boundary      | [`src/lib.rs`](src/lib.rs), [`Cargo.toml`](Cargo.toml)                                                                           | feature checks and rustdoc                       |
-| Shared isolation value                  | [`src/isolation/`](src/isolation)                                                                                                | isolation, host, and container policy tests      |
-| Host policy preparation                 | [`src/host/policy.rs`](src/host/policy.rs)                                                                                        | host policy tests                                |
-| Process state or rlimits                | [`src/host/process.rs`](src/host/process.rs), [`src/host/limits.rs`](src/host/limits.rs)                                          | process and limit tests                          |
-| Cgroup ownership or cleanup             | [`src/host/cgroups.rs`](src/host/cgroups.rs)                                                                                      | cgroup and process-domain tests                  |
-| Host identity, capabilities, or seccomp | [`src/host/security.rs`](src/host/security.rs), [`src/host/capability.rs`](src/host/capability.rs)                                | security and capability tests                    |
-| Subprocess settings, env, or cwd        | [`src/subprocess/backend.rs`](src/subprocess/backend.rs), [`src/subprocess/boundary.rs`](src/subprocess/boundary.rs)              | backend and boundary tests                       |
-| Command or script materialization       | [`src/subprocess/runner.rs`](src/subprocess/runner.rs), [`src/subprocess/script.rs`](src/subprocess/script.rs)                    | runner and script tests                          |
-| Subprocess termination or drop          | [`src/subprocess/domain.rs`](src/subprocess/domain.rs), [`src/subprocess/runner.rs`](src/subprocess/runner.rs)                    | domain and cancellation tests                    |
-| Generic container lifecycle             | [`src/container/engine.rs`](src/container/engine.rs), [`src/container/runner.rs`](src/container/runner.rs)                       | container runner tests                           |
-| Container process policy                | [`src/container/policy.rs`](src/container/policy.rs), [`src/container/oci.rs`](src/container/oci.rs)                             | policy and OCI tests                             |
-| Containerd config or probe              | [`src/container/containerd/config.rs`](src/container/containerd/config.rs), [`src/container/containerd/engine.rs`](src/container/containerd/engine.rs) | config and probe tests                           |
-| Image resolution or metadata            | [`src/container/containerd/image.rs`](src/container/containerd/image.rs)                                                         | image tests                                      |
-| Containerd ownership or lifecycle       | [`src/container/containerd/engine.rs`](src/container/containerd/engine.rs)                                                       | engine ownership and cleanup tests               |
-| OCI base specification                  | [`src/container/containerd/spec.rs`](src/container/containerd/spec.rs)                                                           | spec tests                                       |
-| Containerd output pipes                 | [`src/container/containerd/io.rs`](src/container/containerd/io.rs)                                                               | Linux I/O tests                                  |
-| Shared output behavior                  | [`src/output.rs`](src/output.rs)                                                                                                 | output tests                                     |
-| Runner registration                     | [`src/registration.rs`](src/registration.rs), [`src/error.rs`](src/error.rs)                                                     | runner registration tests                        |
-| User-facing usage                       | [`README.md`](README.md), [`src/lib.rs`](src/lib.rs)                                                                              | README and rustdoc doctests                      |
-
-## Invariants to preserve
-
-Before changing an execution path, check these constraints in the owning module and its tests:
-
-1. Default features remain empty.
-2. Each runner accepts only its exact built-in workload GVK.
-3. `solti-runner` remains responsible for GVK and selector routing.
-4. Building a task does not spawn a process or call a container engine.
-5. One reusable `TaskRef` creates fresh resources for every attempt.
-6. Shared isolation values remain separate from native enforcement.
-7. Host and OCI policies translate shared values independently.
-8. Configured security and resource controls fail closed.
-9. Host process controls are not presented as a complete sandbox.
-10. The subprocess domain retains exclusive ownership of child wait status.
-11. Every available subprocess termination boundary is handled before leader reap.
-12. Dropping a subprocess task cannot abandon child reap and host cleanup.
-13. Output byte and character limits remain bounded before publication.
-14. Only the tracing copy escapes control characters.
-15. The generic container runner does not select a concrete engine.
-16. A returned `ContainerAttempt` is stopped and has exit observation armed.
-17. Container termination and cleanup remain idempotent.
-18. Container cleanup removes only resources owned by the current attempt.
-19. Native containerd remains fixed to major version 2 and one explicit socket.
-20. Native containerd does not discover daemons, use CRI, or configure CNI.
-21. Image metadata remains bounded and digest-verified.
-22. `ContainerNetwork::None` and `Host` differ only in network namespace selection.
-23. Ambiguous create outcomes require ownership read-back.
-24. Foreign containerd resources are never deleted.
-25. Containerd cleanup preserves task, container, and snapshot dependency order.
-26. Output remains live-only and execution state remains outside this crate.
-
-When a change crosses one of these boundaries, update the owning module documentation and the relevant diagram in this guide.
+| Change                                  | Start here                                                                                                                                             | Verify here                                 |
+|-----------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------|
+| Public exports or feature boundary      | [`src/lib.rs`](src/lib.rs), [`Cargo.toml`](Cargo.toml)                                                                                                 | feature checks and rustdoc                  |
+| Shared isolation value                  | [`src/isolation/`](src/isolation)                                                                                                                      | isolation, host, and container policy tests |
+| Host policy preparation                 | [`src/host/policy.rs`](src/host/policy.rs)                                                                                                             | host policy tests                           |
+| Process state or rlimits                | [`src/host/process.rs`](src/host/process.rs), [`src/host/limits.rs`](src/host/limits.rs)                                                               | process and limit tests                     |
+| Cgroup ownership or cleanup             | [`src/host/cgroups.rs`](src/host/cgroups.rs)                                                                                                           | cgroup and process-domain tests             |
+| Host identity, capabilities, or seccomp | [`src/host/security.rs`](src/host/security.rs), [`src/host/capability.rs`](src/host/capability.rs)                                                     | security and capability tests               |
+| Subprocess settings, env, or cwd        | [`src/subprocess/backend.rs`](src/subprocess/backend.rs), [`src/subprocess/boundary.rs`](src/subprocess/boundary.rs)                                   | backend and boundary tests                  |
+| Command or script materialization       | [`src/subprocess/runner.rs`](src/subprocess/runner.rs), [`src/subprocess/script.rs`](src/subprocess/script.rs)                                         | runner and script tests                     |
+| Subprocess termination or drop          | [`src/subprocess/domain.rs`](src/subprocess/domain.rs), [`src/subprocess/runner.rs`](src/subprocess/runner.rs)                                         | domain and cancellation tests               |
+| Generic container lifecycle             | [`src/container/engine.rs`](src/container/engine.rs), [`src/container/runner.rs`](src/container/runner.rs)                                             | container runner tests                      |
+| Container process policy                | [`src/container/policy.rs`](src/container/policy.rs), [`src/container/oci.rs`](src/container/oci.rs)                                                   | policy and OCI tests                        |
+| Containerd config or probe              | [`src/container/containerd/config.rs`](src/container/containerd/config.rs), [`src/container/containerd/engine.rs`](src/container/containerd/engine.rs) | config and probe tests                      |
+| Image resolution or metadata            | [`src/container/containerd/image.rs`](src/container/containerd/image.rs)                                                                               | image tests                                 |
+| Containerd ownership or lifecycle       | [`src/container/containerd/engine.rs`](src/container/containerd/engine.rs)                                                                             | engine ownership and cleanup tests          |
+| OCI base specification                  | [`src/container/containerd/spec.rs`](src/container/containerd/spec.rs)                                                                                 | spec tests                                  |
+| Containerd output pipes                 | [`src/container/containerd/io.rs`](src/container/containerd/io.rs)                                                                                     | Linux I/O tests                             |
+| Shared output behavior                  | [`src/output.rs`](src/output.rs)                                                                                                                       | output tests                                |
+| Runner registration                     | [`src/registration.rs`](src/registration.rs), [`src/error.rs`](src/error.rs)                                                                           | runner registration tests                   |
+| User-facing usage                       | [`README.md`](README.md), [`src/lib.rs`](src/lib.rs)                                                                                                   | README and rustdoc doctests                 |
