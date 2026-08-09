@@ -921,18 +921,10 @@ mod tests {
         let outer = tokio::spawn(async move { task.spawn(TaskContext::detached()).await });
 
         wait_for(&handle.create_entered, "create attempt to start").await;
-        assert!(
-            handle
-                .create_in_flight
-                .load(Ordering::SeqCst)
-        );
+        assert!(handle.create_in_flight.load(Ordering::SeqCst));
         outer.abort();
         assert!(outer.await.unwrap_err().is_cancelled());
-        assert!(
-            !handle
-                .create_in_flight
-                .load(Ordering::SeqCst)
-        );
+        assert!(!handle.create_in_flight.load(Ordering::SeqCst));
 
         handle.create_release.add_permits(1);
         tokio::task::yield_now().await;
@@ -958,21 +950,13 @@ mod tests {
             .unwrap();
 
         wait_for(&handle.create_entered, "create attempt to start").await;
-        assert!(
-            handle
-                .create_in_flight
-                .load(Ordering::SeqCst)
-        );
+        assert!(handle.create_in_flight.load(Ordering::SeqCst));
 
         let shutdown = supervisor_handle.shutdown().await;
         assert!(matches!(shutdown, Err(RuntimeError::GraceExceeded { .. })));
         let outcome = waiter.wait().await.unwrap();
         assert_eq!(outcome.kind(), TaskOutcomeKind::ForceAborted);
-        assert!(
-            !handle
-                .create_in_flight
-                .load(Ordering::SeqCst)
-        );
+        assert!(!handle.create_in_flight.load(Ordering::SeqCst));
         assert_eq!(
             *handle.calls.lock().unwrap(),
             [Call::Create {
@@ -1001,11 +985,7 @@ mod tests {
             .expect("timed out waiting for Taskvisor outcome")
             .unwrap();
         assert_eq!(outcome.kind(), TaskOutcomeKind::Failed);
-        assert!(
-            !handle
-                .create_in_flight
-                .load(Ordering::SeqCst)
-        );
+        assert!(!handle.create_in_flight.load(Ordering::SeqCst));
         assert_eq!(
             *handle.calls.lock().unwrap(),
             [Call::Create {
