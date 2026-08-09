@@ -226,28 +226,21 @@ async fn run_container(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Result
         .sink_for(&ctx.task.resource_name, ctx.task.generation, attempt);
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let worker_ctx = Arc::clone(&ctx);
-    let mut worker =
-        tokio::spawn(
-            async move { run_container_worker(worker_ctx, request, sink, cancel_rx).await },
-        );
+    let worker = run_container_worker(ctx, request, sink, cancel_rx);
+    tokio::pin!(worker);
 
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
             let _ = cancel_tx.send(true);
             match worker.await {
-                Ok(Ok(())) | Ok(Err(TaskError::Canceled)) => Err(TaskError::Canceled),
-                Ok(Err(error)) => Err(error),
-                Err(error) => Err(TaskError::fatal(format!("container lifecycle worker failed: {error}"))),
+                Ok(()) | Err(TaskError::Canceled) => Err(TaskError::Canceled),
+                Err(error) => Err(error),
             }
         }
-        result = &mut worker => {
+        result = worker.as_mut() => {
             drop(cancel_tx);
-            match result {
-                Ok(result) => result,
-                Err(error) => Err(TaskError::fatal(format!("container lifecycle worker failed: {error}"))),
-            }
+            result
         }
     }
 }
@@ -469,6 +462,17 @@ impl OutputTasks {
     }
 }
 
+impl Drop for OutputTasks {
+    fn drop(&mut self) {
+        if let Some(stdout) = self.stdout.take() {
+            stdout.abort();
+        }
+        if let Some(stderr) = self.stderr.take() {
+            stderr.abort();
+        }
+    }
+}
+
 impl fmt::Debug for ContainerRunner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -483,12 +487,15 @@ impl fmt::Debug for ContainerRunner {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, atomic::AtomicBool},
         time::Duration,
     };
 
     use async_trait::async_trait;
     use solti_model::{ContainerSpec, TaskEnv, TaskSpec};
+    use taskvisor::{
+        RuntimeError, Supervisor, SupervisorConfig, TaskOutcomeKind, TaskSpec as TaskvisorTaskSpec,
+    };
     use tokio::sync::{Notify, Semaphore};
 
     use super::*;
@@ -611,8 +618,7 @@ mod tests {
         calls: Arc<Mutex<Vec<Call>>>,
         create_entered: Arc<Notify>,
         create_release: Arc<Semaphore>,
-        create_completed: Arc<Notify>,
-        cleanup_completed: Arc<Notify>,
+        create_in_flight: Arc<AtomicBool>,
         behavior: AttemptBehavior,
     }
 
@@ -620,8 +626,25 @@ mod tests {
         calls: Arc<Mutex<Vec<Call>>>,
         create_entered: Arc<Notify>,
         create_release: Arc<Semaphore>,
-        create_completed: Arc<Notify>,
-        cleanup_completed: Arc<Notify>,
+        create_in_flight: Arc<AtomicBool>,
+    }
+
+    struct InFlightCreate(Arc<AtomicBool>);
+
+    impl InFlightCreate {
+        fn enter(flag: Arc<AtomicBool>) -> Self {
+            assert!(
+                !flag.swap(true, Ordering::SeqCst),
+                "controlled create attempts must not overlap"
+            );
+            Self(flag)
+        }
+    }
+
+    impl Drop for InFlightCreate {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
     }
 
     impl ControlledEngine {
@@ -629,23 +652,20 @@ mod tests {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let create_entered = Arc::new(Notify::new());
             let create_release = Arc::new(Semaphore::new(0));
-            let create_completed = Arc::new(Notify::new());
-            let cleanup_completed = Arc::new(Notify::new());
+            let create_in_flight = Arc::new(AtomicBool::new(false));
             (
                 Arc::new(Self {
                     calls: Arc::clone(&calls),
                     create_entered: Arc::clone(&create_entered),
                     create_release: Arc::clone(&create_release),
-                    create_completed: Arc::clone(&create_completed),
-                    cleanup_completed: Arc::clone(&cleanup_completed),
+                    create_in_flight: Arc::clone(&create_in_flight),
                     behavior,
                 }),
                 ControlledEngineHandle {
                     calls,
                     create_entered,
                     create_release,
-                    create_completed,
-                    cleanup_completed,
+                    create_in_flight,
                 },
             )
         }
@@ -666,6 +686,7 @@ mod tests {
                 attempt: request.attempt(),
                 image: request.image().to_owned(),
             });
+            let _in_flight = InFlightCreate::enter(Arc::clone(&self.create_in_flight));
             self.create_entered.notify_one();
             let permit = self
                 .create_release
@@ -673,10 +694,8 @@ mod tests {
                 .await
                 .map_err(|_| ContainerEngineError::permanent("test create gate closed"))?;
             permit.forget();
-            self.create_completed.notify_one();
             Ok(Box::new(ControlledAttempt {
                 calls: Arc::clone(&self.calls),
-                cleanup_completed: Arc::clone(&self.cleanup_completed),
                 behavior: self.behavior,
             }))
         }
@@ -684,7 +703,6 @@ mod tests {
 
     struct ControlledAttempt {
         calls: Arc<Mutex<Vec<Call>>>,
-        cleanup_completed: Arc<Notify>,
         behavior: AttemptBehavior,
     }
 
@@ -725,7 +743,6 @@ mod tests {
 
         async fn cleanup(&mut self) -> Result<(), ContainerEngineError> {
             self.calls.lock().unwrap().push(Call::Cleanup);
-            self.cleanup_completed.notify_one();
             if self.behavior.cleanup_fails {
                 Err(ContainerEngineError::retryable(
                     "controlled cleanup failure",
@@ -897,33 +914,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_outer_future_keeps_create_alive_and_cleans_attempt() {
+    async fn dropping_outer_future_drops_in_flight_create() {
         let (engine, handle) = ControlledEngine::blocked(AttemptBehavior::default());
         let runner = ContainerRunner::new("containerd", engine).unwrap();
         let task = build(&runner);
         let outer = tokio::spawn(async move { task.spawn(TaskContext::detached()).await });
 
         wait_for(&handle.create_entered, "create attempt to start").await;
+        assert!(handle.create_in_flight.load(Ordering::SeqCst));
         outer.abort();
         assert!(outer.await.unwrap_err().is_cancelled());
-        handle.create_release.add_permits(1);
+        assert!(!handle.create_in_flight.load(Ordering::SeqCst));
 
-        wait_for(
-            &handle.create_completed,
-            "in-flight create attempt to complete",
-        )
-        .await;
-        wait_for(&handle.cleanup_completed, "detached attempt cleanup").await;
+        handle.create_release.add_permits(1);
+        tokio::task::yield_now().await;
         assert_eq!(
             *handle.calls.lock().unwrap(),
-            [
-                Call::Create {
-                    attempt: 1,
-                    image: "docker.io/library/alpine:latest".into(),
-                },
-                Call::Cleanup,
-            ]
+            [Call::Create {
+                attempt: 1,
+                image: "docker.io/library/alpine:latest".into(),
+            }]
         );
+    }
+
+    #[tokio::test]
+    async fn taskvisor_force_abort_drops_lifecycle_before_shutdown_returns() {
+        let (engine, handle) = ControlledEngine::blocked(AttemptBehavior::default());
+        let runner = ContainerRunner::new("containerd", engine).unwrap();
+        let supervisor =
+            Supervisor::new(SupervisorConfig::new().with_grace(Duration::ZERO), vec![]);
+        let supervisor_handle = supervisor.serve();
+        let (_, waiter) = supervisor_handle
+            .add_and_watch(TaskvisorTaskSpec::once(build(&runner)))
+            .await
+            .unwrap();
+
+        wait_for(&handle.create_entered, "create attempt to start").await;
+        assert!(handle.create_in_flight.load(Ordering::SeqCst));
+
+        let shutdown = supervisor_handle.shutdown().await;
+        assert!(matches!(shutdown, Err(RuntimeError::GraceExceeded { .. })));
+        let outcome = waiter.wait().await.unwrap();
+        assert_eq!(outcome.kind(), TaskOutcomeKind::ForceAborted);
+        assert!(!handle.create_in_flight.load(Ordering::SeqCst));
+        assert_eq!(
+            *handle.calls.lock().unwrap(),
+            [Call::Create {
+                attempt: 1,
+                image: "docker.io/library/alpine:latest".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn taskvisor_timeout_drops_lifecycle_before_outcome() {
+        let (engine, handle) = ControlledEngine::blocked(AttemptBehavior::default());
+        let runner = ContainerRunner::new("containerd", engine).unwrap();
+        let supervisor = Supervisor::new(SupervisorConfig::new(), vec![]);
+        let supervisor_handle = supervisor.serve();
+        let (_, waiter) = supervisor_handle
+            .add_and_watch(
+                TaskvisorTaskSpec::once(build(&runner)).with_timeout(Duration::from_millis(20)),
+            )
+            .await
+            .unwrap();
+
+        wait_for(&handle.create_entered, "create attempt to start").await;
+        let outcome = tokio::time::timeout(Duration::from_secs(1), waiter.wait())
+            .await
+            .expect("timed out waiting for Taskvisor outcome")
+            .unwrap();
+        assert_eq!(outcome.kind(), TaskOutcomeKind::Failed);
+        assert!(!handle.create_in_flight.load(Ordering::SeqCst));
+        assert_eq!(
+            *handle.calls.lock().unwrap(),
+            [Call::Create {
+                attempt: 1,
+                image: "docker.io/library/alpine:latest".into(),
+            }]
+        );
+        supervisor_handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_output_tasks_aborts_readers() {
+        let stdout = tokio::spawn(std::future::pending::<()>());
+        let stderr = tokio::spawn(std::future::pending::<()>());
+        let stdout_abort = stdout.abort_handle();
+        let stderr_abort = stderr.abort_handle();
+        tokio::task::yield_now().await;
+
+        drop(OutputTasks {
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !stdout_abort.is_finished() || !stderr_abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("output tasks were not aborted on drop");
     }
 
     #[tokio::test]

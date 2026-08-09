@@ -234,6 +234,10 @@ impl ContainerExitStatus {
 /// `cleanup` removes only resources owned by this attempt.
 /// Cleanup may be repeated after a retryable error.
 /// Completed cleanup steps must remain completed across calls.
+///
+/// Method futures execute inside the Taskvisor-owned attempt future and may be dropped when that attempt times out or is force-aborted.
+/// Implementations must not detach mutating lifecycle work from these futures.
+/// Cooperative cancellation runs `terminate` and `cleanup`, but a force-drop can interrupt either operation before remote cleanup completes.
 #[async_trait]
 pub trait ContainerAttempt: Send + 'static {
     /// Takes the captured stdout stream.

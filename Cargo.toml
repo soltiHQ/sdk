@@ -52,16 +52,16 @@ categories   = ["asynchronous", "concurrency", "network-programming"]
 [workspace.dependencies]
 aide                = { version = "=0.16.0-alpha.4", default-features = false }
 anyhow              = "1.0.104"
-async-trait         = "0.1.91"
+async-trait         = "0.1.92"
 axum                = "0.8.9"
-base64              = "0.23.0"
+base64              = "0.23.1"
 bytes               = "1.12.1"
 containerd-client   = { version = "0.9.0", default-features = false, features = ["connect"] }
 form_urlencoded     = "1.2.2"
 getrandom           = "0.4.3"
 http-body-util      = "0.1.4"
 itoa                = "1.0.18"
-jsonschema          = { version = "0.49.3", default-features = false }
+jsonschema          = { version = "0.49.8", default-features = false }
 libc                = "0.2.177"
 oci-spec            = { version = "0.10.0", default-features = false, features = ["distribution", "image", "runtime"] }
 parking_lot         = "0.12.5"
@@ -94,7 +94,7 @@ solti-tls           = { path = "crates/solti-tls",        version = "0.0.4", def
 subtle              = "2.6.1"
 taskvisor           = { version = "0.7.0", default-features = false }
 tempfile            = "3.27.0"
-thiserror           = "2.0.19"
+thiserror           = "2.0.20"
 time                = { version = "0.3.55" }
 tokio               = { version = "1.53.1" }
 tokio-rustls        = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
