@@ -234,7 +234,8 @@ flowchart TB
 ```
 
 Preflight runs outside the runtime operation lock.
-Runner construction uses Tokio's blocking pool.
+Runner construction alone uses Tokio's blocking pool.
+Policy mapping and Taskvisor preparation happen only after that build returns.
 Runner panics are contained and become `Reconciled=False`.
 
 The runtime operation lock serializes replacement, cancellation, deletion, and binding by name.
@@ -448,7 +449,7 @@ flowchart LR
     Start["shutdown"]
     Fence["Set shutdown flag<br/>hold spawn gate"]
     Watches["Close task watches"]
-    Retention["Cancel retention worker"]
+    Retention["Cancel retention worker<br/>and preflight waits"]
     Tracker["Close worker tracker"]
     Runtime["Shutdown Taskvisor"]
     Drain["Wait for reconciliation,<br/>completion, and retention workers"]
@@ -486,28 +487,3 @@ Call `shutdown` when completion must be observed.
 | Retention defaults or validation        | [`src/config.rs`](src/config.rs)                                                                                     | config and sweep tests                           |
 | Public errors                           | [`src/error.rs`](src/error.rs)                                                                                       | error tests and every affected API test          |
 | User-facing usage                       | [`README.md`](README.md), [`src/lib.rs`](src/lib.rs)                                                                 | `cargo test -p solti-core --doc --all-features`  |
-
-## Invariants to preserve
-
-Before changing a coordination path, check these constraints in the owning module and its tests:
-
-1. A successful create or apply reports a desired-state commit.
-2. Runtime reconciliation remains asynchronous.
-3. Routed and embedded manifests use their matching submission paths.
-4. UID and generation fence every runtime binding and status transition.
-5. One model task name has at most one current runtime binding.
-6. Reconciliation failures stay in the `Reconciled` condition.
-7. Execution failures stay in terminal status and run diagnostics.
-8. Taskvisor events remain best-effort.
-9. Direct completion outcomes remain authoritative for finalization.
-10. Attempt numbers come from Taskvisor and are never synthesized as attempt zero.
-11. Typed outcome values select phases.
-12. Diagnostic text never acts as schema.
-13. Adapter predicates run before pagination and watch classification.
-14. Resource versions remain opaque and local to one state-store incarnation.
-15. Retention never removes a bound task.
-16. Built-in output remains live-only and is not added to run history.
-17. Desired operation locks are acquired before runtime operation locks when both are needed.
-18. Shutdown prevents new reconciliation workers before waiting for the tracker.
-
-When a change crosses one of these boundaries, update the owning module documentation and the relevant diagram in this guide.

@@ -28,7 +28,8 @@
 //! Cleanup and binding failures also set `Reconciled=False`.
 //!
 //! Completion waiters provide the authoritative final outcome.
-//! The task tracker lets shutdown wait for every waiter and retention worker.
+//! The task tracker lets shutdown wait for every tracked worker.
+//! Shutdown stops awaiting runner builds before draining that tracker.
 
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -41,7 +42,10 @@ use solti_runner::RunnerRouter;
 use taskvisor::{
     ControllerSpec, PreparedSubmission, SupervisorHandle, TaskRef, TaskSpec as TvTaskSpec,
 };
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio_util::{
+    sync::CancellationToken,
+    task::{AbortOnDropHandle, TaskTracker},
+};
 use tracing::warn;
 
 use super::{RuntimeObserver, TaskLocks};
@@ -71,6 +75,7 @@ pub(crate) struct Reconciler {
     pub(crate) runtime: tokio::runtime::Handle,
     pub(crate) tasks: TaskTracker,
     pub(crate) retention_stop: CancellationToken,
+    pub(crate) preflight_stop: CancellationToken,
     pub(crate) runtime_operations: TaskLocks,
     pub(crate) grace: Duration,
 }
@@ -93,6 +98,7 @@ impl Reconciler {
             runtime: tokio::runtime::Handle::current(),
             tasks: TaskTracker::new(),
             retention_stop: CancellationToken::new(),
+            preflight_stop: CancellationToken::new(),
             runtime_operations: TaskLocks::default(),
             grace,
         }
@@ -136,15 +142,11 @@ impl Reconciler {
         }
     }
 
-    fn preflight(
+    fn prepare_submission(
         &self,
         task: &Task,
-        source: RuntimeSource,
+        task_ref: TaskRef,
     ) -> Result<PreparedSubmission, CoreError> {
-        let task_ref = match source {
-            RuntimeSource::Routed => self.router.build(task)?,
-            RuntimeSource::Prebuilt(task_ref) => task_ref,
-        };
         let spec = task.spec();
         let task_spec = TvTaskSpec::new(
             task_ref,
@@ -172,19 +174,68 @@ impl Reconciler {
         if !self.state.is_current(&target) {
             return self.current(&target, desired);
         }
-        let preflight_reconciler = self.clone();
-        let preflight_task = desired.clone();
-        let preflight = self
-            .runtime
-            .spawn_blocking(move || {
-                catch_unwind(AssertUnwindSafe(|| {
-                    preflight_reconciler.preflight(&preflight_task, source)
-                }))
-            })
-            .await;
-        let prepared = match preflight {
-            Ok(Ok(Ok(prepared))) => prepared,
-            Ok(Ok(Err(error))) => {
+        if self.preflight_stop.is_cancelled() {
+            return self.current(&target, desired);
+        }
+
+        let task_ref = match source {
+            RuntimeSource::Prebuilt(task_ref) => task_ref,
+            RuntimeSource::Routed => {
+                let router = Arc::clone(&self.router);
+                let build_task = desired.clone();
+                let mut build = AbortOnDropHandle::new(self.runtime.spawn_blocking(move || {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        router.build(&build_task).map_err(CoreError::from)
+                    }))
+                }));
+                let build = tokio::select! {
+                    biased;
+                    _ = self.preflight_stop.cancelled() => {
+                        build.abort();
+                        return self.current(&target, desired);
+                    }
+                    result = &mut build => result,
+                };
+                match build {
+                    Ok(Ok(Ok(task_ref))) => task_ref,
+                    Ok(Ok(Err(error))) => {
+                        self.state.mark_reconciliation_failed(
+                            &target,
+                            Self::failure_reason(&error),
+                            error.to_string(),
+                        );
+                        return self.current(&target, desired);
+                    }
+                    Ok(Err(_)) => {
+                        warn!(task = %target.name, "runner preflight panicked");
+                        self.state.mark_reconciliation_failed(
+                            &target,
+                            "RunnerBuildPanicked",
+                            "reconciliation preflight panicked".to_string(),
+                        );
+                        return self.current(&target, desired);
+                    }
+                    Err(error) => {
+                        warn!(task = %target.name, %error, "runner preflight worker was unavailable");
+                        self.state.mark_reconciliation_failed(
+                            &target,
+                            "RunnerBuildUnavailable",
+                            "reconciliation preflight worker was unavailable".to_string(),
+                        );
+                        return self.current(&target, desired);
+                    }
+                }
+            }
+        };
+
+        if self.preflight_stop.is_cancelled() {
+            return self.current(&target, desired);
+        }
+        let prepared = match catch_unwind(AssertUnwindSafe(|| {
+            self.prepare_submission(&desired, task_ref)
+        })) {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error)) => {
                 self.state.mark_reconciliation_failed(
                     &target,
                     Self::failure_reason(&error),
@@ -192,21 +243,12 @@ impl Reconciler {
                 );
                 return self.current(&target, desired);
             }
-            Ok(Err(_)) => {
+            Err(_) => {
                 warn!(task = %target.name, "runner preflight panicked");
                 self.state.mark_reconciliation_failed(
                     &target,
                     "RunnerBuildPanicked",
                     "reconciliation preflight panicked".to_string(),
-                );
-                return self.current(&target, desired);
-            }
-            Err(error) => {
-                warn!(task = %target.name, %error, "runner preflight worker was unavailable");
-                self.state.mark_reconciliation_failed(
-                    &target,
-                    "RunnerBuildUnavailable",
-                    "reconciliation preflight worker was unavailable".to_string(),
                 );
                 return self.current(&target, desired);
             }
