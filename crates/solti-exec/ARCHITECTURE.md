@@ -342,9 +342,6 @@ Exit observation must be armed before the attempt is returned.
 Cleanup may remove only attempt-owned resources.
 Completed cleanup steps remain completed across retries.
 
-The runner executes the lifecycle in a worker task.
-Closing its cancellation channel makes the worker terminate and clean the attempt.
-
 Retryable create, start, and wait errors become retryable Taskvisor failures.
 Permanent errors become fatal Taskvisor failures.
 Termination and cleanup errors are always fatal.
@@ -594,5 +591,7 @@ Before changing an execution path, check these constraints in the owning module 
 24. Foreign containerd resources are never deleted.
 25. Containerd cleanup preserves task, container, and snapshot dependency order.
 26. Output remains live-only and execution state remains outside this crate.
+27. Container lifecycle work remains inside the Taskvisor-owned attempt future.
+28. Attempt timeout or force-abort may interrupt asynchronous remote cleanup.
 
 When a change crosses one of these boundaries, update the owning module documentation and the relevant diagram in this guide.

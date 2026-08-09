@@ -98,6 +98,8 @@ A cleanup retry does not execute the workload again.
 Permanent cleanup failures stop retry immediately.
 The retries share a 30-second window by default.
 Exhausted cleanup is a fatal attempt failure.
+Force-abort can interrupt asynchronous remote cleanup. 
+The native adapter does not reconcile orphaned resources after force-abort or process loss.
 
 ## What it does
 
@@ -210,6 +212,8 @@ The final binary passes an `Arc<dyn ContainerEngine>` when it registers a runner
 `create_attempt` returns one stopped attempt with exit observation already armed.
 Engine implementations must make `terminate` and `cleanup` idempotent.
 They may clean only resources whose ownership is confirmed for that attempt.
+All lifecycle futures are owned by the Taskvisor attempt and may be dropped on timeout or force-abort. 
+Engine implementations must not detach mutating lifecycle work from them.
 
 `ContainerNetwork::None` creates an OCI network namespace.
 The adapter does not configure an external interface, address, route, DNS, or NAT.

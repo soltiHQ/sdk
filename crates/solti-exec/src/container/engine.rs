@@ -234,6 +234,10 @@ impl ContainerExitStatus {
 /// `cleanup` removes only resources owned by this attempt.
 /// Cleanup may be repeated after a retryable error.
 /// Completed cleanup steps must remain completed across calls.
+///
+/// Method futures execute inside the Taskvisor-owned attempt future and may be dropped when that attempt times out or is force-aborted.
+/// Implementations must not detach mutating lifecycle work from these futures.
+/// Cooperative cancellation runs `terminate` and `cleanup`, but a force-drop can interrupt either operation before remote cleanup completes.
 #[async_trait]
 pub trait ContainerAttempt: Send + 'static {
     /// Takes the captured stdout stream.
@@ -259,6 +263,9 @@ pub trait ContainerAttempt: Send + 'static {
 ///
 /// Implementations own engine-specific setup and attempt resources.
 /// They do not own the engine daemon or foreign resources.
+/// The future returned by `create_attempt` is also Taskvisor-owned and may be dropped on attempt timeout or force-abort.
+/// Engines must not detach mutating creation work;
+/// engines that require recovery after an interrupted remote RPC need an explicit engine-owned reconciliation mechanism.
 #[async_trait]
 pub trait ContainerEngine: Send + Sync + 'static {
     /// Checks endpoint availability and compatibility.

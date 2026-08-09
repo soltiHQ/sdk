@@ -1165,6 +1165,12 @@ impl ContainerdAttempt {
     }
 }
 
+impl Drop for ContainerdAttempt {
+    fn drop(&mut self) {
+        self.abort_wait();
+    }
+}
+
 #[async_trait]
 impl ContainerAttempt for ContainerdAttempt {
     fn take_stdout(&mut self) -> Option<ContainerOutput> {
