@@ -9,7 +9,6 @@
 //!      ├── external subscribers
 //!      ├── state retention
 //!      └── output capacity
-//!              │
 //!              ▼
 //!         SupervisorApi
 //! ```
@@ -92,6 +91,7 @@ impl SupervisorApiBuilder {
 
     /// Installs a synchronous task state persistence hook.
     ///
+    /// Events are serialized in commit order and callbacks run outside the global state lock.
     /// The sink must return quickly and should forward events to an application-owned storage worker.
     pub fn with_state_sink(mut self, sink: TaskStateSinkHandle) -> Self {
         self.state_sink = Some(sink);

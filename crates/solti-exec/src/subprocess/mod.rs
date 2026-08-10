@@ -32,7 +32,12 @@ pub use backend::{CwdPolicy, EnvPolicy, SubprocessBackendConfig};
 
 mod boundary;
 
+mod child;
+
 mod domain;
+
+#[cfg(target_os = "macos")]
+mod spawn_macos;
 
 mod task;
 

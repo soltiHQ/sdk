@@ -35,6 +35,12 @@ use std::{
     time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(target_os = "macos")]
+use std::{
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
+};
+
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tokio::process::Command;
 use tracing::{debug, trace, warn};
@@ -48,6 +54,7 @@ use solti_runner::{
 use crate::subprocess::{
     backend::{PreparedSubprocessBackendConfig, SubprocessBackendConfig},
     boundary::PinnedCwd,
+    child::ProcessChild,
     domain::{ActiveProcessDomain, prepare_drop_finalizer},
     script::AnonymousScript,
     task::SubprocessTaskConfig,
@@ -432,6 +439,44 @@ fn apply_env_policy(cmd: &mut Command, ctx: &TaskExecContext) {
     }
 }
 
+/// Materializes the exact child environment for native macOS spawn.
+#[cfg(target_os = "macos")]
+fn macos_child_environment(ctx: &TaskExecContext) -> BTreeMap<OsString, OsString> {
+    use crate::subprocess::backend::{EnvPolicy, SAFE_DEFAULT_PATH};
+
+    let mut environment = match ctx.runner_cfg.env_policy() {
+        EnvPolicy::Inherit => std::env::vars_os().collect(),
+        EnvPolicy::Clear | EnvPolicy::Allowlist(_) => BTreeMap::new(),
+    };
+    let task_sets_path = ctx.task_cfg.env.contains_key("PATH");
+
+    match ctx.runner_cfg.env_policy() {
+        EnvPolicy::Inherit => {}
+        EnvPolicy::Clear => {
+            if !task_sets_path {
+                environment.insert("PATH".into(), SAFE_DEFAULT_PATH.into());
+            }
+        }
+        EnvPolicy::Allowlist(keys) => {
+            for key in keys {
+                if let Some(value) = std::env::var_os(key) {
+                    environment.insert(key.into(), value);
+                }
+            }
+            if !task_sets_path && !keys.iter().any(|key| key.as_str() == "PATH") {
+                environment.insert("PATH".into(), SAFE_DEFAULT_PATH.into());
+            }
+        }
+    }
+    environment.extend(
+        ctx.task_cfg
+            .env
+            .iter()
+            .map(|(key, value)| (key.into(), value.into())),
+    );
+    environment
+}
+
 /// Adds operation context to an I/O error.
 fn io_with_context(context: &str, source: std::io::Error) -> std::io::Error {
     std::io::Error::new(source.kind(), format!("{context}: {source}"))
@@ -585,6 +630,72 @@ fn apply_backend(
     ctx.runner_cfg.apply_to_command(cmd, prepared)
 }
 
+fn spawn_with_command(
+    ctx: &TaskExecContext,
+    script: Option<&AnonymousScript>,
+    prepared: crate::host::PreparedHostProcessAttempt,
+) -> Result<(ProcessChild, crate::host::AttemptProcessDomain), TaskError> {
+    let mut cmd = build_command(ctx, script.map(AnonymousScript::argument_path));
+    apply_fd_boundary(&mut cmd, ctx, script)?;
+    let host_process_domain = apply_backend(&mut cmd, ctx, prepared);
+    let child = cmd.spawn().map_err(|error| {
+        ctx.metrics
+            .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+        task_io_error("spawn failed", error)
+    })?;
+    Ok((child.into(), host_process_domain))
+}
+
+#[cfg(target_os = "macos")]
+enum MacosSpawnAttempt {
+    Spawned(ProcessChild, crate::host::AttemptProcessDomain),
+    Fallback(crate::host::PreparedHostProcessAttempt),
+}
+
+#[cfg(target_os = "macos")]
+fn try_spawn_macos(
+    ctx: &TaskExecContext,
+    script: Option<&AnonymousScript>,
+    prepared: crate::host::PreparedHostProcessAttempt,
+) -> Result<MacosSpawnAttempt, TaskError> {
+    let Some(reset_signals) = prepared.macos_spawn_signals() else {
+        return Ok(MacosSpawnAttempt::Fallback(prepared));
+    };
+
+    let mut args = Vec::with_capacity(ctx.task_cfg.args.len() + usize::from(script.is_some()));
+    if let Some(script) = script {
+        args.push(script.argument_path().as_os_str().to_owned());
+    }
+    args.extend(ctx.task_cfg.args.iter().map(OsString::from));
+    let environment = macos_child_environment(ctx);
+    let mut passed_fds = ctx.runner_cfg.passed_fds();
+    if let Some(script) = script {
+        passed_fds.push(script.as_raw_fd());
+    }
+    let spec = crate::subprocess::spawn_macos::SpawnSpec {
+        command: OsStr::new(&ctx.task_cfg.command),
+        args: &args,
+        env: &environment,
+        cwd: ctx.pinned_cwd.as_ref(),
+        passed_fds: &passed_fds,
+        reset_signals: &reset_signals,
+    };
+    if !crate::subprocess::spawn_macos::supports(&spec) {
+        return Ok(MacosSpawnAttempt::Fallback(prepared));
+    }
+
+    let child = crate::subprocess::spawn_macos::spawn(&spec).map_err(|error| {
+        ctx.metrics
+            .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+        task_io_error("native macOS spawn failed", error)
+    })?;
+    let Some(child) = child else {
+        return Ok(MacosSpawnAttempt::Fallback(prepared));
+    };
+    let domain = prepared.into_macos_spawn_domain();
+    Ok(MacosSpawnAttempt::Spawned(child, domain))
+}
+
 /// Attaches the subprocess descriptor passlist.
 ///
 /// The script descriptor is attempt-local.
@@ -697,18 +808,18 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
         None => None,
     };
 
-    let mut cmd = build_command(&ctx, script.as_ref().map(AnonymousScript::argument_path));
-    apply_fd_boundary(&mut cmd, &ctx, script.as_ref())?;
-    let host_process_domain = apply_backend(&mut cmd, &ctx, prepared_host_process);
+    #[cfg(target_os = "macos")]
+    let (child, host_process_domain) =
+        match try_spawn_macos(&ctx, script.as_ref(), prepared_host_process)? {
+            MacosSpawnAttempt::Spawned(child, domain) => (child, domain),
+            MacosSpawnAttempt::Fallback(prepared) => {
+                spawn_with_command(&ctx, script.as_ref(), prepared)?
+            }
+        };
+    #[cfg(not(target_os = "macos"))]
+    let (child, host_process_domain) =
+        spawn_with_command(&ctx, script.as_ref(), prepared_host_process)?;
 
-    let child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            ctx.metrics
-                .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
-            return Err(task_io_error("spawn failed", e));
-        }
-    };
     let mut process = ActiveProcessDomain::new(
         child,
         host_process_domain,
@@ -1096,6 +1207,57 @@ mod tests {
         assert_eq!(std_cmd.get_program(), "echo");
         let args: Vec<_> = std_cmd.get_args().collect();
         assert_eq!(args, vec!["hello"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn run_through_macos_fallback(ctx: TaskExecContext) {
+        let prepared = ctx.runner_cfg.prepare_host_process_attempt(None).unwrap();
+        let prepared = match try_spawn_macos(&ctx, None, prepared).unwrap() {
+            MacosSpawnAttempt::Fallback(prepared) => prepared,
+            MacosSpawnAttempt::Spawned(_, _) => panic!("test case unexpectedly used native spawn"),
+        };
+        let (mut child, _domain) = spawn_with_command(&ctx, None, prepared).unwrap();
+        assert!(child.wait().await.unwrap().success());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn executable_text_without_shebang_runs_through_fork_fallback() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let program = directory.path().join("plain-text");
+        std::fs::write(&program, b"exit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&program, permissions).unwrap();
+
+        let mut ctx = make_exec_ctx();
+        ctx.task_cfg.command = program.to_string_lossy().into_owned();
+        ctx.task_cfg.args.clear();
+        run_through_macos_fallback(ctx).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn relative_child_path_in_pinned_cwd_runs_through_fork_fallback() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let canonical = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(canonical.join("bin")).unwrap();
+        let program = canonical.join("bin/probe");
+        std::fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&program, permissions).unwrap();
+
+        let mut ctx = make_exec_ctx();
+        ctx.task_cfg.command = "probe".into();
+        ctx.task_cfg.args.clear();
+        ctx.task_cfg.env.insert("PATH".into(), "bin".into());
+        ctx.pinned_cwd = Some(PinnedCwd::open_absolute(&canonical).unwrap());
+        run_through_macos_fallback(ctx).await;
     }
 
     #[cfg(unix)]

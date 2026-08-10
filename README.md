@@ -327,17 +327,18 @@ Bearer authentication and TLS are independent.
 The subprocess path always validates configuration before runner registration.
 Configured controls fail closed when the current platform cannot enforce them.
 
-| Control                                         | Platform   |
-|-------------------------------------------------|------------|
-| Session, process group, signal reset, umask     | Unix       |
-| `RLIMIT_NOFILE`, `RLIMIT_FSIZE`, core dumps     | Unix       |
-| Pinned working directory                        | Unix       |
-| Explicit descriptor passlist                    | Linux      |
-| Descriptor snapshot and close-on-exec checks    | Other Unix |
-| cgroup v2 CPU, memory, and process limits       | Linux      |
-| Mount, network, IPC, UTS, and cgroup namespaces | Linux      |
-| UID, GID, supplementary groups, capabilities    | Linux      |
-| `no_new_privs` and seccomp denylist             | Linux      |
+| Control                                           | Platform |
+|---------------------------------------------------|----------|
+| Session, process group, signal reset, umask       | Unix     |
+| `RLIMIT_NOFILE`, `RLIMIT_FSIZE`, core dumps       | Unix     |
+| Pinned working directory                          | Unix     |
+| Explicit descriptor passlist with `close_range`   | Linux    |
+| Atomic `posix_spawn` descriptor passlist          | macOS    |
+| Parent snapshot plus child descriptor-table sweep | macOS fallback; other Unix |
+| cgroup v2 CPU, memory, and process limits         | Linux    |
+| Mount, network, IPC, UTS, and cgroup namespaces   | Linux    |
+| UID, GID, supplementary groups, capabilities      | Linux    |
+| `no_new_privs` and seccomp denylist               | Linux    |
 
 The default subprocess backend does not enable optional resource or security controls.
 It clears the inherited environment, pins the working directory on Unix, restricts descriptor inheritance, and owns child cleanup.

@@ -341,8 +341,12 @@ The hooks are storage-neutral.
 They do not add a database, replace the in-memory `TaskState`, retry delivery, or make state durable by themselves.
 They are write-side notifications; core does not load persisted state during startup.
 
-Callbacks run synchronously on core and runner paths. 
-They must return quickly, must not call back into core, and should normally forward cloned events to an application-owned worker:
+State events are queued while the state commit is locked, then delivered in FIFO commit order by one synchronous publisher after the state lock is released.
+If another thread or a reentrant call commits state while a callback is active, that commit appends its event and can return before its own callback runs.
+The publisher never invokes the sink recursively and stops at a batch whose state write is still in progress.
+Dropping that write guard marks the batch ready and resumes FIFO delivery.
+Output callbacks run synchronously on runner paths.
+All callbacks must return quickly and should normally forward cloned events to an application-owned worker:
 
 ```rust,no_run
 use std::sync::{Arc, mpsc};

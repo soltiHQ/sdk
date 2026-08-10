@@ -61,6 +61,7 @@ subprocess   = [
     "dep:thiserror",
     "dep:tokio",
     "tokio/macros",
+    "tokio/net",
     "tokio/process",
     "tokio/signal",
     "tokio/time",

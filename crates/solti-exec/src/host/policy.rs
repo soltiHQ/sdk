@@ -429,6 +429,48 @@ impl PreparedHostProcessPolicy {
 }
 
 impl PreparedHostProcessAttempt {
+    /// Returns signal dispositions representable by the native macOS spawn path.
+    ///
+    /// `None` means that the attempt contains a control which requires the
+    /// portable `fork`/`exec` fallback.
+    #[cfg(all(feature = "subprocess", target_os = "macos"))]
+    pub(crate) fn macos_spawn_signals(&self) -> Option<Arc<[libc::c_int]>> {
+        let process = self.controls.process.as_ref();
+        if process.is_some_and(PreparedProcessConfig::has_umask)
+            || self
+                .controls
+                .rlimits
+                .as_ref()
+                .is_some_and(|limits| !limits.is_empty())
+            || self.cgroup.is_some()
+            || self
+                .controls
+                .security
+                .as_ref()
+                .is_some_and(|security| !security.is_empty())
+        {
+            return None;
+        }
+
+        Some(
+            process
+                .map(PreparedProcessConfig::reset_signals)
+                .unwrap_or_else(|| Arc::from([])),
+        )
+    }
+
+    /// Consumes an attempt handled entirely by native macOS spawn attributes.
+    #[cfg(all(feature = "subprocess", target_os = "macos"))]
+    pub(crate) fn into_macos_spawn_domain(self) -> AttemptProcessDomain {
+        debug_assert!(self.macos_spawn_signals().is_some());
+        let Self {
+            controls: _,
+            cgroup,
+        } = self;
+        debug_assert!(cgroup.is_none());
+        AttemptProcessDomain { cgroup: None }
+    }
+
     /// Attaches enabled controls to a process command.
     ///
     /// This token is consumed.
@@ -680,6 +722,36 @@ mod tests {
             DomainTermination::Unavailable
         );
         domain.cleanup().unwrap();
+    }
+
+    #[cfg(all(feature = "subprocess", target_os = "macos"))]
+    #[test]
+    fn macos_spawn_accepts_native_controls_and_rejects_hook_only_controls() {
+        let native = HostProcessPolicy::new()
+            .with_process_config(ProcessConfig {
+                reset_signals: true,
+                new_session: true,
+                umask: None,
+            })
+            .prepare()
+            .unwrap()
+            .prepare_attempt(None)
+            .unwrap();
+        assert!(!native.macos_spawn_signals().unwrap().is_empty());
+
+        for fallback in [
+            HostProcessPolicy::new().with_process_config(ProcessConfig {
+                umask: Some(0o027),
+                ..Default::default()
+            }),
+            HostProcessPolicy::new().with_rlimits(RlimitConfig {
+                disable_core_dumps: true,
+                ..Default::default()
+            }),
+        ] {
+            let attempt = fallback.prepare().unwrap().prepare_attempt(None).unwrap();
+            assert!(attempt.macos_spawn_signals().is_none());
+        }
     }
 
     #[test]

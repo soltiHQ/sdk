@@ -30,13 +30,17 @@ use std::{
     collections::{HashMap, VecDeque},
     future::Future,
     io::{self, Write},
+    ops::{Deref, DerefMut},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::SystemTime,
 };
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_stream::{
@@ -74,7 +78,130 @@ use crate::{StateConfig, WriteConflict, WritePreconditionViolation, error::CoreE
 pub struct TaskState {
     inner: Arc<RwLock<TaskStateInner>>,
     watch_stop: CancellationToken,
-    event_sink: Option<TaskStateSinkHandle>,
+    event_publisher: Arc<StateEventPublisher>,
+}
+
+struct StateEventPublisher {
+    sink: Option<TaskStateSinkHandle>,
+    inner: Mutex<StateEventPublisherInner>,
+}
+
+#[derive(Default)]
+struct StateEventPublisherInner {
+    pending: VecDeque<Arc<PendingStateEventBatch>>,
+    publishing: bool,
+}
+
+struct PendingStateEventBatch {
+    events: Mutex<VecDeque<TaskStateEvent>>,
+    ready: AtomicBool,
+}
+
+impl PendingStateEventBatch {
+    fn new() -> Self {
+        Self {
+            events: Mutex::new(VecDeque::new()),
+            ready: AtomicBool::new(false),
+        }
+    }
+}
+
+impl StateEventPublisher {
+    fn new(sink: Option<TaskStateSinkHandle>) -> Self {
+        Self {
+            sink,
+            inner: Mutex::new(StateEventPublisherInner::default()),
+        }
+    }
+
+    fn begin_batch(&self) -> Option<Arc<PendingStateEventBatch>> {
+        self.sink.as_ref()?;
+        let batch = Arc::new(PendingStateEventBatch::new());
+        self.inner.lock().pending.push_back(Arc::clone(&batch));
+        Some(batch)
+    }
+
+    fn mark_ready_and_publish(&self, batch: Arc<PendingStateEventBatch>) {
+        batch.ready.store(true, Ordering::Release);
+        self.publish_pending();
+    }
+
+    fn publish_pending(&self) {
+        let Some(sink) = self.sink.as_ref() else {
+            return;
+        };
+        {
+            let mut inner = self.inner.lock();
+            if inner.publishing || inner.pending.is_empty() {
+                return;
+            }
+            inner.publishing = true;
+        }
+
+        loop {
+            let event = {
+                let mut inner = self.inner.lock();
+                let Some(batch) = inner.pending.front().cloned() else {
+                    inner.publishing = false;
+                    return;
+                };
+                if !batch.ready.load(Ordering::Acquire) {
+                    inner.publishing = false;
+                    return;
+                }
+                if let Some(event) = batch.events.lock().pop_front() {
+                    event
+                } else {
+                    inner.pending.pop_front();
+                    continue;
+                }
+            };
+            publish_state_event(Some(sink), event);
+        }
+    }
+}
+
+struct TaskStateWriteGuard<'a> {
+    inner: Option<RwLockWriteGuard<'a, TaskStateInner>>,
+    publisher: &'a StateEventPublisher,
+    batch: Option<Arc<PendingStateEventBatch>>,
+}
+
+impl TaskStateWriteGuard<'_> {
+    fn enqueue(&self, event: TaskStateEvent) {
+        if let Some(batch) = self.batch.as_ref() {
+            batch.events.lock().push_back(event);
+        }
+    }
+}
+
+impl Deref for TaskStateWriteGuard<'_> {
+    type Target = TaskStateInner;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner
+            .as_deref()
+            .expect("TaskState write guard is present until drop")
+    }
+}
+
+impl DerefMut for TaskStateWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+            .as_deref_mut()
+            .expect("TaskState write guard is present until drop")
+    }
+}
+
+impl Drop for TaskStateWriteGuard<'_> {
+    fn drop(&mut self) {
+        let batch = self.batch.take();
+        // Readiness must become visible only after the authoritative state lock is released.
+        drop(self.inner.take());
+        if let Some(batch) = batch {
+            self.publisher.mark_ready_and_publish(batch);
+        }
+    }
 }
 
 struct TaskStateInner {
@@ -425,13 +552,23 @@ impl TaskState {
                 max_runs_per_task: config.max_runs_per_task(),
             })),
             watch_stop: CancellationToken::new(),
-            event_sink,
+            event_publisher: Arc::new(StateEventPublisher::new(event_sink)),
+        }
+    }
+
+    fn write(&self) -> TaskStateWriteGuard<'_> {
+        let inner = self.inner.write();
+        let batch = self.event_publisher.begin_batch();
+        TaskStateWriteGuard {
+            inner: Some(inner),
+            publisher: &self.event_publisher,
+            batch,
         }
     }
 
     #[cfg(test)]
     fn set_max_runs_per_task(&self, max: usize) {
-        self.inner.write().max_runs_per_task = max;
+        self.write().max_runs_per_task = max;
     }
 
     fn format_resource_version(epoch: &str, revision: u64) -> String {
@@ -461,7 +598,7 @@ impl TaskState {
 
     fn record_change(
         &self,
-        inner: &mut TaskStateInner,
+        inner: &mut TaskStateWriteGuard<'_>,
         revision: u64,
         previous: Option<Task>,
         current: Option<Task>,
@@ -512,18 +649,21 @@ impl TaskState {
         }
 
         let _ = inner.watch_tx.send(change);
-        publish_state_event(self.event_sink.as_ref(), persistence_event);
+        inner.enqueue(persistence_event);
     }
 
-    fn record_run_change(&self, task: &TaskId, task_uid: &Uid, run: &TaskRun) {
-        publish_state_event(
-            self.event_sink.as_ref(),
-            TaskStateEvent::RunChanged {
-                task: task.clone(),
-                task_uid: task_uid.clone(),
-                run: run.clone(),
-            },
-        );
+    fn record_run_change(
+        &self,
+        inner: &TaskStateWriteGuard<'_>,
+        task: &TaskId,
+        task_uid: &Uid,
+        run: &TaskRun,
+    ) {
+        inner.enqueue(TaskStateEvent::RunChanged {
+            task: task.clone(),
+            task_uid: task_uid.clone(),
+            run: run.clone(),
+        });
     }
 
     fn index_task(inner: &mut TaskStateInner, task: &Task) {
@@ -545,7 +685,7 @@ impl TaskState {
     /// Inserts a manifest for tests.
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn add_task(&self, manifest: TaskManifest) {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         let name = manifest.name().clone();
         let previous = inner.tasks.remove(&name);
         if let Some(previous) = previous.as_ref() {
@@ -567,7 +707,7 @@ impl TaskState {
         &self,
         manifest: &TaskManifest,
     ) -> Result<DesiredCommit, CoreError> {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         let name = manifest.name().clone();
         if inner.tasks.contains_key(&name) {
             return Err(CoreError::AlreadyExists(format!(
@@ -607,7 +747,7 @@ impl TaskState {
     ) -> Result<DesiredCommit, CoreError> {
         manifest.name().validate_format()?;
         manifest.spec().validate()?;
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         let name = manifest.name().clone();
         let Some(current) = inner.tasks.get(&name) else {
             if !preconditions.is_empty() {
@@ -703,7 +843,7 @@ impl TaskState {
 
     /// Binds a Taskvisor submission to one resource generation.
     pub(crate) fn bind_tv(&self, resource: ResourceGeneration, tv: taskvisor::TaskId) -> bool {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         let current = inner.tasks.get(&resource.name).is_some_and(|task| {
             task.uid() == &resource.uid && task.metadata().generation() == resource.generation
         });
@@ -751,7 +891,7 @@ impl TaskState {
     }
 
     pub(crate) fn unbind_tv(&self, tv_raw: u64) -> Option<RuntimeBinding> {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         let binding = inner.by_tv.get(&tv_raw)?.clone();
         if inner
             .tv_of
@@ -770,7 +910,7 @@ impl TaskState {
     /// Returns `true` when the task existed.
     /// Reconciliation failures do not use this path.
     pub(crate) fn delete_task(&self, id: &TaskId) -> bool {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         inner.runs.remove(id);
         inner.terminal_since.remove(id);
 
@@ -807,7 +947,7 @@ impl TaskState {
         if attempt == 0 {
             return false;
         }
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         let name = &binding.resource.name;
         let Some(task) = inner.tasks.get(name) else {
             return false;
@@ -888,7 +1028,7 @@ impl TaskState {
             self.record_change(&mut inner, revision, Some(previous), Some(current));
         }
         for run in &run_changes {
-            self.record_run_change(name, &binding.resource.uid, run);
+            self.record_run_change(&inner, name, &binding.resource.uid, run);
         }
         true
     }
@@ -905,7 +1045,7 @@ impl TaskState {
         if attempt == 0 || !phase.is_terminal() {
             return false;
         }
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         let name = &binding.resource.name;
         let Some(task) = inner.tasks.get(name) else {
             return false;
@@ -1022,7 +1162,7 @@ impl TaskState {
             self.record_change(&mut inner, revision, Some(previous), Some(current));
         }
         for run in &run_changes {
-            self.record_run_change(name, &binding.resource.uid, run);
+            self.record_run_change(&inner, name, &binding.resource.uid, run);
         }
         changed
     }
@@ -1037,13 +1177,13 @@ impl TaskState {
         error: Option<String>,
         exit_code: Option<i32>,
     ) -> bool {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         self.transition_task_finished_locked(&mut inner, binding, phase, error, exit_code, false)
     }
 
     /// Marks a generation as accepted by Taskvisor intake.
     pub(crate) fn mark_observed(&self, resource: &ResourceGeneration) -> bool {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         let Some(task) = inner.tasks.get(&resource.name) else {
             return false;
         };
@@ -1083,7 +1223,7 @@ impl TaskState {
         reason: &'static str,
         message: String,
     ) -> bool {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         let Some(task) = inner.tasks.get(&resource.name) else {
             return false;
         };
@@ -1116,7 +1256,7 @@ impl TaskState {
 
     fn transition_task_finished_locked(
         &self,
-        inner: &mut TaskStateInner,
+        inner: &mut TaskStateWriteGuard<'_>,
         binding: &RuntimeBinding,
         phase: TaskPhase,
         error: Option<String>,
@@ -1198,7 +1338,7 @@ impl TaskState {
         if !phase.is_terminal() {
             return None;
         }
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
 
         let binding = inner.by_tv.get(&tv_raw)?.clone();
         if inner
@@ -1225,9 +1365,10 @@ impl TaskState {
         }
         self.transition_task_finished_locked(&mut inner, &binding, phase, error, exit_code, force);
         if let Some(run) = run_change.as_ref() {
-            self.record_run_change(&binding.resource.name, &binding.resource.uid, run);
+            self.record_run_change(&inner, &binding.resource.name, &binding.resource.uid, run);
         }
-        Some(binding.resource.name)
+        let name = binding.resource.name;
+        Some(name)
     }
 
     /// Lists retained runs for a task.
@@ -1329,7 +1470,7 @@ impl TaskState {
     ///
     /// Returns `(runs_removed, tasks_removed)` for observability.
     pub(crate) fn sweep(&self, config: &StateConfig) -> (usize, usize) {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         let now = SystemTime::now();
         let mut runs_removed = 0usize;
         let mut tasks_removed = 0usize;
@@ -1729,7 +1870,7 @@ mod tests {
         pin::Pin,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         task::{Context, Poll, Wake, Waker},
         time::Duration,
@@ -1778,7 +1919,7 @@ mod tests {
     }
 
     fn record_current_change(state: &TaskState, task: Task) {
-        let mut inner = state.inner.write();
+        let mut inner = state.write();
         let (revision, resource_version) = TaskState::next_resource_version(&mut inner);
         assert_eq!(task.metadata().resource_version(), resource_version);
         state.record_change(&mut inner, revision, None, Some(task));
@@ -1808,6 +1949,265 @@ mod tests {
         fn on_event(&self, event: &TaskStateEvent) {
             self.events.lock().unwrap().push(event.clone());
         }
+    }
+
+    struct BlockingStateSink {
+        events: std::sync::Mutex<Vec<String>>,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        calls: AtomicUsize,
+    }
+
+    impl crate::TaskStateSink for BlockingStateSink {
+        fn on_event(&self, event: &TaskStateEvent) {
+            let TaskStateEvent::TaskChanged {
+                resource_version, ..
+            } = event
+            else {
+                return;
+            };
+            self.events.lock().unwrap().push(resource_version.clone());
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_state_sink_does_not_hold_state_lock_and_preserves_commit_order() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let sink = Arc::new(BlockingStateSink {
+            events: std::sync::Mutex::new(Vec::new()),
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+            calls: AtomicUsize::new(0),
+        });
+        let state = TaskState::with_epoch_and_sink(
+            StateConfig::default(),
+            "ordered-sink".to_string(),
+            Some(sink.clone()),
+        );
+
+        let first_state = state.clone();
+        let first = std::thread::spawn(move || {
+            first_state.add_task(manifest("first", "slot", 1_000));
+        });
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+
+        let (second_done_tx, second_done_rx) = std::sync::mpsc::sync_channel(1);
+        let second_state = state.clone();
+        let second = std::thread::spawn(move || {
+            second_state.add_task(manifest("second", "slot", 1_000));
+            second_done_tx.send(()).unwrap();
+        });
+        let second_finished_before_release =
+            second_done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        assert!(entered, "the first committed event must reach the sink");
+        assert!(
+            second_finished_before_release,
+            "a blocked sink must not retain the TaskState write lock"
+        );
+        assert_eq!(
+            *sink.events.lock().unwrap(),
+            ["ordered-sink:1", "ordered-sink:2"]
+        );
+    }
+
+    struct ReadinessBarrierStateSink {
+        state_inner: std::sync::Mutex<Option<Arc<RwLock<TaskStateInner>>>>,
+        events: std::sync::Mutex<Vec<String>>,
+        first_entered: std::sync::mpsc::SyncSender<()>,
+        first_release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        second_entered: std::sync::mpsc::SyncSender<()>,
+        second_callback_unlocked: AtomicBool,
+        calls: AtomicUsize,
+    }
+
+    impl crate::TaskStateSink for ReadinessBarrierStateSink {
+        fn on_event(&self, event: &TaskStateEvent) {
+            let TaskStateEvent::TaskChanged {
+                resource_version, ..
+            } = event
+            else {
+                return;
+            };
+            self.events.lock().unwrap().push(resource_version.clone());
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    self.first_entered.send(()).unwrap();
+                    self.first_release.lock().unwrap().recv().unwrap();
+                }
+                1 => {
+                    let state_inner = self
+                        .state_inner
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .expect("test state must be installed before publishing");
+                    self.second_callback_unlocked
+                        .store(state_inner.try_write().is_some(), Ordering::SeqCst);
+                    self.second_entered.send(()).unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn state_sink_waits_for_enqueuing_write_guard_to_release() {
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (first_release_tx, first_release_rx) = std::sync::mpsc::sync_channel(1);
+        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let sink = Arc::new(ReadinessBarrierStateSink {
+            state_inner: std::sync::Mutex::new(None),
+            events: std::sync::Mutex::new(Vec::new()),
+            first_entered: first_entered_tx,
+            first_release: std::sync::Mutex::new(first_release_rx),
+            second_entered: second_entered_tx,
+            second_callback_unlocked: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+        });
+        let state = TaskState::with_epoch_and_sink(
+            StateConfig::default(),
+            "ready-sink".to_string(),
+            Some(sink.clone()),
+        );
+        *sink.state_inner.lock().unwrap() = Some(Arc::clone(&state.inner));
+
+        let (first_done_tx, first_done_rx) = std::sync::mpsc::sync_channel(1);
+        let first_state = state.clone();
+        let first = std::thread::spawn(move || {
+            first_state.add_task(manifest("first", "slot", 1_000));
+            first_done_tx.send(()).unwrap();
+        });
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first callback must enter");
+
+        let (second_enqueued_tx, second_enqueued_rx) = std::sync::mpsc::sync_channel(1);
+        let (second_release_tx, second_release_rx) = std::sync::mpsc::sync_channel(1);
+        let second_state = state.clone();
+        let second = std::thread::spawn(move || {
+            let mut inner = second_state.write();
+            let mut task = Task::from_manifest(manifest("second", "slot", 1_000)).unwrap();
+            let (revision, resource_version) = TaskState::next_resource_version(&mut inner);
+            task.set_resource_version(resource_version).unwrap();
+            TaskState::index_task(&mut inner, &task);
+            inner.tasks.insert(task.name().clone(), task.clone());
+            second_state.record_change(&mut inner, revision, None, Some(task));
+            second_enqueued_tx.send(()).unwrap();
+            second_release_rx.recv().unwrap();
+        });
+        second_enqueued_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second event must enqueue while its write guard is held");
+
+        first_release_tx.send(()).unwrap();
+        first_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first publisher must stop at the unready second event");
+        let second_entered_before_release = match second_entered_rx.try_recv() {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("second callback channel disconnected")
+            }
+        };
+
+        second_release_tx.send(()).unwrap();
+        let second_event_delivered = second_entered_before_release
+            || second_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .is_ok();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let second_callback_unlocked = sink.second_callback_unlocked.load(Ordering::SeqCst);
+        let events = sink.events.lock().unwrap().clone();
+        *sink.state_inner.lock().unwrap() = None;
+        assert!(
+            !second_entered_before_release,
+            "an event must remain unready until its state write guard releases"
+        );
+        assert!(second_event_delivered);
+        assert!(second_callback_unlocked);
+        assert_eq!(events, ["ready-sink:1", "ready-sink:2"]);
+    }
+
+    struct ReentrantStateSink {
+        state: std::sync::Mutex<Option<TaskState>>,
+        events: std::sync::Mutex<Vec<String>>,
+        first: AtomicBool,
+        all_callbacks_unlocked: AtomicBool,
+        depth: AtomicUsize,
+        max_depth: AtomicUsize,
+    }
+
+    impl crate::TaskStateSink for ReentrantStateSink {
+        fn on_event(&self, event: &TaskStateEvent) {
+            let TaskStateEvent::TaskChanged {
+                resource_version, ..
+            } = event
+            else {
+                return;
+            };
+            let depth = self.depth.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_depth.fetch_max(depth, Ordering::SeqCst);
+            self.events.lock().unwrap().push(resource_version.clone());
+
+            let state = self
+                .state
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("test state must be installed before publishing");
+            let state_unlocked = state.inner.try_write().is_some();
+            self.all_callbacks_unlocked
+                .fetch_and(state_unlocked, Ordering::SeqCst);
+            if self.first.swap(false, Ordering::SeqCst) && state_unlocked {
+                state.add_task(manifest("nested", "slot", 1_000));
+            }
+
+            self.depth.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn reentrant_state_change_is_queued_without_recursive_sink_call() {
+        let sink = Arc::new(ReentrantStateSink {
+            state: std::sync::Mutex::new(None),
+            events: std::sync::Mutex::new(Vec::new()),
+            first: AtomicBool::new(true),
+            all_callbacks_unlocked: AtomicBool::new(true),
+            depth: AtomicUsize::new(0),
+            max_depth: AtomicUsize::new(0),
+        });
+        let state = TaskState::with_epoch_and_sink(
+            StateConfig::default(),
+            "reentrant-sink".to_string(),
+            Some(sink.clone()),
+        );
+        *sink.state.lock().unwrap() = Some(state.clone());
+
+        state.add_task(manifest("outer", "slot", 1_000));
+
+        let all_callbacks_unlocked = sink.all_callbacks_unlocked.load(Ordering::SeqCst);
+        let nested_exists = state.contains_task(&TaskId::new("nested").unwrap());
+        let max_depth = sink.max_depth.load(Ordering::SeqCst);
+        let events = sink.events.lock().unwrap().clone();
+        *sink.state.lock().unwrap() = None;
+
+        assert!(all_callbacks_unlocked);
+        assert!(nested_exists);
+        assert_eq!(max_depth, 1);
+        assert_eq!(events, ["reentrant-sink:1", "reentrant-sink:2"]);
     }
 
     #[test]

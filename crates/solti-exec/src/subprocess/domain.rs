@@ -16,16 +16,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::process::{Child, ChildStderr, ChildStdout};
 use tracing::warn;
 
 use crate::host::{AttemptProcessDomain, DomainTermination};
+use crate::subprocess::child::{ChildOutput, ProcessChild};
 
 /// Child process and termination boundary for one active attempt.
 ///
 /// Drop requests termination before scheduling reap and cleanup.
 pub(super) struct ActiveProcessDomain {
-    child: Option<Child>,
+    child: Option<ProcessChild>,
     host: Option<AttemptProcessDomain>,
     drop_finalizer: DropFinalizerHandle,
     #[cfg(unix)]
@@ -61,12 +61,16 @@ type DroppedProcessGroup = ();
 
 impl ActiveProcessDomain {
     /// Arms supervision for a freshly spawned child.
-    pub(super) fn new(
-        child: Child,
+    pub(super) fn new<C>(
+        child: C,
         host: AttemptProcessDomain,
         run_id: Arc<str>,
         drop_finalizer: DropFinalizerHandle,
-    ) -> Self {
+    ) -> Self
+    where
+        C: Into<ProcessChild>,
+    {
+        let child = child.into();
         #[cfg(unix)]
         let group = child.id().map_or(ProcessGroupState::Released, |pid| {
             ProcessGroupState::Armed(pid as libc::pid_t)
@@ -87,21 +91,19 @@ impl ActiveProcessDomain {
     }
 
     /// Takes the child's stdout pipe.
-    pub(super) fn take_stdout(&mut self) -> Option<ChildStdout> {
+    pub(super) fn take_stdout(&mut self) -> Option<ChildOutput> {
         self.child
             .as_mut()
             .expect("active process domain must own its child")
-            .stdout
-            .take()
+            .take_stdout()
     }
 
     /// Takes the child's stderr pipe.
-    pub(super) fn take_stderr(&mut self) -> Option<ChildStderr> {
+    pub(super) fn take_stderr(&mut self) -> Option<ChildOutput> {
         self.child
             .as_mut()
             .expect("active process domain must own its child")
-            .stderr
-            .take()
+            .take_stderr()
     }
 
     /// Returns the attempt cgroup path when one is configured.
@@ -116,9 +118,13 @@ impl ActiveProcessDomain {
     pub(super) async fn observe_exit(&mut self) -> io::Result<()> {
         use tokio::signal::unix::{SignalKind, signal};
 
-        let pid = self.child.as_ref().and_then(Child::id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "subprocess has no process id")
-        })?;
+        let pid = self
+            .child
+            .as_ref()
+            .and_then(ProcessChild::id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "subprocess has no process id")
+            })?;
         let pid = pid as libc::pid_t;
         let mut sigchld = signal(SignalKind::child())?;
 
@@ -512,30 +518,86 @@ fn start_drop_finalizer() -> io::Result<DropFinalizer> {
 }
 
 struct DroppedProcessDomain {
-    child: Option<Child>,
+    child: Option<ProcessChild>,
     host: Option<AttemptProcessDomain>,
     group: DroppedProcessGroup,
     leader: LeaderState,
     tree_handled: bool,
-    cleanup_attempt: usize,
-    cleanup_after: Instant,
+    os_error_backoffs: DroppedProcessBackoffs,
+}
+
+#[repr(usize)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DroppedProcessOperation {
+    TerminateTree,
+    TerminateGroup,
+    TerminateLeader,
+    TryWait,
+    Cleanup,
+}
+
+impl DroppedProcessOperation {
+    const COUNT: usize = 5;
+}
+
+#[derive(Clone, Copy)]
+struct DroppedProcessBackoff {
+    attempt: usize,
+    retry_after: Instant,
+}
+
+struct DroppedProcessBackoffs {
+    operations: [DroppedProcessBackoff; DroppedProcessOperation::COUNT],
+}
+
+impl DroppedProcessBackoffs {
+    fn new(now: Instant) -> Self {
+        Self {
+            operations: [DroppedProcessBackoff {
+                attempt: 0,
+                retry_after: now,
+            }; DroppedProcessOperation::COUNT],
+        }
+    }
+
+    fn operation(&self, operation: DroppedProcessOperation) -> &DroppedProcessBackoff {
+        &self.operations[operation as usize]
+    }
+
+    fn operation_mut(&mut self, operation: DroppedProcessOperation) -> &mut DroppedProcessBackoff {
+        &mut self.operations[operation as usize]
+    }
+
+    fn is_ready(&self, operation: DroppedProcessOperation, now: Instant) -> bool {
+        now >= self.operation(operation).retry_after
+    }
+
+    fn record_error(&mut self, operation: DroppedProcessOperation, now: Instant) {
+        let backoff = self.operation_mut(operation);
+        backoff.attempt = backoff.attempt.saturating_add(1);
+        backoff.retry_after = now + finalizer_os_error_retry_delay(backoff.attempt - 1);
+    }
+
+    fn clear(&mut self, operation: DroppedProcessOperation) {
+        self.operation_mut(operation).attempt = 0;
+    }
 }
 
 impl DroppedProcessDomain {
     fn new(
-        child: Option<Child>,
+        child: Option<ProcessChild>,
         host: Option<AttemptProcessDomain>,
         group: DroppedProcessGroup,
         leader: LeaderState,
     ) -> Self {
+        let now = Instant::now();
         Self {
             child,
             host,
             group,
             leader,
             tree_handled: false,
-            cleanup_attempt: 0,
-            cleanup_after: Instant::now(),
+            os_error_backoffs: DroppedProcessBackoffs::new(now),
         }
     }
 
@@ -544,59 +606,153 @@ impl DroppedProcessDomain {
     /// This path does not emit diagnostics or format errors.
     /// It retains the child until `try_wait` reaps it or reports lost ownership.
     fn poll(&mut self, now: Instant) -> bool {
+        if !self.advance_termination(now) {
+            return false;
+        }
+        if !self.advance_reap(now) {
+            return false;
+        }
+        self.advance_cleanup(now)
+    }
+
+    fn advance_termination(&mut self, now: Instant) -> bool {
         let mut termination_ready = true;
         if !self.tree_handled {
-            match self.host.as_mut() {
-                Some(host) => match host.terminate_tree() {
-                    Ok(_) => self.tree_handled = true,
-                    Err(_) => termination_ready = false,
-                },
-                None => self.tree_handled = true,
+            if let Some(host) = self.host.as_mut() {
+                if self
+                    .os_error_backoffs
+                    .is_ready(DroppedProcessOperation::TerminateTree, now)
+                {
+                    match host.terminate_tree() {
+                        Ok(_) => {
+                            self.tree_handled = true;
+                            self.os_error_backoffs
+                                .clear(DroppedProcessOperation::TerminateTree);
+                        }
+                        Err(_) => {
+                            self.os_error_backoffs
+                                .record_error(DroppedProcessOperation::TerminateTree, now);
+                            termination_ready = false;
+                        }
+                    }
+                } else {
+                    termination_ready = false;
+                }
+            } else {
+                self.tree_handled = true;
+                self.os_error_backoffs
+                    .clear(DroppedProcessOperation::TerminateTree);
             }
         }
 
         #[cfg(unix)]
-        if terminate_process_group(&mut self.group, self.leader).is_err() {
-            termination_ready = false;
+        {
+            if self
+                .os_error_backoffs
+                .is_ready(DroppedProcessOperation::TerminateGroup, now)
+            {
+                match terminate_process_group(&mut self.group, self.leader) {
+                    Ok(()) => self
+                        .os_error_backoffs
+                        .clear(DroppedProcessOperation::TerminateGroup),
+                    Err(_) => {
+                        self.os_error_backoffs
+                            .record_error(DroppedProcessOperation::TerminateGroup, now);
+                        termination_ready = false;
+                    }
+                }
+            } else {
+                termination_ready = false;
+            }
         }
+        #[cfg(not(unix))]
+        self.os_error_backoffs
+            .clear(DroppedProcessOperation::TerminateGroup);
 
-        if terminate_dropped_leader(&mut self.child, &mut self.leader).is_err() {
+        if self
+            .os_error_backoffs
+            .is_ready(DroppedProcessOperation::TerminateLeader, now)
+        {
+            match terminate_dropped_leader(&mut self.child, &mut self.leader) {
+                Ok(()) => self
+                    .os_error_backoffs
+                    .clear(DroppedProcessOperation::TerminateLeader),
+                Err(_) => {
+                    self.os_error_backoffs
+                        .record_error(DroppedProcessOperation::TerminateLeader, now);
+                    termination_ready = false;
+                }
+            }
+        } else {
             termination_ready = false;
         }
-        if !termination_ready {
+        termination_ready
+    }
+
+    fn advance_reap(&mut self, now: Instant) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            self.os_error_backoffs
+                .clear(DroppedProcessOperation::TryWait);
+            return true;
+        };
+        if !self
+            .os_error_backoffs
+            .is_ready(DroppedProcessOperation::TryWait, now)
+        {
             return false;
         }
 
-        if let Some(child) = self.child.as_mut() {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    self.leader = LeaderState::Reaped;
-                    self.child.take();
-                }
-                Ok(None) => return false,
-                Err(error) if wait_ownership_was_lost(&error) => {
-                    self.leader = LeaderState::WaitOwnershipLost;
-                    self.child.take();
-                }
-                Err(_) => return false,
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                self.os_error_backoffs
+                    .clear(DroppedProcessOperation::TryWait);
+                self.leader = LeaderState::Reaped;
+                self.child.take();
+                true
+            }
+            Ok(None) => {
+                self.os_error_backoffs
+                    .clear(DroppedProcessOperation::TryWait);
+                false
+            }
+            Err(error) if wait_ownership_was_lost(&error) => {
+                self.os_error_backoffs
+                    .clear(DroppedProcessOperation::TryWait);
+                self.leader = LeaderState::WaitOwnershipLost;
+                self.child.take();
+                true
+            }
+            Err(_) => {
+                self.os_error_backoffs
+                    .record_error(DroppedProcessOperation::TryWait, now);
+                false
             }
         }
+    }
 
+    fn advance_cleanup(&mut self, now: Instant) -> bool {
         let Some(host) = self.host.as_mut() else {
+            self.os_error_backoffs
+                .clear(DroppedProcessOperation::Cleanup);
             return true;
         };
-        if now < self.cleanup_after {
+        if !self
+            .os_error_backoffs
+            .is_ready(DroppedProcessOperation::Cleanup, now)
+        {
             return false;
         }
 
         match host.cleanup() {
             Ok(()) => {
+                self.os_error_backoffs
+                    .clear(DroppedProcessOperation::Cleanup);
                 self.host.take();
                 true
             }
             Err(_) => {
-                self.cleanup_attempt = self.cleanup_attempt.saturating_add(1);
-                self.cleanup_after = now + cleanup_retry_delay(self.cleanup_attempt - 1);
+                self.os_error_backoffs
+                    .record_error(DroppedProcessOperation::Cleanup, now);
                 false
             }
         }
@@ -607,68 +763,21 @@ impl DroppedProcessDomain {
     /// This terminal path contains no tracing, formatting, callbacks, or unwraps.
     /// It does not release the child, group, or cgroup before completion.
     fn finalize_after_panic(&mut self) {
-        const RETRY_DELAY: Duration = Duration::from_millis(10);
+        const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
         loop {
-            let mut termination_ready = true;
-            if !self.tree_handled {
-                match self.host.as_mut() {
-                    Some(host) => match host.terminate_tree() {
-                        Ok(_) => self.tree_handled = true,
-                        Err(_) => termination_ready = false,
-                    },
-                    None => self.tree_handled = true,
-                }
-            }
-
-            #[cfg(unix)]
-            if terminate_process_group(&mut self.group, self.leader).is_err() {
-                termination_ready = false;
-            }
-            if terminate_dropped_leader(&mut self.child, &mut self.leader).is_err() {
-                termination_ready = false;
-            }
-            if !termination_ready {
-                std::thread::sleep(RETRY_DELAY);
-                continue;
-            }
-
-            if let Some(child) = self.child.as_mut() {
-                match child.try_wait() {
-                    Ok(Some(_)) => {
-                        self.leader = LeaderState::Reaped;
-                        self.child.take();
-                    }
-                    Ok(None) => {
-                        std::thread::sleep(RETRY_DELAY);
-                        continue;
-                    }
-                    Err(error) if wait_ownership_was_lost(&error) => {
-                        self.leader = LeaderState::WaitOwnershipLost;
-                        self.child.take();
-                    }
-                    Err(_) => {
-                        std::thread::sleep(RETRY_DELAY);
-                        continue;
-                    }
-                }
-            }
-
-            let Some(host) = self.host.as_mut() else {
+            if self.poll(Instant::now()) {
                 return;
-            };
-            match host.cleanup() {
-                Ok(()) => {
-                    self.host.take();
-                    return;
-                }
-                Err(_) => std::thread::sleep(RETRY_DELAY),
             }
+            std::thread::sleep(POLL_INTERVAL);
         }
     }
 }
 
-fn terminate_dropped_leader(child: &mut Option<Child>, leader: &mut LeaderState) -> io::Result<()> {
+fn terminate_dropped_leader(
+    child: &mut Option<ProcessChild>,
+    leader: &mut LeaderState,
+) -> io::Result<()> {
     match *leader {
         LeaderState::ExitedObserved
         | LeaderState::KillRequested
@@ -854,6 +963,10 @@ fn cleanup_retry_delay(attempt: usize) -> Duration {
         .min(MAX_DELAY)
 }
 
+fn finalizer_os_error_retry_delay(attempt: usize) -> Duration {
+    cleanup_retry_delay(attempt)
+}
+
 /// Preserves every failed termination boundary.
 fn finish_termination(
     tree: io::Result<DomainTermination>,
@@ -913,6 +1026,87 @@ fn exited_without_reaping(pid: libc::pid_t) -> io::Result<bool> {
 mod tests {
     use super::*;
 
+    fn empty_dropped_domain() -> DroppedProcessDomain {
+        #[cfg(unix)]
+        let group = ProcessGroupState::Released;
+        #[cfg(not(unix))]
+        let group = ();
+
+        DroppedProcessDomain::new(None, None, group, LeaderState::Reaped)
+    }
+
+    #[test]
+    fn finalizer_os_errors_back_off_independently_per_operation() {
+        let now = Instant::now();
+        let mut delayed = DroppedProcessBackoffs::new(now);
+        let unaffected = DroppedProcessBackoffs::new(now);
+
+        delayed.record_error(DroppedProcessOperation::TerminateTree, now);
+        delayed.record_error(DroppedProcessOperation::TerminateGroup, now);
+        let first_retry = now + finalizer_os_error_retry_delay(0);
+        assert!(!delayed.is_ready(DroppedProcessOperation::TerminateTree, now));
+        assert!(!delayed.is_ready(DroppedProcessOperation::TerminateGroup, now));
+        assert!(delayed.is_ready(DroppedProcessOperation::TerminateTree, first_retry));
+        assert!(delayed.is_ready(DroppedProcessOperation::TerminateGroup, first_retry));
+        assert!(unaffected.is_ready(DroppedProcessOperation::TerminateTree, now));
+        assert!(unaffected.is_ready(DroppedProcessOperation::TerminateGroup, now));
+
+        delayed.record_error(DroppedProcessOperation::TerminateTree, first_retry);
+        let second_retry = first_retry + finalizer_os_error_retry_delay(1);
+        assert!(!delayed.is_ready(DroppedProcessOperation::TerminateTree, first_retry));
+        assert!(delayed.is_ready(DroppedProcessOperation::TerminateTree, second_retry));
+        assert!(delayed.is_ready(DroppedProcessOperation::TerminateGroup, first_retry));
+        assert_eq!(
+            delayed
+                .operation(DroppedProcessOperation::TerminateTree)
+                .attempt,
+            2
+        );
+        assert_eq!(
+            delayed
+                .operation(DroppedProcessOperation::TerminateGroup)
+                .attempt,
+            1
+        );
+
+        delayed.clear(DroppedProcessOperation::TerminateTree);
+        delayed.record_error(DroppedProcessOperation::TerminateTree, second_retry);
+        assert_eq!(
+            delayed
+                .operation(DroppedProcessOperation::TerminateTree)
+                .retry_after,
+            second_retry + finalizer_os_error_retry_delay(0)
+        );
+    }
+
+    #[test]
+    fn finalizer_backoff_does_not_delay_an_unaffected_successful_job() {
+        #[cfg(unix)]
+        let delayed_group = ProcessGroupState::Released;
+        #[cfg(not(unix))]
+        let delayed_group = ();
+        let mut delayed =
+            DroppedProcessDomain::new(None, None, delayed_group, LeaderState::Running);
+        let mut ready = empty_dropped_domain();
+        let now = Instant::now();
+
+        delayed
+            .os_error_backoffs
+            .record_error(DroppedProcessOperation::TerminateLeader, now);
+
+        assert!(!delayed.poll(now));
+        assert!(ready.poll(now));
+        let retry = now + finalizer_os_error_retry_delay(0);
+        assert!(!delayed.poll(retry));
+        assert_eq!(
+            delayed
+                .os_error_backoffs
+                .operation(DroppedProcessOperation::TerminateLeader)
+                .attempt,
+            2
+        );
+    }
+
     #[test]
     fn successful_tree_termination_still_requires_process_group_defense() {
         let error = io::Error::other("process group failed");
@@ -963,7 +1157,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn active_domain(child: Child, host: AttemptProcessDomain) -> ActiveProcessDomain {
+    fn active_domain(
+        child: tokio::process::Child,
+        host: AttemptProcessDomain,
+    ) -> ActiveProcessDomain {
         ActiveProcessDomain::new(
             child,
             host,
@@ -1006,6 +1203,33 @@ mod tests {
         let status = child.wait().await.unwrap();
 
         assert_eq!(status.code(), Some(37));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_child_try_wait_keeps_the_fast_poll_path() {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30").process_group(0);
+        let child = command.spawn().unwrap();
+        let mut dropped = DroppedProcessDomain::new(
+            Some(child.into()),
+            None,
+            ProcessGroupState::Handled,
+            LeaderState::KillRequested,
+        );
+        let now = Instant::now();
+
+        assert!(!dropped.poll(now));
+        let wait_backoff = dropped
+            .os_error_backoffs
+            .operation(DroppedProcessOperation::TryWait);
+        assert_eq!(wait_backoff.attempt, 0);
+        assert!(wait_backoff.retry_after <= now);
+
+        let child = dropped.child.as_mut().expect("live child remains owned");
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        dropped.child.take();
     }
 
     #[cfg(unix)]

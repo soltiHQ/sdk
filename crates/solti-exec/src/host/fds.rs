@@ -3,7 +3,7 @@
 //! This module contains the host-process primitive for descriptor inheritance.
 //! Backends decide which descriptors a child may inherit.
 //! Linux marks the complete non-standard descriptor range close-on-exec.
-//! Other Unix platforms mark the bounded parent-side descriptor snapshot.
+//! Unix `fork` fallback paths combine a parent snapshot with a child-side range sweep.
 
 use std::{io, os::fd::RawFd, os::unix::process::CommandExt as _, process::Command};
 
@@ -43,13 +43,18 @@ pub(crate) fn attach_fd_cloexec(command: &mut Command, passed_fds: &[RawFd]) -> 
     let inherited_fds = discover_open_fds()?;
     #[cfg(target_os = "linux")]
     let inherited_fds = Vec::new();
+    #[cfg(not(target_os = "linux"))]
+    let descriptor_table_size = descriptor_table_size()?;
+    #[cfg(target_os = "linux")]
+    let descriptor_table_size = 0;
 
     // SAFETY:
     // both descriptor lists are allocated before `fork`.
-    // The hook uses only descriptor syscalls and inline OS errors.
+    // The descriptor-table bound is resolved in the parent.
+    // The hook uses only `fcntl` and inline OS errors.
     unsafe {
         command.pre_exec(move || {
-            mark_all_close_on_exec(&inherited_fds)?;
+            mark_all_close_on_exec(&inherited_fds, descriptor_table_size)?;
             for &fd in &passed_fds {
                 clear_close_on_exec(fd)?;
             }
@@ -61,7 +66,10 @@ pub(crate) fn attach_fd_cloexec(command: &mut Command, passed_fds: &[RawFd]) -> 
 
 /// Marks the complete non-standard descriptor range close-on-exec.
 #[cfg(target_os = "linux")]
-fn mark_all_close_on_exec(_inherited_fds: &[RawFd]) -> io::Result<()> {
+fn mark_all_close_on_exec(
+    _inherited_fds: &[RawFd],
+    _descriptor_table_size: RawFd,
+) -> io::Result<()> {
     // SAFETY:
     // `close_range` receives only integer arguments and accesses no Rust memory.
     let result = unsafe {
@@ -78,36 +86,58 @@ fn mark_all_close_on_exec(_inherited_fds: &[RawFd]) -> io::Result<()> {
     Ok(())
 }
 
-/// Marks the bounded parent snapshot close-on-exec.
+/// Marks the current child range and the parent snapshot close-on-exec.
 #[cfg(not(target_os = "linux"))]
-fn mark_all_close_on_exec(inherited_fds: &[RawFd]) -> io::Result<()> {
+fn mark_all_close_on_exec(inherited_fds: &[RawFd], descriptor_table_size: RawFd) -> io::Result<()> {
     // macOS does not provide `close_range(CLOSE_RANGE_CLOEXEC)`.
-    // The bounded snapshot is collected in the parent before `fork`.
-    //
-    // Descriptors concurrently opened after that snapshot must be created with `O_CLOEXEC`;
-    // the platform has no child-safe close-on-exec range primitive.
+    // The range sweep covers descriptors opened after the parent snapshot.
+    // The snapshot still covers an inherited descriptor above a subsequently lowered limit.
+    for fd in 3..descriptor_table_size {
+        mark_close_on_exec_if_open(fd)?;
+    }
     for &fd in inherited_fds {
-        if fd < 3 {
-            continue;
+        if fd >= descriptor_table_size {
+            mark_close_on_exec_if_open(fd)?;
         }
+    }
+    Ok(())
+}
+
+/// Resolves the descriptor-table bound before `fork`.
+#[cfg(not(target_os = "linux"))]
+fn descriptor_table_size() -> io::Result<RawFd> {
+    // SAFETY:
+    // `getdtablesize` takes no arguments and writes no caller-owned memory.
+    let descriptor_table_size = unsafe { libc::getdtablesize() };
+    if descriptor_table_size < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(descriptor_table_size)
+    }
+}
+
+/// Marks one descriptor close-on-exec when it is still open in the child.
+#[cfg(not(target_os = "linux"))]
+fn mark_close_on_exec_if_open(fd: RawFd) -> io::Result<()> {
+    if fd < 3 {
+        return Ok(());
+    }
+    // SAFETY:
+    // `F_GETFD` takes no third argument and dereferences no memory.
+    // A closed descriptor is reported through the return value.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EBADF) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    if flags & libc::FD_CLOEXEC == 0 {
         // SAFETY:
-        // `F_GETFD` takes no third argument and dereferences no memory.
-        // A stale descriptor is reported through the return value.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EBADF) {
-                continue;
-            }
-            return Err(error);
-        }
-        if flags & libc::FD_CLOEXEC == 0 {
-            // SAFETY:
-            // `F_SETFD` expects the integer flag value supplied here.
-            // A stale descriptor is reported through the return value.
-            if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-                return Err(io::Error::last_os_error());
-            }
+        // `F_SETFD` expects the integer flag value supplied here.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
         }
     }
     Ok(())
@@ -194,5 +224,20 @@ mod tests {
         let snapshot = discover_open_fds().unwrap();
         assert!(snapshot.contains(&fd));
         assert!(snapshot.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn descriptor_opened_after_policy_attachment_is_not_inherited() {
+        let mut command = Command::new("test");
+        attach_fd_cloexec(&mut command, &[]).unwrap();
+
+        let file = tempfile::tempfile().unwrap();
+        let fd = file.as_raw_fd();
+        clear_close_on_exec(fd).unwrap();
+        let path = format!("/dev/fd/{fd}");
+
+        command.args(["-e", &path]).stdout(Stdio::null());
+        assert!(!command.status().unwrap().success());
     }
 }

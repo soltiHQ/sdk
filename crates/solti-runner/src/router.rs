@@ -273,7 +273,13 @@ fn build_from_entries(
     task: &Task,
     ctx: &BuildContext,
 ) -> Result<TaskRef, RouterError> {
-    trace!(task = ?task, "router received task");
+    trace!(
+        task = %task.name(),
+        slot = %task.slot(),
+        api_version = task.spec().workload().api_version(),
+        kind = task.spec().workload().kind(),
+        "router received task"
+    );
 
     let entry = pick_entry(runners, task)?;
     let runner = entry.runner.as_ref();
@@ -309,8 +315,54 @@ mod tests {
         AdmissionPolicy, BackoffPolicy, EmbeddedSpec, Flag, JitterPolicy, LabelSelector, Labels,
         SubprocessMode, SubprocessSpec, TaskEnv, TaskId, TaskSpec, WasmSpec, WorkloadTypeMeta,
     };
-    use std::path::PathBuf;
+    use std::{fmt, path::PathBuf, sync::Mutex};
     use taskvisor::{TaskContext, TaskError, TaskFn};
+    use tracing::{
+        Event, Metadata, Subscriber,
+        field::{Field, Visit},
+        span::{Attributes, Id, Record},
+    };
+
+    #[derive(Default)]
+    struct TraceCapture {
+        fields: Mutex<Vec<String>>,
+    }
+
+    struct CaptureSubscriber(Arc<TraceCapture>);
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut CaptureVisitor(&self.0));
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    struct CaptureVisitor<'a>(&'a TraceCapture);
+
+    impl Visit for CaptureVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.0
+                .fields
+                .lock()
+                .unwrap()
+                .push(format!("{}={value:?}", field.name()));
+        }
+    }
 
     struct DeclaredRunner {
         name: &'static str,
@@ -427,6 +479,34 @@ mod tests {
             Ok(_) => panic!("expected RouterError::NoRunner for wasm, got Ok(..)"),
             Err(e) => panic!("expected RouterError::NoRunner for wasm, got {e:?}"),
         }
+    }
+
+    #[test]
+    fn router_trace_does_not_record_the_task_payload() {
+        const SECRET: &str = "must-not-appear-in-router-trace";
+
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(subprocess_runner("subprocess-only")))
+            .unwrap();
+        let task = mk_task(TaskWorkload::Subprocess(SubprocessSpec::new(
+            SubprocessMode::Command {
+                command: "echo".into(),
+                args: vec![SECRET.into()],
+            },
+            TaskEnv::default(),
+            None,
+            Flag::enabled(),
+        )));
+        let capture = Arc::new(TraceCapture::default());
+        let dispatch = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
+
+        tracing::dispatcher::with_default(&dispatch, || router.build(&task).unwrap());
+
+        let fields = capture.fields.lock().unwrap().join(" ");
+        assert!(fields.contains("task=test-task"));
+        assert!(fields.contains("slot=test-slot"));
+        assert!(!fields.contains(SECRET));
     }
 
     #[test]

@@ -107,8 +107,8 @@ Exhausted cleanup is a fatal attempt failure.
 - executes commands directly;
 - decodes scripts and creates attempt-scoped script transport;
 - applies environment and pinned working-directory policies;
-- enforces an explicit file descriptor passlist on Linux;
-- applies a bounded descriptor snapshot on other Unix platforms;
+- enforces an explicit file descriptor passlist on Linux and macOS;
+- retains a parent descriptor snapshot plus child-side table sweep for Unix spawn controls that require the `fork` fallback;
 - streams stdout and stderr to tracing and the runner output sink;
 - stops subprocesses on cancellation, timeout, or dropped task futures;
 - applies POSIX rlimits;
@@ -339,9 +339,17 @@ The descriptor number is preserved.
 Linux applies `close_range(CLOSE_RANGE_CLOEXEC)` to every descriptor from `3` upwards.
 Process spawn fails when the running kernel does not support that operation.
 
-Other Unix platforms inspect `/dev/fd` before process creation.
-Descriptors opened concurrently after that snapshot must already use close-on-exec.
-Process spawn fails when `/dev/fd` is unavailable.
+The normal macOS path uses native `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`.
+It preserves only standard streams, the pinned working-directory action, and explicit passlist entries.
+This path also represents session creation and signal reset as spawn attributes, so it does not scan the descriptor table.
+
+`umask` and POSIX rlimits have no corresponding macOS spawn attribute.
+Attempts using either control retain the `fork` fallback: it snapshots open descriptors and captures the descriptor-table bound before `fork`.
+After `fork`, the child sweeps that complete range and any snapshotted descriptor above it, then clears close-on-exec only for explicit passlist entries.
+A descriptor opened after the snapshot is therefore still covered by the child sweep.
+The fallback sweep performs work proportional to the captured descriptor-table bound on every affected spawn.
+
+Other Unix platforms use the same fallback descriptor policy.
 
 ## Process state
 

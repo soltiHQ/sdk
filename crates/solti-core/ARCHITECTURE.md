@@ -339,7 +339,12 @@ Free-form reason text remains diagnostic.
 One `RwLock` protects the complete state.
 A resource mutation and its change-journal entry happen under the same write lock.
 
-An optional state sink receives the committed task snapshot or run value on that same synchronous path. 
+An optional state sink receives the committed task snapshot or run value through a FIFO publisher shared by all `TaskState` clones.
+Each state write reserves an unready FIFO batch while holding the state lock and appends its events to that batch.
+Dropping the write guard releases the state lock before marking its batch ready; the publisher never crosses an unready queue front.
+Application code is therefore invoked only after the write guard that enqueued its event has released the state lock.
+One caller drains the queue synchronously; concurrent or reentrant commits only enqueue and may return before their own event is delivered.
+The publisher does not invoke the sink recursively; it stops at an unready front and the guard that makes that batch ready resumes draining.
 Run events carry both task name and resource UID.
 The sink must forward work and return quickly. 
 Hooks do not hydrate the store during startup.

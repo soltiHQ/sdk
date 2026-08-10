@@ -286,7 +286,8 @@ impl SubprocessBackendConfig {
     /// They are rejected when the runner is created.
     ///
     /// Linux marks every other open descriptor close-on-exec.
-    /// Other Unix platforms apply the bounded snapshot described by the crate README.
+    /// The normal macOS path uses an atomic `posix_spawn` allowlist.
+    /// Unix fallback paths apply the parent snapshot and child-side sweep described by the crate README.
     #[cfg(unix)]
     #[cfg_attr(docsrs, doc(cfg(unix)))]
     pub fn with_passed_fd(mut self, fd: OwnedFd) -> Self {

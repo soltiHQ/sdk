@@ -2,9 +2,9 @@
 //!
 //! These hooks let an agent forward task state and output to external storage.
 //!
-//! Hook callbacks run synchronously on the publishing path.
-//! Implementations must return quickly, must not call back into core, and should
-//! normally forward cloned events to an application-owned worker.
+//! Hook callbacks run on a publishing path rather than on a core-owned worker.
+//! State callbacks are serialized in commit order and run after the global [`TaskState`](crate::TaskState) write lock is released.
+//! Implementations must return quickly and should normally forward cloned events to an application-owned worker.
 
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
