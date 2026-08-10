@@ -12,7 +12,7 @@
 //! output sink + optional cgroup + optional script descriptor
 //!      ▼
 //! process domain
-//!   ├── stdout/stderr ──► tracing + output sink
+//!   ├── stdout/stderr ──► output sink + optional tracing copy
 //!   ├── exit ───────────► cgroup + process group + leader
 //!   └── cancellation ───► cgroup + process group + leader
 //!      ▼
@@ -43,7 +43,7 @@ use std::{
 
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tokio::process::Command;
-use tracing::{debug, trace, warn};
+use tracing::{Instrument as _, debug, debug_span, trace, warn};
 
 use solti_model::{SubprocessSpec, Task, TaskWorkload, WORKLOAD_API_VERSION, WorkloadTypeMeta};
 use solti_runner::{
@@ -294,10 +294,11 @@ impl Runner for SubprocessRunner {
         } = self.build_task_config(task, run_id, ctx)?;
 
         trace!(
-            resource = %task.name(),
+            event = "subprocess.build",
+            task_name = %task.name(),
             generation = task.metadata().generation(),
             slot = %task.slot(),
-            taskvisor_task = %task_cfg.run_id,
+            run_id = %task_cfg.run_id,
             "building subprocess task",
         );
 
@@ -649,7 +650,29 @@ fn spawn_with_command(
 #[cfg(target_os = "macos")]
 enum MacosSpawnAttempt {
     Spawned(ProcessChild, crate::host::AttemptProcessDomain),
-    Fallback(crate::host::PreparedHostProcessAttempt),
+    Fallback {
+        prepared: crate::host::PreparedHostProcessAttempt,
+        reason: MacosFallbackReason,
+    },
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum MacosFallbackReason {
+    HostControls,
+    PinnedCwdUnsupported,
+    CommandCompatibility,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosFallbackReason {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::HostControls => "host_controls",
+            Self::PinnedCwdUnsupported => "pinned_cwd_unsupported",
+            Self::CommandCompatibility => "command_compatibility",
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -659,7 +682,10 @@ fn try_spawn_macos(
     prepared: crate::host::PreparedHostProcessAttempt,
 ) -> Result<MacosSpawnAttempt, TaskError> {
     let Some(reset_signals) = prepared.macos_spawn_signals() else {
-        return Ok(MacosSpawnAttempt::Fallback(prepared));
+        return Ok(MacosSpawnAttempt::Fallback {
+            prepared,
+            reason: MacosFallbackReason::HostControls,
+        });
     };
 
     let mut args = Vec::with_capacity(ctx.task_cfg.args.len() + usize::from(script.is_some()));
@@ -681,7 +707,10 @@ fn try_spawn_macos(
         reset_signals: &reset_signals,
     };
     if !crate::subprocess::spawn_macos::supports(&spec) {
-        return Ok(MacosSpawnAttempt::Fallback(prepared));
+        return Ok(MacosSpawnAttempt::Fallback {
+            prepared,
+            reason: MacosFallbackReason::PinnedCwdUnsupported,
+        });
     }
 
     let child = crate::subprocess::spawn_macos::spawn(&spec).map_err(|error| {
@@ -690,7 +719,10 @@ fn try_spawn_macos(
         task_io_error("native macOS spawn failed", error)
     })?;
     let Some(child) = child else {
-        return Ok(MacosSpawnAttempt::Fallback(prepared));
+        return Ok(MacosSpawnAttempt::Fallback {
+            prepared,
+            reason: MacosFallbackReason::CommandCompatibility,
+        });
     };
     let domain = prepared.into_macos_spawn_domain();
     Ok(MacosSpawnAttempt::Spawned(child, domain))
@@ -739,7 +771,13 @@ fn evaluate_exit(
         };
         Err(TaskError::fail(reason).with_exit_code(exit_code))
     } else {
-        debug!(task = %task_cfg.run_id, "subprocess exited successfully");
+        debug!(
+            event = "subprocess.exited",
+            run_id = %task_cfg.run_id,
+            outcome = "success",
+            exit_code = ?status.code(),
+            "subprocess exited"
+        );
         Ok(())
     }
 }
@@ -768,6 +806,24 @@ async fn drain_output_tasks(
 /// Executes one subprocess attempt.
 async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Result<(), TaskError> {
     let attempt = ctx.attempt.fetch_add(1, Ordering::Relaxed) + 1;
+    let span = debug_span!(
+        "subprocess_attempt",
+        event = "subprocess.attempt",
+        task_name = %ctx.resource_name,
+        generation = ctx.generation,
+        run_id = %ctx.task_cfg.run_id,
+        attempt,
+    );
+    run_subprocess_attempt(ctx, cancel, attempt)
+        .instrument(span)
+        .await
+}
+
+async fn run_subprocess_attempt(
+    ctx: Arc<TaskExecContext>,
+    cancel: TaskContext,
+    attempt: u32,
+) -> Result<(), TaskError> {
     let sink = ctx
         .output_publisher
         .sink_for(&ctx.resource_name, ctx.generation, attempt);
@@ -789,7 +845,8 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
     // Args and cwd are not logged: task arguments routinely carry tokens and
     // other secrets. Only the command name and the argument count are recorded.
     trace!(
-        task = %ctx.task_cfg.run_id,
+        event = "subprocess.lifecycle",
+        stage = "spawning",
         command = %ctx.task_cfg.command,
         arg_count = ctx.task_cfg.args.len(),
         "spawning subprocess",
@@ -809,16 +866,33 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
     };
 
     #[cfg(target_os = "macos")]
-    let (child, host_process_domain) =
+    let (child, host_process_domain, spawn_backend) =
         match try_spawn_macos(&ctx, script.as_ref(), prepared_host_process)? {
-            MacosSpawnAttempt::Spawned(child, domain) => (child, domain),
-            MacosSpawnAttempt::Fallback(prepared) => {
-                spawn_with_command(&ctx, script.as_ref(), prepared)?
+            MacosSpawnAttempt::Spawned(child, domain) => (child, domain, "posix_spawn"),
+            MacosSpawnAttempt::Fallback { prepared, reason } => {
+                debug!(
+                    event = "subprocess.spawn_fallback",
+                    fallback_reason = reason.as_label(),
+                    spawn_backend = "tokio_command",
+                    "subprocess spawn fallback selected"
+                );
+                let (child, domain) = spawn_with_command(&ctx, script.as_ref(), prepared)?;
+                (child, domain, "tokio_command")
             }
         };
     #[cfg(not(target_os = "macos"))]
-    let (child, host_process_domain) =
-        spawn_with_command(&ctx, script.as_ref(), prepared_host_process)?;
+    let (child, host_process_domain, spawn_backend) = {
+        let (child, domain) = spawn_with_command(&ctx, script.as_ref(), prepared_host_process)?;
+        (child, domain, "tokio_command")
+    };
+
+    trace!(
+        event = "subprocess.lifecycle",
+        stage = "spawned",
+        spawn_backend,
+        pid = ?child.id(),
+        "subprocess spawned"
+    );
 
     let mut process = ActiveProcessDomain::new(
         child,
@@ -834,39 +908,47 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
         .ok_or_else(|| TaskError::fatal("failed to capture stdout"))?;
     let run_id_stdout = Arc::clone(&ctx.task_cfg.run_id);
     let sink_stdout = sink.clone();
-    let mut stdout_task = tokio::spawn(async move {
-        log_stream(
-            stdout,
-            &run_id_stdout,
-            StreamKind::Stdout,
-            &log_cfg,
-            sink_stdout.as_ref(),
-        )
-        .await;
-    });
+    let stdout_span = tracing::Span::current();
+    let mut stdout_task = tokio::spawn(
+        async move {
+            log_stream(
+                stdout,
+                &run_id_stdout,
+                StreamKind::Stdout,
+                &log_cfg,
+                sink_stdout.as_ref(),
+            )
+            .await;
+        }
+        .instrument(stdout_span),
+    );
 
     let stderr = process
         .take_stderr()
         .ok_or_else(|| TaskError::fatal("failed to capture stderr"))?;
     let run_id_stderr = Arc::clone(&ctx.task_cfg.run_id);
     let sink_stderr = sink.clone();
-    let mut stderr_task = tokio::spawn(async move {
-        log_stream(
-            stderr,
-            &run_id_stderr,
-            StreamKind::Stderr,
-            &log_cfg,
-            sink_stderr.as_ref(),
-        )
-        .await;
-    });
+    let stderr_span = tracing::Span::current();
+    let mut stderr_task = tokio::spawn(
+        async move {
+            log_stream(
+                stderr,
+                &run_id_stderr,
+                StreamKind::Stderr,
+                &log_cfg,
+                sink_stderr.as_ref(),
+            )
+            .await;
+        }
+        .instrument(stderr_span),
+    );
 
     let completion = tokio::select! {
         biased;
         result = process.observe_exit() => AttemptCompletion::LeaderExited(result),
         _ = cancel.cancelled() => {
             debug!(
-                task = %ctx.task_cfg.run_id,
+                event = "subprocess.cancellation",
                 "cancellation requested; terminating subprocess domain",
             );
             AttemptCompletion::Canceled
@@ -882,7 +964,11 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
     let termination_error = process.terminate().err();
     if let Some(error) = termination_error.as_ref() {
         warn!(
-            task = %ctx.task_cfg.run_id,
+            event = "subprocess.termination_failed",
+            task_name = %ctx.resource_name,
+            generation = ctx.generation,
+            run_id = %ctx.task_cfg.run_id,
+            attempt,
             error = %error,
             "subprocess domain termination reported an error",
         );
@@ -901,7 +987,11 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
         stdout_task.abort();
         stderr_task.abort();
         warn!(
-            task = %ctx.task_cfg.run_id,
+            event = "subprocess.output_drain_timed_out",
+            task_name = %ctx.resource_name,
+            generation = ctx.generation,
+            run_id = %ctx.task_cfg.run_id,
+            attempt,
             "subprocess output drain timed out after domain termination",
         );
     }
@@ -913,7 +1003,11 @@ async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Resul
     };
     if let Some(error) = cleanup_error.as_ref() {
         warn!(
-            task = %ctx.task_cfg.run_id,
+            event = "subprocess.cleanup_failed",
+            task_name = %ctx.resource_name,
+            generation = ctx.generation,
+            run_id = %ctx.task_cfg.run_id,
+            attempt,
             cgroup = ?process.cgroup_path(),
             error = %error,
             "failed to clean up subprocess domain",
@@ -1213,7 +1307,7 @@ mod tests {
     async fn run_through_macos_fallback(ctx: TaskExecContext) {
         let prepared = ctx.runner_cfg.prepare_host_process_attempt(None).unwrap();
         let prepared = match try_spawn_macos(&ctx, None, prepared).unwrap() {
-            MacosSpawnAttempt::Fallback(prepared) => prepared,
+            MacosSpawnAttempt::Fallback { prepared, .. } => prepared,
             MacosSpawnAttempt::Spawned(_, _) => panic!("test case unexpectedly used native spawn"),
         };
         let (mut child, _domain) = spawn_with_command(&ctx, None, prepared).unwrap();

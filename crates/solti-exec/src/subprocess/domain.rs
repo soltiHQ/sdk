@@ -405,7 +405,8 @@ impl Drop for ActiveProcessDomain {
         if let Err(error) = self.terminate() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 warn!(
-                    task = %self.run_id,
+                    event = "subprocess.drop_termination_failed",
+                    run_id = %self.run_id,
                     error = %error,
                     "failed to terminate subprocess domain on drop",
                 );

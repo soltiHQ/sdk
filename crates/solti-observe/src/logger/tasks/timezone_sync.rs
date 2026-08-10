@@ -70,13 +70,21 @@ const BACKOFF_FACTOR: f64 = 2.0;
 /// ```
 pub fn timezone_sync() -> (TaskManifest, TaskRef) {
     let task: TaskRef = TaskFn::arc(TIMEZONE_SYNC_SLOT, |ctx: TaskContext| async move {
-        debug!("timezone sync started");
+        debug!(
+            event = "logger.timezone_sync",
+            stage = "started",
+            "timezone sync started"
+        );
 
         if ctx.is_cancelled() {
             return Err(TaskError::Canceled);
         }
         sync_local_offset().map_err(|error| TaskError::fail(error.to_string()))?;
-        debug!("timezone offset sync completed");
+        debug!(
+            event = "logger.timezone_sync",
+            stage = "completed",
+            "timezone sync completed"
+        );
         Ok(())
     });
 

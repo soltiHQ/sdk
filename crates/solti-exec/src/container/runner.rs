@@ -15,7 +15,7 @@ use solti_runner::{
 };
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tokio::sync::watch;
-use tracing::{debug, trace, warn};
+use tracing::{Instrument as _, debug, debug_span, trace, warn};
 
 use super::{
     ContainerAttempt, ContainerEngine, ContainerEngineError, ContainerErrorClass,
@@ -152,10 +152,11 @@ impl Runner for ContainerRunner {
         };
 
         trace!(
-            resource = %task.name(),
+            event = "container.build",
+            task_name = %task.name(),
             generation = task.metadata().generation(),
             slot = %task.slot(),
-            taskvisor_task = %run_id.name(),
+            run_id = %run_id.name(),
             image = %image,
             "building container task",
         );
@@ -253,6 +254,25 @@ async fn run_container_worker(
     ctx: Arc<TaskExecContext>,
     request: ContainerRequest,
     sink: Option<solti_runner::OutputSink>,
+    cancel: watch::Receiver<bool>,
+) -> Result<(), TaskError> {
+    let span = debug_span!(
+        "container_attempt",
+        event = "container.attempt",
+        task_name = %ctx.task.resource_name,
+        generation = ctx.task.generation,
+        run_id = %ctx.task.run_id,
+        attempt = request.attempt(),
+    );
+    run_container_attempt(ctx, request, sink, cancel)
+        .instrument(span)
+        .await
+}
+
+async fn run_container_attempt(
+    ctx: Arc<TaskExecContext>,
+    request: ContainerRequest,
+    sink: Option<solti_runner::OutputSink>,
     mut cancel: watch::Receiver<bool>,
 ) -> Result<(), TaskError> {
     if cancellation_requested(&cancel) {
@@ -260,8 +280,8 @@ async fn run_container_worker(
     }
 
     trace!(
-        task = %ctx.task.run_id,
-        attempt = request.attempt(),
+        event = "container.lifecycle",
+        stage = "creating",
         image = %request.image(),
         "creating container attempt",
     );
@@ -279,6 +299,11 @@ async fn run_container_worker(
             return Err(map_engine_error(error));
         }
     };
+    trace!(
+        event = "container.lifecycle",
+        stage = "created",
+        "container attempt created"
+    );
 
     let mut output = OutputTasks::start(
         attempt.as_mut(),
@@ -293,6 +318,11 @@ async fn run_container_worker(
         return Err(TaskError::Canceled);
     }
 
+    trace!(
+        event = "container.lifecycle",
+        stage = "starting",
+        "container attempt starting"
+    );
     if let Err(start_error) = attempt.start().await {
         ctx.metrics
             .record_runner_error(RunnerType::Container, RunnerErrorKind::SpawnFailed);
@@ -306,6 +336,11 @@ async fn run_container_worker(
             Err(map_engine_error(start_error))
         };
     }
+    trace!(
+        event = "container.lifecycle",
+        stage = "started",
+        "container attempt started"
+    );
 
     let completion = tokio::select! {
         biased;
@@ -318,7 +353,10 @@ async fn run_container_worker(
 
     let result = match completion {
         AttemptCompletion::Canceled => {
-            debug!(task = %ctx.task.run_id, "cancellation requested; terminating container");
+            debug!(
+                event = "container.cancellation",
+                "cancellation requested; terminating container"
+            );
             let terminate = attempt.terminate().await;
             let waited = attempt.wait().await;
             match (terminate, waited) {
@@ -331,7 +369,15 @@ async fn run_container_worker(
                 ))),
             }
         }
-        AttemptCompletion::Exited(Ok(status)) => evaluate_exit(status),
+        AttemptCompletion::Exited(Ok(status)) => {
+            trace!(
+                event = "container.lifecycle",
+                stage = "exited",
+                exit_code = status.code(),
+                "container attempt exited"
+            );
+            evaluate_exit(status)
+        }
         AttemptCompletion::Exited(Err(error)) => {
             let terminate_error = attempt.terminate().await.err();
             if let Some(terminate_error) = terminate_error {
@@ -355,6 +401,11 @@ async fn run_container_worker(
             "container cleanup failed: {error}"
         )));
     }
+    trace!(
+        event = "container.lifecycle",
+        stage = "cleaned",
+        "container attempt cleaned"
+    );
     result
 }
 
@@ -422,14 +473,22 @@ impl OutputTasks {
         let stdout = attempt.take_stdout().map(|reader| {
             let run_id = Arc::clone(&run_id);
             let sink = sink.clone();
-            tokio::spawn(async move {
-                log_stream(reader, &run_id, StreamKind::Stdout, &logger, sink.as_ref()).await;
-            })
+            let span = tracing::Span::current();
+            tokio::spawn(
+                async move {
+                    log_stream(reader, &run_id, StreamKind::Stdout, &logger, sink.as_ref()).await;
+                }
+                .instrument(span),
+            )
         });
         let stderr = attempt.take_stderr().map(|reader| {
-            tokio::spawn(async move {
-                log_stream(reader, &run_id, StreamKind::Stderr, &logger, sink.as_ref()).await;
-            })
+            let span = tracing::Span::current();
+            tokio::spawn(
+                async move {
+                    log_stream(reader, &run_id, StreamKind::Stderr, &logger, sink.as_ref()).await;
+                }
+                .instrument(span),
+            )
         });
         Self { stdout, stderr }
     }
@@ -457,7 +516,11 @@ impl OutputTasks {
             if let Some(stderr) = &self.stderr {
                 stderr.abort();
             }
-            warn!(task = %run_id, "container output drain timed out");
+            warn!(
+                event = "container.output_drain_timed_out",
+                run_id = %run_id,
+                "container output drain timed out"
+            );
         }
     }
 }

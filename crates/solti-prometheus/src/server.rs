@@ -140,8 +140,12 @@ pub fn server(
             let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
                 TaskError::fail(format!("metrics listener bind failed on {addr}: {e}"))
             })?;
-            debug!(addr = %addr, "metrics server started");
-            info!("metrics http://{addr}/metrics");
+            info!(
+                event = "metrics.server_started",
+                listen_addr = %addr,
+                path = "/metrics",
+                "metrics server started"
+            );
 
             let shutdown_ctx = ctx.clone();
             let serve_result = axum::serve(listener, app)
@@ -149,7 +153,11 @@ pub fn server(
                 .await;
 
             if ctx.is_cancelled() {
-                debug!("metrics server canceled");
+                debug!(
+                    event = "metrics.server_stopped",
+                    reason = "canceled",
+                    "metrics server stopped"
+                );
                 return Err(TaskError::Canceled);
             }
 
@@ -187,8 +195,12 @@ async fn metrics_handler(State(registry): State<Arc<Registry>>) -> axum::respons
     let mut buf = Vec::with_capacity(4096);
     match encoder.encode(&registry.gather(), &mut buf) {
         Ok(()) => ([(header::CONTENT_TYPE, METRICS_CONTENT_TYPE)], buf).into_response(),
-        Err(e) => {
-            error!("metrics encode error: {e}");
+        Err(error) => {
+            error!(
+                event = "metrics.encode_failed",
+                %error,
+                "metrics encoding failed"
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

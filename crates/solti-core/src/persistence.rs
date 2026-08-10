@@ -117,7 +117,12 @@ pub(crate) fn publish_state_event(sink: Option<&TaskStateSinkHandle>, event: Tas
         return;
     };
     if catch_unwind(AssertUnwindSafe(|| sink.on_event(&event))).is_err() {
-        tracing::warn!("task state persistence sink panicked; event was dropped");
+        tracing::warn!(
+            event = "persistence.event_dropped",
+            sink = "task_state",
+            error_kind = "sink_panicked",
+            "persistence event dropped"
+        );
     }
 }
 
@@ -126,7 +131,12 @@ pub(crate) fn publish_output_event(sink: Option<&TaskOutputSinkHandle>, event: T
         return;
     };
     if catch_unwind(AssertUnwindSafe(|| sink.on_event(&event))).is_err() {
-        tracing::warn!("task output persistence sink panicked; event was dropped");
+        tracing::warn!(
+            event = "persistence.event_dropped",
+            sink = "task_output",
+            error_kind = "sink_panicked",
+            "persistence event dropped"
+        );
     }
 }
 

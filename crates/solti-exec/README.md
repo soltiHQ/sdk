@@ -109,7 +109,7 @@ Exhausted cleanup is a fatal attempt failure.
 - applies environment and pinned working-directory policies;
 - enforces an explicit file descriptor passlist on Linux and macOS;
 - retains a parent descriptor snapshot plus child-side table sweep for Unix spawn controls that require the `fork` fallback;
-- streams stdout and stderr to tracing and the runner output sink;
+- streams stdout and stderr to the runner output sink, with an optional tracing copy;
 - stops subprocesses on cancellation, timeout, or dropped task futures;
 - applies POSIX rlimits;
 - applies Linux cgroup, namespace, identity, capability, and seccomp controls;
@@ -164,8 +164,8 @@ Task { workload: Subprocess }
  environment + pinned cwd + HostProcessPolicy
               ▼
       operating-system process
-         ├── stdout ──► tracing + OutputSink
-         ├── stderr ──► tracing + OutputSink
+         ├── stdout ──► OutputSink + optional tracing copy
+         ├── stderr ──► OutputSink + optional tracing copy
          └── exit / cancel / dropped future
                          ▼
                terminate process domain
@@ -412,6 +412,7 @@ fn configured() -> Result<(), solti_exec::ExecError> {
         .with_logger(LogConfig {
             max_line_length: 4096,
             max_line_bytes: 64 * 1024,
+            emit_output_to_tracing: false,
             stdout_info: true,
             stderr_warn: true,
         });
@@ -524,16 +525,19 @@ Concurrent parent mutations also invalidate cleanup ownership.
 ## Output
 
 Stdout and stderr are read line by line.
-`LogConfig` controls both tracing and live output:
+`LogConfig` controls the optional tracing copy and live output limits:
 
-| Field             | Default | Behavior                                         |
-|-------------------|---------|--------------------------------------------------|
-| `max_line_length` | `4096`  | Truncates after this many Unicode scalar values  |
-| `max_line_bytes`  | `65536` | Drains the remainder after this byte limit       |
-| `stdout_info`     | `true`  | Uses `INFO` for stdout; otherwise `DEBUG`        |
-| `stderr_warn`     | `true`  | Uses `WARN` for stderr; otherwise `DEBUG`        |
+| Field                    | Default | Behavior                                         |
+|--------------------------|---------|--------------------------------------------------|
+| `max_line_length`        | `4096`  | Truncates after this many Unicode scalar values  |
+| `max_line_bytes`         | `65536` | Drains the remainder after this byte limit       |
+| `emit_output_to_tracing` | `false` | Copies workload lines to `solti_exec::workload`  |
+| `stdout_info`            | `true`  | Tracing level: `INFO` if true, `DEBUG` if false  |
+| `stderr_warn`            | `true`  | Tracing level: `WARN` if true, `DEBUG` if false  |
 
-Tracing output escapes control characters except tabs.
+The tracing copy is an explicit opt-in because workload output is application
+data rather than SDK diagnostics. The level fields apply only when that copy
+is enabled. Tracing output escapes control characters except tabs.
 The `OutputSink` path keeps control characters unchanged after decoding and truncation.
 Invalid UTF-8 is replaced during line decoding.
 Child stdin is null.

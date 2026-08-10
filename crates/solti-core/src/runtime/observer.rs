@@ -436,6 +436,8 @@ impl RuntimeObserver {
             return;
         };
         let task_id = &binding.resource.name;
+        let task_uid = &binding.resource.uid;
+        let generation = binding.resource.generation;
 
         // Output cleanup does not own the retained SDK resource. The
         // direct completion finalizes it; explicit delete removes it eagerly.
@@ -446,14 +448,39 @@ impl RuntimeObserver {
 
         match event.kind {
             EventKind::TaskAdded => {
-                trace!(task = %task_id, "task added event received (already in state)");
+                trace!(
+                    event = "taskvisor.event",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    event_kind = "task_added",
+                    "task event received"
+                );
             }
             EventKind::AttemptStarting => {
                 let Some(attempt) = event.attempt else {
-                    warn!(task = %task_id, "AttemptStarting event has no attempt");
+                    warn!(
+                        event = "taskvisor.event_invalid",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "attempt_starting",
+                        "task event missing attempt"
+                    );
                     return;
                 };
-                trace!(task = %task_id, "task attempt starting");
+                trace!(
+                    event = "task.attempt",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    attempt,
+                    stage = "starting",
+                    "task attempt starting"
+                );
                 if self.state.transition_attempt_starting(&binding, attempt) {
                     self.output_hub.announce_run_started(
                         task_id,
@@ -462,15 +489,41 @@ impl RuntimeObserver {
                         attempt,
                     );
                 } else {
-                    warn!(task = %task_id, "AttemptStarting event for stale task generation");
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        attempt,
+                        event_kind = "attempt_starting",
+                        "stale task event ignored"
+                    );
                 }
             }
             EventKind::AttemptSucceeded => {
                 let Some(attempt) = event.attempt else {
-                    warn!(task = %task_id, "AttemptSucceeded event has no attempt");
+                    warn!(
+                        event = "taskvisor.event_invalid",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "attempt_succeeded",
+                        "task event missing attempt"
+                    );
                     return;
                 };
-                trace!(task = %task_id, "task attempt succeeded");
+                trace!(
+                    event = "task.attempt",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    attempt,
+                    stage = "succeeded",
+                    "task attempt succeeded"
+                );
                 if self.state.transition_attempt_finished(
                     &binding,
                     attempt,
@@ -486,15 +539,41 @@ impl RuntimeObserver {
                         None,
                     );
                 } else {
-                    warn!(task = %task_id, "AttemptSucceeded event for stale task generation");
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        attempt,
+                        event_kind = "attempt_succeeded",
+                        "stale task event ignored"
+                    );
                 }
             }
             EventKind::AttemptCanceled => {
                 let Some(attempt) = event.attempt else {
-                    warn!(task = %task_id, "AttemptCanceled event has no attempt");
+                    warn!(
+                        event = "taskvisor.event_invalid",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "attempt_canceled",
+                        "task event missing attempt"
+                    );
                     return;
                 };
-                trace!(task = %task_id, "task attempt canceled cooperatively");
+                trace!(
+                    event = "task.attempt",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    attempt,
+                    stage = "canceled",
+                    "task attempt canceled"
+                );
                 if self.state.transition_attempt_finished(
                     &binding,
                     attempt,
@@ -510,12 +589,29 @@ impl RuntimeObserver {
                         None,
                     );
                 } else {
-                    warn!(task = %task_id, "AttemptCanceled event for stale task generation");
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        attempt,
+                        event_kind = "attempt_canceled",
+                        "stale task event ignored"
+                    );
                 }
             }
             EventKind::AttemptFailed => {
                 let Some(attempt) = event.attempt else {
-                    warn!(task = %task_id, "AttemptFailed event has no attempt");
+                    warn!(
+                        event = "taskvisor.event_invalid",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "attempt_failed",
+                        "task event missing attempt"
+                    );
                     return;
                 };
                 let reason = event
@@ -524,8 +620,13 @@ impl RuntimeObserver {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
                 trace!(
-                    task = %task_id,
-                    reason = %reason,
+                    event = "task.attempt",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    attempt,
+                    stage = "failed",
                     exit_code = ?event.exit_code,
                     "task attempt failed",
                 );
@@ -544,19 +645,45 @@ impl RuntimeObserver {
                         event.exit_code,
                     );
                 } else {
-                    warn!(task = %task_id, "AttemptFailed event for stale task generation");
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        attempt,
+                        event_kind = "attempt_failed",
+                        "stale task event ignored"
+                    );
                 }
             }
             EventKind::AttemptTimedOut => {
                 let Some(attempt) = event.attempt else {
-                    warn!(task = %task_id, "AttemptTimedOut event has no attempt");
+                    warn!(
+                        event = "taskvisor.event_invalid",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "attempt_timed_out",
+                        "task event missing attempt"
+                    );
                     return;
                 };
                 let error = event.timeout_ms.map_or_else(
                     || "task attempt timed out".to_string(),
                     |timeout_ms| format!("task attempt timed out after {timeout_ms} ms"),
                 );
-                trace!(task = %task_id, "task attempt timed out");
+                trace!(
+                    event = "task.attempt",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    attempt,
+                    stage = "timed_out",
+                    "task attempt timed out"
+                );
                 if self.state.transition_attempt_finished(
                     &binding,
                     attempt,
@@ -572,18 +699,39 @@ impl RuntimeObserver {
                         None,
                     );
                 } else {
-                    warn!(task = %task_id, "AttemptTimedOut event for stale task generation");
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        attempt,
+                        event_kind = "attempt_timed_out",
+                        "stale task event ignored"
+                    );
                 }
             }
             EventKind::TaskFinished => {
                 let Some(outcome_kind) = event.outcome_kind else {
-                    warn!(task = %task_id, "TaskFinished event has no outcome_kind");
+                    warn!(
+                        event = "taskvisor.event_invalid",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "task_finished",
+                        "task event missing outcome"
+                    );
                     return;
                 };
                 let (phase, error, exit_code) =
                     phase_for_outcome_kind(outcome_kind, event.reason.as_deref(), event.exit_code);
                 trace!(
-                    task = %task_id,
+                    event = "task.finished",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
                     outcome = outcome_kind.as_label(),
                     exit_code = ?exit_code,
                     "task reached final outcome",
@@ -592,7 +740,15 @@ impl RuntimeObserver {
                     .state
                     .transition_task_finished(&binding, phase, error, exit_code)
                 {
-                    warn!(task = %task_id, "TaskFinished event for stale task generation");
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "task_finished",
+                        "stale task event ignored"
+                    );
                 }
             }
             EventKind::ControllerRejected => {
@@ -605,11 +761,28 @@ impl RuntimeObserver {
                     .rejection_kind
                     .map(phase_for_rejection)
                     .unwrap_or(TaskPhase::Failed);
+                trace!(
+                    event = "task.finished",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    outcome = "controller_rejected",
+                    "task rejected"
+                );
                 if !self
                     .state
                     .transition_task_finished(&binding, phase, Some(reason), None)
                 {
-                    warn!(task = %task_id, "rejection event for stale task generation");
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "controller_rejected",
+                        "stale task event ignored"
+                    );
                 }
             }
             EventKind::TaskAddFailed => {
@@ -622,11 +795,28 @@ impl RuntimeObserver {
                     .rejection_kind
                     .map(phase_for_rejection)
                     .unwrap_or(TaskPhase::Failed);
+                trace!(
+                    event = "task.finished",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    outcome = "task_add_failed",
+                    "task submission failed"
+                );
                 if !self
                     .state
                     .transition_task_finished(&binding, phase, Some(reason), None)
                 {
-                    warn!(task = %task_id, "TaskAddFailed event for stale task generation");
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "task_add_failed",
+                        "stale task event ignored"
+                    );
                 }
             }
             _ => {}

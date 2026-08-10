@@ -1,7 +1,7 @@
 //! # Workload output
 //!
 //! Stdout and stderr are read as separate line streams.
-//! Each line is sent to `tracing` and an optional [`OutputSink`].
+//! Each line is sent to an optional [`OutputSink`]. A tracing copy is opt-in.
 //!
 //! ## Flow
 //!
@@ -15,7 +15,7 @@
 //! character limit
 //!      ┌──┴────────────────┐
 //!      ▼                   ▼
-//! tracing copy         OutputSink
+//! optional tracing     OutputSink
 //! control bytes        decoded line
 //! are escaped
 //! ```
@@ -28,18 +28,19 @@ use std::borrow::Cow;
 use bytes::Bytes;
 use solti_runner::OutputSink;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Configuration for workload output logging.
 ///
 /// ## Defaults
 ///
-/// | Field             | Default | Meaning                                  |
-/// |-------------------|---------|------------------------------------------|
-/// | `max_line_length` | `4096`  | Unicode scalar values retained           |
-/// | `max_line_bytes`  | `65536` | Input bytes retained before draining     |
-/// | `stdout_info`     | `true`  | Use `INFO` instead of `DEBUG` for stdout |
-/// | `stderr_warn`     | `true`  | Use `WARN` instead of `DEBUG` for stderr |
+/// | Field                    | Default | Meaning                                    |
+/// |--------------------------|---------|--------------------------------------------|
+/// | `max_line_length`        | `4096`  | Unicode scalar values retained             |
+/// | `max_line_bytes`         | `65536` | Input bytes retained before draining       |
+/// | `emit_output_to_tracing` | `false` | Copy workload lines into `tracing`         |
+/// | `stdout_info`            | `true`  | Use `INFO` instead of `DEBUG` for stdout   |
+/// | `stderr_warn`            | `true`  | Use `WARN` instead of `DEBUG` for stderr   |
 ///
 /// Both size limits must be greater than zero.
 /// They are validated when the runner is created.
@@ -51,11 +52,17 @@ pub struct LogConfig {
     ///
     /// Remaining bytes are drained through the next newline.
     pub max_line_bytes: usize,
-    /// Logs stdout at `INFO`.
+    /// Copies workload stdout and stderr into `tracing`.
+    ///
+    /// This is disabled by default. When enabled, records use the separate
+    /// `solti_exec::workload` target. The output sink is independent of this
+    /// setting and continues to receive every retained line.
+    pub emit_output_to_tracing: bool,
+    /// Logs stdout at `INFO` when the tracing copy is enabled.
     ///
     /// `false` uses `DEBUG`.
     pub stdout_info: bool,
-    /// Logs stderr at `WARN`.
+    /// Logs stderr at `WARN` when the tracing copy is enabled.
     ///
     /// `false` uses `DEBUG`.
     pub stderr_warn: bool,
@@ -66,6 +73,7 @@ impl Default for LogConfig {
         Self {
             max_line_bytes: 64 * 1024,
             max_line_length: 4096,
+            emit_output_to_tracing: false,
             stdout_info: true,
             stderr_warn: true,
         }
@@ -122,7 +130,8 @@ pub(crate) async fn log_stream<R>(
             Ok(n) => n,
             Err(e) => {
                 warn!(
-                    task = %run_id,
+                    event = "workload.stream_read_failed",
+                    run_id = %run_id,
                     stream = %stream_name,
                     error = %e,
                     line_num = line_count,
@@ -179,30 +188,33 @@ pub(crate) async fn log_stream<R>(
         let log_line = sanitize_line(&line);
         line_count += 1;
 
-        if stream.use_elevated_level(config) {
+        if config.emit_output_to_tracing && stream.use_elevated_level(config) {
             match stream {
-                StreamKind::Stdout => info!(
-                    task = %run_id,
+                StreamKind::Stdout => info!(target: "solti_exec::workload",
+                    event = "workload.output",
+                    run_id = %run_id,
                     stream = %stream_name,
                     line_num = line_count,
-                    "{}",
-                    log_line
+                    line = %log_line,
+                    "workload output"
                 ),
-                StreamKind::Stderr => warn!(
-                    task = %run_id,
+                StreamKind::Stderr => warn!(target: "solti_exec::workload",
+                    event = "workload.output",
+                    run_id = %run_id,
                     stream = %stream_name,
                     line_num = line_count,
-                    "{}",
-                    log_line
+                    line = %log_line,
+                    "workload output"
                 ),
             }
-        } else {
-            debug!(
-                task = %run_id,
+        } else if config.emit_output_to_tracing {
+            debug!(target: "solti_exec::workload",
+                event = "workload.output",
+                run_id = %run_id,
                 stream = %stream_name,
                 line_num = line_count,
-                "{}",
-                log_line
+                line = %log_line,
+                "workload output"
             );
         }
 
@@ -218,8 +230,9 @@ pub(crate) async fn log_stream<R>(
         }
     }
 
-    debug!(
-        task = %run_id,
+    trace!(
+        event = "workload.stream_closed",
+        run_id = %run_id,
         stream = %stream_name,
         total_lines = line_count,
         "stream closed"
@@ -280,7 +293,59 @@ mod tests {
 
     use solti_model::OutputEvent;
     use solti_runner::OutputSink;
+    use std::{
+        fmt,
+        sync::{Arc, Mutex},
+    };
     use tokio::sync::broadcast;
+    use tracing::{
+        Event, Metadata, Subscriber,
+        field::{Field, Visit},
+        span::{Attributes, Id, Record},
+    };
+
+    #[derive(Default)]
+    struct TraceCapture {
+        events: Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    struct CaptureSubscriber(Arc<TraceCapture>);
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = Vec::new();
+            event.record(&mut CaptureVisitor(&mut fields));
+            self.0
+                .events
+                .lock()
+                .unwrap()
+                .push((event.metadata().target().to_owned(), fields));
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    struct CaptureVisitor<'a>(&'a mut Vec<String>);
+
+    impl Visit for CaptureVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.0.push(format!("{}={value:?}", field.name()));
+        }
+    }
 
     fn output_sink(sender: broadcast::Sender<OutputEvent>, attempt: u32) -> OutputSink {
         OutputSink::new(1, attempt, move |event| {
@@ -553,5 +618,59 @@ mod tests {
             None,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn workload_output_tracing_is_disabled_by_default() {
+        let capture = Arc::new(TraceCapture::default());
+        let dispatch = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        log_stream(
+            "not-a-diagnostic\n".as_bytes(),
+            "run-default",
+            StreamKind::Stdout,
+            &LogConfig::default(),
+            None,
+        )
+        .await;
+
+        assert!(
+            capture
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(target, _)| target != "solti_exec::workload")
+        );
+    }
+
+    #[tokio::test]
+    async fn workload_output_tracing_uses_dedicated_target_when_enabled() {
+        let capture = Arc::new(TraceCapture::default());
+        let dispatch = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let config = LogConfig {
+            emit_output_to_tracing: true,
+            ..LogConfig::default()
+        };
+
+        log_stream(
+            "visible-line\n".as_bytes(),
+            "run-opt-in",
+            StreamKind::Stdout,
+            &config,
+            None,
+        )
+        .await;
+
+        let events = capture.events.lock().unwrap();
+        let (_, fields) = events
+            .iter()
+            .find(|(target, _)| target == "solti_exec::workload")
+            .expect("opt-in workload event");
+        let fields = fields.join(" ");
+        assert!(fields.contains("run_id=run-opt-in"));
+        assert!(fields.contains("line=visible-line"));
     }
 }

@@ -70,7 +70,11 @@ solti: logging and supervised maintenance
         with_targets: true,
         use_color: false,
     })?;
-    tracing::info!(target: "example::operations", "logger installed");
+    tracing::info!(
+        target: "example::operations",
+        event = "service.logger_ready",
+        "logger installed"
+    );
 
     let mut router = RunnerRouter::new();
     register_subprocess_runner(&mut router, "default")?;
@@ -83,7 +87,8 @@ solti: logging and supervised maintenance
         .await?;
     tracing::info!(
         target: "example::operations",
-        task = %timezone_name,
+        event = "task.supervised",
+        task_name = %timezone_name,
         "timezone refresh is supervised"
     );
 
@@ -107,13 +112,18 @@ solti: logging and supervised maintenance
     let terminal = wait_for_terminal(&mut watch, &task_name).await?;
     tracing::info!(
         target: "example::operations",
-        task = %task_name,
+        event = "task.terminal",
+        task_name = %task_name,
         phase = %terminal.status().phase(),
         "routed task reached terminal state"
     );
 
     supervisor.shutdown().await?;
-    tracing::info!(target: "example::operations", "supervisor stopped");
+    tracing::info!(
+        target: "example::operations",
+        event = "service.supervisor_stopped",
+        "supervisor stopped"
+    );
     println!(
         "\nResult: routed work and recurring in-process maintenance emitted through one validated logger."
     );

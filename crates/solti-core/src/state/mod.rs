@@ -991,7 +991,17 @@ impl TaskState {
                 Ok(true) => task_change = Some((revision, previous, task.clone())),
                 Ok(false) => {}
                 Err(error) => {
-                    tracing::warn!(task = %name, %error, "ignoring illegal attempt start");
+                    tracing::warn!(
+                        event = "task.state_transition_rejected",
+                        task_name = %name,
+                        task_uid = %binding.resource.uid,
+                        generation = binding.resource.generation,
+                        taskvisor_id = tv_raw,
+                        attempt,
+                        operation = "attempt_start",
+                        %error,
+                        "illegal state transition ignored"
+                    );
                     return false;
                 }
             }
@@ -1138,7 +1148,17 @@ impl TaskState {
             ) {
                 Ok(changed) => changed,
                 Err(error) => {
-                    tracing::warn!(task = %name, %error, "ignoring illegal attempt finish");
+                    tracing::warn!(
+                        event = "task.state_transition_rejected",
+                        task_name = %name,
+                        task_uid = %binding.resource.uid,
+                        generation = binding.resource.generation,
+                        taskvisor_id = tv_raw,
+                        attempt,
+                        operation = "attempt_finish",
+                        %error,
+                        "illegal state transition ignored"
+                    );
                     return false;
                 }
             };
@@ -1200,7 +1220,15 @@ impl TaskState {
             .expect("resource was checked under the same write lock")
             .mark_observed(resource_version)
             .unwrap_or_else(|error| {
-                tracing::warn!(task = %resource.name, %error, "could not mark generation observed");
+                tracing::warn!(
+                    event = "task.state_transition_rejected",
+                    task_name = %resource.name,
+                    task_uid = %resource.uid,
+                    generation = resource.generation,
+                    operation = "mark_observed",
+                    %error,
+                    "state transition rejected"
+                );
                 false
             });
         if changed {
@@ -1240,7 +1268,16 @@ impl TaskState {
             .expect("resource was checked under the same write lock")
             .mark_reconciliation_failed(reason, message, resource_version)
             .unwrap_or_else(|error| {
-                tracing::warn!(task = %resource.name, %error, "could not record reconciliation failure");
+                tracing::warn!(
+                    event = "task.state_transition_rejected",
+                    task_name = %resource.name,
+                    task_uid = %resource.uid,
+                    generation = resource.generation,
+                    operation = "record_reconciliation_failure",
+                    reason,
+                    %error,
+                    "state transition rejected"
+                );
                 false
             });
         if changed {
@@ -1309,7 +1346,16 @@ impl TaskState {
                 true
             }
             Err(error) => {
-                tracing::warn!(task = %name, %error, "ignoring illegal task finalization");
+                tracing::warn!(
+                    event = "task.state_transition_rejected",
+                    task_name = %name,
+                    task_uid = %binding.resource.uid,
+                    generation = binding.resource.generation,
+                    taskvisor_id = binding.tv.get(),
+                    operation = "task_finalize",
+                    %error,
+                    "illegal state transition ignored"
+                );
                 false
             }
         }
@@ -1523,7 +1569,10 @@ impl TaskState {
             }
         }
         if runs_removed > 0 || tasks_removed > 0 {
-            debug!(runs_removed, tasks_removed, "state sweep completed");
+            debug!(
+                event = "state.sweep",
+                runs_removed, tasks_removed, "state sweep completed"
+            );
         }
 
         (runs_removed, tasks_removed)

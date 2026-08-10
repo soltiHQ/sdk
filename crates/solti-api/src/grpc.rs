@@ -439,7 +439,13 @@ where
                 TaskTarget::Manifest(&manifest),
             )
             .await?;
-            debug!(name = %manifest.name(), "grpc: creating task");
+            debug!(
+                event = "api.operation",
+                transport = "grpc",
+                operation = "create",
+                task_name = %manifest.name(),
+                "task operation started"
+            );
             let task = self
                 .handler
                 .create_task(manifest)
@@ -474,7 +480,13 @@ where
                 TaskTarget::Manifest(&manifest),
             )
             .await?;
-            debug!(name = %manifest.name(), "grpc: applying task");
+            debug!(
+                event = "api.operation",
+                transport = "grpc",
+                operation = "apply",
+                task_name = %manifest.name(),
+                "task operation started"
+            );
             let task = self
                 .handler
                 .apply_task(manifest, preconditions)
@@ -504,7 +516,13 @@ where
                 TaskTarget::Task(&task_id),
             )
             .await?;
-            debug!(%task_id, "grpc: getting task status");
+            debug!(
+                event = "api.operation",
+                transport = "grpc",
+                operation = "get",
+                task_name = %task_id,
+                "task operation started"
+            );
 
             let task = self
                 .handler
@@ -559,9 +577,12 @@ where
                 .map_err(Status::from)?;
 
             debug!(
+                event = "api.operation_completed",
+                transport = "grpc",
+                operation = "list",
                 count = page.items.len(),
                 remaining = page.remaining_item_count,
-                "grpc: tasks listed"
+                "task operation completed"
             );
 
             let response = tasks_page_to_proto(page).map_err(Status::from)?;
@@ -599,6 +620,13 @@ where
             )
             .await?;
 
+            debug!(
+                event = "api.operation",
+                transport = "grpc",
+                operation = "watch",
+                "task operation started"
+            );
+
             let domain_stream = self
                 .handler
                 .watch_tasks(filter, req.resource_version)
@@ -629,7 +657,13 @@ where
                 TaskTarget::Task(&task_id),
             )
             .await?;
-            debug!(%task_id, "grpc: listing task runs");
+            debug!(
+                event = "api.operation",
+                transport = "grpc",
+                operation = "list_runs",
+                task_name = %task_id,
+                "task operation started"
+            );
 
             let runs = self
                 .handler
@@ -665,14 +699,19 @@ where
                 TaskTarget::Task(&task_id),
             )
             .await?;
-            debug!(%task_id, "grpc: deleting task");
+            debug!(
+                event = "api.operation",
+                transport = "grpc",
+                operation = "delete",
+                task_name = %task_id,
+                "task operation started"
+            );
 
             self.handler
                 .delete_task(&task_id, preconditions)
                 .await
                 .map_err(Status::from)?;
 
-            debug!(%task_id, "grpc: task deleted");
             Ok(Response::new(proto_api::DeleteTaskResponse {}))
         })
         .await
@@ -695,7 +734,13 @@ where
                 TaskTarget::Task(&task_id),
             )
             .await?;
-            debug!(%task_id, "grpc: subscribing to task log stream");
+            debug!(
+                event = "api.operation",
+                transport = "grpc",
+                operation = "stream_logs",
+                task_name = %task_id,
+                "task operation started"
+            );
 
             let domain_stream = self
                 .handler

@@ -12,7 +12,7 @@ use solti_runner::{
     BuildContext, RouterError, RunId, Runner, RunnerCatalog, RunnerError, RunnerRouter,
 };
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
-use tracing::{debug, instrument};
+use tracing::{Instrument as _, debug, debug_span, instrument, trace};
 
 use crate::output::ChainOutput;
 use crate::{CHAIN_API_VERSION, CHAIN_KIND, ChainSpec, FailureMode};
@@ -51,7 +51,11 @@ impl Runner for ChainRunner {
     #[instrument(
         level = "debug",
         skip(self, task, ctx),
-        fields(task = %task.name(), generation = task.metadata().generation())
+        fields(
+            event = "chain.build",
+            task_name = %task.name(),
+            generation = task.metadata().generation()
+        )
     )]
     fn build_task(
         &self,
@@ -70,20 +74,35 @@ impl Runner for ChainRunner {
         let plan = Arc::new(self.compile(task, &spec, &child_ctx)?);
         let attempts = Arc::new(AtomicU32::new(0));
 
-        debug!(steps = plan.steps.len(), entry = %spec.entry(), "chain compiled");
+        debug!(
+            event = "chain.compiled",
+            steps = plan.steps.len(),
+            entry = %spec.entry(),
+            "chain compiled"
+        );
 
-        Ok(TaskFn::arc(
-            run_id.name().to_owned(),
-            move |ctx: TaskContext| {
-                let plan = Arc::clone(&plan);
-                let output = Arc::clone(&output);
-                let attempt = attempts.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-                async move {
-                    let output = output.begin(attempt);
-                    execute(plan, ctx, output.sink()).await
-                }
-            },
-        ))
+        let task_name = task.name().clone();
+        let generation = task.metadata().generation();
+        let run_id = run_id.name().to_owned();
+
+        Ok(TaskFn::arc(run_id.clone(), move |ctx: TaskContext| {
+            let plan = Arc::clone(&plan);
+            let output = Arc::clone(&output);
+            let attempt = attempts.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            let span = debug_span!(
+                "chain_attempt",
+                event = "chain.attempt",
+                task_name = %task_name,
+                generation,
+                run_id = %run_id,
+                attempt,
+            );
+            async move {
+                let output = output.begin(attempt);
+                execute(plan, ctx, output.sink()).await
+            }
+            .instrument(span)
+        }))
     }
 }
 
@@ -173,6 +192,12 @@ async fn execute(
             return Err(TaskError::Canceled);
         }
         let step = &plan.steps[current];
+        trace!(
+            event = "chain.step",
+            step_name = %step.name,
+            stage = "started",
+            "chain step started"
+        );
         marker(output, &step.name, "started", false);
         let result = match ctx.run_until_cancelled(step.task.spawn(ctx.child())).await {
             Ok(result) => result,
@@ -181,14 +206,33 @@ async fn execute(
 
         match result {
             Ok(()) => {
+                trace!(
+                    event = "chain.step",
+                    step_name = %step.name,
+                    stage = "succeeded",
+                    "chain step succeeded"
+                );
                 marker(output, &step.name, "succeeded", false);
                 if let Some(next) = step.on_success {
+                    trace!(
+                        event = "chain.transition",
+                        step_name = %step.name,
+                        next_step = %plan.steps[next].name,
+                        outcome = "success",
+                        "chain selected next step"
+                    );
                     current = next;
                     continue;
                 }
                 return preserved_failure.map_or(Ok(()), Err);
             }
             Err(error) if matches!(error, TaskError::Canceled) => {
+                trace!(
+                    event = "chain.step",
+                    step_name = %step.name,
+                    stage = "canceled",
+                    "chain step canceled"
+                );
                 marker(output, &step.name, "canceled", true);
                 return Err(error);
             }
@@ -197,12 +241,27 @@ async fn execute(
                 let Some(transition) = step.on_failure else {
                     return Err(error);
                 };
+                debug!(
+                    event = "chain.transition",
+                    step_name = %step.name,
+                    next_step = %plan.steps[transition.next].name,
+                    outcome = "failure",
+                    failure_mode = failure_mode_label(transition.mode),
+                    "chain selected failure branch"
+                );
                 if transition.mode == FailureMode::Preserve && preserved_failure.is_none() {
                     preserved_failure = Some(error);
                 }
                 current = transition.next;
             }
         }
+    }
+}
+
+fn failure_mode_label(mode: FailureMode) -> &'static str {
+    match mode {
+        FailureMode::Preserve => "preserve",
+        FailureMode::Recover => "recover",
     }
 }
 

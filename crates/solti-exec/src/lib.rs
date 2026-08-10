@@ -33,7 +33,7 @@
 //!                    process      container task
 //!                       └────┬─────┘
 //!                            ▼
-//!                 tracing + OutputSink
+//!          OutputSink + optional tracing copy
 //!                            ▼
 //!                 terminate, wait, cleanup
 //! ```

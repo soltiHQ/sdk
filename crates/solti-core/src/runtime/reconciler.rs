@@ -46,7 +46,7 @@ use tokio_util::{
     sync::CancellationToken,
     task::{AbortOnDropHandle, TaskTracker},
 };
-use tracing::warn;
+use tracing::{instrument, warn};
 
 use super::{RuntimeObserver, TaskLocks};
 use crate::{
@@ -62,6 +62,15 @@ pub(crate) enum RuntimeSource {
     Routed,
     /// Uses a caller-owned Taskvisor task.
     Prebuilt(TaskRef),
+}
+
+impl RuntimeSource {
+    fn as_label(&self) -> &'static str {
+        match self {
+            Self::Routed => "routed",
+            Self::Prebuilt(_) => "prebuilt",
+        }
+    }
 }
 
 /// Dependencies shared by reconciliation and completion workers.
@@ -164,6 +173,17 @@ impl Reconciler {
             .map_err(|error| CoreError::supervisor("prepare", error))
     }
 
+    #[instrument(
+        level = "debug",
+        skip_all,
+        fields(
+            event = "task.reconcile",
+            task_name = %desired.name(),
+            task_uid = %desired.uid(),
+            generation = desired.metadata().generation(),
+            runtime_source = source.as_label(),
+        )
+    )]
     pub(crate) async fn reconcile(
         &self,
         desired: Task,
@@ -207,7 +227,14 @@ impl Reconciler {
                         return self.current(&target, desired);
                     }
                     Ok(Err(_)) => {
-                        warn!(task = %target.name, "runner preflight panicked");
+                        warn!(
+                            event = "task.reconcile_failed",
+                            task_name = %target.name,
+                            task_uid = %target.uid,
+                            generation = target.generation,
+                            error_kind = "runner_build_panicked",
+                            "runner preflight panicked"
+                        );
                         self.state.mark_reconciliation_failed(
                             &target,
                             "RunnerBuildPanicked",
@@ -216,7 +243,15 @@ impl Reconciler {
                         return self.current(&target, desired);
                     }
                     Err(error) => {
-                        warn!(task = %target.name, %error, "runner preflight worker was unavailable");
+                        warn!(
+                            event = "task.reconcile_failed",
+                            task_name = %target.name,
+                            task_uid = %target.uid,
+                            generation = target.generation,
+                            error_kind = "runner_build_unavailable",
+                            %error,
+                            "runner preflight unavailable"
+                        );
                         self.state.mark_reconciliation_failed(
                             &target,
                             "RunnerBuildUnavailable",
@@ -244,7 +279,14 @@ impl Reconciler {
                 return self.current(&target, desired);
             }
             Err(_) => {
-                warn!(task = %target.name, "runner preflight panicked");
+                warn!(
+                    event = "task.reconcile_failed",
+                    task_name = %target.name,
+                    task_uid = %target.uid,
+                    generation = target.generation,
+                    error_kind = "runner_build_panicked",
+                    "runner preflight panicked"
+                );
                 self.state.mark_reconciliation_failed(
                     &target,
                     "RunnerBuildPanicked",
@@ -331,12 +373,19 @@ impl Reconciler {
         let cleanup_timeout = self.grace.saturating_add(Duration::from_secs(1));
         let tv = binding.tv;
         let tv_raw = tv.get();
+        let task_name = binding.resource.name.clone();
+        let task_uid = binding.resource.uid.clone();
+        let generation = binding.resource.generation;
         let task = self.tasks.spawn_on(
             async move {
                 match waiter.wait().await {
                     Ok(outcome) => observer.finalize_from_outcome(tv_raw, &outcome).await,
                     Err(error) => {
                         warn!(
+                            event = "task.outcome_unavailable",
+                            task_name = %task_name,
+                            task_uid = %task_uid,
+                            generation,
                             taskvisor_id = tv_raw,
                             error = %error,
                             "task completion channel closed without an outcome"
@@ -353,6 +402,10 @@ impl Reconciler {
                             }
                             Err(cleanup_error) => {
                                 warn!(
+                                    event = "task.cleanup_unconfirmed",
+                                    task_name = %task_name,
+                                    task_uid = %task_uid,
+                                    generation,
                                     taskvisor_id = tv_raw,
                                     error = %cleanup_error,
                                     "could not confirm cleanup after task outcome became unavailable"

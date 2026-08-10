@@ -125,6 +125,7 @@ pub(crate) fn sync_local_offset() -> Result<(), LoggerError> {
     let (old_offset, new_offset) = refresh_local_offset_with(UtcOffset::current_local_offset)?;
     if old_offset != new_offset {
         debug!(
+            event = "logger.timezone_updated",
             old_offset = %format_offset(old_offset),
             new_offset = %format_offset(new_offset),
             "timezone offset updated"

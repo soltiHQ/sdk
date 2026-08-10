@@ -344,6 +344,7 @@ impl Drop for PreparedCgroup {
             && error.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(
+                event = "host_process.cgroup_cleanup_failed",
                 cgroup = %self.path.display(),
                 error = %error,
                 "failed to clean up unused prepared cgroup",
@@ -701,7 +702,9 @@ mod linux_impl {
             Err(source) => {
                 if let Err(cleanup) = remove_directory_at(&parent.directory, &name) {
                     tracing::warn!(
+                        event = "host_process.cgroup_rollback_failed",
                         cgroup = %path.display(),
+                        stage = "open",
                         error = %cleanup,
                         "failed to roll back unopened cgroup",
                     );
@@ -736,7 +739,9 @@ mod linux_impl {
                     super::cleanup_owned_cgroup(&parent.directory, &name, &directory, &path)
                 {
                     tracing::warn!(
+                        event = "host_process.cgroup_rollback_failed",
                         cgroup = %path.display(),
+                        stage = "prepare",
                         error = %cleanup,
                         "failed to roll back cgroup setup",
                     );

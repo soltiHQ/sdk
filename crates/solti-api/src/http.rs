@@ -1238,7 +1238,14 @@ fn encode_watch_document(event: Result<TaskWatchEvent, ApiError>) -> Vec<u8> {
             bytes
         }
         Err(error) => {
-            tracing::error!(%error, "failed to serialize HTTP task watch event");
+            tracing::error!(
+                event = "api.internal_error",
+                transport = "http",
+                operation = "watch_tasks",
+                stage = "serialize_event",
+                %error,
+                "failed to serialize task watch event"
+            );
             br#"{"type":"ERROR","object":{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Failure","message":"internal server error","reason":"InternalError","code":500}}
 "#
             .to_vec()
@@ -1350,7 +1357,13 @@ where
             TaskTarget::Manifest(&manifest),
         )
         .await?;
-    debug!(name = %manifest.name(), "creating task");
+    debug!(
+        event = "api.operation",
+        transport = "http",
+        operation = "create",
+        task_name = %manifest.name(),
+        "task operation started"
+    );
     let task = public_task(handler.create_task(manifest).await?)?;
     Ok((StatusCode::CREATED, Json(task)))
 }
@@ -1382,7 +1395,13 @@ where
             TaskTarget::Manifest(&manifest),
         )
         .await?;
-    debug!(name = %manifest.name(), "applying task");
+    debug!(
+        event = "api.operation",
+        transport = "http",
+        operation = "apply",
+        task_name = %manifest.name(),
+        "task operation started"
+    );
     let task = public_task(handler.apply_task(manifest, preconditions).await?)?;
     Ok(Json(task))
 }
@@ -1400,7 +1419,13 @@ where
     access
         .authorize(identity, TaskOperation::Get, TaskTarget::Task(&name))
         .await?;
-    debug!(%name, "getting task");
+    debug!(
+        event = "api.operation",
+        transport = "http",
+        operation = "get",
+        task_name = %name,
+        "task operation started"
+    );
     let task = handler
         .get_task(&name)
         .await?
@@ -1447,6 +1472,12 @@ where
         access
             .authorize(identity, TaskOperation::Watch, TaskTarget::Collection)
             .await?;
+        debug!(
+            event = "api.operation",
+            transport = "http",
+            operation = "watch",
+            "task operation started"
+        );
         let stream = handler.watch_tasks(filter, resource_version).await?;
         let body_stream = TaskWatchBodyStream::new(stream);
         let mut response = Body::from_stream(body_stream).into_response();
@@ -1483,9 +1514,12 @@ where
     let page = handler.query_tasks(query).await?;
     crate::continuation::validate_page(&page, &page_filter, page_limit)?;
     debug!(
+        event = "api.operation_completed",
+        transport = "http",
+        operation = "list",
         count = page.items.len(),
         remaining = page.remaining_item_count,
-        "tasks listed"
+        "task operation completed"
     );
 
     for task in &page.items {
@@ -1527,7 +1561,13 @@ where
     access
         .authorize(identity, TaskOperation::ListRuns, TaskTarget::Task(&name))
         .await?;
-    debug!(%name, "listing task runs");
+    debug!(
+        event = "api.operation",
+        transport = "http",
+        operation = "list_runs",
+        task_name = %name,
+        "task operation started"
+    );
     let runs = handler.list_task_runs(&name).await?;
     if runs.iter().any(|run| !run_is_visible(run)) {
         return Err(ApiError::Internal(
@@ -1552,8 +1592,14 @@ where
     access
         .authorize(identity, TaskOperation::Delete, TaskTarget::Task(&name))
         .await?;
+    debug!(
+        event = "api.operation",
+        transport = "http",
+        operation = "delete",
+        task_name = %name,
+        "task operation started"
+    );
     handler.delete_task(&name, preconditions).await?;
-    debug!(%name, "task deleted");
 
     Ok(NoContent)
 }
@@ -1572,7 +1618,13 @@ where
     access
         .authorize(identity, TaskOperation::StreamLogs, TaskTarget::Task(&name))
         .await?;
-    debug!(%name, "subscribing to task log stream");
+    debug!(
+        event = "api.operation",
+        transport = "http",
+        operation = "stream_logs",
+        task_name = %name,
+        "task operation started"
+    );
     let stream = handler.stream_task_logs(&name).await?;
 
     let sse_stream = stream.map(|ev| {

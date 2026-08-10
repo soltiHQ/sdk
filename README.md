@@ -517,6 +517,7 @@ Start with the relevant crate README.
 
 Read the architecture guides before changing the [model](crates/solti-model/ARCHITECTURE.md), [core](crates/solti-core/ARCHITECTURE.md), or [execution](crates/solti-exec/ARCHITECTURE.md) boundaries.
 Read the [Task API contract](crates/solti-api/CONTRACT.md) or [discovery contract](crates/solti-discover/CONTRACT.md) before changing wire behavior.
+Follow the [logging contract](LOGGING.md) when adding spans or diagnostic events.
 
 Read the [contributing guide](https://github.com/soltiHQ/.github/blob/main/CONTRIBUTING.md) before a large change.
 

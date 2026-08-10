@@ -345,6 +345,7 @@ impl Drop for AttemptProcessDomain {
         #[cfg(feature = "host-process")]
         if let Err(error) = termination {
             warn!(
+                event = "host_process.termination_failed",
                 cgroup = ?self.cgroup_path(),
                 error = %error,
                 "failed to terminate host process domain",
@@ -357,6 +358,7 @@ impl Drop for AttemptProcessDomain {
         #[cfg(feature = "host-process")]
         if let Err(error) = cleanup {
             warn!(
+                event = "host_process.cleanup_failed",
                 cgroup = ?self.cgroup_path(),
                 error = %error,
                 "failed to clean up host process cgroup",
@@ -406,7 +408,12 @@ impl PreparedHostProcessPolicy {
         let cgroup = match (&self.cgroups, cgroup_name) {
             (Some(cgroups), Some(name)) => {
                 validate_cgroup_name(name)?;
-                trace!(?cgroups, group = name, "preparing host process cgroup");
+                trace!(
+                    event = "host_process.cgroup_prepare",
+                    ?cgroups,
+                    group = name,
+                    "preparing host process cgroup"
+                );
                 let parent = self
                     .cgroup_parent
                     .as_ref()
@@ -480,22 +487,44 @@ impl PreparedHostProcessAttempt {
         let mut domain = AttemptProcessDomain { cgroup: None };
 
         if let Some(process) = &controls.process {
-            trace!(?process, "attaching host process state");
+            trace!(
+                event = "host_process.control_attach",
+                control = "process",
+                ?process,
+                "attaching host process control"
+            );
             attach_process_config(command, process);
         }
         if let Some(rlimits) = &controls.rlimits {
-            trace!(?rlimits, "attaching host process rlimits");
+            trace!(
+                event = "host_process.control_attach",
+                control = "rlimits",
+                ?rlimits,
+                "attaching host process control"
+            );
             attach_rlimits(command, rlimits);
         }
         if let Some(prepared) = cgroup {
             trace!(
+                event = "host_process.control_attach",
+                control = "cgroup",
                 cgroup = %prepared.path().display(),
-                "attaching host process cgroup",
+                "attaching host process control",
             );
             domain.cgroup = Some(attach_cgroup(command, prepared));
         }
         if let Some(security) = &controls.security {
-            trace!(?security, "attaching host process security controls");
+            trace!(
+                event = "host_process.control_attach",
+                control = "security",
+                credentials_configured = security.credentials.is_some(),
+                drop_all_caps = security.drop_all_caps,
+                kept_capability_count = security.keep_caps.len(),
+                no_new_privs = security.no_new_privs,
+                namespaces_configured = !security.namespaces.is_empty(),
+                seccomp_configured = security.seccomp != crate::isolation::SeccompPolicy::Disabled,
+                "attaching host process control"
+            );
             attach_security(command, security);
         }
 

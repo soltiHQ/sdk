@@ -443,7 +443,9 @@ impl ContainerdAttempt {
                     }
                     Err(readback) => {
                         warn!(
+                            event = "containerd.create_outcome_unverified",
                             resource_id = %self.resource_id,
+                            stage = "snapshot",
                             error = %readback,
                             "containerd snapshot create outcome could not be verified",
                         );
@@ -512,7 +514,9 @@ impl ContainerdAttempt {
                     }
                     Err(readback) => {
                         warn!(
+                            event = "containerd.create_outcome_unverified",
                             resource_id = %self.resource_id,
+                            stage = "container",
                             error = %readback,
                             "containerd container create outcome could not be verified",
                         );
@@ -575,7 +579,9 @@ impl ContainerdAttempt {
                     }
                     Err(readback) => {
                         warn!(
+                            event = "containerd.create_outcome_unverified",
                             resource_id = %self.resource_id,
+                            stage = "task",
                             error = %readback,
                             "containerd task create outcome could not be verified",
                         );
@@ -930,6 +936,7 @@ impl ContainerdAttempt {
 
         if let Err(error) = self.ensure_wait_armed().await {
             warn!(
+                event = "containerd.wait_rearm_failed",
                 resource_id = %self.resource_id,
                 error = %error,
                 "containerd wait could not be re-armed before termination",

@@ -65,9 +65,11 @@ impl RunnerCatalog {
         level = "debug",
         skip(self, task, ctx),
         fields(
-            task = %task.name(),
-            api_version = task.spec().workload().api_version(),
-            kind = task.spec().workload().kind()
+            event = "runner.build",
+            task_name = %task.name(),
+            generation = task.metadata().generation(),
+            workload_api_version = task.spec().workload().api_version(),
+            workload_kind = task.spec().workload().kind()
         )
     )]
     pub fn build(&self, task: &Task, ctx: &BuildContext) -> Result<TaskRef, RouterError> {
@@ -228,9 +230,11 @@ impl RunnerRouter {
         level = "debug",
         skip(self, task),
         fields(
-            task = %task.name(),
-            api_version = task.spec().workload().api_version(),
-            kind = task.spec().workload().kind()
+            event = "runner.build",
+            task_name = %task.name(),
+            generation = task.metadata().generation(),
+            workload_api_version = task.spec().workload().api_version(),
+            workload_kind = task.spec().workload().kind()
         )
     )]
     pub fn build(&self, task: &Task) -> Result<TaskRef, RouterError> {
@@ -257,12 +261,14 @@ fn pick_entry<'a>(runners: &'a [RunnerEntry], task: &Task) -> Result<&'a RunnerE
     })?;
     if matching.next().is_some() {
         debug!(
-            task = %task.name(),
+            event = "runner.multiple_matches",
+            task_name = %task.name(),
+            generation = task.metadata().generation(),
             slot = %task.slot(),
-            api_version = workload.api_version(),
-            kind = workload.kind(),
+            workload_api_version = workload.api_version(),
+            workload_kind = workload.kind(),
             runner = first.capability.name(),
-            "multiple runners match this spec; using the first registered (registration order is significant)"
+            "multiple runners matched; using first registered"
         );
     }
     Ok(first)
@@ -274,10 +280,12 @@ fn build_from_entries(
     ctx: &BuildContext,
 ) -> Result<TaskRef, RouterError> {
     trace!(
-        task = %task.name(),
+        event = "runner.route",
+        task_name = %task.name(),
+        generation = task.metadata().generation(),
         slot = %task.slot(),
-        api_version = task.spec().workload().api_version(),
-        kind = task.spec().workload().kind(),
+        workload_api_version = task.spec().workload().api_version(),
+        workload_kind = task.spec().workload().kind(),
         "router received task"
     );
 
@@ -299,9 +307,12 @@ fn build_from_entries(
         });
     }
     debug!(
+        event = "runner.built",
+        task_name = %task.name(),
+        generation = task.metadata().generation(),
         runner = runner_name,
         run_id = task_ref.name(),
-        "runner built task successfully"
+        "runner built task"
     );
     Ok(task_ref)
 }
@@ -504,7 +515,7 @@ mod tests {
         tracing::dispatcher::with_default(&dispatch, || router.build(&task).unwrap());
 
         let fields = capture.fields.lock().unwrap().join(" ");
-        assert!(fields.contains("task=test-task"));
+        assert!(fields.contains("task_name=test-task"));
         assert!(fields.contains("slot=test-slot"));
         assert!(!fields.contains(SECRET));
     }

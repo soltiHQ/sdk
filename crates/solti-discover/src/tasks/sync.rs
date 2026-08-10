@@ -94,8 +94,8 @@ pub fn sync(
     let transport = TransportAdapter::from_config(&config)?;
     if config.token.is_some() && !transport.is_secure() {
         warn!(
-            "discovery: presenting a bearer token over a plaintext channel; \
-             enable TLS to protect the credential in transit"
+            event = "discovery.insecure_transport",
+            "bearer token configured for plaintext discovery"
         );
     }
 
@@ -119,8 +119,9 @@ pub fn sync(
             if !ctx.startup_jitter_applied.swap(true, Ordering::Relaxed) {
                 let jitter = Duration::from_millis(startup_jitter_ms(ctx.delay_ms));
                 debug!(
+                    event = "discovery.startup_jitter",
                     jitter_ms = jitter.as_millis() as u64,
-                    "applying startup jitter before first sync",
+                    "discovery startup delayed",
                 );
                 cancel
                     .run_until_cancelled(tokio::time::sleep(jitter))
@@ -129,13 +130,18 @@ pub fn sync(
 
             if let Some(wait) = ctx.retry_hold_wait() {
                 debug!(
+                    event = "discovery.retry_hold",
                     wait_s = wait.as_secs(),
-                    "waiting for server-advised retry hold"
+                    "discovery retry delayed"
                 );
                 cancel.run_until_cancelled(tokio::time::sleep(wait)).await?;
             }
 
-            debug!("sending sync request to control plane");
+            debug!(
+                event = "discovery.sync",
+                stage = "started",
+                "discovery sync started"
+            );
             ctx.metrics.record_attempt();
             let start = Instant::now();
             let request = stamp_request(&ctx.base_request, ctx.uptime.as_ref());
@@ -147,12 +153,17 @@ pub fn sync(
                 Ok(()) => {
                     ctx.metrics.record_success(duration_ms);
                     ctx.clear_retry_hold();
-                    debug!("sync completed successfully");
+                    debug!(
+                        event = "discovery.sync",
+                        stage = "completed",
+                        duration_ms,
+                        "discovery sync completed"
+                    );
                     Ok(())
                 }
                 Err(e) => {
-                    ctx.metrics
-                        .record_failure(duration_ms, classify_failure(&e));
+                    let failure = classify_failure(&e);
+                    ctx.metrics.record_failure(duration_ms, failure);
                     if let DiscoverError::Rejected {
                         retry_after_s: Some(s),
                         ..
@@ -160,7 +171,12 @@ pub fn sync(
                     {
                         let clamped = clamp_retry_after_s(*s);
                         if *s != clamped {
-                            warn!(advised_s = *s, capped_s = clamped, "retry_after_s capped",);
+                            warn!(
+                                event = "discovery.retry_hold_capped",
+                                advised_s = *s,
+                                capped_s = clamped,
+                                "discovery retry hold capped"
+                            );
                         }
                         ctx.set_retry_hold(Duration::from_secs(clamped as u64));
                         ctx.metrics.record_hold(clamped as u64);
@@ -168,11 +184,23 @@ pub fn sync(
 
                     match e.retryability() {
                         Retryability::Permanent => {
-                            warn!("sync failed permanently: {}", e);
+                            warn!(
+                                event = "discovery.sync_failed",
+                                error_kind = failure.as_label(),
+                                retryable = false,
+                                duration_ms,
+                                "discovery sync failed"
+                            );
                             Err(TaskError::fatal_from(e))
                         }
                         Retryability::Retryable => {
-                            warn!("sync failed: {}", e);
+                            debug!(
+                                event = "discovery.sync_failed",
+                                error_kind = failure.as_label(),
+                                retryable = true,
+                                duration_ms,
+                                "discovery sync failed"
+                            );
                             Err(TaskError::fail_from(e))
                         }
                     }

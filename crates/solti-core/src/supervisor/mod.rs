@@ -146,7 +146,7 @@ impl SupervisorApi {
         };
 
         api.reconciler.spawn_retention_worker(state_cfg);
-        info!("supervisor is ready");
+        info!(event = "supervisor.ready", "supervisor ready");
         Ok(api)
     }
 
@@ -601,7 +601,11 @@ impl SupervisorApi {
     ///
     /// Returns [`CoreError::NotFound`] for an unknown task.
     /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
-    #[instrument(level = "debug", skip(self), fields(task = %name))]
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(event = "task.cancel", task_name = %name)
+    )]
     pub async fn cancel_task(&self, name: &TaskId) -> Result<(), CoreError> {
         let _operation = self.task_operations.lock(name).await;
         let _runtime_operation = self.reconciler.runtime_operations.lock(name).await;
@@ -628,7 +632,11 @@ impl SupervisorApi {
     /// # Errors
     ///
     /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
-    #[instrument(level = "debug", skip(self), fields(task = %name))]
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(event = "task.delete", task_name = %name)
+    )]
     pub async fn delete_task(&self, name: &TaskId) -> Result<(), CoreError> {
         let _operation = self.task_operations.lock(name).await;
         self.delete_task_locked(name).await
@@ -687,7 +695,12 @@ impl SupervisorApi {
 
     async fn delete_task_locked(&self, name: &TaskId) -> Result<(), CoreError> {
         let _runtime_operation = self.reconciler.runtime_operations.lock(name).await;
-        debug!(task = %name, "deleting task resource");
+        debug!(
+            event = "task.delete",
+            task_name = %name,
+            stage = "started",
+            "deleting task"
+        );
         let cancellation = self.cancel_bound(name).await?;
         let tv = cancellation.as_ref().map(|(binding, _)| binding.tv);
         self.reconciler.observer.delete_after_cleanup(name, tv);
@@ -702,9 +715,13 @@ impl SupervisorApi {
     /// # Errors
     ///
     /// Returns [`CoreError::Supervisor`] when Taskvisor shutdown fails.
-    #[instrument(level = "info", skip(self))]
+    #[instrument(level = "info", skip(self), fields(event = "supervisor.shutdown"))]
     pub async fn shutdown(&self) -> Result<(), CoreError> {
-        info!("initiating graceful shutdown");
+        info!(
+            event = "supervisor.shutdown",
+            stage = "started",
+            "supervisor shutdown started"
+        );
         {
             let _spawn = self.spawn_gate.lock();
             if !self.shutdown_started.swap(true, Ordering::AcqRel) {
@@ -722,6 +739,13 @@ impl SupervisorApi {
             .await
             .map_err(|error| CoreError::supervisor("shutdown", error));
         self.reconciler.tasks.wait().await;
+        if result.is_ok() {
+            info!(
+                event = "supervisor.shutdown",
+                stage = "completed",
+                "supervisor shutdown completed"
+            );
+        }
         result
     }
 }

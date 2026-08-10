@@ -250,7 +250,12 @@ impl ApiError {
             ApiError::ResourceVersionExpired(msg) => (StatusCode::GONE, msg, None),
             ApiError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg, None),
             ApiError::Internal(msg) => {
-                tracing::error!(error = %msg, "API request failed internally");
+                tracing::error!(
+                    event = "api.internal_error",
+                    transport = "http",
+                    error = %msg,
+                    "api request failed internally"
+                );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal server error".to_owned(),
@@ -419,7 +424,12 @@ impl From<ApiError> for tonic::Status {
             ApiError::ResourceVersionExpired(msg) => tonic::Status::out_of_range(msg),
             ApiError::Unavailable(msg) => tonic::Status::unavailable(msg),
             ApiError::Internal(msg) => {
-                tracing::error!(error = %msg, "API request failed internally");
+                tracing::error!(
+                    event = "api.internal_error",
+                    transport = "grpc",
+                    error = %msg,
+                    "api request failed internally"
+                );
                 tonic::Status::internal("internal server error")
             }
         }
