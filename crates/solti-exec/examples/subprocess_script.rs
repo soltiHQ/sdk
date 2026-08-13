@@ -104,7 +104,7 @@ async fn main() -> ExampleResult {
     let mut router = RunnerRouter::new().with_output_publisher(output_handle);
     register_subprocess_runner(&mut router, "shell")?;
 
-    let task_ref = router.build(&task)?;
+    let task_ref = router.build(&task).await?;
     println!(
         "[build] Decoded the body and built {}; no script transport exists between attempts.",
         task_ref.name(),

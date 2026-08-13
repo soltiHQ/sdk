@@ -111,7 +111,7 @@ The router receives the core-owned `OutputPublisher`.
 Runners can publish output without owning consumer subscriptions.
 
 `SupervisorApi` owns one `Reconciler`.
-The reconciler shares its dependencies with reconciliation and completion workers.
+The reconciler shares its dependencies with keyed reconciliation coordinators and completion workers.
 
 ## Desired-state writes
 
@@ -154,7 +154,7 @@ UID and resource-version preconditions are checked under the state write lock.
 A failed check does not consume a resource version.
 
 The spawn gate orders desired commits against shutdown.
-No reconciliation worker can be registered after shutdown closes the tracker.
+No reconciliation coordinator can be registered after shutdown closes the tracker.
 
 ## Submission paths
 
@@ -234,7 +234,14 @@ flowchart TB
 ```
 
 Preflight runs outside the runtime operation lock.
-Runner construction alone uses Tokio's blocking pool.
+Runner construction is an owned async future. One atomic admission coordinator
+reserves the outer build's global and per-runner slots together. Nested catalog
+builds reuse that global slot and reserve only their selected runner's slot.
+Nested waiters have progress priority over roots, so an outer build does not
+deadlock behind a root waiting for its global slot. The build deadline starts
+after outer admission and includes nested admission waits.
+One coordinator per task retains at most one active and one pending request.
+A newer request cancels active preflight and replaces the pending request.
 Policy mapping and Taskvisor preparation happen only after that build returns.
 Runner panics are contained and become `Reconciled=False`.
 
@@ -339,14 +346,19 @@ Free-form reason text remains diagnostic.
 One `RwLock` protects the complete state.
 A resource mutation and its change-journal entry happen under the same write lock.
 
-An optional state sink receives the committed task snapshot or run value through a FIFO publisher shared by all `TaskState` clones.
-Each state write reserves an unready FIFO batch while holding the state lock and appends its events to that batch.
+An optional state sink receives the committed task snapshot or run value through a bounded FIFO dispatcher shared by all `TaskState` clones.
+Each production write path declares its maximum event count and atomically reserves that many slots before acquiring the state lock.
+Admission is FIFO and does not partially acquire a reservation.
 Dropping the write guard releases the state lock before marking its batch ready; the publisher never crosses an unready queue front.
-Application code is therefore invoked only after the write guard that enqueued its event has released the state lock.
-One caller drains the queue synchronously; concurrent or reentrant commits only enqueue and may return before their own event is delivered.
-The publisher does not invoke the sink recursively; it stops at an unready front and the guard that makes that batch ready resumes draining.
+Application code therefore runs on one dedicated persistence worker and never under the state lock.
+For configured capacity `C`, `reserved + buffered + active <= C + 1`; `active` is zero or one and every admitted event owns exactly one permit.
+The largest atomic commit contains three events: one task change, at most one implicitly closed active run from the same generation, and one current run change.
+The minimum configured capacity is therefore two buffered events, for a hard bound of three including the active callback.
+Unused reservations return only after the state lock is released.
+When the bound is reached, a writer waits before entering its state critical section.
+Retention sweeps publish each expired task deletion as a separate revalidated commit batch.
 Run events carry both task name and resource UID.
-The sink must forward work and return quickly. 
+The sink must eventually return and must not mutate `TaskState`, directly or through a thread it waits for; reads are allowed.
 Hooks do not hydrate the store during startup.
 
 Resource versions contain a random store epoch and a monotonic revision.
@@ -394,9 +406,13 @@ Adapter filtering can therefore apply to historical generations.
 The output hub owns one bounded broadcast ring per bound task name.
 Runners receive an `OutputSink`.
 Consumers receive an `OutputSubscription`.
+Core makes one bounded ownership copy from each borrowed runner chunk, so a
+small view cannot retain a larger producer allocation in the live ring.
 
 Output is live-only and lossy.
-A slow subscriber receives `OutputEvent::Lagged` and continues.
+Oversized chunks retain their exact prefix and set `truncated = true`.
+A slow subscriber receives `OutputEvent::Lagged { skipped, skipped_bytes }`
+and continues; the byte count covers retained chunk payloads that were lost.
 
 An optional output sink receives published chunks and run markers, including the first event. 
 The event carries both task name and resource UID so output from different incarnations stays distinguishable. 
@@ -454,7 +470,7 @@ flowchart LR
     Start["shutdown"]
     Fence["Set shutdown flag<br/>hold spawn gate"]
     Watches["Close task watches"]
-    Retention["Cancel retention worker<br/>and preflight waits"]
+    Retention["Cancel retention worker<br/>and runner builds"]
     Tracker["Close worker tracker"]
     Runtime["Shutdown Taskvisor"]
     Drain["Wait for reconciliation,<br/>completion, and retention workers"]

@@ -112,12 +112,12 @@ impl PreparedProcessConfig {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(feature = "subprocess", target_os = "macos"))]
     pub(crate) fn reset_signals(&self) -> Arc<[libc::c_int]> {
         Arc::clone(&self.reset_signals)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(feature = "subprocess", target_os = "macos"))]
     pub(crate) fn has_umask(&self) -> bool {
         self.umask.is_some()
     }

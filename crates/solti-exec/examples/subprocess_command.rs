@@ -118,7 +118,7 @@ printf 'diagnostic=example\n' >&2"#;
     let task = Task::new("inspect-process-boundary", spec)?;
     println!("[setup/task] Task sets TASK_VALUE and SHARED; runner SHARED must win.");
 
-    let task_ref = router.build(&task)?;
+    let task_ref = router.build(&task).await?;
     println!(
         "[build] Router selected local and built {}; no child exists yet.",
         task_ref.name(),

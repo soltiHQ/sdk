@@ -42,7 +42,8 @@
 //! The runner must use [`RunId::name`] as the returned `TaskRef` name.
 //! The router validates that name.
 //!
-//! Building does not start or supervise the task.
+//! Building is asynchronous and cancellation-aware.
+//! It does not start or supervise the task.
 //! The returned `TaskRef` may execute more than one attempt.
 //!
 //! ## Output and Metrics
@@ -60,7 +61,9 @@
 //! | Area          | Types                                                  |
 //! |---------------|--------------------------------------------------------|
 //! | Runner plugin | [`Runner`], [`RunnerRouter`], [`RunnerCatalog`]        |
-//! | Build data    | [`BuildContext`]                                       |
+//! | Build data    | [`BuildContext`], [`BuildCancellation`], [`BuildScope`] |
+//! | Admission     | [`RunnerBuildAdmission`], [`AdmittedBuild`]             |
+//! | Build owner   | [`BuildCancellationHandle`]                            |
 //! | Output        | [`OutputPublisher`], [`OutputSink`]                    |
 //! | Run identity  | [`RunId`], [`make_run_id`]                             |
 //! | Metrics       | [`MetricsBackend`], [`MetricsHandle`], [`NoOpMetrics`] |
@@ -79,20 +82,21 @@
 //! # use solti_runner::{BuildContext, RunId, Runner, RunnerError};
 //! # use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 //! # struct MyRunner;
+//! # #[solti_runner::async_trait]
 //! # impl Runner for MyRunner {
 //! #     fn name(&self) -> &str { "my-runner" }
 //! #     fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
 //! #         vec![WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").expect("built-in workload GVK")]
 //! #     }
-//! #     fn build_task(&self, _task: &Task, run_id: &RunId, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
+//! #     async fn build_task(&self, _task: &Task, run_id: &RunId, _ctx: &BuildContext, _cancellation: &solti_runner::BuildCancellation, _scope: &mut solti_runner::BuildScope) -> Result<TaskRef, RunnerError> {
 //! #         Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move { Ok::<(), TaskError>(()) }))
 //! #     }
 //! # }
-//! # fn demo(resource: &Task) -> Result<TaskRef, Box<dyn std::error::Error>> {
+//! # async fn demo(resource: &Task) -> Result<TaskRef, Box<dyn std::error::Error>> {
 //! let mut router = RunnerRouter::new();
 //! router.register(Arc::new(MyRunner))?;
 //!
-//! let task = router.build(resource)?;
+//! let task = router.build(resource).await?;
 //! # Ok(task)
 //! # }
 //! ```
@@ -108,6 +112,15 @@ struct ReadmeDoctests;
 mod runner;
 pub use runner::Runner;
 
+mod cancellation;
+pub use cancellation::{BuildCancellation, BuildCancellationHandle};
+
+mod admission;
+pub use admission::{BuildAdmissionConfigError, BuildScope, RunnerBuildAdmission};
+
+/// Attribute used to implement async SDK traits without an additional dependency.
+pub use async_trait::async_trait;
+
 mod error;
 pub use error::{RouterError, RunnerError};
 
@@ -118,13 +131,15 @@ mod environment;
 pub use environment::{RunnerEnv, merge_env};
 
 mod router;
-pub use router::{RunnerCatalog, RunnerRouter};
+pub use router::{AdmittedBuild, RunnerCatalog, RunnerRouter};
 
 mod id;
 pub use id::{RunId, make_run_id};
 
 mod output;
-pub use output::{OutputPublisher, OutputPublisherHandle, OutputSink, noop_output_publisher};
+pub use output::{
+    OutputChunkRef, OutputPublisher, OutputPublisherHandle, OutputSink, noop_output_publisher,
+};
 
 pub mod metrics;
 pub use metrics::{

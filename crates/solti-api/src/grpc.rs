@@ -866,7 +866,8 @@ mod tests {
                     stream: ModelStreamKind::Stdout,
                     seq: 0,
                     ts: UNIX_EPOCH + Duration::from_millis(1100),
-                    line: Bytes::from_static(b"hello-grpc"),
+                    line: Bytes::from_static(&[b'h', b'i', 0xff, 0xfe]),
+                    truncated: true,
                 }),
                 OutputEvent::RunFinished {
                     generation: 2,
@@ -1225,7 +1226,8 @@ mod tests {
                 assert_eq!(c.attempt, 1);
                 assert_eq!(c.stream, proto_api::OutputStreamKind::Stdout as i32);
                 assert_eq!(c.seq, 0);
-                assert_eq!(&c.line[..], b"hello-grpc");
+                assert_eq!(&c.line[..], &[b'h', b'i', 0xff, 0xfe]);
+                assert!(c.truncated);
             }
             other => panic!("expected Chunk, got {other:?}"),
         }

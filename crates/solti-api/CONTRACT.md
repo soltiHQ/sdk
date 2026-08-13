@@ -502,11 +502,17 @@ data: {"type":"lagged","skipped":42}
 
 `line` contains standard padded base64.
 It preserves non-UTF-8 output.
+It contains the exact retained source prefix without the recognized line delimiter.
+When source bytes were omitted, the chunk also contains `"truncated":true`.
+The field is absent when it is false.
 
 The stream is live-only.
 It has no persistence or replay.
 A slow subscriber can miss events.
-`lagged.skipped` reports how many events were missed.
+`lagged.skipped` reports how many events were missed and
+`lagged.skippedBytes` reports the exact retained line bytes carried by those
+events. `skippedBytes` is omitted when zero. Lag metadata is separate from
+`line`; it never changes or inserts text into raw output bytes.
 
 Run markers are best-effort observations.
 They are not ordering barriers for chunks.
@@ -522,6 +528,8 @@ The HTTP transport sends periodic SSE keep-alive comments.
 gRPC `StreamTaskLogs` is a server stream.
 It carries the same four event variants in a protobuf `oneof`.
 Protobuf carries `line` as raw bytes.
+`OutputChunk.truncated` distinguishes a retained prefix from a complete line.
+`Lagged.skipped_bytes` reports retained line bytes lost before the next event.
 
 ## HTTP encoding
 
@@ -646,7 +654,8 @@ Write conflicts also contain:
 }
 ```
 
-Internal diagnostics are logged by the server.
+Internal failures are logged by stable category.
+The transport boundary does not write the diagnostic string to logs.
 Clients receive the fixed message `internal server error`.
 
 ## Version identity

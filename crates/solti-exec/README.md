@@ -23,7 +23,8 @@ use solti_model::{
 };
 use solti_runner::RunnerRouter;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut router = RunnerRouter::new();
     register_subprocess_runner(&mut router, "default")?;
 
@@ -39,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let spec = TaskSpec::builder("jobs", workload, 5_000_u64).build()?;
     let task = Task::new("hello", spec)?;
 
-    let task_ref = router.build(&task)?;
+    let task_ref = router.build(&task).await?;
     assert!(task_ref.name().starts_with("default-jobs-"));
     Ok(())
 }
@@ -529,17 +530,27 @@ Stdout and stderr are read line by line.
 
 | Field                    | Default | Behavior                                         |
 |--------------------------|---------|--------------------------------------------------|
-| `max_line_length`        | `4096`  | Truncates after this many Unicode scalar values  |
-| `max_line_bytes`         | `65536` | Drains the remainder after this byte limit       |
+| `max_line_length`        | `4096`  | Maximum raw bytes published per line             |
+| `max_line_bytes`         | `65536` | Hard retained-byte ceiling per line              |
 | `emit_output_to_tracing` | `false` | Copies workload lines to `solti_exec::workload`  |
 | `stdout_info`            | `true`  | Tracing level: `INFO` if true, `DEBUG` if false  |
 | `stderr_warn`            | `true`  | Tracing level: `WARN` if true, `DEBUG` if false  |
 
 The tracing copy is an explicit opt-in because workload output is application
 data rather than SDK diagnostics. The level fields apply only when that copy
-is enabled. Tracing output escapes control characters except tabs.
-The `OutputSink` path keeps control characters unchanged after decoding and truncation.
-Invalid UTF-8 is replaced during line decoding.
+is enabled. Tracing output preserves tabs but escapes Unicode control
+characters, line and paragraph separators, and bidirectional formatting
+controls.
+The effective published limit is the lesser of `max_line_length` and
+`max_line_bytes`. `OutputSink` receives the exact retained byte prefix and an
+explicit truncation status. It does not receive a textual truncation marker.
+Invalid UTF-8 and control bytes are unchanged on this path.
+
+Only the opt-in tracing copy is decoded with lossy UTF-8 and sanitized for log
+injection and visual-spoofing safety. The raw-byte output path publishes a
+borrowed view; core performs the single bounded ownership copy. When neither
+tracing nor an output sink is active, the pipes are drained without line
+decoding or per-line allocation.
 Child stdin is null.
 Stdout and stderr are always piped.
 

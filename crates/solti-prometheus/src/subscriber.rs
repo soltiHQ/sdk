@@ -102,7 +102,7 @@ pub const DEFAULT_TASKVISOR_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(204
 /// use solti_prometheus::{PrometheusTaskvisorSubscriber, Registry};
 /// use taskvisor::{Event, EventKind, Subscribe};
 ///
-/// # fn main() -> Result<(), prometheus::Error> {
+/// # fn main() -> Result<(), solti_prometheus::Error> {
 /// let registry = Registry::new();
 /// let subscriber = PrometheusTaskvisorSubscriber::new(&registry)?;
 ///
@@ -174,7 +174,7 @@ impl PrometheusTaskvisorSubscriber {
     /// use solti_prometheus::{PrometheusTaskvisorSubscriber, Registry};
     /// use taskvisor::Subscribe;
     ///
-    /// # fn main() -> Result<(), prometheus::Error> {
+    /// # fn main() -> Result<(), solti_prometheus::Error> {
     /// let registry = Registry::new();
     /// let capacity = NonZeroUsize::new(4096).unwrap();
     /// let subscriber = PrometheusTaskvisorSubscriber::with_queue_capacity(&registry, capacity)?;

@@ -70,7 +70,7 @@ use crate::register::{MetricGroup, ms_to_secs};
 /// use solti_discover::{DiscoverFailReason, DiscoverMetricsBackend};
 /// use solti_prometheus::{PrometheusDiscoverMetrics, Registry};
 ///
-/// # fn main() -> Result<(), prometheus::Error> {
+/// # fn main() -> Result<(), solti_prometheus::Error> {
 /// let registry = Registry::new();
 /// let metrics = PrometheusDiscoverMetrics::new(&registry)?;
 ///

@@ -324,5 +324,12 @@ They combine discovery with runner registration, reconciliation, supervision, an
 Protobuf defines the gRPC service and shared request and response messages.
 `CONTRACT.md` defines the HTTP binding and behavior shared by both transports.
 
+The authoritative protobuf tree lives in
+[`soltiHQ/proto`](https://github.com/soltiHQ/proto).
+Release and CI tooling vendor a pinned revision into `proto/`.
+The crate includes generated Rust and protobuf-JSON bindings from that vendored
+contract, so consumer builds do not run `protoc`.
+The `generated_contract` test regenerates the bindings and rejects drift.
+
 The HTTP endpoint is always `POST /api/v1/discovery/sync`.
 Generated protobuf types remain internal.

@@ -321,8 +321,14 @@ async fn print_chain_output(mut output: OutputSubscription) -> Result<(), Exampl
                 );
                 break;
             }
-            OutputEvent::Lagged { skipped } => {
-                return Err(io::Error::other(format!("live output lost {skipped} events")).into());
+            OutputEvent::Lagged {
+                skipped,
+                skipped_bytes,
+            } => {
+                return Err(io::Error::other(format!(
+                    "live output lost {skipped} events ({skipped_bytes} bytes)"
+                ))
+                .into());
             }
             _ => {}
         }

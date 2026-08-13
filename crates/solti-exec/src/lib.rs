@@ -87,6 +87,7 @@
 //! ```rust,no_run
 //! # #[cfg(feature = "subprocess")]
 //! # {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! use solti_exec::subprocess::register_subprocess_runner;
 //! use solti_model::{
 //!     Flag, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskSpec, TaskWorkload,
@@ -108,8 +109,10 @@
 //! let spec = TaskSpec::builder("jobs", workload, 5_000_u64).build()?;
 //! let resource = Task::new("hello", spec)?;
 //!
-//! let task = router.build(&resource)?;
+//! let task = router.build(&resource).await?;
 //! assert!(task.name().starts_with("default-jobs-"));
+//! # Ok(())
+//! # }
 //! # }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```

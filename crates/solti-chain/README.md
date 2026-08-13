@@ -65,7 +65,12 @@ Runners registered later are not available to chain steps.
 | `ChainSpec::into_workload` | `ChainSpec`                           | Solti extension `TaskWorkload` |
 | `ChainSpec::from_workload` | Solti extension `TaskWorkload`        | Validated `ChainSpec`          |
 | `register_chain_runner`    | `RunnerRouter` and runner name        | Registered `ChainRunner`       |
-| `ChainRunner::build_task`  | Outer `Task`, `RunId`, `BuildContext` | One outer `taskvisor::TaskRef` |
+| `ChainRunner::build_task`  | Standard runner build inputs          | One outer `taskvisor::TaskRef` |
+
+The runner build inputs are the outer `Task`, allocated `RunId`, explicit
+`BuildContext`, read-only `BuildCancellation` signal, and inherited
+`BuildScope`. Chain uses scoped catalog builds, so core admission counts every
+leaf runner without reacquiring the outer global slot.
 
 ## Workload contract
 

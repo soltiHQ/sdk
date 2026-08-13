@@ -14,10 +14,10 @@
 //!
 //! ```text
 //! OutputEvent
-//!   ├── chunk       ──▶ generation, attempt, stream, seq, ts, line
+//!   ├── chunk       ──▶ generation, attempt, stream, seq, ts, line, truncated
 //!   ├── runStarted  ──▶ generation, attempt, startedAt
 //!   ├── runFinished ──▶ generation, attempt, exitCode, finishedAt
-//!   └── lagged      ──▶ skipped
+//!   └── lagged      ──▶ skipped, skippedBytes
 //! ```
 //!
 //! `solti-api` maps the same domain events to the separate protobuf shape.
@@ -56,9 +56,10 @@ pub enum StreamKind {
 ///
 /// ```text
 /// {"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"aGVsbG8="}
+/// {"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":1,"ts":1701,"line":"aGVsbA==","truncated":true}
 /// {"type":"runStarted","generation":2,"attempt":1,"startedAt":1700}
 /// {"type":"runFinished","generation":2,"attempt":1,"exitCode":0,"finishedAt":1701}
-/// {"type":"lagged","skipped":42}
+/// {"type":"lagged","skipped":42,"skippedBytes":65536}
 /// ```
 ///
 /// ## Example
@@ -75,6 +76,7 @@ pub enum StreamKind {
 ///     seq: 0,
 ///     ts: SystemTime::UNIX_EPOCH,
 ///     line: Bytes::from_static(b"hello"),
+///     truncated: false,
 /// });
 ///
 /// let json = serde_json::to_string(&event).unwrap();
@@ -131,9 +133,16 @@ pub enum OutputEvent {
     },
 
     /// Reports events lost before the next delivered event.
+    #[serde(rename_all = "camelCase")]
     Lagged {
         /// Number of lost events.
         skipped: u64,
+        /// Retained output bytes carried by the lost events.
+        ///
+        /// A missing JSON field decodes as zero. Serialization omits zero to
+        /// preserve the original wire shape.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        skipped_bytes: u64,
     },
 }
 
@@ -153,6 +162,7 @@ pub enum OutputEvent {
 ///     seq: 7,
 ///     ts: SystemTime::UNIX_EPOCH,
 ///     line: Bytes::from_static(b"warning"),
+///     truncated: false,
 /// };
 ///
 /// assert_eq!(chunk.seq, 7);
@@ -182,7 +192,7 @@ pub struct OutputChunk {
         schemars(schema_with = "crate::schema::unix_millis")
     )]
     pub ts: SystemTime,
-    /// Raw output bytes.
+    /// Exact retained output bytes, excluding a recognized LF or CRLF delimiter.
     ///
     /// Serde encodes them as standard padded base64.
     #[serde(with = "bytes_as_base64")]
@@ -191,6 +201,20 @@ pub struct OutputChunk {
         schemars(schema_with = "crate::schema::base64_bytes")
     )]
     pub line: Bytes,
+    /// Whether one or more source bytes were omitted from the end of this line.
+    ///
+    /// A missing JSON field decodes as `false`. Serialization omits `false` to
+    /// preserve the original wire shape.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Serde adapter for exact binary round trips through JSON.
@@ -235,6 +259,7 @@ mod tests {
                     seq: 0,
                     ts: UNIX_EPOCH + Duration::from_millis(1_700),
                     line: Bytes::from_static(b"hi"),
+                    truncated: false,
                 }),
                 r#"{"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"aGk="}"#,
             ),
@@ -256,7 +281,10 @@ mod tests {
                 r#"{"type":"runFinished","generation":4,"attempt":2,"exitCode":0,"finishedAt":2222}"#,
             ),
             (
-                OutputEvent::Lagged { skipped: 42 },
+                OutputEvent::Lagged {
+                    skipped: 42,
+                    skipped_bytes: 0,
+                },
                 r#"{"type":"lagged","skipped":42}"#,
             ),
         ];
@@ -275,6 +303,7 @@ mod tests {
                 seq: 0,
                 ts: UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
                 line: Bytes::from_static(b"warning"),
+                truncated: false,
             }),
             OutputEvent::RunStarted {
                 generation: 2,
@@ -287,7 +316,10 @@ mod tests {
                 exit_code: Some(42),
                 finished_at: UNIX_EPOCH + Duration::from_millis(1_700_000_001_000),
             },
-            OutputEvent::Lagged { skipped: 7 },
+            OutputEvent::Lagged {
+                skipped: 7,
+                skipped_bytes: 1_024,
+            },
         ];
 
         for original in cases {
@@ -306,11 +338,38 @@ mod tests {
             seq: 0,
             ts: UNIX_EPOCH,
             line: Bytes::from_static(&[b'h', b'i', 0xFF, 0xFE]),
+            truncated: true,
         };
 
         let json = serde_json::to_string(&chunk).unwrap();
         assert!(json.contains(r#""line":"aGn//g==""#), "{json}");
+        assert!(json.contains(r#""truncated":true"#), "{json}");
         let decoded: OutputChunk = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn missing_truncated_field_defaults_to_false() {
+        let json = r#"{"generation":1,"attempt":1,"stream":"stdout","seq":0,"ts":0,"line":"/w=="}"#;
+        let chunk: OutputChunk = serde_json::from_str(json).unwrap();
+        assert_eq!(&chunk.line[..], &[0xff]);
+        assert!(!chunk.truncated);
+        assert!(!serde_json::to_string(&chunk).unwrap().contains("truncated"));
+    }
+
+    #[test]
+    fn missing_skipped_bytes_defaults_to_zero() {
+        let event: OutputEvent = serde_json::from_str(r#"{"type":"lagged","skipped":3}"#).unwrap();
+        assert_eq!(
+            event,
+            OutputEvent::Lagged {
+                skipped: 3,
+                skipped_bytes: 0,
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"type":"lagged","skipped":3}"#
+        );
     }
 }

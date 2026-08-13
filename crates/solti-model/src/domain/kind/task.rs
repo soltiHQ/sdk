@@ -23,6 +23,8 @@ use crate::{Flag, ModelError, ModelResult, SubprocessMode, TaskEnv, validation};
 /// API group and version of built-in Solti workloads.
 pub const WORKLOAD_API_VERSION: &str = "solti.io/v1";
 
+const MAX_EXTENSION_JSON_DEPTH: usize = 128;
+
 /// Group/version and kind of one workload schema.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -318,6 +320,11 @@ impl ExtensionWorkload {
         &self.spec
     }
 
+    /// Splits the extension envelope into its GVK and application-owned spec.
+    pub fn into_parts(self) -> (String, String, Value) {
+        (self.api_version, self.kind, self.spec)
+    }
+
     fn validate(&self) -> ModelResult<()> {
         let group = validation::validate_crd_api_version(
             "extension workload apiVersion",
@@ -338,8 +345,31 @@ impl ExtensionWorkload {
                 "extension workload spec must be a JSON object".into(),
             ));
         }
+        validate_extension_depth(&self.spec)?;
         Ok(())
     }
+}
+
+fn validate_extension_depth(root: &Value) -> ModelResult<()> {
+    let mut pending = vec![(root, 1_usize)];
+    while let Some((value, depth)) = pending.pop() {
+        if depth > MAX_EXTENSION_JSON_DEPTH {
+            return Err(ModelError::Invalid(
+                format!("extension workload spec depth exceeds max {MAX_EXTENSION_JSON_DEPTH}")
+                    .into(),
+            ));
+        }
+        match value {
+            Value::Array(values) => {
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            Value::Object(values) => {
+                pending.extend(values.values().map(|value| (value, depth + 1)));
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+    Ok(())
 }
 
 impl TaskWorkload {
@@ -768,6 +798,17 @@ mod tests {
             ExtensionWorkload::new("example.io/v1", "Example", serde_json::json!(42)).unwrap_err();
 
         assert!(error.to_string().contains("JSON object"));
+    }
+
+    #[test]
+    fn extension_workload_rejects_excessive_json_depth() {
+        let mut value = serde_json::json!(true);
+        for _ in 0..=MAX_EXTENSION_JSON_DEPTH {
+            value = serde_json::json!({ "next": value });
+        }
+
+        let error = ExtensionWorkload::new("example.io/v1", "Example", value).unwrap_err();
+        assert!(error.to_string().contains("depth exceeds"));
     }
 
     #[test]

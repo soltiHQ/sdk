@@ -55,7 +55,7 @@ use crate::register::{MetricGroup, ms_to_secs};
 /// use solti_api::{ApiMetricsBackend, Transport};
 /// use solti_prometheus::{PrometheusApiMetrics, Registry};
 ///
-/// # fn main() -> Result<(), prometheus::Error> {
+/// # fn main() -> Result<(), solti_prometheus::Error> {
 /// let registry = Registry::new();
 /// let metrics = PrometheusApiMetrics::new(&registry)?;
 ///

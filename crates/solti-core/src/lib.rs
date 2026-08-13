@@ -82,7 +82,7 @@
 //! | State          | [`TaskState`], [`TaskWatchSubscription`]               |
 //! | Output         | [`OutputConfig`], [`OutputSubscription`]               |
 //! | Persistence    | [`TaskStateSink`], [`TaskOutputSink`]                  |
-//! | Retention      | [`StateConfig`], [`ConfigError`]                       |
+//! | Configuration  | [`StateConfig`], [`ReconciliationConfig`], [`ConfigError`] |
 //! | Writes         | [`WriteConflict`], [`WritePreconditionViolation`]      |
 //! | Errors         | [`CoreError`], [`CollectionError`]                     |
 //! | Runner routing | [`solti_runner::RunnerRouter`]                         |
@@ -124,7 +124,7 @@ mod error;
 pub use error::{CoreError, WriteConflict, WritePreconditionViolation};
 
 mod config;
-pub use config::{ConfigError, StateConfig};
+pub use config::{ConfigError, ReconciliationConfig, StateConfig};
 
 mod map;
 
@@ -133,8 +133,8 @@ pub use output::{OutputConfig, OutputSubscription};
 
 mod persistence;
 pub use persistence::{
-    TaskOutputEvent, TaskOutputSink, TaskOutputSinkHandle, TaskStateEvent, TaskStateSink,
-    TaskStateSinkHandle,
+    PersistenceConfig, TaskOutputEvent, TaskOutputSink, TaskOutputSinkHandle, TaskStateEvent,
+    TaskStateSink, TaskStateSinkHandle,
 };
 
 mod runtime;

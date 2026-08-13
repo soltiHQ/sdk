@@ -242,8 +242,14 @@ async fn print_child_output(mut output: OutputSubscription) -> Result<(), Exampl
                 saw_stdout |= chunk.stream == StreamKind::Stdout;
                 saw_stderr |= chunk.stream == StreamKind::Stderr;
             }
-            OutputEvent::Lagged { skipped } => {
-                return Err(io::Error::other(format!("live output lost {skipped} events")).into());
+            OutputEvent::Lagged {
+                skipped,
+                skipped_bytes,
+            } => {
+                return Err(io::Error::other(format!(
+                    "live output lost {skipped} events ({skipped_bytes} bytes)"
+                ))
+                .into());
             }
             OutputEvent::RunStarted { .. } | OutputEvent::RunFinished { .. } => {}
             _ => {}

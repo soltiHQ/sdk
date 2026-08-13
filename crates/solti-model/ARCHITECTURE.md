@@ -380,7 +380,7 @@ Several public types are shared contracts without an owned runtime:
 
 | Type             | Model owns                                | Higher layer owns                               |
 |------------------|-------------------------------------------|-------------------------------------------------|
-| `OutputEvent`    | Event fields and JSON encoding            | Publication, channels, lag detection, retention |
+| `OutputEvent`    | Binary chunks, truncation and lag byte counts, JSON encoding | Publication, channels, lag detection, retention |
 | `TaskRun`        | One attempt record and invariants         | History storage and retention                   |
 | `TaskQuery`      | Filter and pagination values              | Snapshot execution                              |
 | `TaskWatchEvent` | Added, modified, and deleted values       | Watch lifecycle and delivery                    |

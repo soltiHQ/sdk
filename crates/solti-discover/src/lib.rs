@@ -155,29 +155,23 @@ mod generated {
     pub(crate) mod solti {
         pub(crate) mod agent {
             pub(crate) mod v1 {
-                include!(concat!(env!("OUT_DIR"), "/solti.agent.v1.rs"));
+                include!("generated/solti.agent.v1.rs");
 
                 #[cfg(feature = "http")]
-                include!(concat!(env!("OUT_DIR"), "/solti.agent.v1.serde.rs"));
+                include!("generated/solti.agent.v1.serde.rs");
             }
         }
 
         pub(crate) mod discover {
             pub(crate) mod wire {
-                include!(concat!(
-                    env!("OUT_DIR"),
-                    "/solti.discover.v",
-                    env!("SOLTI_DISCOVERY_PROTOCOL_MAJOR"),
-                    ".rs"
-                ));
+                #[cfg(feature = "grpc")]
+                include!("generated/solti.discover.v1.rs");
+
+                #[cfg(all(feature = "http", not(feature = "grpc")))]
+                include!("generated/solti.discover.v1.messages.rs");
 
                 #[cfg(feature = "http")]
-                include!(concat!(
-                    env!("OUT_DIR"),
-                    "/solti.discover.v",
-                    env!("SOLTI_DISCOVERY_PROTOCOL_MAJOR"),
-                    ".serde.rs"
-                ));
+                include!("generated/solti.discover.v1.serde.rs");
             }
         }
     }
@@ -192,10 +186,6 @@ pub(crate) use generated::solti::discover::wire as proto;
 mod contract_identity_guard {
     #[test]
     fn discovery_contract_identity_is_consistent() {
-        assert_eq!(
-            super::DISCOVERY_PROTOCOL_VERSION.to_string(),
-            env!("SOLTI_DISCOVERY_PROTOCOL_MAJOR"),
-        );
         assert_eq!(
             super::DISCOVERY_GRPC_PACKAGE,
             format!("solti.discover.v{}", super::DISCOVERY_PROTOCOL_VERSION),

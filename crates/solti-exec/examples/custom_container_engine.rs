@@ -254,7 +254,7 @@ async fn main() -> ExampleResult {
         .lock()
         .expect("engine recorder lock must not be poisoned")
         .len();
-    let task_ref = router.build(&task)?;
+    let task_ref = router.build(&task).await?;
     assert_eq!(
         calls
             .lock()

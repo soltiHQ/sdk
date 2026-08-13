@@ -498,24 +498,21 @@ Subprocess and container attempts use the same line pipeline.
 %%{init: {"flowchart": {"curve": "linear"}}}%%
 flowchart TB
     Bytes["stdout or stderr bytes"]
-    ByteLimit["Byte limit<br/>drain remainder of oversized line"]
-    Decode["Lossy UTF-8 decode"]
-    CharLimit["Unicode scalar limit"]
-    Trace["tracing copy<br/>escape control characters"]
-    Sink["OutputSink<br/>bounded decoded line"]
+    ByteLimit["Byte prefix<br/>drain oversized suffix"]
+    Trace["optional tracing copy<br/>lossy UTF-8 and escaped controls"]
+    Sink["OutputSink<br/>exact prefix and truncation status"]
 
     Bytes --> ByteLimit
-    ByteLimit --> Decode
-    Decode --> CharLimit
-    CharLimit --> Trace
-    CharLimit --> Sink
+    ByteLimit --> Trace
+    ByteLimit --> Sink
 ```
 
 Stdout and stderr are independent streams.
-Invalid UTF-8 uses replacement characters.
-
-Tracing escapes control characters except tab.
-The output sink receives the unsanitized bounded line.
+Only the opt-in tracing copy uses lossy UTF-8. It preserves tabs and escapes
+Unicode control characters, line and paragraph separators, and bidirectional
+formatting controls. The output sink receives a borrowed view of the exact bounded bytes;
+the composition layer can detach it with one ownership copy. Invalid UTF-8 is
+preserved, and truncation is metadata rather than text inserted into the line.
 
 The crate publishes live output only when the build context provides a sink.
 It does not retain output.

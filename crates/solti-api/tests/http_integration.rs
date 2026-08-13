@@ -118,6 +118,7 @@ impl ApiHandler for MockHandler {
                 seq: 0,
                 ts: UNIX_EPOCH + Duration::from_millis(1100),
                 line: Bytes::from_static(b"hello-from-mock"),
+                truncated: false,
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(events)))

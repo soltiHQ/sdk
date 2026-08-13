@@ -136,6 +136,24 @@ impl TaskSpec {
 }
 
 impl TaskSpec {
+    /// Derives a spec with another workload without cloning the existing workload.
+    ///
+    /// Lifecycle policy and slot values are preserved. The runner selector is
+    /// copied and can be removed or replaced by a composite runner.
+    #[must_use]
+    pub fn derive_with_workload(&self, workload: TaskWorkload) -> Self {
+        Self {
+            slot: self.slot.clone(),
+            workload,
+            timeout: self.timeout,
+            restart: self.restart,
+            backoff: self.backoff.clone(),
+            admission: self.admission,
+            max_retries: self.max_retries,
+            runner_selector: self.runner_selector.clone(),
+        }
+    }
+
     /// Replaces the workload on an existing spec.
     ///
     /// This method does not validate `workload`.

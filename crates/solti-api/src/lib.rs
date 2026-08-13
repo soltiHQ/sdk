@@ -118,10 +118,21 @@
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
+macro_rules! task_api_major {
+    () => {
+        1
+    };
+}
+
+const _: () = assert!(
+    solti_model::TASK_API_VERSION_MAJOR == task_api_major!(),
+    "Task model and API transport major versions must match",
+);
+
 /// Compose a compile-time Kubernetes named-group URL rooted at `/apis/solti.io/v<API_MAJOR>`.
 macro_rules! api_url {
     ($path:literal) => {
-        concat!("/apis/solti.io/v", env!("SOLTI_API_MAJOR"), $path)
+        concat!("/apis/solti.io/v", task_api_major!(), $path)
     };
 }
 
@@ -129,13 +140,13 @@ macro_rules! api_url {
 pub const API_VERSION: u32 = solti_model::TASK_API_VERSION_MAJOR;
 
 /// Current public API version name.
-pub const API_VERSION_NAME: &str = concat!("v", env!("SOLTI_API_MAJOR"));
+pub const API_VERSION_NAME: &str = concat!("v", task_api_major!());
 
 /// Current gRPC package exposed by the agent.
-pub const GRPC_API_PACKAGE: &str = concat!("solti.task.v", env!("SOLTI_API_MAJOR"));
+pub const GRPC_API_PACKAGE: &str = concat!("solti.task.v", task_api_major!());
 
 /// Current gRPC service exposed by the agent.
-pub const GRPC_API_SERVICE: &str = concat!("solti.task.v", env!("SOLTI_API_MAJOR"), ".TaskService");
+pub const GRPC_API_SERVICE: &str = concat!("solti.task.v", task_api_major!(), ".TaskService");
 
 /// Root path of the HTTP Kubernetes API group.
 pub const HTTP_API_ROOT: &str = api_url!("");
@@ -143,7 +154,7 @@ pub const HTTP_API_ROOT: &str = api_url!("");
 /// Maximum HTTP request body and gRPC message size.
 ///
 /// The limit is 4 MiB.
-pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_REQUEST_BYTES: usize = solti_model::MAX_TASK_MANIFEST_BYTES;
 
 mod error;
 pub use error::{ApiConflict, ApiError, ApiErrorCause};
@@ -176,12 +187,7 @@ pub use metrics::{
 #[allow(missing_docs)]
 #[allow(rustdoc::all)]
 pub(crate) mod proto_api {
-    include!(concat!(
-        env!("OUT_DIR"),
-        "/solti.task.v",
-        env!("SOLTI_API_MAJOR"),
-        ".rs"
-    ));
+    include!("generated/solti.task.v1.rs");
 }
 
 #[cfg(any(feature = "grpc", feature = "http"))]
@@ -221,7 +227,6 @@ pub use tls::to_tonic_server_tls;
 mod contract_identity_guard {
     #[test]
     fn task_contract_identity_is_consistent() {
-        assert_eq!(super::API_VERSION.to_string(), env!("SOLTI_API_MAJOR"));
         assert_eq!(super::API_VERSION_NAME, format!("v{}", super::API_VERSION));
         assert_eq!(
             super::GRPC_API_PACKAGE,

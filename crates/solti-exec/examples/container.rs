@@ -164,7 +164,7 @@ printf 'diagnostic=container-stderr\n' >&2"#;
     let spec = TaskSpec::builder("containers", workload, 120_000_u64).build()?;
     let task = Task::new("native-container", spec)?;
 
-    let task_ref = router.build(&task)?;
+    let task_ref = router.build(&task).await?;
     println!(
         "[build] Built {}; no image or container operation occurred during build.",
         task_ref.name(),

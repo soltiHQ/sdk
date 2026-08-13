@@ -39,25 +39,23 @@ use solti_model::{
     WorkloadTypeMeta, WritePreconditions,
 };
 use solti_runner::RunnerRouter;
-use taskvisor::{ControllerConfig, Subscribe, Supervisor, SupervisorConfig, TaskRef};
+use taskvisor::{Supervisor, TaskRef};
+#[cfg(test)]
 use tokio::sync::oneshot;
-use tokio_util::task::task_tracker::TaskTrackerToken;
 use tracing::{debug, info, instrument};
 
 use crate::{
-    StateConfig,
     error::CoreError,
-    output::{OutputConfig, OutputHub, OutputSubscription},
-    persistence::PersistenceSinks,
+    output::{OutputHub, OutputSubscription},
     runtime::{Reconciler, RuntimeObserver, RuntimeSource, TaskLocks},
     state::{
-        CollectionError, DesiredCommit, ResourceGeneration, RuntimeBinding, TaskState,
-        TaskWatchSubscription,
+        CollectionError, ResourceGeneration, RuntimeBinding, TaskState, TaskWatchSubscription,
     },
 };
 
 mod builder;
 pub use builder::SupervisorApiBuilder;
+use builder::SupervisorStartConfig;
 
 /// Desired-state API over Taskvisor.
 ///
@@ -98,9 +96,15 @@ impl Drop for SupervisorApi {
         self.reconciler.tasks.close();
         let handle = self.reconciler.handle.clone();
         let tasks = self.reconciler.tasks.clone();
+        let state = self.reconciler.state.clone();
+        let observer = Arc::clone(&self.reconciler.observer);
         let task = self.reconciler.runtime.spawn(async move {
-            let _ = handle.shutdown().await;
+            let shutdown_confirmed = handle.shutdown().await.is_ok();
             tasks.wait().await;
+            if shutdown_confirmed {
+                observer.finalize_pending_after_confirmed_shutdown();
+            }
+            state.shutdown_persistence().await;
         });
         drop(task);
     }
@@ -112,19 +116,24 @@ impl SupervisorApi {
         SupervisorApiBuilder::new(router)
     }
 
-    async fn start(
-        sup_cfg: SupervisorConfig,
-        ctrl_cfg: ControllerConfig,
-        subscribers: Vec<Arc<dyn Subscribe>>,
-        router: RunnerRouter,
-        state_cfg: StateConfig,
-        output_config: OutputConfig,
-        persistence: PersistenceSinks,
-    ) -> Result<Self, CoreError> {
-        let mut subscribers = subscribers;
+    async fn start(config: SupervisorStartConfig) -> Result<Self, CoreError> {
+        let SupervisorStartConfig {
+            runtime: sup_cfg,
+            controller: ctrl_cfg,
+            mut subscribers,
+            router,
+            state: state_cfg,
+            reconciliation: reconciliation_cfg,
+            output: output_config,
+            persistence,
+        } = config;
         let output_hub = Arc::new(OutputHub::with_sink(output_config, persistence.output));
         let router = router.with_output_publisher(output_hub.clone());
-        let state = TaskState::try_with_config_and_sink(state_cfg, persistence.state)?;
+        let state = TaskState::try_with_config_sink_and_persistence(
+            state_cfg,
+            persistence.state,
+            persistence.config,
+        )?;
         let observer = Arc::new(RuntimeObserver::with_output_hub(
             state.clone(),
             Arc::clone(&output_hub),
@@ -137,7 +146,15 @@ impl SupervisorApi {
             .with_controller(ctrl_cfg)
             .build();
         let handle = supervisor.serve();
-        let reconciler = Reconciler::new(output_hub, handle, router, state, observer, grace);
+        let reconciler = Reconciler::new(
+            output_hub,
+            handle,
+            router,
+            state,
+            observer,
+            grace,
+            reconciliation_cfg,
+        );
         let api = Self {
             reconciler,
             task_operations: TaskLocks::default(),
@@ -383,7 +400,12 @@ impl SupervisorApi {
         }
 
         let committed = commit.task.clone();
-        let reconciliation = self.spawn_reconciliation(commit, source, ensure_output, registration);
+        let (reconciliation, superseded) =
+            self.reconciler
+                .schedule(commit.task, source, ensure_output, registration);
+        drop(_spawn);
+        // `TaskRef::drop` is user code and must not run under the global gate.
+        drop(superseded);
         #[cfg(not(test))]
         drop(reconciliation);
         Ok(ScheduledWrite {
@@ -410,30 +432,6 @@ impl SupervisorApi {
                     .into(),
             ))),
         }
-    }
-
-    fn spawn_reconciliation(
-        &self,
-        commit: DesiredCommit,
-        source: RuntimeSource,
-        ensure_output: bool,
-        registration: TaskTrackerToken,
-    ) -> oneshot::Receiver<Task> {
-        let reconciler = self.reconciler.clone();
-        let runtime = reconciler.runtime.clone();
-        let (sender, receiver) = oneshot::channel();
-        let worker = self.reconciler.tasks.spawn_on(
-            async move {
-                let _registration = registration;
-                let task = reconciler
-                    .reconcile(commit.task, source, ensure_output)
-                    .await;
-                let _ = sender.send(task);
-            },
-            &runtime,
-        );
-        drop(worker);
-        receiver
     }
 
     /// Subscribes to one task's live output.
@@ -694,6 +692,7 @@ impl SupervisorApi {
     }
 
     async fn delete_task_locked(&self, name: &TaskId) -> Result<(), CoreError> {
+        self.reconciler.cancel_scheduled(name);
         let _runtime_operation = self.reconciler.runtime_operations.lock(name).await;
         debug!(
             event = "task.delete",
@@ -740,6 +739,12 @@ impl SupervisorApi {
             .map_err(|error| CoreError::supervisor("shutdown", error));
         self.reconciler.tasks.wait().await;
         if result.is_ok() {
+            self.reconciler
+                .observer
+                .finalize_pending_after_confirmed_shutdown();
+        }
+        self.reconciler.state.shutdown_persistence().await;
+        if result.is_ok() {
             info!(
                 event = "supervisor.shutdown",
                 stage = "completed",
@@ -753,21 +758,24 @@ impl SupervisorApi {
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use parking_lot::{Condvar, Mutex};
+    use solti_chain::{ChainRunner, ChainSpec, ChainStep};
     use solti_model::{
-        AdmissionPolicy, ConditionStatus, EmbeddedSpec, Flag, Labels, Slot, SubprocessMode,
-        SubprocessSpec, TaskEnv, TaskPhase, TaskSpec, TaskWorkload, WORKLOAD_API_VERSION,
-        WorkloadTypeMeta,
+        AdmissionPolicy, ConditionStatus, EmbeddedSpec, Flag, LabelSelector, Labels, Slot,
+        SubprocessMode, SubprocessSpec, TaskEnv, TaskPhase, TaskSpec, TaskWorkload,
+        WORKLOAD_API_VERSION, WorkloadTypeMeta,
     };
     use solti_runner::{BuildContext, RunId, Runner, RunnerError};
-    use taskvisor::{TaskContext, TaskError, TaskFn};
+    use taskvisor::{BoxTaskFuture, Task as TvTask, TaskContext, TaskError, TaskFn};
     use tokio_stream::StreamExt;
+    use tokio_util::task::TaskTracker;
 
     use super::*;
+    use crate::{ReconciliationConfig, StateConfig};
 
     fn embedded_with_revision(name: &str, timeout_ms: u64, revision: &str) -> TaskManifest {
         TaskManifest::new(
@@ -800,6 +808,28 @@ mod tests {
         TaskManifest::new(
             name,
             TaskSpec::builder("routed-slot", workload, timeout_ms)
+                .build()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn routed_to(name: &str, timeout_ms: u64, backend: &str) -> TaskManifest {
+        let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+            SubprocessMode::Command {
+                command: "true".into(),
+                args: vec![],
+            },
+            TaskEnv::default(),
+            None,
+            Flag::enabled(),
+        ));
+        let mut labels = Labels::new();
+        labels.insert("backend", backend);
+        TaskManifest::new(
+            name,
+            TaskSpec::builder("routed-slot", workload, timeout_ms)
+                .runner_selector(LabelSelector::from_labels(labels))
                 .build()
                 .unwrap(),
         )
@@ -844,6 +874,17 @@ mod tests {
 
     async fn api(router: RunnerRouter) -> SupervisorApi {
         SupervisorApi::builder(router).start().await.unwrap()
+    }
+
+    async fn api_with_reconciliation(
+        router: RunnerRouter,
+        reconciliation: ReconciliationConfig,
+    ) -> SupervisorApi {
+        SupervisorApi::builder(router)
+            .with_reconciliation_config(reconciliation)
+            .start()
+            .await
+            .unwrap()
     }
 
     async fn wait_for_task(
@@ -908,6 +949,7 @@ mod tests {
         seen: Arc<Mutex<Vec<(TaskId, u64, String)>>>,
     }
 
+    #[solti_runner::async_trait]
     impl Runner for RecordingRunner {
         fn name(&self) -> &str {
             "recording"
@@ -917,11 +959,13 @@ mod tests {
             subprocess_workload_types()
         }
 
-        fn build_task(
+        async fn build_task(
             &self,
             task: &Task,
             run_id: &RunId,
             _ctx: &BuildContext,
+            _cancellation: &solti_runner::BuildCancellation,
+            _scope: &mut solti_runner::BuildScope,
         ) -> Result<TaskRef, RunnerError> {
             self.seen.lock().push((
                 task.name().clone(),
@@ -1381,6 +1425,7 @@ mod tests {
 
     struct PanicRunner;
 
+    #[solti_runner::async_trait]
     impl Runner for PanicRunner {
         fn name(&self) -> &str {
             "panic"
@@ -1390,11 +1435,13 @@ mod tests {
             subprocess_workload_types()
         }
 
-        fn build_task(
+        async fn build_task(
             &self,
             _task: &Task,
             _run_id: &RunId,
             _ctx: &BuildContext,
+            _cancellation: &solti_runner::BuildCancellation,
+            _scope: &mut solti_runner::BuildScope,
         ) -> Result<TaskRef, RunnerError> {
             panic!("runner build panic")
         }
@@ -1453,22 +1500,25 @@ mod tests {
 
     struct BuildGate {
         started: AtomicBool,
-        open: Mutex<bool>,
-        changed: Condvar,
+        release: tokio::sync::Notify,
     }
 
     impl BuildGate {
         fn new() -> Self {
             Self {
                 started: AtomicBool::new(false),
-                open: Mutex::new(false),
-                changed: Condvar::new(),
+                release: tokio::sync::Notify::new(),
             }
         }
 
         fn release(&self) {
-            *self.open.lock() = true;
-            self.changed.notify_all();
+            self.release.notify_one();
+        }
+
+        async fn wait(&self) {
+            let released = self.release.notified();
+            self.started.store(true, Ordering::Release);
+            released.await;
         }
     }
 
@@ -1477,6 +1527,7 @@ mod tests {
         retry_gate: Arc<BuildGate>,
     }
 
+    #[solti_runner::async_trait]
     impl Runner for FailOnceBlockingRunner {
         fn name(&self) -> &str {
             "fail-once-blocking"
@@ -1486,22 +1537,20 @@ mod tests {
             subprocess_workload_types()
         }
 
-        fn build_task(
+        async fn build_task(
             &self,
             _task: &Task,
             run_id: &RunId,
             _ctx: &BuildContext,
+            _cancellation: &solti_runner::BuildCancellation,
+            _scope: &mut solti_runner::BuildScope,
         ) -> Result<TaskRef, RunnerError> {
             let build = self.builds.fetch_add(1, Ordering::AcqRel);
             if build == 0 {
                 return Err(RunnerError::Internal("transient build failure".into()));
             }
             if build == 1 {
-                self.retry_gate.started.store(true, Ordering::Release);
-                let mut open = self.retry_gate.open.lock();
-                while !*open {
-                    self.retry_gate.changed.wait(&mut open);
-                }
+                self.retry_gate.wait().await;
             }
             Ok(immediate_task(run_id.name()))
         }
@@ -1554,6 +1603,27 @@ mod tests {
         .expect("reconciliation worker did not reach runner build");
     }
 
+    struct PredicateGate {
+        started: AtomicBool,
+        open: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl PredicateGate {
+        fn new() -> Self {
+            Self {
+                started: AtomicBool::new(false),
+                open: Mutex::new(false),
+                changed: Condvar::new(),
+            }
+        }
+
+        fn release(&self) {
+            *self.open.lock() = true;
+            self.changed.notify_all();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn conditional_delete_cannot_delete_a_generation_applied_after_its_predicate() {
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1566,7 +1636,7 @@ mod tests {
             .unwrap();
         let first_uid = first.uid().clone();
         let name = first.name().clone();
-        let gate = Arc::new(BuildGate::new());
+        let gate = Arc::new(PredicateGate::new());
 
         let deletion = {
             let api = Arc::clone(&api);
@@ -1637,6 +1707,15 @@ mod tests {
         runtime_started: Arc<AtomicBool>,
     }
 
+    struct BuildFinishedGuard(Arc<AtomicBool>);
+
+    impl Drop for BuildFinishedGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[solti_runner::async_trait]
     impl Runner for BlockingRunner {
         fn name(&self) -> &str {
             "blocking"
@@ -1646,19 +1725,22 @@ mod tests {
             subprocess_workload_types()
         }
 
-        fn build_task(
+        async fn build_task(
             &self,
             _task: &Task,
             run_id: &RunId,
             _ctx: &BuildContext,
+            cancellation: &solti_runner::BuildCancellation,
+            _scope: &mut solti_runner::BuildScope,
         ) -> Result<TaskRef, RunnerError> {
-            self.gate.started.store(true, Ordering::Release);
-            let mut open = self.gate.open.lock();
-            while !*open {
-                self.gate.changed.wait(&mut open);
+            let _finished = BuildFinishedGuard(Arc::clone(&self.build_finished));
+            tokio::select! {
+                _ = self.gate.wait() => {}
+                _ = cancellation.cancelled() => {
+                    return Err(RunnerError::Internal("build cancelled".into()));
+                }
             }
             let runtime_started = Arc::clone(&self.runtime_started);
-            self.build_finished.store(true, Ordering::Release);
             Ok(TaskFn::arc(run_id.name(), move |_ctx: TaskContext| {
                 runtime_started.store(true, Ordering::Release);
                 async move { Ok::<(), TaskError>(()) }
@@ -1707,7 +1789,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shutdown_stops_waiting_for_blocked_runner_build() {
+    async fn shutdown_cancels_and_drains_blocked_runner_build() {
         let gate = Arc::new(BuildGate::new());
         let build_finished = Arc::new(AtomicBool::new(false));
         let runtime_started = Arc::new(AtomicBool::new(false));
@@ -1725,9 +1807,8 @@ mod tests {
         api.create_task(routed(name.as_str(), 1_000)).await.unwrap();
         wait_for_build(&gate).await;
 
-        let shutdown = tokio::time::timeout(Duration::from_secs(1), api.shutdown()).await;
-        gate.release();
-        shutdown
+        tokio::time::timeout(Duration::from_secs(1), api.shutdown())
+            .await
             .expect("shutdown must not wait for a blocked runner build")
             .unwrap();
 
@@ -1737,7 +1818,7 @@ mod tests {
             }
         })
         .await
-        .expect("detached runner build did not return after its gate opened");
+        .expect("runner build future was not dropped during shutdown");
         assert!(api.reconciler.state.binding_for(&name).is_none());
         assert!(
             !runtime_started.load(Ordering::Acquire),
@@ -1750,6 +1831,7 @@ mod tests {
         builds: AtomicUsize,
     }
 
+    #[solti_runner::async_trait]
     impl Runner for FirstBuildBlockingRunner {
         fn name(&self) -> &str {
             "first-build-blocking"
@@ -1759,17 +1841,20 @@ mod tests {
             subprocess_workload_types()
         }
 
-        fn build_task(
+        async fn build_task(
             &self,
             _task: &Task,
             run_id: &RunId,
             _ctx: &BuildContext,
+            cancellation: &solti_runner::BuildCancellation,
+            _scope: &mut solti_runner::BuildScope,
         ) -> Result<TaskRef, RunnerError> {
             if self.builds.fetch_add(1, Ordering::AcqRel) == 0 {
-                self.gate.started.store(true, Ordering::Release);
-                let mut open = self.gate.open.lock();
-                while !*open {
-                    self.gate.changed.wait(&mut open);
+                tokio::select! {
+                    _ = self.gate.wait() => {}
+                    _ = cancellation.cancelled() => {
+                        return Err(RunnerError::Internal("build cancelled".into()));
+                    }
                 }
             }
             Ok(cancellable_task(run_id.name()))
@@ -1816,7 +1901,6 @@ mod tests {
 
         let second_binding = wait_for_binding(&api, &name, 2).await;
         wait_for_observed(&api, &name, 2).await;
-        gate.release();
         tokio::time::timeout(Duration::from_secs(2), first_done)
             .await
             .expect("stale reconciliation did not finish")
@@ -1830,15 +1914,610 @@ mod tests {
         api.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn newer_apply_cancels_stale_preflight_waiting_for_the_runtime_lock() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(RecordingRunner {
+                seen: Arc::clone(&seen),
+            }))
+            .unwrap();
+        let api = api(router).await;
+        let name = TaskId::new("cancel-after-build").unwrap();
+        let runtime_operation = api.reconciler.runtime_operations.lock(&name).await;
+
+        let first = api
+            .write(
+                routed(name.as_str(), 1_000),
+                RuntimeSource::Routed,
+                WriteMode::Create,
+                WritePreconditions::new(),
+                true,
+            )
+            .await
+            .unwrap();
+        let first_done = first
+            .reconciliation
+            .expect("a created spec schedules reconciliation");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while seen.lock().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first runner build did not complete");
+
+        let second = api.apply_task(routed(name.as_str(), 2_000)).await.unwrap();
+        assert_eq!(second.metadata().generation(), 2);
+        tokio::time::timeout(Duration::from_secs(2), first_done)
+            .await
+            .expect("stale preflight remained blocked on the runtime lock")
+            .expect("stale reconciliation acknowledgement dropped");
+        assert!(api.reconciler.state.binding_for(&name).is_none());
+
+        drop(runtime_operation);
+        wait_for_observed(&api, &name, 2).await;
+        assert_eq!(
+            seen.lock()
+                .iter()
+                .map(|(_, generation, _)| *generation)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        api.shutdown().await.unwrap();
+    }
+
+    struct AdmissionProbe {
+        active: AtomicUsize,
+        entered: AtomicUsize,
+        peak: AtomicUsize,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl AdmissionProbe {
+        fn new() -> Self {
+            Self {
+                active: AtomicUsize::new(0),
+                entered: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+
+        async fn wait_for_entered(&self, expected: usize) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self.entered.load(Ordering::Acquire) < expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("runner builds did not reach the admission probe");
+        }
+    }
+
+    struct ActiveBuild(Arc<AdmissionProbe>);
+
+    impl Drop for ActiveBuild {
+        fn drop(&mut self) {
+            self.0.active.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    struct AdmissionRunner {
+        name: &'static str,
+        probe: Arc<AdmissionProbe>,
+    }
+
+    #[solti_runner::async_trait]
+    impl Runner for AdmissionRunner {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+            subprocess_workload_types()
+        }
+
+        async fn build_task(
+            &self,
+            _task: &Task,
+            run_id: &RunId,
+            _ctx: &BuildContext,
+            cancellation: &solti_runner::BuildCancellation,
+            _scope: &mut solti_runner::BuildScope,
+        ) -> Result<TaskRef, RunnerError> {
+            let active = self.probe.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.probe.peak.fetch_max(active, Ordering::AcqRel);
+            self.probe.entered.fetch_add(1, Ordering::AcqRel);
+            let _active = ActiveBuild(Arc::clone(&self.probe));
+            let permit = tokio::select! {
+                permit = self.probe.release.acquire() => {
+                    permit.expect("test admission semaphore remains open")
+                }
+                _ = cancellation.cancelled() => {
+                    return Err(RunnerError::Internal("build cancelled".into()));
+                }
+            };
+            permit.forget();
+            Ok(immediate_task(run_id.name()))
+        }
+    }
+
+    #[tokio::test]
+    async fn global_build_admission_never_exceeds_its_limit() {
+        let probe = Arc::new(AdmissionProbe::new());
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(AdmissionRunner {
+                name: "bounded",
+                probe: Arc::clone(&probe),
+            }))
+            .unwrap();
+        let config = ReconciliationConfig::new()
+            .try_with_max_concurrent_builds(2)
+            .unwrap()
+            .try_with_max_concurrent_builds_per_runner(2)
+            .unwrap();
+        let api = api_with_reconciliation(router, config).await;
+        let names = ["bounded-1", "bounded-2", "bounded-3", "bounded-4"];
+
+        for name in names {
+            api.create_task(routed(name, 1_000)).await.unwrap();
+        }
+        probe.wait_for_entered(2).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(probe.entered.load(Ordering::Acquire), 2);
+        assert_eq!(probe.peak.load(Ordering::Acquire), 2);
+
+        probe.release.add_permits(names.len());
+        for name in names {
+            wait_for_observed(&api, &TaskId::new(name).unwrap(), 1).await;
+        }
+        assert_eq!(probe.entered.load(Ordering::Acquire), names.len());
+        assert_eq!(probe.peak.load(Ordering::Acquire), 2);
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn per_runner_admission_does_not_consume_another_runners_capacity() {
+        let a = Arc::new(AdmissionProbe::new());
+        let b = Arc::new(AdmissionProbe::new());
+        let mut router = RunnerRouter::new();
+        for (name, backend, probe) in [
+            ("runner-a", "a", Arc::clone(&a)),
+            ("runner-b", "b", Arc::clone(&b)),
+        ] {
+            let mut labels = Labels::new();
+            labels.insert("backend", backend);
+            router
+                .register_with_labels(Arc::new(AdmissionRunner { name, probe }), labels)
+                .unwrap();
+        }
+        let config = ReconciliationConfig::new()
+            .try_with_max_concurrent_builds(2)
+            .unwrap()
+            .try_with_max_concurrent_builds_per_runner(1)
+            .unwrap();
+        let api = api_with_reconciliation(router, config).await;
+
+        api.create_task(routed_to("a-1", 1_000, "a")).await.unwrap();
+        api.create_task(routed_to("a-2", 1_000, "a")).await.unwrap();
+        api.create_task(routed_to("b-1", 1_000, "b")).await.unwrap();
+        a.wait_for_entered(1).await;
+        b.wait_for_entered(1).await;
+        assert_eq!(a.entered.load(Ordering::Acquire), 1);
+        assert_eq!(a.peak.load(Ordering::Acquire), 1);
+        assert_eq!(b.entered.load(Ordering::Acquire), 1);
+
+        a.release.add_permits(2);
+        b.release.add_permits(1);
+        wait_for_observed(&api, &TaskId::new("a-1").unwrap(), 1).await;
+        wait_for_observed(&api, &TaskId::new("a-2").unwrap(), 1).await;
+        wait_for_observed(&api, &TaskId::new("b-1").unwrap(), 1).await;
+        assert_eq!(a.entered.load(Ordering::Acquire), 2);
+        assert_eq!(a.peak.load(Ordering::Acquire), 1);
+        api.shutdown().await.unwrap();
+    }
+
+    struct SynchronizedChainRunner {
+        name: &'static str,
+        inner: ChainRunner,
+        entered: Arc<AtomicUsize>,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[solti_runner::async_trait]
+    impl Runner for SynchronizedChainRunner {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+            self.inner.workload_types()
+        }
+
+        async fn build_task(
+            &self,
+            task: &Task,
+            run_id: &RunId,
+            ctx: &BuildContext,
+            cancellation: &solti_runner::BuildCancellation,
+            scope: &mut solti_runner::BuildScope,
+        ) -> Result<TaskRef, RunnerError> {
+            self.entered.fetch_add(1, Ordering::AcqRel);
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Err(RunnerError::Internal("build cancelled".into()));
+                }
+                _ = self.barrier.wait() => {}
+            }
+            self.inner
+                .build_task(task, run_id, ctx, cancellation, scope)
+                .await
+        }
+    }
+
+    fn one_step_chain(name: &str, backend: Option<&str>) -> TaskManifest {
+        let step = ChainStep::new(
+            "leaf",
+            TaskWorkload::Subprocess(SubprocessSpec::new(
+                SubprocessMode::Command {
+                    command: "true".into(),
+                    args: vec![],
+                },
+                TaskEnv::default(),
+                None,
+                Flag::enabled(),
+            )),
+        )
+        .unwrap();
+        let workload = ChainSpec::new("leaf", vec![step])
+            .unwrap()
+            .into_workload()
+            .unwrap();
+        let mut builder = TaskSpec::builder(format!("{name}-slot"), workload, 1_000_u64);
+        if let Some(backend) = backend {
+            let mut labels = Labels::new();
+            labels.insert("chain", backend);
+            builder = builder.runner_selector(LabelSelector::from_labels(labels));
+        }
+        TaskManifest::new(name, builder.build().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn nested_leaf_builds_share_the_registered_runner_limit() {
+        let leaf = Arc::new(AdmissionProbe::new());
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(AdmissionRunner {
+                name: "leaf",
+                probe: Arc::clone(&leaf),
+            }))
+            .unwrap();
+        let catalog = router.catalog();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        for (name, backend) in [("chain-a", "a"), ("chain-b", "b")] {
+            let mut labels = Labels::new();
+            labels.insert("chain", backend);
+            router
+                .register_with_labels(
+                    Arc::new(SynchronizedChainRunner {
+                        name,
+                        inner: ChainRunner::new(name, catalog.clone()),
+                        entered: Arc::clone(&entered),
+                        barrier: Arc::clone(&barrier),
+                    }),
+                    labels,
+                )
+                .unwrap();
+        }
+        let config = ReconciliationConfig::new()
+            .try_with_max_concurrent_builds(2)
+            .unwrap()
+            .try_with_max_concurrent_builds_per_runner(1)
+            .unwrap();
+        let api = api_with_reconciliation(router, config).await;
+
+        api.create_task(one_step_chain("chain-task-a", Some("a")))
+            .await
+            .unwrap();
+        api.create_task(one_step_chain("chain-task-b", Some("b")))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while entered.load(Ordering::Acquire) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both outer chain builds must enter concurrently");
+        leaf.wait_for_entered(1).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(leaf.entered.load(Ordering::Acquire), 1);
+        assert_eq!(leaf.peak.load(Ordering::Acquire), 1);
+
+        leaf.release.add_permits(1);
+        leaf.wait_for_entered(2).await;
+        assert_eq!(leaf.peak.load(Ordering::Acquire), 1);
+        leaf.release.add_permits(1);
+        wait_for_observed(&api, &TaskId::new("chain-task-a").unwrap(), 1).await;
+        wait_for_observed(&api, &TaskId::new("chain-task-b").unwrap(), 1).await;
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn nested_leaf_reuses_the_outer_global_slot() {
+        let leaf = Arc::new(AdmissionProbe::new());
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(AdmissionRunner {
+                name: "leaf",
+                probe: Arc::clone(&leaf),
+            }))
+            .unwrap();
+        let catalog = router.catalog();
+        router
+            .register(Arc::new(ChainRunner::new("chain", catalog)))
+            .unwrap();
+        let config = ReconciliationConfig::new()
+            .try_with_max_concurrent_builds(1)
+            .unwrap()
+            .try_with_max_concurrent_builds_per_runner(1)
+            .unwrap();
+        let api = api_with_reconciliation(router, config).await;
+
+        api.create_task(one_step_chain("single-global-chain", None))
+            .await
+            .unwrap();
+        leaf.wait_for_entered(1).await;
+        leaf.release.add_permits(1);
+        wait_for_observed(&api, &TaskId::new("single-global-chain").unwrap(), 1).await;
+        api.shutdown().await.unwrap();
+    }
+
+    struct CoalescingRunner {
+        blocker: Arc<BuildGate>,
+        builds: Arc<Mutex<Vec<(TaskId, u64)>>>,
+    }
+
+    struct DropProbeTask {
+        dropped: Arc<AtomicBool>,
+        gate_released: Arc<AtomicBool>,
+        api: Weak<SupervisorApi>,
+    }
+
+    impl Drop for DropProbeTask {
+        fn drop(&mut self) {
+            let gate_released = self
+                .api
+                .upgrade()
+                .is_some_and(|api| api.spawn_gate.try_lock().is_some());
+            self.gate_released.store(gate_released, Ordering::Release);
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    impl TvTask for DropProbeTask {
+        fn name(&self) -> &str {
+            "coalesced-drop-probe"
+        }
+
+        fn spawn(&self, _ctx: TaskContext) -> BoxTaskFuture {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[solti_runner::async_trait]
+    impl Runner for CoalescingRunner {
+        fn name(&self) -> &str {
+            "coalescing"
+        }
+
+        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+            subprocess_workload_types()
+        }
+
+        async fn build_task(
+            &self,
+            task: &Task,
+            run_id: &RunId,
+            _ctx: &BuildContext,
+            cancellation: &solti_runner::BuildCancellation,
+            _scope: &mut solti_runner::BuildScope,
+        ) -> Result<TaskRef, RunnerError> {
+            self.builds
+                .lock()
+                .push((task.name().clone(), task.metadata().generation()));
+            if task.name().as_str() == "build-blocker" {
+                tokio::select! {
+                    _ = self.blocker.wait() => {}
+                    _ = cancellation.cancelled() => {
+                        return Err(RunnerError::Internal("build cancelled".into()));
+                    }
+                }
+            }
+            Ok(immediate_task(run_id.name()))
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_reconciliation_keeps_only_the_latest_generation() {
+        let blocker = Arc::new(BuildGate::new());
+        let builds = Arc::new(Mutex::new(Vec::new()));
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(CoalescingRunner {
+                blocker: Arc::clone(&blocker),
+                builds: Arc::clone(&builds),
+            }))
+            .unwrap();
+        let config = ReconciliationConfig::new()
+            .try_with_max_concurrent_builds(1)
+            .unwrap()
+            .try_with_max_concurrent_builds_per_runner(2)
+            .unwrap();
+        let api = api_with_reconciliation(router, config).await;
+
+        api.create_task(routed("build-blocker", 1_000))
+            .await
+            .unwrap();
+        wait_for_build(&blocker).await;
+        api.create_task(routed("coalesced", 1_000)).await.unwrap();
+        api.apply_task(routed("coalesced", 2_000)).await.unwrap();
+        api.apply_task(routed("coalesced", 3_000)).await.unwrap();
+
+        blocker.release();
+        wait_for_observed(&api, &TaskId::new("coalesced").unwrap(), 3).await;
+        assert_eq!(
+            builds.lock().as_slice(),
+            [
+                (TaskId::new("build-blocker").unwrap(), 1),
+                (TaskId::new("coalesced").unwrap(), 3),
+            ]
+        );
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coalescing_defers_user_task_destruction_to_the_caller_boundary() {
+        let api = Arc::new(api(RunnerRouter::new()).await);
+        let manifest = embedded("coalesced-drop", 1_000);
+        let desired = Task::from_manifest(manifest.clone()).unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let gate_released = Arc::new(AtomicBool::new(false));
+        let registration_tracker = TaskTracker::new();
+        let registration = registration_tracker.token();
+        assert_eq!(registration_tracker.len(), 1);
+        let operation = api.task_operations.lock(desired.name()).await;
+
+        let (_first_completion, first_superseded) = api.reconciler.schedule(
+            desired.clone(),
+            RuntimeSource::Prebuilt(Arc::new(DropProbeTask {
+                dropped: Arc::clone(&dropped),
+                gate_released: Arc::clone(&gate_released),
+                api: Arc::downgrade(&api),
+            })),
+            true,
+            registration,
+        );
+        assert!(first_superseded.is_none());
+
+        let scheduled = api
+            .write_locked(
+                manifest,
+                RuntimeSource::Prebuilt(immediate_task("replacement")),
+                WriteMode::Apply,
+                &WritePreconditions::new(),
+                true,
+                operation,
+            )
+            .unwrap();
+        drop(scheduled);
+        assert_eq!(registration_tracker.len(), 0);
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(gate_released.load(Ordering::Acquire));
+        api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_returns_superseded_source_without_dropping_it() {
+        let api = api(RunnerRouter::new()).await;
+        let desired = Task::from_manifest(embedded("coalesced-return", 1_000)).unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        let (_first_completion, first_superseded) = api.reconciler.schedule(
+            desired.clone(),
+            RuntimeSource::Prebuilt(Arc::new(DropProbeTask {
+                dropped: Arc::clone(&dropped),
+                gate_released: Arc::new(AtomicBool::new(false)),
+                api: Weak::new(),
+            })),
+            true,
+            api.reconciler.tasks.token(),
+        );
+        assert!(first_superseded.is_none());
+
+        let (_second_completion, superseded) = api.reconciler.schedule(
+            desired,
+            RuntimeSource::Prebuilt(immediate_task("replacement")),
+            true,
+            api.reconciler.tasks.token(),
+        );
+        let superseded = superseded.expect("the unpolled pending request is replaced");
+        assert!(!dropped.load(Ordering::Acquire));
+
+        drop(superseded);
+        assert!(dropped.load(Ordering::Acquire));
+        api.shutdown().await.unwrap();
+    }
+
+    struct DeadlineRunner {
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[solti_runner::async_trait]
+    impl Runner for DeadlineRunner {
+        fn name(&self) -> &str {
+            "deadline"
+        }
+
+        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+            subprocess_workload_types()
+        }
+
+        async fn build_task(
+            &self,
+            _task: &Task,
+            _run_id: &RunId,
+            _ctx: &BuildContext,
+            cancellation: &solti_runner::BuildCancellation,
+            _scope: &mut solti_runner::BuildScope,
+        ) -> Result<TaskRef, RunnerError> {
+            let _dropped = BuildFinishedGuard(Arc::clone(&self.dropped));
+            cancellation.cancelled().await;
+            Err(RunnerError::Internal("build cancelled".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn build_deadline_cancels_and_drops_the_runner_future() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(DeadlineRunner {
+                dropped: Arc::clone(&dropped),
+            }))
+            .unwrap();
+        let config = ReconciliationConfig::new()
+            .try_with_build_timeout(Duration::from_millis(25))
+            .unwrap();
+        let api = api_with_reconciliation(router, config).await;
+
+        let task = api.create_task(routed("deadline", 1_000)).await.unwrap();
+        let failed = wait_for_reconciled(&api, task.name(), 1, ConditionStatus::False).await;
+        assert_eq!(failed.status().reconciled().reason(), "RunnerBuildTimedOut");
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(api.reconciler.state.binding_for(task.name()).is_none());
+        api.shutdown().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delete_during_blocked_preflight_prevents_late_runtime_submission() {
         let gate = Arc::new(BuildGate::new());
+        let build_finished = Arc::new(AtomicBool::new(false));
         let runtime_started = Arc::new(AtomicBool::new(false));
         let mut router = RunnerRouter::new();
         router
             .register(Arc::new(BlockingRunner {
                 gate: Arc::clone(&gate),
-                build_finished: Arc::new(AtomicBool::new(false)),
+                build_finished: Arc::clone(&build_finished),
                 runtime_started: Arc::clone(&runtime_started),
             }))
             .unwrap();
@@ -1866,11 +2545,11 @@ mod tests {
             .unwrap();
         assert!(api.get_task(&name).is_none());
 
-        gate.release();
         tokio::time::timeout(Duration::from_secs(2), reconciliation)
             .await
             .expect("stale reconciliation did not finish")
             .expect("stale reconciliation acknowledgement dropped");
+        assert!(build_finished.load(Ordering::Acquire));
         assert!(api.get_task(&name).is_none());
         assert!(api.reconciler.state.binding_for(&name).is_none());
         assert!(

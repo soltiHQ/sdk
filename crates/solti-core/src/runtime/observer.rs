@@ -384,6 +384,21 @@ impl RuntimeObserver {
         }
     }
 
+    /// Releases every deferred outcome after Taskvisor has confirmed global shutdown.
+    ///
+    /// At that point no registered runtime remains, so a missing per-task
+    /// `TaskRemoved` event is no longer needed as cleanup evidence.
+    pub(crate) fn finalize_pending_after_confirmed_shutdown(&self) {
+        let _lifecycle = self.lifecycle_gate.lock();
+        let pending = {
+            let mut barriers = self.completion_barriers.lock();
+            barriers.pending.drain().collect::<Vec<_>>()
+        };
+        for (tv_raw, finalization) in pending {
+            self.finalize_locked(tv_raw, finalization);
+        }
+    }
+
     fn task_removed_locked(&self, tv_raw: u64) {
         let pending = {
             let mut barriers = self.completion_barriers.lock();
@@ -1267,6 +1282,24 @@ mod tests {
         );
 
         sub.on_event(&Event::new(EventKind::TaskRemoved).with_id(tv));
+
+        assert!(state.tv_for(&id).is_none());
+        let task = state.get(&id).expect("retained failed task");
+        assert_eq!(task.status().phase(), TaskPhase::Failed);
+        assert!(
+            task.status()
+                .error()
+                .is_some_and(|error| error.contains("outcome unavailable"))
+        );
+    }
+
+    #[test]
+    fn confirmed_shutdown_releases_waiter_error_without_task_removed_event() {
+        let (sub, state, id) = setup("shutdown-missing-outcome");
+        let tv = state.tv_for(&id).expect("bound task");
+
+        sub.finalize_unavailable(tv.get(), "task outcome unavailable: shutting down".into());
+        sub.finalize_pending_after_confirmed_shutdown();
 
         assert!(state.tv_for(&id).is_none());
         let task = state.get(&id).expect("retained failed task");

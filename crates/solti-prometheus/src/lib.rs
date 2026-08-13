@@ -5,7 +5,7 @@
 //! Each adapter implements a trait from the crate that owns the observed behavior.
 //!
 //! All integrations are disabled by default.
-//! [`Registry`] and [`register_build_info`] are always available.
+//! [`Registry`], [`Error`], and [`register_build_info`] are always available.
 //!
 //! ## Data Flow
 //!
@@ -50,9 +50,9 @@
 //! ## Quick Start
 //!
 //! ```rust
-//! use solti_prometheus::{Registry, register_build_info};
+//! use solti_prometheus::{Error, Registry, register_build_info};
 //!
-//! # fn main() -> Result<(), prometheus::Error> {
+//! # fn main() -> Result<(), Error> {
 //! let registry = Registry::new();
 //! register_build_info(
 //!     &registry,
@@ -126,4 +126,4 @@ mod state;
 #[cfg_attr(docsrs, doc(cfg(feature = "state")))]
 pub use state::PrometheusCoreStateCollector;
 
-pub use prometheus::Registry;
+pub use prometheus::{Error, Registry};

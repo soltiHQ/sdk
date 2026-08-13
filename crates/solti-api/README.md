@@ -56,6 +56,13 @@ OpenAPI defines HTTP routes and CRD JSON shapes.
 Protobuf defines gRPC services and DTOs.
 `CONTRACT.md` defines behavior shared by both transports.
 
+The authoritative protobuf tree lives in
+[`soltiHQ/proto`](https://github.com/soltiHQ/proto).
+Release and CI tooling vendor a pinned revision into `proto/`.
+The crate includes generated Rust bindings from that vendored contract, so
+consumer builds do not run `protoc`.
+The `generated_contract` test regenerates the binding and rejects drift.
+
 `HttpApi::build` generates a standalone OpenAPI 3.1 document.
 It uses JSON Schema draft 2020-12.
 Configured bearer authentication is included on the task operations.
@@ -338,10 +345,13 @@ The event names are:
 gRPC uses the matching `StreamTaskLogsResponse` oneof.
 Output lines are raw bytes in protobuf.
 HTTP JSON encodes those bytes as base64.
+`OutputChunk.truncated` is true when `line` is an exact retained prefix and
+source bytes were omitted. False is omitted from the HTTP JSON shape.
 
 The stream is live-only and lossy.
 It does not persist or replay output.
-`Lagged` reports the number of events missed by a slow subscriber.
+`Lagged` reports both the number of events and retained line bytes missed by a
+slow subscriber. Lag metadata never modifies raw `line` bytes.
 One subscription can span later attempts of the same task generation.
 `SupervisorApiAdapter` filters an opened stream to the generation visible at subscription time.
 
@@ -514,7 +524,8 @@ Streaming requests remain in flight until the body ends, fails, or is dropped.
 HTTP errors use a Kubernetes-style `Status` body.
 Write conflicts include machine-readable causes.
 gRPC write conflicts encode `WriteConflictDetails` in status details.
-Internal diagnostic messages are logged and hidden from clients.
+Internal failures are logged by stable category and hidden from clients.
+The transport boundary does not write the diagnostic string to logs.
 
 ## Examples
 

@@ -41,7 +41,7 @@ solti-runner: custom workload routing
                                                       │ first matching runner
                                                       ▼
                                                 resize-gpu
-                                                      │ Task + RunId + BuildContext
+                                                      │ Task + RunId + BuildContext + cancellation
                                                       ▼
                                             Runner::build_task
                                                       │ validate application spec
@@ -64,6 +64,7 @@ struct ImageResizeRunner {
     accelerator: &'static str,
 }
 
+#[solti_runner::async_trait]
 impl Runner for ImageResizeRunner {
     fn name(&self) -> &str {
         self.name
@@ -73,11 +74,13 @@ impl Runner for ImageResizeRunner {
         vec![WorkloadTypeMeta::new(API_VERSION, KIND).expect("valid extension GVK")]
     }
 
-    fn build_task(
+    async fn build_task(
         &self,
         task: &Task,
         run_id: &RunId,
         _ctx: &BuildContext,
+        _cancellation: &solti_runner::BuildCancellation,
+        _scope: &mut solti_runner::BuildScope,
     ) -> Result<TaskRef, RunnerError> {
         let workload = task.spec().workload();
         let TaskWorkload::Extension(extension) = workload else {
@@ -128,7 +131,8 @@ fn labels(accelerator: &str) -> Labels {
     labels
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{FLOW}");
     println!(
         "[purpose] Add an application-owned workload and choose between backends without changing solti-runner."
@@ -188,7 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert_eq!(selected.name(), "resize-gpu");
 
-    let task_ref = router.build(&task)?;
+    let task_ref = router.build(&task).await?;
     println!("[build] The runner validates source and width.");
     println!(
         "[build] The returned TaskRef uses the allocated RunId: {}.",

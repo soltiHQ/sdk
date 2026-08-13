@@ -320,14 +320,17 @@ It rejects duplicate runner names.
 
 ```text
 {"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"aGk="}
+{"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":1,"ts":1701,"line":"aA==","truncated":true}
 {"type":"runStarted","generation":2,"attempt":1,"startedAt":1700}
 {"type":"runFinished","generation":2,"attempt":1,"exitCode":0,"finishedAt":1701}
-{"type":"lagged","skipped":42}
+{"type":"lagged","skipped":42,"skippedBytes":65536}
 ```
 
 Timestamps are Unix milliseconds.
 Chunk bytes use standard padded base64.
 They can contain non-UTF-8 data.
+`truncated` reports an omitted source suffix.
+`skippedBytes` reports retained payload bytes lost with lagged events.
 
 The model does not publish, retain, or subscribe to output.
 `solti-api` maps the domain events to its separate protobuf shape.

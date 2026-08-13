@@ -137,6 +137,8 @@ fn authorization_header(token: Option<&Token>) -> Result<Option<HeaderValue>, Di
 ///
 /// Redirects are disabled to prevent forwarding credentials to another host.
 fn build_client(config: &DiscoverConfig) -> Result<reqwest::Client, DiscoverError> {
+    ensure_tls_provider()?;
+
     #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
@@ -155,6 +157,25 @@ fn build_client(config: &DiscoverConfig) -> Result<reqwest::Client, DiscoverErro
     }
 
     builder.build().map_err(DiscoverError::from)
+}
+
+/// Installs Solti's ring provider when the process has not selected one.
+fn ensure_tls_provider() -> Result<(), DiscoverError> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+        && rustls::crypto::CryptoProvider::get_default().is_none()
+    {
+        return Err(DiscoverError::InvalidConfig(
+            "failed to select a rustls crypto provider".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Reads a bounded diagnostic body preview.

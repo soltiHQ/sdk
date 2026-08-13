@@ -83,6 +83,8 @@ Read the `Reconciled` condition to observe its result.
 Routed submission requires a non-embedded workload.
 The router selects a registered runner by workload GVK and optional labels.
 Runner construction happens in the reconciliation worker.
+It is asynchronous, cancellation-aware, deadline-bound, and admitted through
+global and per-runner concurrency limits.
 
 Embedded submission requires `TaskWorkload::Embedded`.
 The caller supplies the matching `TaskRef`.
@@ -145,6 +147,8 @@ The required `Reconciled` condition reports the reconciliation result:
 Reconciliation failures do not use the execution `phase`, `error`, or `exitCode` fields.
 
 Reconciliation uses latest-wins semantics.
+A task keeps at most one active and one pending reconciliation. A newer commit
+cancels active runner preflight and replaces an older pending generation.
 A stale generation cannot bind or replace the current runtime.
 Side effects accepted before a generation becomes stale are not rolled back.
 The crate does not provide staged rollout or availability guarantees.
@@ -250,8 +254,11 @@ async fn read_output(api: &SupervisorApi, name: &TaskId) {
             OutputEvent::Chunk(chunk) => {
                 println!("{:?}: {:?}", chunk.stream, chunk.line);
             }
-            OutputEvent::Lagged { skipped } => {
-                eprintln!("skipped {skipped} output events");
+            OutputEvent::Lagged {
+                skipped,
+                skipped_bytes,
+            } => {
+                eprintln!("skipped {skipped} output events ({skipped_bytes} bytes)");
             }
             OutputEvent::RunStarted { .. } | OutputEvent::RunFinished { .. } => {}
             _ => {}
@@ -299,14 +306,42 @@ Deleting a missing resource is an idempotent no-op.
 `sweep_interval = 0` is rejected.
 Watch history capacity and byte budget must also be greater than zero.
 
-`OutputConfig` controls the live-output ring.
-Its default capacity is 256 events per task.
-Zero is rejected.
+`ReconciliationConfig` bounds routed runner construction:
+
+| Field                              | Default    | Meaning                                      |
+|------------------------------------|------------|----------------------------------------------|
+| `build_timeout`                    | 30 seconds | Deadline after one build receives admission  |
+| `max_concurrent_builds`            | 32         | Concurrent outer routed-build limit          |
+| `max_concurrent_builds_per_runner` | 8          | Limit for each selected runner, nested too   |
+
+These defaults are SDK policy values, not a claim of a benchmark-derived
+optimum. Override them with values measured for the application's runner
+workloads and service objectives.
+
+One global build slot covers the outer build and every nested catalog build it
+creates. Nested builds acquire only the selected runner's per-runner slot. The
+build deadline starts after outer admission and includes waits for nested
+runner slots.
+
+All reconciliation limits must be greater than zero. Embedded tasks do not use
+runner-build admission because the caller supplies their `TaskRef`.
+
+`OutputConfig` controls the best-effort live-output ring. Defaults are 256
+events, a 16 MiB retained payload budget per task, and 64 KiB per chunk. The
+effective ring capacity is the stricter of the event and byte limits.
+
+Core makes one ownership copy of every retained chunk into bounded storage. A
+custom runner cannot retain an oversized or hidden backing allocation through
+a small `Bytes` view.
+Oversized chunks carry the exact retained prefix with `truncated = true`. A
+slow subscriber receives `Lagged` with the number of overwritten events and
+their retained chunk payload bytes in `skipped_bytes`.
+Zero limits and a chunk limit larger than the byte budget are rejected.
 
 ```rust,no_run
 use std::time::Duration;
 
-use solti_core::{OutputConfig, StateConfig, SupervisorApi};
+use solti_core::{OutputConfig, ReconciliationConfig, StateConfig, SupervisorApi};
 use solti_runner::RunnerRouter;
 
 async fn configured() -> Result<(), Box<dyn std::error::Error>> {
@@ -317,11 +352,17 @@ async fn configured() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_runs_per_task(64)
         .try_with_watch_history_capacity(1024)?
         .try_with_watch_history_byte_budget(16 * 1024 * 1024)?;
-    let output = OutputConfig::try_new(1024)?;
+    let output = OutputConfig::try_new(1024)?
+        .try_with_byte_limits(64 * 1024 * 1024, 64 * 1024)?;
+    let reconciliation = ReconciliationConfig::new()
+        .try_with_build_timeout(Duration::from_secs(20))?
+        .try_with_max_concurrent_builds(16)?
+        .try_with_max_concurrent_builds_per_runner(4)?;
 
     let api = SupervisorApi::builder(RunnerRouter::new())
         .with_state_config(state)
         .with_output_config(output)
+        .with_reconciliation_config(reconciliation)
         .start()
         .await?;
 
@@ -341,12 +382,19 @@ The hooks are storage-neutral.
 They do not add a database, replace the in-memory `TaskState`, retry delivery, or make state durable by themselves.
 They are write-side notifications; core does not load persisted state during startup.
 
-State events are queued while the state commit is locked, then delivered in FIFO commit order by one synchronous publisher after the state lock is released.
-If another thread or a reentrant call commits state while a callback is active, that commit appends its event and can return before its own callback runs.
-The publisher never invokes the sink recursively and stops at a batch whose state write is still in progress.
-Dropping that write guard marks the batch ready and resumes FIFO delivery.
+State events use a bounded, core-owned FIFO dispatcher.
+A writer atomically reserves its mutation path's maximum event count before acquiring the state lock, records one atomic commit batch, and publishes its events only after releasing the lock.
+Unused reservations are returned after the lock is released.
+One dedicated worker invokes the sink in commit order.
+For configured capacity `C`, the hard bound is `reserved + buffered + active <= C + 1`, where `active` is zero or one.
+Reserved includes permits owned by a commit before its event values enter the pending FIFO.
+The minimum capacity is two buffered events because one attempt transition can atomically emit three events: one task change, one implicitly closed prior run, and one current run change.
+Reservation admission is FIFO; saturation applies backpressure before the state critical section.
+Retention sweeps publish each expired task deletion as a separate commit batch.
+State callbacks may read `TaskState`, but must not mutate it directly or wait for another thread that mutates it.
 Output callbacks run synchronously on runner paths.
-All callbacks must return quickly and should normally forward cloned events to an application-owned worker:
+State callbacks must eventually return so shutdown can drain them.
+Output callbacks must return quickly and should normally forward cloned events to an application-owned worker:
 
 ```rust,no_run
 use std::sync::{Arc, mpsc};
@@ -394,14 +442,17 @@ Run retention does not emit delete events.
 `TaskOutputSink` is installed before runners start and receives the same published chunks and run markers as the live output path, including the first published event. 
 Each event carries the task name and UID, so a late event from a deleted task cannot be confused with a recreated task using the same name.
 Subscriber-local `Lagged` notifications are not persisted.
-Sink panics are caught and logged. The sink owns database errors, retries, queue limits, and shutdown draining.
+Sink panics are caught and logged; the event whose callback panicked cannot be recovered by core.
+The application owns database errors and retries.
+Core owns the bounded state queue and drains it during shutdown.
 
 ## Shutdown
 
 Call `shutdown()` when cleanup must finish before the application continues.
 
 Shutdown closes task watches.
-It stops Taskvisor and waits for reconciliation, completion, and retention workers.
+It cancels runner builds, stops Taskvisor, and waits for reconciliation,
+completion, and retention workers.
 
 Dropping `SupervisorApi` starts the same cleanup path in the background.
 It does not provide an awaitable result.

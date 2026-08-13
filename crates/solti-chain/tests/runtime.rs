@@ -40,6 +40,7 @@ impl LeafRunner {
     }
 }
 
+#[solti_runner::async_trait]
 impl Runner for LeafRunner {
     fn name(&self) -> &str {
         self.name
@@ -52,11 +53,13 @@ impl Runner for LeafRunner {
         ]
     }
 
-    fn build_task(
+    async fn build_task(
         &self,
         task: &Task,
         run_id: &RunId,
         ctx: &BuildContext,
+        _cancellation: &solti_runner::BuildCancellation,
+        _scope: &mut solti_runner::BuildScope,
     ) -> Result<TaskRef, RunnerError> {
         let (id, behavior) = leaf_fields(task)?;
         self.builds
@@ -189,8 +192,8 @@ fn basic_router(
     router
 }
 
-fn build_task(router: &RunnerRouter, task: &Task) -> TaskRef {
-    router.build(task).expect("chain task must build")
+async fn build_task(router: &RunnerRouter, task: &Task) -> TaskRef {
+    router.build(task).await.expect("chain task must build")
 }
 
 fn execution_log(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
@@ -223,6 +226,7 @@ async fn success_path_runs_in_order_and_does_not_run_failure_branch() {
     let task = chain_task("ordered", chain);
 
     build_task(&router, &task)
+        .await
         .spawn(TaskContext::detached())
         .await
         .expect("success path must complete");
@@ -263,6 +267,7 @@ async fn preserve_keeps_failure_while_recover_allows_successful_handler() {
         );
 
         let result = build_task(&router, &task)
+            .await
             .spawn(TaskContext::detached())
             .await;
         if should_recover {
@@ -301,6 +306,7 @@ async fn terminal_failure_preserves_exact_error_category_and_exit_code() {
     let task = chain_task("terminal-error", chain);
 
     let result = build_task(&router, &task)
+        .await
         .spawn(TaskContext::detached())
         .await;
 
@@ -330,7 +336,7 @@ async fn every_spawn_restarts_the_chain_at_entry() {
     )
     .unwrap();
     let task = chain_task("repeatable", chain);
-    let runnable = build_task(&router, &task);
+    let runnable = build_task(&router, &task).await;
 
     runnable
         .spawn(TaskContext::detached())
@@ -366,6 +372,7 @@ async fn cancellation_bypasses_failure_transition() {
     let task = chain_task("canceled", chain);
 
     let result = build_task(&router, &task)
+        .await
         .spawn(TaskContext::detached())
         .await;
 
@@ -373,8 +380,8 @@ async fn cancellation_bypasses_failure_transition() {
     assert_eq!(execution_log(&executions), ["leaf:entry"]);
 }
 
-#[test]
-fn build_compiles_every_branch_and_rejects_an_unroutable_one() {
+#[tokio::test]
+async fn build_compiles_every_branch_and_rejects_an_unroutable_one() {
     let executions = Arc::new(Mutex::new(Vec::new()));
     let builds = Arc::new(Mutex::new(Vec::new()));
     let router = basic_router(executions, Arc::clone(&builds));
@@ -395,7 +402,7 @@ fn build_compiles_every_branch_and_rejects_an_unroutable_one() {
     .unwrap();
     let task = chain_task("invalid-branch", chain);
 
-    let error = match router.build(&task) {
+    let error = match router.build(&task).await {
         Ok(_) => panic!("build unexpectedly accepted an unroutable branch"),
         Err(error) => error,
     };
@@ -452,6 +459,7 @@ async fn outer_selector_is_not_inherited_and_each_step_selector_is_local() {
     );
 
     build_task(&router, &task)
+        .await
         .spawn(TaskContext::detached())
         .await
         .expect("selector-isolated chain must complete");
@@ -539,7 +547,7 @@ async fn output_uses_one_upstream_sink_per_outer_attempt_and_one_shared_sequence
     let task = chain_task("output-chain", chain);
     let outer_name = task.name().clone();
     let generation = task.metadata().generation();
-    let runnable = build_task(&router, &task);
+    let runnable = build_task(&router, &task).await;
 
     runnable.spawn(TaskContext::detached()).await.unwrap();
     runnable.spawn(TaskContext::detached()).await.unwrap();

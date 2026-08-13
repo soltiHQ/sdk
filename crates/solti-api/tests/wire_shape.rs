@@ -507,6 +507,7 @@ impl ApiHandler for WireMock {
                 } else {
                     Bytes::from_static(b"hello world")
                 },
+                truncated: self.non_utf8_output,
             }),
             OutputEvent::RunFinished {
                 generation: 1,
@@ -514,7 +515,10 @@ impl ApiHandler for WireMock {
                 exit_code: Some(0),
                 finished_at: UNIX_EPOCH + Duration::from_millis(1_712_750_400_456),
             },
-            OutputEvent::Lagged { skipped: 42 },
+            OutputEvent::Lagged {
+                skipped: 42,
+                skipped_bytes: 1_024,
+            },
         ];
         Ok(Box::pin(tokio_stream::iter(events)))
     }
@@ -1443,7 +1447,7 @@ async fn sse_frames_match_documented_event_names_and_payloads() {
         "event: run-started\ndata: {\"type\":\"runStarted\",\"generation\":1,\"attempt\":1,\"startedAt\":1712750400000}",
         "event: chunk\ndata: {\"type\":\"chunk\",\"generation\":1,\"attempt\":1,\"stream\":\"stdout\",\"seq\":0,\"ts\":1712750400123,\"line\":\"aGVsbG8gd29ybGQ=\"}",
         "event: run-finished\ndata: {\"type\":\"runFinished\",\"generation\":1,\"attempt\":1,\"exitCode\":0,\"finishedAt\":1712750400456}",
-        "event: lagged\ndata: {\"type\":\"lagged\",\"skipped\":42}",
+        "event: lagged\ndata: {\"type\":\"lagged\",\"skipped\":42,\"skippedBytes\":1024}",
     ] {
         assert!(
             body.contains(frame),
@@ -1481,6 +1485,7 @@ async fn sse_preserves_non_utf8_output_as_base64() {
     .unwrap();
 
     assert!(body.contains(r#""line":"aGn//g==""#), "{body}");
+    assert!(body.contains(r#""truncated":true"#), "{body}");
     assert!(!body.contains('\u{FFFD}'), "{body}");
 }
 

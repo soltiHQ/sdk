@@ -103,6 +103,7 @@ struct TaskExecContext {
     attempt: AtomicU32,
 }
 
+#[solti_runner::async_trait]
 impl Runner for ContainerRunner {
     fn name(&self) -> &str {
         &self.name
@@ -115,11 +116,13 @@ impl Runner for ContainerRunner {
         ]
     }
 
-    fn build_task(
+    async fn build_task(
         &self,
         task: &Task,
         run_id: &RunId,
         ctx: &BuildContext,
+        _cancellation: &solti_runner::BuildCancellation,
+        _scope: &mut solti_runner::BuildScope,
     ) -> Result<TaskRef, RunnerError> {
         let ContainerSpec {
             image,
@@ -157,7 +160,6 @@ impl Runner for ContainerRunner {
             generation = task.metadata().generation(),
             slot = %task.slot(),
             run_id = %run_id.name(),
-            image = %image,
             "building container task",
         );
 
@@ -282,7 +284,6 @@ async fn run_container_attempt(
     trace!(
         event = "container.lifecycle",
         stage = "creating",
-        image = %request.image(),
         "creating container attempt",
     );
 
@@ -550,6 +551,7 @@ impl fmt::Debug for ContainerRunner {
 #[cfg(test)]
 mod tests {
     use std::{
+        fmt,
         sync::{Arc, Mutex, atomic::AtomicBool},
         time::Duration,
     };
@@ -560,9 +562,55 @@ mod tests {
         RuntimeError, Supervisor, SupervisorConfig, TaskOutcomeKind, TaskSpec as TaskvisorTaskSpec,
     };
     use tokio::sync::{Notify, Semaphore};
+    use tracing::{
+        Event, Metadata, Subscriber,
+        field::{Field, Visit},
+        span::{Attributes, Id, Record},
+    };
 
     use super::*;
     use crate::container::{ContainerEngineInfo, ContainerOutput};
+
+    #[derive(Default)]
+    struct TraceCapture {
+        fields: Mutex<Vec<String>>,
+    }
+
+    struct CaptureSubscriber(Arc<TraceCapture>);
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut CaptureVisitor(&self.0));
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    struct CaptureVisitor<'a>(&'a TraceCapture);
+
+    impl Visit for CaptureVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.0
+                .fields
+                .lock()
+                .unwrap()
+                .push(format!("{}={value:?}", field.name()));
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Call {
@@ -848,9 +896,9 @@ mod tests {
         })
     }
 
-    fn task() -> Task {
+    fn task_with_image(image: impl Into<String>) -> Task {
         let workload = TaskWorkload::Container(ContainerSpec::new(
-            "docker.io/library/alpine:latest".into(),
+            image.into(),
             Some(vec!["echo".into()]),
             vec!["hello".into()],
             TaskEnv::new(),
@@ -861,11 +909,23 @@ mod tests {
         Task::new("container-task", spec).unwrap()
     }
 
-    fn build(runner: &ContainerRunner) -> TaskRef {
+    fn task() -> Task {
+        task_with_image("docker.io/library/alpine:latest")
+    }
+
+    async fn build(runner: &ContainerRunner) -> TaskRef {
         let resource = task();
         let run_id = solti_runner::make_run_id(runner.name(), resource.slot().as_str());
+        let mut scope = solti_runner::BuildScope::unmanaged(runner.name());
         runner
-            .build_task(&resource, &run_id, &BuildContext::default())
+            .build_task(
+                &resource,
+                &run_id,
+                &BuildContext::default(),
+                &solti_runner::BuildCancellation::new(),
+                &mut scope,
+            )
+            .await
             .unwrap()
     }
 
@@ -873,7 +933,7 @@ mod tests {
     async fn build_has_no_engine_io_and_each_spawn_gets_one_attempt() {
         let (engine, calls) = FakeEngine::new(0);
         let runner = ContainerRunner::new("containerd", engine).unwrap();
-        let task = build(&runner);
+        let task = build(&runner).await;
 
         assert!(calls.lock().unwrap().is_empty());
         task.spawn(TaskContext::detached()).await.unwrap();
@@ -901,11 +961,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tracing_does_not_record_container_image() {
+        const SECRET: &str = "container-credential-secret";
+        const FORGED: &str = "forged-container-record";
+
+        let (engine, _) = FakeEngine::new(0);
+        let runner = ContainerRunner::new("containerd", engine).unwrap();
+
+        // Register both production callsites before installing the scoped
+        // dispatcher so their interest is deterministic during parallel tests.
+        build(&runner)
+            .await
+            .spawn(TaskContext::detached())
+            .await
+            .unwrap();
+
+        let capture = Arc::new(TraceCapture::default());
+        let dispatch = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let resource = task_with_image(format!(
+            "https://user:{SECRET}@registry.invalid/private\n{FORGED}"
+        ));
+        let run_id = solti_runner::make_run_id(runner.name(), resource.slot().as_str());
+        let mut scope = solti_runner::BuildScope::unmanaged(runner.name());
+        let task = runner
+            .build_task(
+                &resource,
+                &run_id,
+                &BuildContext::default(),
+                &solti_runner::BuildCancellation::new(),
+                &mut scope,
+            )
+            .await
+            .unwrap();
+        task.spawn(TaskContext::detached()).await.unwrap();
+
+        let fields = capture.fields.lock().unwrap().join(" ");
+        assert!(fields.contains("container.build"), "{fields}");
+        assert!(fields.contains("container.lifecycle"), "{fields}");
+        assert!(fields.contains("creating"), "{fields}");
+        assert!(!fields.contains("image="), "{fields}");
+        assert!(!fields.contains(SECRET), "{fields}");
+        assert!(!fields.contains(FORGED), "{fields}");
+    }
+
+    #[tokio::test]
     async fn pre_canceled_attempt_performs_no_engine_io() {
         let (engine, calls) = FakeEngine::new(0);
         let runner = ContainerRunner::new("containerd", engine).unwrap();
 
         let error = build(&runner)
+            .await
             .spawn(TaskContext::detached_cancelled())
             .await
             .unwrap_err();
@@ -922,7 +1029,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            build(&retryable).spawn(TaskContext::detached()).await,
+            build(&retryable).await.spawn(TaskContext::detached()).await,
             Err(TaskError::Fail { .. })
         ));
 
@@ -932,14 +1039,14 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            build(&permanent).spawn(TaskContext::detached()).await,
+            build(&permanent).await.spawn(TaskContext::detached()).await,
             Err(TaskError::Fatal { .. })
         ));
 
         let (engine, _) = FakeEngine::new(23);
         let failed = ContainerRunner::new("exit-code", engine).unwrap();
         assert!(matches!(
-            build(&failed).spawn(TaskContext::detached()).await,
+            build(&failed).await.spawn(TaskContext::detached()).await,
             Err(TaskError::Fail {
                 exit_code: Some(23),
                 ..
@@ -980,7 +1087,7 @@ mod tests {
     async fn dropping_outer_future_drops_in_flight_create() {
         let (engine, handle) = ControlledEngine::blocked(AttemptBehavior::default());
         let runner = ContainerRunner::new("containerd", engine).unwrap();
-        let task = build(&runner);
+        let task = build(&runner).await;
         let outer = tokio::spawn(async move { task.spawn(TaskContext::detached()).await });
 
         wait_for(&handle.create_entered, "create attempt to start").await;
@@ -1008,7 +1115,7 @@ mod tests {
             Supervisor::new(SupervisorConfig::new().with_grace(Duration::ZERO), vec![]);
         let supervisor_handle = supervisor.serve();
         let (_, waiter) = supervisor_handle
-            .add_and_watch(TaskvisorTaskSpec::once(build(&runner)))
+            .add_and_watch(TaskvisorTaskSpec::once(build(&runner).await))
             .await
             .unwrap();
 
@@ -1037,7 +1144,8 @@ mod tests {
         let supervisor_handle = supervisor.serve();
         let (_, waiter) = supervisor_handle
             .add_and_watch(
-                TaskvisorTaskSpec::once(build(&runner)).with_timeout(Duration::from_millis(20)),
+                TaskvisorTaskSpec::once(build(&runner).await)
+                    .with_timeout(Duration::from_millis(20)),
             )
             .await
             .unwrap();
@@ -1091,7 +1199,7 @@ mod tests {
         handle.create_release.add_permits(1);
         let runner = ContainerRunner::new("containerd", engine).unwrap();
 
-        let result = build(&runner).spawn(TaskContext::detached()).await;
+        let result = build(&runner).await.spawn(TaskContext::detached()).await;
 
         assert!(matches!(result, Err(TaskError::Fail { .. })));
         assert_eq!(
@@ -1118,7 +1226,7 @@ mod tests {
         handle.create_release.add_permits(1);
         let runner = ContainerRunner::new("containerd", engine).unwrap();
 
-        let result = build(&runner).spawn(TaskContext::detached()).await;
+        let result = build(&runner).await.spawn(TaskContext::detached()).await;
 
         let error = result.unwrap_err().to_string();
         assert!(error.contains("container termination failed"));
@@ -1147,7 +1255,7 @@ mod tests {
         handle.create_release.add_permits(1);
         let runner = ContainerRunner::new("containerd", engine).unwrap();
 
-        let result = build(&runner).spawn(TaskContext::detached()).await;
+        let result = build(&runner).await.spawn(TaskContext::detached()).await;
 
         assert!(matches!(result, Err(TaskError::Fatal { .. })));
         assert_eq!(

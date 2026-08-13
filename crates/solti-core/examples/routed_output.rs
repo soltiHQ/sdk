@@ -67,6 +67,7 @@ struct ImageResizeRunner {
     release: Arc<Notify>,
 }
 
+#[solti_runner::async_trait]
 impl Runner for ImageResizeRunner {
     fn name(&self) -> &str {
         "image-resize"
@@ -76,11 +77,13 @@ impl Runner for ImageResizeRunner {
         vec![WorkloadTypeMeta::new(API_VERSION, KIND).expect("valid extension GVK")]
     }
 
-    fn build_task(
+    async fn build_task(
         &self,
         task: &Task,
         run_id: &RunId,
         ctx: &BuildContext,
+        _cancellation: &solti_runner::BuildCancellation,
+        _scope: &mut solti_runner::BuildScope,
     ) -> Result<TaskRef, RunnerError> {
         let TaskWorkload::Extension(workload) = task.spec().workload() else {
             return Err(unsupported_workload(task.spec().workload()));
@@ -264,8 +267,11 @@ async fn main() -> ExampleResult {
             } => {
                 println!("[output] RunStarted: generation={generation}, attempt={attempt}.");
             }
-            OutputEvent::Lagged { skipped } => {
-                println!("[output] Lagged: skipped={skipped}.");
+            OutputEvent::Lagged {
+                skipped,
+                skipped_bytes,
+            } => {
+                println!("[output] Lagged: skipped={skipped}, skipped_bytes={skipped_bytes}.");
             }
             _ => {}
         }

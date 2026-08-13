@@ -256,6 +256,7 @@ struct BuiltSubprocessTask {
     pinned_cwd: Option<PinnedCwd>,
 }
 
+#[solti_runner::async_trait]
 impl Runner for SubprocessRunner {
     fn name(&self) -> &str {
         &self.name
@@ -281,11 +282,13 @@ impl Runner for SubprocessRunner {
     /// Returns [`RunnerError::UnsupportedWorkload`] for another workload kind.
     /// Returns [`RunnerError::InvalidSpec`] when resolved process settings are invalid.
     /// This includes script decoding, script limits, environment values, and working-directory policy.
-    fn build_task(
+    async fn build_task(
         &self,
         task: &Task,
         run_id: &RunId,
         ctx: &BuildContext,
+        _cancellation: &solti_runner::BuildCancellation,
+        _scope: &mut solti_runner::BuildScope,
     ) -> Result<TaskRef, RunnerError> {
         let BuiltSubprocessTask {
             task: task_cfg,
@@ -842,12 +845,11 @@ async fn run_subprocess_attempt(
         }
     })?;
 
-    // Args and cwd are not logged: task arguments routinely carry tokens and
-    // other secrets. Only the command name and the argument count are recorded.
+    // Command, args, and cwd are not logged: process input routinely carries
+    // credentials and other secrets. The argument count is safe metadata.
     trace!(
         event = "subprocess.lifecycle",
         stage = "spawning",
-        command = %ctx.task_cfg.command,
         arg_count = ctx.task_cfg.args.len(),
         "spawning subprocess",
     );
@@ -1062,6 +1064,53 @@ async fn run_subprocess_attempt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use tracing::{
+        Event, Metadata, Subscriber,
+        field::{Field, Visit},
+        span::{Attributes, Id, Record},
+    };
+
+    #[derive(Default)]
+    struct TraceCapture {
+        fields: Mutex<Vec<String>>,
+    }
+
+    struct CaptureSubscriber(Arc<TraceCapture>);
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut CaptureVisitor(&self.0));
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    struct CaptureVisitor<'a>(&'a TraceCapture);
+
+    impl Visit for CaptureVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.0
+                .fields
+                .lock()
+                .unwrap()
+                .push(format!("{}={value:?}", field.name()));
+        }
+    }
 
     #[test]
     fn process_lifecycle_errors_are_fatal_and_complete() {
@@ -1256,13 +1305,22 @@ mod tests {
         Task::new(format!("task-{slot}"), spec).unwrap()
     }
 
-    fn build_with_run_id(
+    async fn build_with_run_id(
         runner: &SubprocessRunner,
         task: &Task,
         ctx: &BuildContext,
     ) -> Result<TaskRef, RunnerError> {
         let run_id = solti_runner::make_run_id(runner.name(), task.slot().as_str());
-        runner.build_task(task, &run_id, ctx)
+        let mut scope = solti_runner::BuildScope::unmanaged(runner.name());
+        runner
+            .build_task(
+                task,
+                &run_id,
+                ctx,
+                &solti_runner::BuildCancellation::new(),
+                &mut scope,
+            )
+            .await
     }
 
     fn make_task_cfg() -> SubprocessTaskConfig {
@@ -1556,21 +1614,60 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_task_returns_task_ref_for_subprocess() {
+    #[tokio::test]
+    async fn build_task_returns_task_ref_for_subprocess() {
         let runner = SubprocessRunner::new("test-runner").unwrap();
         let task = mk_subprocess_spec("test-slot", "echo");
-        let task_ref = build_with_run_id(&runner, &task, &BuildContext::default()).unwrap();
+        let task_ref = build_with_run_id(&runner, &task, &BuildContext::default())
+            .await
+            .unwrap();
 
         assert_ne!(task_ref.name(), task.name().as_str());
         assert!(task_ref.name().starts_with("test-runner-test-slot-"));
     }
 
-    #[test]
-    fn build_task_rejects_non_subprocess_kind() {
+    #[tokio::test]
+    async fn tracing_does_not_record_subprocess_command() {
+        const SECRET: &str = "subprocess-credential-secret";
+        const FORGED: &str = "forged-subprocess-record";
+
+        let runner = SubprocessRunner::new("trace-runner").unwrap();
+
+        // Register the production callsite before installing the scoped
+        // dispatcher so its interest is deterministic during parallel tests.
+        let warmup = mk_subprocess_spec("trace-warmup", "solti-missing-safe-warmup-command");
+        let warmup = build_with_run_id(&runner, &warmup, &BuildContext::default())
+            .await
+            .unwrap();
+        assert!(warmup.spawn(TaskContext::detached()).await.is_err());
+
+        let capture = Arc::new(TraceCapture::default());
+        let dispatch = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let resource = mk_subprocess_spec(
+            "trace-secret",
+            &format!("https://user:{SECRET}@host.invalid/tool\n{FORGED}"),
+        );
+        let task = build_with_run_id(&runner, &resource, &BuildContext::default())
+            .await
+            .unwrap();
+        assert!(task.spawn(TaskContext::detached()).await.is_err());
+
+        let fields = capture.fields.lock().unwrap().join(" ");
+        assert!(fields.contains("subprocess.lifecycle"), "{fields}");
+        assert!(fields.contains("spawning"), "{fields}");
+        assert!(fields.contains("arg_count"), "{fields}");
+        assert!(!fields.contains("command="), "{fields}");
+        assert!(!fields.contains(SECRET), "{fields}");
+        assert!(!fields.contains(FORGED), "{fields}");
+    }
+
+    #[tokio::test]
+    async fn build_task_rejects_non_subprocess_kind() {
         let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_embedded_spec("test-slot");
-        match build_with_run_id(&runner, &spec, &BuildContext::default()) {
+        match build_with_run_id(&runner, &spec, &BuildContext::default()).await {
             Err(RunnerError::UnsupportedWorkload {
                 runner,
                 api_version,
@@ -1603,7 +1700,7 @@ mod tests {
 
         let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_script_spec("script-e2e", b"echo \"hello-$1\"", &["script"]);
-        let task_ref = build_with_run_id(&runner, &spec, &ctx).unwrap();
+        let task_ref = build_with_run_id(&runner, &spec, &ctx).await.unwrap();
         let cancel = TaskContext::detached();
         task_ref
             .spawn(cancel)
@@ -1660,7 +1757,7 @@ mod tests {
         let cancel = TaskContext::detached();
 
         let script = mk_script_spec("script-credentials", b"exit 0", &[]);
-        let script_ref = build_with_run_id(&runner, &script, &build).unwrap();
+        let script_ref = build_with_run_id(&runner, &script, &build).await.unwrap();
         script_ref
             .spawn(cancel)
             .await
@@ -1673,7 +1770,9 @@ mod tests {
         // A retry must receive a fresh descriptor with the same body.
         let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_script_spec("script-retry", b"exit 0", &[]);
-        let task_ref = build_with_run_id(&runner, &spec, &BuildContext::default()).unwrap();
+        let task_ref = build_with_run_id(&runner, &spec, &BuildContext::default())
+            .await
+            .unwrap();
 
         let ctx = TaskContext::detached();
         task_ref
@@ -1808,7 +1907,9 @@ mod tests {
 
         let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_subprocess_spec_with_args("drop-slot", "bash", &["-c", &script]);
-        let task_ref = build_with_run_id(&runner, &spec, &BuildContext::default()).unwrap();
+        let task_ref = build_with_run_id(&runner, &spec, &BuildContext::default())
+            .await
+            .unwrap();
 
         let cancel = TaskContext::detached();
         let handle = tokio::spawn(async move { task_ref.spawn(cancel).await });
@@ -1841,7 +1942,7 @@ mod tests {
 
         let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_subprocess_spec_with_args("echo-slot", "echo", &["hello-stream"]);
-        let task_ref = build_with_run_id(&runner, &spec, &ctx).unwrap();
+        let task_ref = build_with_run_id(&runner, &spec, &ctx).await.unwrap();
         let cancel = TaskContext::detached();
         task_ref.spawn(cancel).await.expect("echo must succeed");
 
@@ -1875,7 +1976,7 @@ mod tests {
         let (ctx, rx, _calls) = recording_output_context();
         let runner = SubprocessRunner::new("test-runner").unwrap();
         let spec = mk_subprocess_spec_with_args("attempts-slot", "echo", &["x"]);
-        let task_ref = build_with_run_id(&runner, &spec, &ctx).unwrap();
+        let task_ref = build_with_run_id(&runner, &spec, &ctx).await.unwrap();
         let ctx = TaskContext::detached();
         task_ref.spawn(ctx.clone()).await.unwrap();
         task_ref.spawn(ctx).await.unwrap();
@@ -1895,7 +1996,7 @@ mod tests {
         let (ctx, _rx, calls) = recording_output_context();
         let runner = SubprocessRunner::new("test-runner").unwrap();
         let task = mk_subprocess_spec("failed-spawn", "/definitely/not/a/command");
-        let task_ref = build_with_run_id(&runner, &task, &ctx).unwrap();
+        let task_ref = build_with_run_id(&runner, &task, &ctx).await.unwrap();
 
         assert!(task_ref.spawn(TaskContext::detached()).await.is_err());
         assert!(task_ref.spawn(TaskContext::detached()).await.is_err());
@@ -1915,7 +2016,9 @@ mod tests {
     async fn daemonized_grandchild_cannot_hold_output_open() {
         let runner = SubprocessRunner::new("hang-runner").unwrap();
         let spec = mk_subprocess_spec_with_args("hang-slot", "sh", &["-c", "sleep 30 & exit 0"]);
-        let task_ref = build_with_run_id(&runner, &spec, &BuildContext::default()).unwrap();
+        let task_ref = build_with_run_id(&runner, &spec, &BuildContext::default())
+            .await
+            .unwrap();
 
         let ctx = TaskContext::detached();
         tokio::time::timeout(std::time::Duration::from_secs(2), task_ref.spawn(ctx))
@@ -1936,7 +2039,9 @@ mod tests {
 
         let runner = SubprocessRunner::new("descendant-runner").unwrap();
         let spec = mk_subprocess_spec_with_args("descendant-slot", "sh", &["-c", &script]);
-        let task = build_with_run_id(&runner, &spec, &BuildContext::default()).unwrap();
+        let task = build_with_run_id(&runner, &spec, &BuildContext::default())
+            .await
+            .unwrap();
         task.spawn(TaskContext::detached()).await.unwrap();
 
         let pid = wait_for_recorded_pid(&marker)

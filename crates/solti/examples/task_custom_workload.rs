@@ -63,6 +63,7 @@ struct TcpProbeSpec {
 
 struct TcpProbeRunner;
 
+#[solti_runner::async_trait]
 impl Runner for TcpProbeRunner {
     fn name(&self) -> &str {
         "tcp-probe"
@@ -72,11 +73,13 @@ impl Runner for TcpProbeRunner {
         vec![WorkloadTypeMeta::new(API_VERSION, KIND).expect("valid custom GVK")]
     }
 
-    fn build_task(
+    async fn build_task(
         &self,
         task: &Task,
         run_id: &RunId,
         _ctx: &BuildContext,
+        _cancellation: &solti_runner::BuildCancellation,
+        _scope: &mut solti_runner::BuildScope,
     ) -> Result<TaskRef, RunnerError> {
         let workload = task.spec().workload();
         let TaskWorkload::Extension(extension) = workload else {

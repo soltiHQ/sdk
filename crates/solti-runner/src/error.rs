@@ -77,6 +77,20 @@ pub enum RouterError {
         kind: String,
     },
 
+    /// Cancellation won while a selected runner waited for build admission.
+    #[error("runner '{runner}' build admission was cancelled")]
+    BuildCancelled {
+        /// Selected runner name.
+        runner: String,
+    },
+
+    /// A composing runner selected a runner already active in this build path.
+    #[error("recursive build through runner '{runner}' is not allowed")]
+    RecursiveBuild {
+        /// Re-entered runner name.
+        runner: String,
+    },
+
     /// The selected runner failed to build the task.
     #[error("runner '{runner}' failed to build task: {source}")]
     Build {

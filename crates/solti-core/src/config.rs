@@ -1,6 +1,7 @@
-//! # State retention
+//! # Core configuration
 //!
 //! [`StateConfig`] controls in-memory task, run, and collection history.
+//! [`ReconciliationConfig`] bounds runner construction.
 //!
 //! ```text
 //! Taskvisor events
@@ -17,6 +18,7 @@
 use std::time::Duration;
 
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 const DEFAULT_MAX_RUNS_PER_TASK: usize = 256;
 const DEFAULT_RUN_TTL: Duration = Duration::from_secs(3_600);
@@ -24,6 +26,9 @@ const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 const DEFAULT_TASK_TTL: Duration = Duration::from_secs(3_600);
 const DEFAULT_WATCH_HISTORY_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 const DEFAULT_WATCH_HISTORY_CAPACITY: usize = 4_096;
+const DEFAULT_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_CONCURRENT_BUILDS: usize = 32;
+const DEFAULT_MAX_CONCURRENT_BUILDS_PER_RUNNER: usize = 8;
 
 /// Error from checked core configuration.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -35,6 +40,24 @@ pub enum ConfigError {
     Zero {
         /// Stable field name.
         field: &'static str,
+    },
+    /// A positive limit was below its structural minimum.
+    #[error("{field} must be at least {minimum}")]
+    #[non_exhaustive]
+    BelowMinimum {
+        /// Stable field name for the invalid value.
+        field: &'static str,
+        /// Smallest accepted value.
+        minimum: usize,
+    },
+    /// One positive limit exceeded another limit.
+    #[error("{field} must not exceed {limit}")]
+    #[non_exhaustive]
+    Exceeds {
+        /// Stable field name for the invalid value.
+        field: &'static str,
+        /// Stable field name for the upper bound.
+        limit: &'static str,
     },
 }
 
@@ -204,6 +227,138 @@ impl Default for StateConfig {
     }
 }
 
+/// Runner-build admission and deadline settings.
+///
+/// Admission applies only to routed runner builds. One global slot covers an
+/// outer build and its nested catalog builds. Every selected runner, including
+/// a nested catalog runner, consumes its own per-runner slot. Embedded tasks
+/// already carry a built [`taskvisor::TaskRef`] and do not consume build slots.
+///
+/// The defaults are SDK policy values, not a claim of a benchmark-derived
+/// optimum. Applications can replace them with values measured for their runner
+/// workloads and service objectives.
+///
+/// | Value                                                                      | Default    |
+/// |----------------------------------------------------------------------------|------------|
+/// | [`build_timeout`](Self::build_timeout)                                     | 30 seconds |
+/// | [`max_concurrent_builds`](Self::max_concurrent_builds)                     | 32         |
+/// | [`max_concurrent_builds_per_runner`](Self::max_concurrent_builds_per_runner) | 8          |
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub struct ReconciliationConfig {
+    build_timeout: Duration,
+    max_concurrent_builds: usize,
+    max_concurrent_builds_per_runner: usize,
+}
+
+impl ReconciliationConfig {
+    /// Creates the default reconciliation settings.
+    pub const fn new() -> Self {
+        Self {
+            build_timeout: DEFAULT_BUILD_TIMEOUT,
+            max_concurrent_builds: DEFAULT_MAX_CONCURRENT_BUILDS,
+            max_concurrent_builds_per_runner: DEFAULT_MAX_CONCURRENT_BUILDS_PER_RUNNER,
+        }
+    }
+
+    /// Returns the deadline for one admitted runner build.
+    ///
+    /// The deadline includes nested catalog construction and admission waits.
+    pub const fn build_timeout(&self) -> Duration {
+        self.build_timeout
+    }
+
+    /// Returns the concurrent outer runner-build limit.
+    pub const fn max_concurrent_builds(&self) -> usize {
+        self.max_concurrent_builds
+    }
+
+    /// Returns the concurrent build limit for one registered runner.
+    ///
+    /// The limit includes nested builds selected from a [`solti_runner::RunnerCatalog`].
+    pub const fn max_concurrent_builds_per_runner(&self) -> usize {
+        self.max_concurrent_builds_per_runner
+    }
+
+    /// Sets the deadline for one admitted runner build, including nested
+    /// catalog construction and admission waits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Zero`] when `build_timeout` is zero.
+    pub const fn try_with_build_timeout(
+        mut self,
+        build_timeout: Duration,
+    ) -> Result<Self, ConfigError> {
+        if build_timeout.is_zero() {
+            return Err(ConfigError::Zero {
+                field: "build_timeout",
+            });
+        }
+        self.build_timeout = build_timeout;
+        Ok(self)
+    }
+
+    /// Sets the concurrent outer runner-build limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Zero`] when `max_concurrent_builds` is zero.
+    /// Returns [`ConfigError::Exceeds`] when the value exceeds the Tokio
+    /// semaphore limit.
+    pub const fn try_with_max_concurrent_builds(
+        mut self,
+        max_concurrent_builds: usize,
+    ) -> Result<Self, ConfigError> {
+        if max_concurrent_builds == 0 {
+            return Err(ConfigError::Zero {
+                field: "max_concurrent_builds",
+            });
+        }
+        if max_concurrent_builds > Semaphore::MAX_PERMITS {
+            return Err(ConfigError::Exceeds {
+                field: "max_concurrent_builds",
+                limit: "semaphore_max_permits",
+            });
+        }
+        self.max_concurrent_builds = max_concurrent_builds;
+        Ok(self)
+    }
+
+    /// Sets the concurrent build limit for one registered runner, including
+    /// nested catalog builds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Zero`] when `max_concurrent_builds_per_runner` is zero.
+    /// Returns [`ConfigError::Exceeds`] when the value exceeds the Tokio
+    /// semaphore limit.
+    pub const fn try_with_max_concurrent_builds_per_runner(
+        mut self,
+        max_concurrent_builds_per_runner: usize,
+    ) -> Result<Self, ConfigError> {
+        if max_concurrent_builds_per_runner == 0 {
+            return Err(ConfigError::Zero {
+                field: "max_concurrent_builds_per_runner",
+            });
+        }
+        if max_concurrent_builds_per_runner > Semaphore::MAX_PERMITS {
+            return Err(ConfigError::Exceeds {
+                field: "max_concurrent_builds_per_runner",
+                limit: "semaphore_max_permits",
+            });
+        }
+        self.max_concurrent_builds_per_runner = max_concurrent_builds_per_runner;
+        Ok(self)
+    }
+}
+
+impl Default for ReconciliationConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +407,79 @@ mod tests {
     fn zero_run_cap_is_valid() {
         let config = StateConfig::new().with_max_runs_per_task(0);
         assert_eq!(config.max_runs_per_task(), 0);
+    }
+
+    #[test]
+    fn reconciliation_defaults_are_explicit() {
+        const CONFIG: ReconciliationConfig = ReconciliationConfig::new();
+        let config = ReconciliationConfig::default();
+
+        assert_eq!(CONFIG, config);
+        assert_eq!(config.build_timeout(), Duration::from_secs(30));
+        assert_eq!(config.max_concurrent_builds(), 32);
+        assert_eq!(config.max_concurrent_builds_per_runner(), 8);
+    }
+
+    #[test]
+    fn reconciliation_limits_reject_zero() {
+        for (actual, field) in [
+            (
+                ReconciliationConfig::new()
+                    .try_with_build_timeout(Duration::ZERO)
+                    .unwrap_err(),
+                "build_timeout",
+            ),
+            (
+                ReconciliationConfig::new()
+                    .try_with_max_concurrent_builds(0)
+                    .unwrap_err(),
+                "max_concurrent_builds",
+            ),
+            (
+                ReconciliationConfig::new()
+                    .try_with_max_concurrent_builds_per_runner(0)
+                    .unwrap_err(),
+                "max_concurrent_builds_per_runner",
+            ),
+        ] {
+            assert_eq!(actual, ConfigError::Zero { field });
+        }
+    }
+
+    #[test]
+    fn reconciliation_limits_reject_values_that_would_panic_semaphore_creation() {
+        for (actual, field) in [
+            (
+                ReconciliationConfig::new()
+                    .try_with_max_concurrent_builds(usize::MAX)
+                    .unwrap_err(),
+                "max_concurrent_builds",
+            ),
+            (
+                ReconciliationConfig::new()
+                    .try_with_max_concurrent_builds_per_runner(usize::MAX)
+                    .unwrap_err(),
+                "max_concurrent_builds_per_runner",
+            ),
+        ] {
+            assert_eq!(
+                actual,
+                ConfigError::Exceeds {
+                    field,
+                    limit: "semaphore_max_permits",
+                }
+            );
+        }
+
+        assert!(
+            ReconciliationConfig::new()
+                .try_with_max_concurrent_builds(Semaphore::MAX_PERMITS)
+                .is_ok()
+        );
+        assert!(
+            ReconciliationConfig::new()
+                .try_with_max_concurrent_builds_per_runner(Semaphore::MAX_PERMITS)
+                .is_ok()
+        );
     }
 }

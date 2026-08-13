@@ -114,6 +114,10 @@ pub enum CoreError {
     #[error("state initialization failed: {0}")]
     StateInitialization(#[source] solti_model::ModelError),
 
+    /// The core-owned persistence delivery worker could not start.
+    #[error("persistence initialization failed: {0}")]
+    PersistenceInitialization(#[source] std::io::Error),
+
     /// Shutdown has started.
     ///
     /// Desired-state writes are no longer accepted.

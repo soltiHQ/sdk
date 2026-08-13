@@ -21,6 +21,7 @@ default   = []
 test-util = ["taskvisor/test-util"]
 
 [dependencies]
+bytes        = { workspace = true }
 solti-model  = { workspace = true }
 solti-runner = { workspace = true }
 
@@ -34,7 +35,7 @@ tokio-stream = { workspace = true, features = ["sync"] }
 tokio-util   = { workspace = true }
 
 [dev-dependencies]
-bytes     = { workspace = true }
+solti-chain = { workspace = true, default-features = false }
 taskvisor = { workspace = true, features = ["test-util"] }
 
 [package.metadata.docs.rs]

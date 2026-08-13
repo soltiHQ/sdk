@@ -32,8 +32,8 @@ pub use status::TaskStatus;
 
 mod task;
 pub use task::{
-    DesiredChange, TASK_API_VERSION, TASK_API_VERSION_MAJOR, TASK_KIND, Task, TaskManifest,
-    TaskManifestMeta, TypeMeta,
+    DesiredChange, MAX_TASK_MANIFEST_BYTES, TASK_API_VERSION, TASK_API_VERSION_MAJOR, TASK_KIND,
+    Task, TaskManifest, TaskManifestMeta, TypeMeta,
 };
 
 mod run;

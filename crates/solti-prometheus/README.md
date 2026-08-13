@@ -6,10 +6,10 @@ Other crates (`solti-runner`, `solti-api`, `solti-discover`, `solti-core`) defin
 ## Quick start
 
 ```rust
-use solti_prometheus::{PrometheusRunnerMetrics, Registry, register_build_info};
+use solti_prometheus::{Error, PrometheusRunnerMetrics, Registry, register_build_info};
 use solti_runner::{MetricsBackend, RunnerErrorKind, RunnerType};
 
-fn main() -> Result<(), prometheus::Error> {
+fn main() -> Result<(), Error> {
     let registry = Registry::new();
 
     register_build_info(&registry, &[("version", env!("CARGO_PKG_VERSION"))])?;
@@ -64,7 +64,7 @@ Metrics adapter and subscriber constructors register their groups immediately.
 | `taskvisor-controller`  | controller metrics on the subscriber       |
 | `full`                  | every integration above                    |
 
-`Registry` and `register_build_info` are always available.
+`Error`, `Registry`, and `register_build_info` are always available.
 The default feature set does not depend on another Solti crate or Taskvisor.
 
 ## Shared registry
@@ -96,9 +96,9 @@ The source crates call them during normal request and discovery handling.
 ```rust
 use solti_api::{ApiMetricsBackend, Transport};
 use solti_discover::{DiscoverFailReason, DiscoverMetricsBackend};
-use solti_prometheus::{PrometheusApiMetrics, PrometheusDiscoverMetrics, Registry};
+use solti_prometheus::{Error, PrometheusApiMetrics, PrometheusDiscoverMetrics, Registry};
 
-fn main() -> Result<(), prometheus::Error> {
+fn main() -> Result<(), Error> {
     let registry = Registry::new();
     let api = PrometheusApiMetrics::new(&registry)?;
     let discover = PrometheusDiscoverMetrics::new(&registry)?;
@@ -132,9 +132,9 @@ The state collector counts task phases on every scrape:
 
 ```rust
 use solti_core::TaskState;
-use solti_prometheus::{PrometheusCoreStateCollector, Registry};
+use solti_prometheus::{Error, PrometheusCoreStateCollector, Registry};
 
-fn main() -> Result<(), prometheus::Error> {
+fn main() -> Result<(), Error> {
     let registry = Registry::new();
     let collector = PrometheusCoreStateCollector::new(TaskState::new())?;
 
@@ -222,6 +222,6 @@ They combine component crates and own the complete binary lifecycle.
 
 ## Errors
 
-Constructors and registration functions return `prometheus::Error`.
+Constructors and registration functions return the re-exported `solti_prometheus::Error`.
 Registering the same metric group twice in one registry returns `AlreadyReg`.
 `server` also validates the embedded revision and returns `solti_model::ModelError`.

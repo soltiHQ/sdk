@@ -170,6 +170,10 @@ impl ObjectMeta {
         &self.annotations
     }
 
+    pub(crate) fn into_manifest_parts(self) -> (TaskId, Labels, Annotations) {
+        (self.name, self.labels, self.annotations)
+    }
+
     /// Assigns an opaque state-store version.
     ///
     /// The value is stored verbatim and is never parsed by the model.

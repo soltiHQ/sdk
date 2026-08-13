@@ -8,26 +8,21 @@
 //! ```text
 //! stdout/stderr bytes
 //!         ▼
-//! byte limit ──► drain remaining bytes in the line
-//!         ▼
-//! lossy UTF-8 decoding
-//!         ▼
-//! character limit
+//! byte limit ──► drain remainder of an oversized line
 //!      ┌──┴────────────────┐
 //!      ▼                   ▼
 //! optional tracing     OutputSink
-//! control bytes        decoded line
-//! are escaped
+//! lossy UTF-8 +        exact retained bytes
+//! escaped controls     + truncation status
 //! ```
 //!
-//! Invalid UTF-8 uses replacement characters.
-//! Control characters except tab are escaped only in the tracing copy.
+//! UTF-8 conversion and control-character escaping are confined to the
+//! opt-in tracing copy. They never modify bytes sent to [`OutputSink`].
 
-use std::borrow::Cow;
+use std::{borrow::Cow, fmt::Write as _, io};
 
-use bytes::Bytes;
 use solti_runner::OutputSink;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
 use tracing::{debug, info, trace, warn};
 
 /// Configuration for workload output logging.
@@ -36,8 +31,8 @@ use tracing::{debug, info, trace, warn};
 ///
 /// | Field                    | Default | Meaning                                    |
 /// |--------------------------|---------|--------------------------------------------|
-/// | `max_line_length`        | `4096`  | Unicode scalar values retained             |
-/// | `max_line_bytes`         | `65536` | Input bytes retained before draining       |
+/// | `max_line_length`        | `4096`  | Maximum raw bytes published per line       |
+/// | `max_line_bytes`         | `65536` | Hard retained-byte ceiling per line        |
 /// | `emit_output_to_tracing` | `false` | Copy workload lines into `tracing`         |
 /// | `stdout_info`            | `true`  | Use `INFO` instead of `DEBUG` for stdout   |
 /// | `stderr_warn`            | `true`  | Use `WARN` instead of `DEBUG` for stderr   |
@@ -46,11 +41,15 @@ use tracing::{debug, info, trace, warn};
 /// They are validated when the runner is created.
 #[derive(Debug, Clone, Copy)]
 pub struct LogConfig {
-    /// Maximum emitted line length in Unicode scalar values.
-    pub max_line_length: usize,
-    /// Maximum retained input bytes per line.
+    /// Maximum raw bytes published per line.
     ///
-    /// Remaining bytes are drained through the next newline.
+    /// This byte-based interpretation keeps arbitrary subprocess output exact.
+    pub max_line_length: usize,
+    /// Hard maximum retained input bytes per line.
+    ///
+    /// The effective published limit is the lesser of this field and
+    /// [`Self::max_line_length`]. Remaining bytes are drained through the next
+    /// newline and the published chunk is marked as truncated.
     pub max_line_bytes: usize,
     /// Copies workload stdout and stderr into `tracing`.
     ///
@@ -105,7 +104,7 @@ impl StreamKind {
 
 /// Reads, limits, and publishes one workload stream.
 pub(crate) async fn log_stream<R>(
-    reader: R,
+    mut reader: R,
     run_id: &str,
     stream: StreamKind,
     config: &LogConfig,
@@ -113,21 +112,38 @@ pub(crate) async fn log_stream<R>(
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut reader = BufReader::new(reader);
     let stream_name = stream.as_str();
+
+    if output_sink.is_none() && !config.emit_output_to_tracing {
+        let mut sink = tokio::io::sink();
+        match tokio::io::copy(&mut reader, &mut sink).await {
+            Ok(total_bytes) => trace!(
+                event = "workload.stream_closed",
+                run_id = %run_id,
+                stream = %stream_name,
+                total_bytes,
+                "stream closed"
+            ),
+            Err(error) => warn!(
+                event = "workload.stream_read_failed",
+                run_id = %run_id,
+                stream = %stream_name,
+                error = %error,
+                "error while draining workload stream"
+            ),
+        }
+        return;
+    }
+
+    let mut reader = BufReader::new(reader);
     let mut line_count = 0u64;
     let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let retained_limit = config.max_line_length.min(config.max_line_bytes);
 
     loop {
-        buf.clear();
-        let read_result = (&mut reader)
-            .take(config.max_line_bytes as u64)
-            .read_until(b'\n', &mut buf)
-            .await;
-
-        let bytes_read = match read_result {
-            Ok(0) => break,
-            Ok(n) => n,
+        let truncated = match read_bounded_line(&mut reader, &mut buf, retained_limit).await {
+            Ok(None) => break,
+            Ok(Some(truncated)) => truncated,
             Err(e) => {
                 warn!(
                     event = "workload.stream_read_failed",
@@ -140,92 +156,66 @@ pub(crate) async fn log_stream<R>(
                 break;
             }
         };
-
-        let mut hit_cap = bytes_read == config.max_line_bytes && !buf.ends_with(b"\n");
-        if buf.ends_with(b"\n") {
-            buf.pop();
-            if buf.ends_with(b"\r") {
-                buf.pop();
-            }
-        }
-
-        if hit_cap {
-            let mut drained_any = false;
-            let mut junk: Vec<u8> = Vec::with_capacity(256);
-            loop {
-                junk.clear();
-                match (&mut reader)
-                    .take(config.max_line_bytes as u64)
-                    .read_until(b'\n', &mut junk)
-                    .await
-                {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        drained_any = true;
-                        if junk.last() == Some(&b'\n') {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            if !drained_any {
-                hit_cap = false;
-            }
-        }
-
-        let raw_line = String::from_utf8_lossy(&buf).into_owned();
-        let raw_line = if hit_cap {
-            format!(
-                "{raw_line} ...[line exceeded {} bytes, truncated]",
-                config.max_line_bytes
-            )
-        } else {
-            raw_line
-        };
-
-        let line = truncate_line(&raw_line, config.max_line_length);
-        let log_line = sanitize_line(&line);
         line_count += 1;
 
-        if config.emit_output_to_tracing && stream.use_elevated_level(config) {
-            match stream {
-                StreamKind::Stdout => info!(target: "solti_exec::workload",
+        let trace_enabled = config.emit_output_to_tracing
+            && match (stream, stream.use_elevated_level(config)) {
+                (StreamKind::Stdout, true) => {
+                    tracing::enabled!(target: "solti_exec::workload", tracing::Level::INFO)
+                }
+                (StreamKind::Stderr, true) => {
+                    tracing::enabled!(target: "solti_exec::workload", tracing::Level::WARN)
+                }
+                (_, false) => {
+                    tracing::enabled!(target: "solti_exec::workload", tracing::Level::DEBUG)
+                }
+            };
+        if trace_enabled {
+            let decoded = String::from_utf8_lossy(&buf);
+            let log_line = sanitize_line(&decoded);
+            if stream.use_elevated_level(config) {
+                match stream {
+                    StreamKind::Stdout => info!(target: "solti_exec::workload",
+                        event = "workload.output",
+                        run_id = %run_id,
+                        stream = %stream_name,
+                        line_num = line_count,
+                        retained_bytes = buf.len(),
+                        truncated,
+                        line = %log_line,
+                        "workload output"
+                    ),
+                    StreamKind::Stderr => warn!(target: "solti_exec::workload",
+                        event = "workload.output",
+                        run_id = %run_id,
+                        stream = %stream_name,
+                        line_num = line_count,
+                        retained_bytes = buf.len(),
+                        truncated,
+                        line = %log_line,
+                        "workload output"
+                    ),
+                }
+            } else {
+                debug!(target: "solti_exec::workload",
                     event = "workload.output",
                     run_id = %run_id,
                     stream = %stream_name,
                     line_num = line_count,
+                    retained_bytes = buf.len(),
+                    truncated,
                     line = %log_line,
                     "workload output"
-                ),
-                StreamKind::Stderr => warn!(target: "solti_exec::workload",
-                    event = "workload.output",
-                    run_id = %run_id,
-                    stream = %stream_name,
-                    line_num = line_count,
-                    line = %log_line,
-                    "workload output"
-                ),
+                );
             }
-        } else if config.emit_output_to_tracing {
-            debug!(target: "solti_exec::workload",
-                event = "workload.output",
-                run_id = %run_id,
-                stream = %stream_name,
-                line_num = line_count,
-                line = %log_line,
-                "workload output"
-            );
         }
 
         if let Some(sink) = output_sink {
-            let bytes_line: Bytes = match line {
-                Cow::Borrowed(s) => Bytes::copy_from_slice(s.as_bytes()),
-                Cow::Owned(s) => Bytes::from(s),
-            };
-            match stream {
-                StreamKind::Stdout => sink.stdout_line(bytes_line),
-                StreamKind::Stderr => sink.stderr_line(bytes_line),
+            match (stream, truncated) {
+                (StreamKind::Stdout, false) => sink.stdout_line_bytes(&buf),
+                (StreamKind::Stdout, true) => sink.stdout_line_bytes_truncated(&buf),
+                (StreamKind::Stderr, false) => sink.stderr_line_bytes(&buf),
+                (StreamKind::Stderr, true) => sink.stderr_line_bytes_truncated(&buf),
             }
         }
     }
@@ -239,15 +229,88 @@ pub(crate) async fn log_stream<R>(
     );
 }
 
+/// Reads one delimiter-free byte prefix and drains any omitted suffix.
+async fn read_bounded_line<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    retained_limit: usize,
+) -> io::Result<Option<bool>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    buf.clear();
+
+    // Two probe bytes distinguish an exact-length line ending in either LF or
+    // CRLF from a line whose content actually exceeds the retained limit.
+    let probe_limit = u64::try_from(retained_limit)
+        .unwrap_or(u64::MAX)
+        .saturating_add(2);
+    let bytes_read = (&mut *reader)
+        .take(probe_limit)
+        .read_until(b'\n', buf)
+        .await?;
+    if bytes_read == 0 {
+        return Ok(None);
+    }
+
+    let terminated = buf.last() == Some(&b'\n');
+    if terminated {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    }
+
+    let truncated = buf.len() > retained_limit;
+    if truncated {
+        buf.truncate(retained_limit);
+        if !terminated {
+            drain_through_newline(reader).await?;
+        }
+    }
+
+    Ok(Some(truncated))
+}
+
+async fn drain_through_newline<R>(reader: &mut R) -> io::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+{
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(());
+        }
+    }
+}
+
 /// Escapes control characters for tracing output.
 ///
-/// Every ASCII control character except tab becomes a `\xNN` sequence.
+/// Every control character except tab is escaped. ASCII controls become
+/// `\xNN`; non-ASCII controls, line and paragraph separators, and
+/// bidirectional formatting controls become visible `\u{NNNN}` sequences.
 ///
 /// Clean lines are returned without allocation.
-/// The output sink receives the unsanitized limited line.
+/// The output sink never passes through this function.
 pub(crate) fn sanitize_line(line: &str) -> Cow<'_, str> {
     fn needs_escape(c: char) -> bool {
-        c.is_ascii_control() && c != '\t'
+        (c.is_control() && c != '\t')
+            || matches!(
+                c,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            )
     }
 
     let Some(first) = line.find(needs_escape) else {
@@ -259,10 +322,14 @@ pub(crate) fn sanitize_line(line: &str) -> Cow<'_, str> {
     out.push_str(&line[..first]);
     for c in line[first..].chars() {
         if needs_escape(c) {
-            let b = c as u8;
-            out.push_str("\\x");
-            out.push(HEX[usize::from(b >> 4)] as char);
-            out.push(HEX[usize::from(b & 0x0f)] as char);
+            if c.is_ascii() {
+                let b = c as u8;
+                out.push_str("\\x");
+                out.push(HEX[usize::from(b >> 4)] as char);
+                out.push(HEX[usize::from(b & 0x0f)] as char);
+            } else {
+                write!(out, "\\u{{{:04x}}}", c as u32).expect("writing to String cannot fail");
+            }
         } else {
             out.push(c);
         }
@@ -270,27 +337,11 @@ pub(crate) fn sanitize_line(line: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Truncates a line by Unicode scalar count.
-///
-/// Short lines are returned without allocation.
-/// The suffix reports the number of removed bytes.
-pub(crate) fn truncate_line(line: &str, max_chars: usize) -> Cow<'_, str> {
-    match line.char_indices().nth(max_chars) {
-        None => Cow::Borrowed(line),
-        Some((i, _)) => {
-            let skipped_bytes = line.len() - i;
-            Cow::Owned(format!(
-                "{}... (truncated {skipped_bytes} bytes)",
-                &line[..i]
-            ))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use bytes::Bytes;
     use solti_model::OutputEvent;
     use solti_runner::OutputSink;
     use std::{
@@ -354,52 +405,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_line_short_line_borrowed() {
-        let result = truncate_line("hello", 10);
-        assert!(matches!(result, Cow::Borrowed(_)));
-        assert_eq!(&*result, "hello");
-    }
-
-    #[test]
-    fn truncate_line_exact_length_borrowed() {
-        let result = truncate_line("hello", 5);
-        assert!(matches!(result, Cow::Borrowed(_)));
-        assert_eq!(&*result, "hello");
-    }
-
-    #[test]
-    fn truncate_line_truncates_long_line() {
-        let result = truncate_line("hello world", 5);
-        assert!(matches!(result, Cow::Owned(_)));
-        assert_eq!(&*result, "hello... (truncated 6 bytes)");
-    }
-
-    #[test]
-    fn truncate_line_empty_string_borrowed() {
-        let result = truncate_line("", 10);
-        assert!(matches!(result, Cow::Borrowed(_)));
-        assert_eq!(&*result, "");
-    }
-
-    #[test]
-    fn truncate_line_unicode_cyrillic() {
-        let result = truncate_line("привет", 2);
-        assert_eq!(&*result, "пр... (truncated 8 bytes)");
-    }
-
-    #[test]
-    fn truncate_line_unicode_hebrew() {
-        let result = truncate_line("שלום", 2);
-        assert_eq!(&*result, "של... (truncated 4 bytes)");
-    }
-
-    #[test]
-    fn truncate_line_single_char_limit() {
-        let result = truncate_line("abc", 1);
-        assert_eq!(&*result, "a... (truncated 2 bytes)");
-    }
-
-    #[test]
     fn sanitize_line_clean_line_borrowed() {
         let result = sanitize_line("hello world");
         assert!(matches!(result, Cow::Borrowed(_)));
@@ -443,6 +448,23 @@ mod tests {
         assert_eq!(&*sanitize_line("привет\x1bмир"), "привет\\x1bмир");
     }
 
+    #[test]
+    fn sanitize_line_escapes_unicode_line_boundaries() {
+        assert_eq!(
+            &*sanitize_line("a\u{0085}b\u{009b}c\u{2028}d\u{2029}e"),
+            "a\\u{0085}b\\u{009b}c\\u{2028}d\\u{2029}e"
+        );
+    }
+
+    #[test]
+    fn sanitize_line_escapes_bidirectional_formatting_controls() {
+        let controls = "\u{061c}\u{200e}\u{200f}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}";
+        assert_eq!(
+            &*sanitize_line(controls),
+            "\\u{061c}\\u{200e}\\u{200f}\\u{202a}\\u{202b}\\u{202c}\\u{202d}\\u{202e}\\u{2066}\\u{2067}\\u{2068}\\u{2069}"
+        );
+    }
+
     #[tokio::test]
     async fn log_stream_sink_receives_raw_control_bytes() {
         let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
@@ -464,6 +486,31 @@ mod tests {
                     b"\x1b[31mred\x1b[0m",
                     "broadcast path must carry raw bytes, not the sanitized tracing copy"
                 );
+                assert!(!c.truncated);
+            }
+            other => panic!("expected Chunk, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn log_stream_preserves_invalid_utf8_exactly() {
+        let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
+        let sink = output_sink(tx, 1);
+        let input = [b'h', b'i', 0xff, 0xfe, b'\n'];
+
+        log_stream(
+            input.as_slice(),
+            "task-binary",
+            StreamKind::Stdout,
+            &LogConfig::default(),
+            Some(&sink),
+        )
+        .await;
+
+        match rx.recv().await.unwrap() {
+            OutputEvent::Chunk(chunk) => {
+                assert_eq!(&chunk.line[..], &input[..input.len() - 1]);
+                assert!(!chunk.truncated);
             }
             other => panic!("expected Chunk, got {other:?}"),
         }
@@ -518,7 +565,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn log_stream_pushes_truncated_line_not_raw() {
+    async fn log_stream_publishes_exact_prefix_with_explicit_truncation() {
         let cfg = LogConfig {
             max_line_length: 5,
             ..LogConfig::default()
@@ -537,12 +584,8 @@ mod tests {
 
         match rx.recv().await.unwrap() {
             OutputEvent::Chunk(c) => {
-                let line_text = std::str::from_utf8(&c.line).expect("line must be UTF-8");
-                assert!(
-                    line_text.starts_with("hello"),
-                    "expected truncated, got {line_text:?}"
-                );
-                assert!(line_text.contains("truncated"));
+                assert_eq!(&c.line[..], b"hello");
+                assert!(c.truncated);
             }
             other => panic!("expected Chunk, got {other:?}"),
         }
@@ -558,7 +601,7 @@ mod tests {
         let sink = output_sink(tx, 1);
 
         log_stream(
-            b"AAAAAAAA\nKEEPME\n".as_slice(),
+            b"AAAAAAAAA\nKEEPME\n".as_slice(),
             "task-cap",
             StreamKind::Stdout,
             &cfg,
@@ -569,12 +612,16 @@ mod tests {
         let mut lines = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             if let OutputEvent::Chunk(c) = ev {
-                lines.push(String::from_utf8_lossy(&c.line).into_owned());
+                lines.push((c.line, c.truncated));
             }
         }
-        assert!(
-            lines.iter().any(|l| l == "KEEPME"),
-            "the line after an over-cap line must survive intact, got {lines:?}"
+        assert_eq!(
+            lines,
+            vec![
+                (Bytes::from_static(b"AAAAAAAA"), true),
+                (Bytes::from_static(b"KEEPME"), false),
+            ],
+            "the line after an over-cap line must survive intact"
         );
     }
 
@@ -598,11 +645,36 @@ mod tests {
 
         match rx.recv().await.unwrap() {
             OutputEvent::Chunk(c) => {
-                let s = String::from_utf8_lossy(&c.line);
-                assert_eq!(
-                    s, "AAAAAAAA",
-                    "a complete exact-cap line must not be marked truncated"
-                );
+                assert_eq!(&c.line[..], b"AAAAAAAA");
+                assert!(!c.truncated);
+            }
+            other => panic!("expected Chunk, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_cap_line_with_crlf_is_not_truncated() {
+        let cfg = LogConfig {
+            max_line_bytes: 8,
+            max_line_length: 8,
+            ..LogConfig::default()
+        };
+        let (tx, mut rx) = broadcast::channel::<OutputEvent>(16);
+        let sink = output_sink(tx, 1);
+
+        log_stream(
+            b"AAAAAAAA\r\n".as_slice(),
+            "task-exact-crlf",
+            StreamKind::Stdout,
+            &cfg,
+            Some(&sink),
+        )
+        .await;
+
+        match rx.recv().await.unwrap() {
+            OutputEvent::Chunk(chunk) => {
+                assert_eq!(&chunk.line[..], b"AAAAAAAA");
+                assert!(!chunk.truncated);
             }
             other => panic!("expected Chunk, got {other:?}"),
         }
@@ -672,5 +744,46 @@ mod tests {
         let fields = fields.join(" ");
         assert!(fields.contains("run_id=run-opt-in"));
         assert!(fields.contains("line=visible-line"));
+    }
+
+    #[tokio::test]
+    async fn workload_output_tracing_escapes_unicode_spoofing_controls() {
+        let capture = Arc::new(TraceCapture::default());
+        let dispatch = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let config = LogConfig {
+            emit_output_to_tracing: true,
+            ..LogConfig::default()
+        };
+        let input = "first\u{0085}second\u{2028}third\u{2029}\u{202e}spoof\n";
+        let (tx, mut rx) = broadcast::channel::<OutputEvent>(1);
+        let sink = output_sink(tx, 1);
+
+        log_stream(
+            input.as_bytes(),
+            "run-sanitized",
+            StreamKind::Stdout,
+            &config,
+            Some(&sink),
+        )
+        .await;
+
+        let OutputEvent::Chunk(chunk) = rx.recv().await.unwrap() else {
+            panic!("expected chunk");
+        };
+        assert_eq!(&chunk.line[..], &input.as_bytes()[..input.len() - 1]);
+
+        let events = capture.events.lock().unwrap();
+        let (_, fields) = events
+            .iter()
+            .find(|(target, _)| target == "solti_exec::workload")
+            .expect("opt-in workload event");
+        let fields = fields.join(" ");
+        assert!(fields.contains("line=first\\u{0085}second\\u{2028}third\\u{2029}\\u{202e}spoof"));
+        assert!(
+            ['\u{0085}', '\u{2028}', '\u{2029}', '\u{202e}']
+                .into_iter()
+                .all(|control| !fields.contains(control))
+        );
     }
 }

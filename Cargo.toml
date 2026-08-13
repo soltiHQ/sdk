@@ -16,10 +16,16 @@ resolver = "2"
 
 [workspace.metadata.ci]
 clippy-matrix = [
+    { package = "solti", features = ["model"] },
+    { package = "solti", features = ["model-schema"] },
+    { package = "solti", features = ["chain"] },
+    { package = "solti", features = ["chain-schema"] },
     { package = "solti", features = ["api-core-adapter", "api-grpc-tls", "exec-subprocess"] },
     { package = "solti", features = ["api-core-adapter", "api-http", "discover-http", "exec-subprocess"] },
     { package = "solti", features = ["chain", "core", "exec-subprocess"] },
     { package = "solti", features = ["core", "exec-containerd"] },
+    { package = "solti", features = ["discover-grpc-tls"] },
+    { package = "solti", features = ["discover-http-tls"] },
     { package = "solti-api", features = ["grpc"] },
     { package = "solti-api", features = ["grpc-tls"] },
     { package = "solti-api", features = ["http"] },
@@ -70,10 +76,9 @@ pbjson-build        = "0.9.0"
 prometheus          = "0.14.0"
 prost               = "0.14.4"
 prost-types         = "0.14.4"
-prost-reflect       = { version = "0.16.5", default-features = false }
 protoc-bin-vendored = { version = "3.2.0" }
 rcgen               = "0.14.8"
-reqwest             = "0.13.4"
+reqwest             = { version = "0.13.4", default-features = false }
 rustls              = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 schemars            = "1.2.2"
 seccompiler         = "0.5.0"

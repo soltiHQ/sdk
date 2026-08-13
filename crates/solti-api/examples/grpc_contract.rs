@@ -147,6 +147,7 @@ impl ApiHandler for SnapshotHandler {
                 seq: 0,
                 ts: UNIX_EPOCH + Duration::from_millis(1_100),
                 line: Bytes::from_static(b"resized cover.png"),
+                truncated: false,
             }),
             OutputEvent::RunFinished {
                 generation: 1,

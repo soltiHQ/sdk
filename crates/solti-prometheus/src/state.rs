@@ -81,7 +81,7 @@ fn phase_label(phase: TaskPhase) -> &'static str {
 /// use solti_core::TaskState;
 /// use solti_prometheus::{PrometheusCoreStateCollector, Registry};
 ///
-/// # fn main() -> Result<(), prometheus::Error> {
+/// # fn main() -> Result<(), solti_prometheus::Error> {
 /// let registry = Registry::new();
 /// // In an agent, take the supervisor's shared state instead of a fresh one.
 /// let state = TaskState::new();

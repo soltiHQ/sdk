@@ -5,7 +5,8 @@
 //! gRPC converts it into `tonic::Status`.
 //!
 //! Write conflicts carry structured [`ApiConflict`] details.
-//! Internal diagnostics are logged and hidden from wire clients.
+//! Internal failures are logged by stable category and hidden from wire clients.
+//! The transport boundary does not log the diagnostic string.
 
 use std::fmt;
 
@@ -249,11 +250,11 @@ impl ApiError {
             ApiError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg, None),
             ApiError::ResourceVersionExpired(msg) => (StatusCode::GONE, msg, None),
             ApiError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg, None),
-            ApiError::Internal(msg) => {
+            ApiError::Internal(_) => {
                 tracing::error!(
                     event = "api.internal_error",
                     transport = "http",
-                    error = %msg,
+                    error_kind = "internal",
                     "api request failed internally"
                 );
                 (
@@ -423,11 +424,11 @@ impl From<ApiError> for tonic::Status {
             ApiError::UnsupportedMediaType(msg) => tonic::Status::invalid_argument(msg),
             ApiError::ResourceVersionExpired(msg) => tonic::Status::out_of_range(msg),
             ApiError::Unavailable(msg) => tonic::Status::unavailable(msg),
-            ApiError::Internal(msg) => {
+            ApiError::Internal(_) => {
                 tracing::error!(
                     event = "api.internal_error",
                     transport = "grpc",
-                    error = %msg,
+                    error_kind = "internal",
                     "api request failed internally"
                 );
                 tonic::Status::internal("internal server error")
@@ -456,6 +457,64 @@ fn http_field_path(field: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(feature = "grpc", feature = "http"))]
+    use std::{
+        fmt,
+        sync::{Arc, Mutex},
+    };
+    #[cfg(any(feature = "grpc", feature = "http"))]
+    use tracing::{
+        Event, Metadata, Subscriber,
+        field::{Field, Visit},
+        span::{Attributes, Id, Record},
+    };
+
+    #[cfg(any(feature = "grpc", feature = "http"))]
+    #[derive(Default)]
+    struct TraceCapture {
+        fields: Mutex<Vec<String>>,
+    }
+
+    #[cfg(any(feature = "grpc", feature = "http"))]
+    struct CaptureSubscriber(Arc<TraceCapture>);
+
+    #[cfg(any(feature = "grpc", feature = "http"))]
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut CaptureVisitor(&self.0));
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    #[cfg(any(feature = "grpc", feature = "http"))]
+    struct CaptureVisitor<'a>(&'a TraceCapture);
+
+    #[cfg(any(feature = "grpc", feature = "http"))]
+    impl Visit for CaptureVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.0
+                .fields
+                .lock()
+                .unwrap()
+                .push(format!("{}={value:?}", field.name()));
+        }
+    }
 
     fn conflict() -> ApiConflict {
         ApiConflict::new(
@@ -494,6 +553,40 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(error.as_label(), expected);
         }
+    }
+
+    #[cfg(any(feature = "grpc", feature = "http"))]
+    #[test]
+    fn internal_error_logging_does_not_record_diagnostic() {
+        const SECRET: &str = "api-internal-credential-secret";
+        const FORGED: &str = "forged-api-record";
+
+        // Register each enabled transport callsite before installing the scoped
+        // dispatcher so its interest is deterministic during parallel tests.
+        #[cfg(feature = "grpc")]
+        let _ = tonic::Status::from(ApiError::Internal("safe warmup".into()));
+        #[cfg(feature = "http")]
+        let _ = ApiError::Internal("safe warmup".into()).into_http_status();
+
+        let capture = Arc::new(TraceCapture::default());
+        let dispatch = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let diagnostic = format!("{SECRET}\n{FORGED}");
+
+        #[cfg(feature = "grpc")]
+        let _ = tonic::Status::from(ApiError::Internal(diagnostic.clone()));
+        #[cfg(feature = "http")]
+        let _ = ApiError::Internal(diagnostic).into_http_status();
+
+        let fields = capture.fields.lock().unwrap().join(" ");
+        assert!(fields.contains("api.internal_error"), "{fields}");
+        assert!(fields.contains("error_kind=\"internal\""), "{fields}");
+        #[cfg(feature = "grpc")]
+        assert!(fields.contains("transport=\"grpc\""), "{fields}");
+        #[cfg(feature = "http")]
+        assert!(fields.contains("transport=\"http\""), "{fields}");
+        assert!(!fields.contains(SECRET), "{fields}");
+        assert!(!fields.contains(FORGED), "{fields}");
     }
 
     #[cfg(feature = "http")]

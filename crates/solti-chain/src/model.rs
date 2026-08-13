@@ -404,7 +404,11 @@ impl TryFrom<ExtensionWorkload> for ChainSpec {
     type Error = ChainError;
 
     fn try_from(workload: ExtensionWorkload) -> Result<Self, Self::Error> {
-        (&workload).try_into()
+        let (api_version, kind, spec) = workload.into_parts();
+        if api_version != CHAIN_API_VERSION || kind != CHAIN_KIND {
+            return Err(unexpected_workload(&api_version, &kind));
+        }
+        Ok(serde_json::from_value(spec)?)
     }
 }
 
@@ -423,7 +427,10 @@ impl TryFrom<TaskWorkload> for ChainSpec {
     type Error = ChainError;
 
     fn try_from(workload: TaskWorkload) -> Result<Self, Self::Error> {
-        (&workload).try_into()
+        match workload {
+            TaskWorkload::Extension(extension) => extension.try_into(),
+            other => Err(unexpected_workload(other.api_version(), other.kind())),
+        }
     }
 }
 

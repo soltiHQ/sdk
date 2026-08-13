@@ -26,6 +26,8 @@ use solti_model::{AgentCapabilities, Labels, RunnerCapability, Task, TaskWorkloa
 use taskvisor::TaskRef;
 use tracing::{debug, instrument, trace};
 
+use crate::admission::{BuildScope, EnterBuildError, RunnerBuildAdmission};
+use crate::cancellation::BuildCancellation;
 use crate::error::RouterError;
 use crate::runner::Runner;
 use crate::{context::BuildContext, id::make_run_id, output::OutputPublisherHandle};
@@ -54,6 +56,7 @@ pub struct RunnerCatalog {
 impl RunnerCatalog {
     /// Selects a snapshotted runner and builds a [`TaskRef`].
     ///
+    /// This direct build is unmanaged and does not apply core admission limits.
     /// The provided context is passed to the selected runner.
     /// The catalog allocates one [`RunId`](crate::RunId), and the returned task name must equal [`RunId::name`](crate::RunId::name).
     ///
@@ -72,8 +75,84 @@ impl RunnerCatalog {
             workload_kind = task.spec().workload().kind()
         )
     )]
-    pub fn build(&self, task: &Task, ctx: &BuildContext) -> Result<TaskRef, RouterError> {
-        build_from_entries(&self.runners, task, ctx)
+    pub async fn build(&self, task: &Task, ctx: &BuildContext) -> Result<TaskRef, RouterError> {
+        self.build_with_cancellation(task, ctx, BuildCancellation::new())
+            .await
+    }
+
+    /// Selects a snapshotted runner and builds with an external cancellation signal.
+    ///
+    /// The caller retains the matching
+    /// [`BuildCancellationHandle`](crate::BuildCancellationHandle).
+    /// The build future owns all runner work. Cancellation is cooperative for
+    /// child operations and dropping the future cancels the build scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::build`].
+    pub async fn build_with_cancellation(
+        &self,
+        task: &Task,
+        ctx: &BuildContext,
+        cancellation: BuildCancellation,
+    ) -> Result<TaskRef, RouterError> {
+        build_unmanaged_from_entries(&self.runners, task, ctx, &cancellation).await
+    }
+
+    /// Selects and builds a nested runner within an inherited admission scope.
+    ///
+    /// The nested build reuses the outer global permit and acquires the
+    /// selected runner's per-runner permit. Composing runners must use this
+    /// method instead of [`Self::build`] so managed core limits include every
+    /// nested runner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouterError::RecursiveBuild`] when the selected runner already
+    /// exists in the active build path. Returns
+    /// [`RouterError::BuildCancelled`] when cancellation wins while the build
+    /// waits for a per-runner permit. Otherwise returns the same errors as
+    /// [`Self::build`].
+    pub async fn build_scoped_with_cancellation(
+        &self,
+        task: &Task,
+        ctx: &BuildContext,
+        cancellation: &BuildCancellation,
+        scope: &mut BuildScope,
+    ) -> Result<TaskRef, RouterError> {
+        build_scoped_from_entries(&self.runners, task, ctx, cancellation, scope).await
+    }
+}
+
+/// One outer runner build after managed admission succeeds.
+///
+/// The value owns the global and outer-runner permits until
+/// [`build`](Self::build) finishes or the value is dropped.
+#[must_use]
+pub struct AdmittedBuild {
+    entry: RunnerEntry,
+    task: Task,
+    ctx: BuildContext,
+    cancellation: BuildCancellation,
+    scope: BuildScope,
+}
+
+impl AdmittedBuild {
+    /// Builds the admitted task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouterError`] when runner construction or returned-name
+    /// validation fails.
+    pub async fn build(mut self) -> Result<TaskRef, RouterError> {
+        build_entry(
+            &self.entry,
+            &self.task,
+            &self.ctx,
+            &self.cancellation,
+            &mut self.scope,
+        )
+        .await
     }
 }
 
@@ -216,8 +295,20 @@ impl RunnerRouter {
         Ok(pick_entry(&self.runners, task)?.runner.as_ref())
     }
 
+    /// Returns the selected runner name without building the task.
+    ///
+    /// Core uses this stable registration snapshot for per-runner admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same selection errors as [`Self::pick`].
+    pub fn runner_name<'a>(&'a self, task: &Task) -> Result<&'a str, RouterError> {
+        Ok(pick_entry(&self.runners, task)?.capability.name())
+    }
+
     /// Builds a [`TaskRef`] with the selected runner.
     ///
+    /// This direct build is unmanaged and does not apply core admission limits.
     /// The router allocates one [`RunId`](crate::RunId).
     /// It passes the id and build context to the runner.
     /// The returned task name must equal [`RunId::name`](crate::RunId::name).
@@ -237,8 +328,56 @@ impl RunnerRouter {
             workload_kind = task.spec().workload().kind()
         )
     )]
-    pub fn build(&self, task: &Task) -> Result<TaskRef, RouterError> {
-        build_from_entries(&self.runners, task, &self.ctx)
+    pub async fn build(&self, task: &Task) -> Result<TaskRef, RouterError> {
+        self.build_with_cancellation(task, BuildCancellation::new())
+            .await
+    }
+
+    /// Builds with an external cancellation signal.
+    ///
+    /// The caller retains the matching
+    /// [`BuildCancellationHandle`](crate::BuildCancellationHandle).
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::build`].
+    pub async fn build_with_cancellation(
+        &self,
+        task: &Task,
+        cancellation: BuildCancellation,
+    ) -> Result<TaskRef, RouterError> {
+        build_unmanaged_from_entries(&self.runners, task, &self.ctx, &cancellation).await
+    }
+
+    /// Acquires managed admission for one selected outer runner build.
+    ///
+    /// Waiting for root admission is outside the admitted build. Nested builds
+    /// created by the returned value reuse its global permit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same selection errors as [`Self::pick`]. Returns
+    /// [`RouterError::BuildCancelled`] when cancellation wins while admission
+    /// is pending.
+    pub async fn admit(
+        &self,
+        task: &Task,
+        admission: &RunnerBuildAdmission,
+        cancellation: BuildCancellation,
+    ) -> Result<AdmittedBuild, RouterError> {
+        let entry = pick_entry(&self.runners, task)?.clone();
+        let runner_name = entry.capability.name();
+        let scope = admission
+            .enter_root(runner_name, &cancellation)
+            .await
+            .map_err(|error| map_enter_error(runner_name, error))?;
+        Ok(AdmittedBuild {
+            entry,
+            task: task.clone(),
+            ctx: self.ctx.clone(),
+            cancellation,
+            scope,
+        })
     }
 }
 
@@ -274,10 +413,11 @@ fn pick_entry<'a>(runners: &'a [RunnerEntry], task: &Task) -> Result<&'a RunnerE
     Ok(first)
 }
 
-fn build_from_entries(
+async fn build_unmanaged_from_entries(
     runners: &[RunnerEntry],
     task: &Task,
     ctx: &BuildContext,
+    cancellation: &BuildCancellation,
 ) -> Result<TaskRef, RouterError> {
     trace!(
         event = "runner.route",
@@ -288,13 +428,50 @@ fn build_from_entries(
         workload_kind = task.spec().workload().kind(),
         "router received task"
     );
+    let entry = pick_entry(runners, task)?;
+    let mut scope = BuildScope::unmanaged(entry.capability.name());
+    build_entry(entry, task, ctx, cancellation, &mut scope).await
+}
+
+async fn build_scoped_from_entries(
+    runners: &[RunnerEntry],
+    task: &Task,
+    ctx: &BuildContext,
+    cancellation: &BuildCancellation,
+    scope: &mut BuildScope,
+) -> Result<TaskRef, RouterError> {
+    trace!(
+        event = "runner.route",
+        task_name = %task.name(),
+        generation = task.metadata().generation(),
+        slot = %task.slot(),
+        workload_api_version = task.spec().workload().api_version(),
+        workload_kind = task.spec().workload().kind(),
+        "router received nested task"
+    );
 
     let entry = pick_entry(runners, task)?;
+    let runner_name = entry.capability.name();
+    let mut child_scope = scope
+        .enter_child(runner_name, cancellation)
+        .await
+        .map_err(|error| map_enter_error(runner_name, error))?;
+    build_entry(entry, task, ctx, cancellation, &mut child_scope).await
+}
+
+async fn build_entry(
+    entry: &RunnerEntry,
+    task: &Task,
+    ctx: &BuildContext,
+    cancellation: &BuildCancellation,
+    scope: &mut BuildScope,
+) -> Result<TaskRef, RouterError> {
     let runner = entry.runner.as_ref();
     let runner_name = entry.capability.name().to_owned();
     let run_id = make_run_id(&runner_name, task.slot().as_str());
     let task_ref = runner
-        .build_task(task, &run_id, ctx)
+        .build_task(task, &run_id, ctx, cancellation, scope)
+        .await
         .map_err(|source| RouterError::Build {
             runner: runner_name.clone(),
             source,
@@ -315,6 +492,17 @@ fn build_from_entries(
         "runner built task"
     );
     Ok(task_ref)
+}
+
+fn map_enter_error(runner: &str, error: EnterBuildError) -> RouterError {
+    match error {
+        EnterBuildError::Cancelled => RouterError::BuildCancelled {
+            runner: runner.to_owned(),
+        },
+        EnterBuildError::Recursive => RouterError::RecursiveBuild {
+            runner: runner.to_owned(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -380,6 +568,7 @@ mod tests {
         workload_types: Vec<WorkloadTypeMeta>,
     }
 
+    #[crate::async_trait]
     impl Runner for DeclaredRunner {
         fn name(&self) -> &str {
             self.name
@@ -389,11 +578,13 @@ mod tests {
             self.workload_types.clone()
         }
 
-        fn build_task(
+        async fn build_task(
             &self,
             _task: &Task,
             run_id: &RunId,
             _ctx: &BuildContext,
+            _cancellation: &BuildCancellation,
+            _scope: &mut BuildScope,
         ) -> Result<TaskRef, RunnerError> {
             Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move {
                 Ok::<(), TaskError>(())
@@ -445,8 +636,8 @@ mod tests {
         )))
     }
 
-    #[test]
-    fn embedded_workloads_are_not_routed_by_pick_or_build() {
+    #[tokio::test]
+    async fn embedded_workloads_are_not_routed_by_pick_or_build() {
         let router = RunnerRouter::new();
         let catalog = router.catalog();
         let task = mk_task(TaskWorkload::Embedded(
@@ -458,17 +649,79 @@ mod tests {
             Err(RouterError::EmbeddedWorkload)
         ));
         assert!(matches!(
-            router.build(&task),
+            router.build(&task).await,
             Err(RouterError::EmbeddedWorkload)
         ));
         assert!(matches!(
-            catalog.build(&task, &BuildContext::default()),
+            catalog.build(&task, &BuildContext::default()).await,
             Err(RouterError::EmbeddedWorkload)
         ));
     }
 
-    #[test]
-    fn build_fails_when_no_runner_supports_kind() {
+    #[tokio::test]
+    async fn scoped_catalog_rejects_same_runner_reentry_with_typed_error() {
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(subprocess_runner("subprocess-only")))
+            .unwrap();
+        let catalog = router.catalog();
+        let task = subprocess_task();
+        let cancellation = BuildCancellation::new();
+        let admission = RunnerBuildAdmission::new(1, 1).unwrap();
+        let mut scope = admission
+            .enter_root("subprocess-only", &cancellation)
+            .await
+            .unwrap();
+
+        let result = catalog
+            .build_scoped_with_cancellation(
+                &task,
+                &BuildContext::default(),
+                &cancellation,
+                &mut scope,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(RouterError::RecursiveBuild { runner }) if runner == "subprocess-only"
+        ));
+    }
+
+    #[tokio::test]
+    async fn scoped_catalog_maps_cancelled_admission_to_typed_error() {
+        let mut router = RunnerRouter::new();
+        router
+            .register(Arc::new(subprocess_runner("subprocess-only")))
+            .unwrap();
+        let catalog = router.catalog();
+        let task = subprocess_task();
+        let root_cancellation = BuildCancellation::new();
+        let admission = RunnerBuildAdmission::new(1, 1).unwrap();
+        let mut scope = admission
+            .enter_root("outer", &root_cancellation)
+            .await
+            .unwrap();
+        let (cancel_handle, cancellation) = BuildCancellation::pair();
+        cancel_handle.cancel();
+
+        let result = catalog
+            .build_scoped_with_cancellation(
+                &task,
+                &BuildContext::default(),
+                &cancellation,
+                &mut scope,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(RouterError::BuildCancelled { runner }) if runner == "subprocess-only"
+        ));
+    }
+
+    #[tokio::test]
+    async fn build_fails_when_no_runner_supports_kind() {
         let mut router = RunnerRouter::new();
         router
             .register(Arc::new(subprocess_runner("subprocess-only")))
@@ -480,7 +733,7 @@ mod tests {
             TaskEnv::default(),
         )));
 
-        let res = router.build(&task);
+        let res = router.build(&task).await;
 
         match res {
             Err(RouterError::NoRunner { api_version, kind }) => {
@@ -492,15 +745,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn router_trace_does_not_record_the_task_payload() {
+    #[tokio::test]
+    async fn router_trace_does_not_record_the_task_payload() {
         const SECRET: &str = "must-not-appear-in-router-trace";
 
         let mut router = RunnerRouter::new();
         router
             .register(Arc::new(subprocess_runner("subprocess-only")))
             .unwrap();
-        let task = mk_task(TaskWorkload::Subprocess(SubprocessSpec::new(
+        let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
             SubprocessMode::Command {
                 command: "echo".into(),
                 args: vec![SECRET.into()],
@@ -508,20 +761,28 @@ mod tests {
             TaskEnv::default(),
             None,
             Flag::enabled(),
-        )));
+        ));
+        let spec = TaskSpec::builder("trace-test-slot", workload, 10_000_u64)
+            .build()
+            .unwrap();
+        let task = Task::new("trace-test-task", spec).unwrap();
+        // Register the production callsites before the scoped dispatcher
+        // rebuilds their interest cache during parallel tests.
+        router.build(&task).await.unwrap();
         let capture = Arc::new(TraceCapture::default());
         let dispatch = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
 
-        tracing::dispatcher::with_default(&dispatch, || router.build(&task).unwrap());
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        router.build(&task).await.unwrap();
 
         let fields = capture.fields.lock().unwrap().join(" ");
-        assert!(fields.contains("task_name=test-task"));
-        assert!(fields.contains("slot=test-slot"));
+        assert!(fields.contains("task_name=trace-test-task"));
+        assert!(fields.contains("slot=trace-test-slot"));
         assert!(!fields.contains(SECRET));
     }
 
-    #[test]
-    fn build_passes_context_and_allocated_run_id() {
+    #[tokio::test]
+    async fn build_passes_context_and_allocated_run_id() {
         struct EnabledOutput;
 
         impl OutputPublisher for EnabledOutput {
@@ -537,6 +798,7 @@ mod tests {
 
         struct ContextRunner;
 
+        #[crate::async_trait]
         impl Runner for ContextRunner {
             fn name(&self) -> &str {
                 "context"
@@ -549,11 +811,13 @@ mod tests {
                 )]
             }
 
-            fn build_task(
+            async fn build_task(
                 &self,
                 _task: &Task,
                 run_id: &RunId,
                 ctx: &BuildContext,
+                _cancellation: &BuildCancellation,
+                _scope: &mut BuildScope,
             ) -> Result<TaskRef, RunnerError> {
                 if ctx.env().get("AGENT_ROOT") != Some("/opt/agent") {
                     return Err(RunnerError::Internal("missing runner environment".into()));
@@ -578,12 +842,12 @@ mod tests {
             .with_output_publisher(Arc::new(EnabledOutput));
         router.register(Arc::new(ContextRunner)).unwrap();
 
-        let task = router.build(&subprocess_task()).unwrap();
+        let task = router.build(&subprocess_task()).await.unwrap();
         assert!(task.name().starts_with("context-test-slot-"));
     }
 
-    #[test]
-    fn catalog_is_a_cloneable_snapshot_with_explicit_context_and_exact_routing() {
+    #[tokio::test]
+    async fn catalog_is_a_cloneable_snapshot_with_explicit_context_and_exact_routing() {
         struct CatalogOutput;
 
         impl OutputPublisher for CatalogOutput {
@@ -601,6 +865,7 @@ mod tests {
             name: &'static str,
         }
 
+        #[crate::async_trait]
         impl Runner for CatalogContextRunner {
             fn name(&self) -> &str {
                 self.name
@@ -613,11 +878,13 @@ mod tests {
                 )]
             }
 
-            fn build_task(
+            async fn build_task(
                 &self,
                 _task: &Task,
                 run_id: &RunId,
                 ctx: &BuildContext,
+                _cancellation: &BuildCancellation,
+                _scope: &mut BuildScope,
             ) -> Result<TaskRef, RunnerError> {
                 if ctx.env().get("CATALOG_CONTEXT") != Some("provided") {
                     return Err(RunnerError::Internal(
@@ -678,7 +945,10 @@ mod tests {
 
         let cloned_catalog = catalog.clone();
         drop(catalog);
-        let built = cloned_catalog.build(&selected_task, &explicit_ctx).unwrap();
+        let built = cloned_catalog
+            .build(&selected_task, &explicit_ctx)
+            .await
+            .unwrap();
         assert!(built.name().starts_with("catalog-us-first-test-slot-"));
 
         let later_task = mk_task(TaskWorkload::Extension(
@@ -690,10 +960,10 @@ mod tests {
             .unwrap(),
         ));
         assert!(matches!(
-            cloned_catalog.build(&later_task, &explicit_ctx),
+            cloned_catalog.build(&later_task, &explicit_ctx).await,
             Err(RouterError::NoRunner { .. })
         ));
-        assert!(router.build(&later_task).is_ok());
+        assert!(router.build(&later_task).await.is_ok());
     }
 
     #[test]
@@ -722,8 +992,8 @@ mod tests {
         assert_eq!(picked.name(), "r2");
     }
 
-    #[test]
-    fn application_defined_gvk_routes_through_registered_runner() {
+    #[tokio::test]
+    async fn application_defined_gvk_routes_through_registered_runner() {
         let workload = TaskWorkload::Extension(
             solti_model::ExtensionWorkload::new(
                 "tasks.example.io/v1",
@@ -741,7 +1011,7 @@ mod tests {
             }))
             .unwrap();
 
-        let built = router.build(&task).unwrap();
+        let built = router.build(&task).await.unwrap();
         assert!(built.name().starts_with("image-resize-test-slot-"));
     }
 
@@ -843,10 +1113,11 @@ mod tests {
         assert_eq!(router.capabilities().runners().len(), 2);
     }
 
-    #[test]
-    fn build_keeps_runner_name_and_source_error() {
+    #[tokio::test]
+    async fn build_keeps_runner_name_and_source_error() {
         struct FailingRunner;
 
+        #[crate::async_trait]
         impl Runner for FailingRunner {
             fn name(&self) -> &str {
                 "failing"
@@ -859,11 +1130,13 @@ mod tests {
                 )]
             }
 
-            fn build_task(
+            async fn build_task(
                 &self,
                 _task: &Task,
                 _run_id: &RunId,
                 _ctx: &BuildContext,
+                _cancellation: &BuildCancellation,
+                _scope: &mut BuildScope,
             ) -> Result<TaskRef, RunnerError> {
                 Err(RunnerError::InvalidSpec("missing command".into()))
             }
@@ -872,7 +1145,7 @@ mod tests {
         let mut router = RunnerRouter::new();
         router.register(Arc::new(FailingRunner)).unwrap();
 
-        let error = match router.build(&subprocess_task()) {
+        let error = match router.build(&subprocess_task()).await {
             Err(error) => error,
             Ok(_) => panic!("expected runner build failure"),
         };
@@ -885,10 +1158,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn runner_must_use_the_allocated_run_id() {
+    #[tokio::test]
+    async fn runner_must_use_the_allocated_run_id() {
         struct WrongNameRunner;
 
+        #[crate::async_trait]
         impl Runner for WrongNameRunner {
             fn name(&self) -> &str {
                 "wrong-name"
@@ -901,11 +1175,13 @@ mod tests {
                 ]
             }
 
-            fn build_task(
+            async fn build_task(
                 &self,
                 _task: &Task,
                 _run_id: &RunId,
                 _ctx: &BuildContext,
+                _cancellation: &BuildCancellation,
+                _scope: &mut BuildScope,
             ) -> Result<TaskRef, RunnerError> {
                 Ok(TaskFn::arc(
                     "ignored-run-id",
@@ -918,12 +1194,15 @@ mod tests {
         router.register(Arc::new(WrongNameRunner)).unwrap();
         let catalog = router.catalog();
 
-        match router.build(&subprocess_task()) {
+        match router.build(&subprocess_task()).await {
             Err(RouterError::RunIdMismatch { .. }) => {}
             Err(error) => panic!("expected RunIdMismatch, got {error:?}"),
             Ok(_) => panic!("expected RunIdMismatch, got Ok(..)"),
         }
-        match catalog.build(&subprocess_task(), &BuildContext::default()) {
+        match catalog
+            .build(&subprocess_task(), &BuildContext::default())
+            .await
+        {
             Err(RouterError::RunIdMismatch { .. }) => {}
             Err(error) => panic!("expected RunIdMismatch, got {error:?}"),
             Ok(_) => panic!("expected RunIdMismatch, got Ok(..)"),

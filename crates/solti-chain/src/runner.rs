@@ -9,7 +9,8 @@ use std::sync::{
 use bytes::Bytes;
 use solti_model::{Task, TaskId, WorkloadTypeMeta};
 use solti_runner::{
-    BuildContext, RouterError, RunId, Runner, RunnerCatalog, RunnerError, RunnerRouter,
+    BuildCancellation, BuildContext, BuildScope, RouterError, RunId, Runner, RunnerCatalog,
+    RunnerError, RunnerRouter,
 };
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tracing::{Instrument as _, debug, debug_span, instrument, trace};
@@ -36,6 +37,7 @@ impl ChainRunner {
     }
 }
 
+#[solti_runner::async_trait]
 impl Runner for ChainRunner {
     fn name(&self) -> &str {
         &self.name
@@ -50,18 +52,20 @@ impl Runner for ChainRunner {
 
     #[instrument(
         level = "debug",
-        skip(self, task, ctx),
+        skip(self, task, ctx, scope),
         fields(
             event = "chain.build",
             task_name = %task.name(),
             generation = task.metadata().generation()
         )
     )]
-    fn build_task(
+    async fn build_task(
         &self,
         task: &Task,
         run_id: &RunId,
         ctx: &BuildContext,
+        cancellation: &BuildCancellation,
+        scope: &mut BuildScope,
     ) -> Result<TaskRef, RunnerError> {
         let spec = ChainSpec::from_workload(task.spec().workload())
             .map_err(|error| RunnerError::InvalidSpec(error.to_string()))?;
@@ -71,7 +75,10 @@ impl Runner for ChainRunner {
             task.metadata().generation(),
         );
         let child_ctx = ctx.clone().with_output_publisher(output.publisher());
-        let plan = Arc::new(self.compile(task, &spec, &child_ctx)?);
+        let plan = Arc::new(
+            self.compile(task, &spec, &child_ctx, cancellation, scope)
+                .await?,
+        );
         let attempts = Arc::new(AtomicU32::new(0));
 
         debug!(
@@ -107,11 +114,13 @@ impl Runner for ChainRunner {
 }
 
 impl ChainRunner {
-    fn compile(
+    async fn compile(
         &self,
         outer: &Task,
         spec: &ChainSpec,
         ctx: &BuildContext,
+        cancellation: &BuildCancellation,
+        scope: &mut BuildScope,
     ) -> Result<CompiledChain, RunnerError> {
         let indices = spec
             .steps()
@@ -123,12 +132,16 @@ impl ChainRunner {
         let mut steps = Vec::with_capacity(spec.steps().len());
         for step in spec.steps() {
             let derived = derive_task(outer, step)?;
-            let task = self.catalog.build(&derived, ctx).map_err(|error| {
-                RunnerError::InvalidSpec(format!(
-                    "chain step '{}' could not be built: {error}",
-                    step.name()
-                ))
-            })?;
+            let task = self
+                .catalog
+                .build_scoped_with_cancellation(&derived, ctx, cancellation, scope)
+                .await
+                .map_err(|error| {
+                    RunnerError::InvalidSpec(format!(
+                        "chain step '{}' could not be built: {error}",
+                        step.name()
+                    ))
+                })?;
             let on_success = step.on_success().map(|next| indices[next]);
             let on_failure = step.on_failure().map(|transition| CompiledFailure {
                 next: indices[transition.next()],
@@ -150,15 +163,20 @@ impl ChainRunner {
 }
 
 fn derive_task(outer: &Task, step: &crate::ChainStep) -> Result<Task, RunnerError> {
-    let (type_meta, metadata, outer_spec, status) = outer.clone().into_parts();
-    let mut step_spec = outer_spec
-        .with_workload(step.workload().clone())
+    let mut step_spec = outer
+        .spec()
+        .derive_with_workload(step.workload().clone())
         .without_runner_selector();
     if let Some(selector) = step.runner_selector() {
         step_spec = step_spec.with_runner_selector(selector.clone());
     }
-    Task::from_parts(type_meta, metadata, step_spec, status)
-        .map_err(|error| RunnerError::InvalidSpec(error.to_string()))
+    Task::from_parts(
+        outer.type_meta().clone(),
+        outer.metadata().clone(),
+        step_spec,
+        outer.status().clone(),
+    )
+    .map_err(|error| RunnerError::InvalidSpec(error.to_string()))
 }
 
 struct CompiledChain {

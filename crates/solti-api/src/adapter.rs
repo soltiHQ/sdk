@@ -215,6 +215,7 @@ mod tests {
 
     struct TestRunner;
 
+    #[solti_runner::async_trait]
     impl Runner for TestRunner {
         fn name(&self) -> &str {
             "adapter-test"
@@ -229,11 +230,13 @@ mod tests {
             ]
         }
 
-        fn build_task(
+        async fn build_task(
             &self,
             _task: &Task,
             run_id: &RunId,
             _context: &BuildContext,
+            _cancellation: &solti_runner::BuildCancellation,
+            _scope: &mut solti_runner::BuildScope,
         ) -> Result<TaskRef, RunnerError> {
             Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move {
                 Ok::<(), TaskError>(())
@@ -559,6 +562,7 @@ mod tests {
             seq: 0,
             ts: UNIX_EPOCH,
             line: Bytes::from_static(b"current"),
+            truncated: false,
         });
         let stale = OutputEvent::RunStarted {
             generation: 6,
@@ -571,7 +575,10 @@ mod tests {
             exit_code: Some(0),
             finished_at: UNIX_EPOCH,
         };
-        let lagged = OutputEvent::Lagged { skipped: 2 };
+        let lagged = OutputEvent::Lagged {
+            skipped: 2,
+            skipped_bytes: 128,
+        };
 
         assert!(SupervisorApiAdapter::event_is_from_generation(&current, 7));
         assert!(!SupervisorApiAdapter::event_is_from_generation(&stale, 7));

@@ -26,6 +26,8 @@
 //! Stale generation updates are ignored.
 //! Repeating an identical update is a no-op.
 
+use std::{io, sync::Arc};
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -47,6 +49,77 @@ pub const TASK_API_VERSION: &str = concat!("solti.io/v", task_api_major!());
 
 /// Kind of the built-in Task resource.
 pub const TASK_KIND: &str = "Task";
+
+/// Maximum serialized JSON size of one caller-owned Task manifest.
+///
+/// The numeric 4 MiB boundary is also used by Solti HTTP and gRPC request
+/// transports. Each boundary is measured in its native encoding: canonical
+/// manifest JSON here, the HTTP request body, or the encoded protobuf message.
+pub const MAX_TASK_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Default)]
+struct SerializedSize(usize);
+
+impl io::Write for SerializedSize {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskManifestSizeView<'a> {
+    #[serde(flatten)]
+    type_meta: &'a TypeMeta,
+    metadata: TaskManifestMetaSizeView<'a>,
+    spec: &'a TaskSpec,
+}
+
+#[derive(Serialize)]
+struct TaskManifestMetaSizeView<'a> {
+    name: &'a TaskId,
+    #[serde(skip_serializing_if = "Labels::is_empty")]
+    labels: &'a Labels,
+    #[serde(skip_serializing_if = "Annotations::is_empty")]
+    annotations: &'a Annotations,
+}
+
+fn validate_manifest_size(
+    type_meta: &TypeMeta,
+    name: &TaskId,
+    labels: &Labels,
+    annotations: &Annotations,
+    spec: &TaskSpec,
+) -> ModelResult<()> {
+    let view = TaskManifestSizeView {
+        type_meta,
+        metadata: TaskManifestMetaSizeView {
+            name,
+            labels,
+            annotations,
+        },
+        spec,
+    };
+    let mut size = SerializedSize::default();
+    serde_json::to_writer(&mut size, &view).map_err(|error| {
+        ModelError::Invalid(format!("Task manifest serialization failed: {error}").into())
+    })?;
+    if size.0 > MAX_TASK_MANIFEST_BYTES {
+        return Err(ModelError::Invalid(
+            format!(
+                "Task manifest size {} bytes exceeds max {MAX_TASK_MANIFEST_BYTES}",
+                size.0
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Classification of an apply operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,7 +232,7 @@ pub struct TaskManifest {
     #[serde(flatten)]
     type_meta: TypeMeta,
     metadata: TaskManifestMeta,
-    spec: TaskSpec,
+    spec: Arc<TaskSpec>,
 }
 
 impl TaskManifest {
@@ -167,7 +240,8 @@ impl TaskManifest {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when the name or spec is invalid.
+    /// Returns [`ModelError::Invalid`] when the name or spec is invalid or the
+    /// serialized manifest exceeds [`MAX_TASK_MANIFEST_BYTES`].
     pub fn new(name: impl AsRef<str>, spec: TaskSpec) -> ModelResult<Self> {
         Self::from_parts(TypeMeta::task(), TaskManifestMeta::new(name)?, spec)
     }
@@ -176,7 +250,8 @@ impl TaskManifest {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when GVK, metadata, or spec is invalid.
+    /// Returns [`ModelError::Invalid`] when GVK, metadata, or spec is invalid or
+    /// the serialized manifest exceeds [`MAX_TASK_MANIFEST_BYTES`].
     pub fn from_parts(
         type_meta: TypeMeta,
         metadata: TaskManifestMeta,
@@ -185,7 +260,7 @@ impl TaskManifest {
         let manifest = Self {
             type_meta,
             metadata,
-            spec,
+            spec: Arc::new(spec),
         };
         manifest.validate()?;
         Ok(manifest)
@@ -195,10 +270,11 @@ impl TaskManifest {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when a label is invalid.
+    /// Returns [`ModelError::Invalid`] when a label is invalid or the resulting
+    /// manifest exceeds [`MAX_TASK_MANIFEST_BYTES`].
     pub fn with_labels(mut self, labels: Labels) -> ModelResult<Self> {
-        labels.validate()?;
         self.metadata = self.metadata.with_labels(labels);
+        self.validate()?;
         Ok(self)
     }
 
@@ -206,10 +282,11 @@ impl TaskManifest {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when an annotation is invalid.
+    /// Returns [`ModelError::Invalid`] when an annotation is invalid or the
+    /// resulting manifest exceeds [`MAX_TASK_MANIFEST_BYTES`].
     pub fn with_annotations(mut self, annotations: Annotations) -> ModelResult<Self> {
-        annotations.validate()?;
         self.metadata = self.metadata.with_annotations(annotations);
+        self.validate()?;
         Ok(self)
     }
 
@@ -217,11 +294,19 @@ impl TaskManifest {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when GVK, metadata, or spec is invalid.
+    /// Returns [`ModelError::Invalid`] when GVK, metadata, or spec is invalid or
+    /// the serialized manifest exceeds [`MAX_TASK_MANIFEST_BYTES`].
     pub fn validate(&self) -> ModelResult<()> {
         self.type_meta.validate_task()?;
         self.metadata.validate()?;
-        self.spec.validate()
+        self.spec.validate()?;
+        validate_manifest_size(
+            &self.type_meta,
+            self.metadata.name(),
+            self.metadata.labels(),
+            self.metadata.annotations(),
+            &self.spec,
+        )
     }
 
     /// Resource type metadata.
@@ -256,6 +341,14 @@ impl TaskManifest {
 
     /// Returns the serialized manifest fields.
     pub fn into_parts(self) -> (TypeMeta, TaskManifestMeta, TaskSpec) {
+        (
+            self.type_meta,
+            self.metadata,
+            Arc::try_unwrap(self.spec).unwrap_or_else(|spec| spec.as_ref().clone()),
+        )
+    }
+
+    fn into_shared_parts(self) -> (TypeMeta, TaskManifestMeta, Arc<TaskSpec>) {
         (self.type_meta, self.metadata, self.spec)
     }
 }
@@ -313,7 +406,7 @@ pub struct Task {
     #[serde(flatten)]
     type_meta: TypeMeta,
     metadata: ObjectMeta,
-    spec: TaskSpec,
+    spec: Arc<TaskSpec>,
     status: TaskStatus,
 }
 
@@ -325,7 +418,9 @@ impl Task {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when the name or spec is invalid, or the entropy source is unavailable.
+    /// Returns [`ModelError::Invalid`] when the name or spec is invalid, the
+    /// manifest exceeds [`MAX_TASK_MANIFEST_BYTES`], or the entropy source is
+    /// unavailable.
     pub fn new(name: impl AsRef<str>, spec: TaskSpec) -> ModelResult<Self> {
         Self::from_manifest(TaskManifest::new(name, spec)?)
     }
@@ -334,20 +429,19 @@ impl Task {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when the manifest is invalid or the entropy source is unavailable.
+    /// Returns [`ModelError::Invalid`] when the manifest is invalid or the
+    /// entropy source is unavailable.
     pub fn from_manifest(manifest: TaskManifest) -> ModelResult<Self> {
         manifest.validate()?;
-        let (_, metadata, spec) = manifest.into_parts();
+        let (_, metadata, spec) = manifest.into_shared_parts();
         let mut object_meta = ObjectMeta::new(metadata.name.clone())?;
         object_meta.apply_metadata(metadata.labels, metadata.annotations);
-        let task = Self {
+        Ok(Self {
             type_meta: TypeMeta::task(),
             metadata: object_meta,
             spec,
             status: TaskStatus::pending(1)?,
-        };
-        task.validate()?;
-        Ok(task)
+        })
     }
 
     /// Reconstructs a resource from persisted fields.
@@ -364,7 +458,7 @@ impl Task {
         let task = Self {
             type_meta,
             metadata,
-            spec,
+            spec: Arc::new(spec),
             status,
         };
         task.validate()?;
@@ -375,7 +469,8 @@ impl Task {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when GVK, metadata, spec, status, generation, or conditions are inconsistent.
+    /// Returns [`ModelError::Invalid`] when GVK, metadata, spec, status,
+    /// generation, conditions, or the desired manifest size are invalid.
     pub fn validate(&self) -> ModelResult<()> {
         self.type_meta.validate_task()?;
         self.metadata.name().validate_format()?;
@@ -402,7 +497,14 @@ impl Task {
                 "status.conditions[].observedGeneration cannot exceed metadata.generation".into(),
             ));
         }
-        self.spec.validate()
+        self.spec.validate()?;
+        validate_manifest_size(
+            &self.type_meta,
+            self.metadata.name(),
+            self.metadata.labels(),
+            self.metadata.annotations(),
+            &self.spec,
+        )
     }
 
     /// Resource type metadata.
@@ -431,7 +533,12 @@ impl Task {
 
     /// Returns the serialized resource fields.
     pub fn into_parts(self) -> (TypeMeta, ObjectMeta, TaskSpec, TaskStatus) {
-        (self.type_meta, self.metadata, self.spec, self.status)
+        (
+            self.type_meta,
+            self.metadata,
+            Arc::try_unwrap(self.spec).unwrap_or_else(|spec| spec.as_ref().clone()),
+            self.status,
+        )
     }
 
     /// Stable resource address (`metadata.name`).
@@ -485,7 +592,8 @@ impl Task {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when metadata, spec, or a changed `resource_version` is invalid.
+    /// Returns [`ModelError::Invalid`] when desired state or a changed
+    /// `resource_version` is invalid.
     pub fn apply_desired(
         &mut self,
         labels: Labels,
@@ -493,19 +601,33 @@ impl Task {
         spec: TaskSpec,
         resource_version: impl Into<String>,
     ) -> ModelResult<DesiredChange> {
-        spec.validate()?;
-        labels.validate()?;
-        annotations.validate()?;
         let metadata_changed =
             self.metadata.labels() != &labels || self.metadata.annotations() != &annotations;
-        let spec_changed = self.spec != spec;
+        let spec_changed = self.spec.as_ref() != &spec;
         if !metadata_changed && !spec_changed {
             return Ok(DesiredChange::None);
         }
 
+        let desired = TaskManifest {
+            type_meta: self.type_meta.clone(),
+            metadata: TaskManifestMeta {
+                name: self.name().clone(),
+                labels,
+                annotations,
+            },
+            spec: Arc::new(spec),
+        };
+        desired.validate()?;
+        let TaskManifest {
+            type_meta: _,
+            metadata,
+            spec,
+        } = desired;
+
         self.metadata.set_resource_version(resource_version)?;
         if metadata_changed {
-            self.metadata.apply_metadata(labels, annotations);
+            self.metadata
+                .apply_metadata(metadata.labels, metadata.annotations);
         }
         if spec_changed {
             self.spec = spec;
@@ -774,7 +896,22 @@ impl From<&Task> for TaskManifest {
 
 impl From<Task> for TaskManifest {
     fn from(task: Task) -> Self {
-        Self::from(&task)
+        let Task {
+            type_meta,
+            metadata,
+            spec,
+            status: _,
+        } = task;
+        let (name, labels, annotations) = metadata.into_manifest_parts();
+        Self {
+            type_meta,
+            metadata: TaskManifestMeta {
+                name,
+                labels,
+                annotations,
+            },
+            spec,
+        }
     }
 }
 
@@ -910,6 +1047,25 @@ mod tests {
     }
 
     #[test]
+    fn manifest_size_view_matches_serialized_manifest_with_empty_metadata() {
+        let manifest = TaskManifest::new("task-a", spec("slot-a")).unwrap();
+        let expected = serde_json::to_vec(&manifest).unwrap().len();
+        let view = TaskManifestSizeView {
+            type_meta: &manifest.type_meta,
+            metadata: TaskManifestMetaSizeView {
+                name: manifest.metadata.name(),
+                labels: manifest.metadata.labels(),
+                annotations: manifest.metadata.annotations(),
+            },
+            spec: &manifest.spec,
+        };
+        let mut actual = SerializedSize::default();
+        serde_json::to_writer(&mut actual, &view).unwrap();
+
+        assert_eq!(actual.0, expected);
+    }
+
+    #[test]
     fn stored_task_roundtrips_through_its_desired_manifest() {
         let stored = task();
         let manifest = TaskManifest::from(&stored);
@@ -923,6 +1079,17 @@ mod tests {
         );
         assert_ne!(rematerialized.uid(), stored.uid());
         assert_eq!(rematerialized.status().phase(), TaskPhase::Pending);
+    }
+
+    #[test]
+    fn task_and_manifest_clones_share_the_immutable_spec() {
+        let stored = task();
+        let stored_clone = stored.clone();
+        assert!(Arc::ptr_eq(&stored.spec, &stored_clone.spec));
+
+        let manifest = TaskManifest::from(stored);
+        let manifest_clone = manifest.clone();
+        assert!(Arc::ptr_eq(&manifest.spec, &manifest_clone.spec));
     }
 
     #[test]
@@ -943,6 +1110,69 @@ mod tests {
 
         let error = serde_json::from_value::<TaskManifest>(json).unwrap_err();
         assert!(error.to_string().contains("label key"));
+    }
+
+    #[test]
+    fn manifest_rejects_payload_above_the_json_budget() {
+        let workload = TaskWorkload::Extension(
+            crate::ExtensionWorkload::new(
+                "tasks.example.io/v1",
+                "Large",
+                serde_json::json!({ "payload": "x".repeat(MAX_TASK_MANIFEST_BYTES) }),
+            )
+            .unwrap(),
+        );
+        let spec = TaskSpec::builder("slot", workload, 1_000_u64)
+            .build()
+            .unwrap();
+
+        let error = TaskManifest::new("large", spec).unwrap_err();
+        assert!(error.to_string().contains("manifest size"));
+    }
+
+    #[test]
+    fn manifest_setters_preserve_the_json_budget() {
+        let workload = TaskWorkload::Extension(
+            crate::ExtensionWorkload::new(
+                "tasks.example.io/v1",
+                "Large",
+                serde_json::json!({
+                    "payload": "x".repeat(MAX_TASK_MANIFEST_BYTES - 128 * 1024)
+                }),
+            )
+            .unwrap(),
+        );
+        let spec = TaskSpec::builder("slot", workload, 1_000_u64)
+            .build()
+            .unwrap();
+        let manifest = TaskManifest::new("large", spec).unwrap();
+        let mut annotations = Annotations::new();
+        annotations.insert("example.io/data", "x".repeat(192 * 1024));
+
+        let error = manifest.with_annotations(annotations).unwrap_err();
+        assert!(error.to_string().contains("manifest size"));
+    }
+
+    #[test]
+    fn stored_task_parts_enforce_the_desired_manifest_budget() {
+        let stored = task();
+        let oversized = TaskWorkload::Extension(
+            crate::ExtensionWorkload::new(
+                "tasks.example.io/v1",
+                "Large",
+                serde_json::json!({ "payload": "x".repeat(MAX_TASK_MANIFEST_BYTES) }),
+            )
+            .unwrap(),
+        );
+        let oversized = TaskSpec::builder("slot", oversized, 1_000_u64)
+            .build()
+            .unwrap();
+        let (type_meta, metadata, _, status) = stored.clone().into_parts();
+
+        let error = Task::from_parts(type_meta, metadata, oversized, status).unwrap_err();
+        assert!(error.to_string().contains("manifest size"));
+
+        assert!(stored.validate().is_ok());
     }
 
     #[test]

@@ -206,9 +206,9 @@ pub use domain::{
 
 mod resource;
 pub use resource::{
-    Annotations, ConditionStatus, DesiredChange, ObjectMeta, TASK_API_VERSION,
-    TASK_API_VERSION_MAJOR, TASK_KIND, Task, TaskCondition, TaskConditionType, TaskManifest,
-    TaskManifestMeta, TaskRun, TaskSpec, TaskSpecBuilder, TaskStatus, TypeMeta, Uid,
+    Annotations, ConditionStatus, DesiredChange, MAX_TASK_MANIFEST_BYTES, ObjectMeta,
+    TASK_API_VERSION, TASK_API_VERSION_MAJOR, TASK_KIND, Task, TaskCondition, TaskConditionType,
+    TaskManifest, TaskManifestMeta, TaskRun, TaskSpec, TaskSpecBuilder, TaskStatus, TypeMeta, Uid,
     WritePreconditions,
 };
 
