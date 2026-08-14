@@ -141,6 +141,26 @@ pub enum CoreError {
     #[error("task already exists: {0}")]
     AlreadyExists(String),
 
+    /// The state cannot retain another task.
+    #[error("retained task limit reached: {limit}")]
+    RetainedTaskLimitReached {
+        /// Configured task count limit.
+        limit: usize,
+    },
+
+    /// A desired write would exceed the retained TaskManifest byte budget.
+    #[error(
+        "retained task manifest byte limit exceeded: current {current} bytes, requested {requested} bytes, limit {limit} bytes"
+    )]
+    RetainedTaskManifestByteLimitExceeded {
+        /// Caller-owned manifest bytes retained before this write.
+        current: usize,
+        /// Additional caller-owned manifest bytes required by this write.
+        requested: usize,
+        /// Configured aggregate byte limit.
+        limit: usize,
+    },
+
     /// The task does not exist or is hidden by an adapter predicate.
     #[error("task not found: {0}")]
     NotFound(String),

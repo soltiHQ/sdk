@@ -14,8 +14,6 @@ version.workspace      = true
 edition.workspace      = true
 license.workspace      = true
 
-exclude = ["ARCHITECTURE.md"]
-
 [features]
 default   = []
 test-util = ["taskvisor/test-util"]
@@ -37,6 +35,11 @@ tokio-util   = { workspace = true }
 [dev-dependencies]
 solti-chain = { workspace = true, default-features = false }
 taskvisor = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name              = "state_collections"
+harness           = false
+required-features = ["test-util"]
 
 [package.metadata.docs.rs]
 all-features = true

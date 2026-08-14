@@ -15,7 +15,7 @@
 //!
 //! The local server exists only to keep the example self-contained.
 //! `solti-discover` itself is a client and does not run a server.
-//! The example token never leaves the loopback interface.
+//! The explicit insecure-token opt-in is limited to this loopback example.
 //! Use HTTPS whenever a real bearer token is configured.
 //!
 //! Run with `cargo run -p solti-discover --example http_sync --features http`.
@@ -227,11 +227,13 @@ async fn main() -> ExampleResult {
     .metadata(metadata)
     .capabilities(capabilities()?)
     .with_token(Token::new("example-token")?)
+    .allow_insecure_token_transport()
     .with_metrics(metrics_handle)
     .build()?;
     println!("[config] Advertised HTTP Task API v1 at http://127.0.0.1:8085.");
     println!("[config] Selected outbound HTTP discovery at http://{control_address}/control.");
-    println!("[config] The teaching token stays on loopback; a real bearer token requires HTTPS.");
+    println!("[config] Explicitly allowed the teaching token on loopback.");
+    println!("[config] A real bearer token requires HTTPS.");
 
     let uptime = Arc::new(|| 42_u64);
     let (manifest, task_ref) = sync(config, uptime)?;

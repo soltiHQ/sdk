@@ -17,7 +17,8 @@ use solti_api::{
     AuthorizationRequest, HttpApi, TaskOperation, TaskTarget, TaskWatchEventStream, Transport,
 };
 use solti_model::{
-    Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun, Token, WritePreconditions,
+    Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRunPage, TaskRunQuery, Token,
+    Uid, WritePreconditions,
 };
 
 const SECRET: &str = "sekret-token-1";
@@ -67,9 +68,20 @@ impl ApiHandler for MockHandler {
         Ok(Box::pin(tokio_stream::empty()))
     }
 
-    async fn list_task_runs(&self, _id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
+    async fn query_task_runs(
+        &self,
+        id: &TaskId,
+        _query: TaskRunQuery,
+    ) -> Result<TaskRunPage, ApiError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(Vec::new())
+        Ok(TaskRunPage {
+            items: Vec::new(),
+            task: id.clone(),
+            task_uid: Uid::new("auth-http-run-uid").unwrap(),
+            resource_version: "runs-test:1".into(),
+            continuation: None,
+            remaining_item_count: 0,
+        })
     }
 
     async fn delete_task(

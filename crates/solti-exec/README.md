@@ -22,11 +22,12 @@ use solti_model::{
     Flag, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskSpec, TaskWorkload,
 };
 use solti_runner::RunnerRouter;
+use std::time::Duration;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut router = RunnerRouter::new();
-    register_subprocess_runner(&mut router, "default")?;
+    let runner = register_subprocess_runner(&mut router, "default")?;
 
     let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
         SubprocessMode::Command {
@@ -42,12 +43,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let task_ref = router.build(&task).await?;
     assert!(task_ref.name().starts_with("default-jobs-"));
+    drop(task_ref);
+    drop(router);
+    runner.shutdown(Duration::from_secs(5)).await?;
     Ok(())
 }
 ```
 
 `RunnerRouter::build` constructs the task but does not start it.
 `solti-core` submits the returned task to Taskvisor during reconciliation.
+Keep the concrete runner returned by registration.
+After every supervisor and task reference that uses it has stopped, call
+`runner.shutdown(timeout).await`. A successful shutdown closes admission, waits
+for every accepted ownership unit, and joins the finalizer worker.
+`ExecError::Io` carries `std::io::ErrorKind::TimedOut` when the deadline elapsed,
+`Other` for quarantined ownership, or `BrokenPipe` for lost finalizer progress.
+An error result does not by itself confirm that drain and join completed. A
+cancelled or timed-out call can be repeated; admission remains closed.
+The default ownership limit is 1024 active or deferred subprocess attempts per
+runner. `SubprocessBackendConfig::with_cleanup_capacity` changes it.
 
 ## Containerd quick start
 
@@ -64,7 +78,10 @@ use solti_exec::container::{
 };
 use solti_runner::RunnerRouter;
 
-async fn configure() -> Result<RunnerRouter, Box<dyn std::error::Error>> {
+async fn configure() -> Result<
+    (RunnerRouter, Arc<ContainerdEngine>),
+    Box<dyn std::error::Error>,
+> {
     let settings = ContainerdConfig::new(
         "/run/containerd/containerd.sock",
         "solti",
@@ -75,8 +92,8 @@ async fn configure() -> Result<RunnerRouter, Box<dyn std::error::Error>> {
 
     let engine = Arc::new(ContainerdEngine::connect(settings).await?);
     let mut router = RunnerRouter::new();
-    register_container_runner(&mut router, "containerd", engine)?;
-    Ok(router)
+    register_container_runner(&mut router, "containerd", engine.clone())?;
+    Ok((router, engine))
 }
 # }
 ```
@@ -86,8 +103,25 @@ It requires containerd major version 2.
 It also validates the selected snapshotter, platform, and OCI runtime.
 Control RPCs use a 30-second deadline by default.
 Image pull and unpack use a 10-minute deadline by default.
-`ContainerdConfig` can override both deadlines and the cleanup window.
+`ContainerdConfig` can override both deadlines, the cleanup window, and the
+per-engine lifecycle admission limit. The default limit is 1024 admitted create
+or attempt lifecycles.
 The workload wait has no deadline.
+
+Lifecycle admission is reserved before image resolution and remains charged
+through the returned attempt or deferred cleanup. This bounds client-side image
+resolve futures, active attempts, and deferred cleanup with the same limit.
+Image resolution and unpack use containerd's shared image store. The transfer
+is not retained as deferred-cleanup ownership when the create future is dropped.
+Cancelled attempts transfer confirmed or uncertain attempt ownership to an
+isolated cleanup runtime. The transfer is bounded and does not wait in `Drop`.
+Keep the concrete engine handle returned by `configure`.
+After every supervisor that uses it has stopped, call
+`engine.shutdown().await`. This closes lifecycle admission and waits for
+accepted create lifecycles and attempt ownership.
+
+Deferred cleanup is process-local. It does not survive process abort, power
+loss, or `SIGKILL`.
 
 Building a container task performs no engine I/O.
 Each attempt resolves and unpacks the image.
@@ -97,7 +131,8 @@ The same Taskvisor task can run more than once.
 Retryable cleanup failures are retried on the same attempt.
 A cleanup retry does not execute the workload again.
 Permanent cleanup failures stop retry immediately.
-The retries share a 30-second window by default.
+Retries use a 30-second window by default after any retained mutation settles.
+Deferred cleanup starts another bounded pass after a retryable failure.
 Exhausted cleanup is a fatal attempt failure.
 
 ## What it does
@@ -112,6 +147,7 @@ Exhausted cleanup is a fatal attempt failure.
 - retains a parent descriptor snapshot plus child-side table sweep for Unix spawn controls that require the `fork` fallback;
 - streams stdout and stderr to the runner output sink, with an optional tracing copy;
 - stops subprocesses on cancellation, timeout, or dropped task futures;
+- reserves bounded cleanup ownership before script, cgroup, or process creation;
 - applies POSIX rlimits;
 - applies Linux cgroup, namespace, identity, capability, and seccomp controls;
 - reports backend preparation and spawn failures through runner metrics;
@@ -133,14 +169,18 @@ Exhausted cleanup is a fatal attempt failure.
 | `HostProcessPolicy::prepare`              | Declarative host policy                 | Validated `PreparedHostProcessPolicy`         |
 | `PreparedHostProcessPolicy`               | Optional attempt cgroup name            | `PreparedHostProcessAttempt`                  |
 | `PreparedHostProcessAttempt`              | `std::process::Command`                 | Hooks and owning `AttemptProcessDomain`       |
-| `register_subprocess_runner`              | Router and runner name                  | Registered default subprocess runner          |
-| `register_subprocess_runner_with_backend` | Router, runner name, and backend config | Registered configured subprocess runner       |
+| `register_subprocess_runner`              | Router and runner name                  | Registered runner lifecycle handle            |
+| `register_subprocess_runner_with_backend` | Router, runner name, and backend config | Configured runner lifecycle handle             |
+| `SubprocessRunner::shutdown`              | Stopped supervisors and task references | Closed and drained finalizer                   |
 | `RunnerRouter::build`                     | `Task` with a `Subprocess` workload     | Reusable `taskvisor::TaskRef`                 |
 | `SubprocessBackendConfig`                 | Host policy, environment, cwd, output   | Runner-wide attempt settings                  |
 | One task attempt                          | Resolved command or script              | Task result and optional stdout/stderr chunks |
 | `ContainerProcessPolicy`                  | OCI process and resource controls       | Engine-neutral container process policy       |
+| `ContainerEngineBinding`                  | Engine and ownership declaration        | Explicit custom-engine registration boundary  |
+| `ContainerOwnershipContract`              | Drop behavior declaration               | `DropReleases` or `PreAdmittedFinalizer`       |
 | `ContainerdConfig`                        | Socket, namespace, plugins, and network | Native containerd adapter settings            |
 | `ContainerdEngine::connect`               | `ContainerdConfig`                      | Connected and probed containerd 2.x engine    |
+| `ContainerdEngine::shutdown`              | Stopped supervisors                     | Closed and drained cleanup domain              |
 | `register_container_runner`               | Router, runner name, and engine         | Registered `Container` runner                 |
 | One container attempt                     | Image, process overrides, and policy    | Task result and optional stdout/stderr chunks |
 
@@ -162,6 +202,8 @@ Task { workload: Subprocess }
       taskvisor::TaskRef
               │ each attempt
               ▼
+ bounded cleanup admission
+              ▼
  environment + pinned cwd + HostProcessPolicy
               ▼
       operating-system process
@@ -179,6 +221,8 @@ Task { workload: Subprocess }
 
 Attempt-scoped resources are created inside the Taskvisor task.
 The same `TaskRef` can therefore run more than once under a restart policy.
+Admission is charged before script transport, cgroup, or process creation.
+It remains charged through active execution and deferred cleanup.
 
 ## Containerd execution flow
 
@@ -207,12 +251,47 @@ It talks directly to containerd over the configured Unix socket.
 It does not use CRI.
 
 The `container` feature does not select an engine.
-The final binary passes an `Arc<dyn ContainerEngine>` when it registers a runner.
+The final binary passes a `ContainerEngineBinding` when it registers a custom engine.
 `create_attempt` returns one stopped attempt with exit observation already armed.
 Engine implementations must make `terminate` and `cleanup` idempotent.
 They may clean only resources whose ownership is confirmed for that attempt.
-All lifecycle futures are owned by the Taskvisor attempt and may be dropped on timeout or force-abort. 
-Engine implementations must not detach mutating lifecycle work from them.
+
+Every custom engine integration explicitly selects one ownership declaration:
+
+| Declaration | Engine-provider requirement |
+|-------------|-----------------------------|
+| `DropReleases` | Dropping `create_attempt` or the returned attempt cancels forward work and synchronously leaves no owned engine resource or lifecycle task |
+| `PreAdmittedFinalizer` | Finite cleanup admission is reserved before the first attempt-owned resource or mutation; drop transfers confirmed and uncertain attempt ownership without creating unbounded work |
+
+`ContainerEngineBinding` records this declaration in source.
+The runner cannot inspect a custom engine or prove the declaration.
+A pre-admitted finalizer must define failure behavior and awaitable shutdown.
+The application retains the concrete engine handle and drains that shutdown after
+every supervisor using the engine has stopped.
+
+The runner enforces a separate set of lifecycle properties:
+
+- a pre-cancelled attempt performs no engine I/O;
+- cooperative cancellation during create waits for create and cleans any returned attempt;
+- an error returned by create wins over cancellation observed after create returns;
+- cooperative cancellation after start waits for terminate, exit observation, and cleanup;
+- create, start, wait, terminate, and cleanup futures remain inline in the Taskvisor attempt;
+- force-drop drops the current lifecycle future and the returned attempt value;
+- at most two output reader tasks exist per attempt and both abort on drop.
+
+The runner never detaches an engine lifecycle future.
+Force-drop cannot itself complete remote cleanup.
+The selected ownership declaration defines what the engine must do when its state is dropped.
+
+The native containerd engine uses separate bounded domains for remote cleanup
+and blocking local I/O. Filesystem preparation and removal do not run on Tokio
+workers. Engine shutdown drains both domains within one shared deadline.
+Its concrete handle converts to `ContainerEngineBinding` with the
+`PreAdmittedFinalizer` declaration because that behavior is implemented by the
+native adapter for attempt-owned local I/O, snapshots, containers, and tasks.
+The same lifecycle admission bounds client-side shared image resolution and
+unpack. The image transfer itself is not handed to the cleanup domain when the
+create future is dropped.
 
 `ContainerNetwork::None` creates an OCI network namespace.
 The adapter does not configure an external interface, address, route, DNS, or NAT.
@@ -232,6 +311,8 @@ The adapter does not create a user namespace.
 
 The I/O root must be visible at the same path to the SDK process and containerd.
 The adapter creates private `0700` attempt directories and `0600` FIFOs below it.
+FIFO readers stay non-blocking and use Tokio readiness.
+Missing Tokio I/O driver support is reported as attempt creation failure.
 On Linux, every root path component must be a real directory owned by root or the effective UID.
 Group-writable and world-writable components must have the sticky bit.
 
@@ -342,7 +423,8 @@ Process spawn fails when the running kernel does not support that operation.
 
 The normal macOS path uses native `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`.
 It preserves only standard streams, the pinned working-directory action, and explicit passlist entries.
-This path also represents session creation and signal reset as spawn attributes, so it does not scan the descriptor table.
+This path also represents session creation and signal reset as spawn attributes.
+It does not scan the descriptor table.
 
 `umask` and POSIX rlimits have no corresponding macOS spawn attribute.
 Attempts using either control retain the `fork` fallback: it snapshots open descriptors and captures the descriptor-table bound before `fork`.
@@ -369,7 +451,7 @@ Register a configured runner when attempts need resource or security controls:
 
 ```rust,no_run
 use solti_exec::subprocess::{
-    EnvPolicy, LogConfig, SubprocessBackendConfig,
+    EnvPolicy, LogConfig, SubprocessBackendConfig, SubprocessRunner,
     register_subprocess_runner_with_backend,
 };
 use solti_exec::host::{
@@ -378,7 +460,9 @@ use solti_exec::host::{
 };
 use solti_runner::RunnerRouter;
 
-fn configured() -> Result<(), solti_exec::ExecError> {
+fn configured(
+    router: &mut RunnerRouter,
+) -> Result<std::sync::Arc<SubprocessRunner>, solti_exec::ExecError> {
     let host_process = HostProcessPolicy::new()
         .with_process_config(ProcessConfig {
             reset_signals: true,
@@ -418,8 +502,7 @@ fn configured() -> Result<(), solti_exec::ExecError> {
             stderr_warn: true,
         });
 
-    let mut router = RunnerRouter::new();
-    register_subprocess_runner_with_backend(&mut router, "restricted", backend)
+    register_subprocess_runner_with_backend(router, "restricted", backend)
 }
 ```
 
@@ -582,10 +665,15 @@ Without `cgroup.kill`, only the process-group boundary remains.
 That boundary cannot reach descendants that enter another process group or session.
 
 The runner owns the wait status of every child it starts.
-Before process creation, it prepares one Tokio-independent reaper worker.
-A dropped runner future moves the child and host domain to that worker.
+Runner construction starts one bounded Tokio-independent finalizer.
+A dropped task future moves the child and host domain to that worker without waiting.
+Cancellation after cgroup preparation and process spawn failure use the same handoff.
 The worker reaps the leader before cgroup cleanup.
 The dropped future does not wait for process exit.
+Persistent operating-system errors enter quarantine after ten attempts.
+Quarantined ownership remains charged and closes new admission.
+`SubprocessRunner::finalizer_status` exposes admission, health, ownership, capacity,
+and quarantine counters.
 The embedding process must not call process-wide `waitpid` for arbitrary children.
 It must not configure automatic `SIGCHLD` reaping.
 If wait ownership is lost, the attempt fails and releases its numeric process identity.
@@ -610,13 +698,14 @@ With no features, the crate exposes no policy or execution backend.
 
 ## Errors
 
-`ExecError` covers runner registration and backend configuration:
+`ExecError` covers backend construction, registration, and explicit lifecycle
+operations:
 
-| Variant               | Cause                                                |
-|-----------------------|------------------------------------------------------|
-| `Router`              | `RunnerRouter` rejected registration                 |
-| `InvalidRunnerConfig` | Runner name or backend settings are invalid          |
-| `Io`                  | An operating-system resource could not be prepared   |
+| Variant               | Cause                                                         |
+|-----------------------|---------------------------------------------------------------|
+| `Router`              | `RunnerRouter` rejected registration                          |
+| `InvalidRunnerConfig` | Runner name or backend settings are invalid                   |
+| `Io`                  | OS resource preparation or backend lifecycle shutdown failed |
 
 Workload construction failures are returned through `solti_runner::RunnerError`.
 Attempt failures use `taskvisor::TaskError`.
@@ -645,7 +734,7 @@ cargo run -p solti-exec --example subprocess_command --features subprocess
 | [subprocess_script.rs](examples/subprocess_script.rs)             | `subprocess`   | Script decoding, reusable tasks, and attempt-scoped transport.       |
 | [container.rs](examples/container.rs)                             | `containerd`   | One real native container attempt, output, and owned cleanup.        |
 | [host_process_policy.rs](examples/host_process_policy.rs)         | `host-process` | Low-level preparation, attachment, wait ownership, and cleanup.      |
-| [custom_container_engine.rs](examples/custom_container_engine.rs) | `container`    | Custom engine contract, process policy, output, and lifecycle order. |
+| [custom_container_engine.rs](examples/custom_container_engine.rs) | `container`    | Explicit drop ownership, process policy, output, and lifecycle order. |
 | [containerd_config.rs](examples/containerd_config.rs)             | `containerd`   | Native adapter configuration, network modes, and explicit connect.   |
 
 Run the remaining examples explicitly:

@@ -18,8 +18,8 @@ pub use crate::isolation::{CgroupLimits, CpuMax};
 pub use cgroups::DomainTermination;
 #[cfg(feature = "host-process")]
 pub(crate) use cgroups::{
-    CgroupDomain, PreparedCgroup, PreparedCgroupParent, attach_cgroup, prepare_cgroup,
-    resolve_cgroup_parent,
+    CgroupDomain, CgroupPrepareFailure, PreparedCgroup, PreparedCgroupParent, attach_cgroup,
+    prepare_cgroup_owned, resolve_cgroup_parent,
 };
 
 #[cfg(feature = "host-process")]
@@ -50,6 +50,8 @@ pub use process::ProcessConfig;
 pub(crate) use process::{PreparedProcessConfig, attach_process_config};
 
 mod policy;
+#[cfg(feature = "host-process")]
+pub(crate) use policy::AttemptPrepareFailure;
 pub use policy::{
     AttemptProcessDomain, HostProcessPolicy, PreparedHostProcessAttempt, PreparedHostProcessPolicy,
 };

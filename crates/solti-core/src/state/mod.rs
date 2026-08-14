@@ -19,12 +19,28 @@
 //! Normal writes belong to [`SupervisorApi`](crate::SupervisorApi).
 //! Public `TaskState` methods provide shared read access.
 //!
-//! Each store has its own resource-version epoch.
-//! List continuations use retained change history.
-//! Watches use the same history.
-//! They can resume only while that history remains available.
-//! Retention limits that history by both count and serialized bytes.
-//! An oversized change is broadcast live but is not retained.
+//! Each store has distinct Task and TaskRun resource-version epochs.
+//! Task list continuations and watches share retained Task changes.
+//! TaskRun continuations use a separate reversible mutation journal.
+//! Retained runs and run-journal deltas share immutable [`Arc<TaskRun>`] snapshots.
+//! Run mutations use copy-on-write. Queries clone handles under the state lock
+//! and clone model values only when admitting them to a page.
+//! Each continuation can resume only while its journal position remains available.
+//! Both journals are limited by count and serialized bytes.
+//! Task watch admission is limited by concurrent subscription count and the
+//! aggregate compact Task JSON retained by initial and replay buffers.
+//! The live watch ring is smaller than a multi-entry change journal, leaving
+//! count headroom for recovery after a slow subscriber lags. The independent
+//! byte budget can still compact the required changes.
+//! An oversized Task change remains live on the watch stream but is not retained.
+//! An oversized TaskRun batch updates current run state but is not retained.
+//! [`StateConfig::max_retained_tasks`] limits retained task resources.
+//! [`StateConfig::max_retained_task_manifest_bytes`] limits their aggregate
+//! caller-owned manifest bytes.
+//! Admission never evicts a task to admit another task.
+//! Task query pages keep complete-item prefixes within a 4 MiB serialized JSON budget.
+//! TaskRun query pages use the same complete-item budget.
+//! An oversized first item is returned alone for native transport measurement.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -36,7 +52,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::SystemTime,
 };
 
@@ -52,12 +68,13 @@ use tracing::debug;
 
 use solti_model::{
     DesiredChange, Slot, Task, TaskContinuation, TaskFilter, TaskId, TaskManifest, TaskPage,
-    TaskPhase, TaskQuery, TaskRun, TaskWatchEvent, Uid, WorkloadTypeMeta, WritePreconditions,
+    TaskPhase, TaskQuery, TaskRun, TaskRunContinuation, TaskRunPage, TaskRunQuery, TaskWatchEvent,
+    Uid, WorkloadTypeMeta, WritePreconditions,
 };
 
 use crate::persistence::{
     MAX_STATE_EVENTS_PER_COMMIT, PersistenceConfig, StateDispatchEvent, StateEventDispatcher,
-    StateQueuePermit, TaskStateEvent, TaskStateSinkHandle,
+    StateQueuePermit, TaskStateEvent, TaskStateSinkHandle, TaskStateSinkStatus,
 };
 use crate::{StateConfig, WriteConflict, WritePreconditionViolation, error::CoreError};
 
@@ -81,6 +98,7 @@ use crate::{StateConfig, WriteConflict, WritePreconditionViolation, error::CoreE
 pub struct TaskState {
     inner: Arc<RwLock<TaskStateInner>>,
     watch_stop: CancellationToken,
+    watch_admission: Arc<WatchAdmission>,
     event_publisher: Arc<StateEventPublisher>,
 }
 
@@ -214,10 +232,16 @@ impl StateEventPublisher {
             dispatcher.shutdown().await;
         }
     }
+
+    fn status(&self) -> Option<TaskStateSinkStatus> {
+        self.dispatcher.as_ref().map(StateEventDispatcher::status)
+    }
 }
 
 struct TaskStateWriteGuard<'a> {
     inner: Option<RwLockWriteGuard<'a, TaskStateInner>>,
+    watch_admission: &'a WatchAdmission,
+    watch_history_invalidated: bool,
     publisher: &'a StateEventPublisher,
     batch: Option<Arc<PendingStateEventBatch>>,
 }
@@ -247,6 +271,10 @@ impl TaskStateWriteGuard<'_> {
             batch.enqueue(event);
         }
     }
+
+    fn invalidate_watch_history(&mut self) {
+        self.watch_history_invalidated = true;
+    }
 }
 
 impl Deref for TaskStateWriteGuard<'_> {
@@ -270,8 +298,12 @@ impl DerefMut for TaskStateWriteGuard<'_> {
 impl Drop for TaskStateWriteGuard<'_> {
     fn drop(&mut self) {
         let batch = self.batch.take();
+        let watch_history_invalidated = self.watch_history_invalidated;
         // Readiness must become visible only after the authoritative state lock is released.
         drop(self.inner.take());
+        if watch_history_invalidated {
+            self.watch_admission.notify_history_changed();
+        }
         if let Some(batch) = batch {
             batch.release_unused_permits();
             self.publisher.mark_ready_and_publish(batch);
@@ -290,8 +322,24 @@ struct TaskStateInner {
     ordered_tasks: BTreeSet<TaskId>,
     /// Task names indexed by slot.
     by_slot: HashMap<Slot, BTreeSet<TaskId>>,
-    /// Run history indexed by task name.
-    runs: HashMap<TaskId, VecDeque<TaskRun>>,
+    /// Immutable run snapshots indexed by task name.
+    ///
+    /// Pagination and the reversible journal share these allocations.
+    runs: HashMap<TaskId, VecDeque<Arc<TaskRun>>>,
+    /// Store identity embedded in each TaskRun collection version.
+    run_resource_version_epoch: String,
+    /// Latest committed TaskRun mutation-batch counter.
+    run_resource_version: u64,
+    /// Reversible TaskRun mutation batches retained for list snapshots.
+    run_history: VecDeque<RawRunChangeBatch>,
+    /// Serialized bytes retained in the TaskRun journal.
+    run_history_bytes: usize,
+    /// Maximum serialized TaskRun journal bytes.
+    run_history_byte_budget: usize,
+    /// Highest compacted TaskRun revision.
+    run_compacted_through: u64,
+    /// Maximum retained TaskRun mutation-batch count.
+    run_history_capacity: usize,
     /// Taskvisor identity to exact resource generation.
     by_tv: HashMap<u64, RuntimeBinding>,
     /// Resource name to current Taskvisor binding.
@@ -302,7 +350,7 @@ struct TaskStateInner {
     /// Duplicate terminal events therefore remain idempotent.
     finished_attempt_by_tv: HashMap<u64, u32>,
     /// Store identity embedded in each resource version.
-    resource_version_epoch: String,
+    resource_version_epoch: Arc<str>,
     /// Latest committed resource-version counter.
     resource_version: u64,
     /// Changes retained for watches and list snapshots.
@@ -321,13 +369,45 @@ struct TaskStateInner {
     terminal_since: HashMap<TaskId, SystemTime>,
     /// Per-task completed run cap.
     max_runs_per_task: usize,
+    /// Maximum retained task count.
+    max_retained_tasks: Option<std::num::NonZeroUsize>,
+    /// Canonical compact JSON bytes for every retained caller-owned manifest.
+    retained_task_manifest_bytes: usize,
+    /// Retained caller-owned manifest bytes indexed by task name.
+    retained_task_manifest_bytes_by_name: HashMap<TaskId, usize>,
+    /// Maximum aggregate retained caller-owned manifest bytes.
+    max_retained_task_manifest_bytes: Option<std::num::NonZeroUsize>,
 }
 
 struct RawTaskChange {
+    /// Store epoch that committed this change.
+    epoch: Arc<str>,
     revision: u64,
     previous: Option<Arc<Task>>,
     current: Option<Arc<Task>>,
     serialized_bytes: usize,
+}
+
+/// One atomically committed TaskRun revision and its reversible changes.
+struct RawRunChangeBatch {
+    /// Revision assigned to the complete mutation batch.
+    revision: u64,
+    /// Ordered changes committed by this mutation.
+    changes: Vec<RawRunChange>,
+    /// Compact JSON bytes charged to the run journal.
+    serialized_bytes: usize,
+}
+
+/// One reversible TaskRun value change for an exact task identity.
+struct RawRunChange {
+    /// Task name owning the run.
+    task: TaskId,
+    /// Task UID owning the run at this revision.
+    task_uid: Uid,
+    /// Shared immutable value before the mutation.
+    previous: Option<Arc<TaskRun>>,
+    /// Shared immutable value after the mutation.
+    current: Option<Arc<TaskRun>>,
 }
 
 #[derive(Default)]
@@ -348,10 +428,351 @@ type WatchPredicate = Arc<dyn Fn(&Task) -> bool + Send + Sync>;
 
 const WATCH_POLL_BUDGET: usize = 128;
 
+fn task_watch_live_capacity(history_capacity: usize) -> usize {
+    (history_capacity.next_power_of_two() / 2).max(1)
+}
+
+struct WatchAdmission {
+    max_count: Option<usize>,
+    max_bytes: Option<usize>,
+    inner: Mutex<WatchAdmissionInner>,
+}
+
+struct WatchAdmissionInner {
+    closed: bool,
+    next_lease_id: u64,
+    retained_bytes: usize,
+    history_token: Arc<()>,
+    leases: HashMap<u64, usize>,
+    waiters: HashMap<u64, Waker>,
+}
+
+enum WatchAdmissionFailure {
+    Closed,
+    Rejected(CollectionError),
+}
+
+enum WatchReplayReservation {
+    Reserved,
+    Oversized,
+    HistoryChanged,
+    Closed,
+}
+
+struct WatchAdmissionLease {
+    admission: Arc<WatchAdmission>,
+    id: u64,
+}
+
+impl WatchAdmission {
+    fn new(config: StateConfig) -> Arc<Self> {
+        Arc::new(Self {
+            max_count: config
+                .max_concurrent_task_watches()
+                .map(|limit| limit.get()),
+            max_bytes: config
+                .max_task_watch_initial_replay_bytes()
+                .map(|limit| limit.get()),
+            inner: Mutex::new(WatchAdmissionInner {
+                closed: false,
+                next_lease_id: 1,
+                retained_bytes: 0,
+                history_token: Arc::new(()),
+                leases: HashMap::new(),
+                waiters: HashMap::new(),
+            }),
+        })
+    }
+
+    fn precheck_count(&self) -> Result<(), WatchAdmissionFailure> {
+        let inner = self.inner.lock();
+        if inner.closed {
+            return Err(WatchAdmissionFailure::Closed);
+        }
+        if let Some(limit) = self.max_count
+            && inner.leases.len() >= limit
+        {
+            return Err(WatchAdmissionFailure::Rejected(
+                CollectionError::ConcurrentTaskWatchLimitReached { limit },
+            ));
+        }
+        Ok(())
+    }
+
+    fn try_admit(
+        self: &Arc<Self>,
+        requested_bytes: usize,
+    ) -> Result<WatchAdmissionLease, WatchAdmissionFailure> {
+        let mut inner = self.inner.lock();
+        if inner.closed {
+            return Err(WatchAdmissionFailure::Closed);
+        }
+        if let Some(limit) = self.max_count
+            && inner.leases.len() >= limit
+        {
+            return Err(WatchAdmissionFailure::Rejected(
+                CollectionError::ConcurrentTaskWatchLimitReached { limit },
+            ));
+        }
+        if let Some(limit) = self.max_bytes
+            && requested_bytes > limit - inner.retained_bytes
+        {
+            return Err(WatchAdmissionFailure::Rejected(
+                CollectionError::TaskWatchInitialReplayByteLimitExceeded {
+                    current: inner.retained_bytes,
+                    requested: requested_bytes,
+                    limit,
+                },
+            ));
+        }
+
+        let id = loop {
+            let candidate = inner.next_lease_id;
+            inner.next_lease_id = inner.next_lease_id.wrapping_add(1).max(1);
+            if !inner.leases.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        let charged_bytes = self.max_bytes.map_or(0, |_| requested_bytes);
+        inner.retained_bytes = inner
+            .retained_bytes
+            .checked_add(charged_bytes)
+            .expect("watch admission bytes must remain within the configured limit");
+        inner.leases.insert(id, charged_bytes);
+        Ok(WatchAdmissionLease {
+            admission: Arc::clone(self),
+            id,
+        })
+    }
+
+    fn poll_reserve_replay(
+        &self,
+        id: u64,
+        requested_bytes: usize,
+        history_token: &Arc<()>,
+        cx: &Context<'_>,
+    ) -> Poll<WatchReplayReservation> {
+        let mut incoming_waker = Some(cx.waker().clone());
+        let (result, removed_waker) = {
+            let mut inner = self.inner.lock();
+            if inner.closed || !inner.leases.contains_key(&id) {
+                (Poll::Ready(WatchReplayReservation::Closed), None)
+            } else if !Arc::ptr_eq(&inner.history_token, history_token) {
+                let removed_waker = inner.waiters.remove(&id);
+                (
+                    Poll::Ready(WatchReplayReservation::HistoryChanged),
+                    removed_waker,
+                )
+            } else if self.max_bytes.is_none() {
+                (Poll::Ready(WatchReplayReservation::Reserved), None)
+            } else {
+                let limit = self
+                    .max_bytes
+                    .expect("the replay byte limit was checked as present");
+                if requested_bytes > limit {
+                    (Poll::Ready(WatchReplayReservation::Oversized), None)
+                } else if requested_bytes <= limit - inner.retained_bytes {
+                    inner.retained_bytes = inner
+                        .retained_bytes
+                        .checked_add(requested_bytes)
+                        .expect("watch replay bytes must remain within the configured limit");
+                    *inner
+                        .leases
+                        .get_mut(&id)
+                        .expect("an admitted watch lease must remain registered") +=
+                        requested_bytes;
+                    let removed_waker = inner.waiters.remove(&id);
+                    (Poll::Ready(WatchReplayReservation::Reserved), removed_waker)
+                } else {
+                    let removed_waker = match inner.waiters.entry(id) {
+                        std::collections::hash_map::Entry::Occupied(mut waiter) => {
+                            if waiter.get().will_wake(
+                                incoming_waker
+                                    .as_ref()
+                                    .expect("the incoming replay waker must be available"),
+                            ) {
+                                None
+                            } else {
+                                Some(
+                                    waiter.insert(
+                                        incoming_waker
+                                            .take()
+                                            .expect("the incoming replay waker must be available"),
+                                    ),
+                                )
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(waiter) => {
+                            waiter.insert(
+                                incoming_waker
+                                    .take()
+                                    .expect("the incoming replay waker must be available"),
+                            );
+                            None
+                        }
+                    };
+                    (Poll::Pending, removed_waker)
+                }
+            }
+        };
+        drop(removed_waker);
+        drop(incoming_waker);
+        result
+    }
+
+    fn history_token(&self) -> Arc<()> {
+        Arc::clone(&self.inner.lock().history_token)
+    }
+
+    fn notify_history_changed(&self) {
+        let waiters = {
+            let mut inner = self.inner.lock();
+            inner.history_token = Arc::new(());
+            inner
+                .waiters
+                .drain()
+                .map(|(_, waker)| waker)
+                .collect::<Vec<_>>()
+        };
+        for waiter in waiters {
+            waiter.wake();
+        }
+    }
+
+    fn release_bytes(&self, id: u64, released_bytes: usize) {
+        if self.max_bytes.is_none() || released_bytes == 0 {
+            return;
+        }
+        let waiters = {
+            let mut inner = self.inner.lock();
+            let Some(lease_bytes) = inner.leases.get_mut(&id) else {
+                return;
+            };
+            *lease_bytes = lease_bytes
+                .checked_sub(released_bytes)
+                .expect("watch lease byte accounting must not underflow");
+            inner.retained_bytes = inner
+                .retained_bytes
+                .checked_sub(released_bytes)
+                .expect("aggregate watch byte accounting must not underflow");
+            inner
+                .waiters
+                .drain()
+                .map(|(_, waker)| waker)
+                .collect::<Vec<_>>()
+        };
+        for waiter in waiters {
+            waiter.wake();
+        }
+    }
+
+    fn release_lease(&self, id: u64) {
+        let (removed_waiter, waiters) = {
+            let mut inner = self.inner.lock();
+            let Some(released_bytes) = inner.leases.remove(&id) else {
+                return;
+            };
+            inner.retained_bytes = inner
+                .retained_bytes
+                .checked_sub(released_bytes)
+                .expect("aggregate watch lease accounting must not underflow");
+            let removed_waiter = inner.waiters.remove(&id);
+            let waiters = inner
+                .waiters
+                .drain()
+                .map(|(_, waker)| waker)
+                .collect::<Vec<_>>();
+            (removed_waiter, waiters)
+        };
+        drop(removed_waiter);
+        for waiter in waiters {
+            waiter.wake();
+        }
+    }
+
+    fn close(&self) {
+        let waiters = {
+            let mut inner = self.inner.lock();
+            if inner.closed {
+                return;
+            }
+            inner.closed = true;
+            inner.retained_bytes = 0;
+            inner.leases.clear();
+            inner
+                .waiters
+                .drain()
+                .map(|(_, waker)| waker)
+                .collect::<Vec<_>>()
+        };
+        for waiter in waiters {
+            waiter.wake();
+        }
+    }
+
+    #[cfg(test)]
+    fn usage(&self) -> (usize, usize, usize) {
+        let inner = self.inner.lock();
+        (
+            inner.leases.len(),
+            inner.retained_bytes,
+            inner.waiters.len(),
+        )
+    }
+}
+
+impl WatchAdmissionLease {
+    fn is_active(&self) -> bool {
+        self.admission.inner.lock().leases.contains_key(&self.id)
+    }
+
+    fn poll_reserve_replay(
+        &self,
+        requested_bytes: usize,
+        history_token: &Arc<()>,
+        cx: &Context<'_>,
+    ) -> Poll<WatchReplayReservation> {
+        self.admission
+            .poll_reserve_replay(self.id, requested_bytes, history_token, cx)
+    }
+
+    fn history_token(&self) -> Arc<()> {
+        self.admission.history_token()
+    }
+
+    fn release_bytes(&self, released_bytes: usize) {
+        self.admission.release_bytes(self.id, released_bytes);
+    }
+}
+
+impl Drop for WatchAdmissionLease {
+    fn drop(&mut self) {
+        self.admission.release_lease(self.id);
+    }
+}
+
 /// Error from a task collection snapshot.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum CollectionError {
+    /// The state cannot admit another concurrent Task watch.
+    #[error("concurrent Task watch limit reached: {limit}")]
+    ConcurrentTaskWatchLimitReached {
+        /// Configured concurrent Task watch limit.
+        limit: usize,
+    },
+    /// A new Task watch would exceed the aggregate initial and replay byte budget.
+    #[error(
+        "Task watch initial and replay byte limit exceeded: current {current} bytes, requested {requested} bytes, limit {limit} bytes"
+    )]
+    TaskWatchInitialReplayByteLimitExceeded {
+        /// Serialized bytes retained by admitted Task watches.
+        current: usize,
+        /// Serialized bytes required by the new Task watch.
+        requested: usize,
+        /// Configured aggregate byte limit.
+        limit: usize,
+    },
     /// The resource version is malformed or ahead of this store.
     #[error("invalid resourceVersion `{resource_version}`")]
     InvalidResourceVersion {
@@ -373,6 +794,28 @@ pub enum CollectionError {
         /// Missing task name.
         name: TaskId,
     },
+    /// A TaskRun continuation belongs to another task name.
+    #[error(
+        "TaskRun continuation belongs to task `{continuation_task}`, not requested task `{task}`"
+    )]
+    TaskRunContinuationTaskMismatch {
+        /// Requested task name.
+        task: TaskId,
+        /// Task name fixed by the continuation.
+        continuation_task: TaskId,
+    },
+    /// The TaskRun continuation cursor is absent from its retained snapshot.
+    #[error(
+        "TaskRun continuation cursor `{task}` generation {generation} attempt {attempt} is not part of the retained snapshot"
+    )]
+    TaskRunContinuationCursorNotFound {
+        /// Task name fixed by the continuation.
+        task: TaskId,
+        /// Missing run generation.
+        generation: u64,
+        /// Missing run attempt.
+        attempt: u32,
+    },
 }
 
 /// Stream of filtered task changes.
@@ -383,19 +826,86 @@ pub enum CollectionError {
 /// A compacted resume point produces [`CollectionError::ResourceVersionExpired`].
 /// That error is terminal.
 /// The stream ends after returning it.
+///
+/// Initial and exact-resume events retain an aggregate byte lease until each
+/// event is yielded. Lag recovery waits for byte capacity without retaining
+/// replay payload across a pending poll. One event larger than the complete
+/// budget is transferred directly to the caller and is never buffered.
 #[must_use = "streams do nothing unless polled"]
 pub struct TaskWatchSubscription {
     inner: Arc<RwLock<TaskStateInner>>,
     receiver: BroadcastStream<Arc<RawTaskChange>>,
-    initial: VecDeque<TaskWatchEvent>,
+    initial: VecDeque<BufferedWatchEvent>,
     initial_revision: Option<u64>,
-    replay: VecDeque<Arc<RawTaskChange>>,
+    replay: VecDeque<PreparedReplayChange>,
+    recovery: Option<LagRecovery>,
+    permit: Option<WatchAdmissionLease>,
     filter: TaskFilter,
     predicate: WatchPredicate,
-    epoch: String,
+    epoch: Arc<str>,
     last_revision: u64,
     stop: Pin<Box<dyn Future<Output = ()> + Send>>,
     terminal: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PreparedWatchEventKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+struct WatchEventDescriptor {
+    kind: PreparedWatchEventKind,
+    task: Arc<Task>,
+    resource_version: Option<String>,
+    serialized_bytes: usize,
+}
+
+impl WatchEventDescriptor {
+    fn materialize(self) -> TaskWatchEvent {
+        let mut task = self.task.as_ref().clone();
+        if let Some(resource_version) = self.resource_version {
+            task.set_resource_version(resource_version)
+                .expect("store resource version must be valid");
+        }
+        match self.kind {
+            PreparedWatchEventKind::Added => TaskWatchEvent::Added(task),
+            PreparedWatchEventKind::Modified => TaskWatchEvent::Modified(task),
+            PreparedWatchEventKind::Deleted => TaskWatchEvent::Deleted(task),
+        }
+    }
+
+    fn into_buffered(self) -> BufferedWatchEvent {
+        let serialized_bytes = self.serialized_bytes;
+        BufferedWatchEvent {
+            event: self.materialize(),
+            serialized_bytes,
+        }
+    }
+}
+
+struct BufferedWatchEvent {
+    event: TaskWatchEvent,
+    serialized_bytes: usize,
+}
+
+struct PreparedReplayChange {
+    revision: u64,
+    event: Option<BufferedWatchEvent>,
+}
+
+struct LagRecovery {
+    target_revision: u64,
+    pending: Option<RecoveryEventProbe>,
+}
+
+#[derive(Clone)]
+struct RecoveryEventProbe {
+    revision: u64,
+    kind: PreparedWatchEventKind,
+    serialized_bytes: usize,
+    history_token: Arc<()>,
 }
 
 impl TaskWatchSubscription {
@@ -403,7 +913,7 @@ impl TaskWatchSubscription {
         self.filter.matches(task) && (self.predicate)(task)
     }
 
-    fn event_for(&self, change: &RawTaskChange) -> Option<TaskWatchEvent> {
+    fn descriptor_for(&self, change: &RawTaskChange) -> Option<WatchEventDescriptor> {
         let previous_matches = change
             .previous
             .as_ref()
@@ -414,47 +924,171 @@ impl TaskWatchSubscription {
             .is_some_and(|task| self.matches(task));
 
         match (previous_matches, current_matches) {
-            (false, true) => change
-                .current
-                .as_deref()
-                .cloned()
-                .map(TaskWatchEvent::Added),
-            (true, true) => change
-                .current
-                .as_deref()
-                .cloned()
-                .map(TaskWatchEvent::Modified),
+            (false, true) => change.current.as_ref().map(|task| WatchEventDescriptor {
+                kind: PreparedWatchEventKind::Added,
+                task: Arc::clone(task),
+                resource_version: None,
+                serialized_bytes: TaskState::serialized_task_payload_bytes(
+                    None,
+                    Some(task.as_ref()),
+                ),
+            }),
+            (true, true) => change.current.as_ref().map(|task| WatchEventDescriptor {
+                kind: PreparedWatchEventKind::Modified,
+                task: Arc::clone(task),
+                resource_version: None,
+                serialized_bytes: TaskState::serialized_task_payload_bytes(
+                    None,
+                    Some(task.as_ref()),
+                ),
+            }),
             (true, false) => {
-                let mut task = change.previous.as_deref()?.clone();
-                task.set_resource_version(TaskState::format_resource_version(
-                    &self.epoch,
-                    change.revision,
-                ))
-                .expect("store resource version must be valid");
-                Some(TaskWatchEvent::Deleted(task))
+                let task = change.previous.as_ref()?;
+                let resource_version =
+                    TaskState::format_resource_version(change.epoch.as_ref(), change.revision);
+                Some(WatchEventDescriptor {
+                    kind: PreparedWatchEventKind::Deleted,
+                    task: Arc::clone(task),
+                    serialized_bytes: TaskState::serialized_task_with_resource_version_bytes(
+                        task.as_ref(),
+                        &resource_version,
+                    ),
+                    resource_version: Some(resource_version),
+                })
             }
             (false, false) => None,
         }
     }
 
-    fn recover_after_lag(&mut self) -> Result<(), CollectionError> {
+    fn begin_recovery_after_lag(&mut self) -> Result<(), CollectionError> {
         let inner = self.inner.read();
-        if self.last_revision < inner.compacted_through {
+        if inner.resource_version_epoch.as_ref() != self.epoch.as_ref() {
             return Err(CollectionError::ResourceVersionExpired {
                 resource_version: TaskState::format_resource_version(
-                    &self.epoch,
+                    self.epoch.as_ref(),
                     self.last_revision,
                 ),
             });
         }
-        self.replay.extend(
-            inner
-                .watch_history
-                .iter()
-                .filter(|change| change.revision > self.last_revision)
-                .cloned(),
-        );
+        if self.last_revision < inner.compacted_through {
+            return Err(CollectionError::ResourceVersionExpired {
+                resource_version: TaskState::format_resource_version(
+                    self.epoch.as_ref(),
+                    self.last_revision,
+                ),
+            });
+        }
+        self.recovery = Some(LagRecovery {
+            target_revision: inner.resource_version,
+            pending: None,
+        });
         Ok(())
+    }
+
+    fn next_recovery_change(
+        &self,
+        target_revision: u64,
+    ) -> Result<Option<Arc<RawTaskChange>>, CollectionError> {
+        if self.last_revision >= target_revision {
+            return Ok(None);
+        }
+        let inner = self.inner.read();
+        if inner.resource_version_epoch.as_ref() != self.epoch.as_ref()
+            || self.last_revision < inner.compacted_through
+        {
+            return Err(CollectionError::ResourceVersionExpired {
+                resource_version: TaskState::format_resource_version(
+                    self.epoch.as_ref(),
+                    self.last_revision,
+                ),
+            });
+        }
+        Ok(inner
+            .watch_history
+            .iter()
+            .find(|change| {
+                change.revision > self.last_revision && change.revision <= target_revision
+            })
+            .cloned())
+    }
+
+    fn descriptor_from_recovery_probe(
+        &self,
+        target_revision: u64,
+        probe: &RecoveryEventProbe,
+    ) -> Result<WatchEventDescriptor, CollectionError> {
+        let change = self.next_recovery_change(target_revision)?.ok_or_else(|| {
+            CollectionError::ResourceVersionExpired {
+                resource_version: TaskState::format_resource_version(
+                    self.epoch.as_ref(),
+                    self.last_revision,
+                ),
+            }
+        })?;
+        if change.revision != probe.revision {
+            return Err(CollectionError::ResourceVersionExpired {
+                resource_version: TaskState::format_resource_version(
+                    self.epoch.as_ref(),
+                    self.last_revision,
+                ),
+            });
+        }
+        let (task, resource_version) = match probe.kind {
+            PreparedWatchEventKind::Added | PreparedWatchEventKind::Modified => (
+                change.current.as_ref().map(Arc::clone).ok_or_else(|| {
+                    CollectionError::ResourceVersionExpired {
+                        resource_version: TaskState::format_resource_version(
+                            self.epoch.as_ref(),
+                            self.last_revision,
+                        ),
+                    }
+                })?,
+                None,
+            ),
+            PreparedWatchEventKind::Deleted => (
+                change.previous.as_ref().map(Arc::clone).ok_or_else(|| {
+                    CollectionError::ResourceVersionExpired {
+                        resource_version: TaskState::format_resource_version(
+                            self.epoch.as_ref(),
+                            self.last_revision,
+                        ),
+                    }
+                })?,
+                Some(TaskState::format_resource_version(
+                    change.epoch.as_ref(),
+                    change.revision,
+                )),
+            ),
+        };
+        Ok(WatchEventDescriptor {
+            kind: probe.kind,
+            task,
+            resource_version,
+            serialized_bytes: probe.serialized_bytes,
+        })
+    }
+
+    fn take_buffered_event(&self, buffered: BufferedWatchEvent) -> TaskWatchEvent {
+        if let Some(permit) = self.permit.as_ref() {
+            permit.release_bytes(buffered.serialized_bytes);
+        }
+        buffered.event
+    }
+
+    fn finish_terminal(&mut self) {
+        self.terminal = true;
+        self.initial.clear();
+        self.replay.clear();
+        self.recovery = None;
+        self.permit.take();
+    }
+
+    fn terminal_error(
+        &mut self,
+        error: CollectionError,
+    ) -> Poll<Option<Result<TaskWatchEvent, CollectionError>>> {
+        self.finish_terminal();
+        Poll::Ready(Some(Err(error)))
     }
 }
 
@@ -466,7 +1100,7 @@ impl Stream for TaskWatchSubscription {
             return Poll::Ready(None);
         }
         if self.stop.as_mut().poll(cx).is_ready() {
-            self.terminal = true;
+            self.finish_terminal();
             return Poll::Ready(None);
         }
 
@@ -476,6 +1110,7 @@ impl Stream for TaskWatchSubscription {
             {
                 self.last_revision = revision;
             }
+            let event = self.take_buffered_event(event);
             return Poll::Ready(Some(Ok(event)));
         }
         if let Some(revision) = self.initial_revision.take() {
@@ -486,7 +1121,7 @@ impl Stream for TaskWatchSubscription {
         loop {
             if processed == WATCH_POLL_BUDGET {
                 if self.stop.as_mut().poll(cx).is_ready() {
-                    self.terminal = true;
+                    self.finish_terminal();
                     return Poll::Ready(None);
                 }
                 cx.waker().wake_by_ref();
@@ -496,32 +1131,183 @@ impl Stream for TaskWatchSubscription {
             if let Some(change) = self.replay.pop_front() {
                 processed += 1;
                 self.last_revision = change.revision;
-                if let Some(event) = self.event_for(&change) {
+                if let Some(event) = change.event {
+                    let event = self.take_buffered_event(event);
                     return Poll::Ready(Some(Ok(event)));
                 }
                 continue;
             }
 
+            if self.recovery.is_some() {
+                let target_revision = self
+                    .recovery
+                    .as_ref()
+                    .expect("checked recovery state must be present")
+                    .target_revision;
+                if let Some(probe) = self
+                    .recovery
+                    .as_ref()
+                    .expect("checked recovery state must be present")
+                    .pending
+                    .clone()
+                {
+                    let reservation = self
+                        .permit
+                        .as_ref()
+                        .expect("an active watch must own an admission lease")
+                        .poll_reserve_replay(probe.serialized_bytes, &probe.history_token, cx);
+                    let reservation = match reservation {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(WatchReplayReservation::Closed) => {
+                            self.finish_terminal();
+                            return Poll::Ready(None);
+                        }
+                        Poll::Ready(WatchReplayReservation::HistoryChanged) => {
+                            processed += 1;
+                            let history_token = self
+                                .permit
+                                .as_ref()
+                                .expect("an active watch must own an admission lease")
+                                .history_token();
+                            if let Err(error) =
+                                self.descriptor_from_recovery_probe(target_revision, &probe)
+                            {
+                                return self.terminal_error(error);
+                            }
+                            self.recovery
+                                .as_mut()
+                                .expect("checked recovery state must be present")
+                                .pending
+                                .as_mut()
+                                .expect("checked recovery probe must be present")
+                                .history_token = history_token;
+                            continue;
+                        }
+                        Poll::Ready(reservation) => reservation,
+                    };
+                    let descriptor =
+                        match self.descriptor_from_recovery_probe(target_revision, &probe) {
+                            Ok(descriptor) => descriptor,
+                            Err(error) => {
+                                if matches!(reservation, WatchReplayReservation::Reserved) {
+                                    self.permit
+                                        .as_ref()
+                                        .expect("an active watch must own an admission lease")
+                                        .release_bytes(probe.serialized_bytes);
+                                }
+                                return self.terminal_error(error);
+                            }
+                        };
+                    self.recovery
+                        .as_mut()
+                        .expect("checked recovery state must be present")
+                        .pending = None;
+                    self.last_revision = probe.revision;
+                    let event = descriptor.materialize();
+                    if matches!(reservation, WatchReplayReservation::Reserved) {
+                        self.permit
+                            .as_ref()
+                            .expect("an active watch must own an admission lease")
+                            .release_bytes(probe.serialized_bytes);
+                    }
+                    return Poll::Ready(Some(Ok(event)));
+                }
+
+                let history_token = self
+                    .permit
+                    .as_ref()
+                    .expect("an active watch must own an admission lease")
+                    .history_token();
+                let change = match self.next_recovery_change(target_revision) {
+                    Ok(Some(change)) => change,
+                    Ok(None) => {
+                        self.last_revision = target_revision;
+                        self.recovery = None;
+                        continue;
+                    }
+                    Err(error) => return self.terminal_error(error),
+                };
+                processed += 1;
+                let revision = change.revision;
+                let Some(descriptor) = self.descriptor_for(&change) else {
+                    self.last_revision = revision;
+                    continue;
+                };
+                let probe = RecoveryEventProbe {
+                    revision,
+                    kind: descriptor.kind,
+                    serialized_bytes: descriptor.serialized_bytes,
+                    history_token,
+                };
+                let reservation = self
+                    .permit
+                    .as_ref()
+                    .expect("an active watch must own an admission lease")
+                    .poll_reserve_replay(descriptor.serialized_bytes, &probe.history_token, cx);
+                match reservation {
+                    Poll::Pending => {
+                        self.recovery
+                            .as_mut()
+                            .expect("checked recovery state must be present")
+                            .pending = Some(probe);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(WatchReplayReservation::HistoryChanged) => {
+                        self.recovery
+                            .as_mut()
+                            .expect("checked recovery state must be present")
+                            .pending = Some(probe);
+                        continue;
+                    }
+                    Poll::Ready(WatchReplayReservation::Closed) => {
+                        self.finish_terminal();
+                        return Poll::Ready(None);
+                    }
+                    Poll::Ready(WatchReplayReservation::Oversized) => {
+                        self.last_revision = revision;
+                        return Poll::Ready(Some(Ok(descriptor.materialize())));
+                    }
+                    Poll::Ready(WatchReplayReservation::Reserved) => {
+                        let bytes = descriptor.serialized_bytes;
+                        let event = descriptor.materialize();
+                        self.last_revision = revision;
+                        self.permit
+                            .as_ref()
+                            .expect("an active watch must own an admission lease")
+                            .release_bytes(bytes);
+                        return Poll::Ready(Some(Ok(event)));
+                    }
+                }
+            }
+
             match Pin::new(&mut self.receiver).poll_next(cx) {
                 Poll::Ready(Some(Ok(change))) => {
                     processed += 1;
+                    if change.epoch.as_ref() != self.epoch.as_ref() {
+                        let resource_version = TaskState::format_resource_version(
+                            self.epoch.as_ref(),
+                            self.last_revision,
+                        );
+                        return self.terminal_error(CollectionError::ResourceVersionExpired {
+                            resource_version,
+                        });
+                    }
                     if change.revision <= self.last_revision {
                         continue;
                     }
                     self.last_revision = change.revision;
-                    if let Some(event) = self.event_for(&change) {
-                        return Poll::Ready(Some(Ok(event)));
+                    if let Some(descriptor) = self.descriptor_for(&change) {
+                        return Poll::Ready(Some(Ok(descriptor.materialize())));
                     }
                 }
                 Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => {
                     processed += 1;
-                    if let Err(error) = self.recover_after_lag() {
-                        self.terminal = true;
-                        return Poll::Ready(Some(Err(error)));
+                    if let Err(error) = self.begin_recovery_after_lag() {
+                        return self.terminal_error(error);
                     }
                 }
                 Poll::Ready(None) => {
-                    self.terminal = true;
+                    self.finish_terminal();
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
@@ -565,7 +1351,7 @@ pub(crate) struct DesiredCommit {
 }
 
 impl TaskState {
-    /// Creates empty state with default retention settings.
+    /// Creates empty state with default admission and retention settings.
     ///
     /// Most applications use [`SupervisorApi::state`](crate::SupervisorApi::state).
     /// Use [`try_new`](Self::try_new) when initialization failure must be handled.
@@ -587,7 +1373,7 @@ impl TaskState {
             .expect("OS entropy is required to create a TaskState resource-version epoch")
     }
 
-    /// Tries to create empty state with default retention settings.
+    /// Tries to create empty state with default admission and retention settings.
     ///
     /// # Errors
     ///
@@ -639,17 +1425,27 @@ impl TaskState {
         event_sink: Option<TaskStateSinkHandle>,
         persistence_config: PersistenceConfig,
     ) -> Result<Self, CoreError> {
-        let (watch_tx, _) = broadcast::channel(config.watch_history_capacity());
+        let (watch_tx, _) =
+            broadcast::channel(task_watch_live_capacity(config.watch_history_capacity()));
+        let watch_admission = WatchAdmission::new(config);
+        let run_resource_version_epoch = format!("runs-{epoch}");
         Ok(Self {
             inner: Arc::new(RwLock::new(TaskStateInner {
                 by_slot: HashMap::new(),
                 tasks: HashMap::new(),
                 ordered_tasks: BTreeSet::new(),
                 runs: HashMap::new(),
+                run_resource_version_epoch,
+                run_resource_version: 0,
+                run_history: VecDeque::new(),
+                run_history_bytes: 0,
+                run_history_byte_budget: config.run_history_byte_budget(),
+                run_compacted_through: 0,
+                run_history_capacity: config.run_history_capacity(),
                 by_tv: HashMap::new(),
                 tv_of: HashMap::new(),
                 finished_attempt_by_tv: HashMap::new(),
-                resource_version_epoch: epoch,
+                resource_version_epoch: Arc::from(epoch),
                 resource_version: 0,
                 watch_history: VecDeque::new(),
                 watch_history_bytes: 0,
@@ -659,8 +1455,13 @@ impl TaskState {
                 watch_tx,
                 terminal_since: HashMap::new(),
                 max_runs_per_task: config.max_runs_per_task(),
+                max_retained_tasks: config.max_retained_tasks(),
+                retained_task_manifest_bytes: 0,
+                retained_task_manifest_bytes_by_name: HashMap::new(),
+                max_retained_task_manifest_bytes: config.max_retained_task_manifest_bytes(),
             })),
             watch_stop: CancellationToken::new(),
+            watch_admission,
             event_publisher: Arc::new(
                 StateEventPublisher::new(event_sink, persistence_config)
                     .map_err(CoreError::PersistenceInitialization)?,
@@ -677,6 +1478,8 @@ impl TaskState {
         let batch = self.event_publisher.begin_batch(permits);
         TaskStateWriteGuard {
             inner: Some(inner),
+            watch_admission: self.watch_admission.as_ref(),
+            watch_history_invalidated: false,
             publisher: &self.event_publisher,
             batch,
         }
@@ -693,15 +1496,40 @@ impl TaskState {
     }
 
     fn current_resource_version(inner: &TaskStateInner) -> String {
-        Self::format_resource_version(&inner.resource_version_epoch, inner.resource_version)
+        Self::format_resource_version(
+            inner.resource_version_epoch.as_ref(),
+            inner.resource_version,
+        )
     }
 
-    fn next_resource_version(inner: &mut TaskStateInner) -> (u64, String) {
-        inner.resource_version = inner.resource_version.saturating_add(1);
+    fn current_run_resource_version(inner: &TaskStateInner) -> String {
+        Self::format_resource_version(
+            &inner.run_resource_version_epoch,
+            inner.run_resource_version,
+        )
+    }
+
+    fn next_resource_version(inner: &mut TaskStateWriteGuard<'_>) -> (u64, String) {
+        if inner.resource_version == u64::MAX {
+            inner.invalidate_watch_history();
+            inner.resource_version_epoch = Arc::from(Self::next_resource_version_epoch(
+                inner.resource_version_epoch.as_ref(),
+            ));
+            inner.resource_version = 0;
+            inner.watch_history.clear();
+            inner.watch_history_bytes = 0;
+            inner.compacted_through = 0;
+        }
+        inner.resource_version += 1;
         (
             inner.resource_version,
             Self::current_resource_version(inner),
         )
+    }
+
+    /// Advances an opaque store epoch without depending on entropy.
+    fn next_resource_version_epoch(epoch: &str) -> String {
+        format!("next-{epoch}")
     }
 
     fn serialized_task_payload_bytes(previous: Option<&Task>, current: Option<&Task>) -> usize {
@@ -710,6 +1538,124 @@ impl TaskState {
             serde_json::to_writer(&mut counter, task)
                 .expect("TaskState resources must serialize as JSON");
         }
+        counter.0
+    }
+
+    fn serialized_json_string_bytes(value: &str) -> usize {
+        let mut counter = SerializedSizeCounter::default();
+        serde_json::to_writer(&mut counter, value)
+            .expect("validated resource versions must serialize as JSON strings");
+        counter.0
+    }
+
+    fn serialized_task_with_resource_version_bytes(task: &Task, resource_version: &str) -> usize {
+        let task_bytes = Self::serialized_task_payload_bytes(None, Some(task));
+        let previous_version_bytes =
+            Self::serialized_json_string_bytes(task.metadata().resource_version());
+        let next_version_bytes = Self::serialized_json_string_bytes(resource_version);
+        task_bytes
+            .checked_sub(previous_version_bytes)
+            .and_then(|bytes| bytes.checked_add(next_version_bytes))
+            .expect("Task JSON must contain its serialized resource version exactly once")
+    }
+
+    /// Returns the compact JSON size of one TaskRun page item.
+    fn serialized_run_payload_bytes(run: &TaskRun) -> usize {
+        let mut counter = SerializedSizeCounter::default();
+        serde_json::to_writer(&mut counter, run).expect("TaskRun values must serialize as JSON");
+        counter.0
+    }
+
+    /// Returns the journal charge for one TaskRun mutation batch.
+    fn serialized_run_change_bytes(changes: &[RawRunChange]) -> usize {
+        let mut counter = SerializedSizeCounter::default();
+        for change in changes {
+            serde_json::to_writer(&mut counter, &change.task)
+                .expect("TaskId values must serialize as JSON");
+            serde_json::to_writer(&mut counter, &change.task_uid)
+                .expect("Uid values must serialize as JSON");
+            for run in [change.previous.as_ref(), change.current.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                serde_json::to_writer(&mut counter, run.as_ref())
+                    .expect("TaskRun values must serialize as JSON");
+            }
+        }
+        counter.0
+    }
+
+    /// Commits one reversible TaskRun revision and enforces journal limits.
+    fn record_run_snapshot_changes(inner: &mut TaskStateInner, mut changes: Vec<RawRunChange>) {
+        changes.retain(|change| change.previous != change.current);
+        if changes.is_empty() {
+            return;
+        }
+
+        if inner.run_resource_version == u64::MAX {
+            inner.run_resource_version_epoch =
+                Self::next_resource_version_epoch(&inner.run_resource_version_epoch);
+            inner.run_resource_version = 0;
+            inner.run_history.clear();
+            inner.run_history_bytes = 0;
+            inner.run_compacted_through = 0;
+        }
+        inner.run_resource_version += 1;
+        let revision = inner.run_resource_version;
+        let serialized_bytes = Self::serialized_run_change_bytes(&changes);
+        let batch = RawRunChangeBatch {
+            revision,
+            changes,
+            serialized_bytes,
+        };
+
+        if serialized_bytes > inner.run_history_byte_budget {
+            inner.run_history.clear();
+            inner.run_history_bytes = 0;
+            inner.run_compacted_through = revision;
+            return;
+        }
+
+        while inner.run_history.len() >= inner.run_history_capacity
+            || inner.run_history_bytes > inner.run_history_byte_budget - serialized_bytes
+        {
+            let compacted = inner
+                .run_history
+                .pop_front()
+                .expect("a non-empty TaskRun journal must satisfy its configured limits");
+            inner.run_history_bytes = inner
+                .run_history_bytes
+                .checked_sub(compacted.serialized_bytes)
+                .expect("TaskRun journal byte accounting must not underflow");
+            inner.run_compacted_through = compacted.revision;
+        }
+        inner.run_history_bytes = inner
+            .run_history_bytes
+            .checked_add(serialized_bytes)
+            .expect("TaskRun journal byte accounting must not overflow");
+        inner.run_history.push_back(batch);
+    }
+
+    /// Creates one reversible TaskRun change for a task identity.
+    fn run_snapshot_change(
+        task: &TaskId,
+        task_uid: &Uid,
+        previous: Option<Arc<TaskRun>>,
+        current: Option<Arc<TaskRun>>,
+    ) -> RawRunChange {
+        RawRunChange {
+            task: task.clone(),
+            task_uid: task_uid.clone(),
+            previous,
+            current,
+        }
+    }
+
+    /// Returns the canonical compact JSON bytes of one caller-owned manifest.
+    fn serialized_task_manifest_bytes(manifest: &TaskManifest) -> usize {
+        let mut counter = SerializedSizeCounter::default();
+        serde_json::to_writer(&mut counter, manifest)
+            .expect("validated TaskManifest resources must serialize as JSON");
         counter.0
     }
 
@@ -725,7 +1671,7 @@ impl TaskState {
         }
         let persistence_event = TaskStateEvent::TaskChanged {
             resource_version: Self::format_resource_version(
-                &inner.resource_version_epoch,
+                inner.resource_version_epoch.as_ref(),
                 revision,
             ),
             previous: previous.clone(),
@@ -734,16 +1680,19 @@ impl TaskState {
         let serialized_bytes =
             Self::serialized_task_payload_bytes(previous.as_deref(), current.as_deref());
         let change = Arc::new(RawTaskChange {
+            epoch: Arc::clone(&inner.resource_version_epoch),
             revision,
             previous,
             current,
             serialized_bytes,
         });
 
+        let mut history_invalidated = false;
         if serialized_bytes > inner.watch_history_byte_budget {
             inner.watch_history.clear();
             inner.watch_history_bytes = 0;
             inner.compacted_through = revision;
+            history_invalidated = true;
         } else {
             while inner.watch_history.len() >= inner.watch_history_capacity
                 || inner.watch_history_bytes > inner.watch_history_byte_budget - serialized_bytes
@@ -757,12 +1706,16 @@ impl TaskState {
                     .checked_sub(compacted.serialized_bytes)
                     .expect("watch history byte accounting must not underflow");
                 inner.compacted_through = compacted.revision;
+                history_invalidated = true;
             }
             inner.watch_history_bytes = inner
                 .watch_history_bytes
                 .checked_add(serialized_bytes)
                 .expect("watch history byte accounting must not overflow");
             inner.watch_history.push_back(Arc::clone(&change));
+        }
+        if history_invalidated {
+            inner.invalidate_watch_history();
         }
 
         let _ = inner.watch_tx.send(change);
@@ -799,42 +1752,122 @@ impl TaskState {
         }
     }
 
+    /// Replaces one task's manifest-byte contribution.
+    fn set_retained_task_manifest_bytes(
+        inner: &mut TaskStateInner,
+        name: &TaskId,
+        manifest_bytes: usize,
+    ) {
+        let previous = inner
+            .retained_task_manifest_bytes_by_name
+            .insert(name.clone(), manifest_bytes)
+            .unwrap_or(0);
+        inner.retained_task_manifest_bytes = inner
+            .retained_task_manifest_bytes
+            .checked_sub(previous)
+            .and_then(|current| current.checked_add(manifest_bytes))
+            .expect("retained TaskManifest byte accounting must remain exact");
+    }
+
+    /// Removes one task's manifest-byte contribution.
+    fn remove_retained_task_manifest_bytes(inner: &mut TaskStateInner, name: &TaskId) {
+        let removed = inner
+            .retained_task_manifest_bytes_by_name
+            .remove(name)
+            .expect("every retained task must have manifest byte accounting");
+        inner.retained_task_manifest_bytes = inner
+            .retained_task_manifest_bytes
+            .checked_sub(removed)
+            .expect("retained TaskManifest byte accounting must not underflow");
+    }
+
+    /// Verifies that one new task fits in the configured state limit.
+    fn ensure_retained_task_capacity(inner: &TaskStateInner) -> Result<(), CoreError> {
+        if let Some(limit) = inner.max_retained_tasks
+            && inner.tasks.len() >= limit.get()
+        {
+            return Err(CoreError::RetainedTaskLimitReached { limit: limit.get() });
+        }
+        Ok(())
+    }
+
+    /// Verifies that one positive manifest-byte addition fits the state budget.
+    fn ensure_retained_task_manifest_byte_capacity(
+        inner: &TaskStateInner,
+        requested: usize,
+    ) -> Result<(), CoreError> {
+        debug_assert!(requested > 0);
+        if let Some(limit) = inner.max_retained_task_manifest_bytes
+            && requested
+                > limit
+                    .get()
+                    .saturating_sub(inner.retained_task_manifest_bytes)
+        {
+            return Err(CoreError::RetainedTaskManifestByteLimitExceeded {
+                current: inner.retained_task_manifest_bytes,
+                requested,
+                limit: limit.get(),
+            });
+        }
+        Ok(())
+    }
+
     /// Inserts a manifest for tests.
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn add_task(&self, manifest: TaskManifest) {
-        let mut inner = self.write(StateMutationEventCapacity::TaskChange);
+        let manifest_bytes = Self::serialized_task_manifest_bytes(&manifest);
         let name = manifest.name().clone();
+        let mut task = Task::from_manifest(manifest).expect("test manifest must be valid");
+        let mut inner = self.write(StateMutationEventCapacity::TaskChange);
         let previous = inner.tasks.remove(&name);
         if let Some(previous) = previous.as_ref() {
             Self::unindex_task(&mut inner, previous);
+            if let Some(runs) = inner.runs.remove(&name) {
+                let changes = runs
+                    .into_iter()
+                    .map(|run| Self::run_snapshot_change(&name, previous.uid(), Some(run), None))
+                    .collect();
+                Self::record_run_snapshot_changes(&mut inner, changes);
+            }
         }
-        let mut task = Task::from_manifest(manifest).expect("test manifest must be valid");
         let (revision, resource_version) = Self::next_resource_version(&mut inner);
         task.set_resource_version(resource_version)
             .expect("store resource version must be valid");
         Self::index_task(&mut inner, &task);
         let task = Arc::new(task);
         inner.tasks.insert(name, Arc::clone(&task));
+        Self::set_retained_task_manifest_bytes(&mut inner, task.name(), manifest_bytes);
         self.record_change(&mut inner, revision, previous, Some(task));
     }
 
     /// Creates one desired resource.
     ///
     /// Every retained name conflicts.
+    /// A new name is rejected when the retained task limit is full.
+    /// The task-count limit is checked before the manifest byte budget.
+    /// No task is evicted or changed by a rejection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::AlreadyExists`] when the name is retained.
+    /// Returns [`CoreError::RetainedTaskLimitReached`] when no task slot remains.
+    /// Returns [`CoreError::RetainedTaskManifestByteLimitExceeded`] when the
+    /// caller-owned manifest would exceed the aggregate byte budget.
     pub(crate) fn create_desired(
         &self,
         manifest: &TaskManifest,
     ) -> Result<DesiredCommit, CoreError> {
-        // Build and allocate the immutable desired snapshot before entering the
-        // global commit section. A conflicting name may discard this candidate.
+        let manifest_bytes = Self::serialized_task_manifest_bytes(manifest);
         let mut task = Task::from_manifest(manifest.clone())?;
-        let mut inner = self.write(StateMutationEventCapacity::TaskChange);
         let name = manifest.name().clone();
+        let mut inner = self.write(StateMutationEventCapacity::TaskChange);
         if inner.tasks.contains_key(&name) {
             return Err(CoreError::AlreadyExists(format!(
                 "Task resource '{name}' already exists"
             )));
         }
+        Self::ensure_retained_task_capacity(&inner)?;
+        Self::ensure_retained_task_manifest_byte_capacity(&inner, manifest_bytes)?;
 
         let (revision, resource_version) = Self::next_resource_version(&mut inner);
         task.set_resource_version(resource_version)?;
@@ -842,6 +1875,7 @@ impl TaskState {
         inner.terminal_since.remove(&name);
         let task = Arc::new(task);
         inner.tasks.insert(name, Arc::clone(&task));
+        Self::set_retained_task_manifest_bytes(&mut inner, task.name(), manifest_bytes);
         self.record_change(&mut inner, revision, None, Some(Arc::clone(&task)));
         Ok(DesiredCommit {
             task: task.as_ref().clone(),
@@ -861,16 +1895,31 @@ impl TaskState {
     }
 
     /// Applies a manifest after checking write preconditions.
+    ///
+    /// Existing state can change when the retained task limit is full.
+    /// Positive manifest growth is rejected when it exceeds the aggregate byte
+    /// budget. Shrinks and equal-size writes remain allowed.
+    /// An unchecked missing name uses create admission.
+    /// A checked missing name remains not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotFound`] for checked missing state.
+    /// Returns [`CoreError::RetainedTaskLimitReached`] when an unchecked missing
+    /// name cannot be retained.
+    /// Returns [`CoreError::RetainedTaskManifestByteLimitExceeded`] when a new
+    /// manifest or positive existing-manifest growth exceeds the byte budget.
     pub(crate) fn apply_desired_with_preconditions(
         &self,
         manifest: &TaskManifest,
         preconditions: &WritePreconditions,
     ) -> Result<DesiredCommit, CoreError> {
+        let desired_manifest_bytes = Self::serialized_task_manifest_bytes(manifest);
         let desired_labels = manifest.metadata().labels().clone();
         let desired_annotations = manifest.metadata().annotations().clone();
         let desired_spec = manifest.spec().clone();
-        let mut inner = self.write(StateMutationEventCapacity::TaskChange);
         let name = manifest.name().clone();
+        let mut inner = self.write(StateMutationEventCapacity::TaskChange);
         let Some(current) = inner.tasks.get(&name) else {
             if !preconditions.is_empty() {
                 return Err(CoreError::NotFound(name.to_string()));
@@ -879,6 +1928,10 @@ impl TaskState {
             return self.create_desired(manifest);
         };
         Self::check_write_preconditions(current, preconditions)?;
+        let current_manifest_bytes = *inner
+            .retained_task_manifest_bytes_by_name
+            .get(&name)
+            .expect("every retained task must have manifest byte accounting");
 
         let metadata_changed = current.metadata().labels() != &desired_labels
             || current.metadata().annotations() != &desired_annotations;
@@ -889,6 +1942,12 @@ impl TaskState {
                 task: current.as_ref().clone(),
                 reconcile: false,
             });
+        }
+        if desired_manifest_bytes > current_manifest_bytes {
+            Self::ensure_retained_task_manifest_byte_capacity(
+                &inner,
+                desired_manifest_bytes - current_manifest_bytes,
+            )?;
         }
 
         let previous = Arc::clone(current);
@@ -926,6 +1985,7 @@ impl TaskState {
         if change == DesiredChange::Spec || retry {
             inner.terminal_since.remove(&name);
         }
+        Self::set_retained_task_manifest_bytes(&mut inner, &name, desired_manifest_bytes);
         self.record_change(
             &mut inner,
             revision,
@@ -1039,12 +2099,21 @@ impl TaskState {
     /// Reconciliation failures do not use this path.
     pub(crate) fn delete_task(&self, id: &TaskId) -> bool {
         let mut inner = self.write(StateMutationEventCapacity::TaskChange);
-        inner.runs.remove(id);
+        let task_uid = inner.tasks.get(id).map(|task| task.uid().clone());
+        let removed_runs = inner.runs.remove(id);
+        if let (Some(task_uid), Some(removed_runs)) = (task_uid.as_ref(), removed_runs) {
+            let changes = removed_runs
+                .into_iter()
+                .map(|run| Self::run_snapshot_change(id, task_uid, Some(run), None))
+                .collect();
+            Self::record_run_snapshot_changes(&mut inner, changes);
+        }
         inner.terminal_since.remove(id);
 
         Self::unbind_locked(&mut inner, id);
         if let Some(task) = inner.tasks.remove(id) {
             Self::unindex_task(&mut inner, &task);
+            Self::remove_retained_task_manifest_bytes(&mut inner, id);
             let (revision, _) = Self::next_resource_version(&mut inner);
             self.record_change(&mut inner, revision, Some(task), None);
             true
@@ -1057,13 +2126,21 @@ impl TaskState {
         task.name() == &resource.name && task.uid() == &resource.uid
     }
 
-    fn enforce_run_cap(runs: &mut VecDeque<TaskRun>, max: usize) {
-        while runs.len() > max {
+    /// Removes the oldest completed runs above the configured completed-run cap.
+    fn enforce_run_cap(runs: &mut VecDeque<Arc<TaskRun>>, max: usize) -> Vec<Arc<TaskRun>> {
+        let mut removed = Vec::new();
+        let mut completed = runs.iter().filter(|run| !run.is_active()).count();
+        while completed > max {
             let Some(oldest_finished) = runs.iter().position(|run| !run.is_active()) else {
                 break;
             };
-            runs.remove(oldest_finished);
+            removed.push(
+                runs.remove(oldest_finished)
+                    .expect("the selected TaskRun index must exist"),
+            );
+            completed -= 1;
         }
+        removed
     }
 
     /// Records an authoritative attempt start.
@@ -1147,38 +2224,63 @@ impl TaskState {
         let max_runs = inner.max_runs_per_task;
         let runs = inner.runs.entry(name.clone()).or_default();
         let mut run_changes = Vec::new();
+        let mut run_snapshot_changes = Vec::new();
         for run in runs.iter_mut().filter(|run| {
             run.is_active()
                 && run.generation() == binding.resource.generation
                 && run.attempt() < attempt
         }) {
-            run.finish(
-                TaskPhase::Failed,
-                Some("run outcome not observed (a later attempt started first)".to_string()),
-                None,
-            )
-            .expect("an active run accepts a terminal phase");
-            run_changes.push(run.clone());
+            let previous = Arc::clone(run);
+            Arc::make_mut(run)
+                .finish(
+                    TaskPhase::Failed,
+                    Some("run outcome not observed (a later attempt started first)".to_string()),
+                    None,
+                )
+                .expect("an active run accepts a terminal phase");
+            run_changes.push(Arc::clone(run));
+            run_snapshot_changes.push(Self::run_snapshot_change(
+                name,
+                &binding.resource.uid,
+                Some(previous),
+                Some(Arc::clone(run)),
+            ));
         }
         assert!(
             run_changes.len() <= 1,
             "TaskState must retain at most one active run for one generation"
         );
-        let run = TaskRun::starting(
-            binding.resource.generation,
-            attempt,
-            binding.resource.workload.clone(),
-        )
-        .expect("validated resource generation and attempt create a run");
-        run_changes.push(run.clone());
+        let run = Arc::new(
+            TaskRun::starting(
+                binding.resource.generation,
+                attempt,
+                binding.resource.workload.clone(),
+            )
+            .expect("validated resource generation and attempt create a run"),
+        );
+        run_changes.push(Arc::clone(&run));
+        run_snapshot_changes.push(Self::run_snapshot_change(
+            name,
+            &binding.resource.uid,
+            None,
+            Some(Arc::clone(&run)),
+        ));
         runs.push_back(run);
 
-        Self::enforce_run_cap(runs, max_runs);
+        for removed in Self::enforce_run_cap(runs, max_runs) {
+            run_snapshot_changes.push(Self::run_snapshot_change(
+                name,
+                &binding.resource.uid,
+                Some(removed),
+                None,
+            ));
+        }
+        Self::record_run_snapshot_changes(&mut inner, run_snapshot_changes);
         if let Some((revision, previous, current)) = task_change {
             self.record_change(&mut inner, revision, Some(previous), Some(current));
         }
         for run in &run_changes {
-            self.record_run_change(&inner, name, &binding.resource.uid, run);
+            self.record_run_change(&inner, name, &binding.resource.uid, run.as_ref());
         }
         true
     }
@@ -1215,15 +2317,17 @@ impl TaskState {
             && attempt >= task.status().attempt();
 
         let max_runs = inner.max_runs_per_task;
-        let (run_error, run_exit_code, run_changed, run_changes) = {
+        let (run_error, run_exit_code, run_changed, run_changes, run_snapshot_changes) = {
             let runs = inner.runs.entry(name.clone()).or_default();
             let mut run_changes = Vec::new();
+            let mut run_snapshot_changes = Vec::new();
             for previous in runs.iter_mut().filter(|run| {
                 run.is_active()
                     && run.generation() == binding.resource.generation
                     && run.attempt() < attempt
             }) {
-                previous
+                let active = Arc::clone(previous);
+                Arc::make_mut(previous)
                     .finish(
                         TaskPhase::Failed,
                         Some(
@@ -1232,42 +2336,67 @@ impl TaskState {
                         None,
                     )
                     .expect("an active run accepts a terminal phase");
-                run_changes.push(previous.clone());
+                run_changes.push(Arc::clone(previous));
+                run_snapshot_changes.push(Self::run_snapshot_change(
+                    name,
+                    &binding.resource.uid,
+                    Some(active),
+                    Some(Arc::clone(previous)),
+                ));
             }
             assert!(
                 run_changes.len() <= 1,
                 "TaskState must retain at most one active run for one generation"
             );
-            let run = if let Some(index) = runs.iter().position(|run| {
+            let index = runs.iter().position(|run| {
                 run.generation() == binding.resource.generation && run.attempt() == attempt
-            }) {
+            });
+            let previous = index.map(|index| Arc::clone(&runs[index]));
+            let run = if let Some(index) = index {
                 &mut runs[index]
             } else {
-                runs.push_back(
+                runs.push_back(Arc::new(
                     TaskRun::starting(
                         binding.resource.generation,
                         attempt,
                         binding.resource.workload.clone(),
                     )
                     .expect("validated resource generation and attempt create a run"),
-                );
+                ));
                 runs.back_mut().expect("the run was just appended")
             };
             let run_changed = run.is_active();
             if run_changed {
-                run.finish(phase, error, exit_code)
+                Arc::make_mut(run)
+                    .finish(phase, error, exit_code)
                     .expect("terminal phase closes an active run");
-                run_changes.push(run.clone());
+                run_changes.push(Arc::clone(run));
+                run_snapshot_changes.push(Self::run_snapshot_change(
+                    name,
+                    &binding.resource.uid,
+                    previous,
+                    Some(Arc::clone(run)),
+                ));
             }
-            let diagnostics = (
-                run.error().map(str::to_owned),
-                run.exit_code(),
+            let run_error = run.error().map(str::to_owned);
+            let run_exit_code = run.exit_code();
+            for removed in Self::enforce_run_cap(runs, max_runs) {
+                run_snapshot_changes.push(Self::run_snapshot_change(
+                    name,
+                    &binding.resource.uid,
+                    Some(removed),
+                    None,
+                ));
+            }
+            (
+                run_error,
+                run_exit_code,
                 run_changed,
                 run_changes,
-            );
-            Self::enforce_run_cap(runs, max_runs);
-            diagnostics
+                run_snapshot_changes,
+            )
         };
+        Self::record_run_snapshot_changes(&mut inner, run_snapshot_changes);
 
         let mut status_changed = false;
         let mut task_change = None;
@@ -1332,7 +2461,7 @@ impl TaskState {
             self.record_change(&mut inner, revision, Some(previous), Some(current));
         }
         for run in &run_changes {
-            self.record_run_change(&inner, name, &binding.resource.uid, run);
+            self.record_run_change(&inner, name, &binding.resource.uid, run.as_ref());
         }
         changed
     }
@@ -1550,20 +2679,45 @@ impl TaskState {
         inner.by_tv.remove(&tv_raw);
         inner.finished_attempt_by_tv.remove(&tv_raw);
 
+        let max_runs = inner.max_runs_per_task;
         let mut run_change = None;
-        if let Some(runs) = inner.runs.get_mut(&binding.resource.name)
-            && let Some(run) = runs
+        let mut run_snapshot_changes = Vec::new();
+        if let Some(runs) = inner.runs.get_mut(&binding.resource.name) {
+            if let Some(run) = runs
                 .iter_mut()
                 .rev()
                 .find(|run| run.generation() == binding.resource.generation && run.is_active())
-        {
-            run.finish(phase, error.clone(), exit_code)
-                .expect("terminal phase closes an active run");
-            run_change = Some(run.clone());
+            {
+                let previous = Arc::clone(run);
+                Arc::make_mut(run)
+                    .finish(phase, error.clone(), exit_code)
+                    .expect("terminal phase closes an active run");
+                run_change = Some(Arc::clone(run));
+                run_snapshot_changes.push(Self::run_snapshot_change(
+                    &binding.resource.name,
+                    &binding.resource.uid,
+                    Some(previous),
+                    Some(Arc::clone(run)),
+                ));
+            }
+            for removed in Self::enforce_run_cap(runs, max_runs) {
+                run_snapshot_changes.push(Self::run_snapshot_change(
+                    &binding.resource.name,
+                    &binding.resource.uid,
+                    Some(removed),
+                    None,
+                ));
+            }
         }
         self.transition_task_finished_locked(&mut inner, &binding, phase, error, exit_code, force);
+        Self::record_run_snapshot_changes(&mut inner, run_snapshot_changes);
         if let Some(run) = run_change.as_ref() {
-            self.record_run_change(&inner, &binding.resource.name, &binding.resource.uid, run);
+            self.record_run_change(
+                &inner,
+                &binding.resource.name,
+                &binding.resource.uid,
+                run.as_ref(),
+            );
         }
         let name = binding.resource.name;
         Some(name)
@@ -1573,15 +2727,280 @@ impl TaskState {
     ///
     /// Results are ordered by generation and attempt.
     /// Unknown or swept history returns an empty list.
-    pub fn list_runs(&self, id: &TaskId) -> Vec<TaskRun> {
+    #[cfg(test)]
+    pub(crate) fn list_runs(&self, id: &TaskId) -> Vec<TaskRun> {
         let inner = self.inner.read();
         let mut runs: Vec<TaskRun> = inner
             .runs
             .get(id)
-            .map(|runs| runs.iter().cloned().collect())
+            .map(|runs| runs.iter().map(|run| run.as_ref().clone()).collect())
             .unwrap_or_default();
         runs.sort_by_key(|run| (run.generation(), run.attempt()));
         runs
+    }
+
+    /// Queries one task's runs with snapshot-consistent pagination.
+    ///
+    /// The first page returns `None` when the current task is absent.
+    /// A continuation remains bound to the original Task name and UID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] for an invalid or unavailable continuation snapshot.
+    pub fn query_runs(
+        &self,
+        id: &TaskId,
+        query: &TaskRunQuery,
+    ) -> Result<Option<TaskRunPage>, CollectionError> {
+        self.query_runs_where(id, query, |_| true)
+    }
+
+    /// Queries one task's runs through a caller predicate.
+    ///
+    /// The predicate runs before pagination and must stay stable across one
+    /// continuation chain. A first-page query returns `None` when the current
+    /// task is absent. Continuations reconstruct the original UID snapshot
+    /// without requiring a current task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] for an invalid or unavailable continuation snapshot.
+    pub fn query_runs_where<F>(
+        &self,
+        id: &TaskId,
+        query: &TaskRunQuery,
+        predicate: F,
+    ) -> Result<Option<TaskRunPage>, CollectionError>
+    where
+        F: Fn(&TaskRun) -> bool,
+    {
+        self.query_runs_where_visible(id, query, |_| true, predicate)
+    }
+
+    /// Queries runs with separate current-task and historical-run predicates.
+    ///
+    /// The current-task predicate is evaluated only for a first page.
+    /// Both predicates run after the state lock is released.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] for an invalid or unavailable continuation snapshot.
+    pub(crate) fn query_runs_where_visible<F, G>(
+        &self,
+        id: &TaskId,
+        query: &TaskRunQuery,
+        task_predicate: F,
+        run_predicate: G,
+    ) -> Result<Option<TaskRunPage>, CollectionError>
+    where
+        F: Fn(&Task) -> bool,
+        G: Fn(&TaskRun) -> bool,
+    {
+        let inner = self.inner.read();
+        let continuation = query.continuation();
+        if let Some(cursor) = continuation
+            && cursor.task() != id
+        {
+            return Err(CollectionError::TaskRunContinuationTaskMismatch {
+                task: id.clone(),
+                continuation_task: cursor.task().clone(),
+            });
+        }
+
+        let (task_uid, resource_version, mut candidates, current_task) = match continuation {
+            Some(cursor) => (
+                cursor.task_uid().clone(),
+                cursor.resource_version().to_owned(),
+                Self::run_snapshot_at_resource_version(
+                    &inner,
+                    cursor.resource_version(),
+                    cursor.task(),
+                    cursor.task_uid(),
+                )?
+                .into_values()
+                .collect::<Vec<_>>(),
+                None,
+            ),
+            None => {
+                let Some(task) = inner.tasks.get(id) else {
+                    return Ok(None);
+                };
+                let runs = inner
+                    .runs
+                    .get(id)
+                    .map(|runs| runs.iter().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                (
+                    task.uid().clone(),
+                    Self::current_run_resource_version(&inner),
+                    runs,
+                    Some(Arc::clone(task)),
+                )
+            }
+        };
+        drop(inner);
+        candidates.sort_by_key(|run| (run.generation(), run.attempt()));
+        if current_task.is_some_and(|task| !task_predicate(&task)) {
+            return Ok(None);
+        }
+
+        let after = continuation.map(|cursor| (cursor.after_generation(), cursor.after_attempt()));
+        let mut cursor_seen = after.is_none();
+        let mut items = Vec::with_capacity(query.limit().min(candidates.len()));
+        let mut item_bytes = 0usize;
+        let mut page_closed = false;
+        let mut remaining_item_count = 0usize;
+
+        for run in candidates {
+            if !run_predicate(run.as_ref()) {
+                continue;
+            }
+            let key = (run.generation(), run.attempt());
+            if let Some(after) = after
+                && !cursor_seen
+            {
+                match key.cmp(&after) {
+                    std::cmp::Ordering::Less => continue,
+                    std::cmp::Ordering::Equal => {
+                        cursor_seen = true;
+                        continue;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        return Err(CollectionError::TaskRunContinuationCursorNotFound {
+                            task: id.clone(),
+                            generation: after.0,
+                            attempt: after.1,
+                        });
+                    }
+                }
+            }
+            if page_closed || items.len() >= query.limit() {
+                remaining_item_count = remaining_item_count.saturating_add(1);
+                continue;
+            }
+
+            let limit = query.item_byte_limit();
+            let run_bytes = Self::serialized_run_payload_bytes(run.as_ref());
+            if run_bytes > limit.get() && items.is_empty() {
+                page_closed = true;
+                items.push(run.as_ref().clone());
+                continue;
+            }
+            let separator_bytes = usize::from(!items.is_empty());
+            let projected = item_bytes
+                .saturating_add(separator_bytes)
+                .saturating_add(run_bytes);
+            if projected > limit.get() {
+                page_closed = true;
+                remaining_item_count = remaining_item_count.saturating_add(1);
+                continue;
+            }
+            item_bytes = projected;
+            items.push(run.as_ref().clone());
+        }
+
+        if !cursor_seen {
+            let (generation, attempt) =
+                after.expect("a missing TaskRun cursor is seen before iteration");
+            return Err(CollectionError::TaskRunContinuationCursorNotFound {
+                task: id.clone(),
+                generation,
+                attempt,
+            });
+        }
+
+        let next = if remaining_item_count > 0 {
+            let after = items
+                .last()
+                .expect("positive TaskRun page limits return an item before remaining items");
+            Some(
+                TaskRunContinuation::new(
+                    resource_version.clone(),
+                    id.clone(),
+                    task_uid.clone(),
+                    after.generation(),
+                    after.attempt(),
+                )
+                .expect("state-generated TaskRun continuations are valid"),
+            )
+        } else {
+            None
+        };
+
+        Ok(Some(TaskRunPage {
+            items,
+            task: id.clone(),
+            task_uid,
+            resource_version,
+            continuation: next,
+            remaining_item_count,
+        }))
+    }
+
+    /// Reconstructs one task UID's runs at a retained run revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] when the version is malformed, foreign,
+    /// ahead of this store, or compacted.
+    fn run_snapshot_at_resource_version(
+        inner: &TaskStateInner,
+        resource_version: &str,
+        task: &TaskId,
+        task_uid: &Uid,
+    ) -> Result<BTreeMap<(u64, u32), Arc<TaskRun>>, CollectionError> {
+        let (requested_epoch, requested_revision) = Self::parse_resource_version(resource_version)?;
+        if requested_epoch != inner.run_resource_version_epoch {
+            return Err(CollectionError::ResourceVersionExpired {
+                resource_version: resource_version.to_owned(),
+            });
+        }
+        if requested_revision > inner.run_resource_version {
+            return Err(CollectionError::InvalidResourceVersion {
+                resource_version: resource_version.to_owned(),
+            });
+        }
+        if requested_revision < inner.run_compacted_through {
+            return Err(CollectionError::ResourceVersionExpired {
+                resource_version: resource_version.to_owned(),
+            });
+        }
+
+        let mut snapshot = BTreeMap::new();
+        if inner
+            .tasks
+            .get(task)
+            .is_some_and(|current| current.uid() == task_uid)
+            && let Some(runs) = inner.runs.get(task)
+        {
+            for run in runs {
+                snapshot.insert((run.generation(), run.attempt()), run.clone());
+            }
+        }
+
+        for batch in inner
+            .run_history
+            .iter()
+            .rev()
+            .take_while(|batch| batch.revision > requested_revision)
+        {
+            for change in batch
+                .changes
+                .iter()
+                .rev()
+                .filter(|change| &change.task == task && &change.task_uid == task_uid)
+            {
+                if let Some(previous) = change.previous.as_ref() {
+                    snapshot.insert(
+                        (previous.generation(), previous.attempt()),
+                        previous.clone(),
+                    );
+                } else if let Some(current) = change.current.as_ref() {
+                    snapshot.remove(&(current.generation(), current.attempt()));
+                }
+            }
+        }
+        Ok(snapshot)
     }
 
     /// Returns one retained task by name.
@@ -1678,25 +3097,46 @@ impl TaskState {
             let mut inner = self.write(StateMutationEventCapacity::None);
             let mut runs_removed = 0usize;
             let bound: std::collections::HashSet<TaskId> = inner.tv_of.keys().cloned().collect();
+            let task_uids = inner
+                .tasks
+                .iter()
+                .map(|(id, task)| (id.clone(), task.uid().clone()))
+                .collect::<HashMap<_, _>>();
+            let mut run_snapshot_changes = Vec::new();
             for (id, runs) in inner.runs.iter_mut() {
                 let before = runs.len();
                 let task_bound = bound.contains(id);
-                runs.retain(|run| match run.finished_at() {
-                    Some(finished) => now
-                        .duration_since(finished)
-                        .map(|age| age < config.run_ttl())
-                        .unwrap_or(true),
-                    None => {
-                        task_bound
-                            || now
-                                .duration_since(run.started_at())
-                                .map(|age| age < config.run_ttl())
-                                .unwrap_or(true)
+                let task_uid = task_uids
+                    .get(id)
+                    .expect("retained TaskRun history must belong to a retained task");
+                runs.retain(|run| {
+                    let retained = match run.finished_at() {
+                        Some(finished) => now
+                            .duration_since(finished)
+                            .map(|age| age < config.run_ttl())
+                            .unwrap_or(true),
+                        None => {
+                            task_bound
+                                || now
+                                    .duration_since(run.started_at())
+                                    .map(|age| age < config.run_ttl())
+                                    .unwrap_or(true)
+                        }
+                    };
+                    if !retained {
+                        run_snapshot_changes.push(Self::run_snapshot_change(
+                            id,
+                            task_uid,
+                            Some(run.clone()),
+                            None,
+                        ));
                     }
+                    retained
                 });
                 runs_removed += before - runs.len();
             }
             inner.runs.retain(|_, runs| !runs.is_empty());
+            Self::record_run_snapshot_changes(&mut inner, run_snapshot_changes);
 
             let expired_tasks = inner
                 .tasks
@@ -1736,6 +3176,7 @@ impl TaskState {
             Self::unbind_locked(&mut inner, &id);
             if let Some(task) = inner.tasks.remove(&id) {
                 Self::unindex_task(&mut inner, &task);
+                Self::remove_retained_task_manifest_bytes(&mut inner, &id);
                 inner.terminal_since.remove(&id);
                 let (revision, _) = Self::next_resource_version(&mut inner);
                 self.record_change(&mut inner, revision, Some(task), None);
@@ -1838,6 +3279,8 @@ impl TaskState {
         let after = continuation.map(TaskContinuation::after);
         let mut cursor_seen = after.is_none();
         let mut items = Vec::with_capacity(q.limit().min(candidates.len()));
+        let mut item_bytes = 0usize;
+        let mut page_closed = false;
         let mut remaining_item_count = 0usize;
 
         for task in candidates {
@@ -1860,11 +3303,30 @@ impl TaskState {
                     }
                 }
             }
-            if items.len() < q.limit() {
-                items.push(task.as_ref().clone());
-            } else {
+            if page_closed || items.len() >= q.limit() {
                 remaining_item_count = remaining_item_count.saturating_add(1);
+                continue;
             }
+
+            let limit = q.item_byte_limit();
+            let task_bytes = Self::serialized_task_payload_bytes(None, Some(&task));
+            if task_bytes > limit.get() && items.is_empty() {
+                page_closed = true;
+                items.push(task.as_ref().clone());
+                continue;
+            }
+            let separator_bytes = usize::from(!items.is_empty());
+            let projected = item_bytes
+                .saturating_add(separator_bytes)
+                .saturating_add(task_bytes);
+            if projected > limit.get() {
+                page_closed = true;
+                remaining_item_count = remaining_item_count.saturating_add(1);
+                continue;
+            }
+            item_bytes = projected;
+
+            items.push(task.as_ref().clone());
         }
         if !cursor_seen {
             return Err(CollectionError::ContinuationCursorNotFound {
@@ -1900,7 +3362,7 @@ impl TaskState {
         resource_version: &str,
     ) -> Result<BTreeMap<TaskId, Arc<Task>>, CollectionError> {
         let (requested_epoch, requested_revision) = Self::parse_resource_version(resource_version)?;
-        if requested_epoch != inner.resource_version_epoch {
+        if requested_epoch != inner.resource_version_epoch.as_ref() {
             return Err(CollectionError::ResourceVersionExpired {
                 resource_version: resource_version.to_owned(),
             });
@@ -1953,7 +3415,8 @@ impl TaskState {
     ///
     /// # Errors
     ///
-    /// Returns [`CollectionError`] when the supplied resource version cannot be resumed.
+    /// Returns [`CollectionError`] when the supplied resource version cannot be
+    /// resumed or Task watch admission is full.
     pub fn watch(
         &self,
         filter: &TaskFilter,
@@ -1970,7 +3433,8 @@ impl TaskState {
     ///
     /// # Errors
     ///
-    /// Returns [`CollectionError`] when the supplied resource version cannot be resumed.
+    /// Returns [`CollectionError`] when the supplied resource version cannot be
+    /// resumed or Task watch admission is full.
     pub fn watch_where<F>(
         &self,
         filter: &TaskFilter,
@@ -1984,10 +3448,9 @@ impl TaskState {
         let inner = self.inner.read();
         let receiver = BroadcastStream::new(inner.watch_tx.subscribe());
         let epoch = inner.resource_version_epoch.clone();
-        let mut initial = VecDeque::new();
         let mut initial_candidates = None;
         let mut initial_revision = None;
-        let mut replay = VecDeque::new();
+        let mut replay_candidates = Vec::new();
         let last_revision;
 
         match resource_version {
@@ -2005,7 +3468,7 @@ impl TaskState {
             }
             Some(value) => {
                 let (requested_epoch, requested_revision) = Self::parse_resource_version(value)?;
-                if requested_epoch != epoch {
+                if requested_epoch != epoch.as_ref() {
                     return Err(CollectionError::ResourceVersionExpired {
                         resource_version: value.to_string(),
                     });
@@ -2020,7 +3483,7 @@ impl TaskState {
                         resource_version: value.to_string(),
                     });
                 }
-                replay.extend(
+                replay_candidates.extend(
                     inner
                         .watch_history
                         .iter()
@@ -2032,13 +3495,150 @@ impl TaskState {
         }
         drop(inner);
 
-        if let Some(candidates) = initial_candidates {
-            let tasks = candidates
-                .into_iter()
-                .filter(|task| filter.matches(task) && predicate(task))
-                .map(|task| task.as_ref().clone())
-                .collect::<Vec<_>>();
-            initial.extend(tasks.into_iter().map(TaskWatchEvent::Added));
+        match self.watch_admission.precheck_count() {
+            Ok(()) => {}
+            Err(WatchAdmissionFailure::Rejected(error)) => return Err(error),
+            Err(WatchAdmissionFailure::Closed) => {
+                return Ok(TaskWatchSubscription {
+                    inner: Arc::clone(&self.inner),
+                    receiver,
+                    initial: VecDeque::new(),
+                    initial_revision: None,
+                    replay: VecDeque::new(),
+                    recovery: None,
+                    permit: None,
+                    filter: filter.clone(),
+                    predicate,
+                    epoch,
+                    last_revision,
+                    stop: Box::pin(self.watch_stop.clone().cancelled_owned()),
+                    terminal: false,
+                });
+            }
+        }
+
+        let initial_descriptors = initial_candidates
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|task| filter.matches(task) && predicate(task))
+            .map(|task| WatchEventDescriptor {
+                kind: PreparedWatchEventKind::Added,
+                serialized_bytes: Self::serialized_task_payload_bytes(None, Some(task.as_ref())),
+                task,
+                resource_version: None,
+            })
+            .collect::<Vec<_>>();
+        let replay_descriptors = replay_candidates
+            .into_iter()
+            .map(|change| {
+                let revision = change.revision;
+                let event = {
+                    let previous_matches = change
+                        .previous
+                        .as_ref()
+                        .is_some_and(|task| filter.matches(task) && predicate(task));
+                    let current_matches = change
+                        .current
+                        .as_ref()
+                        .is_some_and(|task| filter.matches(task) && predicate(task));
+                    match (previous_matches, current_matches) {
+                        (false, true) => change.current.as_ref().map(|task| WatchEventDescriptor {
+                            kind: PreparedWatchEventKind::Added,
+                            serialized_bytes: Self::serialized_task_payload_bytes(
+                                None,
+                                Some(task.as_ref()),
+                            ),
+                            task: Arc::clone(task),
+                            resource_version: None,
+                        }),
+                        (true, true) => change.current.as_ref().map(|task| WatchEventDescriptor {
+                            kind: PreparedWatchEventKind::Modified,
+                            serialized_bytes: Self::serialized_task_payload_bytes(
+                                None,
+                                Some(task.as_ref()),
+                            ),
+                            task: Arc::clone(task),
+                            resource_version: None,
+                        }),
+                        (true, false) => change.previous.as_ref().map(|task| {
+                            let resource_version = Self::format_resource_version(
+                                change.epoch.as_ref(),
+                                change.revision,
+                            );
+                            WatchEventDescriptor {
+                                kind: PreparedWatchEventKind::Deleted,
+                                serialized_bytes: Self::serialized_task_with_resource_version_bytes(
+                                    task.as_ref(),
+                                    &resource_version,
+                                ),
+                                task: Arc::clone(task),
+                                resource_version: Some(resource_version),
+                            }
+                        }),
+                        (false, false) => None,
+                    }
+                };
+                (revision, event)
+            })
+            .collect::<Vec<_>>();
+        let requested_bytes = initial_descriptors
+            .iter()
+            .map(|event| event.serialized_bytes)
+            .chain(
+                replay_descriptors
+                    .iter()
+                    .filter_map(|(_, event)| event.as_ref().map(|event| event.serialized_bytes)),
+            )
+            .fold(0_usize, usize::saturating_add);
+        let permit = match self.watch_admission.try_admit(requested_bytes) {
+            Ok(permit) => permit,
+            Err(WatchAdmissionFailure::Rejected(error)) => return Err(error),
+            Err(WatchAdmissionFailure::Closed) => {
+                return Ok(TaskWatchSubscription {
+                    inner: Arc::clone(&self.inner),
+                    receiver,
+                    initial: VecDeque::new(),
+                    initial_revision: None,
+                    replay: VecDeque::new(),
+                    recovery: None,
+                    permit: None,
+                    filter: filter.clone(),
+                    predicate,
+                    epoch,
+                    last_revision,
+                    stop: Box::pin(self.watch_stop.clone().cancelled_owned()),
+                    terminal: false,
+                });
+            }
+        };
+        let initial = initial_descriptors
+            .into_iter()
+            .map(WatchEventDescriptor::into_buffered)
+            .collect();
+        let replay = replay_descriptors
+            .into_iter()
+            .map(|(revision, event)| PreparedReplayChange {
+                revision,
+                event: event.map(WatchEventDescriptor::into_buffered),
+            })
+            .collect();
+
+        if !permit.is_active() || self.watch_stop.is_cancelled() {
+            return Ok(TaskWatchSubscription {
+                inner: Arc::clone(&self.inner),
+                receiver,
+                initial: VecDeque::new(),
+                initial_revision: None,
+                replay: VecDeque::new(),
+                recovery: None,
+                permit: None,
+                filter: filter.clone(),
+                predicate,
+                epoch,
+                last_revision,
+                stop: Box::pin(self.watch_stop.clone().cancelled_owned()),
+                terminal: false,
+            });
         }
 
         Ok(TaskWatchSubscription {
@@ -2047,6 +3647,8 @@ impl TaskState {
             initial,
             initial_revision,
             replay,
+            recovery: None,
+            permit: Some(permit),
             filter: filter.clone(),
             predicate,
             epoch,
@@ -2073,10 +3675,15 @@ impl TaskState {
 
     pub(crate) fn close_watches(&self) {
         self.watch_stop.cancel();
+        self.watch_admission.close();
     }
 
     pub(crate) async fn shutdown_persistence(&self) {
         self.event_publisher.shutdown().await;
+    }
+
+    pub(crate) fn persistence_status(&self) -> Option<TaskStateSinkStatus> {
+        self.event_publisher.status()
     }
 }
 
@@ -2136,1932 +3743,4 @@ impl TaskState {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        pin::Pin,
-        sync::{
-            Arc,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
-        },
-        task::{Context, Poll, Wake, Waker},
-        time::Duration,
-    };
-
-    use solti_model::{
-        Annotations, ConditionStatus, EmbeddedSpec, Flag, LabelSelector, Labels, SubprocessMode,
-        SubprocessSpec, TaskEnv, TaskManifest, TaskSpec, TaskWorkload,
-    };
-    use tokio_stream::StreamExt;
-
-    use super::*;
-
-    fn spec(slot: &str, timeout_ms: u64) -> TaskSpec {
-        TaskSpec::builder(
-            slot,
-            TaskWorkload::Embedded(EmbeddedSpec::new("test-v1").unwrap()),
-            timeout_ms,
-        )
-        .build()
-        .expect("valid test spec")
-    }
-
-    fn manifest(name: &str, slot: &str, timeout_ms: u64) -> TaskManifest {
-        TaskManifest::new(name, spec(slot, timeout_ms)).expect("valid test Task manifest")
-    }
-
-    fn create(state: &TaskState, name: &str) -> Task {
-        state
-            .create_desired(&manifest(name, "slot", 1_000))
-            .expect("create")
-            .task
-    }
-
-    fn journal_task(name: &str, revision: u64, annotation_bytes: usize) -> Task {
-        let mut task_manifest = manifest(name, "slot", 1_000);
-        if annotation_bytes > 0 {
-            let mut annotations = Annotations::new();
-            annotations.insert("example.io/payload", "x".repeat(annotation_bytes));
-            task_manifest = task_manifest.with_annotations(annotations).unwrap();
-        }
-        let mut task = Task::from_manifest(task_manifest).unwrap();
-        task.set_resource_version(format!("epoch:{revision}"))
-            .unwrap();
-        task
-    }
-
-    fn record_current_change(state: &TaskState, task: Task) {
-        let mut inner = state.write(StateMutationEventCapacity::TaskChange);
-        let (revision, resource_version) = TaskState::next_resource_version(&mut inner);
-        assert_eq!(task.metadata().resource_version(), resource_version);
-        state.record_change(&mut inner, revision, None, Some(Arc::new(task)));
-    }
-
-    fn bind(state: &TaskState, name: &TaskId) -> RuntimeBinding {
-        let resource =
-            ResourceGeneration::from_task(&state.get(name).expect("resource must exist"));
-        let tv = taskvisor::TaskId::for_tests();
-        assert!(state.bind_tv(resource.clone(), tv));
-        RuntimeBinding { resource, tv }
-    }
-
-    #[test]
-    fn try_new_creates_empty_state() {
-        let state = TaskState::try_new().expect("OS entropy is available");
-
-        assert!(state.list_all().is_empty());
-    }
-
-    #[derive(Default)]
-    struct RecordingStateSink {
-        events: std::sync::Mutex<Vec<TaskStateEvent>>,
-    }
-
-    impl crate::TaskStateSink for RecordingStateSink {
-        fn on_event(&self, event: &TaskStateEvent) {
-            self.events.lock().unwrap().push(event.clone());
-        }
-    }
-
-    struct BlockingStateSink {
-        events: std::sync::Mutex<Vec<String>>,
-        entered: std::sync::mpsc::SyncSender<()>,
-        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-        calls: AtomicUsize,
-    }
-
-    impl crate::TaskStateSink for BlockingStateSink {
-        fn on_event(&self, event: &TaskStateEvent) {
-            let TaskStateEvent::TaskChanged {
-                resource_version, ..
-            } = event
-            else {
-                return;
-            };
-            self.events.lock().unwrap().push(resource_version.clone());
-            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                self.entered.send(()).unwrap();
-                self.release.lock().unwrap().recv().unwrap();
-            }
-        }
-    }
-
-    struct SweepBackpressureStateSink {
-        setup_events: AtomicUsize,
-        setup_event_target: usize,
-        setup_complete: std::sync::mpsc::SyncSender<()>,
-        deletion_events: AtomicUsize,
-        deletion_entered: std::sync::mpsc::SyncSender<()>,
-        deletion_release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-    }
-
-    impl crate::TaskStateSink for SweepBackpressureStateSink {
-        fn on_event(&self, event: &TaskStateEvent) {
-            if matches!(event, TaskStateEvent::TaskChanged { current: None, .. }) {
-                if self.deletion_events.fetch_add(1, Ordering::SeqCst) == 0 {
-                    self.deletion_entered.send(()).unwrap();
-                    self.deletion_release.lock().unwrap().recv().unwrap();
-                }
-                return;
-            }
-
-            if self.setup_events.fetch_add(1, Ordering::SeqCst) + 1 == self.setup_event_target {
-                self.setup_complete.send(()).unwrap();
-            }
-        }
-    }
-
-    struct ArmableStateSink {
-        events: AtomicUsize,
-        setup_complete: std::sync::mpsc::SyncSender<()>,
-        block_next: AtomicBool,
-        entered: std::sync::mpsc::SyncSender<()>,
-        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-    }
-
-    impl crate::TaskStateSink for ArmableStateSink {
-        fn on_event(&self, _event: &TaskStateEvent) {
-            let should_block = self.block_next.swap(false, Ordering::SeqCst);
-            if self.events.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
-                self.setup_complete.send(()).unwrap();
-            }
-            if should_block {
-                self.entered.send(()).unwrap();
-                self.release.lock().unwrap().recv().unwrap();
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocked_state_sink_does_not_hold_state_lock_and_preserves_commit_order() {
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        let sink = Arc::new(BlockingStateSink {
-            events: std::sync::Mutex::new(Vec::new()),
-            entered: entered_tx,
-            release: std::sync::Mutex::new(release_rx),
-            calls: AtomicUsize::new(0),
-        });
-        let state = TaskState::with_epoch_and_sink(
-            StateConfig::default(),
-            "ordered-sink".to_string(),
-            Some(sink.clone()),
-        );
-
-        let first_state = state.clone();
-        let first = std::thread::spawn(move || {
-            first_state.add_task(manifest("first", "slot", 1_000));
-        });
-        let entered = entered_rx.recv_timeout(Duration::from_secs(5)).is_ok();
-
-        let (second_done_tx, second_done_rx) = std::sync::mpsc::sync_channel(1);
-        let second_state = state.clone();
-        let second = std::thread::spawn(move || {
-            second_state.add_task(manifest("second", "slot", 1_000));
-            second_done_tx.send(()).unwrap();
-        });
-        let second_finished_before_release =
-            second_done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
-
-        release_tx.send(()).unwrap();
-        first.join().unwrap();
-        second.join().unwrap();
-        state.shutdown_persistence().await;
-
-        assert!(entered, "the first committed event must reach the sink");
-        assert!(
-            second_finished_before_release,
-            "a blocked sink must not retain the TaskState write lock"
-        );
-        assert_eq!(
-            *sink.events.lock().unwrap(),
-            ["ordered-sink:1", "ordered-sink:2"]
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn full_state_persistence_queue_applies_backpressure_without_dropping() {
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        let sink = Arc::new(BlockingStateSink {
-            events: std::sync::Mutex::new(Vec::new()),
-            entered: entered_tx,
-            release: std::sync::Mutex::new(release_rx),
-            calls: AtomicUsize::new(0),
-        });
-        let state = TaskState::try_with_epoch_and_sink(
-            StateConfig::default(),
-            "bounded-sink".to_string(),
-            Some(sink.clone()),
-            PersistenceConfig::new()
-                .try_with_state_queue_capacity(2)
-                .unwrap(),
-        )
-        .unwrap();
-
-        state.add_task(manifest("first", "slot", 1_000));
-        entered_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("worker must block in the first callback");
-        state.add_task(manifest("second", "slot", 1_000));
-        state.add_task(manifest("third", "slot", 1_000));
-
-        let (fourth_done_tx, fourth_done_rx) = std::sync::mpsc::sync_channel(1);
-        let fourth_state = state.clone();
-        let fourth = std::thread::spawn(move || {
-            fourth_state.add_task(manifest("fourth", "slot", 1_000));
-            fourth_done_tx.send(()).unwrap();
-        });
-        assert!(
-            fourth_done_rx
-                .recv_timeout(Duration::from_millis(100))
-                .is_err(),
-            "the fourth commit must wait while the two-event queue is full"
-        );
-
-        release_tx.send(()).unwrap();
-        fourth_done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("backpressure must release after the sink advances");
-        fourth.join().unwrap();
-        state.shutdown_persistence().await;
-
-        assert_eq!(
-            *sink.events.lock().unwrap(),
-            [
-                "bounded-sink:1",
-                "bounded-sink:2",
-                "bounded-sink:3",
-                "bounded-sink:4"
-            ]
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn maximum_event_commit_reserves_all_permits_before_the_state_lock() {
-        let (setup_complete_tx, setup_complete_rx) = std::sync::mpsc::sync_channel(1);
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        let sink = Arc::new(ArmableStateSink {
-            events: AtomicUsize::new(0),
-            setup_complete: setup_complete_tx,
-            block_next: AtomicBool::new(false),
-            entered: entered_tx,
-            release: std::sync::Mutex::new(release_rx),
-        });
-        let state = TaskState::try_with_epoch_and_sink(
-            StateConfig::default(),
-            "atomic-reservation".to_string(),
-            Some(sink.clone()),
-            PersistenceConfig::new()
-                .try_with_state_queue_capacity(2)
-                .unwrap(),
-        )
-        .unwrap();
-
-        let task = create(&state, "attempt");
-        let binding = bind(&state, task.name());
-        assert!(state.transition_attempt_starting(&binding, 1));
-        setup_complete_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the three setup events must drain");
-
-        sink.block_next.store(true, Ordering::SeqCst);
-        state.add_task(manifest("active-callback", "slot", 1_000));
-        entered_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the armed callback must block");
-        state.add_task(manifest("buffered", "slot", 1_000));
-
-        let (transition_done_tx, transition_done_rx) = std::sync::mpsc::sync_channel(1);
-        let transition_state = state.clone();
-        let transition_binding = binding.clone();
-        let transition = std::thread::spawn(move || {
-            transition_done_tx
-                .send(transition_state.transition_attempt_starting(&transition_binding, 2))
-                .unwrap();
-        });
-        assert!(
-            transition_done_rx
-                .recv_timeout(Duration::from_millis(100))
-                .is_err(),
-            "a three-event commit must wait until all three permits are available"
-        );
-        assert_eq!(state.get(task.name()).unwrap().status().attempt(), 1);
-        assert!(
-            state.event_publisher.inner.lock().pending.is_empty(),
-            "a commit waiting for permits must not create a hidden pending batch"
-        );
-
-        release_tx.send(()).unwrap();
-        assert!(
-            transition_done_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("the transition must proceed after all permits are released")
-        );
-        transition.join().unwrap();
-        state.shutdown_persistence().await;
-
-        assert_eq!(state.get(task.name()).unwrap().status().attempt(), 2);
-        assert_eq!(sink.events.load(Ordering::SeqCst), 8);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sweep_deletions_apply_event_level_backpressure() {
-        let (setup_complete_tx, setup_complete_rx) = std::sync::mpsc::sync_channel(1);
-        let (deletion_entered_tx, deletion_entered_rx) = std::sync::mpsc::sync_channel(1);
-        let (deletion_release_tx, deletion_release_rx) = std::sync::mpsc::sync_channel(1);
-        let sink = Arc::new(SweepBackpressureStateSink {
-            setup_events: AtomicUsize::new(0),
-            setup_event_target: 8,
-            setup_complete: setup_complete_tx,
-            deletion_events: AtomicUsize::new(0),
-            deletion_entered: deletion_entered_tx,
-            deletion_release: std::sync::Mutex::new(deletion_release_rx),
-        });
-        let state = TaskState::try_with_epoch_and_sink(
-            StateConfig::default(),
-            "bounded-sweep".to_string(),
-            Some(sink.clone()),
-            PersistenceConfig::new()
-                .try_with_state_queue_capacity(2)
-                .unwrap(),
-        )
-        .unwrap();
-
-        for index in 0..4 {
-            let task = create(&state, &format!("expired-{index}"));
-            let binding = bind(&state, task.name());
-            assert_eq!(
-                state.finalize_if_bound(
-                    binding.tv.get(),
-                    TaskPhase::Canceled,
-                    Some("canceled".into()),
-                    None,
-                    true,
-                ),
-                Some(task.name().clone())
-            );
-        }
-        setup_complete_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("all setup events must drain before the sweep");
-
-        let (sweep_done_tx, sweep_done_rx) = std::sync::mpsc::sync_channel(1);
-        let sweep_state = state.clone();
-        let sweep = std::thread::spawn(move || {
-            let config = StateConfig::new()
-                .with_run_ttl(Duration::ZERO)
-                .with_task_ttl(Duration::ZERO);
-            sweep_done_tx.send(sweep_state.sweep(&config)).unwrap();
-        });
-        deletion_entered_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the first deletion must reach the persistence worker");
-        assert!(
-            sweep_done_rx
-                .recv_timeout(Duration::from_millis(100))
-                .is_err(),
-            "four deletion events must not fit in one active plus two buffered event slots"
-        );
-
-        deletion_release_tx.send(()).unwrap();
-        assert_eq!(
-            sweep_done_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("the sweep must finish after persistence advances"),
-            (0, 4)
-        );
-        sweep.join().unwrap();
-        state.shutdown_persistence().await;
-
-        assert_eq!(sink.deletion_events.load(Ordering::SeqCst), 4);
-    }
-
-    struct ReadinessBarrierStateSink {
-        state_inner: std::sync::Mutex<Option<Arc<RwLock<TaskStateInner>>>>,
-        events: std::sync::Mutex<Vec<String>>,
-        first_entered: std::sync::mpsc::SyncSender<()>,
-        first_release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-        second_entered: std::sync::mpsc::SyncSender<()>,
-        second_callback_unlocked: AtomicBool,
-        calls: AtomicUsize,
-    }
-
-    impl crate::TaskStateSink for ReadinessBarrierStateSink {
-        fn on_event(&self, event: &TaskStateEvent) {
-            let TaskStateEvent::TaskChanged {
-                resource_version, ..
-            } = event
-            else {
-                return;
-            };
-            self.events.lock().unwrap().push(resource_version.clone());
-            match self.calls.fetch_add(1, Ordering::SeqCst) {
-                0 => {
-                    self.first_entered.send(()).unwrap();
-                    self.first_release.lock().unwrap().recv().unwrap();
-                }
-                1 => {
-                    let state_inner = self
-                        .state_inner
-                        .lock()
-                        .unwrap()
-                        .clone()
-                        .expect("test state must be installed before publishing");
-                    self.second_callback_unlocked
-                        .store(state_inner.try_write().is_some(), Ordering::SeqCst);
-                    self.second_entered.send(()).unwrap();
-                }
-                _ => {}
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn state_sink_waits_for_enqueuing_write_guard_to_release() {
-        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::sync_channel(1);
-        let (first_release_tx, first_release_rx) = std::sync::mpsc::sync_channel(1);
-        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::sync_channel(1);
-        let sink = Arc::new(ReadinessBarrierStateSink {
-            state_inner: std::sync::Mutex::new(None),
-            events: std::sync::Mutex::new(Vec::new()),
-            first_entered: first_entered_tx,
-            first_release: std::sync::Mutex::new(first_release_rx),
-            second_entered: second_entered_tx,
-            second_callback_unlocked: AtomicBool::new(false),
-            calls: AtomicUsize::new(0),
-        });
-        let state = TaskState::with_epoch_and_sink(
-            StateConfig::default(),
-            "ready-sink".to_string(),
-            Some(sink.clone()),
-        );
-        *sink.state_inner.lock().unwrap() = Some(Arc::clone(&state.inner));
-
-        let (first_done_tx, first_done_rx) = std::sync::mpsc::sync_channel(1);
-        let first_state = state.clone();
-        let first = std::thread::spawn(move || {
-            first_state.add_task(manifest("first", "slot", 1_000));
-            first_done_tx.send(()).unwrap();
-        });
-        first_entered_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("first callback must enter");
-
-        let (second_enqueued_tx, second_enqueued_rx) = std::sync::mpsc::sync_channel(1);
-        let (second_release_tx, second_release_rx) = std::sync::mpsc::sync_channel(1);
-        let second_state = state.clone();
-        let second = std::thread::spawn(move || {
-            let mut inner = second_state.write(StateMutationEventCapacity::TaskChange);
-            let mut task = Task::from_manifest(manifest("second", "slot", 1_000)).unwrap();
-            let (revision, resource_version) = TaskState::next_resource_version(&mut inner);
-            task.set_resource_version(resource_version).unwrap();
-            TaskState::index_task(&mut inner, &task);
-            let task = Arc::new(task);
-            inner.tasks.insert(task.name().clone(), Arc::clone(&task));
-            second_state.record_change(&mut inner, revision, None, Some(task));
-            second_enqueued_tx.send(()).unwrap();
-            second_release_rx.recv().unwrap();
-        });
-        second_enqueued_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("second event must enqueue while its write guard is held");
-
-        first_release_tx.send(()).unwrap();
-        first_done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("first publisher must stop at the unready second event");
-        let second_entered_before_release = match second_entered_rx.try_recv() {
-            Ok(()) => true,
-            Err(std::sync::mpsc::TryRecvError::Empty) => false,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                panic!("second callback channel disconnected")
-            }
-        };
-
-        second_release_tx.send(()).unwrap();
-        let second_event_delivered = second_entered_before_release
-            || second_entered_rx
-                .recv_timeout(Duration::from_secs(5))
-                .is_ok();
-        first.join().unwrap();
-        second.join().unwrap();
-        state.shutdown_persistence().await;
-
-        let second_callback_unlocked = sink.second_callback_unlocked.load(Ordering::SeqCst);
-        let events = sink.events.lock().unwrap().clone();
-        *sink.state_inner.lock().unwrap() = None;
-        assert!(
-            !second_entered_before_release,
-            "an event must remain unready until its state write guard releases"
-        );
-        assert!(second_event_delivered);
-        assert!(second_callback_unlocked);
-        assert_eq!(events, ["ready-sink:1", "ready-sink:2"]);
-    }
-
-    struct ReentrantStateSink {
-        state: std::sync::Mutex<Option<TaskState>>,
-        attempted: AtomicBool,
-    }
-
-    impl crate::TaskStateSink for ReentrantStateSink {
-        fn on_event(&self, event: &TaskStateEvent) {
-            if !matches!(event, TaskStateEvent::TaskChanged { .. }) {
-                return;
-            }
-
-            let state = self
-                .state
-                .lock()
-                .unwrap()
-                .clone()
-                .expect("test state must be installed before publishing");
-            assert!(state.inner.try_read().is_some());
-            self.attempted.store(true, Ordering::SeqCst);
-            state.add_task(manifest("nested", "slot", 1_000));
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn state_sink_mutation_is_rejected_before_nested_commit() {
-        let sink = Arc::new(ReentrantStateSink {
-            state: std::sync::Mutex::new(None),
-            attempted: AtomicBool::new(false),
-        });
-        let state = TaskState::with_epoch_and_sink(
-            StateConfig::default(),
-            "reentrant-sink".to_string(),
-            Some(sink.clone()),
-        );
-        *sink.state.lock().unwrap() = Some(state.clone());
-
-        state.add_task(manifest("outer", "slot", 1_000));
-        state.shutdown_persistence().await;
-
-        let nested_exists = state.contains_task(&TaskId::new("nested").unwrap());
-        *sink.state.lock().unwrap() = None;
-
-        assert!(sink.attempted.load(Ordering::SeqCst));
-        assert!(!nested_exists);
-    }
-
-    #[tokio::test]
-    async fn state_sink_receives_task_and_run_lifecycle() {
-        let recording = Arc::new(RecordingStateSink::default());
-        let sink: crate::TaskStateSinkHandle = recording.clone();
-        let state = TaskState::with_epoch_and_sink(
-            StateConfig::default(),
-            "sink-epoch".to_string(),
-            Some(sink),
-        );
-
-        let created = create(&state, "sink-task");
-        let name = created.name().clone();
-
-        let mut desired = manifest("sink-task", "slot", 2_000);
-        let mut annotations = Annotations::new();
-        annotations.insert("example.io/revision", "two");
-        desired = desired.with_annotations(annotations).unwrap();
-        state.apply_desired(&desired).expect("apply");
-
-        let binding = bind(&state, &name);
-        assert!(state.mark_observed(&binding.resource));
-        assert!(state.transition_attempt_starting(&binding, 1));
-        assert!(state.transition_attempt_finished(
-            &binding,
-            1,
-            TaskPhase::Succeeded,
-            None,
-            Some(0),
-        ));
-        assert!(state.delete_task(&name));
-        state.shutdown_persistence().await;
-
-        let events = recording.events.lock().unwrap();
-        let task_changes = events
-            .iter()
-            .filter(|event| matches!(event, TaskStateEvent::TaskChanged { .. }))
-            .count();
-        let runs: Vec<&TaskRun> = events
-            .iter()
-            .filter_map(|event| match event {
-                TaskStateEvent::RunChanged {
-                    task,
-                    task_uid,
-                    run,
-                } if task == &name && task_uid == created.uid() => Some(run),
-                _ => None,
-            })
-            .collect();
-
-        assert_eq!(task_changes, 6);
-        assert_eq!(runs.len(), 2);
-        assert!(runs[0].is_active());
-        assert_eq!(runs[1].phase(), TaskPhase::Succeeded);
-        assert!(matches!(
-            events.last(),
-            Some(TaskStateEvent::TaskChanged {
-                previous: Some(task),
-                current: None,
-                ..
-            }) if task.name() == &name
-        ));
-    }
-
-    #[test]
-    fn create_materializes_server_owned_fields_and_preserves_user_owned_fields() {
-        let state = TaskState::new();
-        let mut labels = Labels::new();
-        labels.insert("team", "runtime");
-        let mut annotations = Annotations::new();
-        annotations.insert("example.io/note", "kept");
-
-        let incoming = manifest("server-owned", "slot", 1_000)
-            .with_labels(labels.clone())
-            .unwrap()
-            .with_annotations(annotations.clone())
-            .unwrap();
-
-        let stored = state.create_desired(&incoming).unwrap().task;
-        assert!(!stored.uid().as_str().is_empty());
-        assert!(!stored.metadata().resource_version().is_empty());
-        assert_eq!(stored.metadata().generation(), 1);
-        assert_eq!(stored.status().phase(), TaskPhase::Pending);
-        assert_eq!(stored.status().attempt(), 0);
-        assert_eq!(stored.metadata().labels(), &labels);
-        assert_eq!(stored.metadata().annotations(), &annotations);
-    }
-
-    #[test]
-    fn create_conflicts_with_every_retained_name_including_terminal() {
-        let state = TaskState::new();
-        let task = create(&state, "retained");
-        let binding = bind(&state, task.name());
-        assert_eq!(
-            state.finalize_if_bound(
-                binding.tv.get(),
-                TaskPhase::Canceled,
-                Some("canceled".into()),
-                None,
-                true,
-            ),
-            Some(task.name().clone())
-        );
-
-        let error = state
-            .create_desired(&manifest("retained", "slot", 1_000))
-            .unwrap_err();
-        assert!(matches!(error, CoreError::AlreadyExists(_)));
-    }
-
-    #[test]
-    fn delete_then_create_assigns_a_new_uid() {
-        let state = TaskState::new();
-        let first = create(&state, "recreated");
-        assert!(state.delete_task(first.name()));
-        let second = create(&state, "recreated");
-
-        assert_ne!(first.uid(), second.uid());
-        assert_eq!(first.name(), second.name());
-    }
-
-    #[test]
-    fn exact_apply_is_a_true_noop() {
-        let state = TaskState::new();
-        let first = create(&state, "noop");
-        let result = state.apply_desired(&TaskManifest::from(&first)).unwrap();
-
-        assert!(!result.reconcile);
-        assert_eq!(result.task, first);
-    }
-
-    #[test]
-    fn checked_apply_accepts_matching_uid_and_resource_version() {
-        let state = TaskState::new();
-        let first = create(&state, "checked");
-        let preconditions = WritePreconditions::from_task(&first).unwrap();
-
-        let result = state
-            .apply_desired_with_preconditions(&TaskManifest::from(&first), &preconditions)
-            .unwrap();
-
-        assert!(!result.reconcile);
-        assert_eq!(result.task, first);
-    }
-
-    #[test]
-    fn checked_apply_rejects_every_mismatch_without_consuming_a_version() {
-        let state = TaskState::new();
-        let first = create(&state, "stale");
-        let preconditions = WritePreconditions::new()
-            .with_uid(Uid::new("stale-uid").unwrap())
-            .with_resource_version("stale-version")
-            .unwrap();
-
-        let error = state
-            .apply_desired_with_preconditions(&TaskManifest::from(&first), &preconditions)
-            .unwrap_err();
-        let CoreError::Conflict(conflict) = error else {
-            panic!("expected conflict");
-        };
-        assert_eq!(conflict.name(), first.name());
-        assert_eq!(conflict.violations().len(), 2);
-        assert_eq!(state.get(first.name()), Some(first.clone()));
-
-        let mut labels = Labels::new();
-        labels.insert("changed", "true");
-        let changed = TaskManifest::from(&first).with_labels(labels).unwrap();
-        let applied = state.apply_desired(&changed).unwrap().task;
-        assert_eq!(
-            TaskState::parse_resource_version(applied.metadata().resource_version())
-                .unwrap()
-                .1,
-            2
-        );
-    }
-
-    #[test]
-    fn checked_apply_does_not_create_a_missing_resource() {
-        let state = TaskState::new();
-        let desired = manifest("missing-checked", "slot", 1_000);
-        let preconditions = WritePreconditions::new()
-            .with_resource_version("1")
-            .unwrap();
-
-        let error = state
-            .apply_desired_with_preconditions(&desired, &preconditions)
-            .unwrap_err();
-
-        assert!(matches!(error, CoreError::NotFound(_)));
-        assert!(state.get(desired.name()).is_none());
-    }
-
-    #[test]
-    fn stale_uid_cannot_update_a_recreated_resource() {
-        let state = TaskState::new();
-        let first = create(&state, "recreated-checked");
-        let stale = WritePreconditions::from_task(&first).unwrap();
-        assert!(state.delete_task(first.name()));
-        let replacement = create(&state, "recreated-checked");
-
-        let error = state
-            .apply_desired_with_preconditions(&TaskManifest::from(&replacement), &stale)
-            .unwrap_err();
-
-        assert!(matches!(error, CoreError::Conflict(_)));
-        assert_eq!(state.get(replacement.name()), Some(replacement));
-    }
-
-    #[test]
-    fn metadata_only_apply_changes_only_resource_version_and_metadata() {
-        let state = TaskState::new();
-        let first = create(&state, "metadata");
-        let binding = bind(&state, first.name());
-        assert!(state.transition_attempt_starting(&binding, 3));
-        let before = state.get(first.name()).unwrap();
-
-        let mut labels = Labels::new();
-        labels.insert("team", "platform");
-        let desired = manifest("metadata", "slot", 1_000)
-            .with_labels(labels.clone())
-            .unwrap();
-        let result = state.apply_desired(&desired).unwrap();
-
-        assert!(!result.reconcile);
-        assert_eq!(result.task.uid(), before.uid());
-        assert_eq!(
-            result.task.metadata().generation(),
-            before.metadata().generation()
-        );
-        assert_ne!(
-            result.task.metadata().resource_version(),
-            before.metadata().resource_version()
-        );
-        assert_eq!(result.task.status(), before.status());
-        assert_eq!(result.task.metadata().labels(), &labels);
-        assert_eq!(state.binding_for(first.name()), Some(binding));
-    }
-
-    #[test]
-    fn spec_apply_commits_a_new_pending_generation_without_rollback() {
-        let state = TaskState::new();
-        let first = create(&state, "changed");
-        let old_binding = bind(&state, first.name());
-        assert!(state.mark_observed(&old_binding.resource));
-        let observed = state.get(first.name()).unwrap();
-
-        let result = state
-            .apply_desired(&manifest("changed", "other-slot", 2_000))
-            .unwrap();
-
-        assert!(result.reconcile);
-        assert_eq!(result.task.uid(), observed.uid());
-        assert_eq!(
-            result.task.metadata().generation(),
-            observed.metadata().generation() + 1
-        );
-        assert_eq!(
-            result.task.status().observed_generation(),
-            observed.metadata().generation()
-        );
-        assert_eq!(result.task.status().phase(), TaskPhase::Pending);
-        assert_eq!(result.task.status().attempt(), 0);
-        assert_eq!(state.binding_for(first.name()), Some(old_binding));
-        assert!(state.list_by_slot("slot").is_empty());
-        assert_eq!(state.list_by_slot("other-slot").len(), 1);
-    }
-
-    #[test]
-    fn apply_missing_creates_a_resource() {
-        let state = TaskState::new();
-        let result = state
-            .apply_desired(&manifest("missing", "slot", 1_000))
-            .unwrap();
-
-        assert!(result.reconcile);
-        assert!(state.contains_task(result.task.name()));
-    }
-
-    #[test]
-    fn reconciliation_failure_retains_desired_generation_in_condition() {
-        let state = TaskState::new();
-        let first = create(&state, "failure");
-        let applied = state
-            .apply_desired(&manifest("failure", "slot", 2_000))
-            .unwrap()
-            .task;
-        let target = ResourceGeneration::from_task(&applied);
-
-        assert!(state.mark_reconciliation_failed(
-            &target,
-            "RunnerBuildFailed",
-            "runner unavailable".into(),
-        ));
-        let stored = state.get(applied.name()).unwrap();
-        assert_eq!(stored.spec(), applied.spec());
-        assert_eq!(stored.metadata().generation(), target.generation);
-        assert_eq!(stored.status().observed_generation(), target.generation);
-        assert_eq!(stored.status().phase(), TaskPhase::Pending);
-        assert_eq!(stored.status().attempt(), 0);
-        assert!(stored.status().error().is_none());
-        assert_eq!(
-            stored.status().reconciled().status(),
-            ConditionStatus::False
-        );
-        assert_eq!(stored.status().reconciled().reason(), "RunnerBuildFailed");
-        assert_eq!(stored.status().reconciled().message(), "runner unavailable");
-        assert_eq!(stored.uid(), first.uid());
-    }
-
-    #[test]
-    fn identical_apply_reschedules_only_a_failed_reconciliation() {
-        let state = TaskState::new();
-        let task = create(&state, "retry");
-        let target = ResourceGeneration::from_task(&task);
-        assert!(state.mark_reconciliation_failed(
-            &target,
-            "RunnerBuildFailed",
-            "runner unavailable".into(),
-        ));
-
-        let retry = state.apply_desired(&TaskManifest::from(&task)).unwrap();
-        assert!(retry.reconcile);
-        assert_eq!(retry.task.metadata().generation(), target.generation);
-        assert_eq!(
-            retry.task.status().reconciled().status(),
-            ConditionStatus::Unknown
-        );
-
-        let duplicate = state.apply_desired(&TaskManifest::from(&task)).unwrap();
-        assert!(!duplicate.reconcile);
-    }
-
-    #[test]
-    fn authoritative_attempt_and_generation_are_recorded_in_status_and_run() {
-        let state = TaskState::new();
-        let task = create(&state, "attempt");
-        let binding = bind(&state, task.name());
-
-        assert!(state.transition_attempt_starting(&binding, 4));
-        assert!(state.transition_attempt_finished(
-            &binding,
-            4,
-            TaskPhase::Failed,
-            Some("exit".into()),
-            Some(17),
-        ));
-
-        let stored = state.get(task.name()).unwrap();
-        assert_eq!(stored.status().attempt(), 4);
-        assert_eq!(
-            stored.status().observed_generation(),
-            binding.resource.generation
-        );
-        let runs = state.list_runs(task.name());
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].generation(), binding.resource.generation);
-        assert_eq!(runs[0].attempt(), 4);
-        assert_eq!(runs[0].exit_code(), Some(17));
-    }
-
-    #[test]
-    fn each_run_snapshots_the_workload_gvk_of_its_generation() {
-        let state = TaskState::new();
-        let first = create(&state, "workload-history");
-        let old_binding = bind(&state, first.name());
-        assert!(state.transition_attempt_finished(
-            &old_binding,
-            1,
-            TaskPhase::Succeeded,
-            None,
-            Some(0),
-        ));
-
-        let routed_workload = TaskWorkload::Subprocess(SubprocessSpec::new(
-            SubprocessMode::Command {
-                command: "true".into(),
-                args: vec![],
-            },
-            TaskEnv::default(),
-            None,
-            Flag::enabled(),
-        ));
-        let desired = TaskManifest::new(
-            first.name().clone(),
-            TaskSpec::builder("slot", routed_workload, 1_000_u64)
-                .build()
-                .unwrap(),
-        )
-        .unwrap();
-        let applied = state.apply_desired(&desired).unwrap().task;
-        let new_binding = bind(&state, applied.name());
-        assert!(state.transition_attempt_starting(&new_binding, 1));
-
-        let runs = state.list_runs(applied.name());
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].generation(), 1);
-        assert_eq!(runs[0].workload().api_version(), "solti.io/v1");
-        assert_eq!(runs[0].workload().kind(), "Embedded");
-        assert_eq!(runs[1].generation(), 2);
-        assert_eq!(runs[1].workload().api_version(), "solti.io/v1");
-        assert_eq!(runs[1].workload().kind(), "Subprocess");
-    }
-
-    #[test]
-    fn duplicate_terminal_attempt_is_an_exact_noop() {
-        let state = TaskState::new();
-        let task = create(&state, "duplicate-finish");
-        let binding = bind(&state, task.name());
-
-        assert!(state.transition_attempt_starting(&binding, 1));
-        assert!(state.transition_attempt_finished(
-            &binding,
-            1,
-            TaskPhase::Succeeded,
-            None,
-            Some(0),
-        ));
-
-        let before_task = state.get(task.name()).unwrap();
-        let before_runs = state.list_runs(task.name());
-        let terminal_marker = SystemTime::UNIX_EPOCH + Duration::from_secs(17);
-        state
-            .inner
-            .write()
-            .terminal_since
-            .insert(task.name().clone(), terminal_marker);
-
-        assert!(!state.transition_attempt_finished(
-            &binding,
-            1,
-            TaskPhase::Succeeded,
-            None,
-            Some(0),
-        ));
-
-        assert_eq!(state.get(task.name()).unwrap(), before_task);
-        assert_eq!(state.list_runs(task.name()), before_runs);
-        assert_eq!(
-            state.inner.read().terminal_since.get(task.name()),
-            Some(&terminal_marker)
-        );
-    }
-
-    #[test]
-    fn duplicate_terminal_attempt_stays_a_noop_after_run_eviction() {
-        let state = TaskState::new();
-        state.set_max_runs_per_task(0);
-        let task = create(&state, "duplicate-evicted-finish");
-        let binding = bind(&state, task.name());
-
-        assert!(state.transition_attempt_starting(&binding, 1));
-        assert!(state.transition_attempt_finished(
-            &binding,
-            1,
-            TaskPhase::Succeeded,
-            None,
-            Some(0),
-        ));
-        assert!(state.list_runs(task.name()).is_empty());
-
-        let before_task = state.get(task.name()).unwrap();
-        assert!(!state.transition_attempt_finished(
-            &binding,
-            1,
-            TaskPhase::Succeeded,
-            None,
-            Some(0),
-        ));
-        assert_eq!(state.get(task.name()).unwrap(), before_task);
-        assert!(state.list_runs(task.name()).is_empty());
-    }
-
-    #[test]
-    fn terminal_event_without_start_creates_the_exact_authoritative_run() {
-        let state = TaskState::new();
-        let task = create(&state, "lost-start");
-        let binding = bind(&state, task.name());
-
-        assert!(state.transition_attempt_finished(
-            &binding,
-            5,
-            TaskPhase::Succeeded,
-            None,
-            Some(0),
-        ));
-
-        let stored = state.get(task.name()).unwrap();
-        assert_eq!(stored.status().attempt(), 5);
-        let runs = state.list_runs(task.name());
-        assert_eq!(runs.len(), 1);
-        assert_eq!((runs[0].generation(), runs[0].attempt()), (1, 5));
-    }
-
-    #[test]
-    fn later_terminal_attempt_closes_an_unresolved_earlier_run() {
-        let state = TaskState::new();
-        let task = create(&state, "lost-terminal");
-        let binding = bind(&state, task.name());
-        assert!(state.transition_attempt_starting(&binding, 1));
-
-        assert!(state.transition_attempt_finished(&binding, 2, TaskPhase::Succeeded, None, None,));
-
-        let runs = state.list_runs(task.name());
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].attempt(), 1);
-        assert_eq!(runs[0].phase(), TaskPhase::Failed);
-        assert!(
-            runs[0]
-                .error()
-                .is_some_and(|error| error.contains("later attempt finished"))
-        );
-        assert_eq!(runs[1].attempt(), 2);
-        assert_eq!(runs[1].phase(), TaskPhase::Succeeded);
-    }
-
-    #[test]
-    fn authoritative_terminals_without_start_remain_bounded() {
-        let state = TaskState::new();
-        state.set_max_runs_per_task(2);
-        let task = create(&state, "bounded-terminal");
-        let binding = bind(&state, task.name());
-        for attempt in 1..=3 {
-            assert!(state.transition_attempt_finished(
-                &binding,
-                attempt,
-                TaskPhase::Failed,
-                Some(format!("attempt {attempt}")),
-                None,
-            ));
-        }
-
-        let runs = state.list_runs(task.name());
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].attempt(), 2);
-        assert_eq!(runs[1].attempt(), 3);
-    }
-
-    #[test]
-    fn zero_run_cap_keeps_only_active_runs() {
-        let state = TaskState::new();
-        state.set_max_runs_per_task(0);
-        let task = create(&state, "no-history");
-        let binding = bind(&state, task.name());
-
-        assert!(state.transition_attempt_starting(&binding, 1));
-        assert_eq!(state.list_runs(task.name()).len(), 1);
-
-        assert!(state.transition_attempt_finished(&binding, 1, TaskPhase::Succeeded, None, None,));
-        assert!(state.list_runs(task.name()).is_empty());
-    }
-
-    #[test]
-    fn old_generation_event_can_close_its_run_but_cannot_mutate_current_status() {
-        let state = TaskState::new();
-        let first = create(&state, "generation-fence");
-        let old = bind(&state, first.name());
-        assert!(state.transition_attempt_starting(&old, 1));
-
-        let current = state
-            .apply_desired(&manifest("generation-fence", "slot", 2_000))
-            .unwrap()
-            .task;
-        assert_eq!(current.status().phase(), TaskPhase::Pending);
-
-        assert!(state.transition_attempt_finished(
-            &old,
-            1,
-            TaskPhase::Failed,
-            Some("late".into()),
-            Some(1),
-        ));
-
-        let stored = state.get(first.name()).unwrap();
-        assert_eq!(stored.metadata().generation(), 2);
-        assert_eq!(stored.status().phase(), TaskPhase::Pending);
-        assert_eq!(stored.status().attempt(), 0);
-        let old_run = &state.list_runs(first.name())[0];
-        assert_eq!(old_run.generation(), 1);
-        assert_eq!(old_run.phase(), TaskPhase::Failed);
-
-        let before_task = stored;
-        let before_runs = state.list_runs(first.name());
-        assert!(!state.transition_attempt_finished(
-            &old,
-            1,
-            TaskPhase::Failed,
-            Some("late".into()),
-            Some(1),
-        ));
-        assert_eq!(state.get(first.name()).unwrap(), before_task);
-        assert_eq!(state.list_runs(first.name()), before_runs);
-    }
-
-    #[test]
-    fn stale_uid_cannot_mutate_a_recreated_resource() {
-        let state = TaskState::new();
-        let first = create(&state, "uid-fence");
-        let stale = bind(&state, first.name());
-        assert!(state.delete_task(first.name()));
-        let replacement = create(&state, "uid-fence");
-
-        assert!(!state.transition_attempt_finished(
-            &stale,
-            1,
-            TaskPhase::Failed,
-            Some("stale".into()),
-            None,
-        ));
-        let stored = state.get(replacement.name()).unwrap();
-        assert_eq!(stored.uid(), replacement.uid());
-        assert_eq!(stored.status().phase(), TaskPhase::Pending);
-        assert!(state.list_runs(replacement.name()).is_empty());
-    }
-
-    #[test]
-    fn lower_attempt_cannot_regress_current_status() {
-        let state = TaskState::new();
-        let task = create(&state, "attempt-fence");
-        let binding = bind(&state, task.name());
-        assert!(state.transition_attempt_starting(&binding, 3));
-
-        assert!(state.transition_attempt_finished(
-            &binding,
-            2,
-            TaskPhase::Failed,
-            Some("late attempt".into()),
-            None,
-        ));
-
-        let stored = state.get(task.name()).unwrap();
-        assert_eq!(stored.status().phase(), TaskPhase::Running);
-        assert_eq!(stored.status().attempt(), 3);
-        assert_eq!(
-            state
-                .list_runs(task.name())
-                .iter()
-                .find(|run| run.attempt() == 2)
-                .unwrap()
-                .phase(),
-            TaskPhase::Failed
-        );
-    }
-
-    #[test]
-    fn late_or_duplicate_start_cannot_reopen_attempt_history() {
-        let state = TaskState::new();
-        let task = create(&state, "start-fence");
-        let binding = bind(&state, task.name());
-        assert!(state.transition_attempt_starting(&binding, 1));
-        assert!(state.transition_attempt_finished(&binding, 1, TaskPhase::Succeeded, None, None,));
-
-        assert!(!state.transition_attempt_starting(&binding, 1));
-        assert!(state.transition_attempt_starting(&binding, 3));
-        assert!(!state.transition_attempt_starting(&binding, 2));
-
-        let stored = state.get(task.name()).unwrap();
-        assert_eq!(stored.status().phase(), TaskPhase::Running);
-        assert_eq!(stored.status().attempt(), 3);
-        let runs = state.list_runs(task.name());
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].phase(), TaskPhase::Succeeded);
-        assert_eq!(runs[1].attempt(), 3);
-    }
-
-    #[test]
-    fn every_embedded_resource_name_and_slot_is_public() {
-        let state = TaskState::new();
-        create(&state, "embedded-public");
-        state
-            .create_desired(&manifest("solti-state-sweep", "solti-state-sweep", 1_000))
-            .unwrap();
-        state
-            .create_desired(&manifest("user-in-sweep-slot", "solti-state-sweep", 1_000))
-            .unwrap();
-
-        assert_eq!(state.list_all().len(), 3);
-        assert_eq!(state.query(&TaskQuery::new()).unwrap().items.len(), 3);
-        assert_eq!(state.list_by_slot("slot").len(), 1);
-        assert_eq!(state.list_by_slot("solti-state-sweep").len(), 2);
-        assert!(
-            state
-                .get(&TaskId::new("solti-state-sweep").unwrap())
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn adapter_predicate_runs_before_pagination() {
-        let state = TaskState::new();
-        create(&state, "a-visible");
-        create(&state, "b-hidden");
-        create(&state, "c-visible");
-        let query = TaskQuery::new().with_limit(1);
-
-        let first = state
-            .query_where(&query, |task| task.name().as_str() != "b-hidden")
-            .unwrap();
-        assert_eq!(first.items.len(), 1);
-        assert_eq!(first.items[0].name().as_str(), "a-visible");
-        assert_eq!(first.remaining_item_count, 1);
-
-        let second = state
-            .query_where(
-                &query.with_continuation(first.continuation.unwrap()),
-                |task| task.name().as_str() != "b-hidden",
-            )
-            .unwrap();
-        assert_eq!(second.items.len(), 1);
-        assert_eq!(second.items[0].name().as_str(), "c-visible");
-        assert_eq!(second.remaining_item_count, 0);
-        assert!(second.continuation.is_none());
-    }
-
-    #[test]
-    fn slot_labels_and_multiple_phases_filter_before_pagination() {
-        let state = TaskState::new();
-        for (name, environment, tier) in [
-            ("a-match", "production", "frontend"),
-            ("b-no-match", "development", "frontend"),
-            ("c-match", "production", "backend"),
-        ] {
-            let mut labels = Labels::new();
-            labels
-                .insert("environment", environment)
-                .insert("tier", tier);
-            state
-                .create_desired(
-                    &manifest(name, "primary", 1_000)
-                        .with_labels(labels)
-                        .unwrap(),
-                )
-                .unwrap();
-        }
-        let running = state.get(&TaskId::new("c-match").unwrap()).unwrap();
-        let binding = bind(&state, running.name());
-        assert!(state.transition_attempt_starting(&binding, 1));
-
-        let selector: LabelSelector = "environment=production,tier in (frontend,backend)"
-            .parse()
-            .unwrap();
-        let query = TaskQuery::new()
-            .with_slot(Slot::new("primary").unwrap())
-            .with_phases([TaskPhase::Pending, TaskPhase::Running])
-            .with_label_selector(selector)
-            .unwrap()
-            .with_limit(1);
-
-        let first = state.query(&query).unwrap();
-        assert_eq!(first.items.len(), 1);
-        assert_eq!(first.items[0].name().as_str(), "a-match");
-        assert_eq!(first.remaining_item_count, 1);
-
-        let second = state
-            .query(&query.with_continuation(first.continuation.unwrap()))
-            .unwrap();
-        assert_eq!(second.items.len(), 1);
-        assert_eq!(second.items[0].name().as_str(), "c-match");
-        assert_eq!(second.remaining_item_count, 0);
-    }
-
-    #[test]
-    fn metadata_apply_changes_label_query_membership_immediately() {
-        let state = TaskState::new();
-        let first = create(&state, "label-change");
-        let query = TaskQuery::new()
-            .with_label_selector("environment=production".parse().unwrap())
-            .unwrap();
-        assert!(state.query(&query).unwrap().items.is_empty());
-
-        let mut labels = Labels::new();
-        labels.insert("environment", "production");
-        let applied = state
-            .apply_desired(&TaskManifest::from(&first).with_labels(labels).unwrap())
-            .unwrap()
-            .task;
-
-        assert_eq!(
-            applied.metadata().generation(),
-            first.metadata().generation()
-        );
-        assert_ne!(
-            applied.metadata().resource_version(),
-            first.metadata().resource_version()
-        );
-        assert_eq!(state.query(&query).unwrap().items.len(), 1);
-    }
-
-    #[test]
-    fn retention_uses_internal_terminal_timestamp() {
-        let state = TaskState::new();
-        let terminal = create(&state, "expired");
-        let binding = bind(&state, terminal.name());
-        assert_eq!(
-            state.finalize_if_bound(
-                binding.tv.get(),
-                TaskPhase::Canceled,
-                Some("canceled".into()),
-                None,
-                true,
-            ),
-            Some(terminal.name().clone())
-        );
-        create(&state, "pending");
-
-        let config = StateConfig::new()
-            .with_run_ttl(Duration::ZERO)
-            .with_task_ttl(Duration::ZERO);
-        assert_eq!(state.sweep(&config), (0, 1));
-        assert!(!state.contains_task(&TaskId::new("expired").unwrap()));
-        assert!(state.contains_task(&TaskId::new("pending").unwrap()));
-    }
-
-    #[test]
-    fn task_level_completion_preserves_authoritative_attempt() {
-        let state = TaskState::new();
-        let task = create(&state, "final");
-        let binding = bind(&state, task.name());
-        assert!(state.transition_attempt_starting(&binding, 8));
-
-        assert!(state.transition_task_finished(
-            &binding,
-            TaskPhase::Canceled,
-            Some("controller stopped".into()),
-            None,
-        ));
-
-        let stored = state.get(task.name()).unwrap();
-        assert_eq!(stored.status().attempt(), 8);
-        assert_eq!(stored.status().phase(), TaskPhase::Canceled);
-    }
-
-    #[test]
-    fn watch_history_retains_a_change_at_the_exact_byte_budget() {
-        let task = journal_task("exact-budget", 1, 0);
-        let serialized_bytes = TaskState::serialized_task_payload_bytes(None, Some(&task));
-        let config = StateConfig::new()
-            .try_with_watch_history_byte_budget(serialized_bytes)
-            .unwrap();
-        let state = TaskState::with_epoch(config, "epoch".to_string());
-
-        record_current_change(&state, task);
-
-        let inner = state.inner.read();
-        assert_eq!(inner.watch_history.len(), 1);
-        assert_eq!(inner.watch_history_bytes, serialized_bytes);
-        assert_eq!(
-            inner.watch_history.front().unwrap().serialized_bytes,
-            serialized_bytes
-        );
-        assert_eq!(inner.compacted_through, 0);
-    }
-
-    #[test]
-    fn watch_history_byte_budget_can_evict_multiple_changes() {
-        let first = journal_task("small-first", 1, 0);
-        let second = journal_task("small-second", 2, 0);
-        let third = journal_task("large-third", 3, 4 * 1024);
-        let first_bytes = TaskState::serialized_task_payload_bytes(None, Some(&first));
-        let second_bytes = TaskState::serialized_task_payload_bytes(None, Some(&second));
-        let third_bytes = TaskState::serialized_task_payload_bytes(None, Some(&third));
-        assert!(first_bytes + second_bytes <= third_bytes);
-        let config = StateConfig::new()
-            .try_with_watch_history_byte_budget(third_bytes)
-            .unwrap();
-        let state = TaskState::with_epoch(config, "epoch".to_string());
-
-        record_current_change(&state, first);
-        record_current_change(&state, second);
-        record_current_change(&state, third);
-
-        let inner = state.inner.read();
-        assert_eq!(inner.watch_history.len(), 1);
-        assert_eq!(inner.watch_history.front().unwrap().revision, 3);
-        assert_eq!(inner.watch_history_bytes, third_bytes);
-        assert_eq!(inner.compacted_through, 2);
-    }
-
-    #[tokio::test]
-    async fn oversized_change_is_live_but_not_retained() {
-        let first = journal_task("retained-before-oversized", 1, 0);
-        let task = journal_task("oversized-live", 2, 4 * 1024);
-        let serialized_bytes = TaskState::serialized_task_payload_bytes(None, Some(&task));
-        let config = StateConfig::new()
-            .try_with_watch_history_byte_budget(serialized_bytes - 1)
-            .unwrap();
-        let state = TaskState::with_epoch(config, "epoch".to_string());
-        record_current_change(&state, first);
-        let mut watch = state.watch(&TaskFilter::new(), Some("epoch:1")).unwrap();
-
-        record_current_change(&state, task.clone());
-
-        {
-            let inner = state.inner.read();
-            assert!(inner.watch_history.is_empty());
-            assert_eq!(inner.watch_history_bytes, 0);
-            assert_eq!(inner.compacted_through, 2);
-        }
-        assert_eq!(
-            watch.next().await.unwrap().unwrap(),
-            TaskWatchEvent::Added(task)
-        );
-        assert!(matches!(
-            state.watch(&TaskFilter::new(), Some("epoch:1")),
-            Err(CollectionError::ResourceVersionExpired { .. })
-        ));
-    }
-
-    #[test]
-    fn continuation_expires_after_byte_budget_compaction() {
-        let config = StateConfig::new()
-            .try_with_watch_history_byte_budget(1)
-            .unwrap();
-        let state = TaskState::with_epoch(config, "epoch".to_string());
-        create(&state, "a-first");
-        create(&state, "b-second");
-        let query = TaskQuery::new().with_limit(1);
-        let first_page = state.query(&query).unwrap();
-        let resource_version = first_page.resource_version.clone();
-        let continuation = first_page.continuation.unwrap();
-
-        create(&state, "c-third");
-
-        assert_eq!(
-            state
-                .query(&query.with_continuation(continuation))
-                .unwrap_err(),
-            CollectionError::ResourceVersionExpired { resource_version }
-        );
-    }
-
-    #[test]
-    fn list_snapshot_carries_the_atomic_collection_version() {
-        let state = TaskState::new();
-        let empty = state.query(&TaskQuery::new()).unwrap();
-        let (epoch, revision) = TaskState::parse_resource_version(&empty.resource_version).unwrap();
-        assert!(!epoch.is_empty());
-        assert_eq!(revision, 0);
-
-        let task = create(&state, "versioned-list");
-        let page = state.query(&TaskQuery::new()).unwrap();
-        assert_eq!(page.resource_version, task.metadata().resource_version());
-        assert_eq!(page.items, vec![task]);
-    }
-
-    #[test]
-    fn continuation_reads_the_first_page_snapshot_after_live_changes() {
-        let state = TaskState::new();
-        let first_task = create(&state, "b-first");
-        let second_task = create(&state, "c-second");
-        let query = TaskQuery::new().with_limit(1);
-
-        let first_page = state.query(&query).unwrap();
-        assert_eq!(first_page.items, vec![first_task]);
-        assert_eq!(first_page.remaining_item_count, 1);
-        let continuation = first_page.continuation.unwrap();
-
-        create(&state, "a-added-later");
-        state
-            .apply_desired(&manifest("c-second", "changed", 2_000))
-            .unwrap();
-        assert!(state.delete_task(second_task.name()));
-
-        let second_page = state.query(&query.with_continuation(continuation)).unwrap();
-        assert_eq!(second_page.resource_version, first_page.resource_version);
-        assert_eq!(second_page.items, vec![second_task]);
-        assert_eq!(second_page.remaining_item_count, 0);
-        assert!(second_page.continuation.is_none());
-    }
-
-    #[test]
-    fn continuation_is_bound_to_its_filter_and_last_returned_name() {
-        let state = TaskState::new();
-        create(&state, "a-first");
-        create(&state, "b-second");
-        let query = TaskQuery::new().with_limit(1);
-        let first_page = state.query(&query).unwrap();
-        let continuation = first_page.continuation.unwrap();
-
-        let mismatch = query
-            .clone()
-            .with_phase(TaskPhase::Running)
-            .with_continuation(continuation.clone());
-        assert_eq!(
-            state.query(&mismatch).unwrap_err(),
-            CollectionError::ContinuationFilterMismatch
-        );
-
-        let missing = TaskContinuation::new(
-            continuation.resource_version(),
-            query.filter().clone(),
-            TaskId::new("missing-cursor").unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            state.query(&query.with_continuation(missing)).unwrap_err(),
-            CollectionError::ContinuationCursorNotFound {
-                name: TaskId::new("missing-cursor").unwrap(),
-            }
-        );
-    }
-
-    #[test]
-    fn continuation_reports_invalid_and_expired_snapshots() {
-        let config = StateConfig::new()
-            .try_with_watch_history_capacity(1)
-            .unwrap();
-        let state = TaskState::with_epoch(config, "epoch".to_string());
-        create(&state, "a-first");
-        create(&state, "b-second");
-        let query = TaskQuery::new().with_limit(1);
-        let first_page = state.query(&query).unwrap();
-        let continuation = first_page.continuation.unwrap();
-
-        let invalid = TaskContinuation::new(
-            "epoch:99",
-            query.filter().clone(),
-            continuation.after().clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            state
-                .query(&query.clone().with_continuation(invalid))
-                .unwrap_err(),
-            CollectionError::InvalidResourceVersion {
-                resource_version: "epoch:99".to_string(),
-            }
-        );
-
-        create(&state, "c-third");
-        create(&state, "d-fourth");
-        assert_eq!(
-            state
-                .query(&query.with_continuation(continuation))
-                .unwrap_err(),
-            CollectionError::ResourceVersionExpired {
-                resource_version: first_page.resource_version,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn list_then_watch_replays_every_change_after_the_snapshot() {
-        let state = TaskState::new();
-        let listed = state.query(&TaskQuery::new()).unwrap();
-        let created = create(&state, "created-in-gap");
-
-        let mut watch = state
-            .watch(&TaskFilter::new(), Some(listed.resource_version.as_str()))
-            .unwrap();
-        let event = watch.next().await.unwrap().unwrap();
-
-        assert_eq!(event, TaskWatchEvent::Added(created));
-    }
-
-    #[tokio::test]
-    async fn watch_without_version_emits_sorted_snapshot_then_live_changes() {
-        let state = TaskState::new();
-        let second = create(&state, "b-snapshot");
-        let first = create(&state, "a-snapshot");
-        let mut watch = state.watch(&TaskFilter::new(), None).unwrap();
-
-        assert_eq!(
-            watch.next().await.unwrap().unwrap(),
-            TaskWatchEvent::Added(first)
-        );
-        assert_eq!(
-            watch.next().await.unwrap().unwrap(),
-            TaskWatchEvent::Added(second)
-        );
-
-        let live = create(&state, "c-live");
-        assert_eq!(
-            watch.next().await.unwrap().unwrap(),
-            TaskWatchEvent::Added(live)
-        );
-    }
-
-    #[test]
-    fn watch_rejects_expired_invalid_and_foreign_versions() {
-        let config = StateConfig::new()
-            .try_with_watch_history_capacity(1)
-            .unwrap();
-        let state = TaskState::with_epoch(config, "epoch".to_string());
-        create(&state, "first");
-        create(&state, "second");
-
-        assert!(matches!(
-            state.watch(&TaskFilter::new(), Some("epoch:0")),
-            Err(CollectionError::ResourceVersionExpired { .. })
-        ));
-        assert!(matches!(
-            state.watch(&TaskFilter::new(), Some("another:2")),
-            Err(CollectionError::ResourceVersionExpired { .. })
-        ));
-        assert!(matches!(
-            state.watch(&TaskFilter::new(), Some("")),
-            Err(CollectionError::InvalidResourceVersion { .. })
-        ));
-        assert!(matches!(
-            state.watch(&TaskFilter::new(), Some("epoch:not-a-number")),
-            Err(CollectionError::InvalidResourceVersion { .. })
-        ));
-        assert!(matches!(
-            state.watch(&TaskFilter::new(), Some("epoch:3")),
-            Err(CollectionError::InvalidResourceVersion { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn selector_membership_changes_map_to_added_modified_and_deleted() {
-        let state = TaskState::new();
-        let first = create(&state, "selector-transition");
-        let filter = TaskFilter::new()
-            .with_label_selector("environment=production".parse().unwrap())
-            .unwrap();
-        let listed = state.query(&TaskQuery::new()).unwrap();
-        let mut watch = state
-            .watch(&filter, Some(listed.resource_version.as_str()))
-            .unwrap();
-
-        let mut labels = Labels::new();
-        labels.insert("environment", "production");
-        let added = state
-            .apply_desired(&TaskManifest::from(&first).with_labels(labels).unwrap())
-            .unwrap()
-            .task;
-        assert_eq!(
-            watch.next().await.unwrap().unwrap(),
-            TaskWatchEvent::Added(added.clone())
-        );
-
-        let mut annotations = Annotations::new();
-        annotations.insert("example.io/revision", "2");
-        let modified = state
-            .apply_desired(
-                &TaskManifest::from(&added)
-                    .with_annotations(annotations)
-                    .unwrap(),
-            )
-            .unwrap()
-            .task;
-        assert_eq!(
-            watch.next().await.unwrap().unwrap(),
-            TaskWatchEvent::Modified(modified.clone())
-        );
-
-        let current = state
-            .apply_desired(
-                &TaskManifest::from(&modified)
-                    .with_labels(Labels::new())
-                    .unwrap(),
-            )
-            .unwrap()
-            .task;
-        let deleted = watch.next().await.unwrap().unwrap();
-        let TaskWatchEvent::Deleted(deleted) = deleted else {
-            panic!("selector exit must be Deleted");
-        };
-        assert_eq!(deleted.name(), current.name());
-        assert_eq!(deleted.metadata().labels(), modified.metadata().labels());
-        assert_eq!(
-            deleted.metadata().resource_version(),
-            current.metadata().resource_version()
-        );
-    }
-
-    #[tokio::test]
-    async fn adapter_predicate_participates_in_watch_transitions() {
-        let state = TaskState::new();
-        let first = create(&state, "visibility-transition");
-        let listed = state.query(&TaskQuery::new()).unwrap();
-        let mut watch = state
-            .watch_where(
-                &TaskFilter::new(),
-                Some(listed.resource_version.as_str()),
-                |task| task.spec().timeout().as_millis() <= 1_000,
-            )
-            .unwrap();
-
-        let hidden = state
-            .apply_desired(&TaskManifest::new(first.name().as_str(), spec("slot", 2_000)).unwrap())
-            .unwrap()
-            .task;
-        let TaskWatchEvent::Deleted(deleted) = watch.next().await.unwrap().unwrap() else {
-            panic!("leaving adapter visibility must be Deleted");
-        };
-        assert_eq!(deleted.name(), hidden.name());
-        assert_eq!(
-            deleted.metadata().resource_version(),
-            hidden.metadata().resource_version()
-        );
-
-        let visible = state
-            .apply_desired(&TaskManifest::new(first.name().as_str(), spec("slot", 1_000)).unwrap())
-            .unwrap()
-            .task;
-        assert_eq!(
-            watch.next().await.unwrap().unwrap(),
-            TaskWatchEvent::Added(visible)
-        );
-    }
-
-    #[test]
-    fn initial_watch_predicate_runs_without_the_state_lock() {
-        let state = TaskState::with_epoch(StateConfig::default(), "epoch".to_string());
-        create(&state, "visible");
-        let inner = Arc::clone(&state.inner);
-        let lock_was_free = Arc::new(AtomicBool::new(false));
-        let observed = Arc::clone(&lock_was_free);
-
-        let _watch = state
-            .watch_where(&TaskFilter::new(), None, move |_| {
-                observed.store(inner.try_write().is_some(), Ordering::SeqCst);
-                true
-            })
-            .unwrap();
-
-        assert!(lock_was_free.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn delete_and_sweep_each_publish_one_deleted_event() {
-        let state = TaskState::new();
-        let deleted = create(&state, "api-deleted");
-        let listed = state.query(&TaskQuery::new()).unwrap();
-        let mut watch = state
-            .watch(&TaskFilter::new(), Some(listed.resource_version.as_str()))
-            .unwrap();
-        assert!(state.delete_task(deleted.name()));
-        let TaskWatchEvent::Deleted(event) = watch.next().await.unwrap().unwrap() else {
-            panic!("delete must emit Deleted");
-        };
-        assert_eq!(event.name(), deleted.name());
-        assert_ne!(
-            event.metadata().resource_version(),
-            deleted.metadata().resource_version()
-        );
-
-        let expired = create(&state, "sweep-deleted");
-        let binding = bind(&state, expired.name());
-        assert_eq!(
-            state.finalize_if_bound(
-                binding.tv.get(),
-                TaskPhase::Canceled,
-                Some("canceled".into()),
-                None,
-                true,
-            ),
-            Some(expired.name().clone())
-        );
-        let listed = state.query(&TaskQuery::new()).unwrap();
-        let mut watch = state
-            .watch(&TaskFilter::new(), Some(listed.resource_version.as_str()))
-            .unwrap();
-        let config = StateConfig::new()
-            .with_run_ttl(Duration::ZERO)
-            .with_task_ttl(Duration::ZERO);
-        assert_eq!(state.sweep(&config), (0, 1));
-        let TaskWatchEvent::Deleted(event) = watch.next().await.unwrap().unwrap() else {
-            panic!("sweep must emit Deleted");
-        };
-        assert_eq!(event.name(), expired.name());
-    }
-
-    #[tokio::test]
-    async fn no_op_apply_and_run_only_change_publish_nothing() {
-        let state = TaskState::new();
-        let first = create(&state, "no-watch-noop");
-        let binding = bind(&state, first.name());
-        assert!(state.transition_attempt_starting(&binding, 1));
-
-        let changed = TaskManifest::new(first.name().as_str(), spec("slot", 2_000)).unwrap();
-        let current = state.apply_desired(&changed).unwrap().task;
-        let listed = state.query(&TaskQuery::new()).unwrap();
-        let mut watch = state
-            .watch(&TaskFilter::new(), Some(listed.resource_version.as_str()))
-            .unwrap();
-
-        let noop = state.apply_desired(&TaskManifest::from(&current)).unwrap();
-        assert!(!noop.reconcile);
-        assert!(state.transition_attempt_finished(&binding, 1, TaskPhase::Succeeded, None, None,));
-        assert_eq!(
-            state.query(&TaskQuery::new()).unwrap().resource_version,
-            listed.resource_version
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), watch.next())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn lag_is_terminal_once_the_resume_point_is_compacted() {
-        let config = StateConfig::new()
-            .try_with_watch_history_capacity(1)
-            .unwrap();
-        let state = TaskState::with_epoch(config, "epoch".to_string());
-        let mut watch = state.watch(&TaskFilter::new(), Some("epoch:0")).unwrap();
-
-        create(&state, "first");
-        create(&state, "second");
-
-        assert!(matches!(
-            watch.next().await,
-            Some(Err(CollectionError::ResourceVersionExpired { .. }))
-        ));
-        assert!(watch.next().await.is_none());
-    }
-
-    #[test]
-    fn irrelevant_live_events_yield_after_the_poll_budget() {
-        struct CountingWake(AtomicUsize);
-
-        impl Wake for CountingWake {
-            fn wake(self: Arc<Self>) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-
-            fn wake_by_ref(self: &Arc<Self>) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        let state = TaskState::new();
-        let listed = state.query(&TaskQuery::new()).unwrap();
-        let filter = TaskFilter::new()
-            .with_label_selector("watched=true".parse().unwrap())
-            .unwrap();
-        let mut watch = state
-            .watch(&filter, Some(listed.resource_version.as_str()))
-            .unwrap();
-        for index in 0..=WATCH_POLL_BUDGET {
-            create(&state, &format!("irrelevant-{index}"));
-        }
-
-        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
-        let waker = Waker::from(Arc::clone(&wake));
-        let mut context = Context::from_waker(&waker);
-        assert!(matches!(
-            Pin::new(&mut watch).poll_next(&mut context),
-            Poll::Pending
-        ));
-        assert_eq!(wake.0.load(Ordering::Relaxed), 1);
-
-        state.close_watches();
-        assert!(matches!(
-            Pin::new(&mut watch).poll_next(&mut context),
-            Poll::Ready(None)
-        ));
-    }
-
-    #[tokio::test]
-    async fn closing_state_watches_ends_the_stream() {
-        let state = TaskState::new();
-        let mut watch = state.watch(&TaskFilter::new(), Some("0")).unwrap();
-        state.close_watches();
-        assert!(watch.next().await.is_none());
-    }
-}
+mod tests;

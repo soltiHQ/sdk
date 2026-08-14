@@ -23,7 +23,7 @@ flowchart TB
     Output["output.rs<br/>live output channels"]
     Persistence["persistence.rs<br/>external event sinks"]
     Map["map/<br/>Taskvisor mapping"]
-    Config["config.rs<br/>retention settings"]
+    Config["config.rs<br/>admission and retention settings"]
     Error["error.rs<br/>public errors"]
 
     Public --> Builder
@@ -62,7 +62,7 @@ They do not represent ownership of model values.
 | `output.rs`             | Per-task live broadcast channels                                       | Output history or persistence              |
 | `persistence.rs`        | Optional task-state and output event sink contracts                    | Storage, retries, or recovery              |
 | `map/`                  | Typed Solti-to-Taskvisor policy and outcome mapping                    | Routing or runtime ownership               |
-| `config.rs`             | State retention and watch journal settings                             | Worker scheduling                          |
+| `config.rs`             | State admission, retention, and watch journal settings                  | Worker scheduling                          |
 | `error.rs`              | Public operation and write-conflict errors                             | Reconciliation status storage              |
 
 ## Runtime construction
@@ -130,6 +130,7 @@ sequenceDiagram
     API->>Lock: lock metadata.name
     API->>API: reject writes after shutdown starts
     API->>State: create or apply desired state
+    State->>State: check retained count and TaskManifest bytes under one write lock
     State-->>API: committed Task + reconcile decision
     API->>Worker: schedule when required
     API-->>Caller: committed Task
@@ -140,6 +141,24 @@ Different names remain independent.
 
 Create rejects every retained resource with the same name.
 Apply creates a missing resource only when preconditions are empty.
+
+Retained Task admission and desired-state mutation use the same state write
+lock. The current Task count and aggregate TaskManifest byte budget are
+independent. The byte budget measures only compact canonical `TaskManifest`
+JSON.
+
+Every current Task counts, including embedded, pending, running, and terminal
+Tasks.
+At the configured count limit, a new name fails. The count limit does not reject
+an apply to an existing Task. A new name or positive-growth existing apply fails
+when it would exceed the TaskManifest byte budget. Shrinking and no-op applies
+remain allowed. Admission does not evict a Task or wait for capacity.
+
+A duplicate create returns `AlreadyExists` before admission errors. A guarded
+missing apply remains `NotFound`; an unchecked missing apply uses create
+admission.
+A rejected admission does not advance the resource version, update indexes or
+watch history, publish persistence events, or schedule reconciliation.
 
 Apply has four outcomes:
 
@@ -237,9 +256,9 @@ Preflight runs outside the runtime operation lock.
 Runner construction is an owned async future. One atomic admission coordinator
 reserves the outer build's global and per-runner slots together. Nested catalog
 builds reuse that global slot and reserve only their selected runner's slot.
-Nested waiters have progress priority over roots, so an outer build does not
+Nested waiters have progress priority over roots. An outer build does not
 deadlock behind a root waiting for its global slot. The build deadline starts
-after outer admission and includes nested admission waits.
+before outer admission and includes nested admission waits.
 One coordinator per task retains at most one active and one pending request.
 A newer request cancels active preflight and replaces the pending request.
 Policy mapping and Taskvisor preparation happen only after that build returns.
@@ -342,6 +361,11 @@ Free-form reason text remains diagnostic.
 | `watch_history`                        | Changes for snapshots, continuations, and replay    |
 | `compacted_through`                    | Oldest unavailable collection revision              |
 | `terminal_since`                       | Internal retention timestamps                       |
+| `max_retained_tasks`                   | Optional current Task count limit                    |
+| `retained_task_manifest_bytes`          | Aggregate current TaskManifest JSON bytes            |
+| `retained_task_manifest_bytes_by_name`  | Per-task TaskManifest byte accounting                |
+| `max_retained_task_manifest_bytes`      | Optional aggregate TaskManifest byte budget          |
+| `watch_admission`                       | Concurrent watch and retained replay byte ledger     |
 
 One `RwLock` protects the complete state.
 A resource mutation and its change-journal entry happen under the same write lock.
@@ -359,11 +383,20 @@ When the bound is reached, a writer waits before entering its state critical sec
 Retention sweeps publish each expired task deletion as a separate revalidated commit batch.
 Run events carry both task name and resource UID.
 The sink must eventually return and must not mutate `TaskState`, directly or through a thread it waits for; reads are allowed.
+Polling `SupervisorApi::shutdown` on the state callback worker panics before
+shutdown changes state. A state callback must not wait for another thread that
+calls shutdown; that cycle can deadlock.
+`SupervisorApi::state_persistence_status` reports accepting, sticky health,
+reserved/buffered/active ownership, the hard `C + 1` capacity, callbacks that
+returned, and callbacks that panicked. A panicking callback is not retried
+because its side effects are ambiguous. Later events continue through the worker.
 Hooks do not hydrate the store during startup.
 
 Resource versions contain a random store epoch and a monotonic revision.
 They are opaque outside `TaskState`.
 A version from another store is expired.
+Counter exhaustion derives a new opaque epoch, clears the previous-epoch
+journal, restarts the counter, and expires outstanding versions and watches.
 
 ### Snapshot pagination
 
@@ -372,6 +405,8 @@ A continuation reconstructs that same snapshot from retained changes.
 
 Filtering runs before pagination.
 Items are ordered by task name.
+Pagination keeps a complete Task prefix within count and serialized-item byte ceilings.
+An oversized first Task is returned alone for native transport measurement.
 
 The continuation carries the filter, snapshot version, and last returned name.
 Changing the filter invalidates the continuation chain.
@@ -381,8 +416,36 @@ Changing the filter invalidates the continuation chain.
 No resource version or `"0"` emits a sorted `Added` snapshot.
 An exact retained version replays later changes before live delivery.
 
+Watch admission atomically reserves one concurrent lease and the compact Task
+JSON bytes required by its initial or exact-resume buffer. The defaults are 256
+leases and 64 MiB across one state. Bytes return to the ledger when a buffered
+event is yielded. Dropping a watch, a terminal error, and shutdown release the
+remaining lease without evicting another watch.
+
+Lag recovery retains only a revision and an event probe across a pending poll.
+It waits on the same byte ledger and re-reads the journal after wakeup. The
+capacity check and waker registration share one mutex critical section. State
+locks are released before predicates, byte measurement, admission, and wakeup.
+History invalidation replaces an identity token after releasing the state lock,
+then wakes admission waiters. Recovery compares the token in the same critical
+section that registers its waker. Compaction before registration is therefore
+observed as a token change, while compaction after registration wakes the
+stream. Compaction during the wait produces the existing expired-version
+error. One event larger than the complete byte budget is transferred directly
+in `Poll::Ready` and is not retained internally.
+
+Resource revisions do not all produce Task changes. After replaying retained
+changes through a captured recovery target, a watch advances across a trailing
+revision gap without emitting an event. A pending exact event probe that
+disappears from retained history still expires the watch.
+
 List continuations and watches share one change journal.
 The journal is bounded by change count and serialized task bytes.
+For a journal capacity above one, the live broadcast ring is the largest power
+of two strictly below the journal capacity. This leaves count headroom when
+real lag is reported. It does not reserve byte headroom: the independent byte
+budget may compact required changes or retain none. A journal capacity of one
+remains valid and has no count headroom for lag recovery.
 
 An oversized change is delivered to current live subscribers.
 It is not retained for replay.
@@ -399,29 +462,54 @@ Transport visibility belongs to the adapter.
 
 Attempt events create and finish `TaskRun` values.
 Runs are ordered by generation and attempt when read.
+Live run state and reversible journal deltas share immutable `Arc<TaskRun>`
+snapshots. Mutations use `Arc::make_mut`. Query planning clones only shared
+handles under the state lock and clones model values only for admitted page items.
 
 A run snapshots its workload GVK.
 Adapter filtering can therefore apply to historical generations.
 
-The output hub owns one bounded broadcast ring per bound task name.
+The output hub may own one admitted bounded broadcast ring per bound task name.
 Runners receive an `OutputSink`.
 Consumers receive an `OutputSubscription`.
-Core makes one bounded ownership copy from each borrowed runner chunk, so a
-small view cannot retain a larger producer allocation in the live ring.
+Core makes one bounded ownership copy from each borrowed runner chunk.
+A small view cannot retain a larger producer allocation in the live ring.
+One aggregate payload ledger defaults to 256 MiB. Each ring reserves exactly
+`effective_capacity * max_chunk_bytes`. Each subscription separately reserves
+`max_chunk_bytes` for the one internal event it can hold behind a lag notice.
+A task continues without a live-output channel when its ring cannot be admitted.
+A subscription returns `None` when its pending-event allowance cannot be admitted.
+The ledger excludes events already yielded to callers and output-sink delivery copies.
 
 Output is live-only and lossy.
 Oversized chunks retain their exact prefix and set `truncated = true`.
 A slow subscriber receives `OutputEvent::Lagged { skipped, skipped_bytes }`
 and continues; the byte count covers retained chunk payloads that were lost.
 
-An optional output sink receives published chunks and run markers, including the first event. 
-The event carries both task name and resource UID so output from different incarnations stays distinguishable. 
-Its callback is synchronous and has no SDK-owned retry or durability guarantee. 
+An optional output sink receives published chunks and run markers, including the first event.
+The event carries both task name and resource UID so output from different incarnations stays distinguishable.
+Live broadcast happens before output callback-copy admission.
+The sink runs on one dedicated worker behind a separate hard event-count bound.
+The default bound is 2048 accepted events, including the active callback.
+Runner publication never waits for output callback capacity or an admission lock.
+A full, closed, contended, or unhealthy dispatcher drops only the callback copy;
+task execution and live delivery continue.
+`SupervisorApi::output_persistence_status` reports accepting, sticky health,
+buffered and active ownership, hard capacity, callbacks that returned, callbacks
+that panicked, and callback copies rejected by admission.
+A callback panic is not retried, makes health false, and closes new admission.
+The worker continues draining events accepted before that panic.
+Polling `SupervisorApi::shutdown` on the callback worker panics before shutdown
+changes state and is handled as a callback panic. A callback must not wait for
+another thread that calls shutdown; that cycle can deadlock.
+Shutdown closes admission after runtime tasks drain, then drains and joins the worker.
+The callback has no SDK-owned retry or durability guarantee.
 Subscriber-local `Lagged` notifications are not sent to the sink.
 
 Terminal cleanup removes the channel from the hub.
 Existing subscribers close after every outstanding sink clone releases its sender.
 A stale sink cannot publish into a channel created later for the same model name.
+Stale sinks and subscriptions retain the old ring's aggregate reservation.
 
 ## Retention
 
@@ -435,7 +523,22 @@ One sweep:
 3. enforces the completed-run cap while keeping active runs;
 4. removes terminal tasks after their run history is empty and `task_ttl` expires.
 
+TaskRun pagination has its own resource-version epoch and reversible journal.
+One committed state mutation uses one run revision, even when it closes an
+active run, creates the next attempt, and evicts completed history together.
+Continuations bind the snapshot to Task name and UID.
+The journal is bounded by mutation-batch count and serialized bytes.
+Counter exhaustion derives a new TaskRun epoch, clears the old journal, and
+expires continuations from the previous epoch.
+
 A task with a runtime binding is never removed by retention.
+Only actual deletion or sweep removal releases retained Task count capacity.
+Deletion, sweep removal, and shrinking applies release retained TaskManifest
+byte capacity.
+`StateConfig::with_max_retained_tasks(None)` disables the count limit.
+`StateConfig::with_max_retained_task_manifest_bytes(None)` disables the
+TaskManifest byte limit. Neither limit evicts Tasks.
+The byte budget does not bound total process memory.
 
 `max_runs_per_task = 0` keeps active runs and removes completed history.
 Zero `run_ttl` and `task_ttl` make eligible values removable on the next sweep.

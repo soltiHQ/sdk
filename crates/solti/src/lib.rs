@@ -126,16 +126,21 @@
 //!
 //! ```rust,no_run
 //! # #[cfg(all(feature = "core", feature = "exec-subprocess"))]
-//! # async fn build() -> Result<solti::core::SupervisorApi, Box<dyn std::error::Error>> {
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::time::Duration;
+//!
 //! use solti::core::SupervisorApi;
 //! use solti::exec::subprocess::register_subprocess_runner;
 //! use solti::runner::RunnerRouter;
 //!
 //! let mut router = RunnerRouter::new();
-//! register_subprocess_runner(&mut router, "default")?;
+//! let subprocess_runner = register_subprocess_runner(&mut router, "default")?;
 //!
 //! let supervisor = SupervisorApi::builder(router).start().await?;
-//! # Ok(supervisor)
+//! // Run application work, then stop task supervision before subprocess cleanup.
+//! supervisor.shutdown().await?;
+//! subprocess_runner.shutdown(Duration::from_secs(5)).await?;
+//! # Ok(())
 //! # }
 //! ```
 

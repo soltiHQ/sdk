@@ -43,6 +43,7 @@ mod workload;
 pub(crate) use output::output_event_to_proto;
 pub(crate) use phase::proto_to_domain_phase;
 pub(crate) use preconditions::write_preconditions_from_proto;
+pub(crate) use run::runs_page_to_proto_bounded;
 pub(crate) use task::task_manifest_from_proto;
 pub(crate) use task::task_watch_event_to_proto;
-pub(crate) use task::tasks_page_to_proto;
+pub(crate) use task::tasks_page_to_proto_bounded;

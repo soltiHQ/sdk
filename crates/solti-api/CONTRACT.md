@@ -85,12 +85,12 @@ Their `spec` must be a JSON object.
 Built-in workload specs reject unknown fields.
 Extension workload fields are owned by the application.
 
-`chain.solti.io/v1alpha1`, kind `Chain`, uses this extension boundary. 
-HTTP places the Chain object directly in `Task.spec.workload.spec`. 
+`chain.solti.io/v1alpha1`, kind `Chain`, uses this extension boundary.
+HTTP places the Chain object directly in `Task.spec.workload.spec`.
 gRPC places the UTF-8 JSON bytes of that same Chain spec in `ExtensionTask.spec.raw`.
 
-The transports validate the extension GVK and require an object payload. 
-The Chain runner validates its entry, steps, transitions, reachability, and acyclicity when core reconciles the Task. 
+The transports validate the extension GVK and require an object payload.
+The Chain runner validates its entry, steps, transitions, reachability, and acyclicity when core reconciles the Task.
 Chain remains one outer Task, existing Task status, run history, and output messages require no extra fields.
 
 The built-in `solti.io/v1` `Embedded` workload is SDK-only.
@@ -187,6 +187,8 @@ CreateTaskRequest { manifest }
 
 Create requires a new retained name.
 An existing name returns HTTP `409` or gRPC `AlreadyExists`.
+When either retained Task admission budget would be exceeded, a new name
+returns HTTP `429` or gRPC `ResourceExhausted`.
 
 With `SupervisorApiAdapter`, success means desired state is committed.
 It does not mean that a runtime has started.
@@ -217,6 +219,10 @@ ApplyTaskRequest { manifest, preconditions }
 Apply without preconditions is an upsert.
 It creates a missing resource.
 It updates an existing resource.
+An unchecked missing apply uses the same retained Task admission as create.
+An existing apply is also rejected when its TaskManifest growth would exceed
+the aggregate retained TaskManifest byte budget. Shrinking and no-op applies
+remain allowed.
 
 Apply and delete accept two optional preconditions:
 
@@ -234,6 +240,25 @@ A mismatch returns `409` or gRPC `Aborted`.
 
 HTTP conflicts contain `Status.details.causes`.
 gRPC conflicts contain encoded `WriteConflictDetails` status details.
+
+### Retained Task admission
+
+The bundled adapter uses two independent core budgets.
+
+- The current Task count defaults to 1024.
+- Aggregate retained TaskManifest bytes default to 256 MiB.
+
+The byte budget measures only each current Task's compact canonical
+`TaskManifest` JSON. It does not measure status, run history, watch history,
+output, indexes, or allocator overhead.
+
+Create and unchecked apply for a missing name are rejected atomically when
+either budget would be exceeded. An existing apply is rejected atomically when
+positive TaskManifest growth would exceed the byte budget. Shrinking and no-op
+applies remain allowed. Core does not evict Tasks to admit a write.
+
+Admission rejection returns HTTP `429` with `reason=TooManyRequests` and no
+`Retry-After` header. gRPC returns `ResourceExhausted`.
 
 ## Desired-state commit
 
@@ -276,6 +301,9 @@ The API does not provide a staged-rollout or availability guarantee.
 | `exitCode`           | Process exit code, when available             |
 | `error`              | Execution diagnostic, when available          |
 | `conditions`         | Extensible controller conditions              |
+
+`Task.status.error` is normalized before storage to the longest UTF-8-safe
+prefix of at most 32 KiB.
 
 The current condition set always contains one `Reconciled` condition.
 
@@ -360,6 +388,19 @@ Its `phases` field is repeated.
 With `SupervisorApiAdapter`, list results are ordered by task name.
 Pagination uses a snapshot captured for the first page.
 Every page in one chain has the same collection `resourceVersion`.
+The count limit is a ceiling.
+The bundled adapter also limits compact-JSON Task item payloads to 4 MiB before
+transport encoding. It passes an oversized first Task through alone for native
+measurement.
+HTTP also limits the complete compact-JSON `TaskList` body to 4 MiB.
+gRPC limits the encoded `ListTasksResponse` protobuf message to 4 MiB.
+Each transport returns the largest complete prefix from that domain page that
+fits its native response limit.
+Truncation advances the continuation only through the last returned Task and
+adds the deferred Tasks to the exact `remainingItemCount`.
+
+If one Task cannot fit with required collection metadata, HTTP returns `429`
+with `reason=TooManyRequests` and gRPC returns `ResourceExhausted`.
 
 The continuation token is opaque.
 Clients must return it unchanged.
@@ -406,6 +447,18 @@ The stream then emits live changes.
 A specific version replays later retained changes.
 It then continues with live changes.
 
+The bundled core admits 256 concurrent Task watches by default. Compact Task
+JSON retained by initial and replay buffers has a 64 MiB aggregate default.
+When either admission limit is full, the initial request returns HTTP `429`
+with `reason=TooManyRequests`, or gRPC `ResourceExhausted`. Rejection is atomic
+and does not evict an existing watch.
+
+Buffered bytes are released as events are sent. Lag recovery waits for byte
+capacity without retaining replay payload across the wait. History compaction
+during that wait still produces the existing expired-version error. Live
+delivery and events already yielded to the client are outside the internal
+retained-payload budget.
+
 The initial request returns `410 Gone` when its position is no longer retained.
 An error after streaming starts becomes one final `ERROR` document.
 The HTTP stream closes after that document.
@@ -421,13 +474,22 @@ Clients resume from the latest processed `object.metadata.resourceVersion`.
 HTTP:
 
 ```text
-GET /apis/solti.io/v1/tasks/{name}/runs
+GET /apis/solti.io/v1/tasks/{name}/runs?limit=100&continue={opaque-token}
 ```
+
+`limit` is optional. Omitted or `0` means `100`; the maximum is `1000`.
+`continue` is an opaque token returned by the previous page.
+Unknown or repeated query parameters are rejected.
 
 The response shape is:
 
 ```json
 {
+  "metadata": {
+    "resourceVersion": "opaque-run-version",
+    "continue": "opaque-token",
+    "remainingItemCount": 2
+  },
   "runs": [
     {
       "workload": {
@@ -445,11 +507,38 @@ The response shape is:
 }
 ```
 
+`continue` and `remainingItemCount` are absent on the final page.
 Runs are ordered by generation and attempt.
 An active run has phase `running` and no terminal fields.
 A finished run has a terminal phase and `finishedAt`.
+`TaskRun.error`, when present, is normalized before storage to the longest
+UTF-8-safe prefix of at most 32 KiB.
+
+The first page captures a separate TaskRun collection snapshot.
+Its continuation binds the Task name, Task UID, run collection version, and
+last returned generation and attempt.
+Every page in one chain reads that snapshot, including the frozen value of a
+run that later finishes.
+Deletion and recreation under the same name do not move the chain to the new
+Task UID.
+
+Visibility filtering happens before pagination.
+The count and `remainingItemCount` cover only public runs.
+HTTP limits the complete compact-JSON response to 4 MiB.
+gRPC limits the encoded `ListTaskRunsResponse` message to 4 MiB.
+Each transport returns the largest complete run prefix that fits and advances
+the continuation only through the last returned run.
+One run that cannot fit returns HTTP `429` with `reason=TooManyRequests` or
+gRPC `ResourceExhausted`.
+
+A malformed token or a token for another Task returns `400` or gRPC
+`InvalidArgument`.
+An unavailable run snapshot returns `410 Gone` or gRPC `OutOfRange`.
 
 gRPC uses `ListTaskRunsRequest` and `ListTaskRunsResponse`.
+The request carries `name`, `limit`, and `continue`.
+The response carries `runs`, `resource_version`, `continue`, and
+`remaining_item_count`.
 Its timestamps are Unix milliseconds.
 
 ## Delete
@@ -562,10 +651,11 @@ The complete service method prefix is:
 Resource and live-output timestamps are Unix milliseconds.
 Output chunks contain raw protobuf bytes.
 Extension workload specs contain one UTF-8 JSON object in `RawExtension.raw`.
-For a Chain workload, `TaskWorkload.api_version` is `chain.solti.io/v1alpha1`, `kind` is `Chain`, and `RawExtension.raw` contains the serialized `ChainSpec` object. 
+For a Chain workload, `TaskWorkload.api_version` is `chain.solti.io/v1alpha1`, `kind` is `Chain`, and `RawExtension.raw` contains the serialized `ChainSpec` object.
 Protobuf JSON represents those bytes as base64; generated clients pass the UTF-8 bytes directly.
 
 Encoded and decoded messages are limited to 4 MiB.
+`ListTasks` and `ListTaskRuns` enforce that limit before returning a protobuf response.
 
 ## Authentication and authorization
 
@@ -588,13 +678,13 @@ Applications can replace static token verification with `ApiAuthenticator`.
 The authenticator receives the bearer credential and returns an `ApiIdentity`.
 Identity subjects and attributes are application-owned.
 
-Applications can install `ApiAuthorizer` independently. 
+Applications can install `ApiAuthorizer` independently.
 It receives the identity, Task operation, and validated target before the handler operation.
 A policy denial returns HTTP `403` or gRPC `PermissionDenied`.
 
-List and Watch use a collection target. 
-The hook does not filter collection items or stream events. 
-Tenant or row-level visibility requires a separate scoped-handler design. 
+List and Watch use a collection target.
+The hook does not filter collection items or stream events.
+Tenant or row-level visibility requires a separate scoped-handler design.
 Stream authorization is checked when the stream opens.
 Solti does not define users, roles, tenants, RBAC rules, or policy storage.
 
@@ -617,11 +707,16 @@ Both transports use the same error categories.
 | Unsupported method           | `405 Method Not Allowed`     | `Unimplemented`     |
 | Unsupported media type       | `415 Unsupported Media Type` | `InvalidArgument`   |
 | Oversized request            | `413 Payload Too Large`      | `ResourceExhausted` |
+| Resource capacity exhausted  | `429 Too Many Requests`      | `ResourceExhausted` |
 | Unavailable resource version | `410 Gone`                   | `OutOfRange`        |
 | Service shutting down        | `503 Service Unavailable`    | `Unavailable`       |
 | Internal failure             | `500 Internal Server Error`  | `Internal`          |
 
 HTTP errors use a Kubernetes-style `Status` resource.
+Resource exhaustion uses `reason=TooManyRequests` and does not add a
+`Retry-After` header. It covers retained Task count admission, retained
+TaskManifest byte admission, initial Task watch admission, and a Task or
+TaskRun that cannot fit into an empty list page.
 
 ```json
 {

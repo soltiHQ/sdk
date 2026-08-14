@@ -219,10 +219,10 @@ They do not form a complete sandbox for untrusted code.
 ```mermaid
 %%{init: {"flowchart": {"curve": "linear"}, "themeVariables": {"fontSize": "12px"}}}%%
 flowchart TB
-    Runner["Runner construction<br/>prepare backend"]
+    Runner["Runner construction<br/>prepare backend<br/>start bounded finalizer"]
     Build["Task build<br/>resolve mode and environment<br/>pin cwd"]
     TaskRef["Reusable TaskRef"]
-    Attempt["Attempt<br/>prepare finalizer and host resources"]
+    Attempt["Attempt<br/>reserve cleanup ownership<br/>prepare host resources"]
     Script{"Script mode?"}
     Materialize["Create attempt script transport"]
     Spawn["Attach fd and host boundaries<br/>spawn child"]
@@ -289,10 +289,24 @@ flowchart LR
 ```
 
 Drop does not wait for process exit.
-It transfers the child, host domain, and process-group state to one finalizer worker.
+Each runner owns one finalizer with 1024 ownership slots by default.
+An attempt reserves one slot before script transport, cgroup, or process creation.
+It transfers the child, host domain, process-group state, and reservation to the
+finalizer worker.
+
+Cancellation after cgroup preparation and process spawn failure transfer the
+prepared host domain through the same queue. The queue is finite because every
+entry already owns one reservation. Handoff uses a non-blocking send.
 
 The worker retains the child until it reaps it or detects lost wait ownership.
 It then advances host cleanup outside the attempt's Tokio runtime.
+An operation enters quarantine after ten persistent operating-system errors.
+Quarantine retains its ownership slot and closes new admission.
+
+After all supervisors and task references have stopped,
+`SubprocessRunner::shutdown` closes admission, waits for accepted ownership,
+and joins the worker. A cancelled or timed-out shutdown leaves that terminal
+state available to another shutdown call.
 
 The embedding process must not reap arbitrary children.
 It must not enable automatic `SIGCHLD` reaping.
@@ -301,6 +315,7 @@ It must not enable automatic `SIGCHLD` reaping.
 
 `ContainerRunner` owns the engine-neutral lifecycle.
 `ContainerEngine` owns engine-specific creation.
+`ContainerEngineBinding` records the engine provider's drop-ownership declaration.
 
 ```mermaid
 %%{init: {"flowchart": {"curve": "linear"}}}%%
@@ -338,12 +353,33 @@ The runner never calls it.
 `create_attempt` returns a stopped attempt.
 Exit observation must be armed before the attempt is returned.
 
+Custom engine registration requires one typed ownership declaration:
+
+| Contract | Provider declaration |
+|----------|----------------------|
+| `DropReleases` | Dropping in-flight creation or the returned attempt synchronously releases all accepted ownership and leaves no lifecycle task |
+| `PreAdmittedFinalizer` | Finite finalizer admission precedes the first attempt-owned resource or mutation; drop transfers confirmed and uncertain attempt ownership without starting unbounded work |
+
+The binding makes the declaration explicit in integration source.
+It does not verify a custom engine implementation at runtime.
+The native containerd conversion selects `PreAdmittedFinalizer` because its
+admission, drop handoff, failure state, and shutdown path are implemented in the adapter.
+
+The runner polls creation and attempt methods inline.
+It does not spawn engine lifecycle futures.
+Cooperative cancellation waits for termination, exit observation, and cleanup.
+A Taskvisor timeout or force-abort drops the current lifecycle future and the attempt object.
+The engine's declared contract owns any cleanup that must continue after that drop.
+The only runner-spawned work in this path is at most two output readers.
+Their handles abort on drop.
+
 `terminate` and `cleanup` are idempotent.
 Cleanup may remove only attempt-owned resources.
 Completed cleanup steps remain completed across retries.
 
 Retryable create, start, and wait errors become retryable Taskvisor failures.
 Permanent errors become fatal Taskvisor failures.
+An error returned by create wins over cancellation observed after create returns.
 Termination and cleanup errors are always fatal.
 
 ## Native containerd lifecycle
@@ -365,6 +401,7 @@ It does not use CRI or configure CNI.
 %%{init: {"flowchart": {"curve": "linear"}, "themeVariables": {"fontSize": "12px"}}}%%
 flowchart TB
     Request["ContainerRequest"]
+    Admission["Reserve lifecycle<br/>cleanup admission"]
     Image["Pull and unpack image<br/>read verified metadata"]
     Spec["Build base OCI spec<br/>apply process policy"]
     Io["Create private attempt FIFOs"]
@@ -378,7 +415,8 @@ flowchart TB
     Cleanup["Delete task → container → snapshot<br/>remove local I/O"]
     Rollback["Ownership-aware rollback"]
 
-    Request --> Image
+    Request --> Admission
+    Admission --> Image
     Image --> Spec
     Spec --> Io
     Io --> Snapshot
@@ -397,7 +435,13 @@ flowchart TB
 
 Image transfer has a separate 10-minute deadline by default.
 Control and metadata RPCs use a 30-second deadline by default.
-Both the gRPC request and the local future enforce finite deadlines.
+Every request carries a finite gRPC deadline. Local futures also enforce the
+default deadlines and configured deadlines that fit Tokio's `Instant` range.
+Lifecycle admission is reserved before image resolution. The reservation bounds
+the client-side resolve future and stays charged through the returned attempt or
+deferred cleanup. Image resolution and unpack use containerd's shared image
+store. They are not stored in `AttemptState` and a dropped create future does
+not hand their transfer to the cleanup domain.
 
 Content reads share one control deadline across the complete stream.
 Each image metadata object is limited to 4 MiB.
@@ -463,10 +507,16 @@ The adapter tracks each remote resource separately.
 | `Absent`    | The resource is known not to exist                  | Do not delete                             |
 | `Foreign`   | The resource exists but does not match this attempt | Never delete                              |
 | `Owned`     | Creation or read-back confirmed this attempt        | Delete after dependent resources are gone |
-| `Uncertain` | A create outcome could not be confirmed             | Read back before any delete               |
+| `CreateUncertain` | A create may still commit remotely          | Keep charged and read back before cleanup |
+| `DeleteUncertain` | A delete needs identity read-back            | Read back before parent cleanup           |
 
-Timeouts and transient create errors are ambiguous outcomes.
-They enter `Uncertain` before read-back.
+Ownership enters `CreateUncertain` before a mutating create RPC is polled.
+Cancellation transfers the in-flight mutation record and ownership state to cleanup.
+Cleanup settles that mutation before ownership read-back or deletion.
+
+The adapter verifies resource identity immediately before deletion.
+Containerd deletion is keyed only by resource ID. The configured namespace
+must not replace that resource between verification and deletion.
 
 Snapshot identity includes its parent and ownership labels.
 Container identity includes its snapshotter, snapshot key, and ownership labels.
@@ -479,9 +529,44 @@ Cleanup follows dependency order:
 3. remove the snapshot;
 4. remove local attempt I/O.
 
+Each `ContainerdEngine` owns one bounded cleanup domain.
+The default admission limit is 1024 admitted create or attempt lifecycles.
+The same limit bounds a separate local I/O domain.
+Lifecycle admission is reserved before image resolution. I/O admission is
+reserved before attempt-owned local or remote resources are created. Shared
+image transfer is charged to lifecycle admission but is not deferred-cleanup
+ownership.
+
+```text
+active attempt -> explicit cleanup -> release admission
+       |
+       v
+future cancellation -> non-blocking handoff -> isolated cleanup runtime
+
+I/O prepare/remove -> bounded handoff -> dedicated blocking I/O thread
+```
+
+The cleanup runtime owns its operating-system thread and containerd channel.
+It does not depend on the runtime that polled the attempt.
+Filesystem preparation and removal run on the engine-local I/O thread.
+
 Retryable cleanup errors use exponential backoff from 100 milliseconds to 2 seconds.
-Every retry shares one 30-second window by default.
-A permanent error stops retry.
+One cleanup retry window uses 30 seconds by default.
+Accepted I/O preparation and a retained mutation settle before that window starts.
+Deferred cleanup starts another bounded pass after a retryable failure.
+Permanent unresolved ownership is quarantined and remains charged.
+
+`ContainerdEngine::shutdown` closes lifecycle admission and waits for accepted
+create lifecycles and attempt ownership.
+It then closes the blocking I/O domain even when remote cleanup reports an error.
+Both phases share one deadline when the configured duration fits Tokio's
+`Instant` range. A larger duration waits without a local deadline.
+Deadline expiry returns a retryable error and leaves the worker owned by the engine.
+Lost or quarantined ownership returns a permanent error immediately.
+Call shutdown after every supervisor that uses the engine has stopped.
+
+Deferred cleanup is process-local. It cannot recover ownership after process
+abort, power loss, or `SIGKILL`.
 
 The same cleanup path handles normal completion and failed-create rollback.
 Incomplete rollback is reported with both creation and cleanup failures.
@@ -489,6 +574,8 @@ Incomplete rollback is reported with both creation and cleanup failures.
 Linux attempt I/O uses one private `0700` directory and two `0600` FIFOs.
 The configured root must be visible at the same path to the SDK process and containerd.
 Writable shared path components require the sticky bit.
+FIFO readers stay non-blocking and use the active Tokio I/O driver.
+Missing driver support is reported as attempt creation failure.
 
 ## Output path
 
@@ -551,7 +638,7 @@ They cannot be hidden by cancellation or an earlier execution result.
 | Container process policy                | [`src/container/policy.rs`](src/container/policy.rs), [`src/container/oci.rs`](src/container/oci.rs)                                                   | policy and OCI tests                        |
 | Containerd config or probe              | [`src/container/containerd/config.rs`](src/container/containerd/config.rs), [`src/container/containerd/engine.rs`](src/container/containerd/engine.rs) | config and probe tests                      |
 | Image resolution or metadata            | [`src/container/containerd/image.rs`](src/container/containerd/image.rs)                                                                               | image tests                                 |
-| Containerd ownership or lifecycle       | [`src/container/containerd/engine.rs`](src/container/containerd/engine.rs)                                                                             | engine ownership and cleanup tests          |
+| Containerd ownership or lifecycle       | [`src/container/containerd/engine.rs`](src/container/containerd/engine.rs), [`src/container/containerd/cleanup.rs`](src/container/containerd/cleanup.rs), [`src/container/containerd/rpc.rs`](src/container/containerd/rpc.rs) | engine ownership and cleanup tests          |
 | OCI base specification                  | [`src/container/containerd/spec.rs`](src/container/containerd/spec.rs)                                                                                 | spec tests                                  |
 | Containerd output pipes                 | [`src/container/containerd/io.rs`](src/container/containerd/io.rs)                                                                                     | Linux I/O tests                             |
 | Shared output behavior                  | [`src/output.rs`](src/output.rs)                                                                                                                       | output tests                                |

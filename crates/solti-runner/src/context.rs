@@ -46,8 +46,8 @@ use crate::output::{OutputPublisherHandle, noop_output_publisher};
 /// ## See Also
 ///
 /// - [`RunnerRouter::with_context`](crate::RunnerRouter::with_context)
-/// - [`MetricsHandle`](crate::MetricsHandle)
-/// - [`OutputPublisherHandle`](crate::OutputPublisherHandle)
+/// - [`MetricsHandle`]
+/// - [`OutputPublisherHandle`]
 #[derive(Clone)]
 pub struct BuildContext {
     output_publisher: OutputPublisherHandle,

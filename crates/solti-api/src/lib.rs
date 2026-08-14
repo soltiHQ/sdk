@@ -40,11 +40,15 @@
 //!
 //! Apply is an upsert without write preconditions.
 //! Apply and delete can check `uid` and `resourceVersion`.
+//! The core adapter maps retained Task count and TaskManifest byte admission
+//! failures to [`ApiError::ResourceExhausted`].
 //!
 //! ## Collections and Streams
 //!
 //! Lists use opaque continuation tokens.
 //! The bundled adapter provides snapshot-consistent pagination.
+//! Task list bodies are limited to 4 MiB in each transport's native encoding.
+//! TaskRun lists use a separate snapshot and the same native response limit.
 //! Watches can resume from a retained resource version.
 //!
 //! Task output is live-only and lossy.
@@ -155,6 +159,18 @@ pub const HTTP_API_ROOT: &str = api_url!("");
 ///
 /// The limit is 4 MiB.
 pub const MAX_REQUEST_BYTES: usize = solti_model::MAX_TASK_MANIFEST_BYTES;
+
+/// Maximum encoded body of one Task list response.
+///
+/// HTTP measures compact JSON without headers. gRPC measures the protobuf
+/// message without its frame header.
+pub const MAX_TASK_LIST_RESPONSE_BYTES: usize = solti_model::MAX_TASK_PAGE_ITEM_BYTES;
+
+/// Maximum encoded body of one TaskRun list response.
+///
+/// HTTP measures compact JSON without headers. gRPC measures the protobuf
+/// message without its frame header.
+pub const MAX_TASK_RUN_LIST_RESPONSE_BYTES: usize = solti_model::MAX_TASK_RUN_PAGE_ITEM_BYTES;
 
 mod error;
 pub use error::{ApiConflict, ApiError, ApiErrorCause};

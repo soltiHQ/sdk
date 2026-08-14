@@ -321,7 +321,7 @@ pub struct TaskStatus {
     /// execution attempt within observed_generation
     #[prost(uint32, tag = "3")]
     pub attempt: u32,
-    /// execution diagnostic, if any
+    /// execution diagnostic; UTF-8-safe prefix of at most 32 KiB
     #[prost(string, optional, tag = "4")]
     pub error: ::core::option::Option<::prost::alloc::string::String>,
     /// process exit code, if the process exited
@@ -368,7 +368,7 @@ pub struct TaskRunInfo {
     /// end time (ms); absent while running
     #[prost(int64, optional, tag = "5")]
     pub finished_at: ::core::option::Option<i64>,
-    /// error message, if any
+    /// diagnostic; UTF-8-safe prefix of at most 32 KiB
     #[prost(string, optional, tag = "6")]
     pub error: ::core::option::Option<::prost::alloc::string::String>,
     /// process exit code, if the process exited
@@ -772,11 +772,18 @@ pub struct WatchTasksResponse {
     pub object: ::core::option::Option<Task>,
 }
 /// ListTaskRuns input.
+/// A non-empty continue token resumes the previous snapshot.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListTaskRunsRequest {
     /// Task name
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
+    /// page size; zero = 100; maximum = 1000
+    #[prost(uint32, tag = "2")]
+    pub limit: u32,
+    /// opaque token from the previous page
+    #[prost(string, tag = "3")]
+    pub r#continue: ::prost::alloc::string::String,
 }
 /// ListTaskRuns output.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -784,6 +791,15 @@ pub struct ListTaskRunsResponse {
     /// attempts, oldest first
     #[prost(message, repeated, tag = "1")]
     pub runs: ::prost::alloc::vec::Vec<TaskRunInfo>,
+    /// opaque run collection version captured with this page
+    #[prost(string, tag = "2")]
+    pub resource_version: ::prost::alloc::string::String,
+    /// opaque token for the next page
+    #[prost(string, tag = "3")]
+    pub r#continue: ::prost::alloc::string::String,
+    /// attempts left in this snapshot
+    #[prost(uint64, optional, tag = "4")]
+    pub remaining_item_count: ::core::option::Option<u64>,
 }
 /// DeleteTask input.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

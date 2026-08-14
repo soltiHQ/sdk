@@ -23,7 +23,7 @@ use crate::config::DiscoverConfig;
 use crate::errors::DiscoverError;
 use crate::proto::SyncRequest;
 use crate::proto::discover_service_client::DiscoverServiceClient;
-use crate::tasks::transport::validate_response;
+use crate::tasks::transport::{validate_response, validate_token_transport};
 
 /// gRPC discovery adapter.
 pub(in crate::tasks) struct GrpcAdapter {
@@ -79,8 +79,11 @@ impl GrpcAdapter {
             ));
         }
 
+        let authorization = authorization_metadata(config.token.as_ref())?;
+        validate_token_transport(config, secure)?;
+
         Ok(Self {
-            authorization: authorization_metadata(config.token.as_ref())?,
+            authorization,
             client: tokio::sync::OnceCell::new(),
             endpoint,
             secure,
@@ -264,11 +267,53 @@ mod tests {
     fn token_is_validated_before_task_execution() {
         let config = config_builder("http://control.example")
             .with_token(solti_model::Token::new("first\nsecond").unwrap())
+            .allow_insecure_token_transport()
             .build()
             .unwrap();
 
         let result = GrpcAdapter::new(&config);
         assert!(matches!(result, Err(DiscoverError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn h2c_with_token_is_rejected_by_default() {
+        let config = config_builder("http://control.example")
+            .with_token(solti_model::Token::new("secret").unwrap())
+            .build()
+            .unwrap();
+
+        let result = GrpcAdapter::new(&config);
+        let Err(DiscoverError::InvalidConfig(message)) = result else {
+            panic!("expected h2c token config to be rejected");
+        };
+        assert!(message.contains("allow_insecure_token_transport()"));
+    }
+
+    #[test]
+    fn h2c_without_token_remains_allowed() {
+        assert!(GrpcAdapter::new(&config("http://control.example")).is_ok());
+    }
+
+    #[test]
+    fn explicit_opt_in_allows_h2c_with_token() {
+        let config = config_builder("http://127.0.0.1:50051")
+            .with_token(solti_model::Token::new("development-secret").unwrap())
+            .allow_insecure_token_transport()
+            .build()
+            .unwrap();
+
+        assert!(GrpcAdapter::new(&config).is_ok());
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn https_with_token_is_allowed_by_default() {
+        let config = config_builder("https://control.example")
+            .with_token(solti_model::Token::new("secret").unwrap())
+            .build()
+            .unwrap();
+
+        assert!(validate_token_transport(&config, true).is_ok());
     }
 
     #[cfg(feature = "tls")]

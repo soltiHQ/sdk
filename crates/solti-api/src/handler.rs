@@ -17,8 +17,8 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 use solti_model::{
-    OutputEvent, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun,
-    TaskWatchEvent, WritePreconditions,
+    OutputEvent, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRunPage,
+    TaskRunQuery, TaskWatchEvent, WritePreconditions,
 };
 use tokio_stream::Stream;
 
@@ -53,7 +53,7 @@ pub type TaskWatchEventStream =
 /// | `get_task`         | `GET    /apis/solti.io/v1/tasks/{name}`      | `GetTask`        |
 /// | `query_tasks`      | `GET    /apis/solti.io/v1/tasks`             | `ListTasks`      |
 /// | `watch_tasks`      | `GET    /apis/solti.io/v1/tasks?watch=true`  | `WatchTasks`     |
-/// | `list_task_runs`   | `GET    /apis/solti.io/v1/tasks/{name}/runs` | `ListTaskRuns`   |
+/// | `query_task_runs`  | `GET    /apis/solti.io/v1/tasks/{name}/runs` | `ListTaskRuns`   |
 /// | `delete_task`      | `DELETE /apis/solti.io/v1/tasks/{name}`      | `DeleteTask`     |
 /// | `stream_task_logs` | `GET    /apis/solti.io/v1/tasks/{name}/logs` | `StreamTaskLogs` |
 ///
@@ -75,6 +75,7 @@ pub trait ApiHandler: Send + Sync + 'static {
     ///
     /// - [`ApiError::InvalidRequest`] when the manifest is rejected.
     /// - [`ApiError::AlreadyExists`] when the name is retained.
+    /// - [`ApiError::ResourceExhausted`] when a retained Task budget rejects the write.
     /// - [`ApiError::Unavailable`] after shutdown starts.
     ///
     /// Later reconciliation failures are status updates.
@@ -94,6 +95,8 @@ pub trait ApiHandler: Send + Sync + 'static {
     ///
     /// - [`ApiError::TaskNotFound`] when conditional apply finds no task.
     /// - [`ApiError::Conflict`] when a precondition does not match.
+    /// - [`ApiError::ResourceExhausted`] when positive TaskManifest growth
+    ///   would exceed the retained byte budget.
     async fn apply_task(
         &self,
         manifest: TaskManifest,
@@ -112,8 +115,11 @@ pub trait ApiHandler: Send + Sync + 'static {
 
     /// Returns one filtered task page.
     ///
-    /// The returned page must match the query filters and limit.
-    /// Its continuation must describe the same snapshot and filter.
+    /// The returned page must match the query filters and count limit.
+    /// Implementations should also honor the query item byte limit before cloning items.
+    /// A continuation page must keep the requested snapshot and must not repeat
+    /// the Task named by the requested cursor. Its returned continuation must
+    /// describe the same snapshot and filter.
     /// The transports reject an inconsistent page as [`ApiError::Internal`].
     ///
     /// ## Errors
@@ -133,8 +139,13 @@ pub trait ApiHandler: Send + Sync + 'static {
     ///
     /// ## Errors
     ///
-    /// The bundled adapter returns [`ApiError::ResourceVersionExpired`]
-    /// when the requested position is no longer retained.
+    /// The bundled adapter returns:
+    ///
+    /// - [`ApiError::InvalidRequest`] for an invalid resource version.
+    /// - [`ApiError::ResourceVersionExpired`] when the requested position is
+    ///   no longer retained.
+    /// - [`ApiError::ResourceExhausted`] when concurrent-watch or retained
+    ///   initial/replay admission is full.
     ///
     /// The stream can later yield the same error when it falls behind.
     /// That error is terminal.
@@ -144,13 +155,25 @@ pub trait ApiHandler: Send + Sync + 'static {
         resource_version: Option<String>,
     ) -> Result<TaskWatchEventStream, ApiError>;
 
-    /// Lists one task's execution attempts from oldest to newest.
+    /// Returns one snapshot-consistent page of a task's execution attempts.
+    ///
+    /// Runs are ordered from oldest to newest.
+    /// The returned page must match the requested task, count limit, and continuation snapshot.
+    /// Implementations should honor the query item byte limit before cloning runs.
+    /// The transports reject an inconsistent page as [`ApiError::Internal`].
     ///
     /// ## Errors
     ///
-    /// The bundled adapter returns [`ApiError::TaskNotFound`]
-    /// when the task is not public or does not exist.
-    async fn list_task_runs(&self, id: &TaskId) -> Result<Vec<TaskRun>, ApiError>;
+    /// The bundled adapter returns:
+    ///
+    /// - [`ApiError::TaskNotFound`] when a first-page task is not public or does not exist.
+    /// - [`ApiError::InvalidRequest`] for an invalid continuation.
+    /// - [`ApiError::ResourceVersionExpired`] for a compacted run snapshot.
+    async fn query_task_runs(
+        &self,
+        id: &TaskId,
+        query: TaskRunQuery,
+    ) -> Result<TaskRunPage, ApiError>;
 
     /// Stops and removes one task and its run history.
     ///

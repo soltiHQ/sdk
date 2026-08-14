@@ -30,10 +30,13 @@
 //! Both streams remain open until their source ends or fails.
 //!
 //! Every request body is limited to [`crate::MAX_REQUEST_BYTES`].
+//! Task and TaskRun list bodies have separate 4 MiB response limits.
 
 use std::{
     convert::Infallible,
+    io::{self, Write},
     num::NonZeroU32,
+    num::NonZeroUsize,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -73,8 +76,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, ContainerSpec, ExtensionWorkload, LabelSelector, ObjectMeta,
     OutputEvent, RestartPolicy, Slot, SubprocessSpec, TASK_API_VERSION, Task, TaskFilter, TaskId,
-    TaskManifest, TaskManifestMeta, TaskPhase, TaskQuery, TaskRun, TaskStatus, TaskWatchEvent,
-    Timeout, Token, TypeMeta, Uid, WORKLOAD_API_VERSION, WasmSpec, WritePreconditions,
+    TaskManifest, TaskManifestMeta, TaskPhase, TaskQuery, TaskRun, TaskRunPage, TaskRunQuery,
+    TaskStatus, TaskWatchEvent, Timeout, Token, TypeMeta, Uid, WORKLOAD_API_VERSION, WasmSpec,
+    WritePreconditions,
 };
 use tokio_stream::{Stream, StreamExt};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -88,8 +92,8 @@ use crate::{
     error::{ApiError, HttpStatusResource},
     handler::{ApiHandler, TaskWatchEventStream},
     metrics::{ApiMetricsHandle, StreamingResponse, http_metrics_middleware, noop_api_metrics},
-    validate::{parse_list_limit, parse_task_id, validate_slot},
-    visibility::{manifest_is_visible, run_is_visible, task_is_visible},
+    validate::{parse_list_limit, parse_task_id, parse_task_run_limit, validate_slot},
+    visibility::{manifest_is_visible, task_is_visible},
 };
 
 const HTTP_BEARER_SCHEME: &str = "soltiTaskBearer";
@@ -414,7 +418,8 @@ where
             .response::<400, ApiError>()
             .response::<409, ApiError>()
             .response::<413, ApiError>()
-            .response::<415, ApiError>();
+            .response::<415, ApiError>()
+            .response::<429, ApiError>();
         document_common_errors(document_access(
             operation,
             auth_enabled,
@@ -427,12 +432,13 @@ where
             .tag("tasks")
             .summary("List or watch tasks")
             .description(
-                "Returns one TaskList unless watch is true. Watch mode emits newline-delimited TaskWatchDocument values. See CONTRACT.md for pagination and resume semantics.",
+                "Returns one TaskList within the count and 4 MiB response limits unless watch is true. Watch mode emits newline-delimited TaskWatchDocument values. See CONTRACT.md for pagination and resume semantics.",
             )
             .input::<Query<ListTasksParams>>()
             .response::<200, ListOrWatchResponse>()
             .response::<400, ApiError>()
-            .response::<410, ApiError>();
+            .response::<410, ApiError>()
+            .response::<429, ApiError>();
         document_common_errors(document_access(
             operation,
             auth_enabled,
@@ -468,7 +474,8 @@ where
             .response::<404, ApiError>()
             .response::<409, ApiError>()
             .response::<413, ApiError>()
-            .response::<415, ApiError>();
+            .response::<415, ApiError>()
+            .response::<429, ApiError>();
         document_common_errors(document_access(
             operation,
             auth_enabled,
@@ -498,9 +505,15 @@ where
             .id("listTaskRuns")
             .tag("tasks")
             .summary("List retained task runs")
+            .description(
+                "Returns one snapshot-consistent page within the count and 4 MiB response limits.",
+            )
+            .input::<Query<ListTaskRunsParams>>()
             .response::<200, Json<TaskRunList>>()
             .response::<400, ApiError>()
-            .response::<404, ApiError>();
+            .response::<404, ApiError>()
+            .response::<410, ApiError>()
+            .response::<429, ApiError>();
         document_common_errors(document_access(
             operation,
             auth_enabled,
@@ -703,6 +716,21 @@ struct ListTasksParams {
     watch: Option<bool>,
 }
 
+#[derive(Debug, Default, JsonSchema)]
+#[schemars(rename = "ListTaskRunsQuery", deny_unknown_fields)]
+struct ListTaskRunsParams {
+    /// Page size.
+    ///
+    /// Omitted or zero means 100.
+    /// The maximum is 1000.
+    #[schemars(range(max = 1000))]
+    limit: Option<u32>,
+
+    /// Opaque continuation token returned by a previous page.
+    #[schemars(rename = "continue", with = "Option<NonEmptyStringSchema>")]
+    continuation: Option<String>,
+}
+
 fn parse_list_tasks_params(raw_query: Option<&str>) -> Result<ListTasksParams, ApiError> {
     let mut params = ListTasksParams::default();
     for (key, value) in form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes()) {
@@ -729,6 +757,28 @@ fn parse_list_tasks_params(raw_query: Option<&str>) -> Result<ListTasksParams, A
             "watch" => {
                 let value = parse_watch_query_param(&value)?;
                 set_query_param(&mut params.watch, "watch", value)?;
+            }
+            other => {
+                return Err(ApiError::InvalidRequest(format!(
+                    "unknown query parameter `{other}`"
+                )));
+            }
+        }
+    }
+    Ok(params)
+}
+
+/// Parses strict TaskRun list query parameters.
+fn parse_list_task_runs_params(raw_query: Option<&str>) -> Result<ListTaskRunsParams, ApiError> {
+    let mut params = ListTaskRunsParams::default();
+    for (key, value) in form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes()) {
+        match key.as_ref() {
+            "limit" => {
+                let value = parse_u32_query_param("limit", &value)?;
+                set_query_param(&mut params.limit, "limit", value)?;
+            }
+            "continue" => {
+                set_query_param(&mut params.continuation, "continue", value.into_owned())?
             }
             other => {
                 return Err(ApiError::InvalidRequest(format!(
@@ -920,6 +970,38 @@ struct TaskList {
     items: Vec<Task>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Task list envelope with an empty item array for exact size accounting.
+struct EmptyTaskList<'a> {
+    /// Task API version.
+    api_version: &'static str,
+    /// Task list kind.
+    kind: &'static str,
+    /// Candidate page metadata.
+    metadata: &'a ListMeta,
+    /// Empty item array.
+    items: &'a [()],
+}
+
+#[derive(Default)]
+/// Allocation-free serialized byte counter.
+struct SerializedSize(
+    /// Counted bytes.
+    usize,
+);
+
+impl Write for SerializedSize {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[allow(dead_code)]
 #[derive(JsonSchema)]
 #[schemars(
@@ -938,10 +1020,23 @@ struct HttpTaskListSchema {
     items: Vec<HttpTaskSchema>,
 }
 
+/// Native HTTP representation of one TaskRun collection page.
 #[derive(Debug, JsonSchema, Serialize)]
 #[schemars(deny_unknown_fields)]
 struct TaskRunList {
+    /// Snapshot and continuation metadata.
+    metadata: ListMeta,
+    /// Complete run items in this prefix.
     runs: Vec<TaskRun>,
+}
+
+/// Empty TaskRun list used for exact envelope-size measurement.
+#[derive(Serialize)]
+struct EmptyTaskRunList<'a> {
+    /// Candidate metadata for the measured prefix.
+    metadata: &'a ListMeta,
+    /// Empty item slice with the final field shape.
+    runs: &'a [()],
 }
 
 #[derive(Serialize)]
@@ -1308,11 +1403,12 @@ async fn list_task_runs_route<H>(
     Extension(access): Extension<HttpAccessControl>,
     identity: Option<Extension<ApiIdentity>>,
     path: ApiPath<TaskPath>,
-) -> NoApi<Result<Json<TaskRunList>, ApiError>>
+    query: RawQuery,
+) -> NoApi<Result<Response, ApiError>>
 where
     H: ApiHandler,
 {
-    NoApi(list_task_runs(state, &access, identity.as_deref(), path).await)
+    NoApi(list_task_runs(state, &access, identity.as_deref(), path, query).await)
 }
 
 async fn delete_task_route<H>(
@@ -1434,6 +1530,179 @@ where
     Ok(Json(public_task(task)?))
 }
 
+/// Builds HTTP collection metadata for one item prefix.
+fn list_meta_for_prefix(
+    page: &solti_model::TaskPage<Task>,
+    filter: &TaskFilter,
+    keep: usize,
+) -> Result<ListMeta, ApiError> {
+    let (continuation, remaining_item_count) =
+        crate::continuation::prefix_metadata(page, filter, keep)?;
+    Ok(ListMeta {
+        resource_version: page.resource_version.clone(),
+        continuation: continuation.map(crate::continuation::encode).transpose()?,
+        remaining_item_count: (remaining_item_count > 0).then_some(remaining_item_count),
+    })
+}
+
+/// Measures one compact JSON value without retaining encoded bytes.
+fn compact_json_size(value: &impl Serialize) -> Result<usize, ApiError> {
+    let mut size = SerializedSize::default();
+    serde_json::to_writer(&mut size, value)
+        .map_err(|error| ApiError::Internal(format!("measure JSON response: {error}")))?;
+    Ok(size.0)
+}
+
+/// Calculates the complete Task list JSON body size.
+fn task_list_size(metadata: &ListMeta, serialized_item_bytes: usize) -> Result<usize, ApiError> {
+    let empty = EmptyTaskList {
+        api_version: TASK_API_VERSION,
+        kind: "TaskList",
+        metadata,
+        items: &[],
+    };
+    compact_json_size(&empty).map(|bytes| bytes.saturating_add(serialized_item_bytes))
+}
+
+/// Encodes the largest complete prefix from one domain page within the HTTP limit.
+fn encode_bounded_task_list(
+    page: solti_model::TaskPage<Task>,
+    filter: &TaskFilter,
+) -> Result<(Response, usize, usize), ApiError> {
+    encode_bounded_task_list_with_limit(page, filter, crate::MAX_TASK_LIST_RESPONSE_BYTES)
+}
+
+/// Encodes a complete Task prefix within an explicit testable limit.
+fn encode_bounded_task_list_with_limit(
+    page: solti_model::TaskPage<Task>,
+    filter: &TaskFilter,
+    limit: usize,
+) -> Result<(Response, usize, usize), ApiError> {
+    let mut serialized_item_bytes = 0usize;
+    let mut keep = None;
+
+    if page.items.is_empty() {
+        keep = Some(0);
+    } else {
+        for (index, task) in page.items.iter().enumerate() {
+            let task_bytes = compact_json_size(task)?;
+            serialized_item_bytes = serialized_item_bytes
+                .saturating_add(usize::from(index > 0))
+                .saturating_add(task_bytes);
+            let candidate = index + 1;
+            let metadata = list_meta_for_prefix(&page, filter, candidate)?;
+            if task_list_size(&metadata, serialized_item_bytes)? <= limit {
+                keep = Some(candidate);
+            }
+        }
+    }
+
+    let keep = keep.ok_or_else(|| {
+        ApiError::ResourceExhausted(format!(
+            "the first Task exceeds the {limit}-byte list response limit"
+        ))
+    })?;
+    let page = crate::continuation::retain_prefix(page, filter, keep)?;
+    let count = page.items.len();
+    let remaining = page.remaining_item_count;
+    let metadata = list_meta_for_prefix(&page, filter, count)?;
+    let body = serde_json::to_vec(&TaskList {
+        api_version: TASK_API_VERSION,
+        kind: "TaskList",
+        metadata,
+        items: page.items,
+    })
+    .map_err(|error| ApiError::Internal(format!("encode Task list response: {error}")))?;
+    if body.len() > limit {
+        return Err(ApiError::Internal(
+            "bounded Task list exceeded its encoded response limit".into(),
+        ));
+    }
+    let mut response = Body::from(body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok((response, count, remaining))
+}
+
+/// Builds HTTP metadata for one retained TaskRun prefix.
+fn run_list_meta_for_prefix(page: &TaskRunPage, keep: usize) -> Result<ListMeta, ApiError> {
+    let (continuation, remaining_item_count) =
+        crate::continuation::run_prefix_metadata(page, keep)?;
+    Ok(ListMeta {
+        resource_version: page.resource_version.clone(),
+        continuation: continuation
+            .map(crate::continuation::encode_run)
+            .transpose()?,
+        remaining_item_count: (remaining_item_count > 0).then_some(remaining_item_count),
+    })
+}
+
+/// Returns the exact compact JSON size for a TaskRun response candidate.
+fn task_run_list_size(
+    metadata: &ListMeta,
+    serialized_item_bytes: usize,
+) -> Result<usize, ApiError> {
+    let empty = EmptyTaskRunList {
+        metadata,
+        runs: &[],
+    };
+    compact_json_size(&empty).map(|bytes| bytes.saturating_add(serialized_item_bytes))
+}
+
+/// Encodes the largest complete TaskRun prefix within the public wire limit.
+fn encode_bounded_task_run_list(page: TaskRunPage) -> Result<(Response, usize, usize), ApiError> {
+    encode_bounded_task_run_list_with_limit(page, crate::MAX_TASK_RUN_LIST_RESPONSE_BYTES)
+}
+
+/// Encodes the largest complete TaskRun prefix within `limit` bytes.
+fn encode_bounded_task_run_list_with_limit(
+    page: TaskRunPage,
+    limit: usize,
+) -> Result<(Response, usize, usize), ApiError> {
+    let mut serialized_item_bytes = 0usize;
+    let mut keep = page.items.is_empty().then_some(0);
+
+    for (index, run) in page.items.iter().enumerate() {
+        let run_bytes = compact_json_size(run)?;
+        serialized_item_bytes = serialized_item_bytes
+            .saturating_add(usize::from(index > 0))
+            .saturating_add(run_bytes);
+        let candidate = index + 1;
+        let metadata = run_list_meta_for_prefix(&page, candidate)?;
+        if task_run_list_size(&metadata, serialized_item_bytes)? <= limit {
+            keep = Some(candidate);
+        }
+    }
+
+    let keep = keep.ok_or_else(|| {
+        ApiError::ResourceExhausted(format!(
+            "the first TaskRun exceeds the {limit}-byte list response limit"
+        ))
+    })?;
+    let page = crate::continuation::retain_run_prefix(page, keep)?;
+    let count = page.items.len();
+    let remaining = page.remaining_item_count;
+    let metadata = run_list_meta_for_prefix(&page, count)?;
+    let body = serde_json::to_vec(&TaskRunList {
+        metadata,
+        runs: page.items,
+    })
+    .map_err(|error| ApiError::Internal(format!("encode TaskRun list response: {error}")))?;
+    if body.len() > limit {
+        return Err(ApiError::Internal(
+            "bounded TaskRun list exceeded its encoded response limit".into(),
+        ));
+    }
+    let mut response = Body::from(body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok((response, count, remaining))
+}
+
 async fn list_tasks<H>(
     State(handler): State<Arc<H>>,
     access: &HttpAccessControl,
@@ -1496,32 +1765,29 @@ where
     }
 
     let mut query = TaskQuery::from_filter(filter);
-    query = query.with_limit(parse_list_limit(limit.unwrap_or(0))?);
+    query = query
+        .with_limit(parse_list_limit(limit.unwrap_or(0))?)
+        .with_item_byte_limit(
+            NonZeroUsize::new(crate::MAX_TASK_LIST_RESPONSE_BYTES)
+                .expect("the Task list response limit is positive"),
+        );
     if let Some(token) = continuation {
         if token.is_empty() {
             return Err(ApiError::InvalidRequest(
                 "query parameter `continue` must not be empty".into(),
             ));
         }
-        query = query.with_continuation(crate::continuation::decode(&token)?);
+        let continuation = crate::continuation::decode(&token)?;
+        crate::continuation::validate_continuation_filter(&continuation, query.filter())?;
+        query = query.with_continuation(continuation);
     }
 
-    let page_filter = query.filter().clone();
-    let page_limit = query.limit();
+    let validation_query = query.clone();
     access
         .authorize(identity, TaskOperation::List, TaskTarget::Collection)
         .await?;
     let page = handler.query_tasks(query).await?;
-    crate::continuation::validate_page(&page, &page_filter, page_limit)?;
-    debug!(
-        event = "api.operation_completed",
-        transport = "http",
-        operation = "list",
-        count = page.items.len(),
-        remaining = page.remaining_item_count,
-        "task operation completed"
-    );
-
+    crate::continuation::validate_page(&page, &validation_query)?;
     for task in &page.items {
         if !task_is_visible(task) {
             return Err(ApiError::Internal(
@@ -1530,22 +1796,16 @@ where
         }
     }
 
-    let continuation = page
-        .continuation
-        .map(crate::continuation::encode)
-        .transpose()?;
-    Ok(Json(TaskList {
-        api_version: TASK_API_VERSION,
-        kind: "TaskList",
-        metadata: ListMeta {
-            resource_version: page.resource_version,
-            continuation,
-            remaining_item_count: (page.remaining_item_count > 0)
-                .then_some(page.remaining_item_count),
-        },
-        items: page.items,
-    })
-    .into_response())
+    let (response, count, remaining) = encode_bounded_task_list(page, validation_query.filter())?;
+    debug!(
+        event = "api.operation_completed",
+        transport = "http",
+        operation = "list",
+        count,
+        remaining,
+        "task operation completed"
+    );
+    Ok(response)
 }
 
 async fn list_task_runs<H>(
@@ -1553,11 +1813,33 @@ async fn list_task_runs<H>(
     access: &HttpAccessControl,
     identity: Option<&ApiIdentity>,
     ApiPath(TaskPath { name }): ApiPath<TaskPath>,
-) -> Result<Json<TaskRunList>, ApiError>
+    RawQuery(raw_query): RawQuery,
+) -> Result<Response, ApiError>
 where
     H: ApiHandler,
 {
+    let ListTaskRunsParams {
+        limit,
+        continuation,
+    } = parse_list_task_runs_params(raw_query.as_deref())?;
     let name = parse_task_id("task name", name)?;
+    let mut query = TaskRunQuery::new()
+        .with_limit(parse_task_run_limit(limit.unwrap_or(0))?)
+        .with_item_byte_limit(
+            NonZeroUsize::new(crate::MAX_TASK_RUN_LIST_RESPONSE_BYTES)
+                .expect("the TaskRun list response limit is positive"),
+        );
+    if let Some(token) = continuation {
+        if token.is_empty() {
+            return Err(ApiError::InvalidRequest(
+                "query parameter `continue` must not be empty".into(),
+            ));
+        }
+        let continuation = crate::continuation::decode_run(&token)?;
+        crate::continuation::validate_run_continuation_task(&continuation, &name)?;
+        query = query.with_continuation(continuation);
+    }
+    let validation_query = query.clone();
     access
         .authorize(identity, TaskOperation::ListRuns, TaskTarget::Task(&name))
         .await?;
@@ -1568,13 +1850,19 @@ where
         task_name = %name,
         "task operation started"
     );
-    let runs = handler.list_task_runs(&name).await?;
-    if runs.iter().any(|run| !run_is_visible(run)) {
-        return Err(ApiError::Internal(
-            "handler returned Embedded run history through the public HTTP API".into(),
-        ));
-    }
-    Ok(Json(TaskRunList { runs }))
+    let page = handler.query_task_runs(&name, query).await?;
+    crate::continuation::validate_run_page(&page, &name, &validation_query)?;
+    let (response, count, remaining) = encode_bounded_task_run_list(page)?;
+    debug!(
+        event = "api.operation_completed",
+        transport = "http",
+        operation = "list_runs",
+        task_name = %name,
+        count,
+        remaining,
+        "task operation completed"
+    );
+    Ok(response)
 }
 
 async fn delete_task<H>(
@@ -1645,4 +1933,137 @@ where
         .into_response();
     response.extensions_mut().insert(StreamingResponse);
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use http_body_util::BodyExt as _;
+    use solti_model::{
+        Flag, SubprocessMode, TaskEnv, TaskPage, TaskSpec, TaskWorkload, WorkloadTypeMeta,
+    };
+
+    fn task(name: &str) -> Task {
+        let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+            SubprocessMode::Command {
+                command: "true".into(),
+                args: Vec::new(),
+            },
+            TaskEnv::new(),
+            None,
+            Flag::enabled(),
+        ));
+        let spec = TaskSpec::builder("slot", workload, 1_000_u64)
+            .build()
+            .unwrap();
+        Task::new(name, spec).unwrap()
+    }
+
+    fn page() -> solti_model::TaskPage<Task> {
+        TaskPage {
+            items: vec![task("a-first"), task("b-second")],
+            resource_version: "store:2".into(),
+            continuation: None,
+            remaining_item_count: 0,
+        }
+    }
+
+    fn run_page() -> TaskRunPage {
+        let workload = WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").unwrap();
+        TaskRunPage {
+            items: vec![
+                TaskRun::starting(1, 1, workload.clone()).unwrap(),
+                TaskRun::from_parts(
+                    workload,
+                    1,
+                    2,
+                    TaskPhase::Failed,
+                    std::time::UNIX_EPOCH + std::time::Duration::from_millis(1),
+                    Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(2)),
+                    Some("x".repeat(1_024)),
+                    Some(1),
+                )
+                .unwrap(),
+            ],
+            task: TaskId::new("task-1").unwrap(),
+            task_uid: Uid::new("task-1-uid").unwrap(),
+            resource_version: "runs-test:2".into(),
+            continuation: None,
+            remaining_item_count: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn task_list_json_stops_at_the_exact_encoded_boundary() {
+        let page = page();
+        let filter = TaskFilter::new();
+        let first_items = compact_json_size(&page.items[0]).unwrap();
+        let first_meta = list_meta_for_prefix(&page, &filter, 1).unwrap();
+        let first_limit = task_list_size(&first_meta, first_items).unwrap();
+
+        let (response, count, remaining) =
+            encode_bounded_task_list_with_limit(page.clone(), &filter, first_limit).unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(bytes.len(), first_limit);
+        assert_eq!(count, 1);
+        assert_eq!(remaining, 1);
+        assert_eq!(json["items"].as_array().unwrap().len(), 1);
+        assert!(json["metadata"]["continue"].is_string());
+        assert_eq!(json["metadata"]["remainingItemCount"], 1);
+
+        let all_items = first_items + 1 + compact_json_size(&page.items[1]).unwrap();
+        let all_meta = list_meta_for_prefix(&page, &filter, 2).unwrap();
+        let all_limit = task_list_size(&all_meta, all_items).unwrap();
+        let (response, count, remaining) =
+            encode_bounded_task_list_with_limit(page, &filter, all_limit).unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.len(), all_limit);
+        assert_eq!(count, 2);
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn first_task_larger_than_the_json_response_limit_is_typed() {
+        let page = page();
+        let filter = TaskFilter::new();
+        let first_items = compact_json_size(&page.items[0]).unwrap();
+        let first_meta = list_meta_for_prefix(&page, &filter, 1).unwrap();
+        let first_limit = task_list_size(&first_meta, first_items).unwrap();
+
+        assert!(matches!(
+            encode_bounded_task_list_with_limit(page, &filter, first_limit - 1),
+            Err(ApiError::ResourceExhausted(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn task_run_list_json_stops_at_the_exact_encoded_boundary() {
+        let page = run_page();
+        let first_items = compact_json_size(&page.items[0]).unwrap();
+        let first_meta = run_list_meta_for_prefix(&page, 1).unwrap();
+        let first_limit = task_run_list_size(&first_meta, first_items).unwrap();
+
+        let (response, count, remaining) =
+            encode_bounded_task_run_list_with_limit(page.clone(), first_limit).unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(bytes.len(), first_limit);
+        assert_eq!(count, 1);
+        assert_eq!(remaining, 1);
+        assert_eq!(json["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(json["metadata"]["remainingItemCount"], 1);
+        let continuation =
+            crate::continuation::decode_run(json["metadata"]["continue"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(continuation.task().as_str(), "task-1");
+        assert_eq!(continuation.task_uid().as_str(), "task-1-uid");
+        assert_eq!(continuation.after_attempt(), 1);
+
+        assert!(matches!(
+            encode_bounded_task_run_list_with_limit(page, first_limit - 1),
+            Err(ApiError::ResourceExhausted(_))
+        ));
+    }
 }

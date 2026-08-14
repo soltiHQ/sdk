@@ -2,12 +2,13 @@
 
 #![cfg(feature = "http")]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU16, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use base64::Engine as _;
 use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
@@ -17,8 +18,9 @@ use solti_api::{
     TaskWatchEventStream, Transport,
 };
 use solti_model::{
-    EmbeddedSpec, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun,
-    TaskWorkload, Token, WritePreconditions,
+    EmbeddedSpec, ExtensionWorkload, Task, TaskContinuation, TaskFilter, TaskId, TaskManifest,
+    TaskPage, TaskPhase, TaskQuery, TaskRunPage, TaskRunQuery, TaskSpec, TaskWorkload, Token, Uid,
+    WritePreconditions,
 };
 
 #[derive(Default)]
@@ -26,6 +28,11 @@ struct MockHandler {
     submit_calls: AtomicUsize,
     delete_calls: AtomicUsize,
     delete_returns_not_found: bool,
+    last_query: Mutex<Option<TaskQuery>>,
+    query_calls: AtomicUsize,
+    query_resource_version: Mutex<Option<String>>,
+    last_run_query: Mutex<Option<TaskRunQuery>>,
+    query_items: Mutex<Vec<Task>>,
 }
 
 #[async_trait]
@@ -48,10 +55,22 @@ impl ApiHandler for MockHandler {
         Ok(None)
     }
 
-    async fn query_tasks(&self, _query: TaskQuery) -> Result<TaskPage<Task>, ApiError> {
+    async fn query_tasks(&self, query: TaskQuery) -> Result<TaskPage<Task>, ApiError> {
+        self.query_calls.fetch_add(1, Ordering::SeqCst);
+        let requested_resource_version = query
+            .continuation()
+            .map(|continuation| continuation.resource_version().to_owned());
+        *self.last_query.lock().unwrap() = Some(query);
+        let resource_version = self
+            .query_resource_version
+            .lock()
+            .unwrap()
+            .clone()
+            .or(requested_resource_version)
+            .unwrap_or_else(|| "test:1".into());
         Ok(TaskPage {
-            items: Vec::new(),
-            resource_version: "test:1".into(),
+            items: self.query_items.lock().unwrap().clone(),
+            resource_version,
             continuation: None,
             remaining_item_count: 0,
         })
@@ -65,11 +84,23 @@ impl ApiHandler for MockHandler {
         Ok(Box::pin(tokio_stream::empty()))
     }
 
-    async fn list_task_runs(&self, id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
+    async fn query_task_runs(
+        &self,
+        id: &TaskId,
+        query: TaskRunQuery,
+    ) -> Result<TaskRunPage, ApiError> {
+        *self.last_run_query.lock().unwrap() = Some(query);
         if id.as_str() == "runs-missing" {
             Err(ApiError::TaskNotFound(id.to_string()))
         } else {
-            Ok(Vec::new())
+            Ok(TaskRunPage {
+                items: Vec::new(),
+                task: id.clone(),
+                task_uid: Uid::new("http-integration-run-uid").unwrap(),
+                resource_version: "runs-test:1".into(),
+                continuation: None,
+                remaining_item_count: 0,
+            })
         }
     }
 
@@ -166,6 +197,16 @@ async fn body_json(resp: axum::http::Response<Body>) -> Value {
     serde_json::from_slice(&bytes).expect("response body must be valid json")
 }
 
+fn encode_task_continuation(continuation: TaskContinuation) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "continuation": continuation,
+        }))
+        .unwrap(),
+    )
+}
+
 fn contains_const(value: &Value, expected: &str) -> bool {
     match value {
         Value::Array(values) => values.iter().any(|value| contains_const(value, expected)),
@@ -221,6 +262,24 @@ fn generated_openapi_describes_the_installed_task_routes() {
         tasks["post"]["responses"]["400"]["content"]["application/json"]["schema"]["$ref"],
         "#/components/schemas/HttpStatusResource"
     );
+    assert_eq!(
+        tasks["post"]["responses"]["429"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/HttpStatusResource"
+    );
+    assert_eq!(
+        tasks["get"]["responses"]["429"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/HttpStatusResource"
+    );
+    assert_eq!(
+        task["put"]["responses"]["429"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/HttpStatusResource"
+    );
+    for status in ["410", "429"] {
+        assert_eq!(
+            runs["get"]["responses"][status]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/HttpStatusResource"
+        );
+    }
     assert!(tasks["post"]["responses"].get("200").is_none());
     assert!(tasks["post"]["responses"].get("422").is_none());
 
@@ -279,6 +338,22 @@ fn generated_openapi_describes_the_installed_task_routes() {
         assert_eq!(parameter["schema"]["minLength"], 1);
         assert_eq!(parameter["schema"]["pattern"], "\\S");
     }
+
+    let run_parameters = runs["get"]["parameters"].as_array().unwrap();
+    for name in ["name", "limit", "continue"] {
+        assert!(
+            run_parameters
+                .iter()
+                .any(|parameter| parameter["name"] == name),
+            "missing run-list parameter {name}"
+        );
+    }
+    let run_continue = run_parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "continue")
+        .unwrap();
+    assert_eq!(run_continue["schema"]["minLength"], 1);
+    assert_eq!(run_continue["schema"]["pattern"], "\\S");
 
     let get_parameters = task["get"]["parameters"].as_array().unwrap();
     let name = get_parameters
@@ -771,6 +846,61 @@ async fn list_runs_for_unknown_parent_returns_404() {
 }
 
 #[tokio::test]
+async fn list_runs_forwards_default_limits_and_returns_snapshot_metadata() {
+    let handler = Arc::new(MockHandler::default());
+    let app = router_with(Arc::clone(&handler));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/apis/solti.io/v1/tasks/task-1/runs?limit=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["metadata"]["resourceVersion"], "runs-test:1");
+    assert_eq!(body["runs"], serde_json::json!([]));
+    let query = handler.last_run_query.lock().unwrap().clone().unwrap();
+    assert_eq!(query.limit(), solti_model::DEFAULT_TASK_RUN_LIMIT);
+    assert_eq!(
+        query.item_byte_limit().get(),
+        solti_api::MAX_TASK_RUN_LIST_RESPONSE_BYTES
+    );
+}
+
+#[tokio::test]
+async fn list_runs_rejects_invalid_pagination_before_the_handler() {
+    for query in [
+        "limit=1001",
+        "limit=-1",
+        "limit=1&limit=2",
+        "continue=",
+        "continue=not-base64!",
+        "unknown=value",
+    ] {
+        let handler = Arc::new(MockHandler::default());
+        let response = router_with(Arc::clone(&handler))
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/apis/solti.io/v1/tasks/task-1/runs?{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "query: {query}");
+        assert!(handler.last_run_query.lock().unwrap().is_none());
+    }
+}
+
+#[tokio::test]
 async fn delete_unknown_task_returns_404_with_structured_error() {
     let handler = Arc::new(MockHandler {
         delete_returns_not_found: true,
@@ -838,6 +968,61 @@ async fn list_tasks_invalid_phase_returns_400() {
 }
 
 #[tokio::test]
+async fn list_tasks_rejects_a_cross_filter_token_before_the_handler() {
+    let handler = Arc::new(MockHandler::default());
+    let continuation = TaskContinuation::new(
+        "test:7",
+        TaskFilter::new().with_phase(TaskPhase::Pending),
+        TaskId::new("task-20").unwrap(),
+    )
+    .unwrap();
+    let token = encode_task_continuation(continuation);
+
+    let response = router_with(Arc::clone(&handler))
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/apis/solti.io/v1/tasks?phase=running&continue={token}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(handler.query_calls.load(Ordering::SeqCst), 0);
+    assert!(handler.last_query.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn list_tasks_rejects_a_custom_handler_page_from_another_snapshot() {
+    let handler = Arc::new(MockHandler {
+        query_resource_version: Mutex::new(Some("test:8".into())),
+        ..MockHandler::default()
+    });
+    let continuation =
+        TaskContinuation::new("test:7", TaskFilter::new(), TaskId::new("task-20").unwrap())
+            .unwrap();
+    let token = encode_task_continuation(continuation);
+
+    let response = router_with(Arc::clone(&handler))
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/apis/solti.io/v1/tasks?continue={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(handler.query_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn list_tasks_invalid_pagination_returns_status_resource() {
     let app = router_with(Arc::new(MockHandler::default()));
 
@@ -879,7 +1064,8 @@ async fn list_tasks_rejects_limit_above_public_maximum() {
 
 #[tokio::test]
 async fn list_tasks_empty_returns_complete_collection_metadata() {
-    let app = router_with(Arc::new(MockHandler::default()));
+    let handler = Arc::new(MockHandler::default());
+    let app = router_with(Arc::clone(&handler));
 
     let resp = app
         .oneshot(
@@ -901,6 +1087,65 @@ async fn list_tasks_empty_returns_complete_collection_metadata() {
         serde_json::json!({ "resourceVersion": "test:1" })
     );
     assert!(body["items"].as_array().unwrap().is_empty());
+    assert_eq!(
+        handler
+            .last_query
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .item_byte_limit()
+            .get(),
+        solti_api::MAX_TASK_LIST_RESPONSE_BYTES
+    );
+}
+
+#[tokio::test]
+async fn list_tasks_maps_native_oversized_item_to_429() {
+    let manifest = |padding: usize| {
+        let workload = TaskWorkload::Extension(
+            ExtensionWorkload::new(
+                "workloads.example.io/v1",
+                "LargePayload",
+                serde_json::json!({ "padding": "x".repeat(padding) }),
+            )
+            .unwrap(),
+        );
+        let spec = TaskSpec::builder("large", workload, 5_000_u64)
+            .build()
+            .unwrap();
+        TaskManifest::new("large", spec).unwrap()
+    };
+    let empty = manifest(0);
+    let padding = solti_model::MAX_TASK_MANIFEST_BYTES
+        .checked_sub(serde_json::to_vec(&empty).unwrap().len())
+        .unwrap();
+    let manifest = manifest(padding);
+    assert_eq!(
+        serde_json::to_vec(&manifest).unwrap().len(),
+        solti_model::MAX_TASK_MANIFEST_BYTES
+    );
+
+    let mut task = Task::from_manifest(manifest).unwrap();
+    task.set_resource_version("r".repeat(4 * 1024)).unwrap();
+    task.validate().unwrap();
+    let handler = Arc::new(MockHandler::default());
+    handler.query_items.lock().unwrap().push(task);
+    let app = router_with(handler);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/apis/solti.io/v1/tasks")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_status(&body_json(response).await, "TooManyRequests", 429);
 }
 
 #[tokio::test]

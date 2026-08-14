@@ -19,7 +19,7 @@
 //! ```
 //!
 //! The first matching registration wins.
-//! [`TaskWorkload::Embedded`](solti_model::TaskWorkload::Embedded) is not routed.
+//! [`TaskWorkload::Embedded`] is not routed.
 use std::sync::Arc;
 
 use solti_model::{AgentCapabilities, Labels, RunnerCapability, Task, TaskWorkload};
@@ -110,6 +110,8 @@ impl RunnerCatalog {
     ///
     /// Returns [`RouterError::RecursiveBuild`] when the selected runner already
     /// exists in the active build path. Returns
+    /// [`RouterError::AdmissionCycle`] when the nested wait would deadlock with
+    /// other active root builds. Returns
     /// [`RouterError::BuildCancelled`] when cancellation wins while the build
     /// waits for a per-runner permit. Otherwise returns the same errors as
     /// [`Self::build`].
@@ -496,6 +498,9 @@ async fn build_entry(
 
 fn map_enter_error(runner: &str, error: EnterBuildError) -> RouterError {
     match error {
+        EnterBuildError::AdmissionCycle => RouterError::AdmissionCycle {
+            runner: runner.to_owned(),
+        },
         EnterBuildError::Cancelled => RouterError::BuildCancelled {
             runner: runner.to_owned(),
         },
@@ -519,6 +524,7 @@ mod tests {
     use tracing::{
         Event, Metadata, Subscriber,
         field::{Field, Visit},
+        instrument::WithSubscriber as _,
         span::{Attributes, Id, Record},
     };
 
@@ -720,6 +726,14 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn admission_cycle_maps_to_typed_router_error() {
+        assert!(matches!(
+            map_enter_error("nested", EnterBuildError::AdmissionCycle),
+            RouterError::AdmissionCycle { runner } if runner == "nested"
+        ));
+    }
+
     #[tokio::test]
     async fn build_fails_when_no_runner_supports_kind() {
         let mut router = RunnerRouter::new();
@@ -766,14 +780,12 @@ mod tests {
             .build()
             .unwrap();
         let task = Task::new("trace-test-task", spec).unwrap();
-        // Register the production callsites before the scoped dispatcher
-        // rebuilds their interest cache during parallel tests.
-        router.build(&task).await.unwrap();
         let capture = Arc::new(TraceCapture::default());
         let dispatch = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
+        let _interest_guard = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
+        tracing::dispatcher::with_default(&dispatch, tracing::callsite::rebuild_interest_cache);
 
-        let _guard = tracing::dispatcher::set_default(&dispatch);
-        router.build(&task).await.unwrap();
+        router.build(&task).with_subscriber(dispatch).await.unwrap();
 
         let fields = capture.fields.lock().unwrap().join(" ");
         assert!(fields.contains("task_name=trace-test-task"));

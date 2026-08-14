@@ -30,6 +30,13 @@
 //! An HTTP agent can sync through gRPC.
 //! A gRPC agent can sync through HTTP.
 //!
+//! ## Credential Transport
+//!
+//! A configured bearer token requires an HTTPS control-plane endpoint by default.
+//! Plaintext HTTP and gRPC remain available when no token is configured.
+//! `DiscoverConfigBuilder::allow_insecure_token_transport` is an explicit
+//! development or loopback escape hatch.
+//!
 //! ## Retry Model
 //!
 //! [`DiscoverError::retryability`] classifies every failure.

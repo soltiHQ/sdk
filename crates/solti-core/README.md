@@ -64,7 +64,7 @@ Read the `Reconciled` condition to observe its result.
 | `get_task`                               | `TaskId`                                   | Current retained `Task`                          |
 | `query_tasks`                            | `TaskQuery`                                | Snapshot-consistent `TaskPage<Task>`             |
 | `watch_tasks`                            | `TaskFilter` and optional resource version | `TaskWatchSubscription`                          |
-| `list_task_runs`                         | `TaskId`                                   | Oldest-first `Vec<TaskRun>`                      |
+| `query_task_runs`                        | `TaskId` and `TaskRunQuery`                | Snapshot-consistent `TaskRunPage`                |
 | `subscribe_output`                       | `TaskId`                                   | Optional live `OutputSubscription`               |
 | `cancel_task`                            | `TaskId`                                   | Runtime cancellation while desired state remains |
 | `delete_task`                            | `TaskId`                                   | Runtime stop and resource removal                |
@@ -97,6 +97,21 @@ Passing an embedded workload to a routed method is also rejected.
 
 `create_*` rejects every retained resource with the same `metadata.name`.
 This includes terminal resources waiting for retention.
+Duplicate-name rejection takes precedence over retained Task admission.
+
+The default state limits are 1024 current Tasks and 256 MiB of aggregate
+retained TaskManifest bytes. Every current Task counts toward cardinality,
+including embedded, pending, running, and terminal Tasks. The byte budget sums
+only each current Task's compact canonical `TaskManifest` JSON. The two budgets
+are independent.
+
+At the count limit, create and an unchecked apply for a missing name return
+`CoreError::RetainedTaskLimitReached`. Applying an existing Task remains
+allowed by the count limit. A create, missing apply, or positive-growth
+existing apply returns `CoreError::RetainedTaskManifestByteLimitExceeded` when
+it would exceed the TaskManifest byte budget. Shrinking and no-op applies remain
+allowed. Admission and the desired-state write are atomic. Core does not evict
+a Task or wait for capacity.
 
 `apply_*` creates a missing resource when no preconditions are supplied.
 It updates labels, annotations, and desired spec on an existing resource.
@@ -181,6 +196,9 @@ The first page captures one collection resource version.
 Every continuation reads the same retained snapshot.
 Items are ordered by task name.
 Filtering happens before pagination.
+Pages keep a complete Task prefix within the query count limit and a 4 MiB serialized-item budget.
+The byte budget can return fewer Tasks than the count limit.
+An oversized first Task is returned alone for native transport measurement.
 
 ## Watch tasks
 
@@ -212,9 +230,36 @@ An absent resource version or `"0"` emits the current sorted snapshot first.
 An exact retained resource version replays later changes before live changes.
 The watch ends during supervisor shutdown.
 
+One state admits at most 256 concurrent watches by default. Initial snapshots
+and exact-resume replay buffers share a 64 MiB aggregate compact Task JSON
+budget. A new watch is rejected atomically when either limit is full. Existing
+watches are not evicted or terminated by watch admission pressure.
+
+Buffered bytes are released as events are yielded. Lag recovery waits for
+available replay capacity without retaining replay payload while waiting. Its
+resume point can still expire if change history compacts. A single lag-recovery
+event larger than the complete byte budget is transferred directly to the
+caller without being buffered. Live events and events already transferred to a
+caller are outside this retained-payload budget.
+
+The live watch ring is derived from `watch_history_capacity`. For every value
+above one, its effective power-of-two capacity is the largest power of two
+strictly below the journal limit. The default 4096-change journal therefore
+uses a 2048-change live ring. This leaves count headroom when a live subscriber
+first reports lag. It does not reserve byte headroom: the independent history
+byte budget may compact required changes or retain none, which expires the
+resume point. A configured history capacity of one stays valid but has no
+count headroom for lag recovery.
+
+Resource versions can contain revisions that did not publish a Task change.
+After replaying every retained change through a captured recovery target, a
+watch advances across a trailing revision gap without inventing an event.
+
 List continuations and watches share retained change history.
 Compacted or foreign versions return `CollectionError::ResourceVersionExpired`.
 Malformed or future versions return `CollectionError::InvalidResourceVersion`.
+Counter exhaustion rotates the opaque collection epoch and expires versions
+from the previous epoch.
 
 `query_tasks_where()` and `watch_tasks_where()` add an adapter-owned visibility predicate.
 Core itself does not hide embedded workloads.
@@ -222,9 +267,21 @@ A network adapter can filter them before pagination and watch transition classif
 
 ## Run history
 
-`list_task_runs()` returns retained runs ordered by generation and attempt.
+`query_task_runs()` returns a bounded snapshot page ordered by generation and attempt.
+The default page size is 100 and the maximum is 1000.
+The continuation fixes the Task name, UID, run revision, and last returned run.
+It remains valid across Task deletion or recreation while its run journal is retained.
 Each run snapshots the workload GVK of its generation.
-An unknown task or swept history returns an empty list.
+A first-page query for an unknown task returns `None`.
+
+TaskRun snapshots use a separate revision epoch and reversible journal.
+The journal records creation, terminal updates, cap eviction, sweep removal,
+and Task deletion. Compacted or foreign versions return
+`CollectionError::ResourceVersionExpired`.
+TaskRun counter exhaustion rotates its opaque epoch and expires earlier versions.
+Core shares immutable run snapshots between live state and the reversible journal.
+A mutation uses copy-on-write. A query clones shared handles under the state lock,
+then clones only the model values admitted to its result page.
 
 Attempt events provide run detail.
 The direct Taskvisor outcome supplies the authoritative resource-level completion.
@@ -271,10 +328,21 @@ Output is live-only.
 New subscribers do not receive historical chunks.
 Each task has one bounded broadcast ring shared across attempts.
 A slow subscriber receives `OutputEvent::Lagged` and then continues.
+Before creating a ring, core reserves that ring's exact maximum chunk payload
+from one aggregate budget. A task continues without a live-output channel when
+the aggregate budget cannot admit its ring.
+Each subscription reserves one additional maximum-size chunk because it can
+hold one internal event while reporting `Lagged`. Subscription returns `None`
+when that allowance cannot be reserved.
+The aggregate budget covers core-owned ring payload and internal post-lag
+pending events. It does not include events already yielded to callers or copies
+queued for an external output sink.
 
 Terminal cleanup blocks new subscriptions.
 Existing subscriptions close after every outstanding runner sink clone is dropped.
 A stale sink remains attached to the old channel when a task name is reused.
+Stale sinks and subscriptions retain the old ring's aggregate reservation until
+their last owner is dropped.
 
 ## Cancel and delete
 
@@ -293,16 +361,40 @@ Deleting a missing resource is an idempotent no-op.
 
 `StateConfig` controls in-memory retention:
 
-| Field                       | Default      | Meaning                                                    |
-|-----------------------------|--------------|------------------------------------------------------------|
-| `run_ttl`                   | 1 hour       | Age limit for finished runs and unbound orphaned runs      |
-| `task_ttl`                  | 1 hour       | Age limit for terminal tasks after run history is empty    |
-| `sweep_interval`            | 5 minutes    | Retention worker interval                                  |
-| `max_runs_per_task`         | 256          | Per-task completed run cap                                 |
-| `watch_history_capacity`    | 4096 changes | Maximum retained collection changes                        |
-| `watch_history_byte_budget` | 64 MiB       | Maximum serialized task bytes in collection change history |
+| Field                              | Default      | Meaning                                                    |
+|------------------------------------|--------------|------------------------------------------------------------|
+| `run_ttl`                          | 1 hour       | Age limit for finished runs and unbound orphaned runs      |
+| `task_ttl`                         | 1 hour       | Age limit for terminal tasks after run history is empty    |
+| `sweep_interval`                   | 5 minutes    | Retention worker interval                                  |
+| `max_runs_per_task`                | 256          | Per-task completed run cap                                 |
+| `max_retained_tasks`               | 1024 tasks   | Maximum current Task resources                             |
+| `max_retained_task_manifest_bytes` | 256 MiB      | Maximum aggregate compact TaskManifest JSON bytes          |
+| `max_concurrent_task_watches`      | 256 watches  | Maximum admitted Task watch subscriptions                  |
+| `max_task_watch_initial_replay_bytes` | 64 MiB    | Aggregate compact Task JSON in initial and replay buffers  |
+| `run_history_capacity`             | 4096 batches | Maximum retained TaskRun mutation batches                  |
+| `run_history_byte_budget`          | 64 MiB       | Maximum compact JSON bytes for run identities and values   |
+| `watch_history_capacity`           | 4096 changes | Maximum retained collection-journal changes                |
+| `watch_history_byte_budget`        | 64 MiB       | Maximum serialized task bytes in collection change history |
 
 `max_runs_per_task = 0` removes completed history while keeping active runs.
+All current Tasks count toward `max_retained_tasks`, including terminal and
+embedded Tasks. Its type is `Option<NonZeroUsize>`, with `Some(1024)` as the
+default. `with_max_retained_tasks(None)` disables the count limit, while
+`try_with_max_retained_tasks(0)` is rejected.
+
+`max_retained_task_manifest_bytes` is also an `Option<NonZeroUsize>`, with
+`Some(256 MiB)` as the default.
+`with_max_retained_task_manifest_bytes(None)` disables this byte budget, while
+`try_with_max_retained_task_manifest_bytes(0)` is rejected. It measures only
+compact canonical `TaskManifest` JSON. It does not bound total process memory.
+
+The two Task watch limits also use `Option<NonZeroUsize>`.
+`with_max_concurrent_task_watches(None)` and
+`with_max_task_watch_initial_replay_bytes(None)` disable their respective
+limits. Their raw checked setters reject zero. The watch byte budget measures
+compact Task JSON retained by internal initial and replay buffers. It excludes
+queue metadata, the shared change journal, live delivery, and caller-owned
+yielded events. It is not a total process-memory limit.
 `sweep_interval = 0` is rejected.
 Watch history capacity and byte budget must also be greater than zero.
 
@@ -310,7 +402,7 @@ Watch history capacity and byte budget must also be greater than zero.
 
 | Field                              | Default    | Meaning                                      |
 |------------------------------------|------------|----------------------------------------------|
-| `build_timeout`                    | 30 seconds | Deadline after one build receives admission  |
+| `build_timeout`                    | 30 seconds | Deadline for root admission and runner build |
 | `max_concurrent_builds`            | 32         | Concurrent outer routed-build limit          |
 | `max_concurrent_builds_per_runner` | 8          | Limit for each selected runner, nested too   |
 
@@ -320,15 +412,20 @@ workloads and service objectives.
 
 One global build slot covers the outer build and every nested catalog build it
 creates. Nested builds acquire only the selected runner's per-runner slot. The
-build deadline starts after outer admission and includes waits for nested
+build deadline starts before outer admission and includes waits for nested
 runner slots.
 
 All reconciliation limits must be greater than zero. Embedded tasks do not use
 runner-build admission because the caller supplies their `TaskRef`.
 
-`OutputConfig` controls the best-effort live-output ring. Defaults are 256
-events, a 16 MiB retained payload budget per task, and 64 KiB per chunk. The
-effective ring capacity is the stricter of the event and byte limits.
+`OutputConfig` controls best-effort live output. Defaults are 256 events, a
+16 MiB retained payload budget per task, 64 KiB per chunk, and a 256 MiB
+aggregate retained payload budget. The effective ring capacity is the stricter
+of the per-task event and byte limits. Each ring reserves
+`effective_capacity * max_chunk_bytes` from the aggregate budget. Each live
+subscription reserves another `max_chunk_bytes`. This is not a total process
+memory limit; caller-owned yielded events and output-sink delivery have separate
+ownership.
 
 Core makes one ownership copy of every retained chunk into bounded storage. A
 custom runner cannot retain an oversized or hidden backing allocation through
@@ -336,7 +433,7 @@ a small `Bytes` view.
 Oversized chunks carry the exact retained prefix with `truncated = true`. A
 slow subscriber receives `Lagged` with the number of overwritten events and
 their retained chunk payload bytes in `skipped_bytes`.
-Zero limits and a chunk limit larger than the byte budget are rejected.
+Zero limits and a chunk limit larger than the per-task byte budget are rejected.
 
 ```rust,no_run
 use std::time::Duration;
@@ -350,10 +447,15 @@ async fn configured() -> Result<(), Box<dyn std::error::Error>> {
         .with_task_ttl(Duration::from_secs(30 * 60))
         .try_with_sweep_interval(Duration::from_secs(60))?
         .with_max_runs_per_task(64)
+        .try_with_max_retained_tasks(1_024)?
+        .try_with_max_retained_task_manifest_bytes(64 * 1024 * 1024)?
+        .try_with_max_concurrent_task_watches(128)?
+        .try_with_max_task_watch_initial_replay_bytes(32 * 1024 * 1024)?
         .try_with_watch_history_capacity(1024)?
         .try_with_watch_history_byte_budget(16 * 1024 * 1024)?;
     let output = OutputConfig::try_new(1024)?
-        .try_with_byte_limits(64 * 1024 * 1024, 64 * 1024)?;
+        .try_with_byte_limits(64 * 1024 * 1024, 64 * 1024)?
+        .try_with_aggregate_byte_budget(512 * 1024 * 1024)?;
     let reconciliation = ReconciliationConfig::new()
         .try_with_build_timeout(Duration::from_secs(20))?
         .try_with_max_concurrent_builds(16)?
@@ -378,7 +480,7 @@ The core state observer is always installed.
 
 Core can forward committed task state changes and task output to optional application-owned sinks.
 
-The hooks are storage-neutral. 
+The hooks are storage-neutral.
 They do not add a database, replace the in-memory `TaskState`, retry delivery, or make state durable by themselves.
 They are write-side notifications; core does not load persisted state during startup.
 
@@ -392,9 +494,14 @@ The minimum capacity is two buffered events because one attempt transition can a
 Reservation admission is FIFO; saturation applies backpressure before the state critical section.
 Retention sweeps publish each expired task deletion as a separate commit batch.
 State callbacks may read `TaskState`, but must not mutate it directly or wait for another thread that mutates it.
-Output callbacks run synchronously on runner paths.
-State callbacks must eventually return so shutdown can drain them.
-Output callbacks must return quickly and should normally forward cloned events to an application-owned worker:
+Polling `SupervisorApi::shutdown()` on the state callback worker panics before shutdown starts.
+A state callback must not wait for another thread that calls shutdown; that cycle can deadlock.
+Output events use a separate bounded dispatcher and dedicated worker.
+Its default hard bound is 2048 accepted `TaskOutputEvent` values, including the active callback.
+Runner publication attempts callback-copy admission without waiting for capacity.
+A full, closed, contended, or unhealthy dispatcher drops only that callback copy.
+Task execution and the live output ring continue.
+Both callback types must eventually return so shutdown can drain accepted events:
 
 ```rust,no_run
 use std::sync::{Arc, mpsc};
@@ -435,24 +542,39 @@ async fn persistent_agent() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`TaskStateEvent` reports task create, apply, status, delete, and run start or finish changes. 
-Run events carry the task name and UID. 
+`TaskStateEvent` reports task create, apply, status, delete, and run start or finish changes.
+Run events carry the task name and UID.
 Run retention does not emit delete events.
 
-`TaskOutputSink` is installed before runners start and receives the same published chunks and run markers as the live output path, including the first published event. 
-Each event carries the task name and UID, so a late event from a deleted task cannot be confused with a recreated task using the same name.
+`TaskOutputSink` is installed before runners start and receives the same published chunks and run markers as the live output path, including the first published event.
+Each event carries the task name and UID.
+A late event from a deleted task cannot be confused with a recreated task using the same name.
 Subscriber-local `Lagged` notifications are not persisted.
-Sink panics are caught and logged; the event whose callback panicked cannot be recovered by core.
+Live broadcast happens before output callback-copy admission.
+An output callback panic is caught and logged, is not retried, marks health false, and closes new admission.
+The worker continues draining events accepted before the panic.
+Polling `SupervisorApi::shutdown()` on the output callback worker panics before shutdown starts and is handled as a callback panic.
+An output callback must not wait for another thread that calls shutdown; that cycle can deadlock.
+`SupervisorApi::state_persistence_status()` exposes admission, sticky health,
+outstanding ownership, the hard ownership capacity, completed callbacks, and
+panicked callbacks. A panicking callback is not retried because its side effects
+are ambiguous. Later state events continue through the worker.
+`SupervisorApi::output_persistence_status()` exposes accepting, sticky health,
+buffered and active ownership, the hard capacity, completed callbacks, panicked
+callbacks, and callback copies rejected by admission.
+`PersistenceConfig::output_queue_capacity()` defaults to the hard bound 2048.
+`try_with_output_queue_capacity` rejects zero.
 The application owns database errors and retries.
-Core owns the bounded state queue and drains it during shutdown.
+Core drains both persistence workers during shutdown.
 
 ## Shutdown
 
 Call `shutdown()` when cleanup must finish before the application continues.
+Do not poll it on a persistence callback worker or wait there for another shutdown caller.
 
 Shutdown closes task watches.
 It cancels runner builds, stops Taskvisor, and waits for reconciliation,
-completion, and retention workers.
+completion, retention, and persistence workers.
 
 Dropping `SupervisorApi` starts the same cleanup path in the background.
 It does not provide an awaitable result.
@@ -531,3 +653,13 @@ They combine core with concrete execution runners, discovery, observability, and
 ## Contributor guide
 
 See the [solti-core source guide](https://github.com/soltiHQ/sdk/blob/main/crates/solti-core/ARCHITECTURE.md) for module ownership, runtime flows, concurrency, and invariants.
+
+Run the bounded collection baseline in release mode:
+
+```bash
+cargo bench -p solti-core --all-features --bench state_collections --locked
+```
+
+The benchmark reports Task query and watch-snapshot capture time for 1024
+retained Tasks. It records measurements without enforcing a machine-specific
+latency threshold.

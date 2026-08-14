@@ -13,6 +13,7 @@
 //! single ownership copy + chunk limit
 //!    ▼
 //! per-task byte-bounded broadcast ring
+//! within one aggregate payload budget
 //!    │
 //!    ▼
 //! OutputSubscription
@@ -23,12 +24,19 @@
 //! Oversized chunks are exact prefixes with `truncated = true`.
 //! Slow subscribers receive [`OutputEvent::Lagged`] with skipped event and
 //! retained-payload byte counts.
+//! A task continues without a live-output channel when the aggregate payload
+//! budget cannot admit a new ring. The budget covers core-owned ring payload
+//! and one internal post-lag event per subscription. It excludes events already
+//! yielded to callers and copies queued for an external output sink.
+//! External output callback copies use a separate hard count bound. Its default
+//! is 2048 accepted events, including the active callback.
 
 use std::collections::HashMap;
+use std::io;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::SystemTime;
 
@@ -42,17 +50,23 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::ConfigError;
-use crate::persistence::{TaskOutputEvent, TaskOutputSinkHandle, publish_output_event};
+use crate::persistence::{
+    OutputEventDispatcher, PersistenceConfig, TaskOutputEvent, TaskOutputSinkHandle,
+    TaskOutputSinkStatus,
+};
 
-/// Per-task live output settings.
+/// Live output settings.
 ///
 /// Event count and retained chunk bytes are bounded independently.
 /// The broadcast ring uses the stricter of both limits.
+/// An aggregate byte budget bounds core-owned ring and subscription-pending
+/// payload. Caller-owned yielded events and external sink copies are separate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputConfig {
     capacity: NonZeroUsize,
     byte_budget: NonZeroUsize,
     max_chunk_bytes: NonZeroUsize,
+    aggregate_byte_budget: NonZeroUsize,
 }
 
 impl OutputConfig {
@@ -62,6 +76,9 @@ impl OutputConfig {
     pub const DEFAULT_MAX_CHUNK_BYTES: NonZeroUsize = NonZeroUsize::new(64 * 1024).unwrap();
     /// Default per-task retained chunk payload budget.
     pub const DEFAULT_BYTE_BUDGET: NonZeroUsize = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
+    /// Default aggregate live-output payload budget.
+    pub const DEFAULT_AGGREGATE_BYTE_BUDGET: NonZeroUsize =
+        NonZeroUsize::new(256 * 1024 * 1024).unwrap();
 
     /// Creates settings with a non-zero event capacity.
     ///
@@ -76,6 +93,7 @@ impl OutputConfig {
             capacity,
             byte_budget: NonZeroUsize::new(byte_budget).unwrap(),
             max_chunk_bytes: Self::DEFAULT_MAX_CHUNK_BYTES,
+            aggregate_byte_budget: Self::DEFAULT_AGGREGATE_BYTE_BUDGET,
         }
     }
 
@@ -110,6 +128,15 @@ impl OutputConfig {
     /// Larger chunks become exact prefixes marked as truncated.
     pub const fn max_chunk_bytes(self) -> NonZeroUsize {
         self.max_chunk_bytes
+    }
+
+    /// Returns the aggregate core-owned live-output payload budget.
+    ///
+    /// Each ring reserves its maximum retained payload while the ring, one of
+    /// its runner sinks, or one of its subscriptions remains alive. Each
+    /// subscription separately reserves one maximum-size pending event.
+    pub const fn aggregate_byte_budget(self) -> NonZeroUsize {
+        self.aggregate_byte_budget
     }
 
     /// Returns the broadcast ring capacity after applying both limits.
@@ -167,6 +194,36 @@ impl OutputConfig {
         self.max_chunk_bytes = max_chunk_bytes;
         Ok(self)
     }
+
+    /// Sets the aggregate core-owned live-output payload budget.
+    ///
+    /// When a new ring cannot reserve its maximum payload, the task continues
+    /// without a live-output channel. When a subscription cannot reserve its
+    /// pending-event allowance, subscription returns `None`. Existing owners
+    /// keep their reservations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Zero`] when `aggregate_byte_budget` is zero.
+    pub const fn try_with_aggregate_byte_budget(
+        mut self,
+        aggregate_byte_budget: usize,
+    ) -> Result<Self, ConfigError> {
+        let Some(aggregate_byte_budget) = NonZeroUsize::new(aggregate_byte_budget) else {
+            return Err(ConfigError::Zero {
+                field: "output_aggregate_byte_budget",
+            });
+        };
+        self.aggregate_byte_budget = aggregate_byte_budget;
+        Ok(self)
+    }
+
+    fn broadcaster_payload_reservation(self) -> usize {
+        self.effective_capacity()
+            .get()
+            .checked_mul(self.max_chunk_bytes.get())
+            .expect("validated output limits must have a representable ring reservation")
+    }
 }
 
 impl Default for OutputConfig {
@@ -183,6 +240,8 @@ impl Default for OutputConfig {
 ///
 /// Terminal cleanup prevents new subscriptions.
 /// An existing subscription closes after every runner sink releases its sender.
+/// A subscription reserves one maximum-size chunk from the aggregate payload
+/// budget while it can hold an internal event behind a lag notification.
 ///
 /// The stream implements [`tokio_stream::Stream`].
 /// Its item type is [`OutputEvent`].
@@ -192,12 +251,18 @@ pub struct OutputSubscription {
     next_bytes: u64,
     pending_lag: u64,
     pending_event: Option<OutputEvent>,
+    // Payload owners are declared last so every retained payload field drops
+    // before its aggregate reservations are released.
+    _ring_payload_lease: Arc<OutputPayloadLease>,
+    _pending_payload_lease: Arc<OutputPayloadLease>,
 }
 
 impl OutputSubscription {
     fn new(
         receiver: broadcast::Receiver<BroadcastOutput>,
         total_bytes: Arc<AtomicU64>,
+        ring_payload_lease: Arc<OutputPayloadLease>,
+        pending_payload_lease: Arc<OutputPayloadLease>,
         next_bytes: u64,
     ) -> Self {
         Self {
@@ -206,6 +271,8 @@ impl OutputSubscription {
             next_bytes,
             pending_lag: 0,
             pending_event: None,
+            _ring_payload_lease: ring_payload_lease,
+            _pending_payload_lease: pending_payload_lease,
         }
     }
 }
@@ -266,6 +333,8 @@ struct BroadcastOutput {
 struct OutputBroadcaster {
     state: parking_lot::Mutex<BroadcastState>,
     total_bytes: Arc<AtomicU64>,
+    ring_payload_lease: Arc<OutputPayloadLease>,
+    pending_payload_reservation: usize,
 }
 
 struct BroadcastState {
@@ -274,23 +343,35 @@ struct BroadcastState {
 }
 
 impl OutputBroadcaster {
-    fn new(capacity: usize) -> Self {
+    fn new(
+        capacity: usize,
+        ring_payload_lease: Arc<OutputPayloadLease>,
+        pending_payload_reservation: usize,
+    ) -> Self {
         Self {
             state: parking_lot::Mutex::new(BroadcastState {
                 sender: broadcast::channel(capacity).0,
                 total_bytes: 0,
             }),
             total_bytes: Arc::new(AtomicU64::new(0)),
+            ring_payload_lease,
+            pending_payload_reservation,
         }
     }
 
-    fn subscribe(&self) -> OutputSubscription {
+    fn subscribe(&self) -> Option<OutputSubscription> {
+        let pending_payload_lease = self
+            .ring_payload_lease
+            .budget
+            .try_reserve(self.pending_payload_reservation)?;
         let state = self.state.lock();
-        OutputSubscription::new(
+        Some(OutputSubscription::new(
             state.sender.subscribe(),
             Arc::clone(&self.total_bytes),
+            Arc::clone(&self.ring_payload_lease),
+            pending_payload_lease,
             state.total_bytes,
-        )
+        ))
     }
 
     fn send(&self, event: OutputEvent) {
@@ -307,8 +388,16 @@ impl OutputBroadcaster {
     }
 
     #[cfg(test)]
-    fn subscribe_raw(&self) -> RawOutputReceiver {
-        RawOutputReceiver(self.state.lock().sender.subscribe())
+    fn subscribe_raw(&self) -> Option<RawOutputReceiver> {
+        let pending_payload_lease = self
+            .ring_payload_lease
+            .budget
+            .try_reserve(self.pending_payload_reservation)?;
+        Some(RawOutputReceiver {
+            receiver: self.state.lock().sender.subscribe(),
+            _ring_payload_lease: Arc::clone(&self.ring_payload_lease),
+            _pending_payload_lease: pending_payload_lease,
+        })
     }
 }
 
@@ -320,12 +409,60 @@ fn output_payload_bytes(event: &OutputEvent) -> u64 {
 }
 
 #[cfg(test)]
-pub(crate) struct RawOutputReceiver(broadcast::Receiver<BroadcastOutput>);
+pub(crate) struct RawOutputReceiver {
+    receiver: broadcast::Receiver<BroadcastOutput>,
+    _ring_payload_lease: Arc<OutputPayloadLease>,
+    _pending_payload_lease: Arc<OutputPayloadLease>,
+}
 
 #[cfg(test)]
 impl RawOutputReceiver {
     pub(crate) fn try_recv(&mut self) -> Result<OutputEvent, broadcast::error::TryRecvError> {
-        self.0.try_recv().map(|output| output.event)
+        self.receiver.try_recv().map(|output| output.event)
+    }
+}
+
+struct OutputPayloadBudget {
+    limit: usize,
+    reserved: AtomicUsize,
+}
+
+impl OutputPayloadBudget {
+    fn new(limit: NonZeroUsize) -> Arc<Self> {
+        Arc::new(Self {
+            limit: limit.get(),
+            reserved: AtomicUsize::new(0),
+        })
+    }
+
+    fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<Arc<OutputPayloadLease>> {
+        let reserved = self
+            .reserved
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                (bytes <= self.limit.saturating_sub(reserved)).then_some(reserved + bytes)
+            })
+            .ok()?;
+        debug_assert!(reserved <= self.limit.saturating_sub(bytes));
+        Some(Arc::new(OutputPayloadLease {
+            budget: Arc::clone(self),
+            bytes,
+        }))
+    }
+}
+
+struct OutputPayloadLease {
+    budget: Arc<OutputPayloadBudget>,
+    bytes: usize,
+}
+
+impl Drop for OutputPayloadLease {
+    fn drop(&mut self) {
+        self.budget
+            .reserved
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                reserved.checked_sub(self.bytes)
+            })
+            .expect("live output payload reservation must not underflow");
     }
 }
 
@@ -334,7 +471,9 @@ pub(crate) struct OutputHub {
     channels: RwLock<HashMap<TaskId, OutputChannel>>,
     capacity: usize,
     max_chunk_bytes: usize,
-    event_sink: Option<TaskOutputSinkHandle>,
+    broadcaster_payload_reservation: usize,
+    payload_budget: Arc<OutputPayloadBudget>,
+    event_sink: Option<Arc<OutputEventDispatcher>>,
 }
 
 struct OutputChannel {
@@ -345,19 +484,38 @@ struct OutputChannel {
 impl OutputHub {
     #[cfg(test)]
     pub(crate) fn new(config: OutputConfig) -> Self {
-        Self::with_sink(config, None)
+        Self::try_with_sink(config, None, PersistenceConfig::default())
+            .expect("an output hub without a persistence sink cannot fail to start")
     }
 
+    #[cfg(test)]
     pub(crate) fn with_sink(
         config: OutputConfig,
         event_sink: Option<TaskOutputSinkHandle>,
     ) -> Self {
-        Self {
+        Self::try_with_sink(config, event_sink, PersistenceConfig::default())
+            .expect("the test output persistence worker must start")
+    }
+
+    pub(crate) fn try_with_sink(
+        config: OutputConfig,
+        event_sink: Option<TaskOutputSinkHandle>,
+        persistence_config: PersistenceConfig,
+    ) -> io::Result<Self> {
+        let event_sink = event_sink
+            .map(|sink| {
+                OutputEventDispatcher::start(sink, persistence_config.output_queue_capacity())
+                    .map(Arc::new)
+            })
+            .transpose()?;
+        Ok(Self {
             channels: RwLock::new(HashMap::new()),
             capacity: config.effective_capacity().get(),
             max_chunk_bytes: config.max_chunk_bytes().get(),
+            broadcaster_payload_reservation: config.broadcaster_payload_reservation(),
+            payload_budget: OutputPayloadBudget::new(config.aggregate_byte_budget()),
             event_sink,
-        }
+        })
     }
 
     /// Ensures that a task channel exists.
@@ -367,9 +525,27 @@ impl OutputHub {
         let mut channels = self.channels.write();
         match channels.entry(task_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
+                let Some(payload_lease) = self
+                    .payload_budget
+                    .try_reserve(self.broadcaster_payload_reservation)
+                else {
+                    tracing::warn!(
+                        event = "output.channel_unavailable",
+                        task_uid = %task_uid,
+                        reserved_bytes = self.payload_budget.reserved.load(Ordering::Acquire),
+                        requested_bytes = self.broadcaster_payload_reservation,
+                        aggregate_byte_budget = self.payload_budget.limit,
+                        "live output aggregate payload budget is saturated"
+                    );
+                    return false;
+                };
                 entry.insert(OutputChannel {
                     task_uid,
-                    broadcaster: Arc::new(OutputBroadcaster::new(self.capacity)),
+                    broadcaster: Arc::new(OutputBroadcaster::new(
+                        self.capacity,
+                        payload_lease,
+                        self.max_chunk_bytes,
+                    )),
                 });
                 true
             }
@@ -385,18 +561,16 @@ impl OutputHub {
     }
 
     pub(crate) fn subscribe(&self, task_id: &TaskId) -> Option<OutputSubscription> {
-        self.channels
-            .read()
-            .get(task_id)
-            .map(|channel| channel.broadcaster.subscribe())
+        let channels = self.channels.read();
+        let channel = channels.get(task_id)?;
+        channel.broadcaster.subscribe()
     }
 
     #[cfg(test)]
     pub(crate) fn subscribe_raw(&self, task_id: &TaskId) -> Option<RawOutputReceiver> {
-        self.channels
-            .read()
-            .get(task_id)
-            .map(|channel| channel.broadcaster.subscribe_raw())
+        let channels = self.channels.read();
+        let channel = channels.get(task_id)?;
+        channel.broadcaster.subscribe_raw()
     }
 
     pub(crate) fn announce_run_started(
@@ -447,10 +621,13 @@ impl OutputHub {
         {
             broadcaster.send(event.clone());
         }
-        publish_output_event(
-            self.event_sink.as_ref(),
-            TaskOutputEvent::new(task_id.clone(), task_uid.clone(), event),
-        );
+        if let Some(event_sink) = &self.event_sink {
+            let _ = event_sink.try_dispatch(TaskOutputEvent::new(
+                task_id.clone(),
+                task_uid.clone(),
+                event,
+            ));
+        }
     }
 
     pub(crate) fn evict(&self, task_id: &TaskId) {
@@ -460,6 +637,21 @@ impl OutputHub {
     #[cfg(test)]
     pub(crate) fn active_channels(&self) -> usize {
         self.channels.read().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserved_payload_bytes(&self) -> usize {
+        self.payload_budget.reserved.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn persistence_status(&self) -> Option<TaskOutputSinkStatus> {
+        self.event_sink.as_ref().map(|sink| sink.status())
+    }
+
+    pub(crate) async fn shutdown_persistence(&self) {
+        if let Some(event_sink) = &self.event_sink {
+            event_sink.shutdown().await;
+        }
     }
 }
 
@@ -479,10 +671,13 @@ impl OutputPublisher for OutputHub {
             move |chunk| {
                 let event = detach_chunk(chunk, max_chunk_bytes);
                 broadcaster.send(event.clone());
-                publish_output_event(
-                    event_sink.as_ref(),
-                    TaskOutputEvent::new(task_id.clone(), task_uid.clone(), event),
-                );
+                if let Some(event_sink) = &event_sink {
+                    let _ = event_sink.try_dispatch(TaskOutputEvent::new(
+                        task_id.clone(),
+                        task_uid.clone(),
+                        event,
+                    ));
+                }
             },
         ))
     }
@@ -506,7 +701,8 @@ fn detach_chunk(chunk: OutputChunkRef<'_>, max_chunk_bytes: usize) -> OutputEven
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -515,7 +711,7 @@ mod tests {
     use tokio_stream::StreamExt;
 
     use super::{ConfigError, OutputConfig, OutputHub};
-    use crate::{TaskOutputEvent, TaskOutputSink, TaskOutputSinkHandle};
+    use crate::{PersistenceConfig, TaskOutputEvent, TaskOutputSink, TaskOutputSinkHandle};
 
     #[derive(Default)]
     struct RecordingOutputSink {
@@ -528,12 +724,31 @@ mod tests {
         }
     }
 
+    struct BlockingFirstOutputSink {
+        first: AtomicBool,
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl TaskOutputSink for BlockingFirstOutputSink {
+        fn on_event(&self, _event: &TaskOutputEvent) {
+            if self.first.swap(false, Ordering::AcqRel) {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+        }
+    }
+
     #[test]
     fn config_preserves_default_and_rejects_zero() {
         let default = OutputConfig::default();
         assert_eq!(default.capacity(), OutputConfig::DEFAULT_CAPACITY);
         assert_eq!(default.effective_capacity(), OutputConfig::DEFAULT_CAPACITY);
         assert_eq!(default.byte_budget(), OutputConfig::DEFAULT_BYTE_BUDGET);
+        assert_eq!(
+            default.aggregate_byte_budget(),
+            OutputConfig::DEFAULT_AGGREGATE_BYTE_BUDGET
+        );
         assert_eq!(
             default.max_chunk_bytes(),
             OutputConfig::DEFAULT_MAX_CHUNK_BYTES
@@ -542,9 +757,21 @@ mod tests {
         assert_eq!(OutputConfig::DEFAULT_BYTE_BUDGET.get(), 16 * 1024 * 1024);
         assert_eq!(OutputConfig::DEFAULT_MAX_CHUNK_BYTES.get(), 64 * 1024);
         assert_eq!(
+            OutputConfig::DEFAULT_AGGREGATE_BYTE_BUDGET.get(),
+            256 * 1024 * 1024
+        );
+        assert_eq!(
             OutputConfig::try_new(0).unwrap_err(),
             ConfigError::Zero {
                 field: "output_capacity"
+            }
+        );
+        assert_eq!(
+            OutputConfig::default()
+                .try_with_aggregate_byte_budget(0)
+                .unwrap_err(),
+            ConfigError::Zero {
+                field: "output_aggregate_byte_budget"
             }
         );
         assert_eq!(OutputConfig::try_new(64).unwrap().capacity().get(), 64);
@@ -607,6 +834,146 @@ mod tests {
         assert_eq!(hub.active_channels(), 0);
     }
 
+    #[test]
+    fn aggregate_payload_budget_admits_exact_reservations() {
+        let config = OutputConfig::try_new(1)
+            .unwrap()
+            .try_with_byte_limits(4, 4)
+            .unwrap()
+            .try_with_aggregate_byte_budget(8)
+            .unwrap();
+        let hub = OutputHub::new(config);
+        let first = TaskId::new("aggregate-first").unwrap();
+        let second = TaskId::new("aggregate-second").unwrap();
+        let saturated = TaskId::new("aggregate-saturated").unwrap();
+
+        assert!(hub.ensure_channel_if_absent(first.clone(), Uid::new("first-uid").unwrap()));
+        assert_eq!(hub.reserved_payload_bytes(), 4);
+        assert!(hub.ensure_channel_if_absent(second.clone(), Uid::new("second-uid").unwrap()));
+        assert_eq!(hub.reserved_payload_bytes(), 8);
+        assert!(
+            !hub.ensure_channel_if_absent(saturated.clone(), Uid::new("saturated-uid").unwrap())
+        );
+        assert!(hub.sink_for(&saturated, 1, 1).is_none());
+        assert_eq!(hub.active_channels(), 2);
+        assert_eq!(hub.reserved_payload_bytes(), 8);
+
+        hub.evict(&first);
+        assert_eq!(hub.reserved_payload_bytes(), 4);
+        assert!(
+            hub.ensure_channel_if_absent(saturated.clone(), Uid::new("saturated-uid").unwrap())
+        );
+        assert!(hub.sink_for(&saturated, 1, 1).is_some());
+        assert_eq!(hub.reserved_payload_bytes(), 8);
+    }
+
+    #[test]
+    fn aggregate_payload_budget_rejects_a_ring_one_byte_past_the_boundary() {
+        let config = OutputConfig::try_new(1)
+            .unwrap()
+            .try_with_byte_limits(4, 4)
+            .unwrap()
+            .try_with_aggregate_byte_budget(3)
+            .unwrap();
+        let hub = OutputHub::new(config);
+        let task_id = TaskId::new("aggregate-boundary").unwrap();
+
+        assert!(!hub.ensure_channel_if_absent(
+            task_id.clone(),
+            Uid::new("aggregate-boundary-uid").unwrap()
+        ));
+        assert!(hub.sink_for(&task_id, 1, 1).is_none());
+        assert_eq!(hub.active_channels(), 0);
+        assert_eq!(hub.reserved_payload_bytes(), 0);
+    }
+
+    #[test]
+    fn stale_sink_and_subscription_hold_the_aggregate_payload_lease() {
+        let config = OutputConfig::try_new(1)
+            .unwrap()
+            .try_with_byte_limits(4, 4)
+            .unwrap()
+            .try_with_aggregate_byte_budget(8)
+            .unwrap();
+        let hub = OutputHub::new(config);
+        let task_id = TaskId::new("aggregate-recreate").unwrap();
+        let old_uid = Uid::new("aggregate-old-uid").unwrap();
+        let new_uid = Uid::new("aggregate-new-uid").unwrap();
+
+        assert!(hub.ensure_channel_if_absent(task_id.clone(), old_uid));
+        let stale_sink = hub.sink_for(&task_id, 1, 1).expect("old sink");
+        let stale_subscription = hub.subscribe(&task_id).expect("old subscription");
+        hub.evict(&task_id);
+
+        assert!(!hub.ensure_channel_if_absent(task_id.clone(), new_uid.clone()));
+        assert_eq!(hub.reserved_payload_bytes(), 8);
+        drop(stale_sink);
+        assert!(!hub.ensure_channel_if_absent(task_id.clone(), new_uid.clone()));
+        assert_eq!(hub.reserved_payload_bytes(), 8);
+        drop(stale_subscription);
+
+        assert!(hub.ensure_channel_if_absent(task_id.clone(), new_uid));
+        assert_eq!(hub.reserved_payload_bytes(), 4);
+    }
+
+    #[tokio::test]
+    async fn lagged_subscriptions_have_independent_pending_payload_leases() {
+        let config = OutputConfig::try_new(1)
+            .unwrap()
+            .try_with_byte_limits(4, 4)
+            .unwrap()
+            .try_with_aggregate_byte_budget(12)
+            .unwrap();
+        let hub = OutputHub::new(config);
+        let task_id = TaskId::new("aggregate-lagged-subscribers").unwrap();
+        hub.ensure_channel(task_id.clone());
+        let mut first = hub.subscribe(&task_id).expect("first subscription");
+        let mut second = hub.subscribe(&task_id).expect("second subscription");
+        assert_eq!(hub.reserved_payload_bytes(), 12);
+        assert!(
+            hub.subscribe(&task_id).is_none(),
+            "a third pending-event lease must exceed the aggregate budget"
+        );
+        let sink = hub.sink_for(&task_id, 1, 1).expect("output sink");
+
+        sink.stdout_line(Bytes::from_static(b"aaaa"));
+        sink.stdout_line(Bytes::from_static(b"bbbb"));
+        assert!(matches!(
+            first.next().await,
+            Some(OutputEvent::Lagged {
+                skipped: 1,
+                skipped_bytes: 4
+            })
+        ));
+
+        sink.stdout_line(Bytes::from_static(b"cccc"));
+        sink.stdout_line(Bytes::from_static(b"dddd"));
+        assert!(matches!(
+            second.next().await,
+            Some(OutputEvent::Lagged {
+                skipped: 3,
+                skipped_bytes: 12
+            })
+        ));
+        assert_eq!(hub.reserved_payload_bytes(), 12);
+        assert!(matches!(
+            first.next().await,
+            Some(OutputEvent::Chunk(chunk)) if &chunk.line[..] == b"bbbb"
+        ));
+        assert!(matches!(
+            second.next().await,
+            Some(OutputEvent::Chunk(chunk)) if &chunk.line[..] == b"dddd"
+        ));
+
+        drop(first);
+        assert_eq!(hub.reserved_payload_bytes(), 8);
+        let third = hub
+            .subscribe(&task_id)
+            .expect("released pending-event lease must admit a new subscription");
+        assert_eq!(hub.reserved_payload_bytes(), 12);
+        drop(third);
+    }
+
     #[tokio::test]
     async fn attempts_share_one_stream_with_run_markers() {
         let hub = OutputHub::new(OutputConfig::try_new(16).unwrap());
@@ -659,8 +1026,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn external_sink_receives_run_markers_and_first_chunk() {
+    #[tokio::test]
+    async fn external_sink_receives_run_markers_and_first_chunk() {
         let recording = Arc::new(RecordingOutputSink::default());
         let sink: TaskOutputSinkHandle = recording.clone();
         let hub = OutputHub::with_sink(OutputConfig::try_new(16).unwrap(), Some(sink));
@@ -672,6 +1039,7 @@ mod tests {
             .expect("attempt sink")
             .stdout_line(Bytes::from_static(b"first"));
         hub.announce_run_finished(&task_id, &task_uid, 1, 1, Some(0));
+        hub.shutdown_persistence().await;
 
         let events = recording.events.lock().unwrap();
         assert_eq!(events.len(), 3);
@@ -746,6 +1114,8 @@ mod tests {
             "a short Bytes view must not keep a large backing allocation"
         );
 
+        hub.shutdown_persistence().await;
+
         let events = recording.events.lock().unwrap();
         let OutputEvent::Chunk(persisted) = events[0].event() else {
             panic!("expected persisted chunk");
@@ -769,8 +1139,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stale_output_keeps_the_original_task_uid() {
+    #[tokio::test]
+    async fn stale_output_keeps_the_original_task_uid() {
         let recording = Arc::new(RecordingOutputSink::default());
         let sink: TaskOutputSinkHandle = recording.clone();
         let hub = OutputHub::with_sink(OutputConfig::try_new(16).unwrap(), Some(sink));
@@ -786,11 +1156,67 @@ mod tests {
 
         stale_sink.stdout_line(Bytes::from_static(b"old"));
         current_sink.stdout_line(Bytes::from_static(b"new"));
+        hub.shutdown_persistence().await;
 
         let events = recording.events.lock().unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].task_uid(), &old_uid);
         assert_eq!(events[1].task_uid(), &new_uid);
+    }
+
+    #[tokio::test]
+    async fn callback_overload_drops_only_the_callback_copy() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let persistence: TaskOutputSinkHandle = Arc::new(BlockingFirstOutputSink {
+            first: AtomicBool::new(true),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let persistence_config = PersistenceConfig::new()
+            .try_with_output_queue_capacity(1)
+            .unwrap();
+        let hub = OutputHub::try_with_sink(
+            OutputConfig::try_new(4).unwrap(),
+            Some(persistence),
+            persistence_config,
+        )
+        .unwrap();
+        let task_id = TaskId::new("output-callback-overload").unwrap();
+        hub.ensure_channel(task_id.clone());
+        let mut output = hub.subscribe(&task_id).expect("output subscription");
+        let sink = hub.sink_for(&task_id, 1, 1).expect("attempt sink");
+
+        sink.stdout_line(Bytes::from_static(b"first"));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first output callback must become active");
+        sink.stdout_line(Bytes::from_static(b"second"));
+
+        assert!(matches!(
+            output.next().await,
+            Some(OutputEvent::Chunk(chunk)) if &chunk.line[..] == b"first"
+        ));
+        assert!(matches!(
+            output.next().await,
+            Some(OutputEvent::Chunk(chunk)) if &chunk.line[..] == b"second"
+        ));
+        let status = hub.persistence_status().unwrap();
+        assert_eq!(status.queued(), 1);
+        assert_eq!(status.capacity(), 1);
+        assert_eq!(status.delivered(), 0);
+        assert_eq!(status.failed(), 0);
+        assert_eq!(status.dropped(), 1);
+        assert!(status.accepting());
+        assert!(status.healthy());
+
+        release_tx.send(()).unwrap();
+        hub.shutdown_persistence().await;
+        let status = hub.persistence_status().unwrap();
+        assert_eq!(status.queued(), 0);
+        assert_eq!(status.delivered(), 1);
+        assert_eq!(status.dropped(), 1);
+        assert!(!status.accepting());
     }
 
     #[tokio::test]

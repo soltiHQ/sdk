@@ -93,9 +93,10 @@
 //!     Flag, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskSpec, TaskWorkload,
 //! };
 //! use solti_runner::RunnerRouter;
+//! use std::time::Duration;
 //!
 //! let mut router = RunnerRouter::new();
-//! register_subprocess_runner(&mut router, "default")?;
+//! let runner = register_subprocess_runner(&mut router, "default")?;
 //!
 //! let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
 //!     SubprocessMode::Command {
@@ -111,6 +112,9 @@
 //!
 //! let task = router.build(&resource).await?;
 //! assert!(task.name().starts_with("default-jobs-"));
+//! drop(task);
+//! drop(router);
+//! runner.shutdown(Duration::from_secs(5)).await?;
 //! # Ok(())
 //! # }
 //! # }

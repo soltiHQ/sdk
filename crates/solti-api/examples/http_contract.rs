@@ -30,7 +30,8 @@ use solti_api::{
 };
 use solti_model::{
     ExtensionWorkload, OutputChunk, OutputEvent, StreamKind, Task, TaskFilter, TaskId,
-    TaskManifest, TaskPage, TaskQuery, TaskRun, TaskSpec, TaskWorkload, Token, WritePreconditions,
+    TaskManifest, TaskPage, TaskQuery, TaskRunPage, TaskRunQuery, TaskSpec, TaskWorkload, Token,
+    WritePreconditions,
 };
 use tower::ServiceExt;
 
@@ -133,12 +134,29 @@ impl ApiHandler for MemoryHandler {
         Ok(Box::pin(tokio_stream::empty()))
     }
 
-    async fn list_task_runs(&self, id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
-        if self.lock_tasks()?.contains_key(id.as_str()) {
-            Ok(Vec::new())
-        } else {
-            Err(ApiError::TaskNotFound(id.to_string()))
+    async fn query_task_runs(
+        &self,
+        id: &TaskId,
+        query: TaskRunQuery,
+    ) -> Result<TaskRunPage, ApiError> {
+        if query.continuation().is_some() {
+            return Err(ApiError::MethodNotAllowed(
+                "the teaching backend does not retain run snapshots".into(),
+            ));
         }
+        let task = self
+            .lock_tasks()?
+            .get(id.as_str())
+            .cloned()
+            .ok_or_else(|| ApiError::TaskNotFound(id.to_string()))?;
+        Ok(TaskRunPage {
+            items: Vec::new(),
+            task: id.clone(),
+            task_uid: task.metadata().uid().clone(),
+            resource_version: "runs-memory:1".into(),
+            continuation: None,
+            remaining_item_count: 0,
+        })
     }
 
     async fn delete_task(

@@ -15,7 +15,8 @@ pub const CHAIN_KIND: &str = "Chain";
 
 /// Failure-state behavior after following an `onFailure` transition.
 ///
-/// `Preserve` is the wire default, so omitting `mode` has the same meaning as writing `mode: preserve`.
+/// `Preserve` is the wire default.
+/// Omitting `mode` has the same meaning as writing `mode: preserve`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]

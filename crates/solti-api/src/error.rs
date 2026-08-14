@@ -115,6 +115,7 @@ impl std::error::Error for ApiConflict {}
 /// | `MethodNotAllowed`         | `405` | `Unimplemented`     |
 /// | `UnsupportedMediaType`     | `415` | `InvalidArgument`   |
 /// | `PayloadTooLarge`          | `413` | `ResourceExhausted` |
+/// | `ResourceExhausted`        | `429` | `ResourceExhausted` |
 /// | `ResourceVersionExpired`   | `410` | `OutOfRange`        |
 /// | `Unavailable`              | `503` | `Unavailable`       |
 /// | `Internal`                 | `500` | `Internal`          |
@@ -164,6 +165,10 @@ pub enum ApiError {
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
 
+    /// The service has no capacity for the requested resource.
+    #[error("resource exhausted: {0}")]
+    ResourceExhausted(String),
+
     /// The requested list snapshot or watch position is no longer retained.
     #[error("resource version expired: {0}")]
     ResourceVersionExpired(String),
@@ -182,6 +187,7 @@ impl ApiError {
     pub fn as_label(&self) -> &'static str {
         match self {
             ApiError::PayloadTooLarge(_) => "PayloadTooLarge",
+            ApiError::ResourceExhausted(_) => "ResourceExhausted",
             ApiError::InvalidRequest(_) => "InvalidRequest",
             ApiError::Unauthenticated(_) => "Unauthenticated",
             ApiError::Forbidden(_) => "Forbidden",
@@ -210,6 +216,7 @@ impl ApiError {
             ApiError::MethodNotAllowed(_) => "MethodNotAllowed",
             ApiError::UnsupportedMediaType(_) => "UnsupportedMediaType",
             ApiError::PayloadTooLarge(_) => "RequestEntityTooLarge",
+            ApiError::ResourceExhausted(_) => "TooManyRequests",
             ApiError::ResourceVersionExpired(_) => "Expired",
             ApiError::Unavailable(_) => "ServiceUnavailable",
             ApiError::Internal(_) => "InternalError",
@@ -248,6 +255,7 @@ impl ApiError {
             ApiError::MethodNotAllowed(msg) => (StatusCode::METHOD_NOT_ALLOWED, msg, None),
             ApiError::UnsupportedMediaType(msg) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, msg, None),
             ApiError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg, None),
+            ApiError::ResourceExhausted(msg) => (StatusCode::TOO_MANY_REQUESTS, msg, None),
             ApiError::ResourceVersionExpired(msg) => (StatusCode::GONE, msg, None),
             ApiError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg, None),
             ApiError::Internal(_) => {
@@ -366,6 +374,7 @@ fn http_status_reason(_generator: &mut schemars::SchemaGenerator) -> schemars::S
             "NotFound",
             "RequestEntityTooLarge",
             "ServiceUnavailable",
+            "TooManyRequests",
             "Unauthorized",
             "UnsupportedMediaType"
         ]
@@ -393,6 +402,7 @@ impl From<ApiError> for tonic::Status {
     fn from(err: ApiError) -> Self {
         match err {
             ApiError::PayloadTooLarge(msg) => tonic::Status::resource_exhausted(msg),
+            ApiError::ResourceExhausted(msg) => tonic::Status::resource_exhausted(msg),
             ApiError::InvalidRequest(msg) => tonic::Status::invalid_argument(msg),
             ApiError::Unauthenticated(msg) => tonic::Status::unauthenticated(msg),
             ApiError::Forbidden(msg) => tonic::Status::permission_denied(msg),
@@ -542,6 +552,7 @@ mod tests {
                 "UnsupportedMediaType",
             ),
             (ApiError::PayloadTooLarge("x".into()), "PayloadTooLarge"),
+            (ApiError::ResourceExhausted("x".into()), "ResourceExhausted"),
             (
                 ApiError::ResourceVersionExpired("x".into()),
                 "ResourceVersionExpired",
@@ -571,6 +582,7 @@ mod tests {
         let capture = Arc::new(TraceCapture::default());
         let dispatch = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
         let _guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
         let diagnostic = format!("{SECRET}\n{FORGED}");
 
         #[cfg(feature = "grpc")]
@@ -604,6 +616,10 @@ mod tests {
             ),
             (ApiError::Conflict(conflict()), StatusCode::CONFLICT),
             (
+                ApiError::ResourceExhausted("x".into()),
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
                 ApiError::Unavailable("x".into()),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
@@ -623,6 +639,10 @@ mod tests {
             (
                 ApiError::ResourceVersionExpired("old revision".into()),
                 Code::OutOfRange,
+            ),
+            (
+                ApiError::ResourceExhausted("x".into()),
+                Code::ResourceExhausted,
             ),
             (ApiError::Unavailable("x".into()), Code::Unavailable),
         ] {
@@ -667,6 +687,25 @@ mod tests {
             "ResourceVersionMismatch"
         );
         assert_eq!(value["details"]["causes"][0]["field"], "resourceVersion");
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn resource_exhausted_http_status_uses_the_transport_contract() {
+        use axum::http::{StatusCode, header::RETRY_AFTER};
+        use axum::response::IntoResponse;
+        use http_body_util::BodyExt;
+
+        let response =
+            ApiError::ResourceExhausted("retained task limit reached".into()).into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!response.headers().contains_key(RETRY_AFTER));
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["reason"], "TooManyRequests");
+        assert_eq!(value["code"], 429);
+        assert_eq!(value["message"], "retained task limit reached");
     }
 
     #[cfg(feature = "grpc")]

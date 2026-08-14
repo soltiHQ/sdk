@@ -18,6 +18,7 @@ Disable default features when schema generation is not needed.
 | Guard a write against stale state | `WritePreconditions`                            |
 | Record one execution attempt      | `TaskRun`                                       |
 | Filter or paginate tasks          | `TaskFilter`, `TaskQuery`, `TaskContinuation`   |
+| Paginate one task's runs          | `TaskRunQuery`, `TaskRunContinuation`           |
 | Match runner labels               | `LabelSelector`                                 |
 | Advertise agent capabilities      | `RunnerCapability`, `AgentCapabilities`         |
 | Read live output                  | `OutputEvent`                                   |
@@ -241,6 +242,12 @@ Use:
 - `reconciled()` for the required `Reconciled` condition;
 - `error()` and `exit_code()` for terminal diagnostics.
 
+`TaskStatus.error` and `TaskRun.error` are stored at no more than
+`MAX_TASK_DIAGNOSTIC_BYTES` (`32 KiB`) of UTF-8. Constructors,
+deserialization, and lifecycle setters truncate a longer value to the longest
+prefix that fits without splitting a code point. This contract does not change
+`TaskCondition.message`; condition messages retain their validation contract.
+
 `Pending` may mean that reconciliation is scheduled, failed, or accepted before execution starts.
 Inspect the `Reconciled` condition to distinguish these states.
 
@@ -295,6 +302,10 @@ The default limit is `100`.
 The maximum limit is `1000`.
 Zero selects the default.
 Larger values are capped.
+Page items also have a 4 MiB compact-JSON budget by default.
+The byte budget can return fewer items than the count limit.
+The first complete item is returned even when its domain encoding is larger.
+The transport then measures that item in its native encoding.
 
 `TaskContinuation` carries the snapshot resource version, the fixed filter, and the last task name.
 It is a domain value.
@@ -387,6 +398,9 @@ Important limits:
 - `Slot`: `[A-Za-z0-9._-]`, `64` bytes;
 - `AgentId`: `[A-Za-z0-9._-]`, `128` bytes;
 - annotations: qualified keys, `256 KiB` total key and value bytes;
+- one Task manifest: `4 MiB` compact JSON;
+- one Task page item payload: `4 MiB` compact JSON by default;
+- Task and TaskRun execution diagnostics: `32 KiB` UTF-8 each;
 - workload GVK: CRD-compatible `apiVersion` and `kind`;
 - `creationTimestamp`: RFC 3339 with millisecond precision.
 

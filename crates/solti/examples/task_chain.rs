@@ -34,7 +34,7 @@ use solti::{
     exec::subprocess::register_subprocess_runner,
     model::{
         ConditionStatus, Flag, OutputEvent, RestartPolicy, SubprocessMode, SubprocessSpec, Task,
-        TaskEnv, TaskFilter, TaskId, TaskManifest, TaskPhase, TaskSpec, TaskWorkload,
+        TaskEnv, TaskFilter, TaskId, TaskManifest, TaskPhase, TaskRunQuery, TaskSpec, TaskWorkload,
     },
     runner::RunnerRouter,
 };
@@ -88,16 +88,18 @@ solti: one supervised conditional chain
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "example path is not UTF-8"))?;
 
     let mut router = RunnerRouter::new();
-    register_subprocess_runner(&mut router, "subprocess")?;
+    let subprocess_runner = register_subprocess_runner(&mut router, "subprocess")?;
     register_chain_runner(&mut router, "chain")?;
     println!("[runner] Registered Subprocess first, then snapshotted it into the Chain allowlist.");
 
     let supervisor = SupervisorApi::builder(router).start().await?;
     let run_result = run(&supervisor, listener, child_address, command).await;
     let shutdown_result = supervisor.shutdown().await;
+    let finalizer_result = subprocess_runner.shutdown(Duration::from_secs(5)).await;
 
     run_result?;
     shutdown_result?;
+    finalizer_result?;
     println!("[shutdown] Supervisor and SDK-owned workers stopped.");
     println!(
         "\nResult: task1 and task2 succeeded, task3 failed, task4 recovered, and the outer Task completed successfully with live output and retained history."
@@ -191,8 +193,11 @@ async fn run(
         .into());
     }
 
-    let runs = supervisor.list_task_runs(&task_name);
+    let runs = supervisor
+        .query_task_runs(&task_name, &TaskRunQuery::new())?
+        .ok_or_else(|| io::Error::other("task disappeared before run history was read"))?;
     let run = runs
+        .items
         .last()
         .ok_or_else(|| io::Error::other("run history is empty"))?;
     println!(
@@ -201,7 +206,7 @@ async fn run(
         run.attempt(),
         run.phase(),
     );
-    if runs.len() != 1 || run.phase() != TaskPhase::Succeeded {
+    if runs.items.len() != 1 || run.phase() != TaskPhase::Succeeded {
         return Err(io::Error::other("expected one successful outer run in history").into());
     }
     Ok(())

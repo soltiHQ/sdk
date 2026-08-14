@@ -27,7 +27,7 @@
 //!
 //! Run with `cargo run -p solti --example agent_http_discovery --features api-core-adapter,api-http,discover-http,exec-subprocess`.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use solti::{
     api::{API_VERSION, HTTP_API_ROOT, HttpApi, SupervisorApiAdapter, axum::serve},
@@ -65,7 +65,7 @@ solti: discovered HTTP agent
 
     let listener = TcpListener::bind(API_ADDRESS).await?;
     let mut router = RunnerRouter::new();
-    register_subprocess_runner(&mut router, "default")?;
+    let subprocess_runner = register_subprocess_runner(&mut router, "default")?;
     let capabilities = router.capabilities();
     println!(
         "[runner] Registered {} runner capability with {} workload GVK.",
@@ -109,8 +109,10 @@ solti: discovered HTTP agent
         .with_graceful_shutdown(shutdown_signal())
         .await;
     let shutdown_result = supervisor.shutdown().await;
+    let finalizer_result = subprocess_runner.shutdown(Duration::from_secs(5)).await;
     server_result?;
     shutdown_result?;
+    finalizer_result?;
     Ok(())
 }
 

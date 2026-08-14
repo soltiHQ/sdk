@@ -34,9 +34,9 @@ use super::{
 };
 #[cfg(feature = "host-process")]
 use super::{
-    HostProcessError, PreparedCgroup, PreparedCgroupParent, PreparedProcessConfig, PreparedRlimits,
-    attach_cgroup, attach_process_config, attach_rlimits, attach_security, prepare_cgroup,
-    resolve_cgroup_parent,
+    CgroupPrepareFailure, HostProcessError, PreparedCgroup, PreparedCgroupParent,
+    PreparedProcessConfig, PreparedRlimits, attach_cgroup, attach_process_config, attach_rlimits,
+    attach_security, prepare_cgroup_owned, resolve_cgroup_parent,
 };
 use crate::isolation::validate_cgroup_limits;
 
@@ -265,6 +265,30 @@ pub struct PreparedHostProcessAttempt {
     cgroup: Option<PreparedCgroup>,
 }
 
+/// Internal attempt preparation failure with residual cleanup ownership.
+#[cfg(feature = "host-process")]
+#[derive(Debug)]
+pub(crate) enum AttemptPrepareFailure {
+    /// Preparation failed after complete rollback.
+    Clean(HostProcessError),
+    /// Preparation failed and rollback left owned cgroup state.
+    Residual {
+        /// Original preparation error returned to the caller.
+        error: HostProcessError,
+        /// Safely pinned cleanup ownership, or `None` when no safe identity is available.
+        cleanup: Option<AttemptProcessDomain>,
+    },
+}
+
+#[cfg(feature = "host-process")]
+impl AttemptPrepareFailure {
+    pub(crate) fn into_error(self) -> HostProcessError {
+        match self {
+            Self::Clean(error) | Self::Residual { error, .. } => error,
+        }
+    }
+}
+
 /// Owns cgroup resources attached to one host process attempt.
 ///
 /// Keep this value until the attached process scope has stopped.
@@ -397,6 +421,11 @@ impl PreparedHostProcessPolicy {
     /// `cgroup_name` is required when cgroup limits are configured.
     /// It must contain one normal path component.
     ///
+    /// This direct low-level API has no retrying cleanup finalizer. If
+    /// preparation leaves a safely pinned cgroup, error conversion performs
+    /// one best-effort drop cleanup. The subprocess runner uses an internal
+    /// ownership-preserving path and its bounded finalizer instead.
+    ///
     /// # Errors
     ///
     /// Returns [`HostProcessError::InvalidConfig`] for a missing or unsafe cgroup name.
@@ -405,9 +434,18 @@ impl PreparedHostProcessPolicy {
         &self,
         cgroup_name: Option<&str>,
     ) -> Result<PreparedHostProcessAttempt, HostProcessError> {
+        self.prepare_attempt_owned(cgroup_name)
+            .map_err(AttemptPrepareFailure::into_error)
+    }
+
+    /// Prepares attempt resources without erasing residual cleanup ownership.
+    pub(crate) fn prepare_attempt_owned(
+        &self,
+        cgroup_name: Option<&str>,
+    ) -> Result<PreparedHostProcessAttempt, AttemptPrepareFailure> {
         let cgroup = match (&self.cgroups, cgroup_name) {
             (Some(cgroups), Some(name)) => {
-                validate_cgroup_name(name)?;
+                validate_cgroup_name(name).map_err(AttemptPrepareFailure::Clean)?;
                 trace!(
                     event = "host_process.cgroup_prepare",
                     ?cgroups,
@@ -418,11 +456,26 @@ impl PreparedHostProcessPolicy {
                     .cgroup_parent
                     .as_ref()
                     .expect("prepared cgroup policy must have a parent");
-                Some(prepare_cgroup(parent, name, cgroups)?)
+                match prepare_cgroup_owned(parent, name, cgroups) {
+                    Ok(cgroup) => Some(cgroup),
+                    Err(CgroupPrepareFailure::Clean(error)) => {
+                        return Err(AttemptPrepareFailure::Clean(error));
+                    }
+                    Err(CgroupPrepareFailure::Residual { source, cleanup }) => {
+                        return Err(AttemptPrepareFailure::Residual {
+                            error: source,
+                            cleanup: cleanup.map(|cgroup| AttemptProcessDomain {
+                                cgroup: Some(cgroup),
+                            }),
+                        });
+                    }
+                }
             }
             (Some(_), None) => {
-                return Err(HostProcessError::InvalidConfig(
-                    "cgroup name is required when cgroup limits are configured".into(),
+                return Err(AttemptPrepareFailure::Clean(
+                    HostProcessError::InvalidConfig(
+                        "cgroup name is required when cgroup limits are configured".into(),
+                    ),
                 ));
             }
             (None, _) => None,
@@ -436,6 +489,19 @@ impl PreparedHostProcessPolicy {
 }
 
 impl PreparedHostProcessAttempt {
+    /// Converts resources prepared for a process that was never spawned into
+    /// the same cleanup domain used after process attachment.
+    #[cfg(feature = "subprocess")]
+    pub(crate) fn into_cleanup_domain(self) -> AttemptProcessDomain {
+        let Self {
+            controls: _,
+            cgroup,
+        } = self;
+        AttemptProcessDomain {
+            cgroup: cgroup.map(PreparedCgroup::into_domain),
+        }
+    }
+
     /// Returns signal dispositions representable by the native macOS spawn path.
     ///
     /// `None` means that the attempt contains a control which requires the

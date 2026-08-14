@@ -7,7 +7,7 @@
 //!      ├── Taskvisor runtime settings
 //!      ├── controller settings
 //!      ├── external subscribers
-//!      ├── state retention
+//!      ├── state admission and retention
 //!      └── output capacity
 //!              ▼
 //!         SupervisorApi
@@ -95,7 +95,7 @@ impl SupervisorApiBuilder {
         self
     }
 
-    /// Replaces state retention settings.
+    /// Replaces state admission and retention settings.
     pub fn with_state_config(mut self, state_config: StateConfig) -> Self {
         self.state_config = state_config;
         self
@@ -125,17 +125,27 @@ impl SupervisorApiBuilder {
     /// Installs a lossless task state persistence hook.
     ///
     /// Core delivers events on its dedicated persistence worker in commit order.
-    /// Queue saturation applies bounded backpressure after the global state lock
-    /// is released. The sink must eventually return so shutdown can drain it.
+    /// Queue saturation applies bounded backpressure before the global state
+    /// lock is acquired. The sink must eventually return so shutdown can drain it.
+    /// Polling [`SupervisorApi::shutdown`] on the callback worker panics before
+    /// shutdown starts. Waiting for another thread that calls shutdown can deadlock.
+    /// [`SupervisorApi::state_persistence_status`] exposes delivery health and
+    /// counters after startup.
     pub fn with_state_sink(mut self, sink: TaskStateSinkHandle) -> Self {
         self.state_sink = Some(sink);
         self
     }
 
-    /// Installs a synchronous task output persistence hook.
+    /// Installs a bounded, best-effort task output persistence hook.
     ///
-    /// The sink receives output from the first event.
-    /// It must return quickly and should forward events to an application-owned storage worker.
+    /// Core invokes the sink on a dedicated worker. Runner publication never
+    /// waits for queue capacity. A full or unhealthy dispatcher drops only the
+    /// external callback copy. [`SupervisorApi::output_persistence_status`]
+    /// exposes admission, health, and delivery counters after startup.
+    /// The sink must eventually return so shutdown can drain accepted events.
+    /// Polling [`SupervisorApi::shutdown`] on the callback worker panics before
+    /// shutdown starts. Waiting for another thread that calls shutdown can
+    /// deadlock and is also forbidden.
     pub fn with_output_sink(mut self, sink: TaskOutputSinkHandle) -> Self {
         self.output_sink = Some(sink);
         self
@@ -146,6 +156,8 @@ impl SupervisorApiBuilder {
     /// # Errors
     ///
     /// Returns [`CoreError::StateInitialization`] when state identity creation fails.
+    /// Returns [`CoreError::PersistenceInitialization`] when a configured
+    /// persistence worker cannot start.
     pub async fn start(self) -> Result<SupervisorApi, CoreError> {
         SupervisorApi::start(SupervisorStartConfig {
             runtime: self.runtime_config,
@@ -167,7 +179,70 @@ impl SupervisorApiBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+    use std::sync::{OnceLock, Weak};
+
+    use solti_model::{EmbeddedSpec, TaskId, TaskManifest, TaskSpec, TaskWorkload, Uid};
+
     use super::*;
+
+    struct IgnoringStateSink;
+
+    impl crate::TaskStateSink for IgnoringStateSink {
+        fn on_event(&self, _event: &crate::TaskStateEvent) {}
+    }
+
+    struct IgnoringOutputSink;
+
+    impl crate::TaskOutputSink for IgnoringOutputSink {
+        fn on_event(&self, _event: &crate::TaskOutputEvent) {}
+    }
+
+    struct ReentrantShutdownOutputSink {
+        api: OnceLock<Weak<SupervisorApi>>,
+        runtime: tokio::runtime::Handle,
+    }
+
+    struct ReentrantShutdownStateSink {
+        api: OnceLock<Weak<SupervisorApi>>,
+        runtime: tokio::runtime::Handle,
+    }
+
+    impl crate::TaskStateSink for ReentrantShutdownStateSink {
+        fn on_event(&self, _event: &crate::TaskStateEvent) {
+            let api = self
+                .api
+                .get()
+                .and_then(Weak::upgrade)
+                .expect("the test API remains alive");
+            let _ = self.runtime.block_on(api.shutdown());
+        }
+    }
+
+    fn persistence_test_manifest(name: &str) -> TaskManifest {
+        TaskManifest::new(
+            name,
+            TaskSpec::builder(
+                "persistence-test-slot",
+                TaskWorkload::Embedded(EmbeddedSpec::new("persistence-test-v1").unwrap()),
+                1_000_u64,
+            )
+            .build()
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    impl crate::TaskOutputSink for ReentrantShutdownOutputSink {
+        fn on_event(&self, _event: &crate::TaskOutputEvent) {
+            let api = self
+                .api
+                .get()
+                .and_then(Weak::upgrade)
+                .expect("the test API remains alive");
+            let _ = self.runtime.block_on(api.shutdown());
+        }
+    }
 
     #[tokio::test]
     async fn defaults_start_and_shutdown() {
@@ -175,6 +250,162 @@ mod tests {
             .start()
             .await
             .unwrap();
+        assert!(api.state_persistence_status().is_none());
+        assert!(api.output_persistence_status().is_none());
         api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn state_persistence_status_is_public_when_a_sink_is_installed() {
+        let api = SupervisorApiBuilder::new(RunnerRouter::new())
+            .with_state_sink(Arc::new(IgnoringStateSink))
+            .start()
+            .await
+            .unwrap();
+        let status = api
+            .state_persistence_status()
+            .expect("installed state sink must expose status");
+        assert!(status.accepting());
+        assert!(status.healthy());
+        assert_eq!(status.queued(), 0);
+        assert_eq!(status.capacity(), 2_049);
+        assert_eq!(status.delivered(), 0);
+        assert_eq!(status.failed(), 0);
+
+        api.shutdown().await.unwrap();
+        assert!(!api.state_persistence_status().unwrap().accepting());
+    }
+
+    #[tokio::test]
+    async fn output_persistence_status_is_public_when_a_sink_is_installed() {
+        let api = SupervisorApiBuilder::new(RunnerRouter::new())
+            .with_output_sink(Arc::new(IgnoringOutputSink))
+            .start()
+            .await
+            .unwrap();
+        let status = api
+            .output_persistence_status()
+            .expect("installed output sink must expose status");
+        assert!(status.accepting());
+        assert!(status.healthy());
+        assert_eq!(status.queued(), 0);
+        assert_eq!(status.capacity(), 2_048);
+        assert_eq!(status.delivered(), 0);
+        assert_eq!(status.failed(), 0);
+        assert_eq!(status.dropped(), 0);
+
+        api.shutdown().await.unwrap();
+        assert!(!api.output_persistence_status().unwrap().accepting());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_callback_cannot_reenter_supervisor_shutdown() {
+        let sink = Arc::new(ReentrantShutdownOutputSink {
+            api: OnceLock::new(),
+            runtime: tokio::runtime::Handle::current(),
+        });
+        let api = Arc::new(
+            SupervisorApiBuilder::new(RunnerRouter::new())
+                .with_output_sink(sink.clone())
+                .start()
+                .await
+                .unwrap(),
+        );
+        sink.api
+            .set(Arc::downgrade(&api))
+            .unwrap_or_else(|_| panic!("the test API is installed only once"));
+
+        api.reconciler.output_hub.announce_run_started(
+            &TaskId::new("reentrant-output-shutdown").unwrap(),
+            &Uid::new("reentrant-output-shutdown-uid").unwrap(),
+            1,
+            1,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while api.output_persistence_status().unwrap().healthy() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reentrant callback panic must be isolated");
+
+        assert!(
+            !api.shutdown_started.load(Ordering::Acquire),
+            "reentrant shutdown must panic before changing supervisor state"
+        );
+        let status = api.output_persistence_status().unwrap();
+        assert!(!status.accepting());
+        assert!(!status.healthy());
+        assert_eq!(status.failed(), 1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), api.shutdown())
+            .await
+            .expect("external shutdown must not wait on the completed callback")
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            api.reconciler.output_hub.shutdown_persistence(),
+        )
+        .await
+        .expect("output persistence shutdown remains idempotent");
+        let status = api.output_persistence_status().unwrap();
+        assert_eq!(status.queued(), 0);
+        assert_eq!(status.delivered(), 0);
+        assert_eq!(status.failed(), 1);
+        assert_eq!(status.dropped(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn state_callback_cannot_reenter_supervisor_shutdown() {
+        let sink = Arc::new(ReentrantShutdownStateSink {
+            api: OnceLock::new(),
+            runtime: tokio::runtime::Handle::current(),
+        });
+        let api = Arc::new(
+            SupervisorApiBuilder::new(RunnerRouter::new())
+                .with_state_sink(sink.clone())
+                .start()
+                .await
+                .unwrap(),
+        );
+        sink.api
+            .set(Arc::downgrade(&api))
+            .unwrap_or_else(|_| panic!("the test API is installed only once"));
+
+        api.reconciler
+            .state
+            .add_task(persistence_test_manifest("reentrant-state-shutdown"));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while api.state_persistence_status().unwrap().healthy() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reentrant callback panic must be isolated");
+
+        assert!(
+            !api.shutdown_started.load(Ordering::Acquire),
+            "reentrant shutdown must panic before changing supervisor state"
+        );
+        let status = api.state_persistence_status().unwrap();
+        assert!(status.accepting());
+        assert!(!status.healthy());
+        assert_eq!(status.failed(), 1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), api.shutdown())
+            .await
+            .expect("external shutdown must not wait on the completed callback")
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            api.reconciler.state.shutdown_persistence(),
+        )
+        .await
+        .expect("state persistence shutdown remains idempotent");
+        let status = api.state_persistence_status().unwrap();
+        assert!(!status.accepting());
+        assert_eq!(status.queued(), 0);
+        assert_eq!(status.delivered(), 0);
+        assert_eq!(status.failed(), 1);
     }
 }

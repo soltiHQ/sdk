@@ -61,6 +61,7 @@ const SLOT: &str = "solti-discover-sync";
 /// # Errors
 ///
 /// Returns [`DiscoverError::InvalidConfig`] when the selected transport cannot use the config.
+/// This includes a bearer token over plaintext transport without the explicit insecure opt-in.
 /// Returns [`DiscoverError::SpecBuild`] when the manifest cannot be built.
 /// With HTTP, returns a transport error when the client cannot be built.
 pub fn sync(
@@ -95,7 +96,7 @@ pub fn sync(
     if config.token.is_some() && !transport.is_secure() {
         warn!(
             event = "discovery.insecure_transport",
-            "bearer token configured for plaintext discovery"
+            "bearer token explicitly allowed over plaintext discovery"
         );
     }
 
@@ -513,6 +514,60 @@ mod tests {
             manifest.spec().timeout().as_millis(),
             worst_case_ms
         );
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn sync_rejects_plaintext_http_token_without_opt_in() {
+        let config = DiscoverConfig::builder(
+            solti_model::AgentId::new("agent-1").unwrap(),
+            "agent-1",
+            crate::AgentEndpoint::new("http://127.0.0.1:8085", crate::AgentEndpointType::Http, 1)
+                .unwrap(),
+            crate::ControlPlaneEndpoint::new(
+                "http://127.0.0.1:9000",
+                crate::DiscoveryTransport::Http,
+            )
+            .unwrap(),
+            30_000,
+            "test@1",
+        )
+        .with_token(solti_model::Token::new("secret").unwrap())
+        .build()
+        .unwrap();
+
+        assert!(matches!(
+            sync(config, Arc::new(|| 0)),
+            Err(DiscoverError::InvalidConfig(message))
+                if message.contains("allow_insecure_token_transport()")
+        ));
+    }
+
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn sync_rejects_h2c_token_without_opt_in() {
+        let config = DiscoverConfig::builder(
+            solti_model::AgentId::new("agent-1").unwrap(),
+            "agent-1",
+            crate::AgentEndpoint::new("http://127.0.0.1:8085", crate::AgentEndpointType::Http, 1)
+                .unwrap(),
+            crate::ControlPlaneEndpoint::new(
+                "http://127.0.0.1:50051",
+                crate::DiscoveryTransport::Grpc,
+            )
+            .unwrap(),
+            30_000,
+            "test@1",
+        )
+        .with_token(solti_model::Token::new("secret").unwrap())
+        .build()
+        .unwrap();
+
+        assert!(matches!(
+            sync(config, Arc::new(|| 0)),
+            Err(DiscoverError::InvalidConfig(message))
+                if message.contains("allow_insecure_token_transport()")
+        ));
     }
 
     #[test]

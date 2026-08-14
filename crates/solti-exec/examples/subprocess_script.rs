@@ -14,7 +14,10 @@
 //!
 //! Run with `cargo run -p solti-exec --example subprocess_script --features subprocess`.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use solti_exec::subprocess::register_subprocess_runner;
@@ -102,7 +105,7 @@ async fn main() -> ExampleResult {
     let output = Arc::new(RecordingOutput::default());
     let output_handle: OutputPublisherHandle = output.clone();
     let mut router = RunnerRouter::new().with_output_publisher(output_handle);
-    register_subprocess_runner(&mut router, "shell")?;
+    let runner = register_subprocess_runner(&mut router, "shell")?;
 
     let task_ref = router.build(&task).await?;
     println!(
@@ -117,25 +120,32 @@ async fn main() -> ExampleResult {
     task_ref.spawn(TaskContext::detached()).await?;
     println!("[attempt/2] Repeated the same lifecycle with a fresh attempt scope.");
 
-    let events = output
-        .events
-        .lock()
-        .expect("output recorder lock must not be poisoned");
-    let mut observed_attempts = Vec::new();
-    println!("[output] Published script lines:");
-    for event in &*events {
-        let OutputEvent::Chunk(chunk) = event else {
-            continue;
-        };
-        let line = String::from_utf8_lossy(&chunk.line);
-        println!(
-            "      generation={} attempt={} stream={:?} seq={} line={line:?}",
-            chunk.generation, chunk.attempt, chunk.stream, chunk.seq,
-        );
-        assert_eq!(line, "argument=payload mode=script");
-        observed_attempts.push(chunk.attempt);
-    }
+    let observed_attempts = {
+        let events = output
+            .events
+            .lock()
+            .expect("output recorder lock must not be poisoned");
+        let mut observed_attempts = Vec::new();
+        println!("[output] Published script lines:");
+        for event in &*events {
+            let OutputEvent::Chunk(chunk) = event else {
+                continue;
+            };
+            let line = String::from_utf8_lossy(&chunk.line);
+            println!(
+                "      generation={} attempt={} stream={:?} seq={} line={line:?}",
+                chunk.generation, chunk.attempt, chunk.stream, chunk.seq,
+            );
+            assert_eq!(line, "argument=payload mode=script");
+            observed_attempts.push(chunk.attempt);
+        }
+        observed_attempts
+    };
     assert_eq!(observed_attempts, [1, 2]);
+    drop(task_ref);
+    drop(router);
+    runner.shutdown(Duration::from_secs(5)).await?;
+    println!("[shutdown] Closed admission and drained accepted process ownership.");
 
     println!(
         "\nResult: one built task produced two isolated script attempts with independent output identity and cleanup."

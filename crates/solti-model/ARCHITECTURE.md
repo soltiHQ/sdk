@@ -185,6 +185,7 @@ It preserves the latest observed attempt because the task-level outcome has no a
 7. Pending uses attempt zero and has no execution diagnostics.
 8. Running uses a positive attempt and has no terminal diagnostics.
 9. A terminal status may use attempt zero when no attempt event was observed.
+10. `error` is a UTF-8-safe prefix of at most 32 KiB.
 
 `Task::validate` adds the resource-level bounds:
 
@@ -215,9 +216,16 @@ flowchart LR
 An active run has no finish fields.
 A terminal run requires `finishedAt`.
 The run snapshots its workload GVK.
+Its `error` uses the same UTF-8-safe 32 KiB prefix contract as
+`TaskStatus.error`.
 
 The model does not retain runs.
 A state store decides whether and how long to keep them.
+
+`TaskRunQuery` applies a default page size of 100 and a hard maximum of 1000.
+`TaskRunContinuation` binds a snapshot to Task name, Task UID, resource
+version, generation, and attempt. `TaskRunPage` carries the same Task identity
+so a transport can shorten a native-encoded prefix without weakening the cursor.
 
 ## Workload type system
 
@@ -305,8 +313,11 @@ Execution layers decide which names and values they support.
 The `schema` feature describes serialized structure.
 It also encodes local field constraints and lifecycle branches.
 
-Runtime validation remains authoritative for relationships that standard JSON Schema cannot express exactly.
-These include generation comparisons, uniqueness by condition type, backoff field ordering, and UTF-8 byte budgets.
+Runtime validation and normalization remain authoritative for relationships
+that standard JSON Schema cannot express exactly. These include generation
+comparisons, uniqueness by condition type, backoff field ordering, and UTF-8
+byte budgets. Schema `maxLength` bounds the number of Unicode code points;
+runtime diagnostic truncation bounds encoded UTF-8 bytes.
 
 ## Queries and collections
 
@@ -317,7 +328,7 @@ The state store owns snapshot retention and query execution.
 %%{init: {"flowchart": {"curve": "linear"}}}%%
 flowchart LR
     Filter["TaskFilter<br/>slot + phases + labels"]
-    Query["TaskQuery<br/>filter + limit + continuation"]
+    Query["TaskQuery<br/>filter + count/byte limits + continuation"]
     Store["State store<br/>snapshot execution"]
     Page["TaskPage<br/>items + resourceVersion + continuation"]
     Transport["Transport<br/>opaque wire token"]
@@ -331,6 +342,8 @@ flowchart LR
 Filters run before pagination.
 Multiple phases use OR semantics.
 Slot, phase, and label filters use AND semantics.
+Pages keep a complete-item prefix within both limits.
+An oversized first item is returned alone for native transport measurement.
 
 `TaskContinuation` fixes:
 

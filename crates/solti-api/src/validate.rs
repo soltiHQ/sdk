@@ -44,6 +44,23 @@ pub(crate) fn parse_list_limit(raw: u32) -> Result<usize, ApiError> {
     Ok(limit)
 }
 
+#[cfg(any(feature = "grpc", feature = "http"))]
+/// Applies the public default and maximum TaskRun page size.
+pub(crate) fn parse_task_run_limit(raw: u32) -> Result<usize, ApiError> {
+    if raw == 0 {
+        return Ok(solti_model::DEFAULT_TASK_RUN_LIMIT);
+    }
+    let limit = usize::try_from(raw)
+        .map_err(|_| ApiError::InvalidRequest(format!("limit `{raw}` is out of range")))?;
+    if limit > solti_model::MAX_TASK_RUN_LIMIT {
+        return Err(ApiError::InvalidRequest(format!(
+            "limit cannot exceed {}",
+            solti_model::MAX_TASK_RUN_LIMIT
+        )));
+    }
+    Ok(limit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +118,20 @@ mod tests {
 
         assert!(parse_list_limit(solti_model::MAX_LIMIT as u32 + 1).is_err());
         assert!(parse_list_limit(u32::MAX).is_err());
+    }
+
+    #[cfg(any(feature = "grpc", feature = "http"))]
+    #[test]
+    fn parse_task_run_limit_applies_defaults_and_bounds() {
+        assert_eq!(
+            parse_task_run_limit(0).unwrap(),
+            solti_model::DEFAULT_TASK_RUN_LIMIT
+        );
+        assert_eq!(parse_task_run_limit(1).unwrap(), 1);
+        assert_eq!(
+            parse_task_run_limit(solti_model::MAX_TASK_RUN_LIMIT as u32).unwrap(),
+            solti_model::MAX_TASK_RUN_LIMIT
+        );
+        assert!(parse_task_run_limit(solti_model::MAX_TASK_RUN_LIMIT as u32 + 1).is_err());
     }
 }

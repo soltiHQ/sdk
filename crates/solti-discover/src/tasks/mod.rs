@@ -1,6 +1,6 @@
 //! # Embedded discovery task
 //!
-//! [`sync`] returns a complete desired resource and its prebuilt runtime task.
+//! [`sync()`] returns a complete desired resource and its prebuilt runtime task.
 //!
 //! ```text
 //! DiscoverConfig + UptimeSource

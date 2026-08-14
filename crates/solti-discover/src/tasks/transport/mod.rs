@@ -16,6 +16,7 @@
 //! ```
 //!
 //! Adapter construction validates transport-specific URI and authentication data.
+//! A bearer token requires TLS unless the config explicitly opts into plaintext transport.
 //! The transport client is reused across task attempts.
 
 #[cfg(feature = "grpc")]
@@ -70,6 +71,18 @@ impl TransportAdapter {
             Self::Http(adapter) => adapter.is_secure(),
         }
     }
+}
+
+/// Enforces the bearer credential transport policy after URI validation.
+fn validate_token_transport(config: &DiscoverConfig, secure: bool) -> Result<(), DiscoverError> {
+    if config.token.is_some() && !secure && !config.allow_insecure_token_transport {
+        return Err(DiscoverError::InvalidConfig(
+            "bearer token over plaintext discovery is disabled; use an https control-plane endpoint or explicitly call allow_insecure_token_transport() for development or loopback use"
+                .into(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Converts `success = false` into [`DiscoverError::Rejected`].

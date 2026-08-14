@@ -34,6 +34,8 @@ tasks:
     cmds:
       - task: rust:check
         vars: { CHECK_ARGS: '--workspace --all-targets --all-features --locked' }
+      - task: rust:check
+        vars: { CHECK_ARGS: '--workspace --all-targets --no-default-features --locked' }
 
   ci/clippy:
     desc: "Run 'cargo clippy' for one workspace or package feature set. FEATURE = none|all|<features> (default: all)."
@@ -54,32 +56,46 @@ tasks:
         vars: { CLIPPY_ARGS: '{{.PACKAGE_FLAGS}} --all-targets {{.FEATURE_FLAGS}} --locked -- -D warnings' }
 
   ci/test:
-    desc: Run 'cargo test' (all targets, all features).
+    desc: Run workspace tests with all features and without default features.
     deps: [proto/vendor]
     cmds:
       - task: rust:test
         vars: { TEST_ARGS: '--workspace --all-features --locked' }
+      - task: rust:test
+        vars: { TEST_ARGS: '--workspace --no-default-features --locked' }
 
   ci/test-unit:
-    desc: Run unit tests ('cargo test --lib') and doctests ('cargo test --doc').
+    desc: Run unit tests and doctests in both workspace feature configurations.
     deps: [proto/vendor]
     cmds:
       - task: rust:test
         vars: { TEST_ARGS: '--workspace --lib --all-features --locked' }
       - task: rust:test
         vars: { TEST_ARGS: '--workspace --doc --all-features --locked' }
+      - task: rust:test
+        vars: { TEST_ARGS: '--workspace --lib --no-default-features --locked' }
+      - task: rust:test
+        vars: { TEST_ARGS: '--workspace --doc --no-default-features --locked' }
 
   ci/test-integration:
-    desc: Run integration tests ('cargo test --test "*"').
+    desc: Run integration tests in both workspace feature configurations.
     deps: [proto/vendor]
     cmds:
       - task: rust:test
         vars: { TEST_ARGS: '--workspace --test "*" --all-features --locked' }
+      - task: rust:test
+        vars: { TEST_ARGS: '--workspace --test "*" --no-default-features --locked' }
 
   ci/audit:
     desc: Run 'cargo audit'.
     cmds:
       - task: rust:audit
+
+  ci/bench-check:
+    desc: Compile every release-mode benchmark without running it.
+    deps: [proto/vendor]
+    cmds:
+      - cmd: cargo bench --workspace --all-features --no-run --locked
 
   ci/build:
     desc: Build all examples for a package. Pass CRATE.
@@ -115,13 +131,15 @@ tasks:
           PUBLISH_ARGS: '--all-features --allow-dirty --locked'
 
   ci/docs:
-    desc: Run 'rustdoc' for the SDK workspace.
+    desc: Run strict public and private rustdoc for both workspace feature configurations.
     deps: [proto/vendor]
+    env:
+      RUSTDOCFLAGS: '-D warnings'
     cmds:
       - task: rust:doc
-        vars: { DOC_ARGS: '--workspace --locked --no-deps' }
+        vars: { DOC_ARGS: '--workspace --locked --no-deps --no-default-features --document-private-items' }
       - task: rust:doc
-        vars: { DOC_ARGS: '--workspace --locked --no-deps --all-features' }
+        vars: { DOC_ARGS: '--workspace --locked --no-deps --all-features --document-private-items' }
       - for:
           var: publish_crates
         task: rust:docs

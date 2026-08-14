@@ -71,6 +71,7 @@ Use `apply_embedded_task` when the desired config changes.
 | `DiscoverConfig::builder`     | Identity, endpoints, interval, task revision  | Config builder                            |
 | `capabilities`                | `AgentCapabilities` snapshot                  | Runner capabilities sent with every sync  |
 | `with_token`                  | `Token`                                       | Bearer authentication                     |
+| `allow_insecure_token_transport` | No value                                   | Explicit development/loopback opt-in      |
 | `with_tls`                    | `solti_tls::ClientTlsConfig`                  | Custom roots and optional client identity |
 | `with_metrics`                | `DiscoverMetricsHandle`                       | Discovery lifecycle metrics               |
 | `sync`                        | `DiscoverConfig` and `Arc<dyn UptimeSource>`  | Embedded `TaskManifest` and `TaskRef`     |
@@ -114,6 +115,7 @@ Optional settings use these defaults:
 | `request_timeout_ms`     | 30 seconds                                               |
 | Metrics                  | `NoOpDiscoverMetrics`                                    |
 | Bearer token             | None                                                     |
+| Insecure token transport | Disabled                                                 |
 | Custom TLS               | None                                                     |
 
 `delay_ms`, `connect_timeout_ms`, and `request_timeout_ms` use milliseconds.
@@ -157,7 +159,15 @@ The default capability snapshot has no runners.
 - gRPC uses `authorization` metadata.
 
 The selected adapter validates the encoded value before the task starts.
-Using a token over a plaintext endpoint emits a warning.
+A token requires an `https` control-plane endpoint by default.
+`sync` returns `DiscoverError::InvalidConfig` without returning a task when a
+token is combined with plaintext HTTP or gRPC.
+
+Plaintext discovery without a token remains supported.
+`allow_insecure_token_transport()` is an explicit escape hatch for controlled
+development or loopback endpoints.
+It permits the plaintext credential and emits a warning.
+Do not use this opt-in for production credentials.
 
 | Transport | Endpoint | Trust behavior                                      |
 |-----------|----------|-----------------------------------------------------|
@@ -254,6 +264,7 @@ Every attempt reads the source again.
 - Every attempt sends a fresh Unix timestamp and uptime value.
 - HTTP and gRPC clients are reused across task attempts.
 - HTTP redirects are disabled to avoid forwarding credentials to another host.
+- Bearer tokens require TLS unless insecure token transport is explicitly enabled.
 - Successful HTTP response bodies are limited to 64 KiB.
 - Non-success HTTP responses read at most 1 KiB of body data.
 - Control-plane rejection text remains untrusted diagnostic text.
@@ -328,7 +339,7 @@ The authoritative protobuf tree lives in
 [`soltiHQ/proto`](https://github.com/soltiHQ/proto).
 Release and CI tooling vendor a pinned revision into `proto/`.
 The crate includes generated Rust and protobuf-JSON bindings from that vendored
-contract, so consumer builds do not run `protoc`.
+contract. Consumer builds do not run `protoc`.
 The `generated_contract` test regenerates the bindings and rejects drift.
 
 The HTTP endpoint is always `POST /api/v1/discovery/sync`.

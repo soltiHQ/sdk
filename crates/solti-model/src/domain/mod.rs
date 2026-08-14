@@ -7,7 +7,7 @@
 //! | `policy/`       | [`RestartPolicy`], [`BackoffPolicy`], [`AdmissionPolicy`]         | Lifecycle and concurrency policies          |
 //! | `selector/`     | [`LabelSelector`], [`SelectorRequirement`]                        | Label selector for routing                  |
 //! | `environment/`  | [`TaskEnv`]                                                       | Task-provided environment variables         |
-//! | `query/`        | [`TaskContinuation`], [`TaskFilter`], [`TaskQuery`], [`TaskPage`] | Task filtering and collections              |
+//! | `query/`        | [`TaskQuery`], [`TaskRunQuery`], continuations and pages          | Task filtering and collections              |
 //! | `identity/`     | [`AgentId`], [`Slot`], [`TaskId`]                                 | Resource identity (`Arc<str>`)              |
 //! | `kind/`         | [`TaskWorkload`]                                                  | Typed and extensible workload model         |
 //! | `label`         | [`Labels`]                                                        | Key-value metadata (`BTreeMap`)             |
@@ -40,7 +40,9 @@ pub use environment::TaskEnv;
 
 mod query;
 pub use query::{
-    DEFAULT_LIMIT, MAX_LIMIT, TaskContinuation, TaskFilter, TaskPage, TaskQuery, TaskWatchEvent,
+    DEFAULT_LIMIT, DEFAULT_TASK_RUN_LIMIT, MAX_LIMIT, MAX_TASK_PAGE_ITEM_BYTES, MAX_TASK_RUN_LIMIT,
+    MAX_TASK_RUN_PAGE_ITEM_BYTES, TaskContinuation, TaskFilter, TaskPage, TaskQuery,
+    TaskRunContinuation, TaskRunPage, TaskRunQuery, TaskWatchEvent,
 };
 
 mod label;

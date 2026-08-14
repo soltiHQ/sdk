@@ -1,7 +1,7 @@
 //! # Subprocess workload
 //!
 //! [`SubprocessMode`] selects a command or an interpreter-backed script.
-//! [`SubprocessSpec`] adds environment, working directory, and exit-code policy.
+//! [`SubprocessSpec`](super::SubprocessSpec) adds environment, working directory, and exit-code policy.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;

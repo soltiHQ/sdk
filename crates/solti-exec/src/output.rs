@@ -352,6 +352,7 @@ mod tests {
     use tracing::{
         Event, Metadata, Subscriber,
         field::{Field, Visit},
+        instrument::WithSubscriber as _,
         span::{Attributes, Id, Record},
     };
 
@@ -388,6 +389,24 @@ mod tests {
         fn enter(&self, _span: &Id) {}
 
         fn exit(&self, _span: &Id) {}
+    }
+
+    async fn prepare_workload_callsite(capture: &TraceCapture, dispatch: &tracing::Dispatch) {
+        let config = LogConfig {
+            emit_output_to_tracing: true,
+            ..LogConfig::default()
+        };
+        log_stream(
+            "warmup\n".as_bytes(),
+            "run-warmup",
+            StreamKind::Stdout,
+            &config,
+            None,
+        )
+        .with_subscriber(dispatch.clone())
+        .await;
+        tracing::dispatcher::with_default(dispatch, tracing::callsite::rebuild_interest_cache);
+        capture.events.lock().unwrap().clear();
     }
 
     struct CaptureVisitor<'a>(&'a mut Vec<String>);
@@ -696,7 +715,6 @@ mod tests {
     async fn workload_output_tracing_is_disabled_by_default() {
         let capture = Arc::new(TraceCapture::default());
         let dispatch = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
-        let _guard = tracing::dispatcher::set_default(&dispatch);
 
         log_stream(
             "not-a-diagnostic\n".as_bytes(),
@@ -705,6 +723,7 @@ mod tests {
             &LogConfig::default(),
             None,
         )
+        .with_subscriber(dispatch)
         .await;
 
         assert!(
@@ -721,7 +740,7 @@ mod tests {
     async fn workload_output_tracing_uses_dedicated_target_when_enabled() {
         let capture = Arc::new(TraceCapture::default());
         let dispatch = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
-        let _guard = tracing::dispatcher::set_default(&dispatch);
+        prepare_workload_callsite(&capture, &dispatch).await;
         let config = LogConfig {
             emit_output_to_tracing: true,
             ..LogConfig::default()
@@ -734,6 +753,7 @@ mod tests {
             &config,
             None,
         )
+        .with_subscriber(dispatch)
         .await;
 
         let events = capture.events.lock().unwrap();
@@ -750,7 +770,7 @@ mod tests {
     async fn workload_output_tracing_escapes_unicode_spoofing_controls() {
         let capture = Arc::new(TraceCapture::default());
         let dispatch = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
-        let _guard = tracing::dispatcher::set_default(&dispatch);
+        prepare_workload_callsite(&capture, &dispatch).await;
         let config = LogConfig {
             emit_output_to_tracing: true,
             ..LogConfig::default()
@@ -766,6 +786,7 @@ mod tests {
             &config,
             Some(&sink),
         )
+        .with_subscriber(dispatch)
         .await;
 
         let OutputEvent::Chunk(chunk) = rx.recv().await.unwrap() else {

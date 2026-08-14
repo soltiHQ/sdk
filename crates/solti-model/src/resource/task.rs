@@ -780,6 +780,8 @@ impl Task {
     /// A stale generation or older attempt returns `false`.
     /// Terminal phases are sticky.
     /// `Failed` may be refined to `Exhausted` or `Timeout`.
+    /// Diagnostics longer than [`MAX_TASK_DIAGNOSTIC_BYTES`](crate::MAX_TASK_DIAGNOSTIC_BYTES)
+    /// are truncated to a UTF-8-safe prefix.
     ///
     /// # Errors
     ///
@@ -832,6 +834,8 @@ impl Task {
     ///
     /// Unlike [`Self::transition_finished`], this may replace a conflicting terminal attempt phase.
     /// A stale generation or identical outcome returns `false`.
+    /// Diagnostics longer than [`MAX_TASK_DIAGNOSTIC_BYTES`](crate::MAX_TASK_DIAGNOSTIC_BYTES)
+    /// are truncated to a UTF-8-safe prefix before change detection.
     ///
     /// # Errors
     ///
@@ -852,6 +856,7 @@ impl Task {
                 format!("reconcile_finished requires a terminal phase, got {phase}").into(),
             ));
         }
+        let error = error.map(super::status::truncate_task_diagnostic);
         let changed = self.status.observed_generation != generation
             || self.status.reconciled_required().status() != ConditionStatus::True
             || self.status.reconciled_required().observed_generation() != generation
@@ -875,7 +880,7 @@ impl Task {
     ) {
         self.status.mark_reconciled(generation);
         self.status.phase = phase;
-        self.status.error = error;
+        self.status.error = error.map(super::status::truncate_task_diagnostic);
         self.status.exit_code = exit_code;
     }
 }
@@ -1387,5 +1392,46 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(*task.phase(), TaskPhase::Exhausted);
+    }
+
+    #[test]
+    fn terminal_transitions_store_bounded_utf8_diagnostics() {
+        let exact = "a".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES);
+        let ascii_over = "b".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES + 1);
+        let multibyte_over = format!("{}é", "c".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES - 1));
+        let cases = [
+            (exact.clone(), exact),
+            (
+                ascii_over.clone(),
+                ascii_over[..crate::MAX_TASK_DIAGNOSTIC_BYTES].to_owned(),
+            ),
+            (
+                multibyte_over,
+                "c".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES - 1),
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let mut task = task();
+            assert!(
+                task.transition_finished(1, 1, TaskPhase::Failed, Some(input.clone()), None, "2",)
+                    .unwrap()
+            );
+            assert_eq!(task.status().error(), Some(expected.as_str()));
+            assert!(
+                task.status()
+                    .error()
+                    .unwrap()
+                    .is_char_boundary(expected.len())
+            );
+
+            assert!(
+                !task
+                    .reconcile_finished(1, TaskPhase::Failed, Some(input), None, "3")
+                    .unwrap(),
+                "change detection must compare the stored normalized diagnostic"
+            );
+            assert_eq!(task.metadata().resource_version(), "2");
+        }
     }
 }

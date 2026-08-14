@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use solti_core::{SupervisorApi, TaskWatchSubscription};
 use solti_model::{
-    ConditionStatus, EmbeddedSpec, Task, TaskFilter, TaskManifest, TaskPhase, TaskSpec,
-    TaskWorkload,
+    ConditionStatus, EmbeddedSpec, Task, TaskFilter, TaskManifest, TaskPhase, TaskRunQuery,
+    TaskSpec, TaskWorkload,
 };
 use solti_runner::RunnerRouter;
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
@@ -222,7 +222,10 @@ async fn main() -> ExampleResult {
     );
 
     println!("[history] Retained attempts, ordered by generation and attempt:");
-    for run in api.list_task_runs(&name) {
+    let runs = api
+        .query_task_runs(&name, &TaskRunQuery::new())?
+        .ok_or_else(|| io::Error::other("task disappeared before run history was read"))?;
+    for run in runs.items {
         println!(
             "      generation={} attempt={} phase={}",
             run.generation(),

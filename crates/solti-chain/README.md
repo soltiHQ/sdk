@@ -69,7 +69,7 @@ Runners registered later are not available to chain steps.
 
 The runner build inputs are the outer `Task`, allocated `RunId`, explicit
 `BuildContext`, read-only `BuildCancellation` signal, and inherited
-`BuildScope`. Chain uses scoped catalog builds, so core admission counts every
+`BuildScope`. Chain uses scoped catalog builds. Core admission counts every
 leaf runner without reacquiring the outer global slot.
 
 ## Workload contract

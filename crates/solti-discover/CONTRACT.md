@@ -215,7 +215,11 @@ Other non-success statuses are permanent.
 Connection, timeout, body, and response decoding failures are retryable.
 
 An optional bearer token uses the `Authorization` header.
-Using it over plaintext emits a warning.
+The token requires `https` by default.
+Plaintext HTTP with a token is rejected during adapter construction.
+`allow_insecure_token_transport()` permits it only as an explicit development
+or loopback opt-in and emits a warning.
+Plaintext HTTP without a token remains valid.
 
 HTTP `https` uses platform roots by default.
 Custom roots and client identity require the `tls` feature.
@@ -239,7 +243,11 @@ Later attempts reuse its channel.
 A failed connection is not cached.
 
 An optional bearer token uses `authorization` metadata.
-Using it over plaintext emits a warning.
+The token requires `https` by default.
+Plaintext gRPC with a token is rejected during adapter construction.
+`allow_insecure_token_transport()` permits it only as an explicit development
+or loopback opt-in and emits a warning.
+Plaintext gRPC without a token remains valid.
 
 gRPC `https` requires the `tls` feature.
 It uses platform roots when custom TLS is absent.

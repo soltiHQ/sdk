@@ -117,6 +117,8 @@ async fn main() -> ExampleResult {
             info.name(),
             info.version(),
         );
+        engine.shutdown().await?;
+        println!("[shutdown] Cleanup admission closed and the cleanup worker stopped.");
         println!("\nResult: configuration and the live containerd endpoint passed startup checks.");
     } else {
         println!(

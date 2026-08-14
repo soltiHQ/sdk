@@ -370,11 +370,20 @@ impl Reconciler {
         cancel_handle: &BuildCancellationHandle,
         cancellation: &BuildCancellation,
     ) -> BuildOutcome {
+        let deadline = tokio::time::sleep(self.build_timeout);
+        tokio::pin!(deadline);
         let admitted = tokio::select! {
             biased;
             _ = self.preflight_stop.cancelled() => {
                 cancel_handle.cancel();
                 return BuildOutcome::Cancelled;
+            }
+            _ = cancellation.cancelled() => {
+                return BuildOutcome::Cancelled;
+            }
+            _ = &mut deadline => {
+                cancel_handle.cancel();
+                return BuildOutcome::TimedOut;
             }
             admitted = self.router.admit(
                 desired,
@@ -391,8 +400,6 @@ impl Reconciler {
             return BuildOutcome::Cancelled;
         }
 
-        let deadline = tokio::time::sleep(self.build_timeout);
-        tokio::pin!(deadline);
         let mut build = AbortOnDropHandle::new(
             self.runtime
                 .spawn(async move { admitted.build().await.map_err(CoreError::from) }),
@@ -426,6 +433,21 @@ impl Reconciler {
             Err(error) if error.is_panic() => BuildOutcome::Panicked,
             Err(error) => BuildOutcome::Unavailable(error.to_string()),
         }
+    }
+
+    /// Acquires one root build admission for a deterministic test.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouterError`] when runner selection or admission fails.
+    #[cfg(test)]
+    pub(crate) async fn admit_for_test(
+        &self,
+        desired: &Task,
+    ) -> Result<solti_runner::AdmittedBuild, RouterError> {
+        self.router
+            .admit(desired, &self.build_admission, BuildCancellation::new())
+            .await
     }
 
     #[cfg(test)]

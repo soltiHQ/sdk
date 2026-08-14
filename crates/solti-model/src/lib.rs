@@ -105,6 +105,8 @@
 //! [`TaskSpec`] is desired state.
 //! [`TaskStatus`] is observed state.
 //! [`ObjectMeta`] carries identity, versions, labels, annotations, and timestamps.
+//! Task and TaskRun execution diagnostics are UTF-8-safe prefixes bounded by
+//! [`MAX_TASK_DIAGNOSTIC_BYTES`].
 //!
 //! ## Lifecycle
 //!
@@ -174,7 +176,7 @@
 //! | Policies     | [`RestartPolicy`], [`BackoffPolicy`], [`JitterPolicy`], [`AdmissionPolicy`], [`Timeout`]       |
 //! | Selection    | [`Labels`], [`LabelSelector`], [`SelectorRequirement`], [`SelectorOperator`]                   |
 //! | Capabilities | [`AgentCapabilities`], [`RunnerCapability`], [`WorkloadTypeMeta`]                              |
-//! | Query        | [`TaskContinuation`], [`TaskFilter`], [`TaskQuery`], [`TaskPage`], [`TaskWatchEvent`]          |
+//! | Query        | [`TaskQuery`], [`TaskRunQuery`], continuations, pages, [`TaskWatchEvent`]                      |
 //! | Output       | [`OutputEvent`], [`OutputChunk`], [`StreamKind`]                                               |
 //! | Auth         | [`Token`]                                                                                      |
 //! | Errors       | [`ModelError`], [`ModelResult`]                                                                |
@@ -196,20 +198,22 @@ struct ReadmeDoctests;
 mod domain;
 pub use domain::{
     AGENT_ID_MAX_LEN, AdmissionPolicy, AgentCapabilities, AgentId, BackoffPolicy, ContainerSpec,
-    DEFAULT_LIMIT, EmbeddedSpec, ExtensionWorkload, Flag, JitterPolicy, KeyValue, LabelSelector,
-    Labels, LabelsIter, MAX_LIMIT, MAX_SCRIPT_BODY_BYTES, OutputChunk, OutputEvent, RestartPolicy,
-    RunnerCapability, SLOT_MAX_LEN, SelectorOperator, SelectorRequirement, Slot, StreamKind,
-    SubprocessMode, SubprocessSpec, TASK_ID_MAX_LEN, TaskContinuation, TaskEnv, TaskFilter, TaskId,
-    TaskPage, TaskPhase, TaskQuery, TaskWatchEvent, TaskWorkload, Timeout, WORKLOAD_API_VERSION,
-    WasmSpec, WorkloadTypeMeta,
+    DEFAULT_LIMIT, DEFAULT_TASK_RUN_LIMIT, EmbeddedSpec, ExtensionWorkload, Flag, JitterPolicy,
+    KeyValue, LabelSelector, Labels, LabelsIter, MAX_LIMIT, MAX_SCRIPT_BODY_BYTES,
+    MAX_TASK_PAGE_ITEM_BYTES, MAX_TASK_RUN_LIMIT, MAX_TASK_RUN_PAGE_ITEM_BYTES, OutputChunk,
+    OutputEvent, RestartPolicy, RunnerCapability, SLOT_MAX_LEN, SelectorOperator,
+    SelectorRequirement, Slot, StreamKind, SubprocessMode, SubprocessSpec, TASK_ID_MAX_LEN,
+    TaskContinuation, TaskEnv, TaskFilter, TaskId, TaskPage, TaskPhase, TaskQuery,
+    TaskRunContinuation, TaskRunPage, TaskRunQuery, TaskWatchEvent, TaskWorkload, Timeout,
+    WORKLOAD_API_VERSION, WasmSpec, WorkloadTypeMeta,
 };
 
 mod resource;
 pub use resource::{
-    Annotations, ConditionStatus, DesiredChange, MAX_TASK_MANIFEST_BYTES, ObjectMeta,
-    TASK_API_VERSION, TASK_API_VERSION_MAJOR, TASK_KIND, Task, TaskCondition, TaskConditionType,
-    TaskManifest, TaskManifestMeta, TaskRun, TaskSpec, TaskSpecBuilder, TaskStatus, TypeMeta, Uid,
-    WritePreconditions,
+    Annotations, ConditionStatus, DesiredChange, MAX_TASK_DIAGNOSTIC_BYTES,
+    MAX_TASK_MANIFEST_BYTES, ObjectMeta, TASK_API_VERSION, TASK_API_VERSION_MAJOR, TASK_KIND, Task,
+    TaskCondition, TaskConditionType, TaskManifest, TaskManifestMeta, TaskRun, TaskSpec,
+    TaskSpecBuilder, TaskStatus, TypeMeta, Uid, WritePreconditions,
 };
 
 mod error;

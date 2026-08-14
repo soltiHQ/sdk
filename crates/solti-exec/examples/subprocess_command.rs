@@ -14,7 +14,10 @@
 //!
 //! Run with `cargo run -p solti-exec --example subprocess_command --features subprocess`.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use solti_exec::subprocess::{
     CwdPolicy, EnvPolicy, SubprocessBackendConfig, register_subprocess_runner_with_backend,
@@ -95,7 +98,7 @@ async fn main() -> ExampleResult {
     let backend = SubprocessBackendConfig::new()
         .with_env_policy(EnvPolicy::Clear)
         .with_cwd_policy(CwdPolicy::Roots(vec![canonical_workdir.clone()]));
-    register_subprocess_runner_with_backend(&mut router, "local", backend)?;
+    let runner = register_subprocess_runner_with_backend(&mut router, "local", backend)?;
     println!("[setup/runner] Registered runner local with a cleared child environment.");
 
     let mut task_env = TaskEnv::new();
@@ -126,23 +129,26 @@ printf 'diagnostic=example\n' >&2"#;
     task_ref.spawn(TaskContext::detached()).await?;
     println!("[attempt] The child exited successfully and was reaped.");
 
-    let events = output
-        .events
-        .lock()
-        .expect("output recorder lock must not be poisoned");
-    let mut lines = Vec::new();
-    println!("[output] Published workload lines:");
-    for event in &*events {
-        let OutputEvent::Chunk(chunk) = event else {
-            continue;
-        };
-        let line = String::from_utf8_lossy(&chunk.line).into_owned();
-        println!(
-            "      attempt={} stream={:?} seq={} line={line:?}",
-            chunk.attempt, chunk.stream, chunk.seq,
-        );
-        lines.push(line);
-    }
+    let lines = {
+        let events = output
+            .events
+            .lock()
+            .expect("output recorder lock must not be poisoned");
+        let mut lines = Vec::new();
+        println!("[output] Published workload lines:");
+        for event in &*events {
+            let OutputEvent::Chunk(chunk) = event else {
+                continue;
+            };
+            let line = String::from_utf8_lossy(&chunk.line).into_owned();
+            println!(
+                "      attempt={} stream={:?} seq={} line={line:?}",
+                chunk.attempt, chunk.stream, chunk.seq,
+            );
+            lines.push(line);
+        }
+        lines
+    };
     assert!(lines.iter().any(|line| line == "task=from-task"));
     assert!(lines.iter().any(|line| line == "shared=from-runner"));
     assert!(
@@ -151,6 +157,10 @@ printf 'diagnostic=example\n' >&2"#;
             .any(|line| line == &format!("cwd={}", canonical_workdir.display()))
     );
     assert!(lines.iter().any(|line| line == "diagnostic=example"));
+    drop(task_ref);
+    drop(router);
+    runner.shutdown(Duration::from_secs(5)).await?;
+    println!("[shutdown] Closed admission and drained accepted process ownership.");
 
     println!(
         "\nResult: the runner applied its environment and cwd policy, executed one child, published both streams, and completed cleanup."

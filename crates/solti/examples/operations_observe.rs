@@ -77,7 +77,7 @@ solti: logging and supervised maintenance
     );
 
     let mut router = RunnerRouter::new();
-    register_subprocess_runner(&mut router, "default")?;
+    let subprocess_runner = register_subprocess_runner(&mut router, "default")?;
     let supervisor = SupervisorApi::builder(router).start().await?;
 
     let (timezone_manifest, timezone_task) = timezone_sync();
@@ -119,6 +119,7 @@ solti: logging and supervised maintenance
     );
 
     supervisor.shutdown().await?;
+    subprocess_runner.shutdown(Duration::from_secs(5)).await?;
     tracing::info!(
         target: "example::operations",
         event = "service.supervisor_stopped",

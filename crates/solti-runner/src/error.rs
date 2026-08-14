@@ -91,6 +91,13 @@ pub enum RouterError {
         runner: String,
     },
 
+    /// A nested admission wait would deadlock with other active root builds.
+    #[error("runner '{runner}' build admission would create a wait cycle")]
+    AdmissionCycle {
+        /// Selected runner name.
+        runner: String,
+    },
+
     /// The selected runner failed to build the task.
     #[error("runner '{runner}' failed to build task: {source}")]
     Build {

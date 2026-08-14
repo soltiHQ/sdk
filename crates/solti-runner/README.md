@@ -132,8 +132,8 @@ Workload GVKs inside each entry use canonical order.
 
 ## Runner composition
 
-`RunnerRouter::catalog()` captures the current registrations, including their labels and routing priority. 
-The catalog is immutable and cheap to clone. 
+`RunnerRouter::catalog()` captures the current registrations, including their labels and routing priority.
+The catalog is immutable and cheap to clone.
 Later registrations do not change it.
 
 Take the catalog before registering a composing runner such as `ChainRunner`:
@@ -151,7 +151,8 @@ Catalog builds use the same exact GVK and selector routing, registration order, 
 Direct `RunnerRouter::build` and `RunnerCatalog::build` calls are unmanaged: no
 core admission limits apply. A scoped catalog build returns
 `RouterError::RecursiveBuild` before admission when it selects a runner already
-present in the active build path.
+present in the active build path. It returns `RouterError::AdmissionCycle` when
+its nested admission wait would deadlock with other active root builds.
 
 ## Build contract
 

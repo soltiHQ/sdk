@@ -35,8 +35,8 @@ use serde_json::json;
 use solti::{
     core::{SupervisorApi, TaskWatchSubscription},
     model::{
-        ExtensionWorkload, RestartPolicy, Task, TaskId, TaskManifest, TaskSpec, TaskWorkload,
-        WorkloadTypeMeta,
+        ExtensionWorkload, RestartPolicy, Task, TaskId, TaskManifest, TaskRunQuery, TaskSpec,
+        TaskWorkload, WorkloadTypeMeta,
     },
     runner::{BuildContext, RunId, Runner, RunnerError, RunnerRouter},
     taskvisor::{TaskContext, TaskError, TaskFn, TaskRef},
@@ -192,13 +192,15 @@ solti: application-owned workload
     assert_eq!(&payload, b"PING");
 
     let terminal = wait_for_terminal(&mut watch, &task_name).await?;
-    let runs = supervisor.list_task_runs(&task_name);
+    let runs = supervisor
+        .query_task_runs(&task_name, &TaskRunQuery::new())?
+        .ok_or_else(|| io::Error::other("task disappeared before run history was read"))?;
     println!(
         "[result] phase={}, retainedRuns={}.",
         terminal.status().phase(),
-        runs.len(),
+        runs.items.len(),
     );
-    assert_eq!(runs.len(), 1);
+    assert_eq!(runs.items.len(), 1);
 
     supervisor.shutdown().await?;
     println!(

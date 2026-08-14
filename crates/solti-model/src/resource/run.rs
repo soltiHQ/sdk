@@ -69,6 +69,9 @@ impl TaskRun {
 
     /// Reconstructs a run from serialized fields.
     ///
+    /// Diagnostics longer than [`MAX_TASK_DIAGNOSTIC_BYTES`](crate::MAX_TASK_DIAGNOSTIC_BYTES)
+    /// are truncated to a UTF-8-safe prefix.
+    ///
     /// # Errors
     ///
     /// Returns [`ModelError::Invalid`] when identity fields, phase, timestamps, or terminal diagnostics are inconsistent.
@@ -90,7 +93,7 @@ impl TaskRun {
             phase,
             started_at,
             finished_at,
-            error,
+            error: error.map(super::status::truncate_task_diagnostic),
             exit_code,
         };
         run.validate()?;
@@ -98,6 +101,9 @@ impl TaskRun {
     }
 
     /// Finishes an active run.
+    ///
+    /// Diagnostics longer than [`MAX_TASK_DIAGNOSTIC_BYTES`](crate::MAX_TASK_DIAGNOSTIC_BYTES)
+    /// are truncated to a UTF-8-safe prefix.
     ///
     /// # Errors
     ///
@@ -118,7 +124,7 @@ impl TaskRun {
         }
         self.finished_at = Some(super::metadata::time_serde::now());
         self.phase = phase;
-        self.error = error;
+        self.error = error.map(super::status::truncate_task_diagnostic);
         self.exit_code = exit_code;
         Ok(())
     }
@@ -154,6 +160,9 @@ impl TaskRun {
     }
 
     /// Terminal diagnostic, when available.
+    ///
+    /// The value is at most [`MAX_TASK_DIAGNOSTIC_BYTES`](crate::MAX_TASK_DIAGNOSTIC_BYTES)
+    /// UTF-8 bytes.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -308,5 +317,40 @@ mod tests {
         let mut unfinished_terminal = serde_json::to_value(run).unwrap();
         unfinished_terminal["phase"] = serde_json::json!("succeeded");
         assert!(serde_json::from_value::<TaskRun>(unfinished_terminal).is_err());
+    }
+
+    #[test]
+    fn run_diagnostic_is_bounded_across_finish_construction_and_deserialization() {
+        let exact = "a".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES);
+        let mut run = TaskRun::starting(1, 1, workload()).unwrap();
+        run.finish(TaskPhase::Failed, Some(exact.clone()), None)
+            .unwrap();
+        assert_eq!(run.error(), Some(exact.as_str()));
+
+        let ascii_over = "b".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES + 1);
+        let reconstructed = TaskRun::from_parts(
+            workload(),
+            1,
+            1,
+            TaskPhase::Failed,
+            SystemTime::UNIX_EPOCH,
+            Some(SystemTime::UNIX_EPOCH),
+            Some(ascii_over.clone()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            reconstructed.error(),
+            Some(&ascii_over[..crate::MAX_TASK_DIAGNOSTIC_BYTES])
+        );
+
+        let multibyte_over = format!("{}é", "c".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES - 1));
+        let mut serialized = serde_json::to_value(run).unwrap();
+        serialized["error"] = serde_json::json!(multibyte_over);
+        let deserialized: TaskRun = serde_json::from_value(serialized).unwrap();
+        let error = deserialized.error().unwrap();
+        assert_eq!(error, "c".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES - 1));
+        assert!(error.is_char_boundary(error.len()));
+        assert!(error.len() <= crate::MAX_TASK_DIAGNOSTIC_BYTES);
     }
 }

@@ -23,8 +23,9 @@ use solti_chain::{ChainSpec, FailureMode};
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, EmbeddedSpec, Flag, JitterPolicy, Labels, OutputChunk,
     OutputEvent, RestartPolicy, StreamKind, SubprocessMode, SubprocessSpec, Task, TaskContinuation,
-    TaskEnv, TaskFilter, TaskId, TaskManifest, TaskPage, TaskPhase, TaskQuery, TaskRun, TaskSpec,
-    TaskWatchEvent, TaskWorkload, WorkloadTypeMeta, WritePreconditions,
+    TaskEnv, TaskFilter, TaskId, TaskManifest, TaskPage, TaskPhase, TaskQuery, TaskRun,
+    TaskRunContinuation, TaskRunPage, TaskRunQuery, TaskSpec, TaskWatchEvent, TaskWorkload, Uid,
+    WorkloadTypeMeta, WritePreconditions,
 };
 
 const CREATE_COMMAND_BODY: &str = r#"{
@@ -267,6 +268,10 @@ const CREATE_EMBEDDED_BODY: &str = r#"{
 }"#;
 
 fn fixture_task() -> Task {
+    fixture_task_named("task-wire-1")
+}
+
+fn fixture_task_named(name: &str) -> Task {
     let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
         SubprocessMode::Command {
             command: "echo".into(),
@@ -292,7 +297,7 @@ fn fixture_task() -> Task {
     labels
         .insert("environment", "production")
         .insert("tier", "backend");
-    let manifest = TaskManifest::new("task-wire-1", spec)
+    let manifest = TaskManifest::new(name, spec)
         .unwrap()
         .with_labels(labels)
         .unwrap();
@@ -345,6 +350,8 @@ fn fixture_runs() -> Vec<TaskRun> {
 struct WireMock {
     last_admission: Mutex<Option<AdmissionPolicy>>,
     last_query: Mutex<Option<TaskQuery>>,
+    last_run_query: Mutex<Option<TaskRunQuery>>,
+    run_query_tasks: Mutex<Vec<TaskId>>,
     last_watch_filter: Mutex<Option<TaskFilter>>,
     last_watch_resource_version: Mutex<Option<Option<String>>>,
     last_write_preconditions: Mutex<Option<WritePreconditions>>,
@@ -409,22 +416,59 @@ impl ApiHandler for WireMock {
     }
 
     async fn query_tasks(&self, query: TaskQuery) -> Result<TaskPage<Task>, ApiError> {
-        let item = if self.leak_embedded_task {
-            embedded_task()
+        let candidates = if self.leak_embedded_task {
+            vec![embedded_task()]
         } else {
-            fixture_task()
+            vec![
+                fixture_task(),
+                fixture_task_named("task-wire-2"),
+                fixture_task_named("task-wire-3"),
+            ]
         };
-        let matches = query.matches(&item);
-        let continuation = matches
-            .then(|| TaskContinuation::new("test:5", query.filter().clone(), item.name().clone()))
-            .transpose()
-            .map_err(|error| ApiError::Internal(error.to_string()))?;
+        let matching = candidates
+            .into_iter()
+            .filter(|item| query.matches(item))
+            .collect::<Vec<_>>();
+        let start = query.continuation().map_or(0, |continuation| {
+            matching
+                .iter()
+                .position(|item| item.name() == continuation.after())
+                .map_or(matching.len(), |index| index + 1)
+        });
+        let page_limit = if query.continuation().is_none() {
+            query.limit().min(1)
+        } else {
+            query.limit()
+        };
+        let total = matching.len();
+        let items = matching
+            .into_iter()
+            .skip(start)
+            .take(page_limit)
+            .collect::<Vec<_>>();
+        let remaining_item_count = total.saturating_sub(start + items.len());
+        let resource_version = query
+            .continuation()
+            .map(|continuation| continuation.resource_version().to_owned())
+            .unwrap_or_else(|| "test:5".into());
+        let continuation = if remaining_item_count > 0 {
+            Some(
+                TaskContinuation::new(
+                    resource_version.clone(),
+                    query.filter().clone(),
+                    items.last().unwrap().name().clone(),
+                )
+                .map_err(|error| ApiError::Internal(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         *self.last_query.lock().unwrap() = Some(query);
         Ok(TaskPage {
-            items: matches.then_some(item).into_iter().collect(),
-            resource_version: "test:5".into(),
+            items,
+            resource_version,
             continuation,
-            remaining_item_count: if matches { 2 } else { 0 },
+            remaining_item_count,
         })
     }
 
@@ -466,18 +510,67 @@ impl ApiHandler for WireMock {
         Ok(Box::pin(tokio_stream::iter(events)))
     }
 
-    async fn list_task_runs(&self, _id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
-        if self.leak_embedded_run {
-            return Ok(vec![
+    async fn query_task_runs(
+        &self,
+        id: &TaskId,
+        query: TaskRunQuery,
+    ) -> Result<TaskRunPage, ApiError> {
+        self.run_query_tasks.lock().unwrap().push(id.clone());
+        let runs = if self.leak_embedded_run {
+            vec![
                 TaskRun::starting(
                     1,
                     1,
                     WorkloadTypeMeta::new("solti.io/v1", "Embedded").unwrap(),
                 )
                 .unwrap(),
-            ]);
-        }
-        Ok(fixture_runs())
+            ]
+        } else {
+            fixture_runs()
+        };
+        let task_uid = Uid::new("wire-task-run-uid").unwrap();
+        let start = query.continuation().map_or(0, |continuation| {
+            runs.iter()
+                .position(|run| {
+                    (run.generation(), run.attempt())
+                        == (
+                            continuation.after_generation(),
+                            continuation.after_attempt(),
+                        )
+                })
+                .map_or(runs.len(), |index| index + 1)
+        });
+        let total = runs.len();
+        let items = runs
+            .into_iter()
+            .skip(start)
+            .take(query.limit())
+            .collect::<Vec<_>>();
+        let remaining_item_count = total.saturating_sub(start + items.len());
+        let continuation = if remaining_item_count > 0 {
+            let last = items.last().unwrap();
+            Some(
+                TaskRunContinuation::new(
+                    "runs-test:5",
+                    id.clone(),
+                    task_uid.clone(),
+                    last.generation(),
+                    last.attempt(),
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        *self.last_run_query.lock().unwrap() = Some(query);
+        Ok(TaskRunPage {
+            items,
+            task: id.clone(),
+            task_uid,
+            resource_version: "runs-test:5".into(),
+            continuation,
+            remaining_item_count,
+        })
     }
 
     async fn delete_task(
@@ -1379,6 +1472,9 @@ async fn list_task_runs_response_matches_documented_shape() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
+    assert_eq!(body["metadata"]["resourceVersion"], "runs-test:5");
+    assert!(body["metadata"].get("continue").is_none());
+    assert!(body["metadata"].get("remainingItemCount").is_none());
     let runs = body["runs"].as_array().expect("runs must be an array");
     assert_eq!(runs.len(), 2);
 
@@ -1400,6 +1496,86 @@ async fn list_task_runs_response_matches_documented_shape() {
     assert_eq!(runs[1]["startedAt"], "2024-04-10T12:00:05Z");
     assert_eq!(runs[1]["finishedAt"], "2024-04-10T12:00:06Z");
     assert_eq!(runs[1]["exitCode"], 0);
+}
+
+#[tokio::test]
+async fn list_task_runs_continues_the_same_snapshot() {
+    let handler = Arc::new(WireMock::default());
+    let app = router_with(Arc::clone(&handler));
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/apis/solti.io/v1/tasks/task-wire-1/runs?limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = body_json(first).await;
+    assert_eq!(first["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(first["metadata"]["remainingItemCount"], 1);
+    let token = first["metadata"]["continue"].as_str().unwrap();
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/apis/solti.io/v1/tasks/task-wire-1/runs?limit=1&continue={token}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = body_json(second).await;
+    assert_eq!(second["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(second["runs"][0]["attempt"], 2);
+    assert_eq!(second["metadata"]["resourceVersion"], "runs-test:5");
+    assert!(second["metadata"].get("continue").is_none());
+    assert!(second["metadata"].get("remainingItemCount").is_none());
+}
+
+#[tokio::test]
+async fn list_task_runs_rejects_a_cross_task_token_before_the_handler() {
+    let handler = Arc::new(WireMock::default());
+    let app = router_with(Arc::clone(&handler));
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/apis/solti.io/v1/tasks/task-wire-1/runs?limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let first = body_json(first).await;
+    let token = first["metadata"]["continue"].as_str().unwrap();
+    assert_eq!(handler.run_query_tasks.lock().unwrap().len(), 1);
+
+    let mismatched = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/apis/solti.io/v1/tasks/another-task/runs?limit=1&continue={token}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(mismatched.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(handler.run_query_tasks.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

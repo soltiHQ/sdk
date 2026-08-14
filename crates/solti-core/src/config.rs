@@ -1,6 +1,7 @@
 //! # Core configuration
 //!
-//! [`StateConfig`] controls in-memory task, run, and collection history.
+//! [`StateConfig`] controls Task admission and retained task, run, and
+//! collection history.
 //! [`ReconciliationConfig`] bounds runner construction.
 //!
 //! ```text
@@ -8,24 +9,37 @@
 //!       ▼
 //! TaskState
 //!       ├── TaskRun history ──► run TTL and per-task cap
+//!       ├── TaskRun changes ──► count and byte limits
 //!       ├── terminal Tasks ───► task TTL
-//!       └── Task changes ─────► count and byte limits
+//!       ├── Task resources ───► retained task cap
+//!       ├── Task manifests ───► aggregate byte budget
+//!       ├── Task changes ─────► count and byte limits
+//!       └── Task watches ─────► concurrent and buffered-byte limits
 //! ```
 //!
 //! The supervisor owns the retention worker.
 //! [`StateConfig::sweep_interval`] controls its cadence.
 
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
 
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
 const DEFAULT_MAX_RUNS_PER_TASK: usize = 256;
+const DEFAULT_MAX_RETAINED_TASK_MANIFEST_BYTES: NonZeroUsize =
+    NonZeroUsize::new(256 * 1024 * 1024).unwrap();
+const DEFAULT_MAX_RETAINED_TASKS: NonZeroUsize = NonZeroUsize::new(1_024).unwrap();
+const DEFAULT_MAX_CONCURRENT_TASK_WATCHES: NonZeroUsize = NonZeroUsize::new(256).unwrap();
+const DEFAULT_MAX_TASK_WATCH_INITIAL_REPLAY_BYTES: NonZeroUsize =
+    NonZeroUsize::new(64 * 1024 * 1024).unwrap();
+const DEFAULT_RUN_HISTORY_BYTE_BUDGET: usize = 64 * 1024 * 1024;
+const DEFAULT_RUN_HISTORY_CAPACITY: usize = 4_096;
 const DEFAULT_RUN_TTL: Duration = Duration::from_secs(3_600);
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 const DEFAULT_TASK_TTL: Duration = Duration::from_secs(3_600);
 const DEFAULT_WATCH_HISTORY_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 const DEFAULT_WATCH_HISTORY_CAPACITY: usize = 4_096;
+const MAX_WATCH_HISTORY_CAPACITY: usize = usize::MAX >> 1;
 const DEFAULT_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_CONCURRENT_BUILDS: usize = 32;
 const DEFAULT_MAX_CONCURRENT_BUILDS_PER_RUNNER: usize = 8;
@@ -61,7 +75,7 @@ pub enum ConfigError {
     },
 }
 
-/// In-memory retention settings.
+/// In-memory state admission and retention settings.
 ///
 /// | Value                                                                    | Default   |
 /// |--------------------------------------------------------------------------|-----------|
@@ -69,6 +83,12 @@ pub enum ConfigError {
 /// | [`task_ttl`](Self::task_ttl)                                             | 1 hour    |
 /// | [`sweep_interval`](Self::sweep_interval)                                 | 5 minutes |
 /// | [`max_runs_per_task`](Self::max_runs_per_task)                           | 256       |
+/// | [`max_retained_tasks`](Self::max_retained_tasks)                         | 1024      |
+/// | [`max_retained_task_manifest_bytes`](Self::max_retained_task_manifest_bytes) | 256 MiB   |
+/// | [`max_concurrent_task_watches`](Self::max_concurrent_task_watches)       | 256       |
+/// | [`max_task_watch_initial_replay_bytes`](Self::max_task_watch_initial_replay_bytes) | 64 MiB |
+/// | [`run_history_capacity`](Self::run_history_capacity)                     | 4096      |
+/// | [`run_history_byte_budget`](Self::run_history_byte_budget)               | 64 MiB    |
 /// | [`watch_history_capacity`](Self::watch_history_capacity)                 | 4096      |
 /// | [`watch_history_byte_budget`](Self::watch_history_byte_budget)           | 64 MiB    |
 ///
@@ -76,25 +96,63 @@ pub enum ConfigError {
 /// An unbound unfinished run can also expire after that age.
 /// A terminal task expires after its run history is empty and `task_ttl` has elapsed.
 /// A task with a runtime binding is not removed.
+/// `max_retained_tasks` counts every stored task.
+/// A full state rejects new names without eviction.
+/// That count limit does not block changes to existing tasks.
+/// `max_retained_task_manifest_bytes` counts canonical compact JSON bytes for
+/// caller-owned manifests of every stored task. It excludes Task status and
+/// TaskRun history. Positive manifest growth is rejected when it would exceed
+/// this byte budget.
+/// `max_concurrent_task_watches` counts admitted watch subscriptions.
+/// `max_task_watch_initial_replay_bytes` counts compact Task JSON retained by
+/// their initial and replay buffers. Live events already transferred to a
+/// caller are outside that byte budget.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use]
 pub struct StateConfig {
+    /// Maximum age of an eligible retained run.
     run_ttl: Duration,
+    /// Maximum age of an eligible terminal task.
     task_ttl: Duration,
+    /// Interval between retention passes.
     sweep_interval: Duration,
+    /// Maximum completed runs retained for one task.
     max_runs_per_task: usize,
+    /// Maximum tasks retained by this state.
+    max_retained_tasks: Option<NonZeroUsize>,
+    /// Maximum caller-owned TaskManifest bytes retained by this state.
+    max_retained_task_manifest_bytes: Option<NonZeroUsize>,
+    /// Maximum concurrent Task watch subscriptions.
+    max_concurrent_task_watches: Option<NonZeroUsize>,
+    /// Maximum aggregate serialized bytes retained by Task watch initial and replay buffers.
+    max_task_watch_initial_replay_bytes: Option<NonZeroUsize>,
+    /// Maximum serialized bytes retained by the TaskRun journal.
+    run_history_byte_budget: usize,
+    /// Maximum TaskRun mutation batches retained by the journal.
+    run_history_capacity: usize,
+    /// Maximum serialized bytes retained by the Task change journal.
     watch_history_byte_budget: usize,
+    /// Maximum Task changes retained by the journal.
+    ///
+    /// Core derives a smaller live ring when this value exceeds one, leaving
+    /// retained journal headroom for lag recovery.
     watch_history_capacity: usize,
 }
 
 impl StateConfig {
-    /// Creates the default retention settings.
+    /// Creates the default state settings.
     pub const fn new() -> Self {
         Self {
             run_ttl: DEFAULT_RUN_TTL,
             task_ttl: DEFAULT_TASK_TTL,
             sweep_interval: DEFAULT_SWEEP_INTERVAL,
             max_runs_per_task: DEFAULT_MAX_RUNS_PER_TASK,
+            max_retained_tasks: Some(DEFAULT_MAX_RETAINED_TASKS),
+            max_retained_task_manifest_bytes: Some(DEFAULT_MAX_RETAINED_TASK_MANIFEST_BYTES),
+            max_concurrent_task_watches: Some(DEFAULT_MAX_CONCURRENT_TASK_WATCHES),
+            max_task_watch_initial_replay_bytes: Some(DEFAULT_MAX_TASK_WATCH_INITIAL_REPLAY_BYTES),
+            run_history_byte_budget: DEFAULT_RUN_HISTORY_BYTE_BUDGET,
+            run_history_capacity: DEFAULT_RUN_HISTORY_CAPACITY,
             watch_history_byte_budget: DEFAULT_WATCH_HISTORY_BYTE_BUDGET,
             watch_history_capacity: DEFAULT_WATCH_HISTORY_CAPACITY,
         }
@@ -127,7 +185,49 @@ impl StateConfig {
         self.max_runs_per_task
     }
 
+    /// Returns the retained task limit.
+    ///
+    /// `None` disables this task-count limit.
+    pub const fn max_retained_tasks(&self) -> Option<NonZeroUsize> {
+        self.max_retained_tasks
+    }
+
+    /// Returns the aggregate retained TaskManifest byte budget.
+    ///
+    /// The budget counts canonical compact JSON bytes for caller-owned
+    /// manifests. `None` disables this byte budget.
+    pub const fn max_retained_task_manifest_bytes(&self) -> Option<NonZeroUsize> {
+        self.max_retained_task_manifest_bytes
+    }
+
+    /// Returns the concurrent Task watch limit.
+    ///
+    /// `None` disables this watch-count limit.
+    pub const fn max_concurrent_task_watches(&self) -> Option<NonZeroUsize> {
+        self.max_concurrent_task_watches
+    }
+
+    /// Returns the aggregate Task watch initial and replay byte budget.
+    ///
+    /// The budget counts compact JSON bytes for Task objects retained by
+    /// initial snapshots and replay buffers. `None` disables this byte budget.
+    pub const fn max_task_watch_initial_replay_bytes(&self) -> Option<NonZeroUsize> {
+        self.max_task_watch_initial_replay_bytes
+    }
+
+    /// Returns the retained TaskRun mutation-batch limit.
+    pub const fn run_history_capacity(&self) -> usize {
+        self.run_history_capacity
+    }
+
+    /// Returns the serialized TaskRun journal byte budget.
+    pub const fn run_history_byte_budget(&self) -> usize {
+        self.run_history_byte_budget
+    }
+
     /// Returns the retained Task change limit.
+    ///
+    /// A value of one leaves no journal headroom for lag recovery.
     pub const fn watch_history_capacity(&self) -> usize {
         self.watch_history_capacity
     }
@@ -180,13 +280,178 @@ impl StateConfig {
         self
     }
 
+    /// Sets the retained task limit.
+    ///
+    /// `None` disables this task-count limit.
+    /// The limit belongs to one state store.
+    pub const fn with_max_retained_tasks(
+        mut self,
+        max_retained_tasks: Option<NonZeroUsize>,
+    ) -> Self {
+        self.max_retained_tasks = max_retained_tasks;
+        self
+    }
+
+    /// Sets the retained task limit from a raw value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Zero`] when `max_retained_tasks` is zero.
+    pub const fn try_with_max_retained_tasks(
+        self,
+        max_retained_tasks: usize,
+    ) -> Result<Self, ConfigError> {
+        let Some(max_retained_tasks) = NonZeroUsize::new(max_retained_tasks) else {
+            return Err(ConfigError::Zero {
+                field: "max_retained_tasks",
+            });
+        };
+        Ok(self.with_max_retained_tasks(Some(max_retained_tasks)))
+    }
+
+    /// Sets the aggregate retained TaskManifest byte budget.
+    ///
+    /// The budget counts canonical compact JSON bytes for caller-owned
+    /// manifests. `None` disables this byte budget.
+    pub const fn with_max_retained_task_manifest_bytes(
+        mut self,
+        max_retained_task_manifest_bytes: Option<NonZeroUsize>,
+    ) -> Self {
+        self.max_retained_task_manifest_bytes = max_retained_task_manifest_bytes;
+        self
+    }
+
+    /// Sets the aggregate retained TaskManifest byte budget from a raw value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Zero`] when `max_retained_task_manifest_bytes` is zero.
+    pub const fn try_with_max_retained_task_manifest_bytes(
+        self,
+        max_retained_task_manifest_bytes: usize,
+    ) -> Result<Self, ConfigError> {
+        let Some(max_retained_task_manifest_bytes) =
+            NonZeroUsize::new(max_retained_task_manifest_bytes)
+        else {
+            return Err(ConfigError::Zero {
+                field: "max_retained_task_manifest_bytes",
+            });
+        };
+        Ok(self.with_max_retained_task_manifest_bytes(Some(max_retained_task_manifest_bytes)))
+    }
+
+    /// Sets the concurrent Task watch limit.
+    ///
+    /// `None` disables this watch-count limit.
+    pub const fn with_max_concurrent_task_watches(
+        mut self,
+        max_concurrent_task_watches: Option<NonZeroUsize>,
+    ) -> Self {
+        self.max_concurrent_task_watches = max_concurrent_task_watches;
+        self
+    }
+
+    /// Sets the concurrent Task watch limit from a raw value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Zero`] when `max_concurrent_task_watches` is zero.
+    pub const fn try_with_max_concurrent_task_watches(
+        self,
+        max_concurrent_task_watches: usize,
+    ) -> Result<Self, ConfigError> {
+        let Some(max_concurrent_task_watches) = NonZeroUsize::new(max_concurrent_task_watches)
+        else {
+            return Err(ConfigError::Zero {
+                field: "max_concurrent_task_watches",
+            });
+        };
+        Ok(self.with_max_concurrent_task_watches(Some(max_concurrent_task_watches)))
+    }
+
+    /// Sets the aggregate Task watch initial and replay byte budget.
+    ///
+    /// `None` disables this byte budget.
+    pub const fn with_max_task_watch_initial_replay_bytes(
+        mut self,
+        max_task_watch_initial_replay_bytes: Option<NonZeroUsize>,
+    ) -> Self {
+        self.max_task_watch_initial_replay_bytes = max_task_watch_initial_replay_bytes;
+        self
+    }
+
+    /// Sets the aggregate Task watch initial and replay budget from a raw value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Zero`] when `max_task_watch_initial_replay_bytes` is zero.
+    pub const fn try_with_max_task_watch_initial_replay_bytes(
+        self,
+        max_task_watch_initial_replay_bytes: usize,
+    ) -> Result<Self, ConfigError> {
+        let Some(max_task_watch_initial_replay_bytes) =
+            NonZeroUsize::new(max_task_watch_initial_replay_bytes)
+        else {
+            return Err(ConfigError::Zero {
+                field: "max_task_watch_initial_replay_bytes",
+            });
+        };
+        Ok(
+            self.with_max_task_watch_initial_replay_bytes(Some(
+                max_task_watch_initial_replay_bytes,
+            )),
+        )
+    }
+
+    /// Sets the retained TaskRun mutation-batch limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Zero`] when `run_history_capacity` is zero.
+    pub const fn try_with_run_history_capacity(
+        mut self,
+        run_history_capacity: usize,
+    ) -> Result<Self, ConfigError> {
+        if run_history_capacity == 0 {
+            return Err(ConfigError::Zero {
+                field: "run_history_capacity",
+            });
+        }
+        self.run_history_capacity = run_history_capacity;
+        Ok(self)
+    }
+
+    /// Sets the serialized TaskRun journal byte budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Zero`] when `run_history_byte_budget` is zero.
+    pub const fn try_with_run_history_byte_budget(
+        mut self,
+        run_history_byte_budget: usize,
+    ) -> Result<Self, ConfigError> {
+        if run_history_byte_budget == 0 {
+            return Err(ConfigError::Zero {
+                field: "run_history_byte_budget",
+            });
+        }
+        self.run_history_byte_budget = run_history_byte_budget;
+        Ok(self)
+    }
+
     /// Sets the retained Task change limit.
     ///
     /// Watches and list snapshots share this history.
+    /// The structural maximum is `usize::MAX / 2`.
+    /// State creation derives a power-of-two live broadcast ring below this
+    /// limit when the limit exceeds one. A value of one remains valid but
+    /// leaves no journal headroom for lag recovery.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError::Zero`] when `watch_history_capacity` is zero.
+    /// Returns [`ConfigError::Exceeds`] when the value exceeds the supported
+    /// structural limit.
     pub const fn try_with_watch_history_capacity(
         mut self,
         watch_history_capacity: usize,
@@ -194,6 +459,12 @@ impl StateConfig {
         if watch_history_capacity == 0 {
             return Err(ConfigError::Zero {
                 field: "watch_history_capacity",
+            });
+        }
+        if watch_history_capacity > MAX_WATCH_HISTORY_CAPACITY {
+            return Err(ConfigError::Exceeds {
+                field: "watch_history_capacity",
+                limit: "watch_history_capacity_max",
             });
         }
         self.watch_history_capacity = watch_history_capacity;
@@ -261,9 +532,10 @@ impl ReconciliationConfig {
         }
     }
 
-    /// Returns the deadline for one admitted runner build.
+    /// Returns the deadline for one routed runner build.
     ///
-    /// The deadline includes nested catalog construction and admission waits.
+    /// The deadline starts before root admission. It includes nested catalog
+    /// construction and admission waits.
     pub const fn build_timeout(&self) -> Duration {
         self.build_timeout
     }
@@ -280,8 +552,10 @@ impl ReconciliationConfig {
         self.max_concurrent_builds_per_runner
     }
 
-    /// Sets the deadline for one admitted runner build, including nested
-    /// catalog construction and admission waits.
+    /// Sets the deadline for one routed runner build.
+    ///
+    /// The deadline starts before root admission. It includes nested catalog
+    /// construction and admission waits.
     ///
     /// # Errors
     ///
@@ -373,6 +647,18 @@ mod tests {
         assert_eq!(config.task_ttl(), Duration::from_secs(3_600));
         assert_eq!(config.sweep_interval(), Duration::from_secs(300));
         assert_eq!(config.max_runs_per_task(), 256);
+        assert_eq!(config.max_retained_tasks(), NonZeroUsize::new(1_024));
+        assert_eq!(
+            config.max_retained_task_manifest_bytes(),
+            NonZeroUsize::new(256 * 1024 * 1024)
+        );
+        assert_eq!(config.max_concurrent_task_watches(), NonZeroUsize::new(256));
+        assert_eq!(
+            config.max_task_watch_initial_replay_bytes(),
+            NonZeroUsize::new(64 * 1024 * 1024)
+        );
+        assert_eq!(config.run_history_byte_budget(), 64 * 1024 * 1024);
+        assert_eq!(config.run_history_capacity(), 4_096);
         assert_eq!(config.watch_history_byte_budget(), 64 * 1024 * 1024);
         assert_eq!(config.watch_history_capacity(), 4_096);
     }
@@ -385,6 +671,42 @@ mod tests {
                     .try_with_sweep_interval(Duration::ZERO)
                     .unwrap_err(),
                 "sweep_interval",
+            ),
+            (
+                StateConfig::new()
+                    .try_with_max_retained_tasks(0)
+                    .unwrap_err(),
+                "max_retained_tasks",
+            ),
+            (
+                StateConfig::new()
+                    .try_with_max_retained_task_manifest_bytes(0)
+                    .unwrap_err(),
+                "max_retained_task_manifest_bytes",
+            ),
+            (
+                StateConfig::new()
+                    .try_with_max_concurrent_task_watches(0)
+                    .unwrap_err(),
+                "max_concurrent_task_watches",
+            ),
+            (
+                StateConfig::new()
+                    .try_with_max_task_watch_initial_replay_bytes(0)
+                    .unwrap_err(),
+                "max_task_watch_initial_replay_bytes",
+            ),
+            (
+                StateConfig::new()
+                    .try_with_run_history_capacity(0)
+                    .unwrap_err(),
+                "run_history_capacity",
+            ),
+            (
+                StateConfig::new()
+                    .try_with_run_history_byte_budget(0)
+                    .unwrap_err(),
+                "run_history_byte_budget",
             ),
             (
                 StateConfig::new()
@@ -404,9 +726,87 @@ mod tests {
     }
 
     #[test]
+    fn watch_history_capacity_enforces_the_structural_limit() {
+        let maximum = StateConfig::new()
+            .try_with_watch_history_capacity(MAX_WATCH_HISTORY_CAPACITY)
+            .unwrap();
+        assert_eq!(maximum.watch_history_capacity(), MAX_WATCH_HISTORY_CAPACITY);
+        assert_eq!(
+            StateConfig::new()
+                .try_with_watch_history_capacity(MAX_WATCH_HISTORY_CAPACITY + 1)
+                .unwrap_err(),
+            ConfigError::Exceeds {
+                field: "watch_history_capacity",
+                limit: "watch_history_capacity_max",
+            }
+        );
+    }
+
+    #[test]
     fn zero_run_cap_is_valid() {
         let config = StateConfig::new().with_max_runs_per_task(0);
         assert_eq!(config.max_runs_per_task(), 0);
+    }
+
+    #[test]
+    fn retained_task_limit_accepts_typed_raw_and_unbounded_values() {
+        let typed = StateConfig::new().with_max_retained_tasks(NonZeroUsize::new(17));
+        assert_eq!(typed.max_retained_tasks(), NonZeroUsize::new(17));
+
+        let raw = StateConfig::new().try_with_max_retained_tasks(23).unwrap();
+        assert_eq!(raw.max_retained_tasks(), NonZeroUsize::new(23));
+
+        let unbounded = StateConfig::new().with_max_retained_tasks(None);
+        assert_eq!(unbounded.max_retained_tasks(), None);
+    }
+
+    #[test]
+    fn retained_task_manifest_budget_accepts_typed_raw_and_unbounded_values() {
+        let typed = StateConfig::new().with_max_retained_task_manifest_bytes(NonZeroUsize::new(17));
+        assert_eq!(
+            typed.max_retained_task_manifest_bytes(),
+            NonZeroUsize::new(17)
+        );
+
+        let raw = StateConfig::new()
+            .try_with_max_retained_task_manifest_bytes(23)
+            .unwrap();
+        assert_eq!(
+            raw.max_retained_task_manifest_bytes(),
+            NonZeroUsize::new(23)
+        );
+
+        let unbounded = StateConfig::new().with_max_retained_task_manifest_bytes(None);
+        assert_eq!(unbounded.max_retained_task_manifest_bytes(), None);
+    }
+
+    #[test]
+    fn task_watch_limits_accept_typed_raw_and_unbounded_values() {
+        let typed = StateConfig::new()
+            .with_max_concurrent_task_watches(NonZeroUsize::new(17))
+            .with_max_task_watch_initial_replay_bytes(NonZeroUsize::new(19));
+        assert_eq!(typed.max_concurrent_task_watches(), NonZeroUsize::new(17));
+        assert_eq!(
+            typed.max_task_watch_initial_replay_bytes(),
+            NonZeroUsize::new(19)
+        );
+
+        let raw = StateConfig::new()
+            .try_with_max_concurrent_task_watches(23)
+            .unwrap()
+            .try_with_max_task_watch_initial_replay_bytes(29)
+            .unwrap();
+        assert_eq!(raw.max_concurrent_task_watches(), NonZeroUsize::new(23));
+        assert_eq!(
+            raw.max_task_watch_initial_replay_bytes(),
+            NonZeroUsize::new(29)
+        );
+
+        let unbounded = StateConfig::new()
+            .with_max_concurrent_task_watches(None)
+            .with_max_task_watch_initial_replay_bytes(None);
+        assert_eq!(unbounded.max_concurrent_task_watches(), None);
+        assert_eq!(unbounded.max_task_watch_initial_replay_bytes(), None);
     }
 
     #[test]

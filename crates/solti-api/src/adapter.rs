@@ -21,8 +21,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use solti_core::{CollectionError, CoreError, SupervisorApi, WritePreconditionViolation};
 use solti_model::{
-    OutputEvent, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun,
-    WritePreconditions,
+    OutputEvent, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRunPage,
+    TaskRunQuery, WritePreconditions,
 };
 use tokio_stream::StreamExt;
 
@@ -127,10 +127,15 @@ impl ApiHandler for SupervisorApiAdapter {
         ))
     }
 
-    async fn list_task_runs(&self, id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
+    async fn query_task_runs(
+        &self,
+        id: &TaskId,
+        query: TaskRunQuery,
+    ) -> Result<TaskRunPage, ApiError> {
         self.supervisor
-            .list_task_runs_where(id, workload_is_visible)
+            .query_task_runs_where(id, &query, workload_is_visible)
             .await
+            .map_err(map_collection_error)?
             .ok_or_else(|| ApiError::TaskNotFound(id.to_string()))
     }
 
@@ -162,6 +167,12 @@ fn map_core_error(error: CoreError) -> ApiError {
         CoreError::InvalidSpec(inner) => ApiError::InvalidRequest(inner.to_string()),
         CoreError::AlreadyExists(message) => ApiError::AlreadyExists(message),
         CoreError::NotFound(message) => ApiError::TaskNotFound(message),
+        error @ CoreError::RetainedTaskLimitReached { .. } => {
+            ApiError::ResourceExhausted(error.to_string())
+        }
+        error @ CoreError::RetainedTaskManifestByteLimitExceeded { .. } => {
+            ApiError::ResourceExhausted(error.to_string())
+        }
         CoreError::Conflict(conflict) => {
             let causes = conflict
                 .violations()
@@ -187,9 +198,15 @@ fn map_core_error(error: CoreError) -> ApiError {
 
 fn map_collection_error(error: CollectionError) -> ApiError {
     match &error {
+        CollectionError::ConcurrentTaskWatchLimitReached { .. }
+        | CollectionError::TaskWatchInitialReplayByteLimitExceeded { .. } => {
+            ApiError::ResourceExhausted(error.to_string())
+        }
         CollectionError::InvalidResourceVersion { .. }
         | CollectionError::ContinuationFilterMismatch
-        | CollectionError::ContinuationCursorNotFound { .. } => {
+        | CollectionError::ContinuationCursorNotFound { .. }
+        | CollectionError::TaskRunContinuationTaskMismatch { .. }
+        | CollectionError::TaskRunContinuationCursorNotFound { .. } => {
             ApiError::InvalidRequest(error.to_string())
         }
         CollectionError::ResourceVersionExpired { .. } => {
@@ -316,7 +333,7 @@ mod tests {
 
         let adapter = SupervisorApiAdapter::new(Arc::new(api));
 
-        let runs = adapter.list_task_runs(&name).await;
+        let runs = adapter.query_task_runs(&name, TaskRunQuery::new()).await;
         assert!(
             matches!(runs, Err(ApiError::TaskNotFound(_))),
             "embedded run history must look like an unknown id, got {runs:?}"
@@ -525,6 +542,24 @@ mod tests {
         let missing = map_core_error(CoreError::NotFound("missing".into()));
         assert!(matches!(missing, ApiError::TaskNotFound(message) if message == "missing"));
 
+        let exhausted = map_core_error(CoreError::RetainedTaskLimitReached { limit: 1_024 });
+        assert!(
+            matches!(exhausted, ApiError::ResourceExhausted(message) if message.contains("1024"))
+        );
+
+        let exhausted = map_core_error(CoreError::RetainedTaskManifestByteLimitExceeded {
+            current: 128,
+            requested: 64,
+            limit: 160,
+        });
+        assert!(matches!(
+            exhausted,
+            ApiError::ResourceExhausted(message)
+                if message.contains("128")
+                    && message.contains("64")
+                    && message.contains("160")
+        ));
+
         let shutting_down = map_core_error(CoreError::ShuttingDown);
         assert!(matches!(shutting_down, ApiError::Unavailable(_)));
 
@@ -547,10 +582,62 @@ mod tests {
         });
         assert!(matches!(missing_cursor, ApiError::InvalidRequest(_)));
 
+        let run_task_mismatch =
+            map_collection_error(CollectionError::TaskRunContinuationTaskMismatch {
+                task: TaskId::new("requested").unwrap(),
+                continuation_task: TaskId::new("other").unwrap(),
+            });
+        assert!(matches!(run_task_mismatch, ApiError::InvalidRequest(_)));
+
+        let missing_run_cursor =
+            map_collection_error(CollectionError::TaskRunContinuationCursorNotFound {
+                task: TaskId::new("requested").unwrap(),
+                generation: 2,
+                attempt: 1,
+            });
+        assert!(matches!(missing_run_cursor, ApiError::InvalidRequest(_)));
+
         let expired = map_collection_error(CollectionError::ResourceVersionExpired {
             resource_version: "old:1".into(),
         });
         assert!(matches!(expired, ApiError::ResourceVersionExpired(_)));
+
+        let count_limit =
+            map_collection_error(CollectionError::ConcurrentTaskWatchLimitReached { limit: 256 });
+        assert!(matches!(count_limit, ApiError::ResourceExhausted(_)));
+
+        let byte_limit =
+            map_collection_error(CollectionError::TaskWatchInitialReplayByteLimitExceeded {
+                current: 64,
+                requested: 32,
+                limit: 64,
+            });
+        assert!(matches!(byte_limit, ApiError::ResourceExhausted(_)));
+
+        #[cfg(feature = "http")]
+        {
+            let error = map_collection_error(CollectionError::ConcurrentTaskWatchLimitReached {
+                limit: 256,
+            });
+            assert_eq!(
+                error.into_http_status().0,
+                axum::http::StatusCode::TOO_MANY_REQUESTS
+            );
+        }
+
+        #[cfg(feature = "grpc")]
+        {
+            let error =
+                map_collection_error(CollectionError::TaskWatchInitialReplayByteLimitExceeded {
+                    current: 64,
+                    requested: 32,
+                    limit: 64,
+                });
+            assert_eq!(
+                tonic::Status::from(error).code(),
+                tonic::Code::ResourceExhausted
+            );
+        }
     }
 
     #[test]

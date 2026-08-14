@@ -26,7 +26,7 @@ use serde_json::json;
 use solti_core::{SupervisorApi, TaskWatchSubscription};
 use solti_model::{
     ConditionStatus, ExtensionWorkload, LabelSelector, Labels, OutputEvent, Task, TaskFilter,
-    TaskManifest, TaskPhase, TaskSpec, TaskWorkload, WorkloadTypeMeta,
+    TaskManifest, TaskPhase, TaskRunQuery, TaskSpec, TaskWorkload, WorkloadTypeMeta,
 };
 use solti_runner::{BuildContext, RunId, Runner, RunnerError, RunnerRouter};
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
@@ -282,10 +282,15 @@ async fn main() -> ExampleResult {
         task.name() == &name && task.phase() == &TaskPhase::Succeeded
     })
     .await?;
+    let retained_runs = api
+        .query_task_runs(&name, &TaskRunQuery::new())?
+        .ok_or_else(|| io::Error::other("task disappeared before run history was read"))?
+        .items
+        .len();
     println!(
         "[complete] Authoritative task phase is {}; retained runs={}.",
         finished.phase(),
-        api.list_task_runs(&name).len(),
+        retained_runs,
     );
 
     api.shutdown().await?;

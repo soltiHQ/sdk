@@ -19,6 +19,7 @@ include = [
     "proto/**/*.proto",
     "src/**/*.rs",
     "CONTRACT.md",
+    "LICENSE",
     "README.md",
 ]
 

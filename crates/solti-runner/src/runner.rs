@@ -89,8 +89,8 @@ use crate::id::RunId;
 /// ## See Also
 ///
 /// - [`RunnerRouter`](crate::RunnerRouter)
-/// - [`BuildContext`](crate::BuildContext)
-/// - [`RunId`](crate::RunId)
+/// - [`BuildContext`]
+/// - [`RunId`]
 #[async_trait]
 pub trait Runner: Send + Sync {
     /// Returns the runner name.

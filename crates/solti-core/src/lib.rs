@@ -67,12 +67,30 @@
 //! ## Collections and Output
 //!
 //! [`TaskState`] stores current tasks and retained [`solti_model::TaskRun`] values.
-//! Queries use snapshot-consistent pagination.
+//! By default, it admits at most 1024 current tasks.
+//! It also retains at most 256 MiB of aggregate TaskManifest bytes by default.
+//! Every current task counts, including embedded, pending, running, and terminal
+//! tasks.
+//! The byte budget measures only compact canonical TaskManifest JSON.
+//! The count and TaskManifest byte budgets are independent.
+//! A full state rejects writes atomically without eviction or waiting for capacity.
+//! Existing applies remain allowed by the count limit. The byte budget allows
+//! shrinking and no-op applies, but it rejects growth past the configured limit.
+//! [`StateConfig`] can disable either limit.
+//! The TaskManifest byte budget does not bound total process memory.
+//! Task and TaskRun queries use independent snapshot revisions and journals.
+//! Both use count limits and a 4 MiB item budget.
+//! An oversized first item is returned alone for native transport measurement.
 //! Watches replay retained changes before switching to live updates.
+//! By default, one state admits 256 concurrent Task watches and retains at most
+//! 64 MiB of aggregate compact Task JSON in their initial and replay buffers.
 //!
 //! Output is live-only and lossy.
 //! A slow consumer receives [`solti_model::OutputEvent::Lagged`].
 //! Output history is not persisted.
+//! [`OutputConfig`] reserves each task ring from a 256 MiB aggregate retained
+//! payload budget by default. A task continues without live output when that
+//! budget cannot admit a new ring.
 //!
 //! ## Main Types
 //!
@@ -81,7 +99,7 @@
 //! | Runtime API    | [`SupervisorApi`], [`SupervisorApiBuilder`]            |
 //! | State          | [`TaskState`], [`TaskWatchSubscription`]               |
 //! | Output         | [`OutputConfig`], [`OutputSubscription`]               |
-//! | Persistence    | [`TaskStateSink`], [`TaskOutputSink`]                  |
+//! | Persistence    | [`TaskStateSink`], [`TaskOutputSink`], [`TaskStateSinkStatus`], [`TaskOutputSinkStatus`] |
 //! | Configuration  | [`StateConfig`], [`ReconciliationConfig`], [`ConfigError`] |
 //! | Writes         | [`WriteConflict`], [`WritePreconditionViolation`]      |
 //! | Errors         | [`CoreError`], [`CollectionError`]                     |
@@ -133,8 +151,8 @@ pub use output::{OutputConfig, OutputSubscription};
 
 mod persistence;
 pub use persistence::{
-    PersistenceConfig, TaskOutputEvent, TaskOutputSink, TaskOutputSinkHandle, TaskStateEvent,
-    TaskStateSink, TaskStateSinkHandle,
+    PersistenceConfig, TaskOutputEvent, TaskOutputSink, TaskOutputSinkHandle, TaskOutputSinkStatus,
+    TaskStateEvent, TaskStateSink, TaskStateSinkHandle, TaskStateSinkStatus,
 };
 
 mod runtime;

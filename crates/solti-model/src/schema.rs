@@ -261,6 +261,7 @@ pub(crate) fn task_run(generator: &mut schemars::SchemaGenerator) -> Schema {
     let workload = generator.subschema_for::<crate::WorkloadTypeMeta>();
     let started_at = rfc3339_time(generator);
     let finished_at = optional_rfc3339_time(generator);
+    let diagnostic = task_diagnostic(generator);
     json_schema!({
         "type": "object",
         "additionalProperties": false,
@@ -290,7 +291,7 @@ pub(crate) fn task_run(generator: &mut schemars::SchemaGenerator) -> Schema {
             },
             "startedAt": started_at,
             "finishedAt": finished_at,
-            "error": { "type": ["string", "null"] },
+            "error": diagnostic,
             "exitCode": {
                 "type": ["integer", "null"],
                 "format": "int32"
@@ -329,6 +330,7 @@ pub(crate) fn task_run(generator: &mut schemars::SchemaGenerator) -> Schema {
 
 pub(crate) fn task_status(generator: &mut schemars::SchemaGenerator) -> Schema {
     let conditions = generator.subschema_for::<Vec<crate::TaskCondition>>();
+    let diagnostic = task_diagnostic(generator);
     json_schema!({
         "type": "object",
         "additionalProperties": false,
@@ -360,7 +362,7 @@ pub(crate) fn task_status(generator: &mut schemars::SchemaGenerator) -> Schema {
                 "type": ["integer", "null"],
                 "format": "int32"
             },
-            "error": { "type": ["string", "null"] },
+            "error": diagnostic,
             "conditions": {
                 "allOf": [
                     conditions,
@@ -399,6 +401,14 @@ pub(crate) fn task_status(generator: &mut schemars::SchemaGenerator) -> Schema {
                 }
             }
         ]
+    })
+}
+
+fn task_diagnostic(_generator: &mut schemars::SchemaGenerator) -> Schema {
+    json_schema!({
+        "type": ["string", "null"],
+        "maxLength": crate::MAX_TASK_DIAGNOSTIC_BYTES,
+        "description": "Runtime values are normalized to the longest UTF-8-safe prefix of at most 32768 bytes. JSON Schema maxLength is the corresponding Unicode code-point ceiling, not a byte measurement."
     })
 }
 
@@ -443,7 +453,7 @@ mod tests {
     use crate::{
         AgentCapabilities, Annotations, ContainerSpec, EmbeddedSpec, ExtensionWorkload, Flag,
         Labels, RunnerCapability, SelectorRequirement, SubprocessMode, SubprocessSpec,
-        TaskConditionType, TaskEnv, TaskManifest, TaskRun, TaskSpec, TaskWorkload,
+        TaskConditionType, TaskEnv, TaskManifest, TaskRun, TaskSpec, TaskStatus, TaskWorkload,
         WORKLOAD_API_VERSION, WasmSpec, WorkloadTypeMeta,
     };
 
@@ -553,6 +563,60 @@ mod tests {
         ] {
             assert!(!schema.is_valid(&invalid), "expected invalid: {invalid}");
         }
+    }
+
+    #[test]
+    fn task_diagnostic_schemas_expose_the_code_point_ceiling() {
+        let exact = "a".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES);
+        let oversized = "a".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES + 1);
+        let multibyte_over_byte_budget = "🙂".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES / 4 + 1);
+
+        let workload = WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").unwrap();
+        let mut run = TaskRun::starting(1, 1, workload).unwrap();
+        run.finish(crate::TaskPhase::Failed, Some("failure".into()), None)
+            .unwrap();
+        let run = serde_json::to_value(run).unwrap();
+        let run_schema = validator::<TaskRun>();
+        assert!(run_schema.is_valid(&with_fields(&run, &[("error", json!(exact))], &[],)));
+        assert!(!run_schema.is_valid(&with_fields(&run, &[("error", json!(oversized))], &[],)));
+        assert!(run_schema.is_valid(&with_fields(
+            &run,
+            &[("error", json!(multibyte_over_byte_budget.clone()))],
+            &[],
+        )));
+
+        let mut task = crate::Task::from_manifest(manifest(TaskWorkload::Embedded(
+            EmbeddedSpec::new("test-v1").unwrap(),
+        )))
+        .unwrap();
+        task.reconcile_finished(
+            1,
+            crate::TaskPhase::Failed,
+            Some("failure".into()),
+            None,
+            "1",
+        )
+        .unwrap();
+        let status = serde_json::to_value(task.status()).unwrap();
+        let status_schema = validator::<TaskStatus>();
+        assert!(status_schema.is_valid(&with_fields(
+            &status,
+            &[("error", json!("a".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES)),)],
+            &[],
+        )));
+        assert!(!status_schema.is_valid(&with_fields(
+            &status,
+            &[(
+                "error",
+                json!("a".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES + 1)),
+            )],
+            &[],
+        )));
+        assert!(status_schema.is_valid(&with_fields(
+            &status,
+            &[("error", json!(multibyte_over_byte_budget))],
+            &[],
+        )));
     }
 
     #[test]

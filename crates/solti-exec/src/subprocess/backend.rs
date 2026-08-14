@@ -35,13 +35,17 @@ use tokio::process::Command;
 
 use crate::ExecError::InvalidRunnerConfig;
 use crate::host::{
-    AttemptProcessDomain, HostProcessPolicy, PreparedHostProcessAttempt, PreparedHostProcessPolicy,
+    AttemptPrepareFailure, AttemptProcessDomain, HostProcessPolicy, PreparedHostProcessAttempt,
+    PreparedHostProcessPolicy,
 };
 use crate::output::LogConfig;
 use crate::subprocess::boundary::PinnedCwd;
 
 /// Minimal `PATH` used for a cleared environment.
 pub(crate) const SAFE_DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+/// Default active and deferred subprocess cleanup ownership per runner.
+pub const DEFAULT_SUBPROCESS_CLEANUP_CAPACITY: usize = 1024;
 
 pub(crate) fn validate_env_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
@@ -195,6 +199,7 @@ fn resolve_directory(path: &Path, field: &str) -> Result<PathBuf, String> {
 /// | Working directory        | [`CwdPolicy::Unrestricted`]      |
 /// | Output logging           | [`LogConfig::default`]           |
 /// | Decoded script body      | [`MAX_SCRIPT_BODY_BYTES`]        |
+/// | Cleanup ownership        | 1024 attempts                    |
 /// | Extra inherited FDs      | Empty                            |
 ///
 /// ## Example
@@ -229,6 +234,8 @@ pub struct SubprocessBackendConfig {
     logger: LogConfig,
     /// Maximum decoded script size.
     max_script_body_bytes: Option<usize>,
+    /// Maximum active and deferred cleanup ownership.
+    cleanup_capacity: Option<usize>,
     /// Owned descriptors explicitly inherited by every subprocess.
     #[cfg(unix)]
     passed_fds: Vec<Arc<OwnedFd>>,
@@ -279,6 +286,22 @@ impl SubprocessBackendConfig {
         self
     }
 
+    /// Sets the active and deferred subprocess cleanup ownership limit.
+    ///
+    /// Admission is reserved before script transport, cgroup, or process
+    /// resources are created. Runner construction rejects zero and values that
+    /// exceed the supported counter range.
+    pub fn with_cleanup_capacity(mut self, capacity: usize) -> Self {
+        self.cleanup_capacity = Some(capacity);
+        self
+    }
+
+    /// Returns the configured subprocess cleanup ownership limit.
+    pub fn cleanup_capacity(&self) -> usize {
+        self.cleanup_capacity
+            .unwrap_or(DEFAULT_SUBPROCESS_CLEANUP_CAPACITY)
+    }
+
     /// Adds one owned file descriptor to the child passlist.
     ///
     /// The runner keeps the descriptor open at the same number.
@@ -297,6 +320,7 @@ impl SubprocessBackendConfig {
 
     /// Validates and normalizes the complete configuration.
     pub(crate) fn prepare(self) -> Result<PreparedSubprocessBackendConfig, crate::ExecError> {
+        let cleanup_capacity = self.cleanup_capacity();
         let cwd_policy = self.cwd_policy.prepare()?;
 
         if let EnvPolicy::Allowlist(keys) = &self.env_policy {
@@ -322,6 +346,11 @@ impl SubprocessBackendConfig {
                 "max_script_body_bytes must be in 1..={MAX_SCRIPT_BODY_BYTES}, got {max}"
             )));
         }
+        if cleanup_capacity == 0 || u32::try_from(cleanup_capacity).is_err() {
+            return Err(InvalidRunnerConfig(
+                "subprocess cleanup capacity is outside the supported range".into(),
+            ));
+        }
         #[cfg(unix)]
         for fd in &self.passed_fds {
             if fd.as_raw_fd() < 3 {
@@ -339,6 +368,7 @@ impl SubprocessBackendConfig {
             cwd_policy,
             logger: self.logger,
             max_script_body_bytes: self.max_script_body_bytes,
+            cleanup_capacity,
             #[cfg(unix)]
             passed_fds: self.passed_fds,
         })
@@ -353,6 +383,7 @@ pub(crate) struct PreparedSubprocessBackendConfig {
     cwd_policy: PreparedCwdPolicy,
     logger: LogConfig,
     max_script_body_bytes: Option<usize>,
+    cleanup_capacity: usize,
     #[cfg(unix)]
     passed_fds: Vec<Arc<OwnedFd>>,
 }
@@ -372,6 +403,11 @@ impl PreparedSubprocessBackendConfig {
     /// Returns the effective decoded script limit.
     pub(crate) fn max_script_body_bytes(&self) -> usize {
         self.max_script_body_bytes.unwrap_or(MAX_SCRIPT_BODY_BYTES)
+    }
+
+    /// Returns the active and deferred cleanup ownership limit.
+    pub(crate) fn prepared_cleanup_capacity(&self) -> usize {
+        self.cleanup_capacity
     }
 
     /// Returns the child environment policy.
@@ -397,6 +433,7 @@ impl PreparedSubprocessBackendConfig {
     /// Prepares host process resources for one attempt.
     ///
     /// This must run before [`apply_to_command`](Self::apply_to_command).
+    #[cfg(test)]
     pub(crate) fn prepare_host_process_attempt(
         &self,
         cgroup_name: Option<&str>,
@@ -404,6 +441,14 @@ impl PreparedSubprocessBackendConfig {
         self.host_process_policy
             .prepare_attempt(cgroup_name)
             .map_err(Into::into)
+    }
+
+    /// Prepares host resources without erasing residual cleanup ownership.
+    pub(crate) fn prepare_host_process_attempt_owned(
+        &self,
+        cgroup_name: Option<&str>,
+    ) -> Result<PreparedHostProcessAttempt, AttemptPrepareFailure> {
+        self.host_process_policy.prepare_attempt_owned(cgroup_name)
     }
 
     /// Attaches configured controls to a command.
@@ -420,218 +465,4 @@ impl PreparedSubprocessBackendConfig {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn invalid_log_limits_are_rejected() {
-        let cases = [
-            (
-                LogConfig {
-                    max_line_length: 0,
-                    ..LogConfig::default()
-                },
-                "max_line_length",
-            ),
-            (
-                LogConfig {
-                    max_line_bytes: 0,
-                    ..LogConfig::default()
-                },
-                "max_line_bytes",
-            ),
-        ];
-
-        for (logger, expected) in cases {
-            let error = SubprocessBackendConfig::new()
-                .with_logger(logger)
-                .prepare()
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains(expected), "got {error:?}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn host_process_policy_is_applied_to_spawned_command() {
-        use crate::host::{HostProcessPolicy, RlimitConfig};
-
-        let requested = crate::host::reduced_nofile_limit_for_test();
-        let config = SubprocessBackendConfig::new()
-            .with_host_process_policy(HostProcessPolicy::new().with_rlimits(RlimitConfig {
-                max_open_files: Some(requested),
-                ..Default::default()
-            }))
-            .prepare()
-            .unwrap();
-        let attempt = config.prepare_host_process_attempt(None).unwrap();
-        let mut command = Command::new("sh");
-        command.arg("-c").arg("ulimit -n");
-        let _guard = config.apply_to_command(&mut command, attempt);
-        let output = command.output().await.unwrap();
-
-        assert!(output.status.success());
-        let actual = std::str::from_utf8(&output.stdout)
-            .unwrap()
-            .trim()
-            .parse::<u64>()
-            .unwrap();
-        assert_eq!(actual, requested);
-    }
-
-    #[test]
-    fn max_script_body_bytes_defaults_to_model_const_and_is_configurable() {
-        use solti_model::MAX_SCRIPT_BODY_BYTES;
-
-        let default_cfg = SubprocessBackendConfig::new().prepare().unwrap();
-        assert_eq!(default_cfg.max_script_body_bytes(), MAX_SCRIPT_BODY_BYTES);
-
-        let custom = SubprocessBackendConfig::new()
-            .with_max_script_body_bytes(4096)
-            .prepare()
-            .unwrap();
-        assert_eq!(custom.max_script_body_bytes(), 4096);
-    }
-
-    #[test]
-    fn invalid_script_body_limits_are_rejected() {
-        for max in [0, MAX_SCRIPT_BODY_BYTES + 1] {
-            let error = SubprocessBackendConfig::new()
-                .with_max_script_body_bytes(max)
-                .prepare()
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("1..="), "limit {max}: got {error:?}");
-        }
-    }
-
-    #[test]
-    fn env_policy_defaults_to_clear() {
-        let cfg = SubprocessBackendConfig::new().prepare().unwrap();
-        assert!(matches!(cfg.env_policy(), EnvPolicy::Clear));
-    }
-
-    #[test]
-    fn invalid_allowlist_key_is_rejected() {
-        let config = SubprocessBackendConfig::new()
-            .with_env_policy(EnvPolicy::Allowlist(vec!["BAD=KEY".into()]));
-        let error = config.prepare().unwrap_err().to_string();
-        assert!(error.contains("environment variable name"), "got: {error}");
-    }
-
-    #[test]
-    fn cwd_unrestricted_allows_inherited_or_existing_directory() {
-        let cfg = SubprocessBackendConfig::new().prepare().unwrap();
-        assert!(cfg.pin_cwd(None).unwrap().is_none());
-
-        let cwd = tempfile::TempDir::new().unwrap();
-        assert!(cfg.pin_cwd(Some(cwd.path())).unwrap().is_some());
-    }
-
-    #[test]
-    fn cwd_unrestricted_rejects_nonexistent_directory() {
-        let cfg = SubprocessBackendConfig::new().prepare().unwrap();
-        let error = cfg
-            .pin_cwd(Some(Path::new("/nonexistent/solti-cwd")))
-            .unwrap_err();
-        assert!(error.contains("cannot be resolved"), "got: {error}");
-    }
-
-    #[test]
-    fn cwd_roots_allows_paths_inside() {
-        let root = tempfile::TempDir::new().unwrap();
-        let sub = root.path().join("work");
-        std::fs::create_dir(&sub).unwrap();
-
-        let cfg = SubprocessBackendConfig::new()
-            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]))
-            .prepare()
-            .unwrap();
-
-        assert!(cfg.pin_cwd(Some(&sub)).unwrap().is_some());
-        assert!(cfg.pin_cwd(Some(root.path())).unwrap().is_some());
-    }
-
-    #[test]
-    fn cwd_roots_requires_explicit_cwd() {
-        let root = tempfile::TempDir::new().unwrap();
-        let cfg = SubprocessBackendConfig::new()
-            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]))
-            .prepare()
-            .unwrap();
-
-        let err = cfg.pin_cwd(None).unwrap_err().to_string();
-        assert!(err.contains("cwd is required"), "got: {err}");
-    }
-
-    #[test]
-    fn cwd_roots_rejects_paths_outside() {
-        let root = tempfile::TempDir::new().unwrap();
-        let other = tempfile::TempDir::new().unwrap();
-
-        let cfg = SubprocessBackendConfig::new()
-            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]))
-            .prepare()
-            .unwrap();
-
-        let err = cfg.pin_cwd(Some(other.path())).unwrap_err().to_string();
-        assert!(err.contains("outside the allowed roots"), "got: {err}");
-    }
-
-    #[test]
-    fn cwd_roots_rejects_nonexistent() {
-        let root = tempfile::TempDir::new().unwrap();
-        let cfg = SubprocessBackendConfig::new()
-            .with_cwd_policy(CwdPolicy::Roots(vec![root.path().to_path_buf()]))
-            .prepare()
-            .unwrap();
-
-        let missing = root.path().join("does-not-exist");
-        let err = cfg.pin_cwd(Some(&missing)).unwrap_err().to_string();
-        assert!(err.contains("cannot be resolved"), "got: {err}");
-    }
-
-    #[test]
-    fn cwd_roots_rejects_traversal_escape() {
-        // A cwd built to look like it is under the root but that resolves out of
-        // it via `..` must be rejected: canonicalize collapses the traversal.
-        let base = tempfile::TempDir::new().unwrap();
-        let root = base.path().join("root");
-        let outside = base.path().join("outside");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-
-        let cfg = SubprocessBackendConfig::new()
-            .with_cwd_policy(CwdPolicy::Roots(vec![root.clone()]))
-            .prepare()
-            .unwrap();
-
-        let escape = root.join("..").join("outside");
-        let err = cfg.pin_cwd(Some(&escape)).unwrap_err().to_string();
-        assert!(err.contains("outside the allowed roots"), "got: {err}");
-    }
-
-    #[test]
-    fn cwd_root_must_exist() {
-        let config = SubprocessBackendConfig::new()
-            .with_cwd_policy(CwdPolicy::Roots(vec![PathBuf::from("/missing/solti-root")]));
-        let error = config.prepare().unwrap_err().to_string();
-        assert!(error.contains("cannot be resolved"), "got: {error}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn passed_fd_is_owned_by_prepared_backend() {
-        use std::os::fd::AsRawFd as _;
-
-        let file = tempfile::tempfile().unwrap();
-        let expected = file.as_raw_fd();
-        let cfg = SubprocessBackendConfig::new()
-            .with_passed_fd(file.into())
-            .prepare()
-            .unwrap();
-
-        assert_eq!(cfg.passed_fds(), vec![expected]);
-    }
-}
+mod tests;

@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Most callers use `into_rustls_config()`. 
+Most callers use `into_rustls_config()`.
 Use `load()` instead when an adapter (`reqwest`, `tonic`) consumes raw PEM rather than `rustls` types.
 
 ## What it does
@@ -50,7 +50,7 @@ Constructors only store their inputs. Files are read by `load()` or `into_rustls
 
 ## Server
 
-A server always requires an identity. 
+A server always requires an identity.
 Client trust roots enable mandatory client authentication.
 
 ```rust,no_run
@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Client
 
-A client always requires roots for server verification. 
+A client always requires roots for server verification.
 A client identity enables mutual TLS.
 
 ```rust,no_run
@@ -108,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The client trusts only the configured roots. 
+The client trusts only the configured roots.
 Operating-system roots are not added automatically.
 
 ## PEM sources

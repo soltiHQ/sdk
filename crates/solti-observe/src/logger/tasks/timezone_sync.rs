@@ -1,6 +1,6 @@
 //! # Timezone refresh task
 //!
-//! [`timezone_sync`](crate::timezone_sync) builds a supervised offset refresh task.
+//! [`timezone_sync`] builds a supervised offset refresh task.
 //!
 //! ```text
 //! system local offset ──► refresh attempt  ──► local offset cache

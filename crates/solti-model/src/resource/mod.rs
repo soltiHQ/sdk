@@ -28,7 +28,7 @@ mod preconditions;
 pub use preconditions::WritePreconditions;
 
 mod status;
-pub use status::TaskStatus;
+pub use status::{MAX_TASK_DIAGNOSTIC_BYTES, TaskStatus};
 
 mod task;
 pub use task::{

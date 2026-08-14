@@ -5,14 +5,21 @@
 //!
 //! Building a task performs no engine I/O.
 //! Each execution attempt receives a unique identifier and owns its resources.
+//!
+//! Custom engines require an explicit [`ContainerEngineBinding`].
+//! The binding records either synchronous drop release or a pre-admitted bounded
+//! finalizer contract. It is a provider declaration, not runtime verification.
+//! The native `containerd::ContainerdEngine` conversion selects its verified
+//! pre-admitted finalizer contract automatically.
 
 mod config;
 pub use config::ContainerRunnerConfig;
 
 mod engine;
 pub use engine::{
-    ContainerAttempt, ContainerEngine, ContainerEngineError, ContainerEngineInfo,
-    ContainerErrorClass, ContainerExitStatus, ContainerOutput, ContainerRequest,
+    ContainerAttempt, ContainerEngine, ContainerEngineBinding, ContainerEngineError,
+    ContainerEngineInfo, ContainerErrorClass, ContainerExitStatus, ContainerOutput,
+    ContainerOwnershipContract, ContainerRequest,
 };
 
 #[cfg(feature = "containerd")]
@@ -39,6 +46,40 @@ pub use crate::registration::LABEL_RUNNER_NAME;
 /// Registers a container runner with default settings.
 ///
 /// The runner receives label `solti.io/runner-name=<name>`.
+/// Custom engines must pass an explicit [`ContainerEngineBinding`].
+/// A concrete native `containerd::ContainerdEngine` handle converts automatically
+/// when the `containerd` feature is enabled.
+///
+/// ```rust,no_run
+/// use std::sync::Arc;
+/// use solti_exec::container::{
+///     ContainerEngine, ContainerEngineBinding, register_container_runner,
+/// };
+/// use solti_runner::RunnerRouter;
+///
+/// fn register_custom(
+///     router: &mut RunnerRouter,
+///     engine: Arc<dyn ContainerEngine>,
+/// ) -> Result<(), solti_exec::ExecError> {
+///     let engine = ContainerEngineBinding::drop_releases(engine);
+///     register_container_runner(router, "custom", engine)
+/// }
+/// ```
+///
+/// A raw custom trait object does not satisfy the registration boundary:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use solti_exec::container::{ContainerEngine, register_container_runner};
+/// use solti_runner::RunnerRouter;
+///
+/// fn register_without_contract(
+///     router: &mut RunnerRouter,
+///     engine: Arc<dyn ContainerEngine>,
+/// ) {
+///     register_container_runner(router, "custom", engine).unwrap();
+/// }
+/// ```
 ///
 /// # Errors
 ///
@@ -46,14 +87,15 @@ pub use crate::registration::LABEL_RUNNER_NAME;
 pub fn register_container_runner(
     router: &mut RunnerRouter,
     name: impl Into<String>,
-    engine: Arc<dyn ContainerEngine>,
+    engine: impl Into<ContainerEngineBinding>,
 ) -> Result<(), crate::ExecError> {
-    register_runner(router, Arc::new(ContainerRunner::new(name, engine)?))
+    register_runner(router, Arc::new(ContainerRunner::new(name, engine.into())?))
 }
 
 /// Registers a container runner with explicit settings.
 ///
 /// The runner receives label `solti.io/runner-name=<name>`.
+/// Custom engines must pass an explicit [`ContainerEngineBinding`].
 ///
 /// # Errors
 ///
@@ -61,13 +103,22 @@ pub fn register_container_runner(
 pub fn register_container_runner_with_config(
     router: &mut RunnerRouter,
     name: impl Into<String>,
-    engine: Arc<dyn ContainerEngine>,
+    engine: impl Into<ContainerEngineBinding>,
     config: ContainerRunnerConfig,
 ) -> Result<(), crate::ExecError> {
     register_runner(
         router,
-        Arc::new(ContainerRunner::with_config(name, engine, config)?),
+        Arc::new(ContainerRunner::with_config(name, engine.into(), config)?),
     )
+}
+
+/// Binds the native engine to its source-verified bounded finalizer contract.
+#[cfg(feature = "containerd")]
+impl From<Arc<containerd::ContainerdEngine>> for ContainerEngineBinding {
+    fn from(engine: Arc<containerd::ContainerdEngine>) -> Self {
+        let engine: Arc<dyn ContainerEngine> = engine;
+        Self::pre_admitted_finalizer(engine)
+    }
 }
 
 fn register_runner(
