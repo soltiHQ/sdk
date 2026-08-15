@@ -56,7 +56,7 @@ impl Runner for LeafRunner {
     async fn build_task(
         &self,
         task: &Task,
-        run_id: &RunId,
+        _run_id: &RunId,
         ctx: &BuildContext,
         _cancellation: &solti_runner::BuildCancellation,
         _scope: &mut solti_runner::BuildScope,
@@ -74,41 +74,36 @@ impl Runner for LeafRunner {
         let runner_name = self.name.to_owned();
         let attempts = Arc::new(AtomicU32::new(0));
 
-        Ok(TaskFn::arc(
-            run_id.name().to_owned(),
-            move |_ctx: TaskContext| {
-                let executions = Arc::clone(&executions);
-                let output = Arc::clone(&output);
-                let resource_name = resource_name.clone();
-                let id = id.clone();
-                let behavior = behavior.clone();
-                let runner_name = runner_name.clone();
-                let attempt = attempts.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        Ok(TaskFn::arc(move |_ctx: TaskContext| {
+            let executions = Arc::clone(&executions);
+            let output = Arc::clone(&output);
+            let resource_name = resource_name.clone();
+            let id = id.clone();
+            let behavior = behavior.clone();
+            let runner_name = runner_name.clone();
+            let attempt = attempts.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
 
-                async move {
-                    executions
-                        .lock()
-                        .expect("execution log mutex must not be poisoned")
-                        .push(format!("{runner_name}:{id}"));
+            async move {
+                executions
+                    .lock()
+                    .expect("execution log mutex must not be poisoned")
+                    .push(format!("{runner_name}:{id}"));
 
-                    if let Some(sink) = output.sink_for(&resource_name, generation, attempt) {
-                        sink.stdout_line(Bytes::from(format!("leaf:{id}")));
-                    }
-
-                    match behavior.as_str() {
-                        "ok" => Ok(()),
-                        "fail" => Err(TaskError::fail(format!("{id} failed")).with_exit_code(17)),
-                        "fatal" => {
-                            Err(TaskError::fatal(format!("{id} is fatal")).with_exit_code(73))
-                        }
-                        "cancel" => Err(TaskError::Canceled),
-                        other => Err(TaskError::fatal(format!(
-                            "test leaf '{id}' has unknown behavior '{other}'"
-                        ))),
-                    }
+                if let Some(sink) = output.sink_for(&resource_name, generation, attempt) {
+                    sink.stdout_line(Bytes::from(format!("leaf:{id}")));
                 }
-            },
-        ))
+
+                match behavior.as_str() {
+                    "ok" => Ok(()),
+                    "fail" => Err(TaskError::fail(format!("{id} failed")).with_exit_code(17)),
+                    "fatal" => Err(TaskError::fatal(format!("{id} is fatal")).with_exit_code(73)),
+                    "cancel" => Err(TaskError::Canceled),
+                    other => Err(TaskError::fatal(format!(
+                        "test leaf '{id}' has unknown behavior '{other}'"
+                    ))),
+                }
+            }
+        }))
     }
 }
 
@@ -193,7 +188,11 @@ fn basic_router(
 }
 
 async fn build_task(router: &RunnerRouter, task: &Task) -> TaskRef {
-    router.build(task).await.expect("chain task must build")
+    router
+        .build(task)
+        .await
+        .expect("chain task must build")
+        .into_task()
 }
 
 fn execution_log(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {

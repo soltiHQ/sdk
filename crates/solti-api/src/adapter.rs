@@ -250,12 +250,12 @@ mod tests {
         async fn build_task(
             &self,
             _task: &Task,
-            run_id: &RunId,
+            _run_id: &RunId,
             _context: &BuildContext,
             _cancellation: &solti_runner::BuildCancellation,
             _scope: &mut solti_runner::BuildScope,
         ) -> Result<TaskRef, RunnerError> {
-            Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move {
+            Ok(TaskFn::arc(|_ctx: TaskContext| async move {
                 Ok::<(), TaskError>(())
             }))
         }
@@ -277,9 +277,7 @@ mod tests {
         // Embedded tasks enter state through the prebuilt-task SDK path; the
         // wire path can never create them, but a point GET by name
         // used to reach them via `state.get` and fail the proto conversion.
-        let task: TaskRef = TaskFn::arc("embedded-probe", |_ctx: TaskContext| async move {
-            Ok::<(), TaskError>(())
-        });
+        let task: TaskRef = TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) });
         let spec = TaskSpec::builder(
             "slot-embedded",
             TaskWorkload::Embedded(EmbeddedSpec::new("adapter-test-v1").unwrap()),
@@ -314,9 +312,7 @@ mod tests {
     async fn embedded_tasks_are_absent_for_all_per_id_operations() {
         let api = supervisor().await;
 
-        let task: TaskRef = TaskFn::arc("embedded-guard", |_ctx: TaskContext| async move {
-            Ok::<(), TaskError>(())
-        });
+        let task: TaskRef = TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) });
         let spec = solti_model::TaskSpec::builder(
             "slot-embedded-guard",
             TaskWorkload::Embedded(EmbeddedSpec::new("adapter-test-v1").unwrap()),
@@ -373,9 +369,8 @@ mod tests {
         };
 
         let api = supervisor().await;
-        let hidden_ref: TaskRef = TaskFn::arc("hidden-runtime", |_ctx: TaskContext| async move {
-            Ok::<(), TaskError>(())
-        });
+        let hidden_ref: TaskRef =
+            TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) });
         let hidden_spec = solti_model::TaskSpec::builder(
             "hidden-slot",
             TaskWorkload::Embedded(EmbeddedSpec::new("adapter-test-v1").unwrap()),
@@ -442,9 +437,8 @@ mod tests {
         use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv};
 
         let api = supervisor().await;
-        let hidden_ref: TaskRef = TaskFn::arc("hidden-runtime", |_ctx: TaskContext| async move {
-            Ok::<(), TaskError>(())
-        });
+        let hidden_ref: TaskRef =
+            TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) });
         let hidden_spec = TaskSpec::builder(
             "hidden-slot",
             TaskWorkload::Embedded(EmbeddedSpec::new("adapter-test-v1").unwrap()),

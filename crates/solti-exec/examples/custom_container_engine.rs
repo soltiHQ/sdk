@@ -261,7 +261,7 @@ async fn main() -> ExampleResult {
         .lock()
         .expect("engine recorder lock must not be poisoned")
         .len();
-    let task_ref = router.build(&task).await?;
+    let built = router.build(&task).await?;
     assert_eq!(
         calls
             .lock()
@@ -271,10 +271,10 @@ async fn main() -> ExampleResult {
     );
     println!(
         "[build] Built {}; engine call count remained {calls_before_build}.",
-        task_ref.name(),
+        built.name(),
     );
 
-    task_ref.spawn(TaskContext::detached()).await?;
+    built.task().spawn(TaskContext::detached()).await?;
     let recorded_calls = calls
         .lock()
         .expect("engine recorder lock must not be poisoned");

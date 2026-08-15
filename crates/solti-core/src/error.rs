@@ -118,6 +118,10 @@ pub enum CoreError {
     #[error("persistence initialization failed: {0}")]
     PersistenceInitialization(#[source] std::io::Error),
 
+    /// Taskvisor could not build the stopped supervisor.
+    #[error("supervisor initialization failed: {0}")]
+    SupervisorInitialization(#[source] taskvisor::BuildError),
+
     /// Shutdown has started.
     ///
     /// Desired-state writes are no longer accepted.
@@ -127,7 +131,7 @@ pub enum CoreError {
     /// A Taskvisor operation failed.
     ///
     /// `op` is a stable operation label.
-    /// Known labels are `"prepare"`, `"submit"`, `"cancel"`, and `"shutdown"`.
+    /// Known labels are `"start"`, `"prepare"`, `"submit"`, `"cancel"`, and `"shutdown"`.
     #[error("supervisor {op} failed: {source}")]
     Supervisor {
         /// Stable operation label.

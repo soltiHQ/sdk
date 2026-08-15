@@ -10,8 +10,10 @@ use crate::{ModelError, ModelResult, TaskPhase, WorkloadTypeMeta};
 
 /// Record of one execution attempt.
 ///
-/// An active run has phase `Running` and no finish fields.
-/// A finished run has a terminal phase and `finishedAt`.
+/// An active run has phase `Running` and no terminal fields.
+/// A terminal run has a terminal phase and `finishedAt`.
+/// The timestamp records the supervisor's logical outcome. It does not prove
+/// physical exit after a force-abort.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", try_from = "raw::TaskRunRaw")]
 pub struct TaskRun {
@@ -154,7 +156,7 @@ impl TaskRun {
         self.started_at
     }
 
-    /// Time when the run finished.
+    /// Time when the supervisor recorded the terminal run outcome.
     pub fn finished_at(&self) -> Option<SystemTime> {
         self.finished_at
     }

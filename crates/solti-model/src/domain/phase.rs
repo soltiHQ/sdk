@@ -9,9 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ModelError, ModelResult};
 
-/// Current execution phase of a task.
+/// Current logical lifecycle phase of a task.
 ///
 /// Phases describe the state visible on [`TaskStatus`](crate::TaskStatus).
+/// Terminal phases record logical outcomes and do not by themselves prove
+/// physical exit.
 ///
 /// ## Example
 ///
@@ -27,19 +29,19 @@ use crate::error::{ModelError, ModelResult};
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum TaskPhase {
-    /// Desired state is waiting for execution.
+    /// The desired generation is pending runtime observation.
     Pending,
-    /// An attempt is executing.
+    /// An attempt has started.
     Running,
-    /// An attempt completed successfully.
+    /// A successful outcome was recorded.
     Succeeded,
-    /// Attempt failed with an error.
+    /// A failure outcome was recorded.
     Failed,
-    /// An attempt exceeded its timeout.
+    /// A timeout outcome was recorded.
     Timeout,
-    /// Execution was canceled.
+    /// A logical cancellation or canceled admission outcome was recorded.
     Canceled,
-    /// Failure retry budget was exhausted.
+    /// Failure retry budget exhaustion was recorded.
     Exhausted,
 }
 

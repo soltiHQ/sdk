@@ -76,7 +76,7 @@ impl Runner for TcpProbeRunner {
     async fn build_task(
         &self,
         task: &Task,
-        run_id: &RunId,
+        _run_id: &RunId,
         _ctx: &BuildContext,
         _cancellation: &solti_runner::BuildCancellation,
         _scope: &mut solti_runner::BuildScope,
@@ -97,22 +97,20 @@ impl Runner for TcpProbeRunner {
 
         let address: Arc<str> = spec.address.into();
         let payload: Arc<[u8]> = spec.payload.into_bytes().into();
-        Ok(TaskFn::arc(
-            run_id.name().to_owned(),
-            move |_ctx: TaskContext| {
-                let address = Arc::clone(&address);
-                let payload = Arc::clone(&payload);
-                async move {
-                    let mut stream = TcpStream::connect(address.as_ref())
-                        .await
-                        .map_err(|error| TaskError::fail(format!("connect {address}: {error}")))?;
-                    stream.write_all(&payload).await.map_err(|error| {
-                        TaskError::fail(format!("write probe payload: {error}"))
-                    })?;
-                    Ok(())
-                }
-            },
-        ))
+        Ok(TaskFn::arc(move |_ctx: TaskContext| {
+            let address = Arc::clone(&address);
+            let payload = Arc::clone(&payload);
+            async move {
+                let mut stream = TcpStream::connect(address.as_ref())
+                    .await
+                    .map_err(|error| TaskError::fail(format!("connect {address}: {error}")))?;
+                stream
+                    .write_all(&payload)
+                    .await
+                    .map_err(|error| TaskError::fail(format!("write probe payload: {error}")))?;
+                Ok(())
+            }
+        }))
     }
 }
 

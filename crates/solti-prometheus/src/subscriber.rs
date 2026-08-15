@@ -68,7 +68,7 @@ pub const DEFAULT_TASKVISOR_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(204
 ///
 /// TaskFinished ─────────────────► final_outcomes{outcome}
 ///
-/// SubscriberOverflow ───────────► subscriber_overflows
+/// SubscriberOverflow ───────────► subscriber_overflows + dropped count
 /// SubscriberPanicked ───────────► subscriber_panics
 /// RuntimeFailure ───────────────► runtime_failures
 ///
@@ -77,8 +77,9 @@ pub const DEFAULT_TASKVISOR_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(204
 ///   ControllerRejected ─────────► controller_rejections{reason}
 /// ```
 ///
-/// `TaskFinished` with `ForceAborted` or `Panicked` also repairs the in-flight gauge.
-/// Those outcomes can end an attempt without an attempt-level terminal event.
+/// `TaskFinished` with `ForceAborted` or `Panicked` also repairs the logical
+/// in-flight gauge. Those outcomes can end an attempt without an attempt-level
+/// terminal event. `ForceAborted` does not prove that task code has exited physically.
 /// Other Taskvisor events do not change metrics.
 ///
 /// ## Labels
@@ -93,6 +94,10 @@ pub const DEFAULT_TASKVISOR_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(204
 /// A slow subscriber may miss events.
 /// The in-flight gauge can therefore drift.
 /// The decrement path checks the current value before changing the gauge.
+/// Taskvisor 0.8 can coalesce an overflow burst into one event.
+/// The overflow counter adds its `dropped` value, or one when no count is available.
+/// Controller metrics count delivered controller events.
+/// Errors returned before controller intake do not emit `ControllerRejected` and are not included.
 ///
 /// Use `PrometheusCoreStateCollector` for a pull-based task-phase snapshot.
 ///
@@ -191,7 +196,7 @@ impl PrometheusTaskvisorSubscriber {
         let attempts_in_flight = metrics.gauge(
             "taskvisor",
             "attempts_in_flight",
-            "Number of task attempts currently executing",
+            "Number of task attempts active in delivered Taskvisor lifecycle events",
         )?;
         let task_restarts = metrics.counter(
             "taskvisor",
@@ -227,7 +232,7 @@ impl PrometheusTaskvisorSubscriber {
         let subscriber_overflows = metrics.counter(
             "taskvisor",
             "subscriber_overflows_total",
-            "Total subscriber queue overflow events (events lost)",
+            "Total Taskvisor events reported lost by overflow diagnostics",
         )?;
         let subscriber_panics = metrics.counter(
             "taskvisor",
@@ -250,7 +255,7 @@ impl PrometheusTaskvisorSubscriber {
         let controller_rejections = metrics.counter_vec(
             "taskvisor_controller",
             "rejections_total",
-            "Total controller rejections grouped by cause",
+            "Total ControllerRejected events grouped by typed cause",
             &["reason"],
         )?;
         metrics.register(registry)?;
@@ -298,7 +303,8 @@ impl Subscribe for PrometheusTaskvisorSubscriber {
                 self.attempt_timeouts.inc();
             }
             EventKind::SubscriberOverflow => {
-                self.subscriber_overflows.inc();
+                self.subscriber_overflows
+                    .inc_by(event.dropped.unwrap_or(1) as f64);
             }
             EventKind::SubscriberPanicked => {
                 self.subscriber_panics.inc();
@@ -559,6 +565,24 @@ mod tests {
         assert_eq!(sub.runtime_failures.get(), 1.0);
     }
 
+    #[test]
+    fn subscriber_overflow_counts_every_reported_lost_event() {
+        let sub = new_subscriber();
+
+        sub.on_event(
+            &Event::new(EventKind::SubscriberOverflow)
+                .with_task("subscriber-listener")
+                .with_dropped(7),
+        );
+        sub.on_event(
+            &Event::new(EventKind::SubscriberOverflow)
+                .with_task("closed-subscriber")
+                .with_reason("closed"),
+        );
+
+        assert_eq!(sub.subscriber_overflows.get(), 8.0);
+    }
+
     #[cfg(feature = "taskvisor-controller")]
     #[test]
     fn controller_events_update_their_metrics() {
@@ -572,6 +596,12 @@ mod tests {
                 .with_rejection_kind(RejectionKind::QueueFull)
                 .with_reason("queue_full: 1/1"),
         );
+        sub.on_event(
+            &Event::new(EventKind::ControllerRejected)
+                .with_task("t")
+                .with_rejection_kind(RejectionKind::ResourceLimit)
+                .with_reason("controller pending limit reached"),
+        );
 
         assert_eq!(sub.controller_submitted_events.get(), 1.0);
         assert_eq!(
@@ -583,6 +613,12 @@ mod tests {
         assert_eq!(
             sub.controller_rejections
                 .with_label_values(&["queue_full"])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            sub.controller_rejections
+                .with_label_values(&["resource_limit"])
                 .get(),
             1.0
         );

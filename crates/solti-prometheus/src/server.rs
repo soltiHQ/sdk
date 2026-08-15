@@ -125,7 +125,7 @@ pub fn server(
     let caller_revision = EmbeddedSpec::new(revision)?;
     let revision = format!("{}|addr={addr}", caller_revision.revision());
 
-    let task: TaskRef = TaskFn::arc(METRICS_SERVER_SLOT, move |ctx: TaskContext| {
+    let task: TaskRef = TaskFn::arc(move |ctx: TaskContext| {
         let addr = addr.clone();
         let registry = registry.clone();
         async move {

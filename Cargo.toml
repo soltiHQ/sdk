@@ -97,7 +97,7 @@ solti-prometheus    = { path = "crates/solti-prometheus", version = "0.0.4", def
 solti-runner        = { path = "crates/solti-runner",     version = "0.0.4", default-features = false }
 solti-tls           = { path = "crates/solti-tls",        version = "0.0.4", default-features = false }
 subtle              = "2.6.1"
-taskvisor           = { version = "0.7.0", default-features = false }
+taskvisor           = { version = "0.8.0", default-features = false }
 tempfile            = "3.27.0"
 thiserror           = "2.0.20"
 time                = { version = "0.3.55" }

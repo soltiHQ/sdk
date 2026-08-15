@@ -71,13 +71,8 @@ fn manifest(revision: &str) -> ExampleResult<TaskManifest> {
 }
 
 /// Creates a task that finishes on release and reports cooperative cancellation.
-fn controlled_task(
-    name: &'static str,
-    started: Arc<Notify>,
-    release: Arc<Notify>,
-    cancelled: Arc<Notify>,
-) -> TaskRef {
-    TaskFn::arc(name, move |ctx: TaskContext| {
+fn controlled_task(started: Arc<Notify>, release: Arc<Notify>, cancelled: Arc<Notify>) -> TaskRef {
+    TaskFn::arc(move |ctx: TaskContext| {
         let started = Arc::clone(&started);
         let release = Arc::clone(&release);
         let cancelled = Arc::clone(&cancelled);
@@ -128,7 +123,6 @@ async fn main() -> ExampleResult {
         .create_embedded_task(
             manifest("implementation-v1")?,
             controlled_task(
-                "cache-refresh-v1",
                 Arc::clone(&v1_started),
                 v1_release,
                 Arc::clone(&v1_cancelled),
@@ -170,7 +164,6 @@ async fn main() -> ExampleResult {
         .apply_embedded_task(
             manifest("implementation-v2")?,
             controlled_task(
-                "cache-refresh-v2",
                 Arc::clone(&v2_started),
                 Arc::clone(&v2_release),
                 v2_cancelled,

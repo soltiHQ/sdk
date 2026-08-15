@@ -160,6 +160,23 @@ impl RuntimeObserver {
         true
     }
 
+    /// Releases a binding whose prepared submission was cancelled before intake.
+    ///
+    /// No Taskvisor event can exist before controller intake. The desired state
+    /// remains pending for the newer reconciliation instead of recording an
+    /// intake failure for the superseded generation.
+    pub(crate) fn release_unsubmitted_binding(&self, binding: &RuntimeBinding) -> bool {
+        let _lifecycle = self.lifecycle_gate.lock();
+        if self.state.resolve_tv(binding.tv.get()).as_ref() != Some(binding) {
+            return false;
+        }
+
+        self.state.unbind_tv(binding.tv.get());
+        self.output_hub.evict(&binding.resource.name);
+        self.mark_completed_locked(binding.tv.get());
+        true
+    }
+
     /// Releases a failed runtime intake binding.
     ///
     /// The desired resource remains with `Reconciled=False`.

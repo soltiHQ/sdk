@@ -26,6 +26,8 @@
 //! A bound generation can submit while a newer apply commits.
 //! A later successful reconciliation replaces that runtime.
 //! Cleanup and binding failures also set `Reconciled=False`.
+//! Controller intake can wait for Taskvisor ownership capacity.
+//! Supersede and shutdown cancel that wait and release the unsubmitted binding.
 //!
 //! Completion waiters provide the authoritative final outcome.
 //! One coordinator worker per task keeps only the latest pending generation.
@@ -42,7 +44,8 @@ use std::{
 use parking_lot::Mutex;
 use solti_model::{Task, TaskId};
 use solti_runner::{
-    BuildCancellation, BuildCancellationHandle, RouterError, RunnerBuildAdmission, RunnerRouter,
+    BuildCancellation, BuildCancellationHandle, BuiltTask, RouterError, RunnerBuildAdmission,
+    RunnerRouter, make_run_id,
 };
 use taskvisor::{
     ControllerSpec, PreparedSubmission, SupervisorHandle, TaskRef, TaskSpec as TvTaskSpec,
@@ -107,7 +110,7 @@ struct ReconciliationQueue {
 }
 
 enum BuildOutcome {
-    Built(TaskRef),
+    Built(BuiltTask),
     Failed(CoreError),
     Panicked,
     TimedOut,
@@ -169,7 +172,8 @@ impl Reconciler {
     /// Schedules one committed generation.
     ///
     /// A task owns at most one active and one pending reconciliation. Scheduling
-    /// a newer generation cancels active preflight and replaces the pending request.
+    /// a newer generation cancels active preflight or intake and replaces the
+    /// pending request.
     pub(crate) fn schedule(
         &self,
         desired: Task,
@@ -245,7 +249,7 @@ impl Reconciler {
         (receiver, superseded)
     }
 
-    /// Cancels active and pending preflight for a task being deleted.
+    /// Cancels active preflight or intake and pending work for a deleted task.
     pub(crate) fn cancel_scheduled(&self, name: &TaskId) {
         let slots = self.reconciliation_queue.slots.lock();
         let Some(slot) = slots.get(name) else {
@@ -332,9 +336,6 @@ impl Reconciler {
         match error {
             CoreError::Runner(solti_runner::RouterError::NoRunner { .. }) => "RunnerNotFound",
             CoreError::Runner(solti_runner::RouterError::EmbeddedWorkload) => "WorkloadNotRoutable",
-            CoreError::Runner(solti_runner::RouterError::RunIdMismatch { .. }) => {
-                "RunnerContractViolation"
-            }
             CoreError::Runner(_) => "RunnerBuildFailed",
             CoreError::Mapping(_) => "PolicyMappingFailed",
             CoreError::Supervisor { op: "prepare", .. } => "RuntimePreparationFailed",
@@ -345,10 +346,12 @@ impl Reconciler {
     fn prepare_submission(
         &self,
         task: &Task,
+        runtime_name: String,
         task_ref: TaskRef,
     ) -> Result<PreparedSubmission, CoreError> {
         let spec = task.spec();
         let task_spec = TvTaskSpec::new(
+            runtime_name,
             task_ref,
             to_restart_policy(spec.restart())?,
             to_backoff_policy(spec.backoff())?,
@@ -428,7 +431,7 @@ impl Reconciler {
         };
 
         match result {
-            Ok(Ok(task_ref)) => BuildOutcome::Built(task_ref),
+            Ok(Ok(built_task)) => BuildOutcome::Built(built_task),
             Ok(Err(error)) => BuildOutcome::Failed(error),
             Err(error) if error.is_panic() => BuildOutcome::Panicked,
             Err(error) => BuildOutcome::Unavailable(error.to_string()),
@@ -495,13 +498,19 @@ impl Reconciler {
             return self.current(&target, desired);
         }
 
-        let task_ref = match source {
-            RuntimeSource::Prebuilt(task_ref) => task_ref,
+        let (runtime_name, task_ref) = match source {
+            RuntimeSource::Prebuilt(task_ref) => (
+                make_run_id("embedded", desired.slot().as_str()).into_name(),
+                task_ref,
+            ),
             RuntimeSource::Routed => match self
                 .build_routed(&desired, &cancel_handle, &cancellation)
                 .await
             {
-                BuildOutcome::Built(task_ref) => task_ref,
+                BuildOutcome::Built(built_task) => {
+                    let (run_id, task_ref) = built_task.into_parts();
+                    (run_id.into_name(), task_ref)
+                }
                 BuildOutcome::Failed(error) => {
                     self.state.mark_reconciliation_failed(
                         &target,
@@ -573,7 +582,7 @@ impl Reconciler {
             return self.current(&target, desired);
         }
         let prepared = match catch_unwind(AssertUnwindSafe(|| {
-            self.prepare_submission(&desired, task_ref)
+            self.prepare_submission(&desired, runtime_name, task_ref)
         })) {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(error)) => {
@@ -667,7 +676,22 @@ impl Reconciler {
             tv,
         };
 
-        match prepared.submit_and_watch().await {
+        let submission = prepared.submit_and_watch();
+        tokio::pin!(submission);
+        let submission = tokio::select! {
+            biased;
+            _ = self.preflight_stop.cancelled() => {
+                self.observer.release_unsubmitted_binding(&binding);
+                return self.current(&target, desired);
+            }
+            _ = cancellation.cancelled() => {
+                self.observer.release_unsubmitted_binding(&binding);
+                return self.current(&target, desired);
+            }
+            result = &mut submission => result,
+        };
+
+        match submission {
             Ok((submitted, waiter)) => {
                 debug_assert_eq!(submitted, tv);
                 self.state.mark_observed(&target);

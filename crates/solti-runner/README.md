@@ -2,7 +2,7 @@
 
 `solti-runner` is the plugin boundary between execution backends and the supervisor.
 
-Implement `Runner` for a backend and register it in a `RunnerRouter`; the router routes each `Task` by workload GVK and optional labels, then builds a `taskvisor::TaskRef`.
+Implement `Runner` for a backend and register it in a `RunnerRouter`; the router routes each `Task` by workload GVK and optional labels, then returns a `BuiltTask` containing the allocated `RunId` and executable `taskvisor::TaskRef`.
 `solti-exec` implements `Runner` for subprocesses; `solti-core` consumes the router.
 
 The crate does not execute or supervise tasks; Taskvisor owns execution and lifecycle.
@@ -16,7 +16,7 @@ Implement `Runner`, register it, and build a Taskvisor task:
 use std::sync::Arc;
 
 use solti_model::{Task, WorkloadTypeMeta, WORKLOAD_API_VERSION};
-use solti_runner::{BuildCancellation, BuildContext, BuildScope, RunId, Runner, RunnerError, RunnerRouter};
+use solti_runner::{BuildCancellation, BuildContext, BuildScope, BuiltTask, RunId, Runner, RunnerError, RunnerRouter};
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 
 struct EchoRunner;
@@ -37,18 +37,18 @@ impl Runner for EchoRunner {
     async fn build_task(
         &self,
         _task: &Task,
-        run_id: &RunId,
+        _run_id: &RunId,
         _ctx: &BuildContext,
         _cancellation: &BuildCancellation,
         _scope: &mut BuildScope,
     ) -> Result<TaskRef, RunnerError> {
-        Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move {
+        Ok(TaskFn::arc(|_ctx: TaskContext| async move {
             Ok::<(), TaskError>(())
         }))
     }
 }
 
-async fn build(resource: &Task) -> Result<TaskRef, Box<dyn std::error::Error>> {
+async fn build(resource: &Task) -> Result<BuiltTask, Box<dyn std::error::Error>> {
     let mut router = RunnerRouter::new();
     router.register(Arc::new(EchoRunner))?;
     Ok(router.build(resource).await?)
@@ -72,10 +72,10 @@ The example declares the built-in `Subprocess` GVK.
 | `register`                            | `Arc<dyn Runner>`                   | Validated runner entry                  |
 | `register_with_labels`                | Runner and static `Labels`          | Labeled runner entry                    |
 | `catalog`                             | Current runner registrations        | Immutable, cloneable `RunnerCatalog`    |
-| `RunnerCatalog::build`                | `Task` and explicit `BuildContext`  | `taskvisor::TaskRef`                    |
-| `RunnerCatalog::build_scoped_with_cancellation` | Nested task, context, cancellation, and `BuildScope` | Admitted nested `TaskRef` |
+| `RunnerCatalog::build`                | `Task` and explicit `BuildContext`  | `BuiltTask`                             |
+| `RunnerCatalog::build_scoped_with_cancellation` | Nested task, context, cancellation, and `BuildScope` | Admitted nested `BuiltTask` |
 | `pick`                                | `Task`                              | First matching `Runner`                 |
-| `build`                               | `Task`                              | `taskvisor::TaskRef`                    |
+| `build`                               | `Task`                              | `BuiltTask`                             |
 | `capabilities`                        | Registered entries                  | Owned `AgentCapabilities` snapshot      |
 | `merge_env`                           | `TaskEnv` and `RunnerEnv`           | Sorted process environment              |
 | `OutputSink::stdout_line`             | Raw `Bytes`, optionally LF-framed   | Delimiter-free `OutputEvent::Chunk`     |
@@ -96,6 +96,9 @@ Task
                           │
                           ▼
                  taskvisor::TaskRef
+                          │ router pairs it with RunId
+                          ▼
+                      BuiltTask
 ```
 
 Routing uses only workload GVK and `runnerSelector`.
@@ -146,7 +149,7 @@ router.register(Arc::new(ChainRunner::new("chain", inner_runners)))?;
 The composing runner calls `RunnerCatalog::build_scoped_with_cancellation` for
 each inner task and passes its inherited `BuildScope`. This reuses the outer
 global admission slot and applies the selected inner runner's per-runner limit.
-Catalog builds use the same exact GVK and selector routing, registration order, `RunId` allocation, and returned-name validation as `RunnerRouter::build`.
+Catalog builds use the same exact GVK and selector routing, registration order, and `RunId` allocation as `RunnerRouter::build`.
 
 Direct `RunnerRouter::build` and `RunnerCatalog::build` calls are unmanaged: no
 core admission limits apply. A scoped catalog build returns
@@ -162,8 +165,9 @@ The sequence comes from one process-global counter initialized to `1`.
 
 The router passes the resource, run ID, `BuildContext`, a read-only
 `BuildCancellation` signal, and an opaque `BuildScope` to `Runner::build_task`.
-The returned `TaskRef` must use the allocated run ID as its name.
-A mismatch returns `RouterError::RunIdMismatch`.
+It returns a `BuiltTask` that keeps the same run ID beside the executable
+`TaskRef`. Use `BuiltTask::name` when constructing the surrounding
+`taskvisor::TaskSpec`.
 
 `build_task` constructs a task but does not start it.
 It is asynchronous and receives a cancellation signal for obsolete generations,
@@ -307,7 +311,6 @@ The application controls cardinality for custom labels.
 | `EmbeddedWorkload`  | Embedded workload sent to the router           |
 | `NoRunner`          | No runner matched the GVK and selector         |
 | `Build`             | Selected runner returned `RunnerError`         |
-| `RunIdMismatch`     | Returned task used a different name            |
 
 `RunnerError` is returned by a concrete runner:
 

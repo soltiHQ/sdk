@@ -33,10 +33,10 @@ use taskvisor::{RejectionKind, TaskOutcomeKind};
 /// Diagnostic for a force-aborted outcome.
 ///
 /// The value does not depend on Taskvisor reason text.
-pub(crate) const FORCE_ABORTED_ERROR: &str = "force_terminated_after_grace";
+pub(crate) const FORCE_ABORTED_ERROR: &str = "force_aborted_after_grace";
 
-/// Diagnostic for an internal Taskvisor runner panic.
-pub(crate) const TASK_RUNNER_PANICKED_ERROR: &str = "actor panicked";
+/// Diagnostic for a Taskvisor actor or protected cleanup panic.
+pub(crate) const TASK_RUNNER_PANICKED_ERROR: &str = "actor or protected cleanup panicked";
 
 /// Maps a typed rejection to a terminal phase.
 ///
@@ -138,6 +138,7 @@ mod tests {
             (RejectionKind::ControllerShuttingDown, TaskPhase::Canceled),
             (RejectionKind::SlotBusy, TaskPhase::Canceled),
             (RejectionKind::QueueFull, TaskPhase::Failed),
+            (RejectionKind::ResourceLimit, TaskPhase::Failed),
             (RejectionKind::AlreadyExists, TaskPhase::Failed),
             (RejectionKind::BatchRejected, TaskPhase::Failed),
             (RejectionKind::AdmissionFailed, TaskPhase::Failed),

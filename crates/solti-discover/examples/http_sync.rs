@@ -248,10 +248,9 @@ async fn main() -> ExampleResult {
         manifest.spec().timeout().as_millis(),
     );
     println!(
-        "[task] restart={:?}, admission={:?}, taskvisorName={}.",
+        "[task] restart={:?}, admission={:?}.",
         manifest.spec().restart(),
         manifest.spec().admission(),
-        task_ref.name(),
     );
     assert_eq!(
         manifest.spec().restart(),

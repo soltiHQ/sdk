@@ -988,13 +988,16 @@ async fn dropping_outer_future_drops_in_flight_create() {
 }
 
 #[tokio::test]
-async fn taskvisor_force_abort_drops_lifecycle_before_shutdown_returns() {
+async fn taskvisor_force_abort_reports_outcome_and_releases_yielding_create() {
     let (engine, handle) = ControlledEngine::blocked(AttemptBehavior::default());
     let runner = ContainerRunner::new("containerd", drop_releasing_engine(engine)).unwrap();
     let supervisor = Supervisor::new(SupervisorConfig::new().with_grace(Duration::ZERO), vec![]);
-    let supervisor_handle = supervisor.serve();
+    let supervisor_handle = supervisor.serve().unwrap();
     let (_, waiter) = supervisor_handle
-        .add_and_watch(TaskvisorTaskSpec::once(build(&runner).await))
+        .add_and_watch(TaskvisorTaskSpec::once(
+            "container-force-abort",
+            build(&runner).await,
+        ))
         .await
         .unwrap();
 
@@ -1005,7 +1008,17 @@ async fn taskvisor_force_abort_drops_lifecycle_before_shutdown_returns() {
     assert!(matches!(shutdown, Err(RuntimeError::GraceExceeded { .. })));
     let outcome = waiter.wait().await.unwrap();
     assert_eq!(outcome.kind(), TaskOutcomeKind::ForceAborted);
-    assert!(!handle.create_in_flight.load(Ordering::SeqCst));
+
+    // ForceAborted is a bounded logical outcome in Taskvisor 0.8. Physical
+    // release can happen later when task code is synchronously blocking. This
+    // engine future yields to Tokio and must still be released without detach.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while handle.create_in_flight.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("yielding create future remained physically active after force-abort");
     assert_eq!(
         *handle.calls.lock().unwrap(),
         [Call::Create {
@@ -1020,10 +1033,11 @@ async fn taskvisor_timeout_drops_lifecycle_before_outcome() {
     let (engine, handle) = ControlledEngine::blocked(AttemptBehavior::default());
     let runner = ContainerRunner::new("containerd", drop_releasing_engine(engine)).unwrap();
     let supervisor = Supervisor::new(SupervisorConfig::new(), vec![]);
-    let supervisor_handle = supervisor.serve();
+    let supervisor_handle = supervisor.serve().unwrap();
     let (_, waiter) = supervisor_handle
         .add_and_watch(
-            TaskvisorTaskSpec::once(build(&runner).await).with_timeout(Duration::from_millis(20)),
+            TaskvisorTaskSpec::once("container-timeout", build(&runner).await)
+                .with_timeout(Duration::from_millis(20)),
         )
         .await
         .unwrap();

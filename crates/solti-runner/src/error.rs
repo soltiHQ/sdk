@@ -107,17 +107,4 @@ pub enum RouterError {
         #[source]
         source: RunnerError,
     },
-
-    /// The runner returned a task with a name different from the allocated run id.
-    #[error(
-        "runner '{runner}' returned task name '{actual}', expected allocated run id '{expected}'"
-    )]
-    RunIdMismatch {
-        /// Selected runner name.
-        runner: String,
-        /// Run id allocated by the router.
-        expected: String,
-        /// Task name returned by the runner.
-        actual: String,
-    },
 }

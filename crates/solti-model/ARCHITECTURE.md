@@ -154,7 +154,7 @@ flowchart TB
     Scheduled -->|reconciliation fails| FailedReconcile
     FailedReconcile -->|manual retry| Scheduled
     Accepted -->|attempt starts| Running
-    Running -->|attempt ends| Terminal
+    Running -->|terminal outcome| Terminal
     Scheduled -->|authoritative final outcome<br/>without an attempt event| Terminal
     Accepted -->|authoritative final outcome<br/>without an attempt event| Terminal
 ```
@@ -163,6 +163,8 @@ Generation is checked before every attempt or terminal transition.
 A stale generation returns without mutation.
 Attempt numbers are authoritative inputs.
 The model does not synthesize a missing attempt number.
+A terminal phase records a logical outcome. It does not by itself prove that
+non-cooperative execution code has exited physically.
 
 `transition_finished` applies attempt-level sticky semantics.
 An identical or older terminal attempt is ignored.
@@ -215,6 +217,8 @@ flowchart LR
 
 An active run has no finish fields.
 A terminal run requires `finishedAt`.
+That timestamp records the supervisor's logical outcome. It does not prove
+physical exit after a force-abort.
 The run snapshots its workload GVK.
 Its `error` uses the same UTF-8-safe 32 KiB prefix contract as
 `TaskStatus.error`.

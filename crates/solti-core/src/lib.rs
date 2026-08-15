@@ -116,7 +116,7 @@
 //! async fn run() -> Result<(), CoreError> {
 //!     let api = SupervisorApi::builder(RunnerRouter::new()).start().await?;
 //!
-//!     let task_ref = TaskFn::arc("cleanup-runtime", |_ctx: TaskContext| async move {
+//!     let task_ref = TaskFn::arc(|_ctx: TaskContext| async move {
 //!         Ok::<(), TaskError>(())
 //!     });
 //!     let workload = TaskWorkload::Embedded(EmbeddedSpec::new("cleanup-v1")?);

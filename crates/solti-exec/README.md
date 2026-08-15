@@ -41,17 +41,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let spec = TaskSpec::builder("jobs", workload, 5_000_u64).build()?;
     let task = Task::new("hello", spec)?;
 
-    let task_ref = router.build(&task).await?;
-    assert!(task_ref.name().starts_with("default-jobs-"));
-    drop(task_ref);
+    let built = router.build(&task).await?;
+    assert!(built.name().starts_with("default-jobs-"));
+    drop(built);
     drop(router);
     runner.shutdown(Duration::from_secs(5)).await?;
     Ok(())
 }
 ```
 
-`RunnerRouter::build` constructs the task but does not start it.
-`solti-core` submits the returned task to Taskvisor during reconciliation.
+`RunnerRouter::build` returns a `BuiltTask` but does not start it.
+The value pairs the reusable `TaskRef` with the router-allocated run identity.
+`solti-core` uses that identity as the Taskvisor registration name during reconciliation.
 Keep the concrete runner returned by registration.
 After every supervisor and task reference that uses it has stopped, call
 `runner.shutdown(timeout).await`. A successful shutdown closes admission, waits
@@ -172,7 +173,7 @@ Exhausted cleanup is a fatal attempt failure.
 | `register_subprocess_runner`              | Router and runner name                  | Registered runner lifecycle handle            |
 | `register_subprocess_runner_with_backend` | Router, runner name, and backend config | Configured runner lifecycle handle             |
 | `SubprocessRunner::shutdown`              | Stopped supervisors and task references | Closed and drained finalizer                   |
-| `RunnerRouter::build`                     | `Task` with a `Subprocess` workload     | Reusable `taskvisor::TaskRef`                 |
+| `RunnerRouter::build`                     | `Task` with a `Subprocess` workload     | `BuiltTask` with run identity and `TaskRef`   |
 | `SubprocessBackendConfig`                 | Host policy, environment, cwd, output   | Runner-wide attempt settings                  |
 | One task attempt                          | Resolved command or script              | Task result and optional stdout/stderr chunks |
 | `ContainerProcessPolicy`                  | OCI process and resource controls       | Engine-neutral container process policy       |
@@ -199,7 +200,7 @@ Task { workload: Subprocess }
       SubprocessRunner
               │ build
               ▼
-      taskvisor::TaskRef
+      BuiltTask { RunId, taskvisor::TaskRef }
               │ each attempt
               ▼
  bounded cleanup admission
@@ -276,7 +277,8 @@ The runner enforces a separate set of lifecycle properties:
 - an error returned by create wins over cancellation observed after create returns;
 - cooperative cancellation after start waits for terminate, exit observation, and cleanup;
 - create, start, wait, terminate, and cleanup futures remain inline in the Taskvisor attempt;
-- force-drop drops the current lifecycle future and the returned attempt value;
+- timeout drops the current lifecycle future and the returned attempt value;
+- force-abort requests actor abort; physical drop follows after any synchronous poll returns to Tokio;
 - at most two output reader tasks exist per attempt and both abort on drop.
 
 The runner never detaches an engine lifecycle future.

@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc, Weak,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+use std::{
+    num::NonZeroUsize,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 use parking_lot::{Condvar, Mutex};
@@ -11,7 +14,10 @@ use solti_model::{
     WORKLOAD_API_VERSION, WorkloadTypeMeta,
 };
 use solti_runner::{BuildContext, RunId, Runner, RunnerError};
-use taskvisor::{BoxTaskFuture, Task as TvTask, TaskContext, TaskError, TaskFn};
+use taskvisor::{
+    BoxTaskFuture, SupervisorConfig, Task as TvTask, TaskContext, TaskError, TaskFn,
+    TaskOutcomeKind, TaskSpec as TvTaskSpec,
+};
 use tokio_stream::StreamExt;
 use tokio_util::task::TaskTracker;
 
@@ -96,15 +102,12 @@ fn retention_slot(name: &str) -> TaskManifest {
     .unwrap()
 }
 
-fn immediate_task(name: &str) -> TaskRef {
-    TaskFn::arc(
-        name,
-        |_ctx: TaskContext| async move { Ok::<(), TaskError>(()) },
-    )
+fn immediate_task() -> TaskRef {
+    TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) })
 }
 
-fn cancellable_task(name: &str) -> TaskRef {
-    TaskFn::arc(name, |ctx: TaskContext| async move {
+fn cancellable_task() -> TaskRef {
+    TaskFn::arc(|ctx: TaskContext| async move {
         ctx.cancelled().await;
         Err::<(), TaskError>(TaskError::Canceled)
     })
@@ -179,8 +182,32 @@ async fn wait_for_binding(api: &SupervisorApi, name: &TaskId, generation: u64) -
     .expect("runtime binding did not converge")
 }
 
+async fn wait_for_taskvisor_name(api: &SupervisorApi, tv: taskvisor::TaskId) -> Arc<str> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some((_, name)) = api
+                .reconciler
+                .handle
+                .list()
+                .await
+                .into_iter()
+                .find(|(id, _)| *id == tv)
+            {
+                return name;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Taskvisor registration did not appear")
+}
+
 struct RecordingRunner {
     seen: Arc<Mutex<Vec<(TaskId, u64, String)>>>,
+}
+
+struct IdentityRunner {
+    allocated_name: Arc<Mutex<Option<String>>>,
 }
 
 #[solti_runner::async_trait]
@@ -196,7 +223,7 @@ impl Runner for RecordingRunner {
     async fn build_task(
         &self,
         task: &Task,
-        run_id: &RunId,
+        _run_id: &RunId,
         _ctx: &BuildContext,
         _cancellation: &solti_runner::BuildCancellation,
         _scope: &mut solti_runner::BuildScope,
@@ -206,8 +233,79 @@ impl Runner for RecordingRunner {
             task.metadata().generation(),
             task.metadata().resource_version().to_string(),
         ));
-        Ok(immediate_task(run_id.name()))
+        Ok(immediate_task())
     }
+}
+
+#[solti_runner::async_trait]
+impl Runner for IdentityRunner {
+    fn name(&self) -> &str {
+        "identity"
+    }
+
+    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+        subprocess_workload_types()
+    }
+
+    async fn build_task(
+        &self,
+        _task: &Task,
+        run_id: &RunId,
+        _ctx: &BuildContext,
+        _cancellation: &solti_runner::BuildCancellation,
+        _scope: &mut solti_runner::BuildScope,
+    ) -> Result<TaskRef, RunnerError> {
+        self.allocated_name.lock().replace(run_id.name().to_owned());
+        Ok(TaskFn::arc(|ctx: TaskContext| async move {
+            ctx.cancelled().await;
+            Err::<(), TaskError>(TaskError::Canceled)
+        }))
+    }
+}
+
+#[tokio::test]
+async fn taskvisor_spec_identity_uses_routed_and_core_allocated_run_names() {
+    let allocated_name = Arc::new(Mutex::new(None));
+    let mut router = RunnerRouter::new();
+    router
+        .register(Arc::new(IdentityRunner {
+            allocated_name: Arc::clone(&allocated_name),
+        }))
+        .unwrap();
+    let api = api(router).await;
+
+    let routed = api
+        .create_task(routed("routed-task-spec-identity", 10_000))
+        .await
+        .unwrap();
+    let routed_binding = wait_for_binding(&api, routed.name(), 1).await;
+    let routed_runtime_name = wait_for_taskvisor_name(&api, routed_binding.tv).await;
+    assert_eq!(
+        routed_runtime_name.as_ref(),
+        allocated_name
+            .lock()
+            .as_deref()
+            .expect("the runner received a RunId")
+    );
+
+    let embedded = api
+        .create_embedded_task(
+            embedded("embedded-task-spec-identity", 10_000),
+            TaskFn::arc(|ctx: TaskContext| async move {
+                ctx.cancelled().await;
+                Err::<(), TaskError>(TaskError::Canceled)
+            }),
+        )
+        .await
+        .unwrap();
+    let embedded_binding = wait_for_binding(&api, embedded.name(), 1).await;
+    let embedded_runtime_name = wait_for_taskvisor_name(&api, embedded_binding.tv).await;
+    assert!(
+        embedded_runtime_name.starts_with("embedded-embedded-slot-"),
+        "core must allocate a unique TaskSpec name for embedded tasks: {embedded_runtime_name}"
+    );
+
+    api.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -293,25 +391,14 @@ async fn all_four_resource_write_paths_accept_desired_manifests() {
     wait_for_observed(&api, applied.name(), 2).await;
 
     let embedded_created = api
-        .create_embedded_task(
-            embedded("embedded-resource", 1_000),
-            immediate_task("unrelated-runtime-name"),
-        )
+        .create_embedded_task(embedded("embedded-resource", 1_000), immediate_task())
         .await
         .unwrap();
     assert_eq!(embedded_created.name().as_str(), "embedded-resource");
     assert_eq!(embedded_created.status().phase(), TaskPhase::Pending);
     wait_for_observed(&api, embedded_created.name(), 1).await;
-    assert!(
-        api.get_task(&TaskId::new("unrelated-runtime-name").unwrap())
-            .is_none()
-    );
-
     let embedded_applied = api
-        .apply_embedded_task(
-            embedded("embedded-resource", 2_000),
-            immediate_task("another-runtime-name"),
-        )
+        .apply_embedded_task(embedded("embedded-resource", 2_000), immediate_task())
         .await
         .unwrap();
     assert_eq!(embedded_applied.metadata().generation(), 2);
@@ -336,7 +423,7 @@ async fn embedded_revision_controls_reconciliation_generation() {
     let first = api
         .create_embedded_task(
             embedded_with_revision("embedded-revision", 10_000, "v1"),
-            cancellable_task("runtime-v1"),
+            cancellable_task(),
         )
         .await
         .unwrap();
@@ -345,7 +432,7 @@ async fn embedded_revision_controls_reconciliation_generation() {
     let unchanged = api
         .apply_embedded_task(
             embedded_with_revision("embedded-revision", 10_000, "v1"),
-            cancellable_task("unused-runtime"),
+            cancellable_task(),
         )
         .await
         .unwrap();
@@ -359,7 +446,7 @@ async fn embedded_revision_controls_reconciliation_generation() {
     let changed = api
         .apply_embedded_task(
             embedded_with_revision("embedded-revision", 10_000, "v2"),
-            cancellable_task("runtime-v2"),
+            cancellable_task(),
         )
         .await
         .unwrap();
@@ -380,10 +467,7 @@ async fn runtime_source_must_match_the_declared_workload_before_commit() {
     let api = api(RunnerRouter::new()).await;
 
     let prebuilt_routed = api
-        .create_embedded_task(
-            routed("prebuilt-routed", 1_000),
-            immediate_task("arbitrary-runtime"),
-        )
+        .create_embedded_task(routed("prebuilt-routed", 1_000), immediate_task())
         .await;
     assert!(matches!(prebuilt_routed, Err(CoreError::InvalidSpec(_))));
     assert!(
@@ -413,19 +497,13 @@ async fn retained_task_limit_counts_routed_and_embedded_resources() {
     api.create_task(routed("retained-routed", 1_000))
         .await
         .unwrap();
-    api.create_embedded_task(
-        embedded("retained-embedded", 1_000),
-        immediate_task("retained-embedded-runtime"),
-    )
-    .await
-    .unwrap();
+    api.create_embedded_task(embedded("retained-embedded", 1_000), immediate_task())
+        .await
+        .unwrap();
 
     assert!(matches!(
-        api.create_embedded_task(
-            embedded("rejected-at-limit", 1_000),
-            immediate_task("rejected-at-limit-runtime"),
-        )
-        .await,
+        api.create_embedded_task(embedded("rejected-at-limit", 1_000), immediate_task(),)
+            .await,
         Err(CoreError::RetainedTaskLimitReached { limit: 2 })
     ));
 
@@ -445,18 +523,12 @@ async fn retention_worker_does_not_reserve_a_resource_name_or_slot() {
     let sweep_name = TaskId::new("solti-state-sweep").unwrap();
     assert!(api.get_task(&sweep_name).is_none());
 
-    api.create_embedded_task(
-        embedded(sweep_name.as_str(), 1_000),
-        immediate_task("former-sweep-name"),
-    )
-    .await
-    .unwrap();
-    api.create_embedded_task(
-        retention_slot("former-sweep-slot"),
-        immediate_task("former-sweep-slot-runtime"),
-    )
-    .await
-    .unwrap();
+    api.create_embedded_task(embedded(sweep_name.as_str(), 1_000), immediate_task())
+        .await
+        .unwrap();
+    api.create_embedded_task(retention_slot("former-sweep-slot"), immediate_task())
+        .await
+        .unwrap();
 
     assert!(api.get_task(&sweep_name).is_some());
     assert_eq!(
@@ -482,10 +554,7 @@ async fn retention_worker_removes_expired_terminal_resources() {
         .await
         .unwrap();
     let task = api
-        .create_embedded_task(
-            embedded("retained-briefly", 1_000),
-            immediate_task("retained-briefly-runtime"),
-        )
+        .create_embedded_task(embedded("retained-briefly", 1_000), immediate_task())
         .await
         .unwrap();
 
@@ -504,10 +573,7 @@ async fn retention_worker_removes_expired_terminal_resources() {
 async fn conditional_reads_and_delete_share_the_resource_operation_lock() {
     let api = api(RunnerRouter::new()).await;
     let task = api
-        .create_embedded_task(
-            embedded("conditional", 10_000),
-            cancellable_task("conditional-runtime"),
-        )
+        .create_embedded_task(embedded("conditional", 10_000), cancellable_task())
         .await
         .unwrap();
     wait_for_binding(&api, task.name(), task.metadata().generation()).await;
@@ -684,10 +750,7 @@ async fn conditional_run_continuation_does_not_require_a_current_task() {
 async fn conditional_apply_cannot_replace_a_hidden_existing_resource() {
     let api = api(RunnerRouter::new()).await;
     let embedded = api
-        .create_embedded_task(
-            embedded("hidden-apply", 10_000),
-            cancellable_task("hidden-runtime"),
-        )
+        .create_embedded_task(embedded("hidden-apply", 10_000), cancellable_task())
         .await
         .unwrap();
 
@@ -797,7 +860,7 @@ async fn runner_panic_is_contained_as_reconciliation_failure() {
 async fn failed_new_generation_does_not_cancel_the_old_runtime() {
     let api = api(RunnerRouter::new()).await;
     let first = api
-        .create_embedded_task(embedded("upgrade", 10_000), cancellable_task("old-runtime"))
+        .create_embedded_task(embedded("upgrade", 10_000), cancellable_task())
         .await
         .unwrap();
     let previous = wait_for_binding(&api, first.name(), 1).await;
@@ -861,7 +924,7 @@ impl Runner for FailOnceBlockingRunner {
     async fn build_task(
         &self,
         _task: &Task,
-        run_id: &RunId,
+        _run_id: &RunId,
         _ctx: &BuildContext,
         _cancellation: &solti_runner::BuildCancellation,
         _scope: &mut solti_runner::BuildScope,
@@ -873,7 +936,7 @@ impl Runner for FailOnceBlockingRunner {
         if build == 1 {
             self.retry_gate.wait().await;
         }
-        Ok(immediate_task(run_id.name()))
+        Ok(immediate_task())
     }
 }
 
@@ -991,11 +1054,8 @@ async fn conditional_delete_cannot_delete_a_generation_applied_after_its_predica
         let api = Arc::clone(&api);
         let name = name.clone();
         tokio::spawn(async move {
-            api.apply_embedded_task(
-                embedded(name.as_str(), 2_000),
-                immediate_task("hidden-runtime"),
-            )
-            .await
+            api.apply_embedded_task(embedded(name.as_str(), 2_000), immediate_task())
+                .await
         })
     };
     tokio::task::yield_now().await;
@@ -1049,7 +1109,7 @@ impl Runner for BlockingRunner {
     async fn build_task(
         &self,
         _task: &Task,
-        run_id: &RunId,
+        _run_id: &RunId,
         _ctx: &BuildContext,
         cancellation: &solti_runner::BuildCancellation,
         _scope: &mut solti_runner::BuildScope,
@@ -1062,7 +1122,7 @@ impl Runner for BlockingRunner {
             }
         }
         let runtime_started = Arc::clone(&self.runtime_started);
-        Ok(TaskFn::arc(run_id.name(), move |_ctx: TaskContext| {
+        Ok(TaskFn::arc(move |_ctx: TaskContext| {
             runtime_started.store(true, Ordering::Release);
             async move { Ok::<(), TaskError>(()) }
         }))
@@ -1165,7 +1225,7 @@ impl Runner for FirstBuildBlockingRunner {
     async fn build_task(
         &self,
         _task: &Task,
-        run_id: &RunId,
+        _run_id: &RunId,
         _ctx: &BuildContext,
         cancellation: &solti_runner::BuildCancellation,
         _scope: &mut solti_runner::BuildScope,
@@ -1178,7 +1238,7 @@ impl Runner for FirstBuildBlockingRunner {
                 }
             }
         }
-        Ok(cancellable_task(run_id.name()))
+        Ok(cancellable_task())
     }
 }
 
@@ -1289,6 +1349,110 @@ async fn newer_apply_cancels_stale_preflight_waiting_for_the_runtime_lock() {
     api.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn newer_apply_cancels_stale_submission_waiting_for_taskvisor_ownership() {
+    let runtime = SupervisorConfig::default().with_ownership_capacity(NonZeroUsize::new(2));
+    let api = SupervisorApi::builder(RunnerRouter::new())
+        .with_runtime_config(runtime)
+        .start()
+        .await
+        .unwrap();
+
+    let (held_id, held_waiter) = api
+        .reconciler
+        .handle
+        .add_and_watch(TvTaskSpec::once("ownership-filler", cancellable_task()))
+        .await
+        .unwrap();
+    let name = TaskId::new("cancel-ownership-intake").unwrap();
+
+    let first = api
+        .write(
+            embedded_with_revision(name.as_str(), 10_000, "generation-1"),
+            RuntimeSource::Prebuilt(cancellable_task()),
+            WriteMode::Create,
+            WritePreconditions::new(),
+            true,
+        )
+        .await
+        .unwrap();
+    let first_done = first
+        .reconciliation
+        .expect("a created spec schedules reconciliation");
+    let first_binding = wait_for_binding(&api, &name, 1).await;
+    assert!(
+        api.reconciler
+            .handle
+            .list()
+            .await
+            .iter()
+            .all(|(id, _)| *id != first_binding.tv),
+        "the first generation must still be waiting before controller intake"
+    );
+
+    let second = api
+        .apply_embedded_task(
+            embedded_with_revision(name.as_str(), 10_000, "generation-2"),
+            cancellable_task(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.metadata().generation(), 2);
+
+    tokio::time::timeout(Duration::from_secs(2), first_done)
+        .await
+        .expect("stale ownership intake did not cancel")
+        .expect("stale reconciliation acknowledgement dropped");
+    let second_binding = wait_for_binding(&api, &name, 2).await;
+    assert_ne!(
+        second_binding.tv, first_binding.tv,
+        "the newer generation must own a distinct prepared identity"
+    );
+    assert!(
+        api.reconciler
+            .handle
+            .list()
+            .await
+            .iter()
+            .all(|(id, _)| *id != second_binding.tv),
+        "the newer generation must wait until ownership capacity is released"
+    );
+    let waiting = api
+        .get_task(&name)
+        .expect("newer desired state remains retained");
+    assert_eq!(
+        waiting.status().reconciled().status(),
+        ConditionStatus::Unknown,
+        "canceling stale intake must not report a reconciliation failure"
+    );
+    assert_eq!(waiting.status().observed_generation(), 0);
+    assert_eq!(
+        api.reconciler.output_hub.active_channels(),
+        1,
+        "the superseded pre-binding must not retain an output channel"
+    );
+
+    api.reconciler
+        .handle
+        .cancel_with_timeout(held_id, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let held_outcome = tokio::time::timeout(Duration::from_secs(1), held_waiter.wait())
+        .await
+        .expect("ownership filler did not finish")
+        .expect("ownership filler outcome channel closed");
+    assert_eq!(held_outcome.kind(), TaskOutcomeKind::Canceled);
+
+    wait_for_observed(&api, &name, 2).await;
+    assert_eq!(
+        api.reconciler.state.binding_for(&name),
+        Some(second_binding),
+        "released capacity must admit the newer generation"
+    );
+    api.delete_task(&name).await.unwrap();
+    api.shutdown().await.unwrap();
+}
+
 struct AdmissionProbe {
     active: AtomicUsize,
     entered: AtomicUsize,
@@ -1343,7 +1507,7 @@ impl Runner for AdmissionRunner {
     async fn build_task(
         &self,
         _task: &Task,
-        run_id: &RunId,
+        _run_id: &RunId,
         _ctx: &BuildContext,
         cancellation: &solti_runner::BuildCancellation,
         _scope: &mut solti_runner::BuildScope,
@@ -1361,7 +1525,7 @@ impl Runner for AdmissionRunner {
             }
         };
         permit.forget();
-        Ok(immediate_task(run_id.name()))
+        Ok(immediate_task())
     }
 }
 
@@ -1626,10 +1790,6 @@ impl Drop for DropProbeTask {
 }
 
 impl TvTask for DropProbeTask {
-    fn name(&self) -> &str {
-        "coalesced-drop-probe"
-    }
-
     fn spawn(&self, _ctx: TaskContext) -> BoxTaskFuture {
         Box::pin(async { Ok(()) })
     }
@@ -1648,7 +1808,7 @@ impl Runner for CoalescingRunner {
     async fn build_task(
         &self,
         task: &Task,
-        run_id: &RunId,
+        _run_id: &RunId,
         _ctx: &BuildContext,
         cancellation: &solti_runner::BuildCancellation,
         _scope: &mut solti_runner::BuildScope,
@@ -1664,7 +1824,7 @@ impl Runner for CoalescingRunner {
                 }
             }
         }
-        Ok(immediate_task(run_id.name()))
+        Ok(immediate_task())
     }
 }
 
@@ -1733,7 +1893,7 @@ async fn coalescing_defers_user_task_destruction_to_the_caller_boundary() {
     let scheduled = api
         .write_locked(
             manifest,
-            RuntimeSource::Prebuilt(immediate_task("replacement")),
+            RuntimeSource::Prebuilt(immediate_task()),
             WriteMode::Apply,
             &WritePreconditions::new(),
             true,
@@ -1767,7 +1927,7 @@ async fn schedule_returns_superseded_source_without_dropping_it() {
 
     let (_second_completion, superseded) = api.reconciler.schedule(
         desired,
-        RuntimeSource::Prebuilt(immediate_task("replacement")),
+        RuntimeSource::Prebuilt(immediate_task()),
         true,
         api.reconciler.tasks.token(),
     );
@@ -1927,10 +2087,7 @@ async fn shutdown_started_rejects_desired_writes_without_committing_them() {
     api.shutdown().await.unwrap();
 
     let error = api
-        .create_embedded_task(
-            embedded("too-late", 1_000),
-            immediate_task("too-late-runtime"),
-        )
+        .create_embedded_task(embedded("too-late", 1_000), immediate_task())
         .await
         .unwrap_err();
     assert!(matches!(error, CoreError::ShuttingDown));

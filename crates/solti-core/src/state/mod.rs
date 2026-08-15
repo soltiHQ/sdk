@@ -3084,9 +3084,9 @@ impl TaskState {
 
     /// Runs one retention sweep.
     ///
-    /// The sweep removes expired finished runs.
-    /// It also removes expired unfinished runs without a binding.
-    /// Bound unfinished runs remain.
+    /// The sweep removes expired terminal runs.
+    /// It also removes expired nonterminal runs without a binding.
+    /// Bound nonterminal runs remain.
     ///
     /// A terminal task is removed after its run history is empty and its task TTL expires.
     ///

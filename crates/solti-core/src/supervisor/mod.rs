@@ -66,7 +66,8 @@ use builder::SupervisorStartConfig;
 /// Cloneable read access is available through [`state`](Self::state).
 ///
 /// Dropping the API starts asynchronous cleanup.
-/// Call [`shutdown`](Self::shutdown) when cleanup must finish before continuing.
+/// Call [`shutdown`](Self::shutdown) to observe completion of the bounded
+/// Taskvisor and SDK-owned cleanup workflow.
 pub struct SupervisorApi {
     reconciler: Reconciler,
     task_operations: TaskLocks,
@@ -152,8 +153,11 @@ impl SupervisorApi {
         let supervisor = Supervisor::builder(sup_cfg)
             .with_subscribers(subscribers)
             .with_controller(ctrl_cfg)
-            .build();
-        let handle = supervisor.serve();
+            .try_build()
+            .map_err(CoreError::SupervisorInitialization)?;
+        let handle = supervisor
+            .serve()
+            .map_err(|error| CoreError::supervisor("start", error))?;
         let reconciler = Reconciler::new(
             output_hub,
             handle,
@@ -655,10 +659,13 @@ impl SupervisorApi {
         Ok(Some((binding, claimed)))
     }
 
-    /// Cancels the current runtime while retaining desired state.
+    /// Requests a terminal logical outcome for the current runtime while
+    /// retaining desired state.
     ///
     /// A known task without a runtime binding is a no-op.
     /// Cancellation does not suppress later reconciliation.
+    /// A Taskvisor `ForceAborted` outcome does not prove physical exit of
+    /// non-cooperative task code.
     ///
     /// # Errors
     ///
@@ -689,7 +696,9 @@ impl SupervisorApi {
 
     /// Deletes a task and its run history.
     ///
-    /// The current runtime is stopped first.
+    /// The current runtime reaches a terminal logical outcome first.
+    /// A Taskvisor `ForceAborted` runtime may remain physically active after
+    /// the resource and run history are removed.
     /// A missing task is an idempotent no-op.
     ///
     /// # Errors
@@ -775,6 +784,8 @@ impl SupervisorApi {
     ///
     /// Task watches close before runtime shutdown.
     /// Reconciliation, completion, retention, and persistence workers are drained.
+    /// A Taskvisor `ForceAborted` outcome is logical: user task code that did
+    /// not cooperate with cancellation may still exit physically afterward.
     ///
     /// # Errors
     ///

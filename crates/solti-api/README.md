@@ -193,7 +193,7 @@ The current API root is `/apis/solti.io/v1`.
 | `GET`    | `/apis/solti.io/v1/tasks?watch=true`          | Watch task resources                    |
 | `GET`    | `/apis/solti.io/v1/tasks/{name}/runs`         | List run history                        |
 | `GET`    | `/apis/solti.io/v1/tasks/{name}/logs`         | Stream live output with SSE             |
-| `DELETE` | `/apis/solti.io/v1/tasks/{name}`              | Stop and remove a task; `204`           |
+| `DELETE` | `/apis/solti.io/v1/tasks/{name}`              | Request logical cancellation and remove retained state; `204` |
 
 List one filtered page:
 

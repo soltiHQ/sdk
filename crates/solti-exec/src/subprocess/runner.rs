@@ -365,8 +365,7 @@ impl Runner for SubprocessRunner {
             pinned_cwd,
         });
 
-        let run_id = exec_ctx.task_cfg.run_id.to_string();
-        let task: TaskRef = TaskFn::arc(run_id, move |cancel: TaskContext| {
+        let task: TaskRef = TaskFn::arc(move |cancel: TaskContext| {
             let ctx = Arc::clone(&exec_ctx);
             async move { run_subprocess(ctx, cancel).await }
         });

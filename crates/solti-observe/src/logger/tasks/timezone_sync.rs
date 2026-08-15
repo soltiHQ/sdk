@@ -69,7 +69,7 @@ const BACKOFF_FACTOR: f64 = 2.0;
 /// let _ = task_ref;
 /// ```
 pub fn timezone_sync() -> (TaskManifest, TaskRef) {
-    let task: TaskRef = TaskFn::arc(TIMEZONE_SYNC_SLOT, |ctx: TaskContext| async move {
+    let task: TaskRef = TaskFn::arc(|ctx: TaskContext| async move {
         debug!(
             event = "logger.timezone_sync",
             stage = "started",

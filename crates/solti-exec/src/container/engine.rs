@@ -236,7 +236,8 @@ impl ContainerExitStatus {
 /// Completed cleanup steps must remain completed across calls.
 ///
 /// Method futures execute inside the Taskvisor-owned attempt future.
-/// They may be dropped when the attempt times out or is force-aborted.
+/// An attempt timeout drops them. A Taskvisor force-abort requests actor abort;
+/// physical drop follows after any synchronous poll returns control to Tokio.
 /// Forward lifecycle work must remain owned by its method future.
 /// The runner does not spawn or retain these method futures after a force-drop.
 /// Cooperative cancellation runs `terminate` and `cleanup`.
@@ -244,8 +245,9 @@ impl ContainerExitStatus {
 ///
 /// The engine provider declares drop ownership through [`ContainerEngineBinding`].
 /// That declaration covers both in-flight method futures and the attempt value.
-/// The runner ensures the attempt value is dropped but cannot verify what its
-/// implementation does during that drop.
+/// The runner ensures the attempt value is dropped when Taskvisor physically
+/// releases the attempt future. It cannot verify what the engine implementation
+/// does during that drop.
 #[async_trait]
 pub trait ContainerAttempt: Send + 'static {
     /// Takes the captured stdout stream.

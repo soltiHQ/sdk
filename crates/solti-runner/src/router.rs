@@ -30,7 +30,11 @@ use crate::admission::{BuildScope, EnterBuildError, RunnerBuildAdmission};
 use crate::cancellation::BuildCancellation;
 use crate::error::RouterError;
 use crate::runner::Runner;
-use crate::{context::BuildContext, id::make_run_id, output::OutputPublisherHandle};
+use crate::{
+    context::BuildContext,
+    id::{RunId, make_run_id},
+    output::OutputPublisherHandle,
+};
 
 /// Single runner entry with optional static labels used for routing.
 #[derive(Clone)]
@@ -41,29 +45,82 @@ struct RunnerEntry {
     capability: RunnerCapability,
 }
 
+/// One runner-built task paired with the run identity allocated by the router.
+///
+/// Taskvisor task objects do not carry registration identity. Use [`name`](Self::name)
+/// when constructing the surrounding `taskvisor::TaskSpec`, and use
+/// [`into_task`](Self::into_task) when only the executable task is needed.
+#[must_use]
+pub struct BuiltTask {
+    run_id: RunId,
+    task: TaskRef,
+}
+
+impl BuiltTask {
+    fn new(run_id: RunId, task: TaskRef) -> Self {
+        Self { run_id, task }
+    }
+
+    /// Returns the router-allocated run identity.
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    /// Returns the name allocated for this run.
+    ///
+    /// This is the name to pass to `taskvisor::TaskSpec` when the built task is
+    /// submitted for supervision.
+    pub fn name(&self) -> &str {
+        self.run_id.name()
+    }
+
+    /// Returns the executable Taskvisor task.
+    pub fn task(&self) -> &TaskRef {
+        &self.task
+    }
+
+    /// Consumes the build result and returns only its executable task.
+    pub fn into_task(self) -> TaskRef {
+        self.task
+    }
+
+    /// Consumes the build result and returns its run identity and executable task.
+    pub fn into_parts(self) -> (RunId, TaskRef) {
+        (self.run_id, self.task)
+    }
+}
+
+impl std::fmt::Debug for BuiltTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuiltTask")
+            .field("run_id", &self.run_id)
+            .field("task", &"<dyn Task>")
+            .finish()
+    }
+}
+
 /// Cloneable, immutable snapshot of runner registrations.
 ///
 /// A catalog preserves the runners, capability labels, and registration order captured by [`RunnerRouter::catalog`].
 /// Later router registrations do not change an existing catalog.
 ///
 /// Composing runners use [`build`](Self::build) to route an inner task with an explicitly provided [`BuildContext`].
-/// Selection, [`RunId`](crate::RunId) allocation, and returned task-name validation are identical to [`RunnerRouter::build`].
+/// Selection and [`RunId`] allocation are identical to [`RunnerRouter::build`].
 #[derive(Clone)]
 pub struct RunnerCatalog {
     runners: Arc<[RunnerEntry]>,
 }
 
 impl RunnerCatalog {
-    /// Selects a snapshotted runner and builds a [`TaskRef`].
+    /// Selects a snapshotted runner and builds a [`BuiltTask`].
     ///
     /// This direct build is unmanaged and does not apply core admission limits.
     /// The provided context is passed to the selected runner.
-    /// The catalog allocates one [`RunId`](crate::RunId), and the returned task name must equal [`RunId::name`](crate::RunId::name).
+    /// The catalog allocates one [`RunId`] and returns it with the executable task.
     ///
     /// # Errors
     ///
     /// Returns [`RouterError`] when selection or task construction fails.
-    /// Returns [`RouterError::RunIdMismatch`] when the task name is incorrect.
     #[instrument(
         level = "debug",
         skip(self, task, ctx),
@@ -75,7 +132,7 @@ impl RunnerCatalog {
             workload_kind = task.spec().workload().kind()
         )
     )]
-    pub async fn build(&self, task: &Task, ctx: &BuildContext) -> Result<TaskRef, RouterError> {
+    pub async fn build(&self, task: &Task, ctx: &BuildContext) -> Result<BuiltTask, RouterError> {
         self.build_with_cancellation(task, ctx, BuildCancellation::new())
             .await
     }
@@ -95,7 +152,7 @@ impl RunnerCatalog {
         task: &Task,
         ctx: &BuildContext,
         cancellation: BuildCancellation,
-    ) -> Result<TaskRef, RouterError> {
+    ) -> Result<BuiltTask, RouterError> {
         build_unmanaged_from_entries(&self.runners, task, ctx, &cancellation).await
     }
 
@@ -121,7 +178,7 @@ impl RunnerCatalog {
         ctx: &BuildContext,
         cancellation: &BuildCancellation,
         scope: &mut BuildScope,
-    ) -> Result<TaskRef, RouterError> {
+    ) -> Result<BuiltTask, RouterError> {
         build_scoped_from_entries(&self.runners, task, ctx, cancellation, scope).await
     }
 }
@@ -144,9 +201,8 @@ impl AdmittedBuild {
     ///
     /// # Errors
     ///
-    /// Returns [`RouterError`] when runner construction or returned-name
-    /// validation fails.
-    pub async fn build(mut self) -> Result<TaskRef, RouterError> {
+    /// Returns [`RouterError`] when runner construction fails.
+    pub async fn build(mut self) -> Result<BuiltTask, RouterError> {
         build_entry(
             &self.entry,
             &self.task,
@@ -170,7 +226,7 @@ impl AdmittedBuild {
 /// - Labels are checked only when a task has `runnerSelector`.
 /// - Registration order defines routing priority.
 /// - Embedded workloads are not routed.
-/// - The router allocates the [`RunId`](crate::RunId).
+/// - The router allocates the [`RunId`].
 #[derive(Default)]
 pub struct RunnerRouter {
     runners: Vec<RunnerEntry>,
@@ -308,17 +364,16 @@ impl RunnerRouter {
         Ok(pick_entry(&self.runners, task)?.capability.name())
     }
 
-    /// Builds a [`TaskRef`] with the selected runner.
+    /// Builds a [`BuiltTask`] with the selected runner.
     ///
     /// This direct build is unmanaged and does not apply core admission limits.
-    /// The router allocates one [`RunId`](crate::RunId).
+    /// The router allocates one [`RunId`].
     /// It passes the id and build context to the runner.
-    /// The returned task name must equal [`RunId::name`](crate::RunId::name).
+    /// The returned [`BuiltTask`] keeps that identity next to the executable task.
     ///
     /// # Errors
     ///
     /// Returns [`RouterError`] when selection or task construction fails.
-    /// Returns [`RouterError::RunIdMismatch`] when the task name is incorrect.
     #[instrument(
         level = "debug",
         skip(self, task),
@@ -330,7 +385,7 @@ impl RunnerRouter {
             workload_kind = task.spec().workload().kind()
         )
     )]
-    pub async fn build(&self, task: &Task) -> Result<TaskRef, RouterError> {
+    pub async fn build(&self, task: &Task) -> Result<BuiltTask, RouterError> {
         self.build_with_cancellation(task, BuildCancellation::new())
             .await
     }
@@ -347,7 +402,7 @@ impl RunnerRouter {
         &self,
         task: &Task,
         cancellation: BuildCancellation,
-    ) -> Result<TaskRef, RouterError> {
+    ) -> Result<BuiltTask, RouterError> {
         build_unmanaged_from_entries(&self.runners, task, &self.ctx, &cancellation).await
     }
 
@@ -420,7 +475,7 @@ async fn build_unmanaged_from_entries(
     task: &Task,
     ctx: &BuildContext,
     cancellation: &BuildCancellation,
-) -> Result<TaskRef, RouterError> {
+) -> Result<BuiltTask, RouterError> {
     trace!(
         event = "runner.route",
         task_name = %task.name(),
@@ -441,7 +496,7 @@ async fn build_scoped_from_entries(
     ctx: &BuildContext,
     cancellation: &BuildCancellation,
     scope: &mut BuildScope,
-) -> Result<TaskRef, RouterError> {
+) -> Result<BuiltTask, RouterError> {
     trace!(
         event = "runner.route",
         task_name = %task.name(),
@@ -467,7 +522,7 @@ async fn build_entry(
     ctx: &BuildContext,
     cancellation: &BuildCancellation,
     scope: &mut BuildScope,
-) -> Result<TaskRef, RouterError> {
+) -> Result<BuiltTask, RouterError> {
     let runner = entry.runner.as_ref();
     let runner_name = entry.capability.name().to_owned();
     let run_id = make_run_id(&runner_name, task.slot().as_str());
@@ -478,22 +533,15 @@ async fn build_entry(
             runner: runner_name.clone(),
             source,
         })?;
-    if task_ref.name() != run_id.name() {
-        return Err(RouterError::RunIdMismatch {
-            runner: runner_name,
-            expected: run_id.into_name(),
-            actual: task_ref.name().to_owned(),
-        });
-    }
     debug!(
         event = "runner.built",
         task_name = %task.name(),
         generation = task.metadata().generation(),
         runner = runner_name,
-        run_id = task_ref.name(),
+        run_id = run_id.name(),
         "runner built task"
     );
-    Ok(task_ref)
+    Ok(BuiltTask::new(run_id, task_ref))
 }
 
 fn map_enter_error(runner: &str, error: EnterBuildError) -> RouterError {
@@ -587,12 +635,12 @@ mod tests {
         async fn build_task(
             &self,
             _task: &Task,
-            run_id: &RunId,
+            _run_id: &RunId,
             _ctx: &BuildContext,
             _cancellation: &BuildCancellation,
             _scope: &mut BuildScope,
         ) -> Result<TaskRef, RunnerError> {
-            Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move {
+            Ok(TaskFn::arc(|_ctx: TaskContext| async move {
                 Ok::<(), TaskError>(())
             }))
         }
@@ -785,7 +833,7 @@ mod tests {
         let _interest_guard = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
         tracing::dispatcher::with_default(&dispatch, tracing::callsite::rebuild_interest_cache);
 
-        router.build(&task).with_subscriber(dispatch).await.unwrap();
+        let _built = router.build(&task).with_subscriber(dispatch).await.unwrap();
 
         let fields = capture.fields.lock().unwrap().join(" ");
         assert!(fields.contains("task_name=trace-test-task"));
@@ -826,7 +874,7 @@ mod tests {
             async fn build_task(
                 &self,
                 _task: &Task,
-                run_id: &RunId,
+                _run_id: &RunId,
                 ctx: &BuildContext,
                 _cancellation: &BuildCancellation,
                 _scope: &mut BuildScope,
@@ -841,7 +889,7 @@ mod tests {
                 {
                     return Err(RunnerError::Internal("missing output publisher".into()));
                 }
-                Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move {
+                Ok(TaskFn::arc(|_ctx: TaskContext| async move {
                     Ok::<(), TaskError>(())
                 }))
             }
@@ -893,7 +941,7 @@ mod tests {
             async fn build_task(
                 &self,
                 _task: &Task,
-                run_id: &RunId,
+                _run_id: &RunId,
                 ctx: &BuildContext,
                 _cancellation: &BuildCancellation,
                 _scope: &mut BuildScope,
@@ -912,7 +960,7 @@ mod tests {
                         "catalog did not pass the explicit output publisher".into(),
                     ));
                 }
-                Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move {
+                Ok(TaskFn::arc(|_ctx: TaskContext| async move {
                     Ok::<(), TaskError>(())
                 }))
             }
@@ -1171,13 +1219,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runner_must_use_the_allocated_run_id() {
-        struct WrongNameRunner;
+    async fn build_result_keeps_the_allocated_run_id_beside_the_task() {
+        struct IdentityAgnosticRunner;
 
         #[crate::async_trait]
-        impl Runner for WrongNameRunner {
+        impl Runner for IdentityAgnosticRunner {
             fn name(&self) -> &str {
-                "wrong-name"
+                "identity-agnostic"
             }
 
             fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
@@ -1195,29 +1243,31 @@ mod tests {
                 _cancellation: &BuildCancellation,
                 _scope: &mut BuildScope,
             ) -> Result<TaskRef, RunnerError> {
-                Ok(TaskFn::arc(
-                    "ignored-run-id",
-                    |_ctx: TaskContext| async move { Ok::<(), TaskError>(()) },
-                ))
+                Ok(TaskFn::arc(|_ctx: TaskContext| async move {
+                    Ok::<(), TaskError>(())
+                }))
             }
         }
 
         let mut router = RunnerRouter::new();
-        router.register(Arc::new(WrongNameRunner)).unwrap();
+        router.register(Arc::new(IdentityAgnosticRunner)).unwrap();
         let catalog = router.catalog();
 
-        match router.build(&subprocess_task()).await {
-            Err(RouterError::RunIdMismatch { .. }) => {}
-            Err(error) => panic!("expected RunIdMismatch, got {error:?}"),
-            Ok(_) => panic!("expected RunIdMismatch, got Ok(..)"),
-        }
-        match catalog
+        let built = router.build(&subprocess_task()).await.unwrap();
+        assert!(built.name().starts_with("identity-agnostic-test-slot-"));
+        assert_eq!(built.run_id().name(), built.name());
+        let name = built.name().to_owned();
+        let task = Arc::clone(built.task());
+        let (run_id, into_task) = built.into_parts();
+        assert_eq!(run_id.name(), name);
+        assert!(Arc::ptr_eq(&task, &into_task));
+
+        let built = catalog
             .build(&subprocess_task(), &BuildContext::default())
             .await
-        {
-            Err(RouterError::RunIdMismatch { .. }) => {}
-            Err(error) => panic!("expected RunIdMismatch, got {error:?}"),
-            Ok(_) => panic!("expected RunIdMismatch, got Ok(..)"),
-        }
+            .unwrap();
+        assert!(built.name().starts_with("identity-agnostic-test-slot-"));
+        let task = Arc::clone(built.task());
+        assert!(Arc::ptr_eq(&task, &built.into_task()));
     }
 }

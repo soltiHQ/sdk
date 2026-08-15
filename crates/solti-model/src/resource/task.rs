@@ -19,8 +19,11 @@
 //!             False          ── manual retry ────▶ Unknown
 //!             Unknown | True ── failure      ────▶ False
 //!
-//! Pending ── attempt starts ──▶ Running ── attempt ends ──▶ terminal phase
+//! Pending ── attempt starts ──▶ Running ── terminal outcome ──▶ terminal phase
 //! ```
+//!
+//! A terminal phase records the supervisor's logical outcome. It does not by
+//! itself prove that non-cooperative execution code has exited physically.
 //!
 //! Generation is checked before attempt transitions.
 //! Stale generation updates are ignored.

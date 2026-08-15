@@ -92,7 +92,7 @@ impl Runner for ChainRunner {
         let generation = task.metadata().generation();
         let run_id = run_id.name().to_owned();
 
-        Ok(TaskFn::arc(run_id.clone(), move |ctx: TaskContext| {
+        Ok(TaskFn::arc(move |ctx: TaskContext| {
             let plan = Arc::clone(&plan);
             let output = Arc::clone(&output);
             let attempt = attempts.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
@@ -141,7 +141,8 @@ impl ChainRunner {
                         "chain step '{}' could not be built: {error}",
                         step.name()
                     ))
-                })?;
+                })?
+                .into_task();
             let on_success = step.on_success().map(|next| indices[next]);
             let on_failure = step.on_failure().map(|transition| CompiledFailure {
                 next: indices[transition.next()],

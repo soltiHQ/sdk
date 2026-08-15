@@ -97,11 +97,10 @@ async fn main() -> ExampleResult {
         return Err("discovery manifest is not Embedded".into());
     };
     println!(
-        "[build] task={}, slot={}, revision={}, taskvisorName={}.",
+        "[build] task={}, slot={}, revision={}.",
         manifest.name(),
         manifest.spec().slot(),
         embedded.revision(),
-        task_ref.name(),
     );
     println!("[build] The gRPC channel has not been created.");
 

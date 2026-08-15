@@ -68,19 +68,14 @@ fn manifest(name: &str, labels: Labels) -> ExampleResult<TaskManifest> {
 }
 
 /// Creates an embedded task that completes at once.
-fn immediate_task(name: impl Into<String>) -> TaskRef {
-    TaskFn::arc(name.into(), |_ctx: TaskContext| async move {
-        Ok::<(), TaskError>(())
-    })
+fn immediate_task() -> TaskRef {
+    TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) })
 }
 
 /// Creates one retained resource through the public supervisor API.
 async fn create_task(api: &SupervisorApi, name: &str, labels: Labels) -> ExampleResult<Task> {
     Ok(api
-        .create_embedded_task(
-            manifest(name, labels)?,
-            immediate_task(format!("{name}-runtime")),
-        )
+        .create_embedded_task(manifest(name, labels)?, immediate_task())
         .await?)
 }
 
@@ -186,7 +181,7 @@ async fn main() -> ExampleResult {
 
     let before_create = api.query_tasks(&TaskQuery::new())?.resource_version;
     let mut completion_watch = api.watch_tasks(&TaskFilter::new(), Some(before_create.as_str()))?;
-    let watched_runtime = immediate_task("watched-runtime");
+    let watched_runtime = immediate_task();
     let watched = api
         .create_embedded_task(
             manifest("watched", labels("development", None))?,

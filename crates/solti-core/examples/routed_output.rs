@@ -80,7 +80,7 @@ impl Runner for ImageResizeRunner {
     async fn build_task(
         &self,
         task: &Task,
-        run_id: &RunId,
+        _run_id: &RunId,
         ctx: &BuildContext,
         _cancellation: &solti_runner::BuildCancellation,
         _scope: &mut solti_runner::BuildScope,
@@ -112,33 +112,30 @@ impl Runner for ImageResizeRunner {
         let started = Arc::clone(&self.started);
         let release = Arc::clone(&self.release);
 
-        Ok(TaskFn::arc(
-            run_id.name().to_owned(),
-            move |_ctx: TaskContext| {
-                let task_name = task_name.clone();
-                let output = Arc::clone(&output);
-                let started = Arc::clone(&started);
-                let release = Arc::clone(&release);
-                let source = source.clone();
+        Ok(TaskFn::arc(move |_ctx: TaskContext| {
+            let task_name = task_name.clone();
+            let output = Arc::clone(&output);
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let source = source.clone();
 
-                async move {
-                    started.notify_one();
-                    release.notified().await;
+            async move {
+                started.notify_one();
+                release.notified().await;
 
-                    let sink = output
-                        .sink_for(&task_name, generation, 1)
-                        .ok_or_else(|| TaskError::fatal("core output channel is unavailable"))?;
-                    sink.stdout_line(Bytes::from(format!(
-                        "loading {source} for generation {generation}"
-                    )));
-                    sink.stderr_line(Bytes::from_static(
-                        b"example diagnostic: CPU backend selected",
-                    ));
-                    sink.stdout_line(Bytes::from(format!("resized {source} to {width}px")));
-                    Ok::<(), TaskError>(())
-                }
-            },
-        ))
+                let sink = output
+                    .sink_for(&task_name, generation, 1)
+                    .ok_or_else(|| TaskError::fatal("core output channel is unavailable"))?;
+                sink.stdout_line(Bytes::from(format!(
+                    "loading {source} for generation {generation}"
+                )));
+                sink.stderr_line(Bytes::from_static(
+                    b"example diagnostic: CPU backend selected",
+                ));
+                sink.stdout_line(Bytes::from(format!("resized {source} to {width}px")));
+                Ok::<(), TaskError>(())
+            }
+        }))
     }
 }
 

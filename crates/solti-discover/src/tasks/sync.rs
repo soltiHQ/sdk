@@ -113,7 +113,7 @@ pub fn sync(
         uptime,
     });
 
-    let task: TaskRef = TaskFn::arc(SLOT, move |cancel: TaskContext| {
+    let task: TaskRef = TaskFn::arc(move |cancel: TaskContext| {
         let ctx = Arc::clone(&ctx);
 
         async move {

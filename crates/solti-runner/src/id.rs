@@ -1,6 +1,6 @@
 //! # Run identity
 //!
-//! [`RunId`] names one `TaskRef` built by a runner.
+//! [`RunId`] identifies one task built through a runner router.
 //! It does not identify an individual execution attempt.
 //!
 //! ## Flow
@@ -10,7 +10,7 @@
 //!               ▼
 //!       runner-slot-sequence
 //!               ▼
-//!        taskvisor TaskRef
+//!           BuiltTask
 //! ```
 //!
 //! The slot comes from task desired state.
@@ -29,7 +29,7 @@ fn next_seq() -> u64 {
     RUN_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Name allocated for one runner-built `TaskRef`.
+/// Identity allocated for one runner build.
 ///
 /// The format is `{runner}-{slot}-{sequence}`.
 /// The sequence is local to the current process.
@@ -53,7 +53,9 @@ pub struct RunId {
 }
 
 impl RunId {
-    /// Returns the allocated `TaskRef` name.
+    /// Returns the allocated run name.
+    ///
+    /// Use this name when constructing the surrounding `taskvisor::TaskSpec`.
     #[inline]
     pub fn name(&self) -> &str {
         &self.name

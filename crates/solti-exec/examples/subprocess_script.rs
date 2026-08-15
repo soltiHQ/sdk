@@ -107,17 +107,17 @@ async fn main() -> ExampleResult {
     let mut router = RunnerRouter::new().with_output_publisher(output_handle);
     let runner = register_subprocess_runner(&mut router, "shell")?;
 
-    let task_ref = router.build(&task).await?;
+    let built = router.build(&task).await?;
     println!(
         "[build] Decoded the body and built {}; no script transport exists between attempts.",
-        task_ref.name(),
+        built.name(),
     );
 
-    task_ref.spawn(TaskContext::detached()).await?;
+    built.task().spawn(TaskContext::detached()).await?;
     println!(
         "[attempt/1] Created transport, ran /bin/sh, reaped the child, and removed transport."
     );
-    task_ref.spawn(TaskContext::detached()).await?;
+    built.task().spawn(TaskContext::detached()).await?;
     println!("[attempt/2] Repeated the same lifecycle with a fresh attempt scope.");
 
     let observed_attempts = {
@@ -142,7 +142,7 @@ async fn main() -> ExampleResult {
         observed_attempts
     };
     assert_eq!(observed_attempts, [1, 2]);
-    drop(task_ref);
+    drop(built);
     drop(router);
     runner.shutdown(Duration::from_secs(5)).await?;
     println!("[shutdown] Closed admission and drained accepted process ownership.");

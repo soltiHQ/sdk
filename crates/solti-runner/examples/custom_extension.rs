@@ -7,7 +7,7 @@
 //! - register two runners for the same GVK;
 //! - select one runner through `runnerSelector`;
 //! - inspect the registered capability snapshot;
-//! - use the allocated `RunId` as the returned `TaskRef` name.
+//! - inspect the allocated `RunId` returned beside the executable task.
 //!
 //! Routing uses only the workload GVK and static runner labels.
 //! The selected runner validates the application-owned `spec`.
@@ -47,6 +47,9 @@ solti-runner: custom workload routing
                                                       │ validate application spec
                                                       ▼
                                              taskvisor::TaskRef
+                                                      │ router pairs it with RunId
+                                                      ▼
+                                                  BuiltTask
 
   Routing reads only the GVK and selector.
   Building validates the payload and creates a task; it does not start it.
@@ -77,7 +80,7 @@ impl Runner for ImageResizeRunner {
     async fn build_task(
         &self,
         task: &Task,
-        run_id: &RunId,
+        _run_id: &RunId,
         _ctx: &BuildContext,
         _cancellation: &solti_runner::BuildCancellation,
         _scope: &mut solti_runner::BuildScope,
@@ -104,16 +107,13 @@ impl Runner for ImageResizeRunner {
         let accelerator = self.accelerator;
         let source: Arc<str> = spec.source.into();
         let width = spec.width;
-        Ok(TaskFn::arc(
-            run_id.name().to_owned(),
-            move |_ctx: TaskContext| {
-                let source = Arc::clone(&source);
-                async move {
-                    println!("resize {source} to {width}px with {accelerator}");
-                    Ok::<(), TaskError>(())
-                }
-            },
-        ))
+        Ok(TaskFn::arc(move |_ctx: TaskContext| {
+            let source = Arc::clone(&source);
+            async move {
+                println!("resize {source} to {width}px with {accelerator}");
+                Ok::<(), TaskError>(())
+            }
+        }))
     }
 }
 
@@ -192,16 +192,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert_eq!(selected.name(), "resize-gpu");
 
-    let task_ref = router.build(&task).await?;
+    let built = router.build(&task).await?;
     println!("[build] The runner validates source and width.");
     println!(
-        "[build] The returned TaskRef uses the allocated RunId: {}.",
-        task_ref.name(),
+        "[build] BuiltTask keeps the allocated RunId beside the executable task: {}.",
+        built.name(),
     );
-    assert!(task_ref.name().starts_with("resize-gpu-image-resize-"));
+    assert!(built.name().starts_with("resize-gpu-image-resize-"));
 
     println!(
-        "\nResult: routing and construction succeeded; the TaskRef was not submitted or executed."
+        "\nResult: routing and construction succeeded; the built task was not submitted or executed."
     );
 
     Ok(())

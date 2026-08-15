@@ -296,7 +296,7 @@ The API does not provide a staged-rollout or availability guarantee.
 | Field                | Meaning                                       |
 |----------------------|-----------------------------------------------|
 | `observedGeneration` | Latest generation processed by the controller |
-| `phase`              | Current execution phase                       |
+| `phase`              | Current logical lifecycle phase               |
 | `attempt`            | Attempt within `observedGeneration`           |
 | `exitCode`           | Process exit code, when available             |
 | `error`              | Execution diagnostic, when available          |
@@ -510,7 +510,9 @@ The response shape is:
 `continue` and `remainingItemCount` are absent on the final page.
 Runs are ordered by generation and attempt.
 An active run has phase `running` and no terminal fields.
-A finished run has a terminal phase and `finishedAt`.
+A terminal run has a terminal phase and `finishedAt`.
+That timestamp records the supervisor's logical outcome. A force-aborted run
+can remain physically active afterward.
 `TaskRun.error`, when present, is normalized before storage to the longest
 UTF-8-safe prefix of at most 32 KiB.
 
@@ -550,7 +552,8 @@ DELETE /apis/solti.io/v1/tasks/{name}?uid={uid}&resourceVersion={opaque-version}
 ```
 
 Preconditions are optional.
-A successful delete stops the task and purges its history.
+A successful delete records a terminal logical outcome and purges retained state.
+Force-aborted task code can remain physically active after the response.
 HTTP returns `204 No Content`.
 
 gRPC uses `DeleteTaskRequest`.

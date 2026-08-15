@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -11,6 +14,14 @@ use taskvisor::{
 use tokio::sync::Notify;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct ReleaseBlockedPoll(Arc<AtomicBool>);
+
+impl Drop for ReleaseBlockedPoll {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 
 #[derive(Default)]
 struct Capture {
@@ -72,8 +83,9 @@ fn backoff() -> BackoffPolicy {
     .expect("valid backoff")
 }
 
-fn task_spec(task: TaskRef) -> TaskSpec {
+fn task_spec(name: &'static str, task: TaskRef) -> TaskSpec {
     TaskSpec::new(
+        name,
         task,
         RestartPolicy::Never,
         backoff(),
@@ -81,8 +93,13 @@ fn task_spec(task: TaskRef) -> TaskSpec {
     )
 }
 
-fn controller_spec(policy: AdmissionPolicy, slot: &'static str, task: TaskRef) -> ControllerSpec {
-    ControllerSpec::new(policy, task_spec(task)).with_slot(slot)
+fn controller_spec(
+    policy: AdmissionPolicy,
+    slot: &'static str,
+    name: &'static str,
+    task: TaskRef,
+) -> ControllerSpec {
+    ControllerSpec::new(policy, task_spec(name, task)).with_slot(slot)
 }
 
 async fn wait_outcome(waiter: TaskWaiter) -> TaskOutcome {
@@ -97,14 +114,13 @@ async fn completed_waiter_and_event_share_the_typed_outcome() {
     let capture = Arc::new(Capture::default());
     let supervisor = Supervisor::builder(SupervisorConfig::default())
         .with_subscribers(vec![capture.clone()])
-        .build();
-    let handle = supervisor.serve();
+        .try_build()
+        .expect("supervisor build");
+    let handle = supervisor.serve().expect("runtime startup");
 
-    let task: TaskRef = TaskFn::arc("contract-completed", |_ctx: TaskContext| async move {
-        Ok::<(), TaskError>(())
-    });
+    let task: TaskRef = TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) });
     let (id, waiter) = handle
-        .add_and_watch(task_spec(task))
+        .add_and_watch(task_spec("contract-completed", task))
         .await
         .expect("add watched task");
 
@@ -125,14 +141,14 @@ async fn canceled_attempt_and_task_have_typed_events() {
     let capture = Arc::new(Capture::default());
     let supervisor = Supervisor::builder(SupervisorConfig::default())
         .with_subscribers(vec![capture.clone()])
-        .build();
-    let handle = supervisor.serve();
+        .try_build()
+        .expect("supervisor build");
+    let handle = supervisor.serve().expect("runtime startup");
 
-    let task: TaskRef = TaskFn::arc("contract-canceled", |_ctx: TaskContext| async move {
-        Err::<(), TaskError>(TaskError::Canceled)
-    });
+    let task: TaskRef =
+        TaskFn::arc(|_ctx: TaskContext| async move { Err::<(), TaskError>(TaskError::Canceled) });
     let (id, waiter) = handle
-        .add_and_watch(task_spec(task))
+        .add_and_watch(task_spec("contract-canceled", task))
         .await
         .expect("add watched task");
 
@@ -156,14 +172,16 @@ async fn configured_timeout_has_one_typed_terminal_attempt_event() {
     let capture = Arc::new(Capture::default());
     let supervisor = Supervisor::builder(SupervisorConfig::default())
         .with_subscribers(vec![capture.clone()])
-        .build();
-    let handle = supervisor.serve();
+        .try_build()
+        .expect("supervisor build");
+    let handle = supervisor.serve().expect("runtime startup");
 
-    let task: TaskRef = TaskFn::arc("contract-timeout", |_ctx: TaskContext| async move {
+    let task: TaskRef = TaskFn::arc(|_ctx: TaskContext| async move {
         std::future::pending::<()>().await;
         Ok::<(), TaskError>(())
     });
     let spec = TaskSpec::new(
+        "contract-timeout",
         task,
         RestartPolicy::Never,
         backoff(),
@@ -207,12 +225,13 @@ async fn drop_if_running_is_classified_by_rejection_kind() {
     let supervisor = Supervisor::builder(SupervisorConfig::default())
         .with_subscribers(vec![capture.clone()])
         .with_controller(ControllerConfig::default())
-        .build();
-    let handle = supervisor.serve();
+        .try_build()
+        .expect("supervisor build");
+    let handle = supervisor.serve().expect("runtime startup");
 
     let started = Arc::new(Notify::new());
     let task_started = Arc::clone(&started);
-    let busy: TaskRef = TaskFn::arc("contract-busy", move |ctx: TaskContext| {
+    let busy: TaskRef = TaskFn::arc(move |ctx: TaskContext| {
         let task_started = Arc::clone(&task_started);
         async move {
             task_started.notify_one();
@@ -220,14 +239,13 @@ async fn drop_if_running_is_classified_by_rejection_kind() {
             Ok::<(), TaskError>(())
         }
     });
-    let dropped: TaskRef = TaskFn::arc("contract-dropped", |_ctx: TaskContext| async move {
-        Ok::<(), TaskError>(())
-    });
+    let dropped: TaskRef = TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) });
 
     let (_busy_id, _busy_waiter) = handle
         .submit_and_watch(controller_spec(
             AdmissionPolicy::DropIfRunning,
             "contract-drop-slot",
+            "contract-busy",
             busy,
         ))
         .await
@@ -240,6 +258,7 @@ async fn drop_if_running_is_classified_by_rejection_kind() {
         .submit_and_watch(controller_spec(
             AdmissionPolicy::DropIfRunning,
             "contract-drop-slot",
+            "contract-dropped",
             dropped,
         ))
         .await
@@ -266,20 +285,100 @@ async fn drop_if_running_is_classified_by_rejection_kind() {
         .expect("shutdown failed");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn force_aborted_owner_keeps_its_controller_slot_until_physical_release() {
+    let supervisor =
+        Supervisor::builder(SupervisorConfig::default().with_grace(Duration::from_millis(20)))
+            .with_controller(ControllerConfig::default())
+            .try_build()
+            .expect("supervisor build");
+    let handle = supervisor.serve().expect("runtime startup");
+    let release = Arc::new(AtomicBool::new(false));
+    let _release_on_drop = ReleaseBlockedPoll(Arc::clone(&release));
+    let started = Arc::new(Notify::new());
+    let owner_started = Arc::clone(&started);
+    let owner_release = Arc::clone(&release);
+    let owner: TaskRef = TaskFn::arc(move |_ctx: TaskContext| {
+        let owner_started = Arc::clone(&owner_started);
+        let owner_release = Arc::clone(&owner_release);
+        async move {
+            owner_started.notify_one();
+            while !owner_release.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            Ok(())
+        }
+    });
+    let (owner_id, owner_waiter) = handle
+        .submit_and_watch(controller_spec(
+            AdmissionPolicy::Queue,
+            "physical-release-slot",
+            "physical-release-owner",
+            owner,
+        ))
+        .await
+        .expect("submit blocking owner");
+    tokio::time::timeout(TEST_TIMEOUT, started.notified())
+        .await
+        .expect("blocking owner did not start");
+
+    let next_runs = Arc::new(AtomicUsize::new(0));
+    let runs = Arc::clone(&next_runs);
+    let next: TaskRef = TaskFn::arc(move |_ctx: TaskContext| {
+        let runs = Arc::clone(&runs);
+        async move {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    });
+    let (_next_id, next_waiter) = handle
+        .submit_and_watch(controller_spec(
+            AdmissionPolicy::Queue,
+            "physical-release-slot",
+            "physical-release-next",
+            next,
+        ))
+        .await
+        .expect("queue next task");
+
+    assert!(handle.cancel(owner_id).await.expect("cancel owner"));
+    assert!(matches!(
+        wait_outcome(owner_waiter).await,
+        TaskOutcome::ForceAborted
+    ));
+    let mut next_outcome = Box::pin(next_waiter.wait());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), next_outcome.as_mut())
+            .await
+            .is_err(),
+        "logical force-abort must not release the controller slot"
+    );
+    assert_eq!(next_runs.load(Ordering::SeqCst), 0);
+
+    release.store(true, Ordering::Release);
+    assert!(matches!(
+        tokio::time::timeout(TEST_TIMEOUT, next_outcome).await,
+        Ok(Ok(TaskOutcome::Completed))
+    ));
+    assert_eq!(next_runs.load(Ordering::SeqCst), 1);
+    handle.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn replace_supersedes_the_queued_submission_by_typed_kind() {
     let capture = Arc::new(Capture::default());
     let supervisor = Supervisor::builder(SupervisorConfig::default())
         .with_subscribers(vec![capture.clone()])
         .with_controller(ControllerConfig::default())
-        .build();
-    let handle = supervisor.serve();
+        .try_build()
+        .expect("supervisor build");
+    let handle = supervisor.serve().expect("runtime startup");
 
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let task_started = Arc::clone(&started);
     let task_release = Arc::clone(&release);
-    let head: TaskRef = TaskFn::arc("contract-head", move |_ctx: TaskContext| {
+    let head: TaskRef = TaskFn::arc(move |_ctx: TaskContext| {
         let task_started = Arc::clone(&task_started);
         let task_release = Arc::clone(&task_release);
         async move {
@@ -288,11 +387,11 @@ async fn replace_supersedes_the_queued_submission_by_typed_kind() {
             Ok::<(), TaskError>(())
         }
     });
-    let queued: TaskRef = TaskFn::arc("contract-queued", |ctx: TaskContext| async move {
+    let queued: TaskRef = TaskFn::arc(|ctx: TaskContext| async move {
         ctx.cancelled().await;
         Ok::<(), TaskError>(())
     });
-    let replacement: TaskRef = TaskFn::arc("contract-replacement", |ctx: TaskContext| async move {
+    let replacement: TaskRef = TaskFn::arc(|ctx: TaskContext| async move {
         ctx.cancelled().await;
         Ok::<(), TaskError>(())
     });
@@ -301,6 +400,7 @@ async fn replace_supersedes_the_queued_submission_by_typed_kind() {
         .submit_and_watch(controller_spec(
             AdmissionPolicy::Replace,
             "contract-replace-slot",
+            "contract-head",
             head,
         ))
         .await
@@ -313,6 +413,7 @@ async fn replace_supersedes_the_queued_submission_by_typed_kind() {
         .submit_and_watch(controller_spec(
             AdmissionPolicy::Replace,
             "contract-replace-slot",
+            "contract-queued",
             queued,
         ))
         .await
@@ -321,6 +422,7 @@ async fn replace_supersedes_the_queued_submission_by_typed_kind() {
         .submit_and_watch(controller_spec(
             AdmissionPolicy::Replace,
             "contract-replace-slot",
+            "contract-replacement",
             replacement,
         ))
         .await

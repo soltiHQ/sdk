@@ -93,7 +93,7 @@ pub enum ConfigError {
 /// | [`watch_history_byte_budget`](Self::watch_history_byte_budget)           | 64 MiB    |
 ///
 /// Finished runs expire after `run_ttl`.
-/// An unbound unfinished run can also expire after that age.
+/// An unbound nonterminal run can also expire after that age.
 /// A terminal task expires after its run history is empty and `task_ttl` has elapsed.
 /// A task with a runtime binding is not removed.
 /// `max_retained_tasks` counts every stored task.
@@ -160,7 +160,7 @@ impl StateConfig {
 
     /// Returns the run retention age.
     ///
-    /// This also applies to unfinished runs without a runtime binding.
+    /// This also applies to nonterminal runs without a runtime binding.
     pub const fn run_ttl(&self) -> Duration {
         self.run_ttl
     }
@@ -180,7 +180,7 @@ impl StateConfig {
 
     /// Returns the per-task completed run cap.
     ///
-    /// Zero keeps active runs and removes every finished run.
+    /// Zero keeps active runs and removes every terminal run.
     pub const fn max_runs_per_task(&self) -> usize {
         self.max_runs_per_task
     }

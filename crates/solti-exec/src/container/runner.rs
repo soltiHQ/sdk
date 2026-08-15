@@ -182,8 +182,7 @@ impl Runner for ContainerRunner {
             logger: self.config.logger(),
             attempt: AtomicU32::new(0),
         });
-        let name = exec.task.run_id.to_string();
-        Ok(TaskFn::arc(name, move |cancel: TaskContext| {
+        Ok(TaskFn::arc(move |cancel: TaskContext| {
             let exec = Arc::clone(&exec);
             async move { run_container(exec, cancel).await }
         }))

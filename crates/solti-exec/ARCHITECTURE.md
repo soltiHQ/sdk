@@ -100,7 +100,8 @@ Attempt I/O returns an unsupported-platform error there.
 ## Build and attempt boundaries
 
 Both runners build reusable `TaskRef` values.
-Taskvisor owns execution after the build.
+`RunnerRouter` returns each one in a `BuiltTask` with its allocated `RunId`.
+Taskvisor owns execution after core constructs a named registration.
 
 ```mermaid
 %%{init: {"flowchart": {"curve": "linear"}}}%%
@@ -110,6 +111,7 @@ flowchart LR
     Build["Runner::build_task"]
     Config["Immutable task settings"]
     TaskRef["taskvisor::TaskRef"]
+    Built["BuiltTask<br/>RunId + TaskRef"]
     Spawn["Taskvisor attempt"]
     Resources["Fresh attempt resources"]
     Result["Task result + cleanup"]
@@ -118,7 +120,8 @@ flowchart LR
     Router --> Build
     Build --> Config
     Config --> TaskRef
-    TaskRef --> Spawn
+    TaskRef --> Built
+    Built --> Spawn
     Spawn --> Resources
     Resources --> Result
 ```
@@ -368,7 +371,9 @@ admission, drop handoff, failure state, and shutdown path are implemented in the
 The runner polls creation and attempt methods inline.
 It does not spawn engine lifecycle futures.
 Cooperative cancellation waits for termination, exit observation, and cleanup.
-A Taskvisor timeout or force-abort drops the current lifecycle future and the attempt object.
+An attempt timeout drops the current lifecycle future and the attempt object.
+A Taskvisor force-abort requests actor abort. Physical drop follows after any
+synchronous poll returns control to Tokio.
 The engine's declared contract owns any cleanup that must continue after that drop.
 The only runner-spawned work in this path is at most two output readers.
 Their handles abort on drop.

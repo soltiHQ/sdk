@@ -518,8 +518,8 @@ It uses `StateConfig::sweep_interval`.
 
 One sweep:
 
-1. removes expired finished runs;
-2. removes expired unfinished runs without a runtime binding;
+1. removes expired terminal runs;
+2. removes expired nonterminal runs without a runtime binding;
 3. enforces the completed-run cap while keeping active runs;
 4. removes terminal tasks after their run history is empty and `task_ttl` expires.
 
@@ -594,6 +594,9 @@ Read methods remain available over retained state.
 Dropping `SupervisorApi` starts the same cleanup work on the captured Tokio runtime.
 Drop cannot await or return the cleanup result.
 Call `shutdown` when completion must be observed.
+Completion covers the bounded Taskvisor workflow and SDK-owned workers. A
+`ForceAborted` outcome does not prove physical exit of non-cooperative user task
+code. Taskvisor keeps the controller slot until that ownership is released.
 
 ## Where to make a change
 

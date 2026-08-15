@@ -75,6 +75,11 @@ impl SupervisorApiBuilder {
     }
 
     /// Replaces Taskvisor runtime settings.
+    ///
+    /// Taskvisor 0.8 shares `ownership_capacity` between configured subscribers
+    /// and task values retained through intake, queuing, physical execution,
+    /// and isolated destruction. Core always installs one subscriber for its
+    /// state observer; each external subscriber consumes another slot.
     pub fn with_runtime_config(mut self, runtime_config: SupervisorConfig) -> Self {
         self.runtime_config = runtime_config;
         self
@@ -90,6 +95,9 @@ impl SupervisorApiBuilder {
     ///
     /// The core observer is installed separately.
     /// It cannot be replaced through this method.
+    /// Taskvisor charges both the core observer and these subscribers against
+    /// `SupervisorConfig::ownership_capacity`, together with retained task
+    /// values.
     pub fn with_subscribers(mut self, subscribers: Vec<Arc<dyn Subscribe>>) -> Self {
         self.subscribers = subscribers;
         self
@@ -158,6 +166,9 @@ impl SupervisorApiBuilder {
     /// Returns [`CoreError::StateInitialization`] when state identity creation fails.
     /// Returns [`CoreError::PersistenceInitialization`] when a configured
     /// persistence worker cannot start.
+    /// Returns [`CoreError::SupervisorInitialization`] when Taskvisor rejects
+    /// the runtime, controller, or subscriber configuration.
+    /// Returns [`CoreError::Supervisor`] when Taskvisor runtime startup fails.
     pub async fn start(self) -> Result<SupervisorApi, CoreError> {
         SupervisorApi::start(SupervisorStartConfig {
             runtime: self.runtime_config,
@@ -179,8 +190,11 @@ impl SupervisorApiBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::num::NonZeroUsize;
     use std::sync::atomic::Ordering;
     use std::sync::{OnceLock, Weak};
+    use std::task::{Context, Poll, Waker};
 
     use solti_model::{EmbeddedSpec, TaskId, TaskManifest, TaskSpec, TaskWorkload, Uid};
 
@@ -193,6 +207,12 @@ mod tests {
     }
 
     struct IgnoringOutputSink;
+
+    struct IgnoringTaskvisorSubscriber;
+
+    impl Subscribe for IgnoringTaskvisorSubscriber {
+        fn on_event(&self, _event: &taskvisor::Event) {}
+    }
 
     impl crate::TaskOutputSink for IgnoringOutputSink {
         fn on_event(&self, _event: &crate::TaskOutputEvent) {}
@@ -253,6 +273,72 @@ mod tests {
         assert!(api.state_persistence_status().is_none());
         assert!(api.output_persistence_status().is_none());
         api.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn taskvisor_build_rejection_is_returned_as_typed_start_error() {
+        let runtime =
+            SupervisorConfig::default().with_bus_capacity(NonZeroUsize::new(usize::MAX).unwrap());
+
+        let error = match SupervisorApiBuilder::new(RunnerRouter::new())
+            .with_runtime_config(runtime)
+            .start()
+            .await
+        {
+            Ok(_) => panic!("Taskvisor must reject a structurally invalid bus capacity"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            CoreError::SupervisorInitialization(taskvisor::BuildError::CapacityTooLarge {
+                field: "bus_capacity",
+                value: usize::MAX,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn taskvisor_ownership_capacity_includes_the_core_observer_and_external_subscribers() {
+        let runtime = SupervisorConfig::default().with_ownership_capacity(NonZeroUsize::new(1));
+        let error = match SupervisorApiBuilder::new(RunnerRouter::new())
+            .with_runtime_config(runtime)
+            .with_subscribers(vec![Arc::new(IgnoringTaskvisorSubscriber)])
+            .start()
+            .await
+        {
+            Ok(_) => panic!("two subscribers must not fit one ownership slot"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            CoreError::SupervisorInitialization(taskvisor::BuildError::ResourceLimitReached {
+                resource: "owned_user_lifetimes",
+                limit: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn taskvisor_runtime_start_failure_keeps_the_start_operation_label() {
+        let mut start = Box::pin(SupervisorApiBuilder::new(RunnerRouter::new()).start());
+        let mut context = Context::from_waker(Waker::noop());
+        let error = match start.as_mut().poll(&mut context) {
+            Poll::Ready(Err(error)) => error,
+            Poll::Ready(Ok(_)) => panic!("Taskvisor startup must require an active Tokio runtime"),
+            Poll::Pending => panic!("startup without Tokio must fail synchronously"),
+        };
+
+        assert!(matches!(
+            error,
+            CoreError::Supervisor {
+                op: "start",
+                source: taskvisor::Error::Runtime(taskvisor::RuntimeError::TokioRuntimeUnavailable),
+            }
+        ));
     }
 
     #[tokio::test]

@@ -121,12 +121,12 @@ printf 'diagnostic=example\n' >&2"#;
     let task = Task::new("inspect-process-boundary", spec)?;
     println!("[setup/task] Task sets TASK_VALUE and SHARED; runner SHARED must win.");
 
-    let task_ref = router.build(&task).await?;
+    let built = router.build(&task).await?;
     println!(
         "[build] Router selected local and built {}; no child exists yet.",
-        task_ref.name(),
+        built.name(),
     );
-    task_ref.spawn(TaskContext::detached()).await?;
+    built.task().spawn(TaskContext::detached()).await?;
     println!("[attempt] The child exited successfully and was reaped.");
 
     let lines = {
@@ -157,7 +157,7 @@ printf 'diagnostic=example\n' >&2"#;
             .any(|line| line == &format!("cwd={}", canonical_workdir.display()))
     );
     assert!(lines.iter().any(|line| line == "diagnostic=example"));
-    drop(task_ref);
+    drop(built);
     drop(router);
     runner.shutdown(Duration::from_secs(5)).await?;
     println!("[shutdown] Closed admission and drained accepted process ownership.");

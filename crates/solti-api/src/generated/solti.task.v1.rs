@@ -315,7 +315,7 @@ pub struct TaskStatus {
     /// latest desired generation processed by the controller
     #[prost(uint64, tag = "1")]
     pub observed_generation: u64,
-    /// current execution phase
+    /// current logical lifecycle phase
     #[prost(enumeration = "TaskPhase", tag = "2")]
     pub phase: i32,
     /// execution attempt within observed_generation
@@ -365,7 +365,7 @@ pub struct TaskRunInfo {
     /// start time (ms)
     #[prost(int64, tag = "4")]
     pub started_at: i64,
-    /// end time (ms); absent while running
+    /// logical terminal-outcome time (ms); absent while running
     #[prost(int64, optional, tag = "5")]
     pub finished_at: ::core::option::Option<i64>,
     /// diagnostic; UTF-8-safe prefix of at most 32 KiB
@@ -381,25 +381,25 @@ pub struct TaskRunInfo {
     #[prost(string, tag = "9")]
     pub workload_kind: ::prost::alloc::string::String,
 }
-/// Phase of a task's current attempt.
+/// Logical lifecycle phase of a task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum TaskPhase {
     /// no task phase
     Unspecified = 0,
-    /// queued, not started yet
+    /// desired generation is pending runtime observation
     Pending = 1,
-    /// currently executing
+    /// an attempt has started
     Running = 2,
-    /// finished successfully
+    /// successful outcome recorded
     Succeeded = 3,
-    /// attempt failed; may restart per policy
+    /// failure outcome recorded
     Failed = 4,
-    /// killed after exceeding timeout_ms
+    /// timeout outcome recorded
     Timeout = 5,
-    /// stopped on request; not a failure
+    /// logical cancellation or canceled admission; physical exit is not implied
     Canceled = 6,
-    /// restart budget spent; no more retries
+    /// failure retry budget exhaustion recorded
     Exhausted = 7,
 }
 impl TaskPhase {
@@ -1221,7 +1221,8 @@ pub mod task_service_client {
                 .insert(GrpcMethod::new("solti.task.v1.TaskService", "ListTaskRuns"));
             self.inner.unary(req, path, codec).await
         }
-        /// Stop a task and purge its history.
+        /// Request a terminal logical outcome and purge retained state.
+        /// Force-aborted task code can remain physically active.
         pub async fn delete_task(
             &mut self,
             request: impl tonic::IntoRequest<super::DeleteTaskRequest>,
@@ -1334,7 +1335,8 @@ pub mod task_service_server {
             tonic::Response<super::ListTaskRunsResponse>,
             tonic::Status,
         >;
-        /// Stop a task and purge its history.
+        /// Request a terminal logical outcome and purge retained state.
+        /// Force-aborted task code can remain physically active.
         async fn delete_task(
             &self,
             request: tonic::Request<super::DeleteTaskRequest>,

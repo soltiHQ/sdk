@@ -259,7 +259,7 @@ Core retains bounded `TaskRun` history separately from the current Task status.
 | Watch       | Stream retained changes and then live changes        |
 | Run history | Paginate a stable retained-attempt snapshot          |
 | Logs        | Stream live stdout and stderr                        |
-| Delete      | Stop the runtime and remove the Task and its history |
+| Delete      | Reach a terminal logical outcome, then remove the Task and its history |
 
 HTTP uses the fixed root `/apis/solti.io/v1` in the current `solti-api` release.
 `HttpApi::build` returns the router and its generated OpenAPI 3.1 document.

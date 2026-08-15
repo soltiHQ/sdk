@@ -23,7 +23,7 @@ use taskvisor::{TaskContext, TaskError, TaskFn};
 async fn run() -> Result<(), CoreError> {
     let api = SupervisorApi::builder(RunnerRouter::new()).start().await?;
 
-    let task_ref = TaskFn::arc("cleanup-runtime", |_ctx: TaskContext| async move {
+    let task_ref = TaskFn::arc(|_ctx: TaskContext| async move {
         Ok::<(), TaskError>(())
     });
     let workload = TaskWorkload::Embedded(EmbeddedSpec::new("cleanup-v1")?);
@@ -67,7 +67,7 @@ Read the `Reconciled` condition to observe its result.
 | `query_task_runs`                        | `TaskId` and `TaskRunQuery`                | Snapshot-consistent `TaskRunPage`                |
 | `subscribe_output`                       | `TaskId`                                   | Optional live `OutputSubscription`               |
 | `cancel_task`                            | `TaskId`                                   | Runtime cancellation while desired state remains |
-| `delete_task`                            | `TaskId`                                   | Runtime stop and resource removal                |
+| `delete_task`                            | `TaskId`                                   | Logical runtime cancellation and resource removal |
 | `shutdown`                               | Running supervisor                         | Drained SDK-owned runtime                        |
 
 ## Submission paths
@@ -346,12 +346,13 @@ their last owner is dropped.
 
 ## Cancel and delete
 
-`cancel_task()` stops the current bound or queued runtime.
+`cancel_task()` requests a terminal logical outcome for the current bound or queued runtime.
 It keeps the desired resource and run history.
 Cancellation before a runtime binding exists is a no-op for a known resource.
 An unknown name returns `CoreError::NotFound`.
 
-`delete_task()` stops the runtime and removes the resource and its runs.
+`delete_task()` waits for that logical outcome and removes the resource and its runs.
+A Taskvisor `ForceAborted` outcome does not prove physical exit of non-cooperative task code.
 Deleting a missing resource is an idempotent no-op.
 
 `delete_task_with_preconditions()` rejects a missing resource and stale guards.
@@ -363,7 +364,7 @@ Deleting a missing resource is an idempotent no-op.
 
 | Field                              | Default      | Meaning                                                    |
 |------------------------------------|--------------|------------------------------------------------------------|
-| `run_ttl`                          | 1 hour       | Age limit for finished runs and unbound orphaned runs      |
+| `run_ttl`                          | 1 hour       | Age limit for terminal runs and unbound orphaned runs      |
 | `task_ttl`                         | 1 hour       | Age limit for terminal tasks after run history is empty    |
 | `sweep_interval`                   | 5 minutes    | Retention worker interval                                  |
 | `max_runs_per_task`                | 256          | Per-task completed run cap                                 |
@@ -475,6 +476,13 @@ async fn configured() -> Result<(), Box<dyn std::error::Error>> {
 
 The builder also accepts Taskvisor runtime configuration, controller configuration, and external Taskvisor subscribers.
 The core state observer is always installed.
+Taskvisor 0.8 charges configured subscribers and task values retained through
+intake, queuing, physical execution, and isolated destruction against the same
+`SupervisorConfig::ownership_capacity`. The core observer consumes one slot,
+and every external subscriber consumes one more. This limit is separate from
+`max_registered_tasks` and the SDK retained-task limit. A configuration that
+cannot reserve all configured subscribers fails startup with
+`CoreError::SupervisorInitialization`.
 
 ## Persistence hooks
 
@@ -569,12 +577,18 @@ Core drains both persistence workers during shutdown.
 
 ## Shutdown
 
-Call `shutdown()` when cleanup must finish before the application continues.
+Call `shutdown()` to observe completion of the bounded Taskvisor and SDK-owned
+cleanup workflow before the application continues.
 Do not poll it on a persistence callback worker or wait there for another shutdown caller.
 
 Shutdown closes task watches.
 It cancels runner builds, stops Taskvisor, and waits for reconciliation,
 completion, retention, and persistence workers.
+
+Taskvisor 0.8 reports `ForceAborted` as a logical outcome. Task code that does
+not cooperate with cancellation can remain physically active after shutdown
+returns. The controller keeps its slot until that task ownership is physically
+released.
 
 Dropping `SupervisorApi` starts the same cleanup path in the background.
 It does not provide an awaitable result.
@@ -597,17 +611,19 @@ It does not provide an awaitable result.
 
 Public write and lifecycle methods return `CoreError`:
 
-| Variant               | Cause                                                    |
-|-----------------------|----------------------------------------------------------|
-| `StateInitialization` | The state resource-version identity could not initialize |
-| `ShuttingDown`        | A desired-state write started after shutdown             |
-| `Supervisor`          | Taskvisor prepare, submit, cancel, or shutdown failed    |
-| `AlreadyExists`       | Create found a retained resource with the same name      |
-| `NotFound`            | A required resource does not exist or is hidden          |
-| `Conflict`            | UID or resource-version preconditions failed             |
-| `Mapping`             | A model policy has no Taskvisor mapping                  |
-| `Runner`              | Runner selection or task construction failed             |
-| `InvalidSpec`         | The submitted model or workload path is invalid          |
+| Variant                    | Cause                                                        |
+|----------------------------|--------------------------------------------------------------|
+| `StateInitialization`      | The state resource-version identity could not initialize     |
+| `PersistenceInitialization` | A configured persistence worker could not start             |
+| `SupervisorInitialization` | Taskvisor rejected supervisor construction                   |
+| `ShuttingDown`             | A desired-state write started after shutdown                 |
+| `Supervisor`               | Taskvisor start, prepare, submit, cancel, or shutdown failed |
+| `AlreadyExists`            | Create found a retained resource with the same name          |
+| `NotFound`                 | A required resource does not exist or is hidden              |
+| `Conflict`                 | UID or resource-version preconditions failed                 |
+| `Mapping`                  | A model policy has no Taskvisor mapping                      |
+| `Runner`                   | Runner selection or task construction failed                 |
+| `InvalidSpec`              | The submitted model or workload path is invalid              |
 
 Create and apply do not return asynchronous reconciliation failures.
 Runner, mapping, prepare, and submit failures set `Reconciled=False`.

@@ -175,7 +175,8 @@ pub trait ApiHandler: Send + Sync + 'static {
         query: TaskRunQuery,
     ) -> Result<TaskRunPage, ApiError>;
 
-    /// Stops and removes one task and its run history.
+    /// Requests a terminal logical outcome and removes one task and its run history.
+    /// Force-aborted task code can remain physically active after this call returns.
     ///
     /// ## Errors
     ///

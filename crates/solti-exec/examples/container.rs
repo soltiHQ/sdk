@@ -167,12 +167,12 @@ printf 'diagnostic=container-stderr\n' >&2"#;
     let spec = TaskSpec::builder("containers", workload, 120_000_u64).build()?;
     let task = Task::new("native-container", spec)?;
 
-    let task_ref = router.build(&task).await?;
+    let built = router.build(&task).await?;
     println!(
         "[build] Built {}; no image or container operation occurred during build.",
-        task_ref.name(),
+        built.name(),
     );
-    task_ref.spawn(TaskContext::detached()).await?;
+    built.task().spawn(TaskContext::detached()).await?;
     println!("[attempt] Container exited with code 0 and owned resources were cleaned.");
     engine.shutdown().await?;
     println!("[shutdown] Cleanup admission closed and the cleanup worker stopped.");

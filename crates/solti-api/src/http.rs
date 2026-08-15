@@ -487,7 +487,10 @@ where
             .id("deleteTask")
             .tag("tasks")
             .summary("Delete a task")
-            .description("Stops the task and removes its retained history.")
+            .description(
+                "Requests a terminal logical outcome and removes retained state. \
+                 Force-aborted task code can remain physically active.",
+            )
             .response::<204, NoContent>()
             .response::<400, ApiError>()
             .response::<404, ApiError>()

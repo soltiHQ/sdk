@@ -769,15 +769,17 @@ fn evaluate_exit_respects_fail_on_non_zero() {
 }
 
 #[tokio::test]
-async fn build_task_returns_task_ref_for_subprocess() {
+async fn build_task_returns_runnable_subprocess() {
     let runner = SubprocessRunner::new("test-runner").unwrap();
     let task = mk_subprocess_spec("test-slot", "echo");
     let task_ref = build_with_run_id(&runner, &task, &BuildContext::default())
         .await
         .unwrap();
 
-    assert_ne!(task_ref.name(), task.name().as_str());
-    assert!(task_ref.name().starts_with("test-runner-test-slot-"));
+    task_ref
+        .spawn(TaskContext::detached())
+        .await
+        .expect("the built subprocess must run");
 }
 
 #[tokio::test]
@@ -1056,9 +1058,9 @@ async fn cancel_reaps_forked_grandchildren() {
 #[cfg(unix)]
 #[tokio::test]
 async fn dropping_the_future_kills_the_whole_process_group() {
-    // taskvisor enforces a per-attempt timeout via `tokio::time::timeout` and
-    // force-abort via `JoinHandle::abort` — both DROP the task future without ever
-    // polling the cooperative `cancel.cancelled()` branch.
+    // Taskvisor enforces a per-attempt timeout via `tokio::time::timeout` and
+    // requests force-abort through `JoinHandle::abort`. This Tokio-cooperative
+    // task yields, then drops without polling the `cancel.cancelled()` branch.
     // The active process domain must still stop the process group on drop.
     let marker_dir = tempfile::TempDir::new().unwrap();
     let leader_marker = marker_dir.path().join("leader.pid");

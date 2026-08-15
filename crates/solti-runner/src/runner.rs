@@ -34,7 +34,8 @@ use crate::id::RunId;
 ///
 /// ## Contract
 ///
-/// - [`build_task`](Self::build_task) must use the allocated [`RunId`] as the task name.
+/// - The router returns the allocated [`RunId`] beside the task in a
+///   [`BuiltTask`](crate::BuiltTask).
 /// - The router snapshots the name and workload GVKs during registration.
 /// - Building must not start or submit the task.
 /// - Building is asynchronous and must remain owned by the returned future.
@@ -74,12 +75,12 @@ use crate::id::RunId;
 ///     async fn build_task(
 ///         &self,
 ///         _task: &Task,
-///         run_id: &solti_runner::RunId,
+///         _run_id: &solti_runner::RunId,
 ///         _ctx: &BuildContext,
 ///         _cancellation: &solti_runner::BuildCancellation,
 ///         _scope: &mut solti_runner::BuildScope,
 ///     ) -> Result<TaskRef, RunnerError> {
-///         Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move {
+///         Ok(TaskFn::arc(|_ctx: TaskContext| async move {
 ///             Ok::<(), TaskError>(())
 ///         }))
 ///     }
@@ -109,7 +110,8 @@ pub trait Runner: Send + Sync {
     ///
     /// [`BuildContext`] provides environment, metrics, and output publishing.
     /// [`BuildScope`] carries admission through nested catalog builds.
-    /// The returned task name must equal `run_id.name()`.
+    /// The router returns `run_id` with the executable task in a
+    /// [`BuiltTask`](crate::BuiltTask).
     ///
     /// # Errors
     ///

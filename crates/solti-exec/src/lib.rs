@@ -7,7 +7,8 @@
 //! The `container` feature provides an engine-neutral `ContainerRunner`.
 //! The `containerd` feature provides its native containerd 2.x engine.
 //! Both runners convert `solti_model::Task` resources into reusable `taskvisor::TaskRef` values.
-//! Taskvisor owns execution after conversion.
+//! `RunnerRouter` pairs each task with its allocated run identity in a
+//! `solti_runner::BuiltTask`. Taskvisor owns execution after conversion.
 //!
 //! ## Start Here
 //!
@@ -110,9 +111,9 @@
 //! let spec = TaskSpec::builder("jobs", workload, 5_000_u64).build()?;
 //! let resource = Task::new("hello", spec)?;
 //!
-//! let task = router.build(&resource).await?;
-//! assert!(task.name().starts_with("default-jobs-"));
-//! drop(task);
+//! let built = router.build(&resource).await?;
+//! assert!(built.name().starts_with("default-jobs-"));
+//! drop(built);
 //! drop(router);
 //! runner.shutdown(Duration::from_secs(5)).await?;
 //! # Ok(())
