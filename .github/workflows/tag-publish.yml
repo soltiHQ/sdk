@@ -17,7 +17,7 @@ permissions: {
 jobs:
   release:
     name: release
-    uses: soltiHQ/actions/.github/workflows/rust-workspace-release.yml@v1
+    uses: soltiHQ/actions/.github/workflows/rust-release.yml@v1
     with:
       crates-file: .github/crates.txt
       prepare-task: proto/vendor
