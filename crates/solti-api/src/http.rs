@@ -50,8 +50,8 @@ use aide::{
     },
     generate::GenContext,
     openapi::{
-        Info, MediaType, OpenApi, ReferenceOr, Response as ApiResponse, SchemaObject,
-        SecurityScheme, Tag,
+        Header, HeaderStyle, Info, MediaType, OpenApi, ParameterSchemaOrContent, ReferenceOr,
+        Response as ApiResponse, SchemaObject, SecurityScheme, Tag,
     },
     operation::{OperationInput, OperationOutput},
     transform::TransformOperation,
@@ -558,7 +558,7 @@ fn document_auth<'a>(
     if auth_enabled {
         operation
             .security_requirement(HTTP_BEARER_SCHEME)
-            .response::<401, ApiError>()
+            .response::<401, HttpUnauthorizedError>()
     } else {
         operation.security_requirement_multi(std::iter::empty::<&str>())
     }
@@ -1133,6 +1133,43 @@ impl OperationOutput for ApiError {
             context,
             "Kubernetes-style Status failure.",
         ))
+    }
+}
+
+struct HttpUnauthorizedError;
+
+impl OperationOutput for HttpUnauthorizedError {
+    type Inner = serde_json::Value;
+
+    fn operation_response(
+        context: &mut GenContext,
+        _operation: &mut aide::openapi::Operation,
+    ) -> Option<ApiResponse> {
+        let mut response = json_response::<HttpStatusResource>(
+            context,
+            "Kubernetes-style Status failure with a Bearer authentication challenge.",
+        );
+        response.headers.insert(
+            "WWW-Authenticate".into(),
+            ReferenceOr::Item(Header {
+                description: Some("Bearer authentication challenge required by HTTP 401.".into()),
+                style: HeaderStyle::Simple,
+                required: true,
+                deprecated: None,
+                format: ParameterSchemaOrContent::Schema(SchemaObject {
+                    json_schema: schemars::json_schema!({
+                        "type": "string",
+                        "const": "Bearer"
+                    }),
+                    example: None,
+                    external_docs: None,
+                }),
+                example: Some(serde_json::json!("Bearer")),
+                examples: Default::default(),
+                extensions: Default::default(),
+            }),
+        );
+        Some(response)
     }
 }
 

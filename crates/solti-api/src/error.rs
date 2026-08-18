@@ -130,6 +130,8 @@ pub enum ApiError {
     InvalidRequest(String),
 
     /// The bearer credential is missing, malformed, or rejected.
+    ///
+    /// HTTP responses include `WWW-Authenticate: Bearer`.
     #[error("unauthenticated: {0}")]
     Unauthenticated(String),
 
@@ -450,8 +452,16 @@ impl From<ApiError> for tonic::Status {
 #[cfg(feature = "http")]
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
+        let advertise_bearer = matches!(&self, ApiError::Unauthenticated(_));
         let (status, body) = self.into_http_status();
-        (status, axum::Json(body)).into_response()
+        let mut response = (status, axum::Json(body)).into_response();
+        if advertise_bearer {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Bearer"),
+            );
+        }
+        response
     }
 }
 
@@ -613,6 +623,18 @@ mod tests {
         assert_eq!(value["reason"], "TooManyRequests");
         assert_eq!(value["code"], 429);
         assert_eq!(value["message"], "retained task limit reached");
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn only_unauthenticated_http_errors_advertise_the_bearer_challenge() {
+        use axum::{http::header::WWW_AUTHENTICATE, response::IntoResponse};
+
+        let response = ApiError::Unauthenticated("credential rejected".into()).into_response();
+        assert_eq!(response.headers()[WWW_AUTHENTICATE], "Bearer");
+
+        let response = ApiError::Forbidden("policy denied".into()).into_response();
+        assert!(!response.headers().contains_key(WWW_AUTHENTICATE));
     }
 
     #[cfg(feature = "grpc")]

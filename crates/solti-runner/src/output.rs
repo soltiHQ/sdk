@@ -20,8 +20,9 @@
 //! The composition layer provides [`OutputPublisher`].
 //! Runners request [`OutputSink`] values by task, generation, and attempt.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use bytes::Bytes;
@@ -149,6 +150,13 @@ enum Publish {
 ///
 /// The callback runs synchronously in the caller.
 /// It must not block runner execution.
+/// An unwinding panic is caught and reported once through structured tracing
+/// without its payload. Once the panic is observed, the sink disables its
+/// callback and drops calls that begin afterwards. Concurrent callback calls
+/// already in progress may still complete or panic. Clones share that sticky
+/// state through [`Self::callback_panicked`]. The process panic hook still runs
+/// before the unwind is caught; its output is controlled by the application.
+/// A process built with `panic = "abort"` cannot isolate a callback panic.
 ///
 /// ## Example
 ///
@@ -178,6 +186,7 @@ pub struct OutputSink {
     attempt: u32,
     seq_stdout: Arc<AtomicU64>,
     seq_stderr: Arc<AtomicU64>,
+    callback_panicked: Arc<AtomicBool>,
     publish: Publish,
 }
 
@@ -195,6 +204,7 @@ impl OutputSink {
             attempt,
             seq_stdout: Arc::new(AtomicU64::new(0)),
             seq_stderr: Arc::new(AtomicU64::new(0)),
+            callback_panicked: Arc::new(AtomicBool::new(false)),
             publish: Publish::Owned(Arc::new(publish)),
         }
     }
@@ -215,6 +225,7 @@ impl OutputSink {
             attempt,
             seq_stdout: Arc::new(AtomicU64::new(0)),
             seq_stderr: Arc::new(AtomicU64::new(0)),
+            callback_panicked: Arc::new(AtomicBool::new(false)),
             publish: Publish::Borrowed(Arc::new(publish)),
         }
     }
@@ -295,6 +306,16 @@ impl OutputSink {
         self.generation
     }
 
+    /// Returns whether this sink's callback has panicked.
+    ///
+    /// The state is sticky and shared by every clone. Once a panic is observed,
+    /// calls that begin afterwards drop their chunks without invoking the
+    /// callback. Concurrent calls already in progress may still complete or
+    /// panic.
+    pub fn callback_panicked(&self) -> bool {
+        self.callback_panicked.load(Ordering::Acquire)
+    }
+
     fn push_bytes(&self, stream: StreamKind, line: Bytes, truncated: bool) {
         for_each_line_range(&line, |range, final_chunk| {
             self.push_owned(stream, line.slice(range), truncated && final_chunk);
@@ -315,9 +336,12 @@ impl OutputSink {
     }
 
     fn push_owned(&self, stream: StreamKind, line: Bytes, truncated: bool) {
+        if self.callback_panicked() {
+            return;
+        }
         let seq = self.next_seq(stream);
         let ts = SystemTime::now();
-        match &self.publish {
+        let result = catch_unwind(AssertUnwindSafe(|| match &self.publish {
             Publish::Owned(publish) => publish(OutputEvent::Chunk(OutputChunk {
                 generation: self.generation,
                 attempt: self.attempt,
@@ -336,13 +360,20 @@ impl OutputSink {
                 line: &line,
                 truncated,
             }),
+        }));
+        if let Err(payload) = result {
+            self.report_callback_panic(stream, seq);
+            dispose_panic_payload(payload);
         }
     }
 
     fn push_borrowed(&self, stream: StreamKind, line: &[u8], truncated: bool) {
+        if self.callback_panicked() {
+            return;
+        }
         let seq = self.next_seq(stream);
         let ts = SystemTime::now();
-        match &self.publish {
+        let result = catch_unwind(AssertUnwindSafe(|| match &self.publish {
             Publish::Owned(publish) => publish(OutputEvent::Chunk(OutputChunk {
                 generation: self.generation,
                 attempt: self.attempt,
@@ -361,7 +392,40 @@ impl OutputSink {
                 line,
                 truncated,
             }),
+        }));
+        if let Err(payload) = result {
+            self.report_callback_panic(stream, seq);
+            dispose_panic_payload(payload);
         }
+    }
+
+    fn report_callback_panic(&self, stream: StreamKind, seq: u64) {
+        if self.callback_panicked.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let stream = match stream {
+            StreamKind::Stdout => "stdout",
+            StreamKind::Stderr => "stderr",
+        };
+        tracing::error!(
+            event = "runner.output_callback_panicked",
+            error_kind = "callback_panicked",
+            generation = self.generation,
+            attempt = self.attempt,
+            stream,
+            seq,
+            "output callback panicked; disabling this attempt sink"
+        );
+    }
+}
+
+fn dispose_panic_payload(payload: Box<dyn std::any::Any + Send>) {
+    // A user-defined panic payload may panic again from Drop. Catch that
+    // secondary unwind too. Its replacement payload is forgotten because
+    // dropping it could repeat the same cycle; this is bounded to one payload
+    // per callback invocation that was already in flight when the sink failed.
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        std::mem::forget(payload);
     }
 }
 
@@ -389,7 +453,11 @@ fn for_each_line_range(line: &[u8], mut publish: impl FnMut(std::ops::Range<usiz
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Barrier, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::thread;
 
     use bytes::Bytes;
     use solti_model::{OutputEvent, StreamKind, TaskId};
@@ -606,6 +674,77 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn borrowed_callback_panic_disables_every_sink_clone() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let sink = OutputSink::new_borrowed(7, 3, move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            panic!("borrowed callback panic");
+        });
+        let clone = sink.clone();
+
+        sink.stdout_line_bytes(b"first");
+        clone.stderr_line_bytes(b"second");
+
+        assert!(sink.callback_panicked());
+        assert!(clone.callback_panicked());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn callback_calls_already_in_progress_can_both_panic() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let entered = Arc::new(Barrier::new(2));
+        let callback_entered = Arc::clone(&entered);
+        let sink = OutputSink::new(7, 3, move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            callback_entered.wait();
+            panic!("concurrent callback panic");
+        });
+        let stdout = sink.clone();
+        let stderr = sink.clone();
+
+        let stdout = thread::spawn(move || stdout.stdout_line_bytes(b"first"));
+        let stderr = thread::spawn(move || stderr.stderr_line_bytes(b"second"));
+        stdout.join().unwrap();
+        stderr.join().unwrap();
+
+        assert!(sink.callback_panicked());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        sink.stdout_line_bytes(b"third");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn cross_dispatch_paths_isolate_callback_panics() {
+        let owned = OutputSink::new(7, 3, |_| panic!("owned callback panic"));
+        owned.stdout_line_bytes(b"borrowed input");
+        assert!(owned.callback_panicked());
+
+        let borrowed = OutputSink::new_borrowed(7, 3, |_| panic!("borrowed callback panic"));
+        borrowed.stdout_line(Bytes::from_static(b"owned input"));
+        assert!(borrowed.callback_panicked());
+    }
+
+    #[test]
+    fn panicking_panic_payload_drop_cannot_escape_the_sink() {
+        struct PanickingDrop;
+
+        impl Drop for PanickingDrop {
+            fn drop(&mut self) {
+                panic!("panic payload drop");
+            }
+        }
+
+        let sink = OutputSink::new(7, 3, |_| std::panic::panic_any(PanickingDrop));
+        sink.stdout_line_bytes(b"first");
+
+        assert!(sink.callback_panicked());
+        sink.stdout_line_bytes(b"second");
     }
 
     #[test]

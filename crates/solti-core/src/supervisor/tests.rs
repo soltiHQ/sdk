@@ -23,6 +23,7 @@ use tokio_stream::StreamExt;
 use tokio_util::task::TaskTracker;
 
 use super::*;
+use crate::state::{TASKVISOR_INTAKE_PENDING_MESSAGE, TASKVISOR_INTAKE_PENDING_REASON};
 use crate::{PersistenceConfig, ReconciliationConfig, StateConfig, TaskStateEvent, TaskStateSink};
 
 struct TokioDependentStateSink {
@@ -714,6 +715,23 @@ async fn retention_worker_does_not_reserve_a_resource_name_or_slot() {
             .len(),
         1
     );
+    api.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn maximum_checked_forward_deadlines_start_without_overflow() {
+    let maximum = Duration::from_secs(60 * 60 * 24 * 365 * 30);
+    let state = StateConfig::new().try_with_sweep_interval(maximum).unwrap();
+    let reconciliation = ReconciliationConfig::new()
+        .try_with_build_timeout(maximum)
+        .unwrap();
+    let api = SupervisorApi::builder(RunnerRouter::new())
+        .with_state_config(state)
+        .with_reconciliation_config(reconciliation)
+        .start()
+        .await
+        .unwrap();
+
     api.shutdown().await.unwrap();
 }
 
@@ -1552,10 +1570,27 @@ async fn newer_apply_cancels_stale_submission_waiting_for_taskvisor_ownership() 
         )
         .await
         .unwrap();
+    let first_transition_time = first.committed.status().reconciled().last_transition_time();
     let first_done = first
         .reconciliation
         .expect("a created spec schedules reconciliation");
     let first_binding = wait_for_binding(&api, &name, 1).await;
+    let first_waiting = wait_for_task(&api, &name, |task| {
+        let condition = task.status().reconciled();
+        condition.observed_generation() == 1
+            && condition.status() == ConditionStatus::Unknown
+            && condition.reason() == TASKVISOR_INTAKE_PENDING_REASON
+    })
+    .await;
+    assert_eq!(
+        first_waiting.status().reconciled().message(),
+        TASKVISOR_INTAKE_PENDING_MESSAGE
+    );
+    assert_eq!(
+        first_waiting.status().reconciled().last_transition_time(),
+        first_transition_time,
+        "changing an Unknown diagnostic must preserve the status transition time"
+    );
     assert!(
         api.reconciler
             .handle
@@ -1574,6 +1609,7 @@ async fn newer_apply_cancels_stale_submission_waiting_for_taskvisor_ownership() 
         .await
         .unwrap();
     assert_eq!(second.metadata().generation(), 2);
+    let second_transition_time = second.status().reconciled().last_transition_time();
 
     tokio::time::timeout(Duration::from_secs(2), first_done)
         .await
@@ -1593,14 +1629,33 @@ async fn newer_apply_cancels_stale_submission_waiting_for_taskvisor_ownership() 
             .all(|(id, _)| *id != second_binding.tv),
         "the newer generation must wait until ownership capacity is released"
     );
-    let waiting = api
-        .get_task(&name)
-        .expect("newer desired state remains retained");
+    let waiting = wait_for_task(&api, &name, |task| {
+        let condition = task.status().reconciled();
+        condition.observed_generation() == 2
+            && condition.status() == ConditionStatus::Unknown
+            && condition.reason() == TASKVISOR_INTAKE_PENDING_REASON
+    })
+    .await;
     assert_eq!(
         waiting.status().reconciled().status(),
         ConditionStatus::Unknown,
         "canceling stale intake must not report a reconciliation failure"
     );
+    assert_eq!(
+        waiting.status().reconciled().message(),
+        TASKVISOR_INTAKE_PENDING_MESSAGE
+    );
+    assert_eq!(
+        waiting.status().reconciled().last_transition_time(),
+        second_transition_time,
+        "changing an Unknown diagnostic must preserve the status transition time"
+    );
+    let waiting_json = serde_json::to_value(&waiting).unwrap();
+    let reconciled = &waiting_json["status"]["conditions"][0];
+    assert_eq!(reconciled["status"], "Unknown");
+    assert_eq!(reconciled["observedGeneration"], 2);
+    assert_eq!(reconciled["reason"], TASKVISOR_INTAKE_PENDING_REASON);
+    assert_eq!(reconciled["message"], TASKVISOR_INTAKE_PENDING_MESSAGE);
     assert_eq!(waiting.status().observed_generation(), 0);
     assert_eq!(
         api.reconciler.output_hub.active_channels(),
@@ -1619,7 +1674,8 @@ async fn newer_apply_cancels_stale_submission_waiting_for_taskvisor_ownership() 
         .expect("ownership filler outcome channel closed");
     assert_eq!(held_outcome.kind(), TaskOutcomeKind::Canceled);
 
-    wait_for_observed(&api, &name, 2).await;
+    let observed = wait_for_observed(&api, &name, 2).await;
+    assert_eq!(observed.status().reconciled().reason(), "RuntimeAccepted");
     assert_eq!(
         api.reconciler.state.binding_for(&name),
         Some(second_binding),
@@ -1627,6 +1683,54 @@ async fn newer_apply_cancels_stale_submission_waiting_for_taskvisor_ownership() 
     );
     api.delete_task(&name).await.unwrap();
     api.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_cancellation_preserves_observable_taskvisor_intake_state() {
+    let runtime = SupervisorConfig::default().with_ownership_capacity(NonZeroUsize::new(2));
+    let api = SupervisorApi::builder(RunnerRouter::new())
+        .with_runtime_config(runtime)
+        .start()
+        .await
+        .unwrap();
+
+    let (_held_id, _held_waiter) = api
+        .reconciler
+        .handle
+        .add_and_watch(TvTaskSpec::once(
+            "shutdown-ownership-filler",
+            cancellable_task(),
+        ))
+        .await
+        .unwrap();
+    let name = TaskId::new("shutdown-ownership-intake").unwrap();
+    api.create_embedded_task(embedded(name.as_str(), 10_000), cancellable_task())
+        .await
+        .unwrap();
+    wait_for_task(&api, &name, |task| {
+        let condition = task.status().reconciled();
+        condition.status() == ConditionStatus::Unknown
+            && condition.reason() == TASKVISOR_INTAKE_PENDING_REASON
+    })
+    .await;
+
+    api.shutdown().await.unwrap();
+
+    let retained = api
+        .get_task(&name)
+        .expect("desired state remains retained after shutdown");
+    assert_eq!(
+        retained.status().reconciled().status(),
+        ConditionStatus::Unknown
+    );
+    assert_eq!(
+        retained.status().reconciled().reason(),
+        TASKVISOR_INTAKE_PENDING_REASON
+    );
+    assert_eq!(
+        retained.status().reconciled().message(),
+        TASKVISOR_INTAKE_PENDING_MESSAGE
+    );
 }
 
 struct AdmissionProbe {

@@ -315,6 +315,11 @@ The current condition set always contains one `Reconciled` condition.
 
 The condition contains its own `observedGeneration`.
 It also contains `reason`, `message`, and `lastTransitionTime`.
+While core waits for Taskvisor intake, the condition stays `Unknown` with
+`reason=TaskvisorOwnershipAndControllerIntakePending`. Its message names the
+combined ownership and controller command-intake wait. Taskvisor exposes that
+wait as one future, so the condition does not identify which capacity is
+currently blocking.
 
 Execution phases are:
 
@@ -653,6 +658,9 @@ The complete service method prefix is:
 
 Resource and live-output timestamps are Unix milliseconds.
 Output chunks contain raw protobuf bytes.
+`Subprocess.cwd` and `Wasm.module` carry exact UTF-8 text in both HTTP JSON and
+protobuf. Native paths that are not valid UTF-8 are rejected; no wire encoder
+performs lossy substitution.
 Extension workload specs contain one UTF-8 JSON object in `RawExtension.raw`.
 For a Chain workload, `TaskWorkload.api_version` is `chain.solti.io/v1alpha1`, `kind` is `Chain`, and `RawExtension.raw` contains the serialized `ChainSpec` object.
 Protobuf JSON represents those bytes as base64; generated clients pass the UTF-8 bytes directly.
@@ -674,7 +682,8 @@ Authorization: Bearer <token>
 gRPC uses the same value in `authorization` metadata.
 The `Bearer` scheme comparison is case-insensitive.
 
-Missing, malformed, or rejected credentials return HTTP `401`.
+Missing, malformed, or rejected credentials return HTTP `401` with
+`WWW-Authenticate: Bearer`.
 gRPC returns `Unauthenticated`.
 
 Applications can replace static token verification with `ApiAuthenticator`.

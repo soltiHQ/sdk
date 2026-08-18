@@ -418,6 +418,19 @@ fn generated_openapi_reflects_configured_authentication() {
             .get("401")
             .is_some()
     );
+    let unauthorized = &document["paths"]["/apis/solti.io/v1/tasks"]["post"]["responses"]["401"];
+    assert_eq!(
+        unauthorized["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/HttpStatusResource"
+    );
+    assert_eq!(
+        unauthorized["headers"]["WWW-Authenticate"]["required"],
+        true
+    );
+    assert_eq!(
+        unauthorized["headers"]["WWW-Authenticate"]["schema"]["const"],
+        "Bearer"
+    );
 }
 
 struct AllowAuthorizer;

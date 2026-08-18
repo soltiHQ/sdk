@@ -42,6 +42,18 @@ const DEFAULT_WATCH_HISTORY_CAPACITY: usize = 4_096;
 const DEFAULT_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_CONCURRENT_BUILDS: usize = 32;
 const DEFAULT_MAX_CONCURRENT_BUILDS_PER_RUNNER: usize = 8;
+/// Longest forward deadline accepted by core configuration.
+///
+/// This matches Taskvisor's deadline ceiling. Bounding forward deadlines once
+/// keeps `Instant` arithmetic portable while leaving elapsed-age TTLs
+/// independent.
+const MAX_FORWARD_DEADLINE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 30);
+
+const fn exceeds_forward_deadline(value: Duration) -> bool {
+    value.as_secs() > MAX_FORWARD_DEADLINE.as_secs()
+        || (value.as_secs() == MAX_FORWARD_DEADLINE.as_secs()
+            && value.subsec_nanos() > MAX_FORWARD_DEADLINE.subsec_nanos())
+}
 
 /// Error from checked core configuration.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -71,6 +83,15 @@ pub enum ConfigError {
         field: &'static str,
         /// Stable field name for the upper bound.
         limit: &'static str,
+    },
+    /// A forward deadline exceeded the portable duration ceiling.
+    #[error("{field} must not exceed {maximum:?}")]
+    #[non_exhaustive]
+    DeadlineTooLong {
+        /// Stable field name for the invalid deadline.
+        field: &'static str,
+        /// Largest accepted forward deadline.
+        maximum: Duration,
     },
 }
 
@@ -252,6 +273,7 @@ impl StateConfig {
     /// # Errors
     ///
     /// Returns [`ConfigError::Zero`] when `sweep_interval` is zero.
+    /// Returns [`ConfigError::DeadlineTooLong`] when it exceeds 30 years.
     pub const fn try_with_sweep_interval(
         mut self,
         sweep_interval: Duration,
@@ -259,6 +281,12 @@ impl StateConfig {
         if sweep_interval.is_zero() {
             return Err(ConfigError::Zero {
                 field: "sweep_interval",
+            });
+        }
+        if exceeds_forward_deadline(sweep_interval) {
+            return Err(ConfigError::DeadlineTooLong {
+                field: "sweep_interval",
+                maximum: MAX_FORWARD_DEADLINE,
             });
         }
         self.sweep_interval = sweep_interval;
@@ -546,6 +574,7 @@ impl ReconciliationConfig {
     /// # Errors
     ///
     /// Returns [`ConfigError::Zero`] when `build_timeout` is zero.
+    /// Returns [`ConfigError::DeadlineTooLong`] when it exceeds 30 years.
     pub const fn try_with_build_timeout(
         mut self,
         build_timeout: Duration,
@@ -553,6 +582,12 @@ impl ReconciliationConfig {
         if build_timeout.is_zero() {
             return Err(ConfigError::Zero {
                 field: "build_timeout",
+            });
+        }
+        if exceeds_forward_deadline(build_timeout) {
+            return Err(ConfigError::DeadlineTooLong {
+                field: "build_timeout",
+                maximum: MAX_FORWARD_DEADLINE,
             });
         }
         self.build_timeout = build_timeout;
@@ -709,6 +744,64 @@ mod tests {
         ] {
             assert_eq!(actual, ConfigError::Zero { field });
         }
+    }
+
+    #[test]
+    fn forward_deadline_ceiling_is_checked_without_restricting_ttls() {
+        let above_maximum = Duration::new(
+            MAX_FORWARD_DEADLINE.as_secs(),
+            MAX_FORWARD_DEADLINE.subsec_nanos() + 1,
+        );
+
+        let state = StateConfig::new()
+            .try_with_sweep_interval(MAX_FORWARD_DEADLINE)
+            .unwrap()
+            .with_run_ttl(Duration::MAX)
+            .with_task_ttl(Duration::MAX);
+        assert_eq!(state.sweep_interval(), MAX_FORWARD_DEADLINE);
+        assert_eq!(state.run_ttl(), Duration::MAX);
+        assert_eq!(state.task_ttl(), Duration::MAX);
+        assert_eq!(
+            StateConfig::new()
+                .try_with_sweep_interval(above_maximum)
+                .unwrap_err(),
+            ConfigError::DeadlineTooLong {
+                field: "sweep_interval",
+                maximum: MAX_FORWARD_DEADLINE,
+            }
+        );
+        assert_eq!(
+            StateConfig::new()
+                .try_with_sweep_interval(Duration::MAX)
+                .unwrap_err(),
+            ConfigError::DeadlineTooLong {
+                field: "sweep_interval",
+                maximum: MAX_FORWARD_DEADLINE,
+            }
+        );
+
+        let reconciliation = ReconciliationConfig::new()
+            .try_with_build_timeout(MAX_FORWARD_DEADLINE)
+            .unwrap();
+        assert_eq!(reconciliation.build_timeout(), MAX_FORWARD_DEADLINE);
+        assert_eq!(
+            ReconciliationConfig::new()
+                .try_with_build_timeout(above_maximum)
+                .unwrap_err(),
+            ConfigError::DeadlineTooLong {
+                field: "build_timeout",
+                maximum: MAX_FORWARD_DEADLINE,
+            }
+        );
+        assert_eq!(
+            ReconciliationConfig::new()
+                .try_with_build_timeout(Duration::MAX)
+                .unwrap_err(),
+            ConfigError::DeadlineTooLong {
+                field: "build_timeout",
+                maximum: MAX_FORWARD_DEADLINE,
+            }
+        );
     }
 
     #[test]

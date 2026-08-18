@@ -18,6 +18,7 @@
 //! Reconciled: Unknown        ── accepted     ────▶ True
 //!             False          ── manual retry ────▶ Unknown
 //!             Unknown | True ── failure      ────▶ False
+//!             Unknown        ── progress     ────▶ Unknown with new diagnostics
 //!
 //! Pending ── attempt starts ──▶ Running ── terminal outcome ──▶ terminal phase
 //! ```
@@ -690,6 +691,48 @@ impl Task {
         self.status.attempt = 0;
         self.status.exit_code = None;
         self.status.error = None;
+        Ok(true)
+    }
+
+    /// Updates diagnostics while reconciliation of the current generation is pending.
+    ///
+    /// This method only changes a pending Task whose `Reconciled` condition is
+    /// already `Unknown` for the current generation. It does not reopen an
+    /// accepted or failed reconciliation. Because the condition status stays
+    /// `Unknown`, its `lastTransitionTime` is preserved.
+    ///
+    /// Returns `false` when reconciliation is not currently pending or the
+    /// diagnostic is unchanged. In those cases, `resource_version` is not
+    /// assigned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when `reason`, `message`, or a changed
+    /// `resource_version` is invalid.
+    pub fn update_reconciliation_pending_diagnostic(
+        &mut self,
+        reason: impl Into<String>,
+        message: impl Into<String>,
+        resource_version: impl Into<String>,
+    ) -> ModelResult<bool> {
+        let reason = reason.into();
+        let message = message.into();
+        TaskCondition::validate_reason_message(&reason, &message)?;
+        let generation = self.metadata.generation();
+        let condition = self.status.reconciled_required();
+        if self.status.phase != TaskPhase::Pending
+            || condition.status() != ConditionStatus::Unknown
+            || condition.observed_generation() != generation
+        {
+            return Ok(false);
+        }
+        if condition.reason() == reason && condition.message() == message {
+            return Ok(false);
+        }
+
+        self.metadata.set_resource_version(resource_version)?;
+        self.status
+            .update_reconciliation_pending_diagnostic(generation, reason, message);
         Ok(true)
     }
 
@@ -1376,6 +1419,92 @@ mod tests {
             ConditionStatus::Unknown
         );
         assert_eq!(task.status().reconciled().observed_generation(), 1);
+    }
+
+    #[test]
+    fn pending_reconciliation_diagnostic_is_validated_and_preserves_transition_time() {
+        let mut task = task();
+        let transition_time = task.status().reconciled().last_transition_time();
+
+        assert!(
+            task.update_reconciliation_pending_diagnostic(
+                "TaskvisorOwnershipAndControllerIntakePending",
+                "waiting for Taskvisor ownership and controller intake capacity",
+                "2",
+            )
+            .unwrap()
+        );
+        let reconciled = task.status().reconciled();
+        assert_eq!(reconciled.status(), ConditionStatus::Unknown);
+        assert_eq!(reconciled.observed_generation(), 1);
+        assert_eq!(
+            reconciled.reason(),
+            "TaskvisorOwnershipAndControllerIntakePending"
+        );
+        assert_eq!(
+            reconciled.message(),
+            "waiting for Taskvisor ownership and controller intake capacity"
+        );
+        assert_eq!(reconciled.last_transition_time(), transition_time);
+        assert_eq!(task.metadata().resource_version(), "2");
+
+        assert!(
+            !task
+                .update_reconciliation_pending_diagnostic(
+                    "TaskvisorOwnershipAndControllerIntakePending",
+                    "waiting for Taskvisor ownership and controller intake capacity",
+                    "unused",
+                )
+                .unwrap()
+        );
+        assert_eq!(task.metadata().resource_version(), "2");
+        assert!(
+            task.update_reconciliation_pending_diagnostic("bad reason", "message", "3")
+                .is_err()
+        );
+        assert_eq!(task.metadata().resource_version(), "2");
+        let before_invalid_version = task.clone();
+        assert!(
+            task.update_reconciliation_pending_diagnostic(
+                "TaskvisorOwnershipPending",
+                "waiting for ownership",
+                "",
+            )
+            .is_err()
+        );
+        assert_eq!(task, before_invalid_version);
+
+        task.mark_observed("3").unwrap();
+        assert!(
+            !task
+                .update_reconciliation_pending_diagnostic(
+                    "TaskvisorOwnershipAndControllerIntakePending",
+                    "message",
+                    "unused",
+                )
+                .unwrap()
+        );
+        assert_eq!(task.status().reconciled().status(), ConditionStatus::True);
+        assert_eq!(task.metadata().resource_version(), "3");
+
+        let mut failed = self::task();
+        failed
+            .mark_reconciliation_failed("RunnerBuildFailed", "no runner", "2")
+            .unwrap();
+        assert!(
+            !failed
+                .update_reconciliation_pending_diagnostic(
+                    "TaskvisorOwnershipAndControllerIntakePending",
+                    "message",
+                    "unused",
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            failed.status().reconciled().status(),
+            ConditionStatus::False
+        );
+        assert_eq!(failed.metadata().resource_version(), "2");
     }
 
     #[test]

@@ -160,6 +160,14 @@ The required `Reconciled` condition reports the reconciliation result:
 
 `reason`, `message`, and `observedGeneration` carry reconciliation diagnostics.
 Reconciliation failures do not use the execution `phase`, `error`, or `exitCode` fields.
+`ReconciliationScheduled` means the generation has not reached Taskvisor intake.
+`TaskvisorOwnershipAndControllerIntakePending` means core is waiting on
+Taskvisor's combined ownership and controller command-intake path. Taskvisor
+0.8 exposes that path as one future. This condition therefore does not claim
+which of those two capacities is currently blocking.
+`task.taskvisor_intake_wait_started` and
+`task.taskvisor_intake_wait_finished` tracing events carry the same scope,
+Taskvisor ID, outcome, and elapsed wait time.
 
 Reconciliation uses latest-wins semantics.
 A task keeps at most one active and one pending reconciliation. A newer commit
@@ -393,7 +401,10 @@ limits. Their raw checked setters reject zero. The watch byte budget measures
 compact Task JSON retained by internal initial and replay buffers. It excludes
 queue metadata, the shared change journal, live delivery, and caller-owned
 yielded events. It is not a total process-memory limit.
-`sweep_interval = 0` is rejected.
+`sweep_interval = 0` is rejected. Forward deadlines are limited to 30 years,
+so `sweep_interval` values above that ceiling are also rejected. `run_ttl` and
+`task_ttl` are elapsed ages rather than forward deadlines and keep accepting
+the full `Duration` range.
 Watch history capacity and byte budget must also be greater than zero.
 
 `ReconciliationConfig` bounds routed runner construction:
@@ -413,8 +424,9 @@ creates. Nested builds acquire only the selected runner's per-runner slot. The
 build deadline starts before outer admission and includes waits for nested
 runner slots.
 
-All reconciliation limits must be greater than zero. Embedded tasks do not use
-runner-build admission because the caller supplies their `TaskRef`.
+All reconciliation limits must be greater than zero. `build_timeout` is also
+limited to the same 30-year forward-deadline ceiling. Embedded tasks do not
+use runner-build admission because the caller supplies their `TaskRef`.
 
 `OutputConfig` controls best-effort live output. Defaults are 256 events, a
 16 MiB retained payload budget per task, 64 KiB per chunk, and a 256 MiB

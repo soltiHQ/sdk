@@ -271,6 +271,29 @@ fn fixture_task() -> Task {
     fixture_task_named("task-wire-1")
 }
 
+fn taskvisor_intake_pending_task() -> Task {
+    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+        SubprocessMode::Command {
+            command: "echo".into(),
+            args: Vec::new(),
+        },
+        TaskEnv::new(),
+        None,
+        Flag::from(true),
+    ));
+    let spec = TaskSpec::builder("my-job", workload, 30_000_u64)
+        .build()
+        .unwrap();
+    let mut task = Task::new("task-intake-pending", spec).unwrap();
+    task.update_reconciliation_pending_diagnostic(
+        "TaskvisorOwnershipAndControllerIntakePending",
+        "waiting for Taskvisor ownership and controller intake capacity",
+        "2",
+    )
+    .unwrap();
+    task
+}
+
 fn fixture_task_named(name: &str) -> Task {
     let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
         SubprocessMode::Command {
@@ -358,6 +381,7 @@ struct WireMock {
     submit_conflicts: bool,
     leak_embedded_task: bool,
     leak_embedded_run: bool,
+    taskvisor_intake_pending: bool,
     non_utf8_output: bool,
     watch_expired: bool,
     watch_error_then_pending: bool,
@@ -410,6 +434,8 @@ impl ApiHandler for WireMock {
     async fn get_task(&self, _id: &TaskId) -> Result<Option<Task>, ApiError> {
         Ok(Some(if self.leak_embedded_task {
             embedded_task()
+        } else if self.taskvisor_intake_pending {
+            taskvisor_intake_pending_task()
         } else {
             fixture_task()
         }))
@@ -649,6 +675,48 @@ async fn create_command_resource_is_accepted() {
     assert_eq!(body["metadata"]["name"], "task-wire-1");
     assert_eq!(body["apiVersion"], "solti.io/v1");
     assert_eq!(body["kind"], "Task");
+}
+
+#[tokio::test]
+async fn http_wire_paths_round_trip_unicode_without_substitution() {
+    let app = router_with(Arc::new(WireMock::default()));
+
+    let mut subprocess: Value = serde_json::from_str(CREATE_COMMAND_BODY).unwrap();
+    subprocess["metadata"]["name"] = "task-unicode-cwd".into();
+    subprocess["spec"]["workload"]["spec"]["cwd"] = "/工作/δ".into();
+    let response = app
+        .clone()
+        .oneshot(post_json(
+            "/apis/solti.io/v1/tasks",
+            &serde_json::to_string(&subprocess).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = body_json(response).await;
+    assert_eq!(body["spec"]["workload"]["spec"]["cwd"], "/工作/δ");
+
+    let mut wasm: Value = serde_json::from_str(CREATE_COMMAND_BODY).unwrap();
+    wasm["metadata"]["name"] = "task-unicode-wasm".into();
+    wasm["spec"]["workload"]["kind"] = "Wasm".into();
+    wasm["spec"]["workload"]["spec"] = serde_json::json!({
+        "module": "/модули/报告.wasm",
+        "args": [],
+        "env": []
+    });
+    let response = app
+        .oneshot(post_json(
+            "/apis/solti.io/v1/tasks",
+            &serde_json::to_string(&wasm).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = body_json(response).await;
+    assert_eq!(
+        body["spec"]["workload"]["spec"]["module"],
+        "/модули/报告.wasm"
+    );
 }
 
 #[tokio::test]
@@ -1049,6 +1117,39 @@ async fn get_task_response_matches_crd_shape() {
     assert_eq!(reconciled["reason"], "RuntimeAccepted");
     assert_eq!(reconciled["message"], "runtime accepted the desired state");
     assert!(reconciled["lastTransitionTime"].is_string());
+}
+
+#[tokio::test]
+async fn get_preserves_observable_taskvisor_intake_condition() {
+    let app = router_with(Arc::new(WireMock {
+        taskvisor_intake_pending: true,
+        ..WireMock::default()
+    }));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/apis/solti.io/v1/tasks/task-intake-pending")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let condition = &body["status"]["conditions"][0];
+    assert_eq!(condition["status"], "Unknown");
+    assert_eq!(condition["observedGeneration"], 1);
+    assert_eq!(
+        condition["reason"],
+        "TaskvisorOwnershipAndControllerIntakePending"
+    );
+    assert_eq!(
+        condition["message"],
+        "waiting for Taskvisor ownership and controller intake capacity"
+    );
 }
 
 #[tokio::test]

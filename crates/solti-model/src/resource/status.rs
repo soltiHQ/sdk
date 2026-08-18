@@ -308,6 +308,16 @@ impl TaskStatus {
         )
     }
 
+    pub(crate) fn update_reconciliation_pending_diagnostic(
+        &mut self,
+        generation: u64,
+        reason: impl Into<String>,
+        message: impl Into<String>,
+    ) -> bool {
+        self.reconciled_mut()
+            .transition(ConditionStatus::Unknown, generation, reason, message)
+    }
+
     pub(crate) fn mark_reconciled(&mut self, generation: u64) -> bool {
         let changed = self.reconciled_mut().transition(
             ConditionStatus::True,

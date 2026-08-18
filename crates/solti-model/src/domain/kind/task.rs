@@ -13,7 +13,7 @@
 //! Built-in workload specs reject unknown fields.
 //! Extension specs preserve application-owned JSON object fields.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -436,7 +436,7 @@ impl TaskWorkload {
     /// ```
     pub fn validate(&self) -> ModelResult<()> {
         match self {
-            Self::Subprocess(spec) => spec.mode.validate(),
+            Self::Subprocess(spec) => spec.validate(),
             Self::Container(spec) => spec.validate(),
             Self::Wasm(spec) => spec.validate(),
             Self::Embedded(spec) => spec.validate(),
@@ -561,7 +561,8 @@ impl WasmSpec {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when the module path is empty.
+    /// Returns [`ModelError::Invalid`] when the module path is empty or cannot
+    /// be represented as UTF-8 on the HTTP and gRPC wire.
     ///
     /// ## Example
     ///
@@ -578,6 +579,7 @@ impl WasmSpec {
                 "wasm module path cannot be empty".into(),
             ));
         }
+        validate_wire_path("wasm module path", &self.module)?;
         Ok(())
     }
 }
@@ -659,6 +661,18 @@ mod tests {
         TaskWorkload::Embedded(EmbeddedSpec::new("v1").unwrap())
             .validate()
             .unwrap();
+        // `cwd` remains optional text; UTF-8 validity does not make it non-empty.
+        TaskWorkload::Subprocess(SubprocessSpec::new(
+            SubprocessMode::Command {
+                command: "echo".into(),
+                args: Vec::new(),
+            },
+            TaskEnv::default(),
+            Some(PathBuf::new()),
+            Flag::enabled(),
+        ))
+        .validate()
+        .unwrap();
 
         for image in ["", "  \t"] {
             let workload = TaskWorkload::Container(ContainerSpec {
@@ -679,6 +693,37 @@ mod tests {
         let error = workload.validate().unwrap_err();
         assert!(error.to_string().contains("wasm module"));
         assert!(EmbeddedSpec::new("  ").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_task_specs_reject_non_utf8_wire_paths_without_lossy_conversion() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let invalid_path = PathBuf::from(OsString::from_vec(vec![b'/', 0xff]));
+        let subprocess = TaskWorkload::Subprocess(SubprocessSpec::new(
+            SubprocessMode::Command {
+                command: "echo".into(),
+                args: Vec::new(),
+            },
+            TaskEnv::default(),
+            Some(invalid_path.clone()),
+            Flag::enabled(),
+        ));
+        let error = crate::TaskSpec::builder("native", subprocess.clone(), 1_000u64)
+            .build()
+            .unwrap_err();
+        assert!(error.to_string().contains("subprocess cwd"));
+        assert!(error.to_string().contains("UTF-8"));
+        assert!(serde_json::to_value(subprocess).is_err());
+
+        let wasm = TaskWorkload::Wasm(WasmSpec::new(invalid_path, Vec::new(), TaskEnv::default()));
+        let error = crate::TaskSpec::builder("native", wasm.clone(), 1_000u64)
+            .build()
+            .unwrap_err();
+        assert!(error.to_string().contains("wasm module path"));
+        assert!(error.to_string().contains("UTF-8"));
+        assert!(serde_json::to_value(wasm).is_err());
     }
 
     #[test]
@@ -864,6 +909,8 @@ pub struct SubprocessSpec {
     #[serde(default, skip_serializing_if = "TaskEnv::is_empty")]
     pub env: TaskEnv,
     /// Working directory.
+    ///
+    /// A validated task spec requires this wire-facing path to be valid UTF-8.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
     /// Whether to treat non-zero exit codes as task failure.
@@ -910,6 +957,29 @@ impl SubprocessSpec {
             fail_on_non_zero,
         }
     }
+
+    /// Validates the subprocess mode and wire-facing path fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the mode is invalid or `cwd`
+    /// cannot be represented as UTF-8 on the HTTP and gRPC wire.
+    pub fn validate(&self) -> ModelResult<()> {
+        self.mode.validate()?;
+        if let Some(cwd) = &self.cwd {
+            validate_wire_path("subprocess cwd", cwd)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_wire_path(field: &str, path: &Path) -> ModelResult<()> {
+    if path.to_str().is_none() {
+        return Err(ModelError::Invalid(
+            format!("{field} must contain valid UTF-8").into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Specification for WebAssembly module execution via a WASI-compatible runtime.

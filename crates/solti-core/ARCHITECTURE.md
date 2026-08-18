@@ -227,6 +227,7 @@ flowchart TB
     Cancel["Cancel and settle previous runtime"]
     Current3{"Still current?"}
     Bind["Bind Taskvisor ID<br/>create output channel"]
+    IntakePending["Reconciled=Unknown<br/>TaskvisorOwnershipAndControllerIntakePending"]
     Submit["submit_and_watch"]
     Accepted["Reconciled=True<br/>completion waiter"]
     Failed["Reconciled=False"]
@@ -247,7 +248,8 @@ flowchart TB
     Current3 -->|no| Stale
     Current3 -->|yes| Bind
     Bind -->|stale| Failed
-    Bind --> Submit
+    Bind --> IntakePending
+    IntakePending --> Submit
     Submit -->|failure| Failed
     Submit -->|accepted| Accepted
 ```
@@ -273,6 +275,12 @@ A stale generation cannot acquire a new binding.
 A bound generation can submit while a newer apply commits.
 A later successful reconciliation replaces that runtime.
 Accepted side effects are not rolled back.
+
+Before `submit_and_watch` is polled, core publishes
+`Reconciled=Unknown/TaskvisorOwnershipAndControllerIntakePending`. It describes
+Taskvisor's combined ownership and controller command-intake wait; Taskvisor
+does not expose those sub-stages separately. Structured start and finish events
+report its duration and accepted, failed, or cancelled outcome.
 
 The crate does not provide staged rollout or availability guarantees.
 

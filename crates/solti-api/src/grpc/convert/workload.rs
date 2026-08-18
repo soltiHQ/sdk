@@ -3,6 +3,8 @@
 //! Converts built-in and extension workloads in both directions.
 //! Embedded workloads have no public protobuf representation.
 
+use std::path::Path;
+
 use solti_model::{
     ContainerSpec, ExtensionWorkload, Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskWorkload,
     WORKLOAD_API_VERSION, WasmSpec,
@@ -42,13 +44,14 @@ pub(super) fn workload_to_proto(
                 env: env_to_proto(&subprocess.env),
                 cwd: subprocess
                     .cwd
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().to_string()),
+                    .as_deref()
+                    .map(|path| wire_path_to_proto("subprocess cwd", path))
+                    .transpose()?,
                 fail_on_non_zero: subprocess.fail_on_non_zero.into(),
             })
         }
         TaskWorkload::Wasm(wasm) => proto_api::task_workload::Spec::Wasm(proto_api::WasmTask {
-            module: wasm.module.to_string_lossy().to_string(),
+            module: wire_path_to_proto("wasm module path", &wasm.module)?,
             env: env_to_proto(&wasm.env),
             args: wasm.args.clone(),
         }),
@@ -170,6 +173,14 @@ pub(super) fn convert_task_workload(
                 .map_err(|error| ApiError::InvalidRequest(error.to_string()))
         }
     }
+}
+
+fn wire_path_to_proto(field: &str, path: &Path) -> Result<String, ApiError> {
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        ApiError::Internal(format!(
+            "handler returned a {field} that is not valid UTF-8"
+        ))
+    })
 }
 
 fn validate_builtin_workload_gvk(

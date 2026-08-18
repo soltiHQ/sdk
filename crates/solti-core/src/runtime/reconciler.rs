@@ -312,7 +312,14 @@ impl Reconciler {
         let state = self.state.clone();
         let stop = self.retention_stop.clone();
         let interval = config.sweep_interval();
-        let start = tokio::time::Instant::now() + interval;
+        let Some(start) = tokio::time::Instant::now().checked_add(interval) else {
+            warn!(
+                event = "task.retention_deadline_unrepresentable",
+                interval_ms = interval.as_millis(),
+                "retention worker deadline is not representable on this platform"
+            );
+            return;
+        };
         let runtime = self.runtime.clone();
         let worker = self.tasks.spawn_on(
             async move {
@@ -373,7 +380,16 @@ impl Reconciler {
         cancel_handle: &BuildCancellationHandle,
         cancellation: &BuildCancellation,
     ) -> BuildOutcome {
-        let deadline = tokio::time::sleep(self.build_timeout);
+        let Some(deadline) = tokio::time::Instant::now().checked_add(self.build_timeout) else {
+            cancel_handle.cancel();
+            warn!(
+                event = "task.runner_build_deadline_unrepresentable",
+                timeout_ms = self.build_timeout.as_millis(),
+                "runner build deadline is not representable on this platform"
+            );
+            return BuildOutcome::TimedOut;
+        };
+        let deadline = tokio::time::sleep_until(deadline);
         tokio::pin!(deadline);
         let admitted = tokio::select! {
             biased;
@@ -740,9 +756,7 @@ impl Reconciler {
             tv,
         };
 
-        let submission = prepared.submit_and_watch();
-        tokio::pin!(submission);
-        let submission = tokio::select! {
+        let admission = tokio::select! {
             biased;
             _ = self.preflight_stop.cancelled() => {
                 self.observer.release_unsubmitted_binding(&binding).await;
@@ -752,8 +766,83 @@ impl Reconciler {
                 self.observer.release_unsubmitted_binding(&binding).await;
                 return self.current(&target, desired);
             }
+            admission = self
+                .state
+                .admit_state_write(StateMutationEventCapacity::TaskChange) => admission,
+        };
+        let Ok(admission) = admission else {
+            self.observer.release_unsubmitted_binding(&binding).await;
+            return self.current(&target, desired);
+        };
+        let intake_is_pending = self
+            .state
+            .ensure_taskvisor_intake_pending_admitted(&target, admission);
+        if !intake_is_pending || !self.state.is_current(&target) {
+            self.observer.release_unsubmitted_binding(&binding).await;
+            return self.current(&target, desired);
+        }
+
+        let intake_started = tokio::time::Instant::now();
+        debug!(
+            event = "task.taskvisor_intake_wait_started",
+            task_name = %target.name,
+            task_uid = %target.uid,
+            generation = target.generation,
+            taskvisor_id = tv.get(),
+            wait_scope = "ownership_and_controller_intake",
+            "waiting for Taskvisor ownership and controller intake capacity"
+        );
+
+        let submission = prepared.submit_and_watch();
+        tokio::pin!(submission);
+        let submission = tokio::select! {
+            biased;
+            _ = self.preflight_stop.cancelled() => {
+                debug!(
+                    event = "task.taskvisor_intake_wait_finished",
+                    task_name = %target.name,
+                    task_uid = %target.uid,
+                    generation = target.generation,
+                    taskvisor_id = tv.get(),
+                    wait_scope = "ownership_and_controller_intake",
+                    outcome = "cancelled",
+                    elapsed_ms = u64::try_from(intake_started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                    "Taskvisor intake wait cancelled"
+                );
+                self.observer.release_unsubmitted_binding(&binding).await;
+                return self.current(&target, desired);
+            }
+            _ = cancellation.cancelled() => {
+                debug!(
+                    event = "task.taskvisor_intake_wait_finished",
+                    task_name = %target.name,
+                    task_uid = %target.uid,
+                    generation = target.generation,
+                    taskvisor_id = tv.get(),
+                    wait_scope = "ownership_and_controller_intake",
+                    outcome = "cancelled",
+                    elapsed_ms = u64::try_from(intake_started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                    "Taskvisor intake wait cancelled"
+                );
+                self.observer.release_unsubmitted_binding(&binding).await;
+                return self.current(&target, desired);
+            }
             result = &mut submission => result,
         };
+
+        debug!(
+            event = "task.taskvisor_intake_wait_finished",
+            task_name = %target.name,
+            task_uid = %target.uid,
+            generation = target.generation,
+            taskvisor_id = tv.get(),
+            wait_scope = "ownership_and_controller_intake",
+            outcome = if submission.is_ok() { "accepted" } else { "failed" },
+            elapsed_ms = u64::try_from(intake_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "Taskvisor intake wait finished"
+        );
 
         match submission {
             Ok((submitted, waiter)) => {

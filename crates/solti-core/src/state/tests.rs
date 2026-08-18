@@ -1612,6 +1612,57 @@ fn reconciliation_failure_retains_desired_generation_in_condition() {
 }
 
 #[test]
+fn taskvisor_intake_pending_ensure_is_exact_and_refuses_accepted_state() {
+    let state = TaskState::new();
+    let task = create(&state, "intake-pending");
+    let target = ResourceGeneration::from_task(&task);
+
+    let admission = state
+        .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+        .unwrap();
+    assert!(state.ensure_taskvisor_intake_pending_admitted(&target, admission));
+    let pending = state.get(task.name()).unwrap();
+    assert_eq!(
+        pending.status().reconciled().reason(),
+        TASKVISOR_INTAKE_PENDING_REASON
+    );
+    let pending_version = pending.metadata().resource_version().to_owned();
+
+    let admission = state
+        .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+        .unwrap();
+    assert!(state.ensure_taskvisor_intake_pending_admitted(&target, admission));
+    assert_eq!(
+        state
+            .get(task.name())
+            .unwrap()
+            .metadata()
+            .resource_version(),
+        pending_version,
+        "an exact condition must not consume another resource version"
+    );
+
+    assert!(state.mark_observed(&target));
+    let accepted = state.get(task.name()).unwrap();
+    let accepted_version = accepted.metadata().resource_version().to_owned();
+    let admission = state
+        .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+        .unwrap();
+    assert!(!state.ensure_taskvisor_intake_pending_admitted(&target, admission));
+    let retained = state.get(task.name()).unwrap();
+    assert_eq!(
+        retained.status().reconciled().status(),
+        ConditionStatus::True
+    );
+    assert_eq!(retained.status().reconciled().reason(), "RuntimeAccepted");
+    assert_eq!(
+        retained.metadata().resource_version(),
+        accepted_version,
+        "a refused transition must not consume a resource version"
+    );
+}
+
+#[test]
 fn identical_apply_reschedules_only_a_failed_reconciliation() {
     let state = TaskState::new();
     let task = create(&state, "retry");

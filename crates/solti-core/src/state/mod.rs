@@ -64,9 +64,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use solti_model::{
-    DesiredChange, Slot, Task, TaskContinuation, TaskFilter, TaskId, TaskManifest, TaskPage,
-    TaskPhase, TaskQuery, TaskRun, TaskRunContinuation, TaskRunPage, TaskRunQuery, TaskWatchEvent,
-    Uid, WorkloadTypeMeta, WritePreconditions,
+    ConditionStatus, DesiredChange, Slot, Task, TaskContinuation, TaskFilter, TaskId, TaskManifest,
+    TaskPage, TaskPhase, TaskQuery, TaskRun, TaskRunContinuation, TaskRunPage, TaskRunQuery,
+    TaskWatchEvent, Uid, WorkloadTypeMeta, WritePreconditions,
 };
 
 use crate::persistence::{
@@ -75,6 +75,11 @@ use crate::persistence::{
     TaskStateSinkStatus,
 };
 use crate::{StateConfig, WriteConflict, WritePreconditionViolation, error::CoreError};
+
+pub(crate) const TASKVISOR_INTAKE_PENDING_REASON: &str =
+    "TaskvisorOwnershipAndControllerIntakePending";
+pub(crate) const TASKVISOR_INTAKE_PENDING_MESSAGE: &str =
+    "waiting for Taskvisor ownership and controller intake capacity";
 
 /// Shared in-memory task state.
 ///
@@ -2356,6 +2361,76 @@ impl TaskState {
     ) -> bool {
         let mut inner = self.write_admitted(admission);
         self.transition_task_finished_locked(&mut inner, binding, phase, error, exit_code, false)
+    }
+
+    /// Makes the combined Taskvisor ownership and controller-intake wait
+    /// observable through the current generation's reconciliation condition.
+    ///
+    /// Returns `true` only when the exact pending condition already existed or
+    /// was committed by this call. A stale or non-pending resource returns
+    /// `false`, which prevents Taskvisor submission.
+    pub(crate) fn ensure_taskvisor_intake_pending_admitted(
+        &self,
+        resource: &ResourceGeneration,
+        admission: StateWriteAdmission,
+    ) -> bool {
+        let mut inner = self.write_admitted(admission);
+        let Some(task) = inner.tasks.get(&resource.name) else {
+            return false;
+        };
+        if !Self::resource_matches(task, resource)
+            || task.metadata().generation() != resource.generation
+        {
+            return false;
+        }
+        let reconciled = task.status().reconciled();
+        if task.status().phase() != TaskPhase::Pending
+            || reconciled.status() != ConditionStatus::Unknown
+            || reconciled.observed_generation() != resource.generation
+        {
+            return false;
+        }
+        if reconciled.reason() == TASKVISOR_INTAKE_PENDING_REASON
+            && reconciled.message() == TASKVISOR_INTAKE_PENDING_MESSAGE
+        {
+            return true;
+        }
+
+        let previous = task.clone();
+        let (revision, resource_version) = Self::next_resource_version(&mut inner);
+        let changed = inner
+            .tasks
+            .get_mut(&resource.name)
+            .map(Arc::make_mut)
+            .expect("resource was checked under the same write lock");
+        let changed = changed
+            .update_reconciliation_pending_diagnostic(
+                TASKVISOR_INTAKE_PENDING_REASON,
+                TASKVISOR_INTAKE_PENDING_MESSAGE,
+                resource_version,
+            )
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    event = "task.state_transition_rejected",
+                    task_name = %resource.name,
+                    task_uid = %resource.uid,
+                    generation = resource.generation,
+                    operation = "ensure_taskvisor_intake_pending",
+                    %error,
+                    "state transition rejected"
+                );
+                false
+            });
+
+        if changed {
+            let current = inner
+                .tasks
+                .get(&resource.name)
+                .expect("resource was checked under the same write lock")
+                .clone();
+            self.record_change(&mut inner, revision, Some(previous), Some(current));
+        }
+        changed
     }
 
     /// Marks a generation as accepted by Taskvisor intake.

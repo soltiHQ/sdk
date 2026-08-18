@@ -150,6 +150,7 @@ async fn invalid_credentials_are_rejected_before_the_handler() {
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
         let body = body_json(response).await;
         assert_eq!(body["apiVersion"], "v1");
         assert_eq!(body["kind"], "Status");
@@ -207,6 +208,7 @@ async fn sse_logs_route_without_token_is_rejected_with_401() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.headers()[header::WWW_AUTHENTICATE], "Bearer");
     let body = body_json(resp).await;
     assert_eq!(body["reason"], "Unauthorized");
     assert_eq!(

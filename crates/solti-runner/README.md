@@ -279,6 +279,12 @@ assert!(matches!(receiver.recv().unwrap(), OutputEvent::Chunk(_)));
 - Borrowed callbacks let bounded composition layers detach input with one copy.
 - Publishing is synchronous.
 - The callback must not block runner execution.
+- An unwinding callback panic is caught, reported once through structured
+  tracing without its payload, and permanently disables new calls on that
+  attempt sink. Calls already in progress may still complete or panic. The
+  process panic hook still runs before the unwind is caught and remains
+  application-controlled. A `panic = "abort"` process cannot isolate it.
+- `OutputSink::callback_panicked()` exposes the sticky state to the owner.
 - Runners cannot subscribe to output or publish lifecycle markers.
 
 ## Metrics

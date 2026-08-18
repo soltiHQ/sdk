@@ -139,6 +139,8 @@ The in-process model keeps it.
 HTTP reads and writes the model-owned CRD JSON representation.
 gRPC reads and writes versioned protobuf DTOs.
 Both are converted to the same domain values before `ApiHandler` is called.
+`Subprocess.cwd` and `Wasm.module` carry exact UTF-8 text in both transports.
+Invalid native `PathBuf` values are rejected instead of converted lossily.
 
 ## Features
 
@@ -442,7 +444,8 @@ fn secured_router<H: ApiHandler>(handler: Arc<H>) -> solti_api::axum::Router {
 HTTP expects `Authorization: Bearer <token>`.
 gRPC expects the same value in `authorization` metadata.
 The scheme is case-insensitive.
-An invalid credential is rejected before the handler.
+An invalid credential is rejected before the handler. HTTP returns the
+`WWW-Authenticate: Bearer` challenge with its `401` Status body.
 
 `with_auth` is the static shared-token convenience path.
 A valid token creates an authenticated identity without an individual subject.

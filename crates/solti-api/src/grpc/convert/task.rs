@@ -286,6 +286,33 @@ mod tests {
     }
 
     #[test]
+    fn taskvisor_intake_pending_condition_converts_exactly() {
+        let spec = TaskSpec::builder("slot", subprocess_workload(), 5_000_u64)
+            .build()
+            .unwrap();
+        let mut task = Task::new("task-intake-pending", spec).unwrap();
+        task.update_reconciliation_pending_diagnostic(
+            "TaskvisorOwnershipAndControllerIntakePending",
+            "waiting for Taskvisor ownership and controller intake capacity",
+            "2",
+        )
+        .unwrap();
+
+        let proto = proto_api::Task::try_from(task).unwrap();
+        let condition = &proto.status.unwrap().conditions[0];
+        assert_eq!(condition.status, proto_api::ConditionStatus::Unknown as i32);
+        assert_eq!(condition.observed_generation, 1);
+        assert_eq!(
+            condition.reason,
+            "TaskvisorOwnershipAndControllerIntakePending"
+        );
+        assert_eq!(
+            condition.message,
+            "waiting for Taskvisor ownership and controller intake capacity"
+        );
+    }
+
+    #[test]
     fn list_response_carries_snapshot_continuation_and_remaining_count() {
         let mk = |id: &str| {
             let spec = TaskSpec::builder("slot", subprocess_workload(), 5_000_u64)

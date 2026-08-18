@@ -532,6 +532,78 @@ mod tests {
     }
 
     #[test]
+    fn wire_paths_round_trip_unicode_without_substitution() {
+        let cwd = std::path::PathBuf::from("/工作/δ");
+        let subprocess = TaskWorkload::Subprocess(SubprocessSpec::new(
+            SubprocessMode::Command {
+                command: "echo".into(),
+                args: Vec::new(),
+            },
+            TaskEnv::default(),
+            Some(cwd.clone()),
+            Flag::enabled(),
+        ));
+        let proto = workload_to_proto(&subprocess).unwrap();
+        let Some(proto_api::task_workload::Spec::Subprocess(proto_subprocess)) = &proto.spec else {
+            panic!("expected subprocess workload");
+        };
+        assert_eq!(proto_subprocess.cwd.as_deref(), Some("/工作/δ"));
+        let decoded = convert_task_workload(proto).unwrap();
+        assert!(matches!(
+            decoded,
+            TaskWorkload::Subprocess(SubprocessSpec { cwd: Some(actual), .. }) if actual == cwd
+        ));
+
+        let module = std::path::PathBuf::from("/модули/报告.wasm");
+        let wasm = TaskWorkload::Wasm(WasmSpec::new(
+            module.clone(),
+            Vec::new(),
+            TaskEnv::default(),
+        ));
+        let proto = workload_to_proto(&wasm).unwrap();
+        let Some(proto_api::task_workload::Spec::Wasm(proto_wasm)) = &proto.spec else {
+            panic!("expected wasm workload");
+        };
+        assert_eq!(proto_wasm.module, "/модули/报告.wasm");
+        let decoded = convert_task_workload(proto).unwrap();
+        assert!(matches!(
+            decoded,
+            TaskWorkload::Wasm(WasmSpec { module: actual, .. }) if actual == module
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn domain_to_grpc_rejects_non_utf8_wire_paths_without_exposing_bytes() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let invalid_path = std::path::PathBuf::from(OsString::from_vec(vec![b'/', 0xff]));
+        let subprocess = TaskWorkload::Subprocess(SubprocessSpec::new(
+            SubprocessMode::Command {
+                command: "echo".into(),
+                args: Vec::new(),
+            },
+            TaskEnv::default(),
+            Some(invalid_path.clone()),
+            Flag::enabled(),
+        ));
+        let error = workload_to_proto(&subprocess).unwrap_err();
+        assert!(matches!(
+            error,
+            ApiError::Internal(message)
+                if message == "handler returned a subprocess cwd that is not valid UTF-8"
+        ));
+
+        let wasm = TaskWorkload::Wasm(WasmSpec::new(invalid_path, Vec::new(), TaskEnv::default()));
+        let error = workload_to_proto(&wasm).unwrap_err();
+        assert!(matches!(
+            error,
+            ApiError::Internal(message)
+                if message == "handler returned a wasm module path that is not valid UTF-8"
+        ));
+    }
+
+    #[test]
     fn task_spec_subprocess_script_interpreter() {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;

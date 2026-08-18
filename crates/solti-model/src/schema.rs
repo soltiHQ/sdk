@@ -523,6 +523,30 @@ mod tests {
     }
 
     #[test]
+    fn task_manifest_schema_accepts_unicode_wire_paths() {
+        let workloads = [
+            TaskWorkload::Subprocess(SubprocessSpec::new(
+                SubprocessMode::Command {
+                    command: "echo".into(),
+                    args: Vec::new(),
+                },
+                TaskEnv::default(),
+                Some(PathBuf::from("/工作/δ")),
+                Flag::enabled(),
+            )),
+            TaskWorkload::Wasm(WasmSpec::new(
+                PathBuf::from("/модули/报告.wasm"),
+                Vec::new(),
+                TaskEnv::default(),
+            )),
+        ];
+
+        for workload in workloads {
+            assert_valid(&manifest(workload));
+        }
+    }
+
+    #[test]
     fn selector_schema_matches_operator_and_value_rules() {
         let schema = validator::<SelectorRequirement>();
         for valid in [

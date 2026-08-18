@@ -183,6 +183,10 @@ Omit the field for an unlimited retry budget.
 
 Built-in workloads use `apiVersion: solti.io/v1`.
 Their envelope and spec reject unknown fields.
+`Subprocess.cwd` and `Wasm.module` are wire-facing paths. A validated
+`TaskSpec` requires both to be valid UTF-8. Their Unicode text is preserved
+exactly by JSON and protobuf transports; the model never substitutes invalid
+native path bytes.
 
 Use `ExtensionWorkload` for an application-defined runner:
 
