@@ -1094,6 +1094,120 @@ async fn dropping_the_future_kills_the_whole_process_group() {
     assert!(status.healthy());
 }
 
+#[cfg(unix)]
+struct StartObservedReader {
+    stream: tokio::net::UnixStream,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(unix)]
+impl tokio::io::AsyncRead for StartObservedReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Some(started) = self.started.take() {
+            let _ = started.send(());
+        }
+        Pin::new(&mut self.stream).poll_read(context, buffer)
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn force_aborting_outer_attempt_aborts_blocked_readers_and_closes_pipe_endpoints() {
+    use tokio::io::AsyncReadExt as _;
+
+    let (stdout_reader, mut stdout_peer) = tokio::net::UnixStream::pair().unwrap();
+    let (stderr_reader, mut stderr_peer) = tokio::net::UnixStream::pair().unwrap();
+    let (stdout_started_tx, stdout_started_rx) = tokio::sync::oneshot::channel();
+    let (stderr_started_tx, stderr_started_rx) = tokio::sync::oneshot::channel();
+    let (readers_owned_tx, readers_owned_rx) = tokio::sync::oneshot::channel();
+    let attempt = tokio::spawn(async move {
+        let output = OutputTasks::start(
+            ChildOutput::new(StartObservedReader {
+                stream: stdout_reader,
+                started: Some(stdout_started_tx),
+            }),
+            ChildOutput::new(StartObservedReader {
+                stream: stderr_reader,
+                started: Some(stderr_started_tx),
+            }),
+            Arc::from("force-drop-test"),
+            LogConfig::default(),
+            None,
+        );
+        let stdout_abort = output
+            .stdout
+            .as_ref()
+            .expect("stdout reader task must be owned")
+            .abort_handle();
+        let stderr_abort = output
+            .stderr
+            .as_ref()
+            .expect("stderr reader task must be owned")
+            .abort_handle();
+        readers_owned_tx
+            .send((stdout_abort, stderr_abort))
+            .unwrap_or_else(|_| panic!("force-drop test must retain its outer attempt"));
+        std::future::pending::<()>().await;
+    });
+    let (stdout_abort, stderr_abort) = readers_owned_rx
+        .await
+        .expect("outer attempt must own both reader handles");
+
+    stdout_started_rx
+        .await
+        .expect("stdout reader must poll its pipe");
+    stderr_started_rx
+        .await
+        .expect("stderr reader must poll its pipe");
+    let mut stdout_probe = [0_u8; 1];
+    let mut stderr_probe = [0_u8; 1];
+    let mut stdout_read = Box::pin(stdout_peer.read(&mut stdout_probe));
+    let mut stderr_read = Box::pin(stderr_peer.read(&mut stderr_probe));
+    assert_future_pending(stdout_read.as_mut());
+    assert_future_pending(stderr_read.as_mut());
+    drop(stdout_read);
+    drop(stderr_read);
+
+    // Taskvisor force-abort reaches this same Tokio abort boundary. Awaiting the
+    // join error proves the outer future and its `OutputTasks` local were dropped.
+    attempt.abort();
+    assert!(attempt.await.unwrap_err().is_cancelled());
+
+    tokio::time::timeout(StdDuration::from_secs(1), async {
+        while !stdout_abort.is_finished() || !stderr_abort.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("attempt-owned output readers must terminate on drop");
+    assert_eq!(
+        tokio::time::timeout(
+            StdDuration::from_secs(1),
+            stdout_peer.read(&mut stdout_probe)
+        )
+        .await
+        .expect("stdout peer must observe endpoint release")
+        .expect("stdout peer read must succeed"),
+        0,
+        "stdout peer EOF proves the reader endpoint was released",
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            StdDuration::from_secs(1),
+            stderr_peer.read(&mut stderr_probe)
+        )
+        .await
+        .expect("stderr peer must observe endpoint release")
+        .expect("stderr peer read must succeed"),
+        0,
+        "stderr peer EOF proves the reader endpoint was released",
+    );
+}
+
 #[test]
 fn resolve_mode_invalid_base64() {
     let mode = solti_model::SubprocessMode::Script {

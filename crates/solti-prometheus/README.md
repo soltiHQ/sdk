@@ -209,7 +209,11 @@ They combine component crates and own the complete binary lifecycle.
 
 ## Specific behavior
 
-- `solti_taskvisor_attempts_in_flight` follows a best-effort event stream and can drift after dropped events.
+- `solti_taskvisor_attempts_in_flight` correlates delivered events by Taskvisor `TaskId` and attempt.
+- Duplicate terminal events and `TaskFinished` repair are idempotent for identified attempts.
+- An overflow for `prometheus-taskvisor` or Taskvisor's shared `subscriber_listener`, or a conflicting active attempt identity, clears tracking and permanently sets the gauge to `NaN`.
+- Overflow diagnostics for another subscriber or without a source still increment the global counter but do not invalidate this subscriber.
+- Tracking remains invalid for the subscriber lifetime; later attempt events are ignored while other metrics continue to update.
 - `PrometheusCoreStateCollector` recomputes phase counts from `TaskState` on each scrape.
 - `register_process_collector` is a no-op on other targets.
 - Build-info labels are constant and the gauge value is `1`.

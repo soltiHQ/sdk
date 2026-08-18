@@ -24,6 +24,9 @@
 //! A configured cgroup is terminated too.
 //! Normal completion applies the same boundary before leader reap.
 //! Other platforms stop the leader process.
+//! Stdout and stderr reader tasks are attempt-owned. Normal completion drains
+//! them within a fixed grace period. Dropping the attempt future aborts them
+//! and releases their pipe endpoints.
 
 use std::{
     fmt,
@@ -47,14 +50,14 @@ use tracing::{Instrument as _, debug, debug_span, trace, warn};
 
 use solti_model::{SubprocessSpec, Task, TaskWorkload, WORKLOAD_API_VERSION, WorkloadTypeMeta};
 use solti_runner::{
-    BuildContext, OutputPublisherHandle, RunId, Runner, RunnerError, RunnerErrorKind, RunnerType,
-    merge_env,
+    BuildContext, OutputPublisherHandle, OutputSink, RunId, Runner, RunnerError, RunnerErrorKind,
+    RunnerType, merge_env,
 };
 
 use crate::subprocess::{
     backend::{PreparedSubprocessBackendConfig, SubprocessBackendConfig},
     boundary::PinnedCwd,
-    child::ProcessChild,
+    child::{ChildOutput, ProcessChild},
     domain::{
         ActiveProcessDomain, AttachedProcessOwnership, DropFinalizerDomain,
         DropFinalizerReservation, PreparedProcessOwnership, SubprocessFinalizerStatus,
@@ -888,15 +891,93 @@ enum AttemptCompletion {
     Canceled,
 }
 
-async fn drain_output_tasks(
-    stdout: &mut tokio::task::JoinHandle<()>,
-    stderr: &mut tokio::task::JoinHandle<()>,
-) -> bool {
-    tokio::time::timeout(LOG_DRAIN_GRACE, async {
-        let _ = tokio::join!(stdout, stderr);
-    })
-    .await
-    .is_ok()
+/// Attempt-owned stdout and stderr readers.
+///
+/// Dropping this owner aborts both tasks. This includes Taskvisor force-abort
+/// dropping the outer attempt future before normal output draining begins.
+struct OutputTasks {
+    stdout: Option<tokio::task::JoinHandle<()>>,
+    stderr: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl OutputTasks {
+    /// Starts both readers and owns each handle before another task is spawned.
+    fn start(
+        stdout: ChildOutput,
+        stderr: ChildOutput,
+        run_id: Arc<str>,
+        logger: LogConfig,
+        sink: Option<OutputSink>,
+    ) -> Self {
+        let mut tasks = Self {
+            stdout: None,
+            stderr: None,
+        };
+
+        let stdout_run_id = Arc::clone(&run_id);
+        let stdout_sink = sink.clone();
+        let stdout_span = tracing::Span::current();
+        tasks.stdout = Some(tokio::spawn(
+            async move {
+                log_stream(
+                    stdout,
+                    &stdout_run_id,
+                    StreamKind::Stdout,
+                    &logger,
+                    stdout_sink.as_ref(),
+                )
+                .await;
+            }
+            .instrument(stdout_span),
+        ));
+
+        let stderr_span = tracing::Span::current();
+        tasks.stderr = Some(tokio::spawn(
+            async move {
+                log_stream(stderr, &run_id, StreamKind::Stderr, &logger, sink.as_ref()).await;
+            }
+            .instrument(stderr_span),
+        ));
+        tasks
+    }
+
+    /// Drains both readers within the existing normal-completion grace period.
+    async fn drain(&mut self) -> bool {
+        let stdout = self
+            .stdout
+            .as_mut()
+            .expect("stdout reader remains owned until drain or abort");
+        let stderr = self
+            .stderr
+            .as_mut()
+            .expect("stderr reader remains owned until drain or abort");
+        let drained = tokio::time::timeout(LOG_DRAIN_GRACE, async {
+            let _ = tokio::join!(stdout, stderr);
+        })
+        .await
+        .is_ok();
+        if drained {
+            self.stdout.take();
+            self.stderr.take();
+        }
+        drained
+    }
+
+    /// Aborts and releases both reader task handles.
+    fn abort(&mut self) {
+        if let Some(stdout) = self.stdout.take() {
+            stdout.abort();
+        }
+        if let Some(stderr) = self.stderr.take() {
+            stderr.abort();
+        }
+    }
+}
+
+impl Drop for OutputTasks {
+    fn drop(&mut self) {
+        self.abort();
+    }
 }
 
 /// Executes one subprocess attempt.
@@ -1010,46 +1091,18 @@ async fn run_subprocess_attempt(
         "subprocess spawned"
     );
 
-    let log_cfg = ctx.log_cfg;
-
     let stdout = process
         .take_stdout()
         .ok_or_else(|| TaskError::fatal("failed to capture stdout"))?;
-    let run_id_stdout = Arc::clone(&ctx.task_cfg.run_id);
-    let sink_stdout = sink.clone();
-    let stdout_span = tracing::Span::current();
-    let mut stdout_task = tokio::spawn(
-        async move {
-            log_stream(
-                stdout,
-                &run_id_stdout,
-                StreamKind::Stdout,
-                &log_cfg,
-                sink_stdout.as_ref(),
-            )
-            .await;
-        }
-        .instrument(stdout_span),
-    );
-
     let stderr = process
         .take_stderr()
         .ok_or_else(|| TaskError::fatal("failed to capture stderr"))?;
-    let run_id_stderr = Arc::clone(&ctx.task_cfg.run_id);
-    let sink_stderr = sink.clone();
-    let stderr_span = tracing::Span::current();
-    let mut stderr_task = tokio::spawn(
-        async move {
-            log_stream(
-                stderr,
-                &run_id_stderr,
-                StreamKind::Stderr,
-                &log_cfg,
-                sink_stderr.as_ref(),
-            )
-            .await;
-        }
-        .instrument(stderr_span),
+    let mut output = OutputTasks::start(
+        stdout,
+        stderr,
+        Arc::clone(&ctx.task_cfg.run_id),
+        ctx.log_cfg,
+        sink,
     );
 
     let completion = tokio::select! {
@@ -1067,7 +1120,7 @@ async fn run_subprocess_attempt(
     let drained_before_termination = matches!(completion, AttemptCompletion::LeaderExited(Ok(())));
     let mut output_drained = false;
     if drained_before_termination {
-        output_drained = drain_output_tasks(&mut stdout_task, &mut stderr_task).await;
+        output_drained = output.drain().await;
     }
 
     let termination_error = process.terminate().err();
@@ -1090,11 +1143,10 @@ async fn run_subprocess_attempt(
     };
 
     if !drained_before_termination {
-        output_drained = drain_output_tasks(&mut stdout_task, &mut stderr_task).await;
+        output_drained = output.drain().await;
     }
     if !output_drained {
-        stdout_task.abort();
-        stderr_task.abort();
+        output.abort();
         warn!(
             event = "subprocess.output_drain_timed_out",
             task_name = %ctx.resource_name,

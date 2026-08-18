@@ -29,10 +29,11 @@
 //! Both journals are limited by count and serialized bytes.
 //! Task watch admission is limited by concurrent subscription count and the
 //! aggregate compact Task JSON retained by initial and replay buffers.
-//! The live watch ring is smaller than a multi-entry change journal, leaving
-//! count headroom for recovery after a slow subscriber lags. The independent
-//! byte budget can still compact the required changes.
-//! An oversized Task change remains live on the watch stream but is not retained.
+//! Live delivery keeps only a coalesced revision notification. Subscribers read
+//! payload lazily from the same count- and byte-bounded journal used by snapshots.
+//! A subscriber expires deterministically when its next required revision is
+//! compacted. An oversized Task change expires existing subscribers because it
+//! cannot be retained within the configured byte budget.
 //! An oversized TaskRun batch updates current run state but is not retained.
 //! [`StateConfig::max_retained_tasks`] limits retained task resources.
 //! [`StateConfig::max_retained_task_manifest_bytes`] limits their aggregate
@@ -52,17 +53,13 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
     time::SystemTime,
 };
 
-use parking_lot::{Condvar, Mutex, RwLock, RwLockWriteGuard};
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use thiserror::Error;
-use tokio::sync::broadcast;
-use tokio_stream::{
-    Stream,
-    wrappers::{BroadcastStream, errors::BroadcastStreamRecvError},
-};
+use tokio_stream::{Stream, wrappers::WatchStream};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -73,8 +70,9 @@ use solti_model::{
 };
 
 use crate::persistence::{
-    MAX_STATE_EVENTS_PER_COMMIT, PersistenceConfig, StateDispatchEvent, StateEventDispatcher,
-    StateQueuePermit, TaskStateEvent, TaskStateSinkHandle, TaskStateSinkStatus,
+    MAX_STATE_EVENTS_PER_COMMIT, PersistenceConfig, StateAdmissionClosed, StateDispatchEvent,
+    StateDispatcherAdmission, StateEventDispatcher, TaskStateEvent, TaskStateSinkHandle,
+    TaskStateSinkStatus,
 };
 use crate::{StateConfig, WriteConflict, WritePreconditionViolation, error::CoreError};
 
@@ -103,8 +101,90 @@ pub struct TaskState {
 }
 
 struct StateEventPublisher {
-    dispatcher: Option<StateEventDispatcher>,
+    dispatcher: Option<Arc<StateEventDispatcher>>,
+    admission_fence: Arc<StateAdmissionFence>,
     inner: Mutex<StateEventPublisherInner>,
+}
+
+struct StateAdmissionFence {
+    inner: Mutex<StateAdmissionFenceInner>,
+    drained: tokio::sync::watch::Sender<bool>,
+}
+
+struct StateAdmissionFenceInner {
+    open: bool,
+    active: usize,
+}
+
+struct StateAdmissionLease {
+    fence: Arc<StateAdmissionFence>,
+}
+
+impl StateAdmissionFence {
+    fn new() -> Arc<Self> {
+        let (drained, _) = tokio::sync::watch::channel(false);
+        Arc::new(Self {
+            inner: Mutex::new(StateAdmissionFenceInner {
+                open: true,
+                active: 0,
+            }),
+            drained,
+        })
+    }
+
+    fn admit(self: &Arc<Self>) -> Result<StateAdmissionLease, StateAdmissionClosed> {
+        let mut inner = self.inner.lock();
+        if !inner.open {
+            return Err(StateAdmissionClosed);
+        }
+        inner.active = inner
+            .active
+            .checked_add(1)
+            .expect("active state admission lease count must not overflow");
+        Ok(StateAdmissionLease {
+            fence: Arc::clone(self),
+        })
+    }
+
+    async fn close_and_wait(&self) {
+        let mut drained = self.drained.subscribe();
+        let is_drained = {
+            let mut inner = self.inner.lock();
+            inner.open = false;
+            inner.active == 0
+        };
+        if is_drained {
+            self.drained.send_replace(true);
+        }
+        while !*drained.borrow_and_update() {
+            drained
+                .changed()
+                .await
+                .expect("state admission drain outcome remains available");
+        }
+    }
+
+    #[cfg(test)]
+    fn status(&self) -> (bool, usize) {
+        let inner = self.inner.lock();
+        (inner.open, inner.active)
+    }
+}
+
+impl Drop for StateAdmissionLease {
+    fn drop(&mut self) {
+        let drained = {
+            let mut inner = self.fence.inner.lock();
+            inner.active = inner
+                .active
+                .checked_sub(1)
+                .expect("state admission lease count must not underflow");
+            !inner.open && inner.active == 0
+        };
+        if drained {
+            self.fence.drained.send_replace(true);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -116,41 +196,43 @@ struct StateEventPublisherInner {
 struct PendingStateEventBatch {
     inner: Mutex<PendingStateEventBatchInner>,
     ready: AtomicBool,
-    published: AtomicBool,
-    completion: Condvar,
 }
 
 struct PendingStateEventBatchInner {
     events: VecDeque<StateDispatchEvent>,
-    permits: VecDeque<StateQueuePermit>,
+    admission: Option<StateDispatcherAdmission>,
 }
 
 impl PendingStateEventBatch {
-    fn new(permits: Vec<StateQueuePermit>) -> Self {
+    fn new(admission: StateDispatcherAdmission) -> Self {
         Self {
             inner: Mutex::new(PendingStateEventBatchInner {
                 events: VecDeque::new(),
-                permits: permits.into(),
+                admission: Some(admission),
             }),
             ready: AtomicBool::new(false),
-            published: AtomicBool::new(false),
-            completion: Condvar::new(),
         }
     }
 
     fn enqueue(&self, event: TaskStateEvent) {
         let mut inner = self.inner.lock();
         let permit = inner
-            .permits
-            .pop_front()
-            .expect("a state mutation must reserve its maximum event count before the write lock");
+            .admission
+            .as_mut()
+            .expect("state persistence admission remains owned until dispatch")
+            .take_permit();
         inner
             .events
             .push_back(StateDispatchEvent::new(event, permit));
     }
 
     fn release_unused_permits(&self) {
-        self.inner.lock().permits.clear();
+        self.inner
+            .lock()
+            .admission
+            .as_mut()
+            .expect("state persistence admission remains owned until dispatch")
+            .release_unused_permits();
     }
 }
 
@@ -164,22 +246,59 @@ impl StateEventPublisher {
             .transpose()?;
         Ok(Self {
             dispatcher,
+            admission_fence: StateAdmissionFence::new(),
             inner: Mutex::new(StateEventPublisherInner::default()),
         })
     }
 
-    fn reserve(&self, event_capacity: usize) -> Option<Vec<StateQueuePermit>> {
-        let dispatcher = self.dispatcher.as_ref()?;
-        let permits = dispatcher.reserve(event_capacity);
-        (!permits.is_empty()).then_some(permits)
+    async fn reserve(
+        &self,
+        event_capacity: usize,
+    ) -> Result<StateWriteAdmission, StateAdmissionClosed> {
+        if event_capacity == 0 {
+            return Ok(StateWriteAdmission {
+                lease: None,
+                dispatcher: None,
+            });
+        }
+        let lease = self.admission_fence.admit()?;
+        let dispatcher = match self.dispatcher.as_ref() {
+            Some(dispatcher) => Some(dispatcher.reserve(event_capacity).await?),
+            None => None,
+        };
+        Ok(StateWriteAdmission {
+            lease: Some(lease),
+            dispatcher,
+        })
+    }
+
+    fn reserve_blocking(
+        &self,
+        event_capacity: usize,
+    ) -> Result<StateWriteAdmission, StateAdmissionClosed> {
+        if event_capacity == 0 {
+            return Ok(StateWriteAdmission {
+                lease: None,
+                dispatcher: None,
+            });
+        }
+        let lease = self.admission_fence.admit()?;
+        let dispatcher = match self.dispatcher.as_ref() {
+            Some(dispatcher) => Some(dispatcher.reserve_blocking(event_capacity)?),
+            None => None,
+        };
+        Ok(StateWriteAdmission {
+            lease: Some(lease),
+            dispatcher,
+        })
     }
 
     fn begin_batch(
         &self,
-        permits: Option<Vec<StateQueuePermit>>,
+        admission: Option<StateDispatcherAdmission>,
     ) -> Option<Arc<PendingStateEventBatch>> {
-        let permits = permits?;
-        let batch = Arc::new(PendingStateEventBatch::new(permits));
+        let admission = admission?;
+        let batch = Arc::new(PendingStateEventBatch::new(admission));
         self.inner.lock().pending.push_back(Arc::clone(&batch));
         Some(batch)
     }
@@ -187,10 +306,6 @@ impl StateEventPublisher {
     fn mark_ready_and_publish(&self, batch: Arc<PendingStateEventBatch>) {
         batch.ready.store(true, Ordering::Release);
         self.publish_pending();
-        let mut inner = batch.inner.lock();
-        while !batch.published.load(Ordering::Acquire) {
-            batch.completion.wait(&mut inner);
-        }
     }
 
     fn publish_pending(&self) {
@@ -206,7 +321,7 @@ impl StateEventPublisher {
         }
 
         loop {
-            let (batch, events) = {
+            let (batch, admission, events) = {
                 let mut inner = self.inner.lock();
                 let Some(batch) = inner.pending.front().cloned() else {
                     inner.publishing = false;
@@ -216,38 +331,68 @@ impl StateEventPublisher {
                     inner.publishing = false;
                     return;
                 }
-                let events = batch.inner.lock().events.drain(..).collect::<Vec<_>>();
+                let (admission, events) = {
+                    let mut batch_inner = batch.inner.lock();
+                    let admission = batch_inner
+                        .admission
+                        .take()
+                        .expect("a ready state batch retains its dispatcher admission");
+                    let events = batch_inner.events.drain(..).collect::<Vec<_>>();
+                    (admission, events)
+                };
                 inner.pending.pop_front();
-                (batch, events)
+                (batch, admission, events)
             };
-            dispatcher.dispatch(events);
-            let _inner = batch.inner.lock();
-            batch.published.store(true, Ordering::Release);
-            batch.completion.notify_all();
+            dispatcher.dispatch(admission, events);
+            drop(batch);
         }
     }
 
     async fn shutdown(&self) {
+        self.admission_fence.close_and_wait().await;
         if let Some(dispatcher) = self.dispatcher.as_ref() {
             dispatcher.shutdown().await;
         }
     }
 
     fn status(&self) -> Option<TaskStateSinkStatus> {
-        self.dispatcher.as_ref().map(StateEventDispatcher::status)
+        self.dispatcher
+            .as_ref()
+            .map(|dispatcher| dispatcher.status())
+    }
+
+    #[cfg(test)]
+    fn admission_waiters(&self) -> usize {
+        self.dispatcher
+            .as_ref()
+            .map_or(0, |dispatcher| dispatcher.admission_waiters())
+    }
+
+    #[cfg(test)]
+    fn admission_closed(&self) -> bool {
+        !self.admission_fence.status().0
+    }
+
+    #[cfg(test)]
+    fn active_admissions(&self) -> usize {
+        self.admission_fence.status().1
     }
 }
 
 struct TaskStateWriteGuard<'a> {
     inner: Option<RwLockWriteGuard<'a, TaskStateInner>>,
-    watch_admission: &'a WatchAdmission,
-    watch_history_invalidated: bool,
     publisher: &'a StateEventPublisher,
     batch: Option<Arc<PendingStateEventBatch>>,
+    lease: Option<StateAdmissionLease>,
+}
+
+pub(crate) struct StateWriteAdmission {
+    lease: Option<StateAdmissionLease>,
+    dispatcher: Option<StateDispatcherAdmission>,
 }
 
 #[derive(Clone, Copy)]
-enum StateMutationEventCapacity {
+pub(crate) enum StateMutationEventCapacity {
     None,
     TaskChange,
     TaskAndRunChange,
@@ -270,10 +415,6 @@ impl TaskStateWriteGuard<'_> {
         if let Some(batch) = self.batch.as_ref() {
             batch.enqueue(event);
         }
-    }
-
-    fn invalidate_watch_history(&mut self) {
-        self.watch_history_invalidated = true;
     }
 }
 
@@ -298,16 +439,14 @@ impl DerefMut for TaskStateWriteGuard<'_> {
 impl Drop for TaskStateWriteGuard<'_> {
     fn drop(&mut self) {
         let batch = self.batch.take();
-        let watch_history_invalidated = self.watch_history_invalidated;
+        let lease = self.lease.take();
         // Readiness must become visible only after the authoritative state lock is released.
         drop(self.inner.take());
-        if watch_history_invalidated {
-            self.watch_admission.notify_history_changed();
-        }
         if let Some(batch) = batch {
             batch.release_unused_permits();
             self.publisher.mark_ready_and_publish(batch);
         }
+        drop(lease);
     }
 }
 
@@ -363,8 +502,8 @@ struct TaskStateInner {
     compacted_through: u64,
     /// Maximum retained change count.
     watch_history_capacity: usize,
-    /// Live Task change broadcast.
-    watch_tx: broadcast::Sender<Arc<RawTaskChange>>,
+    /// Coalesced latest-revision notification for lazy live Task watch delivery.
+    watch_tx: tokio::sync::watch::Sender<u64>,
     /// Terminal transition time used by retention.
     terminal_since: HashMap<TaskId, SystemTime>,
     /// Per-task completed run cap.
@@ -428,10 +567,6 @@ type WatchPredicate = Arc<dyn Fn(&Task) -> bool + Send + Sync>;
 
 const WATCH_POLL_BUDGET: usize = 128;
 
-fn task_watch_live_capacity(history_capacity: usize) -> usize {
-    (history_capacity.next_power_of_two() / 2).max(1)
-}
-
 struct WatchAdmission {
     max_count: Option<usize>,
     max_bytes: Option<usize>,
@@ -442,21 +577,12 @@ struct WatchAdmissionInner {
     closed: bool,
     next_lease_id: u64,
     retained_bytes: usize,
-    history_token: Arc<()>,
     leases: HashMap<u64, usize>,
-    waiters: HashMap<u64, Waker>,
 }
 
 enum WatchAdmissionFailure {
     Closed,
     Rejected(CollectionError),
-}
-
-enum WatchReplayReservation {
-    Reserved,
-    Oversized,
-    HistoryChanged,
-    Closed,
 }
 
 struct WatchAdmissionLease {
@@ -477,9 +603,7 @@ impl WatchAdmission {
                 closed: false,
                 next_lease_id: 1,
                 retained_bytes: 0,
-                history_token: Arc::new(()),
                 leases: HashMap::new(),
-                waiters: HashMap::new(),
             }),
         })
     }
@@ -545,199 +669,54 @@ impl WatchAdmission {
         })
     }
 
-    fn poll_reserve_replay(
-        &self,
-        id: u64,
-        requested_bytes: usize,
-        history_token: &Arc<()>,
-        cx: &Context<'_>,
-    ) -> Poll<WatchReplayReservation> {
-        let mut incoming_waker = Some(cx.waker().clone());
-        let (result, removed_waker) = {
-            let mut inner = self.inner.lock();
-            if inner.closed || !inner.leases.contains_key(&id) {
-                (Poll::Ready(WatchReplayReservation::Closed), None)
-            } else if !Arc::ptr_eq(&inner.history_token, history_token) {
-                let removed_waker = inner.waiters.remove(&id);
-                (
-                    Poll::Ready(WatchReplayReservation::HistoryChanged),
-                    removed_waker,
-                )
-            } else if self.max_bytes.is_none() {
-                (Poll::Ready(WatchReplayReservation::Reserved), None)
-            } else {
-                let limit = self
-                    .max_bytes
-                    .expect("the replay byte limit was checked as present");
-                if requested_bytes > limit {
-                    (Poll::Ready(WatchReplayReservation::Oversized), None)
-                } else if requested_bytes <= limit - inner.retained_bytes {
-                    inner.retained_bytes = inner
-                        .retained_bytes
-                        .checked_add(requested_bytes)
-                        .expect("watch replay bytes must remain within the configured limit");
-                    *inner
-                        .leases
-                        .get_mut(&id)
-                        .expect("an admitted watch lease must remain registered") +=
-                        requested_bytes;
-                    let removed_waker = inner.waiters.remove(&id);
-                    (Poll::Ready(WatchReplayReservation::Reserved), removed_waker)
-                } else {
-                    let removed_waker = match inner.waiters.entry(id) {
-                        std::collections::hash_map::Entry::Occupied(mut waiter) => {
-                            if waiter.get().will_wake(
-                                incoming_waker
-                                    .as_ref()
-                                    .expect("the incoming replay waker must be available"),
-                            ) {
-                                None
-                            } else {
-                                Some(
-                                    waiter.insert(
-                                        incoming_waker
-                                            .take()
-                                            .expect("the incoming replay waker must be available"),
-                                    ),
-                                )
-                            }
-                        }
-                        std::collections::hash_map::Entry::Vacant(waiter) => {
-                            waiter.insert(
-                                incoming_waker
-                                    .take()
-                                    .expect("the incoming replay waker must be available"),
-                            );
-                            None
-                        }
-                    };
-                    (Poll::Pending, removed_waker)
-                }
-            }
-        };
-        drop(removed_waker);
-        drop(incoming_waker);
-        result
-    }
-
-    fn history_token(&self) -> Arc<()> {
-        Arc::clone(&self.inner.lock().history_token)
-    }
-
-    fn notify_history_changed(&self) {
-        let waiters = {
-            let mut inner = self.inner.lock();
-            inner.history_token = Arc::new(());
-            inner
-                .waiters
-                .drain()
-                .map(|(_, waker)| waker)
-                .collect::<Vec<_>>()
-        };
-        for waiter in waiters {
-            waiter.wake();
-        }
-    }
-
     fn release_bytes(&self, id: u64, released_bytes: usize) {
         if self.max_bytes.is_none() || released_bytes == 0 {
             return;
         }
-        let waiters = {
-            let mut inner = self.inner.lock();
-            let Some(lease_bytes) = inner.leases.get_mut(&id) else {
-                return;
-            };
-            *lease_bytes = lease_bytes
-                .checked_sub(released_bytes)
-                .expect("watch lease byte accounting must not underflow");
-            inner.retained_bytes = inner
-                .retained_bytes
-                .checked_sub(released_bytes)
-                .expect("aggregate watch byte accounting must not underflow");
-            inner
-                .waiters
-                .drain()
-                .map(|(_, waker)| waker)
-                .collect::<Vec<_>>()
+        let mut inner = self.inner.lock();
+        let Some(lease_bytes) = inner.leases.get_mut(&id) else {
+            return;
         };
-        for waiter in waiters {
-            waiter.wake();
-        }
+        *lease_bytes = lease_bytes
+            .checked_sub(released_bytes)
+            .expect("watch lease byte accounting must not underflow");
+        inner.retained_bytes = inner
+            .retained_bytes
+            .checked_sub(released_bytes)
+            .expect("aggregate watch byte accounting must not underflow");
     }
 
     fn release_lease(&self, id: u64) {
-        let (removed_waiter, waiters) = {
-            let mut inner = self.inner.lock();
-            let Some(released_bytes) = inner.leases.remove(&id) else {
-                return;
-            };
-            inner.retained_bytes = inner
-                .retained_bytes
-                .checked_sub(released_bytes)
-                .expect("aggregate watch lease accounting must not underflow");
-            let removed_waiter = inner.waiters.remove(&id);
-            let waiters = inner
-                .waiters
-                .drain()
-                .map(|(_, waker)| waker)
-                .collect::<Vec<_>>();
-            (removed_waiter, waiters)
+        let mut inner = self.inner.lock();
+        let Some(released_bytes) = inner.leases.remove(&id) else {
+            return;
         };
-        drop(removed_waiter);
-        for waiter in waiters {
-            waiter.wake();
-        }
+        inner.retained_bytes = inner
+            .retained_bytes
+            .checked_sub(released_bytes)
+            .expect("aggregate watch lease accounting must not underflow");
     }
 
     fn close(&self) {
-        let waiters = {
-            let mut inner = self.inner.lock();
-            if inner.closed {
-                return;
-            }
-            inner.closed = true;
-            inner.retained_bytes = 0;
-            inner.leases.clear();
-            inner
-                .waiters
-                .drain()
-                .map(|(_, waker)| waker)
-                .collect::<Vec<_>>()
-        };
-        for waiter in waiters {
-            waiter.wake();
+        let mut inner = self.inner.lock();
+        if inner.closed {
+            return;
         }
+        inner.closed = true;
+        inner.retained_bytes = 0;
+        inner.leases.clear();
     }
 
     #[cfg(test)]
     fn usage(&self) -> (usize, usize, usize) {
         let inner = self.inner.lock();
-        (
-            inner.leases.len(),
-            inner.retained_bytes,
-            inner.waiters.len(),
-        )
+        (inner.leases.len(), inner.retained_bytes, 0)
     }
 }
 
 impl WatchAdmissionLease {
     fn is_active(&self) -> bool {
         self.admission.inner.lock().leases.contains_key(&self.id)
-    }
-
-    fn poll_reserve_replay(
-        &self,
-        requested_bytes: usize,
-        history_token: &Arc<()>,
-        cx: &Context<'_>,
-    ) -> Poll<WatchReplayReservation> {
-        self.admission
-            .poll_reserve_replay(self.id, requested_bytes, history_token, cx)
-    }
-
-    fn history_token(&self) -> Arc<()> {
-        self.admission.history_token()
     }
 
     fn release_bytes(&self, released_bytes: usize) {
@@ -828,22 +807,23 @@ pub enum CollectionError {
 /// The stream ends after returning it.
 ///
 /// Initial and exact-resume events retain an aggregate byte lease until each
-/// event is yielded. Lag recovery waits for byte capacity without retaining
-/// replay payload across a pending poll. One event larger than the complete
-/// budget is transferred directly to the caller and is never buffered.
+/// event is yielded. Live delivery retains no per-subscriber payload: a
+/// coalesced revision notification drives lazy reads from the shared journal.
+/// Compaction of the next required revision terminates the subscription with
+/// [`CollectionError::ResourceVersionExpired`].
 #[must_use = "streams do nothing unless polled"]
 pub struct TaskWatchSubscription {
     inner: Arc<RwLock<TaskStateInner>>,
-    receiver: BroadcastStream<Arc<RawTaskChange>>,
+    receiver: WatchStream<u64>,
     initial: VecDeque<BufferedWatchEvent>,
     initial_revision: Option<u64>,
     replay: VecDeque<PreparedReplayChange>,
-    recovery: Option<LagRecovery>,
     permit: Option<WatchAdmissionLease>,
     filter: TaskFilter,
     predicate: WatchPredicate,
     epoch: Arc<str>,
     last_revision: u64,
+    target_revision: u64,
     stop: Pin<Box<dyn Future<Output = ()> + Send>>,
     terminal: bool,
 }
@@ -860,6 +840,15 @@ struct WatchEventDescriptor {
     task: Arc<Task>,
     resource_version: Option<String>,
     serialized_bytes: usize,
+}
+
+fn first_after_revision<T>(
+    history: &VecDeque<T>,
+    revision: u64,
+    mut revision_of: impl FnMut(&T) -> u64,
+) -> Option<&T> {
+    let index = history.partition_point(|change| revision_of(change) <= revision);
+    history.get(index)
 }
 
 impl WatchEventDescriptor {
@@ -893,19 +882,6 @@ struct BufferedWatchEvent {
 struct PreparedReplayChange {
     revision: u64,
     event: Option<BufferedWatchEvent>,
-}
-
-struct LagRecovery {
-    target_revision: u64,
-    pending: Option<RecoveryEventProbe>,
-}
-
-#[derive(Clone)]
-struct RecoveryEventProbe {
-    revision: u64,
-    kind: PreparedWatchEventKind,
-    serialized_bytes: usize,
-    history_token: Arc<()>,
 }
 
 impl TaskWatchSubscription {
@@ -960,72 +936,39 @@ impl TaskWatchSubscription {
         }
     }
 
-    fn begin_recovery_after_lag(&mut self) -> Result<(), CollectionError> {
-        let inner = self.inner.read();
-        if inner.resource_version_epoch.as_ref() != self.epoch.as_ref() {
-            return Err(CollectionError::ResourceVersionExpired {
-                resource_version: TaskState::format_resource_version(
-                    self.epoch.as_ref(),
-                    self.last_revision,
-                ),
-            });
-        }
-        if self.last_revision < inner.compacted_through {
-            return Err(CollectionError::ResourceVersionExpired {
-                resource_version: TaskState::format_resource_version(
-                    self.epoch.as_ref(),
-                    self.last_revision,
-                ),
-            });
-        }
-        self.recovery = Some(LagRecovery {
-            target_revision: inner.resource_version,
-            pending: None,
-        });
-        Ok(())
-    }
-
-    fn next_recovery_change(
+    fn next_live_change(
         &self,
         target_revision: u64,
     ) -> Result<Option<Arc<RawTaskChange>>, CollectionError> {
+        let inner = self.inner.read();
+        if self.live_position_expired(&inner) {
+            return Err(CollectionError::ResourceVersionExpired {
+                resource_version: TaskState::format_resource_version(
+                    self.epoch.as_ref(),
+                    self.last_revision,
+                ),
+            });
+        }
         if self.last_revision >= target_revision {
             return Ok(None);
         }
-        let inner = self.inner.read();
-        if inner.resource_version_epoch.as_ref() != self.epoch.as_ref()
-            || self.last_revision < inner.compacted_through
-        {
-            return Err(CollectionError::ResourceVersionExpired {
-                resource_version: TaskState::format_resource_version(
-                    self.epoch.as_ref(),
-                    self.last_revision,
-                ),
-            });
-        }
-        Ok(inner
-            .watch_history
-            .iter()
-            .find(|change| {
-                change.revision > self.last_revision && change.revision <= target_revision
+        Ok(
+            first_after_revision(&inner.watch_history, self.last_revision, |change| {
+                change.revision
             })
-            .cloned())
+            .filter(|change| change.revision <= target_revision)
+            .cloned(),
+        )
     }
 
-    fn descriptor_from_recovery_probe(
-        &self,
-        target_revision: u64,
-        probe: &RecoveryEventProbe,
-    ) -> Result<WatchEventDescriptor, CollectionError> {
-        let change = self.next_recovery_change(target_revision)?.ok_or_else(|| {
-            CollectionError::ResourceVersionExpired {
-                resource_version: TaskState::format_resource_version(
-                    self.epoch.as_ref(),
-                    self.last_revision,
-                ),
-            }
-        })?;
-        if change.revision != probe.revision {
+    fn live_position_expired(&self, inner: &TaskStateInner) -> bool {
+        inner.resource_version_epoch.as_ref() != self.epoch.as_ref()
+            || self.last_revision < inner.compacted_through
+    }
+
+    fn validate_live_position(&self) -> Result<(), CollectionError> {
+        let inner = self.inner.read();
+        if self.live_position_expired(&inner) {
             return Err(CollectionError::ResourceVersionExpired {
                 resource_version: TaskState::format_resource_version(
                     self.epoch.as_ref(),
@@ -1033,39 +976,7 @@ impl TaskWatchSubscription {
                 ),
             });
         }
-        let (task, resource_version) = match probe.kind {
-            PreparedWatchEventKind::Added | PreparedWatchEventKind::Modified => (
-                change.current.as_ref().map(Arc::clone).ok_or_else(|| {
-                    CollectionError::ResourceVersionExpired {
-                        resource_version: TaskState::format_resource_version(
-                            self.epoch.as_ref(),
-                            self.last_revision,
-                        ),
-                    }
-                })?,
-                None,
-            ),
-            PreparedWatchEventKind::Deleted => (
-                change.previous.as_ref().map(Arc::clone).ok_or_else(|| {
-                    CollectionError::ResourceVersionExpired {
-                        resource_version: TaskState::format_resource_version(
-                            self.epoch.as_ref(),
-                            self.last_revision,
-                        ),
-                    }
-                })?,
-                Some(TaskState::format_resource_version(
-                    change.epoch.as_ref(),
-                    change.revision,
-                )),
-            ),
-        };
-        Ok(WatchEventDescriptor {
-            kind: probe.kind,
-            task,
-            resource_version,
-            serialized_bytes: probe.serialized_bytes,
-        })
+        Ok(())
     }
 
     fn take_buffered_event(&self, buffered: BufferedWatchEvent) -> TaskWatchEvent {
@@ -1079,7 +990,6 @@ impl TaskWatchSubscription {
         self.terminal = true;
         self.initial.clear();
         self.replay.clear();
-        self.recovery = None;
         self.permit.take();
     }
 
@@ -1138,91 +1048,11 @@ impl Stream for TaskWatchSubscription {
                 continue;
             }
 
-            if self.recovery.is_some() {
-                let target_revision = self
-                    .recovery
-                    .as_ref()
-                    .expect("checked recovery state must be present")
-                    .target_revision;
-                if let Some(probe) = self
-                    .recovery
-                    .as_ref()
-                    .expect("checked recovery state must be present")
-                    .pending
-                    .clone()
-                {
-                    let reservation = self
-                        .permit
-                        .as_ref()
-                        .expect("an active watch must own an admission lease")
-                        .poll_reserve_replay(probe.serialized_bytes, &probe.history_token, cx);
-                    let reservation = match reservation {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(WatchReplayReservation::Closed) => {
-                            self.finish_terminal();
-                            return Poll::Ready(None);
-                        }
-                        Poll::Ready(WatchReplayReservation::HistoryChanged) => {
-                            processed += 1;
-                            let history_token = self
-                                .permit
-                                .as_ref()
-                                .expect("an active watch must own an admission lease")
-                                .history_token();
-                            if let Err(error) =
-                                self.descriptor_from_recovery_probe(target_revision, &probe)
-                            {
-                                return self.terminal_error(error);
-                            }
-                            self.recovery
-                                .as_mut()
-                                .expect("checked recovery state must be present")
-                                .pending
-                                .as_mut()
-                                .expect("checked recovery probe must be present")
-                                .history_token = history_token;
-                            continue;
-                        }
-                        Poll::Ready(reservation) => reservation,
-                    };
-                    let descriptor =
-                        match self.descriptor_from_recovery_probe(target_revision, &probe) {
-                            Ok(descriptor) => descriptor,
-                            Err(error) => {
-                                if matches!(reservation, WatchReplayReservation::Reserved) {
-                                    self.permit
-                                        .as_ref()
-                                        .expect("an active watch must own an admission lease")
-                                        .release_bytes(probe.serialized_bytes);
-                                }
-                                return self.terminal_error(error);
-                            }
-                        };
-                    self.recovery
-                        .as_mut()
-                        .expect("checked recovery state must be present")
-                        .pending = None;
-                    self.last_revision = probe.revision;
-                    let event = descriptor.materialize();
-                    if matches!(reservation, WatchReplayReservation::Reserved) {
-                        self.permit
-                            .as_ref()
-                            .expect("an active watch must own an admission lease")
-                            .release_bytes(probe.serialized_bytes);
-                    }
-                    return Poll::Ready(Some(Ok(event)));
-                }
-
-                let history_token = self
-                    .permit
-                    .as_ref()
-                    .expect("an active watch must own an admission lease")
-                    .history_token();
-                let change = match self.next_recovery_change(target_revision) {
+            if self.last_revision != self.target_revision {
+                let change = match self.next_live_change(self.target_revision) {
                     Ok(Some(change)) => change,
                     Ok(None) => {
-                        self.last_revision = target_revision;
-                        self.recovery = None;
+                        self.last_revision = self.target_revision;
                         continue;
                     }
                     Err(error) => return self.terminal_error(error),
@@ -1233,78 +1063,18 @@ impl Stream for TaskWatchSubscription {
                     self.last_revision = revision;
                     continue;
                 };
-                let probe = RecoveryEventProbe {
-                    revision,
-                    kind: descriptor.kind,
-                    serialized_bytes: descriptor.serialized_bytes,
-                    history_token,
-                };
-                let reservation = self
-                    .permit
-                    .as_ref()
-                    .expect("an active watch must own an admission lease")
-                    .poll_reserve_replay(descriptor.serialized_bytes, &probe.history_token, cx);
-                match reservation {
-                    Poll::Pending => {
-                        self.recovery
-                            .as_mut()
-                            .expect("checked recovery state must be present")
-                            .pending = Some(probe);
-                        return Poll::Pending;
-                    }
-                    Poll::Ready(WatchReplayReservation::HistoryChanged) => {
-                        self.recovery
-                            .as_mut()
-                            .expect("checked recovery state must be present")
-                            .pending = Some(probe);
-                        continue;
-                    }
-                    Poll::Ready(WatchReplayReservation::Closed) => {
-                        self.finish_terminal();
-                        return Poll::Ready(None);
-                    }
-                    Poll::Ready(WatchReplayReservation::Oversized) => {
-                        self.last_revision = revision;
-                        return Poll::Ready(Some(Ok(descriptor.materialize())));
-                    }
-                    Poll::Ready(WatchReplayReservation::Reserved) => {
-                        let bytes = descriptor.serialized_bytes;
-                        let event = descriptor.materialize();
-                        self.last_revision = revision;
-                        self.permit
-                            .as_ref()
-                            .expect("an active watch must own an admission lease")
-                            .release_bytes(bytes);
-                        return Poll::Ready(Some(Ok(event)));
-                    }
-                }
+                self.last_revision = revision;
+                return Poll::Ready(Some(Ok(descriptor.materialize())));
+            }
+
+            if let Err(error) = self.validate_live_position() {
+                return self.terminal_error(error);
             }
 
             match Pin::new(&mut self.receiver).poll_next(cx) {
-                Poll::Ready(Some(Ok(change))) => {
+                Poll::Ready(Some(target_revision)) => {
                     processed += 1;
-                    if change.epoch.as_ref() != self.epoch.as_ref() {
-                        let resource_version = TaskState::format_resource_version(
-                            self.epoch.as_ref(),
-                            self.last_revision,
-                        );
-                        return self.terminal_error(CollectionError::ResourceVersionExpired {
-                            resource_version,
-                        });
-                    }
-                    if change.revision <= self.last_revision {
-                        continue;
-                    }
-                    self.last_revision = change.revision;
-                    if let Some(descriptor) = self.descriptor_for(&change) {
-                        return Poll::Ready(Some(Ok(descriptor.materialize())));
-                    }
-                }
-                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => {
-                    processed += 1;
-                    if let Err(error) = self.begin_recovery_after_lag() {
-                        return self.terminal_error(error);
-                    }
+                    self.target_revision = target_revision;
                 }
                 Poll::Ready(None) => {
                     self.finish_terminal();
@@ -1425,8 +1195,7 @@ impl TaskState {
         event_sink: Option<TaskStateSinkHandle>,
         persistence_config: PersistenceConfig,
     ) -> Result<Self, CoreError> {
-        let (watch_tx, _) =
-            broadcast::channel(task_watch_live_capacity(config.watch_history_capacity()));
+        let (watch_tx, _) = tokio::sync::watch::channel(0);
         let watch_admission = WatchAdmission::new(config);
         let run_resource_version_epoch = format!("runs-{epoch}");
         Ok(Self {
@@ -1469,20 +1238,49 @@ impl TaskState {
         })
     }
 
-    fn write(&self, event_capacity: StateMutationEventCapacity) -> TaskStateWriteGuard<'_> {
-        // Reserve every event slot atomically before acquiring the authoritative
-        // lock. A slow persistence sink therefore cannot extend the global
-        // critical section or leave hidden, unpermitted events in a pending batch.
-        let permits = self.event_publisher.reserve(event_capacity.get());
+    pub(crate) async fn admit_state_write(
+        &self,
+        event_capacity: StateMutationEventCapacity,
+    ) -> Result<StateWriteAdmission, StateAdmissionClosed> {
+        self.event_publisher.reserve(event_capacity.get()).await
+    }
+
+    fn admit_state_write_blocking(
+        &self,
+        event_capacity: StateMutationEventCapacity,
+    ) -> Result<StateWriteAdmission, StateAdmissionClosed> {
+        self.event_publisher.reserve_blocking(event_capacity.get())
+    }
+
+    pub(crate) fn admit_state_write_from_taskvisor_callback(
+        &self,
+        event_capacity: StateMutationEventCapacity,
+    ) -> Result<StateWriteAdmission, StateAdmissionClosed> {
+        // Taskvisor invokes subscribers on dedicated callback workers. This
+        // adapter polls the same fair semaphore future as Tokio-owned writes.
+        self.admit_state_write_blocking(event_capacity)
+    }
+
+    fn write_admitted(&self, admission: StateWriteAdmission) -> TaskStateWriteGuard<'_> {
+        let StateWriteAdmission { lease, dispatcher } = admission;
         let inner = self.inner.write();
-        let batch = self.event_publisher.begin_batch(permits);
+        let batch = self.event_publisher.begin_batch(dispatcher);
         TaskStateWriteGuard {
             inner: Some(inner),
-            watch_admission: self.watch_admission.as_ref(),
-            watch_history_invalidated: false,
             publisher: &self.event_publisher,
             batch,
+            lease,
         }
+    }
+
+    fn write(&self, event_capacity: StateMutationEventCapacity) -> TaskStateWriteGuard<'_> {
+        // Synchronous writes are limited to test helpers and Taskvisor's
+        // dedicated subscriber callback threads. Tokio-owned paths reserve
+        // asynchronously before entering their state or lifecycle gates.
+        let admission = self
+            .admit_state_write_blocking(event_capacity)
+            .expect("state persistence remains open while internal writes are accepted");
+        self.write_admitted(admission)
     }
 
     #[cfg(test)]
@@ -1511,7 +1309,6 @@ impl TaskState {
 
     fn next_resource_version(inner: &mut TaskStateWriteGuard<'_>) -> (u64, String) {
         if inner.resource_version == u64::MAX {
-            inner.invalidate_watch_history();
             inner.resource_version_epoch = Arc::from(Self::next_resource_version_epoch(
                 inner.resource_version_epoch.as_ref(),
             ));
@@ -1521,6 +1318,7 @@ impl TaskState {
             inner.compacted_through = 0;
         }
         inner.resource_version += 1;
+        inner.watch_tx.send_replace(inner.resource_version);
         (
             inner.resource_version,
             Self::current_resource_version(inner),
@@ -1687,12 +1485,10 @@ impl TaskState {
             serialized_bytes,
         });
 
-        let mut history_invalidated = false;
         if serialized_bytes > inner.watch_history_byte_budget {
             inner.watch_history.clear();
             inner.watch_history_bytes = 0;
             inner.compacted_through = revision;
-            history_invalidated = true;
         } else {
             while inner.watch_history.len() >= inner.watch_history_capacity
                 || inner.watch_history_bytes > inner.watch_history_byte_budget - serialized_bytes
@@ -1706,7 +1502,6 @@ impl TaskState {
                     .checked_sub(compacted.serialized_bytes)
                     .expect("watch history byte accounting must not underflow");
                 inner.compacted_through = compacted.revision;
-                history_invalidated = true;
             }
             inner.watch_history_bytes = inner
                 .watch_history_bytes
@@ -1714,11 +1509,6 @@ impl TaskState {
                 .expect("watch history byte accounting must not overflow");
             inner.watch_history.push_back(Arc::clone(&change));
         }
-        if history_invalidated {
-            inner.invalidate_watch_history();
-        }
-
-        let _ = inner.watch_tx.send(change);
         inner.enqueue(persistence_event);
     }
 
@@ -1853,30 +1643,51 @@ impl TaskState {
     /// Returns [`CoreError::RetainedTaskLimitReached`] when no task slot remains.
     /// Returns [`CoreError::RetainedTaskManifestByteLimitExceeded`] when the
     /// caller-owned manifest would exceed the aggregate byte budget.
+    #[cfg(test)]
     pub(crate) fn create_desired(
         &self,
         manifest: &TaskManifest,
     ) -> Result<DesiredCommit, CoreError> {
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+            .expect("test state persistence remains open");
+        self.create_desired_admitted(manifest, admission)
+    }
+
+    pub(crate) fn create_desired_admitted(
+        &self,
+        manifest: &TaskManifest,
+        admission: StateWriteAdmission,
+    ) -> Result<DesiredCommit, CoreError> {
         let manifest_bytes = Self::serialized_task_manifest_bytes(manifest);
-        let mut task = Task::from_manifest(manifest.clone())?;
-        let name = manifest.name().clone();
-        let mut inner = self.write(StateMutationEventCapacity::TaskChange);
+        let task = Task::from_manifest(manifest.clone())?;
+        let mut inner = self.write_admitted(admission);
+        self.create_desired_locked(&mut inner, task, manifest_bytes)
+    }
+
+    fn create_desired_locked(
+        &self,
+        inner: &mut TaskStateWriteGuard<'_>,
+        mut task: Task,
+        manifest_bytes: usize,
+    ) -> Result<DesiredCommit, CoreError> {
+        let name = task.name().clone();
         if inner.tasks.contains_key(&name) {
             return Err(CoreError::AlreadyExists(format!(
                 "Task resource '{name}' already exists"
             )));
         }
-        Self::ensure_retained_task_capacity(&inner)?;
-        Self::ensure_retained_task_manifest_byte_capacity(&inner, manifest_bytes)?;
+        Self::ensure_retained_task_capacity(inner)?;
+        Self::ensure_retained_task_manifest_byte_capacity(inner, manifest_bytes)?;
 
-        let (revision, resource_version) = Self::next_resource_version(&mut inner);
+        let (revision, resource_version) = Self::next_resource_version(inner);
         task.set_resource_version(resource_version)?;
-        Self::index_task(&mut inner, &task);
+        Self::index_task(inner, &task);
         inner.terminal_since.remove(&name);
         let task = Arc::new(task);
         inner.tasks.insert(name, Arc::clone(&task));
-        Self::set_retained_task_manifest_bytes(&mut inner, task.name(), manifest_bytes);
-        self.record_change(&mut inner, revision, None, Some(Arc::clone(&task)));
+        Self::set_retained_task_manifest_bytes(inner, task.name(), manifest_bytes);
+        self.record_change(inner, revision, None, Some(Arc::clone(&task)));
         Ok(DesiredCommit {
             task: task.as_ref().clone(),
             reconcile: true,
@@ -1909,23 +1720,36 @@ impl TaskState {
     /// name cannot be retained.
     /// Returns [`CoreError::RetainedTaskManifestByteLimitExceeded`] when a new
     /// manifest or positive existing-manifest growth exceeds the byte budget.
+    #[cfg(test)]
     pub(crate) fn apply_desired_with_preconditions(
         &self,
         manifest: &TaskManifest,
         preconditions: &WritePreconditions,
+    ) -> Result<DesiredCommit, CoreError> {
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+            .expect("test state persistence remains open");
+        self.apply_desired_with_preconditions_admitted(manifest, preconditions, admission)
+    }
+
+    pub(crate) fn apply_desired_with_preconditions_admitted(
+        &self,
+        manifest: &TaskManifest,
+        preconditions: &WritePreconditions,
+        admission: StateWriteAdmission,
     ) -> Result<DesiredCommit, CoreError> {
         let desired_manifest_bytes = Self::serialized_task_manifest_bytes(manifest);
         let desired_labels = manifest.metadata().labels().clone();
         let desired_annotations = manifest.metadata().annotations().clone();
         let desired_spec = manifest.spec().clone();
         let name = manifest.name().clone();
-        let mut inner = self.write(StateMutationEventCapacity::TaskChange);
+        let mut inner = self.write_admitted(admission);
         let Some(current) = inner.tasks.get(&name) else {
             if !preconditions.is_empty() {
                 return Err(CoreError::NotFound(name.to_string()));
             }
-            drop(inner);
-            return self.create_desired(manifest);
+            let task = Task::from_manifest(manifest.clone())?;
+            return self.create_desired_locked(&mut inner, task, desired_manifest_bytes);
         };
         Self::check_write_preconditions(current, preconditions)?;
         let current_manifest_bytes = *inner
@@ -2097,8 +1921,16 @@ impl TaskState {
     ///
     /// Returns `true` when the task existed.
     /// Reconciliation failures do not use this path.
+    #[cfg(test)]
     pub(crate) fn delete_task(&self, id: &TaskId) -> bool {
-        let mut inner = self.write(StateMutationEventCapacity::TaskChange);
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+            .expect("test state persistence remains open");
+        self.delete_task_admitted(id, admission)
+    }
+
+    pub(crate) fn delete_task_admitted(&self, id: &TaskId, admission: StateWriteAdmission) -> bool {
+        let mut inner = self.write_admitted(admission);
         let task_uid = inner.tasks.get(id).map(|task| task.uid().clone());
         let removed_runs = inner.runs.remove(id);
         if let (Some(task_uid), Some(removed_runs)) = (task_uid.as_ref(), removed_runs) {
@@ -2144,15 +1976,28 @@ impl TaskState {
     }
 
     /// Records an authoritative attempt start.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn transition_attempt_starting(
         &self,
         binding: &RuntimeBinding,
         attempt: u32,
     ) -> bool {
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::AttemptTransition)
+            .expect("test state persistence remains open");
+        self.transition_attempt_starting_admitted(binding, attempt, admission)
+    }
+
+    pub(crate) fn transition_attempt_starting_admitted(
+        &self,
+        binding: &RuntimeBinding,
+        attempt: u32,
+        admission: StateWriteAdmission,
+    ) -> bool {
         if attempt == 0 {
             return false;
         }
-        let mut inner = self.write(StateMutationEventCapacity::AttemptTransition);
+        let mut inner = self.write_admitted(admission);
         let name = &binding.resource.name;
         let Some(task) = inner.tasks.get(name) else {
             return false;
@@ -2286,6 +2131,7 @@ impl TaskState {
     }
 
     /// Closes the attempt described by a Taskvisor event.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn transition_attempt_finished(
         &self,
         binding: &RuntimeBinding,
@@ -2294,10 +2140,27 @@ impl TaskState {
         error: Option<String>,
         exit_code: Option<i32>,
     ) -> bool {
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::AttemptTransition)
+            .expect("test state persistence remains open");
+        self.transition_attempt_finished_admitted(
+            binding, attempt, phase, error, exit_code, admission,
+        )
+    }
+
+    pub(crate) fn transition_attempt_finished_admitted(
+        &self,
+        binding: &RuntimeBinding,
+        attempt: u32,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+        admission: StateWriteAdmission,
+    ) -> bool {
         if attempt == 0 || !phase.is_terminal() {
             return false;
         }
-        let mut inner = self.write(StateMutationEventCapacity::AttemptTransition);
+        let mut inner = self.write_admitted(admission);
         let name = &binding.resource.name;
         let Some(task) = inner.tasks.get(name) else {
             return false;
@@ -2469,6 +2332,7 @@ impl TaskState {
     /// Projects a task-level final event.
     ///
     /// No attempt number is invented.
+    #[cfg(test)]
     pub(crate) fn transition_task_finished(
         &self,
         binding: &RuntimeBinding,
@@ -2476,13 +2340,39 @@ impl TaskState {
         error: Option<String>,
         exit_code: Option<i32>,
     ) -> bool {
-        let mut inner = self.write(StateMutationEventCapacity::TaskChange);
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+            .expect("test state persistence remains open");
+        self.transition_task_finished_admitted(binding, phase, error, exit_code, admission)
+    }
+
+    pub(crate) fn transition_task_finished_admitted(
+        &self,
+        binding: &RuntimeBinding,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+        admission: StateWriteAdmission,
+    ) -> bool {
+        let mut inner = self.write_admitted(admission);
         self.transition_task_finished_locked(&mut inner, binding, phase, error, exit_code, false)
     }
 
     /// Marks a generation as accepted by Taskvisor intake.
+    #[cfg(test)]
     pub(crate) fn mark_observed(&self, resource: &ResourceGeneration) -> bool {
-        let mut inner = self.write(StateMutationEventCapacity::TaskChange);
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+            .expect("test state persistence remains open");
+        self.mark_observed_admitted(resource, admission)
+    }
+
+    pub(crate) fn mark_observed_admitted(
+        &self,
+        resource: &ResourceGeneration,
+        admission: StateWriteAdmission,
+    ) -> bool {
+        let mut inner = self.write_admitted(admission);
         let Some(task) = inner.tasks.get(&resource.name) else {
             return false;
         };
@@ -2525,13 +2415,27 @@ impl TaskState {
     /// Records a reconciliation failure.
     ///
     /// Desired state remains retained.
+    #[cfg(test)]
     pub(crate) fn mark_reconciliation_failed(
         &self,
         resource: &ResourceGeneration,
         reason: &'static str,
         message: String,
     ) -> bool {
-        let mut inner = self.write(StateMutationEventCapacity::TaskChange);
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+            .expect("test state persistence remains open");
+        self.mark_reconciliation_failed_admitted(resource, reason, message, admission)
+    }
+
+    pub(crate) fn mark_reconciliation_failed_admitted(
+        &self,
+        resource: &ResourceGeneration,
+        reason: &'static str,
+        message: String,
+        admission: StateWriteAdmission,
+    ) -> bool {
+        let mut inner = self.write_admitted(admission);
         let Some(task) = inner.tasks.get(&resource.name) else {
             return false;
         };
@@ -2654,6 +2558,7 @@ impl TaskState {
     ///
     /// Returns the bound task name.
     /// Returns `None` for a stale binding.
+    #[cfg(test)]
     pub(crate) fn finalize_if_bound(
         &self,
         tv_raw: u64,
@@ -2662,10 +2567,25 @@ impl TaskState {
         exit_code: Option<i32>,
         force: bool,
     ) -> Option<TaskId> {
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::TaskAndRunChange)
+            .expect("test state persistence remains open");
+        self.finalize_if_bound_admitted(tv_raw, phase, error, exit_code, force, admission)
+    }
+
+    pub(crate) fn finalize_if_bound_admitted(
+        &self,
+        tv_raw: u64,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+        force: bool,
+        admission: StateWriteAdmission,
+    ) -> Option<TaskId> {
         if !phase.is_terminal() {
             return None;
         }
-        let mut inner = self.write(StateMutationEventCapacity::TaskAndRunChange);
+        let mut inner = self.write_admitted(admission);
 
         let binding = inner.by_tv.get(&tv_raw)?.clone();
         if inner
@@ -3091,106 +3011,154 @@ impl TaskState {
     /// A terminal task is removed after its run history is empty and its task TTL expires.
     ///
     /// Returns `(runs_removed, tasks_removed)` for observability.
-    pub(crate) fn sweep(&self, config: &StateConfig) -> (usize, usize) {
-        let now = SystemTime::now();
-        let (runs_removed, expired_tasks) = {
-            let mut inner = self.write(StateMutationEventCapacity::None);
-            let mut runs_removed = 0usize;
-            let bound: std::collections::HashSet<TaskId> = inner.tv_of.keys().cloned().collect();
-            let task_uids = inner
-                .tasks
-                .iter()
-                .map(|(id, task)| (id.clone(), task.uid().clone()))
-                .collect::<HashMap<_, _>>();
-            let mut run_snapshot_changes = Vec::new();
-            for (id, runs) in inner.runs.iter_mut() {
-                let before = runs.len();
-                let task_bound = bound.contains(id);
-                let task_uid = task_uids
-                    .get(id)
-                    .expect("retained TaskRun history must belong to a retained task");
-                runs.retain(|run| {
-                    let retained = match run.finished_at() {
-                        Some(finished) => now
-                            .duration_since(finished)
-                            .map(|age| age < config.run_ttl())
-                            .unwrap_or(true),
-                        None => {
-                            task_bound
-                                || now
-                                    .duration_since(run.started_at())
-                                    .map(|age| age < config.run_ttl())
-                                    .unwrap_or(true)
-                        }
-                    };
-                    if !retained {
-                        run_snapshot_changes.push(Self::run_snapshot_change(
-                            id,
-                            task_uid,
-                            Some(run.clone()),
-                            None,
-                        ));
+    fn scan_retention(&self, config: &StateConfig, now: SystemTime) -> (usize, Vec<(TaskId, Uid)>) {
+        let mut inner = self.write(StateMutationEventCapacity::None);
+        let mut runs_removed = 0usize;
+        let bound: std::collections::HashSet<TaskId> = inner.tv_of.keys().cloned().collect();
+        let task_uids = inner
+            .tasks
+            .iter()
+            .map(|(id, task)| (id.clone(), task.uid().clone()))
+            .collect::<HashMap<_, _>>();
+        let mut run_snapshot_changes = Vec::new();
+        for (id, runs) in inner.runs.iter_mut() {
+            let before = runs.len();
+            let task_bound = bound.contains(id);
+            let task_uid = task_uids
+                .get(id)
+                .expect("retained TaskRun history must belong to a retained task");
+            runs.retain(|run| {
+                let retained = match run.finished_at() {
+                    Some(finished) => now
+                        .duration_since(finished)
+                        .map(|age| age < config.run_ttl())
+                        .unwrap_or(true),
+                    None => {
+                        task_bound
+                            || now
+                                .duration_since(run.started_at())
+                                .map(|age| age < config.run_ttl())
+                                .unwrap_or(true)
                     }
-                    retained
-                });
-                runs_removed += before - runs.len();
-            }
-            inner.runs.retain(|_, runs| !runs.is_empty());
-            Self::record_run_snapshot_changes(&mut inner, run_snapshot_changes);
+                };
+                if !retained {
+                    run_snapshot_changes.push(Self::run_snapshot_change(
+                        id,
+                        task_uid,
+                        Some(run.clone()),
+                        None,
+                    ));
+                }
+                retained
+            });
+            runs_removed += before - runs.len();
+        }
+        inner.runs.retain(|_, runs| !runs.is_empty());
+        Self::record_run_snapshot_changes(&mut inner, run_snapshot_changes);
 
-            let expired_tasks = inner
-                .tasks
-                .iter()
-                .filter(|(id, task)| {
-                    !inner.tv_of.contains_key(*id)
-                        && task.status().phase().is_terminal()
-                        && inner.runs.get(*id).is_none_or(|runs| runs.is_empty())
-                        && inner.terminal_since.get(*id).is_some_and(|finished| {
-                            now.duration_since(*finished)
-                                .map(|age| age >= config.task_ttl())
-                                .unwrap_or(false)
-                        })
-                })
-                .map(|(id, task)| (id.clone(), task.uid().clone()))
-                .collect::<Vec<_>>();
-            (runs_removed, expired_tasks)
-        };
-
-        let mut tasks_removed = 0usize;
-        for (id, expected_uid) in expired_tasks {
-            let mut inner = self.write(StateMutationEventCapacity::TaskChange);
-            let remains_expired = inner.tasks.get(&id).is_some_and(|task| {
-                task.uid() == &expected_uid
-                    && !inner.tv_of.contains_key(&id)
+        let expired_tasks = inner
+            .tasks
+            .iter()
+            .filter(|(id, task)| {
+                !inner.tv_of.contains_key(*id)
                     && task.status().phase().is_terminal()
-                    && inner.runs.get(&id).is_none_or(|runs| runs.is_empty())
-                    && inner.terminal_since.get(&id).is_some_and(|finished| {
+                    && inner.runs.get(*id).is_none_or(|runs| runs.is_empty())
+                    && inner.terminal_since.get(*id).is_some_and(|finished| {
                         now.duration_since(*finished)
                             .map(|age| age >= config.task_ttl())
                             .unwrap_or(false)
                     })
-            });
-            if !remains_expired {
-                continue;
-            }
-            Self::unbind_locked(&mut inner, &id);
-            if let Some(task) = inner.tasks.remove(&id) {
-                Self::unindex_task(&mut inner, &task);
-                Self::remove_retained_task_manifest_bytes(&mut inner, &id);
-                inner.terminal_since.remove(&id);
-                let (revision, _) = Self::next_resource_version(&mut inner);
-                self.record_change(&mut inner, revision, Some(task), None);
-                tasks_removed += 1;
-            }
+            })
+            .map(|(id, task)| (id.clone(), task.uid().clone()))
+            .collect();
+        (runs_removed, expired_tasks)
+    }
+
+    fn remove_expired_task_admitted(
+        &self,
+        config: &StateConfig,
+        now: SystemTime,
+        id: &TaskId,
+        expected_uid: &Uid,
+        admission: StateWriteAdmission,
+    ) -> bool {
+        let mut inner = self.write_admitted(admission);
+        let remains_expired = inner.tasks.get(id).is_some_and(|task| {
+            task.uid() == expected_uid
+                && !inner.tv_of.contains_key(id)
+                && task.status().phase().is_terminal()
+                && inner.runs.get(id).is_none_or(|runs| runs.is_empty())
+                && inner.terminal_since.get(id).is_some_and(|finished| {
+                    now.duration_since(*finished)
+                        .map(|age| age >= config.task_ttl())
+                        .unwrap_or(false)
+                })
+        });
+        if !remains_expired {
+            return false;
         }
+        Self::unbind_locked(&mut inner, id);
+        let Some(task) = inner.tasks.remove(id) else {
+            return false;
+        };
+        Self::unindex_task(&mut inner, &task);
+        Self::remove_retained_task_manifest_bytes(&mut inner, id);
+        inner.terminal_since.remove(id);
+        let (revision, _) = Self::next_resource_version(&mut inner);
+        self.record_change(&mut inner, revision, Some(task), None);
+        true
+    }
+
+    fn report_sweep(runs_removed: usize, tasks_removed: usize) -> (usize, usize) {
         if runs_removed > 0 || tasks_removed > 0 {
             debug!(
                 event = "state.sweep",
                 runs_removed, tasks_removed, "state sweep completed"
             );
         }
-
         (runs_removed, tasks_removed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sweep(&self, config: &StateConfig) -> (usize, usize) {
+        let now = SystemTime::now();
+        let (runs_removed, expired_tasks) = self.scan_retention(config, now);
+        let mut tasks_removed = 0;
+        for (id, expected_uid) in expired_tasks {
+            let admission = self
+                .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+                .expect("test state persistence remains open");
+            tasks_removed += usize::from(self.remove_expired_task_admitted(
+                config,
+                now,
+                &id,
+                &expected_uid,
+                admission,
+            ));
+        }
+        Self::report_sweep(runs_removed, tasks_removed)
+    }
+
+    pub(crate) async fn sweep_async(&self, config: &StateConfig) -> (usize, usize) {
+        let now = SystemTime::now();
+        let (runs_removed, expired_tasks) = self.scan_retention(config, now);
+        let mut tasks_removed = 0;
+        for (id, expected_uid) in expired_tasks {
+            let admission = self
+                .admit_state_write(StateMutationEventCapacity::TaskChange)
+                .await;
+            let Ok(admission) = admission else {
+                break;
+            };
+            tasks_removed += usize::from(self.remove_expired_task_admitted(
+                config,
+                now,
+                &id,
+                &expected_uid,
+                admission,
+            ));
+        }
+        Self::report_sweep(runs_removed, tasks_removed)
     }
 
     /// Queries tasks with snapshot-consistent pagination.
@@ -3446,8 +3414,9 @@ impl TaskState {
     {
         let predicate: WatchPredicate = Arc::new(predicate);
         let inner = self.inner.read();
-        let receiver = BroadcastStream::new(inner.watch_tx.subscribe());
+        let receiver = WatchStream::from_changes(inner.watch_tx.subscribe());
         let epoch = inner.resource_version_epoch.clone();
+        let target_revision = inner.resource_version;
         let mut initial_candidates = None;
         let mut initial_revision = None;
         let mut replay_candidates = Vec::new();
@@ -3505,12 +3474,12 @@ impl TaskState {
                     initial: VecDeque::new(),
                     initial_revision: None,
                     replay: VecDeque::new(),
-                    recovery: None,
                     permit: None,
                     filter: filter.clone(),
                     predicate,
                     epoch,
                     last_revision,
+                    target_revision,
                     stop: Box::pin(self.watch_stop.clone().cancelled_owned()),
                     terminal: false,
                 });
@@ -3600,12 +3569,12 @@ impl TaskState {
                     initial: VecDeque::new(),
                     initial_revision: None,
                     replay: VecDeque::new(),
-                    recovery: None,
                     permit: None,
                     filter: filter.clone(),
                     predicate,
                     epoch,
                     last_revision,
+                    target_revision,
                     stop: Box::pin(self.watch_stop.clone().cancelled_owned()),
                     terminal: false,
                 });
@@ -3630,12 +3599,12 @@ impl TaskState {
                 initial: VecDeque::new(),
                 initial_revision: None,
                 replay: VecDeque::new(),
-                recovery: None,
                 permit: None,
                 filter: filter.clone(),
                 predicate,
                 epoch,
                 last_revision,
+                target_revision,
                 stop: Box::pin(self.watch_stop.clone().cancelled_owned()),
                 terminal: false,
             });
@@ -3647,12 +3616,12 @@ impl TaskState {
             initial,
             initial_revision,
             replay,
-            recovery: None,
             permit: Some(permit),
             filter: filter.clone(),
             predicate,
             epoch,
             last_revision,
+            target_revision,
             stop: Box::pin(self.watch_stop.clone().cancelled_owned()),
             terminal: false,
         })
@@ -3684,6 +3653,21 @@ impl TaskState {
 
     pub(crate) fn persistence_status(&self) -> Option<TaskStateSinkStatus> {
         self.event_publisher.status()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persistence_admission_waiters(&self) -> usize {
+        self.event_publisher.admission_waiters()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persistence_admission_closed(&self) -> bool {
+        self.event_publisher.admission_closed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_persistence_admissions(&self) -> usize {
+        self.event_publisher.active_admissions()
     }
 }
 

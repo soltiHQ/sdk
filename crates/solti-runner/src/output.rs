@@ -32,11 +32,18 @@ use solti_model::{OutputChunk, OutputEvent, StreamKind, TaskId};
 /// Implementations decide whether output is enabled for an attempt.
 /// Returning `None` disables output without changing task execution.
 ///
+/// Request the sink from the task attempt future before moving output work into
+/// a separately spawned task. Composition runners may route output through
+/// execution-local context that a new task does not inherit. [`OutputSink`] is
+/// cloneable and its clones can be moved into reader or forwarding tasks.
+///
 /// This interface has no subscription or lifecycle operations.
 pub trait OutputPublisher: Send + Sync {
     /// Returns a sink for one task attempt.
     ///
     /// Returns `None` when output is disabled.
+    /// Call this from the task attempt future, then clone the returned sink for
+    /// any separately spawned output work.
     fn sink_for(&self, task_name: &TaskId, generation: u64, attempt: u32) -> Option<OutputSink>;
 }
 

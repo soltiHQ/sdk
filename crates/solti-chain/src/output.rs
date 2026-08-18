@@ -1,21 +1,25 @@
 //! Attempt-scoped output adaptation for nested workloads.
 
+use std::future::Future;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use solti_model::TaskId;
 use solti_runner::{OutputPublisher, OutputPublisherHandle, OutputSink};
 
-/// Shares one outer sink between every nested workload in a chain attempt.
+tokio::task_local! {
+    /// Outer sink visible only while one chain-attempt future is being polled.
+    static ATTEMPT_OUTPUT: Option<OutputSink>;
+}
+
+/// Creates the outer sink and the attempt-local adapter used by nested workloads.
 pub(crate) struct ChainOutput {
     upstream: OutputPublisherHandle,
     task_name: TaskId,
     generation: u64,
-    active: Mutex<Option<ActiveOutput>>,
 }
 
-struct ActiveOutput {
-    attempt: u32,
+/// Owns one outer attempt's sink.
+pub(crate) struct AttemptOutput {
     sink: Option<OutputSink>,
 }
 
@@ -29,70 +33,39 @@ impl ChainOutput {
             upstream,
             task_name,
             generation,
-            active: Mutex::new(None),
         })
     }
 
-    pub(crate) fn publisher(self: &Arc<Self>) -> OutputPublisherHandle {
-        Arc::new(ChildOutputPublisher {
-            output: Arc::clone(self),
-        })
+    pub(crate) fn publisher(&self) -> OutputPublisherHandle {
+        Arc::new(ChildOutputPublisher)
     }
 
-    pub(crate) fn begin(self: &Arc<Self>, attempt: u32) -> AttemptOutputGuard {
+    pub(crate) fn begin(&self, attempt: u32) -> AttemptOutput {
         let sink = self
             .upstream
             .sink_for(&self.task_name, self.generation, attempt);
-        *self.active.lock() = Some(ActiveOutput {
-            attempt,
-            sink: sink.clone(),
-        });
-        AttemptOutputGuard {
-            output: Arc::clone(self),
-            attempt,
-            sink,
-        }
-    }
-
-    fn active_sink(&self) -> Option<OutputSink> {
-        self.active
-            .lock()
-            .as_ref()
-            .and_then(|active| active.sink.clone())
+        AttemptOutput { sink }
     }
 }
 
-struct ChildOutputPublisher {
-    output: Arc<ChainOutput>,
-}
+struct ChildOutputPublisher;
 
 impl OutputPublisher for ChildOutputPublisher {
     fn sink_for(&self, _task_name: &TaskId, _generation: u64, _attempt: u32) -> Option<OutputSink> {
-        self.output.active_sink()
+        ATTEMPT_OUTPUT.try_with(Clone::clone).ok().flatten()
     }
 }
 
-/// Clears the installed sink when an attempt completes or its future is dropped.
-pub(crate) struct AttemptOutputGuard {
-    output: Arc<ChainOutput>,
-    attempt: u32,
-    sink: Option<OutputSink>,
-}
-
-impl AttemptOutputGuard {
+impl AttemptOutput {
     pub(crate) fn sink(&self) -> Option<&OutputSink> {
         self.sink.as_ref()
     }
-}
 
-impl Drop for AttemptOutputGuard {
-    fn drop(&mut self) {
-        let mut active = self.output.active.lock();
-        if active
-            .as_ref()
-            .is_some_and(|active| active.attempt == self.attempt)
-        {
-            *active = None;
-        }
+    /// Polls one chain attempt with its sink installed for nested workloads.
+    pub(crate) async fn scope<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        ATTEMPT_OUTPUT.scope(self.sink.clone(), future).await
     }
 }

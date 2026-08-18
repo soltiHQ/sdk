@@ -2,14 +2,16 @@
 //!
 //! These hooks let an agent forward task state and output to external storage.
 //!
-//! State events enter a bounded, lossless core-owned queue after the authoritative
-//! state lock is released. Queue saturation applies backpressure to the commit.
-//! One worker delivers callbacks in commit order and shutdown drains that queue.
-//! Output callbacks use a separate bounded, nonblocking, best-effort dispatcher.
+//! State writes reserve bounded, lossless queue ownership before entering their
+//! authoritative state critical section. Tokio-owned paths await fair admission;
+//! Taskvisor callback workers use the same admission future on their dedicated
+//! threads. Events enter the queue after the state lock is released. One worker
+//! delivers callbacks in commit order and shutdown drains that queue. Output
+//! callbacks use a separate bounded, nonblocking, best-effort dispatcher.
 
 use std::{
     cell::Cell,
-    collections::VecDeque,
+    future::Future,
     io,
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -18,11 +20,13 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
+    task::{Context, Poll, Wake, Waker},
     thread,
 };
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use solti_model::{OutputEvent, Task, TaskId, TaskRun, Uid};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::ConfigError;
 
@@ -30,7 +34,7 @@ const DEFAULT_STATE_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(2_048).unwr
 const DEFAULT_OUTPUT_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(2_048).unwrap();
 pub(crate) const MAX_STATE_EVENTS_PER_COMMIT: usize = 3;
 const MIN_STATE_QUEUE_CAPACITY: usize = MAX_STATE_EVENTS_PER_COMMIT - 1;
-const MAX_STATE_QUEUE_CAPACITY: usize = usize::MAX - 1;
+const MAX_STATE_QUEUE_CAPACITY: usize = Semaphore::MAX_PERMITS - 1;
 
 /// Persistence delivery settings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,7 +71,7 @@ impl PersistenceConfig {
     /// Returns [`ConfigError::BelowMinimum`] when `capacity` cannot admit the
     /// largest atomic state commit alongside the active callback.
     /// Returns [`ConfigError::Exceeds`] when adding the active callback slot
-    /// would overflow the platform's capacity type.
+    /// would exceed Tokio's safe semaphore capacity.
     pub const fn try_with_state_queue_capacity(
         mut self,
         capacity: usize,
@@ -155,12 +159,14 @@ pub enum TaskStateEvent {
 ///
 /// Core invokes this callback on one dedicated persistence worker. Calls are
 /// serialized in commit order. A slow sink fills the bounded queue and then
-/// applies backpressure to state commits; events are not dropped for overload.
+/// applies fair admission backpressure before Tokio-owned state commits enter
+/// their state or spawn critical sections; events are not dropped for overload.
 /// The callback must eventually return so shutdown can drain the queue.
 /// It must not mutate `TaskState`, directly or by waiting for another thread
-/// that does so. Reads are allowed. Polling [`crate::SupervisorApi::shutdown`]
-/// on the callback worker panics before shutdown starts. Waiting for another
-/// thread that calls shutdown can deadlock and is also forbidden.
+/// that does so. Reads and waits for unrelated Tokio work are allowed. Polling
+/// [`crate::SupervisorApi::shutdown`] on the callback worker panics before
+/// shutdown starts. Waiting for another thread that calls shutdown can deadlock
+/// and is also forbidden.
 pub trait TaskStateSink: Send + Sync + 'static {
     /// Receives one committed state event.
     fn on_event(&self, event: &TaskStateEvent);
@@ -182,6 +188,8 @@ pub struct TaskStateSinkStatus {
 
 impl TaskStateSinkStatus {
     /// Returns whether the dispatcher accepts reservations for new events.
+    /// Reservations that crossed the admission boundary before this becomes
+    /// false remain accepted and are drained by shutdown.
     pub fn accepting(self) -> bool {
         self.accepting
     }
@@ -220,6 +228,34 @@ impl TaskStateSinkStatus {
 
 type StateEventBatch = Vec<StateDispatchEvent>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StateAdmissionClosed;
+
+pub(crate) struct StateDispatcherAdmission {
+    sender: mpsc::Sender<StateDispatchEvent>,
+    permits: Vec<StateQueuePermit>,
+    // This field is last so a dropped admission closes its sender clone before
+    // the final dispatcher owner can synchronously join the worker.
+    _dispatcher_lifetime: Arc<StateEventDispatcher>,
+}
+
+impl StateDispatcherAdmission {
+    pub(crate) fn take_permit(&mut self) -> StateQueuePermit {
+        self.permits
+            .pop()
+            .expect("a state mutation must reserve its maximum event count before the write lock")
+    }
+
+    pub(crate) fn release_unused_permits(&mut self) {
+        self.permits.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.permits.len()
+    }
+}
+
 pub(crate) struct StateDispatchEvent {
     event: TaskStateEvent,
     _permit: StateQueuePermit,
@@ -235,19 +271,11 @@ impl StateDispatchEvent {
 }
 
 struct StateQueuePermits {
-    state: Mutex<StateQueuePermitState>,
+    // Tokio's fair semaphore orders both async callers and the dedicated-thread
+    // adapter below through the same `acquire_many_owned` wait queue.
+    semaphore: Arc<Semaphore>,
     limit: usize,
     metrics: Arc<StateDispatcherMetrics>,
-}
-
-struct StateQueuePermitState {
-    available: usize,
-    waiters: VecDeque<Arc<StateQueueWaiter>>,
-}
-
-struct StateQueueWaiter {
-    requested: usize,
-    ready: Condvar,
 }
 
 pub(crate) struct StateQueuePermit {
@@ -263,62 +291,48 @@ impl Drop for StateQueuePermit {
                 queued.checked_sub(1)
             })
             .expect("state persistence outstanding count must not underflow");
-        let mut state = self.permits.state.lock();
-        state.available = state
-            .available
-            .checked_add(1)
-            .expect("state persistence permit count must not overflow");
-        assert!(
-            state.available <= self.permits.limit,
-            "state persistence permits must not be released more than once"
-        );
-        self.permits.notify_front_if_ready(&state);
+        self.permits.semaphore.add_permits(1);
     }
 }
 
 impl StateQueuePermits {
-    fn reserve(self: &Arc<Self>, requested: usize) -> Vec<StateQueuePermit> {
+    fn validate_request(&self, requested: usize) {
         assert!(
             requested <= self.limit,
             "an atomic state commit must fit within persistence event capacity"
         );
+        assert!(
+            requested <= u32::MAX as usize,
+            "an atomic state commit must fit Tokio semaphore acquisition"
+        );
+    }
+
+    async fn reserve(self: &Arc<Self>, requested: usize) -> Vec<StateQueuePermit> {
+        self.validate_request(requested);
         if requested == 0 {
             return Vec::new();
         }
-
-        let mut state = self.state.lock();
-        if state.waiters.is_empty() && state.available >= requested {
-            state.available -= requested;
-            drop(state);
-            return self.make_permits(requested);
-        }
-
-        let waiter = Arc::new(StateQueueWaiter {
-            requested,
-            ready: Condvar::new(),
-        });
-        state.waiters.push_back(Arc::clone(&waiter));
-        loop {
-            let is_front = state
-                .waiters
-                .front()
-                .is_some_and(|front| Arc::ptr_eq(front, &waiter));
-            if is_front && state.available >= requested {
-                state.available -= requested;
-                let admitted = state
-                    .waiters
-                    .pop_front()
-                    .expect("the admitted state persistence waiter is queued");
-                debug_assert!(Arc::ptr_eq(&admitted, &waiter));
-                self.notify_front_if_ready(&state);
-                drop(state);
-                return self.make_permits(requested);
-            }
-            waiter.ready.wait(&mut state);
-        }
+        let acquired = Arc::clone(&self.semaphore)
+            .acquire_many_owned(requested as u32)
+            .await
+            .expect("state persistence admission remains open while commits are accepted");
+        self.make_permits(requested, acquired)
     }
 
-    fn make_permits(self: &Arc<Self>, count: usize) -> Vec<StateQueuePermit> {
+    #[cfg(test)]
+    fn reserve_blocking_after_pending(
+        self: &Arc<Self>,
+        requested: usize,
+        pending: mpsc::SyncSender<()>,
+    ) -> Vec<StateQueuePermit> {
+        block_on_thread_after_pending(self.reserve(requested), pending)
+    }
+
+    fn make_permits(
+        self: &Arc<Self>,
+        count: usize,
+        acquired: OwnedSemaphorePermit,
+    ) -> Vec<StateQueuePermit> {
         self.metrics
             .queued
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
@@ -327,18 +341,54 @@ impl StateQueuePermits {
                     .filter(|updated| *updated <= self.limit)
             })
             .expect("state persistence outstanding count must remain bounded");
+        acquired.forget();
         (0..count)
             .map(|_| StateQueuePermit {
                 permits: Arc::clone(self),
             })
             .collect()
     }
+}
 
-    fn notify_front_if_ready(&self, state: &StateQueuePermitState) {
-        if let Some(waiter) = state.waiters.front()
-            && state.available >= waiter.requested
-        {
-            waiter.ready.notify_one();
+struct ThreadUnparker(thread::Thread);
+
+impl Wake for ThreadUnparker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+pub(crate) fn block_on_thread<F: Future>(future: F) -> F::Output {
+    let waker = Waker::from(Arc::new(ThreadUnparker(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => thread::park(),
+        }
+    }
+}
+
+#[cfg(test)]
+fn block_on_thread_after_pending<F: Future>(future: F, pending: mpsc::SyncSender<()>) -> F::Output {
+    let waker = Waker::from(Arc::new(ThreadUnparker(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready(_) => panic!("the test reservation must wait for semaphore capacity"),
+        Poll::Pending => pending
+            .send(())
+            .expect("the test must observe the queued blocking reservation"),
+    }
+    loop {
+        thread::park();
+        if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+            return output;
         }
     }
 }
@@ -433,10 +483,33 @@ pub(crate) struct StateEventDispatcher {
     permits: Arc<StateQueuePermits>,
     metrics: Arc<StateDispatcherMetrics>,
     shutdown: StateDispatcherShutdown,
+    #[cfg(test)]
+    admission_waiters: AtomicUsize,
+}
+
+#[cfg(test)]
+struct StateAdmissionWaiter<'a>(&'a AtomicUsize);
+
+#[cfg(test)]
+impl StateAdmissionWaiter<'_> {
+    fn new(waiters: &AtomicUsize) -> StateAdmissionWaiter<'_> {
+        waiters.fetch_add(1, Ordering::AcqRel);
+        StateAdmissionWaiter(waiters)
+    }
+}
+
+#[cfg(test)]
+impl Drop for StateAdmissionWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl StateEventDispatcher {
-    pub(crate) fn start(sink: TaskStateSinkHandle, capacity: NonZeroUsize) -> io::Result<Self> {
+    pub(crate) fn start(
+        sink: TaskStateSinkHandle,
+        capacity: NonZeroUsize,
+    ) -> io::Result<Arc<Self>> {
         let (sender, receiver) = mpsc::channel::<StateDispatchEvent>();
         // `capacity` counts buffered events. One additional permit belongs to
         // the callback currently executing on the persistence worker.
@@ -472,50 +545,87 @@ impl StateEventDispatcher {
                 }
             })?;
         let permits = Arc::new(StateQueuePermits {
-            state: Mutex::new(StateQueuePermitState {
-                available: permit_limit,
-                waiters: VecDeque::new(),
-            }),
+            semaphore: Arc::new(Semaphore::new(permit_limit)),
             limit: permit_limit,
             metrics: Arc::clone(&metrics),
         });
-        Ok(Self {
+        Ok(Arc::new(Self {
             sender: Mutex::new(Some(sender)),
             worker: Mutex::new(Some(worker)),
             permits,
             metrics,
             shutdown: StateDispatcherShutdown::new(),
-        })
+            #[cfg(test)]
+            admission_waiters: AtomicUsize::new(0),
+        }))
     }
 
-    pub(crate) fn reserve(&self, event_count: usize) -> Vec<StateQueuePermit> {
+    pub(crate) async fn reserve(
+        self: &Arc<Self>,
+        event_count: usize,
+    ) -> Result<StateDispatcherAdmission, StateAdmissionClosed> {
         assert_state_sink_is_not_mutating_state();
-        self.permits.reserve(event_count)
-    }
-
-    pub(crate) fn dispatch(&self, events: StateEventBatch) {
         let sender = self
             .sender
             .lock()
             .as_ref()
             .cloned()
-            .expect("state persistence dispatcher is open while commits are accepted");
+            .ok_or(StateAdmissionClosed)?;
+        #[cfg(test)]
+        let _waiter = StateAdmissionWaiter::new(&self.admission_waiters);
+        let permits = self.permits.reserve(event_count).await;
+        Ok(StateDispatcherAdmission {
+            sender,
+            permits,
+            _dispatcher_lifetime: Arc::clone(self),
+        })
+    }
+
+    pub(crate) fn reserve_blocking(
+        self: &Arc<Self>,
+        event_count: usize,
+    ) -> Result<StateDispatcherAdmission, StateAdmissionClosed> {
+        assert_state_sink_is_not_mutating_state();
+        block_on_thread(self.reserve(event_count))
+    }
+
+    pub(crate) fn dispatch(&self, admission: StateDispatcherAdmission, events: StateEventBatch) {
+        let StateDispatcherAdmission {
+            sender,
+            permits,
+            _dispatcher_lifetime,
+        } = admission;
+        debug_assert!(
+            permits.is_empty(),
+            "unused state event permits must be released before dispatch"
+        );
+        drop(permits);
         for event in events {
             if sender.send(event).is_err() {
                 self.metrics.mark_worker_failed();
                 panic!("state persistence worker must remain available");
             }
         }
+        drop(sender);
+        drop(_dispatcher_lifetime);
     }
 
     pub(crate) fn status(&self) -> TaskStateSinkStatus {
         self.metrics.status()
     }
 
+    #[cfg(test)]
+    pub(crate) fn admission_waiters(&self) -> usize {
+        self.admission_waiters.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn shutdown(&self) {
         if self.shutdown.begin() {
-            self.metrics.accepting.store(false, Ordering::Release);
-            self.sender.lock().take();
+            {
+                let mut sender = self.sender.lock();
+                self.metrics.accepting.store(false, Ordering::Release);
+                sender.take();
+            }
             let worker = self.worker.lock().take();
             let outcome = self.shutdown.outcome.clone();
             if let Some(worker) = worker {
@@ -1040,6 +1150,12 @@ mod tests {
         release: Mutex<mpsc::Receiver<()>>,
     }
 
+    struct BlockingFirstStateSink {
+        first: AtomicBool,
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
     struct BlockingFirstOutputSink {
         first: AtomicBool,
         entered: mpsc::SyncSender<()>,
@@ -1088,6 +1204,38 @@ mod tests {
             self.entered.send(()).unwrap();
             self.release.lock().recv().unwrap();
         }
+    }
+
+    impl TaskStateSink for BlockingFirstStateSink {
+        fn on_event(&self, _event: &TaskStateEvent) {
+            if self.first.swap(false, Ordering::AcqRel) {
+                self.entered.send(()).unwrap();
+                self.release.lock().recv().unwrap();
+            }
+        }
+    }
+
+    fn state_event(resource_version: &str) -> TaskStateEvent {
+        TaskStateEvent::TaskChanged {
+            resource_version: resource_version.to_string(),
+            previous: None,
+            current: None,
+        }
+    }
+
+    fn dispatch_state_event(
+        dispatcher: &StateEventDispatcher,
+        mut admission: StateDispatcherAdmission,
+        resource_version: &str,
+    ) {
+        let permit = admission.take_permit();
+        dispatcher.dispatch(
+            admission,
+            vec![StateDispatchEvent::new(
+                state_event(resource_version),
+                permit,
+            )],
+        );
     }
 
     #[test]
@@ -1152,15 +1300,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn event_reservations_are_atomic_and_fifo() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_and_blocking_event_reservations_are_atomic_and_fifo() {
         let sink: TaskStateSinkHandle = Arc::new(IgnoringStateSink);
-        let dispatcher =
-            Arc::new(StateEventDispatcher::start(sink, NonZeroUsize::new(2).unwrap()).unwrap());
-        let active_event = dispatcher
-            .reserve(1)
-            .pop()
-            .expect("one event reservation returns one permit");
+        let dispatcher = StateEventDispatcher::start(sink, NonZeroUsize::new(2).unwrap()).unwrap();
+        let mut active_admission = dispatcher.reserve(1).await.unwrap();
+        let active_event = active_admission.take_permit();
         assert_eq!(
             dispatcher.status(),
             TaskStateSinkStatus {
@@ -1173,52 +1318,54 @@ mod tests {
             }
         );
 
-        let (large_done_tx, large_done_rx) = mpsc::sync_channel(1);
+        let (large_pending_tx, large_pending_rx) = mpsc::sync_channel(1);
         let large_dispatcher = Arc::clone(&dispatcher);
-        let large = thread::spawn(move || {
-            assert!(
-                large_done_tx.send(large_dispatcher.reserve(3)).is_ok(),
-                "the large reservation receiver must remain open"
-            );
+        let mut large = tokio::spawn(async move {
+            let mut reservation = Box::pin(large_dispatcher.reserve(3));
+            std::future::poll_fn(|context| match reservation.as_mut().poll(context) {
+                Poll::Ready(_) => panic!("the head reservation must initially wait"),
+                Poll::Pending => Poll::Ready(()),
+            })
+            .await;
+            large_pending_tx
+                .send(())
+                .expect("the test must observe the queued async reservation");
+            reservation.await
         });
+        large_pending_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the async head must join the semaphore FIFO");
+        assert!(!large.is_finished());
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while dispatcher.permits.state.lock().waiters.len() != 1 {
-            assert!(
-                Instant::now() < deadline,
-                "the large reservation must queue"
-            );
-            thread::yield_now();
-        }
-
+        let (small_pending_tx, small_pending_rx) = mpsc::sync_channel(1);
         let (small_done_tx, small_done_rx) = mpsc::sync_channel(1);
         let small_dispatcher = Arc::clone(&dispatcher);
         let small = thread::spawn(move || {
-            assert!(
-                small_done_tx.send(small_dispatcher.reserve(1)).is_ok(),
-                "the small reservation receiver must remain open"
-            );
+            let permits = small_dispatcher
+                .permits
+                .reserve_blocking_after_pending(1, small_pending_tx);
+            small_done_tx
+                .send(permits)
+                .expect("the test must receive the blocking reservation");
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while dispatcher.permits.state.lock().waiters.len() != 2 {
-            assert!(
-                Instant::now() < deadline,
-                "the small reservation must queue"
-            );
-            thread::yield_now();
-        }
+        small_pending_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the blocking adapter must join the semaphore FIFO");
 
         drop(active_event);
-        let large_permits = large_done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the head reservation must atomically receive all three permits");
+        drop(active_admission);
+        let large_permits = tokio::time::timeout(Duration::from_secs(5), &mut large)
+            .await
+            .expect("the head reservation must atomically receive all three permits")
+            .unwrap()
+            .unwrap();
         assert_eq!(large_permits.len(), 3);
         assert_eq!(dispatcher.status().queued(), 3);
         assert!(
             small_done_rx
                 .recv_timeout(Duration::from_millis(100))
                 .is_err(),
-            "a later small reservation must not bypass the FIFO head"
+            "a later blocking reservation must not bypass the async FIFO head"
         );
 
         drop(large_permits);
@@ -1227,28 +1374,168 @@ mod tests {
             .expect("the next FIFO reservation must resume after the head releases capacity");
         assert_eq!(small_permits.len(), 1);
         drop(small_permits);
-        assert_eq!(dispatcher.status().queued(), 0);
-        large.join().unwrap();
         small.join().unwrap();
+        assert_eq!(dispatcher.status().queued(), 0);
         dispatcher.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceling_a_queued_reservation_releases_all_provisional_capacity() {
+        let sink: TaskStateSinkHandle = Arc::new(IgnoringStateSink);
+        let dispatcher = StateEventDispatcher::start(sink, NonZeroUsize::new(2).unwrap()).unwrap();
+        let mut active_admission = dispatcher.reserve(1).await.unwrap();
+        let active_event = active_admission.take_permit();
+
+        let (pending_tx, pending_rx) = mpsc::sync_channel(1);
+        let waiting_dispatcher = Arc::clone(&dispatcher);
+        let waiting = tokio::spawn(async move {
+            let mut reservation = Box::pin(waiting_dispatcher.reserve(3));
+            std::future::poll_fn(|context| match reservation.as_mut().poll(context) {
+                Poll::Ready(_) => panic!("the oversized reservation must initially wait"),
+                Poll::Pending => Poll::Ready(()),
+            })
+            .await;
+            pending_tx
+                .send(())
+                .expect("the test must observe the queued reservation");
+            reservation.await
+        });
+        pending_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the reservation must enter the semaphore FIFO");
+        waiting.abort();
+        match waiting.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("the queued reservation must be canceled"),
+        }
+
+        let available = tokio::time::timeout(Duration::from_secs(5), dispatcher.reserve(2))
+            .await
+            .expect("canceling the head must return its provisional capacity")
+            .unwrap();
+        assert_eq!(available.len(), 2);
+        assert_eq!(dispatcher.status().queued(), 3);
+        drop(available);
+        drop(active_event);
+        drop(active_admission);
+        assert_eq!(dispatcher.status().queued(), 0);
+        dispatcher.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_started_before_shutdown_dispatches_and_shutdown_waits_for_it() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let sink: TaskStateSinkHandle = Arc::new(BlockingFirstStateSink {
+            first: AtomicBool::new(true),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let dispatcher = StateEventDispatcher::start(sink, NonZeroUsize::new(2).unwrap()).unwrap();
+
+        for revision in 1..=3 {
+            let admission = dispatcher.reserve(1).await.unwrap();
+            dispatch_state_event(&dispatcher, admission, &format!("test:{revision}"));
+            if revision == 1 {
+                entered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the first callback must hold active ownership");
+            }
+        }
+        assert_eq!(dispatcher.status().queued(), 3);
+
+        let (pending_tx, pending_rx) = mpsc::sync_channel(1);
+        let pending_dispatcher = Arc::clone(&dispatcher);
+        let pending = tokio::spawn(async move {
+            let mut admission = Box::pin(pending_dispatcher.reserve(1));
+            std::future::poll_fn(|context| match admission.as_mut().poll(context) {
+                Poll::Ready(_) => panic!("the accepted admission must initially wait"),
+                Poll::Pending => Poll::Ready(()),
+            })
+            .await;
+            pending_tx
+                .send(())
+                .expect("the test must observe the pending accepted admission");
+            admission.await
+        });
+        pending_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the admission must clone the sender before waiting for capacity");
+
+        let shutdown_dispatcher = Arc::clone(&dispatcher);
+        let mut shutdown = tokio::spawn(async move {
+            shutdown_dispatcher.shutdown().await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while dispatcher.sender.lock().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown must close new admission before the sink is released");
+        assert!(!shutdown.is_finished());
+
+        release_tx
+            .send(())
+            .expect("the test must release the active callback");
+        let admission = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("the accepted admission must receive released capacity")
+            .unwrap()
+            .unwrap();
+        assert!(!shutdown.is_finished());
+
+        dispatch_state_event(&dispatcher, admission, "test:4");
+        tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
+            .await
+            .expect("shutdown must drain the event carried by the accepted admission")
+            .unwrap();
+        assert_eq!(dispatcher.status().delivered(), 4);
+        assert_eq!(dispatcher.status().queued(), 0);
+
+        let drop_dispatcher =
+            StateEventDispatcher::start(Arc::new(IgnoringStateSink), NonZeroUsize::new(2).unwrap())
+                .unwrap();
+        let admission = drop_dispatcher.reserve(1).await.unwrap();
+        drop(drop_dispatcher);
+        drop(admission);
+    }
+
+    #[tokio::test]
+    async fn admission_after_shutdown_is_explicitly_closed() {
+        let sink: TaskStateSinkHandle = Arc::new(IgnoringStateSink);
+        let dispatcher = StateEventDispatcher::start(sink, NonZeroUsize::new(2).unwrap()).unwrap();
+
+        dispatcher.shutdown().await;
+
+        assert!(matches!(
+            dispatcher.reserve(1).await,
+            Err(StateAdmissionClosed)
+        ));
+        assert!(matches!(
+            dispatcher.reserve_blocking(0),
+            Err(StateAdmissionClosed)
+        ));
+        assert!(!dispatcher.status().accepting());
     }
 
     #[tokio::test]
     async fn sink_panics_are_isolated() {
         let state: TaskStateSinkHandle = Arc::new(PanickingStateSink);
         let dispatcher = StateEventDispatcher::start(state, NonZeroUsize::new(2).unwrap()).unwrap();
-        let permit = dispatcher
-            .reserve(1)
-            .pop()
-            .expect("one event reservation returns one permit");
-        dispatcher.dispatch(vec![StateDispatchEvent::new(
-            TaskStateEvent::TaskChanged {
-                resource_version: "test:1".to_string(),
-                previous: None,
-                current: None,
-            },
-            permit,
-        )]);
+        let mut admission = dispatcher.reserve(1).await.unwrap();
+        let permit = admission.take_permit();
+        dispatcher.dispatch(
+            admission,
+            vec![StateDispatchEvent::new(
+                TaskStateEvent::TaskChanged {
+                    resource_version: "test:1".to_string(),
+                    previous: None,
+                    current: None,
+                },
+                permit,
+            )],
+        );
         dispatcher.shutdown().await;
         assert_eq!(
             dispatcher.status(),
@@ -1400,20 +1687,20 @@ mod tests {
             entered: entered_tx,
             release: Mutex::new(release_rx),
         });
-        let dispatcher =
-            Arc::new(StateEventDispatcher::start(sink, NonZeroUsize::new(2).unwrap()).unwrap());
-        let permit = dispatcher
-            .reserve(1)
-            .pop()
-            .expect("one event reservation returns one permit");
-        dispatcher.dispatch(vec![StateDispatchEvent::new(
-            TaskStateEvent::TaskChanged {
-                resource_version: "test:1".to_string(),
-                previous: None,
-                current: None,
-            },
-            permit,
-        )]);
+        let dispatcher = StateEventDispatcher::start(sink, NonZeroUsize::new(2).unwrap()).unwrap();
+        let mut admission = dispatcher.reserve(1).await.unwrap();
+        let permit = admission.take_permit();
+        dispatcher.dispatch(
+            admission,
+            vec![StateDispatchEvent::new(
+                TaskStateEvent::TaskChanged {
+                    resource_version: "test:1".to_string(),
+                    previous: None,
+                    current: None,
+                },
+                permit,
+            )],
+        );
         entered_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("state persistence callback must start");

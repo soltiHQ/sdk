@@ -39,7 +39,6 @@ const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 const DEFAULT_TASK_TTL: Duration = Duration::from_secs(3_600);
 const DEFAULT_WATCH_HISTORY_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 const DEFAULT_WATCH_HISTORY_CAPACITY: usize = 4_096;
-const MAX_WATCH_HISTORY_CAPACITY: usize = usize::MAX >> 1;
 const DEFAULT_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_CONCURRENT_BUILDS: usize = 32;
 const DEFAULT_MAX_CONCURRENT_BUILDS_PER_RUNNER: usize = 8;
@@ -133,9 +132,6 @@ pub struct StateConfig {
     /// Maximum serialized bytes retained by the Task change journal.
     watch_history_byte_budget: usize,
     /// Maximum Task changes retained by the journal.
-    ///
-    /// Core derives a smaller live ring when this value exceeds one, leaving
-    /// retained journal headroom for lag recovery.
     watch_history_capacity: usize,
 }
 
@@ -226,8 +222,6 @@ impl StateConfig {
     }
 
     /// Returns the retained Task change limit.
-    ///
-    /// A value of one leaves no journal headroom for lag recovery.
     pub const fn watch_history_capacity(&self) -> usize {
         self.watch_history_capacity
     }
@@ -442,16 +436,14 @@ impl StateConfig {
     /// Sets the retained Task change limit.
     ///
     /// Watches and list snapshots share this history.
-    /// The structural maximum is `usize::MAX / 2`.
-    /// State creation derives a power-of-two live broadcast ring below this
-    /// limit when the limit exceeds one. A value of one remains valid but
-    /// leaves no journal headroom for lag recovery.
+    /// Storage grows lazily and remains independently constrained by
+    /// [`watch_history_byte_budget`](Self::watch_history_byte_budget).
+    /// Live delivery keeps only a coalesced revision notification.
+    /// This value does not size an eager broadcast allocation.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError::Zero`] when `watch_history_capacity` is zero.
-    /// Returns [`ConfigError::Exceeds`] when the value exceeds the supported
-    /// structural limit.
     pub const fn try_with_watch_history_capacity(
         mut self,
         watch_history_capacity: usize,
@@ -459,12 +451,6 @@ impl StateConfig {
         if watch_history_capacity == 0 {
             return Err(ConfigError::Zero {
                 field: "watch_history_capacity",
-            });
-        }
-        if watch_history_capacity > MAX_WATCH_HISTORY_CAPACITY {
-            return Err(ConfigError::Exceeds {
-                field: "watch_history_capacity",
-                limit: "watch_history_capacity_max",
             });
         }
         self.watch_history_capacity = watch_history_capacity;
@@ -726,20 +712,11 @@ mod tests {
     }
 
     #[test]
-    fn watch_history_capacity_enforces_the_structural_limit() {
+    fn watch_history_capacity_accepts_the_platform_maximum_without_eager_allocation() {
         let maximum = StateConfig::new()
-            .try_with_watch_history_capacity(MAX_WATCH_HISTORY_CAPACITY)
+            .try_with_watch_history_capacity(usize::MAX)
             .unwrap();
-        assert_eq!(maximum.watch_history_capacity(), MAX_WATCH_HISTORY_CAPACITY);
-        assert_eq!(
-            StateConfig::new()
-                .try_with_watch_history_capacity(MAX_WATCH_HISTORY_CAPACITY + 1)
-                .unwrap_err(),
-            ConfigError::Exceeds {
-                field: "watch_history_capacity",
-                limit: "watch_history_capacity_max",
-            }
-        );
+        assert_eq!(maximum.watch_history_capacity(), usize::MAX);
     }
 
     #[test]

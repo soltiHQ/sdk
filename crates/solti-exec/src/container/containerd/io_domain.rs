@@ -1,8 +1,8 @@
 //! Bounded blocking I/O for native containerd attempts.
 //!
 //! One domain belongs to one containerd engine. It owns one operating-system
-//! thread and a bounded queue. Filesystem preparation and removal run only on
-//! that thread.
+//! thread and a lazily allocated queue. Filesystem preparation and removal run
+//! only on that thread. The admission semaphore is the exact ownership bound.
 //!
 //! ```text
 //! cleanup admission -> I/O admission -> prepare -> ready owner
@@ -25,7 +25,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, SyncSender, TrySendError},
+        mpsc::{self, SendError, Sender},
     },
     thread,
     time::Duration,
@@ -73,19 +73,19 @@ struct IoAdmission {
 /// Queue sender that terminal shutdown can close despite leaked owners.
 struct IoQueue {
     /// Sole sender removed when terminal shutdown closes the worker queue.
-    sender: Mutex<Option<SyncSender<IoJob>>>,
+    sender: Mutex<Option<Sender<IoJob>>>,
 }
 
 impl IoQueue {
-    /// Tries to enqueue one job without waiting.
-    fn try_send(&self, job: IoJob) -> Result<(), Box<TrySendError<IoJob>>> {
+    /// Enqueues one admitted job without waiting for worker capacity.
+    fn try_send(&self, job: IoJob) -> Result<(), Box<SendError<IoJob>>> {
         let sender = self
             .sender
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match sender.as_ref() {
-            Some(sender) => sender.try_send(job).map_err(Box::new),
-            None => Err(Box::new(TrySendError::Disconnected(job))),
+            Some(sender) => sender.send(job).map_err(Box::new),
+            None => Err(Box::new(SendError(job))),
         }
     }
 
@@ -133,7 +133,7 @@ impl IoDomain {
                 error,
             )
         })?;
-        let (sender, receiver) = mpsc::sync_channel(capacity);
+        let (sender, receiver) = mpsc::channel();
         let queue = Arc::new(IoQueue {
             sender: Mutex::new(Some(sender)),
         });
@@ -215,22 +215,14 @@ impl IoDomain {
             Ok(()) => Ok(IoPreparation {
                 owner: PreparationOwner::Running(result_receiver),
             }),
-            Err(error) => match *error {
-                TrySendError::Full(job) => {
-                    self.inner.health.failed.store(true, Ordering::Release);
-                    job.release_unstarted_prepare();
-                    Err(ContainerEngineError::permanent(
-                        "containerd I/O queue exceeded its admission invariant",
-                    ))
-                }
-                TrySendError::Disconnected(job) => {
-                    self.inner.health.failed.store(true, Ordering::Release);
-                    job.release_unstarted_prepare();
-                    Err(ContainerEngineError::permanent(
-                        "containerd I/O worker is unavailable",
-                    ))
-                }
-            },
+            Err(error) => {
+                let SendError(job) = *error;
+                self.inner.health.failed.store(true, Ordering::Release);
+                job.release_unstarted_prepare();
+                Err(ContainerEngineError::permanent(
+                    "containerd I/O worker is unavailable",
+                ))
+            }
         }
     }
 
@@ -430,7 +422,7 @@ impl ManagedAttemptIo {
     /// Wraps test I/O in one private blocking worker.
     #[cfg(test)]
     pub(super) fn for_test(io: AttemptIo) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::channel();
         let queue = Arc::new(IoQueue {
             sender: Mutex::new(Some(sender)),
         });
@@ -591,22 +583,14 @@ impl ManagedAttemptIo {
                 });
                 Ok(())
             }
-            Err(error) => match *error {
-                TrySendError::Full(job) => {
-                    self.health.failed.store(true, Ordering::Release);
-                    job.quarantine("full");
-                    Err(ContainerEngineError::permanent(
-                        "containerd I/O removal exceeded its queue invariant",
-                    ))
-                }
-                TrySendError::Disconnected(job) => {
-                    self.health.failed.store(true, Ordering::Release);
-                    job.quarantine("disconnected");
-                    Err(ContainerEngineError::permanent(
-                        "containerd I/O worker is unavailable during removal",
-                    ))
-                }
-            },
+            Err(error) => {
+                let SendError(job) = *error;
+                self.health.failed.store(true, Ordering::Release);
+                job.quarantine("disconnected");
+                Err(ContainerEngineError::permanent(
+                    "containerd I/O worker is unavailable during removal",
+                ))
+            }
         }
     }
 }
@@ -622,10 +606,8 @@ impl Drop for ManagedAttemptIo {
         let job = IoJob::remove(inner, result_sender, Arc::clone(&self.health));
         if let Err(error) = self.queue.try_send(job) {
             self.health.failed.store(true, Ordering::Release);
-            match *error {
-                TrySendError::Full(job) => job.quarantine("full"),
-                TrySendError::Disconnected(job) => job.quarantine("disconnected"),
-            }
+            let SendError(job) = *error;
+            job.quarantine("disconnected");
         }
     }
 }
@@ -756,7 +738,7 @@ struct IoJob {
     health: Arc<IoHealth>,
 }
 
-/// Operation stored in one bounded queue slot.
+/// Operation stored in the lazily allocated, admission-bounded queue.
 enum IoJobInner {
     /// Filesystem preparation for a new attempt.
     Prepare(PrepareJob),

@@ -13,6 +13,8 @@
 //!
 //! Admission is reserved before client-side image resolution and attempt-scoped
 //! resources. Image transfer is not deferred-cleanup ownership.
+//! Queue nodes are allocated only when admitted ownership is handed off. The
+//! admission semaphore remains the exact active-plus-queued ownership bound.
 //! Handoff from `Drop` never waits and does not use the caller's runtime.
 //! Retryable cleanup remains charged until it succeeds. Permanent unresolved
 //! ownership is quarantined and remains charged for the process lifetime.
@@ -76,8 +78,8 @@ struct CleanupDomainInner {
 struct CleanupAdmission {
     /// Whether new attempt ownership may be reserved.
     accepting: bool,
-    /// Non-blocking handoff queue for cancelled attempts.
-    sender: Option<mpsc::Sender<CleanupJob>>,
+    /// Lazily allocated handoff queue for cancelled attempts.
+    sender: Option<mpsc::UnboundedSender<CleanupJob>>,
 }
 
 impl CleanupDomain {
@@ -107,7 +109,7 @@ impl CleanupDomain {
                 error,
             )
         })?;
-        let (sender, receiver) = mpsc::channel(capacity);
+        let (sender, receiver) = mpsc::unbounded_channel();
         let admission = Arc::new(Semaphore::new(capacity));
         let (startup_tx, startup_rx) = oneshot::channel();
         let cleanup_failed = Arc::new(AtomicBool::new(false));
@@ -304,7 +306,7 @@ impl CleanupDomain {
 /// Pre-reserved capacity for one create, active, or deferred lifecycle.
 pub(super) struct CleanupReservation {
     /// Queue sender retained until explicit release or deferred handoff.
-    sender: mpsc::Sender<CleanupJob>,
+    sender: mpsc::UnboundedSender<CleanupJob>,
     /// Capacity unit transferred with the cleanup state.
     permit: Option<OwnedSemaphorePermit>,
 }
@@ -325,18 +327,9 @@ impl CleanupReservation {
                     .expect("cleanup reservation owns its permit until handoff"),
             }),
         };
-        match self.sender.try_send(job) {
+        match self.sender.send(job) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(job)) => {
-                error!(
-                    event = "containerd.cleanup_handoff_invariant_failed",
-                    reason = "full",
-                    ownership = %job.state().unresolved_summary(),
-                    "containerd cleanup ownership could not enter its reserved queue slot",
-                );
-                mem::forget(job);
-            }
-            Err(mpsc::error::TrySendError::Closed(job)) => {
+            Err(mpsc::error::SendError(job)) => {
                 error!(
                     event = "containerd.cleanup_handoff_invariant_failed",
                     reason = "closed",
@@ -446,7 +439,7 @@ impl Drop for CleanupJobGuard {
 fn cleanup_thread(
     socket: PathBuf,
     connect_timeout: Duration,
-    receiver: mpsc::Receiver<CleanupJob>,
+    receiver: mpsc::UnboundedReceiver<CleanupJob>,
     startup: oneshot::Sender<Result<(Arc<Client>, tokio::runtime::Handle), ContainerEngineError>>,
     cleanup_failed: Arc<AtomicBool>,
     cleanup_quarantined: Arc<AtomicBool>,
@@ -599,7 +592,7 @@ fn join_finished_thread(worker: thread::JoinHandle<()>) -> Result<(), ContainerE
 
 /// Runs accepted jobs concurrently on the isolated runtime.
 async fn run_cleanup(
-    mut receiver: mpsc::Receiver<CleanupJob>,
+    mut receiver: mpsc::UnboundedReceiver<CleanupJob>,
     cleanup_failed: Arc<AtomicBool>,
     cleanup_quarantined: Arc<AtomicBool>,
 ) {
@@ -710,7 +703,7 @@ pub(super) mod tests {
 
     pub(in crate::container::containerd) struct ObservedDomain {
         domain: CleanupDomain,
-        receiver: mpsc::Receiver<super::CleanupJob>,
+        receiver: mpsc::UnboundedReceiver<super::CleanupJob>,
     }
 
     impl ObservedDomain {
@@ -727,18 +720,23 @@ pub(super) mod tests {
     }
 
     pub(super) fn isolated_domain(capacity: usize) -> CleanupDomain {
-        let (sender, receiver) = mpsc::channel(capacity);
+        let (sender, receiver) = mpsc::unbounded_channel();
         std::mem::forget(receiver);
         test_domain(sender, capacity)
     }
 
-    fn observed_domain(capacity: usize) -> (CleanupDomain, mpsc::Receiver<super::CleanupJob>) {
-        let (sender, receiver) = mpsc::channel(capacity);
+    fn observed_domain(
+        capacity: usize,
+    ) -> (CleanupDomain, mpsc::UnboundedReceiver<super::CleanupJob>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
         let domain = test_domain(sender, capacity);
         (domain, receiver)
     }
 
-    fn test_domain(sender: mpsc::Sender<super::CleanupJob>, capacity: usize) -> CleanupDomain {
+    fn test_domain(
+        sender: mpsc::UnboundedSender<super::CleanupJob>,
+        capacity: usize,
+    ) -> CleanupDomain {
         CleanupDomain {
             inner: Arc::new(CleanupDomainInner {
                 admission: std::sync::Mutex::new(CleanupAdmission {
@@ -780,6 +778,59 @@ pub(super) mod tests {
             .try_reserve()
             .expect("released admission must become available");
         drop(second);
+    }
+
+    #[test]
+    fn admission_counts_active_and_queued_ownership_exactly() {
+        let (domain, mut receiver) = observed_domain(3);
+        let active = domain
+            .try_reserve()
+            .expect("one active owner must be admitted");
+        domain
+            .try_reserve()
+            .expect("first queued owner must be admitted")
+            .handoff(test_state_for_cleanup_handoff());
+        domain
+            .try_reserve()
+            .expect("second queued owner must be admitted")
+            .handoff(test_state_for_cleanup_handoff());
+
+        let error = match domain.try_reserve() {
+            Ok(_) => panic!("active plus queued ownership must reach the exact limit"),
+            Err(error) => error,
+        };
+        assert_eq!(error.reason(), "containerd cleanup admission is full");
+
+        receiver
+            .try_recv()
+            .expect("one queued owner must be observable")
+            .release();
+        let replacement = domain
+            .try_reserve()
+            .expect("releasing one queued owner must free exactly one slot");
+
+        drop(active);
+        drop(replacement);
+        receiver
+            .try_recv()
+            .expect("the other queued owner must remain")
+            .release();
+        assert_eq!(domain.inner.capacity.available_permits(), 3);
+    }
+
+    #[test]
+    fn maximum_supported_capacity_constructs_without_queue_slot_allocation() {
+        let maximum = Semaphore::MAX_PERMITS
+            .min(usize::try_from(u32::MAX).expect("supported targets can represent u32 capacity"));
+        let domain = isolated_domain(maximum);
+
+        assert_eq!(domain.inner.capacity.available_permits(), maximum);
+        let reservation = domain
+            .try_reserve()
+            .expect("maximum-capacity domain must admit its first owner");
+        assert_eq!(domain.inner.capacity.available_permits(), maximum - 1);
+        drop(reservation);
+        assert_eq!(domain.inner.capacity.available_permits(), maximum);
     }
 
     #[test]

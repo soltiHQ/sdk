@@ -3,6 +3,7 @@ use std::{
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
 };
 
@@ -22,7 +23,35 @@ use tokio_stream::StreamExt;
 use tokio_util::task::TaskTracker;
 
 use super::*;
-use crate::{ReconciliationConfig, StateConfig};
+use crate::{PersistenceConfig, ReconciliationConfig, StateConfig, TaskStateEvent, TaskStateSink};
+
+struct TokioDependentStateSink {
+    first: AtomicBool,
+    events: AtomicUsize,
+    entered: mpsc::SyncSender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl TaskStateSink for TokioDependentStateSink {
+    fn on_event(&self, _event: &TaskStateEvent) {
+        self.events.fetch_add(1, Ordering::AcqRel);
+        if self.first.swap(false, Ordering::AcqRel) {
+            self.entered
+                .send(())
+                .expect("the test must observe the active persistence callback");
+            self.release
+                .lock()
+                .recv()
+                .expect("ordinary Tokio work must release the persistence callback");
+        }
+    }
+}
+
+struct IgnoringStateSink;
+
+impl TaskStateSink for IgnoringStateSink {
+    fn on_event(&self, _event: &TaskStateEvent) {}
+}
 
 fn embedded_with_revision(name: &str, timeout_ms: u64, revision: &str) -> TaskManifest {
     TaskManifest::new(
@@ -126,6 +155,153 @@ async fn api_with_reconciliation(
         .start()
         .await
         .unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_write_yields_when_state_persistence_capacity_is_full() {
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let sink = Arc::new(TokioDependentStateSink {
+        first: AtomicBool::new(true),
+        events: AtomicUsize::new(0),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+    let api = SupervisorApi::builder(RunnerRouter::new())
+        .with_state_sink(sink)
+        .with_persistence_config(
+            PersistenceConfig::new()
+                .try_with_state_queue_capacity(2)
+                .unwrap(),
+        )
+        .start()
+        .await
+        .unwrap();
+
+    api.reconciler
+        .state
+        .add_task(embedded("persistence-active", 1_000));
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the first callback must become active");
+    api.reconciler
+        .state
+        .add_task(embedded("persistence-buffered-one", 1_000));
+    api.reconciler
+        .state
+        .add_task(embedded("persistence-buffered-two", 1_000));
+    assert_eq!(api.state_persistence_status().unwrap().queued(), 3);
+
+    // The watchdog only prevents a broken synchronous implementation from
+    // hanging the suite forever. The asserted path releases from Tokio work.
+    let watchdog_release = release_tx.clone();
+    let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+    let watchdog = std::thread::spawn(move || {
+        if completed_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            let _ = watchdog_release.try_send(());
+        }
+    });
+    let release = tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        release_tx
+            .try_send(())
+            .expect("the Tokio task owns the callback release");
+    });
+
+    let created = tokio::time::timeout(
+        Duration::from_secs(1),
+        api.create_embedded_task(embedded("public-write", 1_000), immediate_task()),
+    )
+    .await;
+    let _ = completed_tx.send(());
+    watchdog.join().unwrap();
+    release.await.unwrap();
+    created
+        .expect("public state admission must yield to ordinary Tokio work")
+        .unwrap();
+
+    api.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_persistence_capacity_preserves_an_accepted_delete_during_shutdown() {
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let sink = Arc::new(TokioDependentStateSink {
+        first: AtomicBool::new(true),
+        events: AtomicUsize::new(0),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+    let api = Arc::new(
+        SupervisorApi::builder(RunnerRouter::new())
+            .with_state_sink(sink.clone())
+            .with_persistence_config(
+                PersistenceConfig::new()
+                    .try_with_state_queue_capacity(2)
+                    .unwrap(),
+            )
+            .start()
+            .await
+            .unwrap(),
+    );
+    let target = TaskId::new("delete-during-shutdown").unwrap();
+
+    api.reconciler
+        .state
+        .add_task(embedded(target.as_str(), 1_000));
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the first persistence callback must become active");
+    api.reconciler
+        .state
+        .add_task(embedded("delete-buffered-one", 1_000));
+    api.reconciler
+        .state
+        .add_task(embedded("delete-buffered-two", 1_000));
+    assert_eq!(api.state_persistence_status().unwrap().queued(), 3);
+
+    let delete_api = Arc::clone(&api);
+    let delete_target = target.clone();
+    let deletion = tokio::spawn(async move { delete_api.delete_task(&delete_target).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while api.reconciler.state.persistence_admission_waiters() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete admission must be pending after cloning the persistence sender");
+
+    let shutdown_api = Arc::clone(&api);
+    let shutdown = tokio::spawn(async move { shutdown_api.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !api.reconciler.state.persistence_admission_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown must close persistence admission");
+    assert!(!deletion.is_finished());
+    assert!(!shutdown.is_finished());
+
+    release_tx
+        .send(())
+        .expect("the test must release the active persistence callback");
+    tokio::time::timeout(Duration::from_secs(5), deletion)
+        .await
+        .expect("the accepted delete must finish")
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("shutdown must drain the accepted delete event")
+        .unwrap()
+        .unwrap();
+
+    assert!(api.get_task(&target).is_none());
+    assert_eq!(sink.events.load(Ordering::Acquire), 4);
+    assert_eq!(api.state_persistence_status().unwrap().delivered(), 4);
+    assert_eq!(api.state_persistence_status().unwrap().queued(), 0);
 }
 
 async fn wait_for_task(
@@ -1890,6 +2066,12 @@ async fn coalescing_defers_user_task_destruction_to_the_caller_boundary() {
     );
     assert!(first_superseded.is_none());
 
+    let admission = api
+        .reconciler
+        .state
+        .admit_state_write(StateMutationEventCapacity::TaskChange)
+        .await
+        .unwrap();
     let scheduled = api
         .write_locked(
             manifest,
@@ -1897,7 +2079,10 @@ async fn coalescing_defers_user_task_destruction_to_the_caller_boundary() {
             WriteMode::Apply,
             &WritePreconditions::new(),
             true,
-            operation,
+            WriteGuards {
+                operation,
+                admission,
+            },
         )
         .unwrap();
     drop(scheduled);
@@ -2083,7 +2268,16 @@ async fn delete_during_blocked_preflight_prevents_late_runtime_submission() {
 
 #[tokio::test]
 async fn shutdown_started_rejects_desired_writes_without_committing_them() {
-    let api = api(RunnerRouter::new()).await;
+    let api = SupervisorApi::builder(RunnerRouter::new())
+        .with_state_sink(Arc::new(IgnoringStateSink))
+        .start()
+        .await
+        .unwrap();
+    let retained = embedded("apply-after-close", 1_000);
+    api.reconciler.state.add_task(retained.clone());
+    let before = api
+        .get_task(&TaskId::new("apply-after-close").unwrap())
+        .unwrap();
     api.shutdown().await.unwrap();
 
     let error = api
@@ -2092,6 +2286,32 @@ async fn shutdown_started_rejects_desired_writes_without_committing_them() {
         .unwrap_err();
     assert!(matches!(error, CoreError::ShuttingDown));
     assert!(api.get_task(&TaskId::new("too-late").unwrap()).is_none());
+
+    let error = api
+        .apply_task_where(retained, WritePreconditions::new(), |_| true)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CoreError::ShuttingDown));
+    assert_eq!(
+        api.get_task(&TaskId::new("apply-after-close").unwrap()),
+        Some(before)
+    );
+}
+
+#[tokio::test]
+async fn delete_after_shutdown_is_rejected_without_mutation_or_state_sink() {
+    let api = api(RunnerRouter::new()).await;
+    let name = TaskId::new("delete-after-close-no-sink").unwrap();
+    api.reconciler
+        .state
+        .add_task(embedded(name.as_str(), 1_000));
+    let before = api.get_task(&name).expect("the retained task must exist");
+    api.shutdown().await.unwrap();
+
+    let error = api.delete_task(&name).await.unwrap_err();
+
+    assert!(matches!(error, CoreError::ShuttingDown));
+    assert_eq!(api.get_task(&name), Some(before));
 }
 
 #[tokio::test]

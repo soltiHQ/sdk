@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     pin::Pin,
     sync::{
         Arc, Barrier,
@@ -94,13 +95,72 @@ fn try_new_creates_empty_state() {
 }
 
 #[test]
-fn live_watch_capacity_keeps_recovery_headroom_when_history_exceeds_one() {
-    assert_eq!(task_watch_live_capacity(1), 1);
-    assert_eq!(task_watch_live_capacity(2), 1);
-    assert_eq!(task_watch_live_capacity(3), 2);
-    assert_eq!(task_watch_live_capacity(4), 2);
-    assert_eq!(task_watch_live_capacity(5), 4);
-    assert_eq!(task_watch_live_capacity(4_096), 2_048);
+fn maximum_watch_history_capacity_has_constant_initial_allocation() {
+    let config = StateConfig::new()
+        .try_with_watch_history_capacity(usize::MAX)
+        .unwrap();
+    let state = TaskState::with_epoch(config, "maximum-capacity".to_string());
+    let inner = state.inner.read();
+
+    assert_eq!(inner.watch_history_capacity, usize::MAX);
+    assert!(inner.watch_history.is_empty());
+    assert_eq!(inner.watch_tx.receiver_count(), 0);
+}
+
+#[test]
+fn live_watch_journal_lookup_has_a_logarithmic_comparison_bound() {
+    let mut history = (1..=65_536_u64).collect::<VecDeque<_>>();
+    for revision in 65_537..=98_304 {
+        history.pop_front();
+        history.push_back(revision);
+    }
+    let comparisons = Cell::new(0_usize);
+
+    let change = first_after_revision(&history, 90_000, |revision| {
+        comparisons.set(comparisons.get() + 1);
+        *revision
+    });
+
+    assert_eq!(change, Some(&90_001));
+    let logarithmic_bound = (usize::BITS - (history.len() - 1).leading_zeros()) as usize + 1;
+    assert!(comparisons.get() <= logarithmic_bound);
+    assert!(comparisons.get() < history.len() / 1_000);
+}
+
+#[tokio::test]
+async fn no_sink_shutdown_waits_for_a_preclose_admission_to_commit() {
+    let state = TaskState::new();
+    let admission = state
+        .admit_state_write(StateMutationEventCapacity::TaskChange)
+        .await
+        .expect("the pre-shutdown state admission must be accepted");
+    assert_eq!(state.active_persistence_admissions(), 1);
+
+    let shutdown_state = state.clone();
+    let shutdown = tokio::spawn(async move {
+        shutdown_state.shutdown_persistence().await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !state.persistence_admission_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown must close state mutation admission");
+    assert!(!shutdown.is_finished());
+    assert_eq!(state.active_persistence_admissions(), 1);
+
+    let committed = state
+        .create_desired_admitted(&manifest("preclose-commit", "slot", 1_000), admission)
+        .expect("a pre-boundary admission may finish its commit");
+    assert_eq!(committed.task.name().as_str(), "preclose-commit");
+    tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("shutdown must finish after the pre-boundary lease is released")
+        .expect("the shutdown task must not panic");
+
+    assert_eq!(state.active_persistence_admissions(), 0);
+    assert!(state.get(committed.task.name()).is_some());
 }
 
 #[derive(Default)]
@@ -2857,7 +2917,7 @@ fn watch_history_byte_budget_can_evict_multiple_changes() {
 }
 
 #[tokio::test]
-async fn oversized_change_is_live_but_not_retained() {
+async fn oversized_change_expires_existing_and_new_resume_points() {
     let first = journal_task("retained-before-oversized", 1, 0);
     let task = journal_task("oversized-live", 2, 4 * 1024);
     let serialized_bytes = TaskState::serialized_task_payload_bytes(None, Some(&task));
@@ -2876,10 +2936,11 @@ async fn oversized_change_is_live_but_not_retained() {
         assert_eq!(inner.watch_history_bytes, 0);
         assert_eq!(inner.compacted_through, 2);
     }
-    assert_eq!(
-        watch.next().await.unwrap().unwrap(),
-        TaskWatchEvent::Added(task)
-    );
+    assert!(matches!(
+        watch.next().await,
+        Some(Err(CollectionError::ResourceVersionExpired { .. }))
+    ));
+    assert!(watch.next().await.is_none());
     assert!(matches!(
         state.watch(&TaskFilter::new(), Some("epoch:1")),
         Err(CollectionError::ResourceVersionExpired { .. })
@@ -3547,7 +3608,7 @@ async fn lag_is_terminal_once_the_resume_point_is_compacted() {
 }
 
 #[test]
-fn real_broadcast_lag_recovers_every_retained_change_exactly_once() {
+fn coalesced_revision_notification_replays_retained_changes_exactly_once() {
     struct NoopWake;
 
     impl Wake for NoopWake {
@@ -3560,9 +3621,9 @@ fn real_broadcast_lag_recovers_every_retained_change_exactly_once() {
     let state = TaskState::with_epoch(config, "epoch".to_string());
     let mut watch = state.watch(&TaskFilter::new(), Some("epoch:0")).unwrap();
     let tasks = [
-        journal_task("real-lag-first", 1, 0),
-        journal_task("real-lag-second", 2, 0),
-        journal_task("real-lag-third", 3, 0),
+        journal_task("coalesced-first", 1, 0),
+        journal_task("coalesced-second", 2, 0),
+        journal_task("coalesced-third", 3, 0),
     ];
     for task in tasks.iter().cloned() {
         record_current_change(&state, task);
@@ -3570,19 +3631,7 @@ fn real_broadcast_lag_recovers_every_retained_change_exactly_once() {
     let waker = Waker::from(Arc::new(NoopWake));
     let mut context = Context::from_waker(&waker);
 
-    assert!(matches!(
-        Pin::new(&mut watch).poll_next(&mut context),
-        Poll::Ready(Some(Ok(TaskWatchEvent::Added(task)))) if task == tasks[0]
-    ));
-    assert_eq!(
-        watch
-            .recovery
-            .as_ref()
-            .expect("the actual broadcast lag must enter recovery")
-            .target_revision,
-        3
-    );
-    for expected in &tasks[1..] {
+    for expected in &tasks {
         assert!(matches!(
             Pin::new(&mut watch).poll_next(&mut context),
             Poll::Ready(Some(Ok(TaskWatchEvent::Added(task)))) if task == *expected
@@ -3593,10 +3642,11 @@ fn real_broadcast_lag_recovers_every_retained_change_exactly_once() {
         Poll::Pending
     ));
     assert_eq!(watch.last_revision, 3);
+    assert_eq!(watch.target_revision, 3);
 }
 
 #[test]
-fn real_broadcast_lag_advances_across_a_trailing_revision_gap() {
+fn coalesced_revision_notification_advances_across_a_trailing_gap() {
     struct NoopWake;
 
     impl Wake for NoopWake {
@@ -3607,14 +3657,14 @@ fn real_broadcast_lag_advances_across_a_trailing_revision_gap() {
         .try_with_watch_history_capacity(3)
         .unwrap();
     let state = TaskState::with_epoch(config, "epoch".to_string());
-    let task = create(&state, "real-lag-gap-resource");
+    let task = create(&state, "coalesced-gap-resource");
     let binding = bind(&state, task.name());
     assert!(state.mark_observed(&binding.resource));
     let mut watch = state.watch(&TaskFilter::new(), Some("epoch:2")).unwrap();
     let changes = [
-        journal_task("real-lag-gap-first", 3, 0),
-        journal_task("real-lag-gap-second", 4, 0),
-        journal_task("real-lag-gap-third", 5, 0),
+        journal_task("coalesced-gap-first", 3, 0),
+        journal_task("coalesced-gap-second", 4, 0),
+        journal_task("coalesced-gap-third", 5, 0),
     ];
     for change in changes.iter().cloned() {
         record_current_change(&state, change);
@@ -3635,374 +3685,80 @@ fn real_broadcast_lag_advances_across_a_trailing_revision_gap() {
         Poll::Pending
     ));
     assert_eq!(watch.last_revision, 6);
-    assert!(watch.recovery.is_none());
+    assert_eq!(watch.target_revision, 6);
 }
 
 #[test]
-fn lag_recovery_waits_without_retaining_payload_and_wakes_after_release() {
-    struct CountingWake(AtomicUsize);
+fn slow_live_watchers_retain_no_payload_outside_the_shared_journal() {
+    let state = TaskState::with_epoch(StateConfig::new(), "epoch".to_string());
+    let watchers = (0..64)
+        .map(|_| state.watch(&TaskFilter::new(), Some("epoch:0")).unwrap())
+        .collect::<Vec<_>>();
+    let task = journal_task("shared-live-payload", 1, 16 * 1024);
 
-    impl Wake for CountingWake {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
+    record_current_change(&state, task);
 
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
+    let change = state
+        .inner
+        .read()
+        .watch_history
+        .front()
+        .cloned()
+        .expect("the live change is retained once by the journal");
+    assert_eq!(Arc::strong_count(&change), 2);
+    assert_eq!(
+        Arc::strong_count(change.current.as_ref().expect("current payload")),
+        1
+    );
+    assert_eq!(state.watch_admission.usage(), (64, 0, 0));
+
+    drop(watchers);
+    assert_eq!(Arc::strong_count(&change), 2);
+    assert_eq!(
+        Arc::strong_count(change.current.as_ref().expect("current payload")),
+        1
+    );
+    assert_eq!(state.watch_admission.usage(), (0, 0, 0));
+}
+
+#[test]
+fn live_watch_byte_budget_exact_boundary_delivers_and_one_byte_under_expires() {
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
     }
 
-    let task = journal_task("lag-budget-wait", 1, 128);
+    let task = journal_task("live-byte-boundary", 1, 512);
     let task_bytes = TaskState::serialized_task_payload_bytes(None, Some(&task));
-    let config = StateConfig::new()
-        .try_with_max_task_watch_initial_replay_bytes(task_bytes)
+    let exact_config = StateConfig::new()
+        .try_with_watch_history_byte_budget(task_bytes)
         .unwrap();
-    let state = TaskState::with_epoch(config, "epoch".to_string());
-    record_current_change(&state, task.clone());
-    let blocker = state.watch(&TaskFilter::new(), Some("epoch:0")).unwrap();
-    let predicate_calls = Arc::new(AtomicUsize::new(0));
-    let observed_calls = Arc::clone(&predicate_calls);
-    let mut recovering = state
-        .watch_where(&TaskFilter::new(), Some("epoch:1"), move |_| {
-            observed_calls.fetch_add(1, Ordering::SeqCst);
-            true
-        })
-        .unwrap();
-    recovering.last_revision = 0;
-    recovering.begin_recovery_after_lag().unwrap();
-    let retained_change = state.inner.read().watch_history.front().cloned().unwrap();
-    let strong_before = Arc::strong_count(&retained_change);
-    let retained_task = retained_change.current.as_ref().unwrap();
-    let task_strong_before = Arc::strong_count(retained_task);
-    let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
-    let waker = Waker::from(Arc::clone(&wake));
+    let exact = TaskState::with_epoch(exact_config, "epoch".to_string());
+    let mut exact_watch = exact.watch(&TaskFilter::new(), Some("epoch:0")).unwrap();
+    record_current_change(&exact, task.clone());
+
+    let waker = Waker::from(Arc::new(NoopWake));
     let mut context = Context::from_waker(&waker);
-
     assert!(matches!(
-        Pin::new(&mut recovering).poll_next(&mut context),
-        Poll::Pending
-    ));
-    assert_eq!(Arc::strong_count(&retained_change), strong_before);
-    assert_eq!(Arc::strong_count(retained_task), task_strong_before);
-    assert_eq!(state.watch_admission.usage(), (2, task_bytes, 1));
-    assert_eq!(predicate_calls.load(Ordering::SeqCst), 1);
-
-    drop(blocker);
-    assert_eq!(wake.0.load(Ordering::SeqCst), 1);
-    assert_eq!(state.watch_admission.usage(), (1, 0, 0));
-    assert!(matches!(
-        Pin::new(&mut recovering).poll_next(&mut context),
+        Pin::new(&mut exact_watch).poll_next(&mut context),
         Poll::Ready(Some(Ok(TaskWatchEvent::Added(event)))) if event == task
     ));
-    assert_eq!(state.watch_admission.usage(), (1, 0, 0));
-    assert_eq!(predicate_calls.load(Ordering::SeqCst), 1);
-}
+    assert_eq!(exact.inner.read().watch_history_bytes, task_bytes);
 
-#[test]
-fn lag_recovery_reports_existing_expiration_if_history_compacts_while_waiting() {
-    struct CountingWake(AtomicUsize);
-
-    impl Wake for CountingWake {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    let first = journal_task("lag-compacted-first", 1, 128);
-    let first_bytes = TaskState::serialized_task_payload_bytes(None, Some(&first));
-    let config = StateConfig::new()
-        .try_with_watch_history_capacity(1)
-        .unwrap()
-        .try_with_max_task_watch_initial_replay_bytes(first_bytes)
+    let under_config = StateConfig::new()
+        .try_with_watch_history_byte_budget(task_bytes - 1)
         .unwrap();
-    let state = TaskState::with_epoch(config, "epoch".to_string());
-    record_current_change(&state, first);
-    let blocker = state.watch(&TaskFilter::new(), Some("epoch:0")).unwrap();
-    let mut recovering = state.watch(&TaskFilter::new(), Some("epoch:1")).unwrap();
-    recovering.last_revision = 0;
-    recovering.begin_recovery_after_lag().unwrap();
-    let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
-    let waker = Waker::from(Arc::clone(&wake));
-    let mut context = Context::from_waker(&waker);
+    let under = TaskState::with_epoch(under_config, "epoch".to_string());
+    let mut under_watch = under.watch(&TaskFilter::new(), Some("epoch:0")).unwrap();
+    record_current_change(&under, task);
     assert!(matches!(
-        Pin::new(&mut recovering).poll_next(&mut context),
-        Poll::Pending
-    ));
-
-    wake.0.store(0, Ordering::SeqCst);
-    record_current_change(&state, journal_task("lag-compacted-second", 2, 0));
-    assert_eq!(wake.0.load(Ordering::SeqCst), 1);
-    assert!(matches!(
-        Pin::new(&mut recovering).poll_next(&mut context),
+        Pin::new(&mut under_watch).poll_next(&mut context),
         Poll::Ready(Some(Err(CollectionError::ResourceVersionExpired { .. })))
     ));
-    assert_eq!(state.watch_admission.usage(), (1, first_bytes, 0));
-    assert!(matches!(
-        Pin::new(&mut recovering).poll_next(&mut context),
-        Poll::Ready(None)
-    ));
-    drop(blocker);
-    assert_eq!(state.watch_admission.usage(), (0, 0, 0));
+    assert!(under.inner.read().watch_history.is_empty());
+    assert_eq!(under.watch_admission.usage(), (0, 0, 0));
 }
-
-#[test]
-fn oversized_lag_event_is_directly_yielded_while_new_resume_is_rejected() {
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    let task = journal_task("lag-oversized-direct", 1, 256);
-    let task_bytes = TaskState::serialized_task_payload_bytes(None, Some(&task));
-    let config = StateConfig::new()
-        .try_with_max_task_watch_initial_replay_bytes(task_bytes - 1)
-        .unwrap();
-    let state = TaskState::with_epoch(config, "epoch".to_string());
-    record_current_change(&state, task.clone());
-    assert!(matches!(
-        state.watch(&TaskFilter::new(), Some("epoch:0")),
-        Err(CollectionError::TaskWatchInitialReplayByteLimitExceeded { .. })
-    ));
-
-    let mut recovering = state.watch(&TaskFilter::new(), Some("epoch:1")).unwrap();
-    recovering.last_revision = 0;
-    recovering.begin_recovery_after_lag().unwrap();
-    let waker = Waker::from(Arc::new(NoopWake));
-    let mut context = Context::from_waker(&waker);
-
-    assert!(matches!(
-        Pin::new(&mut recovering).poll_next(&mut context),
-        Poll::Ready(Some(Ok(TaskWatchEvent::Added(event)))) if event == task
-    ));
-    assert_eq!(state.watch_admission.usage(), (1, 0, 0));
-}
-
-#[tokio::test]
-async fn terminal_watch_error_and_shutdown_release_ledger_entries_idempotently() {
-    let state = TaskState::with_epoch(StateConfig::new(), "roll".to_string());
-    create(&state, "watch-terminal-first");
-    let mut watch = state.watch(&TaskFilter::new(), Some("roll:1")).unwrap();
-    assert_eq!(state.watch_admission.usage().0, 1);
-    {
-        let mut inner = state.write(StateMutationEventCapacity::None);
-        inner.resource_version = u64::MAX;
-    }
-    create(&state, "watch-terminal-second");
-    assert!(matches!(
-        watch.next().await,
-        Some(Err(CollectionError::ResourceVersionExpired { .. }))
-    ));
-    assert_eq!(state.watch_admission.usage(), (0, 0, 0));
-    drop(watch);
-    assert_eq!(state.watch_admission.usage(), (0, 0, 0));
-
-    let shutdown_state = TaskState::with_epoch(StateConfig::new(), "shutdown".to_string());
-    let task = create(&shutdown_state, "shutdown-watch-ledger");
-    let task_bytes = TaskState::serialized_task_payload_bytes(None, Some(&task));
-    let mut shutdown_watch = shutdown_state.watch(&TaskFilter::new(), Some("0")).unwrap();
-    assert_eq!(shutdown_state.watch_admission.usage(), (1, task_bytes, 0));
-    shutdown_state.close_watches();
-    shutdown_state.close_watches();
-    assert_eq!(shutdown_state.watch_admission.usage(), (0, 0, 0));
-    assert!(shutdown_watch.next().await.is_none());
-    drop(shutdown_watch);
-    assert_eq!(shutdown_state.watch_admission.usage(), (0, 0, 0));
-}
-
-#[test]
-fn replay_reservation_observes_closed_before_disabled_or_oversized_branches() {
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    let waker = Waker::from(Arc::new(NoopWake));
-    let context = Context::from_waker(&waker);
-    for config in [
-        StateConfig::new().with_max_task_watch_initial_replay_bytes(None),
-        StateConfig::new()
-            .try_with_max_task_watch_initial_replay_bytes(1)
-            .unwrap(),
-    ] {
-        let state = TaskState::with_epoch(config, "closed".to_string());
-        let watch = state.watch(&TaskFilter::new(), Some("closed:0")).unwrap();
-        let history_token = watch.permit.as_ref().unwrap().history_token();
-        state.watch_admission.notify_history_changed();
-        state.close_watches();
-
-        assert!(matches!(
-            watch.permit.as_ref().unwrap().poll_reserve_replay(
-                usize::MAX,
-                &history_token,
-                &context,
-            ),
-            Poll::Ready(WatchReplayReservation::Closed)
-        ));
-        assert_eq!(state.watch_admission.usage(), (0, 0, 0));
-    }
-}
-
-#[test]
-fn history_change_before_replay_waiter_registration_never_pends() {
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    let config = StateConfig::new()
-        .try_with_max_task_watch_initial_replay_bytes(1)
-        .unwrap();
-    let admission = WatchAdmission::new(config);
-    let Ok(_blocker) = admission.try_admit(1) else {
-        panic!("the first byte lease must be admitted");
-    };
-    let Ok(waiting) = admission.try_admit(0) else {
-        panic!("the empty recovery lease must be admitted");
-    };
-    let history_token = waiting.history_token();
-    admission.notify_history_changed();
-    let waker = Waker::from(Arc::new(NoopWake));
-    let context = Context::from_waker(&waker);
-
-    assert!(matches!(
-        waiting.poll_reserve_replay(1, &history_token, &context),
-        Poll::Ready(WatchReplayReservation::HistoryChanged)
-    ));
-    assert_eq!(admission.usage(), (2, 1, 0));
-}
-
-#[test]
-fn reentrant_waiter_drop_cannot_deadlock_replacement_or_removal() {
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    struct ReentrantDropWake {
-        admission: std::sync::Weak<WatchAdmission>,
-        drops: Arc<AtomicUsize>,
-    }
-
-    impl Wake for ReentrantDropWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    impl Drop for ReentrantDropWake {
-        fn drop(&mut self) {
-            if let Some(admission) = self.admission.upgrade() {
-                let _ = admission.usage();
-            }
-            self.drops.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    fn register_reentrant_waiter(
-        admission: &Arc<WatchAdmission>,
-        id: u64,
-        history_token: &Arc<()>,
-        drops: &Arc<AtomicUsize>,
-    ) {
-        let wake = Arc::new(ReentrantDropWake {
-            admission: Arc::downgrade(admission),
-            drops: Arc::clone(drops),
-        });
-        let waker = Waker::from(Arc::clone(&wake));
-        let context = Context::from_waker(&waker);
-        assert!(matches!(
-            admission.poll_reserve_replay(id, 1, history_token, &context),
-            Poll::Pending
-        ));
-    }
-
-    let config = StateConfig::new()
-        .try_with_max_task_watch_initial_replay_bytes(1)
-        .unwrap();
-    let admission = WatchAdmission::new(config);
-    let Ok(blocker) = admission.try_admit(1) else {
-        panic!("the byte-blocking lease must be admitted");
-    };
-    let Ok(waiting) = admission.try_admit(0) else {
-        panic!("the replay-waiting lease must be admitted");
-    };
-    let blocker = std::mem::ManuallyDrop::new(blocker);
-    let waiting = std::mem::ManuallyDrop::new(waiting);
-    let blocker_id = blocker.id;
-    let waiting_id = waiting.id;
-    let history_token = waiting.history_token();
-
-    let drops = Arc::new(AtomicUsize::new(0));
-    register_reentrant_waiter(&admission, waiting_id, &history_token, &drops);
-
-    let (replacement_tx, replacement_rx) = std::sync::mpsc::sync_channel(1);
-    let replacement_admission = Arc::clone(&admission);
-    let replacement_token = Arc::clone(&history_token);
-    let replacement = std::thread::spawn(move || {
-        let waker = Waker::from(Arc::new(NoopWake));
-        let context = Context::from_waker(&waker);
-        let pending = matches!(
-            replacement_admission.poll_reserve_replay(waiting_id, 1, &replacement_token, &context,),
-            Poll::Pending
-        );
-        replacement_tx.send(pending).unwrap();
-    });
-    assert!(
-        replacement_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("reentrant waiter replacement must complete")
-    );
-    replacement.join().unwrap();
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
-
-    register_reentrant_waiter(&admission, waiting_id, &history_token, &drops);
-    admission.inner.lock().history_token = Arc::new(());
-    let (history_tx, history_rx) = std::sync::mpsc::sync_channel(1);
-    let history_admission = Arc::clone(&admission);
-    let stale_history_token = Arc::clone(&history_token);
-    let history_changed = std::thread::spawn(move || {
-        let waker = Waker::from(Arc::new(NoopWake));
-        let context = Context::from_waker(&waker);
-        let changed = matches!(
-            history_admission.poll_reserve_replay(waiting_id, 1, &stale_history_token, &context,),
-            Poll::Ready(WatchReplayReservation::HistoryChanged)
-        );
-        history_tx.send(changed).unwrap();
-    });
-    assert!(
-        history_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("reentrant waiter history removal must complete")
-    );
-    history_changed.join().unwrap();
-    assert_eq!(drops.load(Ordering::SeqCst), 2);
-
-    let current_history_token = admission.history_token();
-    register_reentrant_waiter(&admission, waiting_id, &current_history_token, &drops);
-    let (removal_tx, removal_rx) = std::sync::mpsc::sync_channel(1);
-    let removal_admission = Arc::clone(&admission);
-    let removal = std::thread::spawn(move || {
-        removal_admission.release_lease(waiting_id);
-        removal_tx.send(()).unwrap();
-    });
-    removal_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("reentrant waiter removal must complete");
-    removal.join().unwrap();
-    assert_eq!(drops.load(Ordering::SeqCst), 3);
-
-    admission.release_lease(blocker_id);
-    assert_eq!(admission.usage(), (0, 0, 0));
-    drop(std::mem::ManuallyDrop::into_inner(waiting));
-    drop(std::mem::ManuallyDrop::into_inner(blocker));
-}
-
 #[test]
 fn irrelevant_live_events_yield_after_the_poll_budget() {
     struct CountingWake(AtomicUsize);

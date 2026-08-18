@@ -235,24 +235,21 @@ and exact-resume replay buffers share a 64 MiB aggregate compact Task JSON
 budget. A new watch is rejected atomically when either limit is full. Existing
 watches are not evicted or terminated by watch admission pressure.
 
-Buffered bytes are released as events are yielded. Lag recovery waits for
-available replay capacity without retaining replay payload while waiting. Its
-resume point can still expire if change history compacts. A single lag-recovery
-event larger than the complete byte budget is transferred directly to the
-caller without being buffered. Live events and events already transferred to a
-caller are outside this retained-payload budget.
+Buffered initial and exact-resume bytes are released as events are yielded.
+Live delivery retains only one coalesced revision notification. Each watcher
+reads its next payload lazily from the shared count- and byte-bounded journal.
+The cursor locates its next retained revision with a binary search.
+It retains no private live-event ring or replay payload. If compaction removes
+the next required revision, including when one change exceeds the complete
+journal byte budget, the watcher terminates with an expired resource version.
+Events already transferred to a caller are outside internal retention budgets.
 
-The live watch ring is derived from `watch_history_capacity`. For every value
-above one, its effective power-of-two capacity is the largest power of two
-strictly below the journal limit. The default 4096-change journal therefore
-uses a 2048-change live ring. This leaves count headroom when a live subscriber
-first reports lag. It does not reserve byte headroom: the independent history
-byte budget may compact required changes or retain none, which expires the
-resume point. A configured history capacity of one stays valid but has no
-count headroom for lag recovery.
+`watch_history_capacity` grows the shared journal lazily. It never sizes an
+eager live-delivery allocation. The independent byte budget remains a strict
+upper bound for serialized Task payload retained by that journal.
 
 Resource versions can contain revisions that did not publish a Task change.
-After replaying every retained change through a captured recovery target, a
+After replaying every retained change through a coalesced notification target, a
 watch advances across a trailing revision gap without inventing an event.
 
 List continuations and watches share retained change history.
@@ -493,15 +490,31 @@ They do not add a database, replace the in-memory `TaskState`, retry delivery, o
 They are write-side notifications; core does not load persisted state during startup.
 
 State events use a bounded, core-owned FIFO dispatcher.
-A writer atomically reserves its mutation path's maximum event count before acquiring the state lock, records one atomic commit batch, and publishes its events only after releasing the lock.
+A Tokio-owned writer asynchronously reserves its mutation path's maximum event count before acquiring the lifecycle, state, or spawn gate, records one atomic commit batch, and publishes its events only after releasing the state lock.
+Taskvisor subscriber callbacks use the same fair semaphore from their dedicated callback workers, preserving one FIFO across both caller kinds without parking a Tokio worker.
+They reserve before entering the same fair lifecycle gate. Metadata-only lifecycle
+sections never wait for persistence capacity. `TaskRemoved` reserves one maximum
+finalization batch; overflow rechecks and finalizes safe pending identities one
+at a time instead of holding the gate across a variable-size reservation.
 Unused reservations are returned after the lock is released.
 One dedicated worker invokes the sink in commit order.
 For configured capacity `C`, the hard bound is `reserved + buffered + active <= C + 1`, where `active` is zero or one.
 Reserved includes permits owned by a commit before its event values enter the pending FIFO.
 The minimum capacity is two buffered events because one attempt transition can atomically emit three events: one task change, one implicitly closed prior run, and one current run change.
 Reservation admission is FIFO; saturation applies backpressure before the state critical section.
+Canceling a waiting async writer removes its reservation and returns any provisional semaphore capacity.
+Every eventful mutation first owns a sink-independent admission lease.
+Shutdown closes that admission fence under the same mutex used to issue leases,
+rejects later public writes with `CoreError::ShuttingDown`, and waits for every
+earlier lease to commit or be dropped. A Taskvisor callback that arrives after
+this boundary returns without mutating state, even when no state sink is configured.
+When a state sink is configured, admission also clones the state-dispatch sender
+before waiting for semaphore capacity. After the common mutation fence drains,
+shutdown closes the dispatcher sender under its sender mutex and drains every
+event accepted by an earlier admission before the worker exits.
 Retention sweeps publish each expired task deletion as a separate commit batch.
 State callbacks may read `TaskState`, but must not mutate it directly or wait for another thread that mutates it.
+They may wait for unrelated Tokio work, provided the callback eventually returns.
 Polling `SupervisorApi::shutdown()` on the state callback worker panics before shutdown starts.
 A state callback must not wait for another thread that calls shutdown; that cycle can deadlock.
 Output events use a separate bounded dispatcher and dedicated worker.
@@ -616,7 +629,7 @@ Public write and lifecycle methods return `CoreError`:
 | `StateInitialization`      | The state resource-version identity could not initialize     |
 | `PersistenceInitialization` | A configured persistence worker could not start             |
 | `SupervisorInitialization` | Taskvisor rejected supervisor construction                   |
-| `ShuttingDown`             | A desired-state write started after shutdown                 |
+| `ShuttingDown`             | A desired-state mutation raced with or started after shutdown |
 | `Supervisor`               | Taskvisor start, prepare, submit, cancel, or shutdown failed |
 | `AlreadyExists`            | Create found a retained resource with the same name          |
 | `NotFound`                 | A required resource does not exist or is hidden              |

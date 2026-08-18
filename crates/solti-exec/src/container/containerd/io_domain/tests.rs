@@ -30,7 +30,7 @@ struct ObservedDomain {
 impl ObservedDomain {
     /// Creates a healthy domain with a manually observed queue.
     fn new(capacity: usize) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(capacity);
+        let (sender, receiver) = mpsc::channel();
         let queue = Arc::new(IoQueue {
             sender: Mutex::new(Some(sender)),
         });
@@ -72,7 +72,7 @@ where
 
 /// Creates ready managed I/O with a manually observed removal queue.
 fn observed_managed_io() -> (ManagedAttemptIo, mpsc::Receiver<IoJob>, Arc<Semaphore>) {
-    let (sender, receiver) = mpsc::sync_channel(1);
+    let (sender, receiver) = mpsc::channel();
     let queue = Arc::new(IoQueue {
         sender: Mutex::new(Some(sender)),
     });
@@ -107,6 +107,60 @@ fn admission_rejects_invalid_capacity() {
         Err(error) => error,
     };
     assert_eq!(excessive.class(), ContainerErrorClass::Permanent);
+}
+
+#[tokio::test]
+async fn maximum_supported_capacity_constructs_without_queue_slot_allocation() {
+    let maximum = Semaphore::MAX_PERMITS
+        .min(usize::try_from(u32::MAX).expect("supported targets can represent u32 capacity"));
+    let domain = IoDomain::start(maximum).expect("maximum-capacity I/O domain must start");
+
+    assert_eq!(domain.inner.capacity.available_permits(), maximum);
+    domain
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .expect("idle maximum-capacity I/O domain must shut down");
+}
+
+#[tokio::test]
+async fn admission_uses_the_exact_configured_capacity() {
+    let observed = ObservedDomain::new(3);
+    let mut owners = Vec::new();
+    for index in 0..3 {
+        owners.push(
+            observed
+                .domain
+                .try_prepare(PathBuf::from("queued"), format!("queued-{index}"))
+                .expect("every configured I/O slot must be usable"),
+        );
+    }
+
+    let error = match observed
+        .domain
+        .try_prepare(PathBuf::from("full"), "full".to_owned())
+    {
+        Ok(_) => panic!("one owner above the configured capacity must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.reason(), "containerd I/O admission is full");
+
+    observed.release_prepare();
+    let replacement = observed
+        .domain
+        .try_prepare(PathBuf::from("replacement"), "replacement".to_owned())
+        .expect("releasing one owner must free exactly one I/O slot");
+
+    for _ in 0..3 {
+        observed.release_prepare();
+    }
+    drop(owners);
+    drop(replacement);
+    assert_eq!(observed.domain.inner.capacity.available_permits(), 3);
+    observed
+        .domain
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .expect("released exact-capacity domain must shut down");
 }
 
 #[tokio::test]

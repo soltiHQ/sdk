@@ -18,7 +18,8 @@
 //!                           └──► exit/cancel
 //! ```
 //!
-//! Each attempt owns its process and output readers.
+//! Each attempt owns its process and output-reader task handles.
+//! Dropping the attempt aborts both readers and releases their pipe endpoints.
 //! Script attempts also own an anonymous script descriptor.
 //! A configured cgroup is attempt-scoped.
 //! Unix attempts use a dedicated process group.

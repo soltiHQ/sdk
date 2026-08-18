@@ -52,7 +52,8 @@ use crate::{
     },
     runtime::{Reconciler, RuntimeObserver, RuntimeSource, TaskLocks},
     state::{
-        CollectionError, ResourceGeneration, RuntimeBinding, TaskState, TaskWatchSubscription,
+        CollectionError, ResourceGeneration, RuntimeBinding, StateMutationEventCapacity,
+        StateWriteAdmission, TaskState, TaskWatchSubscription,
     },
 };
 
@@ -88,6 +89,11 @@ struct ScheduledWrite {
     reconciliation: Option<oneshot::Receiver<Task>>,
 }
 
+struct WriteGuards {
+    operation: tokio::sync::OwnedMutexGuard<()>,
+    admission: StateWriteAdmission,
+}
+
 impl Drop for SupervisorApi {
     fn drop(&mut self) {
         let _gate = self.spawn_gate.lock();
@@ -107,7 +113,7 @@ impl Drop for SupervisorApi {
             let shutdown_confirmed = handle.shutdown().await.is_ok();
             tasks.wait().await;
             if shutdown_confirmed {
-                observer.finalize_pending_after_confirmed_shutdown();
+                observer.finalize_pending_after_confirmed_shutdown().await;
             }
             output_hub.shutdown_persistence().await;
             state.shutdown_persistence().await;
@@ -312,6 +318,12 @@ impl SupervisorApi {
         {
             return Err(CoreError::NotFound(name.to_string()));
         }
+        let admission = self
+            .reconciler
+            .state
+            .admit_state_write(StateMutationEventCapacity::TaskChange)
+            .await
+            .map_err(|_| CoreError::ShuttingDown)?;
         Ok(self
             .write_locked(
                 manifest,
@@ -319,7 +331,10 @@ impl SupervisorApi {
                 WriteMode::Apply,
                 &preconditions,
                 true,
-                operation,
+                WriteGuards {
+                    operation,
+                    admission,
+                },
             )?
             .committed)
     }
@@ -386,13 +401,25 @@ impl SupervisorApi {
         Self::ensure_runtime_contract(&manifest, &source)?;
         let name = manifest.name().clone();
         let operation = self.task_operations.lock(&name).await;
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return Err(CoreError::ShuttingDown);
+        }
+        let admission = self
+            .reconciler
+            .state
+            .admit_state_write(StateMutationEventCapacity::TaskChange)
+            .await
+            .map_err(|_| CoreError::ShuttingDown)?;
         self.write_locked(
             manifest,
             source,
             mode,
             &preconditions,
             ensure_output,
-            operation,
+            WriteGuards {
+                operation,
+                admission,
+            },
         )
     }
 
@@ -403,8 +430,12 @@ impl SupervisorApi {
         mode: WriteMode,
         preconditions: &WritePreconditions,
         ensure_output: bool,
-        _operation: tokio::sync::OwnedMutexGuard<()>,
+        guards: WriteGuards,
     ) -> Result<ScheduledWrite, CoreError> {
+        let WriteGuards {
+            operation: _operation,
+            admission,
+        } = guards;
         Self::ensure_runtime_contract(&manifest, &source)?;
         let _spawn = self.spawn_gate.lock();
         if self.shutdown_started.load(Ordering::Acquire) {
@@ -415,12 +446,14 @@ impl SupervisorApi {
         let commit = match mode {
             WriteMode::Create => {
                 debug_assert!(preconditions.is_empty());
-                self.reconciler.state.create_desired(&manifest)?
+                self.reconciler
+                    .state
+                    .create_desired_admitted(&manifest, admission)?
             }
             WriteMode::Apply => self
                 .reconciler
                 .state
-                .apply_desired_with_preconditions(&manifest, preconditions)?,
+                .apply_desired_with_preconditions_admitted(&manifest, preconditions, admission)?,
         };
         if !commit.reconcile {
             drop(registration);
@@ -703,6 +736,7 @@ impl SupervisorApi {
     ///
     /// # Errors
     ///
+    /// Returns [`CoreError::ShuttingDown`] when state mutation admission has closed.
     /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
     #[instrument(
         level = "debug",
@@ -720,6 +754,7 @@ impl SupervisorApi {
     ///
     /// Returns [`CoreError::NotFound`] when the task is missing.
     /// Returns [`CoreError::Conflict`] when a guard does not match.
+    /// Returns [`CoreError::ShuttingDown`] when state mutation admission has closed.
     /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
     pub async fn delete_task_with_preconditions(
         &self,
@@ -744,6 +779,7 @@ impl SupervisorApi {
     ///
     /// Returns [`CoreError::NotFound`] when the task is missing or hidden.
     /// Returns [`CoreError::Conflict`] when a guard does not match.
+    /// Returns [`CoreError::ShuttingDown`] when state mutation admission has closed.
     /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
     pub async fn delete_task_where<F>(
         &self,
@@ -776,7 +812,11 @@ impl SupervisorApi {
         );
         let cancellation = self.cancel_bound(name).await?;
         let tv = cancellation.as_ref().map(|(binding, _)| binding.tv);
-        self.reconciler.observer.delete_after_cleanup(name, tv);
+        self.reconciler
+            .observer
+            .delete_after_cleanup(name, tv)
+            .await
+            .map_err(|_| CoreError::ShuttingDown)?;
         Ok(())
     }
 
@@ -824,7 +864,8 @@ impl SupervisorApi {
         if result.is_ok() {
             self.reconciler
                 .observer
-                .finalize_pending_after_confirmed_shutdown();
+                .finalize_pending_after_confirmed_shutdown()
+                .await;
         }
         self.reconciler.output_hub.shutdown_persistence().await;
         self.reconciler.state.shutdown_persistence().await;

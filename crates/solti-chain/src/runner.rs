@@ -106,7 +106,7 @@ impl Runner for ChainRunner {
             );
             async move {
                 let output = output.begin(attempt);
-                execute(plan, ctx, output.sink()).await
+                output.scope(execute(plan, ctx, output.sink())).await
             }
             .instrument(span)
         }))

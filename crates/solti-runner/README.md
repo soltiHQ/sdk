@@ -248,6 +248,10 @@ OutputPublisher::sink_for(task, generation, attempt)
 
 `OutputSink` is a write-only producer:
 
+Request it from the task attempt future before starting separate output tasks.
+Composition runners may use execution-local routing that a separately spawned
+task does not inherit. Clone the returned sink into reader or forwarding tasks.
+
 ```rust
 use std::sync::mpsc;
 

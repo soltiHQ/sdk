@@ -62,7 +62,7 @@ use crate::{
     CoreError, ReconciliationConfig, StateConfig,
     map::{to_admission_policy, to_backoff_policy, to_restart_policy},
     output::OutputHub,
-    state::{ResourceGeneration, RuntimeBinding, TaskState},
+    state::{ResourceGeneration, RuntimeBinding, StateMutationEventCapacity, TaskState},
 };
 
 /// Executable source for one reconciliation.
@@ -322,7 +322,7 @@ impl Reconciler {
                     tokio::select! {
                         _ = stop.cancelled() => break,
                         _ = ticker.tick() => {
-                            state.sweep(&config);
+                            state.sweep_async(&config).await;
                         }
                     }
                 }
@@ -512,10 +512,18 @@ impl Reconciler {
                     (run_id.into_name(), task_ref)
                 }
                 BuildOutcome::Failed(error) => {
-                    self.state.mark_reconciliation_failed(
+                    let admission = self
+                        .state
+                        .admit_state_write(StateMutationEventCapacity::TaskChange)
+                        .await;
+                    let Ok(admission) = admission else {
+                        return self.current(&target, desired);
+                    };
+                    self.state.mark_reconciliation_failed_admitted(
                         &target,
                         Self::failure_reason(&error),
                         error.to_string(),
+                        admission,
                     );
                     return self.current(&target, desired);
                 }
@@ -528,10 +536,18 @@ impl Reconciler {
                         error_kind = "runner_build_panicked",
                         "runner preflight panicked"
                     );
-                    self.state.mark_reconciliation_failed(
+                    let admission = self
+                        .state
+                        .admit_state_write(StateMutationEventCapacity::TaskChange)
+                        .await;
+                    let Ok(admission) = admission else {
+                        return self.current(&target, desired);
+                    };
+                    self.state.mark_reconciliation_failed_admitted(
                         &target,
                         "RunnerBuildPanicked",
                         "reconciliation preflight panicked".to_string(),
+                        admission,
                     );
                     return self.current(&target, desired);
                 }
@@ -545,13 +561,21 @@ impl Reconciler {
                         timeout_ms = self.build_timeout.as_millis(),
                         "runner preflight exceeded its deadline"
                     );
-                    self.state.mark_reconciliation_failed(
+                    let admission = self
+                        .state
+                        .admit_state_write(StateMutationEventCapacity::TaskChange)
+                        .await;
+                    let Ok(admission) = admission else {
+                        return self.current(&target, desired);
+                    };
+                    self.state.mark_reconciliation_failed_admitted(
                         &target,
                         "RunnerBuildTimedOut",
                         format!(
                             "runner build exceeded {} ms deadline",
                             self.build_timeout.as_millis()
                         ),
+                        admission,
                     );
                     return self.current(&target, desired);
                 }
@@ -568,10 +592,18 @@ impl Reconciler {
                         error = %error,
                         "runner preflight unavailable"
                     );
-                    self.state.mark_reconciliation_failed(
+                    let admission = self
+                        .state
+                        .admit_state_write(StateMutationEventCapacity::TaskChange)
+                        .await;
+                    let Ok(admission) = admission else {
+                        return self.current(&target, desired);
+                    };
+                    self.state.mark_reconciliation_failed_admitted(
                         &target,
                         "RunnerBuildUnavailable",
                         "reconciliation preflight worker was unavailable".to_string(),
+                        admission,
                     );
                     return self.current(&target, desired);
                 }
@@ -586,10 +618,18 @@ impl Reconciler {
         })) {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(error)) => {
-                self.state.mark_reconciliation_failed(
+                let admission = self
+                    .state
+                    .admit_state_write(StateMutationEventCapacity::TaskChange)
+                    .await;
+                let Ok(admission) = admission else {
+                    return self.current(&target, desired);
+                };
+                self.state.mark_reconciliation_failed_admitted(
                     &target,
                     Self::failure_reason(&error),
                     error.to_string(),
+                    admission,
                 );
                 return self.current(&target, desired);
             }
@@ -602,10 +642,18 @@ impl Reconciler {
                     error_kind = "runner_build_panicked",
                     "runner preflight panicked"
                 );
-                self.state.mark_reconciliation_failed(
+                let admission = self
+                    .state
+                    .admit_state_write(StateMutationEventCapacity::TaskChange)
+                    .await;
+                let Ok(admission) = admission else {
+                    return self.current(&target, desired);
+                };
+                self.state.mark_reconciliation_failed_admitted(
                     &target,
                     "RunnerBuildPanicked",
                     "reconciliation preflight panicked".to_string(),
+                    admission,
                 );
                 return self.current(&target, desired);
             }
@@ -645,10 +693,18 @@ impl Reconciler {
                         .await;
                 }
                 Err(error) => {
-                    self.state.mark_reconciliation_failed(
+                    let admission = self
+                        .state
+                        .admit_state_write(StateMutationEventCapacity::TaskChange)
+                        .await;
+                    let Ok(admission) = admission else {
+                        return self.current(&target, desired);
+                    };
+                    self.state.mark_reconciliation_failed_admitted(
                         &target,
                         "PreviousRuntimeCleanupFailed",
                         CoreError::supervisor("cancel", error).to_string(),
+                        admission,
                     );
                     return self.current(&target, desired);
                 }
@@ -663,11 +719,19 @@ impl Reconciler {
         }
 
         let tv = prepared.id();
-        if !self.observer.bind(target.clone(), tv, ensure_output) {
-            self.state.mark_reconciliation_failed(
+        if !self.observer.bind(target.clone(), tv, ensure_output).await {
+            let admission = self
+                .state
+                .admit_state_write(StateMutationEventCapacity::TaskChange)
+                .await;
+            let Ok(admission) = admission else {
+                return self.current(&target, desired);
+            };
+            self.state.mark_reconciliation_failed_admitted(
                 &target,
                 "RuntimeBindingFailed",
                 "resource changed before runtime binding".to_string(),
+                admission,
             );
             return self.current(&target, desired);
         }
@@ -681,11 +745,11 @@ impl Reconciler {
         let submission = tokio::select! {
             biased;
             _ = self.preflight_stop.cancelled() => {
-                self.observer.release_unsubmitted_binding(&binding);
+                self.observer.release_unsubmitted_binding(&binding).await;
                 return self.current(&target, desired);
             }
             _ = cancellation.cancelled() => {
-                self.observer.release_unsubmitted_binding(&binding);
+                self.observer.release_unsubmitted_binding(&binding).await;
                 return self.current(&target, desired);
             }
             result = &mut submission => result,
@@ -694,15 +758,23 @@ impl Reconciler {
         match submission {
             Ok((submitted, waiter)) => {
                 debug_assert_eq!(submitted, tv);
-                self.state.mark_observed(&target);
+                let admission = self
+                    .state
+                    .admit_state_write(StateMutationEventCapacity::TaskChange)
+                    .await;
+                if let Ok(admission) = admission {
+                    self.state.mark_observed_admitted(&target, admission);
+                }
                 self.spawn_completion_waiter(binding, waiter);
             }
             Err(error) => {
-                self.observer.fail_bound_reconciliation(
-                    &binding,
-                    "RuntimeSubmissionFailed",
-                    CoreError::supervisor("submit", error).to_string(),
-                );
+                self.observer
+                    .fail_bound_reconciliation(
+                        &binding,
+                        "RuntimeSubmissionFailed",
+                        CoreError::supervisor("submit", error).to_string(),
+                    )
+                    .await;
             }
         }
         self.current(&target, desired)
@@ -755,7 +827,7 @@ impl Reconciler {
                                     error = %cleanup_error,
                                     "could not confirm cleanup after task outcome became unavailable"
                                 );
-                                observer.finalize_unavailable(tv_raw, unavailable);
+                                observer.finalize_unavailable(tv_raw, unavailable).await;
                             }
                         }
                     }

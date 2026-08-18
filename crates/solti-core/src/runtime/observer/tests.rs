@@ -2,10 +2,48 @@ use super::*;
 use taskvisor::TaskOutcomeKind;
 
 use crate::output::{OutputConfig, OutputHub};
+use crate::{PersistenceConfig, StateConfig, TaskStateEvent, TaskStateSink};
 use solti_model::{
     ConditionStatus, EmbeddedSpec, OutputEvent, TaskManifest, TaskSpec, TaskWorkload,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use taskvisor::Event;
+
+struct IgnoringStateSink;
+
+impl TaskStateSink for IgnoringStateSink {
+    fn on_event(&self, _event: &TaskStateEvent) {}
+}
+
+struct ArmableBlockingStateSink {
+    block_next: AtomicBool,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl TaskStateSink for ArmableBlockingStateSink {
+    fn on_event(&self, _event: &TaskStateEvent) {
+        if self.block_next.swap(false, Ordering::AcqRel) {
+            self.entered
+                .send(())
+                .expect("the test must observe the blocked persistence callback");
+            self.release
+                .lock()
+                .recv()
+                .expect("ordinary Tokio work must release the persistence callback");
+        }
+    }
+}
+
+async fn wait_for_condition(message: &'static str, condition: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !condition() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(message);
+}
 
 fn test_spec() -> TaskSpec {
     TaskSpec::builder(
@@ -65,8 +103,8 @@ fn bound_event(state: &TaskState, id: &TaskId, kind: EventKind) -> Event {
     Event::new(kind).with_id(state.tv_for(id).expect("task must be bound"))
 }
 
-#[test]
-fn prepared_binding_routes_the_first_event_without_replay() {
+#[tokio::test]
+async fn prepared_binding_routes_the_first_event_without_replay() {
     let state = TaskState::new();
     let id = add_test_task(&state, "prepared-start");
     let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
@@ -74,7 +112,7 @@ fn prepared_binding_routes_the_first_event_without_replay() {
     let tv = taskvisor::TaskId::for_tests();
     let resource = ResourceGeneration::from_task(&state.get(&id).expect("task must exist"));
 
-    assert!(sub.bind(resource, tv, true));
+    assert!(sub.bind(resource, tv, true).await);
     sub.on_event(
         &Event::new(EventKind::AttemptStarting)
             .with_id(tv)
@@ -85,6 +123,30 @@ fn prepared_binding_routes_the_first_event_without_replay() {
     assert_eq!(state.list_runs(&id).len(), 1);
     assert_eq!(state.list_runs(&id)[0].attempt(), 1);
     assert!(registry.subscribe_raw(&id).is_some());
+}
+
+#[tokio::test]
+async fn taskvisor_callback_after_state_admission_close_does_not_mutate_without_sink() {
+    let state = TaskState::new();
+    let id = add_test_task(&state, "late-closed-callback");
+    let tv = taskvisor::TaskId::for_tests();
+    bind_test_task(&state, &id, tv);
+    let observer = RuntimeObserver::with_output_hub(
+        state.clone(),
+        Arc::new(OutputHub::new(OutputConfig::default())),
+    );
+    state.shutdown_persistence().await;
+    let before = state.get(&id).unwrap();
+
+    observer.on_event(
+        &Event::new(EventKind::AttemptStarting)
+            .with_id(tv)
+            .with_attempt(1),
+    );
+
+    assert_eq!(state.get(&id).as_ref(), Some(&before));
+    assert!(state.list_runs(&id).is_empty());
+    assert_eq!(state.tv_for(&id), Some(tv));
 }
 
 #[test]
@@ -228,8 +290,8 @@ fn stale_incarnation_event_cannot_touch_recreated_resource() {
     assert!(output.try_recv().is_err());
 }
 
-#[test]
-fn failed_intake_cleanup_is_fenced_by_exact_binding() {
+#[tokio::test]
+async fn failed_intake_cleanup_is_fenced_by_exact_binding() {
     let state = TaskState::new();
     let id = add_test_task(&state, "intake-failure");
     let old_tv = taskvisor::TaskId::for_tests();
@@ -240,20 +302,26 @@ fn failed_intake_cleanup_is_fenced_by_exact_binding() {
     registry.ensure_channel(id.clone());
     let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
 
-    assert!(!sub.fail_bound_reconciliation(
-        &stale,
-        "RuntimeSubmissionFailed",
-        "stale intake failure".into(),
-    ));
+    assert!(
+        !sub.fail_bound_reconciliation(
+            &stale,
+            "RuntimeSubmissionFailed",
+            "stale intake failure".into(),
+        )
+        .await
+    );
     assert_eq!(state.tv_for(&id), Some(current_tv));
     assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Pending);
     assert!(registry.subscribe_raw(&id).is_some());
 
-    assert!(sub.fail_bound_reconciliation(
-        &current,
-        "RuntimeSubmissionFailed",
-        "controller intake failed".into(),
-    ));
+    assert!(
+        sub.fail_bound_reconciliation(
+            &current,
+            "RuntimeSubmissionFailed",
+            "controller intake failed".into(),
+        )
+        .await
+    );
     assert!(state.tv_for(&id).is_none());
     let failed = state.get(&id).expect("desired resource is retained");
     assert_eq!(failed.status().phase(), TaskPhase::Pending);
@@ -352,7 +420,7 @@ async fn late_outcome_after_explicit_delete_skips_the_barrier_wait() {
     let (sub, state, id) = setup("deleted-before-outcome");
     let tv = state.tv_for(&id).expect("bound task");
 
-    assert!(sub.delete_after_cleanup(&id, Some(tv)));
+    assert!(sub.delete_after_cleanup(&id, Some(tv)).await.unwrap());
     tokio::time::timeout(
         Duration::from_millis(100),
         sub.finalize_from_outcome(tv.get(), &taskvisor::TaskOutcome::Completed),
@@ -363,24 +431,25 @@ async fn late_outcome_after_explicit_delete_skips_the_barrier_wait() {
     assert!(state.get(&id).is_none());
 }
 
-#[test]
-fn idempotent_delete_does_not_evict_an_unknown_external_channel() {
+#[tokio::test]
+async fn idempotent_delete_does_not_evict_an_unknown_external_channel() {
     let state = TaskState::new();
     let id = TaskId::new("not-yet-submitted").unwrap();
     let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
     registry.ensure_channel(id.clone());
     let sub = RuntimeObserver::with_output_hub(state, Arc::clone(&registry));
 
-    assert!(!sub.delete_after_cleanup(&id, None));
+    assert!(!sub.delete_after_cleanup(&id, None).await.unwrap());
     assert!(registry.subscribe_raw(&id).is_some());
 }
 
-#[test]
-fn waiter_error_releases_binding_only_after_task_removed_barrier() {
+#[tokio::test]
+async fn waiter_error_releases_binding_only_after_task_removed_barrier() {
     let (sub, state, id) = setup("missing-outcome");
     let tv = state.tv_for(&id).expect("bound task");
 
-    sub.finalize_unavailable(tv.get(), "task outcome unavailable: shutting down".into());
+    sub.finalize_unavailable(tv.get(), "task outcome unavailable: shutting down".into())
+        .await;
     assert!(
         state.tv_for(&id).is_some(),
         "channel closure alone must fail closed while task cleanup is unproven"
@@ -398,13 +467,309 @@ fn waiter_error_releases_binding_only_after_task_removed_barrier() {
     );
 }
 
-#[test]
-fn confirmed_shutdown_releases_waiter_error_without_task_removed_event() {
+#[tokio::test]
+async fn pending_finalization_does_not_retain_persistence_capacity_for_its_barrier() {
+    let state = TaskState::try_with_config_sink_and_persistence(
+        StateConfig::new(),
+        Some(Arc::new(IgnoringStateSink)),
+        PersistenceConfig::new()
+            .try_with_state_queue_capacity(2)
+            .unwrap(),
+    )
+    .unwrap();
+    let id = add_test_task(&state, "pending-finalization-capacity");
+    let tv = taskvisor::TaskId::for_tests();
+    let binding = bind_test_task(&state, &id, tv);
+    assert!(state.transition_attempt_starting(&binding, 1));
+    let sub = RuntimeObserver::with_output_hub(
+        state.clone(),
+        Arc::new(OutputHub::new(OutputConfig::default())),
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state.persistence_status().unwrap().queued() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("setup persistence events must drain");
+
+    sub.finalize_unavailable(tv.get(), "outcome unavailable".into())
+        .await;
+    assert_eq!(state.persistence_status().unwrap().queued(), 0);
+    assert!(state.tv_for(&id).is_some());
+
+    sub.on_event(&Event::new(EventKind::TaskRemoved).with_id(tv));
+    assert!(state.tv_for(&id).is_none());
+    state.shutdown_persistence().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn overflow_finalizes_safe_pending_identities_one_bounded_batch_at_a_time() {
+    let state = TaskState::try_with_config_sink_and_persistence(
+        StateConfig::new(),
+        Some(Arc::new(IgnoringStateSink)),
+        PersistenceConfig::new()
+            .try_with_state_queue_capacity(2)
+            .unwrap(),
+    )
+    .unwrap();
+    let first_id = add_test_task(&state, "overflow-first");
+    let first_tv = taskvisor::TaskId::for_tests();
+    let first_binding = bind_test_task(&state, &first_id, first_tv);
+    assert!(state.transition_attempt_starting(&first_binding, 1));
+    let second_id = add_test_task(&state, "overflow-second");
+    let second_tv = taskvisor::TaskId::for_tests();
+    let second_binding = bind_test_task(&state, &second_id, second_tv);
+    assert!(state.transition_attempt_starting(&second_binding, 1));
+    wait_for_condition("setup persistence events must drain", || {
+        state.persistence_status().unwrap().queued() == 0
+    })
+    .await;
+
+    let observer = Arc::new(RuntimeObserver::with_output_hub(
+        state.clone(),
+        Arc::new(OutputHub::new(OutputConfig::default())),
+    ));
+    {
+        let _lifecycle = observer.lifecycle_gate.lock().await;
+        for tv in [first_tv, second_tv] {
+            let (ready, notification) = observer.register_finalization_locked(
+                tv.get(),
+                Finalization {
+                    phase: TaskPhase::Failed,
+                    error: Some("subscriber overflow".into()),
+                    exit_code: None,
+                    force: true,
+                    safe_without_barrier: true,
+                },
+                true,
+            );
+            assert!(ready.is_none());
+            assert!(notification.is_some());
+        }
+    }
+
+    let event = Event::new(EventKind::SubscriberOverflow)
+        .with_task(observer.name())
+        .with_dropped(1);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    let callback_observer = Arc::clone(&observer);
+    let callback = std::thread::spawn(move || {
+        callback_observer.on_event(&event);
+        done_tx
+            .send(())
+            .expect("the test must observe overflow completion");
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("overflow must finalize more identities than one batch can reserve");
+    callback.join().expect("the callback thread must finish");
+    wait_for_condition("overflow persistence events must drain", || {
+        state.persistence_status().unwrap().queued() == 0
+    })
+    .await;
+
+    for id in [&first_id, &second_id] {
+        assert!(state.tv_for(id).is_none());
+        assert_eq!(state.get(id).unwrap().status().phase(), TaskPhase::Failed);
+        assert_eq!(state.list_runs(id)[0].phase(), TaskPhase::Failed);
+    }
+    state.shutdown_persistence().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn persistence_admission_precedes_lifecycle_gate_for_async_and_callback_writes() {
+    let (sink_entered_tx, sink_entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (sink_release_tx, sink_release_rx) = std::sync::mpsc::sync_channel(1);
+    let sink = Arc::new(ArmableBlockingStateSink {
+        block_next: AtomicBool::new(false),
+        entered: sink_entered_tx,
+        release: Mutex::new(sink_release_rx),
+    });
+    let state = TaskState::try_with_config_sink_and_persistence(
+        StateConfig::new(),
+        Some(sink.clone()),
+        PersistenceConfig::new()
+            .try_with_state_queue_capacity(2)
+            .unwrap(),
+    )
+    .unwrap();
+    let callback_id = add_test_task(&state, "callback-terminal");
+    let callback_tv = taskvisor::TaskId::for_tests();
+    bind_test_task(&state, &callback_id, callback_tv);
+    let finalizer_id = add_test_task(&state, "async-finalizer");
+    let finalizer_tv = taskvisor::TaskId::for_tests();
+    let finalizer_binding = bind_test_task(&state, &finalizer_id, finalizer_tv);
+    assert!(state.transition_attempt_starting(&finalizer_binding, 1));
+    wait_for_condition("setup persistence events must drain", || {
+        state.persistence_status().unwrap().queued() == 0
+    })
+    .await;
+
+    let observer = Arc::new(RuntimeObserver::with_output_hub(
+        state.clone(),
+        Arc::new(OutputHub::new(OutputConfig::default())),
+    ));
+    observer
+        .finalize_unavailable(callback_tv.get(), "outcome unavailable".into())
+        .await;
+    assert_eq!(state.tv_for(&callback_id), Some(callback_tv));
+    sink.block_next.store(true, Ordering::Release);
+    add_test_task(&state, "active-persistence-callback");
+    sink_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("one persistence callback must stay active");
+    assert_eq!(state.persistence_status().unwrap().queued(), 1);
+
+    let (gate_held_tx, gate_held_rx) = std::sync::mpsc::sync_channel(1);
+    let (gate_release_tx, gate_release_rx) = std::sync::mpsc::sync_channel(1);
+    let gate = observer.lifecycle_gate.clone();
+    let gate_holder = std::thread::spawn(move || {
+        let guard = gate.lock_from_taskvisor_callback();
+        gate_held_tx
+            .send(())
+            .expect("the test must observe the held lifecycle gate");
+        gate_release_rx
+            .recv()
+            .expect("the test must release the lifecycle gate");
+        drop(guard);
+    });
+    gate_held_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the lifecycle gate must be held");
+
+    let canceled_finalizer = {
+        let observer = Arc::clone(&observer);
+        tokio::spawn(async move {
+            observer
+                .finalize_async(
+                    finalizer_tv.get(),
+                    Finalization {
+                        phase: TaskPhase::Succeeded,
+                        error: None,
+                        exit_code: None,
+                        force: true,
+                        safe_without_barrier: true,
+                    },
+                )
+                .await;
+        })
+    };
+    wait_for_condition(
+        "the canceled finalizer must own two permits while waiting asynchronously for the gate",
+        || {
+            state.persistence_status().unwrap().queued() == 3
+                && state.active_persistence_admissions() == 1
+                && observer.lifecycle_gate.waiters() == 1
+        },
+    )
+    .await;
+    canceled_finalizer.abort();
+    assert!(canceled_finalizer.await.unwrap_err().is_cancelled());
+    wait_for_condition(
+        "canceling after admission must release both permits and the gate waiter",
+        || {
+            state.persistence_status().unwrap().queued() == 1
+                && state.active_persistence_admissions() == 0
+                && observer.lifecycle_gate.waiters() == 0
+        },
+    )
+    .await;
+    assert_eq!(state.tv_for(&finalizer_id), Some(finalizer_tv));
+
+    let callback_event = Event::new(EventKind::TaskRemoved).with_id(callback_tv);
+    let (callback_done_tx, callback_done_rx) = tokio::sync::oneshot::channel();
+    let callback_observer = Arc::clone(&observer);
+    let callback = std::thread::spawn(move || {
+        callback_observer.on_event(&callback_event);
+        let _ = callback_done_tx.send(());
+    });
+    wait_for_condition(
+        "TaskRemoved must reserve its maximum finalization batch before the lifecycle gate",
+        || {
+            state.persistence_status().unwrap().queued() == 3
+                && observer.lifecycle_gate.waiters() == 1
+        },
+    )
+    .await;
+
+    let mut finalizer = {
+        let observer = Arc::clone(&observer);
+        tokio::spawn(async move {
+            observer
+                .finalize_async(
+                    finalizer_tv.get(),
+                    Finalization {
+                        phase: TaskPhase::Succeeded,
+                        error: None,
+                        exit_code: None,
+                        force: true,
+                        safe_without_barrier: true,
+                    },
+                )
+                .await;
+        })
+    };
+    tokio::task::yield_now().await;
+    assert_eq!(state.persistence_status().unwrap().queued(), 3);
+    assert_eq!(observer.lifecycle_gate.waiters(), 1);
+
+    let sink_release = tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        sink_release_tx
+            .send(())
+            .expect("ordinary Tokio work must release the persistence callback");
+    });
+    gate_release_tx
+        .send(())
+        .expect("the lifecycle gate holder must still be waiting");
+
+    sink_release.await.expect("sink release task must finish");
+    let callback_completed = tokio::time::timeout(Duration::from_secs(2), callback_done_rx)
+        .await
+        .is_ok();
+    let finalizer_completed = tokio::time::timeout(Duration::from_secs(2), &mut finalizer).await;
+    if finalizer_completed.is_err() {
+        finalizer.abort();
+        let _ = finalizer.await;
+    }
+    assert!(
+        callback_completed && finalizer_completed.is_ok(),
+        "TaskRemoved and the async finalizer must not retain the lifecycle gate and persistence permits while waiting for each other"
+    );
+    finalizer_completed
+        .expect("the async finalizer must finish")
+        .expect("the async finalizer task must finish");
+    callback.join().expect("the callback thread must finish");
+    gate_holder
+        .join()
+        .expect("the lifecycle gate holder must finish");
+    wait_for_condition("all persistence ownership must be released", || {
+        state.persistence_status().unwrap().queued() == 0
+    })
+    .await;
+
+    assert_eq!(
+        state.get(&callback_id).unwrap().status().phase(),
+        TaskPhase::Failed
+    );
+    assert!(state.tv_for(&callback_id).is_none());
+    assert_eq!(
+        state.get(&finalizer_id).unwrap().status().phase(),
+        TaskPhase::Succeeded
+    );
+    assert!(state.tv_for(&finalizer_id).is_none());
+    state.shutdown_persistence().await;
+}
+
+#[tokio::test]
+async fn confirmed_shutdown_releases_waiter_error_without_task_removed_event() {
     let (sub, state, id) = setup("shutdown-missing-outcome");
     let tv = state.tv_for(&id).expect("bound task");
 
-    sub.finalize_unavailable(tv.get(), "task outcome unavailable: shutting down".into());
-    sub.finalize_pending_after_confirmed_shutdown();
+    sub.finalize_unavailable(tv.get(), "task outcome unavailable: shutting down".into())
+        .await;
+    sub.finalize_pending_after_confirmed_shutdown().await;
 
     assert!(state.tv_for(&id).is_none());
     let task = state.get(&id).expect("retained failed task");

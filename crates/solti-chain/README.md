@@ -216,6 +216,9 @@ Completed side effects are not rolled back.
 ## Output
 
 All steps publish to one outer Task output sink for the current attempt.
+Concurrent attempts of the same built chain keep separate sinks and sequence counters.
+Nested runners must acquire their sink from the attempt future before spawning
+separate output tasks, as required by the `solti-runner` output contract.
 The chain also writes step markers:
 
 ```text

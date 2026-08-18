@@ -582,6 +582,8 @@ mod tests {
         if let Ok(capacity) = usize::try_from(u64::from(u32::MAX) + 1) {
             assert!(config().with_cleanup_capacity(capacity).validate().is_err());
         }
-        assert!(config().with_cleanup_capacity(1).validate().is_ok());
+        let maximum = tokio::sync::Semaphore::MAX_PERMITS
+            .min(usize::try_from(u32::MAX).expect("supported targets can represent u32 capacity"));
+        assert!(config().with_cleanup_capacity(maximum).validate().is_ok());
     }
 }

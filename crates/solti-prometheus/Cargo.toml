@@ -52,6 +52,7 @@ tracing    = { workspace = true, optional = true }
 
 [dev-dependencies]
 solti-core = { workspace = true, features = ["test-util"] }
+taskvisor  = { workspace = true, features = ["test-util"] }
 
 [[example]]
 name              = "adapter_metrics"

@@ -20,7 +20,6 @@ schema  = ["dep:schemars", "solti-model/schema"]
 
 [dependencies]
 bytes        = { workspace = true }
-parking_lot  = { workspace = true }
 schemars     = { workspace = true, optional = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
@@ -28,6 +27,7 @@ solti-model  = { workspace = true, default-features = false }
 solti-runner = { workspace = true }
 taskvisor    = { workspace = true }
 thiserror    = { workspace = true }
+tokio        = { workspace = true, features = ["rt"] }
 tracing      = { workspace = true }
 
 [dev-dependencies]

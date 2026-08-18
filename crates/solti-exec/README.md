@@ -279,7 +279,9 @@ The runner enforces a separate set of lifecycle properties:
 - create, start, wait, terminate, and cleanup futures remain inline in the Taskvisor attempt;
 - timeout drops the current lifecycle future and the returned attempt value;
 - force-abort requests actor abort; physical drop follows after any synchronous poll returns to Tokio;
-- at most two output reader tasks exist per attempt and both abort on drop.
+- at most two output reader tasks exist per attempt;
+- the attempt owns both reader handles, drains them on normal completion, and
+  aborts them on physical drop so their pipe endpoints are released.
 
 The runner never detaches an engine lifecycle future.
 Force-drop cannot itself complete remote cleanup.
@@ -287,7 +289,10 @@ The selected ownership declaration defines what the engine must do when its stat
 
 The native containerd engine uses separate bounded domains for remote cleanup
 and blocking local I/O. Filesystem preparation and removal do not run on Tokio
-workers. Engine shutdown drains both domains within one shared deadline.
+workers. Queue nodes are allocated only for admitted operations, not in
+proportion to the configured capacity. Separate admission semaphores retain the
+exact remote-cleanup and local-I/O ownership bounds. Engine shutdown drains both
+domains within one shared deadline.
 Its concrete handle converts to `ContainerEngineBinding` with the
 `PreAdmittedFinalizer` declaration because that behavior is implemented by the
 native adapter for attempt-owned local I/O, snapshots, containers, and tasks.

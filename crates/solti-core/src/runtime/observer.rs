@@ -34,12 +34,15 @@ use std::{
 
 use parking_lot::Mutex;
 use taskvisor::{Event, EventKind, Subscribe};
-use tokio::sync::watch;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, watch};
 use tracing::{trace, warn};
 
 use crate::map::phase::{phase_for_outcome, phase_for_outcome_kind, phase_for_rejection};
 use crate::output::OutputHub;
-use crate::state::{ResourceGeneration, RuntimeBinding, TaskState};
+use crate::persistence::{StateAdmissionClosed, block_on_thread};
+use crate::state::{
+    ResourceGeneration, RuntimeBinding, StateMutationEventCapacity, StateWriteAdmission, TaskState,
+};
 use solti_model::{TaskId, TaskPhase};
 
 const RUNTIME_OBSERVER_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(2048).unwrap();
@@ -51,16 +54,58 @@ const EVENT_BARRIER_TIMEOUT: Duration = Duration::from_secs(1);
 /// Event, completion, and management paths share this gate.
 #[derive(Clone, Default)]
 struct LifecycleGate {
-    inner: Arc<Mutex<()>>,
+    inner: Arc<AsyncMutex<()>>,
+    #[cfg(test)]
+    waiters: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl LifecycleGate {
-    fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.inner.lock()
+#[cfg(test)]
+struct LifecycleWaiter {
+    waiters: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl Drop for LifecycleWaiter {
+    fn drop(&mut self) {
+        self.waiters
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
-#[derive(Clone)]
+impl LifecycleGate {
+    #[cfg(test)]
+    fn track_waiter(&self) -> LifecycleWaiter {
+        self.waiters
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        LifecycleWaiter {
+            waiters: Arc::clone(&self.waiters),
+        }
+    }
+
+    async fn lock(&self) -> OwnedMutexGuard<()> {
+        #[cfg(test)]
+        let waiter = self.track_waiter();
+        let guard = Arc::clone(&self.inner).lock_owned().await;
+        #[cfg(test)]
+        drop(waiter);
+        guard
+    }
+
+    fn lock_from_taskvisor_callback(&self) -> OwnedMutexGuard<()> {
+        #[cfg(test)]
+        let waiter = self.track_waiter();
+        let guard = block_on_thread(Arc::clone(&self.inner).lock_owned());
+        #[cfg(test)]
+        drop(waiter);
+        guard
+    }
+
+    #[cfg(test)]
+    fn waiters(&self) -> usize {
+        self.waiters.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 struct Finalization {
     phase: TaskPhase,
     error: Option<String>,
@@ -142,13 +187,13 @@ impl RuntimeObserver {
     /// Binds a prepared submission before it can publish events.
     ///
     /// Returns `false` for a stale UID or generation.
-    pub(crate) fn bind(
+    pub(crate) async fn bind(
         &self,
         resource: ResourceGeneration,
         tv: taskvisor::TaskId,
         ensure_output: bool,
     ) -> bool {
-        let _lifecycle = self.lifecycle_gate.lock();
+        let _lifecycle = self.lifecycle_gate.lock().await;
         let task_id = resource.name.clone();
         let task_uid = resource.uid.clone();
         if !self.state.bind_tv(resource, tv) {
@@ -165,8 +210,8 @@ impl RuntimeObserver {
     /// No Taskvisor event can exist before controller intake. The desired state
     /// remains pending for the newer reconciliation instead of recording an
     /// intake failure for the superseded generation.
-    pub(crate) fn release_unsubmitted_binding(&self, binding: &RuntimeBinding) -> bool {
-        let _lifecycle = self.lifecycle_gate.lock();
+    pub(crate) async fn release_unsubmitted_binding(&self, binding: &RuntimeBinding) -> bool {
+        let _lifecycle = self.lifecycle_gate.lock().await;
         if self.state.resolve_tv(binding.tv.get()).as_ref() != Some(binding) {
             return false;
         }
@@ -180,22 +225,32 @@ impl RuntimeObserver {
     /// Releases a failed runtime intake binding.
     ///
     /// The desired resource remains with `Reconciled=False`.
-    pub(crate) fn fail_bound_reconciliation(
+    pub(crate) async fn fail_bound_reconciliation(
         &self,
         binding: &RuntimeBinding,
         reason: &'static str,
         message: String,
     ) -> bool {
-        let _lifecycle = self.lifecycle_gate.lock();
+        let admission = self
+            .state
+            .admit_state_write(StateMutationEventCapacity::TaskChange)
+            .await;
+        let Ok(admission) = admission else {
+            return false;
+        };
+        let _lifecycle = self.lifecycle_gate.lock().await;
         if self.state.resolve_tv(binding.tv.get()).as_ref() != Some(binding) {
             return false;
         }
 
         self.state.unbind_tv(binding.tv.get());
         self.output_hub.evict(&binding.resource.name);
-        let changed = self
-            .state
-            .mark_reconciliation_failed(&binding.resource, reason, message);
+        let changed = self.state.mark_reconciliation_failed_admitted(
+            &binding.resource,
+            reason,
+            message,
+            admission,
+        );
         self.mark_completed_locked(binding.tv.get());
         changed
     }
@@ -245,16 +300,26 @@ impl RuntimeObserver {
         finalization: Finalization,
         wait_for_barrier: bool,
     ) {
-        let notification = {
-            let _lifecycle = self.lifecycle_gate.lock();
+        let (ready, notification) = {
+            let _lifecycle = self.lifecycle_gate.lock().await;
             self.register_finalization_locked(tv_raw, finalization, wait_for_barrier)
         };
+
+        if let Some(finalization) = ready {
+            self.finalize_async(tv_raw, finalization).await;
+            return;
+        }
 
         if let Some(notification) = notification
             && !Self::wait_for_finalization(notification).await
         {
-            let _lifecycle = self.lifecycle_gate.lock();
-            self.force_pending_locked(tv_raw);
+            let pending = {
+                let _lifecycle = self.lifecycle_gate.lock().await;
+                self.take_safe_pending_locked(tv_raw)
+            };
+            if let Some(finalization) = pending {
+                self.finalize_async(tv_raw, finalization).await;
+            }
         }
     }
 
@@ -275,7 +340,7 @@ impl RuntimeObserver {
     }
 
     /// Preserves a waiter failure until `TaskRemoved` proves cleanup.
-    pub(crate) fn finalize_unavailable(&self, tv_raw: u64, error: String) {
+    pub(crate) async fn finalize_unavailable(&self, tv_raw: u64, error: String) {
         let finalization = Finalization {
             phase: TaskPhase::Failed,
             error: Some(error),
@@ -283,8 +348,14 @@ impl RuntimeObserver {
             force: false,
             safe_without_barrier: false,
         };
-        let _lifecycle = self.lifecycle_gate.lock();
-        self.register_finalization_locked(tv_raw, finalization, true);
+        let ready = {
+            let _lifecycle = self.lifecycle_gate.lock().await;
+            self.register_finalization_locked(tv_raw, finalization, true)
+                .0
+        };
+        if let Some(finalization) = ready {
+            self.finalize_async(tv_raw, finalization).await;
+        }
     }
 
     /// Waits for finalization after Taskvisor confirms cleanup.
@@ -295,7 +366,7 @@ impl RuntimeObserver {
     pub(crate) async fn settle_after_confirmed_cleanup(&self, tv: taskvisor::TaskId) {
         let tv_raw = tv.get();
         let mut notification = {
-            let _lifecycle = self.lifecycle_gate.lock();
+            let _lifecycle = self.lifecycle_gate.lock().await;
             if self.state.resolve_tv(tv_raw).is_none() {
                 return;
             }
@@ -310,16 +381,24 @@ impl RuntimeObserver {
     }
 
     /// Deletes local state after Taskvisor cleanup is settled.
-    pub(crate) fn delete_after_cleanup(&self, id: &TaskId, tv: Option<taskvisor::TaskId>) -> bool {
-        let _lifecycle = self.lifecycle_gate.lock();
-        let removed = self.state.delete_task(id);
+    pub(crate) async fn delete_after_cleanup(
+        &self,
+        id: &TaskId,
+        tv: Option<taskvisor::TaskId>,
+    ) -> Result<bool, StateAdmissionClosed> {
+        let admission = self
+            .state
+            .admit_state_write(StateMutationEventCapacity::TaskChange)
+            .await?;
+        let _lifecycle = self.lifecycle_gate.lock().await;
+        let removed = self.state.delete_task_admitted(id, admission);
         if removed || tv.is_some() {
             self.output_hub.evict(id);
         }
         if let Some(tv) = tv {
             self.mark_completed_locked(tv.get());
         }
-        removed
+        Ok(removed)
     }
 
     async fn wait_for_finalization(mut notification: watch::Receiver<bool>) -> bool {
@@ -337,8 +416,10 @@ impl RuntimeObserver {
         tv_raw: u64,
         finalization: Finalization,
         wait_for_barrier: bool,
-    ) -> Option<watch::Receiver<bool>> {
-        self.state.resolve_tv(tv_raw)?;
+    ) -> (Option<Finalization>, Option<watch::Receiver<bool>>) {
+        if self.state.resolve_tv(tv_raw).is_none() {
+            return (None, None);
+        }
 
         let (finalize_now, notification) = {
             let mut barriers = self.completion_barriers.lock();
@@ -359,45 +440,42 @@ impl RuntimeObserver {
                 (None, Some(barriers.notification(tv_raw)))
             }
         };
-
-        if let Some(finalization) = finalize_now {
-            self.finalize_locked(tv_raw, finalization);
-        }
-        notification
+        (finalize_now, notification)
     }
 
-    fn force_pending_locked(&self, tv_raw: u64) {
-        let pending = {
-            let mut barriers = self.completion_barriers.lock();
-            if barriers
-                .pending
-                .get(&tv_raw)
-                .is_some_and(|pending| pending.safe_without_barrier)
-            {
-                barriers.pending.remove(&tv_raw)
-            } else {
-                None
-            }
-        };
-        if let Some(finalization) = pending {
-            self.finalize_locked(tv_raw, finalization);
+    fn take_safe_pending_locked(&self, tv_raw: u64) -> Option<Finalization> {
+        let mut barriers = self.completion_barriers.lock();
+        if barriers
+            .pending
+            .get(&tv_raw)
+            .is_some_and(|pending| pending.safe_without_barrier)
+        {
+            barriers.pending.remove(&tv_raw)
+        } else {
+            None
         }
     }
 
-    fn force_all_safe_pending_locked(&self) {
-        let pending = {
-            let mut barriers = self.completion_barriers.lock();
-            let ids: Vec<u64> = barriers
+    fn force_all_safe_pending_from_taskvisor_callback(&self) {
+        let ids = {
+            let _lifecycle = self.lifecycle_gate.lock_from_taskvisor_callback();
+            self.completion_barriers
+                .lock()
                 .pending
                 .iter()
                 .filter_map(|(id, pending)| pending.safe_without_barrier.then_some(*id))
-                .collect();
-            ids.into_iter()
-                .filter_map(|id| barriers.pending.remove(&id).map(|pending| (id, pending)))
                 .collect::<Vec<_>>()
         };
-        for (tv_raw, finalization) in pending {
-            self.finalize_locked(tv_raw, finalization);
+        for tv_raw in ids {
+            let Ok(admission) = self.state.admit_state_write_from_taskvisor_callback(
+                StateMutationEventCapacity::TaskAndRunChange,
+            ) else {
+                return;
+            };
+            let _lifecycle = self.lifecycle_gate.lock_from_taskvisor_callback();
+            if let Some(finalization) = self.take_safe_pending_locked(tv_raw) {
+                self.finalize_admitted_locked(tv_raw, finalization, admission);
+            }
         }
     }
 
@@ -405,18 +483,18 @@ impl RuntimeObserver {
     ///
     /// At that point no registered runtime remains. A missing per-task
     /// `TaskRemoved` event is no longer needed as cleanup evidence.
-    pub(crate) fn finalize_pending_after_confirmed_shutdown(&self) {
-        let _lifecycle = self.lifecycle_gate.lock();
+    pub(crate) async fn finalize_pending_after_confirmed_shutdown(&self) {
         let pending = {
+            let _lifecycle = self.lifecycle_gate.lock().await;
             let mut barriers = self.completion_barriers.lock();
             barriers.pending.drain().collect::<Vec<_>>()
         };
         for (tv_raw, finalization) in pending {
-            self.finalize_locked(tv_raw, finalization);
+            self.finalize_async(tv_raw, finalization).await;
         }
     }
 
-    fn task_removed_locked(&self, tv_raw: u64) {
+    fn task_removed_admitted_locked(&self, tv_raw: u64, admission: StateWriteAdmission) {
         let pending = {
             let mut barriers = self.completion_barriers.lock();
             let pending = barriers.pending.remove(&tv_raw);
@@ -426,17 +504,35 @@ impl RuntimeObserver {
             pending
         };
         if let Some(finalization) = pending {
-            self.finalize_locked(tv_raw, finalization);
+            self.finalize_admitted_locked(tv_raw, finalization, admission);
         }
     }
 
-    fn finalize_locked(&self, tv_raw: u64, finalization: Finalization) {
-        if let Some(model_id) = self.state.finalize_if_bound(
+    async fn finalize_async(&self, tv_raw: u64, finalization: Finalization) {
+        let admission = self
+            .state
+            .admit_state_write(StateMutationEventCapacity::TaskAndRunChange)
+            .await;
+        let Ok(admission) = admission else {
+            return;
+        };
+        let _lifecycle = self.lifecycle_gate.lock().await;
+        self.finalize_admitted_locked(tv_raw, finalization, admission);
+    }
+
+    fn finalize_admitted_locked(
+        &self,
+        tv_raw: u64,
+        finalization: Finalization,
+        admission: StateWriteAdmission,
+    ) {
+        if let Some(model_id) = self.state.finalize_if_bound_admitted(
             tv_raw,
             finalization.phase,
             finalization.error,
             finalization.exit_code,
             finalization.force,
+            admission,
         ) {
             self.output_hub.evict(&model_id);
         }
@@ -457,8 +553,33 @@ impl RuntimeObserver {
 }
 
 impl RuntimeObserver {
-    /// Applies one event while holding the lifecycle gate.
-    fn apply_event_locked(&self, event: &Event) {
+    fn event_state_capacity(event: &Event) -> StateMutationEventCapacity {
+        if event.id.is_none() {
+            return StateMutationEventCapacity::None;
+        }
+        match event.kind {
+            EventKind::AttemptStarting
+            | EventKind::AttemptSucceeded
+            | EventKind::AttemptCanceled
+            | EventKind::AttemptFailed
+            | EventKind::AttemptTimedOut
+                if event.attempt.is_some_and(|attempt| attempt > 0) =>
+            {
+                StateMutationEventCapacity::AttemptTransition
+            }
+            EventKind::TaskFinished if event.outcome_kind.is_some() => {
+                StateMutationEventCapacity::TaskChange
+            }
+            EventKind::ControllerRejected | EventKind::TaskAddFailed => {
+                StateMutationEventCapacity::TaskChange
+            }
+            EventKind::TaskRemoved => StateMutationEventCapacity::TaskAndRunChange,
+            _ => StateMutationEventCapacity::None,
+        }
+    }
+
+    /// Applies one pre-admitted event while holding the lifecycle gate.
+    fn apply_event_admitted_locked(&self, event: &Event, admission: StateWriteAdmission) {
         let Some(tv) = event.id else {
             return;
         };
@@ -474,7 +595,7 @@ impl RuntimeObserver {
         // Output cleanup does not own the retained SDK resource. The
         // direct completion finalizes it; explicit delete removes it eagerly.
         if event.kind == EventKind::TaskRemoved {
-            self.task_removed_locked(tv_raw);
+            self.task_removed_admitted_locked(tv_raw, admission);
             return;
         }
 
@@ -513,7 +634,10 @@ impl RuntimeObserver {
                     stage = "starting",
                     "task attempt starting"
                 );
-                if self.state.transition_attempt_starting(&binding, attempt) {
+                if self
+                    .state
+                    .transition_attempt_starting_admitted(&binding, attempt, admission)
+                {
                     self.output_hub.announce_run_started(
                         task_id,
                         &binding.resource.uid,
@@ -556,12 +680,13 @@ impl RuntimeObserver {
                     stage = "succeeded",
                     "task attempt succeeded"
                 );
-                if self.state.transition_attempt_finished(
+                if self.state.transition_attempt_finished_admitted(
                     &binding,
                     attempt,
                     TaskPhase::Succeeded,
                     None,
                     None,
+                    admission,
                 ) {
                     self.output_hub.announce_run_finished(
                         task_id,
@@ -606,12 +731,13 @@ impl RuntimeObserver {
                     stage = "canceled",
                     "task attempt canceled"
                 );
-                if self.state.transition_attempt_finished(
+                if self.state.transition_attempt_finished_admitted(
                     &binding,
                     attempt,
                     TaskPhase::Canceled,
                     None,
                     None,
+                    admission,
                 ) {
                     self.output_hub.announce_run_finished(
                         task_id,
@@ -662,12 +788,13 @@ impl RuntimeObserver {
                     exit_code = ?event.exit_code,
                     "task attempt failed",
                 );
-                if self.state.transition_attempt_finished(
+                if self.state.transition_attempt_finished_admitted(
                     &binding,
                     attempt,
                     TaskPhase::Failed,
                     Some(reason),
                     event.exit_code,
+                    admission,
                 ) {
                     self.output_hub.announce_run_finished(
                         task_id,
@@ -716,12 +843,13 @@ impl RuntimeObserver {
                     stage = "timed_out",
                     "task attempt timed out"
                 );
-                if self.state.transition_attempt_finished(
+                if self.state.transition_attempt_finished_admitted(
                     &binding,
                     attempt,
                     TaskPhase::Timeout,
                     Some(error),
                     None,
+                    admission,
                 ) {
                     self.output_hub.announce_run_finished(
                         task_id,
@@ -770,7 +898,7 @@ impl RuntimeObserver {
                 );
                 if !self
                     .state
-                    .transition_task_finished(&binding, phase, error, exit_code)
+                    .transition_task_finished_admitted(&binding, phase, error, exit_code, admission)
                 {
                     warn!(
                         event = "taskvisor.event_stale",
@@ -802,10 +930,13 @@ impl RuntimeObserver {
                     outcome = "controller_rejected",
                     "task rejected"
                 );
-                if !self
-                    .state
-                    .transition_task_finished(&binding, phase, Some(reason), None)
-                {
+                if !self.state.transition_task_finished_admitted(
+                    &binding,
+                    phase,
+                    Some(reason),
+                    None,
+                    admission,
+                ) {
                     warn!(
                         event = "taskvisor.event_stale",
                         task_name = %task_id,
@@ -836,10 +967,13 @@ impl RuntimeObserver {
                     outcome = "task_add_failed",
                     "task submission failed"
                 );
-                if !self
-                    .state
-                    .transition_task_finished(&binding, phase, Some(reason), None)
-                {
+                if !self.state.transition_task_finished_admitted(
+                    &binding,
+                    phase,
+                    Some(reason),
+                    None,
+                    admission,
+                ) {
                     warn!(
                         event = "taskvisor.event_stale",
                         task_name = %task_id,
@@ -858,18 +992,24 @@ impl RuntimeObserver {
 
 impl Subscribe for RuntimeObserver {
     fn on_event(&self, event: &Event) {
-        let _lifecycle = self.lifecycle_gate.lock();
         if event.kind == EventKind::SubscriberOverflow {
             if event.task.as_deref().is_some_and(|subscriber| {
                 subscriber != self.name() && subscriber != "subscriber_listener"
             }) {
                 return;
             }
-            self.force_all_safe_pending_locked();
+            self.force_all_safe_pending_from_taskvisor_callback();
             return;
         }
 
-        self.apply_event_locked(event);
+        let Ok(admission) = self
+            .state
+            .admit_state_write_from_taskvisor_callback(Self::event_state_capacity(event))
+        else {
+            return;
+        };
+        let _lifecycle = self.lifecycle_gate.lock_from_taskvisor_callback();
+        self.apply_event_admitted_locked(event, admission);
     }
 
     fn name(&self) -> &'static str {
@@ -892,9 +1032,13 @@ impl RuntimeObserver {
         tv_raw: u64,
         outcome: &taskvisor::TaskOutcome,
     ) {
-        let _lifecycle = self.lifecycle_gate.lock();
+        let admission = self
+            .state
+            .admit_state_write_from_taskvisor_callback(StateMutationEventCapacity::TaskAndRunChange)
+            .expect("test finalization requires open state persistence");
+        let _lifecycle = self.lifecycle_gate.lock_from_taskvisor_callback();
         let (phase, error, exit_code) = phase_for_outcome(outcome);
-        self.finalize_locked(
+        self.finalize_admitted_locked(
             tv_raw,
             Finalization {
                 phase,
@@ -903,6 +1047,7 @@ impl RuntimeObserver {
                 force: Self::is_known_outcome(outcome),
                 safe_without_barrier: true,
             },
+            admission,
         );
     }
 }

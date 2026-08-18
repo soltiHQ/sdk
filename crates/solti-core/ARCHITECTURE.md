@@ -341,7 +341,12 @@ Finalization waits for that barrier for at most one second.
 Subscriber overflow releases finalizations that are safe without the barrier.
 
 The lifecycle gate serializes short event, completion, and management commits.
-It is not held while waiting for Taskvisor.
+Tokio-owned paths await it asynchronously. Taskvisor callbacks poll the same
+fair gate only on their dedicated callback workers. A state-mutating path
+reserves persistence ownership before entering the lifecycle gate. Metadata-only
+gate sections never wait for persistence ownership. This single order prevents
+a callback and an async finalizer from retaining one resource while waiting for
+the other. The gate is not held while waiting for Taskvisor.
 
 Typed `TaskOutcomeKind` and `RejectionKind` values select terminal phases.
 Free-form reason text remains diagnostic.
@@ -371,8 +376,14 @@ One `RwLock` protects the complete state.
 A resource mutation and its change-journal entry happen under the same write lock.
 
 An optional state sink receives the committed task snapshot or run value through a bounded FIFO dispatcher shared by all `TaskState` clones.
-Each production write path declares its maximum event count and atomically reserves that many slots before acquiring the state lock.
-Admission is FIFO and does not partially acquire a reservation.
+Each production write path declares its maximum event count and atomically reserves that many slots before acquiring the lifecycle gate, state lock, or spawn gate.
+Tokio-owned paths await a fair semaphore; Taskvisor subscriber callbacks poll the same admission future on their dedicated callback threads.
+Both caller kinds therefore share one FIFO without synchronously parking a Tokio worker.
+Canceling an async wait returns any provisional semaphore capacity.
+`TaskRemoved` reserves the maximum finalization batch before the lifecycle gate.
+Subscriber overflow first snapshots safe pending identities in a metadata-only
+gate section, then reserves and rechecks each identity separately in the same
+persistence-before-lifecycle order.
 Dropping the write guard releases the state lock before marking its batch ready; the publisher never crosses an unready queue front.
 Application code therefore runs on one dedicated persistence worker and never under the state lock.
 For configured capacity `C`, `reserved + buffered + active <= C + 1`; `active` is zero or one and every admitted event owns exactly one permit.
@@ -380,9 +391,21 @@ The largest atomic commit contains three events: one task change, at most one im
 The minimum configured capacity is therefore two buffered events, for a hard bound of three including the active callback.
 Unused reservations return only after the state lock is released.
 When the bound is reached, a writer waits before entering its state critical section.
+Every eventful mutation first owns a lease from a sink-independent admission
+fence. Shutdown closes that fence under the same mutex used to issue leases and
+waits for every pre-boundary lease to commit or be dropped. A post-boundary
+admission is closed. Public mutations map that closure to
+`CoreError::ShuttingDown`, while a late Taskvisor callback returns without a
+state mutation, including when no state sink is configured.
+With a configured sink, admission also clones the dispatcher sender under the
+same mutex that dispatcher shutdown uses to remove it. A pre-boundary admission
+retains that sender while it waits, commits, and dispatches. Dispatcher shutdown
+runs after the common mutation fence drains, closes its sender, and drains every
+accepted event.
 Retention sweeps publish each expired task deletion as a separate revalidated commit batch.
 Run events carry both task name and resource UID.
 The sink must eventually return and must not mutate `TaskState`, directly or through a thread it waits for; reads are allowed.
+It may wait for unrelated Tokio work.
 Polling `SupervisorApi::shutdown` on the state callback worker panics before
 shutdown changes state. A state callback must not wait for another thread that
 calls shutdown; that cycle can deadlock.
@@ -422,34 +445,26 @@ leases and 64 MiB across one state. Bytes return to the ledger when a buffered
 event is yielded. Dropping a watch, a terminal error, and shutdown release the
 remaining lease without evicting another watch.
 
-Lag recovery retains only a revision and an event probe across a pending poll.
-It waits on the same byte ledger and re-reads the journal after wakeup. The
-capacity check and waker registration share one mutex critical section. State
-locks are released before predicates, byte measurement, admission, and wakeup.
-History invalidation replaces an identity token after releasing the state lock,
-then wakes admission waiters. Recovery compares the token in the same critical
-section that registers its waker. Compaction before registration is therefore
-observed as a token change, while compaction after registration wakes the
-stream. Compaction during the wait produces the existing expired-version
-error. One event larger than the complete byte budget is transferred directly
-in `Poll::Ready` and is not retained internally.
+Live delivery owns one coalesced latest-revision notification for the entire
+state. A watcher retains only its cursor and reads each next payload lazily from
+the shared journal by binary-searching its ordered revisions. It owns no private
+live-event ring or recovery buffer. The
+state lock makes journal mutation and revision publication one observed commit:
+subscription captures its receiver and cursor under a read lock, while writers
+publish under the write lock. Compaction of the next required revision produces
+the existing expired-version error.
 
 Resource revisions do not all produce Task changes. After replaying retained
-changes through a captured recovery target, a watch advances across a trailing
+changes through a coalesced notification target, a watch advances across a trailing
 revision gap without emitting an event. A pending exact event probe that
 disappears from retained history still expires the watch.
 
 List continuations and watches share one change journal.
 The journal is bounded by change count and serialized task bytes.
-For a journal capacity above one, the live broadcast ring is the largest power
-of two strictly below the journal capacity. This leaves count headroom when
-real lag is reported. It does not reserve byte headroom: the independent byte
-budget may compact required changes or retain none. A journal capacity of one
-remains valid and has no count headroom for lag recovery.
-
-An oversized change is delivered to current live subscribers.
-It is not retained for replay.
-Older resume points become compacted.
+Journal storage grows lazily; its configured count does not size an eager live
+allocation. An oversized change cannot enter the strict byte bound. It compacts
+the journal through its own revision and expires every older watcher or resume
+point rather than retaining payload through an unaccounted delivery path.
 
 Adapter predicates participate in collection semantics.
 They run before pagination.

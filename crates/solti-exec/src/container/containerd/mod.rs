@@ -54,6 +54,9 @@
 //! by attempt cleanup or handed to the cleanup domain when the create future is
 //! dropped. After attempt ownership begins, cancellation transfers confirmed or
 //! uncertain ownership without waiting.
+//! Cleanup and blocking-I/O queues allocate nodes only for admitted operations.
+//! They do not reserve queue storage proportional to the configured limit. The
+//! admission semaphores remain exact bounds over active and queued ownership.
 //! Identity mismatch prevents adoption and deletion.
 //! The configured containerd namespace must not replace an attempt resource
 //! between identity verification and deletion.
