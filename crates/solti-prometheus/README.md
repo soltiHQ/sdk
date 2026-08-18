@@ -1,7 +1,8 @@
 # solti-prometheus
 
 `solti-prometheus` is the metrics backend for the Solti SDK.
-Other crates (`solti-runner`, `solti-api`, `solti-discover`, `solti-core`) define metrics traits; this crate implements them against one shared Prometheus `Registry` and can expose it over `/metrics`.
+Other crates (`solti-runner`, `solti-api`, `solti-discover`, `solti-core`) define metrics traits; 
+this crate implements them against one shared Prometheus `Registry` and can expose it over `/metrics`.
 
 ## Quick start
 
@@ -81,8 +82,7 @@ prometheus::Registry
   ├─ solti_discover_*
   ├─ solti_core_tasks_by_phase
   └─ process_*
-             │
-             └─ GET /metrics
+          └─ GET /metrics
 ```
 
 Each adapter registers its collectors as one group.

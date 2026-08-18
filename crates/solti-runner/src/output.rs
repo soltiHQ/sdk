@@ -33,18 +33,16 @@ use solti_model::{OutputChunk, OutputEvent, StreamKind, TaskId};
 /// Implementations decide whether output is enabled for an attempt.
 /// Returning `None` disables output without changing task execution.
 ///
-/// Request the sink from the task attempt future before moving output work into
-/// a separately spawned task. Composition runners may route output through
-/// execution-local context that a new task does not inherit. [`OutputSink`] is
-/// cloneable and its clones can be moved into reader or forwarding tasks.
+/// Request the sink from the task attempt future before moving output work into a separately spawned task.
+/// Composition runners may route output through execution-local context that a new task does not inherit.
+/// [`OutputSink`] is cloneable and its clones can be moved into reader or forwarding tasks.
 ///
 /// This interface has no subscription or lifecycle operations.
 pub trait OutputPublisher: Send + Sync {
     /// Returns a sink for one task attempt.
     ///
     /// Returns `None` when output is disabled.
-    /// Call this from the task attempt future, then clone the returned sink for
-    /// any separately spawned output work.
+    /// Call this from the task attempt future, then clone the returned sink for any separately spawned output work.
     fn sink_for(&self, task_name: &TaskId, generation: u64, attempt: u32) -> Option<OutputSink>;
 }
 
@@ -67,9 +65,8 @@ impl OutputPublisher for NoOpOutputPublisher {
 
 /// Borrowed view of one attempt-scoped output chunk.
 ///
-/// The view is valid only for the duration of the synchronous callback passed
-/// to [`OutputSink::new_borrowed`]. Copy [`Self::line`] when the bytes must be
-/// retained after that callback returns.
+/// The view is valid only for the duration of the synchronous callback passed to [`OutputSink::new_borrowed`].
+/// Copy [`Self::line`] when the bytes must be retained after that callback returns.
 #[derive(Debug, Clone, Copy)]
 pub struct OutputChunkRef<'a> {
     generation: u64,
@@ -139,23 +136,22 @@ enum Publish {
 ///
 /// ## Framing
 ///
-/// Every LF terminates one emitted chunk. A CR immediately before that LF is
-/// part of the delimiter; every other byte remains exact. Empty input emits
-/// one empty chunk. A trailing delimiter terminates its preceding chunk and
-/// does not synthesize another. Consecutive delimiters therefore preserve
-/// intervening empty lines.
+/// Every LF terminates one emitted chunk.
+/// A CR immediately before that LF is part of the delimiter; every other byte remains exact.
+/// Empty input emits one empty chunk.
+/// A trailing delimiter terminates its preceding chunk and does not synthesize another.
+/// Consecutive delimiters therefore preserve intervening empty lines.
 ///
-/// A truncated write marks only its final emitted chunk, including when the
-/// input ends in a delimiter. Sequence numbers are assigned per emitted chunk.
+/// A truncated write marks only its final emitted chunk, including when the input ends in a delimiter.
+/// Sequence numbers are assigned per emitted chunk.
 ///
 /// The callback runs synchronously in the caller.
 /// It must not block runner execution.
-/// An unwinding panic is caught and reported once through structured tracing
-/// without its payload. Once the panic is observed, the sink disables its
-/// callback and drops calls that begin afterwards. Concurrent callback calls
-/// already in progress may still complete or panic. Clones share that sticky
-/// state through [`Self::callback_panicked`]. The process panic hook still runs
-/// before the unwind is caught; its output is controlled by the application.
+/// An unwinding panic is caught and reported once through structured tracing without its payload.
+/// Once the panic is observed, the sink disables its callback and drops calls that begin afterward.
+/// Concurrent callback calls already in progress may still complete or panic.
+/// Clones share that sticky state through [`Self::callback_panicked`].
+/// The process panic hook still runs before the unwind is caught; its output is controlled by the application.
 /// A process built with `panic = "abort"` cannot isolate a callback panic.
 ///
 /// ## Example
@@ -211,9 +207,8 @@ impl OutputSink {
 
     /// Creates a sink with a synchronous borrowed-chunk callback.
     ///
-    /// This constructor lets a composition layer copy a chunk directly into
-    /// its bounded storage without an intermediate payload allocation. The
-    /// callback cannot retain [`OutputChunkRef::line`] after it returns.
+    /// This constructor lets a composition layer copy a chunk directly into its bounded storage without an intermediate payload allocation.
+    /// The callback cannot retain [`OutputChunkRef::line`] after it returns.
     ///
     /// The callback must not block runner execution.
     pub fn new_borrowed<F>(generation: u64, attempt: u32, publish: F) -> Self
@@ -240,8 +235,8 @@ impl OutputSink {
 
     /// Publishes stdout bytes whose final source line was truncated.
     ///
-    /// LF and CRLF delimiters split the input. Only the final emitted chunk is
-    /// marked as truncated; every emitted chunk receives its own sequence.
+    /// LF and CRLF delimiters split the input.
+    /// Only the final emitted chunk is marked as truncated; every emitted chunk receives its own sequence.
     pub fn stdout_line_truncated(&self, line: Bytes) {
         self.push_bytes(StreamKind::Stdout, line, true);
     }
@@ -256,8 +251,8 @@ impl OutputSink {
 
     /// Publishes stderr bytes whose final source line was truncated.
     ///
-    /// LF and CRLF delimiters split the input. Only the final emitted chunk is
-    /// marked as truncated; every emitted chunk receives its own sequence.
+    /// LF and CRLF delimiters split the input.
+    /// Only the final emitted chunk is marked as truncated; every emitted chunk receives its own sequence.
     pub fn stderr_line_truncated(&self, line: Bytes) {
         self.push_bytes(StreamKind::Stderr, line, true);
     }
@@ -265,16 +260,15 @@ impl OutputSink {
     /// Publishes borrowed stdout bytes as delimiter-free chunks.
     ///
     /// This has the same framing and sequence semantics as [`Self::stdout_line`].
-    /// An owned-callback sink copies each emitted chunk once. A
-    /// borrowed-callback sink does not allocate payload storage.
+    /// An owned-callback sink copies each emitted chunk once.
+    /// A borrowed-callback sink does not allocate payload storage.
     pub fn stdout_line_bytes(&self, line: &[u8]) {
         self.push_slice(StreamKind::Stdout, line, false);
     }
 
     /// Publishes borrowed stdout bytes whose final source line was truncated.
     ///
-    /// This has the same framing, truncation, and sequence semantics as
-    /// [`Self::stdout_line_truncated`].
+    /// This has the same framing, truncation, and sequence semantics as [`Self::stdout_line_truncated`].
     pub fn stdout_line_bytes_truncated(&self, line: &[u8]) {
         self.push_slice(StreamKind::Stdout, line, true);
     }
@@ -282,16 +276,15 @@ impl OutputSink {
     /// Publishes borrowed stderr bytes as delimiter-free chunks.
     ///
     /// This has the same framing and sequence semantics as [`Self::stderr_line`].
-    /// An owned-callback sink copies each emitted chunk once. A
-    /// borrowed-callback sink does not allocate payload storage.
+    /// An owned-callback sink copies each emitted chunk once.
+    /// A borrowed-callback sink does not allocate payload storage.
     pub fn stderr_line_bytes(&self, line: &[u8]) {
         self.push_slice(StreamKind::Stderr, line, false);
     }
 
     /// Publishes borrowed stderr bytes whose final source line was truncated.
     ///
-    /// This has the same framing, truncation, and sequence semantics as
-    /// [`Self::stderr_line_truncated`].
+    /// This has the same framing, truncation, and sequence semantics as [`Self::stderr_line_truncated`].
     pub fn stderr_line_bytes_truncated(&self, line: &[u8]) {
         self.push_slice(StreamKind::Stderr, line, true);
     }
@@ -308,10 +301,9 @@ impl OutputSink {
 
     /// Returns whether this sink's callback has panicked.
     ///
-    /// The state is sticky and shared by every clone. Once a panic is observed,
-    /// calls that begin afterwards drop their chunks without invoking the
-    /// callback. Concurrent calls already in progress may still complete or
-    /// panic.
+    /// The state is sticky and shared by every clone.
+    /// Once a panic is observed, calls that begin afterward drop their chunks without invoking the callback.
+    /// Concurrent calls already in progress may still complete or panic.
     pub fn callback_panicked(&self) -> bool {
         self.callback_panicked.load(Ordering::Acquire)
     }
@@ -420,10 +412,10 @@ impl OutputSink {
 }
 
 fn dispose_panic_payload(payload: Box<dyn std::any::Any + Send>) {
-    // A user-defined panic payload may panic again from Drop. Catch that
-    // secondary unwind too. Its replacement payload is forgotten because
-    // dropping it could repeat the same cycle; this is bounded to one payload
-    // per callback invocation that was already in flight when the sink failed.
+    // A user-defined panic payload may panic again from Drop.
+    // Catch that secondary unwind too.
+    // Its replacement payload is forgotten because dropping it could repeat the same cycle;
+    // this is bounded to one payload per callback invocation that was already in flight when the sink failed.
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
         std::mem::forget(payload);
     }

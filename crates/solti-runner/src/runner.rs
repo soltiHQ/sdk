@@ -34,21 +34,19 @@ use crate::id::RunId;
 ///
 /// ## Contract
 ///
-/// - The router returns the allocated [`RunId`] beside the task in a
-///   [`BuiltTask`](crate::BuiltTask).
-/// - The router snapshots the name and workload GVKs during registration.
-/// - Building must not start or submit the task.
-/// - Building is asynchronous and must remain owned by the returned future.
+/// - The router returns the allocated [`RunId`] beside the task in a [`BuiltTask`](crate::BuiltTask).
 /// - Implementations must observe [`BuildCancellation`] during interruptible work.
+/// - Building is asynchronous and must remain owned by the returned future.
 /// - Composing runners must pass [`BuildScope`] to scoped catalog builds.
+/// - The router snapshots the name and workload GVKs during registration.
 /// - The returned task must not retain the build cancellation signal.
 /// - Attempt-scoped resources belong inside the task body.
+/// - Building must not start or submit the task.
 ///
 /// A returned task may execute more than one attempt.
-/// A supervisor drops the build future after cancellation or its configured
-/// deadline. Implementations must not detach work from that future. Inherently
-/// blocking work belongs in a runner-owned bounded facility with an explicit
-/// cancellation and shutdown contract.
+/// A supervisor drops the build future after cancellation or its configured deadline.
+/// Implementations must not detach work from that future.
+/// Inherently blocking work belongs in a runner-owned bounded facility with an explicit cancellation and shutdown contract.
 ///
 /// ## Example
 ///
@@ -110,8 +108,7 @@ pub trait Runner: Send + Sync {
     ///
     /// [`BuildContext`] provides environment, metrics, and output publishing.
     /// [`BuildScope`] carries admission through nested catalog builds.
-    /// The router returns `run_id` with the executable task in a
-    /// [`BuiltTask`](crate::BuiltTask).
+    /// The router returns `run_id` with the executable task in a [`BuiltTask`](crate::BuiltTask).
     ///
     /// # Errors
     ///

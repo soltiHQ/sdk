@@ -34,8 +34,7 @@ use crate::{LoadedTlsIdentity, PemRole, TlsError, TlsIdentity, TrustRoots};
 /// - [`Self::load`] and [`Self::into_rustls_config`] read and validate every source.
 /// - Without client roots, the server does not request a client certificate.
 /// - With client roots, every client must present a trusted certificate.
-/// - The generated configuration has no ALPN protocols.
-///   The transport sets them.
+/// - The generated configuration has no ALPN protocols. The transport sets them.
 ///
 /// ## Example
 ///
@@ -120,7 +119,7 @@ impl ServerTlsConfig {
     /// # Security
     ///
     /// The loaded server identity contains private-key PEM.
-    /// This crate zeroizes its buffer on drop.
+    /// This crate zeroizes it's buffer on drop.
     /// An adapter may keep its own copy.
     pub fn load(self) -> Result<LoadedServerTlsConfig, TlsError> {
         let loaded = self.load_material()?;

@@ -2,7 +2,8 @@
 
 `solti-runner` is the plugin boundary between execution backends and the supervisor.
 
-Implement `Runner` for a backend and register it in a `RunnerRouter`; the router routes each `Task` by workload GVK and optional labels, then returns a `BuiltTask` containing the allocated `RunId` and executable `taskvisor::TaskRef`.
+Implement `Runner` for a backend and register it in a `RunnerRouter`; the router routes each `Task` by workload GVK and optional labels, 
+then returns a `BuiltTask` containing the allocated `RunId` and executable `taskvisor::TaskRef`.
 `solti-exec` implements `Runner` for subprocesses; `solti-core` consumes the router.
 
 The crate does not execute or supervise tasks; Taskvisor owns execution and lifecycle.
@@ -67,19 +68,19 @@ The example declares the built-in `Subprocess` GVK.
 
 ## Inputs and outputs
 
-| API                                   | Input                               | Output                                  |
-|---------------------------------------|-------------------------------------|-----------------------------------------|
-| `register`                            | `Arc<dyn Runner>`                   | Validated runner entry                  |
-| `register_with_labels`                | Runner and static `Labels`          | Labeled runner entry                    |
-| `catalog`                             | Current runner registrations        | Immutable, cloneable `RunnerCatalog`    |
-| `RunnerCatalog::build`                | `Task` and explicit `BuildContext`  | `BuiltTask`                             |
-| `RunnerCatalog::build_scoped_with_cancellation` | Nested task, context, cancellation, and `BuildScope` | Admitted nested `BuiltTask` |
-| `pick`                                | `Task`                              | First matching `Runner`                 |
-| `build`                               | `Task`                              | `BuiltTask`                             |
-| `capabilities`                        | Registered entries                  | Owned `AgentCapabilities` snapshot      |
-| `merge_env`                           | `TaskEnv` and `RunnerEnv`           | Sorted process environment              |
-| `OutputSink::stdout_line`             | Raw `Bytes`, optionally LF-framed   | Delimiter-free `OutputEvent::Chunk`     |
-| `MetricsBackend::record_runner_error` | Runner and error labels             | Backend-specific metric update          |
+| API                                             | Input                                                | Output                               |
+|-------------------------------------------------|------------------------------------------------------|--------------------------------------|
+| `register`                                      | `Arc<dyn Runner>`                                    | Validated runner entry               |
+| `register_with_labels`                          | Runner and static `Labels`                           | Labeled runner entry                 |
+| `catalog`                                       | Current runner registrations                         | Immutable, cloneable `RunnerCatalog` |
+| `RunnerCatalog::build`                          | `Task` and explicit `BuildContext`                   | `BuiltTask`                          |
+| `RunnerCatalog::build_scoped_with_cancellation` | Nested task, context, cancellation, and `BuildScope` | Admitted nested `BuiltTask`          |
+| `pick`                                          | `Task`                                               | First matching `Runner`              |
+| `build`                                         | `Task`                                               | `BuiltTask`                          |
+| `capabilities`                                  | Registered entries                                   | Owned `AgentCapabilities` snapshot   |
+| `merge_env`                                     | `TaskEnv` and `RunnerEnv`                            | Sorted process environment           |
+| `OutputSink::stdout_line`                       | Raw `Bytes`, optionally LF-framed                    | Delimiter-free `OutputEvent::Chunk`  |
+| `MetricsBackend::record_runner_error`           | Runner and error labels                              | Backend-specific metric update       |
 
 ## Routing
 
@@ -93,7 +94,6 @@ Task
                           │ first match in registration order
                           ▼
     Runner::build_task(Task, RunId, BuildContext, BuildCancellation, BuildScope)
-                          │
                           ▼
                  taskvisor::TaskRef
                           │ router pairs it with RunId
@@ -122,12 +122,12 @@ The router applies these rules in order:
 
 Registration validates and snapshots the runner declaration.
 
-- Runner names are unique.
 - Runner names use Kubernetes label-value rules.
 - Static labels use Kubernetes label rules.
+- The built-in `Embedded` GVK is rejected.
 - At least one workload GVK is required.
 - Duplicate workload GVKs are rejected.
-- The built-in `Embedded` GVK is rejected.
+- Runner names are unique.
 
 `RunnerRouter::capabilities()` returns an owned snapshot.
 Runner entries remain in routing priority order.
@@ -146,16 +146,13 @@ let inner_runners = router.catalog();
 router.register(Arc::new(ChainRunner::new("chain", inner_runners)))?;
 ```
 
-The composing runner calls `RunnerCatalog::build_scoped_with_cancellation` for
-each inner task and passes its inherited `BuildScope`. This reuses the outer
-global admission slot and applies the selected inner runner's per-runner limit.
+The composing runner calls `RunnerCatalog::build_scoped_with_cancellation` for each inner task and passes its inherited `BuildScope`. 
+This reuses the outer global admission slot and applies the selected inner runner's per-runner limit.
 Catalog builds use the same exact GVK and selector routing, registration order, and `RunId` allocation as `RunnerRouter::build`.
 
-Direct `RunnerRouter::build` and `RunnerCatalog::build` calls are unmanaged: no
-core admission limits apply. A scoped catalog build returns
-`RouterError::RecursiveBuild` before admission when it selects a runner already
-present in the active build path. It returns `RouterError::AdmissionCycle` when
-its nested admission wait would deadlock with other active root builds.
+Direct `RunnerRouter::build` and `RunnerCatalog::build` calls are unmanaged: no core admission limits apply. 
+A scoped catalog build returns `RouterError::RecursiveBuild` before admission when it selects a runner already present in the active build path. 
+It returns `RouterError::AdmissionCycle` when its nested admission wait would deadlock with other active root builds.
 
 ## Build contract
 
@@ -163,18 +160,15 @@ its nested admission wait would deadlock with other active root builds.
 Its format is `{runner}-{slot}-{seq}`.
 The sequence comes from one process-global counter initialized to `1`.
 
-The router passes the resource, run ID, `BuildContext`, a read-only
-`BuildCancellation` signal, and an opaque `BuildScope` to `Runner::build_task`.
-It returns a `BuiltTask` that keeps the same run ID beside the executable
-`TaskRef`. Use `BuiltTask::name` when constructing the surrounding
-`taskvisor::TaskSpec`.
+The router passes the resource, run ID, `BuildContext`, a read-only `BuildCancellation` signal, and an opaque `BuildScope` to `Runner::build_task`.
+It returns a `BuiltTask` that keeps the same run ID beside the executable `TaskRef`. 
+Use `BuiltTask::name` when constructing the surrounding `taskvisor::TaskSpec`.
 
 `build_task` constructs a task but does not start it.
-It is asynchronous and receives a cancellation signal for obsolete generations,
-shutdown, and supervisor-enforced deadlines.
-All build work must remain owned by the returned future. Dropping that future must
-not leave background work running. A runner that delegates inherently blocking
-work must own a bounded facility with explicit cancellation and shutdown behavior.
+It is asynchronous and receives a cancellation signal for obsolete generations, shutdown, and supervisor-enforced deadlines.
+All build work must remain owned by the returned future. 
+Dropping that future must not leave background work running. 
+A runner that delegates inherently blocking work must own a bounded facility with explicit cancellation and shutdown behavior.
 The returned `TaskRef` must not retain the build cancellation signal.
 Submission can still be rejected after construction.
 A returned task can run more than once under its Taskvisor restart policy.
@@ -185,19 +179,15 @@ Attempt-scoped resources belong inside the task body.
 Implementations written for the synchronous runner contract require three changes:
 
 1. Add `#[solti_runner::async_trait]` to the `Runner` implementation.
-2. Change `build_task` to `async fn` and accept `&BuildCancellation` and
-   `&mut BuildScope`.
-3. Await `RunnerRouter::build`; composing runners use
-   `RunnerCatalog::build_scoped_with_cancellation`.
+2. Change `build_task` to `async fn` and accept `&BuildCancellation` and `&mut BuildScope`.
+3. Await `RunnerRouter::build`; composing runners use `RunnerCatalog::build_scoped_with_cancellation`.
 
-Use `cancellation.cancelled()` in waits and pass clones to child futures that are
-owned by the build. Do not migrate synchronous blocking calls by placing them in
-an unbounded or detached `spawn_blocking` task.
+Use `cancellation.cancelled()` in waits and pass clones to child futures that are owned by the build. 
+Do not migrate synchronous blocking calls by placing them in an unbounded or detached `spawn_blocking` task.
 
-Callers that need to cancel a direct router or catalog build create an owner and
-signal with `BuildCancellation::pair()`, retain the `BuildCancellationHandle`,
-and pass the signal to `build_with_cancellation`. A runner receives only the
-read-only signal and cannot request cancellation itself.
+Callers that need to cancel a direct router or catalog build create an owner and signal with `BuildCancellation::pair()`, 
+retain the `BuildCancellationHandle`, and pass the signal to `build_with_cancellation`. 
+A runner receives only the read-only signal and cannot request cancellation itself.
 
 ## Build context
 
@@ -238,10 +228,8 @@ The returned map is sorted by key.
 
 ```text
 runner attempt
-      │
       ▼
 OutputPublisher::sink_for(task, generation, attempt)
-      │
       ├── None ──► output disabled
       └── OutputSink ──► stdout / stderr chunks ──► composition layer
 ```
@@ -249,8 +237,8 @@ OutputPublisher::sink_for(task, generation, attempt)
 `OutputSink` is a write-only producer:
 
 Request it from the task attempt future before starting separate output tasks.
-Composition runners may use execution-local routing that a separately spawned
-task does not inherit. Clone the returned sink into reader or forwarding tasks.
+Composition runners may use execution-local routing that a separately spawned task does not inherit. 
+Clone the returned sink into reader or forwarding tasks.
 
 ```rust
 use std::sync::mpsc;
@@ -279,13 +267,11 @@ assert!(matches!(receiver.recv().unwrap(), OutputEvent::Chunk(_)));
 - Borrowed callbacks let bounded composition layers detach input with one copy.
 - Publishing is synchronous.
 - The callback must not block runner execution.
-- An unwinding callback panic is caught, reported once through structured
-  tracing without its payload, and permanently disables new calls on that
-  attempt sink. Calls already in progress may still complete or panic. The
-  process panic hook still runs before the unwind is caught and remains
-  application-controlled. A `panic = "abort"` process cannot isolate it.
 - `OutputSink::callback_panicked()` exposes the sticky state to the owner.
 - Runners cannot subscribe to output or publish lifecycle markers.
+- An unwinding callback panic is caught, reported once through structured tracing without its payload, and permanently disables
+  new calls on that attempt sink. Calls already in progress may still complete or panic. The process panic hook still runs before
+  the unwind is caught and remains application-controlled. A `panic = "abort"` process cannot isolate it.
 
 ## Metrics
 

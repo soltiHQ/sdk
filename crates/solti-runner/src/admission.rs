@@ -2,8 +2,7 @@
 //!
 //! [`RunnerBuildAdmission`] bounds managed runner construction.
 //! [`BuildScope`] carries one admitted build path through composing runners.
-//! One coordinator owns reservations, wait ordering, and nested wait-cycle
-//! detection for the complete managed runner hierarchy.
+//! One coordinator owns reservations, wait ordering, and nested wait-cycle detection for the complete managed runner hierarchy.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -40,19 +39,17 @@ pub enum BuildAdmissionConfigError {
 
 /// Shared admission capability for one managed runner hierarchy.
 ///
-/// Root admission atomically reserves one global slot and one slot for the
-/// selected runner. Nested builds reuse the outer global slot and reserve only
-/// the selected runner's slot. An unavailable resource never causes a waiter
-/// to hold the other resource.
+/// Root admission atomically reserves one global slot and one slot for the selected runner.
+/// Nested builds reuse the outer global slot and reserve only the selected runner's slot.
+/// An unavailable resource never causes a waiter to hold the other resource.
 ///
-/// Fitting nested waiters have progress priority because their outer builds
-/// already own global slots. Fitting roots follow. Within each class, the
-/// earliest fitting waiter is admitted; an infeasible waiter does not block a
-/// later request whose complete resource set is available.
+/// Fitting nested waiters have progress priority because their outer builds already own global slots.
+/// Fitting roots follow. Within each class, the earliest fitting waiter is admitted;
+/// an infeasible waiter does not block a later request whose complete resource set is available.
 ///
-/// Every root build owns one internal identity. Its nested permits keep that
-/// identity. A nested wait is rejected only when every permit that could
-/// unblock the waiting roots is held inside the same wait cycle.
+/// Every root build owns one internal identity.
+/// Its nested permits keep that identity.
+/// A nested wait is rejected only when every permit that could unblock the waiting roots is held inside the same wait cycle.
 #[derive(Clone)]
 pub struct RunnerBuildAdmission {
     inner: Arc<AdmissionInner>,
@@ -64,8 +61,7 @@ impl RunnerBuildAdmission {
     /// # Errors
     ///
     /// Returns [`BuildAdmissionConfigError::Zero`] when either limit is zero.
-    /// Returns [`BuildAdmissionConfigError::ExceedsSemaphoreMaximum`] when a
-    /// limit exceeds [`Semaphore::MAX_PERMITS`].
+    /// Returns [`BuildAdmissionConfigError::ExceedsSemaphoreMaximum`] when a limit exceeds [`Semaphore::MAX_PERMITS`].
     pub fn new(
         global_limit: usize,
         per_runner_limit: usize,
@@ -305,10 +301,8 @@ impl AdmissionInner {
 
     /// Returns whether one nested waiter belongs to a closed admission wait set.
     ///
-    /// A set is closed when every permit for each requested runner is held by
-    /// another waiting owner in the same set.
-    /// Scoped routing permits at most one queued nested wait for each root
-    /// owner.
+    /// A set is closed when every permit for each requested runner is held by another waiting owner in the same set.
+    /// Scoped routing permits at most one queued nested wait for each root owner.
     fn admission_cycle_contains(&self, state: &AdmissionState, owner: &BuildOwner) -> bool {
         let nested_waits = state
             .waiters

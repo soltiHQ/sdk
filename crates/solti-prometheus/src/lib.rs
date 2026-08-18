@@ -18,7 +18,6 @@
 //! build / process ──► registration functions ────────────┤
 //!                                                        ▼
 //!                                               shared Registry
-//!                                                        │
 //!                                                        ▼
 //!                                                   GET /metrics
 //! ```

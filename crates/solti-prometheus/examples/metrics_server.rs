@@ -24,7 +24,6 @@ const FLOW: &str = r#"
 solti-prometheus: supervised metrics server
 
   shared Registry + listen address + caller revision
-                            │
                             ▼
                          server()
                             ├──► TaskManifest (desired lifecycle) ─┐

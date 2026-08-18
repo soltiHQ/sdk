@@ -1,7 +1,8 @@
 # solti-observe
 
 `solti-observe` is the logging setup for a Solti agent binary.
-Call `init_logger` once at startup to validate settings and install one global `tracing` subscriber: text, JSON, or optional journald output, RFC 3339 timestamps, and an optional supervised task that refreshes the local UTC offset.
+Call `init_logger` once at startup to validate settings and install one global `tracing` subscriber: 
+text, JSON, or optional journald output, RFC 3339 timestamps, and an optional supervised task that refreshes the local UTC offset.
 
 ## Quick start
 

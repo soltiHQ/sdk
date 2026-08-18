@@ -47,8 +47,8 @@ struct RunnerEntry {
 
 /// One runner-built task paired with the run identity allocated by the router.
 ///
-/// Taskvisor task objects do not carry registration identity. Use [`name`](Self::name)
-/// when constructing the surrounding `taskvisor::TaskSpec`, and use
+/// Taskvisor task objects do not carry registration identity.
+/// Use [`name`](Self::name) when constructing the surrounding `taskvisor::TaskSpec`, and use
 /// [`into_task`](Self::into_task) when only the executable task is needed.
 #[must_use]
 pub struct BuiltTask {
@@ -68,8 +68,7 @@ impl BuiltTask {
 
     /// Returns the name allocated for this run.
     ///
-    /// This is the name to pass to `taskvisor::TaskSpec` when the built task is
-    /// submitted for supervision.
+    /// This is the name to pass to `taskvisor::TaskSpec` when the built task is submitted for supervision.
     pub fn name(&self) -> &str {
         self.run_id.name()
     }
@@ -139,10 +138,9 @@ impl RunnerCatalog {
 
     /// Selects a snapshotted runner and builds with an external cancellation signal.
     ///
-    /// The caller retains the matching
-    /// [`BuildCancellationHandle`](crate::BuildCancellationHandle).
-    /// The build future owns all runner work. Cancellation is cooperative for
-    /// child operations and dropping the future cancels the build scope.
+    /// The caller retains the matching [`BuildCancellationHandle`](crate::BuildCancellationHandle).
+    /// The build future owns all runner work.
+    /// Cancellation is cooperative for child operations and dropping the future cancels the build scope.
     ///
     /// # Errors
     ///
@@ -158,20 +156,15 @@ impl RunnerCatalog {
 
     /// Selects and builds a nested runner within an inherited admission scope.
     ///
-    /// The nested build reuses the outer global permit and acquires the
-    /// selected runner's per-runner permit. Composing runners must use this
-    /// method instead of [`Self::build`] so managed core limits include every
-    /// nested runner.
+    /// The nested build reuses the outer global permit and acquires the selected runner's per-runner permit.
+    /// Composing runners must use this method instead of [`Self::build`] so managed core limits include every nested runner.
     ///
     /// # Errors
     ///
-    /// Returns [`RouterError::RecursiveBuild`] when the selected runner already
-    /// exists in the active build path. Returns
-    /// [`RouterError::AdmissionCycle`] when the nested wait would deadlock with
-    /// other active root builds. Returns
-    /// [`RouterError::BuildCancelled`] when cancellation wins while the build
-    /// waits for a per-runner permit. Otherwise returns the same errors as
-    /// [`Self::build`].
+    /// Returns [`RouterError::RecursiveBuild`] when the selected runner already exists in the active build path.
+    /// Returns [`RouterError::AdmissionCycle`] when the nested wait would deadlock with other active root builds.
+    /// Returns [`RouterError::BuildCancelled`] when cancellation wins while the build waits for a per-runner permit.
+    /// Otherwise, returns the same errors as [`Self::build`].
     pub async fn build_scoped_with_cancellation(
         &self,
         task: &Task,
@@ -185,8 +178,7 @@ impl RunnerCatalog {
 
 /// One outer runner build after managed admission succeeds.
 ///
-/// The value owns the global and outer-runner permits until
-/// [`build`](Self::build) finishes or the value is dropped.
+/// The value owns the global and outer-runner permits until [`build`](Self::build) finishes or the value is dropped.
 #[must_use]
 pub struct AdmittedBuild {
     entry: RunnerEntry,
@@ -292,8 +284,8 @@ impl RunnerRouter {
     /// # Errors
     ///
     /// Returns [`RouterError::DuplicateRunner`] when the name is already registered.
-    /// Returns [`RouterError::InvalidLabels`] when labels violate model rules.
     /// Returns [`RouterError::InvalidCapability`] when the declaration is invalid.
+    /// Returns [`RouterError::InvalidLabels`] when labels violate model rules.
     #[inline]
     pub fn register_with_labels(
         &mut self,
@@ -392,8 +384,7 @@ impl RunnerRouter {
 
     /// Builds with an external cancellation signal.
     ///
-    /// The caller retains the matching
-    /// [`BuildCancellationHandle`](crate::BuildCancellationHandle).
+    /// The caller retains the matching [`BuildCancellationHandle`](crate::BuildCancellationHandle).
     ///
     /// # Errors
     ///
@@ -408,14 +399,13 @@ impl RunnerRouter {
 
     /// Acquires managed admission for one selected outer runner build.
     ///
-    /// Waiting for root admission is outside the admitted build. Nested builds
-    /// created by the returned value reuse its global permit.
+    /// Waiting for root admission is outside the admitted build.
+    /// Nested builds created by the returned value reuse its global permit.
     ///
     /// # Errors
     ///
-    /// Returns the same selection errors as [`Self::pick`]. Returns
-    /// [`RouterError::BuildCancelled`] when cancellation wins while admission
-    /// is pending.
+    /// Returns the same selection errors as [`Self::pick`].
+    /// Returns [`RouterError::BuildCancelled`] when cancellation wins while admission is pending.
     pub async fn admit(
         &self,
         task: &Task,

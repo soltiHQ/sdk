@@ -121,9 +121,9 @@ impl RunnerErrorKind {
 ///
 /// ## See Also
 ///
+/// - `solti-prometheus::PrometheusRunnerMetrics`
 /// - [`NoOpMetrics`](super::NoOpMetrics)
 /// - [`crate::BuildContext::metrics`]
-/// - `solti-prometheus::PrometheusRunnerMetrics`
 pub trait MetricsBackend: Send + Sync + 'static {
     /// Records a runner error during task setup or cleanup.
     fn record_runner_error(&self, runner_type: RunnerType, error_kind: RunnerErrorKind);

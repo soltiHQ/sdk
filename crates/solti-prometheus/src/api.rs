@@ -46,8 +46,8 @@ use crate::register::{MetricGroup, ms_to_secs};
 ///
 /// - Construction registers all three collectors as one group.
 /// - Request durations enter the backend in milliseconds.
-/// - Histograms export those durations in seconds.
 /// - In-flight changes are applied as signed deltas.
+/// - Histograms export those durations in seconds.
 ///
 /// ## Example
 ///

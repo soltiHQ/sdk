@@ -12,7 +12,6 @@
 //!       │ best-effort Event
 //!       ▼
 //! subscriber queue
-//!       │
 //!       ▼
 //! PrometheusTaskvisorSubscriber ──► Registry
 //! ```
@@ -84,10 +83,9 @@ const TASKVISOR_SUBSCRIBER_LISTENER: &str = "subscriber_listener";
 ///   ControllerRejected ─────────► controller_rejections{reason}
 /// ```
 ///
-/// While tracking is valid, `TaskFinished` repairs the logical in-flight gauge
-/// by removing any attempt still tracked for that Task ID. The repair is idempotent
-/// when an attempt-level terminal event arrived first. `ForceAborted` and `Panicked`
-/// can end an attempt without an attempt-level terminal event.
+/// While tracking is valid, `TaskFinished` repairs the logical in-flight gauge by removing any attempt still tracked for that Task ID.
+/// The repair is idempotent when an attempt-level terminal event arrived first.
+/// `ForceAborted` and `Panicked` can end an attempt without an attempt-level terminal event.
 /// `ForceAborted` does not prove that task code has exited physically.
 /// Other Taskvisor events do not change metrics.
 ///
@@ -103,21 +101,20 @@ const TASKVISOR_SUBSCRIBER_LISTENER: &str = "subscriber_listener";
 /// A slow subscriber may miss events.
 /// Delivered events are correlated by Taskvisor's canonical `(TaskId, attempt)` identity.
 /// Events constructed without that runtime metadata use a count-only fallback.
-/// At most one attempt can be active for a Task ID. A conflicting active attempt
-/// identity proves that the delivered stream is incomplete.
+/// At most one attempt can be active for a Task ID.
+/// A conflicting active attempt identity proves that the delivered stream is incomplete.
 ///
-/// The first overflow attributed to this subscriber, an overflow from Taskvisor's
-/// shared `subscriber_listener`, or a conflicting identity permanently invalidates
-/// in-flight tracking because the event stream has no authoritative active-attempt
-/// snapshot. The subscriber releases all tracking memory, sets the gauge to `NaN`,
-/// and does not retain or apply later attempt identities. Counters, histograms, and
-/// final outcomes continue to update from delivered events.
+/// The first overflow attributed to this subscriber, an overflow from Taskvisor's shared `subscriber_listener`,
+/// or a conflicting identity permanently invalidates in-flight tracking because the event stream has
+/// no authoritative active-attempt snapshot.
+/// The subscriber releases all tracking memory, sets the gauge to `NaN`, and does not retain or
+/// apply later attempt identities.
+/// Counters, histograms, and final outcomes continue to update from delivered events.
 ///
-/// Taskvisor runtime overflow events always identify their subscriber or internal
-/// relay in `task`. An overflow for another subscriber, or a manually constructed
-/// event without `task`, still increments the global overflow counter but does not
-/// prove that this subscriber missed lifecycle events and does not invalidate it.
-/// Taskvisor 0.8 can coalesce an overflow burst into one event.
+/// Taskvisor runtime overflow events always identify their subscriber or internal relay in `task`.
+/// An overflow for another subscriber, or a manually constructed event without `task`, still increments
+/// the global overflow counter but does not prove that this subscriber missed lifecycle events and does not invalidate it.
+/// Taskvisor can coalesce an overflow burst into one event.
 /// The overflow counter adds its `dropped` value, or one when no count is available.
 /// Controller metrics count delivered controller events.
 /// Errors returned before controller intake do not emit `ControllerRejected` and are not included.

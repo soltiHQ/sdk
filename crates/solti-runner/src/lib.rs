@@ -40,8 +40,7 @@
 //! ## Build Contract
 //!
 //! The router allocates a [`RunId`] for each build.
-//! It passes the ID to the selected runner and returns the same ID with the
-//! executable task in [`BuiltTask`].
+//! It passes the ID to the selected runner and returns the same ID with the executable task in [`BuiltTask`].
 //!
 //! Building is asynchronous and cancellation-aware.
 //! It does not start or supervise the task.
@@ -59,18 +58,18 @@
 //!
 //! ## Main Types
 //!
-//! | Area          | Types                                                  |
-//! |---------------|--------------------------------------------------------|
-//! | Runner plugin | [`Runner`], [`RunnerRouter`], [`RunnerCatalog`]        |
-//! | Build result  | [`BuiltTask`], [`RunId`]                               |
+//! | Area          | Types                                                   |
+//! |---------------|---------------------------------------------------------|
+//! | Runner plugin | [`Runner`], [`RunnerRouter`], [`RunnerCatalog`]         |
+//! | Build result  | [`BuiltTask`], [`RunId`]                                |
 //! | Build data    | [`BuildContext`], [`BuildCancellation`], [`BuildScope`] |
 //! | Admission     | [`RunnerBuildAdmission`], [`AdmittedBuild`]             |
-//! | Build owner   | [`BuildCancellationHandle`]                            |
-//! | Output        | [`OutputPublisher`], [`OutputSink`]                    |
-//! | Run allocator | [`make_run_id`]                                        |
-//! | Metrics       | [`MetricsBackend`], [`MetricsHandle`], [`NoOpMetrics`] |
-//! | Metric labels | [`RunnerType`], [`RunnerErrorKind`]                    |
-//! | Errors        | [`RouterError`], [`RunnerError`]                       |
+//! | Build owner   | [`BuildCancellationHandle`]                             |
+//! | Output        | [`OutputPublisher`], [`OutputSink`]                     |
+//! | Run allocator | [`make_run_id`]                                         |
+//! | Metrics       | [`MetricsBackend`], [`MetricsHandle`], [`NoOpMetrics`]  |
+//! | Metric labels | [`RunnerType`], [`RunnerErrorKind`]                     |
+//! | Errors        | [`RouterError`], [`RunnerError`]                        |
 //!
 //! ## Quick Start
 //!

@@ -21,13 +21,13 @@ default = []
 solti-model = { workspace = true }
 
 async-trait = { workspace = true }
-bytes     = { workspace = true }
-serde     = { workspace = true }
-taskvisor = { workspace = true }
-thiserror = { workspace = true }
-tracing   = { workspace = true }
-tokio     = { workspace = true, features = ["sync"] }
-tokio-util = { workspace = true }
+bytes       = { workspace = true }
+serde       = { workspace = true }
+taskvisor   = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+tokio       = { workspace = true, features = ["sync"] }
+tokio-util  = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
