@@ -40,9 +40,8 @@ use solti_model::{
 };
 use solti_runner::RunnerRouter;
 use taskvisor::{Supervisor, TaskRef};
-#[cfg(test)]
 use tokio::sync::oneshot;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::{
     error::CoreError,
@@ -50,7 +49,10 @@ use crate::{
     persistence::{
         TaskOutputSinkStatus, TaskStateSinkStatus, assert_persistence_sink_is_not_shutting_down,
     },
-    runtime::{Reconciler, RuntimeObserver, RuntimeSource, TaskLocks},
+    runtime::{
+        GuardedRuntimeSource, Reconciler, RuntimeObserver, RuntimeSource, TaskLocks,
+        guard_runtime_source,
+    },
     state::{
         CollectionError, ResourceGeneration, RuntimeBinding, StateMutationEventCapacity,
         StateWriteAdmission, TaskState, TaskWatchSubscription,
@@ -327,7 +329,7 @@ impl SupervisorApi {
         Ok(self
             .write_locked(
                 manifest,
-                RuntimeSource::Routed,
+                guard_runtime_source(RuntimeSource::Routed, name),
                 WriteMode::Apply,
                 &preconditions,
                 true,
@@ -398,18 +400,28 @@ impl SupervisorApi {
         preconditions: WritePreconditions,
         ensure_output: bool,
     ) -> Result<ScheduledWrite, CoreError> {
-        Self::ensure_runtime_contract(&manifest, &source)?;
         let name = manifest.name().clone();
+        let source = guard_runtime_source(source, name.clone());
+        Self::ensure_runtime_contract(&manifest, source.as_ref())?;
         let operation = self.task_operations.lock(&name).await;
         if self.shutdown_started.load(Ordering::Acquire) {
+            drop(operation);
+            source.dispose_at("shutdown_before_state_admission");
             return Err(CoreError::ShuttingDown);
         }
-        let admission = self
+        let admission = match self
             .reconciler
             .state
             .admit_state_write(StateMutationEventCapacity::TaskChange)
             .await
-            .map_err(|_| CoreError::ShuttingDown)?;
+        {
+            Ok(admission) => admission,
+            Err(_) => {
+                drop(operation);
+                source.dispose_at("state_admission_closed");
+                return Err(CoreError::ShuttingDown);
+            }
+        };
         self.write_locked(
             manifest,
             source,
@@ -426,37 +438,57 @@ impl SupervisorApi {
     fn write_locked(
         &self,
         manifest: TaskManifest,
-        source: RuntimeSource,
+        source: GuardedRuntimeSource,
         mode: WriteMode,
         preconditions: &WritePreconditions,
         ensure_output: bool,
         guards: WriteGuards,
     ) -> Result<ScheduledWrite, CoreError> {
         let WriteGuards {
-            operation: _operation,
+            operation,
             admission,
         } = guards;
-        Self::ensure_runtime_contract(&manifest, &source)?;
+        if let Err(error) = Self::ensure_runtime_contract(&manifest, source.as_ref()) {
+            drop(admission);
+            drop(operation);
+            source.dispose_at("runtime_contract_rejected");
+            return Err(error);
+        }
         let _spawn = self.spawn_gate.lock();
         if self.shutdown_started.load(Ordering::Acquire) {
+            drop(_spawn);
+            drop(operation);
+            source.dispose_at("shutdown_before_desired_commit");
             return Err(CoreError::ShuttingDown);
         }
 
         let registration = self.reconciler.tasks.token();
-        let commit = match mode {
+        let commit = match match mode {
             WriteMode::Create => {
                 debug_assert!(preconditions.is_empty());
                 self.reconciler
                     .state
-                    .create_desired_admitted(&manifest, admission)?
+                    .create_desired_admitted(&manifest, admission)
             }
             WriteMode::Apply => self
                 .reconciler
                 .state
-                .apply_desired_with_preconditions_admitted(&manifest, preconditions, admission)?,
+                .apply_desired_with_preconditions_admitted(&manifest, preconditions, admission),
+        } {
+            Ok(commit) => commit,
+            Err(error) => {
+                drop(registration);
+                drop(_spawn);
+                drop(operation);
+                source.dispose_at("desired_commit_rejected");
+                return Err(error);
+            }
         };
         if !commit.reconcile {
             drop(registration);
+            drop(_spawn);
+            drop(operation);
+            source.dispose_at("desired_commit_did_not_schedule");
             return Ok(ScheduledWrite {
                 committed: commit.task,
                 #[cfg(test)]
@@ -469,7 +501,8 @@ impl SupervisorApi {
             self.reconciler
                 .schedule(commit.task, source, ensure_output, registration);
         drop(_spawn);
-        // `TaskRef::drop` is user code and must not run under the global gate.
+        drop(operation);
+        // `TaskRef::drop` is user code and must not run under coordination locks.
         drop(superseded);
         #[cfg(not(test))]
         drop(reconciliation);
@@ -674,28 +707,57 @@ impl SupervisorApi {
     }
 
     async fn cancel_bound(
-        &self,
+        reconciler: &Reconciler,
         name: &TaskId,
     ) -> Result<Option<(RuntimeBinding, bool)>, CoreError> {
-        let Some(binding) = self.reconciler.state.binding_for(name) else {
+        let Some(binding) = reconciler.state.binding_for(name) else {
             return Ok(None);
         };
-        let claimed = self
-            .reconciler
+        let claimed = reconciler
             .handle
             .cancel_with_timeout(
                 binding.tv,
-                self.reconciler.grace.saturating_add(Duration::from_secs(1)),
+                reconciler.grace.saturating_add(Duration::from_secs(1)),
             )
             .await
             .map_err(|error| CoreError::supervisor("cancel", error))?;
         Ok(Some((binding, claimed)))
     }
 
-    /// Requests a terminal logical outcome for the current runtime while
-    /// retaining desired state.
+    async fn run_cancel_task(
+        reconciler: Reconciler,
+        task_operations: TaskLocks,
+        name: TaskId,
+    ) -> Result<(), CoreError> {
+        let _operation = task_operations.lock(&name).await;
+        if !reconciler.state.contains_task(&name) {
+            return Err(CoreError::NotFound(name.to_string()));
+        }
+        if let Some(settled) = reconciler.cancel_scheduled_for_user(&name) {
+            settled.cancelled().await;
+        }
+        let _runtime_operation = reconciler.runtime_operations.lock(&name).await;
+        let cancellation = Self::cancel_bound(&reconciler, &name).await?;
+        if let Some((binding, _)) = cancellation {
+            reconciler
+                .observer
+                .settle_after_confirmed_cleanup(binding.tv)
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Stops current reconciliation or requests a terminal logical outcome for
+    /// the current runtime while retaining desired state.
     ///
-    /// A known task without a runtime binding is a no-op.
+    /// Scheduled reconciliation is cancelled before waiting for the per-task
+    /// runtime lock. If Taskvisor has not accepted the submission, core drops
+    /// the prepared submission and records `Reconciled=False` without creating
+    /// a TaskRun. If shutdown's preflight stop completes that branch first, the
+    /// existing intake-pending `Reconciled=Unknown` condition remains instead.
+    /// Accepted queued or running work is cancelled by Taskvisor ID. After the
+    /// supervisor worker is registered, dropping this method's future stops
+    /// only the caller's wait. Shutdown drains the registered operation.
     /// Cancellation does not suppress later reconciliation.
     /// A Taskvisor `ForceAborted` outcome does not prove physical exit of
     /// non-cooperative task code.
@@ -703,6 +765,7 @@ impl SupervisorApi {
     /// # Errors
     ///
     /// Returns [`CoreError::NotFound`] for an unknown task.
+    /// Returns [`CoreError::ShuttingDown`] when shutdown has closed operation admission.
     /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
     #[instrument(
         level = "debug",
@@ -710,21 +773,39 @@ impl SupervisorApi {
         fields(event = "task.cancel", task_name = %name)
     )]
     pub async fn cancel_task(&self, name: &TaskId) -> Result<(), CoreError> {
-        let _operation = self.task_operations.lock(name).await;
-        let _runtime_operation = self.reconciler.runtime_operations.lock(name).await;
-        let was_known = self.reconciler.state.contains_task(name);
-        let cancellation = self.cancel_bound(name).await?;
-        let claimed = cancellation.as_ref().is_some_and(|(_, claimed)| *claimed);
-        if let Some((binding, _)) = cancellation {
-            self.reconciler
-                .observer
-                .settle_after_confirmed_cleanup(binding.tv)
-                .await;
+        let completion = {
+            let _spawn = self.spawn_gate.lock();
+            if self.shutdown_started.load(Ordering::Acquire) {
+                return Err(CoreError::ShuttingDown);
+            }
+
+            let (sender, completion) = oneshot::channel();
+            let reconciler = self.reconciler.clone();
+            let task_operations = self.task_operations.clone();
+            let name = name.clone();
+            let runtime = self.reconciler.runtime.clone();
+            let operation = self.reconciler.tasks.spawn_on(
+                async move {
+                    let result = Self::run_cancel_task(reconciler, task_operations, name).await;
+                    let _ = sender.send(result);
+                },
+                &runtime,
+            );
+            drop(operation);
+            completion
+        };
+
+        match completion.await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    event = "task.cancel_unavailable",
+                    task_name = %name,
+                    "supervisor-owned cancellation worker became unavailable"
+                );
+                Err(CoreError::ShuttingDown)
+            }
         }
-        if !claimed && !was_known {
-            return Err(CoreError::NotFound(name.to_string()));
-        }
-        Ok(())
     }
 
     /// Deletes a task and its run history.
@@ -802,7 +883,9 @@ impl SupervisorApi {
     }
 
     async fn delete_task_locked(&self, name: &TaskId) -> Result<(), CoreError> {
-        self.reconciler.cancel_scheduled(name);
+        if let Some(settled) = self.reconciler.cancel_scheduled(name) {
+            settled.cancelled().await;
+        }
         let _runtime_operation = self.reconciler.runtime_operations.lock(name).await;
         debug!(
             event = "task.delete",
@@ -810,7 +893,7 @@ impl SupervisorApi {
             stage = "started",
             "deleting task"
         );
-        let cancellation = self.cancel_bound(name).await?;
+        let cancellation = Self::cancel_bound(&self.reconciler, name).await?;
         let tv = cancellation.as_ref().map(|(binding, _)| binding.tv);
         self.reconciler
             .observer

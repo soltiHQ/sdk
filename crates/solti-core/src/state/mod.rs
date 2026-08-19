@@ -34,10 +34,20 @@
 //! A subscriber expires deterministically when its next required revision is
 //! compacted. An oversized Task change expires existing subscribers because it
 //! cannot be retained within the configured byte budget.
-//! An oversized TaskRun batch updates current run state but is not retained.
+//! An oversized TaskRun journal batch updates current run state but is not retained
+//! in the reversible journal.
 //! [`StateConfig::max_retained_tasks`] limits retained task resources.
 //! [`StateConfig::max_retained_task_manifest_bytes`] limits their aggregate
 //! caller-owned manifest bytes.
+//! [`StateConfig::max_retained_task_run_bytes`] limits compact JSON bytes for
+//! TaskRun values in current query state. It is independent of the reversible
+//! journal budget. Completed runs are compacted globally by completion time.
+//! If active values alone cannot fit, attempt execution and lifecycle delivery
+//! continue while the new active value is omitted from retained query state.
+//! A lifecycle-only active handle survives that omission. Direct completion
+//! still publishes the authoritative terminal RunChanged value.
+//! These serialized-byte budgets are logical payload bounds, not allocator or
+//! resident-set-size measurements.
 //! Admission never evicts a task to admit another task.
 //! Task query pages keep complete-item prefixes within a 4 MiB serialized JSON budget.
 //! TaskRun query pages use the same complete-item budget.
@@ -70,9 +80,9 @@ use solti_model::{
 };
 
 use crate::persistence::{
-    MAX_STATE_EVENTS_PER_COMMIT, PersistenceConfig, StateAdmissionClosed, StateDispatchEvent,
-    StateDispatcherAdmission, StateEventDispatcher, TaskStateEvent, TaskStateSinkHandle,
-    TaskStateSinkStatus,
+    MAX_STATE_EVENTS_PER_COMMIT, PersistenceConfig, RUN_CHANGE_BYTE_RESERVATION,
+    StateAdmissionClosed, StateDispatchEvent, StateDispatcherAdmission, StateEventDispatcher,
+    TASK_CHANGE_BYTE_RESERVATION, TaskStateEvent, TaskStateSinkHandle, TaskStateSinkStatus,
 };
 use crate::{StateConfig, WriteConflict, WritePreconditionViolation, error::CoreError};
 
@@ -206,6 +216,7 @@ struct PendingStateEventBatch {
 struct PendingStateEventBatchInner {
     events: VecDeque<StateDispatchEvent>,
     admission: Option<StateDispatcherAdmission>,
+    serialized_bytes: usize,
 }
 
 impl PendingStateEventBatch {
@@ -214,30 +225,37 @@ impl PendingStateEventBatch {
             inner: Mutex::new(PendingStateEventBatchInner {
                 events: VecDeque::new(),
                 admission: Some(admission),
+                serialized_bytes: 0,
             }),
             ready: AtomicBool::new(false),
         }
     }
 
-    fn enqueue(&self, event: TaskStateEvent) {
+    fn enqueue(&self, event: TaskStateEvent, serialized_bytes: usize) {
         let mut inner = self.inner.lock();
         let permit = inner
             .admission
             .as_mut()
             .expect("state persistence admission remains owned until dispatch")
             .take_permit();
+        inner.serialized_bytes = inner
+            .serialized_bytes
+            .checked_add(serialized_bytes)
+            .expect("state persistence payload accounting must not overflow");
         inner
             .events
             .push_back(StateDispatchEvent::new(event, permit));
     }
 
     fn release_unused_permits(&self) {
-        self.inner
-            .lock()
+        let mut inner = self.inner.lock();
+        let serialized_bytes = inner.serialized_bytes;
+        let admission = inner
             .admission
             .as_mut()
-            .expect("state persistence admission remains owned until dispatch")
-            .release_unused_permits();
+            .expect("state persistence admission remains owned until dispatch");
+        admission.release_unused_permits();
+        admission.shrink_byte_reservation(serialized_bytes);
     }
 }
 
@@ -247,7 +265,13 @@ impl StateEventPublisher {
         config: PersistenceConfig,
     ) -> Result<Self, io::Error> {
         let dispatcher = sink
-            .map(|sink| StateEventDispatcher::start(sink, config.state_queue_capacity()))
+            .map(|sink| {
+                StateEventDispatcher::start_with_byte_capacity(
+                    sink,
+                    config.state_queue_capacity(),
+                    config.state_queue_byte_capacity(),
+                )
+            })
             .transpose()?;
         Ok(Self {
             dispatcher,
@@ -259,6 +283,7 @@ impl StateEventPublisher {
     async fn reserve(
         &self,
         event_capacity: usize,
+        byte_capacity: usize,
     ) -> Result<StateWriteAdmission, StateAdmissionClosed> {
         if event_capacity == 0 {
             return Ok(StateWriteAdmission {
@@ -268,7 +293,11 @@ impl StateEventPublisher {
         }
         let lease = self.admission_fence.admit()?;
         let dispatcher = match self.dispatcher.as_ref() {
-            Some(dispatcher) => Some(dispatcher.reserve(event_capacity).await?),
+            Some(dispatcher) => Some(
+                dispatcher
+                    .reserve_with_bytes(event_capacity, byte_capacity)
+                    .await?,
+            ),
             None => None,
         };
         Ok(StateWriteAdmission {
@@ -280,6 +309,7 @@ impl StateEventPublisher {
     fn reserve_blocking(
         &self,
         event_capacity: usize,
+        byte_capacity: usize,
     ) -> Result<StateWriteAdmission, StateAdmissionClosed> {
         if event_capacity == 0 {
             return Ok(StateWriteAdmission {
@@ -289,7 +319,9 @@ impl StateEventPublisher {
         }
         let lease = self.admission_fence.admit()?;
         let dispatcher = match self.dispatcher.as_ref() {
-            Some(dispatcher) => Some(dispatcher.reserve_blocking(event_capacity)?),
+            Some(dispatcher) => {
+                Some(dispatcher.reserve_blocking_with_bytes(event_capacity, byte_capacity)?)
+            }
             None => None,
         };
         Ok(StateWriteAdmission {
@@ -382,6 +414,14 @@ impl StateEventPublisher {
     fn active_admissions(&self) -> usize {
         self.admission_fence.status().1
     }
+
+    #[cfg(test)]
+    fn inject_worker_panic(&self) {
+        self.dispatcher
+            .as_ref()
+            .expect("the test state must have a persistence dispatcher")
+            .inject_worker_panic();
+    }
 }
 
 struct TaskStateWriteGuard<'a> {
@@ -413,12 +453,23 @@ impl StateMutationEventCapacity {
             Self::AttemptTransition => MAX_STATE_EVENTS_PER_COMMIT,
         }
     }
+
+    const fn byte_reservation(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::TaskChange => TASK_CHANGE_BYTE_RESERVATION,
+            Self::TaskAndRunChange => TASK_CHANGE_BYTE_RESERVATION + RUN_CHANGE_BYTE_RESERVATION,
+            Self::AttemptTransition => {
+                TASK_CHANGE_BYTE_RESERVATION + 2 * RUN_CHANGE_BYTE_RESERVATION
+            }
+        }
+    }
 }
 
 impl TaskStateWriteGuard<'_> {
-    fn enqueue(&self, event: TaskStateEvent) {
+    fn enqueue(&self, event: TaskStateEvent, serialized_bytes: usize) {
         if let Some(batch) = self.batch.as_ref() {
-            batch.enqueue(event);
+            batch.enqueue(event, serialized_bytes);
         }
     }
 }
@@ -470,6 +521,14 @@ struct TaskStateInner {
     ///
     /// Pagination and the reversible journal share these allocations.
     runs: HashMap<TaskId, VecDeque<Arc<TaskRun>>>,
+    /// Compact JSON bytes for TaskRun values currently present in `runs`.
+    retained_task_run_bytes: usize,
+    /// Exact current TaskRun charge indexed by run identity.
+    retained_task_run_bytes_by_identity: HashMap<RetainedRunIdentity, usize>,
+    /// Completed TaskRuns ordered for deterministic global byte compaction.
+    completed_runs_by_age: BTreeSet<CompletedRetainedRun>,
+    /// Maximum aggregate current TaskRun bytes.
+    max_retained_task_run_bytes: Option<std::num::NonZeroUsize>,
     /// Store identity embedded in each TaskRun collection version.
     run_resource_version_epoch: String,
     /// Latest committed TaskRun mutation-batch counter.
@@ -493,6 +552,12 @@ struct TaskStateInner {
     /// This survives visible run eviction.
     /// Duplicate terminal events therefore remain idempotent.
     finished_attempt_by_tv: HashMap<u64, u32>,
+    /// Active attempt lifecycle retained independently from query visibility.
+    ///
+    /// The value shares the query allocation while visible. If the current-run
+    /// byte budget omits it, direct completion can still emit the authoritative
+    /// terminal RunChanged value without inventing an attempt.
+    active_run_by_tv: HashMap<u64, Arc<TaskRun>>,
     /// Store identity embedded in each resource version.
     resource_version_epoch: Arc<str>,
     /// Latest committed resource-version counter.
@@ -552,6 +617,19 @@ struct RawRunChange {
     previous: Option<Arc<TaskRun>>,
     /// Shared immutable value after the mutation.
     current: Option<Arc<TaskRun>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct RetainedRunIdentity {
+    task: TaskId,
+    generation: u64,
+    attempt: u32,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CompletedRetainedRun {
+    finished_at: SystemTime,
+    identity: RetainedRunIdentity,
 }
 
 #[derive(Default)]
@@ -1209,6 +1287,10 @@ impl TaskState {
                 tasks: HashMap::new(),
                 ordered_tasks: BTreeSet::new(),
                 runs: HashMap::new(),
+                retained_task_run_bytes: 0,
+                retained_task_run_bytes_by_identity: HashMap::new(),
+                completed_runs_by_age: BTreeSet::new(),
+                max_retained_task_run_bytes: config.max_retained_task_run_bytes(),
                 run_resource_version_epoch,
                 run_resource_version: 0,
                 run_history: VecDeque::new(),
@@ -1219,6 +1301,7 @@ impl TaskState {
                 by_tv: HashMap::new(),
                 tv_of: HashMap::new(),
                 finished_attempt_by_tv: HashMap::new(),
+                active_run_by_tv: HashMap::new(),
                 resource_version_epoch: Arc::from(epoch),
                 resource_version: 0,
                 watch_history: VecDeque::new(),
@@ -1247,14 +1330,17 @@ impl TaskState {
         &self,
         event_capacity: StateMutationEventCapacity,
     ) -> Result<StateWriteAdmission, StateAdmissionClosed> {
-        self.event_publisher.reserve(event_capacity.get()).await
+        self.event_publisher
+            .reserve(event_capacity.get(), event_capacity.byte_reservation())
+            .await
     }
 
     fn admit_state_write_blocking(
         &self,
         event_capacity: StateMutationEventCapacity,
     ) -> Result<StateWriteAdmission, StateAdmissionClosed> {
-        self.event_publisher.reserve_blocking(event_capacity.get())
+        self.event_publisher
+            .reserve_blocking(event_capacity.get(), event_capacity.byte_reservation())
     }
 
     pub(crate) fn admit_state_write_from_taskvisor_callback(
@@ -1388,8 +1474,185 @@ impl TaskState {
         counter.0
     }
 
-    /// Commits one reversible TaskRun revision and enforces journal limits.
+    /// Returns the compact JSON payload charge of one persisted RunChanged event.
+    fn serialized_run_persistence_bytes(task: &TaskId, task_uid: &Uid, run: &TaskRun) -> usize {
+        let mut counter = SerializedSizeCounter::default();
+        serde_json::to_writer(&mut counter, task).expect("TaskId values must serialize as JSON");
+        serde_json::to_writer(&mut counter, task_uid).expect("Uid values must serialize as JSON");
+        serde_json::to_writer(&mut counter, run).expect("TaskRun values must serialize as JSON");
+        counter.0
+    }
+
+    fn retained_run_identity(task: &TaskId, run: &TaskRun) -> RetainedRunIdentity {
+        RetainedRunIdentity {
+            task: task.clone(),
+            generation: run.generation(),
+            attempt: run.attempt(),
+        }
+    }
+
+    fn completed_retained_run(
+        identity: RetainedRunIdentity,
+        run: &TaskRun,
+    ) -> Option<CompletedRetainedRun> {
+        run.finished_at().map(|finished_at| CompletedRetainedRun {
+            finished_at,
+            identity,
+        })
+    }
+
+    fn apply_retained_run_accounting_change(inner: &mut TaskStateInner, change: &RawRunChange) {
+        if let Some(previous) = change.previous.as_ref() {
+            let identity = Self::retained_run_identity(&change.task, previous);
+            let expected = Self::serialized_run_payload_bytes(previous);
+            let removed = inner
+                .retained_task_run_bytes_by_identity
+                .remove(&identity)
+                .expect("every retained TaskRun must have byte accounting");
+            assert_eq!(
+                removed, expected,
+                "retained TaskRun byte accounting must match its current value"
+            );
+            inner.retained_task_run_bytes = inner
+                .retained_task_run_bytes
+                .checked_sub(removed)
+                .expect("retained TaskRun byte accounting must not underflow");
+            if let Some(completed) = Self::completed_retained_run(identity, previous) {
+                assert!(
+                    inner.completed_runs_by_age.remove(&completed),
+                    "every completed retained TaskRun must have an age index entry"
+                );
+            }
+        }
+
+        if let Some(current) = change.current.as_ref() {
+            let identity = Self::retained_run_identity(&change.task, current);
+            let bytes = Self::serialized_run_payload_bytes(current);
+            assert!(
+                inner
+                    .retained_task_run_bytes_by_identity
+                    .insert(identity.clone(), bytes)
+                    .is_none(),
+                "one current TaskRun identity must be retained at most once"
+            );
+            inner.retained_task_run_bytes = inner
+                .retained_task_run_bytes
+                .checked_add(bytes)
+                .expect("retained TaskRun byte accounting must not overflow");
+            if let Some(completed) = Self::completed_retained_run(identity, current) {
+                assert!(
+                    inner.completed_runs_by_age.insert(completed),
+                    "one completed TaskRun identity must be indexed at most once"
+                );
+            }
+        }
+    }
+
+    fn remove_retained_run(
+        inner: &mut TaskStateInner,
+        identity: &RetainedRunIdentity,
+    ) -> Option<RawRunChange> {
+        let task_uid = inner.tasks.get(&identity.task)?.uid().clone();
+        let (removed, empty) = {
+            let runs = inner.runs.get_mut(&identity.task)?;
+            let index = runs.iter().position(|run| {
+                run.generation() == identity.generation && run.attempt() == identity.attempt
+            })?;
+            let removed = runs
+                .remove(index)
+                .expect("the selected retained TaskRun index must exist");
+            (removed, runs.is_empty())
+        };
+        if empty {
+            inner.runs.remove(&identity.task);
+        }
+        Some(Self::run_snapshot_change(
+            &identity.task,
+            &task_uid,
+            Some(removed),
+            None,
+        ))
+    }
+
+    fn enforce_retained_run_byte_budget(
+        inner: &mut TaskStateInner,
+        changes: &mut Vec<RawRunChange>,
+    ) {
+        for change in changes.iter() {
+            Self::apply_retained_run_accounting_change(inner, change);
+        }
+
+        let Some(limit) = inner.max_retained_task_run_bytes.map(|limit| limit.get()) else {
+            return;
+        };
+        let mut completed_evictions = 0usize;
+        while inner.retained_task_run_bytes > limit {
+            let Some(oldest) = inner.completed_runs_by_age.iter().next().cloned() else {
+                break;
+            };
+            let change = Self::remove_retained_run(inner, &oldest.identity)
+                .expect("the completed-run age index must reference current retained state");
+            Self::apply_retained_run_accounting_change(inner, &change);
+            changes.push(change);
+            completed_evictions += 1;
+        }
+
+        let active_candidates = changes
+            .iter()
+            .rev()
+            .filter_map(|change| {
+                change.current.as_ref().and_then(|run| {
+                    run.is_active()
+                        .then(|| Self::retained_run_identity(&change.task, run))
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut active_omissions = 0usize;
+        for identity in active_candidates {
+            if inner.retained_task_run_bytes <= limit {
+                break;
+            }
+            if !inner
+                .retained_task_run_bytes_by_identity
+                .contains_key(&identity)
+            {
+                continue;
+            }
+            let change = Self::remove_retained_run(inner, &identity)
+                .expect("a retained active-run identity must resolve to current state");
+            Self::apply_retained_run_accounting_change(inner, &change);
+            changes.push(change);
+            active_omissions += 1;
+        }
+        assert!(
+            inner.retained_task_run_bytes <= limit,
+            "retained TaskRun bytes must not exceed the configured limit"
+        );
+        if completed_evictions > 0 || active_omissions > 0 {
+            tracing::warn!(
+                event = "state.run_byte_budget_compacted",
+                completed_evictions,
+                active_omissions,
+                retained_bytes = inner.retained_task_run_bytes,
+                limit,
+                "TaskRun retention compacted to its aggregate byte budget"
+            );
+        }
+    }
+
+    /// Applies current-store accounting before committing one reversible revision.
     fn record_run_snapshot_changes(inner: &mut TaskStateInner, mut changes: Vec<RawRunChange>) {
+        changes.retain(|change| change.previous != change.current);
+        if changes.is_empty() {
+            return;
+        }
+
+        Self::enforce_retained_run_byte_budget(inner, &mut changes);
+        Self::record_run_journal_changes(inner, changes);
+    }
+
+    /// Commits one reversible TaskRun revision and enforces journal limits.
+    fn record_run_journal_changes(inner: &mut TaskStateInner, mut changes: Vec<RawRunChange>) {
         changes.retain(|change| change.previous != change.current);
         if changes.is_empty() {
             return;
@@ -1514,7 +1777,7 @@ impl TaskState {
                 .expect("watch history byte accounting must not overflow");
             inner.watch_history.push_back(Arc::clone(&change));
         }
-        inner.enqueue(persistence_event);
+        inner.enqueue(persistence_event, serialized_bytes);
     }
 
     fn record_run_change(
@@ -1524,11 +1787,15 @@ impl TaskState {
         task_uid: &Uid,
         run: &TaskRun,
     ) {
-        inner.enqueue(TaskStateEvent::RunChanged {
-            task: task.clone(),
-            task_uid: task_uid.clone(),
-            run: run.clone(),
-        });
+        let serialized_bytes = Self::serialized_run_persistence_bytes(task, task_uid, run);
+        inner.enqueue(
+            TaskStateEvent::RunChanged {
+                task: task.clone(),
+                task_uid: task_uid.clone(),
+                run: run.clone(),
+            },
+            serialized_bytes,
+        );
     }
 
     fn index_task(inner: &mut TaskStateInner, task: &Task) {
@@ -1870,6 +2137,7 @@ impl TaskState {
         if let Some(old) = inner.tv_of.remove(&resource.name) {
             inner.by_tv.remove(&old.tv.get());
             inner.finished_attempt_by_tv.remove(&old.tv.get());
+            inner.active_run_by_tv.remove(&old.tv.get());
         }
         let binding = RuntimeBinding { resource, tv };
         inner
@@ -1904,22 +2172,23 @@ impl TaskState {
         if let Some(binding) = inner.tv_of.remove(name) {
             inner.by_tv.remove(&binding.tv.get());
             inner.finished_attempt_by_tv.remove(&binding.tv.get());
+            inner.active_run_by_tv.remove(&binding.tv.get());
         }
     }
 
-    pub(crate) fn unbind_tv(&self, tv_raw: u64) -> Option<RuntimeBinding> {
+    /// Removes one binding only when both runtime indexes still identify it.
+    pub(crate) fn unbind_exact(&self, binding: &RuntimeBinding) -> bool {
         let mut inner = self.write(StateMutationEventCapacity::None);
-        let binding = inner.by_tv.get(&tv_raw)?.clone();
-        if inner
-            .tv_of
-            .get(&binding.resource.name)
-            .is_some_and(|current| current == &binding)
+        if inner.by_tv.get(&binding.tv.get()) != Some(binding)
+            || inner.tv_of.get(&binding.resource.name) != Some(binding)
         {
-            inner.tv_of.remove(&binding.resource.name);
+            return false;
         }
-        inner.by_tv.remove(&tv_raw);
-        inner.finished_attempt_by_tv.remove(&tv_raw);
-        Some(binding)
+        inner.by_tv.remove(&binding.tv.get());
+        inner.tv_of.remove(&binding.resource.name);
+        inner.finished_attempt_by_tv.remove(&binding.tv.get());
+        inner.active_run_by_tv.remove(&binding.tv.get());
+        true
     }
 
     /// Deletes a task and its run history.
@@ -2018,6 +2287,11 @@ impl TaskState {
         {
             return false;
         }
+        if inner.active_run_by_tv.get(&tv_raw).is_some_and(|run| {
+            run.generation() == binding.resource.generation && run.attempt() >= attempt
+        }) {
+            return false;
+        }
         if inner.runs.get(name).is_some_and(|runs| {
             runs.iter().any(|run| {
                 run.generation() == binding.resource.generation && run.attempt() >= attempt
@@ -2071,6 +2345,17 @@ impl TaskState {
             inner.terminal_since.remove(name);
         }
 
+        let previous_lifecycle = inner.active_run_by_tv.remove(&tv_raw);
+        let run = Arc::new(
+            TaskRun::starting(
+                binding.resource.generation,
+                attempt,
+                binding.resource.workload.clone(),
+            )
+            .expect("validated resource generation and attempt create a run"),
+        );
+        inner.active_run_by_tv.insert(tv_raw, Arc::clone(&run));
+
         let max_runs = inner.max_runs_per_task;
         let runs = inner.runs.entry(name.clone()).or_default();
         let mut run_changes = Vec::new();
@@ -2100,14 +2385,31 @@ impl TaskState {
             run_changes.len() <= 1,
             "TaskState must retain at most one active run for one generation"
         );
-        let run = Arc::new(
-            TaskRun::starting(
-                binding.resource.generation,
-                attempt,
-                binding.resource.workload.clone(),
-            )
-            .expect("validated resource generation and attempt create a run"),
-        );
+        if let Some(previous_lifecycle) = previous_lifecycle.filter(|previous| {
+            previous.generation() == binding.resource.generation
+                && previous.attempt() < attempt
+                && !run_changes
+                    .iter()
+                    .any(|changed| changed.attempt() == previous.attempt())
+        }) {
+            let mut terminal = previous_lifecycle.as_ref().clone();
+            terminal
+                .finish(
+                    TaskPhase::Failed,
+                    Some("run outcome not observed (a later attempt started first)".to_string()),
+                    None,
+                )
+                .expect("an active lifecycle run accepts a terminal phase");
+            let terminal = Arc::new(terminal);
+            run_changes.push(Arc::clone(&terminal));
+            run_snapshot_changes.push(Self::run_snapshot_change(
+                name,
+                &binding.resource.uid,
+                None,
+                Some(Arc::clone(&terminal)),
+            ));
+            runs.push_back(terminal);
+        }
         run_changes.push(Arc::clone(&run));
         run_snapshot_changes.push(Self::run_snapshot_change(
             name,
@@ -2126,6 +2428,18 @@ impl TaskState {
             ));
         }
         Self::record_run_snapshot_changes(&mut inner, run_snapshot_changes);
+        if let Some(finished) = run_changes
+            .iter()
+            .filter(|run| !run.is_active())
+            .map(|run| run.attempt())
+            .max()
+        {
+            inner
+                .finished_attempt_by_tv
+                .entry(tv_raw)
+                .and_modify(|current| *current = (*current).max(finished))
+                .or_insert(finished);
+        }
         if let Some((revision, previous, current)) = task_change {
             self.record_change(&mut inner, revision, Some(previous), Some(current));
         }
@@ -2183,6 +2497,12 @@ impl TaskState {
         }
         let updates_current_status = task.metadata().generation() == binding.resource.generation
             && attempt >= task.status().attempt();
+        let consumes_active_lifecycle = inner.active_run_by_tv.get(&tv_raw).is_some_and(|run| {
+            run.generation() == binding.resource.generation && run.attempt() <= attempt
+        });
+        let active_lifecycle = consumes_active_lifecycle
+            .then(|| inner.active_run_by_tv.remove(&tv_raw))
+            .flatten();
 
         let max_runs = inner.max_runs_per_task;
         let (run_error, run_exit_code, run_changed, run_changes, run_snapshot_changes) = {
@@ -2216,6 +2536,33 @@ impl TaskState {
                 run_changes.len() <= 1,
                 "TaskState must retain at most one active run for one generation"
             );
+            if let Some(active) = active_lifecycle.as_ref().filter(|active| {
+                active.generation() == binding.resource.generation
+                    && active.attempt() < attempt
+                    && !run_changes
+                        .iter()
+                        .any(|changed| changed.attempt() == active.attempt())
+            }) {
+                let mut terminal = active.as_ref().clone();
+                terminal
+                    .finish(
+                        TaskPhase::Failed,
+                        Some(
+                            "run outcome not observed (a later attempt finished first)".to_string(),
+                        ),
+                        None,
+                    )
+                    .expect("an active lifecycle run accepts a terminal phase");
+                let terminal = Arc::new(terminal);
+                run_changes.push(Arc::clone(&terminal));
+                run_snapshot_changes.push(Self::run_snapshot_change(
+                    name,
+                    &binding.resource.uid,
+                    None,
+                    Some(Arc::clone(&terminal)),
+                ));
+                runs.push_back(terminal);
+            }
             let index = runs.iter().position(|run| {
                 run.generation() == binding.resource.generation && run.attempt() == attempt
             });
@@ -2223,14 +2570,24 @@ impl TaskState {
             let run = if let Some(index) = index {
                 &mut runs[index]
             } else {
-                runs.push_back(Arc::new(
-                    TaskRun::starting(
-                        binding.resource.generation,
-                        attempt,
-                        binding.resource.workload.clone(),
-                    )
-                    .expect("validated resource generation and attempt create a run"),
-                ));
+                let starting = active_lifecycle
+                    .as_ref()
+                    .filter(|active| {
+                        active.generation() == binding.resource.generation
+                            && active.attempt() == attempt
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        Arc::new(
+                            TaskRun::starting(
+                                binding.resource.generation,
+                                attempt,
+                                binding.resource.workload.clone(),
+                            )
+                            .expect("validated resource generation and attempt create a run"),
+                        )
+                    });
+                runs.push_back(starting);
                 runs.back_mut().expect("the run was just appended")
             };
             let run_changed = run.is_active();
@@ -2673,11 +3030,13 @@ impl TaskState {
         inner.tv_of.remove(&binding.resource.name);
         inner.by_tv.remove(&tv_raw);
         inner.finished_attempt_by_tv.remove(&tv_raw);
+        let active_lifecycle = inner.active_run_by_tv.remove(&tv_raw);
 
         let max_runs = inner.max_runs_per_task;
         let mut run_change = None;
         let mut run_snapshot_changes = Vec::new();
-        if let Some(runs) = inner.runs.get_mut(&binding.resource.name) {
+        if inner.runs.contains_key(&binding.resource.name) || active_lifecycle.is_some() {
+            let runs = inner.runs.entry(binding.resource.name.clone()).or_default();
             if let Some(run) = runs
                 .iter_mut()
                 .rev()
@@ -2694,6 +3053,22 @@ impl TaskState {
                     Some(previous),
                     Some(Arc::clone(run)),
                 ));
+            } else if let Some(active) = active_lifecycle.filter(|active| {
+                active.generation() == binding.resource.generation && active.is_active()
+            }) {
+                let mut terminal = active.as_ref().clone();
+                terminal
+                    .finish(phase, error.clone(), exit_code)
+                    .expect("terminal phase closes an active lifecycle run");
+                let terminal = Arc::new(terminal);
+                run_change = Some(Arc::clone(&terminal));
+                run_snapshot_changes.push(Self::run_snapshot_change(
+                    &binding.resource.name,
+                    &binding.resource.uid,
+                    None,
+                    Some(Arc::clone(&terminal)),
+                ));
+                runs.push_back(terminal);
             }
             for removed in Self::enforce_run_cap(runs, max_runs) {
                 run_snapshot_changes.push(Self::run_snapshot_change(
@@ -3743,6 +4118,11 @@ impl TaskState {
     #[cfg(test)]
     pub(crate) fn active_persistence_admissions(&self) -> usize {
         self.event_publisher.active_admissions()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_persistence_worker_panic(&self) {
+        self.event_publisher.inject_worker_panic();
     }
 }
 

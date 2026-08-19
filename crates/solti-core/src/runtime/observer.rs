@@ -24,10 +24,13 @@
 //! It lets queued attempt events arrive before binding and output cleanup.
 //! Finalization waits for that barrier for at most one second.
 //! Subscriber overflow releases finalizations that are safe without the barrier.
+//! If state persistence admission is closed after authoritative cleanup, the
+//! observer removes exact runtime ownership without synthesizing status or runs.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     num::NonZeroUsize,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
     time::Duration,
 };
@@ -170,7 +173,90 @@ pub(crate) struct RuntimeObserver {
     state: TaskState,
     output_hub: Arc<OutputHub>,
     lifecycle_gate: LifecycleGate,
-    completion_barriers: Mutex<CompletionBarriers>,
+    completion_barriers: Arc<Mutex<CompletionBarriers>>,
+}
+
+/// Owns an exact runtime binding until Taskvisor intake is accepted.
+///
+/// The synchronous fallback is intentionally limited to a pre-intake binding.
+/// Taskvisor cannot publish an event before successful controller intake, and
+/// the reconciliation worker still owns the per-name runtime lock. This lets an
+/// unexpected unwind remove the exact binding without awaiting the lifecycle
+/// gate or inventing a Taskvisor outcome.
+pub(crate) struct ProvisionalBinding {
+    state: TaskState,
+    output_hub: Arc<OutputHub>,
+    completion_barriers: Arc<Mutex<CompletionBarriers>>,
+    binding: Option<RuntimeBinding>,
+}
+
+impl ProvisionalBinding {
+    fn new(
+        state: TaskState,
+        output_hub: Arc<OutputHub>,
+        completion_barriers: Arc<Mutex<CompletionBarriers>>,
+        binding: RuntimeBinding,
+    ) -> Self {
+        Self {
+            state,
+            output_hub,
+            completion_barriers,
+            binding: Some(binding),
+        }
+    }
+
+    pub(crate) fn binding(&self) -> &RuntimeBinding {
+        self.binding
+            .as_ref()
+            .expect("provisional binding is armed until release or Taskvisor handoff")
+    }
+
+    /// Releases the binding through the ordinary serialized observer path.
+    pub(crate) async fn release(mut self, observer: &RuntimeObserver) -> bool {
+        let binding = self.binding().clone();
+        let released = observer.release_unsubmitted_binding(&binding).await;
+        if observer.state.resolve_tv(binding.tv.get()).as_ref() != Some(&binding) {
+            self.binding = None;
+        }
+        released
+    }
+
+    /// Transfers ownership to the authoritative Taskvisor completion worker.
+    pub(crate) fn disarm(mut self) {
+        self.binding = None;
+    }
+
+    fn release_exact_without_await(&mut self) {
+        let Some(binding) = self.binding.take() else {
+            return;
+        };
+        if self.state.resolve_tv(binding.tv.get()).as_ref() != Some(&binding) {
+            return;
+        }
+        if self.state.unbind_exact(&binding) {
+            self.output_hub
+                .evict_if_uid(&binding.resource.name, &binding.resource.uid);
+            let mut barriers = self.completion_barriers.lock();
+            barriers.pending.remove(&binding.tv.get());
+            barriers.take_removed(binding.tv.get());
+            barriers.notify_finalized(binding.tv.get());
+        }
+    }
+}
+
+impl Drop for ProvisionalBinding {
+    fn drop(&mut self) {
+        let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+            self.release_exact_without_await();
+        })) else {
+            return;
+        };
+        if let Err(nested) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+            // A hostile panic payload cannot be destroyed recursively. Retain
+            // this one nested payload and preserve the non-unwinding boundary.
+            std::mem::forget(nested);
+        }
+    }
 }
 
 impl RuntimeObserver {
@@ -180,29 +266,40 @@ impl RuntimeObserver {
             state,
             output_hub,
             lifecycle_gate: LifecycleGate::default(),
-            completion_barriers: Mutex::new(CompletionBarriers::default()),
+            completion_barriers: Arc::new(Mutex::new(CompletionBarriers::default())),
         }
     }
 
     /// Binds a prepared submission before it can publish events.
     ///
-    /// Returns `false` for a stale UID or generation.
+    /// Returns `None` for a stale UID or generation.
     pub(crate) async fn bind(
         &self,
         resource: ResourceGeneration,
         tv: taskvisor::TaskId,
         ensure_output: bool,
-    ) -> bool {
+    ) -> Option<ProvisionalBinding> {
         let _lifecycle = self.lifecycle_gate.lock().await;
-        let task_id = resource.name.clone();
-        let task_uid = resource.uid.clone();
+        let binding = RuntimeBinding {
+            resource: resource.clone(),
+            tv,
+        };
         if !self.state.bind_tv(resource, tv) {
-            return false;
+            return None;
         }
+        let provisional = ProvisionalBinding::new(
+            self.state.clone(),
+            Arc::clone(&self.output_hub),
+            Arc::clone(&self.completion_barriers),
+            binding.clone(),
+        );
         if ensure_output {
-            self.output_hub.ensure_channel_if_absent(task_id, task_uid);
+            self.output_hub.ensure_channel_if_absent(
+                binding.resource.name.clone(),
+                binding.resource.uid.clone(),
+            );
         }
-        true
+        Some(provisional)
     }
 
     /// Releases a binding whose prepared submission was cancelled before intake.
@@ -212,12 +309,11 @@ impl RuntimeObserver {
     /// intake failure for the superseded generation.
     pub(crate) async fn release_unsubmitted_binding(&self, binding: &RuntimeBinding) -> bool {
         let _lifecycle = self.lifecycle_gate.lock().await;
-        if self.state.resolve_tv(binding.tv.get()).as_ref() != Some(binding) {
+        if !self.state.unbind_exact(binding) {
             return false;
         }
-
-        self.state.unbind_tv(binding.tv.get());
-        self.output_hub.evict(&binding.resource.name);
+        self.output_hub
+            .evict_if_uid(&binding.resource.name, &binding.resource.uid);
         self.mark_completed_locked(binding.tv.get());
         true
     }
@@ -225,6 +321,7 @@ impl RuntimeObserver {
     /// Releases a failed runtime intake binding.
     ///
     /// The desired resource remains with `Reconciled=False`.
+    #[cfg(test)]
     pub(crate) async fn fail_bound_reconciliation(
         &self,
         binding: &RuntimeBinding,
@@ -239,12 +336,11 @@ impl RuntimeObserver {
             return false;
         };
         let _lifecycle = self.lifecycle_gate.lock().await;
-        if self.state.resolve_tv(binding.tv.get()).as_ref() != Some(binding) {
+        if !self.state.unbind_exact(binding) {
             return false;
         }
-
-        self.state.unbind_tv(binding.tv.get());
-        self.output_hub.evict(&binding.resource.name);
+        self.output_hub
+            .evict_if_uid(&binding.resource.name, &binding.resource.uid);
         let changed = self.state.mark_reconciliation_failed_admitted(
             &binding.resource,
             reason,
@@ -467,14 +563,17 @@ impl RuntimeObserver {
                 .collect::<Vec<_>>()
         };
         for tv_raw in ids {
-            let Ok(admission) = self.state.admit_state_write_from_taskvisor_callback(
+            let admission = self.state.admit_state_write_from_taskvisor_callback(
                 StateMutationEventCapacity::TaskAndRunChange,
-            ) else {
-                return;
-            };
+            );
             let _lifecycle = self.lifecycle_gate.lock_from_taskvisor_callback();
-            if let Some(finalization) = self.take_safe_pending_locked(tv_raw) {
-                self.finalize_admitted_locked(tv_raw, finalization, admission);
+            match admission {
+                Ok(admission) => {
+                    if let Some(finalization) = self.take_safe_pending_locked(tv_raw) {
+                        self.finalize_admitted_locked(tv_raw, finalization, admission);
+                    }
+                }
+                Err(_) => self.cleanup_without_projection_locked(tv_raw),
             }
         }
     }
@@ -513,11 +612,23 @@ impl RuntimeObserver {
             .state
             .admit_state_write(StateMutationEventCapacity::TaskAndRunChange)
             .await;
-        let Ok(admission) = admission else {
-            return;
-        };
         let _lifecycle = self.lifecycle_gate.lock().await;
-        self.finalize_admitted_locked(tv_raw, finalization, admission);
+        match admission {
+            Ok(admission) => self.finalize_admitted_locked(tv_raw, finalization, admission),
+            Err(_) => self.cleanup_without_projection_locked(tv_raw),
+        }
+    }
+
+    /// Removes runtime ownership after authoritative cleanup when projection
+    /// persistence is unavailable. This does not synthesize status or run data.
+    fn cleanup_without_projection_locked(&self, tv_raw: u64) {
+        if let Some(binding) = self.state.resolve_tv(tv_raw)
+            && self.state.unbind_exact(&binding)
+        {
+            self.output_hub
+                .evict_if_uid(&binding.resource.name, &binding.resource.uid);
+        }
+        self.mark_completed_locked(tv_raw);
     }
 
     fn finalize_admitted_locked(

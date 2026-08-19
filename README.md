@@ -245,6 +245,8 @@ Applying an identical manifest schedules one manual retry only when `Reconciled=
 
 Taskvisor owns attempt restart, backoff, timeout, admission, and cancellation.
 Core retains bounded `TaskRun` history separately from the current Task status.
+Current retained run values have a separate 256 MiB compact JSON budget by
+default. This logical payload bound does not measure allocator overhead or RSS.
 
 ## Public Task API
 
@@ -382,19 +384,27 @@ Keep these boundaries explicit:
 - Core stores Tasks, runs, watch history, and runtime bindings in memory.
 - Core retains at most 1024 current Task resources by default.
 - Core also retains at most 256 MiB of aggregate TaskManifest bytes by default.
+- Current TaskRun values have a separate 256 MiB aggregate compact JSON budget.
 - Every current Task counts, including embedded, pending, running, and terminal Tasks.
-- The count and TaskManifest byte budgets are independent.
-- The byte budget measures only compact canonical TaskManifest JSON.
+- Task count, TaskManifest bytes, and current TaskRun bytes are independent limits.
+- The TaskManifest budget measures compact canonical TaskManifest JSON. The
+  TaskRun budget counts each value currently present in query state once.
 - At the count limit, Core rejects new names. At the byte limit, it also rejects
   existing applies that would increase retained bytes past the budget.
 - Shrinking and no-op applies remain allowed. Admission never evicts a Task.
-- `StateConfig` can configure or disable either retained Task budget before startup.
-- The TaskManifest byte budget does not bound total process memory.
+- Current-run overflow compacts the globally oldest completed runs. When active
+  values alone exceed a smaller custom budget, lifecycle processing and state
+  persistence continue while the new active value is omitted from query state.
+- `StateConfig` can configure or disable each retained-state limit before startup.
+- Serialized byte budgets are logical payload bounds, not allocator or RSS limits.
 - Process restart loses all core state.
 - Live output is bounded and lossy.
 - Core does not persist or replay output by itself.
 - Optional core hooks can forward task, run, and output events to an
   application-owned store.
+- Lossless state-hook admission has independent event-count and payload-byte
+  bounds. The payload bound defaults to 256 MiB and applies backpressure before
+  the authoritative state or spawn critical section.
 - A slow output subscriber receives `Lagged` after events are dropped.
 - Watch history is bounded by change count and serialized Task bytes.
 - A watch can resume only while its resource version remains retained.

@@ -2,12 +2,13 @@
 //!
 //! These hooks let an agent forward task state and output to external storage.
 //!
-//! State writes reserve bounded, lossless queue ownership before entering their
-//! authoritative state critical section. Tokio-owned paths await fair admission;
-//! Taskvisor callback workers use the same admission future on their dedicated
-//! threads. Events enter the queue after the state lock is released. One worker
-//! delivers callbacks in commit order and shutdown drains that queue. Output
-//! callbacks use a separate bounded, nonblocking, best-effort dispatcher.
+//! State writes reserve bounded, lossless event and payload ownership before
+//! entering their authoritative state critical section. Tokio-owned paths await
+//! fair admission; Taskvisor callback workers use the same admission future on
+//! their dedicated threads. Events enter the queue after the state lock is
+//! released. One worker delivers callbacks in commit order and shutdown drains
+//! that queue. Output callbacks use a separate bounded, nonblocking, best-effort
+//! dispatcher.
 
 use std::{
     cell::Cell,
@@ -25,21 +26,46 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use solti_model::{OutputEvent, Task, TaskId, TaskRun, Uid};
+use solti_model::{
+    MAX_TASK_DIAGNOSTIC_BYTES, MAX_TASK_MANIFEST_BYTES, OutputEvent, Task, TaskId, TaskRun, Uid,
+};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::ConfigError;
 
 const DEFAULT_STATE_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(2_048).unwrap();
+const DEFAULT_STATE_QUEUE_BYTE_CAPACITY: NonZeroUsize =
+    NonZeroUsize::new(256 * 1024 * 1024).unwrap();
 const DEFAULT_OUTPUT_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(2_048).unwrap();
 pub(crate) const MAX_STATE_EVENTS_PER_COMMIT: usize = 3;
+// A stored Task adds bounded server metadata and status to a manifest. Four
+// manifest bounds conservatively cover both snapshots in TaskChanged.
+pub(crate) const TASK_CHANGE_BYTE_RESERVATION: usize = 4 * MAX_TASK_MANIFEST_BYTES;
+// A JSON string byte can expand to six bytes as a `\u00XX` escape. The remaining
+// 4 KiB covers the complete RunChanged envelope, maximum validated task and
+// workload identities, generated UID, timestamps, numeric fields, and field names.
+// This bound stands on its own instead of borrowing headroom from TaskChanged.
+const JSON_WORST_CASE_ESCAPE_EXPANSION: usize = 6;
+const RUN_CHANGE_FIXED_AND_BOUNDED_FIELDS_RESERVATION: usize = 4 * 1024;
+pub(crate) const RUN_CHANGE_BYTE_RESERVATION: usize = JSON_WORST_CASE_ESCAPE_EXPANSION
+    * MAX_TASK_DIAGNOSTIC_BYTES
+    + RUN_CHANGE_FIXED_AND_BOUNDED_FIELDS_RESERVATION;
+pub(crate) const MAX_STATE_BYTES_PER_COMMIT: usize =
+    TASK_CHANGE_BYTE_RESERVATION + 2 * RUN_CHANGE_BYTE_RESERVATION;
 const MIN_STATE_QUEUE_CAPACITY: usize = MAX_STATE_EVENTS_PER_COMMIT - 1;
 const MAX_STATE_QUEUE_CAPACITY: usize = Semaphore::MAX_PERMITS - 1;
 
 /// Persistence delivery settings.
+///
+/// State delivery defaults to 2048 buffered events plus one active callback and
+/// a 256 MiB hard payload bound. The payload bound counts conservative
+/// pre-write reservations, then the documented compact JSON charge for each
+/// committed event variant. It is a logical payload bound, not allocator or RSS
+/// accounting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PersistenceConfig {
     state_queue_capacity: NonZeroUsize,
+    state_queue_byte_capacity: NonZeroUsize,
     output_queue_capacity: NonZeroUsize,
 }
 
@@ -48,6 +74,7 @@ impl PersistenceConfig {
     pub const fn new() -> Self {
         Self {
             state_queue_capacity: DEFAULT_STATE_QUEUE_CAPACITY,
+            state_queue_byte_capacity: DEFAULT_STATE_QUEUE_BYTE_CAPACITY,
             output_queue_capacity: DEFAULT_OUTPUT_QUEUE_CAPACITY,
         }
     }
@@ -56,6 +83,15 @@ impl PersistenceConfig {
     /// The active callback count is either zero or one.
     pub const fn state_queue_capacity(self) -> NonZeroUsize {
         self.state_queue_capacity
+    }
+
+    /// Returns the hard state-event payload bound, including reservations,
+    /// buffered events, and the active callback.
+    ///
+    /// The minimum is currently 16 MiB plus 392 KiB, the conservative bound
+    /// for one maximum three-event commit.
+    pub const fn state_queue_byte_capacity(self) -> NonZeroUsize {
+        self.state_queue_byte_capacity
     }
 
     /// Returns the hard output-event admission bound, including the active callback.
@@ -94,6 +130,40 @@ impl PersistenceConfig {
             });
         }
         self.state_queue_capacity = capacity;
+        Ok(self)
+    }
+
+    /// Replaces the hard state-event payload bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Zero`] when `capacity` is zero.
+    /// Returns [`ConfigError::BelowMinimum`] when the largest atomic state
+    /// commit cannot reserve its conservative 16 MiB plus 392 KiB payload bound.
+    /// Returns [`ConfigError::Exceeds`] when `capacity` exceeds Tokio's safe
+    /// semaphore capacity.
+    pub const fn try_with_state_queue_byte_capacity(
+        mut self,
+        capacity: usize,
+    ) -> Result<Self, ConfigError> {
+        let Some(capacity) = NonZeroUsize::new(capacity) else {
+            return Err(ConfigError::Zero {
+                field: "persistence_state_queue_byte_capacity",
+            });
+        };
+        if capacity.get() < MAX_STATE_BYTES_PER_COMMIT {
+            return Err(ConfigError::BelowMinimum {
+                field: "persistence_state_queue_byte_capacity",
+                minimum: MAX_STATE_BYTES_PER_COMMIT,
+            });
+        }
+        if capacity.get() > Semaphore::MAX_PERMITS {
+            return Err(ConfigError::Exceeds {
+                field: "persistence_state_queue_byte_capacity",
+                limit: "semaphore_max_permits",
+            });
+        }
+        self.state_queue_byte_capacity = capacity;
         Ok(self)
     }
 
@@ -159,8 +229,13 @@ pub enum TaskStateEvent {
 ///
 /// Core invokes this callback on one dedicated persistence worker. Calls are
 /// serialized in commit order. A slow sink fills the bounded queue and then
-/// applies fair admission backpressure before Tokio-owned state commits enter
-/// their state or spawn critical sections; events are not dropped for overload.
+/// applies fair event-count and payload-byte admission backpressure before
+/// Tokio-owned state commits enter their state or spawn critical sections;
+/// events are not dropped for overload.
+/// An unwinding callback is not retried, and later events continue through the
+/// worker. If a custom panic payload panics again from its destructor, core
+/// forgets the replacement payload to contain that second unwind. Repeating
+/// such a hostile payload can leak one replacement payload per callback panic.
 /// The callback must eventually return so shutdown can drain the queue.
 /// It must not mutate `TaskState`, directly or by waiting for another thread
 /// that does so. Reads and waits for unrelated Tokio work are allowed. Polling
@@ -182,14 +257,17 @@ pub struct TaskStateSinkStatus {
     healthy: bool,
     queued: usize,
     capacity: usize,
+    queued_bytes: usize,
+    byte_capacity: usize,
     delivered: u64,
     failed: u64,
 }
 
 impl TaskStateSinkStatus {
     /// Returns whether the dispatcher accepts reservations for new events.
-    /// Reservations that crossed the admission boundary before this becomes
-    /// false remain accepted and are drained by shutdown.
+    /// During normal shutdown, reservations that crossed the admission boundary
+    /// before this becomes false remain accepted and are drained. A worker
+    /// failure rejects pending reservations that have not completed admission.
     pub fn accepting(self) -> bool {
         self.accepting
     }
@@ -209,6 +287,24 @@ impl TaskStateSinkStatus {
     /// Returns the hard event-ownership bound, including the active callback.
     pub fn capacity(self) -> usize {
         self.capacity
+    }
+
+    /// Returns payload bytes reserved or retained by accepted state commits.
+    ///
+    /// An in-flight mutation reports its conservative reservation. For a
+    /// committed `TaskChanged`, the charge is the byte sum of compact JSON for
+    /// each present `previous` and `current` Task value. It excludes the event's
+    /// separate `resource_version` value and all event-variant framing. For
+    /// `RunChanged`, the charge is the byte sum of compact JSON for its TaskId,
+    /// UID, and TaskRun values, excluding event-variant framing. Batch leases
+    /// sum those variant charges.
+    pub fn queued_bytes(self) -> usize {
+        self.queued_bytes
+    }
+
+    /// Returns the hard state-event payload bound.
+    pub fn byte_capacity(self) -> usize {
+        self.byte_capacity
     }
 
     /// Returns callbacks that returned normally.
@@ -234,6 +330,7 @@ pub(crate) struct StateAdmissionClosed;
 pub(crate) struct StateDispatcherAdmission {
     sender: mpsc::Sender<StateDispatchEvent>,
     permits: Vec<StateQueuePermit>,
+    byte_permit: Option<StateQueueBytePermit>,
     // This field is last so a dropped admission closes its sender clone before
     // the final dispatcher owner can synchronously join the worker.
     _dispatcher_lifetime: Arc<StateEventDispatcher>,
@@ -250,6 +347,13 @@ impl StateDispatcherAdmission {
         self.permits.clear();
     }
 
+    pub(crate) fn shrink_byte_reservation(&mut self, retained: usize) {
+        self.byte_permit
+            .as_mut()
+            .expect("state persistence admission owns a byte reservation")
+            .shrink_to(retained);
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.permits.len()
@@ -259,6 +363,7 @@ impl StateDispatcherAdmission {
 pub(crate) struct StateDispatchEvent {
     event: TaskStateEvent,
     _permit: StateQueuePermit,
+    _byte_permit: Option<Arc<StateQueueBytePermit>>,
 }
 
 impl StateDispatchEvent {
@@ -266,6 +371,7 @@ impl StateDispatchEvent {
         Self {
             event,
             _permit: permit,
+            _byte_permit: None,
         }
     }
 }
@@ -280,6 +386,52 @@ struct StateQueuePermits {
 
 pub(crate) struct StateQueuePermit {
     permits: Arc<StateQueuePermits>,
+}
+
+struct StateQueueBytePermits {
+    semaphore: Arc<Semaphore>,
+    limit: usize,
+    metrics: Arc<StateDispatcherMetrics>,
+}
+
+pub(crate) struct StateQueueBytePermit {
+    permits: Arc<StateQueueBytePermits>,
+    retained: usize,
+}
+
+impl StateQueueBytePermit {
+    fn shrink_to(&mut self, retained: usize) {
+        assert!(
+            retained <= self.retained,
+            "state persistence payload must fit its pre-write reservation"
+        );
+        let released = self.retained - retained;
+        if released == 0 {
+            return;
+        }
+        self.retained = retained;
+        self.permits
+            .metrics
+            .queued_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                queued.checked_sub(released)
+            })
+            .expect("state persistence outstanding bytes must not underflow");
+        self.permits.semaphore.add_permits(released);
+    }
+}
+
+impl Drop for StateQueueBytePermit {
+    fn drop(&mut self) {
+        self.permits
+            .metrics
+            .queued_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                queued.checked_sub(self.retained)
+            })
+            .expect("state persistence outstanding bytes must not underflow");
+        self.permits.semaphore.add_permits(self.retained);
+    }
 }
 
 impl Drop for StateQueuePermit {
@@ -350,6 +502,36 @@ impl StateQueuePermits {
     }
 }
 
+impl StateQueueBytePermits {
+    async fn reserve(self: &Arc<Self>, requested: usize) -> StateQueueBytePermit {
+        assert!(
+            requested <= self.limit,
+            "an atomic state commit must fit within persistence byte capacity"
+        );
+        assert!(
+            requested <= u32::MAX as usize,
+            "an atomic state commit must fit Tokio semaphore acquisition"
+        );
+        let acquired = Arc::clone(&self.semaphore)
+            .acquire_many_owned(requested as u32)
+            .await
+            .expect("state persistence byte admission remains open while commits are accepted");
+        self.metrics
+            .queued_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                queued
+                    .checked_add(requested)
+                    .filter(|updated| *updated <= self.limit)
+            })
+            .expect("state persistence outstanding bytes must remain bounded");
+        acquired.forget();
+        StateQueueBytePermit {
+            permits: Arc::clone(self),
+            retained: requested,
+        }
+    }
+}
+
 struct ThreadUnparker(thread::Thread);
 
 impl Wake for ThreadUnparker {
@@ -393,30 +575,69 @@ fn block_on_thread_after_pending<F: Future>(future: F, pending: mpsc::SyncSender
     }
 }
 
+struct StateDispatcherAdmissionGate {
+    accepting: bool,
+    worker_failed: bool,
+    sender: Option<mpsc::Sender<StateDispatchEvent>>,
+}
+
 struct StateDispatcherMetrics {
-    accepting: AtomicBool,
+    admission: Mutex<StateDispatcherAdmissionGate>,
     healthy: AtomicBool,
     queued: AtomicUsize,
     capacity: usize,
+    queued_bytes: AtomicUsize,
+    byte_capacity: usize,
     delivered: AtomicU64,
     failed: AtomicU64,
+    #[cfg(test)]
+    panic_worker_once: AtomicBool,
 }
 
 impl StateDispatcherMetrics {
     fn status(&self) -> TaskStateSinkStatus {
+        let accepting = self.admission.lock().accepting;
         TaskStateSinkStatus {
-            accepting: self.accepting.load(Ordering::Acquire),
+            accepting,
             healthy: self.healthy.load(Ordering::Acquire),
             queued: self.queued.load(Ordering::Acquire),
             capacity: self.capacity,
+            queued_bytes: self.queued_bytes.load(Ordering::Acquire),
+            byte_capacity: self.byte_capacity,
             delivered: self.delivered.load(Ordering::Acquire),
             failed: self.failed.load(Ordering::Acquire),
         }
     }
 
+    fn sender(&self) -> Result<mpsc::Sender<StateDispatchEvent>, StateAdmissionClosed> {
+        let admission = self.admission.lock();
+        if !admission.accepting {
+            return Err(StateAdmissionClosed);
+        }
+        admission.sender.clone().ok_or(StateAdmissionClosed)
+    }
+
+    #[cfg(test)]
+    fn admission_is_open(&self) -> bool {
+        self.admission.lock().accepting
+    }
+
+    fn worker_failed(&self) -> bool {
+        self.admission.lock().worker_failed
+    }
+
+    fn close_admission(&self) {
+        let mut admission = self.admission.lock();
+        admission.accepting = false;
+        admission.sender.take();
+    }
+
     fn mark_worker_failed(&self) {
+        let mut admission = self.admission.lock();
+        admission.accepting = false;
+        admission.worker_failed = true;
+        admission.sender.take();
         self.healthy.store(false, Ordering::Release);
-        self.accepting.store(false, Ordering::Release);
     }
 }
 
@@ -478,9 +699,9 @@ impl StateDispatcherShutdown {
 }
 
 pub(crate) struct StateEventDispatcher {
-    sender: Mutex<Option<mpsc::Sender<StateDispatchEvent>>>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     permits: Arc<StateQueuePermits>,
+    byte_permits: Arc<StateQueueBytePermits>,
     metrics: Arc<StateDispatcherMetrics>,
     shutdown: StateDispatcherShutdown,
     #[cfg(test)]
@@ -506,9 +727,18 @@ impl Drop for StateAdmissionWaiter<'_> {
 }
 
 impl StateEventDispatcher {
+    #[cfg(test)]
     pub(crate) fn start(
         sink: TaskStateSinkHandle,
         capacity: NonZeroUsize,
+    ) -> io::Result<Arc<Self>> {
+        Self::start_with_byte_capacity(sink, capacity, DEFAULT_STATE_QUEUE_BYTE_CAPACITY)
+    }
+
+    pub(crate) fn start_with_byte_capacity(
+        sink: TaskStateSinkHandle,
+        capacity: NonZeroUsize,
+        byte_capacity: NonZeroUsize,
     ) -> io::Result<Arc<Self>> {
         let (sender, receiver) = mpsc::channel::<StateDispatchEvent>();
         // `capacity` counts buffered events. One additional permit belongs to
@@ -518,12 +748,20 @@ impl StateEventDispatcher {
             .checked_add(1)
             .expect("validated persistence capacity leaves one active event slot");
         let metrics = Arc::new(StateDispatcherMetrics {
-            accepting: AtomicBool::new(true),
+            admission: Mutex::new(StateDispatcherAdmissionGate {
+                accepting: true,
+                worker_failed: false,
+                sender: Some(sender),
+            }),
             healthy: AtomicBool::new(true),
             queued: AtomicUsize::new(0),
             capacity: permit_limit,
+            queued_bytes: AtomicUsize::new(0),
+            byte_capacity: byte_capacity.get(),
             delivered: AtomicU64::new(0),
             failed: AtomicU64::new(0),
+            #[cfg(test)]
+            panic_worker_once: AtomicBool::new(false),
         });
         let worker_metrics = Arc::clone(&metrics);
         let worker = thread::Builder::new()
@@ -531,6 +769,13 @@ impl StateEventDispatcher {
             .spawn(move || {
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     while let Ok(dispatched) = receiver.recv() {
+                        #[cfg(test)]
+                        if worker_metrics
+                            .panic_worker_once
+                            .swap(false, Ordering::AcqRel)
+                        {
+                            panic!("injected state persistence worker panic");
+                        }
                         if deliver_state_event(&sink, dispatched.event) {
                             saturating_increment(&worker_metrics.delivered);
                         } else {
@@ -549,10 +794,15 @@ impl StateEventDispatcher {
             limit: permit_limit,
             metrics: Arc::clone(&metrics),
         });
+        let byte_permits = Arc::new(StateQueueBytePermits {
+            semaphore: Arc::new(Semaphore::new(byte_capacity.get())),
+            limit: byte_capacity.get(),
+            metrics: Arc::clone(&metrics),
+        });
         Ok(Arc::new(Self {
-            sender: Mutex::new(Some(sender)),
             worker: Mutex::new(Some(worker)),
             permits,
+            byte_permits,
             metrics,
             shutdown: StateDispatcherShutdown::new(),
             #[cfg(test)]
@@ -560,39 +810,63 @@ impl StateEventDispatcher {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) async fn reserve(
         self: &Arc<Self>,
         event_count: usize,
     ) -> Result<StateDispatcherAdmission, StateAdmissionClosed> {
+        self.reserve_with_bytes(event_count, MAX_STATE_BYTES_PER_COMMIT)
+            .await
+    }
+
+    pub(crate) async fn reserve_with_bytes(
+        self: &Arc<Self>,
+        event_count: usize,
+        byte_count: usize,
+    ) -> Result<StateDispatcherAdmission, StateAdmissionClosed> {
         assert_state_sink_is_not_mutating_state();
-        let sender = self
-            .sender
-            .lock()
-            .as_ref()
-            .cloned()
-            .ok_or(StateAdmissionClosed)?;
+        let sender = self.metrics.sender()?;
         #[cfg(test)]
         let _waiter = StateAdmissionWaiter::new(&self.admission_waiters);
         let permits = self.permits.reserve(event_count).await;
+        let byte_permit = self.byte_permits.reserve(byte_count).await;
+        // Shutdown closes new admission but preserves reservations that crossed
+        // the admission gate before the shutdown fence. A worker failure is
+        // different: a waiter that has not yet received its reservation cannot
+        // safely enter authoritative state after delivery became unavailable.
+        if self.metrics.worker_failed() {
+            return Err(StateAdmissionClosed);
+        }
         Ok(StateDispatcherAdmission {
             sender,
             permits,
+            byte_permit: Some(byte_permit),
             _dispatcher_lifetime: Arc::clone(self),
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn reserve_blocking(
         self: &Arc<Self>,
         event_count: usize,
     ) -> Result<StateDispatcherAdmission, StateAdmissionClosed> {
-        assert_state_sink_is_not_mutating_state();
         block_on_thread(self.reserve(event_count))
+    }
+
+    pub(crate) fn reserve_blocking_with_bytes(
+        self: &Arc<Self>,
+        event_count: usize,
+        byte_count: usize,
+    ) -> Result<StateDispatcherAdmission, StateAdmissionClosed> {
+        assert_state_sink_is_not_mutating_state();
+        block_on_thread(self.reserve_with_bytes(event_count, byte_count))
     }
 
     pub(crate) fn dispatch(&self, admission: StateDispatcherAdmission, events: StateEventBatch) {
         let StateDispatcherAdmission {
             sender,
             permits,
+            byte_permit,
             _dispatcher_lifetime,
         } = admission;
         debug_assert!(
@@ -600,12 +874,20 @@ impl StateEventDispatcher {
             "unused state event permits must be released before dispatch"
         );
         drop(permits);
-        for event in events {
+        let byte_permit = byte_permit.map(Arc::new);
+        for mut event in events {
+            event._byte_permit = byte_permit.as_ref().map(Arc::clone);
             if sender.send(event).is_err() {
                 self.metrics.mark_worker_failed();
-                panic!("state persistence worker must remain available");
+                tracing::error!(
+                    event = "persistence.worker_unavailable",
+                    sink = "task_state",
+                    "state persistence event could not reach its worker"
+                );
+                break;
             }
         }
+        drop(byte_permit);
         drop(sender);
         drop(_dispatcher_lifetime);
     }
@@ -619,13 +901,21 @@ impl StateEventDispatcher {
         self.admission_waiters.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn admission_is_open_for_test(&self) -> bool {
+        self.metrics.admission_is_open()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_worker_panic(&self) {
+        self.metrics
+            .panic_worker_once
+            .store(true, Ordering::Release);
+    }
+
     pub(crate) async fn shutdown(&self) {
         if self.shutdown.begin() {
-            {
-                let mut sender = self.sender.lock();
-                self.metrics.accepting.store(false, Ordering::Release);
-                sender.take();
-            }
+            self.metrics.close_admission();
             let worker = self.worker.lock().take();
             let outcome = self.shutdown.outcome.clone();
             if let Some(worker) = worker {
@@ -651,8 +941,7 @@ impl StateEventDispatcher {
 
 impl Drop for StateEventDispatcher {
     fn drop(&mut self) {
-        self.metrics.accepting.store(false, Ordering::Release);
-        self.sender.get_mut().take();
+        self.metrics.close_admission();
         if let Some(worker) = self.worker.get_mut().take()
             && worker.thread().id() != thread::current().id()
         {
@@ -706,8 +995,11 @@ impl TaskOutputEvent {
 /// runners start. Runner publication never waits for callback capacity. A full,
 /// closed, contended, or unhealthy dispatcher drops only the callback copy.
 /// A callback panic is not retried, marks health false, and closes new admission;
-/// the worker drains events accepted before that panic. The callback must
-/// eventually return so shutdown can drain accepted events. It must not poll
+/// the worker drains events accepted before that panic. If a custom panic
+/// payload panics again from its destructor, core forgets the replacement
+/// payload to contain that second unwind. Repeating such a hostile payload can
+/// leak one replacement payload per callback panic. The callback must eventually
+/// return so shutdown can drain accepted events. It must not poll
 /// [`crate::SupervisorApi::shutdown`] on the callback worker; that panics before
 /// shutdown starts. It must not wait for another thread that calls shutdown,
 /// because that can deadlock the drain.
@@ -1063,16 +1355,41 @@ fn deliver_state_event(sink: &TaskStateSinkHandle, event: TaskStateEvent) -> boo
         active.set(false);
         result
     });
-    if result.is_err() {
+    match result {
+        Ok(()) => true,
+        Err(payload) => {
+            handle_sink_panic(payload, "task_state");
+            false
+        }
+    }
+}
+
+fn dispose_sink_panic_payload(payload: Box<dyn std::any::Any + Send>) {
+    // A custom payload may panic again from Drop. Forget the replacement to
+    // contain that second unwind and keep the persistence worker alive.
+    if let Err(replacement) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        std::mem::forget(replacement);
+    }
+}
+
+fn handle_sink_panic(payload: Box<dyn std::any::Any + Send>, sink: &'static str) {
+    contain_sink_panic_with_report(payload, || {
         tracing::warn!(
             event = "persistence.event_dropped",
-            sink = "task_state",
+            sink = sink,
             error_kind = "sink_panicked",
             "persistence event dropped"
         );
-        false
-    } else {
-        true
+    });
+}
+
+fn contain_sink_panic_with_report(payload: Box<dyn std::any::Any + Send>, report: impl FnOnce()) {
+    dispose_sink_panic_payload(payload);
+    let result = catch_unwind(AssertUnwindSafe(report));
+    if let Err(payload) = result {
+        // Reporting is user-extensible through tracing subscribers. Do not let
+        // a reporting panic stop persistence delivery or recurse into tracing.
+        dispose_sink_panic_payload(payload);
     }
 }
 
@@ -1102,16 +1419,12 @@ fn deliver_output_event(sink: &TaskOutputSinkHandle, event: &TaskOutputEvent) ->
         active.set(false);
         result
     });
-    if result.is_err() {
-        tracing::warn!(
-            event = "persistence.event_dropped",
-            sink = "task_output",
-            error_kind = "sink_panicked",
-            "persistence event dropped"
-        );
-        false
-    } else {
-        true
+    match result {
+        Ok(()) => true,
+        Err(payload) => {
+            handle_sink_panic(payload, "task_output");
+            false
+        }
     }
 }
 
@@ -1119,7 +1432,7 @@ fn deliver_output_event(sink: &TaskOutputSinkHandle, event: &TaskOutputEvent) ->
 mod tests {
     use std::time::{Duration, Instant, SystemTime};
 
-    use solti_model::{OutputEvent, TaskId};
+    use solti_model::{OutputEvent, TaskId, TaskPhase, Uid, WorkloadTypeMeta};
 
     use super::*;
 
@@ -1128,6 +1441,42 @@ mod tests {
     impl TaskStateSink for PanickingStateSink {
         fn on_event(&self, _event: &TaskStateEvent) {
             panic!("state sink panic");
+        }
+    }
+
+    struct DestructorPanickingOnceStateSink {
+        first: AtomicBool,
+    }
+
+    struct DestructorPanickingPayload;
+
+    struct ReplacementDestructorPanickingPayload;
+
+    struct DropTrackedPanicPayload(Arc<AtomicBool>);
+
+    impl Drop for DestructorPanickingPayload {
+        fn drop(&mut self) {
+            std::panic::panic_any(ReplacementDestructorPanickingPayload);
+        }
+    }
+
+    impl Drop for ReplacementDestructorPanickingPayload {
+        fn drop(&mut self) {
+            panic!("replacement panic payload destructor");
+        }
+    }
+
+    impl Drop for DropTrackedPanicPayload {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    impl TaskStateSink for DestructorPanickingOnceStateSink {
+        fn on_event(&self, _event: &TaskStateEvent) {
+            if self.first.swap(false, Ordering::AcqRel) {
+                std::panic::panic_any(DestructorPanickingPayload);
+            }
         }
     }
 
@@ -1187,6 +1536,22 @@ mod tests {
         }
     }
 
+    struct DestructorPanickingFirstOutputSink {
+        first: AtomicBool,
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl TaskOutputSink for DestructorPanickingFirstOutputSink {
+        fn on_event(&self, _event: &TaskOutputEvent) {
+            if self.first.swap(false, Ordering::AcqRel) {
+                self.entered.send(()).unwrap();
+                self.release.lock().recv().unwrap();
+                std::panic::panic_any(DestructorPanickingPayload);
+            }
+        }
+    }
+
     fn output_event(name: &str) -> TaskOutputEvent {
         TaskOutputEvent::new(
             TaskId::new(name).unwrap(),
@@ -1240,9 +1605,18 @@ mod tests {
 
     #[test]
     fn persistence_config_is_bounded_and_checked() {
+        assert_eq!(TASK_CHANGE_BYTE_RESERVATION, 16 * 1024 * 1024);
+        assert_eq!(RUN_CHANGE_BYTE_RESERVATION, 196 * 1024);
+        assert_eq!(MAX_STATE_BYTES_PER_COMMIT, 16 * 1024 * 1024 + 392 * 1024);
         assert_eq!(
             PersistenceConfig::default().state_queue_capacity().get(),
             2_048
+        );
+        assert_eq!(
+            PersistenceConfig::default()
+                .state_queue_byte_capacity()
+                .get(),
+            256 * 1024 * 1024
         );
         assert_eq!(
             PersistenceConfig::default().output_queue_capacity().get(),
@@ -1284,6 +1658,40 @@ mod tests {
         );
         assert_eq!(
             PersistenceConfig::new()
+                .try_with_state_queue_byte_capacity(0)
+                .unwrap_err(),
+            ConfigError::Zero {
+                field: "persistence_state_queue_byte_capacity"
+            }
+        );
+        assert_eq!(
+            PersistenceConfig::new()
+                .try_with_state_queue_byte_capacity(MAX_STATE_BYTES_PER_COMMIT - 1)
+                .unwrap_err(),
+            ConfigError::BelowMinimum {
+                field: "persistence_state_queue_byte_capacity",
+                minimum: MAX_STATE_BYTES_PER_COMMIT,
+            }
+        );
+        assert_eq!(
+            PersistenceConfig::new()
+                .try_with_state_queue_byte_capacity(usize::MAX)
+                .unwrap_err(),
+            ConfigError::Exceeds {
+                field: "persistence_state_queue_byte_capacity",
+                limit: "semaphore_max_permits",
+            }
+        );
+        assert_eq!(
+            PersistenceConfig::new()
+                .try_with_state_queue_byte_capacity(MAX_STATE_BYTES_PER_COMMIT)
+                .unwrap()
+                .state_queue_byte_capacity()
+                .get(),
+            MAX_STATE_BYTES_PER_COMMIT
+        );
+        assert_eq!(
+            PersistenceConfig::new()
                 .try_with_output_queue_capacity(0)
                 .unwrap_err(),
             ConfigError::Zero {
@@ -1300,6 +1708,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn run_change_reservation_covers_worst_case_escaping_and_fixed_fields_at_boundary() {
+        let group = format!("{}.{}", "a".repeat(126), "b".repeat(126));
+        let version = format!("v{}", "1".repeat(62));
+        let workload = WorkloadTypeMeta::new(format!("{group}/{version}"), "K".repeat(63)).unwrap();
+        let run = TaskRun::from_parts(
+            workload,
+            u64::MAX,
+            u32::MAX,
+            TaskPhase::Failed,
+            SystemTime::UNIX_EPOCH,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            Some("\0".repeat(MAX_TASK_DIAGNOSTIC_BYTES)),
+            Some(i32::MIN),
+        )
+        .unwrap();
+        let envelope = serde_json::json!({
+            "runChanged": {
+                "task": TaskId::new("a".repeat(253)).unwrap(),
+                "taskUid": Uid::new("A".repeat(22)).unwrap(),
+                "run": run,
+            }
+        });
+        let serialized = serde_json::to_vec(&envelope).unwrap().len();
+        assert!(serialized <= RUN_CHANGE_BYTE_RESERVATION);
+        assert!(serialized > 2 * MAX_TASK_DIAGNOSTIC_BYTES);
+
+        let dispatcher = StateEventDispatcher::start_with_byte_capacity(
+            Arc::new(IgnoringStateSink),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(RUN_CHANGE_BYTE_RESERVATION).unwrap(),
+        )
+        .unwrap();
+        let exact = dispatcher
+            .reserve_with_bytes(1, RUN_CHANGE_BYTE_RESERVATION)
+            .await
+            .unwrap();
+        assert_eq!(
+            dispatcher.status().queued_bytes(),
+            RUN_CHANGE_BYTE_RESERVATION
+        );
+        drop(exact);
+        assert_eq!(dispatcher.status().queued_bytes(), 0);
+        dispatcher.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_and_blocking_event_reservations_are_atomic_and_fifo() {
         let sink: TaskStateSinkHandle = Arc::new(IgnoringStateSink);
@@ -1313,6 +1767,8 @@ mod tests {
                 healthy: true,
                 queued: 1,
                 capacity: 3,
+                queued_bytes: MAX_STATE_BYTES_PER_COMMIT,
+                byte_capacity: DEFAULT_STATE_QUEUE_BYTE_CAPACITY.get(),
                 delivered: 0,
                 failed: 0,
             }
@@ -1377,6 +1833,81 @@ mod tests {
         small.join().unwrap();
         assert_eq!(dispatcher.status().queued(), 0);
         dispatcher.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn byte_admission_is_exact_cancellation_safe_and_drained_by_shutdown() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let sink: TaskStateSinkHandle = Arc::new(BlockingStateSink {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let byte_capacity = NonZeroUsize::new(MAX_STATE_BYTES_PER_COMMIT).unwrap();
+        let dispatcher = StateEventDispatcher::start_with_byte_capacity(
+            sink,
+            NonZeroUsize::new(4).unwrap(),
+            byte_capacity,
+        )
+        .unwrap();
+
+        let mut active = dispatcher
+            .reserve_with_bytes(1, MAX_STATE_BYTES_PER_COMMIT)
+            .await
+            .unwrap();
+        active.shrink_byte_reservation(123);
+        assert_eq!(dispatcher.status().queued_bytes(), 123);
+        dispatch_state_event(&dispatcher, active, "bytes:1");
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the exact-byte callback must become active");
+        assert_eq!(dispatcher.status().queued_bytes(), 123);
+
+        let exact_remaining = dispatcher
+            .reserve_with_bytes(1, MAX_STATE_BYTES_PER_COMMIT - 123)
+            .await
+            .unwrap();
+        assert_eq!(
+            dispatcher.status().queued_bytes(),
+            MAX_STATE_BYTES_PER_COMMIT
+        );
+
+        let waiting_dispatcher = Arc::clone(&dispatcher);
+        let one_byte_over =
+            tokio::spawn(async move { waiting_dispatcher.reserve_with_bytes(1, 1).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while dispatcher.admission_waiters() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the one-byte-over reservation must wait");
+        assert!(!one_byte_over.is_finished());
+        one_byte_over.abort();
+        assert!(matches!(one_byte_over.await, Err(error) if error.is_cancelled()));
+        assert_eq!(dispatcher.status().queued(), 2);
+        assert_eq!(
+            dispatcher.status().queued_bytes(),
+            MAX_STATE_BYTES_PER_COMMIT
+        );
+
+        drop(exact_remaining);
+        assert_eq!(dispatcher.status().queued(), 1);
+        assert_eq!(dispatcher.status().queued_bytes(), 123);
+
+        let shutdown_dispatcher = Arc::clone(&dispatcher);
+        let shutdown = tokio::spawn(async move {
+            shutdown_dispatcher.shutdown().await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!shutdown.is_finished());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("shutdown must drain the active byte lease")
+            .expect("shutdown task must not panic");
+        assert_eq!(dispatcher.status().queued(), 0);
+        assert_eq!(dispatcher.status().queued_bytes(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1467,7 +1998,7 @@ mod tests {
             shutdown_dispatcher.shutdown().await;
         });
         tokio::time::timeout(Duration::from_secs(5), async {
-            while dispatcher.sender.lock().is_some() {
+            while dispatcher.admission_is_open_for_test() {
                 tokio::task::yield_now().await;
             }
         })
@@ -1520,6 +2051,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_worker_panic_closes_real_admission_without_panicking_later_callers() {
+        let dispatcher =
+            StateEventDispatcher::start(Arc::new(IgnoringStateSink), NonZeroUsize::new(2).unwrap())
+                .unwrap();
+        dispatcher.inject_worker_panic();
+
+        let admission = dispatcher.reserve(1).await.unwrap();
+        dispatch_state_event(&dispatcher, admission, "worker-panic:1");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while dispatcher.status().healthy() || dispatcher.status().accepting() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the state worker panic must close its real admission gate");
+
+        assert_eq!(
+            dispatcher.status(),
+            TaskStateSinkStatus {
+                accepting: false,
+                healthy: false,
+                queued: 0,
+                capacity: 3,
+                queued_bytes: 0,
+                byte_capacity: DEFAULT_STATE_QUEUE_BYTE_CAPACITY.get(),
+                delivered: 0,
+                failed: 0,
+            }
+        );
+        assert!(matches!(
+            dispatcher.reserve(1).await,
+            Err(StateAdmissionClosed)
+        ));
+        assert!(matches!(
+            dispatcher.reserve_blocking(1),
+            Err(StateAdmissionClosed)
+        ));
+    }
+
+    #[tokio::test]
     async fn sink_panics_are_isolated() {
         let state: TaskStateSinkHandle = Arc::new(PanickingStateSink);
         let dispatcher = StateEventDispatcher::start(state, NonZeroUsize::new(2).unwrap()).unwrap();
@@ -1536,6 +2107,18 @@ mod tests {
                 permit,
             )],
         );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while dispatcher.status().failed() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first panicking callback must be observed");
+        assert!(dispatcher.status().accepting());
+        assert!(!dispatcher.status().healthy());
+
+        let admission = dispatcher.reserve(1).await.unwrap();
+        dispatch_state_event(&dispatcher, admission, "test:2");
         dispatcher.shutdown().await;
         assert_eq!(
             dispatcher.status(),
@@ -1544,8 +2127,10 @@ mod tests {
                 healthy: false,
                 queued: 0,
                 capacity: 3,
+                queued_bytes: 0,
+                byte_capacity: DEFAULT_STATE_QUEUE_BYTE_CAPACITY.get(),
                 delivered: 0,
-                failed: 1,
+                failed: 2,
             }
         );
 
@@ -1566,6 +2151,69 @@ mod tests {
                 dropped: 0,
             }
         );
+    }
+
+    #[test]
+    fn sink_panic_payload_is_disposed_before_contained_reporting() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let reported = Arc::new(AtomicUsize::new(0));
+        let payload: Box<dyn std::any::Any + Send> =
+            Box::new(DropTrackedPanicPayload(Arc::clone(&dropped)));
+        contain_sink_panic_with_report(payload, || {
+            assert!(
+                dropped.load(Ordering::Acquire),
+                "sink panic payload must be disposed before reporting"
+            );
+            reported.fetch_add(1, Ordering::AcqRel);
+            std::panic::panic_any(DestructorPanickingPayload);
+        });
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(reported.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn destructor_panicking_state_payload_does_not_stop_later_delivery() {
+        let sink: TaskStateSinkHandle = Arc::new(DestructorPanickingOnceStateSink {
+            first: AtomicBool::new(true),
+        });
+        let dispatcher = StateEventDispatcher::start(sink, NonZeroUsize::new(2).unwrap()).unwrap();
+
+        let first = dispatcher.reserve(1).await.unwrap();
+        dispatch_state_event(&dispatcher, first, "destructor-panic:1");
+        let second = dispatcher.reserve(1).await.unwrap();
+        dispatch_state_event(&dispatcher, second, "destructor-panic:2");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = dispatcher.status();
+                if status.failed() == 1
+                    && status.delivered() == 1
+                    && status.queued() == 0
+                    && status.queued_bytes() == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the callback panic and later delivery must both be observed");
+        assert_eq!(
+            dispatcher.status(),
+            TaskStateSinkStatus {
+                accepting: true,
+                healthy: false,
+                queued: 0,
+                capacity: 3,
+                queued_bytes: 0,
+                byte_capacity: DEFAULT_STATE_QUEUE_BYTE_CAPACITY.get(),
+                delivered: 1,
+                failed: 1,
+            }
+        );
+
+        dispatcher.shutdown().await;
+        assert!(!dispatcher.status().accepting());
     }
 
     #[tokio::test]
@@ -1645,6 +2293,51 @@ mod tests {
                 dropped: 1,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn destructor_panicking_output_payload_does_not_stop_accepted_delivery() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let sink: TaskOutputSinkHandle = Arc::new(DestructorPanickingFirstOutputSink {
+            first: AtomicBool::new(true),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let dispatcher = OutputEventDispatcher::start(sink, NonZeroUsize::new(2).unwrap()).unwrap();
+
+        assert!(dispatcher.try_dispatch(output_event("destructor-panic")));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first output callback must become active");
+        assert!(dispatcher.try_dispatch(output_event("already-accepted")));
+        release_tx.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = dispatcher.status();
+                if status.failed() == 1 && status.delivered() == 1 && status.queued() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the callback panic and accepted delivery must both be observed");
+        assert_eq!(
+            dispatcher.status(),
+            TaskOutputSinkStatus {
+                accepting: false,
+                healthy: false,
+                queued: 0,
+                capacity: 2,
+                delivered: 1,
+                failed: 1,
+                dropped: 0,
+            }
+        );
+
+        dispatcher.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1740,6 +2433,8 @@ mod tests {
                 healthy: true,
                 queued: 0,
                 capacity: 3,
+                queued_bytes: 0,
+                byte_capacity: DEFAULT_STATE_QUEUE_BYTE_CAPACITY.get(),
                 delivered: 1,
                 failed: 0,
             }

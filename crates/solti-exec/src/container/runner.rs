@@ -466,6 +466,11 @@ enum AttemptCompletion {
     Canceled,
 }
 
+/// Attempt-owned stdout and stderr readers.
+///
+/// Dropping this owner aborts every reader that has already been spawned. The
+/// owner is established before the engine is asked for either stream, which
+/// also covers an engine panic while the second stream is being taken.
 struct OutputTasks {
     stdout: Option<tokio::task::JoinHandle<()>>,
     stderr: Option<tokio::task::JoinHandle<()>>,
@@ -478,27 +483,34 @@ impl OutputTasks {
         logger: LogConfig,
         sink: Option<solti_runner::OutputSink>,
     ) -> Self {
-        let stdout = attempt.take_stdout().map(|reader| {
+        let mut tasks = Self {
+            stdout: None,
+            stderr: None,
+        };
+
+        if let Some(reader) = attempt.take_stdout() {
             let run_id = Arc::clone(&run_id);
             let sink = sink.clone();
             let span = tracing::Span::current();
-            tokio::spawn(
+            tasks.stdout = Some(tokio::spawn(
                 async move {
                     log_stream(reader, &run_id, StreamKind::Stdout, &logger, sink.as_ref()).await;
                 }
                 .instrument(span),
-            )
-        });
-        let stderr = attempt.take_stderr().map(|reader| {
+            ));
+        }
+
+        if let Some(reader) = attempt.take_stderr() {
             let span = tracing::Span::current();
-            tokio::spawn(
+            tasks.stderr = Some(tokio::spawn(
                 async move {
                     log_stream(reader, &run_id, StreamKind::Stderr, &logger, sink.as_ref()).await;
                 }
                 .instrument(span),
-            )
-        });
-        Self { stdout, stderr }
+            ));
+        }
+
+        tasks
     }
 
     async fn drain(&mut self, run_id: &str) {

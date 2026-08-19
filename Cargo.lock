@@ -2453,6 +2453,8 @@ dependencies = [
  "solti-runner",
  "taskvisor",
  "tokio",
+ "tokio-stream",
+ "tower",
  "tracing",
 ]
 

@@ -1081,6 +1081,72 @@ async fn dropping_output_tasks_aborts_readers() {
     .expect("output tasks were not aborted on drop");
 }
 
+struct PanicAfterStdoutAttempt {
+    stdout: Option<ContainerOutput>,
+}
+
+#[async_trait]
+impl ContainerAttempt for PanicAfterStdoutAttempt {
+    fn take_stdout(&mut self) -> Option<ContainerOutput> {
+        self.stdout.take()
+    }
+
+    fn take_stderr(&mut self) -> Option<ContainerOutput> {
+        panic!("hostile attempt panicked while taking stderr")
+    }
+
+    async fn start(&mut self) -> Result<(), ContainerEngineError> {
+        unreachable!("hostile attempt must panic before start")
+    }
+
+    async fn wait(&mut self) -> Result<ContainerExitStatus, ContainerEngineError> {
+        unreachable!("hostile attempt must panic before wait")
+    }
+
+    async fn terminate(&mut self) -> Result<(), ContainerEngineError> {
+        unreachable!("hostile attempt must panic before terminate")
+    }
+
+    async fn cleanup(&mut self) -> Result<(), ContainerEngineError> {
+        unreachable!("hostile attempt must panic before cleanup")
+    }
+}
+
+#[tokio::test]
+async fn panic_while_taking_stderr_aborts_the_owned_stdout_reader() {
+    use tokio::io::AsyncReadExt as _;
+
+    let (stdout_reader, mut stdout_peer) = tokio::io::duplex(64);
+    let outer = tokio::spawn(async move {
+        let mut attempt = PanicAfterStdoutAttempt {
+            stdout: Some(Box::pin(stdout_reader)),
+        };
+        let _output = OutputTasks::start(
+            &mut attempt,
+            Arc::from("panic-between-output-readers"),
+            LogConfig::default(),
+            None,
+        );
+    });
+
+    assert!(
+        outer
+            .await
+            .expect_err("hostile stderr accessor must panic")
+            .is_panic()
+    );
+
+    let mut probe = [0_u8; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), stdout_peer.read(&mut probe))
+            .await
+            .expect("stdout reader task remained detached after owner unwind")
+            .expect("stdout peer read must succeed"),
+        0,
+        "stdout peer EOF proves the spawned reader released its endpoint",
+    );
+}
+
 #[tokio::test]
 async fn start_failure_terminates_and_cleans_attempt() {
     let (engine, handle) = ControlledEngine::blocked(AttemptBehavior {

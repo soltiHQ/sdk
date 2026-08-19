@@ -15,6 +15,8 @@ use solti_model::{
 };
 use tokio_stream::StreamExt;
 
+use crate::persistence::MAX_STATE_BYTES_PER_COMMIT;
+
 use super::*;
 
 fn spec(slot: &str, timeout_ms: u64) -> TaskSpec {
@@ -288,6 +290,150 @@ async fn blocked_state_sink_does_not_hold_state_lock_and_preserves_commit_order(
         *sink.events.lock().unwrap(),
         ["ordered-sink:1", "ordered-sink:2"]
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_state_batch_shrinks_to_its_exact_payload_charge() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let sink = Arc::new(BlockingStateSink {
+        events: std::sync::Mutex::new(Vec::new()),
+        entered: entered_tx,
+        release: std::sync::Mutex::new(release_rx),
+        calls: AtomicUsize::new(0),
+    });
+    let state = TaskState::try_with_epoch_and_sink(
+        StateConfig::default(),
+        "exact-sink-bytes".to_string(),
+        Some(sink),
+        PersistenceConfig::new()
+            .try_with_state_queue_byte_capacity(MAX_STATE_BYTES_PER_COMMIT)
+            .unwrap(),
+    )
+    .unwrap();
+
+    state.add_task(manifest("exact-sink-bytes", "slot", 1_000));
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the state callback must become active");
+    let task = state
+        .get(&TaskId::new("exact-sink-bytes").unwrap())
+        .unwrap();
+    let expected = TaskState::serialized_task_payload_bytes(None, Some(&task));
+    let status = state.persistence_status().unwrap();
+    assert_eq!(status.queued(), 1);
+    assert_eq!(status.queued_bytes(), expected);
+    assert_eq!(status.byte_capacity(), MAX_STATE_BYTES_PER_COMMIT);
+
+    let shutdown_state = state.clone();
+    let shutdown = tokio::spawn(async move {
+        shutdown_state.shutdown_persistence().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!shutdown.is_finished());
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("shutdown must drain the exact payload lease")
+        .expect("shutdown task must not panic");
+    assert_eq!(state.persistence_status().unwrap().queued_bytes(), 0);
+}
+
+#[tokio::test]
+async fn committed_task_and_run_batch_reports_the_exact_documented_value_charge() {
+    let (setup_complete_tx, setup_complete_rx) = std::sync::mpsc::sync_channel(1);
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let sink = Arc::new(ArmableStateSink {
+        events: AtomicUsize::new(0),
+        setup_complete: setup_complete_tx,
+        block_next: AtomicBool::new(false),
+        entered: entered_tx,
+        release: std::sync::Mutex::new(release_rx),
+    });
+    let state = TaskState::try_with_epoch_and_sink(
+        StateConfig::default(),
+        "exact-task-run-bytes".to_string(),
+        Some(sink.clone()),
+        PersistenceConfig::new()
+            .try_with_state_queue_byte_capacity(MAX_STATE_BYTES_PER_COMMIT)
+            .unwrap(),
+    )
+    .unwrap();
+
+    let task = create(&state, "exact-task-run-bytes");
+    let binding = bind(&state, task.name());
+    assert!(state.transition_attempt_starting(&binding, 1));
+    setup_complete_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the create and attempt-start events must drain");
+    let previous = state.get(task.name()).unwrap();
+
+    sink.block_next.store(true, Ordering::SeqCst);
+    assert!(state.transition_attempt_finished(&binding, 1, TaskPhase::Succeeded, None, Some(0),));
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the terminal task callback must become active");
+    let current = state.get(task.name()).unwrap();
+    let run = state
+        .list_runs(task.name())
+        .into_iter()
+        .find(|run| run.attempt() == 1)
+        .expect("the terminal run must be retained");
+    let expected = TaskState::serialized_task_payload_bytes(Some(&previous), Some(&current))
+        + TaskState::serialized_run_persistence_bytes(task.name(), task.uid(), &run);
+    let status = state.persistence_status().unwrap();
+    assert_eq!(status.queued(), 2);
+    assert_eq!(status.queued_bytes(), expected);
+
+    release_tx.send(()).unwrap();
+    state.shutdown_persistence().await;
+    assert_eq!(state.persistence_status().unwrap().queued_bytes(), 0);
+}
+
+#[tokio::test]
+async fn state_worker_panic_rejects_later_public_and_callback_mutations_before_state_lock() {
+    let state = TaskState::with_epoch_and_sink(
+        StateConfig::default(),
+        "state-worker-panic".to_string(),
+        Some(Arc::new(RecordingStateSink::default())),
+    );
+    state.inject_persistence_worker_panic();
+    state.add_task(manifest("worker-panic-trigger", "slot", 1_000));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = state.persistence_status().unwrap();
+            if !status.accepting() && !status.healthy() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the state worker panic must close admission");
+
+    let before = state.list_all();
+    let public_target = manifest("after-worker-panic", "slot", 1_000);
+    let public = match state
+        .admit_state_write(StateMutationEventCapacity::TaskChange)
+        .await
+    {
+        Ok(admission) => state
+            .create_desired_admitted(&public_target, admission)
+            .map(|_| ()),
+        Err(_) => Err(CoreError::ShuttingDown),
+    };
+    assert!(matches!(public, Err(CoreError::ShuttingDown)));
+
+    let callback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        state.admit_state_write_from_taskvisor_callback(StateMutationEventCapacity::TaskChange)
+    }));
+    assert!(matches!(callback, Ok(Err(StateAdmissionClosed))));
+    assert_eq!(state.list_all(), before);
+    assert!(state.get(public_target.name()).is_none());
+    let status = state.persistence_status().unwrap();
+    assert!(!status.accepting());
+    assert!(!status.healthy());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -716,6 +862,154 @@ async fn state_sink_receives_task_and_run_lifecycle() {
             ..
         }) if task.name() == &name
     ));
+}
+
+#[tokio::test]
+async fn run_byte_omission_preserves_lossless_state_sink_lifecycle() {
+    let task_manifest = manifest("sink-run-byte-omission", "slot", 1_000);
+    let config = StateConfig::new()
+        .try_with_max_retained_task_run_bytes(1)
+        .unwrap();
+    let recording = Arc::new(RecordingStateSink::default());
+    let state = TaskState::with_epoch_and_sink(
+        config,
+        "sink-run-byte-omission".to_string(),
+        Some(recording.clone()),
+    );
+    let task = state.create_desired(&task_manifest).unwrap().task;
+    let binding = bind(&state, task.name());
+
+    assert!(state.transition_attempt_starting(&binding, 1));
+    assert!(state.list_runs(task.name()).is_empty());
+    assert!(state.transition_attempt_finished(&binding, 1, TaskPhase::Succeeded, None, Some(0),));
+    assert!(state.list_runs(task.name()).is_empty());
+    state.shutdown_persistence().await;
+
+    let events = recording.events.lock().unwrap();
+    let runs = events
+        .iter()
+        .filter_map(|event| match event {
+            TaskStateEvent::RunChanged {
+                task: event_task,
+                task_uid,
+                run,
+            } if event_task == task.name() && task_uid == task.uid() => Some(run),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(runs.len(), 2);
+    assert!(runs[0].is_active());
+    assert_eq!(runs[1].phase(), TaskPhase::Succeeded);
+}
+
+#[tokio::test]
+async fn run_byte_omission_preserves_terminal_sink_event_from_direct_completion() {
+    let task_manifest = manifest("sink-run-direct-omission", "slot", 1_000);
+    let config = StateConfig::new()
+        .try_with_max_retained_task_run_bytes(1)
+        .unwrap();
+    let recording = Arc::new(RecordingStateSink::default());
+    let state = TaskState::with_epoch_and_sink(
+        config,
+        "sink-run-direct-omission".to_string(),
+        Some(recording.clone()),
+    );
+    let task = state.create_desired(&task_manifest).unwrap().task;
+    let binding = bind(&state, task.name());
+
+    assert!(state.transition_attempt_starting(&binding, 1));
+    assert!(state.list_runs(task.name()).is_empty());
+    assert_eq!(
+        state.finalize_if_bound(binding.tv.get(), TaskPhase::Succeeded, None, Some(0), false,),
+        Some(task.name().clone())
+    );
+    assert!(state.list_runs(task.name()).is_empty());
+    assert!(
+        !state
+            .inner
+            .read()
+            .active_run_by_tv
+            .contains_key(&binding.tv.get())
+    );
+    state.shutdown_persistence().await;
+
+    let events = recording.events.lock().unwrap();
+    let runs = events
+        .iter()
+        .filter_map(|event| match event {
+            TaskStateEvent::RunChanged {
+                task: event_task,
+                task_uid,
+                run,
+            } if event_task == task.name() && task_uid == task.uid() => Some(run),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(runs.len(), 2);
+    assert!(runs[0].is_active());
+    assert_eq!(runs[1].attempt(), 1);
+    assert_eq!(runs[1].phase(), TaskPhase::Succeeded);
+    assert_eq!(runs[1].started_at(), runs[0].started_at());
+}
+
+#[tokio::test]
+async fn omitted_active_lifecycle_survives_a_late_lower_terminal_until_direct_completion() {
+    let task_manifest = manifest("sink-run-late-lower", "slot", 1_000);
+    let config = StateConfig::new()
+        .try_with_max_retained_task_run_bytes(1)
+        .unwrap();
+    let recording = Arc::new(RecordingStateSink::default());
+    let state = TaskState::with_epoch_and_sink(
+        config,
+        "sink-run-late-lower".to_string(),
+        Some(recording.clone()),
+    );
+    let task = state.create_desired(&task_manifest).unwrap().task;
+    let binding = bind(&state, task.name());
+
+    assert!(state.transition_attempt_starting(&binding, 3));
+    assert!(state.list_runs(task.name()).is_empty());
+    assert!(state.transition_attempt_finished(
+        &binding,
+        2,
+        TaskPhase::Failed,
+        Some("late lower attempt".to_string()),
+        None,
+    ));
+    assert_eq!(state.get(task.name()).unwrap().status().attempt(), 3);
+    assert!(
+        state
+            .inner
+            .read()
+            .active_run_by_tv
+            .contains_key(&binding.tv.get())
+    );
+    assert_eq!(
+        state.finalize_if_bound(binding.tv.get(), TaskPhase::Succeeded, None, Some(0), false,),
+        Some(task.name().clone())
+    );
+    state.shutdown_persistence().await;
+
+    let events = recording.events.lock().unwrap();
+    let runs = events
+        .iter()
+        .filter_map(|event| match event {
+            TaskStateEvent::RunChanged {
+                task: event_task,
+                task_uid,
+                run,
+            } if event_task == task.name() && task_uid == task.uid() => Some(run),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[0].attempt(), 3);
+    assert!(runs[0].is_active());
+    assert_eq!(runs[1].attempt(), 2);
+    assert_eq!(runs[1].phase(), TaskPhase::Failed);
+    assert_eq!(runs[2].attempt(), 3);
+    assert_eq!(runs[2].phase(), TaskPhase::Succeeded);
+    assert_eq!(runs[2].started_at(), runs[0].started_at());
 }
 
 #[test]
@@ -1861,6 +2155,311 @@ fn authoritative_terminals_without_start_remain_bounded() {
 }
 
 #[test]
+fn retained_run_fits_at_the_exact_aggregate_byte_budget() {
+    let task_manifest = manifest("run-byte-exact", "slot", 1_000);
+    let expected = TaskRun::starting(1, 1, task_manifest.spec().workload().type_meta()).unwrap();
+    let expected_bytes = TaskState::serialized_run_payload_bytes(&expected);
+    let config = StateConfig::new()
+        .try_with_max_retained_task_run_bytes(expected_bytes)
+        .unwrap();
+    let state = TaskState::with_epoch(config, "run-byte-exact".to_string());
+    let task = state.create_desired(&task_manifest).unwrap().task;
+    let binding = bind(&state, task.name());
+
+    assert!(state.transition_attempt_starting(&binding, 1));
+
+    let inner = state.inner.read();
+    assert_eq!(inner.retained_task_run_bytes, expected_bytes);
+    assert_eq!(inner.retained_task_run_bytes_by_identity.len(), 1);
+    assert_eq!(inner.runs.get(task.name()).unwrap().len(), 1);
+}
+
+#[test]
+fn one_byte_short_run_budget_omits_detail_but_keeps_lifecycle_state() {
+    let task_manifest = manifest("run-byte-short", "slot", 1_000);
+    let expected = TaskRun::starting(1, 1, task_manifest.spec().workload().type_meta()).unwrap();
+    let expected_bytes = TaskState::serialized_run_payload_bytes(&expected);
+    let config = StateConfig::new()
+        .try_with_max_retained_task_run_bytes(expected_bytes - 1)
+        .unwrap();
+    let state = TaskState::with_epoch(config, "run-byte-short".to_string());
+    let task = state.create_desired(&task_manifest).unwrap().task;
+    let binding = bind(&state, task.name());
+
+    assert!(state.transition_attempt_starting(&binding, 1));
+    assert!(state.list_runs(task.name()).is_empty());
+    assert_eq!(
+        state.get(task.name()).unwrap().status().phase(),
+        TaskPhase::Running
+    );
+    assert_eq!(state.inner.read().retained_task_run_bytes, 0);
+
+    assert!(state.transition_attempt_finished(&binding, 1, TaskPhase::Succeeded, None, Some(0),));
+    assert!(state.list_runs(task.name()).is_empty());
+    assert_eq!(
+        state.get(task.name()).unwrap().status().phase(),
+        TaskPhase::Succeeded
+    );
+    assert_eq!(state.inner.read().retained_task_run_bytes, 0);
+}
+
+#[test]
+fn retained_run_replacement_and_shrink_update_exact_accounting() {
+    let state = TaskState::with_epoch(StateConfig::new(), "run-byte-replace".to_string());
+    let task = create(&state, "run-byte-replace");
+    let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    let finished_at = SystemTime::UNIX_EPOCH + Duration::from_secs(11);
+    let workload = task.spec().workload().type_meta();
+    let previous = Arc::new(
+        TaskRun::from_parts(
+            workload.clone(),
+            1,
+            1,
+            TaskPhase::Failed,
+            started_at,
+            Some(finished_at),
+            Some("x".repeat(16 * 1024)),
+            None,
+        )
+        .unwrap(),
+    );
+    let current = Arc::new(
+        TaskRun::from_parts(
+            workload,
+            1,
+            1,
+            TaskPhase::Failed,
+            started_at,
+            Some(finished_at),
+            Some("short".to_string()),
+            None,
+        )
+        .unwrap(),
+    );
+    let previous_bytes = TaskState::serialized_run_payload_bytes(&previous);
+    let current_bytes = TaskState::serialized_run_payload_bytes(&current);
+    assert!(current_bytes < previous_bytes);
+
+    let mut inner = state.write(StateMutationEventCapacity::None);
+    inner
+        .runs
+        .entry(task.name().clone())
+        .or_default()
+        .push_back(Arc::clone(&previous));
+    TaskState::record_run_snapshot_changes(
+        &mut inner,
+        vec![TaskState::run_snapshot_change(
+            task.name(),
+            task.uid(),
+            None,
+            Some(Arc::clone(&previous)),
+        )],
+    );
+    assert_eq!(inner.retained_task_run_bytes, previous_bytes);
+
+    *inner
+        .runs
+        .get_mut(task.name())
+        .unwrap()
+        .front_mut()
+        .unwrap() = Arc::clone(&current);
+    TaskState::record_run_snapshot_changes(
+        &mut inner,
+        vec![TaskState::run_snapshot_change(
+            task.name(),
+            task.uid(),
+            Some(previous),
+            Some(current),
+        )],
+    );
+    assert_eq!(inner.retained_task_run_bytes, current_bytes);
+    assert_eq!(inner.retained_task_run_bytes_by_identity.len(), 1);
+    assert_eq!(inner.completed_runs_by_age.len(), 1);
+}
+
+#[test]
+fn aggregate_run_budget_evicts_the_globally_oldest_completed_run() {
+    let workload = manifest("prototype", "slot", 1_000)
+        .spec()
+        .workload()
+        .type_meta();
+    let make_run = |attempt, finished_at| {
+        Arc::new(
+            TaskRun::from_parts(
+                workload.clone(),
+                1,
+                attempt,
+                TaskPhase::Succeeded,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(finished_at)),
+                None,
+                Some(0),
+            )
+            .unwrap(),
+        )
+    };
+    let first = make_run(1, 2);
+    let second = make_run(1, 3);
+    let third = make_run(1, 4);
+    let one_run_bytes = TaskState::serialized_run_payload_bytes(&first);
+    assert_eq!(
+        TaskState::serialized_run_payload_bytes(&second),
+        one_run_bytes
+    );
+    assert_eq!(
+        TaskState::serialized_run_payload_bytes(&third),
+        one_run_bytes
+    );
+    let config = StateConfig::new()
+        .try_with_max_retained_task_run_bytes(one_run_bytes * 2)
+        .unwrap();
+    let state = TaskState::with_epoch(config, "run-byte-global".to_string());
+    let first_task = create(&state, "run-byte-first");
+    let second_task = create(&state, "run-byte-second");
+    let third_task = create(&state, "run-byte-third");
+
+    for (task, run) in [
+        (&first_task, first),
+        (&second_task, second),
+        (&third_task, third),
+    ] {
+        let mut inner = state.write(StateMutationEventCapacity::None);
+        inner
+            .runs
+            .entry(task.name().clone())
+            .or_default()
+            .push_back(Arc::clone(&run));
+        TaskState::record_run_snapshot_changes(
+            &mut inner,
+            vec![TaskState::run_snapshot_change(
+                task.name(),
+                task.uid(),
+                None,
+                Some(run),
+            )],
+        );
+    }
+
+    assert!(state.list_runs(first_task.name()).is_empty());
+    assert_eq!(state.list_runs(second_task.name()).len(), 1);
+    assert_eq!(state.list_runs(third_task.name()).len(), 1);
+    let inner = state.inner.read();
+    assert_eq!(inner.retained_task_run_bytes, one_run_bytes * 2);
+    assert_eq!(inner.retained_task_run_bytes_by_identity.len(), 2);
+    assert_eq!(inner.completed_runs_by_age.len(), 2);
+}
+
+#[test]
+fn run_byte_compaction_records_multiple_evictions_in_one_reversible_revision() {
+    let workload = manifest("prototype", "slot", 1_000)
+        .spec()
+        .workload()
+        .type_meta();
+    let make_run = |attempt, finished_at, error: Option<String>| {
+        Arc::new(
+            TaskRun::from_parts(
+                workload.clone(),
+                1,
+                attempt,
+                TaskPhase::Failed,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(finished_at)),
+                error,
+                None,
+            )
+            .unwrap(),
+        )
+    };
+    let first = make_run(1, 2, None);
+    let second = make_run(1, 3, None);
+    let large = make_run(1, 4, Some("x".repeat(16 * 1024)));
+    let large_bytes = TaskState::serialized_run_payload_bytes(&large);
+    assert!(
+        TaskState::serialized_run_payload_bytes(&first)
+            + TaskState::serialized_run_payload_bytes(&second)
+            < large_bytes
+    );
+    let config = StateConfig::new()
+        .try_with_max_retained_task_run_bytes(large_bytes)
+        .unwrap();
+    let state = TaskState::with_epoch(config, "run-byte-batch".to_string());
+    let first_task = create(&state, "run-byte-batch-first");
+    let second_task = create(&state, "run-byte-batch-second");
+    let large_task = create(&state, "run-byte-batch-large");
+
+    for (task, run) in [(&first_task, first), (&second_task, second)] {
+        let mut inner = state.write(StateMutationEventCapacity::None);
+        inner
+            .runs
+            .entry(task.name().clone())
+            .or_default()
+            .push_back(Arc::clone(&run));
+        TaskState::record_run_snapshot_changes(
+            &mut inner,
+            vec![TaskState::run_snapshot_change(
+                task.name(),
+                task.uid(),
+                None,
+                Some(run),
+            )],
+        );
+    }
+
+    {
+        let mut inner = state.write(StateMutationEventCapacity::None);
+        inner
+            .runs
+            .entry(large_task.name().clone())
+            .or_default()
+            .push_back(Arc::clone(&large));
+        TaskState::record_run_snapshot_changes(
+            &mut inner,
+            vec![TaskState::run_snapshot_change(
+                large_task.name(),
+                large_task.uid(),
+                None,
+                Some(large),
+            )],
+        );
+    }
+
+    assert!(state.list_runs(first_task.name()).is_empty());
+    assert!(state.list_runs(second_task.name()).is_empty());
+    assert_eq!(state.list_runs(large_task.name()).len(), 1);
+    let inner = state.inner.read();
+    assert_eq!(inner.retained_task_run_bytes, large_bytes);
+    assert_eq!(inner.run_resource_version, 3);
+    let batch = inner.run_history.back().unwrap();
+    assert_eq!(batch.revision, 3);
+    assert_eq!(batch.changes.len(), 3);
+    assert_eq!(batch.changes[1].task, *first_task.name());
+    assert_eq!(batch.changes[2].task, *second_task.name());
+    let previous = TaskState::run_snapshot_at_resource_version(
+        &inner,
+        "runs-run-byte-batch:2",
+        first_task.name(),
+        first_task.uid(),
+    )
+    .unwrap();
+    assert_eq!(previous.len(), 1);
+}
+
+#[test]
+fn deleting_a_task_releases_all_current_run_accounting() {
+    let state = TaskState::new();
+    let task = create(&state, "run-byte-delete");
+    let binding = bind(&state, task.name());
+    assert!(state.transition_attempt_finished(&binding, 1, TaskPhase::Succeeded, None, Some(0),));
+    assert!(state.inner.read().retained_task_run_bytes > 0);
+
+    assert!(state.delete_task(task.name()));
+    let inner = state.inner.read();
+    assert_eq!(inner.retained_task_run_bytes, 0);
+    assert!(inner.retained_task_run_bytes_by_identity.is_empty());
+    assert!(inner.completed_runs_by_age.is_empty());
+}
+
+#[test]
 fn run_pages_keep_an_exact_stable_snapshot_prefix() {
     let state = TaskState::with_epoch(StateConfig::new(), "task-epoch".to_string());
     let task = create(&state, "run-pages");
@@ -2154,10 +2753,17 @@ fn sweep_removal_is_reversible_for_run_continuations() {
     let query = TaskRunQuery::new().with_limit(1);
     let first = state.query_runs(task.name(), &query).unwrap().unwrap();
     let continuation = first.continuation.unwrap();
+    assert!(state.inner.read().retained_task_run_bytes > 0);
 
     let config = StateConfig::new().with_run_ttl(Duration::ZERO);
     assert_eq!(state.sweep(&config).0, 2);
     assert!(state.list_runs(task.name()).is_empty());
+    {
+        let inner = state.inner.read();
+        assert_eq!(inner.retained_task_run_bytes, 0);
+        assert!(inner.retained_task_run_bytes_by_identity.is_empty());
+        assert!(inner.completed_runs_by_age.is_empty());
+    }
 
     let second = state
         .query_runs(task.name(), &query.with_continuation(continuation))
@@ -2241,7 +2847,7 @@ fn run_journal_retains_a_batch_at_the_exact_byte_budget() {
     let state = TaskState::with_epoch(config, "exact-run-bytes".to_string());
 
     let mut inner = state.write(StateMutationEventCapacity::None);
-    TaskState::record_run_snapshot_changes(&mut inner, vec![change]);
+    TaskState::record_run_journal_changes(&mut inner, vec![change]);
 
     assert_eq!(inner.run_history.len(), 1);
     assert_eq!(inner.run_history_bytes, serialized_bytes);
@@ -2263,7 +2869,7 @@ fn oversized_run_batch_compacts_history_and_keeps_the_current_revision_valid() {
     let state = TaskState::with_epoch(config, "oversized-run-bytes".to_string());
 
     let mut inner = state.write(StateMutationEventCapacity::None);
-    TaskState::record_run_snapshot_changes(&mut inner, vec![change]);
+    TaskState::record_run_journal_changes(&mut inner, vec![change]);
 
     assert!(inner.run_history.is_empty());
     assert_eq!(inner.run_history_bytes, 0);
@@ -2308,9 +2914,9 @@ fn run_journal_byte_budget_can_evict_multiple_batches() {
     let state = TaskState::with_epoch(config, "evict-run-bytes".to_string());
 
     let mut inner = state.write(StateMutationEventCapacity::None);
-    TaskState::record_run_snapshot_changes(&mut inner, vec![first]);
-    TaskState::record_run_snapshot_changes(&mut inner, vec![second]);
-    TaskState::record_run_snapshot_changes(&mut inner, vec![third]);
+    TaskState::record_run_journal_changes(&mut inner, vec![first]);
+    TaskState::record_run_journal_changes(&mut inner, vec![second]);
+    TaskState::record_run_journal_changes(&mut inner, vec![third]);
 
     assert_eq!(inner.run_history.len(), 2);
     assert_eq!(inner.run_history_bytes, batch_bytes * 2);

@@ -291,6 +291,10 @@ then clones only the model values admitted to its result page.
 Attempt events provide run detail.
 The direct Taskvisor outcome supplies the authoritative resource-level completion.
 This second path can finalize a task when a best-effort event was dropped.
+If state persistence admission has already closed, core cannot commit a new
+terminal Task or TaskRun value. It still removes the exact runtime binding,
+evicts only the matching UID output channel, and wakes cleanup waiters. The last
+admitted Task and TaskRun values remain unchanged.
 
 Typed `TaskOutcomeKind` and `RejectionKind` values select terminal phases.
 Diagnostic event text never selects a phase.
@@ -351,9 +355,38 @@ their last owner is dropped.
 
 ## Cancel and delete
 
-`cancel_task()` requests a terminal logical outcome for the current bound or queued runtime.
+`cancel_task()` stops current scheduled reconciliation or requests a terminal
+logical outcome for the current bound or queued runtime.
 It keeps the desired resource and run history.
-Cancellation before a runtime binding exists is a no-op for a known resource.
+After the cancel worker is registered under the supervisor spawn gate, dropping
+the caller future stops only that caller's wait. The worker remains in the
+supervisor task tracker, and shutdown drains it.
+A cancel call that reaches the gate after shutdown closes operation admission
+returns `CoreError::ShuttingDown` and registers no worker.
+It first cancels and drains core-owned reconciliation for the task name.
+Dropping a `PreparedSubmission` before Taskvisor intake starts no Taskvisor work
+and releases the cancellation-safe ownership wait.
+Core keeps the caller `TaskRef` in guarded ownership before preparation. It
+retains a separate anchor while a clone is inside preparation or intake.
+Runtime sources, prepared submissions, intake futures, and the final anchor use
+a non-unwinding disposal boundary. A destructor panic and a nested panic-payload
+destructor cannot strand cancellation or shutdown. Cleanup reporting is also
+best effort and never reports the panic payload. This boundary does not make a
+blocking destructor bounded.
+The runtime observer returns an exact provisional-binding guard as soon as both
+binding indexes are installed. An unexpected reconciliation unwind removes only
+that binding and its UID-matched output channel before coordinator settlement.
+Core creates no `TaskRun`. The retained task stays `Pending` with attempt zero and
+`Reconciled=False/RuntimeSubmissionCancelled`. Applying the same manifest may
+retry that failed reconciliation.
+If shutdown's preflight stop reaches the coordinator first, the retained task
+keeps its existing `Reconciled=Unknown/TaskvisorOwnershipAndControllerIntakePending`
+diagnostic instead. This path also creates no `TaskRun`.
+If controller intake won the race, core delegates queued or running cancellation
+to Taskvisor by the exact prepared ID and waits for Taskvisor's authoritative
+outcome. Core registers the returned completion waiter before tracing or waiting
+for observed-state persistence. A full persistence queue therefore cannot keep
+the coordinator from reaching native exact-ID cancellation.
 An unknown name returns `CoreError::NotFound`.
 
 `delete_task()` waits for that logical outcome and removes the resource and its runs.
@@ -375,6 +408,7 @@ Deleting a missing resource is an idempotent no-op.
 | `max_runs_per_task`                | 256          | Per-task completed run cap                                 |
 | `max_retained_tasks`               | 1024 tasks   | Maximum current Task resources                             |
 | `max_retained_task_manifest_bytes` | 256 MiB      | Maximum aggregate compact TaskManifest JSON bytes          |
+| `max_retained_task_run_bytes`      | 256 MiB      | Maximum aggregate compact JSON for current TaskRun values  |
 | `max_concurrent_task_watches`      | 256 watches  | Maximum admitted Task watch subscriptions                  |
 | `max_task_watch_initial_replay_bytes` | 64 MiB    | Aggregate compact Task JSON in initial and replay buffers  |
 | `run_history_capacity`             | 4096 batches | Maximum retained TaskRun mutation batches                  |
@@ -393,6 +427,22 @@ default. `with_max_retained_tasks(None)` disables the count limit, while
 `with_max_retained_task_manifest_bytes(None)` disables this byte budget, while
 `try_with_max_retained_task_manifest_bytes(0)` is rejected. It measures only
 compact canonical `TaskManifest` JSON. It does not bound total process memory.
+
+`max_retained_task_run_bytes` is an independent `Option<NonZeroUsize>`, with
+`Some(256 MiB)` as the default. It counts each TaskRun currently present in
+query state once. When a run mutation exceeds the bound, core uses a maintained
+completion-time index to compact the globally oldest completed runs. If active
+values alone cannot fit a deliberately smaller custom budget, execution and
+`TaskStateSink` lifecycle delivery continue while the new active value is
+omitted from retained query state. A lifecycle-only active handle retains the
+observed attempt start. Direct completion still publishes its authoritative
+terminal `RunChanged` event without forcing the value into query retention.
+This budget does not include reversible run journal deltas.
+`with_max_retained_task_run_bytes(None)` disables it and the raw checked setter
+rejects zero.
+
+All serialized byte budgets are logical compact JSON payload bounds. They do
+not measure Rust allocation overhead or process RSS.
 
 The two Task watch limits also use `Option<NonZeroUsize>`.
 `with_max_concurrent_task_watches(None)` and
@@ -431,7 +481,10 @@ use runner-build admission because the caller supplies their `TaskRef`.
 `OutputConfig` controls best-effort live output. Defaults are 256 events, a
 16 MiB retained payload budget per task, 64 KiB per chunk, and a 256 MiB
 aggregate retained payload budget. The effective ring capacity is the stricter
-of the per-task event and byte limits. Each ring reserves
+of the per-task event and byte limits. Ring storage starts empty and grows only
+with events published while at least one subscriber exists. Creating a task
+channel does not allocate the configured event capacity, and output published
+without subscribers is not retained. Each ring reserves
 `effective_capacity * max_chunk_bytes` from the aggregate budget. Each live
 subscription reserves another `max_chunk_bytes`. This is not a total process
 memory limit; caller-owned yielded events and output-sink delivery have separate
@@ -459,6 +512,7 @@ async fn configured() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_runs_per_task(64)
         .try_with_max_retained_tasks(1_024)?
         .try_with_max_retained_task_manifest_bytes(64 * 1024 * 1024)?
+        .try_with_max_retained_task_run_bytes(64 * 1024 * 1024)?
         .try_with_max_concurrent_task_watches(128)?
         .try_with_max_task_watch_initial_replay_bytes(32 * 1024 * 1024)?
         .try_with_watch_history_capacity(1024)?
@@ -589,14 +643,30 @@ The worker continues draining events accepted before the panic.
 Polling `SupervisorApi::shutdown()` on the output callback worker panics before shutdown starts and is handled as a callback panic.
 An output callback must not wait for another thread that calls shutdown; that cycle can deadlock.
 `SupervisorApi::state_persistence_status()` exposes admission, sticky health,
-outstanding ownership, the hard ownership capacity, completed callbacks, and
-panicked callbacks. A panicking callback is not retried because its side effects
-are ambiguous. Later state events continue through the worker.
+outstanding event and payload ownership, their hard capacities, completed
+callbacks, and panicked callbacks. State payload admission defaults to 256 MiB.
+Writes first reserve a conservative mutation-class bound before lifecycle,
+spawn, and state critical sections. After commit, that reservation shrinks to
+the sum of its emitted variant charges. `TaskChanged` counts the concatenated
+compact JSON of present previous and current Task values. It excludes the
+event's separate `resource_version` value and all event-variant framing.
+`RunChanged` counts the compact JSON of its task name, task UID, and TaskRun
+values and excludes event-variant framing. Saturation applies lossless
+backpressure. A panicking callback is not retried because its side effects are
+ambiguous. Later state events continue through the worker. An internal
+state-worker panic marks the dispatcher unhealthy and closes new admission
+before later callers can enter the state lock.
 `SupervisorApi::output_persistence_status()` exposes accepting, sticky health,
 buffered and active ownership, the hard capacity, completed callbacks, panicked
 callbacks, and callback copies rejected by admission.
 `PersistenceConfig::output_queue_capacity()` defaults to the hard bound 2048.
 `try_with_output_queue_capacity` rejects zero.
+`PersistenceConfig::state_queue_byte_capacity()` defaults to 256 MiB. Its
+checked setter rejects zero, values below the largest atomic commit reservation,
+and values above Tokio's semaphore limit. One Task change reserves 16 MiB. One
+Run change reserves 196 KiB, including worst-case JSON escaping of the bounded
+diagnostic and a standalone fixed-field allowance. The three-event maximum
+reserves 16 MiB plus 392 KiB.
 The application owns database errors and retries.
 Core drains both persistence workers during shutdown.
 

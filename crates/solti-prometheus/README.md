@@ -46,7 +46,7 @@ Enable one feature per adapter you use; the source crate then calls it during no
 | `PrometheusDiscoverMetrics::new`         | Registry                                   | `solti_discover_*` collector                            |
 | `PrometheusCoreStateCollector::new`      | `TaskState`                                | Pull-based `solti_core_tasks_by_phase` collector        |
 | `register_process_collector`             | Registry                                   | Standard `process_*` collectors on Linux                |
-| `server`                                 | Shared registry, listen address, revision  | `TaskManifest` and embedded `TaskRef`                   |
+| `server` / `server_with_config`          | Shared registry, address, revision, limits | `TaskManifest` and embedded `TaskRef`                   |
 
 Metrics adapter and subscriber constructors register their groups immediately.
 `PrometheusCoreStateCollector` is returned unregistered because it implements `prometheus::core::Collector`.
@@ -169,10 +169,48 @@ fn main() -> Result<(), solti_model::ModelError> {
 }
 ```
 
-The task serves only `GET /metrics`.
+The task serves only `GET /metrics`; `HEAD /metrics` returns `405` without gathering.
 It uses `AdmissionPolicy::Replace` in the `solti-metrics-server` slot.
 It restarts after exit and backs off from 1 to 30 seconds after failure.
-The embedded revision includes the listen address.
+The default scrape policy admits at most two physical gather jobs, allows a 4 MiB
+encoded response, and waits up to 10 seconds for gather plus encoding before
+returning `504`. The physical blocking job may outlive that response deadline and
+keeps its ownership slot until it returns.
+`MetricsServerConfig` can raise those values up to 16 jobs, 64 MiB, and 60 seconds.
+
+`server_with_config` applies custom checked settings. The embedded revision includes
+the listen address and every effective scrape setting.
+
+| Outcome                                  | HTTP response                 |
+|------------------------------------------|-------------------------------|
+| Complete exposition                     | `200 OK`                      |
+| Every scrape ownership slot is occupied | `503` with `Retry-After: 1`   |
+| Response deadline elapsed                | `504 Gateway Timeout`         |
+| Oversize, encoding failure, or panic     | `500 Internal Server Error`   |
+
+Gather and encoding run on Tokio's blocking pool. A response over the byte limit is
+discarded in full; the endpoint never sends a truncated Prometheus exposition.
+A timed-out or disconnected request cannot cancel synchronous collector code. Its
+job keeps the concurrency slot until it physically returns.
+A successful job transfers its slot to the encoded `Bytes` owner. The permit follows
+clones retained by the HTTP transport and returns only after the final clone drops.
+Slow clients therefore cannot retain a bounded response while admitting additional
+gather allocations through the same slot.
+
+The response limit bounds the encoded body, not allocations inside a collector,
+the `MetricFamily` graph returned by `Registry::gather`, or temporary encoder
+values. Collector work is concurrency-bounded, not byte-bounded. Register only
+trusted collectors with bounded behavior. An unwinding collector panic becomes
+`500`; `panic = "abort"` cannot be isolated. Structured tracing is best effort.
+A tracing subscriber panic is contained and cannot replace the scrape outcome.
+A custom panic payload whose destructor also panics cannot be safely reclaimed;
+its replacement payload is forgotten to contain the second unwind. Repeating that
+hostile payload can leak one replacement payload per admitted panic.
+
+Structured tracing records completed gather work plus `saturated`, `timeout`,
+`response_too_large`, `encode_failed`, `scrape_panicked`, and blocking-worker
+failure outcomes. The server does not register recursive self-metrics into the
+application registry.
 
 ## Examples
 

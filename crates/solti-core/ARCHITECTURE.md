@@ -266,6 +266,45 @@ A newer request cancels active preflight and replaces the pending request.
 Policy mapping and Taskvisor preparation happen only after that build returns.
 Runner panics are contained and become `Reconciled=False`.
 
+`cancel_task` signals that coordinator and waits for its slot to settle before
+waiting for the runtime operation lock. This ordering lets cancellation stop a
+build or Taskvisor intake wait that already owns the runtime lock. Delete uses
+the same coordinator drain but removes desired state afterward. A newer apply
+still serializes through the desired operation lock.
+
+The public cancel future registers a supervisor-owned worker while holding the
+spawn gate. Its caller observes that worker through a one-shot channel. Dropping
+the caller future after registration does not drop the cancel worker. Shutdown
+closes the task tracker under the same spawn gate and drains every registered
+cancel worker. A cancel call that reaches the gate after shutdown closes it is
+rejected with `CoreError::ShuttingDown` before worker registration.
+
+Before preparation, every caller `TaskRef` remains inside guarded source
+ownership. Core creates a separate anchor before a clone enters Taskvisor
+preparation or intake. It destroys runtime sources, built tasks, prepared
+submissions, intake futures, and the final anchor through one non-unwinding
+boundary. It safely consumes caught panic payloads and forgets only a nested
+payload whose own destructor panics. Cleanup logs do not inspect the payload and
+cannot unwind the cleanup path. This protection contains unwinding; it cannot
+bound a blocking user destructor.
+
+Each coordinator owns an identity-bound settlement guard. Normal completion
+removes only its own queue slot. An unexpected unwind removes the same slot,
+extracts pending work outside the queue mutex, releases its source and tracker
+registration, and then wakes settlement waiters. It never removes a newer slot
+for the same task name. This cleanup does not create a Taskvisor outcome or a
+`TaskRun`.
+
+The tracked coordinator retains request ownership while it awaits a child
+reconciliation task. A shared intake handoff distinguishes an exact provisional
+binding from an accepted `TaskWaiter`. `RuntimeObserver::bind` creates the
+provisional guard immediately after installing both binding indexes. If bind or
+the child unwinds before intake, the guard atomically removes only that full
+binding identity and its matching output channel without awaiting or reporting.
+The parent consumes a child panic and completes queue settlement only after this
+cleanup. Its existing tracker ownership prevents shutdown drain from overtaking
+recovery.
+
 The runtime operation lock serializes replacement, cancellation, deletion, and binding by name.
 It is separate from the desired operation lock.
 
@@ -281,6 +320,31 @@ Before `submit_and_watch` is polled, core publishes
 Taskvisor's combined ownership and controller command-intake wait; Taskvisor
 does not expose those sub-stages separately. Structured start and finish events
 report its duration and accepted, failed, or cancelled outcome.
+
+An explicit cancellation that wins before Taskvisor intake drops the
+`PreparedSubmission`. Taskvisor starts no work or event before that boundary,
+and its ownership admission returns an abandoned wait or grant. Core releases
+the submission future before it awaits binding cleanup or status persistence.
+Core then releases the provisional binding and output channel, creates no
+`TaskRun`, and records `Pending`, attempt zero, and
+`Reconciled=False/RuntimeSubmissionCancelled` for the current generation. The
+failed condition makes an identical apply eligible for reconciliation retry.
+
+Explicit cancel and shutdown can produce either documented pre-intake status.
+If the coordinator completes the explicit cancel branch, the current generation
+records `RuntimeSubmissionCancelled`. If it completes shutdown's preflight stop
+branch, the existing
+`TaskvisorOwnershipAndControllerIntakePending` diagnostic remains `Unknown`.
+Neither pre-intake path creates a `TaskRun`.
+
+If Taskvisor command intake wins the race, the coordinator settles with its
+binding intact. `cancel_task` then uses `cancel_with_timeout` for that exact
+Taskvisor ID. Taskvisor owns queued removal, runtime cancellation, and the
+authoritative final outcome. Core registers the returned `TaskWaiter` in its task
+tracker before it disarms the provisional guard, emits tracing, or waits for the
+observed-state persistence admission. Cancellation and preflight stop can end
+that later admission wait without dropping the waiter or delaying exact-ID
+cancellation. Both paths retain the desired resource and existing run history.
 
 The crate does not provide staged rollout or availability guarantees.
 
@@ -344,6 +408,12 @@ The direct `TaskWaiter` outcome owns final resource completion.
 It does not depend on terminal event delivery.
 It does not provide persistence across process termination.
 
+If state persistence admission is already closed after an authoritative outcome
+or confirmed global shutdown, core cannot project a new terminal status or run.
+It instead performs cleanup only: exact runtime unbind, UID-matched output
+eviction, and completion-barrier notification. The last admitted Task and
+TaskRun values remain unchanged. This fallback does not synthesize an outcome.
+
 `TaskRemoved` is a FIFO barrier for queued attempt events.
 Finalization waits for that barrier for at most one second.
 Subscriber overflow releases finalizations that are safe without the barrier.
@@ -368,6 +438,10 @@ Free-form reason text remains diagnostic.
 | `tasks`                                | Current resources by model task name                |
 | `by_slot`                              | Task names grouped by slot                          |
 | `runs`                                 | Active and retained attempt history                 |
+| `retained_task_run_bytes`              | Compact JSON bytes in current TaskRun query state   |
+| `retained_task_run_bytes_by_identity`  | Exact current TaskRun byte charges                  |
+| `completed_runs_by_age`                | Deterministic global completed-run compaction index |
+| `max_retained_task_run_bytes`          | Optional aggregate current TaskRun byte budget      |
 | `by_tv` and `tv_of`                    | Bidirectional runtime bindings                      |
 | `finished_attempt_by_tv`               | Duplicate terminal event fencing                    |
 | `resource_version_epoch` and counter   | Store-local collection identity                     |
@@ -384,10 +458,12 @@ One `RwLock` protects the complete state.
 A resource mutation and its change-journal entry happen under the same write lock.
 
 An optional state sink receives the committed task snapshot or run value through a bounded FIFO dispatcher shared by all `TaskState` clones.
-Each production write path declares its maximum event count and atomically reserves that many slots before acquiring the lifecycle gate, state lock, or spawn gate.
+Each production write path declares its maximum event count and conservative
+payload bound and reserves both before acquiring the lifecycle gate, state
+lock, or spawn gate.
 Tokio-owned paths await a fair semaphore; Taskvisor subscriber callbacks poll the same admission future on their dedicated callback threads.
 Both caller kinds therefore share one FIFO without synchronously parking a Tokio worker.
-Canceling an async wait returns any provisional semaphore capacity.
+Canceling an async wait returns provisional event and byte capacity.
 `TaskRemoved` reserves the maximum finalization batch before the lifecycle gate.
 Subscriber overflow first snapshots safe pending identities in a metadata-only
 gate section, then reserves and rechecks each identity separately in the same
@@ -397,7 +473,19 @@ Application code therefore runs on one dedicated persistence worker and never un
 For configured capacity `C`, `reserved + buffered + active <= C + 1`; `active` is zero or one and every admitted event owns exactly one permit.
 The largest atomic commit contains three events: one task change, at most one implicitly closed active run from the same generation, and one current run change.
 The minimum configured capacity is therefore two buffered events, for a hard bound of three including the active callback.
-Unused reservations return only after the state lock is released.
+State payload ownership has a separate 256 MiB default hard bound. A Task
+change reserves 16 MiB. A Run change reserves 196 KiB, including worst-case JSON
+escaping of the bounded diagnostic and a standalone fixed-field allowance. The
+largest atomic commit reserves 16 MiB plus 392 KiB. After the state lock is
+released, the reservation shrinks to the sum of emitted variant charges.
+`TaskChanged` counts compact JSON for its present previous and current Task
+values, excluding the event's separate `resource_version` value and all
+event-variant framing. `RunChanged` counts compact JSON for its task name, task
+UID, and TaskRun values and excludes event-variant framing. One shared RAII
+lease remains until the last event in that atomic batch leaves the active
+callback. The charge is a logical serialized-payload bound, not allocator or
+RSS accounting.
+Unused event and byte reservations return only after the state lock is released.
 When the bound is reached, a writer waits before entering its state critical section.
 Every eventful mutation first owns a lease from a sink-independent admission
 fence. Shutdown closes that fence under the same mutex used to issue leases and
@@ -405,6 +493,9 @@ waits for every pre-boundary lease to commit or be dropped. A post-boundary
 admission is closed. Public mutations map that closure to
 `CoreError::ShuttingDown`, while a late Taskvisor callback returns without a
 state mutation, including when no state sink is configured.
+An internal state-worker panic atomically closes the dispatcher admission gate.
+Reservations that have not crossed that failure boundary return closed before
+their callers can enter the state lock.
 With a configured sink, admission also clones the dispatcher sender under the
 same mutex that dispatcher shutdown uses to remove it. A pre-boundary admission
 retains that sender while it waits, commits, and dispatches. Dispatcher shutdown
@@ -489,12 +580,29 @@ Live run state and reversible journal deltas share immutable `Arc<TaskRun>`
 snapshots. Mutations use `Arc::make_mut`. Query planning clones only shared
 handles under the state lock and clones model values only for admitted page items.
 
+Current run query state has its own aggregate compact JSON ledger, separate
+from the reversible journal. Its default limit is 256 MiB. A maintained
+`BTreeSet` orders completed runs by finish time and deterministic identity. This
+global oldest-run selection is `O(log n)` rather than a scan of all runs.
+Removal locates the selected value only inside that task's run deque. Byte
+replacement, shrink, cap eviction, TTL sweep, delete, and recreate update the
+ledger under the same state write lock. If active values alone cannot fit a
+custom limit, the new active value is omitted from query retention; execution,
+Task status, output markers, and lifecycle persistence continue. A separate
+lifecycle-only active handle retains the observed attempt start. Direct
+completion therefore emits the authoritative terminal `RunChanged` value
+without requiring current query retention.
+
 A run snapshots its workload GVK.
 Adapter filtering can therefore apply to historical generations.
 
 The output hub may own one admitted bounded broadcast ring per bound task name.
 Runners receive an `OutputSink`.
 Consumers receive an `OutputSubscription`.
+The ring is a lazy deque. Channel creation allocates no capacity-sized event
+array. Storage grows only with events published while subscribers exist, never
+retains more than `effective_capacity` events, and is released when the last
+subscriber drops. A new subscriber receives only future events.
 Core makes one bounded ownership copy from each borrowed runner chunk.
 A small view cannot retain a larger producer allocation in the live ring.
 One aggregate payload ledger defaults to 256 MiB. Each ring reserves exactly
@@ -546,6 +654,11 @@ One sweep:
 3. enforces the completed-run cap while keeping active runs;
 4. removes terminal tasks after their run history is empty and `task_ttl` expires.
 
+Run mutations also enforce the aggregate current-run byte budget immediately.
+Completed byte compaction is part of the same reversible run revision. It does
+not emit persistence delete events because `TaskStateSink` is a lifecycle
+journal rather than a mirror of the in-memory retention window.
+
 TaskRun pagination has its own resource-version epoch and reversible journal.
 One committed state mutation uses one run revision, even when it closes an
 active run, creates the next attempt, and evicts completed history together.
@@ -557,11 +670,13 @@ expires continuations from the previous epoch.
 A task with a runtime binding is never removed by retention.
 Only actual deletion or sweep removal releases retained Task count capacity.
 Deletion, sweep removal, and shrinking applies release retained TaskManifest
-byte capacity.
+byte capacity. Run replacement, compaction, cap eviction, sweep, and task
+deletion release current TaskRun byte capacity.
 `StateConfig::with_max_retained_tasks(None)` disables the count limit.
 `StateConfig::with_max_retained_task_manifest_bytes(None)` disables the
-TaskManifest byte limit. Neither limit evicts Tasks.
-The byte budget does not bound total process memory.
+TaskManifest byte limit. `with_max_retained_task_run_bytes(None)` disables the
+current-run byte limit. None of these limits evicts Tasks.
+Serialized byte budgets do not bound allocator overhead or total process memory.
 
 `max_runs_per_task = 0` keeps active runs and removes completed history.
 Zero `run_ttl` and `task_ttl` make eligible values removable on the next sweep.
@@ -582,9 +697,13 @@ Stale entries are pruned when a new lock is created.
 
 When an operation needs both keyed locks, it acquires the desired operation lock first.
 Reconciliation acquires only the runtime operation lock.
+Cancellation and deletion signal and drain scheduled reconciliation while
+holding the desired operation lock, then acquire the runtime operation lock.
 
 The spawn gate is separate.
-It orders reconciliation worker registration against shutdown.
+It orders reconciliation and cancel-worker registration against shutdown.
+Registered cancel workers remain owned by the task tracker when their external
+caller stops waiting.
 
 ## Shutdown
 
@@ -613,6 +732,8 @@ flowchart LR
 
 Desired writes fail with `CoreError::ShuttingDown` after the shutdown flag is set.
 Read methods remain available over retained state.
+Cancel operations registered before that flag are drained with the other
+SDK-owned workers.
 
 Dropping `SupervisorApi` starts the same cleanup work on the captured Tokio runtime.
 Drop cannot await or return the cleanup result.

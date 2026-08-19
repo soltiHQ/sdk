@@ -30,7 +30,7 @@
 //! | `discover`             | Discovery metrics  | `PrometheusDiscoverMetrics`      |
 //! | `process`              | Current process    | `register_process_collector`     |
 //! | `runner`               | Runner metrics     | `PrometheusRunnerMetrics`        |
-//! | `server`               | Shared registry    | `server`                         |
+//! | `server`               | Shared registry    | `server`, `server_with_config`   |
 //! | `state`                | `TaskState`        | `PrometheusCoreStateCollector`   |
 //! | `taskvisor`            | Taskvisor events   | `PrometheusTaskvisorSubscriber`  |
 //! | `taskvisor-controller` | Controller events  | Controller subscriber metrics    |
@@ -117,7 +117,9 @@ pub use api::PrometheusApiMetrics;
 mod server;
 #[cfg(feature = "server")]
 #[cfg_attr(docsrs, doc(cfg(feature = "server")))]
-pub use server::{METRICS_SERVER_SLOT, server};
+pub use server::{
+    METRICS_SERVER_SLOT, MetricsServerConfig, MetricsServerConfigError, server, server_with_config,
+};
 
 #[cfg(feature = "state")]
 mod state;

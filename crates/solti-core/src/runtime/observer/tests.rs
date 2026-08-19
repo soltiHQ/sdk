@@ -112,7 +112,10 @@ async fn prepared_binding_routes_the_first_event_without_replay() {
     let tv = taskvisor::TaskId::for_tests();
     let resource = ResourceGeneration::from_task(&state.get(&id).expect("task must exist"));
 
-    assert!(sub.bind(resource, tv, true).await);
+    let _provisional = sub
+        .bind(resource, tv, true)
+        .await
+        .expect("current generation must bind");
     sub.on_event(
         &Event::new(EventKind::AttemptStarting)
             .with_id(tv)
@@ -123,6 +126,48 @@ async fn prepared_binding_routes_the_first_event_without_replay() {
     assert_eq!(state.list_runs(&id).len(), 1);
     assert_eq!(state.list_runs(&id)[0].attempt(), 1);
     assert!(registry.subscribe_raw(&id).is_some());
+}
+
+#[tokio::test]
+async fn provisional_drop_notifies_an_existing_completion_barrier_waiter() {
+    let state = TaskState::new();
+    let id = add_test_task(&state, "provisional-drop-barrier");
+    let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
+    let sub = Arc::new(RuntimeObserver::with_output_hub(
+        state.clone(),
+        Arc::clone(&registry),
+    ));
+    let tv = taskvisor::TaskId::for_tests();
+    let resource = ResourceGeneration::from_task(&state.get(&id).expect("task must exist"));
+    let provisional = sub
+        .bind(resource, tv, true)
+        .await
+        .expect("current generation must bind");
+
+    let settle_sub = Arc::clone(&sub);
+    let settlement = tokio::spawn(async move {
+        settle_sub.settle_after_confirmed_cleanup(tv).await;
+    });
+    wait_for_condition("completion barrier waiter was not registered", || {
+        sub.completion_barriers
+            .lock()
+            .notifications
+            .contains_key(&tv.get())
+    })
+    .await;
+
+    drop(provisional);
+    tokio::time::timeout(Duration::from_secs(1), settlement)
+        .await
+        .expect("provisional Drop did not notify the completion barrier")
+        .expect("completion barrier waiter panicked");
+    assert!(state.binding_for(&id).is_none());
+    assert!(registry.subscribe_raw(&id).is_none());
+    let barriers = sub.completion_barriers.lock();
+    assert!(!barriers.pending.contains_key(&tv.get()));
+    assert!(!barriers.removed.contains(&tv.get()));
+    assert!(!barriers.notifications.contains_key(&tv.get()));
+    assert!(state.list_runs(&id).is_empty());
 }
 
 #[tokio::test]
@@ -299,7 +344,7 @@ async fn failed_intake_cleanup_is_fenced_by_exact_binding() {
     let current_tv = taskvisor::TaskId::for_tests();
     let current = bind_test_task(&state, &id, current_tv);
     let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
-    registry.ensure_channel(id.clone());
+    registry.ensure_channel_if_absent(id.clone(), current.resource.uid.clone());
     let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
 
     assert!(
@@ -393,6 +438,46 @@ async fn task_removed_barrier_preserves_queued_attempt_events_before_cleanup() {
         output.try_recv(),
         Ok(OutputEvent::RunFinished { attempt: 1, .. })
     ));
+}
+
+#[tokio::test]
+async fn confirmed_shutdown_cleans_pending_binding_when_state_admission_is_closed() {
+    let state = TaskState::try_with_config_and_sink(
+        StateConfig::default(),
+        Some(Arc::new(IgnoringStateSink)),
+    )
+    .unwrap();
+    let id = add_test_task(&state, "shutdown-pending-closed-admission");
+    let before = state.get(&id).unwrap();
+    let tv = taskvisor::TaskId::for_tests();
+    bind_test_task(&state, &id, tv);
+    let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
+    registry.ensure_channel_if_absent(id.clone(), before.uid().clone());
+    let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
+
+    sub.finalize_unavailable(tv.get(), "outcome channel closed".into())
+        .await;
+    assert_eq!(state.tv_for(&id), Some(tv));
+    assert!(registry.subscribe_raw(&id).is_some());
+
+    state.inject_persistence_worker_panic();
+    state.add_task(TaskManifest::new("shutdown-pending-panic-trigger", test_spec()).unwrap());
+    wait_for_condition("state persistence admission did not close", || {
+        state
+            .persistence_status()
+            .is_some_and(|status| !status.accepting() && !status.healthy())
+    })
+    .await;
+
+    sub.finalize_pending_after_confirmed_shutdown().await;
+    assert!(state.tv_for(&id).is_none());
+    assert!(registry.subscribe_raw(&id).is_none());
+    assert_eq!(
+        state.get(&id).as_ref(),
+        Some(&before),
+        "cleanup-only shutdown fallback must not synthesize Task status"
+    );
+    assert!(state.list_runs(&id).is_empty());
 }
 
 #[test]

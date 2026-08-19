@@ -12,7 +12,7 @@
 //!    ▼
 //! single ownership copy + chunk limit
 //!    ▼
-//! per-task byte-bounded broadcast ring
+//! per-task lazy byte-bounded broadcast ring
 //! within one aggregate payload budget
 //!    │
 //!    ▼
@@ -21,6 +21,8 @@
 //!
 //! Output is live-only and best-effort.
 //! It is not stored in task history.
+//! A ring allocates storage only for events published while subscribers exist.
+//! Channel creation does not allocate the configured event capacity.
 //! Oversized chunks are exact prefixes with `truncated = true`.
 //! Slow subscribers receive [`OutputEvent::Lagged`] with skipped event and
 //! retained-payload byte counts.
@@ -31,12 +33,12 @@
 //! External output callback copies use a separate hard count bound. Its default
 //! is 2048 accepted events, including the active callback.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::SystemTime;
 
@@ -44,10 +46,9 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use solti_model::{OutputChunk, OutputEvent, TaskId, Uid};
 use solti_runner::{OutputChunkRef, OutputPublisher, OutputSink};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio_stream::Stream;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::wrappers::WatchStream;
 
 use crate::ConfigError;
 use crate::persistence::{
@@ -59,6 +60,8 @@ use crate::persistence::{
 ///
 /// Event count and retained chunk bytes are bounded independently.
 /// The broadcast ring uses the stricter of both limits.
+/// Ring storage grows with retained events instead of allocating the configured
+/// event capacity when a task channel is created.
 /// An aggregate byte budget bounds core-owned ring and subscription-pending
 /// payload. Caller-owned yielded events and external sink copies are separate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,8 +144,8 @@ impl OutputConfig {
 
     /// Returns the broadcast ring capacity after applying both limits.
     ///
-    /// Tokio rounds broadcast capacities up to a power of two. This method
-    /// rounds down first so the allocated ring cannot exceed either limit.
+    /// The ring preserves a power-of-two capacity. This method rounds down so
+    /// the retained event count cannot exceed either configured limit.
     pub const fn effective_capacity(self) -> NonZeroUsize {
         let byte_capacity = self.byte_budget.get() / self.max_chunk_bytes.get();
         let upper_bound = if self.capacity.get() < byte_capacity {
@@ -246,8 +249,8 @@ impl Default for OutputConfig {
 /// The stream implements [`tokio_stream::Stream`].
 /// Its item type is [`OutputEvent`].
 pub struct OutputSubscription {
-    inner: BroadcastStream<BroadcastOutput>,
-    total_bytes: Arc<AtomicU64>,
+    receiver: LazyBroadcastReceiver,
+    wake: WatchStream<u64>,
     next_bytes: u64,
     pending_lag: u64,
     pending_event: Option<OutputEvent>,
@@ -259,15 +262,15 @@ pub struct OutputSubscription {
 
 impl OutputSubscription {
     fn new(
-        receiver: broadcast::Receiver<BroadcastOutput>,
-        total_bytes: Arc<AtomicU64>,
+        receiver: LazyBroadcastReceiver,
+        wake: watch::Receiver<u64>,
         ring_payload_lease: Arc<OutputPayloadLease>,
         pending_payload_lease: Arc<OutputPayloadLease>,
         next_bytes: u64,
     ) -> Self {
         Self {
-            inner: BroadcastStream::new(receiver),
-            total_bytes,
+            receiver,
+            wake: WatchStream::new(wake),
             next_bytes,
             pending_lag: 0,
             pending_event: None,
@@ -287,8 +290,8 @@ impl Stream for OutputSubscription {
         }
 
         loop {
-            match Pin::new(&mut this.inner).poll_next(cx) {
-                Poll::Ready(Some(Ok(output))) => {
+            match this.receiver.try_recv() {
+                Ok(output) => {
                     if this.pending_lag != 0 {
                         let skipped = std::mem::take(&mut this.pending_lag);
                         let skipped_bytes = output.bytes_before.saturating_sub(this.next_bytes);
@@ -302,22 +305,24 @@ impl Stream for OutputSubscription {
                     this.next_bytes = output.bytes_after;
                     return Poll::Ready(Some(output.event));
                 }
-                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(skipped)))) => {
+                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                     this.pending_lag = this.pending_lag.saturating_add(skipped);
                 }
-                Poll::Ready(None) if this.pending_lag != 0 => {
+                Err(broadcast::error::TryRecvError::Closed) if this.pending_lag != 0 => {
                     let skipped = std::mem::take(&mut this.pending_lag);
-                    let skipped_bytes = this
-                        .total_bytes
-                        .load(Ordering::Acquire)
-                        .saturating_sub(this.next_bytes);
+                    let skipped_bytes = this.receiver.total_bytes().saturating_sub(this.next_bytes);
                     return Poll::Ready(Some(OutputEvent::Lagged {
                         skipped,
                         skipped_bytes,
                     }));
                 }
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
+                Err(broadcast::error::TryRecvError::Closed) => return Poll::Ready(None),
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    match Pin::new(&mut this.wake).poll_next(cx) {
+                        Poll::Ready(Some(_)) | Poll::Ready(None) => continue,
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
             }
         }
     }
@@ -331,15 +336,35 @@ struct BroadcastOutput {
 }
 
 struct OutputBroadcaster {
-    state: parking_lot::Mutex<BroadcastState>,
-    total_bytes: Arc<AtomicU64>,
+    shared: Arc<LazyBroadcastShared>,
+    wake: watch::Sender<u64>,
+    capacity: usize,
     ring_payload_lease: Arc<OutputPayloadLease>,
     pending_payload_reservation: usize,
 }
 
-struct BroadcastState {
-    sender: broadcast::Sender<BroadcastOutput>,
+struct LazyBroadcastShared {
+    state: parking_lot::Mutex<LazyBroadcastState>,
+}
+
+struct LazyBroadcastState {
+    events: VecDeque<LazyBroadcastSlot>,
+    next_sequence: u128,
+    receiver_count: usize,
     total_bytes: u64,
+    revision: u64,
+    closed: bool,
+}
+
+struct LazyBroadcastSlot {
+    sequence: u128,
+    output: BroadcastOutput,
+    remaining: usize,
+}
+
+struct LazyBroadcastReceiver {
+    shared: Arc<LazyBroadcastShared>,
+    next_sequence: u128,
 }
 
 impl OutputBroadcaster {
@@ -348,12 +373,20 @@ impl OutputBroadcaster {
         ring_payload_lease: Arc<OutputPayloadLease>,
         pending_payload_reservation: usize,
     ) -> Self {
+        let (wake, _initial_receiver) = watch::channel(0);
         Self {
-            state: parking_lot::Mutex::new(BroadcastState {
-                sender: broadcast::channel(capacity).0,
-                total_bytes: 0,
+            shared: Arc::new(LazyBroadcastShared {
+                state: parking_lot::Mutex::new(LazyBroadcastState {
+                    events: VecDeque::new(),
+                    next_sequence: 0,
+                    receiver_count: 0,
+                    total_bytes: 0,
+                    revision: 0,
+                    closed: false,
+                }),
             }),
-            total_bytes: Arc::new(AtomicU64::new(0)),
+            wake,
+            capacity,
             ring_payload_lease,
             pending_payload_reservation,
         }
@@ -364,27 +397,60 @@ impl OutputBroadcaster {
             .ring_payload_lease
             .budget
             .try_reserve(self.pending_payload_reservation)?;
-        let state = self.state.lock();
+        let wake = self.wake.subscribe();
+        let (receiver, next_bytes) = self.register_receiver()?;
         Some(OutputSubscription::new(
-            state.sender.subscribe(),
-            Arc::clone(&self.total_bytes),
+            receiver,
+            wake,
             Arc::clone(&self.ring_payload_lease),
             pending_payload_lease,
-            state.total_bytes,
+            next_bytes,
         ))
     }
 
     fn send(&self, event: OutputEvent) {
-        let mut state = self.state.lock();
+        let mut state = self.shared.state.lock();
         let bytes_before = state.total_bytes;
         let bytes_after = bytes_before.saturating_add(output_payload_bytes(&event));
         state.total_bytes = bytes_after;
-        self.total_bytes.store(bytes_after, Ordering::Release);
-        let _ = state.sender.send(BroadcastOutput {
-            event,
-            bytes_before,
-            bytes_after,
+        if state.receiver_count == 0 {
+            return;
+        }
+
+        if state.events.len() == self.capacity {
+            state.events.pop_front();
+        }
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        let remaining = state.receiver_count;
+        state.events.push_back(LazyBroadcastSlot {
+            sequence,
+            output: BroadcastOutput {
+                event,
+                bytes_before,
+                bytes_after,
+            },
+            remaining,
         });
+        state.revision = state.revision.wrapping_add(1);
+        let revision = state.revision;
+        drop(state);
+        self.wake.send_replace(revision);
+    }
+
+    fn register_receiver(&self) -> Option<(LazyBroadcastReceiver, u64)> {
+        let mut state = self.shared.state.lock();
+        if state.closed {
+            return None;
+        }
+        state.receiver_count = state.receiver_count.checked_add(1)?;
+        Some((
+            LazyBroadcastReceiver {
+                shared: Arc::clone(&self.shared),
+                next_sequence: state.next_sequence,
+            },
+            state.total_bytes,
+        ))
     }
 
     #[cfg(test)]
@@ -393,11 +459,108 @@ impl OutputBroadcaster {
             .ring_payload_lease
             .budget
             .try_reserve(self.pending_payload_reservation)?;
+        let (receiver, _) = self.register_receiver()?;
         Some(RawOutputReceiver {
-            receiver: self.state.lock().sender.subscribe(),
+            receiver,
             _ring_payload_lease: Arc::clone(&self.ring_payload_lease),
             _pending_payload_lease: pending_payload_lease,
         })
+    }
+
+    #[cfg(test)]
+    fn retained_events_and_allocation(&self) -> (usize, usize) {
+        let state = self.shared.state.lock();
+        (state.events.len(), state.events.capacity())
+    }
+}
+
+impl Drop for OutputBroadcaster {
+    fn drop(&mut self) {
+        let mut state = self.shared.state.lock();
+        state.closed = true;
+        state.revision = state.revision.wrapping_add(1);
+        let revision = state.revision;
+        drop(state);
+        self.wake.send_replace(revision);
+    }
+}
+
+impl LazyBroadcastReceiver {
+    fn try_recv(&mut self) -> Result<BroadcastOutput, broadcast::error::TryRecvError> {
+        let mut state = self.shared.state.lock();
+        let Some(front) = state.events.front() else {
+            return if state.closed {
+                Err(broadcast::error::TryRecvError::Closed)
+            } else {
+                Err(broadcast::error::TryRecvError::Empty)
+            };
+        };
+
+        if self.next_sequence < front.sequence {
+            let skipped = front.sequence - self.next_sequence;
+            self.next_sequence = front.sequence;
+            return Err(broadcast::error::TryRecvError::Lagged(
+                u64::try_from(skipped).unwrap_or(u64::MAX),
+            ));
+        }
+
+        let offset = self.next_sequence - front.sequence;
+        let Ok(offset) = usize::try_from(offset) else {
+            return if state.closed {
+                Err(broadcast::error::TryRecvError::Closed)
+            } else {
+                Err(broadcast::error::TryRecvError::Empty)
+            };
+        };
+        let Some(slot) = state.events.get_mut(offset) else {
+            return if state.closed {
+                Err(broadcast::error::TryRecvError::Closed)
+            } else {
+                Err(broadcast::error::TryRecvError::Empty)
+            };
+        };
+
+        let output = slot.output.clone();
+        slot.remaining = slot
+            .remaining
+            .checked_sub(1)
+            .expect("a live output receiver must own each unread retained event");
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        prune_consumed_events(&mut state.events);
+        Ok(output)
+    }
+
+    fn total_bytes(&self) -> u64 {
+        self.shared.state.lock().total_bytes
+    }
+}
+
+impl Drop for LazyBroadcastReceiver {
+    fn drop(&mut self) {
+        let mut state = self.shared.state.lock();
+        state.receiver_count = state
+            .receiver_count
+            .checked_sub(1)
+            .expect("a live output receiver must remain registered until drop");
+        for slot in &mut state.events {
+            if slot.sequence >= self.next_sequence {
+                slot.remaining = slot
+                    .remaining
+                    .checked_sub(1)
+                    .expect("a live output receiver must own each unread retained event");
+            }
+        }
+        if state.receiver_count == 0 {
+            state.events = VecDeque::new();
+        } else {
+            prune_consumed_events(&mut state.events);
+        }
+    }
+}
+
+fn prune_consumed_events(events: &mut VecDeque<LazyBroadcastSlot>) {
+    while events.front().is_some_and(|slot| slot.remaining == 0) {
+        events.pop_front();
     }
 }
 
@@ -410,7 +573,7 @@ fn output_payload_bytes(event: &OutputEvent) -> u64 {
 
 #[cfg(test)]
 pub(crate) struct RawOutputReceiver {
-    receiver: broadcast::Receiver<BroadcastOutput>,
+    receiver: LazyBroadcastReceiver,
     _ring_payload_lease: Arc<OutputPayloadLease>,
     _pending_payload_lease: Arc<OutputPayloadLease>,
 }
@@ -634,6 +797,15 @@ impl OutputHub {
         self.channels.write().remove(task_id);
     }
 
+    /// Evicts a channel only when it still belongs to the exact task identity.
+    pub(crate) fn evict_if_uid(&self, task_id: &TaskId, task_uid: &Uid) -> bool {
+        let mut channels = self.channels.write();
+        let matches = channels
+            .get(task_id)
+            .is_some_and(|channel| &channel.task_uid == task_uid);
+        matches && channels.remove(task_id).is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn active_channels(&self) -> usize {
         self.channels.read().len()
@@ -642,6 +814,14 @@ impl OutputHub {
     #[cfg(test)]
     pub(crate) fn reserved_payload_bytes(&self) -> usize {
         self.payload_budget.reserved.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn retained_events_and_allocation(&self, task_id: &TaskId) -> Option<(usize, usize)> {
+        self.channels
+            .read()
+            .get(task_id)
+            .map(|channel| channel.broadcaster.retained_events_and_allocation())
     }
 
     pub(crate) fn persistence_status(&self) -> Option<TaskOutputSinkStatus> {
@@ -822,6 +1002,61 @@ mod tests {
                 field: "output_max_chunk_bytes",
                 limit: "output_byte_budget"
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn maximum_config_constructs_an_empty_lazy_ring_and_keeps_future_only_delivery() {
+        let config = OutputConfig::try_new(usize::MAX)
+            .unwrap()
+            .try_with_byte_limits(usize::MAX, 1)
+            .unwrap()
+            .try_with_aggregate_byte_budget(usize::MAX)
+            .unwrap();
+        let effective_capacity = config.effective_capacity().get();
+        let hub = OutputHub::new(config);
+        let task_id = TaskId::new("maximum-lazy-output").unwrap();
+
+        assert!(hub.ensure_channel_if_absent(
+            task_id.clone(),
+            Uid::new("maximum-lazy-output-uid").unwrap()
+        ));
+        assert_eq!(hub.retained_events_and_allocation(&task_id), Some((0, 0)));
+
+        let sink = hub.sink_for(&task_id, 1, 1).expect("output sink");
+        sink.stdout_line(Bytes::from_static(b"x"));
+        assert_eq!(
+            hub.retained_events_and_allocation(&task_id),
+            Some((0, 0)),
+            "publishing without a subscriber must not allocate or retain a ring entry"
+        );
+
+        let mut output = hub.subscribe(&task_id).expect("output subscription");
+        sink.stdout_line(Bytes::from_static(b"y"));
+        let (retained, allocated) = hub
+            .retained_events_and_allocation(&task_id)
+            .expect("live channel");
+        assert_eq!(retained, 1);
+        assert!(
+            allocated < effective_capacity,
+            "one retained event must not allocate the configured maximum ring"
+        );
+        assert!(matches!(
+            output.next().await,
+            Some(OutputEvent::Chunk(chunk)) if &chunk.line[..] == b"y"
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), output.next())
+                .await
+                .is_err(),
+            "a subscriber must not receive output published before subscription"
+        );
+
+        drop(output);
+        assert_eq!(
+            hub.retained_events_and_allocation(&task_id),
+            Some((0, 0)),
+            "dropping the last subscriber must release lazy ring storage"
         );
     }
 

@@ -143,6 +143,35 @@ fn cancellable_task() -> TaskRef {
     })
 }
 
+struct PanickingDropPayload;
+
+impl Drop for PanickingDropPayload {
+    fn drop(&mut self) {
+        panic!("nested panic payload destructor");
+    }
+}
+
+struct PanickingDropTask {
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for PanickingDropTask {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Release);
+        std::panic::panic_any(PanickingDropPayload);
+    }
+}
+
+impl TvTask for PanickingDropTask {
+    fn spawn(&self, _ctx: TaskContext) -> BoxTaskFuture {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn panicking_drop_task(dropped: Arc<AtomicBool>) -> TaskRef {
+    Arc::new(PanickingDropTask { dropped })
+}
+
 async fn api(router: RunnerRouter) -> SupervisorApi {
     SupervisorApi::builder(router).start().await.unwrap()
 }
@@ -1686,6 +1715,1385 @@ async fn newer_apply_cancels_stale_submission_waiting_for_taskvisor_ownership() 
 }
 
 #[tokio::test]
+async fn cancel_task_releases_saturated_taskvisor_intake_and_allows_exact_retry() {
+    let runtime = SupervisorConfig::default().with_ownership_capacity(NonZeroUsize::new(2));
+    let api = SupervisorApi::builder(RunnerRouter::new())
+        .with_runtime_config(runtime)
+        .start()
+        .await
+        .unwrap();
+
+    let (held_id, held_waiter) = api
+        .reconciler
+        .handle
+        .add_and_watch(TvTaskSpec::once(
+            "cancel-task-ownership-filler",
+            cancellable_task(),
+        ))
+        .await
+        .unwrap();
+    let name = TaskId::new("cancel-task-saturated-intake").unwrap();
+    let manifest = embedded(name.as_str(), 10_000);
+    let created = api
+        .create_embedded_task(manifest.clone(), cancellable_task())
+        .await
+        .unwrap();
+    let prepared_binding = wait_for_binding(&api, &name, 1).await;
+    wait_for_task(&api, &name, |task| {
+        task.status().reconciled().reason() == TASKVISOR_INTAKE_PENDING_REASON
+    })
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(2), api.cancel_task(&name))
+        .await
+        .expect("cancel_task must not wait for saturated Taskvisor ownership")
+        .unwrap();
+
+    let cancelled = api
+        .get_task(&name)
+        .expect("explicit cancellation retains desired state");
+    assert_eq!(cancelled.uid(), created.uid());
+    assert_eq!(cancelled.metadata().generation(), 1);
+    assert_eq!(cancelled.status().phase(), TaskPhase::Pending);
+    assert_eq!(cancelled.status().attempt(), 0);
+    assert_eq!(
+        cancelled.status().reconciled().status(),
+        ConditionStatus::False
+    );
+    assert_eq!(
+        cancelled.status().reconciled().reason(),
+        "RuntimeSubmissionCancelled"
+    );
+    assert_eq!(
+        cancelled.status().reconciled().message(),
+        "runtime submission was cancelled before Taskvisor intake completed"
+    );
+    assert_eq!(cancelled.status().observed_generation(), 1);
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    assert!(
+        api.reconciler
+            .handle
+            .list()
+            .await
+            .iter()
+            .all(|(id, _)| *id != prepared_binding.tv),
+        "a dropped PreparedSubmission must never reach Taskvisor"
+    );
+    assert_eq!(
+        api.query_task_runs(&name, &TaskRunQuery::new())
+            .unwrap()
+            .unwrap()
+            .items
+            .len(),
+        0,
+        "pre-intake cancellation must not invent an attempt"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        api.reconciler.runtime_operations.lock(&name),
+    )
+    .await
+    .expect("cancelled reconciliation must not leak the per-task runtime lock");
+
+    let retried = api
+        .apply_embedded_task(manifest, cancellable_task())
+        .await
+        .unwrap();
+    assert_eq!(retried.metadata().generation(), 1);
+    assert_eq!(
+        retried.status().reconciled().status(),
+        ConditionStatus::Unknown
+    );
+    let retry_binding = wait_for_binding(&api, &name, 1).await;
+    assert_ne!(retry_binding.tv, prepared_binding.tv);
+
+    api.reconciler
+        .handle
+        .cancel_with_timeout(held_id, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let held_outcome = tokio::time::timeout(Duration::from_secs(1), held_waiter.wait())
+        .await
+        .expect("ownership filler did not finish")
+        .expect("ownership filler outcome channel closed");
+    assert_eq!(held_outcome.kind(), TaskOutcomeKind::Canceled);
+
+    wait_for_observed(&api, &name, 1).await;
+    api.delete_task(&name).await.unwrap();
+    api.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn panicking_last_owner_during_saturated_intake_cannot_strand_cancel_or_shutdown() {
+    let runtime = SupervisorConfig::default().with_ownership_capacity(NonZeroUsize::new(2));
+    let api = SupervisorApi::builder(RunnerRouter::new())
+        .with_runtime_config(runtime)
+        .start()
+        .await
+        .unwrap();
+    let (held_id, held_waiter) = api
+        .reconciler
+        .handle
+        .add_and_watch(TvTaskSpec::once(
+            "panic-drop-ownership-filler",
+            cancellable_task(),
+        ))
+        .await
+        .unwrap();
+
+    let name = TaskId::new("panic-drop-saturated-intake").unwrap();
+    let dropped = Arc::new(AtomicBool::new(false));
+    api.create_embedded_task(
+        embedded(name.as_str(), 10_000),
+        panicking_drop_task(Arc::clone(&dropped)),
+    )
+    .await
+    .unwrap();
+    let provisional = wait_for_binding(&api, &name, 1).await;
+    wait_for_task(&api, &name, |task| {
+        task.status().reconciled().reason() == TASKVISOR_INTAKE_PENDING_REASON
+    })
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(2), api.cancel_task(&name))
+        .await
+        .expect("panicking pre-intake disposal must not strand cancel_task")
+        .unwrap();
+
+    assert!(dropped.load(Ordering::Acquire));
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    assert!(
+        api.reconciler
+            .handle
+            .list()
+            .await
+            .iter()
+            .all(|(id, _)| *id != provisional.tv),
+        "the provisional Taskvisor identity must remain unsubmitted"
+    );
+    let cancelled = api.get_task(&name).unwrap();
+    assert_eq!(cancelled.status().phase(), TaskPhase::Pending);
+    assert_eq!(cancelled.status().attempt(), 0);
+    assert_eq!(
+        cancelled.status().reconciled().reason(),
+        "RuntimeSubmissionCancelled"
+    );
+    assert_eq!(
+        api.query_task_runs(&name, &TaskRunQuery::new())
+            .unwrap()
+            .unwrap()
+            .items
+            .len(),
+        0
+    );
+
+    api.reconciler
+        .handle
+        .cancel_with_timeout(held_id, Duration::from_secs(1))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), held_waiter.wait())
+        .await
+        .expect("ownership filler did not finish")
+        .expect("ownership filler outcome channel closed");
+    tokio::time::timeout(Duration::from_secs(2), api.shutdown())
+        .await
+        .expect("shutdown must drain after panicking pre-intake disposal")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn panicking_last_owner_before_preparation_does_not_escape_public_write() {
+    let api = api(RunnerRouter::new()).await;
+    let name = TaskId::new("panic-drop-invalid-source").unwrap();
+    let dropped = Arc::new(AtomicBool::new(false));
+
+    let result = api
+        .create_embedded_task(
+            routed(name.as_str(), 1_000),
+            panicking_drop_task(Arc::clone(&dropped)),
+        )
+        .await;
+    assert!(matches!(result, Err(CoreError::InvalidSpec(_))));
+    assert!(dropped.load(Ordering::Acquire));
+    assert!(api.get_task(&name).is_none());
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    assert!(api.reconciler.handle.list().await.is_empty());
+    assert!(
+        api.query_task_runs(&name, &TaskRunQuery::new())
+            .unwrap()
+            .is_none()
+    );
+    tokio::time::timeout(Duration::from_secs(2), api.shutdown())
+        .await
+        .expect("shutdown must drain after rejected source disposal")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn panicking_last_owner_in_pending_source_cannot_strand_cancel_or_shutdown() {
+    let api = api(RunnerRouter::new()).await;
+    let name = TaskId::new("panic-drop-pending-source").unwrap();
+    api.create_embedded_task(embedded(name.as_str(), 10_000), immediate_task())
+        .await
+        .unwrap();
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let applied = api
+        .apply_embedded_task(
+            embedded_with_revision(name.as_str(), 10_000, "pending-v2"),
+            panicking_drop_task(Arc::clone(&dropped)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.metadata().generation(), 2);
+    let settled = api
+        .reconciler
+        .cancel_scheduled_for_user(&name)
+        .expect("the unpolled pending source must still be scheduled");
+
+    tokio::time::timeout(Duration::from_secs(2), api.cancel_task(&name))
+        .await
+        .expect("pending-source disposal must not strand cancel_task")
+        .unwrap();
+    assert!(settled.is_cancelled());
+    assert!(dropped.load(Ordering::Acquire));
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    assert!(api.reconciler.handle.list().await.is_empty());
+    let cancelled = api.get_task(&name).unwrap();
+    assert_eq!(cancelled.metadata().generation(), 2);
+    assert_eq!(cancelled.status().phase(), TaskPhase::Pending);
+    assert_eq!(cancelled.status().attempt(), 0);
+    assert_eq!(
+        cancelled.status().reconciled().reason(),
+        "RuntimeSubmissionCancelled"
+    );
+    assert_eq!(
+        api.query_task_runs(&name, &TaskRunQuery::new())
+            .unwrap()
+            .unwrap()
+            .items
+            .len(),
+        0
+    );
+    tokio::time::timeout(Duration::from_secs(2), api.shutdown())
+        .await
+        .expect("shutdown must drain after pending-source disposal")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_bind_panic_releases_the_exact_unsubmitted_binding_before_settlement() {
+    let api = Arc::new(api(RunnerRouter::new()).await);
+    let name = TaskId::new("panic-after-provisional-bind").unwrap();
+    let (entered, release) = api
+        .reconciler
+        .arm_after_provisional_bind_panic(name.clone());
+
+    api.create_embedded_task(embedded(name.as_str(), 10_000), cancellable_task())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered)
+        .await
+        .expect("reconciliation did not reach the post-bind panic point")
+        .expect("post-bind panic point was dropped");
+    let provisional = api
+        .reconciler
+        .state
+        .binding_for(&name)
+        .expect("the injected panic must pause with an exact provisional binding");
+    assert!(api.subscribe_output(&name).is_some());
+
+    let cancel_api = Arc::clone(&api);
+    let cancel_name = name.clone();
+    let cancellation = tokio::spawn(async move { cancel_api.cancel_task(&cancel_name).await });
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !cancellation.is_finished(),
+        "cancel_task must wait for coordinator-owned unwind recovery"
+    );
+    release
+        .send(())
+        .expect("the injected reconciliation panic must still be armed");
+
+    tokio::time::timeout(Duration::from_secs(2), cancellation)
+        .await
+        .expect("post-bind panic stranded cancel_task")
+        .expect("cancel_task worker panicked")
+        .unwrap();
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    assert!(api.subscribe_output(&name).is_none());
+    assert!(
+        api.reconciler
+            .handle
+            .list()
+            .await
+            .iter()
+            .all(|(id, _)| *id != provisional.tv),
+        "the provisional identity must never enter Taskvisor"
+    );
+    let retained = api
+        .get_task(&name)
+        .expect("cancellation retains desired state");
+    assert_eq!(retained.status().phase(), TaskPhase::Pending);
+    assert_eq!(retained.status().attempt(), 0);
+    assert_eq!(
+        retained.status().reconciled().reason(),
+        "RuntimeSubmissionCancelled"
+    );
+    assert_eq!(
+        api.query_task_runs(&name, &TaskRunQuery::new())
+            .unwrap()
+            .unwrap()
+            .items
+            .len(),
+        0,
+        "unsubmitted unwind recovery must not invent a Taskvisor attempt"
+    );
+    tokio::time::timeout(Duration::from_secs(2), api.shutdown())
+        .await
+        .expect("shutdown must drain after post-bind unwind recovery")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_handoff_panic_preserves_the_authoritative_taskvisor_waiter() {
+    let api = Arc::new(api(RunnerRouter::new()).await);
+    let name = TaskId::new("panic-before-accepted-waiter-handoff").unwrap();
+    let (entered, release) = api
+        .reconciler
+        .arm_before_accepted_waiter_handoff_panic(name.clone());
+
+    api.create_embedded_task(embedded(name.as_str(), 10_000), cancellable_task())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered)
+        .await
+        .expect("reconciliation did not reach the accepted handoff panic point")
+        .expect("accepted handoff panic point was dropped");
+    let binding = api
+        .reconciler
+        .state
+        .binding_for(&name)
+        .expect("accepted runtime must retain its exact binding");
+    wait_for_task(&api, &name, |task| {
+        task.status().phase() == TaskPhase::Running && task.status().attempt() == 1
+    })
+    .await;
+    assert!(
+        api.reconciler
+            .handle
+            .list()
+            .await
+            .iter()
+            .any(|(id, _)| *id == binding.tv),
+        "Taskvisor must own the accepted identity before cancellation"
+    );
+
+    let cancel_api = Arc::clone(&api);
+    let cancel_name = name.clone();
+    let cancellation = tokio::spawn(async move { cancel_api.cancel_task(&cancel_name).await });
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !cancellation.is_finished(),
+        "cancel_task must wait for the accepted waiter recovery handoff"
+    );
+    release
+        .send(())
+        .expect("the accepted handoff panic must still be armed");
+
+    tokio::time::timeout(Duration::from_secs(2), cancellation)
+        .await
+        .expect("accepted handoff panic stranded exact-ID cancellation")
+        .expect("cancel_task worker panicked")
+        .unwrap();
+    let cancelled = api
+        .get_task(&name)
+        .expect("Taskvisor cancellation retains desired state");
+    assert_eq!(cancelled.status().phase(), TaskPhase::Canceled);
+    assert_eq!(cancelled.status().attempt(), 1);
+    assert_eq!(
+        cancelled.status().reconciled().status(),
+        ConditionStatus::True,
+        "accepted work keeps Taskvisor's authoritative reconciliation outcome"
+    );
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    assert!(api.subscribe_output(&name).is_none());
+    let runs = api
+        .query_task_runs(&name, &TaskRunQuery::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(runs.items.len(), 1);
+    assert_eq!(runs.items[0].attempt(), 1);
+    assert_eq!(runs.items[0].phase(), TaskPhase::Canceled);
+    tokio::time::timeout(Duration::from_secs(2), api.shutdown())
+        .await
+        .expect("shutdown must drain the recovered authoritative waiter")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_registration_panic_keeps_accepted_cancellation_taskvisor_native() {
+    let api = Arc::new(api(RunnerRouter::new()).await);
+    let name = TaskId::new("panic-after-accepted-waiter-registration").unwrap();
+    let (entered, release) = api
+        .reconciler
+        .arm_after_accepted_waiter_registration_panic(name.clone());
+
+    api.create_embedded_task(embedded(name.as_str(), 10_000), cancellable_task())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered)
+        .await
+        .expect("reconciliation did not reach the post-registration panic point")
+        .expect("post-registration panic point was dropped");
+    let binding = api
+        .reconciler
+        .state
+        .binding_for(&name)
+        .expect("accepted runtime must retain its exact binding");
+    wait_for_task(&api, &name, |task| {
+        task.status().phase() == TaskPhase::Running && task.status().attempt() == 1
+    })
+    .await;
+
+    release
+        .send(())
+        .expect("the post-registration panic must still be armed");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while api.reconciler.cancel_scheduled_for_user(&name).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("parent coordinator did not consume accepted progress after child panic");
+    tokio::time::timeout(Duration::from_secs(2), api.cancel_task(&name))
+        .await
+        .expect("post-registration panic stranded exact-ID cancellation")
+        .unwrap();
+
+    let cancelled = api.get_task(&name).unwrap();
+    assert_eq!(cancelled.status().phase(), TaskPhase::Canceled);
+    assert_eq!(cancelled.status().attempt(), 1);
+    assert_eq!(
+        cancelled.status().reconciled().status(),
+        ConditionStatus::True
+    );
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    assert!(
+        api.reconciler
+            .handle
+            .list()
+            .await
+            .iter()
+            .all(|(id, _)| *id != binding.tv)
+    );
+    let runs = api
+        .query_task_runs(&name, &TaskRunQuery::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(runs.items.len(), 1);
+    assert_eq!(runs.items[0].phase(), TaskPhase::Canceled);
+    tokio::time::timeout(Duration::from_secs(2), api.shutdown())
+        .await
+        .expect("shutdown must drain after post-registration panic recovery")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborted_cancel_task_before_intake_releases_ownership_before_status_admission() {
+    let runtime = SupervisorConfig::default().with_ownership_capacity(NonZeroUsize::new(2));
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let sink = Arc::new(TokioDependentStateSink {
+        first: AtomicBool::new(false),
+        events: AtomicUsize::new(0),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+    let api = Arc::new(
+        SupervisorApi::builder(RunnerRouter::new())
+            .with_runtime_config(runtime)
+            .with_state_sink(sink.clone())
+            .with_persistence_config(
+                PersistenceConfig::new()
+                    .try_with_state_queue_capacity(2)
+                    .unwrap(),
+            )
+            .start()
+            .await
+            .unwrap(),
+    );
+
+    let (held_id, held_waiter) = api
+        .reconciler
+        .handle
+        .add_and_watch(TvTaskSpec::once(
+            "aborted-cancel-ownership-filler",
+            cancellable_task(),
+        ))
+        .await
+        .unwrap();
+    let name = TaskId::new("aborted-cancel-before-intake").unwrap();
+    api.create_embedded_task(embedded(name.as_str(), 10_000), cancellable_task())
+        .await
+        .unwrap();
+    let prepared_binding = wait_for_binding(&api, &name, 1).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if api.get_task(&name).is_some_and(|task| {
+                task.status().reconciled().reason() == TASKVISOR_INTAKE_PENDING_REASON
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Taskvisor intake-pending state did not converge");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while api.state_persistence_status().unwrap().queued() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial desired and intake-pending events did not drain");
+    sink.first.store(true, Ordering::Release);
+    api.reconciler
+        .state
+        .add_task(embedded("aborted-cancel-persistence-active", 1_000));
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the armed persistence callback must become active");
+
+    api.reconciler
+        .state
+        .add_task(embedded("aborted-cancel-persistence-buffer-one", 1_000));
+    api.reconciler
+        .state
+        .add_task(embedded("aborted-cancel-persistence-buffer-two", 1_000));
+    assert_eq!(api.state_persistence_status().unwrap().queued(), 3);
+
+    let cancel_api = Arc::clone(&api);
+    let cancel_name = name.clone();
+    let cancellation = tokio::spawn(async move { cancel_api.cancel_task(&cancel_name).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while api.reconciler.state.persistence_admission_waiters() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the cancellation status write must wait for persistence admission");
+
+    cancellation.abort();
+    assert!(
+        cancellation.await.unwrap_err().is_cancelled(),
+        "aborting the caller must stop only its wait"
+    );
+    assert!(
+        api.reconciler.state.binding_for(&name).is_none(),
+        "the prepared binding must be released before status persistence admission"
+    );
+    assert!(
+        api.reconciler
+            .handle
+            .list()
+            .await
+            .iter()
+            .all(|(id, _)| *id != prepared_binding.tv),
+        "the cancelled prepared identity must never enter Taskvisor"
+    );
+
+    let handle = api.reconciler.handle.clone();
+    let probe = tokio::spawn(async move {
+        handle
+            .add_and_watch(TvTaskSpec::once(
+                "aborted-cancel-ownership-probe",
+                cancellable_task(),
+            ))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !probe.is_finished(),
+        "the ownership probe must wait while the filler still owns capacity"
+    );
+
+    api.reconciler
+        .handle
+        .cancel_with_timeout(held_id, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let held_outcome = tokio::time::timeout(Duration::from_secs(1), held_waiter.wait())
+        .await
+        .expect("ownership filler did not finish")
+        .expect("ownership filler outcome channel closed");
+    assert_eq!(held_outcome.kind(), TaskOutcomeKind::Canceled);
+    let (probe_id, probe_waiter) = tokio::time::timeout(Duration::from_secs(1), probe)
+        .await
+        .expect("released ownership must admit the independent probe")
+        .unwrap()
+        .unwrap();
+    assert!(
+        api.reconciler.state.persistence_admission_waiters() >= 1,
+        "status persistence must still have a blocked admission after ownership is released"
+    );
+
+    release_tx
+        .send(())
+        .expect("the test must release the active persistence callback");
+    let cancelled = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(task) = api.get_task(&name)
+                && task.status().reconciled().reason() == "RuntimeSubmissionCancelled"
+            {
+                break task;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancellation status did not converge after persistence resumed");
+    assert_eq!(cancelled.status().phase(), TaskPhase::Pending);
+    assert_eq!(cancelled.status().attempt(), 0);
+    assert_eq!(
+        cancelled.status().reconciled().status(),
+        ConditionStatus::False
+    );
+    assert_eq!(
+        api.query_task_runs(&name, &TaskRunQuery::new())
+            .unwrap()
+            .unwrap()
+            .items
+            .len(),
+        0,
+        "pre-intake cancellation must not invent a Taskvisor outcome"
+    );
+
+    api.reconciler
+        .handle
+        .cancel_with_timeout(probe_id, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let probe_outcome = tokio::time::timeout(Duration::from_secs(1), probe_waiter.wait())
+        .await
+        .expect("ownership probe did not finish")
+        .expect("ownership probe outcome channel closed");
+    assert_eq!(probe_outcome.kind(), TaskOutcomeKind::Canceled);
+    api.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_task_delegates_an_accepted_runtime_to_taskvisor() {
+    let api = api(RunnerRouter::new()).await;
+    let name = TaskId::new("cancel-task-accepted-runtime").unwrap();
+    let manifest = embedded(name.as_str(), 10_000);
+    let created = api
+        .create_embedded_task(manifest.clone(), cancellable_task())
+        .await
+        .unwrap();
+    let binding = wait_for_binding(&api, &name, 1).await;
+    wait_for_observed(&api, &name, 1).await;
+
+    tokio::time::timeout(Duration::from_secs(2), api.cancel_task(&name))
+        .await
+        .expect("Taskvisor cancellation did not settle")
+        .unwrap();
+
+    let cancelled = api
+        .get_task(&name)
+        .expect("runtime cancellation retains desired state");
+    assert_eq!(cancelled.uid(), created.uid());
+    assert_eq!(TaskManifest::from(&cancelled), manifest);
+    assert_eq!(cancelled.status().phase(), TaskPhase::Canceled);
+    assert_eq!(
+        cancelled.status().reconciled().status(),
+        ConditionStatus::True,
+        "an accepted runtime keeps Taskvisor's authoritative outcome"
+    );
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    assert!(
+        api.reconciler
+            .handle
+            .list()
+            .await
+            .iter()
+            .all(|(id, _)| *id != binding.tv)
+    );
+
+    let next = api
+        .apply_embedded_task(
+            embedded_with_revision(name.as_str(), 10_000, "test-v2"),
+            cancellable_task(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.metadata().generation(), 2);
+    wait_for_observed(&api, &name, 2).await;
+    api.delete_task(&name).await.unwrap();
+    api.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_runtime_reaches_exact_id_cancel_while_observed_persistence_is_saturated() {
+    let runtime = SupervisorConfig::default().with_ownership_capacity(NonZeroUsize::new(2));
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let sink = Arc::new(TokioDependentStateSink {
+        first: AtomicBool::new(false),
+        events: AtomicUsize::new(0),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+    let api = Arc::new(
+        SupervisorApi::builder(RunnerRouter::new())
+            .with_runtime_config(runtime)
+            .with_state_sink(sink.clone())
+            .with_persistence_config(
+                PersistenceConfig::new()
+                    .try_with_state_queue_capacity(2)
+                    .unwrap(),
+            )
+            .start()
+            .await
+            .unwrap(),
+    );
+    let (held_id, held_waiter) = api
+        .reconciler
+        .handle
+        .add_and_watch(TvTaskSpec::once(
+            "accepted-persistence-ownership-filler",
+            cancellable_task(),
+        ))
+        .await
+        .unwrap();
+    let name = TaskId::new("accepted-persistence-cancel").unwrap();
+    let scheduled = api
+        .write(
+            embedded(name.as_str(), 10_000),
+            RuntimeSource::Prebuilt(cancellable_task()),
+            WriteMode::Create,
+            WritePreconditions::new(),
+            true,
+        )
+        .await
+        .unwrap();
+    let reconciliation = scheduled
+        .reconciliation
+        .expect("the created task must schedule reconciliation");
+    let binding = wait_for_binding(&api, &name, 1).await;
+    wait_for_task(&api, &name, |task| {
+        task.status().reconciled().reason() == TASKVISOR_INTAKE_PENDING_REASON
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while api.state_persistence_status().unwrap().queued() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial target state events did not drain");
+
+    sink.first.store(true, Ordering::Release);
+    api.reconciler
+        .state
+        .add_task(embedded("accepted-persistence-active", 1_000));
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the armed persistence callback must become active");
+    api.reconciler
+        .state
+        .add_task(embedded("accepted-persistence-buffer-one", 1_000));
+    api.reconciler
+        .state
+        .add_task(embedded("accepted-persistence-buffer-two", 1_000));
+    assert_eq!(api.state_persistence_status().unwrap().queued(), 3);
+
+    api.reconciler
+        .handle
+        .cancel_with_timeout(held_id, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let held_outcome = tokio::time::timeout(Duration::from_secs(1), held_waiter.wait())
+        .await
+        .expect("ownership filler did not finish")
+        .expect("ownership filler outcome channel closed");
+    assert_eq!(held_outcome.kind(), TaskOutcomeKind::Canceled);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let accepted = api
+                .reconciler
+                .handle
+                .list()
+                .await
+                .iter()
+                .any(|(id, _)| *id == binding.tv);
+            if accepted && api.reconciler.state.persistence_admission_waiters() >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("accepted runtime did not block only on observed-state admission");
+
+    let cancel_api = Arc::clone(&api);
+    let cancel_name = name.clone();
+    let cancellation = tokio::spawn(async move { cancel_api.cancel_task(&cancel_name).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if api
+                .reconciler
+                .handle
+                .list()
+                .await
+                .iter()
+                .all(|(id, _)| *id != binding.tv)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("post-accept persistence admission blocked exact-ID cancellation");
+    assert!(
+        !cancellation.is_finished(),
+        "authoritative finalization should still honor persistence backpressure"
+    );
+
+    release_tx
+        .send(())
+        .expect("the test must release the active persistence callback");
+    tokio::time::timeout(Duration::from_secs(5), cancellation)
+        .await
+        .expect("exact-ID cancellation did not settle after persistence resumed")
+        .expect("cancel_task worker panicked")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), reconciliation)
+        .await
+        .expect("reconciliation acknowledgement did not settle")
+        .expect("reconciliation acknowledgement dropped");
+    let cancelled = api.get_task(&name).unwrap();
+    assert_eq!(cancelled.status().phase(), TaskPhase::Canceled);
+    assert_eq!(cancelled.status().attempt(), 1);
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    api.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_state_admission_cleans_authoritative_completion_without_synthesizing_state() {
+    let api = Arc::new(
+        SupervisorApi::builder(RunnerRouter::new())
+            .with_state_sink(Arc::new(IgnoringStateSink))
+            .start()
+            .await
+            .unwrap(),
+    );
+    let name = TaskId::new("closed-admission-authoritative-completion").unwrap();
+    api.create_embedded_task(embedded(name.as_str(), 10_000), cancellable_task())
+        .await
+        .unwrap();
+    let binding = wait_for_binding(&api, &name, 1).await;
+    wait_for_task(&api, &name, |task| {
+        task.status().phase() == TaskPhase::Running && task.status().attempt() == 1
+    })
+    .await;
+    let before = api.get_task(&name).unwrap();
+    let before_runs = api
+        .query_task_runs(&name, &TaskRunQuery::new())
+        .unwrap()
+        .unwrap()
+        .items;
+    assert_eq!(before_runs.len(), 1);
+    assert_eq!(before_runs[0].phase(), TaskPhase::Running);
+
+    api.reconciler.state.inject_persistence_worker_panic();
+    api.reconciler
+        .state
+        .add_task(embedded("closed-admission-panic-trigger", 1_000));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = api.state_persistence_status().unwrap();
+            if !status.accepting() && !status.healthy() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("injected state persistence worker panic did not close admission");
+
+    tokio::time::timeout(Duration::from_secs(2), api.cancel_task(&name))
+        .await
+        .expect("closed state admission stranded authoritative cancellation")
+        .unwrap();
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    assert!(api.subscribe_output(&name).is_none());
+    assert!(
+        api.reconciler
+            .handle
+            .list()
+            .await
+            .iter()
+            .all(|(id, _)| *id != binding.tv)
+    );
+    assert_eq!(
+        api.get_task(&name).as_ref(),
+        Some(&before),
+        "cleanup-only fallback must not synthesize a terminal Task status"
+    );
+    assert_eq!(
+        api.query_task_runs(&name, &TaskRunQuery::new())
+            .unwrap()
+            .unwrap()
+            .items,
+        before_runs,
+        "cleanup-only fallback must not synthesize or rewrite a TaskRun"
+    );
+
+    let shutdown_api = Arc::clone(&api);
+    let shutdown = tokio::spawn(async move { shutdown_api.shutdown().await });
+    let shutdown = tokio::time::timeout(Duration::from_secs(2), shutdown)
+        .await
+        .expect("shutdown hung after cleanup-only authoritative finalization");
+    assert!(
+        shutdown.is_err_and(|error| error.is_panic()),
+        "shutdown must observably report the injected persistence worker panic"
+    );
+}
+
+#[tokio::test]
+async fn aborted_cancel_task_after_intake_still_cancels_the_bound_taskvisor_id() {
+    let api = Arc::new(api(RunnerRouter::new()).await);
+    let name = TaskId::new("aborted-cancel-after-intake").unwrap();
+    let scheduled = api
+        .write(
+            embedded(name.as_str(), 10_000),
+            RuntimeSource::Prebuilt(cancellable_task()),
+            WriteMode::Create,
+            WritePreconditions::new(),
+            true,
+        )
+        .await
+        .unwrap();
+    let reconciliation = scheduled
+        .reconciliation
+        .expect("the created task must schedule reconciliation");
+    let binding = wait_for_binding(&api, &name, 1).await;
+    let observed = tokio::time::timeout(Duration::from_secs(2), reconciliation)
+        .await
+        .expect("runtime reconciliation did not finish")
+        .expect("runtime reconciliation acknowledgement dropped");
+    assert_eq!(observed.status().observed_generation(), 1);
+    wait_for_task(&api, &name, |task| {
+        task.status().phase() == TaskPhase::Running && task.status().attempt() == 1
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while api.reconciler.tasks.len() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reconciliation must hand off to the retention and completion workers");
+    let (unrelated_id, unrelated_waiter) = api
+        .reconciler
+        .handle
+        .add_and_watch(TvTaskSpec::once(
+            "aborted-cancel-unrelated-taskvisor",
+            cancellable_task(),
+        ))
+        .await
+        .unwrap();
+
+    let operation = api.task_operations.lock(&name).await;
+    let tracked_before = api.reconciler.tasks.len();
+    let cancel_api = Arc::clone(&api);
+    let cancel_name = name.clone();
+    let cancellation = tokio::spawn(async move { cancel_api.cancel_task(&cancel_name).await });
+    let registered = tokio::time::timeout(Duration::from_secs(2), async {
+        while api.reconciler.tasks.len() <= tracked_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        registered.is_ok(),
+        "cancel_task must register its supervisor-owned operation; tracked before = {tracked_before}, current = {}",
+        api.reconciler.tasks.len()
+    );
+
+    cancellation.abort();
+    assert!(
+        cancellation.await.unwrap_err().is_cancelled(),
+        "aborting the caller must stop only its wait"
+    );
+    drop(operation);
+
+    let cancelled = wait_for_task(&api, &name, |task| {
+        task.status().phase() == TaskPhase::Canceled
+    })
+    .await;
+    assert_eq!(cancelled.status().attempt(), 1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while api.reconciler.state.binding_for(&name).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Taskvisor completion must release the bound identity");
+    let registered = api.reconciler.handle.list().await;
+    assert!(registered.iter().all(|(id, _)| *id != binding.tv));
+    assert!(
+        registered.iter().any(|(id, _)| *id == unrelated_id),
+        "exact-ID cancellation must not cancel an unrelated Taskvisor task"
+    );
+    let runs = api
+        .query_task_runs(&name, &TaskRunQuery::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(runs.items.len(), 1);
+    assert_eq!(runs.items[0].phase(), TaskPhase::Canceled);
+
+    api.reconciler
+        .handle
+        .cancel_with_timeout(unrelated_id, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let unrelated_outcome = tokio::time::timeout(Duration::from_secs(1), unrelated_waiter.wait())
+        .await
+        .expect("unrelated Taskvisor task did not finish")
+        .expect("unrelated Taskvisor task outcome channel closed");
+    assert_eq!(unrelated_outcome.kind(), TaskOutcomeKind::Canceled);
+    api.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancel_task_and_apply_serialize_without_losing_the_new_generation() {
+    let runtime = SupervisorConfig::default().with_ownership_capacity(NonZeroUsize::new(2));
+    let api = Arc::new(
+        SupervisorApi::builder(RunnerRouter::new())
+            .with_runtime_config(runtime)
+            .start()
+            .await
+            .unwrap(),
+    );
+    let (held_id, held_waiter) = api
+        .reconciler
+        .handle
+        .add_and_watch(TvTaskSpec::once(
+            "cancel-apply-ownership-filler",
+            cancellable_task(),
+        ))
+        .await
+        .unwrap();
+    let name = TaskId::new("cancel-apply-race").unwrap();
+    api.create_embedded_task(embedded(name.as_str(), 10_000), cancellable_task())
+        .await
+        .unwrap();
+    wait_for_task(&api, &name, |task| {
+        task.status().reconciled().reason() == TASKVISOR_INTAKE_PENDING_REASON
+    })
+    .await;
+
+    let operation = api.task_operations.lock(&name).await;
+    let (cancel_started_tx, cancel_started_rx) = oneshot::channel();
+    let cancel_api = Arc::clone(&api);
+    let cancel_name = name.clone();
+    let cancel = tokio::spawn(async move {
+        let _ = cancel_started_tx.send(());
+        cancel_api.cancel_task(&cancel_name).await
+    });
+    cancel_started_rx.await.unwrap();
+    tokio::task::yield_now().await;
+
+    let apply_api = Arc::clone(&api);
+    let apply_name = name.clone();
+    let apply = tokio::spawn(async move {
+        apply_api
+            .apply_embedded_task(
+                embedded_with_revision(apply_name.as_str(), 10_000, "apply-v2"),
+                cancellable_task(),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    drop(operation);
+
+    tokio::time::timeout(Duration::from_secs(2), cancel)
+        .await
+        .expect("cancel_task remained blocked behind reconciliation")
+        .unwrap()
+        .unwrap();
+    let applied = tokio::time::timeout(Duration::from_secs(2), apply)
+        .await
+        .expect("apply remained blocked behind cancel_task")
+        .unwrap()
+        .unwrap();
+    assert_eq!(applied.metadata().generation(), 2);
+    let second_binding = wait_for_binding(&api, &name, 2).await;
+    assert_eq!(second_binding.resource.generation, 2);
+
+    api.reconciler
+        .handle
+        .cancel_with_timeout(held_id, Duration::from_secs(1))
+        .await
+        .unwrap();
+    held_waiter.wait().await.unwrap();
+    wait_for_observed(&api, &name, 2).await;
+    api.delete_task(&name).await.unwrap();
+    api.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancel_task_and_delete_serialize_without_retaining_runtime_ownership() {
+    let api = Arc::new(api(RunnerRouter::new()).await);
+    let name = TaskId::new("cancel-delete-race").unwrap();
+    api.create_embedded_task(embedded(name.as_str(), 10_000), cancellable_task())
+        .await
+        .unwrap();
+    let binding = wait_for_binding(&api, &name, 1).await;
+    wait_for_observed(&api, &name, 1).await;
+
+    let operation = api.task_operations.lock(&name).await;
+    let (cancel_started_tx, cancel_started_rx) = oneshot::channel();
+    let cancel_api = Arc::clone(&api);
+    let cancel_name = name.clone();
+    let cancel = tokio::spawn(async move {
+        let _ = cancel_started_tx.send(());
+        cancel_api.cancel_task(&cancel_name).await
+    });
+    cancel_started_rx.await.unwrap();
+    tokio::task::yield_now().await;
+
+    let delete_api = Arc::clone(&api);
+    let delete_name = name.clone();
+    let delete = tokio::spawn(async move { delete_api.delete_task(&delete_name).await });
+    tokio::task::yield_now().await;
+    drop(operation);
+
+    tokio::time::timeout(Duration::from_secs(2), cancel)
+        .await
+        .expect("cancel_task did not settle before queued delete")
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), delete)
+        .await
+        .expect("delete did not settle after cancel_task")
+        .unwrap()
+        .unwrap();
+    assert!(api.get_task(&name).is_none());
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    assert!(
+        api.reconciler
+            .handle
+            .list()
+            .await
+            .iter()
+            .all(|(id, _)| *id != binding.tv)
+    );
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        api.reconciler.runtime_operations.lock(&name),
+    )
+    .await
+    .expect("cancel/delete must release the runtime operation lock");
+    api.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_task_and_shutdown_settle_saturated_intake_without_a_lock_leak() {
+    let runtime = SupervisorConfig::default().with_ownership_capacity(NonZeroUsize::new(2));
+    let api = Arc::new(
+        SupervisorApi::builder(RunnerRouter::new())
+            .with_runtime_config(runtime)
+            .start()
+            .await
+            .unwrap(),
+    );
+    let (_held_id, _held_waiter) = api
+        .reconciler
+        .handle
+        .add_and_watch(TvTaskSpec::once(
+            "cancel-shutdown-ownership-filler",
+            cancellable_task(),
+        ))
+        .await
+        .unwrap();
+    let name = TaskId::new("cancel-shutdown-race").unwrap();
+    api.create_embedded_task(embedded(name.as_str(), 10_000), cancellable_task())
+        .await
+        .unwrap();
+    wait_for_task(&api, &name, |task| {
+        task.status().reconciled().reason() == TASKVISOR_INTAKE_PENDING_REASON
+    })
+    .await;
+
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let cancel_api = Arc::clone(&api);
+    let cancel_start = Arc::clone(&start);
+    let cancel_name = name.clone();
+    let cancel = tokio::spawn(async move {
+        cancel_start.wait().await;
+        cancel_api.cancel_task(&cancel_name).await
+    });
+    let shutdown_api = Arc::clone(&api);
+    let shutdown_start = Arc::clone(&start);
+    let shutdown = tokio::spawn(async move {
+        shutdown_start.wait().await;
+        shutdown_api.shutdown().await
+    });
+    start.wait().await;
+
+    let (cancel_result, shutdown_result) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(cancel, shutdown)
+    })
+    .await
+    .expect("concurrent cancel and shutdown did not settle");
+    match cancel_result.unwrap() {
+        Ok(()) | Err(CoreError::ShuttingDown) => {}
+        Err(error) => panic!("unexpected cancel/shutdown race result: {error}"),
+    }
+    shutdown_result.unwrap().unwrap();
+
+    let retained = api
+        .get_task(&name)
+        .expect("shutdown and cancellation retain desired state");
+    let reconciled = retained.status().reconciled();
+    match reconciled.status() {
+        ConditionStatus::False => {
+            assert_eq!(reconciled.reason(), "RuntimeSubmissionCancelled");
+            assert_eq!(retained.status().phase(), TaskPhase::Pending);
+            assert_eq!(retained.status().attempt(), 0);
+        }
+        ConditionStatus::Unknown => {
+            assert_eq!(reconciled.reason(), TASKVISOR_INTAKE_PENDING_REASON);
+        }
+        status => panic!("unexpected reconciled status after cancel/shutdown race: {status:?}"),
+    }
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        api.reconciler.runtime_operations.lock(&name),
+    )
+    .await
+    .expect("cancel/shutdown must release the runtime operation lock");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_drains_an_aborted_external_cancel_operation() {
+    let api = Arc::new(api(RunnerRouter::new()).await);
+    let name = TaskId::new("aborted-external-cancel-shutdown").unwrap();
+    let scheduled = api
+        .write(
+            embedded(name.as_str(), 10_000),
+            RuntimeSource::Prebuilt(cancellable_task()),
+            WriteMode::Create,
+            WritePreconditions::new(),
+            true,
+        )
+        .await
+        .unwrap();
+    let reconciliation = scheduled
+        .reconciliation
+        .expect("the created task must schedule reconciliation");
+    let binding = wait_for_binding(&api, &name, 1).await;
+    let observed = tokio::time::timeout(Duration::from_secs(2), reconciliation)
+        .await
+        .expect("runtime reconciliation did not finish")
+        .expect("runtime reconciliation acknowledgement dropped");
+    assert_eq!(observed.status().observed_generation(), 1);
+    wait_for_task(&api, &name, |task| {
+        task.status().phase() == TaskPhase::Running && task.status().attempt() == 1
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while api.reconciler.tasks.len() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reconciliation must hand off to the retention and completion workers");
+
+    let operation = api.task_operations.lock(&name).await;
+    let tracked_before = api.reconciler.tasks.len();
+    let cancel_api = Arc::clone(&api);
+    let cancel_name = name.clone();
+    let cancellation = tokio::spawn(async move { cancel_api.cancel_task(&cancel_name).await });
+    let registered = tokio::time::timeout(Duration::from_secs(2), async {
+        while api.reconciler.tasks.len() <= tracked_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        registered.is_ok(),
+        "cancel_task must register its supervisor-owned operation; tracked before = {tracked_before}, current = {}",
+        api.reconciler.tasks.len()
+    );
+    cancellation.abort();
+    assert!(cancellation.await.unwrap_err().is_cancelled());
+
+    let shutdown_api = Arc::clone(&api);
+    let shutdown = tokio::spawn(async move { shutdown_api.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !api.shutdown_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown did not close operation admission");
+    tokio::task::yield_now().await;
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown must drain the accepted cancel worker"
+    );
+
+    drop(operation);
+    tokio::time::timeout(Duration::from_secs(3), shutdown)
+        .await
+        .expect("shutdown did not drain the accepted cancel worker")
+        .unwrap()
+        .unwrap();
+
+    let retained = api
+        .get_task(&name)
+        .expect("external cancellation and shutdown retain desired state");
+    assert_eq!(retained.status().phase(), TaskPhase::Canceled);
+    assert_eq!(retained.status().attempt(), 1);
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    assert!(
+        api.reconciler
+            .handle
+            .list()
+            .await
+            .iter()
+            .all(|(id, _)| *id != binding.tv)
+    );
+    let runs = api
+        .query_task_runs(&name, &TaskRunQuery::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(runs.items.len(), 1);
+    assert_eq!(runs.items[0].phase(), TaskPhase::Canceled);
+    tokio::time::timeout(Duration::from_secs(1), api.task_operations.lock(&name))
+        .await
+        .expect("cancel/shutdown must release the desired-state operation lock");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        api.reconciler.runtime_operations.lock(&name),
+    )
+    .await
+    .expect("cancel/shutdown must release the runtime operation lock");
+}
+
+#[tokio::test]
 async fn shutdown_cancellation_preserves_observable_taskvisor_intake_state() {
     let runtime = SupervisorConfig::default().with_ownership_capacity(NonZeroUsize::new(2));
     let api = SupervisorApi::builder(RunnerRouter::new())
@@ -2160,11 +3568,14 @@ async fn coalescing_defers_user_task_destruction_to_the_caller_boundary() {
 
     let (_first_completion, first_superseded) = api.reconciler.schedule(
         desired.clone(),
-        RuntimeSource::Prebuilt(Arc::new(DropProbeTask {
-            dropped: Arc::clone(&dropped),
-            gate_released: Arc::clone(&gate_released),
-            api: Arc::downgrade(&api),
-        })),
+        guard_runtime_source(
+            RuntimeSource::Prebuilt(Arc::new(DropProbeTask {
+                dropped: Arc::clone(&dropped),
+                gate_released: Arc::clone(&gate_released),
+                api: Arc::downgrade(&api),
+            })),
+            desired.name().clone(),
+        ),
         true,
         registration,
     );
@@ -2176,10 +3587,14 @@ async fn coalescing_defers_user_task_destruction_to_the_caller_boundary() {
         .admit_state_write(StateMutationEventCapacity::TaskChange)
         .await
         .unwrap();
+    let source = guard_runtime_source(
+        RuntimeSource::Prebuilt(immediate_task()),
+        manifest.name().clone(),
+    );
     let scheduled = api
         .write_locked(
             manifest,
-            RuntimeSource::Prebuilt(immediate_task()),
+            source,
             WriteMode::Apply,
             &WritePreconditions::new(),
             true,
@@ -2204,19 +3619,25 @@ async fn schedule_returns_superseded_source_without_dropping_it() {
 
     let (_first_completion, first_superseded) = api.reconciler.schedule(
         desired.clone(),
-        RuntimeSource::Prebuilt(Arc::new(DropProbeTask {
-            dropped: Arc::clone(&dropped),
-            gate_released: Arc::new(AtomicBool::new(false)),
-            api: Weak::new(),
-        })),
+        guard_runtime_source(
+            RuntimeSource::Prebuilt(Arc::new(DropProbeTask {
+                dropped: Arc::clone(&dropped),
+                gate_released: Arc::new(AtomicBool::new(false)),
+                api: Weak::new(),
+            })),
+            desired.name().clone(),
+        ),
         true,
         api.reconciler.tasks.token(),
     );
     assert!(first_superseded.is_none());
 
     let (_second_completion, superseded) = api.reconciler.schedule(
-        desired,
-        RuntimeSource::Prebuilt(immediate_task()),
+        desired.clone(),
+        guard_runtime_source(
+            RuntimeSource::Prebuilt(immediate_task()),
+            desired.name().clone(),
+        ),
         true,
         api.reconciler.tasks.token(),
     );

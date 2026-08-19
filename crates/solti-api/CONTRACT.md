@@ -318,8 +318,8 @@ It also contains `reason`, `message`, and `lastTransitionTime`.
 While core waits for Taskvisor intake, the condition stays `Unknown` with
 `reason=TaskvisorOwnershipAndControllerIntakePending`. Its message names the
 combined ownership and controller command-intake wait. Taskvisor exposes that
-wait as one future, so the condition does not identify which capacity is
-currently blocking.
+wait as one future. The condition therefore does not identify which capacity
+is currently blocking.
 
 Execution phases are:
 

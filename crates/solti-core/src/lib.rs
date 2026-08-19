@@ -69,15 +69,21 @@
 //! [`TaskState`] stores current tasks and retained [`solti_model::TaskRun`] values.
 //! By default, it admits at most 1024 current tasks.
 //! It also retains at most 256 MiB of aggregate TaskManifest bytes by default.
+//! Current TaskRun query state has a separate 256 MiB aggregate compact JSON
+//! budget. Completed runs are compacted oldest-first when that bound is reached.
+//! An omitted active query value keeps a lifecycle-only handle. Direct
+//! completion can still publish its terminal persistence event.
 //! Every current task counts, including embedded, pending, running, and terminal
 //! tasks.
 //! The byte budget measures only compact canonical TaskManifest JSON.
-//! The count and TaskManifest byte budgets are independent.
-//! A full state rejects writes atomically without eviction or waiting for capacity.
-//! Existing applies remain allowed by the count limit. The byte budget allows
-//! shrinking and no-op applies, but it rejects growth past the configured limit.
-//! [`StateConfig`] can disable either limit.
-//! The TaskManifest byte budget does not bound total process memory.
+//! The count, TaskManifest, and current TaskRun byte budgets are independent.
+//! Full Task count or TaskManifest budgets reject desired writes atomically
+//! without evicting Tasks or waiting for capacity. Existing applies remain
+//! allowed by the count limit. The TaskManifest budget allows shrinking and
+//! no-op applies, but rejects growth past its configured limit.
+//! [`StateConfig`] can disable each limit.
+//! Serialized byte budgets are logical payload bounds. They do not measure
+//! allocator overhead or total process memory.
 //! Task and TaskRun queries use independent snapshot revisions and journals.
 //! Both use count limits and a 4 MiB item budget.
 //! An oversized first item is returned alone for native transport measurement.
@@ -91,6 +97,9 @@
 //! [`OutputConfig`] reserves each task ring from a 256 MiB aggregate retained
 //! payload budget by default. A task continues without live output when that
 //! budget cannot admit a new ring.
+//! Ring storage starts empty and grows only for output published to live
+//! subscribers. Task-channel creation does not allocate the configured event
+//! capacity.
 //!
 //! ## Main Types
 //!
