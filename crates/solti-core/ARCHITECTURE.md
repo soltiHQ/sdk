@@ -503,7 +503,8 @@ runs after the common mutation fence drains, closes its sender, and drains every
 accepted event.
 Retention sweeps publish each expired task deletion as a separate revalidated commit batch.
 Run events carry both task name and resource UID.
-The sink must eventually return and must not mutate `TaskState`, directly or through a thread it waits for; reads are allowed.
+The sink callback and destructor must eventually return. The callback must not
+mutate `TaskState`, directly or through a thread it waits for; reads are allowed.
 It may wait for unrelated Tokio work.
 Polling `SupervisorApi::shutdown` on the state callback worker panics before
 shutdown changes state. A state callback must not wait for another thread that
@@ -511,7 +512,10 @@ calls shutdown; that cycle can deadlock.
 `SupervisorApi::state_persistence_status` reports accepting, sticky health,
 reserved/buffered/active ownership, the hard `C + 1` capacity, callbacks that
 returned, and callbacks that panicked. A panicking callback is not retried
-because its side effects are ambiguous. Later events continue through the worker.
+because its side effects are ambiguous. Later events continue after an ordinary
+callback panic. If destroying a callback or reporting panic payload itself
+panics, the worker forgets that one replacement payload, closes admission, and
+drops its remaining accepted events before publishing terminal worker failure.
 Hooks do not hydrate the store during startup.
 
 Resource versions contain a random store epoch and a monotonic revision.
@@ -538,11 +542,13 @@ Changing the filter invalidates the continuation chain.
 No resource version or `"0"` emits a sorted `Added` snapshot.
 An exact retained version replays later changes before live delivery.
 
-Watch admission atomically reserves one concurrent lease and the compact Task
-JSON bytes required by its initial or exact-resume buffer. The defaults are 256
-leases and 64 MiB across one state. Bytes return to the ledger when a buffered
-event is yielded. Dropping a watch, a terminal error, and shutdown release the
-remaining lease without evicting another watch.
+Watch admission reserves its concurrent-count lease before cloning a snapshot
+or replay plan. Rejected concurrent constructors therefore do not scan or
+serialize the retained collection. The admitted constructor then charges the
+exact compact Task JSON bytes required by its initial or exact-resume buffer.
+The defaults are 256 leases and 64 MiB across one state. Bytes return to the
+ledger when a buffered event is yielded. Dropping a watch, a terminal error,
+and shutdown release the remaining lease without evicting another watch.
 
 Live delivery owns one coalesced latest-revision notification for the entire
 state. A watcher retains only its cursor and reads each next payload lazily from
@@ -605,12 +611,14 @@ retains more than `effective_capacity` events, and is released when the last
 subscriber drops. A new subscriber receives only future events.
 Core makes one bounded ownership copy from each borrowed runner chunk.
 A small view cannot retain a larger producer allocation in the live ring.
-One aggregate payload ledger defaults to 256 MiB. Each ring reserves exactly
-`effective_capacity * max_chunk_bytes`. Each subscription separately reserves
-`max_chunk_bytes` for the one internal event it can hold behind a lag notice.
-A task continues without a live-output channel when its ring cannot be admitted.
-A subscription returns `None` when its pending-event allowance cannot be admitted.
-The ledger excludes events already yielded to callers and output-sink delivery copies.
+One aggregate payload ledger defaults to 256 MiB. Each ring charges exactly the
+actual payload bytes retained by its lazy slots. An internal post-lag event
+shares the same lease, and subscriber count does not multiply the charge. Empty
+channels and subscriptions cost zero payload bytes. If the aggregate ledger
+cannot charge a published payload, the ring advances its sequence without
+retaining the event. Subscribers then observe its exact count and byte loss
+through `Lagged`. The ledger excludes events already yielded to callers and
+output-sink delivery copies.
 
 Output is live-only and lossy.
 Oversized chunks retain their exact prefix and set `truncated = true`.
@@ -629,7 +637,11 @@ task execution and live delivery continue.
 buffered and active ownership, hard capacity, callbacks that returned, callbacks
 that panicked, and callback copies rejected by admission.
 A callback panic is not retried, makes health false, and closes new admission.
-The worker continues draining events accepted before that panic.
+The worker continues draining events accepted before an ordinary callback
+panic. If destroying a callback or reporting panic payload itself panics, the
+worker forgets that one replacement payload and drops its remaining callback
+copies before publishing terminal worker failure. The sink callback and
+destructor must eventually return.
 Polling `SupervisorApi::shutdown` on the callback worker panics before shutdown
 changes state and is handled as a callback panic. A callback must not wait for
 another thread that calls shutdown; that cycle can deadlock.
@@ -640,7 +652,8 @@ Subscriber-local `Lagged` notifications are not sent to the sink.
 Terminal cleanup removes the channel from the hub.
 Existing subscribers close after every outstanding sink clone releases its sender.
 A stale sink cannot publish into a channel created later for the same model name.
-Stale sinks and subscriptions retain the old ring's aggregate reservation.
+Stale subscriptions retain only unread or post-lag payload and its shared
+aggregate charge.
 
 ## Retention
 
@@ -653,6 +666,12 @@ One sweep:
 2. removes expired nonterminal runs without a runtime binding;
 3. enforces the completed-run cap while keeping active runs;
 4. removes terminal tasks after their run history is empty and `task_ttl` expires.
+
+The sweep snapshots task identities, then processes one task per write-lock
+section. It does not scan and serialize every task and run while holding one
+global write lock. Each task's run removals remain one reversible journal
+revision, and task deletion still rechecks UID and expiry after persistence
+admission.
 
 Run mutations also enforce the aggregate current-run byte budget immediately.
 Completed byte compaction is part of the same reversible run revision. It does
@@ -719,7 +738,8 @@ flowchart LR
     Tracker["Close worker tracker"]
     Runtime["Shutdown Taskvisor"]
     Drain["Wait for reconciliation,<br/>completion, and retention workers"]
-    Result["Return Taskvisor shutdown result"]
+    Persistence["Drain state and output<br/>persistence workers"]
+    Result["Return shutdown result"]
 
     Start --> Fence
     Fence --> Watches
@@ -727,7 +747,8 @@ flowchart LR
     Retention --> Tracker
     Tracker --> Runtime
     Runtime --> Drain
-    Drain --> Result
+    Drain --> Persistence
+    Persistence --> Result
 ```
 
 Desired writes fail with `CoreError::ShuttingDown` after the shutdown flag is set.
@@ -738,6 +759,16 @@ SDK-owned workers.
 Dropping `SupervisorApi` starts the same cleanup work on the captured Tokio runtime.
 Drop cannot await or return the cleanup result.
 Call `shutdown` when completion must be observed.
+`shutdown` and `shutdown_with_timeout` join one cached owned coordinator.
+Repeated, timed-out, or canceled callers do not create additional cleanup
+owners. A timeout returns `CoreError::ShutdownTimedOut`; it does not cancel the
+coordinator or forcefully terminate application callbacks. State and output
+persistence are enrolled in one common cleanup tail. One worker failure cannot
+skip the other shutdown path. Persistence dispatcher destructors never join an
+application callback synchronously.
+The explicit worker join path destroys the final application sink handle behind
+a non-unwinding boundary and always publishes a terminal drain or worker-failed
+outcome.
 Completion covers the bounded Taskvisor workflow and SDK-owned workers. A
 `ForceAborted` outcome does not prove physical exit of non-cooperative user task
 code. Taskvisor keeps the controller slot until that ownership is released.

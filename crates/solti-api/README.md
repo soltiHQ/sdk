@@ -533,6 +533,11 @@ Bearer authentication and TLS are independent.
 
 Both builders accept one `ApiMetricsHandle` through `with_metrics`.
 The default backend does nothing.
+The installed handle has one sticky panic boundary shared by all request paths.
+After the first callback panic, later updates are dropped without invoking the
+backend again.
+Callbacks that already entered the boundary concurrently may still finish or
+panic. The boundary does not serialize healthy metrics updates.
 
 The backend receives:
 

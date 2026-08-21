@@ -71,9 +71,17 @@ It builds one base request from that snapshot.
 
 Every attempt clones the base request.
 Only `ts` and `uptime_seconds` are refreshed.
+Both values are converted to the signed 64-bit discovery v1 wire fields with
+checked conversions. An out-of-range uptime is `InvalidConfig`, does not reach
+the transport, does not record transport attempt or failure metrics, and
+terminates the task attempt as `TaskError::Fatal`.
 
 Apply a new embedded task when captured discovery settings change.
 Use a new `task_revision` for the changed runtime intent.
+This includes credentials, TLS material, the metrics backend, and the supplied
+`UptimeSource` or its epoch. The current public interfaces do not expose a
+stable identity for every opaque value. Revision ownership therefore remains
+with the composition root.
 
 The request contract is defined in
 `proto/solti/discover/v1/discovery.proto`.
@@ -96,6 +104,10 @@ The request contract is defined in
 
 The caller owns `AgentId` assignment and uniqueness.
 The SDK validates its format.
+
+Discovery v1 does not define an aggregate request byte ceiling, and the SDK
+does not enforce one before transport. The 128 KiB limit in the `http_sync`
+example belongs to that example server and is not an SDK protocol policy.
 
 `AgentEndpoint` accepts `api_version` values from `1` through `i32::MAX`.
 

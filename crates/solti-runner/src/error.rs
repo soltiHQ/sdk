@@ -25,6 +25,24 @@ pub enum RunnerError {
     #[error("invalid specification: {0}")]
     InvalidSpec(String),
 
+    /// Build cancellation won during interruptible runner-owned work.
+    #[error("runner build was cancelled")]
+    BuildCancelled,
+
+    /// A composing runner could not build one nested workload.
+    ///
+    /// The original router error remains available as the error source. This
+    /// preserves selection, admission, recursion, cancellation, and concrete
+    /// runner failure taxonomy across a composition boundary.
+    #[error("{context} could not be built: {source}")]
+    NestedBuild {
+        /// Composition-specific location of the nested workload.
+        context: String,
+        /// Original nested router failure.
+        #[source]
+        source: Box<RouterError>,
+    },
+
     /// The runner could not build the task because of an internal failure.
     #[error("internal error: {0}")]
     Internal(String),

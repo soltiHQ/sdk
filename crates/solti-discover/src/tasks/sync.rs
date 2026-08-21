@@ -138,21 +138,23 @@ pub fn sync(
                 cancel.run_until_cancelled(tokio::time::sleep(wait)).await?;
             }
 
+            let request = stamp_request(&ctx.base_request, ctx.uptime.as_ref())
+                .map_err(TaskError::fatal_from)?;
+
             debug!(
                 event = "discovery.sync",
                 stage = "started",
                 "discovery sync started"
             );
-            ctx.metrics.record_attempt();
+            metrics::record_attempt(&ctx.metrics);
             let start = Instant::now();
-            let request = stamp_request(&ctx.base_request, ctx.uptime.as_ref());
             let result = cancel
                 .run_until_cancelled(ctx.transport.sync(request))
                 .await?;
             let duration_ms = start.elapsed().as_millis() as u64;
             match result {
                 Ok(()) => {
-                    ctx.metrics.record_success(duration_ms);
+                    metrics::record_success(&ctx.metrics, duration_ms);
                     ctx.clear_retry_hold();
                     debug!(
                         event = "discovery.sync",
@@ -164,7 +166,7 @@ pub fn sync(
                 }
                 Err(e) => {
                     let failure = classify_failure(&e);
-                    ctx.metrics.record_failure(duration_ms, failure);
+                    metrics::record_failure(&ctx.metrics, duration_ms, failure);
                     if let DiscoverError::Rejected {
                         retry_after_s: Some(s),
                         ..
@@ -180,7 +182,7 @@ pub fn sync(
                             );
                         }
                         ctx.set_retry_hold(Duration::from_secs(clamped as u64));
-                        ctx.metrics.record_hold(clamped as u64);
+                        metrics::record_hold(&ctx.metrics, clamped as u64);
                     }
 
                     match e.retryability() {
@@ -384,12 +386,24 @@ fn capabilities_to_proto(capabilities: &AgentCapabilities) -> ProtoAgentCapabili
     }
 }
 
-fn stamp_request(base: &SyncRequest, uptime: &dyn UptimeSource) -> SyncRequest {
-    SyncRequest {
-        ts: now_unix_seconds() as i64,
-        uptime_seconds: uptime.uptime_seconds() as i64,
+fn stamp_request(
+    base: &SyncRequest,
+    uptime: &dyn UptimeSource,
+) -> Result<SyncRequest, DiscoverError> {
+    let ts = i64::try_from(now_unix_seconds()).map_err(|_| {
+        DiscoverError::InvalidConfig(
+            "current Unix timestamp exceeds the discovery v1 wire range".into(),
+        )
+    })?;
+    let uptime_seconds = i64::try_from(uptime.uptime_seconds()).map_err(|_| {
+        DiscoverError::InvalidConfig("uptime_seconds exceeds the discovery v1 wire range".into())
+    })?;
+
+    Ok(SyncRequest {
+        ts,
+        uptime_seconds,
         ..base.clone()
-    }
+    })
 }
 
 /// Returns the current Unix timestamp in seconds.
@@ -431,6 +445,9 @@ fn clamp_retry_after_s(seconds: i32) -> i32 {
 mod tests {
     use super::*;
     use solti_model::{Labels, RunnerCapability, WORKLOAD_API_VERSION, WorkloadTypeMeta};
+
+    #[cfg(feature = "http")]
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn capabilities_preserve_runner_name_labels_and_workload_gvks() {
@@ -627,9 +644,71 @@ mod tests {
         let base = build_base_request(&test_config());
         let source = || 42;
 
-        let request = stamp_request(&base, &source);
+        let request = stamp_request(&base, &source).expect("uptime fits the wire range");
 
         assert_eq!(request.uptime_seconds, 42);
+    }
+
+    #[test]
+    fn stamp_request_rejects_uptime_outside_the_wire_range() {
+        let source = || u64::MAX;
+
+        let error = stamp_request(&SyncRequest::default(), &source)
+            .expect_err("u64::MAX does not fit discovery v1 int64 uptime");
+
+        assert!(matches!(error, DiscoverError::InvalidConfig(message) if
+            message == "uptime_seconds exceeds the discovery v1 wire range"));
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn local_wire_stamp_failure_records_no_transport_metrics() {
+        #[derive(Debug, Default)]
+        struct MetricsProbe {
+            attempts: AtomicUsize,
+            failures: AtomicUsize,
+        }
+
+        impl crate::DiscoverMetricsBackend for MetricsProbe {
+            fn record_attempt(&self) {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn record_failure(&self, _duration_ms: u64, _reason: crate::DiscoverFailReason) {
+                self.failures.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let metrics = Arc::new(MetricsProbe::default());
+        let metrics_handle: crate::DiscoverMetricsHandle = metrics.clone();
+        let config = DiscoverConfig::builder(
+            solti_model::AgentId::new("agent-1").unwrap(),
+            "agent-1",
+            crate::AgentEndpoint::new("http://127.0.0.1:8085", crate::AgentEndpointType::Http, 1)
+                .unwrap(),
+            crate::ControlPlaneEndpoint::new("http://127.0.0.1:9", crate::DiscoveryTransport::Http)
+                .unwrap(),
+            1,
+            "wire-stamp-failure@1",
+        )
+        .with_metrics(metrics_handle)
+        .build()
+        .unwrap();
+        let (_, task) = sync(config, Arc::new(|| u64::MAX)).unwrap();
+
+        let error = task
+            .spawn(TaskContext::detached())
+            .await
+            .expect_err("out-of-range uptime must fail before transport");
+
+        assert!(
+            error
+                .to_string()
+                .contains("uptime_seconds exceeds the discovery v1 wire range"),
+            "{error}"
+        );
+        assert_eq!(metrics.attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(metrics.failures.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(feature = "http")]

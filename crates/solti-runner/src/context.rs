@@ -15,13 +15,20 @@
 use std::fmt;
 
 use crate::RunnerEnv;
-use crate::metrics::MetricsHandle;
-use crate::output::{OutputPublisherHandle, noop_output_publisher};
+use crate::metrics::{MetricsHandle, panic_contained_metrics};
+use crate::output::{
+    OutputPublisherHandle, noop_output_publisher, panic_contained_output_publisher,
+};
 
 /// Dependencies passed to [`Runner::build_task`](crate::Runner::build_task).
 ///
 /// Create the context when the router is assembled.
 /// [`RunnerRouter::with_context`](crate::RunnerRouter::with_context) installs it.
+/// Metrics and output publisher handles are installed behind separate sticky
+/// panic boundaries. A boundary stops invoking its callback after the first
+/// observed panic and is shared by every clone of this context. Calls that
+/// already entered the boundary concurrently may still finish or panic; the
+/// boundary does not serialize healthy callbacks.
 ///
 /// ## Defaults
 ///
@@ -62,8 +69,8 @@ impl BuildContext {
     pub fn new(env: RunnerEnv, metrics: MetricsHandle) -> Self {
         Self {
             env,
-            metrics,
-            output_publisher: noop_output_publisher(),
+            metrics: panic_contained_metrics(metrics),
+            output_publisher: panic_contained_output_publisher(noop_output_publisher()),
         }
     }
 
@@ -88,15 +95,15 @@ impl BuildContext {
         self
     }
 
-    /// Replaces the metrics backend.
+    /// Replaces the metrics backend and installs a new sticky panic boundary.
     pub fn with_metrics(mut self, metrics: MetricsHandle) -> Self {
-        self.metrics = metrics;
+        self.metrics = panic_contained_metrics(metrics);
         self
     }
 
-    /// Replaces the output publisher.
+    /// Replaces the output publisher and installs a new sticky panic boundary.
     pub fn with_output_publisher(mut self, publisher: OutputPublisherHandle) -> Self {
-        self.output_publisher = publisher;
+        self.output_publisher = panic_contained_output_publisher(publisher);
         self
     }
 }
@@ -105,8 +112,8 @@ impl Default for BuildContext {
     fn default() -> Self {
         Self {
             env: RunnerEnv::default(),
-            metrics: crate::metrics::noop_metrics(),
-            output_publisher: noop_output_publisher(),
+            metrics: panic_contained_metrics(crate::metrics::noop_metrics()),
+            output_publisher: panic_contained_output_publisher(noop_output_publisher()),
         }
     }
 }
@@ -208,7 +215,6 @@ mod tests {
             .sink_for(&TaskId::new("task").unwrap(), 3, 7)
             .expect("enabled sink");
 
-        assert!(Arc::ptr_eq(ctx.output_publisher(), &publisher));
         assert_eq!(sink.attempt(), 7);
         assert_eq!(sink.generation(), 3);
     }

@@ -691,25 +691,7 @@ impl WatchAdmission {
         })
     }
 
-    fn precheck_count(&self) -> Result<(), WatchAdmissionFailure> {
-        let inner = self.inner.lock();
-        if inner.closed {
-            return Err(WatchAdmissionFailure::Closed);
-        }
-        if let Some(limit) = self.max_count
-            && inner.leases.len() >= limit
-        {
-            return Err(WatchAdmissionFailure::Rejected(
-                CollectionError::ConcurrentTaskWatchLimitReached { limit },
-            ));
-        }
-        Ok(())
-    }
-
-    fn try_admit(
-        self: &Arc<Self>,
-        requested_bytes: usize,
-    ) -> Result<WatchAdmissionLease, WatchAdmissionFailure> {
+    fn try_reserve_count(self: &Arc<Self>) -> Result<WatchAdmissionLease, WatchAdmissionFailure> {
         let mut inner = self.inner.lock();
         if inner.closed {
             return Err(WatchAdmissionFailure::Closed);
@@ -720,6 +702,30 @@ impl WatchAdmission {
             return Err(WatchAdmissionFailure::Rejected(
                 CollectionError::ConcurrentTaskWatchLimitReached { limit },
             ));
+        }
+
+        let id = loop {
+            let candidate = inner.next_lease_id;
+            inner.next_lease_id = inner.next_lease_id.wrapping_add(1).max(1);
+            if !inner.leases.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        inner.leases.insert(id, 0);
+        Ok(WatchAdmissionLease {
+            admission: Arc::clone(self),
+            id,
+        })
+    }
+
+    fn try_charge_bytes(
+        &self,
+        id: u64,
+        requested_bytes: usize,
+    ) -> Result<(), WatchAdmissionFailure> {
+        let mut inner = self.inner.lock();
+        if inner.closed || !inner.leases.contains_key(&id) {
+            return Err(WatchAdmissionFailure::Closed);
         }
         if let Some(limit) = self.max_bytes
             && requested_bytes > limit - inner.retained_bytes
@@ -732,24 +738,17 @@ impl WatchAdmission {
                 },
             ));
         }
-
-        let id = loop {
-            let candidate = inner.next_lease_id;
-            inner.next_lease_id = inner.next_lease_id.wrapping_add(1).max(1);
-            if !inner.leases.contains_key(&candidate) {
-                break candidate;
-            }
-        };
         let charged_bytes = self.max_bytes.map_or(0, |_| requested_bytes);
+        let previous = inner
+            .leases
+            .insert(id, charged_bytes)
+            .expect("a provisional watch admission must remain registered");
+        assert_eq!(previous, 0, "watch bytes must be charged exactly once");
         inner.retained_bytes = inner
             .retained_bytes
             .checked_add(charged_bytes)
             .expect("watch admission bytes must remain within the configured limit");
-        inner.leases.insert(id, charged_bytes);
-        Ok(WatchAdmissionLease {
-            admission: Arc::clone(self),
-            id,
-        })
+        Ok(())
     }
 
     fn release_bytes(&self, id: u64, released_bytes: usize) {
@@ -804,6 +803,10 @@ impl WatchAdmissionLease {
 
     fn release_bytes(&self, released_bytes: usize) {
         self.admission.release_bytes(self.id, released_bytes);
+    }
+
+    fn try_charge_bytes(&self, requested_bytes: usize) -> Result<(), WatchAdmissionFailure> {
+        self.admission.try_charge_bytes(self.id, requested_bytes)
     }
 }
 
@@ -3393,38 +3396,62 @@ impl TaskState {
     }
 
     /// Lists tasks in one slot.
+    ///
+    /// The state read lock is released before owned [`Task`] values are cloned.
+    /// Use [`Self::query`] when the response itself must have a byte ceiling.
     pub fn list_by_slot(&self, slot: &str) -> Vec<Task> {
-        let inner = self.inner.read();
-
-        inner
-            .by_slot
-            .get(slot)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| inner.tasks.get(id))
-                    .map(|task| task.as_ref().clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let tasks = {
+            let inner = self.inner.read();
+            inner
+                .by_slot
+                .get(slot)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| inner.tasks.get(id))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        tasks
+            .into_iter()
+            .map(|task: Arc<Task>| task.as_ref().clone())
+            .collect()
     }
 
     /// Lists all retained tasks.
+    ///
+    /// The state read lock is released before owned [`Task`] values are cloned.
+    /// Use [`Self::query`] when the response itself must have a byte ceiling.
     pub fn list_all(&self) -> Vec<Task> {
-        let inner = self.inner.read();
-        inner
+        let tasks = self
+            .inner
+            .read()
             .tasks
             .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        tasks
+            .into_iter()
             .map(|task| task.as_ref().clone())
             .collect()
     }
 
     /// Lists tasks in one phase.
+    ///
+    /// The state read lock is released before owned [`Task`] values are cloned.
+    /// Use [`Self::query`] when the response itself must have a byte ceiling.
     pub fn list_by_status(&self, phase: TaskPhase) -> Vec<Task> {
-        let inner = self.inner.read();
-        inner
+        let tasks = self
+            .inner
+            .read()
             .tasks
             .values()
             .filter(|task| task.status().phase() == phase)
+            .cloned()
+            .collect::<Vec<_>>();
+        tasks
+            .into_iter()
             .map(|task| task.as_ref().clone())
             .collect()
     }
@@ -3462,65 +3489,75 @@ impl TaskState {
     ///
     /// Returns `(runs_removed, tasks_removed)` for observability.
     fn scan_retention(&self, config: &StateConfig, now: SystemTime) -> (usize, Vec<(TaskId, Uid)>) {
-        let mut inner = self.write(StateMutationEventCapacity::None);
+        let task_ids = self
+            .inner
+            .read()
+            .ordered_tasks
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut runs_removed = 0usize;
-        let bound: std::collections::HashSet<TaskId> = inner.tv_of.keys().cloned().collect();
-        let task_uids = inner
-            .tasks
-            .iter()
-            .map(|(id, task)| (id.clone(), task.uid().clone()))
-            .collect::<HashMap<_, _>>();
-        let mut run_snapshot_changes = Vec::new();
-        for (id, runs) in inner.runs.iter_mut() {
-            let before = runs.len();
-            let task_bound = bound.contains(id);
-            let task_uid = task_uids
-                .get(id)
-                .expect("retained TaskRun history must belong to a retained task");
-            runs.retain(|run| {
-                let retained = match run.finished_at() {
-                    Some(finished) => now
-                        .duration_since(finished)
-                        .map(|age| age < config.run_ttl())
-                        .unwrap_or(true),
-                    None => {
-                        task_bound
-                            || now
-                                .duration_since(run.started_at())
-                                .map(|age| age < config.run_ttl())
-                                .unwrap_or(true)
-                    }
-                };
-                if !retained {
-                    run_snapshot_changes.push(Self::run_snapshot_change(
-                        id,
-                        task_uid,
-                        Some(run.clone()),
-                        None,
-                    ));
-                }
-                retained
-            });
-            runs_removed += before - runs.len();
-        }
-        inner.runs.retain(|_, runs| !runs.is_empty());
-        Self::record_run_snapshot_changes(&mut inner, run_snapshot_changes);
+        let mut expired_tasks = Vec::new();
 
-        let expired_tasks = inner
-            .tasks
-            .iter()
-            .filter(|(id, task)| {
-                !inner.tv_of.contains_key(*id)
+        // Process one task per write-lock section and scan that task's run deque
+        // once. The sweep no longer scans and serializes every retained task in
+        // one stop-the-world section.
+        for id in task_ids {
+            let mut inner = self.write(StateMutationEventCapacity::None);
+            let Some(task_uid) = inner.tasks.get(&id).map(|task| task.uid().clone()) else {
+                continue;
+            };
+            let task_bound = inner.tv_of.contains_key(&id);
+            let mut run_snapshot_changes = Vec::new();
+            let mut remove_empty_history = false;
+            if let Some(runs) = inner.runs.get_mut(&id) {
+                runs.retain(|run| {
+                    let expired = match run.finished_at() {
+                        Some(finished) => now
+                            .duration_since(finished)
+                            .map(|age| age >= config.run_ttl())
+                            .unwrap_or(false),
+                        None => {
+                            !task_bound
+                                && now
+                                    .duration_since(run.started_at())
+                                    .map(|age| age >= config.run_ttl())
+                                    .unwrap_or(false)
+                        }
+                    };
+                    if expired {
+                        run_snapshot_changes.push(Self::run_snapshot_change(
+                            &id,
+                            &task_uid,
+                            Some(Arc::clone(run)),
+                            None,
+                        ));
+                    }
+                    !expired
+                });
+                remove_empty_history = runs.is_empty();
+            }
+            if remove_empty_history {
+                inner.runs.remove(&id);
+            }
+            runs_removed += run_snapshot_changes.len();
+            Self::record_run_snapshot_changes(&mut inner, run_snapshot_changes);
+
+            let task_expired = inner.tasks.get(&id).is_some_and(|task| {
+                task.uid() == &task_uid
+                    && !inner.tv_of.contains_key(&id)
                     && task.status().phase().is_terminal()
-                    && inner.runs.get(*id).is_none_or(|runs| runs.is_empty())
-                    && inner.terminal_since.get(*id).is_some_and(|finished| {
+                    && inner.runs.get(&id).is_none_or(|runs| runs.is_empty())
+                    && inner.terminal_since.get(&id).is_some_and(|finished| {
                         now.duration_since(*finished)
                             .map(|age| age >= config.task_ttl())
                             .unwrap_or(false)
                     })
-            })
-            .map(|(id, task)| (id.clone(), task.uid().clone()))
-            .collect();
+            });
+            if task_expired {
+                expired_tasks.push((id, task_uid));
+            }
+        }
         (runs_removed, expired_tasks)
     }
 
@@ -3569,8 +3606,9 @@ impl TaskState {
         (runs_removed, tasks_removed)
     }
 
-    #[cfg(test)]
-    pub(crate) fn sweep(&self, config: &StateConfig) -> (usize, usize) {
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn sweep_retention_for_test(&self, config: &StateConfig) -> (usize, usize) {
         let now = SystemTime::now();
         let (runs_removed, expired_tasks) = self.scan_retention(config, now);
         let mut tasks_removed = 0;
@@ -3867,24 +3905,8 @@ impl TaskState {
         let receiver = WatchStream::from_changes(inner.watch_tx.subscribe());
         let epoch = inner.resource_version_epoch.clone();
         let target_revision = inner.resource_version;
-        let mut initial_candidates = None;
-        let mut initial_revision = None;
-        let mut replay_candidates = Vec::new();
-        let last_revision;
-
-        match resource_version {
-            None | Some("0") => {
-                initial_candidates = Some(
-                    inner
-                        .ordered_tasks
-                        .iter()
-                        .filter_map(|name| inner.tasks.get(name))
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                );
-                initial_revision = Some(inner.resource_version);
-                last_revision = 0;
-            }
+        let (snapshot_requested, initial_revision, last_revision) = match resource_version {
+            None | Some("0") => (true, Some(inner.resource_version), 0),
             Some(value) => {
                 let (requested_epoch, requested_revision) = Self::parse_resource_version(value)?;
                 if requested_epoch != epoch.as_ref() {
@@ -3902,22 +3924,15 @@ impl TaskState {
                         resource_version: value.to_string(),
                     });
                 }
-                replay_candidates.extend(
-                    inner
-                        .watch_history
-                        .iter()
-                        .filter(|change| change.revision > requested_revision)
-                        .cloned(),
-                );
-                last_revision = requested_revision;
+                (false, None, requested_revision)
             }
-        }
-        drop(inner);
+        };
 
-        match self.watch_admission.precheck_count() {
-            Ok(()) => {}
+        let permit = match self.watch_admission.try_reserve_count() {
+            Ok(permit) => permit,
             Err(WatchAdmissionFailure::Rejected(error)) => return Err(error),
             Err(WatchAdmissionFailure::Closed) => {
+                drop(inner);
                 return Ok(TaskWatchSubscription {
                     inner: Arc::clone(&self.inner),
                     receiver,
@@ -3934,7 +3949,27 @@ impl TaskState {
                     terminal: false,
                 });
             }
-        }
+        };
+
+        let initial_candidates = snapshot_requested.then(|| {
+            inner
+                .ordered_tasks
+                .iter()
+                .filter_map(|name| inner.tasks.get(name))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        let replay_candidates = if snapshot_requested {
+            Vec::new()
+        } else {
+            inner
+                .watch_history
+                .iter()
+                .filter(|change| change.revision > last_revision)
+                .cloned()
+                .collect()
+        };
+        drop(inner);
 
         let initial_descriptors = initial_candidates
             .unwrap_or_default()
@@ -4009,8 +4044,8 @@ impl TaskState {
                     .filter_map(|(_, event)| event.as_ref().map(|event| event.serialized_bytes)),
             )
             .fold(0_usize, usize::saturating_add);
-        let permit = match self.watch_admission.try_admit(requested_bytes) {
-            Ok(permit) => permit,
+        match permit.try_charge_bytes(requested_bytes) {
+            Ok(()) => {}
             Err(WatchAdmissionFailure::Rejected(error)) => return Err(error),
             Err(WatchAdmissionFailure::Closed) => {
                 return Ok(TaskWatchSubscription {
@@ -4029,7 +4064,7 @@ impl TaskState {
                     terminal: false,
                 });
             }
-        };
+        }
         let initial = initial_descriptors
             .into_iter()
             .map(WatchEventDescriptor::into_buffered)

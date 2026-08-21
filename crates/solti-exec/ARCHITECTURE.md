@@ -255,6 +255,12 @@ flowchart TB
 Command mode starts the configured executable directly.
 Script mode stores decoded bytes in fresh attempt-scoped transport.
 
+Task build submits cwd resolution and descriptor pinning to one dedicated
+runner-owned blocking worker. A semaphore bounds active and queued operations.
+Build cancellation drops its result receiver; accepted filesystem work remains
+owned until the worker finishes and releases admission. The task keeps the
+pinned descriptor, preserving the path-replacement boundary.
+
 Linux uses a sealed anonymous `memfd`.
 Other Unix platforms use an unlinked file.
 Non-Unix platforms use a named temporary file.
@@ -268,6 +274,8 @@ This prevents descendants from retaining output pipes or attempt resources.
 
 Lifecycle termination, reap, and cleanup errors are fatal.
 Exit status is evaluated only after lifecycle cleanup succeeds.
+Output reader join failures emit stable diagnostics but do not replace that
+lifecycle result. Output remains best-effort.
 
 ## Dropped subprocess attempts
 
@@ -307,9 +315,9 @@ An operation enters quarantine after ten persistent operating-system errors.
 Quarantine retains its ownership slot and closes new admission.
 
 After all supervisors and task references have stopped,
-`SubprocessRunner::shutdown` closes admission, waits for accepted ownership,
-and joins the worker. A cancelled or timed-out shutdown leaves that terminal
-state available to another shutdown call.
+`SubprocessRunner::shutdown` closes finalizer and cwd admission concurrently,
+waits for accepted ownership, and joins both workers. A cancelled or timed-out
+shutdown leaves that terminal state available to another shutdown call.
 
 The embedding process must not reap arbitrary children.
 It must not enable automatic `SIGCHLD` reaping.
@@ -365,6 +373,11 @@ Custom engine registration requires one typed ownership declaration:
 
 The binding makes the declaration explicit in integration source.
 It does not verify a custom engine implementation at runtime.
+`ContainerEngineFinalizer` plus
+`ContainerEngineBinding::pre_admitted_finalizer_with_shutdown` adds a typed,
+awaitable shutdown capability for custom finalizer engines. The returned handle
+must be retained by the application. The trait still cannot prove the declared
+drop behavior.
 The native containerd conversion selects `PreAdmittedFinalizer` because its
 admission, drop handoff, failure state, and shutdown path are implemented in the adapter.
 
@@ -377,6 +390,9 @@ synchronous poll returns control to Tokio.
 The engine's declared contract owns any cleanup that must continue after that drop.
 The only runner-spawned work in this path is at most two output readers.
 Their handles abort on drop.
+Normal drain classifies a cancelled or panicked reader and emits a stable
+diagnostic. Reader join failure remains best-effort output state and does not
+replace the task or container lifecycle result.
 
 `terminate` and `cleanup` are idempotent.
 Cleanup may remove only attempt-owned resources.

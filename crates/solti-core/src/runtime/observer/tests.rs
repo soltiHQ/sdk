@@ -1079,12 +1079,12 @@ fn terminal_events_become_sweepable_only_after_waiter_cleanup() {
         sub.on_event(&event);
         assert_eq!(state.get(&id).unwrap().status().phase(), phase);
         assert!(state.tv_for(&id).is_some());
-        assert_eq!(state.sweep(&config).1, 0);
+        assert_eq!(state.sweep_retention_for_test(&config).1, 0);
         assert_eq!(
             state.finalize_if_bound(tv.get(), phase, error, None, force),
             Some(id.clone()),
         );
-        assert_eq!(state.sweep(&config).1, 1);
+        assert_eq!(state.sweep_retention_for_test(&config).1, 1);
         assert!(state.get(&id).is_none());
     }
 }

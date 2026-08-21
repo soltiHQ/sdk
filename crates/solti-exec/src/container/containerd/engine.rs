@@ -468,6 +468,13 @@ impl ContainerEngine for ContainerdEngine {
     }
 }
 
+#[async_trait]
+impl crate::container::ContainerEngineFinalizer for ContainerdEngine {
+    async fn shutdown(&self) -> Result<(), ContainerEngineError> {
+        ContainerdEngine::shutdown(self).await
+    }
+}
+
 /// Local attempt I/O retained across preparation and removal cancellation.
 enum AttemptIoState {
     /// Blocking preparation is running or has a result to collect.

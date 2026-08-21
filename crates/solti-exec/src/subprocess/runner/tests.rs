@@ -86,6 +86,15 @@ fn cgroup_name_is_stable() {
     );
 }
 
+#[test]
+fn attempt_counter_rejects_after_identity_limit() {
+    let attempts = AtomicU32::new(u32::MAX - 1);
+
+    assert_eq!(next_attempt(&attempts), Some(u32::MAX));
+    assert_eq!(next_attempt(&attempts), None);
+    assert_eq!(attempts.load(Ordering::Relaxed), u32::MAX);
+}
+
 fn assert_future_pending<F: std::future::Future>(future: Pin<&mut F>) {
     let mut context = Context::from_waker(Waker::noop());
     assert!(matches!(future.poll(&mut context), Poll::Pending));
@@ -474,6 +483,93 @@ async fn build_with_run_id(
             &mut scope,
         )
         .await
+}
+
+#[test]
+fn cwd_pinning_does_not_use_tokio_blocking_workers() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (release, blocker) = occupy_only_blocking_worker().await;
+            let directory = tempfile::TempDir::new().unwrap();
+            let spec = solti_model::TaskSpec::builder(
+                "dedicated-cwd",
+                TaskWorkload::Subprocess(SubprocessSpec::new(
+                    solti_model::SubprocessMode::Command {
+                        command: "true".into(),
+                        args: Vec::new(),
+                    },
+                    Default::default(),
+                    Some(directory.path().to_path_buf()),
+                    Default::default(),
+                )),
+                5_000_u64,
+            )
+            .build()
+            .unwrap();
+            let task = Task::new("dedicated-cwd", spec).unwrap();
+            let runner = SubprocessRunner::new("dedicated-cwd").unwrap();
+
+            tokio::time::timeout(
+                StdDuration::from_secs(1),
+                build_with_run_id(&runner, &task, &BuildContext::default()),
+            )
+            .await
+            .expect("cwd pinning must not wait for Tokio's blocking pool")
+            .unwrap();
+
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            runner.shutdown(StdDuration::from_secs(2)).await.unwrap();
+        });
+}
+
+#[tokio::test]
+async fn pre_cancelled_cwd_build_returns_typed_cancellation() {
+    let runner = SubprocessRunner::new("cancelled-cwd").unwrap();
+    let task = mk_subprocess_spec("cancelled-cwd", "true");
+    let run_id = solti_runner::make_run_id(runner.name(), task.slot().as_str());
+    let mut scope = solti_runner::BuildScope::unmanaged(runner.name());
+    let (cancel, cancellation) = solti_runner::BuildCancellation::pair();
+    cancel.cancel();
+
+    let error = match runner
+        .build_task(
+            &task,
+            &run_id,
+            &BuildContext::default(),
+            &cancellation,
+            &mut scope,
+        )
+        .await
+    {
+        Ok(_) => panic!("pre-cancelled build unexpectedly produced a task"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, RunnerError::BuildCancelled));
+    runner.shutdown(StdDuration::from_secs(2)).await.unwrap();
+}
+
+#[tokio::test]
+async fn output_drain_preserves_reader_join_failures() {
+    let mut output = OutputTasks {
+        stdout: Some(tokio::spawn(async { panic!("stdout reader failure") })),
+        stderr: Some(tokio::spawn(async {})),
+    };
+
+    let drain = output.drain().await;
+
+    assert!(matches!(
+        drain,
+        OutputDrain::Completed {
+            stdout: Some(OutputReaderFailure::Panicked),
+            stderr: None,
+        }
+    ));
 }
 
 fn make_task_cfg() -> SubprocessTaskConfig {

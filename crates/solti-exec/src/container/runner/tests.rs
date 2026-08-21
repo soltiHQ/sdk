@@ -73,6 +73,7 @@ enum Call {
     Terminate,
     Cleanup,
     AttemptDropped,
+    Shutdown,
 }
 
 struct FakeEngine {
@@ -132,6 +133,14 @@ impl ContainerEngine for FakeEngine {
             calls: Arc::clone(&self.calls),
             exit_code: self.exit_code,
         }))
+    }
+}
+
+#[async_trait]
+impl super::super::ContainerEngineFinalizer for FakeEngine {
+    async fn shutdown(&self) -> Result<(), ContainerEngineError> {
+        self.calls.lock().unwrap().push(Call::Shutdown);
+        Ok(())
     }
 }
 
@@ -694,6 +703,20 @@ fn engine_binding_records_explicit_contract_and_redacts_engine() {
 }
 
 #[tokio::test]
+async fn typed_finalizer_binding_returns_awaitable_shutdown_capability() {
+    let (engine, calls) = FakeEngine::new(0);
+    let (binding, shutdown) = ContainerEngineBinding::pre_admitted_finalizer_with_shutdown(engine);
+
+    assert_eq!(
+        binding.ownership_contract(),
+        ContainerOwnershipContract::PreAdmittedFinalizer,
+    );
+    shutdown.shutdown().await.unwrap();
+    assert_eq!(*calls.lock().unwrap(), [Call::Shutdown]);
+    assert!(format!("{shutdown:?}").contains("<engine>"));
+}
+
+#[tokio::test]
 async fn build_has_no_engine_io_and_each_spawn_gets_one_attempt() {
     let (engine, calls) = FakeEngine::new(0);
     let runner = ContainerRunner::new("containerd", drop_releasing_engine(engine)).unwrap();
@@ -1228,4 +1251,37 @@ async fn cleanup_failure_is_fatal() {
             Call::Cleanup,
         ]
     );
+}
+
+#[tokio::test]
+async fn output_drain_reports_reader_join_failure_without_task_failure() {
+    let capture = Arc::new(TraceCapture::default());
+    let dispatch = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
+    let mut output = OutputTasks {
+        stdout: Some(tokio::spawn(async {
+            panic!("container stdout reader failure")
+        })),
+        stderr: Some(tokio::spawn(async {})),
+    };
+
+    output
+        .drain("container-output-join")
+        .with_subscriber(dispatch)
+        .await;
+
+    let fields = capture.fields.lock().unwrap().join(" ");
+    assert!(
+        fields.contains("container.output_reader_failed"),
+        "{fields}"
+    );
+    assert!(fields.contains("panicked"), "{fields}");
+}
+
+#[test]
+fn attempt_counter_rejects_after_identity_limit() {
+    let attempts = AtomicU32::new(u32::MAX - 1);
+
+    assert_eq!(next_attempt(&attempts), Some(u32::MAX));
+    assert_eq!(next_attempt(&attempts), None);
+    assert_eq!(attempts.load(Ordering::Relaxed), u32::MAX);
 }

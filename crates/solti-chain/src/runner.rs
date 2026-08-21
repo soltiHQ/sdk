@@ -95,16 +95,20 @@ impl Runner for ChainRunner {
         Ok(TaskFn::arc(move |ctx: TaskContext| {
             let plan = Arc::clone(&plan);
             let output = Arc::clone(&output);
-            let attempt = attempts.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            let attempt = next_attempt(&attempts);
+            let span_attempt = attempt.unwrap_or(u32::MAX);
             let span = debug_span!(
                 "chain_attempt",
                 event = "chain.attempt",
                 task_name = %task_name,
                 generation,
                 run_id = %run_id,
-                attempt,
+                attempt = span_attempt,
             );
             async move {
+                let Some(attempt) = attempt else {
+                    return Err(TaskError::fatal("chain attempt identity exhausted"));
+                };
                 let output = output.begin(attempt);
                 output.scope(execute(plan, ctx, output.sink())).await
             }
@@ -136,11 +140,9 @@ impl ChainRunner {
                 .catalog
                 .build_scoped_with_cancellation(&derived, ctx, cancellation, scope)
                 .await
-                .map_err(|error| {
-                    RunnerError::InvalidSpec(format!(
-                        "chain step '{}' could not be built: {error}",
-                        step.name()
-                    ))
+                .map_err(|source| RunnerError::NestedBuild {
+                    context: format!("chain step '{}'", step.name()),
+                    source: Box::new(source),
                 })?
                 .into_task();
             let on_success = step.on_success().map(|next| indices[next]);
@@ -161,6 +163,16 @@ impl ChainRunner {
             steps,
         })
     }
+}
+
+/// Allocates a unique one-based attempt number without wrapping identity.
+fn next_attempt(attempts: &AtomicU32) -> Option<u32> {
+    attempts
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |attempt| {
+            attempt.checked_add(1)
+        })
+        .ok()
+        .and_then(|attempt| attempt.checked_add(1))
 }
 
 fn derive_task(outer: &Task, step: &crate::ChainStep) -> Result<Task, RunnerError> {
@@ -310,4 +322,18 @@ pub fn register_chain_runner(
 ) -> Result<(), RouterError> {
     let runner = Arc::new(ChainRunner::new(name, router.catalog()));
     router.register(runner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attempt_counter_rejects_after_identity_limit() {
+        let attempts = AtomicU32::new(u32::MAX - 1);
+
+        assert_eq!(next_attempt(&attempts), Some(u32::MAX));
+        assert_eq!(next_attempt(&attempts), None);
+        assert_eq!(attempts.load(Ordering::Relaxed), u32::MAX);
+    }
 }

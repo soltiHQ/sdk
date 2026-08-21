@@ -19,7 +19,13 @@
 //! UTF-8 conversion and control-character escaping are confined to the
 //! opt-in tracing copy. They never modify bytes sent to [`OutputSink`].
 
-use std::{borrow::Cow, fmt::Write as _, io};
+use std::{
+    any::Any,
+    borrow::Cow,
+    fmt::Write as _,
+    io,
+    panic::{AssertUnwindSafe, catch_unwind},
+};
 
 use solti_runner::OutputSink;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -99,6 +105,55 @@ impl StreamKind {
             Self::Stdout => config.stdout_info,
             Self::Stderr => config.stderr_warn,
         }
+    }
+}
+
+/// Stable classification of a failed attempt-owned output reader task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputReaderFailure {
+    /// The reader task was cancelled outside normal drain ownership.
+    Cancelled,
+    /// The reader task panicked.
+    Panicked,
+}
+
+impl OutputReaderFailure {
+    /// Returns the stable diagnostic label.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Panicked => "panicked",
+        }
+    }
+}
+
+/// Converts a Tokio join result into a payload-free diagnostic.
+///
+/// Panic payload destruction is contained before the result returns. This
+/// keeps best-effort output failure from changing the owning task result.
+pub(crate) fn classify_output_reader_join(
+    result: Result<(), tokio::task::JoinError>,
+) -> Option<OutputReaderFailure> {
+    match result {
+        Ok(()) => None,
+        Err(error) if error.is_panic() => {
+            match error.try_into_panic() {
+                Ok(payload) => dispose_panic_payload(payload),
+                Err(error) => drop(error),
+            }
+            Some(OutputReaderFailure::Panicked)
+        }
+        Err(error) => {
+            drop(error);
+            Some(OutputReaderFailure::Cancelled)
+        }
+    }
+}
+
+fn dispose_panic_payload(payload: Box<dyn Any + Send + 'static>) {
+    if let Err(nested) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        // The replacement payload may itself have a hostile destructor.
+        std::mem::forget(nested);
     }
 }
 
@@ -355,6 +410,26 @@ mod tests {
         instrument::WithSubscriber as _,
         span::{Attributes, Id, Record},
     };
+
+    #[tokio::test]
+    async fn reader_join_panic_payload_is_contained_and_classified() {
+        struct PanicOnDrop;
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("panic payload drop");
+            }
+        }
+
+        let reader = tokio::spawn(async move {
+            std::panic::panic_any(PanicOnDrop);
+        });
+        let joined = reader.await;
+
+        let classified =
+            std::panic::catch_unwind(AssertUnwindSafe(|| classify_output_reader_join(joined)));
+        assert_eq!(classified.unwrap(), Some(OutputReaderFailure::Panicked));
+    }
 
     #[derive(Default)]
     struct TraceCapture {

@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use solti_model::TaskId;
-use solti_runner::{OutputPublisher, OutputPublisherHandle, OutputSink};
+use solti_runner::{OutputPublisher, OutputPublisherHandle, OutputSink, request_output_sink};
 
 tokio::task_local! {
     /// Outer sink visible only while one chain-attempt future is being polled.
@@ -41,9 +41,7 @@ impl ChainOutput {
     }
 
     pub(crate) fn begin(&self, attempt: u32) -> AttemptOutput {
-        let sink = self
-            .upstream
-            .sink_for(&self.task_name, self.generation, attempt);
+        let sink = request_output_sink(&self.upstream, &self.task_name, self.generation, attempt);
         AttemptOutput { sink }
     }
 }

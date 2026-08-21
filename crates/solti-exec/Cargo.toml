@@ -62,6 +62,7 @@ subprocess   = [
     "tokio/net",
     "tokio/process",
     "tokio/signal",
+    "tokio/sync",
     "tokio/time",
 ]
 

@@ -610,7 +610,9 @@ async fn sweep_deletions_apply_event_level_backpressure() {
         let config = StateConfig::new()
             .with_run_ttl(Duration::ZERO)
             .with_task_ttl(Duration::ZERO);
-        sweep_done_tx.send(sweep_state.sweep(&config)).unwrap();
+        sweep_done_tx
+            .send(sweep_state.sweep_retention_for_test(&config))
+            .unwrap();
     });
     deletion_entered_rx
         .recv_timeout(Duration::from_secs(5))
@@ -1368,7 +1370,7 @@ fn delete_and_sweep_release_retained_task_capacity() {
     let sweep_config = config
         .with_run_ttl(Duration::ZERO)
         .with_task_ttl(Duration::ZERO);
-    assert_eq!(swept_state.sweep(&sweep_config), (0, 1));
+    assert_eq!(swept_state.sweep_retention_for_test(&sweep_config), (0, 1));
     create(&swept_state, "after-sweep");
     assert_eq!(swept_state.list_all().len(), 1);
 }
@@ -1425,7 +1427,7 @@ fn delete_and_sweep_release_exact_manifest_bytes() {
     let immediate = sweep_config
         .with_run_ttl(Duration::ZERO)
         .with_task_ttl(Duration::ZERO);
-    assert_eq!(swept_state.sweep(&immediate), (0, 1));
+    assert_eq!(swept_state.sweep_retention_for_test(&immediate), (0, 1));
     assert_eq!(swept_state.inner.read().retained_task_manifest_bytes, 0);
     swept_state.create_desired(&after_sweep).unwrap();
     assert_eq!(
@@ -2756,7 +2758,7 @@ fn sweep_removal_is_reversible_for_run_continuations() {
     assert!(state.inner.read().retained_task_run_bytes > 0);
 
     let config = StateConfig::new().with_run_ttl(Duration::ZERO);
-    assert_eq!(state.sweep(&config).0, 2);
+    assert_eq!(state.sweep_retention_for_test(&config).0, 2);
     assert!(state.list_runs(task.name()).is_empty());
     {
         let inner = state.inner.read();
@@ -2771,6 +2773,94 @@ fn sweep_removal_is_reversible_for_run_continuations() {
         .unwrap();
     assert_eq!(second.items.len(), 1);
     assert_eq!(second.items[0].attempt(), 2);
+}
+
+#[test]
+fn retention_removes_mixed_expired_runs_in_one_reversible_batch() {
+    let state = TaskState::with_epoch(StateConfig::new(), "mixed-sweep-epoch".to_string());
+    let task = create(&state, "mixed-run-sweep");
+    let workload = task.spec().workload().type_meta();
+    let expired_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    let retained_at = SystemTime::now()
+        .checked_add(Duration::from_secs(3_600))
+        .expect("the test future timestamp must be representable");
+    let make_run = |attempt, finished_at: SystemTime| {
+        Arc::new(
+            TaskRun::from_parts(
+                workload.clone(),
+                1,
+                attempt,
+                TaskPhase::Succeeded,
+                finished_at
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("the test start timestamp must be representable"),
+                Some(finished_at),
+                None,
+                Some(0),
+            )
+            .unwrap(),
+        )
+    };
+    let retained_first = make_run(1, retained_at);
+    let expired_second = make_run(2, expired_at);
+    let retained_third = make_run(3, retained_at);
+    let expired_fourth = make_run(4, expired_at);
+    let runs = [
+        Arc::clone(&retained_first),
+        Arc::clone(&expired_second),
+        Arc::clone(&retained_third),
+        Arc::clone(&expired_fourth),
+    ];
+
+    {
+        let mut inner = state.write(StateMutationEventCapacity::None);
+        inner
+            .runs
+            .insert(task.name().clone(), runs.iter().cloned().collect());
+        TaskState::record_run_snapshot_changes(
+            &mut inner,
+            runs.iter()
+                .cloned()
+                .map(|run| TaskState::run_snapshot_change(task.name(), task.uid(), None, Some(run)))
+                .collect(),
+        );
+        assert_eq!(inner.run_resource_version, 1);
+    }
+
+    let config = StateConfig::new().with_run_ttl(Duration::ZERO);
+    assert_eq!(state.sweep_retention_for_test(&config), (2, 0));
+
+    let inner = state.inner.read();
+    let retained = inner
+        .runs
+        .get(task.name())
+        .expect("the two future runs must remain retained");
+    assert_eq!(retained.len(), 2);
+    assert!(Arc::ptr_eq(&retained[0], &retained_first));
+    assert!(Arc::ptr_eq(&retained[1], &retained_third));
+    assert_eq!(inner.retained_task_run_bytes_by_identity.len(), 2);
+    assert_eq!(inner.completed_runs_by_age.len(), 2);
+    assert_eq!(
+        inner.retained_task_run_bytes,
+        TaskState::serialized_run_payload_bytes(&retained_first)
+            + TaskState::serialized_run_payload_bytes(&retained_third)
+    );
+    assert_eq!(inner.run_resource_version, 2);
+    let batch = inner
+        .run_history
+        .back()
+        .expect("the sweep must commit one reversible batch");
+    assert_eq!(batch.revision, 2);
+    assert_eq!(batch.changes.len(), 2);
+    assert_eq!(
+        batch
+            .changes
+            .iter()
+            .map(|change| change.previous.as_ref().unwrap().attempt())
+            .collect::<Vec<_>>(),
+        vec![2, 4]
+    );
+    assert!(batch.changes.iter().all(|change| change.current.is_none()));
 }
 
 #[test]
@@ -3493,7 +3583,7 @@ fn retention_uses_internal_terminal_timestamp() {
     let config = StateConfig::new()
         .with_run_ttl(Duration::ZERO)
         .with_task_ttl(Duration::ZERO);
-    assert_eq!(state.sweep(&config), (0, 1));
+    assert_eq!(state.sweep_retention_for_test(&config), (0, 1));
     assert!(!state.contains_task(&TaskId::new("expired").unwrap()));
     assert!(state.contains_task(&TaskId::new("pending").unwrap()));
 }
@@ -3805,6 +3895,110 @@ async fn watch_without_version_emits_sorted_snapshot_then_live_changes() {
     assert_eq!(
         watch.next().await.unwrap().unwrap(),
         TaskWatchEvent::Added(live)
+    );
+}
+
+#[tokio::test]
+async fn watch_construction_replays_a_mutation_while_the_predicate_is_blocked() {
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    let state = TaskState::new();
+    let initial = create(&state, "watch-construction-race");
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let first_predicate = Arc::new(AtomicBool::new(true));
+    let predicate_state = Arc::clone(&first_predicate);
+    let watch_state = state.clone();
+    let constructor = std::thread::spawn(move || {
+        watch_state
+            .watch_where(&TaskFilter::new(), None, move |_| {
+                if predicate_state.swap(false, Ordering::AcqRel) {
+                    entered_tx
+                        .send(())
+                        .expect("the test must observe the blocked predicate");
+                    release_rx
+                        .lock()
+                        .recv()
+                        .expect("the test must release the blocked predicate");
+                }
+                true
+            })
+            .expect("watch construction")
+    });
+
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("watch construction must reach the predicate");
+    assert!(state.delete_task(initial.name()));
+    release_tx
+        .send(())
+        .expect("watch construction must resume after the mutation");
+    let mut watch = constructor.join().unwrap();
+
+    assert_eq!(
+        watch.next().await.unwrap().unwrap(),
+        TaskWatchEvent::Added(initial.clone())
+    );
+    let TaskWatchEvent::Deleted(deleted) = watch.next().await.unwrap().unwrap() else {
+        panic!("the mutation racing with watch construction must be replayed as Deleted");
+    };
+    assert_eq!(deleted.name(), initial.name());
+    assert_eq!(deleted.uid(), initial.uid());
+
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut context = Context::from_waker(&waker);
+    assert!(matches!(
+        Pin::new(&mut watch).poll_next(&mut context),
+        Poll::Pending
+    ));
+}
+
+#[tokio::test]
+async fn closing_watches_during_initial_predicate_releases_provisional_admission() {
+    let state = TaskState::new();
+    create(&state, "watch-close-construction-race");
+    let receivers_before = state.inner.read().watch_tx.receiver_count();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let watch_state = state.clone();
+    let constructor = std::thread::spawn(move || {
+        watch_state
+            .watch_where(&TaskFilter::new(), None, move |_| {
+                entered_tx
+                    .send(())
+                    .expect("the test must observe the blocked predicate");
+                release_rx
+                    .lock()
+                    .recv()
+                    .expect("the test must release the blocked predicate");
+                true
+            })
+            .expect("closing watch admission returns a terminal subscription")
+    });
+
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("watch construction must reach the predicate");
+    assert_eq!(state.watch_admission.usage().0, 1);
+    state.close_watches();
+    assert_eq!(state.watch_admission.usage(), (0, 0, 0));
+    release_tx
+        .send(())
+        .expect("watch construction must resume after close");
+
+    let mut watch = constructor.join().unwrap();
+    assert!(watch.next().await.is_none());
+    assert_eq!(state.watch_admission.usage(), (0, 0, 0));
+    drop(watch);
+    assert_eq!(
+        state.inner.read().watch_tx.receiver_count(),
+        receivers_before
     );
 }
 
@@ -4211,7 +4405,7 @@ async fn delete_and_sweep_each_publish_one_deleted_event() {
     let config = StateConfig::new()
         .with_run_ttl(Duration::ZERO)
         .with_task_ttl(Duration::ZERO);
-    assert_eq!(state.sweep(&config), (0, 1));
+    assert_eq!(state.sweep_retention_for_test(&config), (0, 1));
     let TaskWatchEvent::Deleted(event) = watch.next().await.unwrap().unwrap() else {
         panic!("sweep must emit Deleted");
     };

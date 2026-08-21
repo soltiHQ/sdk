@@ -254,6 +254,9 @@ Disable default features when schema generation is not needed.
 | `Model`              | The shared Solti model rejects a nested value           |
 
 Runner selection and build failures use `solti_runner::RunnerError` and `RouterError`.
+A failed step build becomes `RunnerError::NestedBuild` and retains the original
+`RouterError` as its source. Admission cancellation, wait-cycle, recursion,
+selection, and concrete leaf-runner failures therefore remain distinguishable.
 
 ## Examples
 

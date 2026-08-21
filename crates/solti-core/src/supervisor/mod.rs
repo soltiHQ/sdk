@@ -27,6 +27,7 @@
 //! - Accepted side effects are not rolled back.
 
 use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -40,7 +41,7 @@ use solti_model::{
 };
 use solti_runner::RunnerRouter;
 use taskvisor::{Supervisor, TaskRef};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
@@ -76,6 +77,44 @@ pub struct SupervisorApi {
     task_operations: TaskLocks,
     spawn_gate: parking_lot::Mutex<()>,
     shutdown_started: AtomicBool,
+    shutdown: ShutdownCoordinator,
+}
+
+struct ShutdownCoordinator {
+    operation: parking_lot::Mutex<Option<Arc<ShutdownOperation>>>,
+}
+
+struct ShutdownOperation {
+    outcome: watch::Receiver<Option<ShutdownOutcome>>,
+}
+
+#[derive(Clone, Copy)]
+enum ShutdownOutcome {
+    Completed,
+    SupervisorFailed,
+    CoordinatorStopped,
+}
+
+impl ShutdownCoordinator {
+    fn new() -> Self {
+        Self {
+            operation: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
+impl ShutdownOperation {
+    async fn wait(&self) -> ShutdownOutcome {
+        let mut outcome = self.outcome.clone();
+        loop {
+            if let Some(outcome) = *outcome.borrow_and_update() {
+                return outcome;
+            }
+            if outcome.changed().await.is_err() {
+                return ShutdownOutcome::CoordinatorStopped;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -98,29 +137,7 @@ struct WriteGuards {
 
 impl Drop for SupervisorApi {
     fn drop(&mut self) {
-        let _gate = self.spawn_gate.lock();
-        if self.shutdown_started.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.reconciler.state.close_watches();
-        self.reconciler.retention_stop.cancel();
-        self.reconciler.preflight_stop.cancel();
-        self.reconciler.tasks.close();
-        let handle = self.reconciler.handle.clone();
-        let tasks = self.reconciler.tasks.clone();
-        let state = self.reconciler.state.clone();
-        let output_hub = Arc::clone(&self.reconciler.output_hub);
-        let observer = Arc::clone(&self.reconciler.observer);
-        let task = self.reconciler.runtime.spawn(async move {
-            let shutdown_confirmed = handle.shutdown().await.is_ok();
-            tasks.wait().await;
-            if shutdown_confirmed {
-                observer.finalize_pending_after_confirmed_shutdown().await;
-            }
-            output_hub.shutdown_persistence().await;
-            state.shutdown_persistence().await;
-        });
-        drop(task);
+        drop(self.shutdown_operation());
     }
 }
 
@@ -128,6 +145,114 @@ impl SupervisorApi {
     /// Creates a supervisor builder.
     pub fn builder(router: RunnerRouter) -> SupervisorApiBuilder {
         SupervisorApiBuilder::new(router)
+    }
+
+    fn begin_shutdown(&self) -> bool {
+        let _spawn = self.spawn_gate.lock();
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.reconciler.state.close_watches();
+        self.reconciler.retention_stop.cancel();
+        self.reconciler.preflight_stop.cancel();
+        self.reconciler.tasks.close();
+        true
+    }
+
+    fn shutdown_operation(&self) -> Arc<ShutdownOperation> {
+        let mut installed = self.shutdown.operation.lock();
+        if let Some(operation) = installed.as_ref() {
+            return Arc::clone(operation);
+        }
+
+        self.begin_shutdown();
+        let (outcome_tx, outcome_rx) = watch::channel(None);
+        let operation = Arc::new(ShutdownOperation {
+            outcome: outcome_rx,
+        });
+        *installed = Some(Arc::clone(&operation));
+        let reconciler = self.reconciler.clone();
+        let runtime = self.reconciler.runtime.clone();
+        drop(installed);
+        drop(runtime.spawn(async move {
+            let outcome = Self::run_shutdown_coordinator(reconciler).await;
+            outcome_tx.send_replace(Some(outcome));
+        }));
+        operation
+    }
+
+    async fn run_runtime_shutdown(reconciler: Reconciler) -> bool {
+        let succeeded = reconciler.handle.clone().shutdown().await.is_ok();
+        reconciler.tasks.wait().await;
+        if succeeded {
+            reconciler
+                .observer
+                .finalize_pending_after_confirmed_shutdown()
+                .await;
+        }
+        succeeded
+    }
+
+    async fn run_shutdown_coordinator(reconciler: Reconciler) -> ShutdownOutcome {
+        let runtime = reconciler.runtime.clone();
+        let runtime_shutdown = runtime.spawn(Self::run_runtime_shutdown(reconciler.clone()));
+        let runtime_outcome = match runtime_shutdown.await {
+            Ok(true) => ShutdownOutcome::Completed,
+            Ok(false) => ShutdownOutcome::SupervisorFailed,
+            Err(error) => {
+                Self::dispose_join_error(error);
+                ShutdownOutcome::CoordinatorStopped
+            }
+        };
+
+        let output_hub = Arc::clone(&reconciler.output_hub);
+        let output_shutdown = runtime.spawn(async move {
+            output_hub.shutdown_persistence().await;
+        });
+        let state = reconciler.state.clone();
+        let state_shutdown = runtime.spawn(async move {
+            state.shutdown_persistence().await;
+        });
+        let (output_result, state_result) = tokio::join!(output_shutdown, state_shutdown);
+        let output_completed = Self::join_completed(output_result);
+        let state_completed = Self::join_completed(state_result);
+        if output_completed && state_completed {
+            runtime_outcome
+        } else {
+            ShutdownOutcome::CoordinatorStopped
+        }
+    }
+
+    fn join_completed(result: Result<(), tokio::task::JoinError>) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                Self::dispose_join_error(error);
+                false
+            }
+        }
+    }
+
+    fn dispose_join_error(error: tokio::task::JoinError) {
+        if error.is_panic() {
+            let payload = error.into_panic();
+            if let Err(replacement) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+                std::mem::forget(replacement);
+            }
+        }
+    }
+
+    async fn shutdown_result(&self, outcome: ShutdownOutcome) -> Result<(), CoreError> {
+        match outcome {
+            ShutdownOutcome::Completed => Ok(()),
+            ShutdownOutcome::CoordinatorStopped => Err(CoreError::ShutdownCoordinatorStopped),
+            ShutdownOutcome::SupervisorFailed => {
+                match self.reconciler.handle.clone().shutdown().await {
+                    Err(error) => Err(CoreError::supervisor("shutdown", error)),
+                    Ok(()) => Err(CoreError::ShutdownCoordinatorStopped),
+                }
+            }
+        }
     }
 
     async fn start(config: SupervisorStartConfig) -> Result<Self, CoreError> {
@@ -180,6 +305,7 @@ impl SupervisorApi {
             task_operations: TaskLocks::default(),
             spawn_gate: parking_lot::Mutex::new(()),
             shutdown_started: AtomicBool::new(false),
+            shutdown: ShutdownCoordinator::new(),
         };
 
         api.reconciler.spawn_retention_worker(state_cfg);
@@ -534,8 +660,8 @@ impl SupervisorApi {
 
     /// Subscribes to one task's live output.
     ///
-    /// Returns `None` when no output channel exists or the aggregate output
-    /// budget cannot reserve one subscription's pending-event allowance.
+    /// Returns `None` when no output channel exists, the channel is closed, or
+    /// its subscriber count cannot be represented.
     pub fn subscribe_output(&self, name: &TaskId) -> Option<OutputSubscription> {
         self.reconciler.output_hub.subscribe(name)
     }
@@ -544,8 +670,8 @@ impl SupervisorApi {
     ///
     /// The predicate, runtime binding, and subscription use the same per-name locks.
     /// The returned generation identifies the bound desired state.
-    /// Returns `None` for missing, hidden, or unbound state, or when the
-    /// aggregate output budget cannot admit the subscription.
+    /// Returns `None` for missing, hidden, or unbound state, or when the output
+    /// channel is closed or its subscriber count cannot be represented.
     pub async fn subscribe_output_where<F>(
         &self,
         name: &TaskId,
@@ -913,6 +1039,8 @@ impl SupervisorApi {
     /// # Errors
     ///
     /// Returns [`CoreError::Supervisor`] when Taskvisor shutdown fails.
+    /// Returns [`CoreError::ShutdownCoordinatorStopped`] when an SDK-owned
+    /// shutdown or persistence worker stops unexpectedly.
     ///
     /// # Panics
     ///
@@ -927,31 +1055,8 @@ impl SupervisorApi {
             stage = "started",
             "supervisor shutdown started"
         );
-        {
-            let _spawn = self.spawn_gate.lock();
-            if !self.shutdown_started.swap(true, Ordering::AcqRel) {
-                self.reconciler.state.close_watches();
-                self.reconciler.retention_stop.cancel();
-                self.reconciler.preflight_stop.cancel();
-                self.reconciler.tasks.close();
-            }
-        }
-        let result = self
-            .reconciler
-            .handle
-            .clone()
-            .shutdown()
-            .await
-            .map_err(|error| CoreError::supervisor("shutdown", error));
-        self.reconciler.tasks.wait().await;
-        if result.is_ok() {
-            self.reconciler
-                .observer
-                .finalize_pending_after_confirmed_shutdown()
-                .await;
-        }
-        self.reconciler.output_hub.shutdown_persistence().await;
-        self.reconciler.state.shutdown_persistence().await;
+        let operation = self.shutdown_operation();
+        let result = self.shutdown_result(operation.wait().await).await;
         if result.is_ok() {
             info!(
                 event = "supervisor.shutdown",
@@ -960,6 +1065,46 @@ impl SupervisorApi {
             );
         }
         result
+    }
+
+    /// Stops Taskvisor and waits at most `timeout` for SDK-owned cleanup.
+    ///
+    /// This method has the same ordering and lossless persistence semantics as
+    /// [`Self::shutdown`]. If the deadline elapses, the accepted shutdown
+    /// coordinator remains detached and continues draining in the background.
+    /// No callback or task is forcefully terminated by this deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ShutdownTimedOut`] when `timeout` elapses first.
+    /// Other shutdown failures are the same as [`Self::shutdown`]. Every
+    /// caller joins the same cached SDK-owned operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same callback-worker condition as [`Self::shutdown`].
+    #[instrument(
+        level = "info",
+        skip(self),
+        fields(event = "supervisor.shutdown", timeout_ms = timeout.as_millis())
+    )]
+    pub async fn shutdown_with_timeout(&self, timeout: Duration) -> Result<(), CoreError> {
+        assert_persistence_sink_is_not_shutting_down();
+        info!(
+            event = "supervisor.shutdown",
+            stage = "started",
+            timeout_ms = timeout.as_millis(),
+            "supervisor shutdown with a caller deadline started"
+        );
+        let operation = self.shutdown_operation();
+        match tokio::time::timeout(timeout, async {
+            self.shutdown_result(operation.wait().await).await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(CoreError::ShutdownTimedOut { timeout }),
+        }
     }
 }
 

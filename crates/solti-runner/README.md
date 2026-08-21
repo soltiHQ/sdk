@@ -199,6 +199,11 @@ A runner receives only the read-only signal and cannot request cancellation itse
 
 `RunnerRouter::with_context` installs one context for all registered runners.
 `RunnerRouter::with_output_publisher` replaces only the output producer.
+Installed metrics and output publisher handles have independent sticky panic
+boundaries. After a callback panic, every later call through the same context
+boundary is dropped without invoking that callback again.
+Calls that already entered the same boundary concurrently may still finish or
+panic. The boundary does not serialize healthy callbacks.
 
 ## Environment
 
@@ -290,6 +295,8 @@ metrics.record_runner_error(
 `NoOpMetrics` is the default backend.
 `solti-prometheus` provides a Prometheus implementation.
 Task lifecycle metrics come from Taskvisor events.
+An installed metrics backend is disabled after its first callback panic.
+Metrics calls that were already in progress may still finish or panic.
 
 Built-in metric variants use stable labels.
 `Custom` variants use the application-provided string unchanged.
@@ -306,6 +313,9 @@ The application controls cardinality for custom labels.
 | `InvalidCapability` | Runner name or workload declaration invalid    |
 | `EmbeddedWorkload`  | Embedded workload sent to the router           |
 | `NoRunner`          | No runner matched the GVK and selector         |
+| `BuildCancelled`    | Build admission cancellation won               |
+| `RecursiveBuild`    | Composition re-entered an active runner        |
+| `AdmissionCycle`    | Nested admission would create a wait cycle     |
 | `Build`             | Selected runner returned `RunnerError`         |
 
 `RunnerError` is returned by a concrete runner:
@@ -314,6 +324,8 @@ The application controls cardinality for custom labels.
 |-----------------------|--------------------------------------------|
 | `UnsupportedWorkload` | Runner received an unsupported GVK         |
 | `InvalidSpec`         | Workload desired state is invalid          |
+| `BuildCancelled`      | Cancellation won during runner-owned work  |
+| `NestedBuild`         | Original nested `RouterError` is preserved |
 | `Internal`            | Runner could not construct the task        |
 
 ## Examples

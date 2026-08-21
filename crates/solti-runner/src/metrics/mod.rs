@@ -16,7 +16,10 @@
 //! [`NoOpMetrics`] is the default runner backend.
 //! `solti-prometheus` provides a Prometheus implementation.
 mod backend;
-pub use backend::{MetricsBackend, MetricsHandle, RunnerErrorKind, RunnerType};
+pub(crate) use backend::panic_contained_metrics;
+pub use backend::{
+    MetricsBackend, MetricsHandle, RunnerErrorKind, RunnerType, record_runner_error,
+};
 
 mod noop;
 pub use noop::NoOpMetrics;

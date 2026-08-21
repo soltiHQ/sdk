@@ -91,7 +91,10 @@ use crate::{
     auth::{StaticBearerAuthenticator, bearer_value},
     error::{ApiError, HttpStatusResource},
     handler::{ApiHandler, TaskWatchEventStream},
-    metrics::{ApiMetricsHandle, StreamingResponse, http_metrics_middleware, noop_api_metrics},
+    metrics::{
+        ApiMetricsHandle, StreamingResponse, http_metrics_middleware, noop_api_metrics,
+        panic_contained_api_metrics,
+    },
     validate::{parse_list_limit, parse_task_id, parse_task_run_limit, validate_slot},
     visibility::{manifest_is_visible, task_is_visible},
 };
@@ -284,7 +287,7 @@ where
     pub fn new(handler: Arc<H>) -> Self {
         Self {
             handler,
-            metrics: noop_api_metrics(),
+            metrics: panic_contained_api_metrics(noop_api_metrics()),
             authenticator: None,
             authorizer: None,
         }
@@ -320,8 +323,9 @@ where
     /// Attaches a metrics backend.
     ///
     /// The default backend ignores every update.
+    /// The installed backend is sticky-disabled after its first observed panic.
     pub fn with_metrics(mut self, metrics: ApiMetricsHandle) -> Self {
-        self.metrics = metrics;
+        self.metrics = panic_contained_api_metrics(metrics);
         self
     }
 

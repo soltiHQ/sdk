@@ -18,8 +18,9 @@ pub use config::ContainerRunnerConfig;
 mod engine;
 pub use engine::{
     ContainerAttempt, ContainerEngine, ContainerEngineBinding, ContainerEngineError,
-    ContainerEngineInfo, ContainerErrorClass, ContainerExitStatus, ContainerOutput,
-    ContainerOwnershipContract, ContainerRequest,
+    ContainerEngineFinalizer, ContainerEngineInfo, ContainerEngineShutdownHandle,
+    ContainerErrorClass, ContainerExitStatus, ContainerOutput, ContainerOwnershipContract,
+    ContainerRequest,
 };
 
 #[cfg(feature = "containerd")]

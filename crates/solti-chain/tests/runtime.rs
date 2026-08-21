@@ -10,8 +10,8 @@ use solti_model::{
     TaskWorkload, WorkloadTypeMeta,
 };
 use solti_runner::{
-    BuildContext, OutputPublisher, OutputPublisherHandle, OutputSink, RunId, Runner, RunnerError,
-    RunnerRouter,
+    BuildContext, OutputPublisher, OutputPublisherHandle, OutputSink, RouterError, RunId, Runner,
+    RunnerError, RunnerRouter,
 };
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 
@@ -409,6 +409,13 @@ async fn build_compiles_every_branch_and_rejects_an_unroutable_one() {
     let message = error.to_string();
     assert!(message.contains("unselected-missing"), "{message}");
     assert!(message.contains("no runner"), "{message}");
+    assert!(matches!(
+        error,
+        RouterError::Build {
+            source: RunnerError::NestedBuild { source, .. },
+            ..
+        } if matches!(*source, RouterError::NoRunner { .. })
+    ));
     assert_eq!(execution_log(&builds), ["leaf:entry", "leaf:selected"]);
 }
 

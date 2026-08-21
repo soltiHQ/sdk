@@ -19,7 +19,9 @@ use std::collections::HashMap;
 use solti_model::{AgentCapabilities, AgentId, BackoffPolicy, Token};
 
 use crate::errors::DiscoverError;
-use crate::metrics::{DiscoverMetricsHandle, noop_discover_metrics};
+use crate::metrics::{
+    DiscoverMetricsHandle, noop_discover_metrics, panic_contained_discover_metrics,
+};
 use crate::proto::EndpointType;
 
 /// Default connect timeout in milliseconds.
@@ -190,6 +192,9 @@ impl DiscoverConfig {
     ///
     /// `task_revision` identifies the captured runtime intent.
     /// Change it whenever a setting used by the embedded task changes.
+    /// This includes opaque settings such as credentials, TLS material, and
+    /// the metrics backend. Change it when the [`UptimeSource`](crate::UptimeSource)
+    /// passed to [`sync`](crate::sync) changes too.
     pub fn builder(
         agent_id: AgentId,
         name: impl Into<String>,
@@ -284,6 +289,9 @@ impl DiscoverConfigBuilder {
     }
 
     /// Sets the metrics backend.
+    ///
+    /// [`Self::build`] installs a sticky panic boundary shared by every task
+    /// attempt using the resulting configuration.
     pub fn with_metrics(mut self, metrics: DiscoverMetricsHandle) -> Self {
         self.metrics = metrics;
         self
@@ -374,7 +382,7 @@ impl DiscoverConfigBuilder {
             connect_timeout_ms: self.connect_timeout_ms,
             request_timeout_ms: self.request_timeout_ms,
             task_revision,
-            metrics: self.metrics,
+            metrics: panic_contained_discover_metrics(self.metrics),
             #[cfg(feature = "tls")]
             tls: self.tls,
         })

@@ -40,6 +40,8 @@
 //! ```
 //!
 //! Building performs no process or engine I/O.
+//! An explicit subprocess working directory is resolved and descriptor-pinned
+//! on the runner-owned bounded cwd worker during build.
 //! Runtime resources and output streams are attempt-scoped.
 //!
 //! ## Commands and Scripts

@@ -51,13 +51,14 @@ use tracing::{Instrument as _, debug, debug_span, trace, warn};
 use solti_model::{SubprocessSpec, Task, TaskWorkload, WORKLOAD_API_VERSION, WorkloadTypeMeta};
 use solti_runner::{
     BuildContext, OutputPublisherHandle, OutputSink, RunId, Runner, RunnerError, RunnerErrorKind,
-    RunnerType, merge_env,
+    RunnerType, merge_env, record_runner_error, request_output_sink,
 };
 
 use crate::subprocess::{
     backend::{PreparedSubprocessBackendConfig, SubprocessBackendConfig},
     boundary::PinnedCwd,
     child::{ChildOutput, ProcessChild},
+    cwd_domain::{CwdDomain, CwdPinError},
     domain::{
         ActiveProcessDomain, AttachedProcessOwnership, DropFinalizerDomain,
         DropFinalizerReservation, PreparedProcessOwnership, SubprocessFinalizerStatus,
@@ -66,7 +67,7 @@ use crate::subprocess::{
     task::SubprocessTaskConfig,
 };
 use crate::{
-    output::{LogConfig, StreamKind, log_stream},
+    output::{LogConfig, OutputReaderFailure, StreamKind, classify_output_reader_join, log_stream},
     registration::validate_runner_name,
 };
 
@@ -95,6 +96,7 @@ use crate::{
 /// A dropped task future moves the child and host domain to one reaper worker.
 /// The worker does not depend on the attempt's Tokio runtime.
 /// Cleanup admission is reserved before script, cgroup, or process resources.
+/// Build-time cwd resolution runs on a separate bounded runner-owned worker.
 /// Keep the concrete runner and call [`shutdown`](Self::shutdown) after its
 /// supervisors and task references have stopped.
 /// The embedding process must not reap arbitrary children or enable automatic `SIGCHLD` reaping.
@@ -111,11 +113,38 @@ pub struct SubprocessRunner {
     config: Arc<PreparedSubprocessBackendConfig>,
     /// Bounded active and deferred process ownership for this runner.
     finalizer: DropFinalizerDomain,
+    /// Bounded runner-owned blocking cwd preparation.
+    cwd_domain: CwdDomain,
 }
 
 /// Builds a cgroup name for one task build.
 fn build_cgroup_name(runner: &str, slot: &str, seq: u64, timestamp: u64) -> String {
     format!("{runner}-{slot}-{seq:x}-{timestamp:x}")
+}
+
+/// Combines independently owned subprocess shutdown domains without dropping
+/// either failure.
+fn combine_runner_shutdown(
+    cleanup: std::io::Result<()>,
+    cwd: std::io::Result<()>,
+) -> std::io::Result<()> {
+    match (cleanup, cwd) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(cleanup), Err(cwd)) => Err(std::io::Error::other(format!(
+            "subprocess cleanup shutdown failed: {cleanup}; cwd I/O shutdown failed: {cwd}"
+        ))),
+    }
+}
+
+/// Allocates a unique one-based attempt number without wrapping identity.
+fn next_attempt(attempts: &AtomicU32) -> Option<u32> {
+    attempts
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |attempt| {
+            attempt.checked_add(1)
+        })
+        .ok()
+        .and_then(|attempt| attempt.checked_add(1))
 }
 
 impl SubprocessRunner {
@@ -127,16 +156,20 @@ impl SubprocessRunner {
     /// # Errors
     ///
     /// Returns [`crate::ExecError::InvalidRunnerConfig`] for an invalid name.
-    /// Returns [`crate::ExecError::Io`] when the cleanup worker cannot start.
+    /// Returns [`crate::ExecError::Io`] when the cleanup or cwd worker cannot
+    /// start.
     pub fn new(name: impl Into<String>) -> Result<Self, crate::ExecError> {
         let name = name.into();
         validate_runner_name(&name)?;
         let config = SubprocessBackendConfig::new().prepare()?;
-        let finalizer = DropFinalizerDomain::start(config.prepared_cleanup_capacity())?;
+        let capacity = config.prepared_cleanup_capacity();
+        let finalizer = DropFinalizerDomain::start(capacity)?;
+        let cwd_domain = CwdDomain::start(capacity)?;
         Ok(Self {
             name,
             config: Arc::new(config),
             finalizer,
+            cwd_domain,
         })
     }
 
@@ -148,7 +181,7 @@ impl SubprocessRunner {
     ///
     /// Returns [`crate::ExecError::InvalidRunnerConfig`] for invalid settings.
     /// Returns [`crate::ExecError::Io`] when host resource preparation or the
-    /// cleanup worker fails.
+    /// cleanup or cwd worker fails.
     pub fn with_config(
         name: impl Into<String>,
         config: SubprocessBackendConfig,
@@ -156,11 +189,14 @@ impl SubprocessRunner {
         let name = name.into();
         validate_runner_name(&name)?;
         let config = config.prepare()?;
-        let finalizer = DropFinalizerDomain::start(config.prepared_cleanup_capacity())?;
+        let capacity = config.prepared_cleanup_capacity();
+        let finalizer = DropFinalizerDomain::start(capacity)?;
+        let cwd_domain = CwdDomain::start(capacity)?;
         Ok(Self {
             name,
             config: Arc::new(config),
             finalizer,
+            cwd_domain,
         })
     }
 
@@ -169,7 +205,7 @@ impl SubprocessRunner {
         self.finalizer.status()
     }
 
-    /// Closes cleanup admission and waits for accepted ownership.
+    /// Closes cleanup and cwd admission and waits for accepted ownership.
     ///
     /// Call this after every supervisor and task reference that uses this
     /// runner has stopped. The operation is terminal and idempotent. A
@@ -179,19 +215,24 @@ impl SubprocessRunner {
     /// # Errors
     ///
     /// Returns [`crate::ExecError::Io`] when the deadline expires, cleanup is
-    /// quarantined, or the finalizer loses forward progress.
+    /// quarantined, or either worker loses forward progress.
     pub async fn shutdown(&self, timeout: StdDuration) -> Result<(), crate::ExecError> {
-        self.finalizer.shutdown(timeout).await.map_err(Into::into)
+        let (finalizer, cwd) = tokio::join!(
+            self.finalizer.shutdown(timeout),
+            self.cwd_domain.shutdown(timeout),
+        );
+        combine_runner_shutdown(finalizer, cwd).map_err(Into::into)
     }
 
     /// Builds immutable task settings from a resource.
     ///
     /// The returned settings are reused by every attempt.
-    fn build_task_config(
+    async fn build_task_config(
         &self,
         task: &Task,
         run_id: &RunId,
         ctx: &BuildContext,
+        cancellation: &solti_runner::BuildCancellation,
     ) -> Result<BuiltSubprocessTask, RunnerError> {
         let spec = task.spec();
         let (cfg, script_body) = match spec.workload() {
@@ -229,9 +270,14 @@ impl SubprocessRunner {
         };
         cfg.validate().map_err(RunnerError::InvalidSpec)?;
         let pinned_cwd = self
-            .config
-            .pin_cwd(cfg.cwd.as_deref())
-            .map_err(RunnerError::InvalidSpec)?;
+            .cwd_domain
+            .pin(Arc::clone(&self.config), cfg.cwd.clone(), cancellation)
+            .await
+            .map_err(|error| match error {
+                CwdPinError::InvalidSpec(error) => RunnerError::InvalidSpec(error),
+                CwdPinError::Cancelled => RunnerError::BuildCancelled,
+                CwdPinError::Unavailable(error) => RunnerError::Internal(error),
+            })?;
         Ok(BuiltSubprocessTask {
             task: cfg,
             script_body,
@@ -308,8 +354,8 @@ impl Runner for SubprocessRunner {
 
     /// Builds a reusable [`TaskRef`] from a subprocess resource.
     ///
-    /// This method resolves the mode, environment, and working directory.
-    /// It pins an explicit working directory.
+    /// This method resolves the mode and environment. It resolves and pins an
+    /// explicit working directory on the runner-owned bounded cwd worker.
     /// It does not create script backing storage, a cgroup, or a process.
     /// Runner environment values from [`BuildContext`] override task values.
     /// Output and metrics also come from that context.
@@ -319,19 +365,23 @@ impl Runner for SubprocessRunner {
     /// Returns [`RunnerError::UnsupportedWorkload`] for another workload kind.
     /// Returns [`RunnerError::InvalidSpec`] when resolved process settings are invalid.
     /// This includes script decoding, script limits, environment values, and working-directory policy.
+    /// Returns [`RunnerError::BuildCancelled`] when cancellation wins during
+    /// cwd admission or preparation.
     async fn build_task(
         &self,
         task: &Task,
         run_id: &RunId,
         ctx: &BuildContext,
-        _cancellation: &solti_runner::BuildCancellation,
+        cancellation: &solti_runner::BuildCancellation,
         _scope: &mut solti_runner::BuildScope,
     ) -> Result<TaskRef, RunnerError> {
         let BuiltSubprocessTask {
             task: task_cfg,
             script_body,
             pinned_cwd,
-        } = self.build_task_config(task, run_id, ctx)?;
+        } = self
+            .build_task_config(task, run_id, ctx, cancellation)
+            .await?;
 
         trace!(
             event = "subprocess.build",
@@ -626,11 +676,19 @@ async fn materialize_script(
     match written {
         Ok(Ok(file)) => Ok(file),
         Ok(Err(error)) => {
-            metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+            record_runner_error(
+                metrics,
+                RunnerType::Subprocess,
+                RunnerErrorKind::SpawnFailed,
+            );
             Err(task_io_error("script materialization failed", error))
         }
         Err(error) => {
-            metrics.record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+            record_runner_error(
+                metrics,
+                RunnerType::Subprocess,
+                RunnerErrorKind::SpawnFailed,
+            );
             Err(TaskError::fail(format!(
                 "script materialization worker failed: {error}"
             )))
@@ -676,8 +734,11 @@ async fn prepare_backend(
 ) -> Result<PreparedProcessOwnership, TaskError> {
     if cgroup_name.is_none() {
         return prepare_host_process_ownership(backend, None, reservation).map_err(|error| {
-            metrics
-                .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::CgroupPrepareFailed);
+            record_runner_error(
+                metrics,
+                RunnerType::Subprocess,
+                RunnerErrorKind::CgroupPrepareFailed,
+            );
             TaskError::fatal(format!("host process resource preparation failed: {error}"))
         });
     }
@@ -690,20 +751,29 @@ async fn prepare_backend(
     match prepared {
         Ok(Ok(prepared)) => Ok(prepared),
         Ok(Err(crate::ExecError::Io(error))) => {
-            metrics
-                .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::CgroupPrepareFailed);
+            record_runner_error(
+                metrics,
+                RunnerType::Subprocess,
+                RunnerErrorKind::CgroupPrepareFailed,
+            );
             Err(task_io_error("cgroup preparation failed", error))
         }
         Ok(Err(error)) => {
-            metrics
-                .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::CgroupPrepareFailed);
+            record_runner_error(
+                metrics,
+                RunnerType::Subprocess,
+                RunnerErrorKind::CgroupPrepareFailed,
+            );
             Err(TaskError::fatal(format!(
                 "cgroup preparation failed: {error}"
             )))
         }
         Err(error) => {
-            metrics
-                .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::CgroupPrepareFailed);
+            record_runner_error(
+                metrics,
+                RunnerType::Subprocess,
+                RunnerErrorKind::CgroupPrepareFailed,
+            );
             Err(TaskError::fail(format!(
                 "cgroup preparation worker failed: {error}"
             )))
@@ -738,8 +808,11 @@ fn spawn_with_command(
     let host_process_domain = apply_backend(&mut cmd, ctx, prepared);
     let ownership = AttachedProcessOwnership::new(host_process_domain, reservation);
     let child = cmd.spawn().map_err(|error| {
-        ctx.metrics
-            .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+        record_runner_error(
+            &ctx.metrics,
+            RunnerType::Subprocess,
+            RunnerErrorKind::SpawnFailed,
+        );
         task_io_error("spawn failed", error)
     })?;
     let (host_process_domain, reservation) = ownership.into_parts();
@@ -813,8 +886,11 @@ fn try_spawn_macos(
     }
 
     let child = crate::subprocess::spawn_macos::spawn(&spec).map_err(|error| {
-        ctx.metrics
-            .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+        record_runner_error(
+            &ctx.metrics,
+            RunnerType::Subprocess,
+            RunnerErrorKind::SpawnFailed,
+        );
         task_io_error("native macOS spawn failed", error)
     })?;
     let Some(child) = child else {
@@ -842,8 +918,11 @@ fn apply_fd_boundary(
         passed_fds.push(script.as_raw_fd());
     }
     crate::host::attach_fd_cloexec(cmd.as_std_mut(), &passed_fds).map_err(|error| {
-        ctx.metrics
-            .record_runner_error(RunnerType::Subprocess, RunnerErrorKind::SpawnFailed);
+        record_runner_error(
+            &ctx.metrics,
+            RunnerType::Subprocess,
+            RunnerErrorKind::SpawnFailed,
+        );
         task_io_error("child file descriptor preparation failed", error)
     })
 }
@@ -900,6 +979,14 @@ struct OutputTasks {
     stderr: Option<tokio::task::JoinHandle<()>>,
 }
 
+enum OutputDrain {
+    Completed {
+        stdout: Option<OutputReaderFailure>,
+        stderr: Option<OutputReaderFailure>,
+    },
+    TimedOut,
+}
+
 impl OutputTasks {
     /// Starts both readers and owns each handle before another task is spawned.
     fn start(
@@ -942,7 +1029,7 @@ impl OutputTasks {
     }
 
     /// Drains both readers within the existing normal-completion grace period.
-    async fn drain(&mut self) -> bool {
+    async fn drain(&mut self) -> OutputDrain {
         let stdout = self
             .stdout
             .as_mut()
@@ -951,16 +1038,19 @@ impl OutputTasks {
             .stderr
             .as_mut()
             .expect("stderr reader remains owned until drain or abort");
-        let drained = tokio::time::timeout(LOG_DRAIN_GRACE, async {
-            let _ = tokio::join!(stdout, stderr);
-        })
-        .await
-        .is_ok();
-        if drained {
-            self.stdout.take();
-            self.stderr.take();
+        let joined =
+            tokio::time::timeout(LOG_DRAIN_GRACE, async { tokio::join!(stdout, stderr) }).await;
+        match joined {
+            Ok((stdout, stderr)) => {
+                self.stdout.take();
+                self.stderr.take();
+                OutputDrain::Completed {
+                    stdout: classify_output_reader_join(stdout),
+                    stderr: classify_output_reader_join(stderr),
+                }
+            }
+            Err(_) => OutputDrain::TimedOut,
         }
-        drained
     }
 
     /// Aborts and releases both reader task handles.
@@ -974,6 +1064,44 @@ impl OutputTasks {
     }
 }
 
+fn report_output_drain(
+    output: &mut OutputTasks,
+    drain: OutputDrain,
+    ctx: &TaskExecContext,
+    attempt: u32,
+) {
+    match drain {
+        OutputDrain::Completed { stdout, stderr } => {
+            for (stream, failure) in [(StreamKind::Stdout, stdout), (StreamKind::Stderr, stderr)] {
+                let Some(failure) = failure else {
+                    continue;
+                };
+                warn!(
+                    event = "subprocess.output_reader_failed",
+                    task_name = %ctx.resource_name,
+                    generation = ctx.generation,
+                    run_id = %ctx.task_cfg.run_id,
+                    attempt,
+                    stream = stream.as_str(),
+                    join_error = failure.as_str(),
+                    "subprocess output reader task failed",
+                );
+            }
+        }
+        OutputDrain::TimedOut => {
+            output.abort();
+            warn!(
+                event = "subprocess.output_drain_timed_out",
+                task_name = %ctx.resource_name,
+                generation = ctx.generation,
+                run_id = %ctx.task_cfg.run_id,
+                attempt,
+                "subprocess output drain timed out after domain termination",
+            );
+        }
+    }
+}
+
 impl Drop for OutputTasks {
     fn drop(&mut self) {
         self.abort();
@@ -982,7 +1110,9 @@ impl Drop for OutputTasks {
 
 /// Executes one subprocess attempt.
 async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Result<(), TaskError> {
-    let attempt = ctx.attempt.fetch_add(1, Ordering::Relaxed) + 1;
+    let Some(attempt) = next_attempt(&ctx.attempt) else {
+        return Err(TaskError::fatal("subprocess attempt identity exhausted"));
+    };
     let span = debug_span!(
         "subprocess_attempt",
         event = "subprocess.attempt",
@@ -1001,11 +1131,15 @@ async fn run_subprocess_attempt(
     cancel: TaskContext,
     attempt: u32,
 ) -> Result<(), TaskError> {
-    let sink = ctx
-        .output_publisher
-        .sink_for(&ctx.resource_name, ctx.generation, attempt);
+    let sink = request_output_sink(
+        &ctx.output_publisher,
+        &ctx.resource_name,
+        ctx.generation,
+        attempt,
+    );
     let drop_finalizer = ctx.finalizer.try_reserve().map_err(|error| {
-        ctx.metrics.record_runner_error(
+        record_runner_error(
+            &ctx.metrics,
             RunnerType::Subprocess,
             RunnerErrorKind::Custom("drop_finalizer_unavailable".into()),
         );
@@ -1118,10 +1252,11 @@ async fn run_subprocess_attempt(
     };
 
     let drained_before_termination = matches!(completion, AttemptCompletion::LeaderExited(Ok(())));
-    let mut output_drained = false;
-    if drained_before_termination {
-        output_drained = output.drain().await;
-    }
+    let mut output_drain = if drained_before_termination {
+        Some(output.drain().await)
+    } else {
+        None
+    };
 
     let termination_error = process.terminate().err();
     if let Some(error) = termination_error.as_ref() {
@@ -1143,19 +1278,14 @@ async fn run_subprocess_attempt(
     };
 
     if !drained_before_termination {
-        output_drained = output.drain().await;
+        output_drain = Some(output.drain().await);
     }
-    if !output_drained {
-        output.abort();
-        warn!(
-            event = "subprocess.output_drain_timed_out",
-            task_name = %ctx.resource_name,
-            generation = ctx.generation,
-            run_id = %ctx.task_cfg.run_id,
-            attempt,
-            "subprocess output drain timed out after domain termination",
-        );
-    }
+    report_output_drain(
+        &mut output,
+        output_drain.expect("one output drain path always runs"),
+        &ctx,
+        attempt,
+    );
 
     let cleanup_error = if leader_status.as_ref().is_some_and(Result::is_ok) {
         process.cleanup().await.err()

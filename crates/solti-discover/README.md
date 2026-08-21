@@ -122,7 +122,9 @@ Optional settings use these defaults:
 The heartbeat interval sent on the wire uses seconds rounded up.
 
 `task_revision` identifies the complete runtime intent captured by the embedded task.
-Change it when any captured discovery setting changes.
+Change it when any captured discovery setting changes, including credentials,
+TLS material, or the metrics backend. Also change it when the `UptimeSource`
+or its epoch changes.
 This lets `solti-core` reconcile an otherwise identical embedded workload.
 
 ## Capabilities
@@ -244,6 +246,9 @@ println!("{elapsed}");
 
 Implement `UptimeSource` or pass a closure when another epoch is required.
 Every attempt reads the source again.
+Values above `i64::MAX` cannot be represented by discovery v1 and fail that
+attempt permanently before a transport request is sent. This local validation
+failure does not record a transport attempt or transport failure metric.
 
 ## Metrics
 
@@ -251,13 +256,18 @@ Every attempt reads the source again.
 
 | Hook             | Value                                  |
 |------------------|----------------------------------------|
-| `record_attempt` | One call before each transport request |
+| `record_attempt` | One call after wire stamping and before each transport request |
 | `record_success` | Request duration in milliseconds       |
 | `record_failure` | Duration and bounded failure reason    |
 | `record_hold`    | Clamped server hold in seconds         |
 
 `NoOpDiscoverMetrics` is the default.
 `DiscoverFailReason` keeps failure labels bounded.
+`build` installs one sticky panic boundary around the selected backend. After
+its first callback panic, later task attempts drop metrics updates without
+invoking that backend again.
+Callbacks that already entered the boundary concurrently may still finish or
+panic. The boundary does not serialize healthy metrics updates.
 
 ## Specific behavior
 

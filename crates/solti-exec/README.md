@@ -55,14 +55,16 @@ The value pairs the reusable `TaskRef` with the router-allocated run identity.
 `solti-core` uses that identity as the Taskvisor registration name during reconciliation.
 Keep the concrete runner returned by registration.
 After every supervisor and task reference that uses it has stopped, call
-`runner.shutdown(timeout).await`. A successful shutdown closes admission, waits
-for every accepted ownership unit, and joins the finalizer worker.
+`runner.shutdown(timeout).await`. A successful shutdown closes cleanup and cwd
+admission, waits for every accepted ownership unit, and joins both workers.
 `ExecError::Io` carries `std::io::ErrorKind::TimedOut` when the deadline elapsed,
-`Other` for quarantined ownership, or `BrokenPipe` for lost finalizer progress.
+`Other` for quarantined ownership, or `BrokenPipe` for lost worker progress.
 An error result does not by itself confirm that drain and join completed. A
 cancelled or timed-out call can be repeated; admission remains closed.
 The default ownership limit is 1024 active or deferred subprocess attempts per
-runner. `SubprocessBackendConfig::with_cleanup_capacity` changes it.
+runner. The same value independently bounds queued and active cwd preparations.
+The cwd queue allocates entries only for operations that acquired admission.
+`SubprocessBackendConfig::with_cleanup_capacity` changes both bounds.
 
 ## Containerd quick start
 
@@ -172,12 +174,13 @@ Exhausted cleanup is a fatal attempt failure.
 | `PreparedHostProcessAttempt`              | `std::process::Command`                 | Hooks and owning `AttemptProcessDomain`       |
 | `register_subprocess_runner`              | Router and runner name                  | Registered runner lifecycle handle            |
 | `register_subprocess_runner_with_backend` | Router, runner name, and backend config | Configured runner lifecycle handle             |
-| `SubprocessRunner::shutdown`              | Stopped supervisors and task references | Closed and drained finalizer                   |
+| `SubprocessRunner::shutdown`              | Stopped supervisors and task references | Closed and drained finalizer and cwd worker    |
 | `RunnerRouter::build`                     | `Task` with a `Subprocess` workload     | `BuiltTask` with run identity and `TaskRef`   |
 | `SubprocessBackendConfig`                 | Host policy, environment, cwd, output   | Runner-wide attempt settings                  |
 | One task attempt                          | Resolved command or script              | Task result and optional stdout/stderr chunks |
 | `ContainerProcessPolicy`                  | OCI process and resource controls       | Engine-neutral container process policy       |
 | `ContainerEngineBinding`                  | Engine and ownership declaration        | Explicit custom-engine registration boundary  |
+| `ContainerEngineShutdownHandle`           | Typed finalizer engine                   | Awaitable terminal shutdown capability        |
 | `ContainerOwnershipContract`              | Drop behavior declaration               | `DropReleases` or `PreAdmittedFinalizer`       |
 | `ContainerdConfig`                        | Socket, namespace, plugins, and network | Native containerd adapter settings            |
 | `ContainerdEngine::connect`               | `ContainerdConfig`                      | Connected and probed containerd 2.x engine    |
@@ -267,8 +270,12 @@ Every custom engine integration explicitly selects one ownership declaration:
 `ContainerEngineBinding` records this declaration in source.
 The runner cannot inspect a custom engine or prove the declaration.
 A pre-admitted finalizer must define failure behavior and awaitable shutdown.
-The application retains the concrete engine handle and drains that shutdown after
-every supervisor using the engine has stopped.
+Custom implementations can implement `ContainerEngineFinalizer` and use
+`ContainerEngineBinding::pre_admitted_finalizer_with_shutdown`. That constructor
+returns a typed `ContainerEngineShutdownHandle`. The application retains it and
+drains shutdown after every supervisor using the engine has stopped. The older
+declaration-only constructor remains available for compatibility and requires
+the application to retain its concrete shutdown handle separately.
 
 The runner enforces a separate set of lifecycle properties:
 
@@ -759,6 +766,23 @@ Its endpoint and runtime values can be overridden through the environment variab
 
 The `containerd_config` example does not contact a daemon by default.
 Pass `--connect` only when its configured socket and a compatible containerd 2.x daemon are available.
+
+Run the opt-in public containerd lifecycle integration test only on a provisioned
+Linux lane. The lane must provide the daemon, configured plugins, privileges,
+shared I/O path, and cached or reachable image:
+
+```bash
+SOLTI_TEST_CONTAINERD=1 cargo test -p solti-exec --features containerd \
+  --test containerd_public -- --ignored --exact \
+  public_container_runner_completes_one_real_containerd_attempt --nocapture
+```
+
+`SOLTI_TEST_CONTAINERD_SOCKET`, `SOLTI_TEST_CONTAINERD_NAMESPACE`,
+`SOLTI_TEST_CONTAINERD_SNAPSHOTTER`, `SOLTI_TEST_CONTAINERD_RUNTIME`,
+`SOLTI_TEST_CONTAINERD_IMAGE`, and `SOLTI_TEST_CONTAINERD_IO_ROOT` override its
+explicit defaults. The test is ignored by default. An explicit run without
+`SOLTI_TEST_CONTAINERD=1` fails before contacting a daemon. A normal Cargo
+success therefore cannot be mistaken for a live containerd result.
 
 ### Full examples
 

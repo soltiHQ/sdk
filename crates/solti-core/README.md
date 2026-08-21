@@ -337,21 +337,19 @@ Output is live-only.
 New subscribers do not receive historical chunks.
 Each task has one bounded broadcast ring shared across attempts.
 A slow subscriber receives `OutputEvent::Lagged` and then continues.
-Before creating a ring, core reserves that ring's exact maximum chunk payload
-from one aggregate budget. A task continues without a live-output channel when
-the aggregate budget cannot admit its ring.
-Each subscription reserves one additional maximum-size chunk because it can
-hold one internal event while reporting `Lagged`. Subscription returns `None`
-when that allowance cannot be reserved.
-The aggregate budget covers core-owned ring payload and internal post-lag
-pending events. It does not include events already yielded to callers or copies
-queued for an external output sink.
+Empty channels and subscriptions reserve no payload bytes. Core charges the
+aggregate budget only for payload currently retained by a ring or an internal
+post-lag event. One shared payload has one charge even when several subscribers
+can still read it. If a published chunk cannot be charged, the live stream
+omits it and reports the exact event and payload loss through `Lagged`.
+The aggregate budget does not include events already yielded to callers or
+copies queued for an external output sink.
 
 Terminal cleanup blocks new subscriptions.
 Existing subscriptions close after every outstanding runner sink clone is dropped.
 A stale sink remains attached to the old channel when a task name is reused.
-Stale sinks and subscriptions retain the old ring's aggregate reservation until
-their last owner is dropped.
+Stale subscriptions retain only payload they can still read. The charge is
+released when core drops its final owner.
 
 ## Cancel and delete
 
@@ -484,11 +482,10 @@ aggregate retained payload budget. The effective ring capacity is the stricter
 of the per-task event and byte limits. Ring storage starts empty and grows only
 with events published while at least one subscriber exists. Creating a task
 channel does not allocate the configured event capacity, and output published
-without subscribers is not retained. Each ring reserves
-`effective_capacity * max_chunk_bytes` from the aggregate budget. Each live
-subscription reserves another `max_chunk_bytes`. This is not a total process
-memory limit; caller-owned yielded events and output-sink delivery have separate
-ownership.
+without subscribers is not retained. The aggregate ledger charges actual
+retained chunk bytes. Shared payload is charged once across all subscribers.
+This is not a total process memory limit; caller-owned yielded events and
+output-sink delivery have separate ownership.
 
 Core makes one ownership copy of every retained chunk into bounded storage. A
 custom runner cannot retain an oversized or hidden backing allocation through
@@ -588,7 +585,8 @@ Its default hard bound is 2048 accepted `TaskOutputEvent` values, including the 
 Runner publication attempts callback-copy admission without waiting for capacity.
 A full, closed, contended, or unhealthy dispatcher drops only that callback copy.
 Task execution and the live output ring continue.
-Both callback types must eventually return so shutdown can drain accepted events:
+Both callback types and their sink destructors must eventually return so
+shutdown can drain accepted events:
 
 ```rust,no_run
 use std::sync::{Arc, mpsc};
@@ -639,7 +637,10 @@ A late event from a deleted task cannot be confused with a recreated task using 
 Subscriber-local `Lagged` notifications are not persisted.
 Live broadcast happens before output callback-copy admission.
 An output callback panic is caught and logged, is not retried, marks health false, and closes new admission.
-The worker continues draining events accepted before the panic.
+The worker continues draining events accepted before an ordinary callback panic.
+If destroying the callback or reporting panic payload itself panics, the worker
+forgets that one replacement payload, stops invoking the sink, and drops its
+remaining callback copies.
 Polling `SupervisorApi::shutdown()` on the output callback worker panics before shutdown starts and is handled as a callback panic.
 An output callback must not wait for another thread that calls shutdown; that cycle can deadlock.
 `SupervisorApi::state_persistence_status()` exposes admission, sticky health,
@@ -653,9 +654,12 @@ event's separate `resource_version` value and all event-variant framing.
 `RunChanged` counts the compact JSON of its task name, task UID, and TaskRun
 values and excludes event-variant framing. Saturation applies lossless
 backpressure. A panicking callback is not retried because its side effects are
-ambiguous. Later state events continue through the worker. An internal
-state-worker panic marks the dispatcher unhealthy and closes new admission
-before later callers can enter the state lock.
+ambiguous. Later state events continue after an ordinary callback panic. If
+destroying the callback or reporting panic payload itself panics, the worker
+forgets that one replacement payload, closes admission, drops its remaining
+accepted events, and reports terminal worker failure. An internal state-worker
+panic also marks the dispatcher unhealthy and closes new admission before later
+callers can enter the state lock.
 `SupervisorApi::output_persistence_status()` exposes accepting, sticky health,
 buffered and active ownership, the hard capacity, completed callbacks, panicked
 callbacks, and callback copies rejected by admission.
@@ -676,9 +680,25 @@ Call `shutdown()` to observe completion of the bounded Taskvisor and SDK-owned
 cleanup workflow before the application continues.
 Do not poll it on a persistence callback worker or wait there for another shutdown caller.
 
+`shutdown` and `shutdown_with_timeout(duration)` join one cached SDK-owned
+operation. Repeated or canceled callers do not create additional cleanup
+owners. A timeout applies only to that caller. If it returns
+`ShutdownTimedOut`, the shared coordinator remains detached and continues
+draining. The deadline does not terminate a callback or task. This makes an
+application callback that never returns observable without changing the
+lossless `shutdown()` contract.
+
 Shutdown closes task watches.
 It cancels runner builds, stops Taskvisor, and waits for reconciliation,
 completion, retention, and persistence workers.
+State and output persistence use one common cleanup tail. Failure of either
+worker is reported as `ShutdownCoordinatorStopped` only after both shutdown
+paths have been attempted.
+Each worker destroys its final application sink handle before publishing its
+terminal outcome. Sink destructor panics, including a nested panic-payload
+destructor, are contained and reported as worker failure rather than leaving
+shutdown pending. A sink destructor must eventually return; a caller deadline
+can observe a blocked destructor but does not terminate it.
 
 Taskvisor 0.8 reports `ForceAborted` as a logical outcome. Task code that does
 not cooperate with cancellation can remain physically active after shutdown
@@ -687,6 +707,8 @@ released.
 
 Dropping `SupervisorApi` starts the same cleanup path in the background.
 It does not provide an awaitable result.
+Persistence dispatcher destructors close admission and detach their worker;
+only explicit shutdown observes lossless drain completion.
 
 ## Specific behavior
 
@@ -712,6 +734,8 @@ Public write and lifecycle methods return `CoreError`:
 | `PersistenceInitialization` | A configured persistence worker could not start             |
 | `SupervisorInitialization` | Taskvisor rejected supervisor construction                   |
 | `ShuttingDown`             | A desired-state mutation raced with or started after shutdown |
+| `ShutdownTimedOut`         | A caller-owned shutdown deadline elapsed before drain completed |
+| `ShutdownCoordinatorStopped` | The SDK-owned shutdown coordinator stopped unexpectedly      |
 | `Supervisor`               | Taskvisor start, prepare, submit, cancel, or shutdown failed |
 | `AlreadyExists`            | Create found a retained resource with the same name          |
 | `NotFound`                 | A required resource does not exist or is hidden              |

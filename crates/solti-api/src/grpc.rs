@@ -39,6 +39,7 @@ use crate::auth::bearer_value;
 use crate::handler::ApiHandler;
 use crate::metrics::{
     ApiMetricsHandle, InFlightGuard, RequestMetrics, Transport, noop_api_metrics,
+    panic_contained_api_metrics, record_request,
 };
 use crate::proto_api::{
     self, task_service_server::TaskService, task_service_server::TaskServiceServer,
@@ -131,8 +132,10 @@ where
     }
 
     /// Creates a service with an explicit metrics backend.
+    ///
+    /// The installed backend is sticky-disabled after its first observed panic.
     pub fn new_with_metrics(handler: Arc<H>, metrics: ApiMetricsHandle) -> Self {
-        Self::new_with_access(handler, metrics, None, None)
+        Self::new_with_access(handler, panic_contained_api_metrics(metrics), None, None)
     }
 
     fn new_with_access(
@@ -267,7 +270,7 @@ where
     pub fn new(handler: Arc<H>) -> Self {
         Self {
             handler,
-            metrics: noop_api_metrics(),
+            metrics: panic_contained_api_metrics(noop_api_metrics()),
             auth: None,
             authenticator: None,
             authorizer: None,
@@ -306,8 +309,9 @@ where
     /// Attaches a metrics backend.
     ///
     /// The default backend ignores every update.
+    /// The installed backend is sticky-disabled after its first observed panic.
     pub fn with_metrics(mut self, metrics: ApiMetricsHandle) -> Self {
-        self.metrics = metrics;
+        self.metrics = panic_contained_api_metrics(metrics);
         self
     }
 
@@ -381,7 +385,8 @@ fn record_auth_failure(metrics: &ApiMetricsHandle, request: &Request<()>) {
         .map(|grpc| format!("/{}/{}", grpc.service(), grpc.method()))
         .unwrap_or_else(|| "<unknown>".to_owned());
     let _in_flight = InFlightGuard::enter(metrics, Transport::Grpc);
-    metrics.record_request(
+    record_request(
+        metrics,
         Transport::Grpc,
         method,
         &path,

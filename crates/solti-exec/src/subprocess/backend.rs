@@ -290,7 +290,8 @@ impl SubprocessBackendConfig {
     ///
     /// Admission is reserved before script transport, cgroup, or process
     /// resources are created. Runner construction rejects zero and values that
-    /// exceed the supported counter range.
+    /// exceed the supported counter range. The same value independently bounds
+    /// build-time cwd operations on the runner-owned blocking worker.
     pub fn with_cleanup_capacity(mut self, capacity: usize) -> Self {
         self.cleanup_capacity = Some(capacity);
         self
@@ -346,7 +347,10 @@ impl SubprocessBackendConfig {
                 "max_script_body_bytes must be in 1..={MAX_SCRIPT_BODY_BYTES}, got {max}"
             )));
         }
-        if cleanup_capacity == 0 || u32::try_from(cleanup_capacity).is_err() {
+        if cleanup_capacity == 0
+            || u32::try_from(cleanup_capacity).is_err()
+            || cleanup_capacity > tokio::sync::Semaphore::MAX_PERMITS
+        {
             return Err(InvalidRunnerConfig(
                 "subprocess cleanup capacity is outside the supported range".into(),
             ));

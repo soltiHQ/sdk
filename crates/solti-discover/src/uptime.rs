@@ -26,6 +26,9 @@ use std::time::Instant;
 /// A closure returning `u64` also implements this trait.
 pub trait UptimeSource: Send + Sync + 'static {
     /// Returns elapsed whole seconds since the application-owned epoch.
+    ///
+    /// Discovery rejects values above `i64::MAX` before transport because the
+    /// discovery v1 wire field is a signed 64-bit integer.
     fn uptime_seconds(&self) -> u64;
 }
 

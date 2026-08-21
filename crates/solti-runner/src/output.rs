@@ -28,6 +28,10 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use solti_model::{OutputChunk, OutputEvent, StreamKind, TaskId};
 
+use crate::callback::{
+    CallbackPanicFuse, PanicPayload, dispose_panic_payload, report_without_unwind,
+};
+
 /// Producer capability used by runners to obtain an attempt-scoped output sink.
 ///
 /// Implementations decide whether output is enabled for an attempt.
@@ -38,6 +42,11 @@ use solti_model::{OutputChunk, OutputEvent, StreamKind, TaskId};
 /// [`OutputSink`] is cloneable and its clones can be moved into reader or forwarding tasks.
 ///
 /// This interface has no subscription or lifecycle operations.
+/// Implementations must not panic; SDK containment is a defensive boundary.
+/// SDK-owned runner paths invoke it through [`request_output_sink`], which contains unwinding
+/// publisher panics. Direct application calls to [`Self::sink_for`] are not mediated by that
+/// boundary. Calls that already entered an installed sticky boundary concurrently may still
+/// finish or panic; the boundary does not serialize healthy publishers.
 pub trait OutputPublisher: Send + Sync {
     /// Returns a sink for one task attempt.
     ///
@@ -52,6 +61,93 @@ pub type OutputPublisherHandle = Arc<dyn OutputPublisher>;
 /// Returns an output publisher that disables live output.
 pub fn noop_output_publisher() -> OutputPublisherHandle {
     Arc::new(NoOpOutputPublisher)
+}
+
+/// Requests an attempt-scoped output sink without allowing a publisher panic to unwind.
+///
+/// SDK-owned runner paths use this boundary instead of calling [`OutputPublisher::sink_for`]
+/// directly. An unwinding publisher panic is isolated, its opaque payload is discarded, and
+/// the request returns `None`. The failure is reported through non-unwinding structured tracing.
+/// A later request may invoke a raw publisher again. Publishers installed through
+/// [`crate::BuildContext`] share a sticky panic fuse and are not invoked again after the first
+/// observed panic.
+/// If destroying a hostile payload itself panics, that replacement payload is intentionally
+/// forgotten to prevent another unwind.
+///
+/// Direct application calls to [`OutputPublisher::sink_for`] are not mediated by this function.
+/// The process panic hook still runs before the unwind is caught. A process built with
+/// `panic = "abort"` cannot isolate a publisher panic.
+pub fn request_output_sink(
+    publisher: &OutputPublisherHandle,
+    task_name: &TaskId,
+    generation: u64,
+    attempt: u32,
+) -> Option<OutputSink> {
+    match catch_unwind(AssertUnwindSafe(|| {
+        publisher.sink_for(task_name, generation, attempt)
+    })) {
+        Ok(sink) => sink,
+        Err(payload) => {
+            dispose_panic_payload(payload);
+            report_without_unwind(|| {
+                tracing::error!(
+                    event = "runner.output_publisher_panicked",
+                    error_kind = "callback_panicked",
+                    task = %task_name,
+                    generation,
+                    attempt,
+                    "output publisher panicked; disabling output for this sink request"
+                );
+            });
+            None
+        }
+    }
+}
+
+/// Installs one sticky panic boundary around an application output publisher.
+pub(crate) fn panic_contained_output_publisher(
+    publisher: OutputPublisherHandle,
+) -> OutputPublisherHandle {
+    Arc::new(PanicContainedOutputPublisher {
+        publisher,
+        panic_fuse: CallbackPanicFuse::default(),
+    })
+}
+
+struct PanicContainedOutputPublisher {
+    publisher: OutputPublisherHandle,
+    panic_fuse: CallbackPanicFuse,
+}
+
+impl OutputPublisher for PanicContainedOutputPublisher {
+    fn sink_for(&self, task_name: &TaskId, generation: u64, attempt: u32) -> Option<OutputSink> {
+        if self.panic_fuse.is_disabled() {
+            return None;
+        }
+
+        match catch_unwind(AssertUnwindSafe(|| {
+            self.publisher.sink_for(task_name, generation, attempt)
+        })) {
+            Ok(sink) => sink,
+            Err(payload) => {
+                let report = self.panic_fuse.trip();
+                dispose_panic_payload(payload);
+                if report {
+                    report_without_unwind(|| {
+                        tracing::error!(
+                            event = "runner.output_publisher_panicked",
+                            error_kind = "callback_panicked",
+                            task = %task_name,
+                            generation,
+                            attempt,
+                            "output publisher panicked; disabling the installed publisher"
+                        );
+                    });
+                }
+                None
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -147,10 +243,13 @@ enum Publish {
 ///
 /// The callback runs synchronously in the caller.
 /// It must not block runner execution.
+/// It should not panic; containment is a defensive boundary.
 /// An unwinding panic is caught and reported once through structured tracing without its payload.
 /// Once the panic is observed, the sink disables its callback and drops calls that begin afterward.
 /// Concurrent callback calls already in progress may still complete or panic.
 /// Clones share that sticky state through [`Self::callback_panicked`].
+/// If destroying a hostile payload itself panics, that replacement payload is intentionally
+/// forgotten to prevent another unwind.
 /// The process panic hook still runs before the unwind is caught; its output is controlled by the application.
 /// A process built with `panic = "abort"` cannot isolate a callback panic.
 ///
@@ -354,8 +453,7 @@ impl OutputSink {
             }),
         }));
         if let Err(payload) = result {
-            self.report_callback_panic(stream, seq);
-            dispose_panic_payload(payload);
+            self.handle_callback_panic(payload, stream, seq);
         }
     }
 
@@ -386,38 +484,34 @@ impl OutputSink {
             }),
         }));
         if let Err(payload) = result {
-            self.report_callback_panic(stream, seq);
-            dispose_panic_payload(payload);
+            self.handle_callback_panic(payload, stream, seq);
         }
     }
 
-    fn report_callback_panic(&self, stream: StreamKind, seq: u64) {
+    fn handle_callback_panic(&self, payload: PanicPayload, stream: StreamKind, seq: u64) {
         if self.callback_panicked.swap(true, Ordering::AcqRel) {
+            dispose_panic_payload(payload);
             return;
         }
+
+        // Dispose the opaque callback payload before invoking application-owned tracing.
+        // Neither boundary is allowed to unwind into runner execution.
+        dispose_panic_payload(payload);
         let stream = match stream {
             StreamKind::Stdout => "stdout",
             StreamKind::Stderr => "stderr",
         };
-        tracing::error!(
-            event = "runner.output_callback_panicked",
-            error_kind = "callback_panicked",
-            generation = self.generation,
-            attempt = self.attempt,
-            stream,
-            seq,
-            "output callback panicked; disabling this attempt sink"
-        );
-    }
-}
-
-fn dispose_panic_payload(payload: Box<dyn std::any::Any + Send>) {
-    // A user-defined panic payload may panic again from Drop.
-    // Catch that secondary unwind too.
-    // Its replacement payload is forgotten because dropping it could repeat the same cycle;
-    // this is bounded to one payload per callback invocation that was already in flight when the sink failed.
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
-        std::mem::forget(payload);
+        report_without_unwind(|| {
+            tracing::error!(
+                event = "runner.output_callback_panicked",
+                error_kind = "callback_panicked",
+                generation = self.generation,
+                attempt = self.attempt,
+                stream,
+                seq,
+                "output callback panicked; disabling this attempt sink"
+            );
+        });
     }
 }
 

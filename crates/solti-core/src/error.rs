@@ -6,7 +6,7 @@
 //! Collection reads use [`CollectionError`](crate::CollectionError).
 //! Checked configuration uses [`ConfigError`](crate::ConfigError).
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use thiserror::Error;
 
@@ -127,6 +127,22 @@ pub enum CoreError {
     /// Desired-state writes are no longer accepted.
     #[error("supervisor is shutting down")]
     ShuttingDown,
+
+    /// The caller-provided shutdown deadline elapsed while SDK-owned work was
+    /// still draining.
+    ///
+    /// The accepted shutdown coordinator remains owned by the SDK and
+    /// continues cleanup after this error is returned.
+    #[error("SDK shutdown did not drain within {timeout:?}")]
+    ShutdownTimedOut {
+        /// Deadline supplied by the caller.
+        timeout: Duration,
+    },
+
+    /// The SDK-owned shutdown coordinator stopped before publishing an
+    /// outcome.
+    #[error("SDK shutdown coordinator stopped unexpectedly")]
+    ShutdownCoordinatorStopped,
 
     /// A Taskvisor operation failed.
     ///

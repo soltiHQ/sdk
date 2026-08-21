@@ -11,7 +11,7 @@ use std::{
 use solti_model::{ContainerSpec, Task, TaskWorkload, WORKLOAD_API_VERSION, WorkloadTypeMeta};
 use solti_runner::{
     BuildContext, OutputPublisherHandle, RunId, Runner, RunnerError, RunnerErrorKind, RunnerType,
-    merge_env,
+    merge_env, record_runner_error, request_output_sink,
 };
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tokio::sync::watch;
@@ -23,7 +23,7 @@ use super::{
     ContainerRunnerConfig,
 };
 use crate::{
-    output::{LogConfig, StreamKind, log_stream},
+    output::{LogConfig, OutputReaderFailure, StreamKind, classify_output_reader_join, log_stream},
     registration::validate_runner_name,
 };
 
@@ -232,11 +232,16 @@ fn validate_process_input(
 }
 
 async fn run_container(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Result<(), TaskError> {
-    let attempt = ctx.attempt.fetch_add(1, Ordering::Relaxed) + 1;
+    let Some(attempt) = next_attempt(&ctx.attempt) else {
+        return Err(TaskError::fatal("container attempt identity exhausted"));
+    };
     let request = ctx.task.request(attempt);
-    let sink = ctx
-        .output_publisher
-        .sink_for(&ctx.task.resource_name, ctx.task.generation, attempt);
+    let sink = request_output_sink(
+        &ctx.output_publisher,
+        &ctx.task.resource_name,
+        ctx.task.generation,
+        attempt,
+    );
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let worker = run_container_worker(ctx, request, sink, cancel_rx);
@@ -256,6 +261,16 @@ async fn run_container(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Result
             result
         }
     }
+}
+
+/// Allocates a unique one-based attempt number without wrapping identity.
+fn next_attempt(attempts: &AtomicU32) -> Option<u32> {
+    attempts
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |attempt| {
+            attempt.checked_add(1)
+        })
+        .ok()
+        .and_then(|attempt| attempt.checked_add(1))
 }
 
 fn cancellation_requested(cancel: &watch::Receiver<bool>) -> bool {
@@ -300,7 +315,8 @@ async fn run_container_attempt(
     let mut attempt = match ctx.engine.create_attempt(request).await {
         Ok(attempt) => attempt,
         Err(error) => {
-            ctx.metrics.record_runner_error(
+            record_runner_error(
+                &ctx.metrics,
                 RunnerType::Container,
                 RunnerErrorKind::Custom("attempt_create_failed".into()),
             );
@@ -332,8 +348,11 @@ async fn run_container_attempt(
         "container attempt starting"
     );
     if let Err(start_error) = attempt.start().await {
-        ctx.metrics
-            .record_runner_error(RunnerType::Container, RunnerErrorKind::SpawnFailed);
+        record_runner_error(
+            &ctx.metrics,
+            RunnerType::Container,
+            RunnerErrorKind::SpawnFailed,
+        );
         let canceled = cancellation_requested(&cancel);
         let cleanup = cleanup_attempt(attempt.as_mut(), true).await;
         output.drain(&ctx.task.run_id).await;
@@ -401,7 +420,8 @@ async fn run_container_attempt(
     output.drain(&ctx.task.run_id).await;
     let cleanup = attempt.cleanup().await;
     if let Err(error) = cleanup {
-        ctx.metrics.record_runner_error(
+        record_runner_error(
+            &ctx.metrics,
             RunnerType::Container,
             RunnerErrorKind::Custom("cleanup_failed".into()),
         );
@@ -518,18 +538,24 @@ impl OutputTasks {
         const GRACE: std::time::Duration = std::time::Duration::from_secs(5);
         #[cfg(test)]
         const GRACE: std::time::Duration = std::time::Duration::from_millis(100);
-        let drained = tokio::time::timeout(GRACE, async {
-            if let Some(stdout) = self.stdout.as_mut() {
-                let _ = stdout.await;
-            }
-            if let Some(stderr) = self.stderr.as_mut() {
-                let _ = stderr.await;
-            }
+        let joined = tokio::time::timeout(GRACE, async {
+            let stdout = async {
+                match self.stdout.as_mut() {
+                    Some(stdout) => Some(stdout.await),
+                    None => None,
+                }
+            };
+            let stderr = async {
+                match self.stderr.as_mut() {
+                    Some(stderr) => Some(stderr.await),
+                    None => None,
+                }
+            };
+            tokio::join!(stdout, stderr)
         })
-        .await
-        .is_ok();
+        .await;
 
-        if !drained {
+        let Ok((stdout, stderr)) = joined else {
             if let Some(stdout) = &self.stdout {
                 stdout.abort();
             }
@@ -540,6 +566,31 @@ impl OutputTasks {
                 event = "container.output_drain_timed_out",
                 run_id = %run_id,
                 "container output drain timed out"
+            );
+            return;
+        };
+
+        self.stdout.take();
+        self.stderr.take();
+        for (stream, failure) in [
+            (
+                StreamKind::Stdout,
+                stdout.and_then(classify_output_reader_join),
+            ),
+            (
+                StreamKind::Stderr,
+                stderr.and_then(classify_output_reader_join),
+            ),
+        ] {
+            let Some(failure): Option<OutputReaderFailure> = failure else {
+                continue;
+            };
+            warn!(
+                event = "container.output_reader_failed",
+                run_id = %run_id,
+                stream = stream.as_str(),
+                join_error = failure.as_str(),
+                "container output reader task failed"
             );
         }
     }

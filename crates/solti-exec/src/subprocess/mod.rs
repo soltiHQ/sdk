@@ -40,6 +40,8 @@ mod boundary;
 
 mod child;
 
+mod cwd_domain;
+
 mod domain;
 pub use domain::SubprocessFinalizerStatus;
 
@@ -73,7 +75,7 @@ pub use crate::registration::LABEL_RUNNER_NAME;
 ///
 /// Returns [`ExecError::InvalidRunnerConfig`] when `name` is invalid.
 /// Returns [`ExecError::Router`] when the router rejects registration.
-/// Returns [`ExecError::Io`] when the cleanup worker cannot start.
+/// Returns [`ExecError::Io`] when the cleanup or cwd worker cannot start.
 pub fn register_subprocess_runner(
     router: &mut RunnerRouter,
     name: impl Into<String>,
@@ -91,8 +93,8 @@ pub fn register_subprocess_runner(
 ///
 /// Returns [`ExecError::InvalidRunnerConfig`] when `name` or `backend` is invalid.
 /// Returns [`ExecError::Router`] when the router rejects registration.
-/// Returns [`ExecError::Io`] when backend preparation fails or the cleanup worker
-/// cannot start.
+/// Returns [`ExecError::Io`] when backend preparation fails or the cleanup or
+/// cwd worker cannot start.
 pub fn register_subprocess_runner_with_backend(
     router: &mut RunnerRouter,
     name: impl Into<String>,

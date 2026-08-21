@@ -11,7 +11,7 @@ use parking_lot::{Condvar, Mutex};
 use solti_chain::{ChainRunner, ChainSpec, ChainStep};
 use solti_model::{
     AdmissionPolicy, ConditionStatus, EmbeddedSpec, Flag, LabelSelector, Labels, Slot,
-    SubprocessMode, SubprocessSpec, TaskEnv, TaskPhase, TaskSpec, TaskWorkload,
+    SubprocessMode, SubprocessSpec, TaskEnv, TaskPhase, TaskSpec, TaskWorkload, Uid,
     WORKLOAD_API_VERSION, WorkloadTypeMeta,
 };
 use solti_runner::{BuildContext, RunId, Runner, RunnerError};
@@ -24,7 +24,10 @@ use tokio_util::task::TaskTracker;
 
 use super::*;
 use crate::state::{TASKVISOR_INTAKE_PENDING_MESSAGE, TASKVISOR_INTAKE_PENDING_REASON};
-use crate::{PersistenceConfig, ReconciliationConfig, StateConfig, TaskStateEvent, TaskStateSink};
+use crate::{
+    PersistenceConfig, ReconciliationConfig, StateConfig, TaskOutputEvent, TaskOutputSink,
+    TaskStateEvent, TaskStateSink,
+};
 
 struct TokioDependentStateSink {
     first: AtomicBool,
@@ -52,6 +55,12 @@ struct IgnoringStateSink;
 
 impl TaskStateSink for IgnoringStateSink {
     fn on_event(&self, _event: &TaskStateEvent) {}
+}
+
+struct IgnoringOutputSink;
+
+impl TaskOutputSink for IgnoringOutputSink {
+    fn on_event(&self, _event: &TaskOutputEvent) {}
 }
 
 fn embedded_with_revision(name: &str, timeout_ms: u64, revision: &str) -> TaskManifest {
@@ -251,6 +260,208 @@ async fn public_write_yields_when_state_persistence_capacity_is_full() {
         .unwrap();
 
     api.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_timeout_returns_while_the_owned_coordinator_keeps_draining() {
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let sink = Arc::new(TokioDependentStateSink {
+        first: AtomicBool::new(true),
+        events: AtomicUsize::new(0),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+    let api = SupervisorApi::builder(RunnerRouter::new())
+        .with_state_sink(sink.clone())
+        .start()
+        .await
+        .unwrap();
+    api.reconciler
+        .state
+        .add_task(embedded("shutdown-deadline", 1_000));
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the persistence callback must block before shutdown");
+
+    let timeout = Duration::from_millis(25);
+    assert!(matches!(
+        api.shutdown_with_timeout(timeout).await,
+        Err(CoreError::ShutdownTimedOut { timeout: actual }) if actual == timeout
+    ));
+    assert!(api.shutdown_started.load(Ordering::Acquire));
+    let first_operation = api
+        .shutdown
+        .operation
+        .lock()
+        .as_ref()
+        .cloned()
+        .expect("the first shutdown waiter must install one shared operation");
+
+    let second_shutdown = api.shutdown();
+    tokio::pin!(second_shutdown);
+    assert!(
+        tokio::time::timeout(timeout, &mut second_shutdown)
+            .await
+            .is_err(),
+        "a later public shutdown waiter must observe the same pending drain"
+    );
+    let second_operation = api
+        .shutdown
+        .operation
+        .lock()
+        .as_ref()
+        .cloned()
+        .expect("the later waiter must join the installed operation");
+    assert!(
+        Arc::ptr_eq(&first_operation, &second_operation),
+        "all public waiters must share one SDK-owned shutdown operation"
+    );
+
+    release_tx
+        .send(())
+        .expect("the callback must resume after the caller observed timeout");
+    tokio::time::timeout(Duration::from_secs(5), &mut second_shutdown)
+        .await
+        .expect("the later public shutdown waiter must finish after callback release")
+        .unwrap();
+    assert_eq!(sink.events.load(Ordering::Acquire), 1);
+    let status = api.state_persistence_status().unwrap();
+    assert!(!status.accepting());
+    assert_eq!(status.queued(), 0);
+    assert_eq!(status.queued_bytes(), 0);
+    assert_eq!(status.delivered(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn output_worker_panic_does_not_skip_the_state_persistence_cleanup_tail() {
+    let api = SupervisorApi::builder(RunnerRouter::new())
+        .with_state_sink(Arc::new(IgnoringStateSink))
+        .with_output_sink(Arc::new(IgnoringOutputSink))
+        .start()
+        .await
+        .unwrap();
+    api.reconciler.output_hub.inject_persistence_worker_panic();
+    api.reconciler.output_hub.announce_run_started(
+        &TaskId::new("output-worker-panic").unwrap(),
+        &Uid::new("output-worker-panic-uid").unwrap(),
+        1,
+        1,
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while api.output_persistence_status().unwrap().healthy() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the injected output worker panic did not become observable");
+    assert!(api.state_persistence_status().unwrap().accepting());
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), api.shutdown()).await,
+        Ok(Err(CoreError::ShutdownCoordinatorStopped))
+    ));
+    let state_status = api.state_persistence_status().unwrap();
+    assert!(!state_status.accepting());
+    assert_eq!(state_status.queued(), 0);
+    assert_eq!(state_status.queued_bytes(), 0);
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), api.shutdown()).await,
+        Ok(Err(CoreError::ShutdownCoordinatorStopped))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn state_worker_panic_does_not_skip_the_output_persistence_cleanup_tail() {
+    let api = SupervisorApi::builder(RunnerRouter::new())
+        .with_state_sink(Arc::new(IgnoringStateSink))
+        .with_output_sink(Arc::new(IgnoringOutputSink))
+        .start()
+        .await
+        .unwrap();
+    api.reconciler.state.inject_persistence_worker_panic();
+    api.reconciler
+        .state
+        .add_task(embedded("state-worker-panic", 1_000));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while api.state_persistence_status().unwrap().healthy() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the injected state worker panic did not become observable");
+    assert!(api.output_persistence_status().unwrap().accepting());
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), api.shutdown()).await,
+        Ok(Err(CoreError::ShutdownCoordinatorStopped))
+    ));
+    let output_status = api.output_persistence_status().unwrap();
+    assert!(!output_status.accepting());
+    assert_eq!(output_status.queued(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborted_public_shutdown_waiter_does_not_cancel_the_owned_drain() {
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let sink = Arc::new(TokioDependentStateSink {
+        first: AtomicBool::new(true),
+        events: AtomicUsize::new(0),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+    let api = Arc::new(
+        SupervisorApi::builder(RunnerRouter::new())
+            .with_state_sink(sink.clone())
+            .start()
+            .await
+            .unwrap(),
+    );
+    api.reconciler
+        .state
+        .add_task(embedded("aborted-shutdown-waiter", 1_000));
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the persistence callback must block before shutdown");
+
+    let first_api = Arc::clone(&api);
+    let first_waiter = tokio::spawn(async move { first_api.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !api.shutdown_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first public shutdown waiter must start shutdown");
+    first_waiter.abort();
+    assert!(first_waiter.await.unwrap_err().is_cancelled());
+
+    let second_api = Arc::clone(&api);
+    let mut second_waiter = tokio::spawn(async move { second_api.shutdown().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut second_waiter)
+            .await
+            .is_err(),
+        "aborting one caller must not complete the still-blocked owned drain"
+    );
+
+    release_tx
+        .send(())
+        .expect("the callback must resume after the second waiter is pending");
+    tokio::time::timeout(Duration::from_secs(5), second_waiter)
+        .await
+        .expect("the second public shutdown waiter must finish after callback release")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(sink.events.load(Ordering::Acquire), 1);
+    let status = api.state_persistence_status().unwrap();
+    assert!(!status.accepting());
+    assert_eq!(status.queued(), 0);
+    assert_eq!(status.queued_bytes(), 0);
+    assert_eq!(status.delivered(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2613,6 +2824,20 @@ async fn closed_state_admission_cleans_authoritative_completion_without_synthesi
     assert_eq!(before_runs.len(), 1);
     assert_eq!(before_runs[0].phase(), TaskPhase::Running);
 
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if api
+                .state_persistence_status()
+                .is_some_and(|status| status.queued() == 0)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the running-state persistence event did not drain");
+
     api.reconciler.state.inject_persistence_worker_panic();
     api.reconciler
         .state
@@ -2662,10 +2887,10 @@ async fn closed_state_admission_cleans_authoritative_completion_without_synthesi
     let shutdown = tokio::time::timeout(Duration::from_secs(2), shutdown)
         .await
         .expect("shutdown hung after cleanup-only authoritative finalization");
-    assert!(
-        shutdown.is_err_and(|error| error.is_panic()),
-        "shutdown must observably report the injected persistence worker panic"
-    );
+    assert!(matches!(
+        shutdown,
+        Ok(Err(CoreError::ShutdownCoordinatorStopped))
+    ));
 }
 
 #[tokio::test]

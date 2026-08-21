@@ -125,6 +125,8 @@ pub use async_trait::async_trait;
 mod error;
 pub use error::{RouterError, RunnerError};
 
+mod callback;
+
 mod context;
 pub use context::BuildContext;
 
@@ -140,9 +142,11 @@ pub use id::{RunId, make_run_id};
 mod output;
 pub use output::{
     OutputChunkRef, OutputPublisher, OutputPublisherHandle, OutputSink, noop_output_publisher,
+    request_output_sink,
 };
 
 pub mod metrics;
 pub use metrics::{
     MetricsBackend, MetricsHandle, NoOpMetrics, RunnerErrorKind, RunnerType, noop_metrics,
+    record_runner_error,
 };

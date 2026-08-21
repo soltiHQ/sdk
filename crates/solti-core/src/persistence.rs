@@ -233,10 +233,13 @@ pub enum TaskStateEvent {
 /// Tokio-owned state commits enter their state or spawn critical sections;
 /// events are not dropped for overload.
 /// An unwinding callback is not retried, and later events continue through the
-/// worker. If a custom panic payload panics again from its destructor, core
-/// forgets the replacement payload to contain that second unwind. Repeating
-/// such a hostile payload can leak one replacement payload per callback panic.
-/// The callback must eventually return so shutdown can drain the queue.
+/// worker. If destroying the caught payload or a reporting payload panics, core
+/// forgets that one replacement payload and terminally disables the worker.
+/// Core also destroys its last sink handle through a non-unwinding boundary;
+/// a sink destructor panic makes shutdown fail instead of leaving its outcome
+/// pending.
+/// The callback and the sink's destructor must eventually return so shutdown
+/// can drain the queue.
 /// It must not mutate `TaskState`, directly or by waiting for another thread
 /// that does so. Reads and waits for unrelated Tokio work are allowed. Polling
 /// [`crate::SupervisorApi::shutdown`] on the callback worker panics before
@@ -659,6 +662,19 @@ enum StateDispatcherShutdownOutcome {
     WorkerPanicked,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistenceWorkerExit {
+    Drained,
+    Panicked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistenceCallbackOutcome {
+    Delivered,
+    Panicked,
+    BoundaryFailed,
+}
+
 struct StateDispatcherShutdown {
     started: AtomicBool,
     // `watch` retains the terminal result even when every current waiter is canceled.
@@ -699,7 +715,7 @@ impl StateDispatcherShutdown {
 }
 
 pub(crate) struct StateEventDispatcher {
-    worker: Mutex<Option<thread::JoinHandle<()>>>,
+    worker: Mutex<Option<thread::JoinHandle<PersistenceWorkerExit>>>,
     permits: Arc<StateQueuePermits>,
     byte_permits: Arc<StateQueueBytePermits>,
     metrics: Arc<StateDispatcherMetrics>,
@@ -776,17 +792,36 @@ impl StateEventDispatcher {
                         {
                             panic!("injected state persistence worker panic");
                         }
-                        if deliver_state_event(&sink, dispatched.event) {
-                            saturating_increment(&worker_metrics.delivered);
-                        } else {
-                            worker_metrics.healthy.store(false, Ordering::Release);
-                            saturating_increment(&worker_metrics.failed);
+                        match deliver_state_event(&sink, dispatched.event) {
+                            PersistenceCallbackOutcome::Delivered => {
+                                saturating_increment(&worker_metrics.delivered);
+                            }
+                            PersistenceCallbackOutcome::Panicked => {
+                                worker_metrics.healthy.store(false, Ordering::Release);
+                                saturating_increment(&worker_metrics.failed);
+                            }
+                            PersistenceCallbackOutcome::BoundaryFailed => {
+                                saturating_increment(&worker_metrics.failed);
+                                worker_metrics.mark_worker_failed();
+                                return true;
+                            }
                         }
                     }
+                    false
                 }));
-                if let Err(payload) = result {
+                let callback_loop_failed = match result {
+                    Ok(boundary_failed) => boundary_failed,
+                    Err(payload) => {
+                        dispose_sink_panic_payload(payload);
+                        true
+                    }
+                };
+                let sink_drop_panicked = !drop_value_without_unwind(sink);
+                if callback_loop_failed || sink_drop_panicked {
                     worker_metrics.mark_worker_failed();
-                    std::panic::resume_unwind(payload);
+                    PersistenceWorkerExit::Panicked
+                } else {
+                    PersistenceWorkerExit::Drained
                 }
             })?;
         let permits = Arc::new(StateQueuePermits {
@@ -919,13 +954,23 @@ impl StateEventDispatcher {
             let worker = self.worker.lock().take();
             let outcome = self.shutdown.outcome.clone();
             if let Some(worker) = worker {
+                let metrics = Arc::clone(&self.metrics);
                 // The detached join owns completion publication. Canceling the
                 // caller can only remove that caller's wait, never the drain.
                 drop(tokio::task::spawn_blocking(move || {
-                    let completed = if worker.join().is_ok() {
-                        StateDispatcherShutdownOutcome::Drained
-                    } else {
-                        StateDispatcherShutdownOutcome::WorkerPanicked
+                    let completed = match worker.join() {
+                        Ok(PersistenceWorkerExit::Drained) => {
+                            StateDispatcherShutdownOutcome::Drained
+                        }
+                        Ok(PersistenceWorkerExit::Panicked) => {
+                            metrics.mark_worker_failed();
+                            StateDispatcherShutdownOutcome::WorkerPanicked
+                        }
+                        Err(payload) => {
+                            dispose_sink_panic_payload(payload);
+                            metrics.mark_worker_failed();
+                            StateDispatcherShutdownOutcome::WorkerPanicked
+                        }
                     };
                     outcome.send_replace(completed);
                 }));
@@ -942,11 +987,10 @@ impl StateEventDispatcher {
 impl Drop for StateEventDispatcher {
     fn drop(&mut self) {
         self.metrics.close_admission();
-        if let Some(worker) = self.worker.get_mut().take()
-            && worker.thread().id() != thread::current().id()
-        {
-            let _ = worker.join();
-        }
+        // Dropping a std JoinHandle detaches the worker. Destructors must not
+        // block indefinitely on an application callback; explicit shutdown is
+        // the observable lossless-drain boundary.
+        drop(self.worker.get_mut().take());
     }
 }
 
@@ -996,10 +1040,12 @@ impl TaskOutputEvent {
 /// closed, contended, or unhealthy dispatcher drops only the callback copy.
 /// A callback panic is not retried, marks health false, and closes new admission;
 /// the worker drains events accepted before that panic. If a custom panic
-/// payload panics again from its destructor, core forgets the replacement
-/// payload to contain that second unwind. Repeating such a hostile payload can
-/// leak one replacement payload per callback panic. The callback must eventually
-/// return so shutdown can drain accepted events. It must not poll
+/// payload or a reporting payload panics again from its destructor, core forgets
+/// that one replacement payload and terminally disables the worker. Core
+/// destroys its last sink handle through a non-unwinding boundary; a sink
+/// destructor panic makes shutdown fail instead of leaving its outcome pending.
+/// The callback and the sink's destructor must eventually return so shutdown can
+/// drain accepted events. It must not poll
 /// [`crate::SupervisorApi::shutdown`] on the callback worker; that panics before
 /// shutdown starts. It must not wait for another thread that calls shutdown,
 /// because that can deadlock the drain.
@@ -1190,7 +1236,7 @@ impl OutputDispatcherShutdown {
 }
 
 pub(crate) struct OutputEventDispatcher {
-    worker: Mutex<Option<thread::JoinHandle<()>>>,
+    worker: Mutex<Option<thread::JoinHandle<PersistenceWorkerExit>>>,
     metrics: Arc<OutputDispatcherMetrics>,
     shutdown: OutputDispatcherShutdown,
 }
@@ -1226,16 +1272,34 @@ impl OutputEventDispatcher {
                         {
                             panic!("injected output persistence worker panic");
                         }
-                        if deliver_output_event(&sink, &dispatched.event) {
-                            saturating_increment(&worker_metrics.delivered);
-                        } else {
-                            worker_metrics.mark_callback_failed();
+                        match deliver_output_event(&sink, &dispatched.event) {
+                            PersistenceCallbackOutcome::Delivered => {
+                                saturating_increment(&worker_metrics.delivered);
+                            }
+                            PersistenceCallbackOutcome::Panicked => {
+                                worker_metrics.mark_callback_failed();
+                            }
+                            PersistenceCallbackOutcome::BoundaryFailed => {
+                                worker_metrics.mark_callback_failed();
+                                return true;
+                            }
                         }
                     }
+                    false
                 }));
-                if let Err(payload) = result {
+                let callback_loop_failed = match result {
+                    Ok(boundary_failed) => boundary_failed,
+                    Err(payload) => {
+                        dispose_sink_panic_payload(payload);
+                        true
+                    }
+                };
+                let sink_drop_panicked = !drop_value_without_unwind(sink);
+                if callback_loop_failed || sink_drop_panicked {
                     worker_metrics.mark_worker_failed();
-                    std::panic::resume_unwind(payload);
+                    PersistenceWorkerExit::Panicked
+                } else {
+                    PersistenceWorkerExit::Drained
                 }
             })?;
         Ok(Self {
@@ -1303,13 +1367,23 @@ impl OutputEventDispatcher {
             let worker = self.worker.lock().take();
             let outcome = self.shutdown.outcome.clone();
             if let Some(worker) = worker {
+                let metrics = Arc::clone(&self.metrics);
                 // The detached join owns completion publication. Canceling the
                 // caller can only remove that caller's wait, never the drain.
                 drop(tokio::task::spawn_blocking(move || {
-                    let completed = if worker.join().is_ok() {
-                        OutputDispatcherShutdownOutcome::Drained
-                    } else {
-                        OutputDispatcherShutdownOutcome::WorkerPanicked
+                    let completed = match worker.join() {
+                        Ok(PersistenceWorkerExit::Drained) => {
+                            OutputDispatcherShutdownOutcome::Drained
+                        }
+                        Ok(PersistenceWorkerExit::Panicked) => {
+                            metrics.mark_worker_failed();
+                            OutputDispatcherShutdownOutcome::WorkerPanicked
+                        }
+                        Err(payload) => {
+                            dispose_sink_panic_payload(payload);
+                            metrics.mark_worker_failed();
+                            OutputDispatcherShutdownOutcome::WorkerPanicked
+                        }
                     };
                     outcome.send_replace(completed);
                 }));
@@ -1323,7 +1397,7 @@ impl OutputEventDispatcher {
     }
 
     #[cfg(test)]
-    fn inject_worker_panic(&self) {
+    pub(crate) fn inject_worker_panic(&self) {
         self.metrics
             .panic_worker_once
             .store(true, Ordering::Release);
@@ -1333,11 +1407,9 @@ impl OutputEventDispatcher {
 impl Drop for OutputEventDispatcher {
     fn drop(&mut self) {
         self.metrics.close_admission();
-        if let Some(worker) = self.worker.get_mut().take()
-            && worker.thread().id() != thread::current().id()
-        {
-            let _ = worker.join();
-        }
+        // See StateEventDispatcher::drop: explicit shutdown observes drain;
+        // destructor cleanup only closes admission and detaches safely.
+        drop(self.worker.get_mut().take());
     }
 }
 
@@ -1347,7 +1419,10 @@ pub(crate) struct PersistenceSinks {
     pub(crate) config: PersistenceConfig,
 }
 
-fn deliver_state_event(sink: &TaskStateSinkHandle, event: TaskStateEvent) -> bool {
+fn deliver_state_event(
+    sink: &TaskStateSinkHandle,
+    event: TaskStateEvent,
+) -> PersistenceCallbackOutcome {
     let result = IN_STATE_SINK_CALLBACK.with(|active| {
         let was_active = active.replace(true);
         debug_assert!(!was_active);
@@ -1356,23 +1431,40 @@ fn deliver_state_event(sink: &TaskStateSinkHandle, event: TaskStateEvent) -> boo
         result
     });
     match result {
-        Ok(()) => true,
+        Ok(()) => PersistenceCallbackOutcome::Delivered,
         Err(payload) => {
-            handle_sink_panic(payload, "task_state");
+            if handle_sink_panic(payload, "task_state") {
+                PersistenceCallbackOutcome::Panicked
+            } else {
+                PersistenceCallbackOutcome::BoundaryFailed
+            }
+        }
+    }
+}
+
+fn dispose_sink_panic_payload(payload: Box<dyn std::any::Any + Send>) -> bool {
+    // A custom payload may panic again from Drop. Forget the replacement to
+    // contain that second unwind and keep the persistence worker alive.
+    match catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        Ok(()) => true,
+        Err(replacement) => {
+            std::mem::forget(replacement);
             false
         }
     }
 }
 
-fn dispose_sink_panic_payload(payload: Box<dyn std::any::Any + Send>) {
-    // A custom payload may panic again from Drop. Forget the replacement to
-    // contain that second unwind and keep the persistence worker alive.
-    if let Err(replacement) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
-        std::mem::forget(replacement);
+fn drop_value_without_unwind<T>(value: T) -> bool {
+    match catch_unwind(AssertUnwindSafe(|| drop(value))) {
+        Ok(()) => true,
+        Err(payload) => {
+            let _ = dispose_sink_panic_payload(payload);
+            false
+        }
     }
 }
 
-fn handle_sink_panic(payload: Box<dyn std::any::Any + Send>, sink: &'static str) {
+fn handle_sink_panic(payload: Box<dyn std::any::Any + Send>, sink: &'static str) -> bool {
     contain_sink_panic_with_report(payload, || {
         tracing::warn!(
             event = "persistence.event_dropped",
@@ -1380,16 +1472,27 @@ fn handle_sink_panic(payload: Box<dyn std::any::Any + Send>, sink: &'static str)
             error_kind = "sink_panicked",
             "persistence event dropped"
         );
-    });
+    })
 }
 
-fn contain_sink_panic_with_report(payload: Box<dyn std::any::Any + Send>, report: impl FnOnce()) {
-    dispose_sink_panic_payload(payload);
+fn contain_sink_panic_with_report(
+    payload: Box<dyn std::any::Any + Send>,
+    report: impl FnOnce(),
+) -> bool {
+    if !dispose_sink_panic_payload(payload) {
+        // Reporting is another user-extensible boundary. Stop after the first
+        // nested payload failure so one callback can retain at most one
+        // replacement payload.
+        return false;
+    }
     let result = catch_unwind(AssertUnwindSafe(report));
-    if let Err(payload) = result {
-        // Reporting is user-extensible through tracing subscribers. Do not let
-        // a reporting panic stop persistence delivery or recurse into tracing.
-        dispose_sink_panic_payload(payload);
+    match result {
+        Ok(()) => true,
+        Err(payload) => {
+            // Reporting is user-extensible through tracing subscribers. Do not
+            // let a reporting panic escape or recurse into tracing.
+            dispose_sink_panic_payload(payload)
+        }
     }
 }
 
@@ -1411,7 +1514,10 @@ pub(crate) fn assert_persistence_sink_is_not_shutting_down() {
     );
 }
 
-fn deliver_output_event(sink: &TaskOutputSinkHandle, event: &TaskOutputEvent) -> bool {
+fn deliver_output_event(
+    sink: &TaskOutputSinkHandle,
+    event: &TaskOutputEvent,
+) -> PersistenceCallbackOutcome {
     let result = IN_OUTPUT_SINK_CALLBACK.with(|active| {
         let was_active = active.replace(true);
         debug_assert!(!was_active);
@@ -1420,10 +1526,13 @@ fn deliver_output_event(sink: &TaskOutputSinkHandle, event: &TaskOutputEvent) ->
         result
     });
     match result {
-        Ok(()) => true,
+        Ok(()) => PersistenceCallbackOutcome::Delivered,
         Err(payload) => {
-            handle_sink_panic(payload, "task_output");
-            false
+            if handle_sink_panic(payload, "task_output") {
+                PersistenceCallbackOutcome::Panicked
+            } else {
+                PersistenceCallbackOutcome::BoundaryFailed
+            }
         }
     }
 }
@@ -1444,18 +1553,30 @@ mod tests {
         }
     }
 
-    struct DestructorPanickingOnceStateSink {
-        first: AtomicBool,
+    struct RepeatedDestructorPanickingStateSink {
+        calls: Arc<AtomicUsize>,
+        payload_drops: Arc<AtomicUsize>,
     }
 
     struct DestructorPanickingPayload;
 
+    struct CountedDestructorPanickingPayload(Arc<AtomicUsize>);
+
     struct ReplacementDestructorPanickingPayload;
+
+    struct DestructorPanickingSink;
 
     struct DropTrackedPanicPayload(Arc<AtomicBool>);
 
     impl Drop for DestructorPanickingPayload {
         fn drop(&mut self) {
+            std::panic::panic_any(ReplacementDestructorPanickingPayload);
+        }
+    }
+
+    impl Drop for CountedDestructorPanickingPayload {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
             std::panic::panic_any(ReplacementDestructorPanickingPayload);
         }
     }
@@ -1472,11 +1593,26 @@ mod tests {
         }
     }
 
-    impl TaskStateSink for DestructorPanickingOnceStateSink {
+    impl Drop for DestructorPanickingSink {
+        fn drop(&mut self) {
+            std::panic::panic_any(DestructorPanickingPayload);
+        }
+    }
+
+    impl TaskStateSink for DestructorPanickingSink {
+        fn on_event(&self, _event: &TaskStateEvent) {}
+    }
+
+    impl TaskOutputSink for DestructorPanickingSink {
+        fn on_event(&self, _event: &TaskOutputEvent) {}
+    }
+
+    impl TaskStateSink for RepeatedDestructorPanickingStateSink {
         fn on_event(&self, _event: &TaskStateEvent) {
-            if self.first.swap(false, Ordering::AcqRel) {
-                std::panic::panic_any(DestructorPanickingPayload);
-            }
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            std::panic::panic_any(CountedDestructorPanickingPayload(Arc::clone(
+                &self.payload_drops,
+            )));
         }
     }
 
@@ -1536,19 +1672,24 @@ mod tests {
         }
     }
 
-    struct DestructorPanickingFirstOutputSink {
+    struct RepeatedDestructorPanickingOutputSink {
         first: AtomicBool,
         entered: mpsc::SyncSender<()>,
         release: Mutex<mpsc::Receiver<()>>,
+        calls: Arc<AtomicUsize>,
+        payload_drops: Arc<AtomicUsize>,
     }
 
-    impl TaskOutputSink for DestructorPanickingFirstOutputSink {
+    impl TaskOutputSink for RepeatedDestructorPanickingOutputSink {
         fn on_event(&self, _event: &TaskOutputEvent) {
+            self.calls.fetch_add(1, Ordering::AcqRel);
             if self.first.swap(false, Ordering::AcqRel) {
                 self.entered.send(()).unwrap();
                 self.release.lock().recv().unwrap();
-                std::panic::panic_any(DestructorPanickingPayload);
             }
+            std::panic::panic_any(CountedDestructorPanickingPayload(Arc::clone(
+                &self.payload_drops,
+            )));
         }
     }
 
@@ -2050,6 +2191,37 @@ mod tests {
         assert!(!dispatcher.status().accepting());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn state_sink_destructor_panic_publishes_a_terminal_shutdown_outcome() {
+        let dispatcher = StateEventDispatcher::start(
+            Arc::new(DestructorPanickingSink),
+            NonZeroUsize::new(2).unwrap(),
+        )
+        .unwrap();
+
+        let first_dispatcher = Arc::clone(&dispatcher);
+        let first = tokio::spawn(async move {
+            first_dispatcher.shutdown().await;
+        });
+        let first = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("state sink destruction must publish a shutdown outcome")
+            .unwrap_err();
+        assert!(first.is_panic());
+        assert!(!dispatcher.status().accepting());
+        assert!(!dispatcher.status().healthy());
+
+        let second_dispatcher = Arc::clone(&dispatcher);
+        let second = tokio::spawn(async move {
+            second_dispatcher.shutdown().await;
+        });
+        let second = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the cached state shutdown outcome must remain available")
+            .unwrap_err();
+        assert!(second.is_panic());
+    }
+
     #[tokio::test]
     async fn state_worker_panic_closes_real_admission_without_panicking_later_callers() {
         let dispatcher =
@@ -2159,7 +2331,7 @@ mod tests {
         let reported = Arc::new(AtomicUsize::new(0));
         let payload: Box<dyn std::any::Any + Send> =
             Box::new(DropTrackedPanicPayload(Arc::clone(&dropped)));
-        contain_sink_panic_with_report(payload, || {
+        let boundary_survived = contain_sink_panic_with_report(payload, || {
             assert!(
                 dropped.load(Ordering::Acquire),
                 "sink panic payload must be disposed before reporting"
@@ -2169,51 +2341,94 @@ mod tests {
         });
         assert!(dropped.load(Ordering::Acquire));
         assert_eq!(reported.load(Ordering::Acquire), 1);
+        assert!(
+            !boundary_survived,
+            "a hostile reporting payload must terminally fail the callback boundary"
+        );
     }
 
-    #[tokio::test]
-    async fn destructor_panicking_state_payload_does_not_stop_later_delivery() {
-        let sink: TaskStateSinkHandle = Arc::new(DestructorPanickingOnceStateSink {
-            first: AtomicBool::new(true),
+    #[test]
+    fn hostile_sink_payload_skips_reporting_to_bound_retained_replacements() {
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let reported = Arc::new(AtomicUsize::new(0));
+        let payload: Box<dyn std::any::Any + Send> = Box::new(CountedDestructorPanickingPayload(
+            Arc::clone(&payload_drops),
+        ));
+        let report_count = Arc::clone(&reported);
+
+        let boundary_survived = contain_sink_panic_with_report(payload, move || {
+            report_count.fetch_add(1, Ordering::AcqRel);
+        });
+
+        assert!(!boundary_survived);
+        assert_eq!(payload_drops.load(Ordering::Acquire), 1);
+        assert_eq!(reported.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_hostile_state_payload_stops_after_one_bounded_leak() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let sink: TaskStateSinkHandle = Arc::new(RepeatedDestructorPanickingStateSink {
+            calls: Arc::clone(&calls),
+            payload_drops: Arc::clone(&payload_drops),
         });
         let dispatcher = StateEventDispatcher::start(sink, NonZeroUsize::new(2).unwrap()).unwrap();
 
-        let first = dispatcher.reserve(1).await.unwrap();
-        dispatch_state_event(&dispatcher, first, "destructor-panic:1");
-        let second = dispatcher.reserve(1).await.unwrap();
-        dispatch_state_event(&dispatcher, second, "destructor-panic:2");
+        let mut admission = dispatcher.reserve(3).await.unwrap();
+        let events = (1..=3)
+            .map(|index| {
+                let permit = admission.take_permit();
+                StateDispatchEvent::new(
+                    state_event(&format!("hostile-state-payload:{index}")),
+                    permit,
+                )
+            })
+            .collect();
+        dispatcher.dispatch(admission, events);
 
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let status = dispatcher.status();
-                if status.failed() == 1
-                    && status.delivered() == 1
-                    && status.queued() == 0
-                    && status.queued_bytes() == 0
-                {
+                if !status.accepting() && status.queued() == 0 && status.queued_bytes() == 0 {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the callback panic and later delivery must both be observed");
+        .expect("the hostile state callback must terminally drain its ownership");
         assert_eq!(
             dispatcher.status(),
             TaskStateSinkStatus {
-                accepting: true,
+                accepting: false,
                 healthy: false,
                 queued: 0,
                 capacity: 3,
                 queued_bytes: 0,
                 byte_capacity: DEFAULT_STATE_QUEUE_BYTE_CAPACITY.get(),
-                delivered: 1,
+                delivered: 0,
                 failed: 1,
             }
         );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(payload_drops.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            dispatcher.reserve(1).await,
+            Err(StateAdmissionClosed)
+        ));
 
-        dispatcher.shutdown().await;
-        assert!(!dispatcher.status().accepting());
+        for label in ["first", "cached"] {
+            let shutdown_dispatcher = Arc::clone(&dispatcher);
+            let shutdown = tokio::spawn(async move {
+                shutdown_dispatcher.shutdown().await;
+            });
+            let error = tokio::time::timeout(Duration::from_secs(5), shutdown)
+                .await
+                .unwrap_or_else(|_| panic!("{label} state shutdown outcome remained pending"))
+                .expect_err("a terminal state callback boundary must fail shutdown");
+            assert!(error.is_panic());
+        }
     }
 
     #[tokio::test]
@@ -2296,15 +2511,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn destructor_panicking_output_payload_does_not_stop_accepted_delivery() {
+    async fn repeated_hostile_output_payload_stops_after_one_bounded_leak() {
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
-        let sink: TaskOutputSinkHandle = Arc::new(DestructorPanickingFirstOutputSink {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let sink: TaskOutputSinkHandle = Arc::new(RepeatedDestructorPanickingOutputSink {
             first: AtomicBool::new(true),
             entered: entered_tx,
             release: Mutex::new(release_rx),
+            calls: Arc::clone(&calls),
+            payload_drops: Arc::clone(&payload_drops),
         });
-        let dispatcher = OutputEventDispatcher::start(sink, NonZeroUsize::new(2).unwrap()).unwrap();
+        let dispatcher =
+            Arc::new(OutputEventDispatcher::start(sink, NonZeroUsize::new(2).unwrap()).unwrap());
 
         assert!(dispatcher.try_dispatch(output_event("destructor-panic")));
         entered_rx
@@ -2316,14 +2536,14 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let status = dispatcher.status();
-                if status.failed() == 1 && status.delivered() == 1 && status.queued() == 0 {
+                if !status.accepting() && status.queued() == 0 {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the callback panic and accepted delivery must both be observed");
+        .expect("the hostile output callback must terminally drain its ownership");
         assert_eq!(
             dispatcher.status(),
             TaskOutputSinkStatus {
@@ -2331,13 +2551,25 @@ mod tests {
                 healthy: false,
                 queued: 0,
                 capacity: 2,
-                delivered: 1,
+                delivered: 0,
                 failed: 1,
                 dropped: 0,
             }
         );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(payload_drops.load(Ordering::Acquire), 1);
 
-        dispatcher.shutdown().await;
+        for label in ["first", "cached"] {
+            let shutdown_dispatcher = Arc::clone(&dispatcher);
+            let shutdown = tokio::spawn(async move {
+                shutdown_dispatcher.shutdown().await;
+            });
+            let error = tokio::time::timeout(Duration::from_secs(5), shutdown)
+                .await
+                .unwrap_or_else(|_| panic!("{label} output shutdown outcome remained pending"))
+                .expect_err("a terminal output callback boundary must fail shutdown");
+            assert!(error.is_panic());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2370,6 +2602,39 @@ mod tests {
         assert_eq!(dispatcher.status().delivered(), 1);
         assert!(!dispatcher.status().accepting());
         assert!(!dispatcher.status().healthy());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_sink_destructor_panic_publishes_a_terminal_shutdown_outcome() {
+        let dispatcher = Arc::new(
+            OutputEventDispatcher::start(
+                Arc::new(DestructorPanickingSink),
+                NonZeroUsize::new(2).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let first_dispatcher = Arc::clone(&dispatcher);
+        let first = tokio::spawn(async move {
+            first_dispatcher.shutdown().await;
+        });
+        let first = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("output sink destruction must publish a shutdown outcome")
+            .unwrap_err();
+        assert!(first.is_panic());
+        assert!(!dispatcher.status().accepting());
+        assert!(!dispatcher.status().healthy());
+
+        let second_dispatcher = Arc::clone(&dispatcher);
+        let second = tokio::spawn(async move {
+            second_dispatcher.shutdown().await;
+        });
+        let second = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the cached output shutdown outcome must remain available")
+            .unwrap_err();
+        assert!(second.is_panic());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

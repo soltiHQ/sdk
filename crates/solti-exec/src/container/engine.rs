@@ -297,6 +297,44 @@ pub trait ContainerEngine: Send + Sync + 'static {
     ) -> Result<Box<dyn ContainerAttempt>, ContainerEngineError>;
 }
 
+/// A pre-admitted finalizer engine with an awaitable terminal shutdown.
+///
+/// Implementations must reserve bounded finalizer admission before the first
+/// attempt-owned mutation, retain dropped lifecycle ownership, and make
+/// [`shutdown`](Self::shutdown) wait for all accepted ownership. The trait makes
+/// the required shutdown capability available to the application. It cannot
+/// prove the implementation's ownership behavior.
+#[async_trait]
+pub trait ContainerEngineFinalizer: ContainerEngine {
+    /// Closes lifecycle admission and waits for accepted ownership.
+    ///
+    /// The call must be terminal and safe to retry after caller cancellation.
+    async fn shutdown(&self) -> Result<(), ContainerEngineError>;
+}
+
+/// Retained shutdown capability for a typed pre-admitted finalizer binding.
+#[derive(Clone)]
+#[must_use = "retain this handle and call shutdown after every engine user has stopped"]
+pub struct ContainerEngineShutdownHandle {
+    engine: Arc<dyn ContainerEngineFinalizer>,
+}
+
+impl ContainerEngineShutdownHandle {
+    /// Closes lifecycle admission and waits for accepted ownership.
+    pub async fn shutdown(&self) -> Result<(), ContainerEngineError> {
+        self.engine.shutdown().await
+    }
+}
+
+impl fmt::Debug for ContainerEngineShutdownHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContainerEngineShutdownHandle")
+            .field("engine", &"<engine>")
+            .finish()
+    }
+}
+
 /// Declared ownership behavior when a container lifecycle future is dropped.
 ///
 /// This value is an integration-time declaration by the engine provider.
@@ -348,6 +386,25 @@ impl ContainerEngineBinding {
             engine,
             ownership: ContainerOwnershipContract::PreAdmittedFinalizer,
         }
+    }
+
+    /// Creates a pre-admitted binding and its typed shutdown capability.
+    ///
+    /// Prefer this constructor for custom finalizer engines. Retain the second
+    /// returned value and call [`ContainerEngineShutdownHandle::shutdown`] after
+    /// every supervisor and task reference using the binding has stopped.
+    pub fn pre_admitted_finalizer_with_shutdown<E>(
+        engine: Arc<E>,
+    ) -> (Self, ContainerEngineShutdownHandle)
+    where
+        E: ContainerEngineFinalizer,
+    {
+        let finalizer: Arc<dyn ContainerEngineFinalizer> = engine;
+        let bound_engine: Arc<dyn ContainerEngine> = finalizer.clone();
+        (
+            Self::pre_admitted_finalizer(bound_engine),
+            ContainerEngineShutdownHandle { engine: finalizer },
+        )
     }
 
     /// Returns the declared ownership behavior.
