@@ -176,8 +176,12 @@ fn spawn_first_available(
         match result {
             0 => return Ok(Some(pid)),
             libc::ENOENT | libc::ENOTDIR if candidate_is_missing(program) => {}
-            // Darwin execvp applies additional stat and shell-fallback rules
-            // for ambiguous errors. Preserve them through the fork path.
+            // Command mode is direct execution. Returning ENOEXEC prevents the
+            // compatibility path from interpreting executable text via /bin/sh.
+            libc::ENOEXEC => return Err(io::Error::from_raw_os_error(libc::ENOEXEC)),
+            // Darwin execvp applies additional stat and PATH-search rules for
+            // other ambiguous errors. Preserve that non-shell behavior through
+            // the fail-closed fork path.
             _ => return Ok(None),
         }
     }
@@ -374,6 +378,7 @@ impl SpawnAttributes {
 
     fn configure_signals(&mut self, reset_signals: &[libc::c_int]) -> io::Result<()> {
         // Match Rust `Command`: SIGPIPE is restored to its default disposition.
+        // SAFETY: an all-zero `sigset_t` is valid storage for `sigemptyset` on Darwin.
         let mut defaults = unsafe { std::mem::zeroed::<libc::sigset_t>() };
         // SAFETY: `defaults` is writable signal-set storage.
         cvt_errno(unsafe { libc::sigemptyset(&mut defaults) })?;
@@ -390,6 +395,7 @@ impl SpawnAttributes {
             | libc::POSIX_SPAWN_SETSIGDEF as c_short
             | POSIX_SPAWN_SETSID;
         if !reset_signals.is_empty() {
+            // SAFETY: an all-zero `sigset_t` is valid storage for `sigemptyset` on Darwin.
             let mut empty = unsafe { std::mem::zeroed::<libc::sigset_t>() };
             // SAFETY: `empty` is writable signal-set storage.
             cvt_errno(unsafe { libc::sigemptyset(&mut empty) })?;
@@ -692,7 +698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executable_text_without_shebang_requests_fork_fallback() {
+    async fn executable_text_without_shebang_fails_with_enoexec() {
         let directory = tempfile::TempDir::new().unwrap();
         let program = directory.path().join("plain-text");
         write_executable(&program, b"exit 0\n");
@@ -706,6 +712,10 @@ mod tests {
             passed_fds: &[],
             reset_signals: &[],
         };
-        assert!(spawn(&spec).unwrap().is_none());
+        let error = match spawn(&spec) {
+            Ok(_) => panic!("native spawn accepted executable text without a shebang"),
+            Err(error) => error,
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::ENOEXEC));
     }
 }

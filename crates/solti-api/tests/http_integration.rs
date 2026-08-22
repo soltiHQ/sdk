@@ -4,6 +4,7 @@
 
 use std::sync::atomic::{AtomicI64, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -11,6 +12,9 @@ use axum::http::{Method, Request, StatusCode};
 use base64::Engine as _;
 use http_body_util::BodyExt;
 use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 use tower::ServiceExt;
 
 use solti_api::{
@@ -189,6 +193,30 @@ fn router_with_metrics(handler: Arc<MockHandler>, metrics: Arc<MetricsProbe>) ->
     HttpApi::new(handler).with_metrics(metrics).router()
 }
 
+async fn tcp_http_request(address: std::net::SocketAddr, authorization: Option<&str>) -> String {
+    let mut stream = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(address))
+        .await
+        .expect("TCP connect must finish within the test bound")
+        .expect("connect to the loopback HTTP server");
+    let authorization = authorization
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "GET /apis/solti.io/v1/tasks HTTP/1.1\r\nHost: {address}\r\n{authorization}Connection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write the complete HTTP request");
+
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+        .await
+        .expect("HTTP response must finish within the test bound")
+        .expect("read the complete HTTP response");
+    String::from_utf8(response).expect("the HTTP response is UTF-8")
+}
+
 async fn body_json(resp: axum::http::Response<Body>) -> Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     if bytes.is_empty() {
@@ -226,6 +254,50 @@ fn assert_status(body: &Value, reason: &str, code: u16) {
     assert_eq!(body["reason"], reason);
     assert_eq!(body["code"], code);
     assert!(body["message"].is_string());
+}
+
+#[tokio::test]
+async fn real_tcp_http_server_enforces_auth_and_serves_the_generated_shape() {
+    let handler = Arc::new(MockHandler::default());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local HTTP listener");
+    let address = listener.local_addr().expect("read HTTP listener address");
+    let app = HttpApi::new(Arc::clone(&handler))
+        .with_auth(Token::new("socket-http-token").expect("valid test token"))
+        .router();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    let unauthenticated = tcp_http_request(address, None).await;
+    assert!(
+        unauthenticated.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "{unauthenticated}"
+    );
+    assert!(unauthenticated.contains("\"reason\":\"Unauthorized\""));
+    assert_eq!(handler.query_calls.load(Ordering::SeqCst), 0);
+
+    let authenticated = tcp_http_request(address, Some("Bearer socket-http-token")).await;
+    assert!(
+        authenticated.starts_with("HTTP/1.1 200 OK\r\n"),
+        "{authenticated}"
+    );
+    assert!(authenticated.contains("\"apiVersion\":\"solti.io/v1\""));
+    assert!(authenticated.contains("\"kind\":\"TaskList\""));
+    assert_eq!(handler.query_calls.load(Ordering::SeqCst), 1);
+
+    shutdown_tx.send(()).expect("HTTP server is still running");
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("HTTP server shuts down within the bound")
+        .expect("HTTP server task does not panic")
+        .expect("HTTP server exits cleanly");
 }
 
 #[test]

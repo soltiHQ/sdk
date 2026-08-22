@@ -133,6 +133,7 @@ impl PreparedCgroup {
         (procs, domain)
     }
 
+    #[cfg(any(feature = "subprocess", not(target_os = "linux"), test))]
     pub(super) fn into_domain(mut self) -> CgroupDomain {
         self.cleanup_on_drop = false;
         #[cfg(target_os = "linux")]
@@ -958,6 +959,7 @@ mod linux_impl {
 
         // SAFETY: fd refers to cgroup.procs and pid is a valid byte slice.
         let written = loop {
+            // SAFETY: `fd` refers to cgroup.procs and `pid` is a valid byte slice.
             let written = unsafe { libc::write(fd, pid.as_ptr().cast(), pid.len()) };
             if written >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                 break written;
@@ -1019,6 +1021,8 @@ mod linux_impl {
             let duplicated = duplicate_child_fd(file).unwrap();
 
             assert!(duplicated.as_raw_fd() >= 3);
+            // SAFETY: `duplicated` owns a valid live descriptor and `F_GETFD`
+            // does not dereference process memory.
             let flags = unsafe { libc::fcntl(duplicated.as_raw_fd(), libc::F_GETFD) };
             assert!(flags >= 0);
             assert_ne!(flags & libc::FD_CLOEXEC, 0);

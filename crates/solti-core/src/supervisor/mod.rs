@@ -42,6 +42,7 @@ use solti_model::{
 use solti_runner::RunnerRouter;
 use taskvisor::{Supervisor, TaskRef};
 use tokio::sync::{oneshot, watch};
+use tokio_util::task::TaskTracker;
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
@@ -75,6 +76,7 @@ use builder::SupervisorStartConfig;
 pub struct SupervisorApi {
     reconciler: Reconciler,
     task_operations: TaskLocks,
+    delete_operations: TaskTracker,
     spawn_gate: parking_lot::Mutex<()>,
     shutdown_started: AtomicBool,
     shutdown: ShutdownCoordinator,
@@ -155,6 +157,7 @@ impl SupervisorApi {
         self.reconciler.state.close_watches();
         self.reconciler.retention_stop.cancel();
         self.reconciler.preflight_stop.cancel();
+        self.delete_operations.close();
         self.reconciler.tasks.close();
         true
     }
@@ -172,10 +175,11 @@ impl SupervisorApi {
         });
         *installed = Some(Arc::clone(&operation));
         let reconciler = self.reconciler.clone();
+        let delete_operations = self.delete_operations.clone();
         let runtime = self.reconciler.runtime.clone();
         drop(installed);
         drop(runtime.spawn(async move {
-            let outcome = Self::run_shutdown_coordinator(reconciler).await;
+            let outcome = Self::run_shutdown_coordinator(reconciler, delete_operations).await;
             outcome_tx.send_replace(Some(outcome));
         }));
         operation
@@ -193,7 +197,11 @@ impl SupervisorApi {
         succeeded
     }
 
-    async fn run_shutdown_coordinator(reconciler: Reconciler) -> ShutdownOutcome {
+    async fn run_shutdown_coordinator(
+        reconciler: Reconciler,
+        delete_operations: TaskTracker,
+    ) -> ShutdownOutcome {
+        delete_operations.wait().await;
         let runtime = reconciler.runtime.clone();
         let runtime_shutdown = runtime.spawn(Self::run_runtime_shutdown(reconciler.clone()));
         let runtime_outcome = match runtime_shutdown.await {
@@ -303,6 +311,7 @@ impl SupervisorApi {
         let api = Self {
             reconciler,
             task_operations: TaskLocks::default(),
+            delete_operations: TaskTracker::new(),
             spawn_gate: parking_lot::Mutex::new(()),
             shutdown_started: AtomicBool::new(false),
             shutdown: ShutdownCoordinator::new(),
@@ -422,6 +431,8 @@ impl SupervisorApi {
     /// A missing resource is created when preconditions are empty.
     /// A hidden resource is reported as missing.
     /// The predicate and commit share one per-name lock.
+    /// The predicate must be pure and non-blocking. It must not call back into
+    /// [`SupervisorApi`] because it runs synchronously while that lock is held.
     ///
     /// # Errors
     ///
@@ -669,6 +680,8 @@ impl SupervisorApi {
     /// Subscribes through an adapter visibility predicate.
     ///
     /// The predicate, runtime binding, and subscription use the same per-name locks.
+    /// The predicate must be pure and non-blocking. It must not call back into
+    /// [`SupervisorApi`] because it runs synchronously while those locks are held.
     /// The returned generation identifies the bound desired state.
     /// Returns `None` for missing, hidden, or unbound state, or when the output
     /// channel is closed or its subscriber count cannot be represented.
@@ -785,6 +798,9 @@ impl SupervisorApi {
     /// Continuation pages reconstruct the original UID snapshot without
     /// consulting the current task. Historical runs are filtered by their
     /// workload snapshot before pagination.
+    /// The first-page predicate must be pure and non-blocking. It must not call
+    /// back into [`SupervisorApi`] because it runs synchronously while the
+    /// per-name lock is held.
     ///
     /// # Errors
     ///
@@ -939,11 +955,15 @@ impl SupervisorApi {
     /// The current runtime reaches a terminal logical outcome first.
     /// A Taskvisor `ForceAborted` runtime may remain physically active after
     /// the resource and run history are removed.
-    /// A missing task is an idempotent no-op.
+    /// A missing task is an idempotent no-op that returns before SDK-owned
+    /// delete registration or persistence admission. After the delete worker
+    /// is registered, dropping this method's future stops only the caller's
+    /// wait. Shutdown drains the registered operation.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::ShuttingDown`] when state mutation admission has closed.
+    /// For a retained task, returns [`CoreError::ShuttingDown`] when shutdown
+    /// has closed operation or state mutation admission.
     /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
     #[instrument(
         level = "debug",
@@ -951,42 +971,54 @@ impl SupervisorApi {
         fields(event = "task.delete", task_name = %name)
     )]
     pub async fn delete_task(&self, name: &TaskId) -> Result<(), CoreError> {
-        let _operation = self.task_operations.lock(name).await;
-        self.delete_task_locked(name).await
+        let operation = self.task_operations.lock(name).await;
+        if !self.reconciler.state.contains_task(name) {
+            return Ok(());
+        }
+        self.delete_task_owned(name, operation).await
     }
 
     /// Deletes a task after checking write preconditions.
+    ///
+    /// After the delete worker is registered, dropping this method's future
+    /// stops only the caller's wait. Shutdown drains the registered operation.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::NotFound`] when the task is missing.
     /// Returns [`CoreError::Conflict`] when a guard does not match.
-    /// Returns [`CoreError::ShuttingDown`] when state mutation admission has closed.
+    /// Returns [`CoreError::ShuttingDown`] when shutdown has closed operation
+    /// or state mutation admission.
     /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
     pub async fn delete_task_with_preconditions(
         &self,
         name: &TaskId,
         preconditions: WritePreconditions,
     ) -> Result<(), CoreError> {
-        let _operation = self.task_operations.lock(name).await;
+        let operation = self.task_operations.lock(name).await;
         let task = self
             .reconciler
             .state
             .get_retained(name)
             .ok_or_else(|| CoreError::NotFound(name.to_string()))?;
         TaskState::check_write_preconditions(&task, &preconditions)?;
-        self.delete_task_locked(name).await
+        self.delete_task_owned(name, operation).await
     }
 
     /// Deletes a task through an adapter visibility predicate.
     ///
     /// Missing and hidden tasks are reported as missing.
+    /// The predicate must be pure and non-blocking. It must not call back into
+    /// [`SupervisorApi`] because it runs synchronously while the per-name lock is held.
+    /// After the delete worker is registered, dropping this method's future
+    /// stops only the caller's wait. Shutdown drains the registered operation.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::NotFound`] when the task is missing or hidden.
     /// Returns [`CoreError::Conflict`] when a guard does not match.
-    /// Returns [`CoreError::ShuttingDown`] when state mutation admission has closed.
+    /// Returns [`CoreError::ShuttingDown`] when shutdown has closed operation
+    /// or state mutation admission.
     /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
     pub async fn delete_task_where<F>(
         &self,
@@ -997,7 +1029,7 @@ impl SupervisorApi {
     where
         F: Fn(&Task) -> bool,
     {
-        let _operation = self.task_operations.lock(name).await;
+        let operation = self.task_operations.lock(name).await;
         let Some(task) = self.reconciler.state.get_retained(name) else {
             return Err(CoreError::NotFound(name.to_string()));
         };
@@ -1005,32 +1037,78 @@ impl SupervisorApi {
             return Err(CoreError::NotFound(name.to_string()));
         }
         TaskState::check_write_preconditions(&task, &preconditions)?;
-        self.delete_task_locked(name).await
+        self.delete_task_owned(name, operation).await
     }
 
-    async fn delete_task_locked(&self, name: &TaskId) -> Result<(), CoreError> {
-        if let Some(settled) = self.reconciler.cancel_scheduled(name) {
+    async fn run_delete_task(
+        reconciler: Reconciler,
+        name: TaskId,
+        _operation: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(), CoreError> {
+        if let Some(settled) = reconciler.cancel_scheduled(&name) {
             settled.cancelled().await;
         }
-        let _runtime_operation = self.reconciler.runtime_operations.lock(name).await;
+        let _runtime_operation = reconciler.runtime_operations.lock(&name).await;
         debug!(
             event = "task.delete",
             task_name = %name,
             stage = "started",
             "deleting task"
         );
-        let cancellation = Self::cancel_bound(&self.reconciler, name).await?;
+        let cancellation = Self::cancel_bound(&reconciler, &name).await?;
         let tv = cancellation.as_ref().map(|(binding, _)| binding.tv);
-        self.reconciler
+        reconciler
             .observer
-            .delete_after_cleanup(name, tv)
+            .delete_after_cleanup(&name, tv)
             .await
             .map_err(|_| CoreError::ShuttingDown)?;
         Ok(())
     }
 
+    /// Registers one checked delete and transfers its per-name guard to an
+    /// SDK-owned worker.
+    async fn delete_task_owned(
+        &self,
+        name: &TaskId,
+        operation: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(), CoreError> {
+        let completion = {
+            let _spawn = self.spawn_gate.lock();
+            if self.shutdown_started.load(Ordering::Acquire) {
+                return Err(CoreError::ShuttingDown);
+            }
+
+            let (sender, completion) = oneshot::channel();
+            let reconciler = self.reconciler.clone();
+            let worker_name = name.clone();
+            let runtime = self.reconciler.runtime.clone();
+            let worker = self.delete_operations.spawn_on(
+                async move {
+                    let result = Self::run_delete_task(reconciler, worker_name, operation).await;
+                    let _ = sender.send(result);
+                },
+                &runtime,
+            );
+            drop(worker);
+            completion
+        };
+
+        match completion.await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    event = "task.delete_unavailable",
+                    task_name = %name,
+                    "supervisor-owned delete worker became unavailable"
+                );
+                Err(CoreError::ShuttingDown)
+            }
+        }
+    }
+
     /// Stops Taskvisor and waits for SDK-owned workers.
     ///
+    /// Accepted delete operations drain before Taskvisor shutdown starts.
     /// Task watches close before runtime shutdown.
     /// Reconciliation, completion, retention, and persistence workers are drained.
     /// A Taskvisor `ForceAborted` outcome is logical: user task code that did

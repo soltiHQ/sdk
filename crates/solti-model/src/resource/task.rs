@@ -597,7 +597,7 @@ impl Task {
     /// # Errors
     ///
     /// Returns [`ModelError::Invalid`] when desired state or a changed
-    /// `resource_version` is invalid.
+    /// `resource_version` is invalid, or when generation is exhausted.
     pub fn apply_desired(
         &mut self,
         labels: Labels,
@@ -628,15 +628,24 @@ impl Task {
             spec,
         } = desired;
 
-        self.metadata.set_resource_version(resource_version)?;
+        let next_generation = spec_changed
+            .then(|| self.metadata.checked_next_generation())
+            .transpose()?;
+
+        let mut object_metadata = self.metadata.clone();
+        object_metadata.set_resource_version(resource_version)?;
         if metadata_changed {
-            self.metadata
-                .apply_metadata(metadata.labels, metadata.annotations);
+            object_metadata.apply_metadata(metadata.labels, metadata.annotations);
         }
-        if spec_changed {
+        let status = next_generation.map(|generation| {
+            object_metadata.set_generation(generation);
+            self.status.pending_after(generation)
+        });
+
+        self.metadata = object_metadata;
+        if let Some(status) = status {
             self.spec = spec;
-            self.metadata.bump_generation();
-            self.status = self.status.pending_after(self.metadata.generation());
+            self.status = status;
         }
         Ok(if spec_changed {
             DesiredChange::Spec
@@ -1299,6 +1308,36 @@ mod tests {
         );
         assert_eq!(task.status().reconciled().observed_generation(), 2);
         assert_eq!(task.slot(), "slot-b");
+    }
+
+    #[test]
+    fn spec_apply_rejects_exhausted_generation_without_mutating_reconstructed_task() {
+        let mut stored = serde_json::to_value(task()).unwrap();
+        stored["metadata"]["generation"] = serde_json::json!(u64::MAX);
+        let mut task: Task = serde_json::from_value(stored).unwrap();
+        let before = serde_json::to_vec(&task).unwrap();
+        let mut labels = Labels::new();
+        labels.insert("tier", "production");
+
+        let error = task
+            .apply_desired(labels, Annotations::new(), spec("slot-b"), "2")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelError::Invalid(message) if message == "metadata.generation is exhausted"
+        ));
+        assert_eq!(serde_json::to_vec(&task).unwrap(), before);
+
+        let unchanged_spec = task.spec().clone();
+        let mut labels = Labels::new();
+        labels.insert("tier", "production");
+        assert_eq!(
+            task.apply_desired(labels, Annotations::new(), unchanged_spec, "2")
+                .unwrap(),
+            DesiredChange::Metadata
+        );
+        assert_eq!(task.metadata().generation(), u64::MAX);
     }
 
     #[test]

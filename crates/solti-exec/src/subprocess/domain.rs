@@ -494,6 +494,7 @@ struct DropFinalizerState {
     healthy: AtomicBool,
     quarantined: AtomicUsize,
     worker_stopped: AtomicBool,
+    shutdown_changed: tokio::sync::Notify,
     #[cfg(test)]
     panic_worker_once: AtomicBool,
     #[cfg(test)]
@@ -571,6 +572,7 @@ impl DropFinalizerDomain {
             healthy: AtomicBool::new(true),
             quarantined: AtomicUsize::new(0),
             worker_stopped: AtomicBool::new(false),
+            shutdown_changed: tokio::sync::Notify::new(),
             #[cfg(test)]
             panic_worker_once: AtomicBool::new(false),
             #[cfg(test)]
@@ -653,19 +655,33 @@ impl DropFinalizerDomain {
     ///
     /// Cancellation leaves admission closed and the worker handle retained.
     pub(super) async fn shutdown(&self, timeout: Duration) -> io::Result<()> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "subprocess cleanup shutdown timeout exceeds the supported range",
+                )
+            })?;
         self.inner.state.close_admission();
-        let deadline = tokio::time::Instant::now().checked_add(timeout);
         loop {
+            // Register before inspecting state. A terminal worker transition
+            // between this check and `.await` then wakes this exact waiter.
+            let changed = self.inner.state.shutdown_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+
             let status = self.status();
             if status.quarantined > 0 {
                 return Err(io::Error::other(
                     "subprocess cleanup ownership is quarantined",
                 ));
             }
-            if status.owned == 0
-                && self.inner.state.worker_stopped.load(Ordering::Acquire)
-                && worker_is_finished(&self.inner.worker)
-            {
+            if status.owned == 0 && self.inner.state.worker_stopped.load(Ordering::Acquire) {
+                // The worker publishes `worker_stopped` only after all
+                // finalizer work is complete. Join the terminal thread here;
+                // requiring `JoinHandle::is_finished()` would race the last
+                // notification against the thread's return epilogue.
                 #[cfg(test)]
                 if self
                     .inner
@@ -675,7 +691,7 @@ impl DropFinalizerDomain {
                 {
                     self.inner.state.healthy.store(false, Ordering::Release);
                 }
-                join_finished_worker(&self.inner.worker)?;
+                join_stopped_worker(&self.inner.worker)?;
                 return if self.inner.state.healthy.load(Ordering::Acquire) {
                     Ok(())
                 } else {
@@ -685,26 +701,22 @@ impl DropFinalizerDomain {
                     ))
                 };
             }
-            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            if tokio::time::Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "subprocess cleanup shutdown deadline exceeded",
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                // Re-check terminal state once at the deadline. Completion
+                // keeps precedence when it races the timer.
+                continue;
+            }
         }
     }
 }
 
-fn worker_is_finished(worker: &Mutex<Option<std::thread::JoinHandle<()>>>) -> bool {
-    worker
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .is_none_or(std::thread::JoinHandle::is_finished)
-}
-
-fn join_finished_worker(worker: &Mutex<Option<std::thread::JoinHandle<()>>>) -> io::Result<()> {
+fn join_stopped_worker(worker: &Mutex<Option<std::thread::JoinHandle<()>>>) -> io::Result<()> {
     let worker = worker
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -793,6 +805,7 @@ struct DropFinalizerPermit {
 impl Drop for DropFinalizerPermit {
     fn drop(&mut self) {
         self.state.owned.fetch_sub(1, Ordering::AcqRel);
+        self.state.shutdown_changed.notify_waiters();
     }
 }
 
@@ -1212,6 +1225,7 @@ fn run_drop_finalizer(state: Arc<DropFinalizerState>, receiver: &Receiver<Droppe
         }
     }
     state.worker_stopped.store(true, Ordering::Release);
+    state.shutdown_changed.notify_waiters();
 }
 
 const DROP_FINALIZER_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -1303,6 +1317,7 @@ fn run_drop_finalizer_loop(
                 .quarantined
                 .fetch_add(quarantined_jobs.len(), Ordering::AcqRel);
             lock_quarantine(state).extend(quarantined_jobs);
+            state.shutdown_changed.notify_waiters();
         }
         let active_remains = input_closed && !lock_active(state).is_empty();
         if active_remains {

@@ -30,6 +30,7 @@
 
 use std::{
     fmt,
+    future::Future,
     process::Stdio,
     sync::{
         Arc,
@@ -38,7 +39,7 @@ use std::{
     time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
@@ -67,9 +68,12 @@ use crate::subprocess::{
     task::SubprocessTaskConfig,
 };
 use crate::{
-    output::{LogConfig, OutputReaderFailure, StreamKind, classify_output_reader_join, log_stream},
+    output::{LogConfig, OutputDrain, OutputTasks, StreamKind, log_stream},
     registration::validate_runner_name,
 };
+
+#[cfg(unix)]
+use crate::subprocess::exec_unix::ExecvePlan;
 
 /// Runner that executes [`TaskWorkload::Subprocess`] as OS subprocesses.
 ///
@@ -91,6 +95,9 @@ use crate::{
 /// On Unix, one attempt owns one session and process group.
 /// The runner waits up to five seconds for output pipes after the leader exits.
 /// It then signals descendants that remain inside its cgroup or process group.
+/// Cancellation wins a tie with leader exit and remains latched while output,
+/// reap, and cleanup ownership is discharged. A physical lifecycle failure is
+/// still fatal and is not hidden by cancellation.
 ///
 /// The runner owns the wait status of every child it starts.
 /// A dropped task future moves the child and host domain to one reaper worker.
@@ -320,7 +327,6 @@ impl SubprocessRunner {
 }
 
 /// Subprocess mode resolved during task construction.
-#[derive(Debug)]
 struct Resolved {
     command: String,
     args: Vec<String>,
@@ -330,6 +336,16 @@ struct Resolved {
     /// Command mode stores `None`.
     /// Script mode creates anonymous backing storage for each attempt.
     script_body: Option<Arc<str>>,
+}
+
+impl fmt::Debug for Resolved {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Resolved")
+            .field("argument_count", &self.args.len())
+            .field("script_present", &self.script_body.is_some())
+            .finish()
+    }
 }
 
 /// Immutable subprocess settings resolved while a task is built.
@@ -459,6 +475,7 @@ fn build_command(ctx: &TaskExecContext, script_path: Option<&std::path::Path>) -
     if let Some(cwd) = &ctx.pinned_cwd {
         cwd.attach_to_command(&mut cmd);
     }
+    #[cfg(not(unix))]
     apply_env_policy(&mut cmd, ctx);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
@@ -498,6 +515,7 @@ fn attach_attempt_session(command: &mut Command) {
 /// `Allowlist` also requires that the allowlist does not name `PATH`.
 ///
 /// [safe `PATH`]: crate::subprocess::backend::SAFE_DEFAULT_PATH
+#[cfg(not(unix))]
 fn apply_env_policy(cmd: &mut Command, ctx: &TaskExecContext) {
     use crate::subprocess::backend::{EnvPolicy, SAFE_DEFAULT_PATH};
 
@@ -531,9 +549,9 @@ fn apply_env_policy(cmd: &mut Command, ctx: &TaskExecContext) {
     }
 }
 
-/// Materializes the exact child environment for native macOS spawn.
-#[cfg(target_os = "macos")]
-fn macos_child_environment(ctx: &TaskExecContext) -> BTreeMap<OsString, OsString> {
+/// Materializes the exact Unix child environment for direct exec.
+#[cfg(unix)]
+fn unix_child_environment(ctx: &TaskExecContext) -> BTreeMap<OsString, OsString> {
     use crate::subprocess::backend::{EnvPolicy, SAFE_DEFAULT_PATH};
 
     let mut environment = match ctx.runner_cfg.env_policy() {
@@ -569,6 +587,21 @@ fn macos_child_environment(ctx: &TaskExecContext) -> BTreeMap<OsString, OsString
     environment
 }
 
+/// Materializes argv entries after `argv[0]` for direct exec.
+#[cfg(unix)]
+fn unix_child_arguments(
+    ctx: &TaskExecContext,
+    script_path: Option<&std::path::Path>,
+) -> Vec<OsString> {
+    let mut arguments =
+        Vec::with_capacity(ctx.task_cfg.args.len() + usize::from(script_path.is_some()));
+    if let Some(script_path) = script_path {
+        arguments.push(script_path.as_os_str().to_owned());
+    }
+    arguments.extend(ctx.task_cfg.args.iter().map(OsString::from));
+    arguments
+}
+
 /// Adds operation context to an I/O error.
 fn io_with_context(context: &str, source: std::io::Error) -> std::io::Error {
     std::io::Error::new(source.kind(), format!("{context}: {source}"))
@@ -600,8 +633,11 @@ fn io_error_is_permanent(error: &std::io::Error) -> bool {
 }
 
 fn task_io_error(context: &str, source: std::io::Error) -> TaskError {
+    // Preserve raw errno classification before adding human-readable context.
+    // `io::Error::new` intentionally does not retain `raw_os_error`.
+    let permanent = io_error_is_permanent(&source);
     let error = io_with_context(context, source);
-    if io_error_is_permanent(&error) {
+    if permanent {
         TaskError::fatal_from(error)
     } else {
         TaskError::fail_from(error)
@@ -781,6 +817,17 @@ async fn prepare_backend(
     }
 }
 
+fn cancellation_wins_pre_spawn<T>(
+    cancel: &TaskContext,
+    result: Result<T, TaskError>,
+) -> Result<T, TaskError> {
+    if cancel.is_cancelled() {
+        Err(TaskError::Canceled)
+    } else {
+        result
+    }
+}
+
 /// Attaches process state, rlimits, cgroup membership, and security controls.
 fn apply_backend(
     cmd: &mut Command,
@@ -794,6 +841,7 @@ fn spawn_with_command(
     ctx: &TaskExecContext,
     script: Option<&AnonymousScript>,
     prepared: PreparedProcessOwnership,
+    #[cfg(unix)] environment: &BTreeMap<OsString, OsString>,
 ) -> Result<
     (
         ProcessChild,
@@ -802,10 +850,32 @@ fn spawn_with_command(
     ),
     TaskError,
 > {
-    let mut cmd = build_command(ctx, script.map(AnonymousScript::argument_path));
+    let script_path = script.map(AnonymousScript::argument_path);
+    let mut cmd = build_command(ctx, script_path);
     apply_fd_boundary(&mut cmd, ctx, script)?;
+    #[cfg(unix)]
+    let direct_exec = {
+        let arguments = unix_child_arguments(ctx, script_path);
+
+        // Keep `Command` and the final execve hook on one exact environment
+        // snapshot. This preserves inherited non-UTF-8 entries too.
+        cmd.env_clear();
+        cmd.envs(environment);
+        ExecvePlan::prepare(OsStr::new(&ctx.task_cfg.command), &arguments, environment).map_err(
+            |error| {
+                record_runner_error(
+                    &ctx.metrics,
+                    RunnerType::Subprocess,
+                    RunnerErrorKind::SpawnFailed,
+                );
+                task_io_error("direct executable preparation failed", error)
+            },
+        )?
+    };
     let (prepared, reservation) = prepared.into_parts();
     let host_process_domain = apply_backend(&mut cmd, ctx, prepared);
+    #[cfg(unix)]
+    direct_exec.attach(&mut cmd);
     let ownership = AttachedProcessOwnership::new(host_process_domain, reservation);
     let child = cmd.spawn().map_err(|error| {
         record_runner_error(
@@ -852,6 +922,7 @@ fn try_spawn_macos(
     ctx: &TaskExecContext,
     script: Option<&AnonymousScript>,
     prepared: crate::host::PreparedHostProcessAttempt,
+    environment: &BTreeMap<OsString, OsString>,
 ) -> Result<MacosSpawnAttempt, TaskError> {
     let Some(reset_signals) = prepared.macos_spawn_signals() else {
         return Ok(MacosSpawnAttempt::Fallback {
@@ -860,12 +931,7 @@ fn try_spawn_macos(
         });
     };
 
-    let mut args = Vec::with_capacity(ctx.task_cfg.args.len() + usize::from(script.is_some()));
-    if let Some(script) = script {
-        args.push(script.argument_path().as_os_str().to_owned());
-    }
-    args.extend(ctx.task_cfg.args.iter().map(OsString::from));
-    let environment = macos_child_environment(ctx);
+    let args = unix_child_arguments(ctx, script.map(AnonymousScript::argument_path));
     let mut passed_fds = ctx.runner_cfg.passed_fds();
     if let Some(script) = script {
         passed_fds.push(script.as_raw_fd());
@@ -873,7 +939,7 @@ fn try_spawn_macos(
     let spec = crate::subprocess::spawn_macos::SpawnSpec {
         command: OsStr::new(&ctx.task_cfg.command),
         args: &args,
-        env: &environment,
+        env: environment,
         cwd: ctx.pinned_cwd.as_ref(),
         passed_fds: &passed_fds,
         reset_signals: &reset_signals,
@@ -960,108 +1026,120 @@ fn evaluate_exit(
     }
 }
 
-#[cfg(not(test))]
-const LOG_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-#[cfg(test)]
-const LOG_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
-
 enum AttemptCompletion {
     LeaderExited(std::io::Result<()>),
     Canceled,
 }
 
-/// Attempt-owned stdout and stderr readers.
+/// Observes the first logical completion signal for an active attempt.
 ///
-/// Dropping this owner aborts both tasks. This includes Taskvisor force-abort
-/// dropping the outer attempt future before normal output draining begins.
-struct OutputTasks {
-    stdout: Option<tokio::task::JoinHandle<()>>,
-    stderr: Option<tokio::task::JoinHandle<()>>,
+/// This mirrors [`TaskContext::run_until_cancelled`]: cancellation wins when
+/// both futures are ready in the same poll.
+async fn observe_attempt_completion<F>(cancel: &TaskContext, observe_exit: F) -> AttemptCompletion
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            debug!(
+                event = "subprocess.cancellation",
+                "cancellation requested; terminating subprocess domain",
+            );
+            AttemptCompletion::Canceled
+        }
+        result = observe_exit => AttemptCompletion::LeaderExited(result),
+    }
 }
 
-enum OutputDrain {
-    Completed {
-        stdout: Option<OutputReaderFailure>,
-        stderr: Option<OutputReaderFailure>,
-    },
-    TimedOut,
+/// Sticky logical cancellation state for one attempt's physical teardown.
+struct AttemptCancellationLatch<'a> {
+    cancel: &'a TaskContext,
+    latched: bool,
 }
 
-impl OutputTasks {
-    /// Starts both readers and owns each handle before another task is spawned.
-    fn start(
-        stdout: ChildOutput,
-        stderr: ChildOutput,
-        run_id: Arc<str>,
-        logger: LogConfig,
-        sink: Option<OutputSink>,
-    ) -> Self {
-        let mut tasks = Self {
-            stdout: None,
-            stderr: None,
-        };
-
-        let stdout_run_id = Arc::clone(&run_id);
-        let stdout_sink = sink.clone();
-        let stdout_span = tracing::Span::current();
-        tasks.stdout = Some(tokio::spawn(
-            async move {
-                log_stream(
-                    stdout,
-                    &stdout_run_id,
-                    StreamKind::Stdout,
-                    &logger,
-                    stdout_sink.as_ref(),
-                )
-                .await;
-            }
-            .instrument(stdout_span),
-        ));
-
-        let stderr_span = tracing::Span::current();
-        tasks.stderr = Some(tokio::spawn(
-            async move {
-                log_stream(stderr, &run_id, StreamKind::Stderr, &logger, sink.as_ref()).await;
-            }
-            .instrument(stderr_span),
-        ));
-        tasks
-    }
-
-    /// Drains both readers within the existing normal-completion grace period.
-    async fn drain(&mut self) -> OutputDrain {
-        let stdout = self
-            .stdout
-            .as_mut()
-            .expect("stdout reader remains owned until drain or abort");
-        let stderr = self
-            .stderr
-            .as_mut()
-            .expect("stderr reader remains owned until drain or abort");
-        let joined =
-            tokio::time::timeout(LOG_DRAIN_GRACE, async { tokio::join!(stdout, stderr) }).await;
-        match joined {
-            Ok((stdout, stderr)) => {
-                self.stdout.take();
-                self.stderr.take();
-                OutputDrain::Completed {
-                    stdout: classify_output_reader_join(stdout),
-                    stderr: classify_output_reader_join(stderr),
-                }
-            }
-            Err(_) => OutputDrain::TimedOut,
+impl<'a> AttemptCancellationLatch<'a> {
+    fn after_completion(cancel: &'a TaskContext, completion: &AttemptCompletion) -> Self {
+        Self {
+            cancel,
+            latched: matches!(completion, AttemptCompletion::Canceled),
         }
     }
 
-    /// Aborts and releases both reader task handles.
-    fn abort(&mut self) {
-        if let Some(stdout) = self.stdout.take() {
-            stdout.abort();
+    /// Completes one mandatory post-exit ownership step while latching cancellation.
+    ///
+    /// Cancellation does not drop `operation`: output drain, leader reap, and
+    /// host cleanup own physical resources and must finish. Their errors retain
+    /// fatal precedence; the latch determines the result only after a
+    /// successful lifecycle cleanup.
+    async fn complete<F>(&mut self, operation: F) -> F::Output
+    where
+        F: Future,
+    {
+        if self.latched {
+            return operation.await;
         }
-        if let Some(stderr) = self.stderr.take() {
-            stderr.abort();
+
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => {
+                self.latched = true;
+                operation.await
+            }
+            output = &mut operation => {
+                // The token is sticky. This closes the ready-operation versus
+                // cancellation race at the completion boundary.
+                self.refresh();
+                output
+            }
         }
     }
+
+    fn refresh(&mut self) {
+        self.latched |= self.cancel.is_cancelled();
+    }
+
+    fn is_latched(&self) -> bool {
+        self.latched
+    }
+}
+
+/// Starts both subprocess readers and enrolls each spawned task immediately.
+fn start_output_tasks(
+    stdout: ChildOutput,
+    stderr: ChildOutput,
+    run_id: Arc<str>,
+    logger: LogConfig,
+    sink: Option<OutputSink>,
+) -> OutputTasks {
+    let mut tasks = OutputTasks::new();
+
+    let stdout_run_id = Arc::clone(&run_id);
+    let stdout_sink = sink.clone();
+    let stdout_span = tracing::Span::current();
+    tasks.spawn_stdout(
+        async move {
+            log_stream(
+                stdout,
+                &stdout_run_id,
+                StreamKind::Stdout,
+                &logger,
+                stdout_sink.as_ref(),
+            )
+            .await;
+        }
+        .instrument(stdout_span),
+    );
+
+    let stderr_span = tracing::Span::current();
+    tasks.spawn_stderr(
+        async move {
+            log_stream(stderr, &run_id, StreamKind::Stderr, &logger, sink.as_ref()).await;
+        }
+        .instrument(stderr_span),
+    );
+    tasks
 }
 
 fn report_output_drain(
@@ -1102,12 +1180,6 @@ fn report_output_drain(
     }
 }
 
-impl Drop for OutputTasks {
-    fn drop(&mut self) {
-        self.abort();
-    }
-}
-
 /// Executes one subprocess attempt.
 async fn run_subprocess(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Result<(), TaskError> {
     let Some(attempt) = next_attempt(&ctx.attempt) else {
@@ -1131,6 +1203,10 @@ async fn run_subprocess_attempt(
     cancel: TaskContext,
     attempt: u32,
 ) -> Result<(), TaskError> {
+    if cancel.is_cancelled() {
+        return Err(TaskError::Canceled);
+    }
+
     let sink = request_output_sink(
         &ctx.output_publisher,
         &ctx.resource_name,
@@ -1167,24 +1243,36 @@ async fn run_subprocess_attempt(
         .as_ref()
         .map(|base| format!("{base}-{attempt:x}"));
     let prepared_host_process =
-        prepare_backend(&ctx.runner_cfg, &ctx.metrics, cgroup_name, drop_finalizer).await?;
+        prepare_backend(&ctx.runner_cfg, &ctx.metrics, cgroup_name, drop_finalizer).await;
+    let prepared_host_process = cancellation_wins_pre_spawn(&cancel, prepared_host_process)?;
 
     // Script mode: prepare anonymous attempt-local backing storage.
     // The descriptor remains owned until the attempt ends.
     let (script, prepared_host_process) = match &ctx.script_body {
         Some(body) => {
             let materialized =
-                materialize_script(&ctx.metrics, Arc::clone(body), prepared_host_process).await?;
+                materialize_script(&ctx.metrics, Arc::clone(body), prepared_host_process).await;
+            let materialized = cancellation_wins_pre_spawn(&cancel, materialized)?;
             let (script, prepared) = materialized.into_parts();
             (Some(script), prepared)
         }
         None => (None, prepared_host_process),
     };
 
+    // Preparation can yield while cancellation is requested. Keep the
+    // prepared ownership local until this check: dropping it transfers any
+    // unspawned host resources to the bounded finalizer.
+    if cancel.is_cancelled() {
+        return Err(TaskError::Canceled);
+    }
+
+    #[cfg(unix)]
+    let child_environment = unix_child_environment(&ctx);
+
     #[cfg(target_os = "macos")]
     let (child, host_process_domain, drop_finalizer, spawn_backend) = {
         let (prepared, reservation) = prepared_host_process.into_parts();
-        match try_spawn_macos(&ctx, script.as_ref(), prepared)? {
+        match try_spawn_macos(&ctx, script.as_ref(), prepared, &child_environment)? {
             MacosSpawnAttempt::Spawned(child, domain) => {
                 (child, domain, reservation, "posix_spawn")
             }
@@ -1197,12 +1285,22 @@ async fn run_subprocess_attempt(
                 );
                 let prepared = PreparedProcessOwnership::new(prepared, reservation);
                 let (child, domain, reservation) =
-                    spawn_with_command(&ctx, script.as_ref(), prepared)?;
+                    spawn_with_command(&ctx, script.as_ref(), prepared, &child_environment)?;
                 (child, domain, reservation, "tokio_command")
             }
         }
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let (child, host_process_domain, drop_finalizer, spawn_backend) = {
+        let (child, domain, reservation) = spawn_with_command(
+            &ctx,
+            script.as_ref(),
+            prepared_host_process,
+            &child_environment,
+        )?;
+        (child, domain, reservation, "tokio_command")
+    };
+    #[cfg(not(unix))]
     let (child, host_process_domain, drop_finalizer, spawn_backend) = {
         let (child, domain, reservation) =
             spawn_with_command(&ctx, script.as_ref(), prepared_host_process)?;
@@ -1231,7 +1329,7 @@ async fn run_subprocess_attempt(
     let stderr = process
         .take_stderr()
         .ok_or_else(|| TaskError::fatal("failed to capture stderr"))?;
-    let mut output = OutputTasks::start(
+    let mut output = start_output_tasks(
         stdout,
         stderr,
         Arc::clone(&ctx.task_cfg.run_id),
@@ -1239,21 +1337,12 @@ async fn run_subprocess_attempt(
         sink,
     );
 
-    let completion = tokio::select! {
-        biased;
-        result = process.observe_exit() => AttemptCompletion::LeaderExited(result),
-        _ = cancel.cancelled() => {
-            debug!(
-                event = "subprocess.cancellation",
-                "cancellation requested; terminating subprocess domain",
-            );
-            AttemptCompletion::Canceled
-        }
-    };
+    let completion = observe_attempt_completion(&cancel, process.observe_exit()).await;
+    let mut cancellation = AttemptCancellationLatch::after_completion(&cancel, &completion);
 
     let drained_before_termination = matches!(completion, AttemptCompletion::LeaderExited(Ok(())));
     let mut output_drain = if drained_before_termination {
-        Some(output.drain().await)
+        Some(cancellation.complete(output.drain()).await)
     } else {
         None
     };
@@ -1272,13 +1361,13 @@ async fn run_subprocess_attempt(
     }
 
     let leader_status = if process.leader_can_be_reaped() {
-        Some(process.reap().await)
+        Some(cancellation.complete(process.reap()).await)
     } else {
         None
     };
 
     if !drained_before_termination {
-        output_drain = Some(output.drain().await);
+        output_drain = Some(cancellation.complete(output.drain()).await);
     }
     report_output_drain(
         &mut output,
@@ -1288,7 +1377,7 @@ async fn run_subprocess_attempt(
     );
 
     let cleanup_error = if leader_status.as_ref().is_some_and(Result::is_ok) {
-        process.cleanup().await.err()
+        cancellation.complete(process.cleanup()).await.err()
     } else {
         None
     };
@@ -1305,10 +1394,9 @@ async fn run_subprocess_attempt(
         );
     }
 
-    let (canceled, observation_error) = match completion {
-        AttemptCompletion::Canceled => (true, None),
-        AttemptCompletion::LeaderExited(Ok(())) => (false, None),
-        AttemptCompletion::LeaderExited(Err(error)) => (false, Some(error)),
+    let observation_error = match completion {
+        AttemptCompletion::Canceled | AttemptCompletion::LeaderExited(Ok(())) => None,
+        AttemptCompletion::LeaderExited(Err(error)) => Some(error),
     };
     let (exit_status, reap_error) = match leader_status {
         Some(Ok(status)) => (Some(status), None),
@@ -1338,7 +1426,10 @@ async fn run_subprocess_attempt(
     if let Some(error) = observation_error {
         return Err(task_io_error("exit observation failed", error));
     }
-    if canceled {
+    // Cancellation is sticky and wins the final successful-lifecycle
+    // boundary. Physical lifecycle errors above deliberately remain fatal.
+    cancellation.refresh();
+    if cancellation.is_latched() {
         return Err(TaskError::Canceled);
     }
 

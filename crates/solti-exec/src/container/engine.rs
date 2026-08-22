@@ -137,7 +137,7 @@ impl ContainerEngineInfo {
 }
 
 /// Immutable task data passed to a container engine for one attempt.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ContainerRequest {
     pub(super) attempt_id: String,
     pub(super) task_name: solti_model::TaskId,
@@ -148,6 +148,29 @@ pub struct ContainerRequest {
     pub(super) args: Vec<String>,
     pub(super) env: std::collections::BTreeMap<String, String>,
     pub(super) process_policy: super::ContainerProcessPolicy,
+}
+
+impl fmt::Debug for ContainerRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContainerRequest")
+            .field("attempt_id", &self.attempt_id)
+            .field("task_name", &self.task_name)
+            .field("generation", &self.generation)
+            .field("attempt", &self.attempt)
+            .field("image", &"<redacted>")
+            .field(
+                "command_len",
+                &self.command.as_ref().map(std::vec::Vec::len),
+            )
+            .field("args_len", &self.args.len())
+            .field("env_len", &self.env.len())
+            .field(
+                "process_policy_configured",
+                &!self.process_policy.is_empty(),
+            )
+            .finish()
+    }
 }
 
 impl ContainerRequest {

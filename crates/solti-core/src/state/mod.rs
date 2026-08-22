@@ -444,6 +444,13 @@ pub(crate) enum StateMutationEventCapacity {
     AttemptTransition,
 }
 
+struct PlannedResourceVersion {
+    epoch: Arc<str>,
+    revision: u64,
+    value: String,
+    rolls_epoch: bool,
+}
+
 impl StateMutationEventCapacity {
     const fn get(self) -> usize {
         match self {
@@ -510,8 +517,8 @@ struct TaskStateInner {
     /// Tasks indexed by model task name.
     ///
     /// Stored snapshots are immutable and shared with watch history, persistence,
-    /// and pagination. A state transition clones the resource only when it is
-    /// actually mutated through [`Arc::make_mut`].
+    /// and pagination. A state transition clones the resource only when it
+    /// prepares a mutation for commit.
     tasks: HashMap<TaskId, Arc<Task>>,
     /// Task names in stable pagination and watch-snapshot order.
     ordered_tasks: BTreeSet<TaskId>,
@@ -1401,22 +1408,44 @@ impl TaskState {
         )
     }
 
-    fn next_resource_version(inner: &mut TaskStateWriteGuard<'_>) -> (u64, String) {
-        if inner.resource_version == u64::MAX {
-            inner.resource_version_epoch = Arc::from(Self::next_resource_version_epoch(
-                inner.resource_version_epoch.as_ref(),
-            ));
-            inner.resource_version = 0;
+    fn plan_resource_version(inner: &TaskStateInner) -> PlannedResourceVersion {
+        let (epoch, revision, rolls_epoch) = match inner.resource_version.checked_add(1) {
+            Some(revision) => (Arc::clone(&inner.resource_version_epoch), revision, false),
+            None => (
+                Arc::from(Self::next_resource_version_epoch(
+                    inner.resource_version_epoch.as_ref(),
+                )),
+                1,
+                true,
+            ),
+        };
+        let value = Self::format_resource_version(epoch.as_ref(), revision);
+        PlannedResourceVersion {
+            epoch,
+            revision,
+            value,
+            rolls_epoch,
+        }
+    }
+
+    fn commit_resource_version(
+        inner: &mut TaskStateWriteGuard<'_>,
+        planned: PlannedResourceVersion,
+    ) -> (u64, String) {
+        if planned.rolls_epoch {
+            inner.resource_version_epoch = planned.epoch;
             inner.watch_history.clear();
             inner.watch_history_bytes = 0;
             inner.compacted_through = 0;
         }
-        inner.resource_version += 1;
+        inner.resource_version = planned.revision;
         inner.watch_tx.send_replace(inner.resource_version);
-        (
-            inner.resource_version,
-            Self::current_resource_version(inner),
-        )
+        (planned.revision, planned.value)
+    }
+
+    fn next_resource_version(inner: &mut TaskStateWriteGuard<'_>) -> (u64, String) {
+        let planned = Self::plan_resource_version(inner);
+        Self::commit_resource_version(inner, planned)
     }
 
     /// Advances an opaque store epoch without depending on entropy.
@@ -2051,12 +2080,9 @@ impl TaskState {
 
         let previous = Arc::clone(current);
         let previous_slot = previous.slot().clone();
-        let (revision, resource_version) = Self::next_resource_version(&mut inner);
-        let task = inner
-            .tasks
-            .get_mut(&name)
-            .expect("resource was checked under the same write lock");
-        let task = Arc::make_mut(task);
+        let planned_resource_version = Self::plan_resource_version(&inner);
+        let resource_version = planned_resource_version.value.clone();
+        let mut task = previous.as_ref().clone();
         let change = task.apply_desired(
             desired_labels,
             desired_annotations,
@@ -2064,14 +2090,12 @@ impl TaskState {
             resource_version.clone(),
         )?;
         if retry {
-            task.mark_reconciliation_pending(resource_version)?;
+            task.mark_reconciliation_pending(resource_version.clone())?;
         }
+        let (revision, _) = Self::commit_resource_version(&mut inner, planned_resource_version);
+        let task = Arc::new(task);
+        inner.tasks.insert(name.clone(), Arc::clone(&task));
 
-        let task = inner
-            .tasks
-            .get(&name)
-            .expect("applied resource must remain stored")
-            .clone();
         if task.slot() != &previous_slot {
             if let Some(ids) = inner.by_slot.get_mut(&previous_slot) {
                 ids.remove(&name);

@@ -229,9 +229,9 @@ fn resolve_env(
 
 fn parse_env(entry: &str) -> Result<(&str, &str), ContainerEngineError> {
     let (name, value) = entry.split_once('=').ok_or_else(|| {
-        ContainerEngineError::permanent(format!(
-            "invalid container image environment entry {entry:?}: expected NAME=VALUE"
-        ))
+        ContainerEngineError::permanent(
+            "invalid container image environment entry: expected NAME=VALUE",
+        )
     })?;
     validate_env(name, value)?;
     Ok((name, value))
@@ -257,9 +257,9 @@ fn resolve_cwd(image: Option<&oci_spec::image::Config>) -> Result<PathBuf, Conta
         .filter(|cwd| !cwd.is_empty())
         .unwrap_or("/");
     if cwd.contains('\0') || !cwd.starts_with('/') {
-        return Err(ContainerEngineError::permanent(format!(
-            "container image working directory must be an absolute path without NUL: {cwd:?}"
-        )));
+        return Err(ContainerEngineError::permanent(
+            "container image working directory must be an absolute path without NUL",
+        ));
     }
     Ok(PathBuf::from(cwd))
 }
@@ -291,9 +291,9 @@ fn resolve_user(
         .parse::<u32>()
         .map_err(|_| unsupported_image_user(user))?;
     if uid > i32::MAX as u32 || gid > i32::MAX as u32 {
-        return Err(ContainerEngineError::permanent(format!(
-            "container image user {user:?} exceeds the containerd runtime ID range"
-        )));
+        return Err(ContainerEngineError::permanent(
+            "container image user exceeds the containerd runtime ID range",
+        ));
     }
 
     UserBuilder::default()
@@ -303,10 +303,10 @@ fn resolve_user(
         .map_err(oci_build_error)
 }
 
-fn unsupported_image_user(user: &str) -> ContainerEngineError {
-    ContainerEngineError::permanent(format!(
-        "container image user {user:?} requires filesystem identity resolution; configure exact numeric container credentials or use UID:GID"
-    ))
+fn unsupported_image_user(_user: &str) -> ContainerEngineError {
+    ContainerEngineError::permanent(
+        "container image user requires filesystem identity resolution; configure exact numeric container credentials or use UID:GID",
+    )
 }
 
 fn validate_runtime_credentials(request: &ContainerRequest) -> Result<(), ContainerEngineError> {
@@ -592,29 +592,57 @@ mod tests {
 
     #[test]
     fn malformed_image_environment_is_rejected() {
-        let image = image(json!({ "Entrypoint": ["app"], "Env": ["BROKEN"] }));
+        const SECRET: &str = "malformed-image-environment-secret";
+        let image = image(json!({ "Entrypoint": ["app"], "Env": [SECRET] }));
         let request = request(None, &[], &[], ContainerProcessPolicy::new());
 
         let error = render(&request, &image, ContainerNetwork::None).unwrap_err();
 
-        assert!(error.reason().contains("expected NAME=VALUE"));
+        assert_eq!(
+            error.reason(),
+            "invalid container image environment entry: expected NAME=VALUE"
+        );
+        assert!(!error.reason().contains(SECRET));
+        assert!(!format!("{error}").contains(SECRET));
+        assert!(!format!("{error:?}").contains(SECRET));
+    }
+
+    #[test]
+    fn invalid_image_working_directory_is_redacted() {
+        const SECRET: &str = "relative-image-working-directory-secret";
+        let image = image(json!({ "Entrypoint": ["app"], "WorkingDir": SECRET }));
+        let request = request(None, &[], &[], ContainerProcessPolicy::new());
+
+        let error = render(&request, &image, ContainerNetwork::None).unwrap_err();
+
+        assert_eq!(
+            error.reason(),
+            "container image working directory must be an absolute path without NUL"
+        );
+        assert!(!error.reason().contains(SECRET));
+        assert!(!format!("{error}").contains(SECRET));
+        assert!(!format!("{error:?}").contains(SECRET));
     }
 
     #[test]
     fn numeric_image_user_is_applied_and_named_user_is_rejected() {
+        const SECRET: &str = "named-image-user-secret";
         let numeric = image(json!({ "Entrypoint": ["app"], "User": "1000:1001" }));
         let request = request(None, &[], &[], ContainerProcessPolicy::new());
         let spec = render(&request, &numeric, ContainerNetwork::None).unwrap();
         let user = spec.process().as_ref().unwrap().user();
         assert_eq!((user.uid(), user.gid()), (1000, 1001));
 
-        let named = image(json!({ "Entrypoint": ["app"], "User": "worker" }));
+        let named = image(json!({ "Entrypoint": ["app"], "User": SECRET }));
         let error = render(&request, &named, ContainerNetwork::None).unwrap_err();
         assert!(
             error
                 .reason()
                 .contains("requires filesystem identity resolution")
         );
+        assert!(!error.reason().contains(SECRET));
+        assert!(!format!("{error}").contains(SECRET));
+        assert!(!format!("{error:?}").contains(SECRET));
     }
 
     #[test]

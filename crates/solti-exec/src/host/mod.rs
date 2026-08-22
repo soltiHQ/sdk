@@ -50,7 +50,7 @@ pub use process::ProcessConfig;
 pub(crate) use process::{PreparedProcessConfig, attach_process_config};
 
 mod policy;
-#[cfg(feature = "host-process")]
+#[cfg(all(feature = "host-process", feature = "subprocess"))]
 pub(crate) use policy::AttemptPrepareFailure;
 pub use policy::{
     AttemptProcessDomain, HostProcessPolicy, PreparedHostProcessAttempt, PreparedHostProcessPolicy,

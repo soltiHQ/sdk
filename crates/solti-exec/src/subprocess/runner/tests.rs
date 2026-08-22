@@ -1,4 +1,5 @@
 use super::*;
+use crate::output::OutputReaderFailure;
 use std::{
     pin::Pin,
     sync::Mutex,
@@ -78,6 +79,144 @@ fn process_lifecycle_errors_are_fatal_and_complete() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn executable_format_errors_are_permanent_before_context_is_added() {
+    let error = task_io_error(
+        "spawn failed",
+        std::io::Error::from_raw_os_error(libc::ENOEXEC),
+    );
+
+    assert!(matches!(error, TaskError::Fatal { .. }));
+}
+
+#[test]
+fn resolved_debug_redacts_command_arguments_and_script() {
+    let resolved = Resolved {
+        command: "resolved-command-secret".into(),
+        args: vec!["resolved-argument-secret".into()],
+        script_body: Some(Arc::from("resolved-script-secret")),
+    };
+
+    let formatted = format!("{resolved:?}");
+    for secret in [
+        "resolved-command-secret",
+        "resolved-argument-secret",
+        "resolved-script-secret",
+    ] {
+        assert!(!formatted.contains(secret), "{formatted}");
+    }
+    assert!(formatted.contains("argument_count"), "{formatted}");
+    assert!(formatted.contains("script_present"), "{formatted}");
+}
+
+#[tokio::test]
+async fn cancellation_wins_a_ready_leader_exit_tie() {
+    let completion = observe_attempt_completion(
+        &TaskContext::detached_cancelled(),
+        std::future::ready(Ok(())),
+    )
+    .await;
+
+    assert!(matches!(completion, AttemptCompletion::Canceled));
+}
+
+#[tokio::test]
+async fn cancellation_during_a_mandatory_post_exit_wait_is_latched() {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    let cancellation_latched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let task: TaskRef = TaskFn::arc({
+        let entered_tx = Arc::clone(&entered_tx);
+        let release_rx = Arc::clone(&release_rx);
+        let cancellation_latched = Arc::clone(&cancellation_latched);
+        move |cancel: TaskContext| {
+            let entered_tx = entered_tx
+                .lock()
+                .unwrap()
+                .take()
+                .expect("post-exit test runs one attempt");
+            let release_rx = release_rx
+                .lock()
+                .unwrap()
+                .take()
+                .expect("post-exit test runs one attempt");
+            let cancellation_latched = Arc::clone(&cancellation_latched);
+            async move {
+                // Model the point immediately after a successful leader-exit
+                // observation. The following future represents a mandatory
+                // drain, reap, or cleanup operation and may not be dropped.
+                let completion = AttemptCompletion::LeaderExited(Ok(()));
+                let mut cancellation =
+                    AttemptCancellationLatch::after_completion(&cancel, &completion);
+                entered_tx.send(()).unwrap();
+                let completed = cancellation
+                    .complete(async {
+                        release_rx.await.expect("mandatory operation release");
+                        true
+                    })
+                    .await;
+                assert!(completed, "the mandatory operation must finish");
+                cancellation_latched.store(cancellation.is_latched(), Ordering::Release);
+                if cancellation.is_latched() {
+                    Err(TaskError::Canceled)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    });
+
+    let supervisor = taskvisor::Supervisor::new(taskvisor::SupervisorConfig::default(), Vec::new());
+    let handle = supervisor.serve().unwrap();
+    let (id, waiter) = handle
+        .add_and_watch(taskvisor::TaskSpec::once("post-exit-cancellation", task))
+        .await
+        .unwrap();
+    entered_rx
+        .await
+        .expect("attempt must enter its mandatory post-exit wait");
+
+    assert!(handle.remove(id).await.unwrap());
+    release_tx
+        .send(())
+        .expect("mandatory operation must remain owned after cancellation");
+
+    let outcome = waiter.wait().await.unwrap();
+    assert_eq!(outcome.kind(), taskvisor::TaskOutcomeKind::Canceled);
+    assert!(cancellation_latched.load(Ordering::Acquire));
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_physical_post_exit_failure_remains_fatal_after_cancellation() {
+    let cancel = TaskContext::detached_cancelled();
+    let completion = AttemptCompletion::Canceled;
+    let mut cancellation = AttemptCancellationLatch::after_completion(&cancel, &completion);
+    let error = cancellation
+        .complete(std::future::ready(Err::<(), _>(std::io::Error::other(
+            "injected reap failure",
+        ))))
+        .await
+        .unwrap_err();
+
+    assert!(
+        cancellation.is_latched(),
+        "cancellation must remain latched"
+    );
+    let mut lifecycle = ProcessLifecycleError::default();
+    lifecycle.push("leader reap", error);
+    match TaskError::fatal_from(lifecycle) {
+        TaskError::Fatal { reason, .. } => {
+            assert_eq!(reason, "leader reap failed: injected reap failure");
+        }
+        other => panic!("physical lifecycle failure must remain fatal, got {other:?}"),
+    }
+}
+
 #[test]
 fn cgroup_name_is_stable() {
     assert_eq!(
@@ -126,6 +265,82 @@ fn injected_prepare_error() -> crate::host::HostProcessError {
     crate::host::HostProcessError::Io(std::io::Error::other(
         "injected host resource preparation failure",
     ))
+}
+
+#[test]
+fn cancellation_wins_a_backend_prepare_error() {
+    let result = cancellation_wins_pre_spawn::<()>(
+        &TaskContext::detached_cancelled(),
+        Err(TaskError::fatal("injected backend preparation error")),
+    );
+
+    assert!(matches!(result, Err(TaskError::Canceled)));
+}
+
+#[test]
+fn cancellation_wins_a_script_materialization_error() {
+    let result = cancellation_wins_pre_spawn::<()>(
+        &TaskContext::detached_cancelled(),
+        Err(TaskError::fail("injected script materialization error")),
+    );
+
+    assert!(matches!(result, Err(TaskError::Canceled)));
+}
+
+#[test]
+fn active_backend_prepare_error_is_preserved() {
+    let result = cancellation_wins_pre_spawn::<()>(
+        &TaskContext::detached(),
+        Err(TaskError::fatal("injected backend preparation error").with_exit_code(71)),
+    );
+
+    match result.unwrap_err() {
+        TaskError::Fatal {
+            reason, exit_code, ..
+        } => {
+            assert_eq!(reason, "injected backend preparation error");
+            assert_eq!(exit_code, Some(71));
+        }
+        other => panic!("expected preserved fatal backend error, got {other:?}"),
+    }
+}
+
+#[test]
+fn active_script_materialization_error_is_preserved() {
+    let result = cancellation_wins_pre_spawn::<()>(
+        &TaskContext::detached(),
+        Err(TaskError::fail("injected script materialization error").with_exit_code(72)),
+    );
+
+    match result.unwrap_err() {
+        TaskError::Fail {
+            reason, exit_code, ..
+        } => {
+            assert_eq!(reason, "injected script materialization error");
+            assert_eq!(exit_code, Some(72));
+        }
+        other => panic!("expected preserved script error, got {other:?}"),
+    }
+}
+
+#[test]
+fn cancellation_drops_a_successful_pre_spawn_result() {
+    struct DropProbe(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let result = cancellation_wins_pre_spawn(
+        &TaskContext::detached_cancelled(),
+        Ok(DropProbe(Arc::clone(&dropped))),
+    );
+
+    assert!(matches!(result, Err(TaskError::Canceled)));
+    assert!(dropped.load(Ordering::Acquire));
 }
 
 fn expect_injected_prepare_error(prepared: Result<PreparedProcessOwnership, crate::ExecError>) {
@@ -376,6 +591,8 @@ async fn wait_for_recorded_pid(marker: &std::path::Path) -> Option<i32> {
 async fn assert_process_gone(pid: i32) {
     let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
+            // SAFETY: signal zero performs an existence check and `pid` was
+            // reported by the child process started by this test.
             if unsafe { libc::kill(pid, 0) } != 0
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
             {
@@ -388,6 +605,8 @@ async fn assert_process_gone(pid: i32) {
     .is_ok();
 
     if !stopped {
+        // SAFETY: `pid` was reported by the child process started by this test;
+        // failure is intentionally ignored before the panic.
         unsafe { libc::kill(pid, libc::SIGKILL) };
         panic!("descendant process {pid} survived cleanup");
     }
@@ -407,6 +626,16 @@ fn mk_subprocess_spec(slot: &str, command: &str) -> Task {
 }
 
 fn mk_subprocess_spec_with_args(slot: &str, command: &str, args: &[&str]) -> Task {
+    mk_command_spec(slot, command, args, Default::default(), None)
+}
+
+fn mk_command_spec(
+    slot: &str,
+    command: &str,
+    args: &[&str],
+    env: solti_model::TaskEnv,
+    cwd: Option<std::path::PathBuf>,
+) -> Task {
     let spec = solti_model::TaskSpec::builder(
         slot,
         TaskWorkload::Subprocess(SubprocessSpec::new(
@@ -414,8 +643,8 @@ fn mk_subprocess_spec_with_args(slot: &str, command: &str, args: &[&str]) -> Tas
                 command: command.into(),
                 args: args.iter().map(|s| s.to_string()).collect(),
             },
-            Default::default(),
-            None,
+            env,
+            cwd,
             Default::default(),
         )),
         5_000u64,
@@ -429,6 +658,15 @@ fn mk_subprocess_spec_with_args(slot: &str, command: &str, args: &[&str]) -> Tas
 }
 
 fn mk_script_spec(slot: &str, body: &[u8], args: &[&str]) -> Task {
+    mk_script_spec_with_interpreter(slot, "bash", body, args)
+}
+
+fn mk_script_spec_with_interpreter(
+    slot: &str,
+    interpreter: &str,
+    body: &[u8],
+    args: &[&str],
+) -> Task {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -436,7 +674,7 @@ fn mk_script_spec(slot: &str, body: &[u8], args: &[&str]) -> Task {
         slot,
         TaskWorkload::Subprocess(SubprocessSpec::new(
             solti_model::SubprocessMode::Script {
-                interpreter: "bash".into(),
+                interpreter: interpreter.into(),
                 body: BASE64.encode(body),
                 args: args.iter().map(|s| s.to_string()).collect(),
             },
@@ -556,10 +794,9 @@ async fn pre_cancelled_cwd_build_returns_typed_cancellation() {
 
 #[tokio::test]
 async fn output_drain_preserves_reader_join_failures() {
-    let mut output = OutputTasks {
-        stdout: Some(tokio::spawn(async { panic!("stdout reader failure") })),
-        stderr: Some(tokio::spawn(async {})),
-    };
+    let mut output = OutputTasks::new();
+    output.spawn_stdout(async { panic!("stdout reader failure") });
+    output.spawn_stderr(async {});
 
     let drain = output.drain().await;
 
@@ -612,21 +849,26 @@ fn build_command_sets_args_and_pipes() {
 }
 
 #[cfg(target_os = "macos")]
-async fn run_through_macos_fallback(ctx: TaskExecContext) {
+async fn run_through_macos_fallback(mut ctx: TaskExecContext) {
+    let environment = unix_child_environment(&ctx);
     let prepared = ctx.runner_cfg.prepare_host_process_attempt(None).unwrap();
-    let prepared = match try_spawn_macos(&ctx, None, prepared).unwrap() {
+    let prepared = match try_spawn_macos(&ctx, None, prepared, &environment).unwrap() {
         MacosSpawnAttempt::Fallback { prepared, .. } => prepared,
         MacosSpawnAttempt::Spawned(_, _) => panic!("test case unexpectedly used native spawn"),
     };
+    ctx.task_cfg
+        .env
+        .insert("SOLTI_FALLBACK_SNAPSHOT".into(), "after-snapshot".into());
     let reservation = ctx.finalizer.try_reserve().unwrap();
     let prepared = PreparedProcessOwnership::new(prepared, reservation);
-    let (mut child, _domain, _reservation) = spawn_with_command(&ctx, None, prepared).unwrap();
+    let (mut child, _domain, _reservation) =
+        spawn_with_command(&ctx, None, prepared, &environment).unwrap();
     assert!(child.wait().await.unwrap().success());
 }
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn executable_text_without_shebang_runs_through_fork_fallback() {
+async fn native_macos_spawn_rejects_executable_text_without_shebang() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let directory = tempfile::TempDir::new().unwrap();
@@ -639,7 +881,203 @@ async fn executable_text_without_shebang_runs_through_fork_fallback() {
     let mut ctx = make_exec_ctx();
     ctx.task_cfg.command = program.to_string_lossy().into_owned();
     ctx.task_cfg.args.clear();
-    run_through_macos_fallback(ctx).await;
+    let environment = unix_child_environment(&ctx);
+    let prepared = ctx.runner_cfg.prepare_host_process_attempt(None).unwrap();
+    let error = match try_spawn_macos(&ctx, None, prepared, &environment) {
+        Ok(_) => panic!("native macOS spawn accepted executable text without a shebang"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, TaskError::Fatal { .. }));
+}
+
+#[cfg(unix)]
+fn write_executable(path: &std::path::Path, body: &[u8]) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::write(path, body).unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(unix)]
+async fn assert_command_is_permanently_rejected(task: &Task, runner_name: &str) {
+    let runner = SubprocessRunner::new(runner_name).unwrap();
+    let task = build_with_run_id(&runner, task, &BuildContext::default())
+        .await
+        .unwrap();
+    match task.spawn(TaskContext::detached()).await {
+        Err(TaskError::Fatal { reason, .. }) => {
+            assert!(reason.contains("spawn failed"), "{reason}");
+            assert!(
+                reason.contains(&format!("os error {}", libc::ENOEXEC)),
+                "{reason}"
+            );
+        }
+        other => panic!("expected permanent spawn failure, got {other:?}"),
+    }
+    runner.shutdown(StdDuration::from_secs(2)).await.unwrap();
+}
+
+#[cfg(target_os = "macos")]
+async fn assert_command_succeeds(task: &Task, runner_name: &str) {
+    let runner = SubprocessRunner::new(runner_name).unwrap();
+    let task = build_with_run_id(&runner, task, &BuildContext::default())
+        .await
+        .unwrap();
+    task.spawn(TaskContext::detached()).await.unwrap();
+    runner.shutdown(StdDuration::from_secs(2)).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_rejects_absolute_executable_text_without_shebang() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let program = directory.path().join("plain-absolute");
+    write_executable(&program, b"exit 0\n");
+    let task = mk_subprocess_spec("plain-absolute", program.to_str().unwrap());
+
+    assert_command_is_permanently_rejected(&task, "plain-absolute").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_rejects_relative_executable_text_in_pinned_cwd() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let canonical = directory.path().canonicalize().unwrap();
+    write_executable(&canonical.join("plain-relative"), b"exit 0\n");
+    let task = mk_command_spec(
+        "plain-relative",
+        "./plain-relative",
+        &[],
+        Default::default(),
+        Some(canonical),
+    );
+
+    assert_command_is_permanently_rejected(&task, "plain-relative").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_rejects_path_resolved_executable_text_without_shebang() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let canonical = directory.path().canonicalize().unwrap();
+    write_executable(&canonical.join("plain-path"), b"exit 0\n");
+    let task = mk_command_spec(
+        "plain-path",
+        "plain-path",
+        &[],
+        solti_model::TaskEnv::single("PATH", canonical.to_str().unwrap()),
+        None,
+    );
+
+    assert_command_is_permanently_rejected(&task, "plain-path").await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn command_fork_fallback_rejects_executable_text_without_shebang() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let canonical = directory.path().canonicalize().unwrap();
+    std::fs::create_dir(canonical.join("bin")).unwrap();
+    write_executable(&canonical.join("bin/plain-fallback"), b"exit 0\n");
+    let task = mk_command_spec(
+        "plain-fallback",
+        "plain-fallback",
+        &[],
+        solti_model::TaskEnv::single("PATH", "bin"),
+        Some(canonical),
+    );
+
+    assert_command_is_permanently_rejected(&task, "plain-fallback").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_preserves_binary_and_kernel_shebang_execution() {
+    let binary_runner = SubprocessRunner::new("direct-binary").unwrap();
+    let binary = mk_subprocess_spec("direct-binary", "/usr/bin/true");
+    let binary = build_with_run_id(&binary_runner, &binary, &BuildContext::default())
+        .await
+        .unwrap();
+    binary.spawn(TaskContext::detached()).await.unwrap();
+    binary_runner
+        .shutdown(StdDuration::from_secs(2))
+        .await
+        .unwrap();
+
+    let directory = tempfile::TempDir::new().unwrap();
+    let program = directory.path().join("shebang-command");
+    write_executable(
+        &program,
+        b"#!/bin/sh\nif [ \"$1\" != 'literal;exit 41' ] || [ \"$SOLTI_LITERAL\" != 'env;exit 42' ]; then exit 97; fi\nexit 0\n",
+    );
+    let shebang = mk_command_spec(
+        "direct-shebang",
+        program.to_str().unwrap(),
+        &["literal;exit 41"],
+        solti_model::TaskEnv::single("SOLTI_LITERAL", "env;exit 42"),
+        None,
+    );
+    let shebang_runner = SubprocessRunner::new("direct-shebang").unwrap();
+    let shebang = build_with_run_id(&shebang_runner, &shebang, &BuildContext::default())
+        .await
+        .unwrap();
+    shebang.spawn(TaskContext::detached()).await.unwrap();
+    shebang_runner
+        .shutdown(StdDuration::from_secs(2))
+        .await
+        .unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn command_path_skips_a_symlink_loop_before_a_valid_executable() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::TempDir::new().unwrap();
+    let first = directory.path().join("loop");
+    let second = directory.path().join("valid");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    symlink("probe", first.join("probe")).unwrap();
+    write_executable(&second.join("probe"), b"#!/bin/sh\nexit 0\n");
+    let path = std::env::join_paths([first, second])
+        .unwrap()
+        .into_string()
+        .unwrap();
+    let task = mk_command_spec(
+        "path-loop",
+        "probe",
+        &[],
+        solti_model::TaskEnv::single("PATH", path),
+        None,
+    );
+
+    assert_command_succeeds(&task, "path-loop").await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn command_path_skips_an_overlong_component_before_a_valid_executable() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let valid = directory.path().join("valid");
+    std::fs::create_dir(&valid).unwrap();
+    write_executable(&valid.join("probe"), b"#!/bin/sh\nexit 0\n");
+    let path = format!(
+        "{}:{}",
+        "x".repeat(libc::PATH_MAX as usize),
+        valid.display()
+    );
+    let task = mk_command_spec(
+        "path-long",
+        "probe",
+        &[],
+        solti_model::TaskEnv::single("PATH", path),
+        None,
+    );
+
+    assert_command_succeeds(&task, "path-long").await;
 }
 
 #[cfg(target_os = "macos")]
@@ -651,7 +1089,11 @@ async fn relative_child_path_in_pinned_cwd_runs_through_fork_fallback() {
     let canonical = directory.path().canonicalize().unwrap();
     std::fs::create_dir(canonical.join("bin")).unwrap();
     let program = canonical.join("bin/probe");
-    std::fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::write(
+        &program,
+        b"#!/bin/sh\ntest \"$SOLTI_FALLBACK_SNAPSHOT\" = before-snapshot\n",
+    )
+    .unwrap();
     let mut permissions = std::fs::metadata(&program).unwrap().permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(&program, permissions).unwrap();
@@ -660,6 +1102,9 @@ async fn relative_child_path_in_pinned_cwd_runs_through_fork_fallback() {
     ctx.task_cfg.command = "probe".into();
     ctx.task_cfg.args.clear();
     ctx.task_cfg.env.insert("PATH".into(), "bin".into());
+    ctx.task_cfg
+        .env
+        .insert("SOLTI_FALLBACK_SNAPSHOT".into(), "before-snapshot".into());
     ctx.pinned_cwd = Some(PinnedCwd::open_absolute(&canonical).unwrap());
     run_through_macos_fallback(ctx).await;
 }
@@ -762,6 +1207,7 @@ fn build_command_prepends_script_path() {
     assert_eq!(args, vec!["/tmp/solti-script-x", "hello"]);
 }
 
+#[cfg(not(unix))]
 fn env_of(cmd: &Command) -> std::collections::HashMap<String, Option<String>> {
     cmd.as_std()
         .get_envs()
@@ -780,6 +1226,7 @@ fn ctx_with_backend(cfg: SubprocessBackendConfig) -> TaskExecContext {
     ctx
 }
 
+#[cfg(not(unix))]
 #[test]
 fn env_inherit_injects_no_path() {
     use crate::subprocess::backend::EnvPolicy;
@@ -789,6 +1236,7 @@ fn env_inherit_injects_no_path() {
     assert!(!env_of(&cmd).contains_key("PATH"));
 }
 
+#[cfg(not(unix))]
 #[test]
 fn env_clear_injects_safe_path() {
     use crate::subprocess::backend::{EnvPolicy, SAFE_DEFAULT_PATH};
@@ -798,6 +1246,7 @@ fn env_clear_injects_safe_path() {
     assert_eq!(env.get("PATH"), Some(&Some(SAFE_DEFAULT_PATH.to_string())));
 }
 
+#[cfg(not(unix))]
 #[test]
 fn env_clear_respects_task_provided_path() {
     use crate::subprocess::backend::EnvPolicy;
@@ -813,6 +1262,7 @@ fn env_clear_respects_task_provided_path() {
     );
 }
 
+#[cfg(not(unix))]
 #[test]
 fn env_clear_keeps_task_vars() {
     use crate::subprocess::backend::EnvPolicy;
@@ -823,6 +1273,7 @@ fn env_clear_keeps_task_vars() {
     assert_eq!(env_of(&cmd).get("FOO"), Some(&Some("bar".to_string())));
 }
 
+#[cfg(not(unix))]
 #[test]
 fn env_allowlist_skips_absent_key_and_still_injects_path() {
     use crate::subprocess::backend::{EnvPolicy, SAFE_DEFAULT_PATH};
@@ -836,6 +1287,71 @@ fn env_allowlist_skips_absent_key_and_still_injects_path() {
         env_of(&cmd).get("PATH"),
         Some(&Some(SAFE_DEFAULT_PATH.to_string()))
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_build_command_defers_environment_materialization() {
+    use crate::subprocess::backend::EnvPolicy;
+
+    let ctx = ctx_with_backend(SubprocessBackendConfig::new().with_env_policy(EnvPolicy::Clear));
+    let cmd = build_command(&ctx, None);
+
+    assert_eq!(cmd.as_std().get_envs().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_child_environment_materializes_inherit_once() {
+    use crate::subprocess::backend::EnvPolicy;
+
+    let mut ctx =
+        ctx_with_backend(SubprocessBackendConfig::new().with_env_policy(EnvPolicy::Inherit));
+    ctx.task_cfg
+        .env
+        .insert("SOLTI_TASK_ENV".into(), "task".into());
+    let mut expected: std::collections::BTreeMap<OsString, OsString> =
+        std::env::vars_os().collect();
+    expected.extend(
+        ctx.task_cfg
+            .env
+            .iter()
+            .map(|(key, value)| (key.into(), value.into())),
+    );
+
+    assert_eq!(unix_child_environment(&ctx), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_child_environment_applies_clear_and_allowlist() {
+    use crate::subprocess::backend::{EnvPolicy, SAFE_DEFAULT_PATH};
+
+    let mut clear =
+        ctx_with_backend(SubprocessBackendConfig::new().with_env_policy(EnvPolicy::Clear));
+    clear
+        .task_cfg
+        .env
+        .insert("SOLTI_TASK_ENV".into(), "task".into());
+    let clear_environment = unix_child_environment(&clear);
+    assert_eq!(
+        clear_environment.get(OsStr::new("PATH")),
+        Some(&OsString::from(SAFE_DEFAULT_PATH))
+    );
+    assert_eq!(
+        clear_environment.get(OsStr::new("SOLTI_TASK_ENV")),
+        Some(&OsString::from("task"))
+    );
+
+    let allowlist = ctx_with_backend(SubprocessBackendConfig::new().with_env_policy(
+        EnvPolicy::Allowlist(vec!["SOLTI_DEFINITELY_ABSENT_VAR_XYZ".into()]),
+    ));
+    let allowlist_environment = unix_child_environment(&allowlist);
+    assert_eq!(
+        allowlist_environment.get(OsStr::new("PATH")),
+        Some(&OsString::from(SAFE_DEFAULT_PATH))
+    );
+    assert!(!allowlist_environment.contains_key(OsStr::new("SOLTI_DEFINITELY_ABSENT_VAR_XYZ")));
 }
 
 #[test]
@@ -879,8 +1395,75 @@ async fn build_task_returns_runnable_subprocess() {
 }
 
 #[tokio::test]
-async fn tracing_does_not_record_subprocess_command() {
-    const SECRET: &str = "subprocess-credential-secret";
+async fn pre_cancelled_subprocess_requests_no_sink_or_cleanup_ownership() {
+    let (build, _events, calls) = recording_output_context();
+    let runner = SubprocessRunner::new("pre-cancel-runner").unwrap();
+    let task = mk_subprocess_spec("pre-cancel-slot", "/definitely/not/a/solti-command");
+    let task_ref = build_with_run_id(&runner, &task, &build).await.unwrap();
+
+    let result = task_ref.spawn(TaskContext::detached_cancelled()).await;
+
+    assert!(matches!(result, Err(TaskError::Canceled)));
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(runner.finalizer_status().owned(), 0);
+    runner.shutdown(StdDuration::from_secs(2)).await.unwrap();
+}
+
+#[test]
+fn cancellation_after_awaited_script_prepare_prevents_spawn() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (release, blocker) = occupy_only_blocking_worker().await;
+            let (build, _events, calls) = recording_output_context();
+            let runner = SubprocessRunner::new("prepare-cancel-runner").unwrap();
+            let task = mk_script_spec_with_interpreter(
+                "prepare-cancel-slot",
+                "/definitely/not/a/solti-interpreter",
+                b"exit 0",
+                &[],
+            );
+            let task_ref = build_with_run_id(&runner, &task, &build).await.unwrap();
+            let supervisor =
+                taskvisor::Supervisor::new(taskvisor::SupervisorConfig::default(), Vec::new());
+            let handle = supervisor.serve().unwrap();
+            let (id, waiter) = handle
+                .add_and_watch(taskvisor::TaskSpec::once(
+                    "prepare-cancel-attempt",
+                    task_ref,
+                ))
+                .await
+                .unwrap();
+
+            tokio::time::timeout(StdDuration::from_secs(2), async {
+                while calls.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("attempt did not reach script preparation");
+            assert_eq!(runner.finalizer_status().owned(), 1);
+            assert!(handle.remove(id).await.unwrap());
+
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+
+            let outcome = waiter.wait().await.unwrap();
+            assert_eq!(outcome.kind(), taskvisor::TaskOutcomeKind::Canceled);
+            wait_for_finalizer_release(&runner.finalizer).await;
+            runner.shutdown(StdDuration::from_secs(2)).await.unwrap();
+            handle.shutdown().await.unwrap();
+        });
+}
+
+#[tokio::test]
+async fn tracing_does_not_record_subprocess_process_inputs() {
+    const COMMAND_SECRET: &str = "subprocess-command-secret";
+    const ARG_SECRET: &str = "subprocess-argument-secret";
+    const ENV_SECRET: &str = "subprocess-environment-secret";
     const FORGED: &str = "forged-subprocess-record";
 
     let runner = SubprocessRunner::new("trace-runner").unwrap();
@@ -903,28 +1486,46 @@ async fn tracing_does_not_record_subprocess_command() {
     tracing::dispatcher::with_default(&dispatch, tracing::callsite::rebuild_interest_cache);
     capture.fields.lock().unwrap().clear();
 
-    let resource = mk_subprocess_spec(
+    let spec = solti_model::TaskSpec::builder(
         "trace-secret",
-        &format!("https://user:{SECRET}@host.invalid/tool\n{FORGED}"),
-    );
+        TaskWorkload::Subprocess(SubprocessSpec::new(
+            solti_model::SubprocessMode::Command {
+                command: format!("https://user:{COMMAND_SECRET}@host.invalid/tool\n{FORGED}"),
+                args: vec![format!("--token={ARG_SECRET}")],
+            },
+            solti_model::TaskEnv::single("SECRET_TOKEN", ENV_SECRET),
+            None,
+            Default::default(),
+        )),
+        5_000u64,
+    )
+    .restart(solti_model::RestartPolicy::Never)
+    .build()
+    .unwrap();
+    let resource = Task::new("task-trace-secret", spec).unwrap();
     let task = build_with_run_id(&runner, &resource, &BuildContext::default())
         .with_subscriber(dispatch.clone())
         .await
         .unwrap();
-    assert!(
-        task.spawn(TaskContext::detached())
-            .with_subscriber(dispatch)
-            .await
-            .is_err()
-    );
+    let error = task
+        .spawn(TaskContext::detached())
+        .with_subscriber(dispatch)
+        .await
+        .unwrap_err();
 
     let fields = capture.fields.lock().unwrap().join(" ");
+    let error = format!("{error:?} {error}");
     assert!(fields.contains("subprocess.lifecycle"), "{fields}");
     assert!(fields.contains("spawning"), "{fields}");
     assert!(fields.contains("arg_count"), "{fields}");
     assert!(!fields.contains("command="), "{fields}");
-    assert!(!fields.contains(SECRET), "{fields}");
+    assert!(!fields.contains(COMMAND_SECRET), "{fields}");
+    assert!(!fields.contains(ARG_SECRET), "{fields}");
+    assert!(!fields.contains(ENV_SECRET), "{fields}");
     assert!(!fields.contains(FORGED), "{fields}");
+    for secret in [COMMAND_SECRET, ARG_SECRET, ENV_SECRET, FORGED] {
+        assert!(!error.contains(secret), "{error}");
+    }
 }
 
 #[tokio::test]
@@ -991,6 +1592,7 @@ async fn script_task_runs_and_streams_output() {
 async fn script_task_runs_after_exact_credential_change() {
     use crate::host::{HostProcessPolicy, LinuxCapability, ProcessCredentials, SecurityConfig};
 
+    // SAFETY: `geteuid` has no preconditions.
     assert_eq!(unsafe { libc::geteuid() }, 0, "test requires root");
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     let effective = status
@@ -1139,6 +1741,8 @@ async fn cancel_reaps_forked_grandchildren() {
     let grandchild_pid = wait_for_recorded_pid(&marker).await;
     if let Some(pid) = grandchild_pid {
         assert_eq!(
+            // SAFETY: signal zero performs an existence check and `pid` was
+            // reported by the child process started by this test.
             unsafe { libc::kill(pid, 0) },
             0,
             "grandchild must be alive before cancel"
@@ -1219,9 +1823,8 @@ async fn force_aborting_outer_attempt_aborts_blocked_readers_and_closes_pipe_end
     let (stderr_reader, mut stderr_peer) = tokio::net::UnixStream::pair().unwrap();
     let (stdout_started_tx, stdout_started_rx) = tokio::sync::oneshot::channel();
     let (stderr_started_tx, stderr_started_rx) = tokio::sync::oneshot::channel();
-    let (readers_owned_tx, readers_owned_rx) = tokio::sync::oneshot::channel();
     let attempt = tokio::spawn(async move {
-        let output = OutputTasks::start(
+        let _output = start_output_tasks(
             ChildOutput::new(StartObservedReader {
                 stream: stdout_reader,
                 started: Some(stdout_started_tx),
@@ -1234,24 +1837,8 @@ async fn force_aborting_outer_attempt_aborts_blocked_readers_and_closes_pipe_end
             LogConfig::default(),
             None,
         );
-        let stdout_abort = output
-            .stdout
-            .as_ref()
-            .expect("stdout reader task must be owned")
-            .abort_handle();
-        let stderr_abort = output
-            .stderr
-            .as_ref()
-            .expect("stderr reader task must be owned")
-            .abort_handle();
-        readers_owned_tx
-            .send((stdout_abort, stderr_abort))
-            .unwrap_or_else(|_| panic!("force-drop test must retain its outer attempt"));
         std::future::pending::<()>().await;
     });
-    let (stdout_abort, stderr_abort) = readers_owned_rx
-        .await
-        .expect("outer attempt must own both reader handles");
 
     stdout_started_rx
         .await
@@ -1273,13 +1860,6 @@ async fn force_aborting_outer_attempt_aborts_blocked_readers_and_closes_pipe_end
     attempt.abort();
     assert!(attempt.await.unwrap_err().is_cancelled());
 
-    tokio::time::timeout(StdDuration::from_secs(1), async {
-        while !stdout_abort.is_finished() || !stderr_abort.is_finished() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("attempt-owned output readers must terminate on drop");
     assert_eq!(
         tokio::time::timeout(
             StdDuration::from_secs(1),

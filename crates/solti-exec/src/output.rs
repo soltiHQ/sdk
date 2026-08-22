@@ -23,8 +23,10 @@ use std::{
     any::Any,
     borrow::Cow,
     fmt::Write as _,
+    future::Future,
     io,
     panic::{AssertUnwindSafe, catch_unwind},
+    time::Duration,
 };
 
 use solti_runner::OutputSink;
@@ -147,6 +149,113 @@ pub(crate) fn classify_output_reader_join(
             drop(error);
             Some(OutputReaderFailure::Cancelled)
         }
+    }
+}
+
+/// Shared normal-completion grace for attempt-owned output readers.
+pub(crate) const OUTPUT_DRAIN_GRACE: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(5)
+};
+
+/// Attempt-owned stdout and stderr reader tasks.
+///
+/// Each task is enrolled immediately after it is spawned. Dropping the owner
+/// aborts every enrolled task and releases its pipe endpoint.
+pub(crate) struct OutputTasks {
+    stdout: Option<tokio::task::JoinHandle<()>>,
+    stderr: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result of draining attempt-owned output readers.
+pub(crate) enum OutputDrain {
+    /// Every present reader completed within the grace period.
+    Completed {
+        /// Stable stdout reader failure, when one occurred.
+        stdout: Option<OutputReaderFailure>,
+        /// Stable stderr reader failure, when one occurred.
+        stderr: Option<OutputReaderFailure>,
+    },
+    /// At least one reader remained pending at the deadline.
+    TimedOut,
+}
+
+impl OutputTasks {
+    /// Creates an empty reader owner before any task is spawned.
+    pub(crate) const fn new() -> Self {
+        Self {
+            stdout: None,
+            stderr: None,
+        }
+    }
+
+    /// Spawns and immediately enrolls the stdout reader task.
+    pub(crate) fn spawn_stdout<F>(&mut self, reader: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        assert!(self.stdout.is_none(), "stdout reader is already owned");
+        self.stdout = Some(tokio::spawn(reader));
+    }
+
+    /// Spawns and immediately enrolls the stderr reader task.
+    pub(crate) fn spawn_stderr<F>(&mut self, reader: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        assert!(self.stderr.is_none(), "stderr reader is already owned");
+        self.stderr = Some(tokio::spawn(reader));
+    }
+
+    /// Drains every owned reader within the shared normal-completion grace.
+    ///
+    /// Missing streams are successful. A timeout leaves the handles owned so
+    /// the caller can report the timeout before aborting them.
+    pub(crate) async fn drain(&mut self) -> OutputDrain {
+        let joined = tokio::time::timeout(OUTPUT_DRAIN_GRACE, async {
+            let stdout = async {
+                match self.stdout.as_mut() {
+                    Some(stdout) => Some(stdout.await),
+                    None => None,
+                }
+            };
+            let stderr = async {
+                match self.stderr.as_mut() {
+                    Some(stderr) => Some(stderr.await),
+                    None => None,
+                }
+            };
+            tokio::join!(stdout, stderr)
+        })
+        .await;
+
+        let Ok((stdout, stderr)) = joined else {
+            return OutputDrain::TimedOut;
+        };
+        self.stdout.take();
+        self.stderr.take();
+        OutputDrain::Completed {
+            stdout: stdout.and_then(classify_output_reader_join),
+            stderr: stderr.and_then(classify_output_reader_join),
+        }
+    }
+
+    /// Aborts and releases every owned reader task.
+    pub(crate) fn abort(&mut self) {
+        if let Some(stdout) = self.stdout.take() {
+            stdout.abort();
+        }
+        if let Some(stderr) = self.stderr.take() {
+            stderr.abort();
+        }
+    }
+}
+
+impl Drop for OutputTasks {
+    fn drop(&mut self) {
+        self.abort();
     }
 }
 
@@ -401,7 +510,10 @@ mod tests {
     use solti_runner::OutputSink;
     use std::{
         fmt,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
     use tokio::sync::broadcast;
     use tracing::{
@@ -429,6 +541,57 @@ mod tests {
         let classified =
             std::panic::catch_unwind(AssertUnwindSafe(|| classify_output_reader_join(joined)));
         assert_eq!(classified.unwrap(), Some(OutputReaderFailure::Panicked));
+    }
+
+    #[tokio::test]
+    async fn output_tasks_drain_optional_streams_and_are_idempotent() {
+        let mut tasks = OutputTasks::new();
+        tasks.spawn_stdout(async {});
+
+        assert_eq!(
+            tasks.drain().await,
+            OutputDrain::Completed {
+                stdout: None,
+                stderr: None,
+            }
+        );
+        assert_eq!(
+            tasks.drain().await,
+            OutputDrain::Completed {
+                stdout: None,
+                stderr: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn output_drain_timeout_retains_task_until_abort() {
+        struct DropMarker(Arc<AtomicUsize>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let marker = DropMarker(Arc::clone(&dropped));
+        let mut tasks = OutputTasks::new();
+        tasks.spawn_stderr(async move {
+            let _owned = marker;
+            std::future::pending::<()>().await;
+        });
+
+        assert_eq!(tasks.drain().await, OutputDrain::TimedOut);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        tasks.abort();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while dropped.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted output reader remained alive");
     }
 
     #[derive(Default)]

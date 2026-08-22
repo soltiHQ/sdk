@@ -330,14 +330,15 @@ fn container_identity_requires_our_snapshot_binding_and_labels() {
 
 #[test]
 fn task_identity_requires_our_container() {
-    let matches = |ownership, container_id, pid, stdout| {
+    let matches = |ownership, container_id, id, pid, stdout, stderr| {
         task_identity_matches(
             ownership,
             TaskIdentity {
                 container_id,
+                id,
                 pid,
                 stdout,
-                stderr: "/stderr",
+                stderr,
             },
             ExpectedTaskIdentity {
                 resource_id: "resource-1",
@@ -353,21 +354,71 @@ fn task_identity_requires_our_container() {
         Ownership::CreateUncertain,
         Ownership::DeleteUncertain,
     ] {
-        assert!(!matches(ownership, "resource-1", 42, "/stdout"));
+        assert!(!matches(
+            ownership,
+            "",
+            "resource-1",
+            42,
+            "/stdout",
+            "/stderr",
+        ));
     }
-    assert!(matches(Ownership::Owned, "resource-1", 42, "/stdout"));
+    assert!(matches(
+        Ownership::Owned,
+        "",
+        "resource-1",
+        42,
+        "/stdout",
+        "/stderr",
+    ));
+    assert!(matches(
+        Ownership::Owned,
+        "resource-1",
+        "resource-1",
+        42,
+        "/stdout",
+        "/stderr",
+    ));
     assert!(!matches(
         Ownership::Owned,
         "foreign-resource",
-        42,
-        "/stdout"
-    ));
-    assert!(!matches(Ownership::Owned, "resource-1", 99, "/stdout"));
-    assert!(!matches(
-        Ownership::Owned,
         "resource-1",
         42,
-        "/foreign/stdout"
+        "/stdout",
+        "/stderr",
+    ));
+    assert!(!matches(
+        Ownership::Owned,
+        "",
+        "foreign-resource",
+        42,
+        "/stdout",
+        "/stderr",
+    ));
+    assert!(!matches(Ownership::Owned, "", "", 42, "/stdout", "/stderr",));
+    assert!(!matches(
+        Ownership::Owned,
+        "",
+        "resource-1",
+        99,
+        "/stdout",
+        "/stderr",
+    ));
+    assert!(!matches(
+        Ownership::Owned,
+        "",
+        "resource-1",
+        42,
+        "/foreign/stdout",
+        "/stderr",
+    ));
+    assert!(!matches(
+        Ownership::Owned,
+        "",
+        "resource-1",
+        42,
+        "/stdout",
+        "/foreign/stderr",
     ));
 }
 

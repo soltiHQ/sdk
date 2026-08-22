@@ -19,7 +19,7 @@ use std::{
 };
 
 use solti_runner::BuildCancellation;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 
 use super::{backend::PreparedSubprocessBackendConfig, boundary::PinnedCwd};
 
@@ -46,6 +46,7 @@ struct CwdDomainInner {
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     failed: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
+    shutdown_changed: Arc<Notify>,
     shutdown: tokio::sync::Mutex<()>,
 }
 
@@ -84,6 +85,8 @@ impl CwdDomain {
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_failed = Arc::clone(&failed);
         let worker_stopped = Arc::clone(&stopped);
+        let shutdown_changed = Arc::new(Notify::new());
+        let worker_shutdown_changed = Arc::clone(&shutdown_changed);
         let worker = thread::Builder::new()
             .name("solti-exec-cwd".into())
             .spawn(move || {
@@ -96,6 +99,7 @@ impl CwdDomain {
                     worker_failed.store(true, Ordering::Release);
                 }
                 worker_stopped.store(true, Ordering::Release);
+                worker_shutdown_changed.notify_waiters();
             })
             .map_err(|error| {
                 io::Error::new(
@@ -112,6 +116,7 @@ impl CwdDomain {
                 worker: Mutex::new(Some(worker)),
                 failed,
                 stopped,
+                shutdown_changed,
                 shutdown: tokio::sync::Mutex::new(()),
             }),
         })
@@ -198,20 +203,36 @@ impl CwdDomain {
     /// another call can continue the same shutdown.
     pub(super) async fn shutdown(&self, timeout: Duration) -> io::Result<()> {
         let _shutdown = self.inner.shutdown.lock().await;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "subprocess cwd I/O shutdown timeout exceeds the supported range",
+                )
+            })?;
         self.inner.admission.close();
         self.inner
             .sender
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        let deadline = tokio::time::Instant::now().checked_add(timeout);
 
         loop {
+            // Register before inspecting state. A terminal worker transition
+            // between this check and `.await` then wakes this exact waiter.
+            let changed = self.inner.shutdown_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+
             if self.inner.admission.available_permits() == self.inner.capacity
                 && self.inner.stopped.load(Ordering::Acquire)
-                && worker_finished(&self.inner.worker)
             {
-                join_finished_worker(&self.inner.worker)?;
+                // `stopped` is published after the receiver and every queued
+                // operation have been dropped. Join the terminal epilogue
+                // directly; an `is_finished` check here can miss the worker's
+                // final notification just before the thread returns.
+                join_stopped_worker(&self.inner.worker)?;
                 return if self.inner.failed.load(Ordering::Acquire) {
                     Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
@@ -223,21 +244,24 @@ impl CwdDomain {
             }
             if self.inner.failed.load(Ordering::Acquire)
                 && self.inner.stopped.load(Ordering::Acquire)
-                && worker_finished(&self.inner.worker)
             {
-                join_finished_worker(&self.inner.worker)?;
+                join_stopped_worker(&self.inner.worker)?;
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "subprocess cwd I/O worker lost forward progress",
                 ));
             }
-            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            if tokio::time::Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "subprocess cwd I/O shutdown deadline exceeded",
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                // Re-check terminal state once at the deadline. Completion
+                // keeps precedence when it races the timer.
+                continue;
+            }
         }
     }
 
@@ -303,7 +327,7 @@ fn worker_finished(worker: &Mutex<Option<thread::JoinHandle<()>>>) -> bool {
         .is_none_or(thread::JoinHandle::is_finished)
 }
 
-fn join_finished_worker(worker: &Mutex<Option<thread::JoinHandle<()>>>) -> io::Result<()> {
+fn join_stopped_worker(worker: &Mutex<Option<thread::JoinHandle<()>>>) -> io::Result<()> {
     let worker = worker
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -323,6 +347,16 @@ fn join_finished_worker(worker: &Mutex<Option<thread::JoinHandle<()>>>) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn wait_for_shutdown_admission_to_close(domain: &CwdDomain) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !domain.inner.admission.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cwd shutdown did not close admission");
+    }
 
     #[tokio::test]
     async fn cancelled_operation_remains_owned_until_worker_finishes() {
@@ -357,6 +391,80 @@ mod tests {
             .min(Semaphore::MAX_PERMITS);
         let domain = CwdDomain::start(maximum).unwrap();
 
+        domain.shutdown(Duration::from_secs(2)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_when_the_active_operation_releases_and_worker_stops() {
+        let domain = CwdDomain::start(1).unwrap();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (_cancel, cancellation) = BuildCancellation::pair();
+        let operation_domain = domain.clone();
+        let operation = tokio::spawn(async move {
+            operation_domain
+                .block_for_test(started_tx, release_rx, &cancellation)
+                .await
+        });
+        started_rx.await.unwrap();
+        let shutdown_domain = domain.clone();
+        let shutdown =
+            tokio::spawn(async move { shutdown_domain.shutdown(Duration::from_secs(2)).await });
+
+        wait_for_shutdown_admission_to_close(&domain).await;
+        release_tx.send(()).unwrap();
+
+        assert!(matches!(operation.await.unwrap(), Ok(None)));
+        shutdown.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_can_be_canceled_and_retried() {
+        let domain = CwdDomain::start(1).unwrap();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (_cancel, cancellation) = BuildCancellation::pair();
+        let operation_domain = domain.clone();
+        let operation = tokio::spawn(async move {
+            operation_domain
+                .block_for_test(started_tx, release_rx, &cancellation)
+                .await
+        });
+        started_rx.await.unwrap();
+        let shutdown_domain = domain.clone();
+        let shutdown =
+            tokio::spawn(async move { shutdown_domain.shutdown(Duration::from_secs(30)).await });
+
+        wait_for_shutdown_admission_to_close(&domain).await;
+        shutdown.abort();
+        assert!(shutdown.await.unwrap_err().is_cancelled());
+
+        release_tx.send(()).unwrap();
+        assert!(matches!(operation.await.unwrap(), Ok(None)));
+        domain.shutdown(Duration::from_secs(2)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_shutdown_of_drained_domain_succeeds_without_waiting() {
+        let domain = CwdDomain::start(1).unwrap();
+
+        let started = std::time::Instant::now();
+        domain.shutdown(Duration::from_secs(2)).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "drained cwd domain waited until the shutdown deadline"
+        );
+        domain.shutdown(Duration::ZERO).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn overflowing_shutdown_timeout_is_rejected_without_closing_admission() {
+        let domain = CwdDomain::start(1).unwrap();
+
+        let error = domain.shutdown(Duration::MAX).await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!domain.inner.admission.is_closed());
         domain.shutdown(Duration::from_secs(2)).await.unwrap();
     }
 }

@@ -284,7 +284,13 @@ pub(crate) enum AttemptPrepareFailure {
 impl AttemptPrepareFailure {
     pub(crate) fn into_error(self) -> HostProcessError {
         match self {
-            Self::Clean(error) | Self::Residual { error, .. } => error,
+            Self::Clean(error) => error,
+            Self::Residual { error, cleanup } => {
+                // Dropping retained ownership performs the direct API's
+                // documented best-effort rollback.
+                drop(cleanup);
+                error
+            }
         }
     }
 }

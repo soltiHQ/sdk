@@ -167,8 +167,13 @@ They reuse value types but have different enforcement semantics.
 | `LinuxCapability`    | Reduces the host capability boundary                  | Replaces all five OCI capability sets                  |
 | `SeccompPolicy`      | Installs a host BPF filter                             | Builds OCI named syscall rules                         |
 
-The host seccomp renderer also rejects the x32 syscall ABI on LP64 `x86_64`.
-OCI named syscall rules cannot express that raw-number guard.
+The host seccomp renderer explicitly rejects the x32 syscall ABI on LP64
+`x86_64`. The native containerd profile leaves OCI compatibility architectures
+unset. Its supported runc/libseccomp path treats x32 and i386 as foreign ABIs
+and sends them to the fail-closed bad-architecture action. Listing those ABIs
+would enable compatibility execution and requires separate policy rules and
+runtime certification. A custom OCI runtime must preserve an equivalent
+fail-closed foreign-ABI boundary.
 
 An empty host policy adds no host control.
 An empty container policy preserves the engine's base OCI specification.
@@ -255,6 +260,9 @@ flowchart TB
 Command mode starts the configured executable directly.
 Script mode stores decoded bytes in fresh attempt-scoped transport.
 
+An already-cancelled attempt returns before output callback invocation,
+cleanup admission, host preparation, script materialization, or process spawn.
+
 Task build submits cwd resolution and descriptor pinning to one dedicated
 runner-owned blocking worker. A semaphore bounds active and queued operations.
 Build cancellation drops its result receiver; accepted filesystem work remains
@@ -272,7 +280,11 @@ Termination requests every available boundary before the leader is reaped.
 Normal leader exit receives the same descendant cleanup.
 This prevents descendants from retaining output pipes or attempt resources.
 
+Cancellation wins a tie with leader exit. Once observed, cancellation remains
+latched while required output drain, termination, reap, and cleanup complete.
+
 Lifecycle termination, reap, and cleanup errors are fatal.
+They are not hidden by a latched cancellation.
 Exit status is evaluated only after lifecycle cleanup succeeds.
 Output reader join failures emit stable diagnostics but do not replace that
 lifecycle result. Output remains best-effort.
@@ -383,6 +395,8 @@ admission, drop handoff, failure state, and shutdown path are implemented in the
 
 The runner polls creation and attempt methods inline.
 It does not spawn engine lifecycle futures.
+An already-cancelled attempt returns before requesting an output sink or
+calling the engine.
 Cooperative cancellation waits for termination, exit observation, and cleanup.
 An attempt timeout drops the current lifecycle future and the attempt object.
 A Taskvisor force-abort requests actor abort. Physical drop follows after any
@@ -534,6 +548,10 @@ The adapter tracks each remote resource separately.
 Ownership enters `CreateUncertain` before a mutating create RPC is polled.
 Cancellation transfers the in-flight mutation record and ownership state to cleanup.
 Cleanup settles that mutation before ownership read-back or deletion.
+An ambiguous task start stays marked uncertain. Cleanup reads back the exact
+owned task and either deletes it while it is still created or terminates it
+after a late start commits. A state-transition rejection returns to read-back
+inside the existing bounded retry window.
 
 The adapter verifies resource identity immediately before deletion.
 Containerd deletion is keyed only by resource ID. The configured namespace

@@ -50,11 +50,12 @@ pub use crate::registration::LABEL_RUNNER_NAME;
 /// Custom engines must pass an explicit [`ContainerEngineBinding`].
 /// A concrete native `containerd::ContainerdEngine` handle converts automatically
 /// when the `containerd` feature is enabled.
+/// The returned handle is the same runner registered in the router.
 ///
 /// ```rust,no_run
 /// use std::sync::Arc;
 /// use solti_exec::container::{
-///     ContainerEngine, ContainerEngineBinding, register_container_runner,
+///     ContainerEngine, ContainerEngineBinding, ContainerRunner, register_container_runner,
 /// };
 /// use solti_runner::RunnerRouter;
 ///
@@ -63,7 +64,9 @@ pub use crate::registration::LABEL_RUNNER_NAME;
 ///     engine: Arc<dyn ContainerEngine>,
 /// ) -> Result<(), solti_exec::ExecError> {
 ///     let engine = ContainerEngineBinding::drop_releases(engine);
-///     register_container_runner(router, "custom", engine)
+///     let _runner: Arc<ContainerRunner> =
+///         register_container_runner(router, "custom", engine)?;
+///     Ok(())
 /// }
 /// ```
 ///
@@ -89,7 +92,7 @@ pub fn register_container_runner(
     router: &mut RunnerRouter,
     name: impl Into<String>,
     engine: impl Into<ContainerEngineBinding>,
-) -> Result<(), crate::ExecError> {
+) -> Result<Arc<ContainerRunner>, crate::ExecError> {
     register_runner(router, Arc::new(ContainerRunner::new(name, engine.into())?))
 }
 
@@ -97,6 +100,7 @@ pub fn register_container_runner(
 ///
 /// The runner receives label `solti.io/runner-name=<name>`.
 /// Custom engines must pass an explicit [`ContainerEngineBinding`].
+/// The returned handle is the same runner registered in the router.
 ///
 /// # Errors
 ///
@@ -106,7 +110,7 @@ pub fn register_container_runner_with_config(
     name: impl Into<String>,
     engine: impl Into<ContainerEngineBinding>,
     config: ContainerRunnerConfig,
-) -> Result<(), crate::ExecError> {
+) -> Result<Arc<ContainerRunner>, crate::ExecError> {
     register_runner(
         router,
         Arc::new(ContainerRunner::with_config(name, engine.into(), config)?),
@@ -125,9 +129,10 @@ impl From<Arc<containerd::ContainerdEngine>> for ContainerEngineBinding {
 fn register_runner(
     router: &mut RunnerRouter,
     runner: Arc<ContainerRunner>,
-) -> Result<(), crate::ExecError> {
+) -> Result<Arc<ContainerRunner>, crate::ExecError> {
     let mut labels = Labels::new();
     labels.insert(LABEL_RUNNER_NAME, runner.name());
-    router.register_with_labels(runner, labels)?;
-    Ok(())
+    let registered: Arc<dyn Runner> = runner.clone();
+    router.register_with_labels(registered, labels)?;
+    Ok(runner)
 }

@@ -210,7 +210,148 @@ fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tonic::codegen::{Body, BoxFuture, Service, StdError, http};
+    use tonic::server::{NamedService, UnaryService};
+    use tonic::transport::server::TcpIncoming;
+
     use super::*;
+
+    #[derive(Clone)]
+    struct TestDiscoverServer {
+        expected_authorization: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl<B> Service<http::Request<B>> for TestDiscoverServer
+    where
+        B: Body + Send + 'static,
+        B::Error: Into<StdError> + Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: http::Request<B>) -> Self::Future {
+            if request.uri().path() != "/solti.discover.v1.DiscoverService/Sync" {
+                return Box::pin(async move {
+                    let mut response = http::Response::new(tonic::body::Body::default());
+                    response.headers_mut().insert(
+                        tonic::Status::GRPC_STATUS,
+                        (tonic::Code::Unimplemented as i32).into(),
+                    );
+                    response.headers_mut().insert(
+                        http::header::CONTENT_TYPE,
+                        tonic::metadata::GRPC_CONTENT_TYPE,
+                    );
+                    Ok(response)
+                });
+            }
+
+            struct SyncService {
+                expected_authorization: &'static str,
+                calls: Arc<AtomicUsize>,
+            }
+
+            impl UnaryService<SyncRequest> for SyncService {
+                type Response = crate::proto::SyncResponse;
+                type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+
+                fn call(&mut self, request: tonic::Request<SyncRequest>) -> Self::Future {
+                    let expected_authorization = self.expected_authorization;
+                    let calls = Arc::clone(&self.calls);
+                    Box::pin(async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let authorization = request
+                            .metadata()
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok());
+                        if authorization != Some(expected_authorization) {
+                            return Err(tonic::Status::unauthenticated("invalid bearer token"));
+                        }
+                        if request.get_ref().id != "agent-1" {
+                            return Err(tonic::Status::invalid_argument("unexpected agent id"));
+                        }
+
+                        Ok(tonic::Response::new(crate::proto::SyncResponse {
+                            success: true,
+                            reason: String::new(),
+                            retry_after_s: 0,
+                        }))
+                    })
+                }
+            }
+
+            let service = SyncService {
+                expected_authorization: self.expected_authorization,
+                calls: Arc::clone(&self.calls),
+            };
+            Box::pin(async move {
+                let codec = tonic_prost::ProstCodec::default();
+                let mut grpc = tonic::server::Grpc::new(codec);
+                Ok(grpc.unary(service, request).await)
+            })
+        }
+    }
+
+    impl NamedService for TestDiscoverServer {
+        const NAME: &'static str = "solti.discover.v1.DiscoverService";
+    }
+
+    async fn spawn_test_server(
+        expected_authorization: &'static str,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicUsize>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local discovery listener");
+        let address = listener.local_addr().expect("read discovery address");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = TestDiscoverServer {
+            expected_authorization,
+            calls: Arc::clone(&calls),
+        };
+        let incoming = TcpIncoming::from(listener);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        (address, calls, shutdown_tx, server)
+    }
+
+    async fn stop_test_server(
+        shutdown_tx: oneshot::Sender<()>,
+        server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        shutdown_tx
+            .send(())
+            .expect("discovery server is still running");
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("discovery server shuts down within the bound")
+            .expect("discovery server task does not panic")
+            .expect("discovery server exits cleanly");
+    }
 
     fn config_builder(endpoint: impl Into<String>) -> crate::DiscoverConfigBuilder {
         DiscoverConfig::builder(
@@ -226,6 +367,57 @@ mod tests {
 
     fn config(endpoint: impl Into<String>) -> DiscoverConfig {
         config_builder(endpoint).build().expect("config builds")
+    }
+
+    #[tokio::test]
+    async fn real_grpc_sync_sends_bearer_metadata_and_accepts_success() {
+        let (address, calls, shutdown_tx, server) =
+            spawn_test_server("Bearer socket-discovery-token").await;
+        let config = config_builder(format!("http://{address}"))
+            .with_token(solti_model::Token::new("socket-discovery-token").unwrap())
+            .allow_insecure_token_transport()
+            .build()
+            .unwrap();
+        let adapter = GrpcAdapter::new(&config).expect("build gRPC adapter");
+        let request = SyncRequest {
+            id: "agent-1".into(),
+            ..SyncRequest::default()
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), adapter.sync(request))
+            .await
+            .expect("gRPC sync finishes within the bound")
+            .expect("gRPC sync succeeds");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        stop_test_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn real_grpc_sync_maps_unauthenticated_status() {
+        let (address, calls, shutdown_tx, server) =
+            spawn_test_server("Bearer expected-token").await;
+        let config = config_builder(format!("http://{address}"))
+            .with_token(solti_model::Token::new("wrong-token").unwrap())
+            .allow_insecure_token_transport()
+            .build()
+            .unwrap();
+        let adapter = GrpcAdapter::new(&config).expect("build gRPC adapter");
+        let request = SyncRequest {
+            id: "agent-1".into(),
+            ..SyncRequest::default()
+        };
+
+        let error = tokio::time::timeout(Duration::from_secs(2), adapter.sync(request))
+            .await
+            .expect("gRPC sync finishes within the bound")
+            .expect_err("invalid bearer metadata is rejected");
+        let DiscoverError::AuthFailed { reason } = error else {
+            panic!("expected AuthFailed, got {error}");
+        };
+        assert!(reason.contains("Unauthenticated"), "{reason}");
+        assert!(reason.contains("invalid bearer token"), "{reason}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        stop_test_server(shutdown_tx, server).await;
     }
 
     #[test]

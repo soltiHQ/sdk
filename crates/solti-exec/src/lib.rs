@@ -84,6 +84,8 @@
 //! They signal the process group and a running leader before reap.
 //! Without `cgroup.kill`, only the process-group boundary remains.
 //! That boundary cannot reach descendants that enter another process group or session.
+
+#![deny(clippy::undocumented_unsafe_blocks)]
 //!
 //! ## Subprocess Quick Start
 //!

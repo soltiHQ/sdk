@@ -45,6 +45,9 @@ mod cwd_domain;
 mod domain;
 pub use domain::SubprocessFinalizerStatus;
 
+#[cfg(unix)]
+mod exec_unix;
+
 #[cfg(target_os = "macos")]
 mod spawn_macos;
 

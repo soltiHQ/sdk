@@ -3256,6 +3256,84 @@ fn old_generation_event_can_close_its_run_but_cannot_mutate_current_status() {
     assert_eq!(state.list_runs(first.name()), before_runs);
 }
 
+#[tokio::test]
+async fn exhausted_generation_rejects_spec_change_without_state_side_effects() {
+    let state = TaskState::new();
+    let stored = create(&state, "generation-exhausted");
+    let name = stored.name().clone();
+    let mut serialized = serde_json::to_value(stored).unwrap();
+    serialized["metadata"]["generation"] = serde_json::json!(u64::MAX);
+    let task: Task = serde_json::from_value(serialized).unwrap();
+    {
+        let mut inner = state.write(StateMutationEventCapacity::None);
+        inner.tasks.insert(name.clone(), Arc::new(task));
+    }
+    let binding = bind(&state, &name);
+    let before = serde_json::to_vec(&state.get(&name).unwrap()).unwrap();
+    let before_page = state.query(&TaskQuery::new()).unwrap();
+    let mut watch = state
+        .watch(&TaskFilter::new(), Some(&before_page.resource_version))
+        .unwrap();
+    let state_snapshot = || {
+        let inner = state.inner.read();
+        let entries = inner
+            .watch_history
+            .iter()
+            .map(|change| {
+                (
+                    change.epoch.to_string(),
+                    change.revision,
+                    change
+                        .previous
+                        .as_deref()
+                        .map(serde_json::to_vec)
+                        .transpose()
+                        .unwrap(),
+                    change
+                        .current
+                        .as_deref()
+                        .map(serde_json::to_vec)
+                        .transpose()
+                        .unwrap(),
+                    change.serialized_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        (
+            inner.resource_version_epoch.to_string(),
+            inner.resource_version,
+            inner.watch_history_bytes,
+            inner.compacted_through,
+            entries,
+        )
+    };
+    let history_before = state_snapshot();
+
+    let error = state
+        .apply_desired(&manifest("generation-exhausted", "slot", 2_000))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::InvalidSpec(error)
+            if error.to_string() == "invalid model: metadata.generation is exhausted"
+    ));
+    assert_eq!(
+        serde_json::to_vec(&state.get(&name).unwrap()).unwrap(),
+        before
+    );
+    assert_eq!(state.binding_for(&name), Some(binding));
+    let after_page = state.query(&TaskQuery::new()).unwrap();
+    assert_eq!(after_page.resource_version, before_page.resource_version);
+    assert_eq!(after_page.items, before_page.items);
+    assert_eq!(state_snapshot(), history_before);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), watch.next())
+            .await
+            .is_err()
+    );
+}
+
 #[test]
 fn stale_uid_cannot_mutate_a_recreated_resource() {
     let state = TaskState::new();
@@ -3763,6 +3841,35 @@ async fn task_revision_rolls_epoch_and_expires_old_watch_and_cursor() {
         state.query(&TaskQuery::new().with_continuation(old_cursor)),
         Err(CollectionError::ResourceVersionExpired { .. })
     ));
+}
+
+#[test]
+fn desired_apply_commits_its_planned_resource_version_across_epoch_rollover() {
+    let state = TaskState::with_epoch(StateConfig::new(), "apply-roll".to_string());
+    let first = create(&state, "rollover-apply");
+    {
+        let mut inner = state.write(StateMutationEventCapacity::None);
+        inner.resource_version = u64::MAX;
+    }
+
+    let applied = state
+        .apply_desired(&manifest("rollover-apply", "slot", 2_000))
+        .unwrap()
+        .task;
+
+    assert_eq!(applied.metadata().generation(), 2);
+    assert_eq!(applied.metadata().resource_version(), "next-apply-roll:1");
+    let page = state.query(&TaskQuery::new()).unwrap();
+    assert_eq!(page.resource_version, "next-apply-roll:1");
+    assert_eq!(page.items, vec![applied.clone()]);
+    let inner = state.inner.read();
+    assert_eq!(inner.resource_version_epoch.as_ref(), "next-apply-roll");
+    assert_eq!(inner.resource_version, 1);
+    assert_eq!(inner.watch_history.len(), 1);
+    let change = inner.watch_history.front().unwrap();
+    assert_eq!(change.revision, 1);
+    assert_eq!(change.previous.as_deref(), Some(&first));
+    assert_eq!(change.current.as_deref(), Some(&applied));
 }
 
 #[test]

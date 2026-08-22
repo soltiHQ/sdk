@@ -119,7 +119,7 @@ impl ServerTlsConfig {
     /// # Security
     ///
     /// The loaded server identity contains private-key PEM.
-    /// This crate zeroizes it's buffer on drop.
+    /// This crate zeroizes its buffer on drop.
     /// An adapter may keep its own copy.
     pub fn load(self) -> Result<LoadedServerTlsConfig, TlsError> {
         let loaded = self.load_material()?;

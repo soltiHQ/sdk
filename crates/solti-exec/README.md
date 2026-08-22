@@ -118,6 +118,10 @@ Image resolution and unpack use containerd's shared image store. The transfer
 is not retained as deferred-cleanup ownership when the create future is dropped.
 Cancelled attempts transfer confirmed or uncertain attempt ownership to an
 isolated cleanup runtime. The transfer is bounded and does not wait in `Drop`.
+An ambiguous task start remains uncertain until cleanup reads back the owned
+task. Cleanup deletes a still-created task or terminates a task whose start
+committed late, then continues the normal task, container, snapshot, and local
+I/O deletion order within the configured cleanup window.
 Keep the concrete engine handle returned by `configure`.
 After every supervisor that uses it has stopped, call
 `engine.shutdown().await`. This closes lifecycle admission and waits for
@@ -185,7 +189,7 @@ Exhausted cleanup is a fatal attempt failure.
 | `ContainerdConfig`                        | Socket, namespace, plugins, and network | Native containerd adapter settings            |
 | `ContainerdEngine::connect`               | `ContainerdConfig`                      | Connected and probed containerd 2.x engine    |
 | `ContainerdEngine::shutdown`              | Stopped supervisors                     | Closed and drained cleanup domain              |
-| `register_container_runner`               | Router, runner name, and engine         | Registered `Container` runner                 |
+| `register_container_runner`               | Router, runner name, and engine         | Registered `ContainerRunner` handle           |
 | One container attempt                     | Image, process overrides, and policy    | Task result and optional stdout/stderr chunks |
 
 `SubprocessRunner` accepts only the exact built-in `Subprocess` GVK.
@@ -225,8 +229,14 @@ Task { workload: Subprocess }
 
 Attempt-scoped resources are created inside the Taskvisor task.
 The same `TaskRef` can therefore run more than once under a restart policy.
+An already-cancelled attempt returns before requesting output, reserving
+cleanup ownership, preparing host resources, or spawning a child.
 Admission is charged before script transport, cgroup, or process creation.
 It remains charged through active execution and deferred cleanup.
+Cancellation wins a tie with leader exit. Once observed, cancellation remains
+the attempt result while required output drain, termination, reap, and cleanup
+finish. A physical lifecycle failure remains fatal and is not hidden by
+cancellation.
 
 ## Containerd execution flow
 
@@ -279,7 +289,7 @@ the application to retain its concrete shutdown handle separately.
 
 The runner enforces a separate set of lifecycle properties:
 
-- a pre-cancelled attempt performs no engine I/O;
+- a pre-cancelled attempt requests no output sink and performs no engine I/O;
 - cooperative cancellation during create waits for create and cleans any returned attempt;
 - an error returned by create wins over cancellation observed after create returns;
 - cooperative cancellation after start waits for terminate, exit observation, and cleanup;
@@ -609,7 +619,11 @@ The retained capabilities must already be available to the agent process.
 `DenyHostControl` enables `no_new_privs` before installing its filter.
 This implicit setting does not replace the explicit credential and capability contract.
 It rejects host-control operations such as mounts, namespace entry, kernel module loading, BPF, and ptrace.
-On LP64 `x86_64`, it also rejects the x32 syscall ABI.
+On LP64 `x86_64`, the host backend also rejects the x32 syscall ABI with
+`EPERM`. The native containerd profile leaves compatibility architectures
+disabled; its supported runc/libseccomp path kills x32 and i386 as foreign
+ABIs. Enabling a compatibility ABI requires separate policy rules and runtime
+certification.
 
 `DenyHostControl` is a denylist.
 It is not a complete syscall allowlist.
@@ -766,6 +780,24 @@ Its endpoint and runtime values can be overridden through the environment variab
 
 The `containerd_config` example does not contact a daemon by default.
 Pass `--connect` only when its configured socket and a compatible containerd 2.x daemon are available.
+
+Run the opt-in Linux host-policy integration test only on a lane with a
+dedicated writable cgroup v2 parent. The parent must expose `cgroup.kill` and
+delegate the `pids` controller to child cgroups:
+
+```bash
+SOLTI_TEST_LINUX_HOST=1 \
+SOLTI_TEST_CGROUP_PARENT=/sys/fs/cgroup/solti-live-host \
+cargo test -p solti-exec --features subprocess,seccomp \
+  --test linux_host_runtime -- --ignored --exact \
+  public_linux_host_policy_is_enforced --nocapture --test-threads=1
+```
+
+The test exercises the production subprocess backend. It verifies kernel
+seccomp enforcement, `no_new_privs`, the configured PID limit, cgroup-wide
+termination of a descendant that escaped the process session, finalizer drain,
+and removal of the attempt cgroup. It is ignored by default and rejects an
+explicit run unless both environment variables are present.
 
 Run the opt-in public containerd lifecycle integration test only on a provisioned
 Linux lane. The lane must provide the daemon, configured plugins, privileges,

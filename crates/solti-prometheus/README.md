@@ -1,7 +1,7 @@
 # solti-prometheus
 
 `solti-prometheus` is the metrics backend for the Solti SDK.
-Other crates (`solti-runner`, `solti-api`, `solti-discover`, `solti-core`) define metrics traits; 
+Other crates (`solti-runner`, `solti-api`, `solti-discover`, `solti-core`) define metrics traits;
 this crate implements them against one shared Prometheus `Registry` and can expose it over `/metrics`.
 
 ## Quick start
@@ -170,6 +170,10 @@ fn main() -> Result<(), solti_model::ModelError> {
 ```
 
 The task serves only `GET /metrics`; `HEAD /metrics` returns `405` without gathering.
+The endpoint is plaintext and unauthenticated. Binding `0.0.0.0` exposes it on
+every available interface. A production deployment must restrict reachability
+with a controlled bind address, network policy, firewall, or authenticated TLS
+proxy appropriate to that deployment.
 It uses `AdmissionPolicy::Replace` in the `solti-metrics-server` slot.
 It restarts after exit and backs off from 1 to 30 seconds after failure.
 The default scrape policy admits at most two physical gather jobs, allows a 4 MiB

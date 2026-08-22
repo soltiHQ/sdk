@@ -196,6 +196,34 @@ async fn api_with_reconciliation(
         .unwrap()
 }
 
+async fn spawn_registered_delete(
+    api: &Arc<SupervisorApi>,
+    name: &TaskId,
+) -> tokio::task::JoinHandle<Result<(), CoreError>> {
+    let tracked_before = api.delete_operations.len();
+    let delete_api = Arc::clone(api);
+    let delete_name = name.clone();
+    let deletion = tokio::spawn(async move { delete_api.delete_task(&delete_name).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while api.delete_operations.len() <= tracked_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete did not register its SDK-owned worker");
+    deletion
+}
+
+async fn wait_for_deleted(api: &SupervisorApi, name: &TaskId) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while api.get_task(name).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the SDK-owned delete worker did not remove desired state");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn public_write_yields_when_state_persistence_capacity_is_full() {
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
@@ -516,12 +544,16 @@ async fn full_persistence_capacity_preserves_an_accepted_delete_during_shutdown(
     let shutdown_api = Arc::clone(&api);
     let shutdown = tokio::spawn(async move { shutdown_api.shutdown().await });
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !api.reconciler.state.persistence_admission_closed() {
+        while !api.shutdown_started.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("shutdown must close persistence admission");
+    .expect("shutdown must close operation admission");
+    assert!(
+        !api.reconciler.state.persistence_admission_closed(),
+        "shutdown must keep persistence admission open while the owned delete drains"
+    );
     assert!(!deletion.is_finished());
     assert!(!shutdown.is_finished());
 
@@ -543,6 +575,7 @@ async fn full_persistence_capacity_preserves_an_accepted_delete_during_shutdown(
     assert_eq!(sink.events.load(Ordering::Acquire), 4);
     assert_eq!(api.state_persistence_status().unwrap().delivered(), 4);
     assert_eq!(api.state_persistence_status().unwrap().queued(), 0);
+    assert!(api.reconciler.state.persistence_admission_closed());
 }
 
 async fn wait_for_task(
@@ -4062,6 +4095,347 @@ async fn delete_after_shutdown_is_rejected_without_mutation_or_state_sink() {
 
     assert!(matches!(error, CoreError::ShuttingDown));
     assert_eq!(api.get_task(&name), Some(before));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_deletes_bypass_owned_workers_and_saturated_persistence_admission() {
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let sink = Arc::new(TokioDependentStateSink {
+        first: AtomicBool::new(true),
+        events: AtomicUsize::new(0),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+    let api = Arc::new(
+        SupervisorApi::builder(RunnerRouter::new())
+            .with_state_sink(sink)
+            .with_persistence_config(
+                PersistenceConfig::new()
+                    .try_with_state_queue_capacity(2)
+                    .unwrap(),
+            )
+            .start()
+            .await
+            .unwrap(),
+    );
+
+    api.reconciler
+        .state
+        .add_task(embedded("missing-delete-persistence-active", 1_000));
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the persistence callback must become active");
+    api.reconciler
+        .state
+        .add_task(embedded("missing-delete-buffer-one", 1_000));
+    api.reconciler
+        .state
+        .add_task(embedded("missing-delete-buffer-two", 1_000));
+    assert_eq!(api.state_persistence_status().unwrap().queued(), 3);
+
+    let mut deletions = Vec::new();
+    for index in 0..64 {
+        let delete_api = Arc::clone(&api);
+        let name = TaskId::new(format!("missing-delete-{index}")).unwrap();
+        deletions.push(tokio::spawn(
+            async move { delete_api.delete_task(&name).await },
+        ));
+    }
+    let completed_while_saturated = tokio::time::timeout(Duration::from_secs(2), async {
+        while deletions.iter().any(|deletion| !deletion.is_finished()) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    let tracked_while_saturated = api.delete_operations.len();
+    let admission_waiters_while_saturated = api.reconciler.state.persistence_admission_waiters();
+    let queued_while_saturated = api.state_persistence_status().unwrap().queued();
+
+    release_tx
+        .send(())
+        .expect("the persistence callback must remain blocked until observation");
+    for deletion in deletions {
+        deletion.await.unwrap().unwrap();
+    }
+    api.shutdown().await.unwrap();
+
+    assert!(
+        completed_while_saturated,
+        "missing deletes must not wait for saturated persistence"
+    );
+    assert_eq!(
+        tracked_while_saturated, 0,
+        "missing deletes must not register SDK-owned workers"
+    );
+    assert_eq!(
+        admission_waiters_while_saturated, 0,
+        "missing deletes must not acquire persistence admission"
+    );
+    assert_eq!(
+        queued_while_saturated, 3,
+        "missing deletes must not mutate the saturated persistence queue"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborted_delete_during_scheduled_settlement_still_removes_desired_state() {
+    let api = Arc::new(api(RunnerRouter::new()).await);
+    let name = TaskId::new("aborted-delete-scheduled-settlement").unwrap();
+    let (entered, release) = api
+        .reconciler
+        .arm_after_provisional_bind_panic(name.clone());
+
+    api.create_embedded_task(embedded(name.as_str(), 10_000), cancellable_task())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered)
+        .await
+        .expect("reconciliation did not reach provisional binding")
+        .expect("provisional binding hook was dropped");
+    let provisional = api
+        .reconciler
+        .state
+        .binding_for(&name)
+        .expect("the paused reconciliation must retain its provisional binding");
+    let deletion = spawn_registered_delete(&api, &name).await;
+    assert!(
+        !deletion.is_finished(),
+        "delete must wait for scheduled reconciliation settlement"
+    );
+
+    deletion.abort();
+    assert!(deletion.await.unwrap_err().is_cancelled());
+    assert!(api.get_task(&name).is_some());
+    let shutdown_api = Arc::clone(&api);
+    let shutdown = tokio::spawn(async move { shutdown_api.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !api.shutdown_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown did not close delete admission");
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown must wait for scheduled delete settlement"
+    );
+    release
+        .send(())
+        .expect("the paused reconciliation must remain owned by its coordinator");
+
+    tokio::time::timeout(Duration::from_secs(2), shutdown)
+        .await
+        .expect("shutdown did not drain the settled delete worker")
+        .unwrap()
+        .unwrap();
+    assert!(api.get_task(&name).is_none());
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    assert!(api.subscribe_output(&name).is_none());
+    assert!(
+        api.reconciler
+            .handle
+            .list()
+            .await
+            .iter()
+            .all(|(id, _)| *id != provisional.tv),
+        "an unsubmitted provisional identity must not enter Taskvisor"
+    );
+    assert!(
+        api.query_task_runs(&name, &TaskRunQuery::new())
+            .unwrap()
+            .is_none(),
+        "delete must not synthesize a TaskRun for unsubmitted work"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborted_delete_before_runtime_lock_still_cancels_only_the_bound_taskvisor_id() {
+    let api = Arc::new(api(RunnerRouter::new()).await);
+    let name = TaskId::new("aborted-delete-exact-runtime").unwrap();
+    api.create_embedded_task(embedded(name.as_str(), 10_000), cancellable_task())
+        .await
+        .unwrap();
+    let binding = wait_for_binding(&api, &name, 1).await;
+    wait_for_observed(&api, &name, 1).await;
+    let (unrelated_id, unrelated_waiter) = api
+        .reconciler
+        .handle
+        .add_and_watch(TvTaskSpec::once(
+            "aborted-delete-unrelated-taskvisor",
+            cancellable_task(),
+        ))
+        .await
+        .unwrap();
+    let runtime_operation = api.reconciler.runtime_operations.lock(&name).await;
+    let deletion = spawn_registered_delete(&api, &name).await;
+    deletion.abort();
+    assert!(deletion.await.unwrap_err().is_cancelled());
+    assert!(
+        api.reconciler
+            .handle
+            .list()
+            .await
+            .iter()
+            .any(|(id, _)| *id == binding.tv),
+        "the runtime lock must stage exact cancellation"
+    );
+
+    drop(runtime_operation);
+    wait_for_deleted(&api, &name).await;
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    let registered = api.reconciler.handle.list().await;
+    assert!(registered.iter().all(|(id, _)| *id != binding.tv));
+    assert!(
+        registered.iter().any(|(id, _)| *id == unrelated_id),
+        "exact-ID cancellation must preserve unrelated Taskvisor work"
+    );
+    assert!(
+        api.query_task_runs(&name, &TaskRunQuery::new())
+            .unwrap()
+            .is_none(),
+        "local deletion must remove the authoritative run history"
+    );
+
+    api.reconciler
+        .handle
+        .cancel_with_timeout(unrelated_id, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        unrelated_waiter.wait().await.unwrap().kind(),
+        TaskOutcomeKind::Canceled
+    );
+    api.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborted_delete_at_state_admission_finishes_and_repeated_delete_is_idempotent() {
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let sink = Arc::new(TokioDependentStateSink {
+        first: AtomicBool::new(false),
+        events: AtomicUsize::new(0),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+    let api = Arc::new(
+        SupervisorApi::builder(RunnerRouter::new())
+            .with_state_sink(sink.clone())
+            .with_persistence_config(
+                PersistenceConfig::new()
+                    .try_with_state_queue_capacity(2)
+                    .unwrap(),
+            )
+            .start()
+            .await
+            .unwrap(),
+    );
+    let name = TaskId::new("aborted-delete-state-admission").unwrap();
+    api.reconciler
+        .state
+        .add_task(embedded(name.as_str(), 1_000));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while api.state_persistence_status().unwrap().queued() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the target creation event did not drain");
+
+    sink.first.store(true, Ordering::Release);
+    api.reconciler
+        .state
+        .add_task(embedded("delete-state-admission-active", 1_000));
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the persistence callback must become active");
+    api.reconciler
+        .state
+        .add_task(embedded("delete-state-admission-buffer-one", 1_000));
+    api.reconciler
+        .state
+        .add_task(embedded("delete-state-admission-buffer-two", 1_000));
+    assert_eq!(api.state_persistence_status().unwrap().queued(), 3);
+
+    let deletion = spawn_registered_delete(&api, &name).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while api.reconciler.state.persistence_admission_waiters() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete did not reach final state mutation admission");
+
+    deletion.abort();
+    assert!(deletion.await.unwrap_err().is_cancelled());
+    assert!(api.get_task(&name).is_some());
+    release_tx
+        .send(())
+        .expect("the persistence callback must still own the staged delete");
+    wait_for_deleted(&api, &name).await;
+
+    api.delete_task(&name).await.unwrap();
+    assert!(api.get_task(&name).is_none());
+    api.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_drains_an_aborted_delete_worker() {
+    let api = Arc::new(api(RunnerRouter::new()).await);
+    let name = TaskId::new("aborted-delete-shutdown-drain").unwrap();
+    api.create_embedded_task(embedded(name.as_str(), 10_000), cancellable_task())
+        .await
+        .unwrap();
+    let binding = wait_for_binding(&api, &name, 1).await;
+    wait_for_observed(&api, &name, 1).await;
+    let runtime_operation = api.reconciler.runtime_operations.lock(&name).await;
+    let deletion = spawn_registered_delete(&api, &name).await;
+    deletion.abort();
+    assert!(deletion.await.unwrap_err().is_cancelled());
+
+    let shutdown_api = Arc::clone(&api);
+    let shutdown = tokio::spawn(async move { shutdown_api.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !api.shutdown_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown did not close operation admission");
+    tokio::task::yield_now().await;
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown must wait for the accepted delete worker"
+    );
+
+    drop(runtime_operation);
+    tokio::time::timeout(Duration::from_secs(2), shutdown)
+        .await
+        .expect("shutdown did not drain the accepted delete worker")
+        .unwrap()
+        .unwrap();
+    api.shutdown().await.unwrap();
+    assert!(api.get_task(&name).is_none());
+    assert!(api.reconciler.state.binding_for(&name).is_none());
+    assert!(
+        api.reconciler
+            .handle
+            .list()
+            .await
+            .iter()
+            .all(|(id, _)| *id != binding.tv)
+    );
+    tokio::time::timeout(Duration::from_secs(1), api.task_operations.lock(&name))
+        .await
+        .expect("delete/shutdown must release the desired-state operation lock");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        api.reconciler.runtime_operations.lock(&name),
+    )
+    .await
+    .expect("delete/shutdown must release the runtime operation lock");
 }
 
 #[tokio::test]

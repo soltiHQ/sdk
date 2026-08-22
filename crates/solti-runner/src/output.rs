@@ -227,8 +227,10 @@ enum Publish {
 /// Its timestamp comes from [`SystemTime::now`].
 ///
 /// Stdout and stderr have independent sequence counters.
-/// Both counters start at `0` and wrap on `u64` overflow.
+/// Both counters start at `0` and never wrap.
 /// Cloned sinks share those counters.
+/// After a stream emits sequence `u64::MAX`, its next emission panics before
+/// invoking the callback so an earlier sequence cannot be reused.
 ///
 /// ## Framing
 ///
@@ -279,10 +281,56 @@ enum Publish {
 pub struct OutputSink {
     generation: u64,
     attempt: u32,
-    seq_stdout: Arc<AtomicU64>,
-    seq_stderr: Arc<AtomicU64>,
+    seq_stdout: Arc<OutputSequence>,
+    seq_stderr: Arc<OutputSequence>,
     callback_panicked: Arc<AtomicBool>,
     publish: Publish,
+}
+
+struct OutputSequence {
+    next: AtomicU64,
+    max_issued: AtomicBool,
+}
+
+impl OutputSequence {
+    fn new() -> Self {
+        Self {
+            next: AtomicU64::new(0),
+            max_issued: AtomicBool::new(false),
+        }
+    }
+
+    fn allocate(&self) -> u64 {
+        loop {
+            let current = self.next.load(Ordering::Relaxed);
+            let Some(next) = current.checked_add(1) else {
+                if self
+                    .max_issued
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return current;
+                }
+                panic!("output sequence exhausted; ordering cannot wrap safely");
+            };
+
+            if self
+                .next
+                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return current;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn seeded(next: u64) -> Self {
+        Self {
+            next: AtomicU64::new(next),
+            max_issued: AtomicBool::new(false),
+        }
+    }
 }
 
 impl OutputSink {
@@ -297,8 +345,8 @@ impl OutputSink {
         Self {
             generation,
             attempt,
-            seq_stdout: Arc::new(AtomicU64::new(0)),
-            seq_stderr: Arc::new(AtomicU64::new(0)),
+            seq_stdout: Arc::new(OutputSequence::new()),
+            seq_stderr: Arc::new(OutputSequence::new()),
             callback_panicked: Arc::new(AtomicBool::new(false)),
             publish: Publish::Owned(Arc::new(publish)),
         }
@@ -317,8 +365,8 @@ impl OutputSink {
         Self {
             generation,
             attempt,
-            seq_stdout: Arc::new(AtomicU64::new(0)),
-            seq_stderr: Arc::new(AtomicU64::new(0)),
+            seq_stdout: Arc::new(OutputSequence::new()),
+            seq_stderr: Arc::new(OutputSequence::new()),
             callback_panicked: Arc::new(AtomicBool::new(false)),
             publish: Publish::Borrowed(Arc::new(publish)),
         }
@@ -328,6 +376,10 @@ impl OutputSink {
     ///
     /// LF and CRLF delimiters split the input without changing other bytes.
     /// Each emitted chunk receives the next stdout sequence number.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an emitted chunk would reuse an exhausted stdout sequence.
     pub fn stdout_line(&self, line: Bytes) {
         self.push_bytes(StreamKind::Stdout, line, false);
     }
@@ -336,6 +388,10 @@ impl OutputSink {
     ///
     /// LF and CRLF delimiters split the input.
     /// Only the final emitted chunk is marked as truncated; every emitted chunk receives its own sequence.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an emitted chunk would reuse an exhausted stdout sequence.
     pub fn stdout_line_truncated(&self, line: Bytes) {
         self.push_bytes(StreamKind::Stdout, line, true);
     }
@@ -344,6 +400,10 @@ impl OutputSink {
     ///
     /// LF and CRLF delimiters split the input without changing other bytes.
     /// Each emitted chunk receives the next stderr sequence number.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an emitted chunk would reuse an exhausted stderr sequence.
     pub fn stderr_line(&self, line: Bytes) {
         self.push_bytes(StreamKind::Stderr, line, false);
     }
@@ -352,6 +412,10 @@ impl OutputSink {
     ///
     /// LF and CRLF delimiters split the input.
     /// Only the final emitted chunk is marked as truncated; every emitted chunk receives its own sequence.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an emitted chunk would reuse an exhausted stderr sequence.
     pub fn stderr_line_truncated(&self, line: Bytes) {
         self.push_bytes(StreamKind::Stderr, line, true);
     }
@@ -361,6 +425,10 @@ impl OutputSink {
     /// This has the same framing and sequence semantics as [`Self::stdout_line`].
     /// An owned-callback sink copies each emitted chunk once.
     /// A borrowed-callback sink does not allocate payload storage.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an emitted chunk would reuse an exhausted stdout sequence.
     pub fn stdout_line_bytes(&self, line: &[u8]) {
         self.push_slice(StreamKind::Stdout, line, false);
     }
@@ -368,6 +436,10 @@ impl OutputSink {
     /// Publishes borrowed stdout bytes whose final source line was truncated.
     ///
     /// This has the same framing, truncation, and sequence semantics as [`Self::stdout_line_truncated`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when an emitted chunk would reuse an exhausted stdout sequence.
     pub fn stdout_line_bytes_truncated(&self, line: &[u8]) {
         self.push_slice(StreamKind::Stdout, line, true);
     }
@@ -377,6 +449,10 @@ impl OutputSink {
     /// This has the same framing and sequence semantics as [`Self::stderr_line`].
     /// An owned-callback sink copies each emitted chunk once.
     /// A borrowed-callback sink does not allocate payload storage.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an emitted chunk would reuse an exhausted stderr sequence.
     pub fn stderr_line_bytes(&self, line: &[u8]) {
         self.push_slice(StreamKind::Stderr, line, false);
     }
@@ -384,6 +460,10 @@ impl OutputSink {
     /// Publishes borrowed stderr bytes whose final source line was truncated.
     ///
     /// This has the same framing, truncation, and sequence semantics as [`Self::stderr_line_truncated`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when an emitted chunk would reuse an exhausted stderr sequence.
     pub fn stderr_line_bytes_truncated(&self, line: &[u8]) {
         self.push_slice(StreamKind::Stderr, line, true);
     }
@@ -421,8 +501,8 @@ impl OutputSink {
 
     fn next_seq(&self, stream: StreamKind) -> u64 {
         match stream {
-            StreamKind::Stdout => self.seq_stdout.fetch_add(1, Ordering::Relaxed),
-            StreamKind::Stderr => self.seq_stderr.fetch_add(1, Ordering::Relaxed),
+            StreamKind::Stdout => self.seq_stdout.allocate(),
+            StreamKind::Stderr => self.seq_stderr.allocate(),
         }
     }
 
@@ -548,7 +628,19 @@ mod tests {
     use bytes::Bytes;
     use solti_model::{OutputEvent, StreamKind, TaskId};
 
-    use super::{OutputSink, noop_output_publisher};
+    use super::{OutputSequence, OutputSink, noop_output_publisher};
+
+    #[test]
+    fn output_sequence_issues_max_once_and_then_fails_closed() {
+        let sequence = OutputSequence::seeded(u64::MAX - 1);
+
+        assert_eq!(sequence.allocate(), u64::MAX - 1);
+        assert_eq!(sequence.allocate(), u64::MAX);
+        assert!(
+            std::panic::catch_unwind(|| sequence.allocate()).is_err(),
+            "sequence exhaustion must panic instead of reusing zero"
+        );
+    }
 
     fn recording_sink(generation: u64, attempt: u32) -> (OutputSink, Arc<Mutex<Vec<OutputEvent>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));

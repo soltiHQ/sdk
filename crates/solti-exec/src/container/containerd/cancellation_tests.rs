@@ -114,6 +114,7 @@ struct RemoteLedger {
     container: Option<Container>,
     task: Option<TaskRecord>,
     running: bool,
+    task_status_override: Option<ProcessStatus>,
     deletes: Vec<Operation>,
 }
 
@@ -133,8 +134,13 @@ struct FakeRpc {
     gate: Option<Arc<Gate>>,
     wait_stopped: Arc<AtomicBool>,
     fail_task_delete_once: AtomicBool,
+    fail_task_delete_precondition_once: AtomicBool,
+    task_status_after_delete_precondition: Mutex<Option<ProcessStatus>>,
     task_delete_failed: AtomicBool,
     task_delete_failed_notify: Notify,
+    ambiguous_start_without_commit: AtomicBool,
+    commit_start_on_delete: AtomicBool,
+    late_start_delete_is_unknown: AtomicBool,
 }
 
 impl FakeRpc {
@@ -144,8 +150,13 @@ impl FakeRpc {
             gate: gated_operation.map(Gate::new).map(Arc::new),
             wait_stopped: Arc::new(AtomicBool::new(false)),
             fail_task_delete_once: AtomicBool::new(false),
+            fail_task_delete_precondition_once: AtomicBool::new(false),
+            task_status_after_delete_precondition: Mutex::new(None),
             task_delete_failed: AtomicBool::new(false),
             task_delete_failed_notify: Notify::new(),
+            ambiguous_start_without_commit: AtomicBool::new(false),
+            commit_start_on_delete: AtomicBool::new(false),
+            late_start_delete_is_unknown: AtomicBool::new(false),
         })
     }
 
@@ -229,6 +240,34 @@ impl FakeRpc {
 
     fn fail_next_task_delete(&self) {
         self.fail_task_delete_once.store(true, Ordering::Release);
+    }
+
+    fn fail_next_task_delete_with_precondition(&self) {
+        self.fail_task_delete_precondition_once
+            .store(true, Ordering::Release);
+    }
+
+    fn fail_next_task_delete_with_precondition_and_status(&self, status: ProcessStatus) {
+        *self
+            .task_status_after_delete_precondition
+            .lock()
+            .expect("task status override lock is not poisoned") = Some(status);
+        self.fail_next_task_delete_with_precondition();
+    }
+
+    fn fail_start_ambiguously(&self) {
+        self.ambiguous_start_without_commit
+            .store(true, Ordering::Release);
+    }
+
+    fn commit_late_start_on_delete(&self) {
+        self.commit_start_on_delete.store(true, Ordering::Release);
+    }
+
+    fn commit_late_start_on_delete_with_unknown(&self) {
+        self.late_start_delete_is_unknown
+            .store(true, Ordering::Release);
+        self.commit_late_start_on_delete();
     }
 
     async fn wait_for_task_delete_failure(&self) {
@@ -441,6 +480,7 @@ impl AttemptRpc for FakeRpc {
                 stdout: request.stdout,
                 stderr: request.stderr,
             });
+            ledger.task_status_override = None;
         }
         self.block(Operation::CreateTask).await;
         Ok(CreateTaskResponse {
@@ -464,10 +504,15 @@ impl AttemptRpc for FakeRpc {
             .ok_or_else(|| Status::not_found("task is absent"))?;
         Ok(GetResponse {
             process: Some(Process {
-                container_id: RESOURCE_ID.to_owned(),
+                id: RESOURCE_ID.to_owned(),
                 pid: task.pid,
                 stdout: task.stdout.clone(),
                 stderr: task.stderr.clone(),
+                status: ledger.task_status_override.unwrap_or(if ledger.running {
+                    ProcessStatus::Running
+                } else {
+                    ProcessStatus::Created
+                }) as i32,
                 ..Default::default()
             }),
         })
@@ -478,6 +523,11 @@ impl AttemptRpc for FakeRpc {
         _request: StartRequest,
         _timeout: Duration,
     ) -> Result<StartResponse, Status> {
+        if self.ambiguous_start_without_commit.load(Ordering::Acquire) {
+            return Err(Status::deadline_exceeded(
+                "task start outcome is unavailable",
+            ));
+        }
         {
             let mut ledger = self
                 .ledger
@@ -487,6 +537,7 @@ impl AttemptRpc for FakeRpc {
                 return Err(Status::not_found("task is absent"));
             }
             ledger.running = true;
+            ledger.task_status_override = None;
         }
         self.block(Operation::StartTask).await;
         Ok(StartResponse { pid: 1 })
@@ -505,6 +556,7 @@ impl AttemptRpc for FakeRpc {
                 return Err(Status::failed_precondition("task is stopped"));
             }
             ledger.running = false;
+            ledger.task_status_override = Some(ProcessStatus::Stopped);
         }
         self.block(Operation::KillTask).await;
         Ok(())
@@ -515,6 +567,28 @@ impl AttemptRpc for FakeRpc {
         _request: DeleteTaskRequest,
         _timeout: Duration,
     ) -> Result<DeleteResponse, Status> {
+        if self
+            .fail_task_delete_precondition_once
+            .swap(false, Ordering::AcqRel)
+        {
+            if let Some(status) = self
+                .task_status_after_delete_precondition
+                .lock()
+                .expect("task status override lock is not poisoned")
+                .take()
+            {
+                let mut ledger = self
+                    .ledger
+                    .lock()
+                    .expect("remote ledger lock is not poisoned");
+                ledger.running = matches!(
+                    status,
+                    ProcessStatus::Running | ProcessStatus::Paused | ProcessStatus::Pausing
+                );
+                ledger.task_status_override = Some(status);
+            }
+            return Err(Status::failed_precondition("unrelated delete precondition"));
+        }
         if self.fail_task_delete_once.swap(false, Ordering::AcqRel) {
             self.task_delete_failed.store(true, Ordering::Release);
             self.task_delete_failed_notify.notify_one();
@@ -528,8 +602,24 @@ impl AttemptRpc for FakeRpc {
             if ledger.task.is_none() {
                 return Err(Status::not_found("task is absent"));
             }
+            let late_start = self.commit_start_on_delete.swap(false, Ordering::AcqRel);
+            if late_start {
+                ledger.running = true;
+                ledger.task_status_override = None;
+            }
+            if ledger.running {
+                if late_start
+                    && self
+                        .late_start_delete_is_unknown
+                        .swap(false, Ordering::AcqRel)
+                {
+                    return Err(Status::unknown("cannot delete a running process"));
+                }
+                return Err(Status::failed_precondition("task is running"));
+            }
             ledger.task = None;
             ledger.running = false;
+            ledger.task_status_override = None;
             ledger.deletes.push(Operation::DeleteTask);
         }
         self.block(Operation::DeleteTask).await;
@@ -947,6 +1037,187 @@ async fn cancelled_start_is_terminated_and_cleaned_after_remote_commit() {
         .await
         .expect("cancelled start must remain cleanable");
     rpc.assert_empty();
+}
+
+#[tokio::test]
+async fn ambiguous_uncommitted_start_remains_deletable_after_transient_delete_failure() {
+    let rpc = FakeRpc::new(None);
+    rpc.fail_start_ambiguously();
+    rpc.fail_next_task_delete();
+    let mut state = test_state(Arc::clone(&rpc));
+    create_all(&mut state).await;
+
+    let start = state
+        .start_inner()
+        .await
+        .expect_err("ambiguous start must fail the active attempt");
+    assert_eq!(start.class(), ContainerErrorClass::Retryable);
+    state
+        .terminate_inner()
+        .await
+        .expect("created task must accept idempotent termination handling");
+    assert!(!state.termination_sent);
+
+    state
+        .cleanup_owned_with_retry()
+        .await
+        .expect("owned created task must remain deletable on a later cleanup pass");
+
+    assert!(state.is_released());
+    rpc.assert_empty();
+}
+
+#[tokio::test]
+async fn late_start_after_failed_precondition_is_killed_on_cleanup_retry() {
+    let rpc = FakeRpc::new(None);
+    rpc.fail_start_ambiguously();
+    rpc.commit_late_start_on_delete();
+    let mut state = test_state(Arc::clone(&rpc));
+    create_all(&mut state).await;
+
+    let start = state
+        .start_inner()
+        .await
+        .expect_err("ambiguous start must fail the active attempt");
+    assert_eq!(start.class(), ContainerErrorClass::Retryable);
+    state
+        .terminate_inner()
+        .await
+        .expect("pre-start termination is an idempotent cleanup step");
+    assert!(!state.termination_sent);
+
+    state
+        .cleanup_owned_with_retry()
+        .await
+        .expect("late-started owned task must be killed and deleted on retry");
+
+    assert!(state.is_released());
+    rpc.assert_empty();
+}
+
+#[tokio::test]
+async fn late_start_after_unknown_delete_is_killed_on_cleanup_retry() {
+    let rpc = FakeRpc::new(None);
+    rpc.fail_start_ambiguously();
+    rpc.commit_late_start_on_delete_with_unknown();
+    let mut state = test_state(Arc::clone(&rpc));
+    create_all(&mut state).await;
+
+    let start = state
+        .start_inner()
+        .await
+        .expect_err("ambiguous start must fail the active attempt");
+    assert_eq!(start.class(), ContainerErrorClass::Retryable);
+    state
+        .terminate_inner()
+        .await
+        .expect("pre-start termination is an idempotent cleanup step");
+    assert!(!state.termination_sent);
+
+    state
+        .cleanup_owned_with_retry()
+        .await
+        .expect("an owned task rejected as running must be killed and deleted on retry");
+
+    assert!(state.is_released());
+    rpc.assert_empty();
+}
+
+#[tokio::test]
+async fn stopped_readback_after_ambiguous_start_is_reaped_and_deleted() {
+    let rpc = FakeRpc::new(None);
+    rpc.fail_start_ambiguously();
+    rpc.fail_next_task_delete_with_precondition_and_status(ProcessStatus::Stopped);
+    let mut state = test_state(Arc::clone(&rpc));
+    create_all(&mut state).await;
+
+    let start = state
+        .start_inner()
+        .await
+        .expect_err("ambiguous start must fail the active attempt");
+    assert_eq!(start.class(), ContainerErrorClass::Retryable);
+    state
+        .terminate_inner()
+        .await
+        .expect("pre-start termination is an idempotent cleanup step");
+    assert!(!state.termination_sent);
+
+    state
+        .cleanup_owned_with_retry()
+        .await
+        .expect("a matching stopped task must be reaped and deleted on cleanup retry");
+
+    assert!(state.start_confirmed);
+    assert!(!state.start_uncertain);
+    assert!(state.exit_status.is_some());
+    assert!(state.is_released());
+    rpc.assert_empty();
+}
+
+#[tokio::test]
+async fn unknown_readback_after_ambiguous_start_remains_unconfirmed_and_fail_closed() {
+    let rpc = FakeRpc::new(None);
+    rpc.fail_start_ambiguously();
+    rpc.fail_next_task_delete_with_precondition_and_status(ProcessStatus::Unknown);
+    let mut state = test_state(Arc::clone(&rpc));
+    create_all(&mut state).await;
+
+    let start = state
+        .start_inner()
+        .await
+        .expect_err("ambiguous start must fail the active attempt");
+    assert_eq!(start.class(), ContainerErrorClass::Retryable);
+    state
+        .terminate_inner()
+        .await
+        .expect("pre-start termination is an idempotent cleanup step");
+    assert!(!state.termination_sent);
+
+    let error = state
+        .cleanup_owned_with_retry()
+        .await
+        .expect_err("an unknown task state must not be reclassified as a late start");
+
+    assert_eq!(error.class(), ContainerErrorClass::Permanent);
+    assert_eq!(error.reason(), "containerd attempt cleanup failed");
+    assert!(!state.start_confirmed);
+    assert!(state.start_uncertain);
+    assert!(!state.termination_sent);
+    assert_eq!(state.task, Ownership::Owned);
+    let ledger = rpc
+        .ledger
+        .lock()
+        .expect("remote ledger lock is not poisoned");
+    assert!(ledger.task.is_some());
+    assert!(!ledger.running);
+}
+
+#[tokio::test]
+async fn unrelated_delete_precondition_is_not_reclassified_as_retryable() {
+    let rpc = FakeRpc::new(None);
+    rpc.fail_start_ambiguously();
+    rpc.fail_next_task_delete_with_precondition();
+    let mut state = test_state(Arc::clone(&rpc));
+    create_all(&mut state).await;
+
+    let start = state
+        .start_inner()
+        .await
+        .expect_err("ambiguous start must fail the active attempt");
+    assert_eq!(start.class(), ContainerErrorClass::Retryable);
+    state
+        .terminate_inner()
+        .await
+        .expect("pre-start termination is an idempotent cleanup step");
+
+    let error = state
+        .cleanup_owned_with_retry()
+        .await
+        .expect_err("an unrelated delete precondition must remain permanent");
+
+    assert_eq!(error.class(), ContainerErrorClass::Permanent);
+    assert_eq!(error.reason(), "containerd attempt cleanup failed");
+    assert_eq!(state.task, Ownership::Owned);
 }
 
 #[tokio::test]

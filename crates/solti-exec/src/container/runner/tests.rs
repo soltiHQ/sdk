@@ -654,6 +654,10 @@ fn task() -> Task {
 }
 
 async fn build(runner: &ContainerRunner) -> TaskRef {
+    build_with_context(runner, &BuildContext::default()).await
+}
+
+async fn build_with_context(runner: &ContainerRunner, context: &BuildContext) -> TaskRef {
     let resource = task();
     let run_id = solti_runner::make_run_id(runner.name(), resource.slot().as_str());
     let mut scope = solti_runner::BuildScope::unmanaged(runner.name());
@@ -661,7 +665,7 @@ async fn build(runner: &ContainerRunner) -> TaskRef {
         .build_task(
             &resource,
             &run_id,
-            &BuildContext::default(),
+            context,
             &solti_runner::BuildCancellation::new(),
             &mut scope,
         )
@@ -700,6 +704,50 @@ fn engine_binding_records_explicit_contract_and_redacts_engine() {
     let debug = format!("{runner:?}");
     assert!(debug.contains("PreAdmittedFinalizer"), "{debug}");
     assert!(debug.contains("<engine>"), "{debug}");
+}
+
+#[test]
+fn container_request_debug_redacts_process_inputs() {
+    const IMAGE_SECRET: &str = "image-credential-secret";
+    const COMMAND_SECRET: &str = "command-secret";
+    const ARG_SECRET: &str = "argument-secret";
+    const ENV_SECRET: &str = "environment-secret";
+
+    let mut env = std::collections::BTreeMap::new();
+    env.insert("ACCESS_TOKEN".to_owned(), ENV_SECRET.to_owned());
+    let request = ContainerRequest {
+        attempt_id: "container-safe-a7".to_owned(),
+        task_name: solti_model::TaskId::new("debug-safe").unwrap(),
+        generation: 11,
+        attempt: 7,
+        image: format!("https://user:{IMAGE_SECRET}@registry.invalid/private"),
+        command: Some(vec![COMMAND_SECRET.to_owned()]),
+        args: vec![ARG_SECRET.to_owned()],
+        env,
+        process_policy: super::super::ContainerProcessPolicy::default(),
+    };
+
+    let debug = format!("{request:?}");
+    assert!(
+        debug.contains("attempt_id: \"container-safe-a7\""),
+        "{debug}"
+    );
+    assert!(debug.contains("generation: 11"), "{debug}");
+    assert!(debug.contains("attempt: 7"), "{debug}");
+    assert!(debug.contains("image: \"<redacted>\""), "{debug}");
+    assert!(debug.contains("command_len: Some(1)"), "{debug}");
+    assert!(debug.contains("args_len: 1"), "{debug}");
+    assert!(debug.contains("env_len: 1"), "{debug}");
+    assert!(
+        debug.contains("process_policy_configured: false"),
+        "{debug}"
+    );
+    for secret in [IMAGE_SECRET, COMMAND_SECRET, ARG_SECRET, ENV_SECRET] {
+        assert!(
+            !debug.contains(secret),
+            "debug output leaked {secret:?}: {debug}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -748,8 +796,11 @@ async fn build_has_no_engine_io_and_each_spawn_gets_one_attempt() {
 }
 
 #[tokio::test]
-async fn tracing_does_not_record_container_image() {
-    const SECRET: &str = "container-credential-secret";
+async fn tracing_does_not_record_container_process_inputs() {
+    const IMAGE_SECRET: &str = "container-credential-secret";
+    const COMMAND_SECRET: &str = "container-command-secret";
+    const ARG_SECRET: &str = "container-argument-secret";
+    const ENV_SECRET: &str = "container-environment-secret";
     const FORGED: &str = "forged-container-record";
 
     let (engine, _) = FakeEngine::new(0);
@@ -768,9 +819,16 @@ async fn tracing_does_not_record_container_image() {
     tracing::dispatcher::with_default(&dispatch, tracing::callsite::rebuild_interest_cache);
     capture.fields.lock().unwrap().clear();
 
-    let resource = task_with_image(format!(
-        "https://user:{SECRET}@registry.invalid/private\n{FORGED}"
+    let workload = TaskWorkload::Container(ContainerSpec::new(
+        format!("https://user:{IMAGE_SECRET}@registry.invalid/private\n{FORGED}"),
+        Some(vec![COMMAND_SECRET.to_owned()]),
+        vec![ARG_SECRET.to_owned()],
+        TaskEnv::single("ACCESS_TOKEN", ENV_SECRET),
     ));
+    let spec = TaskSpec::builder("container-slot", workload, 5_000_u64)
+        .build()
+        .unwrap();
+    let resource = Task::new("container-task", spec).unwrap();
     let run_id = solti_runner::make_run_id(runner.name(), resource.slot().as_str());
     let mut scope = solti_runner::BuildScope::unmanaged(runner.name());
     let task = runner
@@ -794,8 +852,13 @@ async fn tracing_does_not_record_container_image() {
     assert!(fields.contains("container.lifecycle"), "{fields}");
     assert!(fields.contains("creating"), "{fields}");
     assert!(!fields.contains("image="), "{fields}");
-    assert!(!fields.contains(SECRET), "{fields}");
     assert!(!fields.contains(FORGED), "{fields}");
+    for secret in [IMAGE_SECRET, COMMAND_SECRET, ARG_SECRET, ENV_SECRET] {
+        assert!(
+            !fields.contains(secret),
+            "tracing leaked {secret:?}: {fields}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -810,6 +873,42 @@ async fn pre_canceled_attempt_performs_no_engine_io() {
         .unwrap_err();
 
     assert!(matches!(error, TaskError::Canceled));
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[derive(Default)]
+struct HostileOutputPublisher {
+    calls: AtomicUsize,
+}
+
+impl solti_runner::OutputPublisher for HostileOutputPublisher {
+    fn sink_for(
+        &self,
+        _task_name: &solti_model::TaskId,
+        _generation: u64,
+        _attempt: u32,
+    ) -> Option<solti_runner::OutputSink> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        panic!("pre-canceled container attempt invoked hostile output publisher")
+    }
+}
+
+#[tokio::test]
+async fn pre_canceled_attempt_does_not_request_output_sink() {
+    let (engine, calls) = FakeEngine::new(0);
+    let runner = ContainerRunner::new("containerd", drop_releasing_engine(engine)).unwrap();
+    let publisher = Arc::new(HostileOutputPublisher::default());
+    let publisher_handle: solti_runner::OutputPublisherHandle = publisher.clone();
+    let context = BuildContext::default().with_output_publisher(publisher_handle);
+
+    let error = build_with_context(&runner, &context)
+        .await
+        .spawn(TaskContext::detached_cancelled())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, TaskError::Canceled));
+    assert_eq!(publisher.calls.load(Ordering::SeqCst), 0);
     assert!(calls.lock().unwrap().is_empty());
 }
 
@@ -852,7 +951,7 @@ async fn cancellation_during_create_cleans_without_starting() {
     let ctx = worker_context(engine);
     let request = ctx.task.request(1);
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let worker = tokio::spawn(run_container_worker(ctx, request, None, cancel_rx));
+    let worker = tokio::spawn(run_container_worker(ctx, request, cancel_rx));
 
     wait_for(&handle.create_entered, "create attempt to start").await;
     cancel_tx.send(true).unwrap();
@@ -881,7 +980,7 @@ async fn create_rollback_error_wins_over_concurrent_cancellation() {
     let ctx = worker_context(engine);
     let request = ctx.task.request(1);
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let worker = tokio::spawn(run_container_worker(ctx, request, None, cancel_rx));
+    let worker = tokio::spawn(run_container_worker(ctx, request, cancel_rx));
 
     wait_for(&handle.create_entered, "create attempt to start").await;
     cancel_tx.send(true).unwrap();
@@ -914,7 +1013,7 @@ async fn cooperative_cancellation_waits_for_termination_wait_and_cleanup() {
     let ctx = worker_context(engine);
     let request = ctx.task.request(1);
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let worker = tokio::spawn(run_container_worker(ctx, request, None, cancel_rx));
+    let worker = tokio::spawn(run_container_worker(ctx, request, cancel_rx));
 
     wait_for(&handle.wait_entered, "container wait to start").await;
     cancel_tx.send(true).unwrap();
@@ -947,7 +1046,7 @@ async fn force_drop_at_attempt_stage(target: BlockingStage) {
     let ctx = worker_context(engine);
     let request = ctx.task.request(1);
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let worker = tokio::spawn(run_container_worker(ctx, request, None, cancel_rx));
+    let worker = tokio::spawn(run_container_worker(ctx, request, cancel_rx));
 
     if target == BlockingStage::Terminate {
         wait_for(&handle.state.wait_entered, "container wait to start").await;
@@ -1084,19 +1183,30 @@ async fn taskvisor_timeout_drops_lifecycle_before_outcome() {
 
 #[tokio::test]
 async fn dropping_output_tasks_aborts_readers() {
-    let stdout = tokio::spawn(std::future::pending::<()>());
-    let stderr = tokio::spawn(std::future::pending::<()>());
-    let stdout_abort = stdout.abort_handle();
-    let stderr_abort = stderr.abort_handle();
-    tokio::task::yield_now().await;
+    struct DropMarker(Arc<AtomicUsize>);
 
-    drop(OutputTasks {
-        stdout: Some(stdout),
-        stderr: Some(stderr),
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut output = OutputTasks::new();
+    let stdout = DropMarker(Arc::clone(&dropped));
+    output.spawn_stdout(async move {
+        let _owned = stdout;
+        std::future::pending::<()>().await;
     });
+    let stderr = DropMarker(Arc::clone(&dropped));
+    output.spawn_stderr(async move {
+        let _owned = stderr;
+        std::future::pending::<()>().await;
+    });
+    drop(output);
 
     tokio::time::timeout(Duration::from_secs(1), async {
-        while !stdout_abort.is_finished() || !stderr_abort.is_finished() {
+        while dropped.load(Ordering::SeqCst) != 2 {
             tokio::task::yield_now().await;
         }
     })
@@ -1144,7 +1254,7 @@ async fn panic_while_taking_stderr_aborts_the_owned_stdout_reader() {
         let mut attempt = PanicAfterStdoutAttempt {
             stdout: Some(Box::pin(stdout_reader)),
         };
-        let _output = OutputTasks::start(
+        let _output = start_output_tasks(
             &mut attempt,
             Arc::from("panic-between-output-readers"),
             LogConfig::default(),
@@ -1257,15 +1367,11 @@ async fn cleanup_failure_is_fatal() {
 async fn output_drain_reports_reader_join_failure_without_task_failure() {
     let capture = Arc::new(TraceCapture::default());
     let dispatch = tracing::Dispatch::new(CaptureSubscriber(Arc::clone(&capture)));
-    let mut output = OutputTasks {
-        stdout: Some(tokio::spawn(async {
-            panic!("container stdout reader failure")
-        })),
-        stderr: Some(tokio::spawn(async {})),
-    };
+    let mut output = OutputTasks::new();
+    output.spawn_stdout(async { panic!("container stdout reader failure") });
+    output.spawn_stderr(async {});
 
-    output
-        .drain("container-output-join")
+    drain_output_tasks(&mut output, "container-output-join")
         .with_subscriber(dispatch)
         .await;
 

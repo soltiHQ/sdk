@@ -248,11 +248,11 @@ impl Default for OutputConfig {
 pub struct OutputSubscription {
     receiver: LazyBroadcastReceiver,
     wake: WatchStream<u64>,
-    next_bytes: u64,
+    next_bytes: u128,
 }
 
 impl OutputSubscription {
-    fn new(receiver: LazyBroadcastReceiver, wake: watch::Receiver<u64>, next_bytes: u64) -> Self {
+    fn new(receiver: LazyBroadcastReceiver, wake: watch::Receiver<u64>, next_bytes: u128) -> Self {
         Self {
             receiver,
             wake: WatchStream::new(wake),
@@ -276,7 +276,7 @@ impl Stream for OutputSubscription {
                     skipped,
                     bytes_after,
                 }) => {
-                    let skipped_bytes = bytes_after.saturating_sub(this.next_bytes);
+                    let skipped_bytes = wire_skipped_bytes(bytes_after, this.next_bytes);
                     this.next_bytes = bytes_after;
                     return Poll::Ready(Some(OutputEvent::Lagged {
                         skipped,
@@ -298,8 +298,8 @@ impl Stream for OutputSubscription {
 #[derive(Clone)]
 struct BroadcastOutput {
     event: OutputEvent,
-    bytes_before: u64,
-    bytes_after: u64,
+    bytes_before: u128,
+    bytes_after: u128,
     _payload_lease: Arc<OutputPayloadLease>,
 }
 
@@ -318,7 +318,7 @@ struct LazyBroadcastState {
     events: VecDeque<LazyBroadcastSlot>,
     next_sequence: u128,
     receiver_count: usize,
-    total_bytes: u64,
+    total_bytes: u128,
     revision: u64,
     closed: bool,
 }
@@ -335,7 +335,7 @@ struct LazyBroadcastReceiver {
 }
 
 enum LazyBroadcastTryRecvError {
-    Lagged { skipped: u64, bytes_after: u64 },
+    Lagged { skipped: u64, bytes_after: u128 },
     Closed,
     Empty,
 }
@@ -370,8 +370,7 @@ impl OutputBroadcaster {
         let mut state = self.shared.state.lock();
         let payload_bytes = output_payload_bytes(&event);
         let bytes_before = state.total_bytes;
-        let bytes_after =
-            bytes_before.saturating_add(u64::try_from(payload_bytes).unwrap_or(u64::MAX));
+        let bytes_after = bytes_before.saturating_add(payload_bytes as u128);
         state.total_bytes = bytes_after;
         if state.receiver_count == 0 {
             return;
@@ -401,7 +400,7 @@ impl OutputBroadcaster {
         self.wake.send_replace(revision);
     }
 
-    fn register_receiver(&self) -> Option<(LazyBroadcastReceiver, u64)> {
+    fn register_receiver(&self) -> Option<(LazyBroadcastReceiver, u128)> {
         let mut state = self.shared.state.lock();
         if state.closed {
             return None;
@@ -527,6 +526,10 @@ fn output_payload_bytes(event: &OutputEvent) -> usize {
         OutputEvent::Chunk(chunk) => chunk.line.len(),
         _ => 0,
     }
+}
+
+fn wire_skipped_bytes(bytes_after: u128, next_bytes: u128) -> u64 {
+    u64::try_from(bytes_after.saturating_sub(next_bytes)).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -843,12 +846,12 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use solti_model::{OutputEvent, TaskId, Uid};
+    use solti_model::{OutputChunk, OutputEvent, StreamKind, TaskId, Uid};
     use solti_runner::OutputPublisher;
     use tokio::sync::oneshot;
     use tokio_stream::StreamExt;
 
-    use super::{ConfigError, OutputConfig, OutputHub};
+    use super::{ConfigError, OutputBroadcaster, OutputConfig, OutputHub, OutputPayloadBudget};
     use crate::{
         PersistenceConfig, StateConfig, TaskOutputEvent, TaskOutputSink, TaskOutputSinkHandle,
     };
@@ -1117,6 +1120,42 @@ mod tests {
             Some(OutputEvent::Chunk(chunk)) if &chunk.line[..] == b"dddd"
         ));
         assert_eq!(hub.reserved_payload_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn lagged_bytes_remain_exact_across_the_cumulative_u64_boundary() {
+        let broadcaster = OutputBroadcaster::new(
+            1,
+            OutputPayloadBudget::new(OutputConfig::DEFAULT_AGGREGATE_BYTE_BUDGET),
+        );
+        broadcaster.shared.state.lock().total_bytes = u128::from(u64::MAX) - 1;
+        let mut output = broadcaster.subscribe().expect("output subscription");
+        let chunk = |line| {
+            OutputEvent::Chunk(OutputChunk {
+                generation: 1,
+                attempt: 1,
+                stream: StreamKind::Stdout,
+                seq: 0,
+                ts: std::time::SystemTime::UNIX_EPOCH,
+                line,
+                truncated: false,
+            })
+        };
+
+        broadcaster.send(chunk(Bytes::from_static(b"aa")));
+        broadcaster.send(chunk(Bytes::from_static(b"bbb")));
+
+        assert!(matches!(
+            output.next().await,
+            Some(OutputEvent::Lagged {
+                skipped: 1,
+                skipped_bytes: 2,
+            })
+        ));
+        assert!(matches!(
+            output.next().await,
+            Some(OutputEvent::Chunk(chunk)) if &chunk.line[..] == b"bbb"
+        ));
     }
 
     #[tokio::test]

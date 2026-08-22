@@ -17,6 +17,10 @@
 //!
 //! `server()` does not bind the address.
 //! Binding starts when Taskvisor runs the returned task.
+//!
+//! The server exposes a plaintext, unauthenticated `GET /metrics` endpoint.
+//! Production deployments must restrict its reachability with a controlled
+//! bind address, network policy, firewall, or authenticated TLS proxy.
 
 use std::{
     convert::Infallible,
@@ -297,6 +301,10 @@ impl std::error::Error for MetricsServerConfigError {}
 /// The composed embedded revision contains the caller revision, listen address,
 /// and default scrape settings. Changing any effective value changes the revision.
 ///
+/// The endpoint is plaintext and unauthenticated. Binding `0.0.0.0` exposes it
+/// on every available interface. Production deployments must provide an
+/// appropriate network perimeter.
+///
 /// ## Example
 ///
 /// ```rust,no_run
@@ -337,6 +345,9 @@ pub fn server(
 /// This function has the same lifecycle contract as [`server`]. The composed
 /// embedded revision additionally covers every effective [`MetricsServerConfig`]
 /// value.
+///
+/// The endpoint is plaintext and unauthenticated. Production deployments must
+/// restrict its reachability outside this server API.
 ///
 /// A request receives `503 Service Unavailable` with `Retry-After: 1` when all
 /// scrape ownership slots are occupied. It receives `504 Gateway Timeout` when its

@@ -193,6 +193,11 @@ fn build_seccomp() -> Result<oci_spec::runtime::LinuxSeccomp, oci_spec::OciSpecE
         .errno_ret(LINUX_EPERM)
         .build()?;
 
+    // Keep compatibility architectures unset. The supported runc/libseccomp
+    // path creates a native filter and sends foreign ABIs, including x32 and
+    // i386 on x86_64, to its fail-closed bad-architecture action. Listing
+    // those architectures would enable them and requires separate policy
+    // rules plus runtime certification.
     LinuxSeccompBuilder::default()
         .default_action(LinuxSeccompAction::ScmpActAllow)
         .syscalls(vec![deny])
@@ -379,6 +384,7 @@ mod tests {
         );
         let seccomp = spec.linux().as_ref().unwrap().seccomp().as_ref().unwrap();
         assert_eq!(seccomp.default_action(), LinuxSeccompAction::ScmpActAllow);
+        assert!(seccomp.architectures().is_none());
         let rules = seccomp.syscalls().as_ref().unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].action(), LinuxSeccompAction::ScmpActErrno);

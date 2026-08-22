@@ -123,6 +123,10 @@ required-features = ["subprocess"]
 name              = "subprocess_script"
 required-features = ["subprocess"]
 
+[[test]]
+name              = "linux_host_runtime"
+required-features = ["subprocess", "seccomp"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

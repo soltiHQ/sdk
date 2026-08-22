@@ -82,7 +82,7 @@ solti-model         = { workspace = true, features = ["schema"] }
 solti-runner        = { workspace = true }
 taskvisor           = { workspace = true }
 tempfile            = { workspace = true }
-tokio               = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+tokio               = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-stream        = { workspace = true, features = ["net"] }
 tonic-prost-build   = { workspace = true }
 tower               = { workspace = true, features = ["util"] }

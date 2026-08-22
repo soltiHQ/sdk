@@ -449,7 +449,7 @@ An invalid credential is rejected before the handler. HTTP returns the
 
 `with_auth` is the static shared-token convenience path.
 A valid token creates an authenticated identity without an individual subject.
-Use`with_authenticator` to validate application credentials and return an `ApiIdentity` with a subject and application-owned attributes.
+Use `with_authenticator` to validate application credentials and return an `ApiIdentity` with a subject and application-owned attributes.
 
 Both transports also accept an `ApiAuthorizer`:
 

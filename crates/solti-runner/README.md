@@ -2,7 +2,7 @@
 
 `solti-runner` is the plugin boundary between execution backends and the supervisor.
 
-Implement `Runner` for a backend and register it in a `RunnerRouter`; the router routes each `Task` by workload GVK and optional labels, 
+Implement `Runner` for a backend and register it in a `RunnerRouter`; the router routes each `Task` by workload GVK and optional labels,
 then returns a `BuiltTask` containing the allocated `RunId` and executable `taskvisor::TaskRef`.
 `solti-exec` implements `Runner` for subprocesses; `solti-core` consumes the router.
 
@@ -146,12 +146,12 @@ let inner_runners = router.catalog();
 router.register(Arc::new(ChainRunner::new("chain", inner_runners)))?;
 ```
 
-The composing runner calls `RunnerCatalog::build_scoped_with_cancellation` for each inner task and passes its inherited `BuildScope`. 
+The composing runner calls `RunnerCatalog::build_scoped_with_cancellation` for each inner task and passes its inherited `BuildScope`.
 This reuses the outer global admission slot and applies the selected inner runner's per-runner limit.
 Catalog builds use the same exact GVK and selector routing, registration order, and `RunId` allocation as `RunnerRouter::build`.
 
-Direct `RunnerRouter::build` and `RunnerCatalog::build` calls are unmanaged: no core admission limits apply. 
-A scoped catalog build returns `RouterError::RecursiveBuild` before admission when it selects a runner already present in the active build path. 
+Direct `RunnerRouter::build` and `RunnerCatalog::build` calls are unmanaged: no core admission limits apply.
+A scoped catalog build returns `RouterError::RecursiveBuild` before admission when it selects a runner already present in the active build path.
 It returns `RouterError::AdmissionCycle` when its nested admission wait would deadlock with other active root builds.
 
 ## Build contract
@@ -159,15 +159,17 @@ It returns `RouterError::AdmissionCycle` when its nested admission wait would de
 `RunnerRouter::build` allocates a `RunId`.
 Its format is `{runner}-{slot}-{seq}`.
 The sequence comes from one process-global counter initialized to `1`.
+It never wraps; allocation panics after the sequence space is exhausted so an
+earlier run identity cannot be reused within the process.
 
 The router passes the resource, run ID, `BuildContext`, a read-only `BuildCancellation` signal, and an opaque `BuildScope` to `Runner::build_task`.
-It returns a `BuiltTask` that keeps the same run ID beside the executable `TaskRef`. 
+It returns a `BuiltTask` that keeps the same run ID beside the executable `TaskRef`.
 Use `BuiltTask::name` when constructing the surrounding `taskvisor::TaskSpec`.
 
 `build_task` constructs a task but does not start it.
 It is asynchronous and receives a cancellation signal for obsolete generations, shutdown, and supervisor-enforced deadlines.
-All build work must remain owned by the returned future. 
-Dropping that future must not leave background work running. 
+All build work must remain owned by the returned future.
+Dropping that future must not leave background work running.
 A runner that delegates inherently blocking work must own a bounded facility with explicit cancellation and shutdown behavior.
 The returned `TaskRef` must not retain the build cancellation signal.
 Submission can still be rejected after construction.
@@ -182,11 +184,11 @@ Implementations written for the synchronous runner contract require three change
 2. Change `build_task` to `async fn` and accept `&BuildCancellation` and `&mut BuildScope`.
 3. Await `RunnerRouter::build`; composing runners use `RunnerCatalog::build_scoped_with_cancellation`.
 
-Use `cancellation.cancelled()` in waits and pass clones to child futures that are owned by the build. 
+Use `cancellation.cancelled()` in waits and pass clones to child futures that are owned by the build.
 Do not migrate synchronous blocking calls by placing them in an unbounded or detached `spawn_blocking` task.
 
-Callers that need to cancel a direct router or catalog build create an owner and signal with `BuildCancellation::pair()`, 
-retain the `BuildCancellationHandle`, and pass the signal to `build_with_cancellation`. 
+Callers that need to cancel a direct router or catalog build create an owner and signal with `BuildCancellation::pair()`,
+retain the `BuildCancellationHandle`, and pass the signal to `build_with_cancellation`.
 A runner receives only the read-only signal and cannot request cancellation itself.
 
 ## Build context
@@ -242,7 +244,7 @@ OutputPublisher::sink_for(task, generation, attempt)
 `OutputSink` is a write-only producer:
 
 Request it from the task attempt future before starting separate output tasks.
-Composition runners may use execution-local routing that a separately spawned task does not inherit. 
+Composition runners may use execution-local routing that a separately spawned task does not inherit.
 Clone the returned sink into reader or forwarding tasks.
 
 ```rust
@@ -264,6 +266,8 @@ assert!(matches!(receiver.recv().unwrap(), OutputEvent::Chunk(_)));
 - A sink belongs to one generation and attempt.
 - Stdout and stderr have independent sequences starting at `0`.
 - Clones share both sequence counters.
+- Sequences never wrap. After a stream emits `u64::MAX`, its next emission
+  panics before invoking the callback instead of reusing an earlier value.
 - LF and CRLF delimiters split input into chunks and are not included in payloads.
 - Every emitted chunk receives the next sequence number for its stream.
 - Truncated multi-line input marks only its final emitted chunk as truncated.

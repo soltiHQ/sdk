@@ -1144,6 +1144,7 @@ impl AttemptState {
             self.container,
             TaskIdentity {
                 container_id: &process.container_id,
+                id: &process.id,
                 pid: process.pid,
                 stdout: &process.stdout,
                 stderr: &process.stderr,
@@ -1180,12 +1181,11 @@ impl AttemptState {
                     self.start_confirmed = true;
                     self.start_uncertain = false;
                 }
-                Ok(ProcessStatus::Created | ProcessStatus::Unknown) | Err(_) => {
-                    self.task = Ownership::DeleteUncertain;
-                    return Err(ContainerEngineError::retryable(
-                        "containerd task start outcome remains unresolved",
-                    ));
-                }
+                // A matching task remains owned even when its start outcome is
+                // unresolved. Cleanup may race a late start safely: delete wins
+                // while the task is still created, or fails and a later pass
+                // observes and terminates the running process.
+                Ok(ProcessStatus::Created | ProcessStatus::Unknown) | Err(_) => {}
             }
         }
         Ok(true)
@@ -1384,17 +1384,25 @@ impl AttemptState {
                 Ok(())
             }
             Err(status) if status.code() == Code::FailedPrecondition => {
-                self.termination_sent = true;
-                self.termination_requires_wait = self.start_confirmed;
-                if !self.termination_requires_wait {
-                    self.abort_wait();
-                }
+                self.apply_kill_failed_precondition();
                 Ok(())
             }
             Err(status) => Err(image::rpc_error(
                 "containerd task termination failed",
                 status,
             )),
+        }
+    }
+
+    /// Records a kill rejection for a task that is not signalable in its current state.
+    ///
+    /// Before start is confirmed, a late start may still win after this
+    /// response. Keep termination retryable until delete confirms absence.
+    fn apply_kill_failed_precondition(&mut self) {
+        self.termination_sent = self.start_confirmed;
+        self.termination_requires_wait = self.start_confirmed;
+        if !self.termination_requires_wait {
+            self.abort_wait();
         }
     }
 
@@ -1476,6 +1484,23 @@ impl AttemptState {
                         self.task = Ownership::DeleteUncertain;
                         if let Err(error) = self.confirm_task_absent_after_delete().await {
                             failures.push(error);
+                        }
+                    }
+                    Err(status)
+                        if status.code() == Code::FailedPrecondition && self.start_uncertain =>
+                    {
+                        self.task = Ownership::Owned;
+                        match self.confirm_task_ownership().await {
+                            Ok(false) => {}
+                            Ok(true) if self.start_confirmed => {
+                                failures.push(ContainerEngineError::retryable_from(
+                                    "containerd task cleanup is waiting for termination",
+                                    status,
+                                ));
+                            }
+                            Ok(true) => failures
+                                .push(image::rpc_error("containerd task cleanup failed", status)),
+                            Err(error) => failures.push(error),
                         }
                     }
                     Err(status) => {
@@ -1860,11 +1885,7 @@ impl AttemptState {
                     self.abort_wait();
                 }
                 Err(status) if status.code() == Code::FailedPrecondition => {
-                    self.termination_sent = true;
-                    self.termination_requires_wait = self.start_confirmed;
-                    if !self.termination_requires_wait {
-                        self.abort_wait();
-                    }
+                    self.apply_kill_failed_precondition();
                 }
                 Err(_) => {}
             },
@@ -2208,9 +2229,11 @@ fn container_identity_matches(
 
 /// Runtime task identity returned by containerd.
 struct TaskIdentity<'a> {
-    /// Container identifier reported for the process.
+    /// Optional container identifier reported for the process.
     container_id: &'a str,
     /// Process identifier reported by containerd.
+    id: &'a str,
+    /// Operating-system process identifier reported by containerd.
     pid: u32,
     /// Standard output path reported by containerd.
     stdout: &'a str,
@@ -2237,7 +2260,8 @@ fn task_identity_matches(
     expected: ExpectedTaskIdentity<'_>,
 ) -> bool {
     container == Ownership::Owned
-        && actual.container_id == expected.resource_id
+        && actual.id == expected.resource_id
+        && (actual.container_id.is_empty() || actual.container_id == expected.resource_id)
         && expected.pid.is_none_or(|expected| actual.pid == expected)
         && expected
             .stdout

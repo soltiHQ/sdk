@@ -64,11 +64,12 @@ async fn maximum_supported_capacity_is_constructed_lazily() {
 }
 
 #[tokio::test]
-async fn huge_timeout_shutdown_can_be_canceled_and_retried() {
+async fn shutdown_can_be_canceled_and_retried() {
     let finalizer = DropFinalizerDomain::start(1).unwrap();
     let reservation = finalizer.try_reserve().unwrap();
     let shutdown_finalizer = finalizer.clone();
-    let shutdown = tokio::spawn(async move { shutdown_finalizer.shutdown(Duration::MAX).await });
+    let shutdown =
+        tokio::spawn(async move { shutdown_finalizer.shutdown(Duration::from_secs(30)).await });
 
     wait_for_status(&finalizer, |status| !status.accepting()).await;
     shutdown.abort();
@@ -78,6 +79,51 @@ async fn huge_timeout_shutdown_can_be_canceled_and_retried() {
     drop(reservation);
     finalizer.shutdown(Duration::from_secs(2)).await.unwrap();
     assert_eq!(finalizer.status().owned(), 0);
+}
+
+#[tokio::test]
+async fn shutdown_wakes_when_the_final_reservation_releases_and_worker_stops() {
+    let finalizer = DropFinalizerDomain::start(1).unwrap();
+    let reservation = finalizer.try_reserve().unwrap();
+    let shutdown_finalizer = finalizer.clone();
+    let started = std::time::Instant::now();
+    let shutdown =
+        tokio::spawn(async move { shutdown_finalizer.shutdown(Duration::from_secs(2)).await });
+
+    wait_for_status(&finalizer, |status| !status.accepting()).await;
+    drop(reservation);
+
+    shutdown.await.unwrap().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "terminal worker notification waited until the shutdown deadline"
+    );
+    assert_eq!(finalizer.status().owned(), 0);
+}
+
+#[tokio::test]
+async fn repeated_shutdown_of_drained_finalizer_succeeds_without_waiting() {
+    let finalizer = DropFinalizerDomain::start(1).unwrap();
+
+    let started = std::time::Instant::now();
+    finalizer.shutdown(Duration::from_secs(2)).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "drained finalizer waited until the shutdown deadline"
+    );
+    finalizer.shutdown(Duration::ZERO).await.unwrap();
+}
+
+#[tokio::test]
+async fn overflowing_shutdown_timeout_is_rejected_without_closing_admission() {
+    let finalizer = DropFinalizerDomain::start(1).unwrap();
+
+    let error = finalizer.shutdown(Duration::MAX).await.unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(finalizer.status().accepting());
+    drop(finalizer.try_reserve().unwrap());
+    finalizer.shutdown(Duration::from_secs(2)).await.unwrap();
 }
 
 #[tokio::test]

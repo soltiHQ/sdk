@@ -23,7 +23,7 @@ use super::{
     ContainerRunnerConfig,
 };
 use crate::{
-    output::{LogConfig, OutputReaderFailure, StreamKind, classify_output_reader_join, log_stream},
+    output::{LogConfig, OutputDrain, OutputTasks, StreamKind, log_stream},
     registration::validate_runner_name,
 };
 
@@ -77,7 +77,7 @@ impl ContainerRunner {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ContainerTaskConfig {
     run_id: Arc<str>,
     resource_name: solti_model::TaskId,
@@ -232,19 +232,17 @@ fn validate_process_input(
 }
 
 async fn run_container(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Result<(), TaskError> {
+    if cancel.is_cancelled() {
+        return Err(TaskError::Canceled);
+    }
+
     let Some(attempt) = next_attempt(&ctx.attempt) else {
         return Err(TaskError::fatal("container attempt identity exhausted"));
     };
     let request = ctx.task.request(attempt);
-    let sink = request_output_sink(
-        &ctx.output_publisher,
-        &ctx.task.resource_name,
-        ctx.task.generation,
-        attempt,
-    );
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let worker = run_container_worker(ctx, request, sink, cancel_rx);
+    let worker = run_container_worker(ctx, request, cancel_rx);
     tokio::pin!(worker);
 
     tokio::select! {
@@ -280,7 +278,6 @@ fn cancellation_requested(cancel: &watch::Receiver<bool>) -> bool {
 async fn run_container_worker(
     ctx: Arc<TaskExecContext>,
     request: ContainerRequest,
-    sink: Option<solti_runner::OutputSink>,
     cancel: watch::Receiver<bool>,
 ) -> Result<(), TaskError> {
     let span = debug_span!(
@@ -291,7 +288,7 @@ async fn run_container_worker(
         run_id = %ctx.task.run_id,
         attempt = request.attempt(),
     );
-    run_container_attempt(ctx, request, sink, cancel)
+    run_container_attempt(ctx, request, cancel)
         .instrument(span)
         .await
 }
@@ -299,12 +296,18 @@ async fn run_container_worker(
 async fn run_container_attempt(
     ctx: Arc<TaskExecContext>,
     request: ContainerRequest,
-    sink: Option<solti_runner::OutputSink>,
     mut cancel: watch::Receiver<bool>,
 ) -> Result<(), TaskError> {
     if cancellation_requested(&cancel) {
         return Err(TaskError::Canceled);
     }
+
+    let sink = request_output_sink(
+        &ctx.output_publisher,
+        request.task_name(),
+        request.generation(),
+        request.attempt(),
+    );
 
     trace!(
         event = "container.lifecycle",
@@ -329,7 +332,7 @@ async fn run_container_attempt(
         "container attempt created"
     );
 
-    let mut output = OutputTasks::start(
+    let mut output = start_output_tasks(
         attempt.as_mut(),
         Arc::clone(&ctx.task.run_id),
         ctx.logger,
@@ -338,7 +341,7 @@ async fn run_container_attempt(
 
     if cancellation_requested(&cancel) {
         cleanup_attempt(attempt.as_mut(), false).await?;
-        output.drain(&ctx.task.run_id).await;
+        drain_output_tasks(&mut output, &ctx.task.run_id).await;
         return Err(TaskError::Canceled);
     }
 
@@ -355,7 +358,7 @@ async fn run_container_attempt(
         );
         let canceled = cancellation_requested(&cancel);
         let cleanup = cleanup_attempt(attempt.as_mut(), true).await;
-        output.drain(&ctx.task.run_id).await;
+        drain_output_tasks(&mut output, &ctx.task.run_id).await;
         cleanup?;
         return if canceled {
             Err(TaskError::Canceled)
@@ -417,7 +420,7 @@ async fn run_container_attempt(
         }
     };
 
-    output.drain(&ctx.task.run_id).await;
+    drain_output_tasks(&mut output, &ctx.task.run_id).await;
     let cleanup = attempt.cleanup().await;
     if let Err(error) = cleanup {
         record_runner_error(
@@ -486,123 +489,65 @@ enum AttemptCompletion {
     Canceled,
 }
 
-/// Attempt-owned stdout and stderr readers.
-///
-/// Dropping this owner aborts every reader that has already been spawned. The
-/// owner is established before the engine is asked for either stream, which
-/// also covers an engine panic while the second stream is being taken.
-struct OutputTasks {
-    stdout: Option<tokio::task::JoinHandle<()>>,
-    stderr: Option<tokio::task::JoinHandle<()>>,
-}
+/// Starts available container readers and enrolls each task before asking the
+/// engine for another stream. This preserves unwind-safe reader ownership when
+/// a custom engine panics while returning the second stream.
+fn start_output_tasks(
+    attempt: &mut dyn ContainerAttempt,
+    run_id: Arc<str>,
+    logger: LogConfig,
+    sink: Option<solti_runner::OutputSink>,
+) -> OutputTasks {
+    let mut tasks = OutputTasks::new();
 
-impl OutputTasks {
-    fn start(
-        attempt: &mut dyn ContainerAttempt,
-        run_id: Arc<str>,
-        logger: LogConfig,
-        sink: Option<solti_runner::OutputSink>,
-    ) -> Self {
-        let mut tasks = Self {
-            stdout: None,
-            stderr: None,
-        };
-
-        if let Some(reader) = attempt.take_stdout() {
-            let run_id = Arc::clone(&run_id);
-            let sink = sink.clone();
-            let span = tracing::Span::current();
-            tasks.stdout = Some(tokio::spawn(
-                async move {
-                    log_stream(reader, &run_id, StreamKind::Stdout, &logger, sink.as_ref()).await;
-                }
-                .instrument(span),
-            ));
-        }
-
-        if let Some(reader) = attempt.take_stderr() {
-            let span = tracing::Span::current();
-            tasks.stderr = Some(tokio::spawn(
-                async move {
-                    log_stream(reader, &run_id, StreamKind::Stderr, &logger, sink.as_ref()).await;
-                }
-                .instrument(span),
-            ));
-        }
-
-        tasks
+    if let Some(reader) = attempt.take_stdout() {
+        let run_id = Arc::clone(&run_id);
+        let sink = sink.clone();
+        let span = tracing::Span::current();
+        tasks.spawn_stdout(
+            async move {
+                log_stream(reader, &run_id, StreamKind::Stdout, &logger, sink.as_ref()).await;
+            }
+            .instrument(span),
+        );
     }
 
-    async fn drain(&mut self, run_id: &str) {
-        #[cfg(not(test))]
-        const GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-        #[cfg(test)]
-        const GRACE: std::time::Duration = std::time::Duration::from_millis(100);
-        let joined = tokio::time::timeout(GRACE, async {
-            let stdout = async {
-                match self.stdout.as_mut() {
-                    Some(stdout) => Some(stdout.await),
-                    None => None,
-                }
-            };
-            let stderr = async {
-                match self.stderr.as_mut() {
-                    Some(stderr) => Some(stderr.await),
-                    None => None,
-                }
-            };
-            tokio::join!(stdout, stderr)
-        })
-        .await;
+    if let Some(reader) = attempt.take_stderr() {
+        let span = tracing::Span::current();
+        tasks.spawn_stderr(
+            async move {
+                log_stream(reader, &run_id, StreamKind::Stderr, &logger, sink.as_ref()).await;
+            }
+            .instrument(span),
+        );
+    }
 
-        let Ok((stdout, stderr)) = joined else {
-            if let Some(stdout) = &self.stdout {
-                stdout.abort();
-            }
-            if let Some(stderr) = &self.stderr {
-                stderr.abort();
-            }
+    tasks
+}
+
+async fn drain_output_tasks(output: &mut OutputTasks, run_id: &str) {
+    match output.drain().await {
+        OutputDrain::TimedOut => {
+            output.abort();
             warn!(
                 event = "container.output_drain_timed_out",
                 run_id = %run_id,
                 "container output drain timed out"
             );
-            return;
-        };
-
-        self.stdout.take();
-        self.stderr.take();
-        for (stream, failure) in [
-            (
-                StreamKind::Stdout,
-                stdout.and_then(classify_output_reader_join),
-            ),
-            (
-                StreamKind::Stderr,
-                stderr.and_then(classify_output_reader_join),
-            ),
-        ] {
-            let Some(failure): Option<OutputReaderFailure> = failure else {
-                continue;
-            };
-            warn!(
-                event = "container.output_reader_failed",
-                run_id = %run_id,
-                stream = stream.as_str(),
-                join_error = failure.as_str(),
-                "container output reader task failed"
-            );
         }
-    }
-}
-
-impl Drop for OutputTasks {
-    fn drop(&mut self) {
-        if let Some(stdout) = self.stdout.take() {
-            stdout.abort();
-        }
-        if let Some(stderr) = self.stderr.take() {
-            stderr.abort();
+        OutputDrain::Completed { stdout, stderr } => {
+            for (stream, failure) in [(StreamKind::Stdout, stdout), (StreamKind::Stderr, stderr)] {
+                let Some(failure) = failure else {
+                    continue;
+                };
+                warn!(
+                    event = "container.output_reader_failed",
+                    run_id = %run_id,
+                    stream = stream.as_str(),
+                    join_error = failure.as_str(),
+                    "container output reader task failed"
+                );
+            }
         }
     }
 }
