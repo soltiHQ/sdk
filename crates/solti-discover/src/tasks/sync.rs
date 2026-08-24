@@ -513,6 +513,7 @@ mod tests {
                 crate::DiscoveryTransport::Http,
             )
             .unwrap(),
+            solti_model::AgentCapabilities::default(),
             delay_ms,
             "test@1",
         )
@@ -546,6 +547,7 @@ mod tests {
                 crate::DiscoveryTransport::Http,
             )
             .unwrap(),
+            solti_model::AgentCapabilities::default(),
             30_000,
             "test@1",
         )
@@ -573,6 +575,7 @@ mod tests {
                 crate::DiscoveryTransport::Grpc,
             )
             .unwrap(),
+            solti_model::AgentCapabilities::default(),
             30_000,
             "test@1",
         )
@@ -631,6 +634,7 @@ mod tests {
                 crate::DiscoveryTransport::Http,
             )
             .unwrap(),
+            solti_model::AgentCapabilities::default(),
             30_000,
             "test@1",
         )
@@ -688,6 +692,7 @@ mod tests {
                 .unwrap(),
             crate::ControlPlaneEndpoint::new("http://127.0.0.1:9", crate::DiscoveryTransport::Http)
                 .unwrap(),
+            solti_model::AgentCapabilities::default(),
             1,
             "wire-stamp-failure@1",
         )
@@ -724,6 +729,7 @@ mod tests {
                 crate::DiscoveryTransport::Http,
             )
             .unwrap(),
+            solti_model::AgentCapabilities::default(),
             30_000,
             "test@1",
         )

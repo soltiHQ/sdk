@@ -680,6 +680,19 @@ impl OutputHub {
         channel.broadcaster.subscribe()
     }
 
+    pub(crate) fn subscribe_if_uid(
+        &self,
+        task_id: &TaskId,
+        task_uid: &Uid,
+    ) -> Option<OutputSubscription> {
+        let channels = self.channels.read();
+        let channel = channels.get(task_id)?;
+        if &channel.task_uid != task_uid {
+            return None;
+        }
+        channel.broadcaster.subscribe()
+    }
+
     #[cfg(test)]
     pub(crate) fn subscribe_raw(&self, task_id: &TaskId) -> Option<RawOutputReceiver> {
         let channels = self.channels.read();

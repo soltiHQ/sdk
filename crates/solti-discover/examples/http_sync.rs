@@ -221,11 +221,11 @@ async fn main() -> ExampleResult {
             format!("http://{control_address}/control"),
             DiscoveryTransport::Http,
         )?,
+        capabilities()?,
         1,
         "http-discovery@1",
     )
     .metadata(metadata)
-    .capabilities(capabilities()?)
     .with_token(Token::new("example-token")?)
     .allow_insecure_token_transport()
     .with_metrics(metrics_handle)

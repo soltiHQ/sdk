@@ -39,7 +39,7 @@
 //! Clients observe reconciliation through `status.conditions[type=Reconciled]`.
 //!
 //! Apply is an upsert without write preconditions.
-//! Apply and delete can check `uid` and `resourceVersion`.
+//! Apply, cancel, and delete can check `uid` and `resourceVersion`.
 //! The core adapter maps retained Task count and TaskManifest byte admission
 //! failures to [`ApiError::ResourceExhausted`].
 //!
@@ -48,6 +48,7 @@
 //! Lists use opaque continuation tokens.
 //! The bundled adapter provides snapshot-consistent pagination.
 //! Task list bodies are limited to 4 MiB in each transport's native encoding.
+//! Live-log subscriptions require the exact Task UID and never retarget across recreation.
 //! TaskRun lists use a separate snapshot and the same native response limit.
 //! Watches can resume from a retained resource version.
 //!

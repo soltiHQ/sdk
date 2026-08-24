@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use solti_core::{CollectionError, CoreError, SupervisorApi, WritePreconditionViolation};
 use solti_model::{
     OutputEvent, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRunPage,
-    TaskRunQuery, WritePreconditions,
+    TaskRunQuery, Uid, WritePreconditions,
 };
 use tokio_stream::StreamExt;
 
@@ -161,10 +161,14 @@ impl ApiHandler for SupervisorApiAdapter {
             .map_err(map_core_error)
     }
 
-    async fn stream_task_logs(&self, id: &TaskId) -> Result<OutputEventStream, ApiError> {
+    async fn stream_task_logs(
+        &self,
+        id: &TaskId,
+        task_uid: &Uid,
+    ) -> Result<OutputEventStream, ApiError> {
         let (generation, stream) = self
             .supervisor
-            .subscribe_output_where(id, task_is_visible)
+            .subscribe_output_where(id, task_uid, task_is_visible)
             .await
             .ok_or_else(|| ApiError::TaskNotFound(id.to_string()))?;
         Ok(Box::pin(stream.filter(move |event| {
@@ -370,7 +374,7 @@ mod tests {
             "the embedded task must survive the delete attempt"
         );
 
-        let stream = adapter.stream_task_logs(&name).await;
+        let stream = adapter.stream_task_logs(&name, created.uid()).await;
         assert!(
             matches!(stream, Err(ApiError::TaskNotFound(_))),
             "embedded log streams must look like an unknown id"

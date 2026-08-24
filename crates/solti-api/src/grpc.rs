@@ -32,7 +32,7 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
-use solti_model::{LabelSelector, TaskFilter, TaskQuery, TaskRunQuery, Token};
+use solti_model::{LabelSelector, TaskFilter, TaskQuery, TaskRunQuery, Token, Uid};
 
 #[cfg(test)]
 use crate::auth::StaticBearerAuthenticator;
@@ -796,6 +796,8 @@ where
             let identity = self.authenticate(&request).await?;
             let req = request.into_inner();
             let task_id = parse_task_id("task name", req.name).map_err(Status::from)?;
+            let task_uid = Uid::new(req.task_uid)
+                .map_err(|error| Status::invalid_argument(format!("invalid task_uid: {error}")))?;
             self.authorize(
                 identity.as_ref(),
                 TaskOperation::StreamLogs,
@@ -807,17 +809,18 @@ where
                 transport = "grpc",
                 operation = "stream_logs",
                 task_name = %task_id,
+                task_uid = %task_uid,
                 "task operation started"
             );
 
             let domain_stream = self
                 .handler
-                .stream_task_logs(&task_id)
+                .stream_task_logs(&task_id, &task_uid)
                 .await
                 .map_err(Status::from)?;
 
-            let proto_stream =
-                domain_stream.map(|event| output_event_to_proto(event).map_err(Status::from));
+            let proto_stream = domain_stream
+                .map(move |event| output_event_to_proto(event, &task_uid).map_err(Status::from));
             let stream: Self::StreamTaskLogsStream = Box::pin(proto_stream);
             Ok(stream)
         })

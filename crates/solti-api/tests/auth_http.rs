@@ -105,6 +105,7 @@ impl ApiHandler for MockHandler {
     async fn stream_task_logs(
         &self,
         _id: &TaskId,
+        _task_uid: &solti_model::Uid,
     ) -> Result<solti_api::OutputEventStream, ApiError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(Box::pin(tokio_stream::empty()))
@@ -221,7 +222,7 @@ async fn sse_logs_route_without_token_is_rejected_with_401() {
     let app = secured_router(Arc::clone(&handler));
 
     let resp = app
-        .oneshot(get("/apis/solti.io/v1/tasks/task-1/logs"))
+        .oneshot(get("/apis/solti.io/v1/tasks/task-1/logs?taskUid=task-uid"))
         .await
         .unwrap();
 
@@ -243,7 +244,7 @@ async fn sse_logs_route_with_valid_token_streams() {
 
     let resp = app
         .oneshot(get_with_authorization(
-            "/apis/solti.io/v1/tasks/task-1/logs",
+            "/apis/solti.io/v1/tasks/task-1/logs?taskUid=task-uid",
             &format!("Bearer {SECRET}"),
         ))
         .await
@@ -343,7 +344,7 @@ async fn custom_access_hooks_propagate_identity_and_return_forbidden() {
 
     let denied = app
         .oneshot(get_with_authorization(
-            "/apis/solti.io/v1/tasks/task-a/logs",
+            "/apis/solti.io/v1/tasks/task-a/logs?taskUid=task-uid",
             "Bearer subject-token",
         ))
         .await

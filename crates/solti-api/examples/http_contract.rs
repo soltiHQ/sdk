@@ -185,8 +185,16 @@ impl ApiHandler for MemoryHandler {
             .ok_or_else(|| ApiError::TaskNotFound(id.to_string()))
     }
 
-    async fn stream_task_logs(&self, id: &TaskId) -> Result<OutputEventStream, ApiError> {
-        if !self.lock_tasks()?.contains_key(id.as_str()) {
+    async fn stream_task_logs(
+        &self,
+        id: &TaskId,
+        task_uid: &solti_model::Uid,
+    ) -> Result<OutputEventStream, ApiError> {
+        if self
+            .lock_tasks()?
+            .get(id.as_str())
+            .is_none_or(|task| task.uid() != task_uid)
+        {
             return Err(ApiError::TaskNotFound(id.to_string()));
         }
         let events = vec![
@@ -313,7 +321,10 @@ async fn main() -> ExampleResult {
     assert_eq!(created_status, StatusCode::CREATED);
     assert_eq!(created_body["metadata"]["name"], "resize-cover");
 
-    let logs_uri = format!("{HTTP_API_ROOT}/tasks/resize-cover/logs");
+    let task_uid = created_body["metadata"]["uid"]
+        .as_str()
+        .ok_or("created Task has no UID")?;
+    let logs_uri = format!("{HTTP_API_ROOT}/tasks/resize-cover/logs?taskUid={task_uid}");
     let logs = parts
         .router
         .oneshot(request(

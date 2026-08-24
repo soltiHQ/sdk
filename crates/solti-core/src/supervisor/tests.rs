@@ -1058,12 +1058,17 @@ async fn conditional_per_id_operations_share_visibility_and_the_resource_operati
             .is_some()
     );
     assert!(
-        api.subscribe_output_where(task.name(), |_| false)
+        api.subscribe_output_where(task.name(), task.uid(), |_| false)
+            .await
+            .is_none()
+    );
+    assert!(
+        api.subscribe_output_where(task.name(), &Uid::new("wrong-uid").unwrap(), |_| true)
             .await
             .is_none()
     );
     let (generation, _subscription) = api
-        .subscribe_output_where(task.name(), |_| true)
+        .subscribe_output_where(task.name(), task.uid(), |_| true)
         .await
         .expect("current bound generation has an output channel");
     assert_eq!(generation, task.metadata().generation());

@@ -617,7 +617,11 @@ impl ApiHandler for WireMock {
         Ok(())
     }
 
-    async fn stream_task_logs(&self, _id: &TaskId) -> Result<OutputEventStream, ApiError> {
+    async fn stream_task_logs(
+        &self,
+        _id: &TaskId,
+        _task_uid: &solti_model::Uid,
+    ) -> Result<OutputEventStream, ApiError> {
         let events = vec![
             OutputEvent::RunStarted {
                 generation: 1,
@@ -1748,7 +1752,7 @@ async fn sse_frames_match_documented_event_names_and_payloads() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/apis/solti.io/v1/tasks/task-wire-1/logs")
+                .uri("/apis/solti.io/v1/tasks/task-wire-1/logs?taskUid=task-uid")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1760,10 +1764,10 @@ async fn sse_frames_match_documented_event_names_and_payloads() {
     let body = std::str::from_utf8(&bytes).unwrap();
 
     for frame in [
-        "event: run-started\ndata: {\"type\":\"runStarted\",\"generation\":1,\"attempt\":1,\"startedAt\":1712750400000}",
-        "event: chunk\ndata: {\"type\":\"chunk\",\"generation\":1,\"attempt\":1,\"stream\":\"stdout\",\"seq\":0,\"ts\":1712750400123,\"line\":\"aGVsbG8gd29ybGQ=\"}",
-        "event: run-finished\ndata: {\"type\":\"runFinished\",\"generation\":1,\"attempt\":1,\"exitCode\":0,\"finishedAt\":1712750400456}",
-        "event: lagged\ndata: {\"type\":\"lagged\",\"skipped\":42,\"skippedBytes\":1024}",
+        "event: run-started\ndata: {\"taskUid\":\"task-uid\",\"type\":\"runStarted\",\"generation\":1,\"attempt\":1,\"startedAt\":1712750400000}",
+        "event: chunk\ndata: {\"taskUid\":\"task-uid\",\"type\":\"chunk\",\"generation\":1,\"attempt\":1,\"stream\":\"stdout\",\"seq\":0,\"ts\":1712750400123,\"line\":\"aGVsbG8gd29ybGQ=\"}",
+        "event: run-finished\ndata: {\"taskUid\":\"task-uid\",\"type\":\"runFinished\",\"generation\":1,\"attempt\":1,\"exitCode\":0,\"finishedAt\":1712750400456}",
+        "event: lagged\ndata: {\"taskUid\":\"task-uid\",\"type\":\"lagged\",\"skipped\":42,\"skippedBytes\":1024}",
     ] {
         assert!(
             body.contains(frame),
@@ -1783,7 +1787,7 @@ async fn sse_preserves_non_utf8_output_as_base64() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/apis/solti.io/v1/tasks/task-wire-1/logs")
+                .uri("/apis/solti.io/v1/tasks/task-wire-1/logs?taskUid=task-uid")
                 .body(Body::empty())
                 .unwrap(),
         )

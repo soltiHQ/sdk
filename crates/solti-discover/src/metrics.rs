@@ -328,6 +328,7 @@ mod tests {
                     crate::DiscoveryTransport::Http,
                 )
                 .unwrap(),
+                solti_model::AgentCapabilities::default(),
                 1_000,
                 "hostile-metrics@1",
             )

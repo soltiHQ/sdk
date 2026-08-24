@@ -83,10 +83,10 @@ async fn main() -> ExampleResult {
         "Agent gRPC 1",
         AgentEndpoint::new("http://127.0.0.1:8085", AgentEndpointType::Http, 1)?,
         ControlPlaneEndpoint::new(endpoint, DiscoveryTransport::Grpc)?,
+        capabilities()?,
         1,
         "grpc-discovery@1",
     )
-    .capabilities(capabilities()?)
     .connect_timeout_ms(5_000)
     .request_timeout_ms(10_000)
     .build()?;

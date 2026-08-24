@@ -140,6 +140,7 @@ impl ApiHandler for MockHandler {
     async fn stream_task_logs(
         &self,
         id: &TaskId,
+        _task_uid: &solti_model::Uid,
     ) -> Result<solti_api::OutputEventStream, ApiError> {
         // Mock surface: return a fixed two-event stream so the SSE handler
         // has something deterministic to render. Real adapter feeds this
@@ -1367,7 +1368,7 @@ async fn stream_task_logs_returns_sse_with_chunk_and_run_started_events() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/apis/solti.io/v1/tasks/some-task/logs")
+                .uri("/apis/solti.io/v1/tasks/some-task/logs?taskUid=task-uid")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1400,6 +1401,25 @@ async fn stream_task_logs_returns_sse_with_chunk_and_run_started_events() {
         body.contains("\"line\":\"aGVsbG8tZnJvbS1tb2Nr\""),
         "missing inlined chunk fields in SSE body: {body}"
     );
+    assert!(
+        body.contains("\"taskUid\":\"task-uid\""),
+        "missing Task UID in SSE body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn stream_task_logs_requires_task_uid() {
+    let response = router_with(Arc::new(MockHandler::default()))
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/apis/solti.io/v1/tasks/some-task/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1411,7 +1431,7 @@ async fn sse_metrics_span_response_body_until_eof() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/apis/solti.io/v1/tasks/some-task/logs")
+                .uri("/apis/solti.io/v1/tasks/some-task/logs?taskUid=task-uid")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1440,7 +1460,7 @@ async fn dropping_sse_body_releases_gauge_without_completion() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/apis/solti.io/v1/tasks/stream-pending/logs")
+                .uri("/apis/solti.io/v1/tasks/stream-pending/logs?taskUid=task-uid")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1494,7 +1514,7 @@ async fn initial_sse_failure_is_recorded_immediately() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/apis/solti.io/v1/tasks/stream-missing/logs")
+                .uri("/apis/solti.io/v1/tasks/stream-missing/logs?taskUid=task-uid")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1519,7 +1539,7 @@ async fn stream_task_logs_missing_task_returns_404() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/apis/solti.io/v1/tasks/stream-missing/logs")
+                .uri("/apis/solti.io/v1/tasks/stream-missing/logs?taskUid=task-uid")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1539,7 +1559,7 @@ async fn stream_task_logs_empty_id_returns_400() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/apis/solti.io/v1/tasks/%20%20/logs")
+                .uri("/apis/solti.io/v1/tasks/%20%20/logs?taskUid=task-uid")
                 .body(Body::empty())
                 .unwrap(),
         )

@@ -50,7 +50,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use solti_model::{Task, TaskId};
+use solti_model::{AgentCapabilities, Task, TaskId};
 use solti_runner::{
     BuildCancellation, BuildCancellationHandle, BuiltTask, RouterError, RunnerBuildAdmission,
     RunnerRouter, make_run_id,
@@ -554,6 +554,10 @@ impl Reconciler {
             #[cfg(test)]
             injected_intake_panic: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn runner_capabilities(&self) -> AgentCapabilities {
+        self.router.capabilities()
     }
 
     #[cfg(test)]

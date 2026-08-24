@@ -260,11 +260,16 @@ default. This logical payload bound does not measure allocator overhead or RSS.
 | List        | Filter and paginate a stable collection snapshot     |
 | Watch       | Stream retained changes and then live changes        |
 | Run history | Paginate a stable retained-attempt snapshot          |
-| Logs        | Stream live stdout and stderr                        |
+| Cancel      | Reach a terminal logical outcome while retaining desired state and history |
+| Logs        | Stream live stdout and stderr for an exact Task UID  |
 | Delete      | Reach a terminal logical outcome, then remove the Task and its history |
 
 HTTP uses the fixed root `/apis/solti.io/v1` in the current `solti-api` release.
 `HttpApi::build` returns the router and its generated OpenAPI 3.1 document.
+
+Opening a live-output stream requires the current Task UID. Every returned event
+repeats that UID, and the stream remains pinned to the same Task incarnation and
+generation even if the name is deleted and recreated.
 
 gRPC uses the `solti.task.v1` protobuf package.
 Generated server and client types are available from the crate.

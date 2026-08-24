@@ -37,8 +37,8 @@ use std::{
 };
 
 use solti_model::{
-    ModelError, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRunPage,
-    TaskRunQuery, TaskWorkload, WorkloadTypeMeta, WritePreconditions,
+    AgentCapabilities, ModelError, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery,
+    TaskRunPage, TaskRunQuery, TaskWorkload, Uid, WorkloadTypeMeta, WritePreconditions,
 };
 use solti_runner::RunnerRouter;
 use taskvisor::{Supervisor, TaskRef};
@@ -148,6 +148,11 @@ impl SupervisorApi {
     /// Creates a supervisor builder.
     pub fn builder(router: RunnerRouter) -> SupervisorApiBuilder {
         SupervisorApiBuilder::new(router)
+    }
+
+    /// Returns the capabilities of the immutable runner router used by this supervisor.
+    pub fn runner_capabilities(&self) -> AgentCapabilities {
+        self.reconciler.runner_capabilities()
     }
 
     fn begin_shutdown(&self) -> bool {
@@ -680,15 +685,16 @@ impl SupervisorApi {
 
     /// Subscribes through an adapter visibility predicate.
     ///
-    /// The predicate, runtime binding, and subscription use the same per-name locks.
+    /// The UID check, predicate, runtime binding, and subscription use the same per-name locks.
     /// The predicate must be pure and non-blocking. It must not call back into
     /// [`SupervisorApi`] because it runs synchronously while those locks are held.
     /// The returned generation identifies the bound desired state.
-    /// Returns `None` for missing, hidden, or unbound state, or when the output
-    /// channel is closed or its subscriber count cannot be represented.
+    /// Returns `None` for a mismatched UID, missing, hidden, or unbound state,
+    /// or when the output channel is closed or its subscriber count cannot be represented.
     pub async fn subscribe_output_where<F>(
         &self,
         name: &TaskId,
+        task_uid: &Uid,
         predicate: F,
     ) -> Option<(u64, OutputSubscription)>
     where
@@ -697,14 +703,17 @@ impl SupervisorApi {
         let _operation = self.task_operations.lock(name).await;
         let _runtime_operation = self.reconciler.runtime_operations.lock(name).await;
         let task = self.reconciler.state.get_retained(name)?;
-        if !predicate(&task) {
+        if task.uid() != task_uid || !predicate(&task) {
             return None;
         }
         let resource = ResourceGeneration::from_task(&task);
         if self.reconciler.state.binding_for(name)?.resource != resource {
             return None;
         }
-        let subscription = self.reconciler.output_hub.subscribe(name)?;
+        let subscription = self
+            .reconciler
+            .output_hub
+            .subscribe_if_uid(name, task_uid)?;
         Some((resource.generation, subscription))
     }
 

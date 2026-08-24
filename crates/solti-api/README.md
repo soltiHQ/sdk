@@ -35,7 +35,7 @@ The application owns listener addresses, startup, and shutdown.
 
 ## What it does
 
-- exposes create, apply, get, list, watch, run history, delete, and live output;
+- exposes create, apply, get, list, watch, run history, cancellation, delete, and live output;
 - keeps HTTP and gRPC on one handler contract;
 - validates request fields before handler calls;
 - maps domain errors to Kubernetes-style HTTP `Status` resources and gRPC status codes;
@@ -166,7 +166,7 @@ HTTP request ── parse CRD JSON ──┐
 gRPC call ── convert v1 DTO ─────┘
 ```
 
-`ApiHandler` has eight operations:
+`ApiHandler` has nine operations:
 
 | Operation          | Input                                             | Output                    |
 |--------------------|---------------------------------------------------|---------------------------|
@@ -176,8 +176,9 @@ gRPC call ── convert v1 DTO ─────┘
 | `query_tasks`      | `TaskQuery`                                       | `TaskPage<Task>`          |
 | `watch_tasks`      | `TaskFilter`, optional resource version           | Task watch stream         |
 | `query_task_runs`  | `TaskId`, `TaskRunQuery`                          | `TaskRunPage`             |
+| `cancel_task`      | `TaskId`, `WritePreconditions`                    | Empty success             |
 | `delete_task`      | `TaskId`, `WritePreconditions`                    | Empty success             |
-| `stream_task_logs` | `TaskId`                                          | Live `OutputEvent` stream |
+| `stream_task_logs` | `TaskId`, exact Task UID                          | UID-pinned live stream    |
 
 Implement the trait directly when the application has another backend.
 Transport validation and public workload visibility still apply.
@@ -194,7 +195,8 @@ The current API root is `/apis/solti.io/v1`.
 | `GET`    | `/apis/solti.io/v1/tasks`                     | List tasks                              |
 | `GET`    | `/apis/solti.io/v1/tasks?watch=true`          | Watch task resources                    |
 | `GET`    | `/apis/solti.io/v1/tasks/{name}/runs`         | List run history                        |
-| `GET`    | `/apis/solti.io/v1/tasks/{name}/logs`         | Stream live output with SSE             |
+| `POST`   | `/apis/solti.io/v1/tasks/{name}/cancel`       | Request a terminal logical outcome while retaining desired state and history; `204` |
+| `GET`    | `/apis/solti.io/v1/tasks/{name}/logs?taskUid={uid}` | Stream UID-pinned live output with SSE |
 | `DELETE` | `/apis/solti.io/v1/tasks/{name}`              | Request logical cancellation and remove retained state; `204` |
 
 List one filtered page:
@@ -234,6 +236,7 @@ GET /apis/solti.io/v1/tasks/{name}/runs?limit=100&continue={opaque-token}
 ```
 
 The response keeps the `runs` array and adds collection `metadata`.
+`metadata.taskUid` identifies the exact Task incarnation captured by the run snapshot.
 Runs are ordered by generation and attempt.
 Each compact-JSON response is limited to 4 MiB at complete-run boundaries.
 
@@ -248,8 +251,9 @@ Each compact-JSON response is limited to 4 MiB at complete-run boundaries.
 | `continue`                | Resume the matching Task or TaskRun snapshot         |
 | `watch`                   | Select watch mode with `true` or `1`                 |
 | `resourceVersion` (read)  | Start a watch at an opaque collection version        |
-| `uid`                     | Apply or delete precondition                         |
-| `resourceVersion` (write) | Apply or delete version precondition on write routes |
+| `uid`                     | Apply, cancel, or delete precondition                 |
+| `resourceVersion` (write) | Apply, cancel, or delete version precondition         |
+| `taskUid`                 | Required Task UID for a live-output stream            |
 
 Filters are combined with AND.
 Repeated `phase` values are combined with OR.
@@ -258,7 +262,8 @@ Singleton parameters cannot be repeated.
 
 `limit` and `continue` are not accepted in watch mode.
 Read `resourceVersion` is accepted only in watch mode.
-Write `resourceVersion` is accepted only by apply and delete routes.
+Write `resourceVersion` is accepted only by apply, cancel, and delete routes.
+`taskUid` is accepted only by the live-output route.
 
 ## gRPC
 
@@ -273,6 +278,7 @@ Generated public types are available under `solti_api::grpc::wire`.
 | `ListTasks`      | Unary            | List                |
 | `WatchTasks`     | Server streaming | Watch               |
 | `ListTaskRuns`   | Unary            | Paginated run history |
+| `CancelTask`     | Unary            | Cancel              |
 | `DeleteTask`     | Unary            | Delete              |
 | `StreamTaskLogs` | Server streaming | Live output         |
 
@@ -305,12 +311,12 @@ Every encoded and decoded gRPC message is limited to `MAX_REQUEST_BYTES`.
 `ListTasks` and `ListTaskRuns` proactively keep their protobuf responses within that limit.
 One Task or TaskRun that cannot fit returns gRPC `ResourceExhausted`.
 
-## Create and apply
+## Create, apply, cancel, and delete
 
 Create requires a new `metadata.name`.
 Apply is an unconditional upsert when no precondition is supplied.
 
-Apply and delete support two optional preconditions:
+Apply, cancel, and delete support two optional preconditions:
 
 - `uid` checks resource identity;
 - `resourceVersion` checks the current stored version.
@@ -379,6 +385,21 @@ gRPC reports the stream error as a status.
 
 ## Live output
 
+Both transports require the exact Task UID when opening a live-output stream:
+
+```text
+GET /apis/solti.io/v1/tasks/{name}/logs?taskUid={uid}
+
+StreamTaskLogsRequest { name, task_uid }
+```
+
+A missing or invalid UID returns HTTP `400` or gRPC `InvalidArgument`. A valid
+UID that does not identify the current Task returns HTTP `404` or gRPC
+`NotFound`. These failures happen before the stream opens. A successful
+subscription is pinned atomically to that Task UID and to the generation visible
+at subscription time. Deleting and recreating the same name does not retarget an
+existing stream.
+
 HTTP uses Server-Sent Events.
 The event names are:
 
@@ -386,6 +407,10 @@ The event names are:
 - `run-started`;
 - `run-finished`;
 - `lagged`.
+
+Every SSE event payload contains `taskUid`.
+Every gRPC `StreamTaskLogsResponse` contains the matching `task_uid` beside its oneof.
+The value is constant for the lifetime of the stream, including `lagged` events.
 
 gRPC uses the matching `StreamTaskLogsResponse` oneof.
 Output lines are raw bytes in protobuf.
@@ -397,6 +422,7 @@ The stream is live-only and lossy.
 It does not persist or replay output.
 `Lagged` reports both the number of events and retained line bytes missed by a
 slow subscriber. Lag metadata never modifies raw `line` bytes.
+Clients identify a run by Task UID, generation, and attempt.
 One subscription can span later attempts of the same task generation.
 `SupervisorApiAdapter` filters an opened stream to the generation visible at subscription time.
 
@@ -407,7 +433,7 @@ They have no public HTTP or gRPC representation.
 
 The transports reject `Embedded` input.
 They also reject an `Embedded` value returned by a custom handler.
-`SupervisorApiAdapter` hides embedded tasks, watches, history, output, apply, and delete operations.
+`SupervisorApiAdapter` hides embedded tasks, watches, history, output, apply, cancel, and delete operations.
 
 Extension workloads remain public.
 Their GVK and JSON object are preserved across both transports.

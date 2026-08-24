@@ -387,6 +387,10 @@ for observed-state persistence. A full persistence queue therefore cannot keep
 the coordinator from reaching native exact-ID cancellation.
 An unknown name returns `CoreError::NotFound`.
 
+`cancel_task_with_preconditions()` rejects a missing resource and stale guards.
+`cancel_task_where()` also applies an adapter-owned visibility predicate under
+the same per-name operation lock.
+
 `delete_task()` waits for that logical outcome and removes the resource and its runs.
 A Taskvisor `ForceAborted` outcome does not prove physical exit of non-cooperative task code.
 Deleting a missing resource is an idempotent no-op.

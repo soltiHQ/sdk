@@ -860,6 +860,20 @@ struct WriteParams {
     resource_version: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(rename = "TaskLogQuery", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TaskLogParams {
+    /// Exact Task incarnation to subscribe to.
+    #[schemars(with = "Uid")]
+    task_uid: String,
+}
+
+fn parse_task_log_uid(params: TaskLogParams) -> Result<Uid, ApiError> {
+    Uid::new(params.task_uid)
+        .map_err(|error| ApiError::InvalidRequest(format!("invalid taskUid: {error}")))
+}
+
 fn parse_write_preconditions(params: WriteParams) -> Result<WritePreconditions, ApiError> {
     let mut preconditions = WritePreconditions::new();
     if let Some(uid) = params.uid {
@@ -1145,6 +1159,14 @@ impl OperationOutput for ListOrWatchResponse {
     }
 }
 
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct TaskLogEvent {
+    task_uid: Uid,
+    #[serde(flatten)]
+    event: OutputEvent,
+}
+
 struct TaskLogStreamResponse;
 
 impl OperationOutput for TaskLogStreamResponse {
@@ -1156,11 +1178,11 @@ impl OperationOutput for TaskLogStreamResponse {
     ) -> Option<ApiResponse> {
         Some(ApiResponse {
             description:
-                "Server-Sent Events. Each data field is JSON matching OutputEvent. See CONTRACT.md for framing and delivery semantics."
+                "Server-Sent Events. Each data field carries taskUid and one OutputEvent. See CONTRACT.md for framing and delivery semantics."
                     .into(),
             content: [(
                 "text/event-stream".into(),
-                media_type(context.schema.subschema_for::<OutputEvent>()),
+                media_type(context.schema.subschema_for::<TaskLogEvent>()),
             )]
             .into_iter()
             .collect(),
@@ -1529,11 +1551,12 @@ async fn stream_task_logs_route<H>(
     Extension(access): Extension<HttpAccessControl>,
     identity: Option<Extension<ApiIdentity>>,
     path: ApiPath<TaskPath>,
+    query: ApiQuery<TaskLogParams>,
 ) -> NoApi<Result<Response, ApiError>>
 where
     H: ApiHandler,
 {
-    NoApi(stream_task_logs(state, &access, identity.as_deref(), path).await)
+    NoApi(stream_task_logs(state, &access, identity.as_deref(), path, query).await)
 }
 
 async fn create_task<H>(
@@ -2026,11 +2049,13 @@ async fn stream_task_logs<H>(
     access: &HttpAccessControl,
     identity: Option<&ApiIdentity>,
     ApiPath(TaskPath { name }): ApiPath<TaskPath>,
+    ApiQuery(params): ApiQuery<TaskLogParams>,
 ) -> Result<Response, ApiError>
 where
     H: ApiHandler,
 {
     let name = parse_task_id("task name", name)?;
+    let task_uid = parse_task_log_uid(params)?;
     access
         .authorize(identity, TaskOperation::StreamLogs, TaskTarget::Task(&name))
         .await?;
@@ -2039,11 +2064,12 @@ where
         transport = "http",
         operation = "stream_logs",
         task_name = %name,
+        task_uid = %task_uid,
         "task operation started"
     );
-    let stream = handler.stream_task_logs(&name).await?;
+    let stream = handler.stream_task_logs(&name, &task_uid).await?;
 
-    let sse_stream = stream.map(|ev| {
+    let sse_stream = stream.map(move |ev| {
         let name = match &ev {
             OutputEvent::Chunk(_) => "chunk",
             OutputEvent::RunStarted { .. } => "run-started",
@@ -2051,7 +2077,11 @@ where
             OutputEvent::Lagged { .. } => "lagged",
             _ => "unknown",
         };
-        let data = serde_json::to_string(&ev).map_err(|error| {
+        let data = serde_json::to_string(&TaskLogEvent {
+            task_uid: task_uid.clone(),
+            event: ev,
+        })
+        .map_err(|error| {
             ApiError::Internal(format!("failed to serialize output event: {error}"))
         })?;
         Ok::<Event, ApiError>(Event::default().event(name).data(data))

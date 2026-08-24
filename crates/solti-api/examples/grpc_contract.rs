@@ -155,8 +155,12 @@ impl ApiHandler for SnapshotHandler {
         ))
     }
 
-    async fn stream_task_logs(&self, id: &TaskId) -> Result<OutputEventStream, ApiError> {
-        if id != self.task.name() {
+    async fn stream_task_logs(
+        &self,
+        id: &TaskId,
+        task_uid: &solti_model::Uid,
+    ) -> Result<OutputEventStream, ApiError> {
+        if id != self.task.name() || task_uid != self.task.uid() {
             return Err(ApiError::TaskNotFound(id.to_string()));
         }
         let events = vec![
@@ -285,6 +289,7 @@ async fn main() -> ExampleResult {
     let mut logs = client
         .stream_task_logs(authenticated(StreamTaskLogsRequest {
             name: "resize-cover".into(),
+            task_uid: metadata.uid.clone(),
         })?)
         .await?
         .into_inner();

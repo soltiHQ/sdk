@@ -121,6 +121,7 @@ mod tests {
             crate::AgentEndpoint::new("http://127.0.0.1:8085", crate::AgentEndpointType::Http, 1)
                 .unwrap(),
             crate::ControlPlaneEndpoint::new("http://127.0.0.1:9000", transport).unwrap(),
+            solti_model::AgentCapabilities::default(),
             30_000,
             "test@1",
         )

@@ -67,8 +67,9 @@ Every operation delegates to one `ApiHandler` method.
 | List      | `GET /apis/solti.io/v1/tasks`             | `ListTasks`      |
 | Watch     | `GET /apis/solti.io/v1/tasks?watch=true`  | `WatchTasks`     |
 | Runs      | `GET /apis/solti.io/v1/tasks/{name}/runs` | `ListTaskRuns`   |
+| Cancel    | `POST /apis/solti.io/v1/tasks/{name}/cancel` | `CancelTask`  |
 | Delete    | `DELETE /apis/solti.io/v1/tasks/{name}`   | `DeleteTask`     |
-| Logs      | `GET /apis/solti.io/v1/tasks/{name}/logs` | `StreamTaskLogs` |
+| Logs      | `GET /apis/solti.io/v1/tasks/{name}/logs?taskUid={uid}` | `StreamTaskLogs` |
 
 ## Public workloads
 
@@ -95,7 +96,7 @@ Chain remains one outer Task, existing Task status, run history, and output mess
 
 The built-in `solti.io/v1` `Embedded` workload is SDK-only.
 HTTP and gRPC reject it as input.
-`SupervisorApiAdapter` also hides it from reads, watches, history, deletion, and output.
+`SupervisorApiAdapter` also hides it from reads, watches, history, cancellation, deletion, and output.
 
 ## Resource shapes
 
@@ -224,7 +225,7 @@ An existing apply is also rejected when its TaskManifest growth would exceed
 the aggregate retained TaskManifest byte budget. Shrinking and no-op applies
 remain allowed.
 
-Apply and delete accept two optional preconditions:
+Apply, cancel, and delete accept two optional preconditions:
 
 | Field             | Check                                     |
 |-------------------|-------------------------------------------|
@@ -495,6 +496,7 @@ The response shape is:
 ```json
 {
   "metadata": {
+    "taskUid": "task-incarnation-uid",
     "resourceVersion": "opaque-run-version",
     "continue": "opaque-token",
     "remainingItemCount": 2
@@ -526,6 +528,8 @@ can remain physically active afterward.
 UTF-8-safe prefix of at most 32 KiB.
 
 The first page captures a separate TaskRun collection snapshot.
+`metadata.taskUid` identifies the exact Task incarnation whose runs are in that
+snapshot. It remains constant across the full continuation chain.
 Its continuation binds the Task name, Task UID, run collection version, and
 last returned generation and attempt.
 Every page in one chain reads that snapshot, including the frozen value of a
@@ -548,9 +552,28 @@ An unavailable run snapshot returns `410 Gone` or gRPC `OutOfRange`.
 
 gRPC uses `ListTaskRunsRequest` and `ListTaskRunsResponse`.
 The request carries `name`, `limit`, and `continue`.
-The response carries `runs`, `resource_version`, `continue`, and
-`remaining_item_count`.
+The response carries `runs`, `task_uid`, `resource_version`, `continue`, and
+`remaining_item_count`. `task_uid` is the same Task-incarnation identity exposed
+as HTTP `metadata.taskUid`.
 Its timestamps are Unix milliseconds.
+
+## Cancel
+
+HTTP:
+
+```text
+POST /apis/solti.io/v1/tasks/{name}/cancel?uid={uid}&resourceVersion={opaque-version}
+```
+
+Preconditions are optional. A successful cancel requests a terminal logical
+outcome while retaining desired Task state and run history. HTTP returns `204 No
+Content`.
+
+gRPC uses `CancelTaskRequest { name, preconditions }` and returns an empty
+`CancelTaskResponse`.
+
+Cancellation does not suppress later reconciliation. Force-aborted task code can
+remain physically active after the response.
 
 ## Delete
 
@@ -573,9 +596,13 @@ It returns an empty `DeleteTaskResponse`.
 HTTP:
 
 ```text
-GET /apis/solti.io/v1/tasks/{name}/logs
+GET /apis/solti.io/v1/tasks/{name}/logs?taskUid={uid}
 Accept: text/event-stream
 ```
+
+`taskUid` is required and must identify the current Task incarnation. A missing
+or invalid value returns `400 Bad Request`. A valid non-current UID returns `404
+Not Found`. Both failures happen before streaming starts.
 
 The response uses Server-Sent Events.
 The current event names are:
@@ -589,16 +616,16 @@ Example frames:
 
 ```text
 event: run-started
-data: {"type":"runStarted","generation":2,"attempt":1,"startedAt":1712750400000}
+data: {"taskUid":"task-incarnation-uid","type":"runStarted","generation":2,"attempt":1,"startedAt":1712750400000}
 
 event: chunk
-data: {"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":0,"ts":1712750400123,"line":"aGVsbG8="}
+data: {"taskUid":"task-incarnation-uid","type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":0,"ts":1712750400123,"line":"aGVsbG8="}
 
 event: run-finished
-data: {"type":"runFinished","generation":2,"attempt":1,"exitCode":0,"finishedAt":1712750400456}
+data: {"taskUid":"task-incarnation-uid","type":"runFinished","generation":2,"attempt":1,"exitCode":0,"finishedAt":1712750400456}
 
 event: lagged
-data: {"type":"lagged","skipped":42}
+data: {"taskUid":"task-incarnation-uid","type":"lagged","skipped":42}
 ```
 
 `line` contains standard padded base64.
@@ -617,17 +644,26 @@ events. `skippedBytes` is omitted when zero. Lag metadata is separate from
 
 Run markers are best-effort observations.
 They are not ordering barriers for chunks.
-Clients group chunks by generation, attempt, and stream.
+Clients identify a run by Task UID, generation, and attempt.
+They group chunks by Task UID, generation, attempt, and stream.
 They order those chunks by `seq`.
 
-With `SupervisorApiAdapter`, a subscription is pinned to the generation visible when it opens.
+With `SupervisorApiAdapter`, a subscription is atomically pinned to the supplied
+Task UID and the generation visible when it opens.
 It can span later attempts of that generation.
 Events from another generation are filtered out.
+Deleting and recreating the same name does not retarget an existing stream.
+Every SSE event contains the same `taskUid`, including `lagged` events.
 
 The HTTP transport sends periodic SSE keep-alive comments.
 
-gRPC `StreamTaskLogs` is a server stream.
+gRPC `StreamTaskLogs` is a server stream. `StreamTaskLogsRequest.task_uid` is
+required and has the same current-incarnation check as HTTP `taskUid`. A missing
+or invalid value returns `InvalidArgument`; a valid non-current UID returns
+`NotFound`. Both failures happen before streaming starts.
 It carries the same four event variants in a protobuf `oneof`.
+Every `StreamTaskLogsResponse.task_uid` contains the supplied Task UID and remains
+constant for the lifetime of the stream.
 Protobuf carries `line` as raw bytes.
 `OutputChunk.truncated` distinguishes a retained prefix from a complete line.
 `Lagged.skipped_bytes` reports retained line bytes lost before the next event.

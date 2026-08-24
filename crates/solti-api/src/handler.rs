@@ -18,7 +18,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use solti_model::{
     OutputEvent, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRunPage,
-    TaskRunQuery, TaskWatchEvent, WritePreconditions,
+    TaskRunQuery, TaskWatchEvent, Uid, WritePreconditions,
 };
 use tokio_stream::Stream;
 
@@ -210,19 +210,23 @@ pub trait ApiHandler: Send + Sync + 'static {
         preconditions: WritePreconditions,
     ) -> Result<(), ApiError>;
 
-    /// Subscribes to one task's live output.
+    /// Subscribes to one exact task incarnation's live output.
     ///
     /// The stream is lossy and has no replay.
     /// It can cover later attempts of the same task generation.
     /// Run boundary events are best-effort observations.
     /// They are not ordering barriers for output chunks.
     ///
-    /// The bundled adapter pins the stream to the generation visible
-    /// when this method is called.
+    /// The bundled adapter verifies `task_uid` and pins the stream to the
+    /// generation visible when this method is called.
     ///
     /// ## Errors
     ///
     /// The bundled adapter returns [`ApiError::TaskNotFound`]
-    /// when no public live output channel exists for this task.
-    async fn stream_task_logs(&self, id: &TaskId) -> Result<OutputEventStream, ApiError>;
+    /// when the UID does not match or no public live output channel exists for this task.
+    async fn stream_task_logs(
+        &self,
+        id: &TaskId,
+        task_uid: &Uid,
+    ) -> Result<OutputEventStream, ApiError>;
 }

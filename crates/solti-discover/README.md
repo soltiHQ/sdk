@@ -34,6 +34,7 @@ fn discovery_task() -> Result<(), Box<dyn std::error::Error>> {
             "https://control.example",
             DiscoveryTransport::Http,
         )?,
+        solti_model::AgentCapabilities::default(),
         30_000,
         "discovery-config@1",
     )
@@ -109,7 +110,6 @@ Optional settings use these defaults:
 | Setting                  | Default                                                  |
 |--------------------------|----------------------------------------------------------|
 | `metadata`               | Empty                                                    |
-| `capabilities`           | No runners                                               |
 | `backoff`                | Equal jitter, half interval to three intervals, factor 2 |
 | `connect_timeout_ms`     | 5 seconds                                                |
 | `request_timeout_ms`     | 30 seconds                                               |
@@ -129,14 +129,16 @@ This lets `solti-core` reconcile an otherwise identical embedded workload.
 
 ## Capabilities
 
-Pass the snapshot returned by `RunnerRouter::capabilities()` after runner registration:
+Capabilities are a required `DiscoverConfig::builder` input. For a running
+`SupervisorApi`, use the exact immutable router snapshot returned by
+`SupervisorApi::runner_capabilities()`:
 
 ```text
 registered runners
        ▼
-RunnerRouter::capabilities()
+SupervisorApi::runner_capabilities()
        ▼
-DiscoverConfigBuilder::capabilities()
+DiscoverConfig::builder(..., capabilities, ...)
        ▼
 discovery SyncRequest
 ```
@@ -151,7 +153,7 @@ Runner order preserves routing priority.
 Workload GVKs use canonical order.
 Embedded workloads are absent because they bypass runner routing.
 
-The default capability snapshot has no runners.
+An agent with no routed runners passes `AgentCapabilities::default()` explicitly.
 
 ## Authentication and TLS
 

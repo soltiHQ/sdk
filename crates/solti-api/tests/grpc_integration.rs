@@ -97,7 +97,11 @@ impl ApiHandler for SocketHandler {
         Err(ApiError::MethodNotAllowed("read-only test backend".into()))
     }
 
-    async fn stream_task_logs(&self, _id: &TaskId) -> Result<OutputEventStream, ApiError> {
+    async fn stream_task_logs(
+        &self,
+        _id: &TaskId,
+        _task_uid: &solti_model::Uid,
+    ) -> Result<OutputEventStream, ApiError> {
         Err(ApiError::MethodNotAllowed("not used by this test".into()))
     }
 }

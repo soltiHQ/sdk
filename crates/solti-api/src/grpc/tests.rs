@@ -122,7 +122,11 @@ impl ApiHandler for StreamMock {
         *self.last_preconditions.lock().unwrap() = Some(preconditions);
         Ok(())
     }
-    async fn stream_task_logs(&self, id: &TaskId) -> Result<OutputEventStream, ApiError> {
+    async fn stream_task_logs(
+        &self,
+        id: &TaskId,
+        _task_uid: &solti_model::Uid,
+    ) -> Result<OutputEventStream, ApiError> {
         if id.as_str() == "missing" {
             return Err(ApiError::TaskNotFound(id.to_string()));
         }
@@ -713,12 +717,15 @@ async fn stream_task_logs_returns_three_proto_events_in_order() {
     let svc = service();
     let req = Request::new(proto_api::StreamTaskLogsRequest {
         name: "task-1".into(),
+        task_uid: "task-1-uid".into(),
     });
 
     let response = svc.stream_task_logs(req).await.expect("stream Ok");
     let mut stream = response.into_inner();
 
-    match stream.next().await.unwrap().unwrap().kind.unwrap() {
+    let event = stream.next().await.unwrap().unwrap();
+    assert_eq!(event.task_uid, "task-1-uid");
+    match event.kind.unwrap() {
         proto_api::stream_task_logs_response::Kind::RunStarted(r) => {
             assert_eq!(r.generation, 2);
             assert_eq!(r.attempt, 1);
@@ -727,7 +734,9 @@ async fn stream_task_logs_returns_three_proto_events_in_order() {
         other => panic!("expected RunStarted, got {other:?}"),
     }
 
-    match stream.next().await.unwrap().unwrap().kind.unwrap() {
+    let event = stream.next().await.unwrap().unwrap();
+    assert_eq!(event.task_uid, "task-1-uid");
+    match event.kind.unwrap() {
         proto_api::stream_task_logs_response::Kind::Chunk(c) => {
             assert_eq!(c.generation, 2);
             assert_eq!(c.attempt, 1);
@@ -739,7 +748,9 @@ async fn stream_task_logs_returns_three_proto_events_in_order() {
         other => panic!("expected Chunk, got {other:?}"),
     }
 
-    match stream.next().await.unwrap().unwrap().kind.unwrap() {
+    let event = stream.next().await.unwrap().unwrap();
+    assert_eq!(event.task_uid, "task-1-uid");
+    match event.kind.unwrap() {
         proto_api::stream_task_logs_response::Kind::RunFinished(r) => {
             assert_eq!(r.generation, 2);
             assert_eq!(r.attempt, 1);
@@ -757,6 +768,7 @@ async fn stream_task_logs_rejects_every_invalid_model_name() {
     for invalid in ["  ", "a/b", "a b", ".", "bad$name"] {
         let req = Request::new(proto_api::StreamTaskLogsRequest {
             name: invalid.into(),
+            task_uid: "task-1-uid".into(),
         });
         let status = match svc.stream_task_logs(req).await {
             Err(s) => s,
@@ -771,12 +783,28 @@ async fn stream_task_logs_maps_task_not_found_to_not_found_status() {
     let svc = service();
     let req = Request::new(proto_api::StreamTaskLogsRequest {
         name: "missing".into(),
+        task_uid: "missing-uid".into(),
     });
     let status = match svc.stream_task_logs(req).await {
         Err(s) => s,
         Ok(_) => panic!("expected error status"),
     };
     assert_eq!(status.code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn stream_task_logs_rejects_an_empty_task_uid() {
+    let status = match service()
+        .stream_task_logs(Request::new(proto_api::StreamTaskLogsRequest {
+            name: "task-1".into(),
+            task_uid: String::new(),
+        }))
+        .await
+    {
+        Err(status) => status,
+        Ok(_) => panic!("expected invalid task UID"),
+    };
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
 }
 
 fn authenticated_service(secret: &str) -> TaskApiService<StreamMock> {
@@ -938,6 +966,7 @@ async fn custom_access_hooks_propagate_identity_and_deny_before_handler() {
 
     let mut logs = Request::new(proto_api::StreamTaskLogsRequest {
         name: "task-a".into(),
+        task_uid: "task-a-uid".into(),
     });
     logs.metadata_mut()
         .insert("authorization", "Bearer subject-token".parse().unwrap());
@@ -1058,6 +1087,7 @@ async fn stream_subscription_is_instrumented() {
     let mut stream = service
         .stream_task_logs(Request::new(proto_api::StreamTaskLogsRequest {
             name: "task-a".into(),
+            task_uid: "task-a-uid".into(),
         }))
         .await
         .unwrap()
@@ -1089,6 +1119,7 @@ async fn dropping_server_stream_releases_gauge_without_completion() {
     let response = service
         .stream_task_logs(Request::new(proto_api::StreamTaskLogsRequest {
             name: "task-a".into(),
+            task_uid: "task-a-uid".into(),
         }))
         .await
         .unwrap();

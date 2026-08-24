@@ -101,6 +101,7 @@
 //!         "https://control.example",
 //!         DiscoveryTransport::Http,
 //!     )?,
+//!     solti_model::AgentCapabilities::default(),
 //!     30_000,
 //!     "discovery-config@1",
 //! )

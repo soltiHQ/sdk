@@ -190,6 +190,7 @@ pub struct DiscoverConfig {
 impl DiscoverConfig {
     /// Starts a discovery config builder.
     ///
+    /// `capabilities` is an explicit snapshot of the runners served by the agent.
     /// `task_revision` identifies the captured runtime intent.
     /// Change it whenever a setting used by the embedded task changes.
     /// This includes opaque settings such as credentials, TLS material, and
@@ -200,6 +201,7 @@ impl DiscoverConfig {
         name: impl Into<String>,
         agent_endpoint: AgentEndpoint,
         control_plane: ControlPlaneEndpoint,
+        capabilities: AgentCapabilities,
         delay_ms: u64,
         task_revision: impl Into<String>,
     ) -> DiscoverConfigBuilder {
@@ -210,7 +212,7 @@ impl DiscoverConfig {
             control_plane,
             delay_ms,
             metadata: HashMap::new(),
-            capabilities: AgentCapabilities::default(),
+            capabilities,
             token: None,
             allow_insecure_token_transport: false,
             backoff: None,
@@ -229,7 +231,6 @@ impl DiscoverConfig {
 /// | Setting                  | Default                 |
 /// |--------------------------|-------------------------|
 /// | Metadata                 | Empty                   |
-/// | Capabilities             | No runners              |
 /// | Backoff                  | Derived from `delay_ms` |
 /// | Connect timeout          | 5 seconds               |
 /// | Request timeout          | 30 seconds              |
@@ -261,12 +262,6 @@ impl DiscoverConfigBuilder {
     /// Sets metadata sent with every sync.
     pub fn metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = metadata;
-        self
-    }
-
-    /// Sets the registered runner capabilities sent with every sync.
-    pub fn capabilities(mut self, capabilities: AgentCapabilities) -> Self {
-        self.capabilities = capabilities;
         self
     }
 
@@ -400,6 +395,7 @@ mod tests {
             "agent-1",
             AgentEndpoint::new("http://127.0.0.1:8085", AgentEndpointType::Http, 1)?,
             ControlPlaneEndpoint::new("http://127.0.0.1:9000", DiscoveryTransport::Http)?,
+            AgentCapabilities::default(),
             delay_ms,
             "test@1",
         )
@@ -444,6 +440,7 @@ mod tests {
             "agent-1",
             AgentEndpoint::new("127.0.0.1:8085", AgentEndpointType::Http, 1).unwrap(),
             ControlPlaneEndpoint::new("http://127.0.0.1:9000", DiscoveryTransport::Http).unwrap(),
+            AgentCapabilities::default(),
             1_000,
             " ",
         )
@@ -463,6 +460,7 @@ mod tests {
             "agent-1",
             AgentEndpoint::new("http://127.0.0.1:8085", AgentEndpointType::Http, 1).unwrap(),
             ControlPlaneEndpoint::new("http://127.0.0.1:9000", DiscoveryTransport::Http).unwrap(),
+            AgentCapabilities::default(),
             1_000,
             "test@1",
         )
