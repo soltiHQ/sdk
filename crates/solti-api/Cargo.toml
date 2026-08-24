@@ -21,6 +21,7 @@ include = [
     "src/**/*.rs",
     "LICENSE",
     "README.md",
+    "build.rs",
 ]
 
 [features]
@@ -29,10 +30,12 @@ core-adapter = ["dep:solti-core"]
 grpc         = [
     "dep:base64",
     "dep:prost",
+    "dep:protoc-bin-vendored",
     "dep:serde",
     "dep:serde_json",
     "dep:tonic",
     "dep:tonic-prost",
+    "dep:tonic-prost-build",
     "dep:tracing",
 ]
 grpc-tls     = ["grpc", "dep:solti-tls", "tonic/tls-ring"]
@@ -71,21 +74,23 @@ tower-http      = { workspace = true, features = ["limit"], optional = true }
 tracing         = { workspace = true, optional = true }
 
 [dev-dependencies]
-base64              = { workspace = true }
-bytes               = { workspace = true }
-http-body-util      = { workspace = true }
-protoc-bin-vendored = { workspace = true }
-rcgen               = { workspace = true }
-serde_json          = { workspace = true }
-solti-chain         = { workspace = true }
-solti-model         = { workspace = true, features = ["schema"] }
-solti-runner        = { workspace = true }
-taskvisor           = { workspace = true }
-tempfile            = { workspace = true }
-tokio               = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
-tokio-stream        = { workspace = true, features = ["net"] }
-tonic-prost-build   = { workspace = true }
-tower               = { workspace = true, features = ["util"] }
+base64         = { workspace = true }
+bytes          = { workspace = true }
+http-body-util = { workspace = true }
+rcgen          = { workspace = true }
+serde_json     = { workspace = true }
+solti-chain    = { workspace = true }
+solti-model    = { workspace = true, features = ["schema"] }
+solti-runner   = { workspace = true }
+taskvisor      = { workspace = true }
+tokio          = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-stream   = { workspace = true, features = ["net"] }
+tower          = { workspace = true, features = ["util"] }
+
+[build-dependencies]
+protoc-bin-vendored = { workspace = true, optional = true }
+solti-model         = { workspace = true }
+tonic-prost-build   = { workspace = true, optional = true }
 
 [[example]]
 name              = "core_adapter"

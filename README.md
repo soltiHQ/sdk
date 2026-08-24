@@ -521,7 +521,9 @@ task proto/vendor
 ```
 
 The task fetches the revision pinned in [`Taskfile.yml`](Taskfile.yml).
-Generated protobuf trees are ignored by Git and included in published transport crates.
+Vendored Protobuf source trees are ignored by Git and included in published
+transport crates. Each transport crate generates Rust bindings into Cargo's
+`OUT_DIR` at build time; those artifacts are never committed.
 
 Run the workspace checks:
 

@@ -162,23 +162,29 @@ mod generated {
     pub(crate) mod solti {
         pub(crate) mod agent {
             pub(crate) mod v1 {
-                include!("generated/solti.agent.v1.rs");
+                include!(concat!(env!("OUT_DIR"), "/solti.agent.v1.rs"));
 
                 #[cfg(feature = "http")]
-                include!("generated/solti.agent.v1.serde.rs");
+                include!(concat!(env!("OUT_DIR"), "/solti.agent.v1.serde.rs"));
             }
         }
 
         pub(crate) mod discover {
             pub(crate) mod wire {
-                #[cfg(feature = "grpc")]
-                include!("generated/solti.discover.v1.rs");
-
-                #[cfg(all(feature = "http", not(feature = "grpc")))]
-                include!("generated/solti.discover.v1.messages.rs");
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/solti.discover.v",
+                    env!("SOLTI_DISCOVERY_PROTOCOL_MAJOR"),
+                    ".rs"
+                ));
 
                 #[cfg(feature = "http")]
-                include!("generated/solti.discover.v1.serde.rs");
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/solti.discover.v",
+                    env!("SOLTI_DISCOVERY_PROTOCOL_MAJOR"),
+                    ".serde.rs"
+                ));
             }
         }
     }

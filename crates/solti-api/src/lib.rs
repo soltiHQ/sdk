@@ -203,7 +203,12 @@ pub use metrics::{
 #[allow(missing_docs)]
 #[allow(rustdoc::all)]
 pub(crate) mod proto_api {
-    include!("generated/solti.task.v1.rs");
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/solti.task.v",
+        env!("SOLTI_API_MAJOR"),
+        ".rs"
+    ));
 }
 
 #[cfg(any(feature = "grpc", feature = "http"))]

@@ -348,9 +348,10 @@ Protobuf defines the gRPC service and shared request and response messages.
 The authoritative protobuf tree lives in
 [`soltiHQ/proto`](https://github.com/soltiHQ/proto).
 Release and CI tooling vendor a pinned revision into `proto/`.
-The crate includes generated Rust and protobuf-JSON bindings from that vendored
-contract. Consumer builds do not run `protoc`.
-The `generated_contract` test regenerates the bindings and rejects drift.
+The crate build script generates Rust and protobuf-JSON bindings from that
+vendored contract into Cargo's `OUT_DIR`. Generated bindings are build artifacts
+and are never committed. The build uses a vendored `protoc` binary and does not
+require a system installation.
 
 The HTTP endpoint is always `POST /api/v1/discovery/sync`.
 Generated protobuf types remain internal.

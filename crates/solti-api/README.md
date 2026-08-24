@@ -59,9 +59,9 @@ Protobuf defines gRPC services and DTOs.
 The authoritative protobuf tree lives in
 [`soltiHQ/proto`](https://github.com/soltiHQ/proto).
 Release and CI tooling vendor a pinned revision into `proto/`.
-The crate includes generated Rust bindings from that vendored contract.
-Consumer builds do not run `protoc`.
-The `generated_contract` test regenerates the binding and rejects drift.
+The crate build script generates Rust bindings from that vendored contract into
+Cargo's `OUT_DIR`. Generated bindings are build artifacts and are never committed.
+The build uses a vendored `protoc` binary and does not require a system installation.
 
 `HttpApi::build` generates a standalone OpenAPI 3.1 document.
 It uses JSON Schema draft 2020-12.
