@@ -239,7 +239,11 @@ A missing resource returns `404` or gRPC `NotFound`.
 A mismatch returns `409` or gRPC `Aborted`.
 
 HTTP conflicts contain `Status.details.causes`.
-gRPC conflicts contain encoded `WriteConflictDetails` status details.
+Their `reason` is one of `UIDMismatch`, `ResourceVersionMismatch`, or
+`PreconditionFailed`.
+gRPC conflicts contain encoded `WriteConflictDetails` status details. Each
+`WriteConflictCause.reason` is a `WriteConflictReason` enum value; clients must
+not branch on the readable cause message.
 
 ### Retained Task admission
 

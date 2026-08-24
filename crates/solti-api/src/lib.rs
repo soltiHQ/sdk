@@ -173,7 +173,7 @@ pub const MAX_TASK_LIST_RESPONSE_BYTES: usize = solti_model::MAX_TASK_PAGE_ITEM_
 pub const MAX_TASK_RUN_LIST_RESPONSE_BYTES: usize = solti_model::MAX_TASK_RUN_PAGE_ITEM_BYTES;
 
 mod error;
-pub use error::{ApiConflict, ApiError, ApiErrorCause};
+pub use error::{ApiConflict, ApiConflictReason, ApiError, ApiErrorCause};
 
 mod auth;
 pub use auth::{

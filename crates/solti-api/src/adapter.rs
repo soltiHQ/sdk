@@ -26,7 +26,7 @@ use solti_model::{
 };
 use tokio_stream::StreamExt;
 
-use crate::error::{ApiConflict, ApiError, ApiErrorCause};
+use crate::error::{ApiConflict, ApiConflictReason, ApiError, ApiErrorCause};
 use crate::handler::{ApiHandler, OutputEventStream, TaskWatchEventStream};
 use crate::visibility::{manifest_is_visible, task_is_visible, workload_is_visible};
 
@@ -190,14 +190,18 @@ fn map_core_error(error: CoreError) -> ApiError {
                 .iter()
                 .map(|violation| match violation {
                     WritePreconditionViolation::Uid { .. } => {
-                        ApiErrorCause::new("UIDMismatch", violation.to_string())
+                        ApiErrorCause::new(ApiConflictReason::UidMismatch, violation.to_string())
                             .with_field("preconditions.uid")
                     }
-                    WritePreconditionViolation::ResourceVersion { .. } => {
-                        ApiErrorCause::new("ResourceVersionMismatch", violation.to_string())
-                            .with_field("preconditions.resourceVersion")
-                    }
-                    _ => ApiErrorCause::new("PreconditionFailed", violation.to_string()),
+                    WritePreconditionViolation::ResourceVersion { .. } => ApiErrorCause::new(
+                        ApiConflictReason::ResourceVersionMismatch,
+                        violation.to_string(),
+                    )
+                    .with_field("preconditions.resourceVersion"),
+                    _ => ApiErrorCause::new(
+                        ApiConflictReason::PreconditionFailed,
+                        violation.to_string(),
+                    ),
                 })
                 .collect();
             ApiError::Conflict(ApiConflict::new(conflict.name().to_string(), causes))

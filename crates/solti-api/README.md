@@ -577,7 +577,9 @@ HTTP errors use a Kubernetes-style `Status` body.
 `ResourceExhausted` uses the HTTP reason `TooManyRequests` and does not add
 `Retry-After`.
 Write conflicts include machine-readable causes.
-gRPC write conflicts encode `WriteConflictDetails` in status details.
+HTTP cause reasons are `UIDMismatch`, `ResourceVersionMismatch`, or
+`PreconditionFailed`. gRPC write conflicts encode `WriteConflictDetails` in
+status details and use the typed `WriteConflictReason` enum.
 Internal failures are logged by stable category and hidden from clients.
 The transport boundary does not write the diagnostic string to logs.
 

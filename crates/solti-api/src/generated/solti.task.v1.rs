@@ -393,13 +393,13 @@ pub enum TaskPhase {
     Running = 2,
     /// successful outcome recorded
     Succeeded = 3,
-    /// failure outcome recorded
+    /// attempt, fatal, runtime, or non-cancel-like admission failure recorded
     Failed = 4,
-    /// timeout outcome recorded
+    /// configured attempt deadline observed; retry may follow
     Timeout = 5,
     /// logical cancellation or canceled admission; physical exit is not implied
     Canceled = 6,
-    /// failure retry budget exhaustion recorded
+    /// retry-eligible failure stopped by restart policy or retry limit
     Exhausted = 7,
 }
 impl TaskPhase {
@@ -638,12 +638,12 @@ pub struct WritePreconditions {
     #[prost(string, optional, tag = "2")]
     pub resource_version: ::core::option::Option<::prost::alloc::string::String>,
 }
-/// One readable cause attached to an API error.
+/// One failed write precondition.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct StatusCause {
-    /// stable machine-readable reason
-    #[prost(string, tag = "1")]
-    pub reason: ::prost::alloc::string::String,
+pub struct WriteConflictCause {
+    /// stable machine-readable category
+    #[prost(enumeration = "WriteConflictReason", tag = "1")]
+    pub reason: i32,
     /// related request field, when known
     #[prost(string, optional, tag = "2")]
     pub field: ::core::option::Option<::prost::alloc::string::String>,
@@ -659,7 +659,7 @@ pub struct WriteConflictDetails {
     pub name: ::prost::alloc::string::String,
     /// failed write preconditions
     #[prost(message, repeated, tag = "2")]
-    pub causes: ::prost::alloc::vec::Vec<StatusCause>,
+    pub causes: ::prost::alloc::vec::Vec<WriteConflictCause>,
 }
 /// CreateTask desired-state input.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -718,7 +718,7 @@ pub struct ListTasksRequest {
     /// OR; empty = all phases
     #[prost(enumeration = "TaskPhase", repeated, tag = "2")]
     pub phases: ::prost::alloc::vec::Vec<i32>,
-    /// page size
+    /// page size; zero = 100; maximum = 1000
     #[prost(uint32, tag = "3")]
     pub limit: u32,
     /// label-selector syntax
@@ -800,9 +800,7 @@ pub struct ListTaskRunsResponse {
     /// attempts left in this snapshot
     #[prost(uint64, optional, tag = "4")]
     pub remaining_item_count: ::core::option::Option<u64>,
-    /// UID of the Task incarnation whose runs this snapshot contains.
-    /// It is fixed across continuation pages. Recreating the Task under the same
-    /// name creates a different UID.
+    /// UID of the Task incarnation whose runs this snapshot contains
     #[prost(string, tag = "5")]
     pub task_uid: ::prost::alloc::string::String,
 }
@@ -925,6 +923,47 @@ pub mod stream_task_logs_response {
         /// events were dropped
         #[prost(message, tag = "4")]
         Lagged(super::Lagged),
+    }
+}
+/// Stable category of a failed write precondition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum WriteConflictReason {
+    /// no conflict reason; never emitted intentionally
+    Unspecified = 0,
+    /// requested UID differs from the stored Task UID
+    UidMismatch = 1,
+    /// requested resourceVersion differs from the stored revision
+    ResourceVersionMismatch = 2,
+    /// failed precondition has no more specific v1 category
+    PreconditionFailed = 3,
+}
+impl WriteConflictReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "WRITE_CONFLICT_REASON_UNSPECIFIED",
+            Self::UidMismatch => "WRITE_CONFLICT_REASON_UID_MISMATCH",
+            Self::ResourceVersionMismatch => {
+                "WRITE_CONFLICT_REASON_RESOURCE_VERSION_MISMATCH"
+            }
+            Self::PreconditionFailed => "WRITE_CONFLICT_REASON_PRECONDITION_FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WRITE_CONFLICT_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "WRITE_CONFLICT_REASON_UID_MISMATCH" => Some(Self::UidMismatch),
+            "WRITE_CONFLICT_REASON_RESOURCE_VERSION_MISMATCH" => {
+                Some(Self::ResourceVersionMismatch)
+            }
+            "WRITE_CONFLICT_REASON_PRECONDITION_FAILED" => Some(Self::PreconditionFailed),
+            _ => None,
+        }
     }
 }
 /// Task collection watch event type.
