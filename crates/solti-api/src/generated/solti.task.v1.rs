@@ -628,7 +628,7 @@ impl ConditionStatus {
         }
     }
 }
-/// Optional identity and version checks for apply and delete.
+/// Optional identity and version checks for apply, cancel, and delete.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WritePreconditions {
     /// current resource UID
@@ -800,7 +800,25 @@ pub struct ListTaskRunsResponse {
     /// attempts left in this snapshot
     #[prost(uint64, optional, tag = "4")]
     pub remaining_item_count: ::core::option::Option<u64>,
+    /// UID of the Task incarnation whose runs this snapshot contains.
+    /// It is fixed across continuation pages. Recreating the Task under the same
+    /// name creates a different UID.
+    #[prost(string, tag = "5")]
+    pub task_uid: ::prost::alloc::string::String,
 }
+/// CancelTask input.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CancelTaskRequest {
+    /// Task name
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// absent = no identity or version check
+    #[prost(message, optional, tag = "2")]
+    pub preconditions: ::core::option::Option<WritePreconditions>,
+}
+/// CancelTask output. Empty on success.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CancelTaskResponse {}
 /// DeleteTask input.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteTaskRequest {
@@ -1221,6 +1239,34 @@ pub mod task_service_client {
                 .insert(GrpcMethod::new("solti.task.v1.TaskService", "ListTaskRuns"));
             self.inner.unary(req, path, codec).await
         }
+        /// Stop current reconciliation or request a terminal logical outcome for the
+        /// current runtime while retaining desired Task state and run history.
+        /// Cancellation does not suppress later reconciliation.
+        /// Force-aborted task code can remain physically active.
+        pub async fn cancel_task(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CancelTaskRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CancelTaskResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/solti.task.v1.TaskService/CancelTask",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("solti.task.v1.TaskService", "CancelTask"));
+            self.inner.unary(req, path, codec).await
+        }
         /// Request a terminal logical outcome and purge retained state.
         /// Force-aborted task code can remain physically active.
         pub async fn delete_task(
@@ -1333,6 +1379,17 @@ pub mod task_service_server {
             request: tonic::Request<super::ListTaskRunsRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ListTaskRunsResponse>,
+            tonic::Status,
+        >;
+        /// Stop current reconciliation or request a terminal logical outcome for the
+        /// current runtime while retaining desired Task state and run history.
+        /// Cancellation does not suppress later reconciliation.
+        /// Force-aborted task code can remain physically active.
+        async fn cancel_task(
+            &self,
+            request: tonic::Request<super::CancelTaskRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CancelTaskResponse>,
             tonic::Status,
         >;
         /// Request a terminal logical outcome and purge retained state.
@@ -1692,6 +1749,51 @@ pub mod task_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ListTaskRunsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/solti.task.v1.TaskService/CancelTask" => {
+                    #[allow(non_camel_case_types)]
+                    struct CancelTaskSvc<T: TaskService>(pub Arc<T>);
+                    impl<
+                        T: TaskService,
+                    > tonic::server::UnaryService<super::CancelTaskRequest>
+                    for CancelTaskSvc<T> {
+                        type Response = super::CancelTaskResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CancelTaskRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TaskService>::cancel_task(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CancelTaskSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

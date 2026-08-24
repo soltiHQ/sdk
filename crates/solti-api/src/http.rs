@@ -16,6 +16,7 @@
 //! | `GET`    | `/apis/solti.io/v1/tasks?watch=true`          | Watch       |
 //! | `GET`    | `/apis/solti.io/v1/tasks/{name}/runs`         | Run history |
 //! | `GET`    | `/apis/solti.io/v1/tasks/{name}/logs`         | Live output |
+//! | `POST`   | `/apis/solti.io/v1/tasks/{name}/cancel`       | Cancel      |
 //! | `DELETE` | `/apis/solti.io/v1/tasks/{name}`              | Delete      |
 //!
 //! ## Wire Shapes
@@ -529,6 +530,27 @@ where
     })
     .fallback_service(method_not_allowed.into_service());
 
+    let cancel = post_with(cancel_task_route::<H>, move |operation| {
+        let operation = operation
+            .id("cancelTask")
+            .tag("tasks")
+            .summary("Cancel current task execution")
+            .description(
+                "Requests a terminal logical outcome while retaining desired state and run history. \
+                 Later reconciliation remains enabled. Force-aborted task code can remain physically active.",
+            )
+            .response::<204, NoContent>()
+            .response::<400, ApiError>()
+            .response::<404, ApiError>()
+            .response::<409, ApiError>();
+        document_common_errors(document_access(
+            operation,
+            auth_enabled,
+            authorization_enabled,
+        ))
+    })
+    .fallback_service(method_not_allowed.into_service());
+
     let logs = get_with(stream_task_logs_route::<H>, move |operation| {
         let operation = operation
             .id("streamTaskLogs")
@@ -552,6 +574,7 @@ where
         .api_route("/tasks", tasks)
         .api_route("/tasks/{name}", task)
         .api_route("/tasks/{name}/runs", runs)
+        .api_route("/tasks/{name}/cancel", cancel)
         .api_route("/tasks/{name}/logs", logs)
 }
 
@@ -966,6 +989,26 @@ struct ListMeta {
     remaining_item_count: Option<usize>,
 }
 
+/// Snapshot metadata for one TaskRun collection page.
+#[derive(Debug, JsonSchema, Serialize)]
+#[schemars(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct TaskRunListMeta {
+    /// UID of the Task incarnation whose runs belong to this snapshot.
+    task_uid: String,
+
+    /// Run collection version shared by every page in one snapshot.
+    resource_version: String,
+
+    /// Opaque continuation token.
+    #[serde(rename = "continue", skip_serializing_if = "Option::is_none")]
+    continuation: Option<String>,
+
+    /// Remaining runs after this page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remaining_item_count: Option<usize>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TaskList {
@@ -1032,7 +1075,7 @@ struct HttpTaskListSchema {
 #[schemars(deny_unknown_fields)]
 struct TaskRunList {
     /// Snapshot and continuation metadata.
-    metadata: ListMeta,
+    metadata: TaskRunListMeta,
     /// Complete run items in this prefix.
     runs: Vec<TaskRun>,
 }
@@ -1041,7 +1084,7 @@ struct TaskRunList {
 #[derive(Serialize)]
 struct EmptyTaskRunList<'a> {
     /// Candidate metadata for the measured prefix.
-    metadata: &'a ListMeta,
+    metadata: &'a TaskRunListMeta,
     /// Empty item slice with the final field shape.
     runs: &'a [()],
 }
@@ -1468,6 +1511,19 @@ where
     NoApi(delete_task(state, &access, identity.as_deref(), path, query).await)
 }
 
+async fn cancel_task_route<H>(
+    state: State<Arc<H>>,
+    Extension(access): Extension<HttpAccessControl>,
+    identity: Option<Extension<ApiIdentity>>,
+    path: ApiPath<TaskPath>,
+    query: ApiQuery<WriteParams>,
+) -> NoApi<Result<NoContent, ApiError>>
+where
+    H: ApiHandler,
+{
+    NoApi(cancel_task(state, &access, identity.as_deref(), path, query).await)
+}
+
 async fn stream_task_logs_route<H>(
     state: State<Arc<H>>,
     Extension(access): Extension<HttpAccessControl>,
@@ -1671,10 +1727,11 @@ fn encode_bounded_task_list_with_limit(
 }
 
 /// Builds HTTP metadata for one retained TaskRun prefix.
-fn run_list_meta_for_prefix(page: &TaskRunPage, keep: usize) -> Result<ListMeta, ApiError> {
+fn run_list_meta_for_prefix(page: &TaskRunPage, keep: usize) -> Result<TaskRunListMeta, ApiError> {
     let (continuation, remaining_item_count) =
         crate::continuation::run_prefix_metadata(page, keep)?;
-    Ok(ListMeta {
+    Ok(TaskRunListMeta {
+        task_uid: page.task_uid.as_str().to_owned(),
         resource_version: page.resource_version.clone(),
         continuation: continuation
             .map(crate::continuation::encode_run)
@@ -1685,7 +1742,7 @@ fn run_list_meta_for_prefix(page: &TaskRunPage, keep: usize) -> Result<ListMeta,
 
 /// Returns the exact compact JSON size for a TaskRun response candidate.
 fn task_run_list_size(
-    metadata: &ListMeta,
+    metadata: &TaskRunListMeta,
     serialized_item_bytes: usize,
 ) -> Result<usize, ApiError> {
     let empty = EmptyTaskRunList {
@@ -1936,6 +1993,33 @@ where
     Ok(NoContent)
 }
 
+async fn cancel_task<H>(
+    State(handler): State<Arc<H>>,
+    access: &HttpAccessControl,
+    identity: Option<&ApiIdentity>,
+    ApiPath(TaskPath { name }): ApiPath<TaskPath>,
+    ApiQuery(params): ApiQuery<WriteParams>,
+) -> Result<NoContent, ApiError>
+where
+    H: ApiHandler,
+{
+    let name = parse_task_id("task name", name)?;
+    let preconditions = parse_write_preconditions(params)?;
+    access
+        .authorize(identity, TaskOperation::Cancel, TaskTarget::Task(&name))
+        .await?;
+    debug!(
+        event = "api.operation",
+        transport = "http",
+        operation = "cancel",
+        task_name = %name,
+        "task operation started"
+    );
+    handler.cancel_task(&name, preconditions).await?;
+
+    Ok(NoContent)
+}
+
 /// Streams task output as Server-Sent Events.
 async fn stream_task_logs<H>(
     State(handler): State<Arc<H>>,
@@ -2097,6 +2181,7 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(remaining, 1);
         assert_eq!(json["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(json["metadata"]["taskUid"], "task-1-uid");
         assert_eq!(json["metadata"]["remainingItemCount"], 1);
         let continuation =
             crate::continuation::decode_run(json["metadata"]["continue"].as_str().unwrap())

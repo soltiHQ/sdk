@@ -1037,7 +1037,7 @@ async fn retention_worker_removes_expired_terminal_resources() {
 }
 
 #[tokio::test]
-async fn conditional_reads_and_delete_share_the_resource_operation_lock() {
+async fn conditional_per_id_operations_share_visibility_and_the_resource_operation_lock() {
     let api = api(RunnerRouter::new()).await;
     let task = api
         .create_embedded_task(embedded("conditional", 10_000), cancellable_task())
@@ -1069,6 +1069,26 @@ async fn conditional_reads_and_delete_share_the_resource_operation_lock() {
     assert_eq!(generation, task.metadata().generation());
 
     assert!(matches!(
+        api.cancel_task_where(task.name(), WritePreconditions::new(), |_| false)
+            .await,
+        Err(CoreError::NotFound(_))
+    ));
+    assert!(api.get_task(task.name()).is_some());
+    assert!(matches!(
+        api.cancel_task_where(
+            &TaskId::new("missing").unwrap(),
+            WritePreconditions::new(),
+            |_| true,
+        )
+        .await,
+        Err(CoreError::NotFound(_))
+    ));
+    api.cancel_task_where(task.name(), WritePreconditions::new(), |_| true)
+        .await
+        .unwrap();
+    assert!(api.get_task(task.name()).is_some());
+
+    assert!(matches!(
         api.delete_task_where(task.name(), WritePreconditions::new(), |_| false)
             .await,
         Err(CoreError::NotFound(_))
@@ -1087,6 +1107,33 @@ async fn conditional_reads_and_delete_share_the_resource_operation_lock() {
         .await
         .unwrap();
     assert!(api.get_task(task.name()).is_none());
+    api.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn checked_cancel_rejects_stale_uid_and_retains_desired_state() {
+    let api = api(RunnerRouter::new()).await;
+    let task = api
+        .create_task(routed("checked-cancel", 1_000))
+        .await
+        .unwrap();
+    let stale = WritePreconditions::new().with_uid(solti_model::Uid::new("stale-uid").unwrap());
+
+    let error = api
+        .cancel_task_with_preconditions(task.name(), stale)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, CoreError::Conflict(_)));
+    let current = api.get_task(task.name()).expect("task remains retained");
+
+    let matching = WritePreconditions::new().with_uid(current.uid().clone());
+    api.cancel_task_with_preconditions(task.name(), matching)
+        .await
+        .unwrap();
+    assert!(api.get_task(task.name()).is_some());
+
+    api.delete_task(task.name()).await.unwrap();
     api.shutdown().await.unwrap();
 }
 

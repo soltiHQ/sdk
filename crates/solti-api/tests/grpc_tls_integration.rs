@@ -120,6 +120,14 @@ impl ApiHandler for TlsHandler {
         Err(ApiError::MethodNotAllowed("not used by this test".into()))
     }
 
+    async fn cancel_task(
+        &self,
+        _id: &TaskId,
+        _preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::MethodNotAllowed("not used by this test".into()))
+    }
+
     async fn delete_task(
         &self,
         _id: &TaskId,

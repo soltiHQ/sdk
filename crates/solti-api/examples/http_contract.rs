@@ -159,6 +159,16 @@ impl ApiHandler for MemoryHandler {
         })
     }
 
+    async fn cancel_task(
+        &self,
+        _id: &TaskId,
+        _preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::MethodNotAllowed(
+            "the teaching backend does not execute tasks".into(),
+        ))
+    }
+
     async fn delete_task(
         &self,
         id: &TaskId,

@@ -30,8 +30,10 @@ use solti_model::{
 #[derive(Default)]
 struct MockHandler {
     submit_calls: AtomicUsize,
+    cancel_calls: AtomicUsize,
     delete_calls: AtomicUsize,
     delete_returns_not_found: bool,
+    last_cancel_preconditions: Mutex<Option<WritePreconditions>>,
     last_query: Mutex<Option<TaskQuery>>,
     query_calls: AtomicUsize,
     query_resource_version: Mutex<Option<String>>,
@@ -105,6 +107,20 @@ impl ApiHandler for MockHandler {
                 continuation: None,
                 remaining_item_count: 0,
             })
+        }
+    }
+
+    async fn cancel_task(
+        &self,
+        id: &TaskId,
+        preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_cancel_preconditions.lock().unwrap() = Some(preconditions);
+        if id.as_str() == "cancel-missing" {
+            Err(ApiError::TaskNotFound(id.to_string()))
+        } else {
+            Ok(())
         }
     }
 
@@ -316,6 +332,7 @@ fn generated_openapi_describes_the_installed_task_routes() {
     let tasks = &paths["/apis/solti.io/v1/tasks"];
     let task = &paths["/apis/solti.io/v1/tasks/{name}"];
     let runs = &paths["/apis/solti.io/v1/tasks/{name}/runs"];
+    let cancel = &paths["/apis/solti.io/v1/tasks/{name}/cancel"];
     let logs = &paths["/apis/solti.io/v1/tasks/{name}/logs"];
 
     assert_eq!(tasks["post"]["operationId"], "createTask");
@@ -324,6 +341,7 @@ fn generated_openapi_describes_the_installed_task_routes() {
     assert_eq!(task["put"]["operationId"], "applyTask");
     assert_eq!(task["delete"]["operationId"], "deleteTask");
     assert_eq!(runs["get"]["operationId"], "listTaskRuns");
+    assert_eq!(cancel["post"]["operationId"], "cancelTask");
     assert_eq!(logs["get"]["operationId"], "streamTaskLogs");
 
     assert_eq!(
@@ -455,6 +473,17 @@ fn generated_openapi_describes_the_installed_task_routes() {
     assert_eq!(resource_version["schema"]["minLength"], 1);
     assert_eq!(resource_version["schema"]["pattern"], "\\S");
 
+    let cancel_parameters = cancel["post"]["parameters"].as_array().unwrap();
+    for name in ["name", "uid", "resourceVersion"] {
+        assert!(
+            cancel_parameters
+                .iter()
+                .any(|parameter| parameter["name"] == name),
+            "missing cancel parameter {name}"
+        );
+    }
+    assert!(cancel["post"]["responses"].get("204").is_some());
+
     let schemas = &document["components"]["schemas"];
     assert!(schemas.get("SoltiTaskManifest").is_some());
     assert!(schemas.get("SoltiTask").is_some());
@@ -531,6 +560,7 @@ fn generated_openapi_reflects_configured_authorization() {
         ("/apis/solti.io/v1/tasks/{name}", "put"),
         ("/apis/solti.io/v1/tasks/{name}", "delete"),
         ("/apis/solti.io/v1/tasks/{name}/runs", "get"),
+        ("/apis/solti.io/v1/tasks/{name}/cancel", "post"),
         ("/apis/solti.io/v1/tasks/{name}/logs", "get"),
     ] {
         assert!(
@@ -948,6 +978,7 @@ async fn list_runs_forwards_default_limits_and_returns_snapshot_metadata() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
+    assert_eq!(body["metadata"]["taskUid"], "http-integration-run-uid");
     assert_eq!(body["metadata"]["resourceVersion"], "runs-test:1");
     assert_eq!(body["runs"], serde_json::json!([]));
     let query = handler.last_run_query.lock().unwrap().clone().unwrap();
@@ -1029,6 +1060,54 @@ async fn delete_task_success_returns_204_no_content() {
 
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert_eq!(handler.delete_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cancel_task_forwards_preconditions_and_returns_204_without_deleting() {
+    let handler = Arc::new(MockHandler::default());
+    let app = router_with(Arc::clone(&handler));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/apis/solti.io/v1/tasks/task-1/cancel?uid=uid-1&resourceVersion=17")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(handler.cancel_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(handler.delete_calls.load(Ordering::SeqCst), 0);
+    let preconditions = handler
+        .last_cancel_preconditions
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("handler received cancel preconditions");
+    assert_eq!(preconditions.uid().unwrap().as_str(), "uid-1");
+    assert_eq!(preconditions.resource_version(), Some("17"));
+}
+
+#[tokio::test]
+async fn cancel_unknown_task_returns_404_with_structured_error() {
+    let handler = Arc::new(MockHandler::default());
+    let response = router_with(Arc::clone(&handler))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/apis/solti.io/v1/tasks/cancel-missing/cancel")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_status(&body_json(response).await, "NotFound", 404);
+    assert_eq!(handler.cancel_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

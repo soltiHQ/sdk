@@ -106,6 +106,14 @@ impl ApiHandler for StreamMock {
             remaining_item_count: 0,
         })
     }
+    async fn cancel_task(
+        &self,
+        _id: &TaskId,
+        preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
+        *self.last_preconditions.lock().unwrap() = Some(preconditions);
+        Ok(())
+    }
     async fn delete_task(
         &self,
         _id: &TaskId,
@@ -235,6 +243,52 @@ async fn delete_task_forwards_write_preconditions() {
         .expect("handler received preconditions");
     assert_eq!(preconditions.uid().unwrap().as_str(), "uid-1");
     assert_eq!(preconditions.resource_version(), Some("17"));
+}
+
+#[tokio::test]
+async fn cancel_task_forwards_write_preconditions() {
+    let handler = Arc::new(StreamMock::default());
+    let service = TaskApiService::new(Arc::clone(&handler));
+
+    service
+        .cancel_task(Request::new(proto_api::CancelTaskRequest {
+            name: "task-1".into(),
+            preconditions: Some(proto_api::WritePreconditions {
+                uid: Some("uid-1".into()),
+                resource_version: Some("17".into()),
+            }),
+        }))
+        .await
+        .unwrap();
+
+    let preconditions = handler
+        .last_preconditions
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("handler received preconditions");
+    assert_eq!(preconditions.uid().unwrap().as_str(), "uid-1");
+    assert_eq!(preconditions.resource_version(), Some("17"));
+}
+
+#[tokio::test]
+async fn cancel_task_rejects_empty_write_precondition() {
+    let handler = Arc::new(StreamMock::default());
+    let service = TaskApiService::new(Arc::clone(&handler));
+
+    let status = service
+        .cancel_task(Request::new(proto_api::CancelTaskRequest {
+            name: "task-1".into(),
+            preconditions: Some(proto_api::WritePreconditions {
+                uid: None,
+                resource_version: Some(String::new()),
+            }),
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(handler.last_preconditions.lock().unwrap().is_none());
 }
 
 #[tokio::test]
@@ -560,6 +614,7 @@ async fn list_task_runs_exposes_historical_workload_gvk() {
         "workloads.example.io/v1"
     );
     assert_eq!(response.runs[0].workload_kind, "DatabaseBackup");
+    assert_eq!(response.task_uid, "grpc-test-run-uid");
     assert_eq!(response.resource_version, "runs-test:1");
     assert!(response.r#continue.is_empty());
     assert_eq!(response.remaining_item_count, None);
@@ -872,6 +927,15 @@ async fn custom_access_hooks_propagate_identity_and_deny_before_handler() {
         .await
         .unwrap();
 
+    let mut cancel = Request::new(proto_api::CancelTaskRequest {
+        name: "task-a".into(),
+        preconditions: None,
+    });
+    cancel
+        .metadata_mut()
+        .insert("authorization", "Bearer subject-token".parse().unwrap());
+    service.cancel_task(cancel).await.unwrap();
+
     let mut logs = Request::new(proto_api::StreamTaskLogsRequest {
         name: "task-a".into(),
     });
@@ -890,6 +954,11 @@ async fn custom_access_hooks_propagate_identity_and_deny_before_handler() {
                 Some("user-7".to_owned()),
                 TaskOperation::List,
                 "collection".to_owned(),
+            ),
+            (
+                Some("user-7".to_owned()),
+                TaskOperation::Cancel,
+                "task-a".to_owned(),
             ),
             (
                 Some("user-7".to_owned()),

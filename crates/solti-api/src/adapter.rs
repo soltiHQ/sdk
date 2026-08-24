@@ -139,6 +139,17 @@ impl ApiHandler for SupervisorApiAdapter {
             .ok_or_else(|| ApiError::TaskNotFound(id.to_string()))
     }
 
+    async fn cancel_task(
+        &self,
+        id: &TaskId,
+        preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
+        self.supervisor
+            .cancel_task_where(id, preconditions, task_is_visible)
+            .await
+            .map_err(map_core_error)
+    }
+
     async fn delete_task(
         &self,
         id: &TaskId,
@@ -333,6 +344,16 @@ mod tests {
         assert!(
             matches!(runs, Err(ApiError::TaskNotFound(_))),
             "embedded run history must look like an unknown id, got {runs:?}"
+        );
+
+        let canceled = adapter.cancel_task(&name, WritePreconditions::new()).await;
+        assert!(
+            matches!(canceled, Err(ApiError::TaskNotFound(_))),
+            "canceling an embedded task must look like an unknown id, got {canceled:?}"
+        );
+        assert!(
+            adapter.supervisor.get_task(&name).is_some(),
+            "the embedded task must survive the cancel attempt"
         );
 
         let deleted = adapter.delete_task(&name, WritePreconditions::new()).await;

@@ -39,7 +39,7 @@ pub type TaskWatchEventStream =
 /// Transport-independent task API.
 ///
 /// The trait covers desired writes, current reads, collection watches,
-/// run history, deletion, and live output.
+/// run history, cancellation, deletion, and live output.
 ///
 /// Implementations must not expose the built-in `Embedded` workload.
 /// Both transports check that boundary before encoding a response.
@@ -54,6 +54,7 @@ pub type TaskWatchEventStream =
 /// | `query_tasks`      | `GET    /apis/solti.io/v1/tasks`             | `ListTasks`      |
 /// | `watch_tasks`      | `GET    /apis/solti.io/v1/tasks?watch=true`  | `WatchTasks`     |
 /// | `query_task_runs`  | `GET    /apis/solti.io/v1/tasks/{name}/runs` | `ListTaskRuns`   |
+/// | `cancel_task`      | `POST   /apis/solti.io/v1/tasks/{name}/cancel` | `CancelTask`    |
 /// | `delete_task`      | `DELETE /apis/solti.io/v1/tasks/{name}`      | `DeleteTask`     |
 /// | `stream_task_logs` | `GET    /apis/solti.io/v1/tasks/{name}/logs` | `StreamTaskLogs` |
 ///
@@ -174,6 +175,24 @@ pub trait ApiHandler: Send + Sync + 'static {
         id: &TaskId,
         query: TaskRunQuery,
     ) -> Result<TaskRunPage, ApiError>;
+
+    /// Requests a terminal logical outcome while retaining desired state and run history.
+    /// Cancellation does not suppress later reconciliation.
+    /// Force-aborted task code can remain physically active after this call returns.
+    ///
+    /// ## Errors
+    ///
+    /// The bundled adapter returns:
+    ///
+    /// - [`ApiError::TaskNotFound`] when the task is not public or does not exist.
+    /// - [`ApiError::Conflict`] when a precondition does not match.
+    /// - [`ApiError::Unavailable`] after supervisor shutdown closes operation admission.
+    /// - [`ApiError::Internal`] when runtime cancellation fails.
+    async fn cancel_task(
+        &self,
+        id: &TaskId,
+        preconditions: WritePreconditions,
+    ) -> Result<(), ApiError>;
 
     /// Requests a terminal logical outcome and removes one task and its run history.
     /// Force-aborted task code can remain physically active after this call returns.

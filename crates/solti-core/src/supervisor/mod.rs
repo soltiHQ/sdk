@@ -27,6 +27,7 @@
 //! - Accepted side effects are not rolled back.
 
 use std::{
+    future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
@@ -871,10 +872,18 @@ impl SupervisorApi {
         task_operations: TaskLocks,
         name: TaskId,
     ) -> Result<(), CoreError> {
-        let _operation = task_operations.lock(&name).await;
+        let operation = task_operations.lock(&name).await;
         if !reconciler.state.contains_task(&name) {
             return Err(CoreError::NotFound(name.to_string()));
         }
+        Self::run_cancel_task_owned(reconciler, name, operation).await
+    }
+
+    async fn run_cancel_task_owned(
+        reconciler: Reconciler,
+        name: TaskId,
+        _operation: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(), CoreError> {
         if let Some(settled) = reconciler.cancel_scheduled_for_user(&name) {
             settled.cancelled().await;
         }
@@ -887,6 +896,42 @@ impl SupervisorApi {
                 .await;
         }
         Ok(())
+    }
+
+    async fn await_cancel_task<F>(&self, name: &TaskId, operation: F) -> Result<(), CoreError>
+    where
+        F: Future<Output = Result<(), CoreError>> + Send + 'static,
+    {
+        let completion = {
+            let _spawn = self.spawn_gate.lock();
+            if self.shutdown_started.load(Ordering::Acquire) {
+                return Err(CoreError::ShuttingDown);
+            }
+
+            let (sender, completion) = oneshot::channel();
+            let runtime = self.reconciler.runtime.clone();
+            let worker = self.reconciler.tasks.spawn_on(
+                async move {
+                    let result = operation.await;
+                    let _ = sender.send(result);
+                },
+                &runtime,
+            );
+            drop(worker);
+            completion
+        };
+
+        match completion.await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    event = "task.cancel_unavailable",
+                    task_name = %name,
+                    "supervisor-owned cancellation worker became unavailable"
+                );
+                Err(CoreError::ShuttingDown)
+            }
+        }
     }
 
     /// Stops current reconciliation or requests a terminal logical outcome for
@@ -915,39 +960,73 @@ impl SupervisorApi {
         fields(event = "task.cancel", task_name = %name)
     )]
     pub async fn cancel_task(&self, name: &TaskId) -> Result<(), CoreError> {
-        let completion = {
-            let _spawn = self.spawn_gate.lock();
-            if self.shutdown_started.load(Ordering::Acquire) {
-                return Err(CoreError::ShuttingDown);
-            }
+        let reconciler = self.reconciler.clone();
+        let task_operations = self.task_operations.clone();
+        let worker_name = name.clone();
+        self.await_cancel_task(name, async move {
+            Self::run_cancel_task(reconciler, task_operations, worker_name).await
+        })
+        .await
+    }
 
-            let (sender, completion) = oneshot::channel();
-            let reconciler = self.reconciler.clone();
-            let task_operations = self.task_operations.clone();
-            let name = name.clone();
-            let runtime = self.reconciler.runtime.clone();
-            let operation = self.reconciler.tasks.spawn_on(
-                async move {
-                    let result = Self::run_cancel_task(reconciler, task_operations, name).await;
-                    let _ = sender.send(result);
-                },
-                &runtime,
-            );
-            drop(operation);
-            completion
+    /// Stops current reconciliation or runtime after checking write preconditions.
+    ///
+    /// The resource check and cancellation are serialized with create, apply,
+    /// delete, and other cancellation operations for the same task name.
+    /// Desired state and run history remain retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotFound`] when the task is missing.
+    /// Returns [`CoreError::Conflict`] when a guard does not match.
+    /// Returns [`CoreError::ShuttingDown`] when shutdown has closed operation admission.
+    /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
+    pub async fn cancel_task_with_preconditions(
+        &self,
+        name: &TaskId,
+        preconditions: WritePreconditions,
+    ) -> Result<(), CoreError> {
+        self.cancel_task_where(name, preconditions, |_| true).await
+    }
+
+    /// Stops current reconciliation or runtime through an adapter visibility predicate.
+    ///
+    /// Missing and hidden tasks are reported as missing. The visibility and
+    /// precondition checks are atomic with respect to other operations for the
+    /// same task name. The predicate must be pure and non-blocking. It must not
+    /// call back into [`SupervisorApi`] because it runs synchronously while the
+    /// per-name lock is held. Desired state and run history remain retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotFound`] when the task is missing or hidden.
+    /// Returns [`CoreError::Conflict`] when a guard does not match.
+    /// Returns [`CoreError::ShuttingDown`] when shutdown has closed operation admission.
+    /// Returns [`CoreError::Supervisor`] when Taskvisor cancellation fails.
+    pub async fn cancel_task_where<F>(
+        &self,
+        name: &TaskId,
+        preconditions: WritePreconditions,
+        predicate: F,
+    ) -> Result<(), CoreError>
+    where
+        F: Fn(&Task) -> bool,
+    {
+        let operation = self.task_operations.lock(name).await;
+        let Some(task) = self.reconciler.state.get_retained(name) else {
+            return Err(CoreError::NotFound(name.to_string()));
         };
-
-        match completion.await {
-            Ok(result) => result,
-            Err(_) => {
-                warn!(
-                    event = "task.cancel_unavailable",
-                    task_name = %name,
-                    "supervisor-owned cancellation worker became unavailable"
-                );
-                Err(CoreError::ShuttingDown)
-            }
+        if !predicate(&task) {
+            return Err(CoreError::NotFound(name.to_string()));
         }
+        TaskState::check_write_preconditions(&task, &preconditions)?;
+
+        let reconciler = self.reconciler.clone();
+        let worker_name = name.clone();
+        self.await_cancel_task(name, async move {
+            Self::run_cancel_task_owned(reconciler, worker_name, operation).await
+        })
+        .await
     }
 
     /// Deletes a task and its run history.

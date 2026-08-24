@@ -127,6 +127,8 @@ pub enum TaskOperation {
     Watch,
     /// Read retained runs for one task.
     ListRuns,
+    /// Cancel current reconciliation or runtime while retaining desired state.
+    Cancel,
     /// Delete one task.
     Delete,
     /// Open one live output stream.
@@ -143,6 +145,7 @@ impl TaskOperation {
             TaskOperation::List => "list",
             TaskOperation::Watch => "watch",
             TaskOperation::ListRuns => "list_runs",
+            TaskOperation::Cancel => "cancel",
             TaskOperation::Delete => "delete",
             TaskOperation::StreamLogs => "stream_logs",
         }

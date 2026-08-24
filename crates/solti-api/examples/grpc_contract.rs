@@ -135,6 +135,16 @@ impl ApiHandler for SnapshotHandler {
         })
     }
 
+    async fn cancel_task(
+        &self,
+        _id: &TaskId,
+        _preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::MethodNotAllowed(
+            "the teaching backend is read-only".into(),
+        ))
+    }
+
     async fn delete_task(
         &self,
         _id: &TaskId,

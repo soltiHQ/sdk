@@ -2,14 +2,15 @@
 
 #![cfg(feature = "grpc")]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
 use solti_api::grpc::wire::{
-    GetTaskRequest, TaskServiceClient, TaskWatchEventType, WatchTasksRequest,
+    CancelTaskRequest, GetTaskRequest, TaskServiceClient, TaskWatchEventType, WatchTasksRequest,
+    WritePreconditions as WireWritePreconditions,
 };
 use solti_api::tonic::{Code, Request};
 use solti_api::{
@@ -26,6 +27,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 struct SocketHandler {
     task: Task,
     get_calls: AtomicUsize,
+    last_cancel_preconditions: Mutex<Option<WritePreconditions>>,
 }
 
 #[async_trait]
@@ -70,6 +72,21 @@ impl ApiHandler for SocketHandler {
         _query: TaskRunQuery,
     ) -> Result<TaskRunPage, ApiError> {
         Err(ApiError::MethodNotAllowed("not used by this test".into()))
+    }
+
+    async fn cancel_task(
+        &self,
+        id: &TaskId,
+        preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
+        if id != self.task.name() {
+            return Err(ApiError::TaskNotFound(id.to_string()));
+        }
+        *self
+            .last_cancel_preconditions
+            .lock()
+            .expect("cancel precondition lock is not poisoned") = Some(preconditions);
+        Ok(())
     }
 
     async fn delete_task(
@@ -119,6 +136,7 @@ async fn generated_client_observes_the_real_grpc_contract_over_tcp() {
     let handler = Arc::new(SocketHandler {
         task: fixture_task(),
         get_calls: AtomicUsize::new(0),
+        last_cancel_preconditions: Mutex::new(None),
     });
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -161,11 +179,34 @@ async fn generated_client_observes_the_real_grpc_contract_over_tcp() {
         .expect("authenticated unary call succeeds")
         .into_inner();
     let task = response.task.expect("GetTask returns a task");
-    assert_eq!(
-        task.metadata.expect("task metadata is present").name,
-        "socket-task"
-    );
+    let metadata = task.metadata.expect("task metadata is present");
+    assert_eq!(metadata.name, "socket-task");
     assert_eq!(handler.get_calls.load(Ordering::SeqCst), 1);
+
+    client
+        .cancel_task(authenticated(CancelTaskRequest {
+            name: "socket-task".into(),
+            preconditions: Some(WireWritePreconditions {
+                uid: Some(metadata.uid.clone()),
+                resource_version: Some(metadata.resource_version.clone()),
+            }),
+        }))
+        .await
+        .expect("authenticated cancel succeeds");
+    let cancel_preconditions = handler
+        .last_cancel_preconditions
+        .lock()
+        .expect("cancel precondition lock is not poisoned")
+        .clone()
+        .expect("cancel reaches the handler");
+    assert_eq!(
+        cancel_preconditions.uid().map(ToString::to_string),
+        Some(metadata.uid)
+    );
+    assert_eq!(
+        cancel_preconditions.resource_version(),
+        Some(metadata.resource_version.as_str())
+    );
 
     let mut watch = client
         .watch_tasks(authenticated(WatchTasksRequest::default()))

@@ -599,6 +599,15 @@ impl ApiHandler for WireMock {
         })
     }
 
+    async fn cancel_task(
+        &self,
+        _id: &TaskId,
+        preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
+        *self.last_write_preconditions.lock().unwrap() = Some(preconditions);
+        Ok(())
+    }
+
     async fn delete_task(
         &self,
         _id: &TaskId,
@@ -982,6 +991,33 @@ async fn delete_forwards_write_preconditions() {
             Request::builder()
                 .method(Method::DELETE)
                 .uri("/apis/solti.io/v1/tasks/task-wire-1?uid=uid-1&resourceVersion=17")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let preconditions = handler
+        .last_write_preconditions
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("handler received preconditions");
+    assert_eq!(preconditions.uid().unwrap().as_str(), "uid-1");
+    assert_eq!(preconditions.resource_version(), Some("17"));
+}
+
+#[tokio::test]
+async fn cancel_forwards_write_preconditions() {
+    let handler = Arc::new(WireMock::default());
+    let app = router_with(Arc::clone(&handler));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/apis/solti.io/v1/tasks/task-wire-1/cancel?uid=uid-1&resourceVersion=17")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1573,6 +1609,7 @@ async fn list_task_runs_response_matches_documented_shape() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
+    assert_eq!(body["metadata"]["taskUid"], "wire-task-run-uid");
     assert_eq!(body["metadata"]["resourceVersion"], "runs-test:5");
     assert!(body["metadata"].get("continue").is_none());
     assert!(body["metadata"].get("remainingItemCount").is_none());
@@ -1618,6 +1655,7 @@ async fn list_task_runs_continues_the_same_snapshot() {
     assert_eq!(first.status(), StatusCode::OK);
     let first = body_json(first).await;
     assert_eq!(first["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(first["metadata"]["taskUid"], "wire-task-run-uid");
     assert_eq!(first["metadata"]["remainingItemCount"], 1);
     let token = first["metadata"]["continue"].as_str().unwrap();
 
@@ -1637,6 +1675,7 @@ async fn list_task_runs_continues_the_same_snapshot() {
     let second = body_json(second).await;
     assert_eq!(second["runs"].as_array().unwrap().len(), 1);
     assert_eq!(second["runs"][0]["attempt"], 2);
+    assert_eq!(second["metadata"]["taskUid"], "wire-task-run-uid");
     assert_eq!(second["metadata"]["resourceVersion"], "runs-test:5");
     assert!(second["metadata"].get("continue").is_none());
     assert!(second["metadata"].get("remainingItemCount").is_none());

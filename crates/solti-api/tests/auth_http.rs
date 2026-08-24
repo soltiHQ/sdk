@@ -84,6 +84,15 @@ impl ApiHandler for MockHandler {
         })
     }
 
+    async fn cancel_task(
+        &self,
+        _id: &TaskId,
+        _preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
     async fn delete_task(
         &self,
         _id: &TaskId,
@@ -127,6 +136,15 @@ fn get(uri: &str) -> Request<Body> {
 fn get_with_authorization(uri: &str, value: &str) -> Request<Body> {
     Request::builder()
         .method(Method::GET)
+        .uri(uri)
+        .header(header::AUTHORIZATION, value)
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn post_with_authorization(uri: &str, value: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
         .uri(uri)
         .header(header::AUTHORIZATION, value)
         .body(Body::empty())
@@ -312,6 +330,17 @@ async fn custom_access_hooks_propagate_identity_and_return_forbidden() {
     assert_eq!(listed.status(), StatusCode::OK);
     assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
 
+    let canceled = app
+        .clone()
+        .oneshot(post_with_authorization(
+            "/apis/solti.io/v1/tasks/task-a/cancel",
+            "Bearer subject-token",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(canceled.status(), StatusCode::NO_CONTENT);
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 2);
+
     let denied = app
         .oneshot(get_with_authorization(
             "/apis/solti.io/v1/tasks/task-a/logs",
@@ -323,7 +352,7 @@ async fn custom_access_hooks_propagate_identity_and_return_forbidden() {
     let body = body_json(denied).await;
     assert_eq!(body["reason"], "Forbidden");
     assert_eq!(body["code"], 403);
-    assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 2);
 
     assert_eq!(
         *recording.checks.lock().unwrap(),
@@ -332,6 +361,11 @@ async fn custom_access_hooks_propagate_identity_and_return_forbidden() {
                 Some("user-7".to_owned()),
                 TaskOperation::List,
                 "collection".to_owned(),
+            ),
+            (
+                Some("user-7".to_owned()),
+                TaskOperation::Cancel,
+                "task-a".to_owned(),
             ),
             (
                 Some("user-7".to_owned()),

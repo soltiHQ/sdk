@@ -16,6 +16,7 @@
 //! | `ListTasks`      | Unary            | List        |
 //! | `WatchTasks`     | Server streaming | Watch       |
 //! | `ListTaskRuns`   | Unary            | Paged run history |
+//! | `CancelTask`     | Unary            | Cancel      |
 //! | `DeleteTask`     | Unary            | Delete      |
 //! | `StreamTaskLogs` | Server streaming | Live output |
 //!
@@ -745,6 +746,41 @@ where
                 .map_err(Status::from)?;
 
             Ok(Response::new(proto_api::DeleteTaskResponse {}))
+        })
+        .await
+    }
+
+    async fn cancel_task(
+        &self,
+        request: Request<proto_api::CancelTaskRequest>,
+    ) -> Result<Response<proto_api::CancelTaskResponse>, Status> {
+        self.instrument("CancelTask", async move {
+            let identity = self.authenticate(&request).await?;
+            let req = request.into_inner();
+
+            let task_id = parse_task_id("task name", req.name).map_err(Status::from)?;
+            let preconditions =
+                write_preconditions_from_proto(req.preconditions).map_err(Status::from)?;
+            self.authorize(
+                identity.as_ref(),
+                TaskOperation::Cancel,
+                TaskTarget::Task(&task_id),
+            )
+            .await?;
+            debug!(
+                event = "api.operation",
+                transport = "grpc",
+                operation = "cancel",
+                task_name = %task_id,
+                "task operation started"
+            );
+
+            self.handler
+                .cancel_task(&task_id, preconditions)
+                .await
+                .map_err(Status::from)?;
+
+            Ok(Response::new(proto_api::CancelTaskResponse {}))
         })
         .await
     }

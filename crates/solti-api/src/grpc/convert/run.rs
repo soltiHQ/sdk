@@ -57,6 +57,7 @@ fn runs_page_to_proto(page: TaskRunPage) -> Result<proto_api::ListTaskRunsRespon
         resource_version: page.resource_version,
         r#continue: continuation,
         remaining_item_count: (remaining_item_count > 0).then_some(remaining_item_count),
+        task_uid: page.task_uid.as_str().to_owned(),
     })
 }
 
@@ -78,6 +79,7 @@ fn proto_metadata_for_prefix(
             .transpose()?
             .unwrap_or_default(),
         remaining_item_count: (remaining_item_count > 0).then_some(remaining_item_count),
+        task_uid: page.task_uid.as_str().to_owned(),
     })
 }
 
@@ -207,6 +209,7 @@ mod tests {
         assert_eq!(response.encoded_len(), first_limit);
         assert_eq!(response.runs.len(), 1);
         assert_eq!(response.remaining_item_count, Some(1));
+        assert_eq!(response.task_uid, "task-1-uid");
         let continuation = crate::continuation::decode_run(&response.r#continue).unwrap();
         assert_eq!(continuation.task().as_str(), "task-1");
         assert_eq!(continuation.task_uid().as_str(), "task-1-uid");
