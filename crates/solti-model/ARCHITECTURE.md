@@ -126,7 +126,7 @@ flowchart TB
 Apply preserves UID and creation time.
 A metadata-only change preserves generation and status.
 A spec change advances generation and resets phase, attempt, exit code, and lifecycle error.
-Generation advancement saturates at `u64::MAX`.
+At `u64::MAX`, a spec change returns `ModelError::Invalid` without mutating the resource.
 The previous `status.observedGeneration` is retained until the new generation is processed.
 
 An identical apply is a true no-op.
