@@ -1,5 +1,40 @@
 use super::*;
 
+#[cfg(target_os = "linux")]
+#[test]
+fn credential_change_requires_process_group_termination_authority() {
+    assert!(!credential_termination_authority_required(
+        None, 1000, 2000, false
+    ));
+    assert!(!credential_termination_authority_required(
+        Some(1000),
+        1000,
+        2000,
+        false
+    ));
+    assert!(!credential_termination_authority_required(
+        Some(2000),
+        1000,
+        2000,
+        false
+    ));
+    assert!(credential_termination_authority_required(
+        Some(3000),
+        1000,
+        2000,
+        false
+    ));
+    assert!(credential_termination_authority_required(
+        None, 1000, 2000, true
+    ));
+    assert!(credential_termination_authority_required(
+        Some(1000),
+        1000,
+        2000,
+        true
+    ));
+}
+
 #[test]
 fn invalid_log_limits_are_rejected() {
     let cases = [

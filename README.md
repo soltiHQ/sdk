@@ -354,6 +354,11 @@ Configured controls fail closed when the current platform cannot enforce them.
 
 The default subprocess backend does not enable optional resource or security controls.
 It clears the inherited environment, pins the working directory on Unix, restricts descriptor inheritance, and owns child cleanup.
+On Linux, a configured subprocess user ID that differs from both the real and
+effective agent user IDs requires the agent process to retain effective
+`CAP_KILL` so process-group cleanup remains enforceable. A subprocess policy
+that retains child `CAP_SETUID` requires the same parent authority.
+All runtime threads that can poll those attempts must retain that authority.
 
 These controls harden a host process.
 They do not form a complete sandbox for untrusted code.

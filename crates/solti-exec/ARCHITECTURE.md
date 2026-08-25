@@ -279,6 +279,24 @@ Termination requests every available boundary before the leader is reaped.
 
 Normal leader exit receives the same descendant cleanup.
 This prevents descendants from retaining output pipes or attempt resources.
+On Linux, a credential change to another user ID therefore requires effective
+`CAP_KILL` in the agent process. Retaining child `CAP_SETUID` requires the same
+parent authority because the workload can replace all of its IDs after `exec`.
+Runner construction and process spawn fail closed when either policy requires
+that authority and it is unavailable. Child capabilities and parent-side
+termination authority remain separate capability sets.
+Linux capabilities are thread-scoped. The construction thread, executor
+threads that can poll attempts, and the runner-owned finalizer must inherit the
+same effective termination authority. Runtime capability mutation while the
+runner is active is outside the supported contract.
+
+Without an explicit capability drop, post-exec credential mutation remains a
+workload contract because executable file capabilities and later execs are not
+known during runner construction. A workload without parent `CAP_KILL` must
+preserve a real or saved user ID matching the agent. Preventing arbitrary UID
+replacement requires `no_new_privs`, dropping all capabilities, and excluding
+`CAP_SETUID`. Establishing one exact immutable UID, GID, and group set also
+requires explicit `ProcessCredentials` and excludes `CAP_SETGID`.
 
 Cancellation wins a tie with leader exit. Once observed, cancellation remains
 latched while required output drain, termination, reap, and cleanup complete.

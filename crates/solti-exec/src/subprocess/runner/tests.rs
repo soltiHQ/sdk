@@ -1587,46 +1587,258 @@ async fn script_task_runs_and_streams_output() {
 }
 
 #[cfg(target_os = "linux")]
-#[tokio::test]
-#[ignore = "requires root with only CAP_SETUID and CAP_SETGID"]
-async fn script_task_runs_after_exact_credential_change() {
-    use crate::host::{HostProcessPolicy, LinuxCapability, ProcessCredentials, SecurityConfig};
-
-    // SAFETY: `geteuid` has no preconditions.
-    assert_eq!(unsafe { libc::geteuid() }, 0, "test requires root");
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let effective = status
+fn effective_linux_capabilities() -> u64 {
+    let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+    status
         .lines()
         .find_map(|line| line.strip_prefix("CapEff:"))
         .map(str::trim)
         .and_then(|value| u64::from_str_radix(value, 16).ok())
-        .expect("CapEff is missing from /proc/self/status");
-    let has = |capability: LinuxCapability| effective & (1_u64 << capability.to_cap_value()) != 0;
+        .expect("CapEff is missing from /proc/thread-self/status")
+}
+
+#[cfg(target_os = "linux")]
+fn has_effective_linux_capability(
+    effective: u64,
+    capability: crate::host::LinuxCapability,
+) -> bool {
+    effective & (1_u64 << capability.to_cap_value()) != 0
+}
+
+#[cfg(target_os = "linux")]
+const EXACT_CREDENTIAL_UID: u32 = 65_534;
+
+#[cfg(target_os = "linux")]
+fn exact_credential_backend() -> SubprocessBackendConfig {
+    use crate::host::{HostProcessPolicy, ProcessCredentials, SecurityConfig};
+
+    SubprocessBackendConfig::new().with_host_process_policy(HostProcessPolicy::new().with_security(
+        SecurityConfig {
+            credentials: Some(ProcessCredentials::new(
+                EXACT_CREDENTIAL_UID,
+                EXACT_CREDENTIAL_UID,
+            )),
+            no_new_privs: true,
+            ..Default::default()
+        },
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn setuid_retaining_backend() -> SubprocessBackendConfig {
+    use crate::host::{HostProcessPolicy, LinuxCapability, SecurityConfig};
+
+    SubprocessBackendConfig::new().with_host_process_policy(HostProcessPolicy::new().with_security(
+        SecurityConfig {
+            drop_all_caps: true,
+            keep_caps: vec![LinuxCapability::SetUid],
+            no_new_privs: true,
+            ..Default::default()
+        },
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn assert_exact_credential_capability_profile(expect_kill: bool) {
+    use crate::host::LinuxCapability;
+
+    // SAFETY: `geteuid` has no preconditions.
+    assert_eq!(unsafe { libc::geteuid() }, 0, "test requires root");
+    // SAFETY: `getuid` has no preconditions.
+    assert_ne!(unsafe { libc::getuid() }, EXACT_CREDENTIAL_UID);
+    // SAFETY: `geteuid` has no preconditions.
+    assert_ne!(unsafe { libc::geteuid() }, EXACT_CREDENTIAL_UID);
+
+    let effective = effective_linux_capabilities();
+    let has = |capability| has_effective_linux_capability(effective, capability);
     assert!(has(LinuxCapability::SetUid), "CAP_SETUID is required");
     assert!(has(LinuxCapability::SetGid), "CAP_SETGID is required");
+    assert_eq!(
+        has(LinuxCapability::Kill),
+        expect_kill,
+        "CAP_KILL profile does not match the live test"
+    );
     assert!(!has(LinuxCapability::Chown), "CAP_CHOWN must be absent");
     assert!(!has(LinuxCapability::FOwner), "CAP_FOWNER must be absent");
     if let Ok(setgroups) = std::fs::read_to_string("/proc/self/setgroups") {
         assert_ne!(setgroups.trim(), "deny", "setgroups must be permitted");
     }
+}
 
-    let backend = SubprocessBackendConfig::new().with_host_process_policy(
-        HostProcessPolicy::new().with_security(SecurityConfig {
-            credentials: Some(ProcessCredentials::new(65_534, 65_534)),
-            no_new_privs: true,
-            ..Default::default()
-        }),
+#[cfg(target_os = "linux")]
+fn credential_descendant_spec(
+    slot: &str,
+) -> (tempfile::TempDir, std::path::PathBuf, solti_model::Task) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let marker_dir = tempfile::TempDir::new().unwrap();
+    std::fs::set_permissions(marker_dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let marker = marker_dir.path().join("descendant-pid");
+    let body = format!(
+        "umask 000; sleep 30 </dev/null >/dev/null 2>&1 & {{ echo \"$!\"; id -u; id -g; }} > \"{}\"; wait",
+        marker.display()
     );
-    let runner = SubprocessRunner::with_config("credential-test", backend).unwrap();
-    let build = BuildContext::default();
-    let cancel = TaskContext::detached();
+    let spec = mk_script_spec(slot, body.as_bytes(), &[]);
+    (marker_dir, marker, spec)
+}
 
-    let script = mk_script_spec("script-credentials", b"exit 0", &[]);
-    let script_ref = build_with_run_id(&runner, &script, &build).await.unwrap();
-    script_ref
-        .spawn(cancel)
+#[cfg(target_os = "linux")]
+async fn wait_for_credential_descendant(marker: &std::path::Path) -> Option<i32> {
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        loop {
+            if let Ok(value) = std::fs::read_to_string(marker) {
+                let mut lines = value.lines();
+                if let (Some(pid), Some(uid), Some(gid)) =
+                    (lines.next(), lines.next(), lines.next())
+                    && let (Ok(pid), Ok(uid), Ok(gid)) =
+                        (pid.parse::<i32>(), uid.parse::<u32>(), gid.parse::<u32>())
+                {
+                    assert_eq!(uid, EXACT_CREDENTIAL_UID);
+                    assert_eq!(gid, EXACT_CREDENTIAL_UID);
+                    break pid;
+                }
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .ok()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires root with CAP_SETUID and CAP_SETGID but without CAP_KILL"]
+fn credential_change_rejects_missing_kill_capability() {
+    assert_exact_credential_capability_profile(false);
+
+    for (runner_name, backend) in [
+        ("credential-test", exact_credential_backend()),
+        ("setuid-retaining-test", setuid_retaining_backend()),
+    ] {
+        let error = match SubprocessRunner::with_config(runner_name, backend) {
+            Ok(_) => panic!("credential-changing runner must reject missing CAP_KILL"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                crate::ExecError::InvalidRunnerConfig(ref message) if message.contains("CAP_KILL")
+            ),
+            "got: {error}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires root with CAP_SETUID, CAP_SETGID, and CAP_KILL"]
+async fn script_task_runs_after_exact_credential_change() {
+    assert_exact_credential_capability_profile(true);
+
+    let runner =
+        SubprocessRunner::with_config("credential-test", exact_credential_backend()).unwrap();
+    let (_marker_dir, marker, script) = credential_descendant_spec("script-credentials");
+    let script_ref = build_with_run_id(&runner, &script, &BuildContext::default())
         .await
-        .expect("sealed script must remain readable after changing credentials");
+        .unwrap();
+    let supervisor = taskvisor::Supervisor::new(taskvisor::SupervisorConfig::default(), Vec::new());
+    let handle = supervisor.serve().unwrap();
+    let (id, waiter) = handle
+        .add_and_watch(taskvisor::TaskSpec::once(
+            "credential-changing-attempt",
+            script_ref,
+        ))
+        .await
+        .unwrap();
+
+    let descendant_pid = wait_for_credential_descendant(&marker)
+        .await
+        .expect("credential-changing descendant must report its PID and credentials");
+    assert_eq!(
+        // SAFETY: signal zero performs an existence check and the PID was
+        // reported by this test's credential-changing child.
+        unsafe { libc::kill(descendant_pid, 0) },
+        0,
+        "credential-changing descendant must be alive before cancellation"
+    );
+
+    assert!(handle.remove(id).await.unwrap());
+    let outcome = tokio::time::timeout(StdDuration::from_secs(5), waiter.wait())
+        .await
+        .expect("credential-changing attempt must stop within its cleanup deadline")
+        .unwrap();
+    assert_eq!(outcome.kind(), taskvisor::TaskOutcomeKind::Canceled);
+
+    assert_process_gone(descendant_pid).await;
+    let status = runner.finalizer_status();
+    assert!(status.accepting());
+    assert!(status.healthy());
+    assert_eq!(status.owned(), 0);
+    assert_eq!(status.quarantined(), 0);
+
+    runner
+        .shutdown(StdDuration::from_secs(2))
+        .await
+        .expect("credential-changing runner shutdown must drain");
+    let status = runner.finalizer_status();
+    assert!(!status.accepting());
+    assert!(status.healthy());
+    assert_eq!(status.owned(), 0);
+    assert_eq!(status.quarantined(), 0);
+    handle.shutdown().await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires root with CAP_SETUID, CAP_SETGID, and CAP_KILL"]
+async fn dropped_credential_changing_attempt_is_finalized() {
+    assert_exact_credential_capability_profile(true);
+
+    let runner =
+        SubprocessRunner::with_config("credential-drop-test", exact_credential_backend()).unwrap();
+    let (_marker_dir, marker, script) = credential_descendant_spec("script-credentials-drop");
+    let script_ref = build_with_run_id(&runner, &script, &BuildContext::default())
+        .await
+        .unwrap();
+
+    let descendant_pid = {
+        let attempt = script_ref.spawn(TaskContext::detached());
+        tokio::pin!(attempt);
+
+        let descendant_pid = tokio::select! {
+            result = &mut attempt => panic!("credential-changing attempt ended before its descendant was observed: {result:?}"),
+            pid = wait_for_credential_descendant(&marker) => pid.expect("credential-changing descendant must report its PID and credentials"),
+        };
+        assert_eq!(
+            // SAFETY: signal zero performs an existence check and the PID was
+            // reported by this test's credential-changing child.
+            unsafe { libc::kill(descendant_pid, 0) },
+            0,
+            "credential-changing descendant must be alive before attempt drop"
+        );
+        assert_eq!(runner.finalizer_status().owned(), 1);
+
+        descendant_pid
+    };
+
+    assert_process_gone(descendant_pid).await;
+    wait_for_finalizer_release(&runner.finalizer).await;
+    let status = runner.finalizer_status();
+    assert!(status.accepting());
+    assert!(status.healthy());
+    assert_eq!(status.owned(), 0);
+    assert_eq!(status.quarantined(), 0);
+
+    drop(script_ref);
+    runner
+        .shutdown(StdDuration::from_secs(2))
+        .await
+        .expect("credential-changing runner shutdown must drain");
+    let status = runner.finalizer_status();
+    assert!(!status.accepting());
+    assert!(status.healthy());
+    assert_eq!(status.owned(), 0);
+    assert_eq!(status.quarantined(), 0);
 }
 
 #[tokio::test]

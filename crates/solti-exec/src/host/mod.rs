@@ -12,6 +12,8 @@
 
 mod capability;
 pub use crate::isolation::LinuxCapability;
+#[cfg(all(feature = "subprocess", target_os = "linux"))]
+pub(crate) use capability::current_thread_has_effective_capability;
 
 mod cgroups;
 pub use crate::isolation::{CgroupLimits, CpuMax};

@@ -38,6 +38,8 @@ use crate::host::{
     AttemptPrepareFailure, AttemptProcessDomain, HostProcessPolicy, PreparedHostProcessAttempt,
     PreparedHostProcessPolicy,
 };
+#[cfg(target_os = "linux")]
+use crate::host::{HostProcessError, LinuxCapability, current_thread_has_effective_capability};
 use crate::output::LogConfig;
 use crate::subprocess::boundary::PinnedCwd;
 
@@ -248,6 +250,17 @@ impl SubprocessBackendConfig {
     }
 
     /// Sets controls applied to every host process attempt.
+    ///
+    /// On Linux, changing the child user ID requires the agent process to retain
+    /// effective `CAP_KILL` unless the target ID matches the agent's real or
+    /// effective user ID. Retaining child `CAP_SETUID` always requires the same
+    /// parent authority because the workload can replace all of its IDs after
+    /// `exec`. The subprocess runner checks this authority during construction
+    /// and again before every attempt because it must terminate the complete
+    /// process group after the leader exits.
+    /// Linux capabilities are thread-scoped. Applications must keep the same
+    /// effective `CAP_KILL` authority on every runtime thread that may poll an
+    /// attempt and must not mutate that authority while the runner is active.
     pub fn with_host_process_policy(mut self, policy: HostProcessPolicy) -> Self {
         self.host_process_policy = policy;
         self
@@ -323,6 +336,19 @@ impl SubprocessBackendConfig {
     pub(crate) fn prepare(self) -> Result<PreparedSubprocessBackendConfig, crate::ExecError> {
         let cleanup_capacity = self.cleanup_capacity();
         let cwd_policy = self.cwd_policy.prepare()?;
+        #[cfg(target_os = "linux")]
+        let (credential_uid, retains_setuid) =
+            self.host_process_policy
+                .security()
+                .map_or((None, false), |security| {
+                    (
+                        security
+                            .credentials
+                            .as_ref()
+                            .map(|credentials| credentials.uid),
+                        security.keep_caps.contains(&LinuxCapability::SetUid),
+                    )
+                });
 
         if let EnvPolicy::Allowlist(keys) = &self.env_policy {
             for key in keys {
@@ -365,6 +391,8 @@ impl SubprocessBackendConfig {
             }
         }
         let host_process_policy = self.host_process_policy.prepare()?;
+        #[cfg(target_os = "linux")]
+        validate_credential_termination_authority(credential_uid, retains_setuid)?;
 
         Ok(PreparedSubprocessBackendConfig {
             host_process_policy,
@@ -373,6 +401,10 @@ impl SubprocessBackendConfig {
             logger: self.logger,
             max_script_body_bytes: self.max_script_body_bytes,
             cleanup_capacity,
+            #[cfg(target_os = "linux")]
+            credential_uid,
+            #[cfg(target_os = "linux")]
+            retains_setuid,
             #[cfg(unix)]
             passed_fds: self.passed_fds,
         })
@@ -388,6 +420,10 @@ pub(crate) struct PreparedSubprocessBackendConfig {
     logger: LogConfig,
     max_script_body_bytes: Option<usize>,
     cleanup_capacity: usize,
+    #[cfg(target_os = "linux")]
+    credential_uid: Option<u32>,
+    #[cfg(target_os = "linux")]
+    retains_setuid: bool,
     #[cfg(unix)]
     passed_fds: Vec<Arc<OwnedFd>>,
 }
@@ -455,6 +491,14 @@ impl PreparedSubprocessBackendConfig {
         self.host_process_policy.prepare_attempt_owned(cgroup_name)
     }
 
+    /// Rechecks parent-side signal authority on the thread that will spawn the child.
+    pub(crate) fn validate_credential_termination_authority(&self) -> Result<(), crate::ExecError> {
+        #[cfg(target_os = "linux")]
+        validate_credential_termination_authority(self.credential_uid, self.retains_setuid)?;
+
+        Ok(())
+    }
+
     /// Attaches configured controls to a command.
     ///
     /// The hooks apply process state, rlimits, cgroup membership, and security.
@@ -466,6 +510,49 @@ impl PreparedSubprocessBackendConfig {
     ) -> AttemptProcessDomain {
         attempt.apply_to_command(cmd.as_std_mut())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_credential_termination_authority(
+    target_uid: Option<u32>,
+    retains_setuid: bool,
+) -> Result<(), HostProcessError> {
+    // SAFETY: `getuid` and `geteuid` have no preconditions.
+    let real_uid = unsafe { libc::getuid() };
+    // SAFETY: `getuid` and `geteuid` have no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !credential_termination_authority_required(
+        target_uid,
+        real_uid,
+        effective_uid,
+        retains_setuid,
+    ) {
+        return Ok(());
+    }
+
+    if current_thread_has_effective_capability(LinuxCapability::Kill)
+        .map_err(HostProcessError::Io)?
+    {
+        Ok(())
+    } else {
+        Err(HostProcessError::InvalidConfig(
+            "subprocess security policy may change the process user beyond the agent's real and effective IDs; the agent requires effective CAP_KILL to terminate the attempt process group"
+                .into(),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn credential_termination_authority_required(
+    target_uid: Option<u32>,
+    agent_real_uid: u32,
+    agent_effective_uid: u32,
+    retains_setuid: bool,
+) -> bool {
+    retains_setuid
+        || target_uid.is_some_and(|target_uid| {
+            target_uid != agent_real_uid && target_uid != agent_effective_uid
+        })
 }
 
 #[cfg(test)]

@@ -534,6 +534,9 @@ Configuration is validated when the runner is created.
 Configured controls are fail-closed.
 An unsupported or invalid control rejects the runner or fails the attempt.
 The example requires features `subprocess` and `seccomp`.
+Because the example changes the child user ID, the agent process must retain
+effective `CAP_KILL` for process-group cleanup. That parent capability is
+separate from the capabilities retained in the child through `keep_caps`.
 
 The default backend uses an empty `HostProcessPolicy`.
 It does not create a cgroup.
@@ -611,6 +614,26 @@ A Linux child retaining `CAP_SYS_RESOURCE` can raise a hard limit again.
 Its supplementary group list is exact.
 An empty list clears inherited supplementary groups.
 Credentials require explicit `no_new_privs = true`.
+When the configured user ID differs from the agent's real and effective IDs,
+the subprocess runner requires effective `CAP_KILL`. It validates that
+termination authority during runner construction and before every attempt.
+Retaining child `CAP_SETUID` requires parent `CAP_KILL` even when the initial
+user ID matches, because the workload can replace all real, effective, and
+saved IDs after `exec`.
+The capability belongs to the agent process; it does not need to be retained
+in the child through `keep_caps`.
+Linux capabilities are thread-scoped. Every runtime thread that can poll a
+subprocess attempt must retain the same effective `CAP_KILL`, and the
+application must not mutate that authority while the runner is active.
+
+When a policy does not drop capabilities, the SDK cannot determine whether a
+workload will acquire or use `CAP_SETUID` after `exec`. Such workloads and
+descendants must preserve a real or saved user ID matching the agent, or every
+signalling thread must retain effective `CAP_KILL`. To enforce stable workload
+UIDs against arbitrary replacement, set `no_new_privs = true`, set
+`drop_all_caps = true`, and do not include `CAP_SETUID` in `keep_caps`. To
+establish one exact immutable UID, GID, and supplementary-group set, also
+configure `ProcessCredentials` and exclude `CAP_SETGID`.
 
 `keep_caps` requires `drop_all_caps = true`.
 Capability dropping requires explicit `no_new_privs = true`.
@@ -815,6 +838,53 @@ SOLTI_TEST_CONTAINERD=1 cargo test -p solti-exec --features containerd \
 explicit defaults. The test is ignored by default. An explicit run without
 `SOLTI_TEST_CONTAINERD=1` fails before contacting a daemon. A normal Cargo
 success therefore cannot be mistaken for a live containerd result.
+
+The credential-change live tests require two exact parent capability profiles.
+Build the Linux test binary once:
+
+```bash
+credential_target="$(mktemp -d /tmp/solti-credential-live.XXXXXX)"
+CARGO_TARGET_DIR="$credential_target" \
+cargo test -p solti-exec --no-default-features --features subprocess,seccomp \
+  --lib --locked --no-run
+
+test_binary="$({ find "$credential_target/debug/deps" -maxdepth 1 \
+  -type f -name 'solti_exec-*' -perm -111; } | head -n 1)"
+test -n "$test_binary"
+```
+
+Run the negative profile with effective `CAP_SETUID` and `CAP_SETGID` but
+without `CAP_KILL`, `CAP_CHOWN`, or `CAP_FOWNER`:
+
+```bash
+sudo setpriv --reuid=0 --regid=0 --clear-groups \
+  --bounding-set=-all,+setuid,+setgid \
+  --inh-caps=-all,+setuid,+setgid \
+  --ambient-caps=-all,+setuid,+setgid \
+  -- "$test_binary" --ignored --exact \
+  subprocess::runner::tests::credential_change_rejects_missing_kill_capability \
+  --nocapture --test-threads=1
+```
+
+It confirms fail-closed runner construction. Run both positive cases with the
+same narrow profile plus effective `CAP_KILL`:
+
+```bash
+for test_name in \
+  subprocess::runner::tests::script_task_runs_after_exact_credential_change \
+  subprocess::runner::tests::dropped_credential_changing_attempt_is_finalized
+do
+  sudo setpriv --reuid=0 --regid=0 --clear-groups \
+    --bounding-set=-all,+setuid,+setgid,+kill \
+    --inh-caps=-all,+setuid,+setgid,+kill \
+    --ambient-caps=-all,+setuid,+setgid,+kill \
+    -- "$test_binary" --ignored --exact "$test_name" \
+    --nocapture --test-threads=1
+done
+```
+
+They observe the child at `65534:65534` and confirm cancellation cleanup plus
+dedicated finalizer cleanup.
 
 ### Full examples
 
