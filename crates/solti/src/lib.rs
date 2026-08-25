@@ -115,7 +115,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! solti = { version = "0.0.4", features = [
+//! solti = { version = "0.0.5", features = [
 //!     "api-core-adapter",
 //!     "api-http",
 //!     "exec-subprocess",

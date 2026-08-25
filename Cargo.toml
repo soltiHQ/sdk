@@ -44,7 +44,7 @@ clippy-matrix = [
 ]
 
 [workspace.package]
-version      = "0.0.4"
+version      = "0.0.5"
 edition      = "2024"
 rust-version = "1.90.0"
 license      = "Apache-2.0"
@@ -87,17 +87,17 @@ seccompiler         = "0.5.0"
 serde               = { version = "1.0.229", features = ["derive"] }
 serde_json          = "1.0.151"
 sha2                = "0.11.0"
-solti               = { path = "crates/solti",            version = "0.0.4", default-features = false }
-solti-api           = { path = "crates/solti-api",        version = "0.0.4", default-features = false }
-solti-chain         = { path = "crates/solti-chain",      version = "0.0.4", default-features = false }
-solti-core          = { path = "crates/solti-core",       version = "0.0.4", default-features = false }
-solti-discover      = { path = "crates/solti-discover",   version = "0.0.4", default-features = false }
-solti-exec          = { path = "crates/solti-exec",       version = "0.0.4", default-features = false }
-solti-model         = { path = "crates/solti-model",      version = "0.0.4", default-features = false }
-solti-observe       = { path = "crates/solti-observe",    version = "0.0.4", default-features = false }
-solti-prometheus    = { path = "crates/solti-prometheus", version = "0.0.4", default-features = false }
-solti-runner        = { path = "crates/solti-runner",     version = "0.0.4", default-features = false }
-solti-tls           = { path = "crates/solti-tls",        version = "0.0.4", default-features = false }
+solti               = { path = "crates/solti",            version = "0.0.5", default-features = false }
+solti-api           = { path = "crates/solti-api",        version = "0.0.5", default-features = false }
+solti-chain         = { path = "crates/solti-chain",      version = "0.0.5", default-features = false }
+solti-core          = { path = "crates/solti-core",       version = "0.0.5", default-features = false }
+solti-discover      = { path = "crates/solti-discover",   version = "0.0.5", default-features = false }
+solti-exec          = { path = "crates/solti-exec",       version = "0.0.5", default-features = false }
+solti-model         = { path = "crates/solti-model",      version = "0.0.5", default-features = false }
+solti-observe       = { path = "crates/solti-observe",    version = "0.0.5", default-features = false }
+solti-prometheus    = { path = "crates/solti-prometheus", version = "0.0.5", default-features = false }
+solti-runner        = { path = "crates/solti-runner",     version = "0.0.5", default-features = false }
+solti-tls           = { path = "crates/solti-tls",        version = "0.0.5", default-features = false }
 subtle              = "2.6.1"
 taskvisor           = { version = "0.8.3", default-features = false }
 tempfile            = "3.27.0"

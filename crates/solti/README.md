@@ -17,7 +17,7 @@ Default features are empty. Enable only the capabilities used by the binary:
 
 ```toml
 [dependencies]
-solti = { version = "0.0.4", features = [
+solti = { version = "0.0.5", features = [
     "api-core-adapter",
     "api-http",
     "chain",

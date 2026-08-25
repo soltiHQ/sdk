@@ -55,7 +55,7 @@ Add the umbrella crate with only the required capabilities:
 
 ```toml
 [dependencies]
-solti = { version = "0.0.4", features = ["core", "exec-subprocess"] }
+solti = { version = "0.0.5", features = ["core", "exec-subprocess"] }
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 ```
 
