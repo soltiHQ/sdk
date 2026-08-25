@@ -439,7 +439,8 @@ All umbrella features are off by default.
 
 | Feature or family                | Adds                                                                  |
 |----------------------------------|-----------------------------------------------------------------------|
-| `model`                          | `solti-model` with JSON Schema support                                |
+| `model`                          | Base `solti-model` domain types                                        |
+| `model-schema`                   | JSON Schema support for `solti-model`                                  |
 | `runner`                         | Runner contract, model, and Taskvisor                                 |
 | `core`                           | Desired-state supervisor and Taskvisor controller                     |
 | `exec`                           | Base `solti-exec` namespace                                           |
