@@ -107,6 +107,9 @@ use crate::subprocess::exec_unix::ExecvePlan;
 /// Keep the concrete runner and call [`shutdown`](Self::shutdown) after its
 /// supervisors and task references have stopped.
 /// The embedding process must not reap arbitrary children or enable automatic `SIGCHLD` reaping.
+/// On Linux, a configured target user outside the agent's real and effective
+/// user IDs, or a child policy retaining `CAP_SETUID`, requires effective
+/// parent `CAP_KILL` on construction, executor, and finalizer threads.
 ///
 /// ## See Also
 ///
@@ -186,7 +189,9 @@ impl SubprocessRunner {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ExecError::InvalidRunnerConfig`] for invalid settings.
+    /// Returns [`crate::ExecError::InvalidRunnerConfig`] for invalid settings
+    /// or missing Linux process-group termination authority. See
+    /// [`SubprocessBackendConfig::with_host_process_policy`].
     /// Returns [`crate::ExecError::Io`] when host resource preparation or the
     /// cleanup or cwd worker fails.
     pub fn with_config(
@@ -850,6 +855,17 @@ fn spawn_with_command(
     ),
     TaskError,
 > {
+    ctx.runner_cfg
+        .validate_credential_termination_authority()
+        .map_err(|error| {
+            record_runner_error(
+                &ctx.metrics,
+                RunnerType::Subprocess,
+                RunnerErrorKind::BackendConfigFailed,
+            );
+            TaskError::fatal(format!("host security preflight failed: {error}"))
+        })?;
+
     let script_path = script.map(AnonymousScript::argument_path);
     let mut cmd = build_command(ctx, script_path);
     apply_fd_boundary(&mut cmd, ctx, script)?;

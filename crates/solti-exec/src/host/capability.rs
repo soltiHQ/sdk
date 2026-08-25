@@ -1,5 +1,27 @@
 use crate::isolation::LinuxCapability;
 
+#[cfg(all(feature = "subprocess", target_os = "linux"))]
+use std::io;
+
+#[cfg(all(feature = "subprocess", target_os = "linux"))]
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+#[cfg(all(feature = "subprocess", target_os = "linux"))]
+#[repr(C)]
+struct CapUserHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[cfg(all(feature = "subprocess", target_os = "linux"))]
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct CapUserData {
+    effective: u32,
+    _permitted: u32,
+    _inheritable: u32,
+}
+
 impl LinuxCapability {
     /// Returns the value from `<linux/capability.h>`.
     #[cfg(all(feature = "host-process", target_os = "linux"))]
@@ -30,4 +52,26 @@ impl LinuxCapability {
             Self::SetFCap => 31,        // CAP_SETFCAP
         }
     }
+}
+
+/// Returns whether the current thread has one effective Linux capability.
+#[cfg(all(feature = "subprocess", target_os = "linux"))]
+pub(crate) fn current_thread_has_effective_capability(
+    capability: LinuxCapability,
+) -> io::Result<bool> {
+    let mut header = CapUserHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapUserData::default(); 2];
+
+    // SAFETY:
+    // the structs match Linux capability ABI version 3 and point to writable storage.
+    if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let value = capability.to_cap_value();
+    let index = (value / 32) as usize;
+    Ok(index < data.len() && data[index].effective & (1 << (value % 32)) != 0)
 }
