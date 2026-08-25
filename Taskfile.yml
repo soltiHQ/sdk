@@ -84,7 +84,7 @@ tasks:
       - task: rust:test
         vars: { TEST_ARGS: '--workspace --test "*" --all-features --locked' }
       - task: rust:test
-        vars: { TEST_ARGS: '--workspace --test "*" --no-default-features --locked' }
+        vars: { TEST_ARGS: '--workspace --tests --no-default-features --locked' }
 
   ci/audit:
     desc: Run 'cargo audit'.
