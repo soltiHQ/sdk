@@ -10,7 +10,8 @@
 //! - runner and task environment merging;
 //! - low-level process policy reaching the engine boundary;
 //! - build without engine I/O;
-//! - create, output, start, wait, and cleanup ordering.
+//! - create, output, start, wait, and cleanup ordering;
+//! - an explicit synchronous drop-release ownership declaration.
 //!
 //! The engine is an in-memory teaching adapter.
 //! It demonstrates the contract but does not create a real container.
@@ -22,9 +23,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use solti_exec::container::{
-    ContainerAttempt, ContainerEngine, ContainerEngineError, ContainerEngineInfo,
-    ContainerExitStatus, ContainerOutput, ContainerProcessPolicy, ContainerRequest,
-    ContainerRunnerConfig, register_container_runner_with_config,
+    ContainerAttempt, ContainerEngine, ContainerEngineBinding, ContainerEngineError,
+    ContainerEngineInfo, ContainerExitStatus, ContainerOutput, ContainerProcessPolicy,
+    ContainerRequest, ContainerRunnerConfig, register_container_runner_with_config,
 };
 use solti_exec::isolation::{CgroupLimits, ProcessCredentials, RlimitConfig, SeccompPolicy};
 use solti_model::{ContainerSpec, OutputEvent, Task, TaskEnv, TaskId, TaskSpec, TaskWorkload};
@@ -59,6 +60,7 @@ solti-exec: engine-neutral container attempt
 
   The runner owns lifecycle order.
   The engine owns image resolution and attempt resources.
+  The binding declares what engine drop must do.
 "#;
 
 #[derive(Default)]
@@ -236,7 +238,12 @@ async fn main() -> ExampleResult {
         .with_output_publisher(output_handle);
     let mut router = RunnerRouter::new().with_context(context);
     let engine_handle: Arc<dyn ContainerEngine> = engine;
-    register_container_runner_with_config(&mut router, "teaching", engine_handle, runner_config)?;
+    let engine = ContainerEngineBinding::drop_releases(engine_handle);
+    println!(
+        "[ownership] Declared {:?}; this in-memory engine owns no external resources or background lifecycle work.",
+        engine.ownership_contract(),
+    );
+    register_container_runner_with_config(&mut router, "teaching", engine, runner_config)?;
 
     let mut task_env = TaskEnv::new();
     task_env.push("TASK_VALUE", "from-task");
@@ -254,7 +261,7 @@ async fn main() -> ExampleResult {
         .lock()
         .expect("engine recorder lock must not be poisoned")
         .len();
-    let task_ref = router.build(&task)?;
+    let built = router.build(&task).await?;
     assert_eq!(
         calls
             .lock()
@@ -264,10 +271,10 @@ async fn main() -> ExampleResult {
     );
     println!(
         "[build] Built {}; engine call count remained {calls_before_build}.",
-        task_ref.name(),
+        built.name(),
     );
 
-    task_ref.spawn(TaskContext::detached()).await?;
+    built.task().spawn(TaskContext::detached()).await?;
     let recorded_calls = calls
         .lock()
         .expect("engine recorder lock must not be poisoned");

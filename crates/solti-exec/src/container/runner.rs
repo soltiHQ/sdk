@@ -11,62 +11,73 @@ use std::{
 use solti_model::{ContainerSpec, Task, TaskWorkload, WORKLOAD_API_VERSION, WorkloadTypeMeta};
 use solti_runner::{
     BuildContext, OutputPublisherHandle, RunId, Runner, RunnerError, RunnerErrorKind, RunnerType,
-    merge_env,
+    merge_env, record_runner_error, request_output_sink,
 };
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tokio::sync::watch;
-use tracing::{debug, trace, warn};
+use tracing::{Instrument as _, debug, debug_span, trace, warn};
 
 use super::{
-    ContainerAttempt, ContainerEngine, ContainerEngineError, ContainerErrorClass,
-    ContainerExitStatus, ContainerRequest, ContainerRunnerConfig,
+    ContainerAttempt, ContainerEngine, ContainerEngineBinding, ContainerEngineError,
+    ContainerErrorClass, ContainerExitStatus, ContainerOwnershipContract, ContainerRequest,
+    ContainerRunnerConfig,
 };
 use crate::{
-    output::{LogConfig, StreamKind, log_stream},
+    output::{LogConfig, OutputDrain, OutputTasks, StreamKind, log_stream},
     registration::validate_runner_name,
 };
 
 /// Runner for `solti.io/v1`, kind `Container` workloads.
+///
+/// Construction requires an explicit [`ContainerEngineBinding`].
+/// The binding records the engine provider's dropped-lifecycle ownership contract.
 pub struct ContainerRunner {
     name: String,
     engine: Arc<dyn ContainerEngine>,
+    ownership_contract: ContainerOwnershipContract,
     config: ContainerRunnerConfig,
 }
 
 impl ContainerRunner {
     /// Creates a container runner with default settings.
     ///
+    /// `engine` must carry an explicit ownership contract.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::ExecError::InvalidRunnerConfig`] for an invalid name.
     pub fn new(
         name: impl Into<String>,
-        engine: Arc<dyn ContainerEngine>,
+        engine: impl Into<ContainerEngineBinding>,
     ) -> Result<Self, crate::ExecError> {
-        Self::with_config(name, engine, ContainerRunnerConfig::new())
+        Self::with_config(name, engine.into(), ContainerRunnerConfig::new())
     }
 
     /// Creates a container runner with explicit settings.
+    ///
+    /// `engine` must carry an explicit ownership contract.
     ///
     /// # Errors
     ///
     /// Returns [`crate::ExecError::InvalidRunnerConfig`] for invalid settings.
     pub fn with_config(
         name: impl Into<String>,
-        engine: Arc<dyn ContainerEngine>,
+        engine: impl Into<ContainerEngineBinding>,
         config: ContainerRunnerConfig,
     ) -> Result<Self, crate::ExecError> {
         let name = name.into();
         validate_runner_name(&name)?;
+        let (engine, ownership_contract) = engine.into().into_parts();
         Ok(Self {
             name,
             engine,
+            ownership_contract,
             config: config.prepare()?,
         })
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ContainerTaskConfig {
     run_id: Arc<str>,
     resource_name: solti_model::TaskId,
@@ -103,6 +114,7 @@ struct TaskExecContext {
     attempt: AtomicU32,
 }
 
+#[solti_runner::async_trait]
 impl Runner for ContainerRunner {
     fn name(&self) -> &str {
         &self.name
@@ -115,11 +127,13 @@ impl Runner for ContainerRunner {
         ]
     }
 
-    fn build_task(
+    async fn build_task(
         &self,
         task: &Task,
         run_id: &RunId,
         ctx: &BuildContext,
+        _cancellation: &solti_runner::BuildCancellation,
+        _scope: &mut solti_runner::BuildScope,
     ) -> Result<TaskRef, RunnerError> {
         let ContainerSpec {
             image,
@@ -152,11 +166,11 @@ impl Runner for ContainerRunner {
         };
 
         trace!(
-            resource = %task.name(),
+            event = "container.build",
+            task_name = %task.name(),
             generation = task.metadata().generation(),
             slot = %task.slot(),
-            taskvisor_task = %run_id.name(),
-            image = %image,
+            run_id = %run_id.name(),
             "building container task",
         );
 
@@ -168,8 +182,7 @@ impl Runner for ContainerRunner {
             logger: self.config.logger(),
             attempt: AtomicU32::new(0),
         });
-        let name = exec.task.run_id.to_string();
-        Ok(TaskFn::arc(name, move |cancel: TaskContext| {
+        Ok(TaskFn::arc(move |cancel: TaskContext| {
             let exec = Arc::clone(&exec);
             async move { run_container(exec, cancel).await }
         }))
@@ -219,14 +232,17 @@ fn validate_process_input(
 }
 
 async fn run_container(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Result<(), TaskError> {
-    let attempt = ctx.attempt.fetch_add(1, Ordering::Relaxed) + 1;
+    if cancel.is_cancelled() {
+        return Err(TaskError::Canceled);
+    }
+
+    let Some(attempt) = next_attempt(&ctx.attempt) else {
+        return Err(TaskError::fatal("container attempt identity exhausted"));
+    };
     let request = ctx.task.request(attempt);
-    let sink = ctx
-        .output_publisher
-        .sink_for(&ctx.task.resource_name, ctx.task.generation, attempt);
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let worker = run_container_worker(ctx, request, sink, cancel_rx);
+    let worker = run_container_worker(ctx, request, cancel_rx);
     tokio::pin!(worker);
 
     tokio::select! {
@@ -245,6 +261,16 @@ async fn run_container(ctx: Arc<TaskExecContext>, cancel: TaskContext) -> Result
     }
 }
 
+/// Allocates a unique one-based attempt number without wrapping identity.
+fn next_attempt(attempts: &AtomicU32) -> Option<u32> {
+    attempts
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |attempt| {
+            attempt.checked_add(1)
+        })
+        .ok()
+        .and_then(|attempt| attempt.checked_add(1))
+}
+
 fn cancellation_requested(cancel: &watch::Receiver<bool>) -> bool {
     *cancel.borrow() || cancel.has_changed().is_err()
 }
@@ -252,35 +278,61 @@ fn cancellation_requested(cancel: &watch::Receiver<bool>) -> bool {
 async fn run_container_worker(
     ctx: Arc<TaskExecContext>,
     request: ContainerRequest,
-    sink: Option<solti_runner::OutputSink>,
+    cancel: watch::Receiver<bool>,
+) -> Result<(), TaskError> {
+    let span = debug_span!(
+        "container_attempt",
+        event = "container.attempt",
+        task_name = %ctx.task.resource_name,
+        generation = ctx.task.generation,
+        run_id = %ctx.task.run_id,
+        attempt = request.attempt(),
+    );
+    run_container_attempt(ctx, request, cancel)
+        .instrument(span)
+        .await
+}
+
+async fn run_container_attempt(
+    ctx: Arc<TaskExecContext>,
+    request: ContainerRequest,
     mut cancel: watch::Receiver<bool>,
 ) -> Result<(), TaskError> {
     if cancellation_requested(&cancel) {
         return Err(TaskError::Canceled);
     }
 
+    let sink = request_output_sink(
+        &ctx.output_publisher,
+        request.task_name(),
+        request.generation(),
+        request.attempt(),
+    );
+
     trace!(
-        task = %ctx.task.run_id,
-        attempt = request.attempt(),
-        image = %request.image(),
+        event = "container.lifecycle",
+        stage = "creating",
         "creating container attempt",
     );
 
     let mut attempt = match ctx.engine.create_attempt(request).await {
         Ok(attempt) => attempt,
         Err(error) => {
-            ctx.metrics.record_runner_error(
+            record_runner_error(
+                &ctx.metrics,
                 RunnerType::Container,
                 RunnerErrorKind::Custom("attempt_create_failed".into()),
             );
-            if cancellation_requested(&cancel) {
-                return Err(TaskError::Canceled);
-            }
             return Err(map_engine_error(error));
         }
     };
+    trace!(
+        event = "container.lifecycle",
+        stage = "created",
+        "container attempt created"
+    );
 
-    let mut output = OutputTasks::start(
+    let mut output = start_output_tasks(
         attempt.as_mut(),
         Arc::clone(&ctx.task.run_id),
         ctx.logger,
@@ -289,16 +341,24 @@ async fn run_container_worker(
 
     if cancellation_requested(&cancel) {
         cleanup_attempt(attempt.as_mut(), false).await?;
-        output.drain(&ctx.task.run_id).await;
+        drain_output_tasks(&mut output, &ctx.task.run_id).await;
         return Err(TaskError::Canceled);
     }
 
+    trace!(
+        event = "container.lifecycle",
+        stage = "starting",
+        "container attempt starting"
+    );
     if let Err(start_error) = attempt.start().await {
-        ctx.metrics
-            .record_runner_error(RunnerType::Container, RunnerErrorKind::SpawnFailed);
+        record_runner_error(
+            &ctx.metrics,
+            RunnerType::Container,
+            RunnerErrorKind::SpawnFailed,
+        );
         let canceled = cancellation_requested(&cancel);
         let cleanup = cleanup_attempt(attempt.as_mut(), true).await;
-        output.drain(&ctx.task.run_id).await;
+        drain_output_tasks(&mut output, &ctx.task.run_id).await;
         cleanup?;
         return if canceled {
             Err(TaskError::Canceled)
@@ -306,6 +366,11 @@ async fn run_container_worker(
             Err(map_engine_error(start_error))
         };
     }
+    trace!(
+        event = "container.lifecycle",
+        stage = "started",
+        "container attempt started"
+    );
 
     let completion = tokio::select! {
         biased;
@@ -318,7 +383,10 @@ async fn run_container_worker(
 
     let result = match completion {
         AttemptCompletion::Canceled => {
-            debug!(task = %ctx.task.run_id, "cancellation requested; terminating container");
+            debug!(
+                event = "container.cancellation",
+                "cancellation requested; terminating container"
+            );
             let terminate = attempt.terminate().await;
             let waited = attempt.wait().await;
             match (terminate, waited) {
@@ -331,7 +399,15 @@ async fn run_container_worker(
                 ))),
             }
         }
-        AttemptCompletion::Exited(Ok(status)) => evaluate_exit(status),
+        AttemptCompletion::Exited(Ok(status)) => {
+            trace!(
+                event = "container.lifecycle",
+                stage = "exited",
+                exit_code = status.code(),
+                "container attempt exited"
+            );
+            evaluate_exit(status)
+        }
         AttemptCompletion::Exited(Err(error)) => {
             let terminate_error = attempt.terminate().await.err();
             if let Some(terminate_error) = terminate_error {
@@ -344,10 +420,11 @@ async fn run_container_worker(
         }
     };
 
-    output.drain(&ctx.task.run_id).await;
+    drain_output_tasks(&mut output, &ctx.task.run_id).await;
     let cleanup = attempt.cleanup().await;
     if let Err(error) = cleanup {
-        ctx.metrics.record_runner_error(
+        record_runner_error(
+            &ctx.metrics,
             RunnerType::Container,
             RunnerErrorKind::Custom("cleanup_failed".into()),
         );
@@ -355,6 +432,11 @@ async fn run_container_worker(
             "container cleanup failed: {error}"
         )));
     }
+    trace!(
+        event = "container.lifecycle",
+        stage = "cleaned",
+        "container attempt cleaned"
+    );
     result
 }
 
@@ -407,68 +489,65 @@ enum AttemptCompletion {
     Canceled,
 }
 
-struct OutputTasks {
-    stdout: Option<tokio::task::JoinHandle<()>>,
-    stderr: Option<tokio::task::JoinHandle<()>>,
-}
+/// Starts available container readers and enrolls each task before asking the
+/// engine for another stream. This preserves unwind-safe reader ownership when
+/// a custom engine panics while returning the second stream.
+fn start_output_tasks(
+    attempt: &mut dyn ContainerAttempt,
+    run_id: Arc<str>,
+    logger: LogConfig,
+    sink: Option<solti_runner::OutputSink>,
+) -> OutputTasks {
+    let mut tasks = OutputTasks::new();
 
-impl OutputTasks {
-    fn start(
-        attempt: &mut dyn ContainerAttempt,
-        run_id: Arc<str>,
-        logger: LogConfig,
-        sink: Option<solti_runner::OutputSink>,
-    ) -> Self {
-        let stdout = attempt.take_stdout().map(|reader| {
-            let run_id = Arc::clone(&run_id);
-            let sink = sink.clone();
-            tokio::spawn(async move {
+    if let Some(reader) = attempt.take_stdout() {
+        let run_id = Arc::clone(&run_id);
+        let sink = sink.clone();
+        let span = tracing::Span::current();
+        tasks.spawn_stdout(
+            async move {
                 log_stream(reader, &run_id, StreamKind::Stdout, &logger, sink.as_ref()).await;
-            })
-        });
-        let stderr = attempt.take_stderr().map(|reader| {
-            tokio::spawn(async move {
+            }
+            .instrument(span),
+        );
+    }
+
+    if let Some(reader) = attempt.take_stderr() {
+        let span = tracing::Span::current();
+        tasks.spawn_stderr(
+            async move {
                 log_stream(reader, &run_id, StreamKind::Stderr, &logger, sink.as_ref()).await;
-            })
-        });
-        Self { stdout, stderr }
+            }
+            .instrument(span),
+        );
     }
 
-    async fn drain(&mut self, run_id: &str) {
-        #[cfg(not(test))]
-        const GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-        #[cfg(test)]
-        const GRACE: std::time::Duration = std::time::Duration::from_millis(100);
-        let drained = tokio::time::timeout(GRACE, async {
-            if let Some(stdout) = self.stdout.as_mut() {
-                let _ = stdout.await;
-            }
-            if let Some(stderr) = self.stderr.as_mut() {
-                let _ = stderr.await;
-            }
-        })
-        .await
-        .is_ok();
-
-        if !drained {
-            if let Some(stdout) = &self.stdout {
-                stdout.abort();
-            }
-            if let Some(stderr) = &self.stderr {
-                stderr.abort();
-            }
-            warn!(task = %run_id, "container output drain timed out");
-        }
-    }
+    tasks
 }
 
-impl Drop for OutputTasks {
-    fn drop(&mut self) {
-        if let Some(stdout) = self.stdout.take() {
-            stdout.abort();
+async fn drain_output_tasks(output: &mut OutputTasks, run_id: &str) {
+    match output.drain().await {
+        OutputDrain::TimedOut => {
+            output.abort();
+            warn!(
+                event = "container.output_drain_timed_out",
+                run_id = %run_id,
+                "container output drain timed out"
+            );
         }
-        if let Some(stderr) = self.stderr.take() {
-            stderr.abort();
+        OutputDrain::Completed { stdout, stderr } => {
+            for (stream, failure) in [(StreamKind::Stdout, stdout), (StreamKind::Stderr, stderr)] {
+                let Some(failure) = failure else {
+                    continue;
+                };
+                warn!(
+                    event = "container.output_reader_failed",
+                    run_id = %run_id,
+                    stream = stream.as_str(),
+                    join_error = failure.as_str(),
+                    "container output reader task failed"
+                );
+            }
         }
     }
 }
@@ -479,625 +558,12 @@ impl fmt::Debug for ContainerRunner {
             .debug_struct("ContainerRunner")
             .field("name", &self.name)
             .field("engine", &"<engine>")
+            .field("ownership_contract", &self.ownership_contract)
             .field("config", &self.config)
             .finish()
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        sync::{Arc, Mutex, atomic::AtomicBool},
-        time::Duration,
-    };
-
-    use async_trait::async_trait;
-    use solti_model::{ContainerSpec, TaskEnv, TaskSpec};
-    use taskvisor::{
-        RuntimeError, Supervisor, SupervisorConfig, TaskOutcomeKind, TaskSpec as TaskvisorTaskSpec,
-    };
-    use tokio::sync::{Notify, Semaphore};
-
-    use super::*;
-    use crate::container::{ContainerEngineInfo, ContainerOutput};
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum Call {
-        Probe,
-        Create { attempt: u32, image: String },
-        Start,
-        Wait,
-        Terminate,
-        Cleanup,
-    }
-
-    struct FakeEngine {
-        calls: Arc<Mutex<Vec<Call>>>,
-        exit_code: i32,
-        create_error: Option<ContainerErrorClass>,
-    }
-
-    impl FakeEngine {
-        fn new(exit_code: i32) -> (Arc<Self>, Arc<Mutex<Vec<Call>>>) {
-            let calls = Arc::new(Mutex::new(Vec::new()));
-            (
-                Arc::new(Self {
-                    calls: Arc::clone(&calls),
-                    exit_code,
-                    create_error: None,
-                }),
-                calls,
-            )
-        }
-
-        fn failing(class: ContainerErrorClass) -> Arc<Self> {
-            Arc::new(Self {
-                calls: Arc::new(Mutex::new(Vec::new())),
-                exit_code: 0,
-                create_error: Some(class),
-            })
-        }
-    }
-
-    #[async_trait]
-    impl ContainerEngine for FakeEngine {
-        async fn probe(&self) -> Result<ContainerEngineInfo, ContainerEngineError> {
-            self.calls.lock().unwrap().push(Call::Probe);
-            Ok(ContainerEngineInfo::new("fake", "1"))
-        }
-
-        async fn create_attempt(
-            &self,
-            request: ContainerRequest,
-        ) -> Result<Box<dyn ContainerAttempt>, ContainerEngineError> {
-            self.calls.lock().unwrap().push(Call::Create {
-                attempt: request.attempt(),
-                image: request.image().to_owned(),
-            });
-            if let Some(class) = self.create_error {
-                return Err(match class {
-                    ContainerErrorClass::Retryable => {
-                        ContainerEngineError::retryable("temporary create failure")
-                    }
-                    ContainerErrorClass::Permanent => {
-                        ContainerEngineError::permanent("permanent create failure")
-                    }
-                });
-            }
-            Ok(Box::new(FakeAttempt {
-                calls: Arc::clone(&self.calls),
-                exit_code: self.exit_code,
-            }))
-        }
-    }
-
-    struct FakeAttempt {
-        calls: Arc<Mutex<Vec<Call>>>,
-        exit_code: i32,
-    }
-
-    #[async_trait]
-    impl ContainerAttempt for FakeAttempt {
-        fn take_stdout(&mut self) -> Option<ContainerOutput> {
-            None
-        }
-
-        fn take_stderr(&mut self) -> Option<ContainerOutput> {
-            None
-        }
-
-        async fn start(&mut self) -> Result<(), ContainerEngineError> {
-            self.calls.lock().unwrap().push(Call::Start);
-            Ok(())
-        }
-
-        async fn wait(&mut self) -> Result<ContainerExitStatus, ContainerEngineError> {
-            self.calls.lock().unwrap().push(Call::Wait);
-            Ok(ContainerExitStatus::new(self.exit_code))
-        }
-
-        async fn terminate(&mut self) -> Result<(), ContainerEngineError> {
-            self.calls.lock().unwrap().push(Call::Terminate);
-            Ok(())
-        }
-
-        async fn cleanup(&mut self) -> Result<(), ContainerEngineError> {
-            self.calls.lock().unwrap().push(Call::Cleanup);
-            Ok(())
-        }
-    }
-
-    #[derive(Clone, Copy, Default)]
-    struct AttemptBehavior {
-        start_fails: bool,
-        terminate_fails: bool,
-        cleanup_fails: bool,
-    }
-
-    struct ControlledEngine {
-        calls: Arc<Mutex<Vec<Call>>>,
-        create_entered: Arc<Notify>,
-        create_release: Arc<Semaphore>,
-        create_in_flight: Arc<AtomicBool>,
-        behavior: AttemptBehavior,
-    }
-
-    struct ControlledEngineHandle {
-        calls: Arc<Mutex<Vec<Call>>>,
-        create_entered: Arc<Notify>,
-        create_release: Arc<Semaphore>,
-        create_in_flight: Arc<AtomicBool>,
-    }
-
-    struct InFlightCreate(Arc<AtomicBool>);
-
-    impl InFlightCreate {
-        fn enter(flag: Arc<AtomicBool>) -> Self {
-            assert!(
-                !flag.swap(true, Ordering::SeqCst),
-                "controlled create attempts must not overlap"
-            );
-            Self(flag)
-        }
-    }
-
-    impl Drop for InFlightCreate {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::SeqCst);
-        }
-    }
-
-    impl ControlledEngine {
-        fn blocked(behavior: AttemptBehavior) -> (Arc<Self>, ControlledEngineHandle) {
-            let calls = Arc::new(Mutex::new(Vec::new()));
-            let create_entered = Arc::new(Notify::new());
-            let create_release = Arc::new(Semaphore::new(0));
-            let create_in_flight = Arc::new(AtomicBool::new(false));
-            (
-                Arc::new(Self {
-                    calls: Arc::clone(&calls),
-                    create_entered: Arc::clone(&create_entered),
-                    create_release: Arc::clone(&create_release),
-                    create_in_flight: Arc::clone(&create_in_flight),
-                    behavior,
-                }),
-                ControlledEngineHandle {
-                    calls,
-                    create_entered,
-                    create_release,
-                    create_in_flight,
-                },
-            )
-        }
-    }
-
-    #[async_trait]
-    impl ContainerEngine for ControlledEngine {
-        async fn probe(&self) -> Result<ContainerEngineInfo, ContainerEngineError> {
-            self.calls.lock().unwrap().push(Call::Probe);
-            Ok(ContainerEngineInfo::new("controlled", "1"))
-        }
-
-        async fn create_attempt(
-            &self,
-            request: ContainerRequest,
-        ) -> Result<Box<dyn ContainerAttempt>, ContainerEngineError> {
-            self.calls.lock().unwrap().push(Call::Create {
-                attempt: request.attempt(),
-                image: request.image().to_owned(),
-            });
-            let _in_flight = InFlightCreate::enter(Arc::clone(&self.create_in_flight));
-            self.create_entered.notify_one();
-            let permit = self
-                .create_release
-                .acquire()
-                .await
-                .map_err(|_| ContainerEngineError::permanent("test create gate closed"))?;
-            permit.forget();
-            Ok(Box::new(ControlledAttempt {
-                calls: Arc::clone(&self.calls),
-                behavior: self.behavior,
-            }))
-        }
-    }
-
-    struct ControlledAttempt {
-        calls: Arc<Mutex<Vec<Call>>>,
-        behavior: AttemptBehavior,
-    }
-
-    #[async_trait]
-    impl ContainerAttempt for ControlledAttempt {
-        fn take_stdout(&mut self) -> Option<ContainerOutput> {
-            None
-        }
-
-        fn take_stderr(&mut self) -> Option<ContainerOutput> {
-            None
-        }
-
-        async fn start(&mut self) -> Result<(), ContainerEngineError> {
-            self.calls.lock().unwrap().push(Call::Start);
-            if self.behavior.start_fails {
-                Err(ContainerEngineError::retryable("controlled start failure"))
-            } else {
-                Ok(())
-            }
-        }
-
-        async fn wait(&mut self) -> Result<ContainerExitStatus, ContainerEngineError> {
-            self.calls.lock().unwrap().push(Call::Wait);
-            Ok(ContainerExitStatus::new(0))
-        }
-
-        async fn terminate(&mut self) -> Result<(), ContainerEngineError> {
-            self.calls.lock().unwrap().push(Call::Terminate);
-            if self.behavior.terminate_fails {
-                Err(ContainerEngineError::retryable(
-                    "controlled termination failure",
-                ))
-            } else {
-                Ok(())
-            }
-        }
-
-        async fn cleanup(&mut self) -> Result<(), ContainerEngineError> {
-            self.calls.lock().unwrap().push(Call::Cleanup);
-            if self.behavior.cleanup_fails {
-                Err(ContainerEngineError::retryable(
-                    "controlled cleanup failure",
-                ))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    async fn wait_for(signal: &Notify, operation: &str) {
-        tokio::time::timeout(Duration::from_secs(1), signal.notified())
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for {operation}"));
-    }
-
-    fn worker_context(engine: Arc<dyn ContainerEngine>) -> Arc<TaskExecContext> {
-        let resource = task();
-        let run_id = solti_runner::make_run_id("containerd", resource.slot().as_str());
-        let build = BuildContext::default();
-        let TaskWorkload::Container(spec) = resource.spec().workload() else {
-            unreachable!("test task is a container workload");
-        };
-        Arc::new(TaskExecContext {
-            engine,
-            metrics: build.metrics().clone(),
-            output_publisher: Arc::clone(build.output_publisher()),
-            task: ContainerTaskConfig {
-                run_id: Arc::from(run_id.name()),
-                resource_name: resource.name().clone(),
-                generation: resource.metadata().generation(),
-                image: spec.image.clone(),
-                command: spec.command.clone(),
-                args: spec.args.clone(),
-                env: std::collections::BTreeMap::new(),
-                process_policy: super::super::ContainerProcessPolicy::default(),
-            },
-            logger: LogConfig::default(),
-            attempt: AtomicU32::new(0),
-        })
-    }
-
-    fn task() -> Task {
-        let workload = TaskWorkload::Container(ContainerSpec::new(
-            "docker.io/library/alpine:latest".into(),
-            Some(vec!["echo".into()]),
-            vec!["hello".into()],
-            TaskEnv::new(),
-        ));
-        let spec = TaskSpec::builder("container-slot", workload, 5_000_u64)
-            .build()
-            .unwrap();
-        Task::new("container-task", spec).unwrap()
-    }
-
-    fn build(runner: &ContainerRunner) -> TaskRef {
-        let resource = task();
-        let run_id = solti_runner::make_run_id(runner.name(), resource.slot().as_str());
-        runner
-            .build_task(&resource, &run_id, &BuildContext::default())
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn build_has_no_engine_io_and_each_spawn_gets_one_attempt() {
-        let (engine, calls) = FakeEngine::new(0);
-        let runner = ContainerRunner::new("containerd", engine).unwrap();
-        let task = build(&runner);
-
-        assert!(calls.lock().unwrap().is_empty());
-        task.spawn(TaskContext::detached()).await.unwrap();
-        task.spawn(TaskContext::detached()).await.unwrap();
-
-        assert_eq!(
-            *calls.lock().unwrap(),
-            [
-                Call::Create {
-                    attempt: 1,
-                    image: "docker.io/library/alpine:latest".into(),
-                },
-                Call::Start,
-                Call::Wait,
-                Call::Cleanup,
-                Call::Create {
-                    attempt: 2,
-                    image: "docker.io/library/alpine:latest".into(),
-                },
-                Call::Start,
-                Call::Wait,
-                Call::Cleanup,
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn pre_canceled_attempt_performs_no_engine_io() {
-        let (engine, calls) = FakeEngine::new(0);
-        let runner = ContainerRunner::new("containerd", engine).unwrap();
-
-        let error = build(&runner)
-            .spawn(TaskContext::detached_cancelled())
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, TaskError::Canceled));
-        assert!(calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn engine_class_and_exit_code_reach_taskvisor() {
-        let retryable = ContainerRunner::new(
-            "retryable",
-            FakeEngine::failing(ContainerErrorClass::Retryable),
-        )
-        .unwrap();
-        assert!(matches!(
-            build(&retryable).spawn(TaskContext::detached()).await,
-            Err(TaskError::Fail { .. })
-        ));
-
-        let permanent = ContainerRunner::new(
-            "permanent",
-            FakeEngine::failing(ContainerErrorClass::Permanent),
-        )
-        .unwrap();
-        assert!(matches!(
-            build(&permanent).spawn(TaskContext::detached()).await,
-            Err(TaskError::Fatal { .. })
-        ));
-
-        let (engine, _) = FakeEngine::new(23);
-        let failed = ContainerRunner::new("exit-code", engine).unwrap();
-        assert!(matches!(
-            build(&failed).spawn(TaskContext::detached()).await,
-            Err(TaskError::Fail {
-                exit_code: Some(23),
-                ..
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn cancellation_during_create_cleans_without_starting() {
-        let (engine, handle) = ControlledEngine::blocked(AttemptBehavior::default());
-        let ctx = worker_context(engine);
-        let request = ctx.task.request(1);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let worker = tokio::spawn(run_container_worker(ctx, request, None, cancel_rx));
-
-        wait_for(&handle.create_entered, "create attempt to start").await;
-        cancel_tx.send(true).unwrap();
-        handle.create_release.add_permits(1);
-
-        let result = tokio::time::timeout(Duration::from_secs(1), worker)
-            .await
-            .expect("container worker did not finish")
-            .expect("container worker panicked");
-        assert!(matches!(result, Err(TaskError::Canceled)));
-        assert_eq!(
-            *handle.calls.lock().unwrap(),
-            [
-                Call::Create {
-                    attempt: 1,
-                    image: "docker.io/library/alpine:latest".into(),
-                },
-                Call::Cleanup,
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn dropping_outer_future_drops_in_flight_create() {
-        let (engine, handle) = ControlledEngine::blocked(AttemptBehavior::default());
-        let runner = ContainerRunner::new("containerd", engine).unwrap();
-        let task = build(&runner);
-        let outer = tokio::spawn(async move { task.spawn(TaskContext::detached()).await });
-
-        wait_for(&handle.create_entered, "create attempt to start").await;
-        assert!(handle.create_in_flight.load(Ordering::SeqCst));
-        outer.abort();
-        assert!(outer.await.unwrap_err().is_cancelled());
-        assert!(!handle.create_in_flight.load(Ordering::SeqCst));
-
-        handle.create_release.add_permits(1);
-        tokio::task::yield_now().await;
-        assert_eq!(
-            *handle.calls.lock().unwrap(),
-            [Call::Create {
-                attempt: 1,
-                image: "docker.io/library/alpine:latest".into(),
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn taskvisor_force_abort_drops_lifecycle_before_shutdown_returns() {
-        let (engine, handle) = ControlledEngine::blocked(AttemptBehavior::default());
-        let runner = ContainerRunner::new("containerd", engine).unwrap();
-        let supervisor =
-            Supervisor::new(SupervisorConfig::new().with_grace(Duration::ZERO), vec![]);
-        let supervisor_handle = supervisor.serve();
-        let (_, waiter) = supervisor_handle
-            .add_and_watch(TaskvisorTaskSpec::once(build(&runner)))
-            .await
-            .unwrap();
-
-        wait_for(&handle.create_entered, "create attempt to start").await;
-        assert!(handle.create_in_flight.load(Ordering::SeqCst));
-
-        let shutdown = supervisor_handle.shutdown().await;
-        assert!(matches!(shutdown, Err(RuntimeError::GraceExceeded { .. })));
-        let outcome = waiter.wait().await.unwrap();
-        assert_eq!(outcome.kind(), TaskOutcomeKind::ForceAborted);
-        assert!(!handle.create_in_flight.load(Ordering::SeqCst));
-        assert_eq!(
-            *handle.calls.lock().unwrap(),
-            [Call::Create {
-                attempt: 1,
-                image: "docker.io/library/alpine:latest".into(),
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn taskvisor_timeout_drops_lifecycle_before_outcome() {
-        let (engine, handle) = ControlledEngine::blocked(AttemptBehavior::default());
-        let runner = ContainerRunner::new("containerd", engine).unwrap();
-        let supervisor = Supervisor::new(SupervisorConfig::new(), vec![]);
-        let supervisor_handle = supervisor.serve();
-        let (_, waiter) = supervisor_handle
-            .add_and_watch(
-                TaskvisorTaskSpec::once(build(&runner)).with_timeout(Duration::from_millis(20)),
-            )
-            .await
-            .unwrap();
-
-        wait_for(&handle.create_entered, "create attempt to start").await;
-        let outcome = tokio::time::timeout(Duration::from_secs(1), waiter.wait())
-            .await
-            .expect("timed out waiting for Taskvisor outcome")
-            .unwrap();
-        assert_eq!(outcome.kind(), TaskOutcomeKind::Failed);
-        assert!(!handle.create_in_flight.load(Ordering::SeqCst));
-        assert_eq!(
-            *handle.calls.lock().unwrap(),
-            [Call::Create {
-                attempt: 1,
-                image: "docker.io/library/alpine:latest".into(),
-            }]
-        );
-        supervisor_handle.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn dropping_output_tasks_aborts_readers() {
-        let stdout = tokio::spawn(std::future::pending::<()>());
-        let stderr = tokio::spawn(std::future::pending::<()>());
-        let stdout_abort = stdout.abort_handle();
-        let stderr_abort = stderr.abort_handle();
-        tokio::task::yield_now().await;
-
-        drop(OutputTasks {
-            stdout: Some(stdout),
-            stderr: Some(stderr),
-        });
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !stdout_abort.is_finished() || !stderr_abort.is_finished() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("output tasks were not aborted on drop");
-    }
-
-    #[tokio::test]
-    async fn start_failure_terminates_and_cleans_attempt() {
-        let (engine, handle) = ControlledEngine::blocked(AttemptBehavior {
-            start_fails: true,
-            terminate_fails: false,
-            cleanup_fails: false,
-        });
-        handle.create_release.add_permits(1);
-        let runner = ContainerRunner::new("containerd", engine).unwrap();
-
-        let result = build(&runner).spawn(TaskContext::detached()).await;
-
-        assert!(matches!(result, Err(TaskError::Fail { .. })));
-        assert_eq!(
-            *handle.calls.lock().unwrap(),
-            [
-                Call::Create {
-                    attempt: 1,
-                    image: "docker.io/library/alpine:latest".into(),
-                },
-                Call::Start,
-                Call::Terminate,
-                Call::Cleanup,
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn termination_and_cleanup_failures_are_both_reported() {
-        let (engine, handle) = ControlledEngine::blocked(AttemptBehavior {
-            start_fails: true,
-            terminate_fails: true,
-            cleanup_fails: true,
-        });
-        handle.create_release.add_permits(1);
-        let runner = ContainerRunner::new("containerd", engine).unwrap();
-
-        let result = build(&runner).spawn(TaskContext::detached()).await;
-
-        let error = result.unwrap_err().to_string();
-        assert!(error.contains("container termination failed"));
-        assert!(error.contains("cleanup failed"));
-        assert_eq!(
-            *handle.calls.lock().unwrap(),
-            [
-                Call::Create {
-                    attempt: 1,
-                    image: "docker.io/library/alpine:latest".into(),
-                },
-                Call::Start,
-                Call::Terminate,
-                Call::Cleanup,
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn cleanup_failure_is_fatal() {
-        let (engine, handle) = ControlledEngine::blocked(AttemptBehavior {
-            start_fails: false,
-            terminate_fails: false,
-            cleanup_fails: true,
-        });
-        handle.create_release.add_permits(1);
-        let runner = ContainerRunner::new("containerd", engine).unwrap();
-
-        let result = build(&runner).spawn(TaskContext::detached()).await;
-
-        assert!(matches!(result, Err(TaskError::Fatal { .. })));
-        assert_eq!(
-            *handle.calls.lock().unwrap(),
-            [
-                Call::Create {
-                    attempt: 1,
-                    image: "docker.io/library/alpine:latest".into(),
-                },
-                Call::Start,
-                Call::Wait,
-                Call::Cleanup,
-            ]
-        );
-    }
-}
+#[path = "runner/tests.rs"]
+mod tests;

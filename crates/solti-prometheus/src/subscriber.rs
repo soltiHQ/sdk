@@ -12,22 +12,26 @@
 //!       │ best-effort Event
 //!       ▼
 //! subscriber queue
-//!       │
 //!       ▼
 //! PrometheusTaskvisorSubscriber ──► Registry
 //! ```
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::sync::Mutex;
 
 use prometheus::{Counter, CounterVec, Gauge, Histogram, Registry};
 #[cfg(feature = "taskvisor-controller")]
 use taskvisor::RejectionKind;
-use taskvisor::{Event, EventKind, Subscribe, TaskOutcomeKind};
+use taskvisor::{Event, EventKind, Subscribe, TaskId, TaskOutcomeKind};
 
 use crate::register::{MetricGroup, ms_to_secs};
 
 /// Default capacity of the Taskvisor subscriber queue.
 pub const DEFAULT_TASKVISOR_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(2048).unwrap();
+
+const PROMETHEUS_TASKVISOR_SUBSCRIBER_NAME: &str = "prometheus-taskvisor";
+const TASKVISOR_SUBSCRIBER_LISTENER: &str = "subscriber_listener";
 
 /// Prometheus metrics from Taskvisor lifecycle events.
 ///
@@ -59,8 +63,8 @@ pub const DEFAULT_TASKVISOR_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(204
 ///      attempt > 1 ────────────► restarts + 1
 ///
 /// AttemptSucceeded ─┐
-/// AttemptCanceled ──┼──────────► in_flight - 1
-/// AttemptFailed ────┤
+/// AttemptCanceled ──┼──────────► remove matching (TaskId, attempt)
+/// AttemptFailed ────┤             in_flight - 1 exactly once
 /// AttemptTimedOut ──┘             timeouts + 1
 ///
 /// BackoffScheduled ─────────────► backoffs{source}
@@ -68,17 +72,21 @@ pub const DEFAULT_TASKVISOR_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(204
 ///
 /// TaskFinished ─────────────────► final_outcomes{outcome}
 ///
-/// SubscriberOverflow ───────────► subscriber_overflows
+/// SubscriberOverflow ───────────► subscriber_overflows + dropped count
 /// SubscriberPanicked ───────────► subscriber_panics
 /// RuntimeFailure ───────────────► runtime_failures
+/// SubscriberOverflow from this subscriber or subscriber_listener also clears
+/// attempt tracking and sets in_flight to NaN.
 ///
 /// taskvisor-controller:
 ///   ControllerSubmitted ────────► controller_submitted_events
 ///   ControllerRejected ─────────► controller_rejections{reason}
 /// ```
 ///
-/// `TaskFinished` with `ForceAborted` or `Panicked` also repairs the in-flight gauge.
-/// Those outcomes can end an attempt without an attempt-level terminal event.
+/// While tracking is valid, `TaskFinished` repairs the logical in-flight gauge by removing any attempt still tracked for that Task ID.
+/// The repair is idempotent when an attempt-level terminal event arrived first.
+/// `ForceAborted` and `Panicked` can end an attempt without an attempt-level terminal event.
+/// `ForceAborted` does not prove that task code has exited physically.
 /// Other Taskvisor events do not change metrics.
 ///
 /// ## Labels
@@ -91,8 +99,25 @@ pub const DEFAULT_TASKVISOR_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(204
 ///
 /// Taskvisor events are best-effort.
 /// A slow subscriber may miss events.
-/// The in-flight gauge can therefore drift.
-/// The decrement path checks the current value before changing the gauge.
+/// Delivered events are correlated by Taskvisor's canonical `(TaskId, attempt)` identity.
+/// Events constructed without that runtime metadata use a count-only fallback.
+/// At most one attempt can be active for a Task ID.
+/// A conflicting active attempt identity proves that the delivered stream is incomplete.
+///
+/// The first overflow attributed to this subscriber, an overflow from Taskvisor's shared `subscriber_listener`,
+/// or a conflicting identity permanently invalidates in-flight tracking because the event stream has
+/// no authoritative active-attempt snapshot.
+/// The subscriber releases all tracking memory, sets the gauge to `NaN`, and does not retain or
+/// apply later attempt identities.
+/// Counters, histograms, and final outcomes continue to update from delivered events.
+///
+/// Taskvisor runtime overflow events always identify their subscriber or internal relay in `task`.
+/// An overflow for another subscriber, or a manually constructed event without `task`, still increments
+/// the global overflow counter but does not prove that this subscriber missed lifecycle events and does not invalidate it.
+/// Taskvisor can coalesce an overflow burst into one event.
+/// The overflow counter adds its `dropped` value, or one when no count is available.
+/// Controller metrics count delivered controller events.
+/// Errors returned before controller intake do not emit `ControllerRejected` and are not included.
 ///
 /// Use `PrometheusCoreStateCollector` for a pull-based task-phase snapshot.
 ///
@@ -102,7 +127,7 @@ pub const DEFAULT_TASKVISOR_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(204
 /// use solti_prometheus::{PrometheusTaskvisorSubscriber, Registry};
 /// use taskvisor::{Event, EventKind, Subscribe};
 ///
-/// # fn main() -> Result<(), prometheus::Error> {
+/// # fn main() -> Result<(), solti_prometheus::Error> {
 /// let registry = Registry::new();
 /// let subscriber = PrometheusTaskvisorSubscriber::new(&registry)?;
 ///
@@ -115,6 +140,7 @@ pub const DEFAULT_TASKVISOR_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(204
 /// ```
 pub struct PrometheusTaskvisorSubscriber {
     attempts_in_flight: Gauge,
+    in_flight: Mutex<InFlightAttempts>,
     task_restarts: Counter,
     task_backoffs: CounterVec,
     task_backoff_duration: Histogram,
@@ -128,6 +154,30 @@ pub struct PrometheusTaskvisorSubscriber {
     #[cfg(feature = "taskvisor-controller")]
     controller_rejections: CounterVec,
     queue_capacity: NonZeroUsize,
+}
+
+struct InFlightAttempts {
+    identified: HashMap<TaskId, u32>,
+    anonymous: usize,
+    valid: bool,
+}
+
+impl Default for InFlightAttempts {
+    fn default() -> Self {
+        Self {
+            identified: HashMap::new(),
+            anonymous: 0,
+            valid: true,
+        }
+    }
+}
+
+impl InFlightAttempts {
+    fn invalidate(&mut self) {
+        self.identified = HashMap::new();
+        self.anonymous = 0;
+        self.valid = false;
+    }
 }
 
 #[cfg(feature = "taskvisor-controller")]
@@ -144,10 +194,110 @@ fn terminal_outcome_label(kind: Option<TaskOutcomeKind>) -> &'static str {
 }
 
 impl PrometheusTaskvisorSubscriber {
-    fn decrement_in_flight(&self) {
-        if self.attempts_in_flight.get() > 0.0 {
+    fn start_attempt(&self, event: &Event) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !in_flight.valid {
+            return;
+        }
+
+        let inserted = match (event.id, event.attempt) {
+            (Some(id), Some(attempt)) => match in_flight.identified.get(&id).copied() {
+                None => {
+                    in_flight.identified.insert(id, attempt);
+                    true
+                }
+                Some(active) if active == attempt => false,
+                Some(_) => {
+                    in_flight.invalidate();
+                    self.attempts_in_flight.set(f64::NAN);
+                    return;
+                }
+            },
+            _ => {
+                let previous = in_flight.anonymous;
+                in_flight.anonymous = in_flight.anonymous.saturating_add(1);
+                in_flight.anonymous != previous
+            }
+        };
+        if inserted {
+            self.attempts_in_flight.inc();
+        }
+    }
+
+    fn finish_attempt(&self, event: &Event) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !in_flight.valid {
+            return;
+        }
+
+        let removed = match (event.id, event.attempt) {
+            (Some(id), Some(attempt)) => match in_flight.identified.get(&id).copied() {
+                Some(active) if active == attempt => {
+                    in_flight.identified.remove(&id);
+                    true
+                }
+                Some(_) => {
+                    in_flight.invalidate();
+                    self.attempts_in_flight.set(f64::NAN);
+                    return;
+                }
+                None => false,
+            },
+            _ if in_flight.anonymous > 0 => {
+                in_flight.anonymous -= 1;
+                true
+            }
+            _ => false,
+        };
+        if removed {
             self.attempts_in_flight.dec();
         }
+    }
+
+    fn finish_task(&self, event: &Event) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !in_flight.valid {
+            return;
+        }
+
+        let removed = if let Some(id) = event.id {
+            usize::from(in_flight.identified.remove(&id).is_some())
+        } else if in_flight.anonymous > 0 {
+            in_flight.anonymous -= 1;
+            1
+        } else {
+            0
+        };
+        if removed > 0 {
+            self.attempts_in_flight.sub(removed as f64);
+        }
+    }
+
+    fn invalidate_in_flight(&self) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if in_flight.valid {
+            in_flight.invalidate();
+            self.attempts_in_flight.set(f64::NAN);
+        }
+    }
+
+    fn overflow_invalidates_in_flight(&self, event: &Event) -> bool {
+        event
+            .task
+            .as_deref()
+            .is_some_and(|source| source == self.name() || source == TASKVISOR_SUBSCRIBER_LISTENER)
     }
 
     /// Creates and registers a subscriber with the default queue capacity.
@@ -174,7 +324,7 @@ impl PrometheusTaskvisorSubscriber {
     /// use solti_prometheus::{PrometheusTaskvisorSubscriber, Registry};
     /// use taskvisor::Subscribe;
     ///
-    /// # fn main() -> Result<(), prometheus::Error> {
+    /// # fn main() -> Result<(), solti_prometheus::Error> {
     /// let registry = Registry::new();
     /// let capacity = NonZeroUsize::new(4096).unwrap();
     /// let subscriber = PrometheusTaskvisorSubscriber::with_queue_capacity(&registry, capacity)?;
@@ -191,7 +341,7 @@ impl PrometheusTaskvisorSubscriber {
         let attempts_in_flight = metrics.gauge(
             "taskvisor",
             "attempts_in_flight",
-            "Number of task attempts currently executing",
+            "Active task attempts tracked from delivered Taskvisor events; permanently NaN after detected event loss",
         )?;
         let task_restarts = metrics.counter(
             "taskvisor",
@@ -227,7 +377,7 @@ impl PrometheusTaskvisorSubscriber {
         let subscriber_overflows = metrics.counter(
             "taskvisor",
             "subscriber_overflows_total",
-            "Total subscriber queue overflow events (events lost)",
+            "Total Taskvisor events reported lost by overflow diagnostics",
         )?;
         let subscriber_panics = metrics.counter(
             "taskvisor",
@@ -250,13 +400,14 @@ impl PrometheusTaskvisorSubscriber {
         let controller_rejections = metrics.counter_vec(
             "taskvisor_controller",
             "rejections_total",
-            "Total controller rejections grouped by cause",
+            "Total ControllerRejected events grouped by typed cause",
             &["reason"],
         )?;
         metrics.register(registry)?;
 
         Ok(Self {
             attempts_in_flight,
+            in_flight: Mutex::new(InFlightAttempts::default()),
             task_restarts,
             task_backoffs,
             task_backoff_duration,
@@ -285,20 +436,24 @@ impl Subscribe for PrometheusTaskvisorSubscriber {
     fn on_event(&self, event: &Event) {
         match event.kind {
             EventKind::AttemptStarting => {
-                self.attempts_in_flight.inc();
+                self.start_attempt(event);
                 if event.attempt.unwrap_or(1) > 1 {
                     self.task_restarts.inc();
                 }
             }
             EventKind::AttemptSucceeded | EventKind::AttemptCanceled | EventKind::AttemptFailed => {
-                self.decrement_in_flight();
+                self.finish_attempt(event);
             }
             EventKind::AttemptTimedOut => {
-                self.decrement_in_flight();
+                self.finish_attempt(event);
                 self.attempt_timeouts.inc();
             }
             EventKind::SubscriberOverflow => {
-                self.subscriber_overflows.inc();
+                if self.overflow_invalidates_in_flight(event) {
+                    self.invalidate_in_flight();
+                }
+                self.subscriber_overflows
+                    .inc_by(event.dropped.unwrap_or(1) as f64);
             }
             EventKind::SubscriberPanicked => {
                 self.subscriber_panics.inc();
@@ -322,13 +477,7 @@ impl Subscribe for PrometheusTaskvisorSubscriber {
             EventKind::TaskFinished => {
                 let label = terminal_outcome_label(event.outcome_kind);
                 self.task_final_outcomes.with_label_values(&[label]).inc();
-
-                if matches!(
-                    event.outcome_kind,
-                    Some(TaskOutcomeKind::ForceAborted | TaskOutcomeKind::Panicked)
-                ) {
-                    self.decrement_in_flight();
-                }
+                self.finish_task(event);
             }
             #[cfg(feature = "taskvisor-controller")]
             EventKind::ControllerSubmitted => {
@@ -358,7 +507,7 @@ impl Subscribe for PrometheusTaskvisorSubscriber {
 
     /// Returns `"prometheus-taskvisor"`.
     fn name(&self) -> &'static str {
-        "prometheus-taskvisor"
+        PROMETHEUS_TASKVISOR_SUBSCRIBER_NAME
     }
 
     /// Returns the per-subscriber queue capacity configured at construction.
@@ -370,7 +519,6 @@ impl Subscribe for PrometheusTaskvisorSubscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "runner")]
     use prometheus::Encoder;
     #[cfg(feature = "runner")]
     use solti_runner::MetricsBackend;
@@ -381,7 +529,6 @@ mod tests {
         PrometheusTaskvisorSubscriber::new(&registry).unwrap()
     }
 
-    #[cfg(feature = "runner")]
     fn metrics_text(registry: &Registry) -> String {
         let encoder = prometheus::TextEncoder::new();
         let families = registry.gather();
@@ -506,13 +653,16 @@ mod tests {
             (TaskOutcomeKind::ForceAborted, "outcome_force_aborted"),
             (TaskOutcomeKind::Panicked, "outcome_panicked"),
         ] {
+            let id = TaskId::for_tests();
             sub.on_event(
                 &Event::new(EventKind::AttemptStarting)
+                    .with_id(id)
                     .with_task("t")
                     .with_attempt(1),
             );
             sub.on_event(
                 &Event::new(EventKind::TaskFinished)
+                    .with_id(id)
                     .with_task("t")
                     .with_outcome_kind(outcome),
             );
@@ -522,6 +672,73 @@ mod tests {
                 1.0
             );
         }
+    }
+
+    #[test]
+    fn cleanup_panic_sequence_decrements_only_its_identified_attempt() {
+        let sub = new_subscriber();
+        let panicked = TaskId::for_tests();
+        let still_running = TaskId::for_tests();
+
+        for id in [panicked, still_running] {
+            sub.on_event(
+                &Event::new(EventKind::AttemptStarting)
+                    .with_id(id)
+                    .with_task("same-name-is-not-the-identity")
+                    .with_attempt(1),
+            );
+        }
+        assert_eq!(sub.attempts_in_flight.get(), 2.0);
+
+        sub.on_event(
+            &Event::new(EventKind::AttemptFailed)
+                .with_id(panicked)
+                .with_task("same-name-is-not-the-identity")
+                .with_attempt(1),
+        );
+        assert_eq!(sub.attempts_in_flight.get(), 1.0);
+
+        sub.on_event(
+            &Event::new(EventKind::TaskFinished)
+                .with_id(panicked)
+                .with_task("same-name-is-not-the-identity")
+                .with_outcome_kind(TaskOutcomeKind::Panicked),
+        );
+        assert_eq!(
+            sub.attempts_in_flight.get(),
+            1.0,
+            "TaskFinished(Panicked) must be idempotent after AttemptFailed"
+        );
+
+        sub.on_event(
+            &Event::new(EventKind::AttemptSucceeded)
+                .with_id(still_running)
+                .with_task("same-name-is-not-the-identity")
+                .with_attempt(1),
+        );
+        assert_eq!(sub.attempts_in_flight.get(), 0.0);
+    }
+
+    #[test]
+    fn duplicate_identified_events_are_idempotent() {
+        let sub = new_subscriber();
+        let id = TaskId::for_tests();
+        let starting = Event::new(EventKind::AttemptStarting)
+            .with_id(id)
+            .with_task("t")
+            .with_attempt(1);
+
+        sub.on_event(&starting);
+        sub.on_event(&starting);
+        assert_eq!(sub.attempts_in_flight.get(), 1.0);
+
+        let finished = Event::new(EventKind::AttemptSucceeded)
+            .with_id(id)
+            .with_task("t")
+            .with_attempt(1);
+        sub.on_event(&finished);
+        sub.on_event(&finished);
+        assert_eq!(sub.attempts_in_flight.get(), 0.0);
     }
 
     #[test]
@@ -559,6 +776,199 @@ mod tests {
         assert_eq!(sub.runtime_failures.get(), 1.0);
     }
 
+    #[test]
+    fn subscriber_overflow_counts_every_reported_lost_event() {
+        let sub = new_subscriber();
+
+        sub.on_event(
+            &Event::new(EventKind::SubscriberOverflow)
+                .with_task("another-subscriber")
+                .with_dropped(2),
+        );
+        sub.on_event(
+            &Event::new(EventKind::SubscriberOverflow)
+                .with_task(sub.name())
+                .with_dropped(3),
+        );
+        sub.on_event(
+            &Event::new(EventKind::SubscriberOverflow)
+                .with_task(TASKVISOR_SUBSCRIBER_LISTENER)
+                .with_dropped(5),
+        );
+        sub.on_event(&Event::new(EventKind::SubscriberOverflow).with_dropped(7));
+
+        assert_eq!(sub.subscriber_overflows.get(), 17.0);
+    }
+
+    #[test]
+    fn other_or_missing_overflow_source_preserves_in_flight_tracking() {
+        let sub = new_subscriber();
+        let id = TaskId::for_tests();
+
+        sub.on_event(
+            &Event::new(EventKind::AttemptStarting)
+                .with_id(id)
+                .with_task("t")
+                .with_attempt(1),
+        );
+        sub.on_event(
+            &Event::new(EventKind::SubscriberOverflow)
+                .with_task("another-subscriber")
+                .with_dropped(2),
+        );
+        sub.on_event(&Event::new(EventKind::SubscriberOverflow).with_dropped(3));
+
+        assert_eq!(sub.attempts_in_flight.get(), 1.0);
+        assert_eq!(sub.subscriber_overflows.get(), 5.0);
+        {
+            let in_flight = sub.in_flight.lock().unwrap();
+            assert!(in_flight.valid);
+            assert_eq!(in_flight.identified.get(&id), Some(&1));
+        }
+
+        sub.on_event(
+            &Event::new(EventKind::AttemptSucceeded)
+                .with_id(id)
+                .with_task("t")
+                .with_attempt(1),
+        );
+        assert_eq!(sub.attempts_in_flight.get(), 0.0);
+    }
+
+    #[test]
+    fn subscriber_listener_overflow_invalidates_in_flight_tracking() {
+        let sub = new_subscriber();
+        let id = TaskId::for_tests();
+
+        sub.on_event(
+            &Event::new(EventKind::AttemptStarting)
+                .with_id(id)
+                .with_task("t")
+                .with_attempt(1),
+        );
+        sub.on_event(
+            &Event::new(EventKind::SubscriberOverflow)
+                .with_task(TASKVISOR_SUBSCRIBER_LISTENER)
+                .with_dropped(1),
+        );
+
+        assert!(sub.attempts_in_flight.get().is_nan());
+        let in_flight = sub.in_flight.lock().unwrap();
+        assert!(!in_flight.valid);
+        assert_eq!(in_flight.identified.capacity(), 0);
+        assert_eq!(in_flight.anonymous, 0);
+    }
+
+    #[test]
+    fn own_overflow_releases_tracking_and_permanently_sets_in_flight_to_nan() {
+        let registry = Registry::new();
+        let sub = PrometheusTaskvisorSubscriber::new(&registry).unwrap();
+
+        for index in 0..4_096 {
+            sub.on_event(
+                &Event::new(EventKind::AttemptStarting)
+                    .with_id(TaskId::for_tests())
+                    .with_task(format!("t-{index}"))
+                    .with_attempt(1),
+            );
+        }
+        sub.on_event(
+            &Event::new(EventKind::AttemptStarting)
+                .with_task("anonymous")
+                .with_attempt(1),
+        );
+        {
+            let in_flight = sub.in_flight.lock().unwrap();
+            assert!(in_flight.valid);
+            assert_eq!(in_flight.identified.len(), 4_096);
+            assert!(in_flight.identified.capacity() >= 4_096);
+            assert_eq!(in_flight.anonymous, 1);
+        }
+
+        sub.on_event(
+            &Event::new(EventKind::SubscriberOverflow)
+                .with_task(sub.name())
+                .with_dropped(7),
+        );
+        assert!(sub.attempts_in_flight.get().is_nan());
+        let text = metrics_text(&registry);
+        assert!(text.contains(
+            "# HELP solti_taskvisor_attempts_in_flight Active task attempts tracked from delivered Taskvisor events; permanently NaN after detected event loss"
+        ));
+        assert!(text.contains("solti_taskvisor_attempts_in_flight NaN"));
+        {
+            let in_flight = sub.in_flight.lock().unwrap();
+            assert!(!in_flight.valid);
+            assert_eq!(in_flight.identified.len(), 0);
+            assert_eq!(in_flight.identified.capacity(), 0);
+            assert_eq!(in_flight.anonymous, 0);
+        }
+
+        let ignored = TaskId::for_tests();
+        sub.on_event(
+            &Event::new(EventKind::AttemptStarting)
+                .with_id(ignored)
+                .with_task("t")
+                .with_attempt(1),
+        );
+        sub.on_event(
+            &Event::new(EventKind::AttemptStarting)
+                .with_task("anonymous-after-overflow")
+                .with_attempt(1),
+        );
+        sub.on_event(
+            &Event::new(EventKind::AttemptTimedOut)
+                .with_id(ignored)
+                .with_task("t")
+                .with_attempt(1),
+        );
+        sub.on_event(
+            &Event::new(EventKind::TaskFinished)
+                .with_id(ignored)
+                .with_task("t")
+                .with_outcome_kind(TaskOutcomeKind::Completed),
+        );
+        assert!(sub.attempts_in_flight.get().is_nan());
+        assert_eq!(sub.attempt_timeouts.get(), 1.0);
+        assert_eq!(
+            sub.task_final_outcomes
+                .with_label_values(&["outcome_completed"])
+                .get(),
+            1.0
+        );
+        let in_flight = sub.in_flight.lock().unwrap();
+        assert!(!in_flight.valid);
+        assert_eq!(in_flight.identified.capacity(), 0);
+        assert_eq!(in_flight.anonymous, 0);
+    }
+
+    #[test]
+    fn conflicting_active_attempt_identity_invalidates_tracking() {
+        for conflict in [EventKind::AttemptStarting, EventKind::AttemptFailed] {
+            let sub = new_subscriber();
+            let id = TaskId::for_tests();
+
+            sub.on_event(
+                &Event::new(EventKind::AttemptStarting)
+                    .with_id(id)
+                    .with_task("t")
+                    .with_attempt(1),
+            );
+            sub.on_event(
+                &Event::new(conflict)
+                    .with_id(id)
+                    .with_task("t")
+                    .with_attempt(2),
+            );
+
+            assert!(sub.attempts_in_flight.get().is_nan());
+            let in_flight = sub.in_flight.lock().unwrap();
+            assert!(!in_flight.valid);
+            assert_eq!(in_flight.identified.capacity(), 0);
+            assert_eq!(in_flight.anonymous, 0);
+        }
+    }
+
     #[cfg(feature = "taskvisor-controller")]
     #[test]
     fn controller_events_update_their_metrics() {
@@ -572,6 +982,12 @@ mod tests {
                 .with_rejection_kind(RejectionKind::QueueFull)
                 .with_reason("queue_full: 1/1"),
         );
+        sub.on_event(
+            &Event::new(EventKind::ControllerRejected)
+                .with_task("t")
+                .with_rejection_kind(RejectionKind::ResourceLimit)
+                .with_reason("controller pending limit reached"),
+        );
 
         assert_eq!(sub.controller_submitted_events.get(), 1.0);
         assert_eq!(
@@ -583,6 +999,12 @@ mod tests {
         assert_eq!(
             sub.controller_rejections
                 .with_label_values(&["queue_full"])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            sub.controller_rejections
+                .with_label_values(&["resource_limit"])
                 .get(),
             1.0
         );

@@ -20,10 +20,10 @@ use crate::{PemRole, PemSource, PrivateKeySource, TlsError};
 /// ## Rules
 ///
 /// - The certificate chain is passed to `rustls` in its original order; put the end-entity certificate first, follow it with the issuer chain.
+/// - [`PrivateKeySource`] zeroizes its in-memory bytes after the last owner is dropped.
 /// - File sources are read when a client or server configuration is loaded or built.
 /// - Every source is validated at that boundary.
 /// - An identity always contains both sources.
-/// - [`PrivateKeySource`] zeroizes its in-memory bytes after the last owner is dropped.
 /// - `Debug` does not expose in-memory PEM.
 ///
 /// ## Example
@@ -109,8 +109,7 @@ impl TlsIdentity {
 
 /// Loaded identity PEM accepted as part of a client or server configuration.
 ///
-/// [`ServerTlsConfig::load`](crate::ServerTlsConfig::load) and
-/// [`ClientTlsConfig::load`](crate::ClientTlsConfig::load) produce this value.
+/// [`ServerTlsConfig::load`](crate::ServerTlsConfig::load) and [`ClientTlsConfig::load`](crate::ClientTlsConfig::load) produce this value.
 /// `rustls` accepted the certificate chain and private key together.
 /// The value keeps PEM encoding for adapters that do not use `rustls` types.
 pub struct LoadedTlsIdentity {

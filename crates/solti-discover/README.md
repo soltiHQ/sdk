@@ -34,6 +34,7 @@ fn discovery_task() -> Result<(), Box<dyn std::error::Error>> {
             "https://control.example",
             DiscoveryTransport::Http,
         )?,
+        solti_model::AgentCapabilities::default(),
         30_000,
         "discovery-config@1",
     )
@@ -71,6 +72,7 @@ Use `apply_embedded_task` when the desired config changes.
 | `DiscoverConfig::builder`     | Identity, endpoints, interval, task revision  | Config builder                            |
 | `capabilities`                | `AgentCapabilities` snapshot                  | Runner capabilities sent with every sync  |
 | `with_token`                  | `Token`                                       | Bearer authentication                     |
+| `allow_insecure_token_transport` | No value                                   | Explicit development/loopback opt-in      |
 | `with_tls`                    | `solti_tls::ClientTlsConfig`                  | Custom roots and optional client identity |
 | `with_metrics`                | `DiscoverMetricsHandle`                       | Discovery lifecycle metrics               |
 | `sync`                        | `DiscoverConfig` and `Arc<dyn UptimeSource>`  | Embedded `TaskManifest` and `TaskRef`     |
@@ -108,31 +110,35 @@ Optional settings use these defaults:
 | Setting                  | Default                                                  |
 |--------------------------|----------------------------------------------------------|
 | `metadata`               | Empty                                                    |
-| `capabilities`           | No runners                                               |
 | `backoff`                | Equal jitter, half interval to three intervals, factor 2 |
 | `connect_timeout_ms`     | 5 seconds                                                |
 | `request_timeout_ms`     | 30 seconds                                               |
 | Metrics                  | `NoOpDiscoverMetrics`                                    |
 | Bearer token             | None                                                     |
+| Insecure token transport | Disabled                                                 |
 | Custom TLS               | None                                                     |
 
 `delay_ms`, `connect_timeout_ms`, and `request_timeout_ms` use milliseconds.
 The heartbeat interval sent on the wire uses seconds rounded up.
 
 `task_revision` identifies the complete runtime intent captured by the embedded task.
-Change it when any captured discovery setting changes.
+Change it when any captured discovery setting changes, including credentials,
+TLS material, or the metrics backend. Also change it when the `UptimeSource`
+or its epoch changes.
 This lets `solti-core` reconcile an otherwise identical embedded workload.
 
 ## Capabilities
 
-Pass the snapshot returned by `RunnerRouter::capabilities()` after runner registration:
+Capabilities are a required `DiscoverConfig::builder` input. For a running
+`SupervisorApi`, use the exact immutable router snapshot returned by
+`SupervisorApi::runner_capabilities()`:
 
 ```text
 registered runners
        ▼
-RunnerRouter::capabilities()
+SupervisorApi::runner_capabilities()
        ▼
-DiscoverConfigBuilder::capabilities()
+DiscoverConfig::builder(..., capabilities, ...)
        ▼
 discovery SyncRequest
 ```
@@ -147,7 +153,7 @@ Runner order preserves routing priority.
 Workload GVKs use canonical order.
 Embedded workloads are absent because they bypass runner routing.
 
-The default capability snapshot has no runners.
+An agent with no routed runners passes `AgentCapabilities::default()` explicitly.
 
 ## Authentication and TLS
 
@@ -157,7 +163,15 @@ The default capability snapshot has no runners.
 - gRPC uses `authorization` metadata.
 
 The selected adapter validates the encoded value before the task starts.
-Using a token over a plaintext endpoint emits a warning.
+A token requires an `https` control-plane endpoint by default.
+`sync` returns `DiscoverError::InvalidConfig` without returning a task when a
+token is combined with plaintext HTTP or gRPC.
+
+Plaintext discovery without a token remains supported.
+`allow_insecure_token_transport()` is an explicit escape hatch for controlled
+development or loopback endpoints.
+It permits the plaintext credential and emits a warning.
+Do not use this opt-in for production credentials.
 
 | Transport | Endpoint | Trust behavior                                      |
 |-----------|----------|-----------------------------------------------------|
@@ -234,6 +248,9 @@ println!("{elapsed}");
 
 Implement `UptimeSource` or pass a closure when another epoch is required.
 Every attempt reads the source again.
+Values above `i64::MAX` cannot be represented by discovery v1 and fail that
+attempt permanently before a transport request is sent. This local validation
+failure does not record a transport attempt or transport failure metric.
 
 ## Metrics
 
@@ -241,19 +258,25 @@ Every attempt reads the source again.
 
 | Hook             | Value                                  |
 |------------------|----------------------------------------|
-| `record_attempt` | One call before each transport request |
+| `record_attempt` | One call after wire stamping and before each transport request |
 | `record_success` | Request duration in milliseconds       |
 | `record_failure` | Duration and bounded failure reason    |
 | `record_hold`    | Clamped server hold in seconds         |
 
 `NoOpDiscoverMetrics` is the default.
 `DiscoverFailReason` keeps failure labels bounded.
+`build` installs one sticky panic boundary around the selected backend. After
+its first callback panic, later task attempts drop metrics updates without
+invoking that backend again.
+Callbacks that already entered the boundary concurrently may still finish or
+panic. The boundary does not serialize healthy metrics updates.
 
 ## Specific behavior
 
 - Every attempt sends a fresh Unix timestamp and uptime value.
 - HTTP and gRPC clients are reused across task attempts.
 - HTTP redirects are disabled to avoid forwarding credentials to another host.
+- Bearer tokens require TLS unless insecure token transport is explicitly enabled.
 - Successful HTTP response bodies are limited to 64 KiB.
 - Non-success HTTP responses read at most 1 KiB of body data.
 - Control-plane rejection text remains untrusted diagnostic text.
@@ -323,6 +346,14 @@ They combine discovery with runner registration, reconciliation, supervision, an
 
 Protobuf defines the gRPC service and shared request and response messages.
 `CONTRACT.md` defines the HTTP binding and behavior shared by both transports.
+
+The authoritative protobuf tree lives in
+[`soltiHQ/proto`](https://github.com/soltiHQ/proto).
+Release and CI tooling vendor a pinned revision into `proto/`.
+The crate build script generates Rust and protobuf-JSON bindings from that
+vendored contract into Cargo's `OUT_DIR`. Generated bindings are build artifacts
+and are never committed. The build uses a vendored `protoc` binary and does not
+require a system installation.
 
 The HTTP endpoint is always `POST /api/v1/discovery/sync`.
 Generated protobuf types remain internal.

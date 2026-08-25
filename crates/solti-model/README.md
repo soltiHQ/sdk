@@ -18,6 +18,7 @@ Disable default features when schema generation is not needed.
 | Guard a write against stale state | `WritePreconditions`                            |
 | Record one execution attempt      | `TaskRun`                                       |
 | Filter or paginate tasks          | `TaskFilter`, `TaskQuery`, `TaskContinuation`   |
+| Paginate one task's runs          | `TaskRunQuery`, `TaskRunContinuation`           |
 | Match runner labels               | `LabelSelector`                                 |
 | Advertise agent capabilities      | `RunnerCapability`, `AgentCapabilities`         |
 | Read live output                  | `OutputEvent`                                   |
@@ -121,7 +122,7 @@ The state store assigns the resource version.
 
 ## Guard writes
 
-`WritePreconditions` protects an apply or delete from a stale resource snapshot.
+`WritePreconditions` protects an apply, cancel, or delete from a stale resource snapshot.
 
 Use `WritePreconditions::from_task` to capture both UID and resource version:
 
@@ -182,6 +183,10 @@ Omit the field for an unlimited retry budget.
 
 Built-in workloads use `apiVersion: solti.io/v1`.
 Their envelope and spec reject unknown fields.
+`Subprocess.cwd` and `Wasm.module` are wire-facing paths. A validated
+`TaskSpec` requires both to be valid UTF-8. Their Unicode text is preserved
+exactly by JSON and protobuf transports; the model never substitutes invalid
+native path bytes.
 
 Use `ExtensionWorkload` for an application-defined runner:
 
@@ -228,6 +233,8 @@ Invalid desired state is rejected before mutation.
 Execution status transitions take an authoritative generation.
 Stale generations are ignored.
 Attempt numbers come from the execution source of truth.
+A start transition must carry an attempt strictly newer than the latest one
+recorded in status.
 
 ## Read status
 
@@ -241,11 +248,25 @@ Use:
 - `reconciled()` for the required `Reconciled` condition;
 - `error()` and `exit_code()` for terminal diagnostics.
 
+`TaskStatus.error` and `TaskRun.error` are stored at no more than
+`MAX_TASK_DIAGNOSTIC_BYTES` (`32 KiB`) of UTF-8. Constructors,
+deserialization, and lifecycle setters truncate a longer value to the longest
+prefix that fits without splitting a code point. This contract does not change
+`TaskCondition.message`; condition messages retain their validation contract.
+
 `Pending` may mean that reconciliation is scheduled, failed, or accepted before execution starts.
 Inspect the `Reconciled` condition to distinguish these states.
 
 Terminal phases are `Succeeded`, `Failed`, `Timeout`, `Canceled`, and `Exhausted`.
 A terminal status can have attempt zero when no attempt event was observed.
+A strictly newer attempt may move terminal aggregate status back to `Running`.
+Terminal `error` and `exitCode` values are optional details; they do not select
+the phase.
+
+`TaskRun.startedAt` is a recorded logical timestamp. The model validates
+timestamp presence but does not require `finishedAt >= startedAt`. If
+`solti-core` receives a terminal attempt without its start event, the fallback
+run uses local projection time for `startedAt`, not a recovered execution start.
 
 ## Select labels
 
@@ -295,6 +316,10 @@ The default limit is `100`.
 The maximum limit is `1000`.
 Zero selects the default.
 Larger values are capped.
+Page items also have a 4 MiB compact-JSON budget by default.
+The byte budget can return fewer items than the count limit.
+The first complete item is returned even when its domain encoding is larger.
+The transport then measures that item in its native encoding.
 
 `TaskContinuation` carries the snapshot resource version, the fixed filter, and the last task name.
 It is a domain value.
@@ -320,14 +345,17 @@ It rejects duplicate runner names.
 
 ```text
 {"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":0,"ts":1700,"line":"aGk="}
+{"type":"chunk","generation":2,"attempt":1,"stream":"stdout","seq":1,"ts":1701,"line":"aA==","truncated":true}
 {"type":"runStarted","generation":2,"attempt":1,"startedAt":1700}
 {"type":"runFinished","generation":2,"attempt":1,"exitCode":0,"finishedAt":1701}
-{"type":"lagged","skipped":42}
+{"type":"lagged","skipped":42,"skippedBytes":65536}
 ```
 
 Timestamps are Unix milliseconds.
 Chunk bytes use standard padded base64.
 They can contain non-UTF-8 data.
+`truncated` reports an omitted source suffix.
+`skippedBytes` reports retained payload bytes lost with lagged events.
 
 The model does not publish, retain, or subscribe to output.
 `solti-api` maps the domain events to its separate protobuf shape.
@@ -384,6 +412,9 @@ Important limits:
 - `Slot`: `[A-Za-z0-9._-]`, `64` bytes;
 - `AgentId`: `[A-Za-z0-9._-]`, `128` bytes;
 - annotations: qualified keys, `256 KiB` total key and value bytes;
+- one Task manifest: `4 MiB` compact JSON;
+- one Task page item payload: `4 MiB` compact JSON by default;
+- Task and TaskRun execution diagnostics: `32 KiB` UTF-8 each;
 - workload GVK: CRD-compatible `apiVersion` and `kind`;
 - `creationTimestamp`: RFC 3339 with millisecond precision.
 

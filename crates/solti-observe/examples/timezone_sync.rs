@@ -45,7 +45,7 @@ fn main() -> ExampleResult {
         "[purpose] Keep local log timestamps aligned with system offset changes under supervision."
     );
 
-    let (manifest, task_ref) = timezone_sync();
+    let (manifest, _task_ref) = timezone_sync();
     let spec = manifest.spec();
     let TaskWorkload::Embedded(embedded) = spec.workload() else {
         return Err("timezone sync must produce an Embedded workload".into());
@@ -69,11 +69,12 @@ fn main() -> ExampleResult {
         spec.backoff().factor,
         spec.backoff().jitter,
     );
-    println!("[task] TaskRef name={}.", task_ref.name());
+    println!(
+        "[task] Reusable TaskRef built; Taskvisor assigns its registration name through TaskSpec."
+    );
 
     assert_eq!(manifest.name().as_str(), SLOT);
     assert_eq!(manifest.slot().as_str(), SLOT);
-    assert_eq!(task_ref.name(), SLOT);
     assert_eq!(spec.timeout().as_millis(), 60_000);
 
     println!("[runtime] No offset was detected; this example did not submit the TaskRef.");

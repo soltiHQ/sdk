@@ -5,25 +5,64 @@
 //! gRPC converts it into `tonic::Status`.
 //!
 //! Write conflicts carry structured [`ApiConflict`] details.
-//! Internal diagnostics are logged and hidden from wire clients.
+//! Internal failures are logged by stable category and hidden from wire clients.
+//! The transport boundary does not log the diagnostic string.
 
 use std::fmt;
 
 use thiserror::Error;
 
+/// Stable category of a failed write precondition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "http", derive(schemars::JsonSchema, serde::Serialize))]
+#[non_exhaustive]
+pub enum ApiConflictReason {
+    /// The requested UID differs from the stored Task UID.
+    #[cfg_attr(feature = "http", serde(rename = "UIDMismatch"))]
+    UidMismatch,
+    /// The requested resource version differs from the stored revision.
+    #[cfg_attr(feature = "http", serde(rename = "ResourceVersionMismatch"))]
+    ResourceVersionMismatch,
+    /// The failed precondition has no more specific category.
+    #[cfg_attr(feature = "http", serde(rename = "PreconditionFailed"))]
+    PreconditionFailed,
+}
+
+impl ApiConflictReason {
+    /// Returns the stable HTTP reason label.
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::UidMismatch => "UIDMismatch",
+            Self::ResourceVersionMismatch => "ResourceVersionMismatch",
+            Self::PreconditionFailed => "PreconditionFailed",
+        }
+    }
+
+    #[cfg(feature = "grpc")]
+    fn into_proto(self) -> crate::proto_api::WriteConflictReason {
+        match self {
+            Self::UidMismatch => crate::proto_api::WriteConflictReason::UidMismatch,
+            Self::ResourceVersionMismatch => {
+                crate::proto_api::WriteConflictReason::ResourceVersionMismatch
+            }
+            Self::PreconditionFailed => crate::proto_api::WriteConflictReason::PreconditionFailed,
+        }
+    }
+}
+
 /// One machine-readable cause of an API conflict.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiErrorCause {
-    reason: String,
+    reason: ApiConflictReason,
     field: Option<String>,
     message: String,
 }
 
 impl ApiErrorCause {
     /// Creates a cause with a reason and readable message.
-    pub fn new(reason: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn new(reason: ApiConflictReason, message: impl Into<String>) -> Self {
         Self {
-            reason: reason.into(),
+            reason,
             field: None,
             message: message.into(),
         }
@@ -36,8 +75,8 @@ impl ApiErrorCause {
     }
 
     /// Returns the machine-readable reason.
-    pub fn reason(&self) -> &str {
-        &self.reason
+    pub fn reason(&self) -> ApiConflictReason {
+        self.reason
     }
 
     /// Returns the related request field.
@@ -114,6 +153,7 @@ impl std::error::Error for ApiConflict {}
 /// | `MethodNotAllowed`         | `405` | `Unimplemented`     |
 /// | `UnsupportedMediaType`     | `415` | `InvalidArgument`   |
 /// | `PayloadTooLarge`          | `413` | `ResourceExhausted` |
+/// | `ResourceExhausted`        | `429` | `ResourceExhausted` |
 /// | `ResourceVersionExpired`   | `410` | `OutOfRange`        |
 /// | `Unavailable`              | `503` | `Unavailable`       |
 /// | `Internal`                 | `500` | `Internal`          |
@@ -128,6 +168,8 @@ pub enum ApiError {
     InvalidRequest(String),
 
     /// The bearer credential is missing, malformed, or rejected.
+    ///
+    /// HTTP responses include `WWW-Authenticate: Bearer`.
     #[error("unauthenticated: {0}")]
     Unauthenticated(String),
 
@@ -163,6 +205,10 @@ pub enum ApiError {
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
 
+    /// The service has no capacity for the requested resource.
+    #[error("resource exhausted: {0}")]
+    ResourceExhausted(String),
+
     /// The requested list snapshot or watch position is no longer retained.
     #[error("resource version expired: {0}")]
     ResourceVersionExpired(String),
@@ -181,6 +227,7 @@ impl ApiError {
     pub fn as_label(&self) -> &'static str {
         match self {
             ApiError::PayloadTooLarge(_) => "PayloadTooLarge",
+            ApiError::ResourceExhausted(_) => "ResourceExhausted",
             ApiError::InvalidRequest(_) => "InvalidRequest",
             ApiError::Unauthenticated(_) => "Unauthenticated",
             ApiError::Forbidden(_) => "Forbidden",
@@ -209,6 +256,7 @@ impl ApiError {
             ApiError::MethodNotAllowed(_) => "MethodNotAllowed",
             ApiError::UnsupportedMediaType(_) => "UnsupportedMediaType",
             ApiError::PayloadTooLarge(_) => "RequestEntityTooLarge",
+            ApiError::ResourceExhausted(_) => "TooManyRequests",
             ApiError::ResourceVersionExpired(_) => "Expired",
             ApiError::Unavailable(_) => "ServiceUnavailable",
             ApiError::Internal(_) => "InternalError",
@@ -234,7 +282,7 @@ impl ApiError {
                         .causes()
                         .iter()
                         .map(|cause| HttpStatusCause {
-                            reason: cause.reason().to_owned(),
+                            reason: cause.reason(),
                             field: cause.field().map(http_field_path),
                             message: cause.message().to_owned(),
                         })
@@ -247,10 +295,16 @@ impl ApiError {
             ApiError::MethodNotAllowed(msg) => (StatusCode::METHOD_NOT_ALLOWED, msg, None),
             ApiError::UnsupportedMediaType(msg) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, msg, None),
             ApiError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg, None),
+            ApiError::ResourceExhausted(msg) => (StatusCode::TOO_MANY_REQUESTS, msg, None),
             ApiError::ResourceVersionExpired(msg) => (StatusCode::GONE, msg, None),
             ApiError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg, None),
-            ApiError::Internal(msg) => {
-                tracing::error!(error = %msg, "API request failed internally");
+            ApiError::Internal(_) => {
+                tracing::error!(
+                    event = "api.internal_error",
+                    transport = "http",
+                    error_kind = "internal",
+                    "api request failed internally"
+                );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal server error".to_owned(),
@@ -315,7 +369,7 @@ struct HttpStatusDetails {
 #[derive(schemars::JsonSchema, serde::Serialize)]
 #[schemars(deny_unknown_fields)]
 struct HttpStatusCause {
-    reason: String,
+    reason: ApiConflictReason,
     #[serde(skip_serializing_if = "Option::is_none")]
     field: Option<String>,
     message: String,
@@ -360,6 +414,7 @@ fn http_status_reason(_generator: &mut schemars::SchemaGenerator) -> schemars::S
             "NotFound",
             "RequestEntityTooLarge",
             "ServiceUnavailable",
+            "TooManyRequests",
             "Unauthorized",
             "UnsupportedMediaType"
         ]
@@ -387,6 +442,7 @@ impl From<ApiError> for tonic::Status {
     fn from(err: ApiError) -> Self {
         match err {
             ApiError::PayloadTooLarge(msg) => tonic::Status::resource_exhausted(msg),
+            ApiError::ResourceExhausted(msg) => tonic::Status::resource_exhausted(msg),
             ApiError::InvalidRequest(msg) => tonic::Status::invalid_argument(msg),
             ApiError::Unauthenticated(msg) => tonic::Status::unauthenticated(msg),
             ApiError::Forbidden(msg) => tonic::Status::permission_denied(msg),
@@ -399,8 +455,8 @@ impl From<ApiError> for tonic::Status {
                     causes: conflict
                         .causes()
                         .iter()
-                        .map(|cause| crate::proto_api::StatusCause {
-                            reason: cause.reason().to_owned(),
+                        .map(|cause| crate::proto_api::WriteConflictCause {
+                            reason: cause.reason().into_proto() as i32,
                             field: cause.field().map(str::to_owned),
                             message: cause.message().to_owned(),
                         })
@@ -418,8 +474,13 @@ impl From<ApiError> for tonic::Status {
             ApiError::UnsupportedMediaType(msg) => tonic::Status::invalid_argument(msg),
             ApiError::ResourceVersionExpired(msg) => tonic::Status::out_of_range(msg),
             ApiError::Unavailable(msg) => tonic::Status::unavailable(msg),
-            ApiError::Internal(msg) => {
-                tracing::error!(error = %msg, "API request failed internally");
+            ApiError::Internal(_) => {
+                tracing::error!(
+                    event = "api.internal_error",
+                    transport = "grpc",
+                    error_kind = "internal",
+                    "api request failed internally"
+                );
                 tonic::Status::internal("internal server error")
             }
         }
@@ -429,8 +490,16 @@ impl From<ApiError> for tonic::Status {
 #[cfg(feature = "http")]
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
+        let advertise_bearer = matches!(&self, ApiError::Unauthenticated(_));
         let (status, body) = self.into_http_status();
-        (status, axum::Json(body)).into_response()
+        let mut response = (status, axum::Json(body)).into_response();
+        if advertise_bearer {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Bearer"),
+            );
+        }
+        response
     }
 }
 
@@ -451,10 +520,72 @@ mod tests {
         ApiConflict::new(
             "task-1",
             vec![
-                ApiErrorCause::new("ResourceVersionMismatch", "expected `1`, current `2`")
-                    .with_field("preconditions.resourceVersion"),
+                ApiErrorCause::new(
+                    ApiConflictReason::ResourceVersionMismatch,
+                    "expected `1`, current `2`",
+                )
+                .with_field("preconditions.resourceVersion"),
             ],
         )
+    }
+
+    #[test]
+    fn conflict_reason_labels_are_stable() {
+        assert_eq!(ApiConflictReason::UidMismatch.as_label(), "UIDMismatch");
+        assert_eq!(
+            ApiConflictReason::ResourceVersionMismatch.as_label(),
+            "ResourceVersionMismatch"
+        );
+        assert_eq!(
+            ApiConflictReason::PreconditionFailed.as_label(),
+            "PreconditionFailed"
+        );
+    }
+
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn conflict_reasons_map_to_typed_grpc_values() {
+        for (reason, expected) in [
+            (
+                ApiConflictReason::UidMismatch,
+                crate::proto_api::WriteConflictReason::UidMismatch,
+            ),
+            (
+                ApiConflictReason::ResourceVersionMismatch,
+                crate::proto_api::WriteConflictReason::ResourceVersionMismatch,
+            ),
+            (
+                ApiConflictReason::PreconditionFailed,
+                crate::proto_api::WriteConflictReason::PreconditionFailed,
+            ),
+        ] {
+            assert_eq!(reason.into_proto(), expected);
+        }
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn conflict_reason_openapi_schema_is_bounded() {
+        let schema = schemars::schema_for!(HttpStatusCause);
+        let value = serde_json::to_value(schema).unwrap();
+        assert_eq!(
+            value["properties"]["reason"]["$ref"],
+            "#/$defs/ApiConflictReason"
+        );
+        let reasons = value["$defs"]["ApiConflictReason"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|variant| variant["const"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons,
+            [
+                "UIDMismatch",
+                "ResourceVersionMismatch",
+                "PreconditionFailed",
+            ]
+        );
     }
 
     #[test]
@@ -473,6 +604,7 @@ mod tests {
                 "UnsupportedMediaType",
             ),
             (ApiError::PayloadTooLarge("x".into()), "PayloadTooLarge"),
+            (ApiError::ResourceExhausted("x".into()), "ResourceExhausted"),
             (
                 ApiError::ResourceVersionExpired("x".into()),
                 "ResourceVersionExpired",
@@ -501,6 +633,10 @@ mod tests {
             ),
             (ApiError::Conflict(conflict()), StatusCode::CONFLICT),
             (
+                ApiError::ResourceExhausted("x".into()),
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
                 ApiError::Unavailable("x".into()),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
@@ -521,6 +657,10 @@ mod tests {
                 ApiError::ResourceVersionExpired("old revision".into()),
                 Code::OutOfRange,
             ),
+            (
+                ApiError::ResourceExhausted("x".into()),
+                Code::ResourceExhausted,
+            ),
             (ApiError::Unavailable("x".into()), Code::Unavailable),
         ] {
             assert_eq!(tonic::Status::from(error).code(), expected);
@@ -538,7 +678,10 @@ mod tests {
         let details = crate::proto_api::WriteConflictDetails::decode(status.details()).unwrap();
         assert_eq!(details.name, "task-1");
         assert_eq!(details.causes.len(), 1);
-        assert_eq!(details.causes[0].reason, "ResourceVersionMismatch");
+        assert_eq!(
+            crate::proto_api::WriteConflictReason::try_from(details.causes[0].reason).unwrap(),
+            crate::proto_api::WriteConflictReason::ResourceVersionMismatch
+        );
         assert_eq!(
             details.causes[0].field.as_deref(),
             Some("preconditions.resourceVersion")
@@ -564,6 +707,37 @@ mod tests {
             "ResourceVersionMismatch"
         );
         assert_eq!(value["details"]["causes"][0]["field"], "resourceVersion");
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn resource_exhausted_http_status_uses_the_transport_contract() {
+        use axum::http::{StatusCode, header::RETRY_AFTER};
+        use axum::response::IntoResponse;
+        use http_body_util::BodyExt;
+
+        let response =
+            ApiError::ResourceExhausted("retained task limit reached".into()).into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!response.headers().contains_key(RETRY_AFTER));
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["reason"], "TooManyRequests");
+        assert_eq!(value["code"], 429);
+        assert_eq!(value["message"], "retained task limit reached");
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn only_unauthenticated_http_errors_advertise_the_bearer_challenge() {
+        use axum::{http::header::WWW_AUTHENTICATE, response::IntoResponse};
+
+        let response = ApiError::Unauthenticated("credential rejected".into()).into_response();
+        assert_eq!(response.headers()[WWW_AUTHENTICATE], "Bearer");
+
+        let response = ApiError::Forbidden("policy denied".into()).into_response();
+        assert!(!response.headers().contains_key(WWW_AUTHENTICATE));
     }
 
     #[cfg(feature = "grpc")]

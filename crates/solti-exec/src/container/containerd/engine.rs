@@ -5,13 +5,11 @@ use std::{
     error::Error,
     fmt,
     future::Future,
-    io,
     pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    task::Poll,
     time::Duration,
 };
 
@@ -21,34 +19,39 @@ use containerd_client::{
     services::v1::{
         Container, CreateContainerRequest, CreateTaskRequest, DeleteContainerRequest,
         DeleteTaskRequest, GetContainerRequest, GetRequest, KillRequest, PluginInfoRequest,
-        PluginsRequest, StartRequest, WaitRequest, WaitResponse,
+        PluginsRequest, StartRequest, WaitRequest,
         container::Runtime,
         snapshots::{
             MountsRequest, PrepareSnapshotRequest, RemoveSnapshotRequest, StatSnapshotRequest,
         },
     },
     tonic::{
-        Code, GrpcMethod, Response, Status,
-        client::Grpc,
-        codegen::http::uri::PathAndQuery,
+        Code, Status,
         metadata::{Ascii, MetadataValue},
     },
+    types::v1::Status as ProcessStatus,
 };
 use prost::Message;
 use prost_types::Any;
-use tokio::{sync::oneshot, task::JoinHandle};
 use tracing::warn;
 
 use super::{
     ContainerPlatform, ContainerdConfig,
+    cleanup::{CleanupDomain, CleanupReservation},
     config::{normalize_architecture, normalize_os},
     image::{self, ImageResolveRequest},
-    io::AttemptIo,
+    io_domain::{IoDomain, IoPreparation, ManagedAttemptIo},
+    rpc::{
+        AttemptMutation, AttemptRpc, AttemptWait, ClientAttemptRpc, MutationRequest, MutationResult,
+    },
 };
 use crate::container::{
     ContainerAttempt, ContainerEngine, ContainerEngineError, ContainerEngineInfo,
     ContainerErrorClass, ContainerExitStatus, ContainerOutput, ContainerRequest,
 };
+
+#[cfg(test)]
+use super::io::AttemptIo;
 
 const OCI_SPEC_TYPE_URL: &str = "types.containerd.io/opencontainers/runtime-spec/1/Spec";
 const CONTAINERD_MAJOR_VERSION: u64 = 2;
@@ -60,8 +63,6 @@ const RUNTIME_INFO_TYPE: &str = "containerd.types.RuntimeInfo";
 const SNAPSHOTTER_PLUGIN_TYPE: &str = "io.containerd.snapshotter.v1";
 const SIGKILL: u32 = 9;
 const SESSION_BYTES: usize = 16;
-const WAIT_METHOD: &str = "/containerd.services.tasks.v1.Tasks/Wait";
-const WAIT_SERVICE: &str = "containerd.services.tasks.v1.Tasks";
 
 const LABEL_ATTEMPT: &str = "solti.io/attempt";
 const LABEL_GENERATION: &str = "solti.io/generation";
@@ -71,14 +72,72 @@ const LABEL_SESSION: &str = "solti.io/session";
 const LABEL_TASK: &str = "solti.io/task";
 const MANAGED_BY: &str = "solti-exec";
 
-type WaitRpcResult = Result<Response<WaitResponse>, Status>;
-
+/// Ownership decision for one attempt resource.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ownership {
+    /// The resource is confirmed missing.
     Absent,
+    /// The resource exists but does not belong to this attempt.
     Foreign,
+    /// The resource is confirmed to belong to this attempt.
     Owned,
-    Uncertain,
+    /// A create request may still commit remotely.
+    CreateUncertain,
+    /// A delete result requires identity read-back.
+    DeleteUncertain,
+}
+
+/// Mutating RPC stage whose remote result is not yet settled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MutationStage {
+    /// Snapshot creation may still commit.
+    PrepareSnapshot,
+    /// Container creation may still commit.
+    CreateContainer,
+    /// Runtime task creation may still commit.
+    CreateTask,
+    /// Runtime task start may still commit.
+    StartTask,
+    /// Runtime task termination may still commit.
+    KillTask,
+    /// Runtime task deletion may still commit.
+    DeleteTask,
+    /// Container deletion may still commit.
+    DeleteContainer,
+    /// Snapshot deletion may still commit.
+    DeleteSnapshot,
+}
+
+impl MutationStage {
+    /// Returns the stable stage name used by diagnostics.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PrepareSnapshot => "prepare_snapshot",
+            Self::CreateContainer => "create_container",
+            Self::CreateTask => "create_task",
+            Self::StartTask => "start_task",
+            Self::KillTask => "kill_task",
+            Self::DeleteTask => "delete_task",
+            Self::DeleteContainer => "delete_container",
+            Self::DeleteSnapshot => "delete_snapshot",
+        }
+    }
+}
+
+/// Remote mutation that must settle before ownership read-back or retry.
+struct InFlightMutation {
+    /// Operation whose client result is still owned by the engine runtime.
+    stage: MutationStage,
+    /// Cancellation-safe RPC owner or a terminal worker failure.
+    owner: MutationOwner,
+}
+
+/// State of one engine-owned mutation task.
+enum MutationOwner {
+    /// The client request is still running or has a result to collect.
+    Running(AttemptMutation),
+    /// The request task stopped without a result.
+    Lost,
 }
 
 /// Native adapter for a configured containerd 2.x endpoint.
@@ -86,32 +145,52 @@ enum Ownership {
 /// Construction validates the endpoint major version, snapshotter, platform, and OCI runtime.
 /// The adapter never scans for sockets or starts a daemon.
 pub struct ContainerdEngine {
+    /// Client used for image resolution and compatibility probes.
     client: Arc<Client>,
+    /// Attempt-scoped RPC adapter shared by active and deferred cleanup.
+    attempt_rpc: Arc<dyn AttemptRpc>,
+    /// Bounded owner for attempt resources after lifecycle cancellation.
+    cleanup: CleanupDomain,
+    /// Bounded blocking owner for local attempt I/O.
+    io_domain: IoDomain,
+    /// Validated engine settings.
     config: ContainerdConfig,
+    /// Namespace metadata attached to image and probe operations.
     namespace: MetadataValue<Ascii>,
+    /// Process-local attempt identifier source.
     ids: ResourceIdGenerator,
 }
 
 impl ContainerdEngine {
     /// Connects to an explicit containerd 2.x Unix socket.
     ///
-    /// The connection fails for another major version or an incompatible configured plugin.
+    /// The method starts engine-local cleanup and blocking I/O threads. The
+    /// containerd channel is created and driven inside the cleanup thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid settings, cleanup runtime startup failure,
+    /// connection failure, another major version, or an incompatible plugin.
     pub async fn connect(config: ContainerdConfig) -> Result<Self, ContainerEngineError> {
         let namespace = config.validate()?;
-        let channel = tokio::time::timeout(
+        let io_domain = IoDomain::start(config.cleanup_capacity())?;
+        let (client, mutation_executor, cleanup) = CleanupDomain::start(
+            config.socket().to_owned(),
             config.control_timeout(),
-            containerd_client::connect(config.socket()),
+            config.cleanup_capacity(),
         )
-        .await
-        .map_err(|error| {
-            ContainerEngineError::retryable_from("cannot connect to containerd", error)
-        })?
-        .map_err(|error| {
-            ContainerEngineError::retryable_from("cannot connect to containerd", error)
-        })?;
+        .await?;
+        let attempt_rpc: Arc<dyn AttemptRpc> = Arc::new(ClientAttemptRpc::new(
+            Arc::clone(&client),
+            namespace.clone(),
+            mutation_executor,
+        ));
         let ids = ResourceIdGenerator::random()?;
         let engine = Self {
-            client: Arc::new(Client::from(channel)),
+            client,
+            attempt_rpc,
+            cleanup,
+            io_domain,
             config,
             namespace,
             ids,
@@ -121,6 +200,11 @@ impl ContainerdEngine {
     }
 
     /// Checks major version 2 and the configured snapshotter, platform, and OCI runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when containerd is unavailable or incompatible with
+    /// the configured version, snapshotter, platform, or runtime.
     pub async fn probe(&self) -> Result<ContainerEngineInfo, ContainerEngineError> {
         let response = image::rpc_with_timeout(
             self.config.control_timeout(),
@@ -137,6 +221,29 @@ impl ContainerdEngine {
         Ok(ContainerEngineInfo::new("containerd", response.version))
     }
 
+    /// Stops lifecycle admission and waits for accepted create lifecycles and
+    /// attempt ownership.
+    ///
+    /// Call this after supervisors that use the engine have stopped. The
+    /// method is terminal and idempotent. Later create calls fail before image
+    /// resolution because lifecycle admission remains closed. Local I/O shutdown
+    /// still runs when remote cleanup reports an error. A configured duration
+    /// beyond Tokio's representable `Instant` range waits without a local
+    /// deadline and remains cancellation-safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns a retryable error when accepted ownership does not finish
+    /// within the configured cleanup timeout. Returns a permanent error when
+    /// either worker loses or quarantines ownership.
+    pub async fn shutdown(&self) -> Result<(), ContainerEngineError> {
+        let deadline = tokio::time::Instant::now().checked_add(self.config.cleanup_timeout());
+        let cleanup = self.cleanup.shutdown_until(deadline).await;
+        let io = self.io_domain.shutdown_until(deadline).await;
+        combine_shutdown_results(cleanup, io)
+    }
+
+    /// Verifies snapshotter readiness and platform support.
     async fn probe_snapshotter(&self) -> Result<(), ContainerEngineError> {
         let response = image::rpc_with_timeout(
             self.config.control_timeout(),
@@ -183,6 +290,7 @@ impl ContainerdEngine {
         Ok(())
     }
 
+    /// Verifies OCI runtime readiness and platform support.
     async fn probe_runtime(&self) -> Result<(), ContainerEngineError> {
         let response = image::rpc_with_timeout(
             self.config.control_timeout(),
@@ -240,12 +348,18 @@ impl ContainerdEngine {
         Ok(())
     }
 
+    /// Creates one admitted native lifecycle and resolves its shared image.
+    ///
+    /// Lifecycle admission precedes image resolution and remains charged through
+    /// the attempt or deferred cleanup. Image transfer itself is not retained in
+    /// [`AttemptState`] for deferred cleanup.
     async fn create_owned_attempt(
         &self,
         request: ContainerRequest,
     ) -> Result<ContainerdAttempt, ContainerEngineError> {
         let resource_id = self.ids.next()?;
         let labels = attempt_labels(&request, &resource_id, self.ids.session());
+        let cleanup = self.cleanup.try_reserve()?;
         let resolved = image::resolve(
             self.client.as_ref(),
             &self.namespace,
@@ -264,42 +378,58 @@ impl ContainerdEngine {
             ContainerEngineError::permanent_from("cannot encode OCI runtime specification", error)
         })?;
 
-        let io = AttemptIo::prepare(self.config.io_root(), &resource_id)
-            .map_err(|error| io_error("cannot prepare containerd output pipes", error))?;
-        let mut attempt = ContainerdAttempt::new(
-            Arc::clone(&self.client),
-            self.namespace.clone(),
+        let io = self
+            .io_domain
+            .try_prepare(self.config.io_root().to_owned(), resource_id.clone())?;
+        let state = AttemptState::new(
+            Arc::clone(&self.attempt_rpc),
             self.config.snapshotter().to_owned(),
             resource_id,
             labels,
-            io,
+            AttemptIoState::Preparing(io),
             AttemptTimeouts {
                 control: self.config.control_timeout(),
                 cleanup: self.config.cleanup_timeout(),
             },
         );
+        let mut attempt = ContainerdAttempt::new(state, cleanup);
 
-        let create_result = attempt
-            .create_resources(
-                &resolved.reference,
-                &resolved.chain_id,
-                self.config.runtime(),
-                spec,
-            )
-            .await;
+        let create_result = async {
+            attempt.state_mut().settle_io_preparation().await?;
+            attempt
+                .state_mut()
+                .create_resources(
+                    &resolved.reference,
+                    &resolved.chain_id,
+                    self.config.runtime(),
+                    spec,
+                )
+                .await
+        }
+        .await;
         match create_result {
             Ok(()) => Ok(attempt),
-            Err(creation) => match attempt.cleanup_owned_with_retry().await {
-                Ok(()) => Err(creation),
-                Err(rollback) => Err(ContainerEngineError::permanent_from(
-                    "containerd attempt creation failed and rollback was incomplete",
-                    CreationRollbackFailure { creation, rollback },
-                )),
-            },
+            Err(creation) => {
+                let rollback = attempt.state_mut().cleanup_owned_with_retry().await;
+                match rollback {
+                    Ok(()) => {
+                        attempt.disarm_if_released();
+                        Err(creation)
+                    }
+                    Err(rollback) => {
+                        attempt.handoff();
+                        Err(ContainerEngineError::permanent_from(
+                            "containerd attempt creation failed and rollback was incomplete",
+                            CreationRollbackFailure { creation, rollback },
+                        ))
+                    }
+                }
+            }
         }
     }
 }
 
+/// Decodes and validates containerd runtime information.
 fn decode_runtime_info(
     extra: Any,
 ) -> Result<containerd_client::types::RuntimeInfo, ContainerEngineError> {
@@ -338,56 +468,150 @@ impl ContainerEngine for ContainerdEngine {
     }
 }
 
-struct ContainerdAttempt {
-    client: Arc<Client>,
-    namespace: MetadataValue<Ascii>,
+#[async_trait]
+impl crate::container::ContainerEngineFinalizer for ContainerdEngine {
+    async fn shutdown(&self) -> Result<(), ContainerEngineError> {
+        ContainerdEngine::shutdown(self).await
+    }
+}
+
+/// Local attempt I/O retained across preparation and removal cancellation.
+enum AttemptIoState {
+    /// Blocking preparation is running or has a result to collect.
+    Preparing(IoPreparation),
+    /// Prepared local resources belong to the active attempt.
+    Ready(ManagedAttemptIo),
+    /// No local resources remain owned.
+    Absent,
+    /// The I/O worker lost safe ownership progress.
+    Lost,
+}
+
+impl AttemptIoState {
+    /// Returns whether local ownership may still exist.
+    fn is_present(&self) -> bool {
+        !matches!(self, Self::Absent)
+    }
+
+    /// Returns whether all local ownership is released.
+    fn is_released(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+
+    /// Borrows prepared local I/O.
+    fn ready(&self) -> Option<&ManagedAttemptIo> {
+        match self {
+            Self::Ready(io) => Some(io),
+            Self::Preparing(_) | Self::Absent | Self::Lost => None,
+        }
+    }
+
+    /// Borrows mutable prepared local I/O.
+    fn ready_mut(&mut self) -> Option<&mut ManagedAttemptIo> {
+        match self {
+            Self::Ready(io) => Some(io),
+            Self::Preparing(_) | Self::Absent | Self::Lost => None,
+        }
+    }
+
+    /// Returns the stable state label used by cleanup diagnostics.
+    fn status_label(&self) -> &'static str {
+        match self {
+            Self::Preparing(_) => "preparing",
+            Self::Ready(io) if io.is_lost() => "lost",
+            Self::Ready(_) => "ready",
+            Self::Absent => "absent",
+            Self::Lost => "lost",
+        }
+    }
+}
+
+/// Mutable ownership and lifecycle state for one attempt.
+pub(super) struct AttemptState {
+    /// RPC adapter used by the active lifecycle and deferred cleanup.
+    rpc: Arc<dyn AttemptRpc>,
+    /// Snapshotter that owns the active snapshot.
     snapshotter: String,
+    /// Attempt-scoped identifier shared by all native resources.
     resource_id: String,
+    /// Labels required before uncertain resources may be adopted.
     labels: HashMap<String, String>,
-    io: Option<AttemptIo>,
+    /// Local output resources retained until remote task cleanup completes.
+    io: AttemptIoState,
+    /// Snapshot ownership known by this process.
     snapshot: Ownership,
+    /// Parent chain identifier required to verify the attempt snapshot.
+    snapshot_parent: Option<String>,
+    /// Container metadata ownership known by this process.
     container: Ownership,
+    /// Runtime task ownership known by this process.
     task: Ownership,
-    wait: Option<JoinHandle<WaitRpcResult>>,
+    /// Process identifier returned by task creation or ownership read-back.
+    task_pid: Option<u32>,
+    /// Output path passed to the owned runtime task.
+    task_stdout: Option<String>,
+    /// Error path passed to the owned runtime task.
+    task_stderr: Option<String>,
+    /// Armed task wait owned by this attempt.
+    wait: Option<AttemptWait>,
+    /// Remote mutation that may still commit after local cancellation.
+    in_flight: Option<InFlightMutation>,
+    /// Exit status observed for the runtime task.
     exit_status: Option<ContainerExitStatus>,
+    /// Whether task start was requested.
     start_requested: bool,
+    /// Whether task start returned success.
     start_confirmed: bool,
+    /// Whether a start request may still commit remotely.
+    start_uncertain: bool,
+    /// Whether task termination returned an accepted result.
     termination_sent: bool,
+    /// Whether termination must be followed by task wait.
     termination_requires_wait: bool,
+    /// Deadline for one containerd control RPC.
     control_timeout: Duration,
+    /// Duration of one cleanup retry window.
     cleanup_timeout: Duration,
 }
 
+/// Deadlines used by one attempt lifecycle.
 #[derive(Clone, Copy)]
 struct AttemptTimeouts {
+    /// Deadline for one containerd control RPC.
     control: Duration,
+    /// Duration of one cleanup retry window.
     cleanup: Duration,
 }
 
-impl ContainerdAttempt {
+impl AttemptState {
+    /// Creates dormant ownership state for one admitted attempt.
     fn new(
-        client: Arc<Client>,
-        namespace: MetadataValue<Ascii>,
+        rpc: Arc<dyn AttemptRpc>,
         snapshotter: String,
         resource_id: String,
         labels: HashMap<String, String>,
-        io: AttemptIo,
+        io: AttemptIoState,
         timeouts: AttemptTimeouts,
     ) -> Self {
         Self {
-            client,
-            namespace,
+            rpc,
             snapshotter,
             resource_id,
             labels,
-            io: Some(io),
+            io,
             snapshot: Ownership::Absent,
+            snapshot_parent: None,
             container: Ownership::Absent,
             task: Ownership::Absent,
+            task_pid: None,
+            task_stdout: None,
+            task_stderr: None,
             wait: None,
+            in_flight: None,
             exit_status: None,
             start_requested: false,
             start_confirmed: false,
+            start_uncertain: false,
             termination_sent: false,
             termination_requires_wait: false,
             control_timeout: timeouts.control,
@@ -395,6 +619,50 @@ impl ContainerdAttempt {
         }
     }
 
+    /// Waits for accepted I/O preparation without removing its owner.
+    ///
+    /// Cancellation leaves the preparation receiver inside this state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the preparation failure. A lost worker result keeps this
+    /// attempt in the terminal `Lost` state.
+    async fn settle_io_preparation(&mut self) -> Result<(), ContainerEngineError> {
+        let result = match &mut self.io {
+            AttemptIoState::Preparing(preparation) => preparation.join().await,
+            AttemptIoState::Ready(_) | AttemptIoState::Absent => return Ok(()),
+            AttemptIoState::Lost => {
+                return Err(ContainerEngineError::permanent(
+                    "containerd I/O ownership is lost",
+                ));
+            }
+        };
+
+        match result {
+            Ok(io) => {
+                self.io = AttemptIoState::Ready(io);
+                Ok(())
+            }
+            Err(error) => {
+                let lost = matches!(
+                    &self.io,
+                    AttemptIoState::Preparing(preparation) if preparation.is_lost()
+                );
+                self.io = if lost {
+                    AttemptIoState::Lost
+                } else {
+                    AttemptIoState::Absent
+                };
+                Err(error)
+            }
+        }
+    }
+
+    /// Creates the snapshot, container, runtime task, output, and wait owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a resource cannot be created, verified, or armed.
     async fn create_resources(
         &mut self,
         image_reference: &str,
@@ -402,27 +670,26 @@ impl ContainerdAttempt {
         runtime: &str,
         spec: Vec<u8>,
     ) -> Result<(), ContainerEngineError> {
-        let snapshot = image::raw_rpc_with_timeout(
-            self.control_timeout,
-            "containerd snapshot prepare failed",
-            self.client
-                .snapshots()
-                .prepare(image::namespaced_with_timeout(
-                    PrepareSnapshotRequest {
-                        snapshotter: self.snapshotter.clone(),
-                        key: self.resource_id.clone(),
-                        parent: parent_snapshot.to_owned(),
-                        labels: self.labels.clone(),
-                    },
-                    &self.namespace,
-                    self.control_timeout,
-                )),
-        )
-        .await;
+        self.snapshot_parent = Some(parent_snapshot.to_owned());
+        self.snapshot = Ownership::CreateUncertain;
+        self.begin_mutation(
+            MutationStage::PrepareSnapshot,
+            MutationRequest::PrepareSnapshot(PrepareSnapshotRequest {
+                snapshotter: self.snapshotter.clone(),
+                key: self.resource_id.clone(),
+                parent: parent_snapshot.to_owned(),
+                labels: self.labels.clone(),
+            }),
+        );
+        let MutationResult::PrepareSnapshot(snapshot) =
+            self.await_mutation(MutationStage::PrepareSnapshot).await?
+        else {
+            unreachable!("snapshot preparation returned another mutation result")
+        };
         let mounts = match snapshot {
             Ok(response) => {
                 self.snapshot = Ownership::Owned;
-                response.into_inner().mounts
+                response.mounts
             }
             Err(status) if status.code() == Code::AlreadyExists => {
                 self.snapshot = Ownership::Foreign;
@@ -432,7 +699,7 @@ impl ContainerdAttempt {
                 ));
             }
             Err(status) if ambiguous_create_status(&status) => {
-                self.snapshot = Ownership::Uncertain;
+                self.snapshot = Ownership::CreateUncertain;
                 match self.confirm_snapshot_ownership(parent_snapshot).await {
                     Ok(true) => self.snapshot_mounts().await?,
                     Ok(false) => {
@@ -443,7 +710,9 @@ impl ContainerdAttempt {
                     }
                     Err(readback) => {
                         warn!(
+                            event = "containerd.create_outcome_unverified",
                             resource_id = %self.resource_id,
+                            stage = "snapshot",
                             error = %readback,
                             "containerd snapshot create outcome could not be verified",
                         );
@@ -455,6 +724,7 @@ impl ContainerdAttempt {
                 }
             }
             Err(status) => {
+                self.snapshot = Ownership::Absent;
                 return Err(image::rpc_error(
                     "containerd snapshot prepare failed",
                     status,
@@ -462,37 +732,37 @@ impl ContainerdAttempt {
             }
         };
 
-        let container = image::raw_rpc_with_timeout(
-            self.control_timeout,
-            "containerd container create failed",
-            self.client
-                .containers()
-                .create(image::namespaced_with_timeout(
-                    CreateContainerRequest {
-                        container: Some(Container {
-                            id: self.resource_id.clone(),
-                            labels: self.labels.clone(),
-                            image: image_reference.to_owned(),
-                            runtime: Some(Runtime {
-                                name: runtime.to_owned(),
-                                options: None,
-                            }),
-                            spec: Some(Any {
-                                type_url: OCI_SPEC_TYPE_URL.to_owned(),
-                                value: spec,
-                            }),
-                            snapshotter: self.snapshotter.clone(),
-                            snapshot_key: self.resource_id.clone(),
-                            ..Default::default()
-                        }),
-                    },
-                    &self.namespace,
-                    self.control_timeout,
-                )),
-        )
-        .await;
-        match container {
-            Ok(_) => self.container = Ownership::Owned,
+        self.container = Ownership::CreateUncertain;
+        self.begin_mutation(
+            MutationStage::CreateContainer,
+            MutationRequest::CreateContainer(CreateContainerRequest {
+                container: Some(Container {
+                    id: self.resource_id.clone(),
+                    labels: self.labels.clone(),
+                    image: image_reference.to_owned(),
+                    runtime: Some(Runtime {
+                        name: runtime.to_owned(),
+                        options: None,
+                    }),
+                    spec: Some(Any {
+                        type_url: OCI_SPEC_TYPE_URL.to_owned(),
+                        value: spec,
+                    }),
+                    snapshotter: self.snapshotter.clone(),
+                    snapshot_key: self.resource_id.clone(),
+                    ..Default::default()
+                }),
+            }),
+        );
+        let MutationResult::CreateContainer(container) =
+            self.await_mutation(MutationStage::CreateContainer).await?
+        else {
+            unreachable!("container creation returned another mutation result")
+        };
+        match *container {
+            Ok(_) => {
+                self.container = Ownership::Owned;
+            }
             Err(status) if status.code() == Code::AlreadyExists => {
                 self.container = Ownership::Foreign;
                 return Err(image::rpc_error(
@@ -501,7 +771,7 @@ impl ContainerdAttempt {
                 ));
             }
             Err(status) if ambiguous_create_status(&status) => {
-                self.container = Ownership::Uncertain;
+                self.container = Ownership::CreateUncertain;
                 match self.confirm_container_ownership().await {
                     Ok(true) => {}
                     Ok(false) => {
@@ -512,7 +782,9 @@ impl ContainerdAttempt {
                     }
                     Err(readback) => {
                         warn!(
+                            event = "containerd.create_outcome_unverified",
                             resource_id = %self.resource_id,
+                            stage = "container",
                             error = %readback,
                             "containerd container create outcome could not be verified",
                         );
@@ -524,6 +796,7 @@ impl ContainerdAttempt {
                 }
             }
             Err(status) => {
+                self.container = Ownership::Absent;
                 return Err(image::rpc_error(
                     "containerd container create failed",
                     status,
@@ -531,43 +804,56 @@ impl ContainerdAttempt {
             }
         }
 
-        let io = self.io.as_ref().ok_or_else(|| {
+        let io = self.io.ready().ok_or_else(|| {
             ContainerEngineError::permanent("containerd attempt has no output pipes")
         })?;
-        let stdout = io.stdout_path().to_str().ok_or_else(|| {
-            ContainerEngineError::permanent("containerd stdout path is not valid UTF-8")
-        })?;
-        let stderr = io.stderr_path().to_str().ok_or_else(|| {
-            ContainerEngineError::permanent("containerd stderr path is not valid UTF-8")
-        })?;
-        let task = image::raw_rpc_with_timeout(
-            self.control_timeout,
-            "containerd task create failed",
-            self.client.tasks().create(image::namespaced_with_timeout(
-                CreateTaskRequest {
-                    container_id: self.resource_id.clone(),
-                    rootfs: mounts,
-                    stdin: String::new(),
-                    stdout: stdout.to_owned(),
-                    stderr: stderr.to_owned(),
-                    terminal: false,
-                    checkpoint: None,
-                    options: None,
-                    runtime_path: String::new(),
-                },
-                &self.namespace,
-                self.control_timeout,
-            )),
-        )
-        .await;
+        let stdout = io
+            .stdout_path()
+            .to_str()
+            .ok_or_else(|| {
+                ContainerEngineError::permanent("containerd stdout path is not valid UTF-8")
+            })?
+            .to_owned();
+        let stderr = io
+            .stderr_path()
+            .to_str()
+            .ok_or_else(|| {
+                ContainerEngineError::permanent("containerd stderr path is not valid UTF-8")
+            })?
+            .to_owned();
+        self.task_stdout = Some(stdout.clone());
+        self.task_stderr = Some(stderr.clone());
+        self.task = Ownership::CreateUncertain;
+        self.begin_mutation(
+            MutationStage::CreateTask,
+            MutationRequest::CreateTask(CreateTaskRequest {
+                container_id: self.resource_id.clone(),
+                rootfs: mounts,
+                stdin: String::new(),
+                stdout,
+                stderr,
+                terminal: false,
+                checkpoint: None,
+                options: None,
+                runtime_path: String::new(),
+            }),
+        );
+        let MutationResult::CreateTask(task) =
+            self.await_mutation(MutationStage::CreateTask).await?
+        else {
+            unreachable!("task creation returned another mutation result")
+        };
         match task {
-            Ok(_) => self.task = Ownership::Owned,
+            Ok(response) => {
+                self.task = Ownership::Owned;
+                self.task_pid = Some(response.pid);
+            }
             Err(status) if status.code() == Code::AlreadyExists => {
                 self.task = Ownership::Foreign;
                 return Err(image::rpc_error("containerd task create failed", status));
             }
             Err(status) if ambiguous_create_status(&status) => {
-                self.task = Ownership::Uncertain;
+                self.task = Ownership::CreateUncertain;
                 match self.confirm_task_ownership().await {
                     Ok(true) => {}
                     Ok(false) => {
@@ -575,7 +861,9 @@ impl ContainerdAttempt {
                     }
                     Err(readback) => {
                         warn!(
+                            event = "containerd.create_outcome_unverified",
                             resource_id = %self.resource_id,
+                            stage = "task",
                             error = %readback,
                             "containerd task create outcome could not be verified",
                         );
@@ -584,73 +872,91 @@ impl ContainerdAttempt {
                 }
             }
             Err(status) => {
+                self.task = Ownership::Absent;
                 return Err(image::rpc_error("containerd task create failed", status));
             }
         }
 
         self.io
-            .as_mut()
+            .ready_mut()
             .expect("attempt I/O exists until cleanup")
-            .activate()
-            .map_err(|error| io_error("cannot activate containerd output pipes", error))?;
+            .activate()?;
         self.wait = Some(
-            arm_wait(
-                Arc::clone(&self.client),
-                self.namespace.clone(),
-                self.resource_id.clone(),
-                self.control_timeout,
-            )
-            .await?,
+            self.rpc
+                .arm_wait(
+                    WaitRequest {
+                        container_id: self.resource_id.clone(),
+                        exec_id: String::new(),
+                    },
+                    self.control_timeout,
+                )
+                .await?,
         );
         Ok(())
     }
 
+    /// Reads snapshot metadata and verifies the expected parent and labels.
     async fn confirm_snapshot_ownership(
         &mut self,
         expected_parent: &str,
     ) -> Result<bool, ContainerEngineError> {
-        self.confirm_snapshot_ownership_with_parent(Some(expected_parent))
+        self.confirm_snapshot_ownership_with_parent(expected_parent)
             .await
     }
 
+    /// Reads snapshot metadata and verifies cleanup ownership labels.
     async fn confirm_snapshot_ownership_for_cleanup(
         &mut self,
     ) -> Result<bool, ContainerEngineError> {
-        self.confirm_snapshot_ownership_with_parent(None).await
+        let expected_parent = self.snapshot_parent.clone().ok_or_else(|| {
+            ContainerEngineError::permanent("containerd attempt has no expected snapshot parent")
+        })?;
+        self.confirm_snapshot_ownership_with_parent(&expected_parent)
+            .await
     }
 
+    /// Verifies snapshot ownership with the expected parent constraint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when read-back fails or another resource owns the ID.
     async fn confirm_snapshot_ownership_with_parent(
         &mut self,
-        expected_parent: Option<&str>,
+        expected_parent: &str,
     ) -> Result<bool, ContainerEngineError> {
-        if self.snapshot == Ownership::Owned {
-            return Ok(true);
-        }
         if matches!(self.snapshot, Ownership::Absent | Ownership::Foreign) {
             return Ok(false);
         }
-        let response = image::raw_rpc_with_timeout(
-            self.control_timeout,
-            "containerd snapshot ownership read-back failed",
-            self.client.snapshots().stat(image::namespaced_with_timeout(
+        let previous = self.snapshot;
+        let response = self
+            .rpc
+            .stat_snapshot(
                 StatSnapshotRequest {
                     snapshotter: self.snapshotter.clone(),
                     key: self.resource_id.clone(),
                 },
-                &self.namespace,
                 self.control_timeout,
-            )),
-        )
-        .await;
+            )
+            .await;
         let info = match response {
-            Ok(response) => response.into_inner().info.ok_or_else(|| {
-                ContainerEngineError::permanent(
-                    "containerd snapshot read-back returned no metadata",
-                )
-            })?,
+            Ok(response) => match response.info {
+                Some(info) => info,
+                None => {
+                    self.snapshot =
+                        ownership_after_read_back(self.snapshot, OwnershipReadBack::Unavailable);
+                    return Err(ContainerEngineError::permanent(
+                        "containerd snapshot read-back returned no metadata",
+                    ));
+                }
+            },
             Err(status) if status.code() == Code::NotFound => {
                 self.snapshot =
                     ownership_after_read_back(self.snapshot, OwnershipReadBack::Missing);
+                if previous == Ownership::CreateUncertain {
+                    return Err(ContainerEngineError::retryable(
+                        "containerd snapshot create outcome remains unresolved",
+                    ));
+                }
                 return Ok(false);
             }
             Err(status) => {
@@ -686,55 +992,65 @@ impl ContainerdAttempt {
         Ok(true)
     }
 
+    /// Returns mounts for the admitted snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when containerd cannot return snapshot mounts.
     async fn snapshot_mounts(
         &mut self,
     ) -> Result<Vec<containerd_client::types::Mount>, ContainerEngineError> {
-        image::rpc_with_timeout(
-            self.control_timeout,
-            "containerd snapshot mounts lookup failed",
-            self.client
-                .snapshots()
-                .mounts(image::namespaced_with_timeout(
-                    MountsRequest {
-                        snapshotter: self.snapshotter.clone(),
-                        key: self.resource_id.clone(),
-                    },
-                    &self.namespace,
-                    self.control_timeout,
-                )),
-        )
-        .await
-        .map(|response| response.into_inner().mounts)
+        self.rpc
+            .mount_snapshot(
+                MountsRequest {
+                    snapshotter: self.snapshotter.clone(),
+                    key: self.resource_id.clone(),
+                },
+                self.control_timeout,
+            )
+            .await
+            .map(|response| response.mounts)
+            .map_err(|status| image::rpc_error("containerd snapshot mounts lookup failed", status))
     }
 
+    /// Reads and verifies container identity metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when read-back fails or another resource owns the ID.
     async fn confirm_container_ownership(&mut self) -> Result<bool, ContainerEngineError> {
-        if self.container == Ownership::Owned {
-            return Ok(true);
-        }
         if matches!(self.container, Ownership::Absent | Ownership::Foreign) {
             return Ok(false);
         }
-        let response = image::raw_rpc_with_timeout(
-            self.control_timeout,
-            "containerd container ownership read-back failed",
-            self.client.containers().get(image::namespaced_with_timeout(
+        let previous = self.container;
+        let response = self
+            .rpc
+            .get_container(
                 GetContainerRequest {
                     id: self.resource_id.clone(),
                 },
-                &self.namespace,
                 self.control_timeout,
-            )),
-        )
-        .await;
+            )
+            .await;
         let container = match response {
-            Ok(response) => response.into_inner().container.ok_or_else(|| {
-                ContainerEngineError::permanent(
-                    "containerd container read-back returned no metadata",
-                )
-            })?,
+            Ok(response) => match response.container {
+                Some(container) => container,
+                None => {
+                    self.container =
+                        ownership_after_read_back(self.container, OwnershipReadBack::Unavailable);
+                    return Err(ContainerEngineError::permanent(
+                        "containerd container read-back returned no metadata",
+                    ));
+                }
+            },
             Err(status) if status.code() == Code::NotFound => {
                 self.container =
                     ownership_after_read_back(self.container, OwnershipReadBack::Missing);
+                if previous == Ownership::CreateUncertain {
+                    return Err(ContainerEngineError::retryable(
+                        "containerd container create outcome remains unresolved",
+                    ));
+                }
                 return Ok(false);
             }
             Err(status) => {
@@ -771,10 +1087,12 @@ impl ContainerdAttempt {
         Ok(true)
     }
 
+    /// Reads and verifies runtime task identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when read-back fails or another process owns the ID.
     async fn confirm_task_ownership(&mut self) -> Result<bool, ContainerEngineError> {
-        if self.task == Ownership::Owned {
-            return Ok(true);
-        }
         if matches!(self.task, Ownership::Absent | Ownership::Foreign) {
             return Ok(false);
         }
@@ -783,25 +1101,35 @@ impl ContainerdAttempt {
                 "cannot adopt a containerd task without its owned container metadata",
             ));
         }
-        let response = image::raw_rpc_with_timeout(
-            self.control_timeout,
-            "containerd task ownership read-back failed",
-            self.client.tasks().get(image::namespaced_with_timeout(
+        let previous = self.task;
+        let response = self
+            .rpc
+            .get_task(
                 GetRequest {
                     container_id: self.resource_id.clone(),
                     exec_id: String::new(),
                 },
-                &self.namespace,
                 self.control_timeout,
-            )),
-        )
-        .await;
+            )
+            .await;
         let process = match response {
-            Ok(response) => response.into_inner().process.ok_or_else(|| {
-                ContainerEngineError::permanent("containerd task read-back returned no process")
-            })?,
+            Ok(response) => match response.process {
+                Some(process) => process,
+                None => {
+                    self.task =
+                        ownership_after_read_back(self.task, OwnershipReadBack::Unavailable);
+                    return Err(ContainerEngineError::permanent(
+                        "containerd task read-back returned no process",
+                    ));
+                }
+            },
             Err(status) if status.code() == Code::NotFound => {
                 self.task = ownership_after_read_back(self.task, OwnershipReadBack::Missing);
+                if previous == Ownership::CreateUncertain {
+                    return Err(ContainerEngineError::retryable(
+                        "containerd task create outcome remains unresolved",
+                    ));
+                }
                 return Ok(false);
             }
             Err(status) => {
@@ -812,8 +1140,22 @@ impl ContainerdAttempt {
                 ));
             }
         };
-        let matches =
-            task_identity_matches(self.container, &process.container_id, &self.resource_id);
+        let matches = task_identity_matches(
+            self.container,
+            TaskIdentity {
+                container_id: &process.container_id,
+                id: &process.id,
+                pid: process.pid,
+                stdout: &process.stdout,
+                stderr: &process.stderr,
+            },
+            ExpectedTaskIdentity {
+                resource_id: &self.resource_id,
+                pid: self.task_pid,
+                stdout: self.task_stdout.as_deref(),
+                stderr: self.task_stderr.as_deref(),
+            },
+        );
         self.task = ownership_after_read_back(
             self.task,
             if matches {
@@ -827,24 +1169,85 @@ impl ContainerdAttempt {
                 "containerd task resource ID is owned by another resource",
             ));
         }
+        self.task_pid = Some(process.pid);
+        if self.start_uncertain {
+            match ProcessStatus::try_from(process.status) {
+                Ok(
+                    ProcessStatus::Running
+                    | ProcessStatus::Stopped
+                    | ProcessStatus::Paused
+                    | ProcessStatus::Pausing,
+                ) => {
+                    self.start_confirmed = true;
+                    self.start_uncertain = false;
+                }
+                // A matching task remains owned even when its start outcome is
+                // unresolved. Cleanup may race a late start safely: delete wins
+                // while the task is still created, or fails and a later pass
+                // observes and terminates the running process.
+                Ok(ProcessStatus::Created | ProcessStatus::Unknown) | Err(_) => {}
+            }
+        }
         Ok(true)
     }
 
+    /// Confirms that a completed task deletion did not expose a replacement.
+    async fn confirm_task_absent_after_delete(&mut self) -> Result<(), ContainerEngineError> {
+        match self.confirm_task_ownership().await? {
+            false => Ok(()),
+            true => Err(ContainerEngineError::retryable(
+                "containerd task still exists after deletion",
+            )),
+        }
+    }
+
+    /// Confirms that a completed container deletion did not expose a replacement.
+    async fn confirm_container_absent_after_delete(&mut self) -> Result<(), ContainerEngineError> {
+        match self.confirm_container_ownership().await? {
+            false => Ok(()),
+            true => Err(ContainerEngineError::retryable(
+                "containerd container still exists after deletion",
+            )),
+        }
+    }
+
+    /// Confirms that a completed snapshot deletion did not expose a replacement.
+    async fn confirm_snapshot_absent_after_delete(&mut self) -> Result<(), ContainerEngineError> {
+        match self.confirm_snapshot_ownership_for_cleanup().await? {
+            false => Ok(()),
+            true => Err(ContainerEngineError::retryable(
+                "containerd snapshot still exists after deletion",
+            )),
+        }
+    }
+
+    /// Arms task wait when the owned task has no active wait owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when task wait cannot be armed.
     async fn ensure_wait_armed(&mut self) -> Result<(), ContainerEngineError> {
         if self.wait.is_none() && self.task == Ownership::Owned {
             self.wait = Some(
-                arm_wait(
-                    Arc::clone(&self.client),
-                    self.namespace.clone(),
-                    self.resource_id.clone(),
-                    self.control_timeout,
-                )
-                .await?,
+                self.rpc
+                    .arm_wait(
+                        WaitRequest {
+                            container_id: self.resource_id.clone(),
+                            exec_id: String::new(),
+                        },
+                        self.control_timeout,
+                    )
+                    .await?,
             );
         }
         Ok(())
     }
 
+    /// Starts the owned runtime task once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unavailable ownership or a failed start request.
     async fn start_inner(&mut self) -> Result<(), ContainerEngineError> {
         if self.task != Ownership::Owned {
             return Err(ContainerEngineError::permanent(
@@ -861,23 +1264,36 @@ impl ContainerdAttempt {
         }
 
         self.start_requested = true;
-        image::rpc_with_timeout(
-            self.control_timeout,
-            "containerd task start failed",
-            self.client.tasks().start(image::namespaced_with_timeout(
-                StartRequest {
-                    container_id: self.resource_id.clone(),
-                    exec_id: String::new(),
-                },
-                &self.namespace,
-                self.control_timeout,
-            )),
-        )
-        .await?;
-        self.start_confirmed = true;
-        Ok(())
+        self.begin_mutation(
+            MutationStage::StartTask,
+            MutationRequest::StartTask(StartRequest {
+                container_id: self.resource_id.clone(),
+                exec_id: String::new(),
+            }),
+        );
+        let MutationResult::StartTask(result) =
+            self.await_mutation(MutationStage::StartTask).await?
+        else {
+            unreachable!("task start returned another mutation result")
+        };
+        match result {
+            Ok(_) => {
+                self.start_confirmed = true;
+                self.start_uncertain = false;
+                Ok(())
+            }
+            Err(status) => {
+                self.start_uncertain = ambiguous_create_status(&status);
+                Err(image::rpc_error("containerd task start failed", status))
+            }
+        }
     }
 
+    /// Waits for the runtime task and caches its exit status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when wait cannot be armed or its worker fails.
     async fn wait_inner(&mut self) -> Result<ContainerExitStatus, ContainerEngineError> {
         if let Some(status) = self.exit_status {
             return Ok(status);
@@ -889,9 +1305,10 @@ impl ContainerdAttempt {
             .ok_or_else(|| {
                 ContainerEngineError::permanent("containerd task wait is not available")
             })?
+            .join()
             .await
         {
-            Ok(Ok(response)) => response.into_inner(),
+            Ok(Ok(response)) => response,
             Ok(Err(status)) => {
                 self.wait.take();
                 if status.code() == Code::NotFound {
@@ -920,6 +1337,11 @@ impl ContainerdAttempt {
         Ok(status)
     }
 
+    /// Sends one terminating signal to an active owned task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when containerd rejects or cannot deliver the signal.
     async fn terminate_inner(&mut self) -> Result<(), ContainerEngineError> {
         if self.task != Ownership::Owned || self.exit_status.is_some() || !self.start_requested {
             return Ok(());
@@ -930,29 +1352,28 @@ impl ContainerdAttempt {
 
         if let Err(error) = self.ensure_wait_armed().await {
             warn!(
+                event = "containerd.wait_rearm_failed",
                 resource_id = %self.resource_id,
                 error = %error,
                 "containerd wait could not be re-armed before termination",
             );
         }
 
-        match image::raw_rpc_with_timeout(
-            self.control_timeout,
-            "containerd task termination failed",
-            self.client.tasks().kill(image::namespaced_with_timeout(
-                KillRequest {
-                    container_id: self.resource_id.clone(),
-                    exec_id: String::new(),
-                    signal: SIGKILL,
-                    all: true,
-                },
-                &self.namespace,
-                self.control_timeout,
-            )),
-        )
-        .await
-        {
-            Ok(_) => {
+        self.begin_mutation(
+            MutationStage::KillTask,
+            MutationRequest::KillTask(KillRequest {
+                container_id: self.resource_id.clone(),
+                exec_id: String::new(),
+                signal: SIGKILL,
+                all: true,
+            }),
+        );
+        let MutationResult::KillTask(result) = self.await_mutation(MutationStage::KillTask).await?
+        else {
+            unreachable!("task termination returned another mutation result")
+        };
+        match result {
+            Ok(()) => {
                 self.termination_sent = true;
                 self.termination_requires_wait = true;
                 Ok(())
@@ -963,11 +1384,7 @@ impl ContainerdAttempt {
                 Ok(())
             }
             Err(status) if status.code() == Code::FailedPrecondition => {
-                self.termination_sent = true;
-                self.termination_requires_wait = self.start_confirmed;
-                if !self.termination_requires_wait {
-                    self.abort_wait();
-                }
+                self.apply_kill_failed_precondition();
                 Ok(())
             }
             Err(status) => Err(image::rpc_error(
@@ -977,11 +1394,33 @@ impl ContainerdAttempt {
         }
     }
 
+    /// Records a kill rejection for a task that is not signalable in its current state.
+    ///
+    /// Before start is confirmed, a late start may still win after this
+    /// response. Keep termination retryable until delete confirms absence.
+    fn apply_kill_failed_precondition(&mut self) {
+        self.termination_sent = self.start_confirmed;
+        self.termination_requires_wait = self.start_confirmed;
+        if !self.termination_requires_wait {
+            self.abort_wait();
+        }
+    }
+
+    /// Runs one dependency-ordered cleanup attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns all resource cleanup failures observed during this attempt.
     async fn cleanup_owned(&mut self) -> Result<(), ContainerEngineError> {
         let mut failures = CleanupFailures::default();
 
-        if cleanup_eligibility(self.task, self.container, self.snapshot, self.io.is_some())
-            .confirm_task
+        if cleanup_eligibility(
+            self.task,
+            self.container,
+            self.snapshot,
+            self.io.is_present(),
+        )
+        .confirm_task
         {
             match self.confirm_task_ownership().await {
                 Ok(_) => {}
@@ -989,8 +1428,13 @@ impl ContainerdAttempt {
             }
         }
 
-        if cleanup_eligibility(self.task, self.container, self.snapshot, self.io.is_some())
-            .delete_task
+        if cleanup_eligibility(
+            self.task,
+            self.container,
+            self.snapshot,
+            self.io.is_present(),
+        )
+        .delete_task
         {
             let mut task_can_be_deleted = true;
             let mut wait_error = None;
@@ -1009,34 +1453,74 @@ impl ContainerdAttempt {
             }
 
             if task_can_be_deleted
-                && cleanup_eligibility(self.task, self.container, self.snapshot, self.io.is_some())
-                    .delete_task
-            {
-                match image::raw_rpc_with_timeout(
-                    self.control_timeout,
-                    "containerd task cleanup failed",
-                    self.client.tasks().delete(image::namespaced_with_timeout(
-                        DeleteTaskRequest {
-                            container_id: self.resource_id.clone(),
-                        },
-                        &self.namespace,
-                        self.control_timeout,
-                    )),
+                && cleanup_eligibility(
+                    self.task,
+                    self.container,
+                    self.snapshot,
+                    self.io.is_present(),
                 )
-                .await
-                {
+                .delete_task
+            {
+                self.task = Ownership::DeleteUncertain;
+                self.begin_mutation(
+                    MutationStage::DeleteTask,
+                    MutationRequest::DeleteTask(DeleteTaskRequest {
+                        container_id: self.resource_id.clone(),
+                    }),
+                );
+                let MutationResult::DeleteTask(result) =
+                    self.await_mutation(MutationStage::DeleteTask).await?
+                else {
+                    unreachable!("task deletion returned another mutation result")
+                };
+                match result {
                     Ok(_) => {
-                        self.task = ownership_after_delete(self.task, OwnershipDelete::Removed);
+                        self.task = Ownership::DeleteUncertain;
+                        if let Err(error) = self.confirm_task_absent_after_delete().await {
+                            failures.push(error);
+                        }
                     }
                     Err(status) if status.code() == Code::NotFound => {
-                        self.task = ownership_after_delete(self.task, OwnershipDelete::Missing);
+                        self.task = Ownership::DeleteUncertain;
+                        if let Err(error) = self.confirm_task_absent_after_delete().await {
+                            failures.push(error);
+                        }
+                    }
+                    Err(status)
+                        if status.code() == Code::FailedPrecondition && self.start_uncertain =>
+                    {
+                        self.task = Ownership::Owned;
+                        match self.confirm_task_ownership().await {
+                            Ok(false) => {}
+                            Ok(true) if self.start_confirmed => {
+                                failures.push(ContainerEngineError::retryable_from(
+                                    "containerd task cleanup is waiting for termination",
+                                    status,
+                                ));
+                            }
+                            Ok(true) => failures
+                                .push(image::rpc_error("containerd task cleanup failed", status)),
+                            Err(error) => failures.push(error),
+                        }
                     }
                     Err(status) => {
-                        self.task = ownership_after_delete(self.task, OwnershipDelete::Failed);
+                        self.task = if ambiguous_create_status(&status) {
+                            Ownership::DeleteUncertain
+                        } else {
+                            Ownership::Owned
+                        };
+                        if self.task == Ownership::DeleteUncertain
+                            && let Err(error) = self.confirm_task_absent_after_delete().await
+                        {
+                            failures.push(error);
+                        }
                         if let Some(error) = wait_error {
                             failures.push(error);
                         }
-                        failures.push(image::rpc_error("containerd task cleanup failed", status));
+                        if self.task == Ownership::Owned {
+                            failures
+                                .push(image::rpc_error("containerd task cleanup failed", status));
+                        }
                     }
                 }
             }
@@ -1045,159 +1529,478 @@ impl ContainerdAttempt {
             }
         }
 
-        if cleanup_eligibility(self.task, self.container, self.snapshot, self.io.is_some())
-            .confirm_container
+        if cleanup_eligibility(
+            self.task,
+            self.container,
+            self.snapshot,
+            self.io.is_present(),
+        )
+        .confirm_container
         {
             match self.confirm_container_ownership().await {
                 Ok(_) => {}
                 Err(error) => failures.push(error),
             }
         }
-        if cleanup_eligibility(self.task, self.container, self.snapshot, self.io.is_some())
-            .delete_container
+        if cleanup_eligibility(
+            self.task,
+            self.container,
+            self.snapshot,
+            self.io.is_present(),
+        )
+        .delete_container
         {
-            match image::raw_rpc_with_timeout(
-                self.control_timeout,
-                "containerd container cleanup failed",
-                self.client
-                    .containers()
-                    .delete(image::namespaced_with_timeout(
-                        DeleteContainerRequest {
-                            id: self.resource_id.clone(),
-                        },
-                        &self.namespace,
-                        self.control_timeout,
-                    )),
-            )
-            .await
-            {
+            self.container = Ownership::DeleteUncertain;
+            self.begin_mutation(
+                MutationStage::DeleteContainer,
+                MutationRequest::DeleteContainer(DeleteContainerRequest {
+                    id: self.resource_id.clone(),
+                }),
+            );
+            let MutationResult::DeleteContainer(result) =
+                self.await_mutation(MutationStage::DeleteContainer).await?
+            else {
+                unreachable!("container deletion returned another mutation result")
+            };
+            match result {
                 Ok(_) => {
-                    self.container =
-                        ownership_after_delete(self.container, OwnershipDelete::Removed);
+                    self.container = Ownership::DeleteUncertain;
+                    if let Err(error) = self.confirm_container_absent_after_delete().await {
+                        failures.push(error);
+                    }
                 }
                 Err(status) if status.code() == Code::NotFound => {
-                    self.container =
-                        ownership_after_delete(self.container, OwnershipDelete::Missing);
+                    self.container = Ownership::DeleteUncertain;
+                    if let Err(error) = self.confirm_container_absent_after_delete().await {
+                        failures.push(error);
+                    }
                 }
                 Err(status) => {
-                    self.container =
-                        ownership_after_delete(self.container, OwnershipDelete::Failed);
-                    failures.push(image::rpc_error(
-                        "containerd container cleanup failed",
-                        status,
-                    ));
+                    self.container = if ambiguous_create_status(&status) {
+                        Ownership::DeleteUncertain
+                    } else {
+                        Ownership::Owned
+                    };
+                    if self.container == Ownership::DeleteUncertain
+                        && let Err(error) = self.confirm_container_absent_after_delete().await
+                    {
+                        failures.push(error);
+                    }
+                    if self.container == Ownership::Owned {
+                        failures.push(image::rpc_error(
+                            "containerd container cleanup failed",
+                            status,
+                        ));
+                    }
                 }
             }
         }
 
-        if cleanup_eligibility(self.task, self.container, self.snapshot, self.io.is_some())
-            .confirm_snapshot
+        if cleanup_eligibility(
+            self.task,
+            self.container,
+            self.snapshot,
+            self.io.is_present(),
+        )
+        .confirm_snapshot
         {
             match self.confirm_snapshot_ownership_for_cleanup().await {
                 Ok(_) => {}
                 Err(error) => failures.push(error),
             }
         }
-        if cleanup_eligibility(self.task, self.container, self.snapshot, self.io.is_some())
-            .delete_snapshot
+        if cleanup_eligibility(
+            self.task,
+            self.container,
+            self.snapshot,
+            self.io.is_present(),
+        )
+        .delete_snapshot
         {
-            match image::raw_rpc_with_timeout(
-                self.control_timeout,
-                "containerd snapshot cleanup failed",
-                self.client
-                    .snapshots()
-                    .remove(image::namespaced_with_timeout(
-                        RemoveSnapshotRequest {
-                            snapshotter: self.snapshotter.clone(),
-                            key: self.resource_id.clone(),
-                        },
-                        &self.namespace,
-                        self.control_timeout,
-                    )),
-            )
-            .await
-            {
+            self.snapshot = Ownership::DeleteUncertain;
+            self.begin_mutation(
+                MutationStage::DeleteSnapshot,
+                MutationRequest::RemoveSnapshot(RemoveSnapshotRequest {
+                    snapshotter: self.snapshotter.clone(),
+                    key: self.resource_id.clone(),
+                }),
+            );
+            let MutationResult::RemoveSnapshot(result) =
+                self.await_mutation(MutationStage::DeleteSnapshot).await?
+            else {
+                unreachable!("snapshot deletion returned another mutation result")
+            };
+            match result {
                 Ok(_) => {
-                    self.snapshot = ownership_after_delete(self.snapshot, OwnershipDelete::Removed);
+                    self.snapshot = Ownership::DeleteUncertain;
+                    if let Err(error) = self.confirm_snapshot_absent_after_delete().await {
+                        failures.push(error);
+                    }
                 }
                 Err(status) if status.code() == Code::NotFound => {
-                    self.snapshot = ownership_after_delete(self.snapshot, OwnershipDelete::Missing);
+                    self.snapshot = Ownership::DeleteUncertain;
+                    if let Err(error) = self.confirm_snapshot_absent_after_delete().await {
+                        failures.push(error);
+                    }
                 }
                 Err(status) => {
-                    self.snapshot = ownership_after_delete(self.snapshot, OwnershipDelete::Failed);
-                    failures.push(image::rpc_error(
-                        "containerd snapshot cleanup failed",
-                        status,
-                    ));
+                    self.snapshot = if ambiguous_create_status(&status) {
+                        Ownership::DeleteUncertain
+                    } else {
+                        Ownership::Owned
+                    };
+                    if self.snapshot == Ownership::DeleteUncertain
+                        && let Err(error) = self.confirm_snapshot_absent_after_delete().await
+                    {
+                        failures.push(error);
+                    }
+                    if self.snapshot == Ownership::Owned {
+                        failures.push(image::rpc_error(
+                            "containerd snapshot cleanup failed",
+                            status,
+                        ));
+                    }
                 }
             }
         }
 
-        if cleanup_eligibility(self.task, self.container, self.snapshot, self.io.is_some())
-            .cleanup_io
-            && let Some(io) = self.io.as_mut()
+        if cleanup_eligibility(
+            self.task,
+            self.container,
+            self.snapshot,
+            self.io.is_present(),
+        )
+        .cleanup_io
+            && let AttemptIoState::Ready(io) = &mut self.io
         {
-            match io.cleanup() {
-                Ok(()) => self.io = None,
-                Err(error) => {
-                    failures.push(io_error("cannot clean up containerd output pipes", error))
-                }
+            match io.cleanup().await {
+                Ok(()) => self.io = AttemptIoState::Absent,
+                Err(error) => failures.push(error),
             }
         }
 
         failures.into_result()
     }
 
-    async fn cleanup_owned_with_retry(&mut self) -> Result<(), ContainerEngineError> {
+    /// Waits for the client result of an interrupted mutating RPC.
+    ///
+    /// # Errors
+    ///
+    /// Returns a permanent internal error if the mutation worker stops before
+    /// it reports the containerd result.
+    pub(super) async fn settle_in_flight(&mut self) -> Result<(), ContainerEngineError> {
+        let Some(mutation) = self.in_flight.as_ref() else {
+            return Ok(());
+        };
+        let stage = mutation.stage;
+        let result = self.join_active_mutation(stage).await?;
+        self.apply_settled_mutation(stage, result)?;
+        warn!(
+            event = "containerd.mutation_settled_after_cancellation",
+            resource_id = %self.resource_id,
+            stage = stage.as_str(),
+            "containerd cleanup resumed after an interrupted mutation completed",
+        );
+        Ok(())
+    }
+
+    /// Runs one bounded retry window for owned-resource cleanup.
+    pub(super) async fn cleanup_owned_with_retry(&mut self) -> Result<(), ContainerEngineError> {
+        let io_failure = match self.settle_io_preparation().await {
+            Ok(()) => None,
+            Err(error) if self.io.is_released() => {
+                warn!(
+                    event = "containerd.io_prepare_failed_after_cancellation",
+                    resource_id = %self.resource_id,
+                    error = %error,
+                    "containerd cleanup released a failed I/O preparation",
+                );
+                None
+            }
+            Err(error) => Some(error),
+        };
+        if let Some(error) = io_failure.as_ref() {
+            warn!(
+                event = "containerd.io_ownership_lost",
+                resource_id = %self.resource_id,
+                error = %error,
+                "containerd cleanup retained unresolved local I/O ownership",
+            );
+        }
+        self.settle_in_flight().await?;
         let timeout = self.cleanup_timeout;
-        let result =
-            retry_cleanup(self, timeout, |attempt| Box::pin(attempt.cleanup_owned())).await;
+        let mut result = retry_cleanup(self, timeout, |attempt| {
+            Box::pin(async move {
+                attempt.settle_in_flight().await?;
+                attempt.cleanup_owned().await
+            })
+        })
+        .await;
+        if result.is_ok() {
+            result = match io_failure {
+                Some(error) => Err(error),
+                None if !self.is_released() => Err(ContainerEngineError::permanent(format!(
+                    "containerd cleanup left unresolved ownership: {}",
+                    self.unresolved_summary(),
+                ))),
+                None => Ok(()),
+            };
+        }
         if result.is_err() {
             self.abort_wait();
         }
         result
     }
 
+    /// Returns `true` when no local or remote attempt resource remains owned.
+    pub(super) fn is_released(&self) -> bool {
+        !matches!(
+            self.snapshot,
+            Ownership::Owned | Ownership::CreateUncertain | Ownership::DeleteUncertain
+        ) && !matches!(
+            self.container,
+            Ownership::Owned | Ownership::CreateUncertain | Ownership::DeleteUncertain
+        ) && !matches!(
+            self.task,
+            Ownership::Owned | Ownership::CreateUncertain | Ownership::DeleteUncertain
+        ) && self.io.is_released()
+            && self.wait.is_none()
+            && self.in_flight.is_none()
+    }
+
+    /// Describes unresolved ownership for structured cleanup diagnostics.
+    pub(super) fn unresolved_summary(&self) -> String {
+        format!(
+            "resource_id={}, snapshot={:?}, container={:?}, task={:?}, io={}, wait={}, mutation={}",
+            self.resource_id,
+            self.snapshot,
+            self.container,
+            self.task,
+            self.io.status_label(),
+            self.wait.is_some(),
+            self.in_flight
+                .as_ref()
+                .map(|mutation| mutation.stage.as_str())
+                .unwrap_or("none"),
+        )
+    }
+
+    /// Starts and records a cancellation-safe remote mutation.
+    fn begin_mutation(&mut self, stage: MutationStage, request: MutationRequest) {
+        debug_assert!(self.in_flight.is_none());
+        self.in_flight = Some(InFlightMutation {
+            stage,
+            owner: MutationOwner::Running(
+                Arc::clone(&self.rpc).start_mutation(request, self.control_timeout),
+            ),
+        });
+    }
+
+    /// Waits for the active mutation and transfers its raw result.
+    async fn await_mutation(
+        &mut self,
+        stage: MutationStage,
+    ) -> Result<MutationResult, ContainerEngineError> {
+        self.join_active_mutation(stage).await
+    }
+
+    /// Waits without removing the mutation owner before completion.
+    async fn join_active_mutation(
+        &mut self,
+        stage: MutationStage,
+    ) -> Result<MutationResult, ContainerEngineError> {
+        let joined = {
+            let mutation = self
+                .in_flight
+                .as_mut()
+                .expect("mutation remains present until its result is observed");
+            debug_assert_eq!(mutation.stage, stage);
+            match &mut mutation.owner {
+                MutationOwner::Running(owner) => owner.join().await,
+                MutationOwner::Lost => {
+                    return Err(ContainerEngineError::permanent(
+                        "containerd mutation worker stopped before reporting its result",
+                    ));
+                }
+            }
+        };
+
+        match joined {
+            Ok(result) => {
+                let mutation = self
+                    .in_flight
+                    .take()
+                    .expect("mutation remains present until its result is observed");
+                debug_assert_eq!(mutation.stage, stage);
+                Ok(result)
+            }
+            Err(error) => {
+                self.in_flight
+                    .as_mut()
+                    .expect("failed mutation remains recorded")
+                    .owner = MutationOwner::Lost;
+                Err(ContainerEngineError::permanent_from(
+                    "containerd mutation worker stopped before reporting its result",
+                    error,
+                ))
+            }
+        }
+    }
+
+    /// Applies a mutation result that completed after caller cancellation.
+    fn apply_settled_mutation(
+        &mut self,
+        stage: MutationStage,
+        result: MutationResult,
+    ) -> Result<(), ContainerEngineError> {
+        match (stage, result) {
+            (MutationStage::PrepareSnapshot, MutationResult::PrepareSnapshot(result)) => {
+                self.snapshot = ownership_after_create_result(&result);
+            }
+            (MutationStage::CreateContainer, MutationResult::CreateContainer(result)) => {
+                self.container = ownership_after_create_result(result.as_ref());
+            }
+            (MutationStage::CreateTask, MutationResult::CreateTask(result)) => {
+                if let Ok(response) = &result {
+                    self.task_pid = Some(response.pid);
+                }
+                self.task = ownership_after_create_result(&result);
+            }
+            (MutationStage::StartTask, MutationResult::StartTask(result)) => match result {
+                Ok(_) => {
+                    self.start_confirmed = true;
+                    self.start_uncertain = false;
+                }
+                Err(status) => {
+                    self.start_uncertain = ambiguous_create_status(&status);
+                }
+            },
+            (MutationStage::KillTask, MutationResult::KillTask(result)) => match result {
+                Ok(()) => {
+                    self.termination_sent = true;
+                    self.termination_requires_wait = true;
+                }
+                Err(status) if status.code() == Code::NotFound => {
+                    self.task = Ownership::Absent;
+                    self.abort_wait();
+                }
+                Err(status) if status.code() == Code::FailedPrecondition => {
+                    self.apply_kill_failed_precondition();
+                }
+                Err(_) => {}
+            },
+            (MutationStage::DeleteTask, MutationResult::DeleteTask(result)) => {
+                self.task = ownership_after_delete_result(self.task, &result);
+                if self.task == Ownership::Absent {
+                    self.abort_wait();
+                }
+            }
+            (MutationStage::DeleteContainer, MutationResult::DeleteContainer(result)) => {
+                self.container = ownership_after_delete_result(self.container, &result);
+            }
+            (MutationStage::DeleteSnapshot, MutationResult::RemoveSnapshot(result)) => {
+                self.snapshot = ownership_after_delete_result(self.snapshot, &result);
+            }
+            _ => {
+                return Err(ContainerEngineError::permanent(
+                    "containerd mutation returned a mismatched result",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Aborts and releases an armed task wait.
     fn abort_wait(&mut self) {
-        if let Some(wait) = self.wait.take() {
+        if let Some(mut wait) = self.wait.take() {
             wait.abort();
         }
     }
 }
 
+/// Active attempt that transfers unresolved ownership to deferred cleanup on drop.
+struct ContainerdAttempt {
+    /// Lifecycle state retained until explicit cleanup or deferred handoff.
+    state: Option<AttemptState>,
+    /// Pre-reserved finalizer admission owned for the full attempt lifetime.
+    cleanup: Option<CleanupReservation>,
+}
+
+impl ContainerdAttempt {
+    /// Creates an attempt with cleanup admission already reserved.
+    fn new(state: AttemptState, cleanup: CleanupReservation) -> Self {
+        Self {
+            state: Some(state),
+            cleanup: Some(cleanup),
+        }
+    }
+
+    /// Returns mutable lifecycle state while the attempt is active.
+    fn state_mut(&mut self) -> &mut AttemptState {
+        self.state
+            .as_mut()
+            .expect("containerd attempt state exists until cleanup handoff")
+    }
+
+    /// Releases the reservation after complete explicit cleanup.
+    fn disarm_if_released(&mut self) {
+        if self.state.as_ref().is_some_and(AttemptState::is_released) {
+            self.state.take();
+            self.cleanup.take();
+        }
+    }
+
+    /// Transfers unresolved state to the bounded cleanup owner.
+    fn handoff(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        let reservation = self
+            .cleanup
+            .take()
+            .expect("cleanup admission exists while attempt state is owned");
+        reservation.handoff(state);
+    }
+}
+
 impl Drop for ContainerdAttempt {
     fn drop(&mut self) {
-        self.abort_wait();
+        self.handoff();
     }
 }
 
 #[async_trait]
 impl ContainerAttempt for ContainerdAttempt {
     fn take_stdout(&mut self) -> Option<ContainerOutput> {
-        self.io.as_mut().and_then(AttemptIo::take_stdout)
+        self.state_mut().io.ready_mut()?.take_stdout()
     }
 
     fn take_stderr(&mut self) -> Option<ContainerOutput> {
-        self.io.as_mut().and_then(AttemptIo::take_stderr)
+        self.state_mut().io.ready_mut()?.take_stderr()
     }
 
     async fn start(&mut self) -> Result<(), ContainerEngineError> {
-        self.start_inner().await
+        self.state_mut().start_inner().await
     }
 
     async fn wait(&mut self) -> Result<ContainerExitStatus, ContainerEngineError> {
-        self.wait_inner().await
+        self.state_mut().wait_inner().await
     }
 
     async fn terminate(&mut self) -> Result<(), ContainerEngineError> {
-        self.terminate_inner().await
+        self.state_mut().terminate_inner().await
     }
 
     async fn cleanup(&mut self) -> Result<(), ContainerEngineError> {
-        self.cleanup_owned_with_retry().await
+        let result = self.state_mut().cleanup_owned_with_retry().await;
+        if result.is_ok() {
+            self.disarm_if_released();
+        }
+        result
     }
 }
 
+/// Creates the error returned when one cleanup pass exceeds its window.
 fn cleanup_retry_exhausted(
     timeout: Duration,
     last_error: Option<ContainerEngineError>,
@@ -1211,9 +2014,12 @@ fn cleanup_retry_exhausted(
     )
 }
 
+/// One borrowed cleanup attempt used by the bounded retry loop.
 type CleanupOperation<'a> =
     Pin<Box<dyn Future<Output = Result<(), ContainerEngineError>> + Send + 'a>>;
 
+/// Repeats a cleanup operation under one total representable deadline.
+/// An overflowing duration waits without a local deadline.
 async fn retry_cleanup<T, F>(
     state: &mut T,
     timeout: Duration,
@@ -1223,12 +2029,16 @@ where
     T: Send,
     F: for<'a> FnMut(&'a mut T) -> CleanupOperation<'a>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now().checked_add(timeout);
     let mut backoff = CLEANUP_BACKOFF_INITIAL;
     let mut last_error = None;
 
     loop {
-        match tokio::time::timeout_at(deadline, operation(state)).await {
+        let result = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, operation(state)).await,
+            None => Ok(operation(state).await),
+        };
+        match result {
             Ok(Ok(())) => return Ok(()),
             Ok(Err(error)) if error.class() == ContainerErrorClass::Permanent => {
                 return Err(error);
@@ -1238,110 +2048,28 @@ where
         }
 
         let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return Err(cleanup_retry_exhausted(timeout, last_error));
+        if let Some(deadline) = deadline {
+            if now >= deadline {
+                return Err(cleanup_retry_exhausted(timeout, last_error));
+            }
+            tokio::time::sleep_until((now + backoff).min(deadline)).await;
+        } else {
+            tokio::time::sleep(backoff).await;
         }
-        tokio::time::sleep_until((now + backoff).min(deadline)).await;
         backoff = backoff.saturating_mul(2).min(CLEANUP_BACKOFF_MAX);
     }
 }
 
-async fn arm_wait(
-    client: Arc<Client>,
-    namespace: MetadataValue<Ascii>,
-    resource_id: String,
-    control_timeout: Duration,
-) -> Result<JoinHandle<WaitRpcResult>, ContainerEngineError> {
-    let (armed_tx, armed_rx) = oneshot::channel();
-    let wait = tokio::spawn(async move {
-        let mut grpc = Grpc::new(client.channel());
-        match tokio::time::timeout(control_timeout, grpc.ready()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                let status =
-                    Status::unknown(format!("containerd task service was not ready: {error}"));
-                let _ = armed_tx.send(Err(status.clone()));
-                return Err(status);
-            }
-            Err(_) => {
-                let status = Status::deadline_exceeded(
-                    "containerd task service readiness deadline exceeded",
-                );
-                let _ = armed_tx.send(Err(status.clone()));
-                return Err(status);
-            }
-        }
-
-        let mut request = image::namespaced(
-            WaitRequest {
-                container_id: resource_id,
-                exec_id: String::new(),
-            },
-            &namespace,
-        );
-        request
-            .extensions_mut()
-            .insert(GrpcMethod::new(WAIT_SERVICE, "Wait"));
-        let mut request = Box::pin(grpc.unary(
-            request,
-            PathAndQuery::from_static(WAIT_METHOD),
-            tonic_prost::ProstCodec::default(),
-        ));
-        poll_wait_once(&mut request, armed_tx).await
-    });
-
-    match armed_rx.await {
-        Ok(Ok(())) => Ok(wait),
-        Ok(Err(status)) => {
-            let _ = wait.await;
-            Err(image::rpc_error("containerd task wait failed", status))
-        }
-        Err(error) => match wait.await {
-            Ok(Ok(_)) => Err(ContainerEngineError::retryable_from(
-                "containerd task wait arm signal was lost",
-                error,
-            )),
-            Ok(Err(status)) => Err(image::rpc_error("containerd task wait failed", status)),
-            Err(join) => Err(ContainerEngineError::retryable_from(
-                "containerd task wait worker failed",
-                join,
-            )),
-        },
-    }
-}
-
-async fn poll_wait_once<F>(
-    future: &mut Pin<Box<F>>,
-    armed: oneshot::Sender<Result<(), Status>>,
-) -> WaitRpcResult
-where
-    F: Future<Output = WaitRpcResult>,
-{
-    let mut armed = Some(armed);
-    std::future::poll_fn(|context| match future.as_mut().poll(context) {
-        Poll::Ready(result) => {
-            if let Some(armed) = armed.take() {
-                let signal = result.as_ref().map(|_| ()).map_err(|status| status.clone());
-                let _ = armed.send(signal);
-            }
-            Poll::Ready(result)
-        }
-        Poll::Pending => {
-            if let Some(armed) = armed.take() {
-                let _ = armed.send(Ok(()));
-            }
-            Poll::Pending
-        }
-    })
-    .await
-}
-
+/// Creates attempt identifiers unique to one engine session.
 struct ResourceIdGenerator {
+    /// Random process-local engine session.
     session: String,
+    /// Monotonic sequence within the session.
     sequence: AtomicU64,
 }
 
 impl ResourceIdGenerator {
+    /// Creates a generator with a random session.
     fn random() -> Result<Self, ContainerEngineError> {
         let mut session = [0_u8; SESSION_BYTES];
         getrandom::fill(&mut session).map_err(|error| {
@@ -1353,6 +2081,7 @@ impl ResourceIdGenerator {
         Ok(Self::from_session(session))
     }
 
+    /// Creates a generator from fixed session bytes.
     fn from_session(session: [u8; SESSION_BYTES]) -> Self {
         Self {
             session: lower_hex(&session),
@@ -1360,10 +2089,12 @@ impl ResourceIdGenerator {
         }
     }
 
+    /// Returns the encoded engine session.
     fn session(&self) -> &str {
         &self.session
     }
 
+    /// Returns the next metadata-safe attempt identifier.
     fn next(&self) -> Result<String, ContainerEngineError> {
         let previous = self
             .sequence
@@ -1376,6 +2107,7 @@ impl ResourceIdGenerator {
     }
 }
 
+/// Encodes bytes as lowercase hexadecimal.
 fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
@@ -1386,6 +2118,7 @@ fn lower_hex(bytes: &[u8]) -> String {
     encoded
 }
 
+/// Builds ownership labels for one attempt.
 fn attempt_labels(
     request: &ContainerRequest,
     resource_id: &str,
@@ -1407,6 +2140,7 @@ fn attempt_labels(
     ])
 }
 
+/// Returns whether every expected ownership label matches.
 fn has_ownership_labels(
     actual: &HashMap<String, String>,
     expected: &HashMap<String, String>,
@@ -1416,50 +2150,68 @@ fn has_ownership_labels(
         .all(|(key, value)| actual.get(key) == Some(value))
 }
 
+/// Result of one ownership read-back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OwnershipReadBack {
+    /// The resource is missing.
     Missing,
+    /// The resource matches this attempt.
     Matching,
+    /// The resource belongs to another owner.
     Mismatched,
+    /// Read-back could not decide ownership.
     Unavailable,
 }
 
+/// Applies one read-back result to local ownership.
 fn ownership_after_read_back(current: Ownership, outcome: OwnershipReadBack) -> Ownership {
     match outcome {
+        OwnershipReadBack::Missing if current == Ownership::CreateUncertain => {
+            Ownership::CreateUncertain
+        }
         OwnershipReadBack::Missing => Ownership::Absent,
         OwnershipReadBack::Matching => Ownership::Owned,
         OwnershipReadBack::Mismatched => Ownership::Foreign,
+        OwnershipReadBack::Unavailable if current == Ownership::Owned => Ownership::DeleteUncertain,
         OwnershipReadBack::Unavailable => current,
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OwnershipDelete {
-    Removed,
-    Missing,
-    Failed,
-}
-
-fn ownership_after_delete(current: Ownership, outcome: OwnershipDelete) -> Ownership {
-    match outcome {
-        OwnershipDelete::Removed | OwnershipDelete::Missing => Ownership::Absent,
-        OwnershipDelete::Failed => current,
+/// Maps a completed create result to local ownership.
+fn ownership_after_create_result<T>(result: &Result<T, Status>) -> Ownership {
+    match result {
+        Ok(_) => Ownership::Owned,
+        Err(status) if status.code() == Code::AlreadyExists => Ownership::Foreign,
+        Err(status) if ambiguous_create_status(status) => Ownership::CreateUncertain,
+        Err(_) => Ownership::Absent,
     }
 }
 
+/// Maps a completed delete result to local ownership.
+fn ownership_after_delete_result<T>(current: Ownership, result: &Result<T, Status>) -> Ownership {
+    match result {
+        Ok(_) => Ownership::DeleteUncertain,
+        Err(status) if status.code() == Code::NotFound => Ownership::DeleteUncertain,
+        Err(status) if ambiguous_create_status(status) => Ownership::DeleteUncertain,
+        Err(_) => current,
+    }
+}
+
+/// Checks snapshot identity against attempt metadata.
 fn snapshot_identity_matches(
     actual_name: &str,
     actual_parent: &str,
     actual_labels: &HashMap<String, String>,
     expected_resource_id: &str,
-    expected_parent: Option<&str>,
+    expected_parent: &str,
     expected_labels: &HashMap<String, String>,
 ) -> bool {
     actual_name == expected_resource_id
-        && expected_parent.is_none_or(|expected| actual_parent == expected)
+        && actual_parent == expected_parent
         && has_ownership_labels(actual_labels, expected_labels)
 }
 
+/// Checks container identity against attempt metadata.
 fn container_identity_matches(
     actual_id: &str,
     actual_snapshotter: &str,
@@ -1475,25 +2227,70 @@ fn container_identity_matches(
         && has_ownership_labels(actual_labels, expected_labels)
 }
 
-fn task_identity_matches(
-    container: Ownership,
-    actual_container_id: &str,
-    expected_resource_id: &str,
-) -> bool {
-    container == Ownership::Owned && actual_container_id == expected_resource_id
+/// Runtime task identity returned by containerd.
+struct TaskIdentity<'a> {
+    /// Optional container identifier reported for the process.
+    container_id: &'a str,
+    /// Process identifier reported by containerd.
+    id: &'a str,
+    /// Operating-system process identifier reported by containerd.
+    pid: u32,
+    /// Standard output path reported by containerd.
+    stdout: &'a str,
+    /// Standard error path reported by containerd.
+    stderr: &'a str,
 }
 
+/// Expected identity of one attempt runtime task.
+struct ExpectedTaskIdentity<'a> {
+    /// Attempt resource identifier.
+    resource_id: &'a str,
+    /// Process identifier when task creation returned one.
+    pid: Option<u32>,
+    /// Standard output path passed during task creation.
+    stdout: Option<&'a str>,
+    /// Standard error path passed during task creation.
+    stderr: Option<&'a str>,
+}
+
+/// Checks runtime task identity against attempt metadata.
+fn task_identity_matches(
+    container: Ownership,
+    actual: TaskIdentity<'_>,
+    expected: ExpectedTaskIdentity<'_>,
+) -> bool {
+    container == Ownership::Owned
+        && actual.id == expected.resource_id
+        && (actual.container_id.is_empty() || actual.container_id == expected.resource_id)
+        && expected.pid.is_none_or(|expected| actual.pid == expected)
+        && expected
+            .stdout
+            .is_none_or(|expected| actual.stdout == expected)
+        && expected
+            .stderr
+            .is_none_or(|expected| actual.stderr == expected)
+}
+
+/// Cleanup actions currently safe for one ownership state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CleanupEligibility {
+    /// Whether task ownership requires read-back.
     confirm_task: bool,
+    /// Whether the owned task may be deleted.
     delete_task: bool,
+    /// Whether container ownership requires read-back.
     confirm_container: bool,
+    /// Whether the owned container may be deleted.
     delete_container: bool,
+    /// Whether snapshot ownership requires read-back.
     confirm_snapshot: bool,
+    /// Whether the owned snapshot may be deleted.
     delete_snapshot: bool,
+    /// Whether local output resources may be removed.
     cleanup_io: bool,
 }
 
+/// Computes dependency-safe cleanup actions.
 fn cleanup_eligibility(
     task: Ownership,
     container: Ownership,
@@ -1501,19 +2298,33 @@ fn cleanup_eligibility(
     has_io: bool,
 ) -> CleanupEligibility {
     let task_absent = task == Ownership::Absent;
+    let task_released = matches!(task, Ownership::Absent | Ownership::Foreign);
     let container_absent = container == Ownership::Absent;
 
     CleanupEligibility {
-        confirm_task: task == Ownership::Uncertain,
+        confirm_task: matches!(
+            task,
+            Ownership::Owned | Ownership::CreateUncertain | Ownership::DeleteUncertain
+        ),
         delete_task: task == Ownership::Owned,
-        confirm_container: task_absent && container == Ownership::Uncertain,
+        confirm_container: task_absent
+            && matches!(
+                container,
+                Ownership::Owned | Ownership::CreateUncertain | Ownership::DeleteUncertain
+            ),
         delete_container: task_absent && container == Ownership::Owned,
-        confirm_snapshot: task_absent && container_absent && snapshot == Ownership::Uncertain,
+        confirm_snapshot: task_absent
+            && container_absent
+            && matches!(
+                snapshot,
+                Ownership::Owned | Ownership::CreateUncertain | Ownership::DeleteUncertain
+            ),
         delete_snapshot: task_absent && container_absent && snapshot == Ownership::Owned,
-        cleanup_io: has_io,
+        cleanup_io: task_released && has_io,
     }
 }
 
+/// Returns whether an RPC status leaves a mutation outcome uncertain.
 fn ambiguous_create_status(status: &Status) -> bool {
     matches!(
         status.code(),
@@ -1528,6 +2339,7 @@ fn ambiguous_create_status(status: &Status) -> bool {
     )
 }
 
+/// Verifies the supported containerd major version.
 fn validate_version(version: &str) -> Result<(), ContainerEngineError> {
     let version = version.trim();
     let version = version.strip_prefix('v').unwrap_or(version);
@@ -1549,6 +2361,7 @@ fn validate_version(version: &str) -> Result<(), ContainerEngineError> {
     Ok(())
 }
 
+/// Verifies that a discovered plugin reports ready state.
 fn validate_plugin_ready(
     subject: &str,
     init_error: Option<&containerd_client::google::rpc::Status>,
@@ -1562,6 +2375,7 @@ fn validate_plugin_ready(
     )))
 }
 
+/// Returns whether a containerd platform matches the configured platform.
 fn platform_matches(
     candidate: &containerd_client::types::Platform,
     requested: &ContainerPlatform,
@@ -1576,6 +2390,7 @@ fn platform_matches(
         && candidate_variant == requested_variant
 }
 
+/// Formats an optional OCI platform variant.
 fn platform_variant_suffix(variant: &str) -> String {
     if variant.is_empty() {
         String::new()
@@ -1584,29 +2399,17 @@ fn platform_variant_suffix(variant: &str) -> String {
     }
 }
 
-fn io_error(reason: &'static str, error: io::Error) -> ContainerEngineError {
-    if matches!(
-        error.kind(),
-        io::ErrorKind::NotFound
-            | io::ErrorKind::PermissionDenied
-            | io::ErrorKind::InvalidInput
-            | io::ErrorKind::InvalidData
-            | io::ErrorKind::Unsupported
-    ) {
-        ContainerEngineError::permanent_from(reason, error)
-    } else {
-        ContainerEngineError::retryable_from(reason, error)
-    }
-}
-
+/// Collects independent failures from one dependency-ordered cleanup attempt.
 #[derive(Debug, Default)]
 struct CleanupFailures(Vec<ContainerEngineError>);
 
 impl CleanupFailures {
+    /// Records one cleanup failure without stopping later independent steps.
     fn push(&mut self, error: ContainerEngineError) {
         self.0.push(error);
     }
 
+    /// Returns one classified error containing every recorded failure.
     fn into_result(self) -> Result<(), ContainerEngineError> {
         if self.0.is_empty() {
             return Ok(());
@@ -1630,6 +2433,7 @@ impl CleanupFailures {
     }
 }
 
+/// Error source that preserves every failure from one cleanup attempt.
 #[derive(Debug)]
 struct CleanupFailureSet(Vec<ContainerEngineError>);
 
@@ -1651,9 +2455,60 @@ impl Error for CleanupFailureSet {
     }
 }
 
+/// Combines the terminal results of both engine-owned domains.
+fn combine_shutdown_results(
+    cleanup: Result<(), ContainerEngineError>,
+    io: Result<(), ContainerEngineError>,
+) -> Result<(), ContainerEngineError> {
+    match (cleanup, io) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(cleanup), Err(io)) => {
+            let permanent = cleanup.class() == ContainerErrorClass::Permanent
+                || io.class() == ContainerErrorClass::Permanent;
+            let source = ShutdownFailureSet { cleanup, io };
+            if permanent {
+                Err(ContainerEngineError::permanent_from(
+                    "containerd engine shutdown failed",
+                    source,
+                ))
+            } else {
+                Err(ContainerEngineError::retryable_from(
+                    "containerd engine shutdown failed",
+                    source,
+                ))
+            }
+        }
+    }
+}
+
+/// Errors returned by remote cleanup and local I/O shutdown.
+#[derive(Debug)]
+struct ShutdownFailureSet {
+    /// Remote cleanup domain failure.
+    cleanup: ContainerEngineError,
+    /// Local I/O domain failure.
+    io: ContainerEngineError,
+}
+
+impl fmt::Display for ShutdownFailureSet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "remote cleanup: {}; local I/O: {}",
+            self.cleanup, self.io,
+        )
+    }
+}
+
+impl Error for ShutdownFailureSet {}
+
+/// Error source returned when one cleanup retry window expires.
 #[derive(Debug)]
 struct CleanupRetryExhausted {
+    /// Configured retry window.
     timeout: Duration,
+    /// Last observed cleanup failure.
     last_error: Option<ContainerEngineError>,
 }
 
@@ -1679,9 +2534,12 @@ impl Error for CleanupRetryExhausted {
     }
 }
 
+/// Error source preserving creation and rollback failures.
 #[derive(Debug)]
 struct CreationRollbackFailure {
+    /// Original attempt creation failure.
     creation: ContainerEngineError,
+    /// Failure returned by immediate rollback.
     rollback: ContainerEngineError,
 }
 
@@ -1702,461 +2560,8 @@ impl Error for CreationRollbackFailure {
 }
 
 #[cfg(test)]
-mod tests {
-    use containerd_client::tonic::Code;
-
-    use super::*;
-    use crate::container::ContainerErrorClass;
-
-    #[derive(Default)]
-    struct RetryCleanupState {
-        calls: Vec<tokio::time::Instant>,
-        retryable_failures: usize,
-    }
-
-    fn retry_then_succeed(state: &mut RetryCleanupState) -> CleanupOperation<'_> {
-        Box::pin(async move {
-            state.calls.push(tokio::time::Instant::now());
-            if state.retryable_failures == 0 {
-                Ok(())
-            } else {
-                state.retryable_failures -= 1;
-                Err(ContainerEngineError::retryable("temporary cleanup failure"))
-            }
-        })
-    }
-
-    fn fail_permanently(state: &mut RetryCleanupState) -> CleanupOperation<'_> {
-        Box::pin(async move {
-            state.calls.push(tokio::time::Instant::now());
-            Err(ContainerEngineError::permanent("permanent cleanup failure"))
-        })
-    }
-
-    #[derive(Default)]
-    struct BudgetCleanupState {
-        calls: Vec<tokio::time::Instant>,
-    }
-
-    fn slow_then_pending(state: &mut BudgetCleanupState) -> CleanupOperation<'_> {
-        Box::pin(async move {
-            state.calls.push(tokio::time::Instant::now());
-            if state.calls.len() == 1 {
-                tokio::time::sleep(Duration::from_secs(20)).await;
-                Err(ContainerEngineError::retryable("temporary cleanup failure"))
-            } else {
-                std::future::pending().await
-            }
-        })
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn retryable_cleanup_uses_bounded_exponential_backoff() {
-        let mut state = RetryCleanupState {
-            retryable_failures: 2,
-            ..Default::default()
-        };
-
-        retry_cleanup(&mut state, Duration::from_secs(30), retry_then_succeed)
-            .await
-            .unwrap();
-
-        assert_eq!(state.calls.len(), 3);
-        assert_eq!(state.calls[1] - state.calls[0], CLEANUP_BACKOFF_INITIAL);
-        assert_eq!(state.calls[2] - state.calls[1], CLEANUP_BACKOFF_INITIAL * 2);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn permanent_cleanup_failure_is_not_retried() {
-        let mut state = RetryCleanupState::default();
-
-        let error = retry_cleanup(&mut state, Duration::from_secs(30), fail_permanently)
-            .await
-            .unwrap_err();
-
-        assert_eq!(error.class(), ContainerErrorClass::Permanent);
-        assert_eq!(state.calls.len(), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cleanup_retries_share_one_total_budget() {
-        let mut state = BudgetCleanupState::default();
-        let started = tokio::time::Instant::now();
-
-        let error = retry_cleanup(&mut state, Duration::from_secs(30), slow_then_pending)
-            .await
-            .unwrap_err();
-
-        assert_eq!(error.class(), ContainerErrorClass::Retryable);
-        assert_eq!(
-            tokio::time::Instant::now() - started,
-            Duration::from_secs(30)
-        );
-        assert_eq!(state.calls.len(), 2);
-    }
-
-    #[test]
-    fn only_containerd_major_two_is_accepted() {
-        for version in ["2", "2.0.0", "v2.1.4", "  v2.0.0-beta.1  "] {
-            assert!(validate_version(version).is_ok(), "{version}");
-        }
-        for version in ["", "v", "1.7.27", "v3.0.0", "main"] {
-            assert!(validate_version(version).is_err(), "{version}");
-        }
-    }
-
-    #[test]
-    fn runtime_info_accepts_containerd_and_canonical_any_type_urls() {
-        let runtime = containerd_client::types::RuntimeInfo {
-            name: "io.containerd.runc.v2".into(),
-            ..Default::default()
-        };
-        let value = runtime.encode_to_vec();
-
-        for type_url in [
-            RUNTIME_INFO_TYPE,
-            "/containerd.types.RuntimeInfo",
-            "type.googleapis.com/containerd.types.RuntimeInfo",
-        ] {
-            let decoded = decode_runtime_info(Any {
-                type_url: type_url.into(),
-                value: value.clone(),
-            })
-            .unwrap();
-            assert_eq!(decoded.name, runtime.name);
-        }
-
-        assert!(
-            decode_runtime_info(Any {
-                type_url: "containerd.types.RuntimeRequest".into(),
-                value,
-            })
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn status_mapping_distinguishes_contract_and_transport_failures() {
-        for code in [
-            Code::InvalidArgument,
-            Code::NotFound,
-            Code::AlreadyExists,
-            Code::PermissionDenied,
-            Code::Unauthenticated,
-            Code::FailedPrecondition,
-            Code::OutOfRange,
-            Code::Unimplemented,
-        ] {
-            let error = image::rpc_error("operation failed", Status::new(code, "test"));
-            assert_eq!(error.class(), ContainerErrorClass::Permanent, "{code:?}");
-        }
-        for code in [
-            Code::Cancelled,
-            Code::Unknown,
-            Code::DeadlineExceeded,
-            Code::ResourceExhausted,
-            Code::Aborted,
-            Code::Internal,
-            Code::Unavailable,
-            Code::DataLoss,
-        ] {
-            let error = image::rpc_error("operation failed", Status::new(code, "test"));
-            assert_eq!(error.class(), ContainerErrorClass::Retryable, "{code:?}");
-        }
-    }
-
-    #[test]
-    fn resource_ids_are_attempt_scoped_and_metadata_safe() {
-        let ids = ResourceIdGenerator::from_session([0xab; SESSION_BYTES]);
-
-        let first = ids.next().unwrap();
-        let second = ids.next().unwrap();
-
-        assert_eq!(
-            first,
-            "solti-abababababababababababababababab-0000000000000001"
-        );
-        assert_eq!(
-            second,
-            "solti-abababababababababababababababab-0000000000000002"
-        );
-        assert!(
-            first
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        );
-    }
-
-    #[test]
-    fn ownership_labels_identify_only_the_attempt() {
-        let request = ContainerRequest {
-            attempt_id: "run-secret-a3".to_owned(),
-            task_name: solti_model::TaskId::new("task-a").unwrap(),
-            generation: 7,
-            attempt: 3,
-            image: "registry.invalid/image:tag".to_owned(),
-            command: Some(vec!["secret-command".to_owned()]),
-            args: vec!["secret-argument".to_owned()],
-            env: std::collections::BTreeMap::from([("SECRET".to_owned(), "value".to_owned())]),
-            process_policy: crate::container::ContainerProcessPolicy::new(),
-        };
-
-        let labels = attempt_labels(&request, "resource-1", "session-1");
-
-        assert_eq!(labels.len(), 6);
-        assert_eq!(labels[LABEL_MANAGED_BY], MANAGED_BY);
-        assert_eq!(labels[LABEL_SESSION], "session-1");
-        assert_eq!(labels[LABEL_RESOURCE_ID], "resource-1");
-        assert_eq!(labels[LABEL_TASK], "task-a");
-        assert_eq!(labels[LABEL_GENERATION], "7");
-        assert_eq!(labels[LABEL_ATTEMPT], "3");
-        assert!(!labels.values().any(|value| value.contains("secret")));
-
-        let mut changed = labels.clone();
-        changed.insert(LABEL_SESSION.to_owned(), "another-session".to_owned());
-        assert!(has_ownership_labels(&labels, &labels));
-        assert!(!has_ownership_labels(&changed, &labels));
-    }
-
-    #[test]
-    fn snapshot_identity_requires_our_id_parent_and_labels() {
-        let expected_labels = HashMap::from([
-            (LABEL_MANAGED_BY.to_owned(), MANAGED_BY.to_owned()),
-            (LABEL_SESSION.to_owned(), "session-1".to_owned()),
-        ]);
-        let mut actual_labels = expected_labels.clone();
-        actual_labels.insert("containerd.io/unrelated".to_owned(), "value".to_owned());
-
-        assert!(snapshot_identity_matches(
-            "resource-1",
-            "parent-1",
-            &actual_labels,
-            "resource-1",
-            Some("parent-1"),
-            &expected_labels,
-        ));
-        assert!(snapshot_identity_matches(
-            "resource-1",
-            "another-parent",
-            &actual_labels,
-            "resource-1",
-            None,
-            &expected_labels,
-        ));
-        assert!(!snapshot_identity_matches(
-            "foreign-resource",
-            "parent-1",
-            &actual_labels,
-            "resource-1",
-            Some("parent-1"),
-            &expected_labels,
-        ));
-        assert!(!snapshot_identity_matches(
-            "resource-1",
-            "foreign-parent",
-            &actual_labels,
-            "resource-1",
-            Some("parent-1"),
-            &expected_labels,
-        ));
-
-        actual_labels.insert(LABEL_SESSION.to_owned(), "foreign-session".to_owned());
-        assert!(!snapshot_identity_matches(
-            "resource-1",
-            "parent-1",
-            &actual_labels,
-            "resource-1",
-            Some("parent-1"),
-            &expected_labels,
-        ));
-    }
-
-    #[test]
-    fn container_identity_requires_our_snapshot_binding_and_labels() {
-        let expected_labels = HashMap::from([
-            (LABEL_MANAGED_BY.to_owned(), MANAGED_BY.to_owned()),
-            (LABEL_SESSION.to_owned(), "session-1".to_owned()),
-        ]);
-        let mut actual_labels = expected_labels.clone();
-        actual_labels.insert("containerd.io/unrelated".to_owned(), "value".to_owned());
-
-        assert!(container_identity_matches(
-            "resource-1",
-            "overlayfs",
-            "resource-1",
-            &actual_labels,
-            "resource-1",
-            "overlayfs",
-            &expected_labels,
-        ));
-        for (id, snapshotter, snapshot_key) in [
-            ("foreign-resource", "overlayfs", "resource-1"),
-            ("resource-1", "foreign-snapshotter", "resource-1"),
-            ("resource-1", "overlayfs", "foreign-snapshot"),
-        ] {
-            assert!(!container_identity_matches(
-                id,
-                snapshotter,
-                snapshot_key,
-                &actual_labels,
-                "resource-1",
-                "overlayfs",
-                &expected_labels,
-            ));
-        }
-
-        actual_labels.insert(LABEL_SESSION.to_owned(), "foreign-session".to_owned());
-        assert!(!container_identity_matches(
-            "resource-1",
-            "overlayfs",
-            "resource-1",
-            &actual_labels,
-            "resource-1",
-            "overlayfs",
-            &expected_labels,
-        ));
-    }
-
-    #[test]
-    fn task_identity_requires_our_container() {
-        for ownership in [Ownership::Absent, Ownership::Foreign, Ownership::Uncertain] {
-            assert!(!task_identity_matches(
-                ownership,
-                "resource-1",
-                "resource-1"
-            ));
-        }
-        assert!(task_identity_matches(
-            Ownership::Owned,
-            "resource-1",
-            "resource-1"
-        ));
-        assert!(!task_identity_matches(
-            Ownership::Owned,
-            "foreign-resource",
-            "resource-1"
-        ));
-    }
-
-    #[test]
-    fn ownership_transitions_preserve_uncertain_failures() {
-        assert_eq!(
-            ownership_after_read_back(Ownership::Uncertain, OwnershipReadBack::Missing),
-            Ownership::Absent,
-        );
-        assert_eq!(
-            ownership_after_read_back(Ownership::Uncertain, OwnershipReadBack::Matching),
-            Ownership::Owned,
-        );
-        assert_eq!(
-            ownership_after_read_back(Ownership::Uncertain, OwnershipReadBack::Mismatched),
-            Ownership::Foreign,
-        );
-        assert_eq!(
-            ownership_after_read_back(Ownership::Uncertain, OwnershipReadBack::Unavailable),
-            Ownership::Uncertain,
-        );
-    }
-
-    #[test]
-    fn cleanup_eligibility_is_dependency_safe_for_every_ownership_state() {
-        let ownerships = [
-            Ownership::Absent,
-            Ownership::Foreign,
-            Ownership::Owned,
-            Ownership::Uncertain,
-        ];
-
-        for task in ownerships {
-            for container in ownerships {
-                for snapshot in ownerships {
-                    let task_absent = task == Ownership::Absent;
-                    let container_absent = container == Ownership::Absent;
-                    let expected = CleanupEligibility {
-                        confirm_task: task == Ownership::Uncertain,
-                        delete_task: task == Ownership::Owned,
-                        confirm_container: task_absent && container == Ownership::Uncertain,
-                        delete_container: task_absent && container == Ownership::Owned,
-                        confirm_snapshot: task_absent
-                            && container_absent
-                            && snapshot == Ownership::Uncertain,
-                        delete_snapshot: task_absent
-                            && container_absent
-                            && snapshot == Ownership::Owned,
-                        cleanup_io: true,
-                    };
-
-                    assert_eq!(
-                        cleanup_eligibility(task, container, snapshot, true),
-                        expected,
-                        "task={task:?}, container={container:?}, snapshot={snapshot:?}",
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn cleanup_dependencies_open_only_after_confirmed_removal() {
-        let snapshot = Ownership::Owned;
-        let mut task = Ownership::Owned;
-        let mut container = Ownership::Owned;
-
-        task = ownership_after_delete(task, OwnershipDelete::Failed);
-        assert!(!cleanup_eligibility(task, container, snapshot, true).delete_container);
-
-        task = ownership_after_delete(task, OwnershipDelete::Missing);
-        assert!(cleanup_eligibility(task, container, snapshot, true).delete_container);
-
-        container = ownership_after_delete(container, OwnershipDelete::Failed);
-        assert!(!cleanup_eligibility(task, container, snapshot, true).delete_snapshot);
-
-        container = ownership_after_delete(container, OwnershipDelete::Removed);
-        assert!(cleanup_eligibility(task, container, snapshot, true).delete_snapshot);
-        assert!(cleanup_eligibility(task, container, snapshot, true).cleanup_io);
-        assert!(!cleanup_eligibility(task, container, snapshot, false).cleanup_io);
-    }
-
-    #[test]
-    fn only_retryable_statuses_have_ambiguous_create_outcomes() {
-        for code in [
-            Code::Cancelled,
-            Code::Unknown,
-            Code::DeadlineExceeded,
-            Code::ResourceExhausted,
-            Code::Aborted,
-            Code::Internal,
-            Code::Unavailable,
-            Code::DataLoss,
-        ] {
-            assert!(ambiguous_create_status(&Status::new(code, "test")));
-        }
-        for code in [
-            Code::InvalidArgument,
-            Code::NotFound,
-            Code::AlreadyExists,
-            Code::PermissionDenied,
-            Code::Unauthenticated,
-            Code::FailedPrecondition,
-            Code::OutOfRange,
-            Code::Unimplemented,
-        ] {
-            assert!(!ambiguous_create_status(&Status::new(code, "test")));
-        }
-    }
-
-    #[test]
-    fn plugin_platforms_use_oci_normalization() {
-        let amd64_v1 = containerd_client::types::Platform {
-            os: "linux".to_owned(),
-            architecture: "x86_64".to_owned(),
-            variant: "v1".to_owned(),
-            os_version: String::new(),
-        };
-        let arm64 = ContainerPlatform::new("linux", "arm64", "");
-        let amd64 = ContainerPlatform::new("linux", "amd64", "");
-
-        assert!(platform_matches(&amd64_v1, &amd64));
-        assert!(!platform_matches(&amd64_v1, &arm64));
-    }
-}
+#[path = "cancellation_tests.rs"]
+pub(super) mod cancellation_tests;
+#[cfg(test)]
+#[path = "engine/tests.rs"]
+mod tests;

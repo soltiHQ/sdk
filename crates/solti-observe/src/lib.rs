@@ -41,7 +41,7 @@
 //!     };
 //!
 //!     init_logger(&config)?;
-//!     tracing::info!("agent ready");
+//!     tracing::info!(event = "service.ready", "agent ready");
 //!     Ok(())
 //! }
 //! ```

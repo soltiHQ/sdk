@@ -21,7 +21,14 @@ api                  = ["dep:itoa", "dep:solti-api"]
 discover             = ["dep:solti-discover"]
 process              = ["prometheus/process"]
 runner               = ["dep:solti-runner"]
-server               = ["dep:axum", "dep:solti-model", "dep:taskvisor", "dep:tokio", "dep:tracing"]
+server               = [
+    "dep:axum",
+    "dep:solti-model",
+    "dep:taskvisor",
+    "dep:tokio",
+    "dep:tokio-stream",
+    "dep:tracing",
+]
 state                = ["dep:solti-core", "dep:solti-model"]
 taskvisor            = ["dep:taskvisor"]
 taskvisor-controller = ["taskvisor", "taskvisor/controller"]
@@ -43,15 +50,19 @@ solti-discover = { workspace = true, optional = true }
 solti-model    = { workspace = true, optional = true }
 solti-runner   = { workspace = true, optional = true }
 
-axum       = { workspace = true, optional = true }
-itoa       = { workspace = true, optional = true }
-prometheus = { workspace = true }
-taskvisor  = { workspace = true, optional = true }
-tokio      = { workspace = true, optional = true, features = ["net", "rt"] }
-tracing    = { workspace = true, optional = true }
+axum         = { workspace = true, optional = true }
+itoa         = { workspace = true, optional = true }
+prometheus   = { workspace = true }
+taskvisor    = { workspace = true, optional = true }
+tokio        = { workspace = true, optional = true, features = ["net", "rt", "sync", "time"] }
+tokio-stream = { workspace = true, optional = true }
+tracing      = { workspace = true, optional = true }
 
 [dev-dependencies]
 solti-core = { workspace = true, features = ["test-util"] }
+taskvisor  = { workspace = true, features = ["test-util"] }
+tokio      = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tower      = { workspace = true, features = ["util"] }
 
 [[example]]
 name              = "adapter_metrics"

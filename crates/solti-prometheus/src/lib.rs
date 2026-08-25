@@ -5,7 +5,7 @@
 //! Each adapter implements a trait from the crate that owns the observed behavior.
 //!
 //! All integrations are disabled by default.
-//! [`Registry`] and [`register_build_info`] are always available.
+//! [`Registry`], [`Error`], and [`register_build_info`] are always available.
 //!
 //! ## Data Flow
 //!
@@ -18,7 +18,6 @@
 //! build / process ──► registration functions ────────────┤
 //!                                                        ▼
 //!                                               shared Registry
-//!                                                        │
 //!                                                        ▼
 //!                                                   GET /metrics
 //! ```
@@ -31,7 +30,7 @@
 //! | `discover`             | Discovery metrics  | `PrometheusDiscoverMetrics`      |
 //! | `process`              | Current process    | `register_process_collector`     |
 //! | `runner`               | Runner metrics     | `PrometheusRunnerMetrics`        |
-//! | `server`               | Shared registry    | `server`                         |
+//! | `server`               | Shared registry    | `server`, `server_with_config`   |
 //! | `state`                | `TaskState`        | `PrometheusCoreStateCollector`   |
 //! | `taskvisor`            | Taskvisor events   | `PrometheusTaskvisorSubscriber`  |
 //! | `taskvisor-controller` | Controller events  | Controller subscriber metrics    |
@@ -50,9 +49,9 @@
 //! ## Quick Start
 //!
 //! ```rust
-//! use solti_prometheus::{Registry, register_build_info};
+//! use solti_prometheus::{Error, Registry, register_build_info};
 //!
-//! # fn main() -> Result<(), prometheus::Error> {
+//! # fn main() -> Result<(), Error> {
 //! let registry = Registry::new();
 //! register_build_info(
 //!     &registry,
@@ -118,7 +117,9 @@ pub use api::PrometheusApiMetrics;
 mod server;
 #[cfg(feature = "server")]
 #[cfg_attr(docsrs, doc(cfg(feature = "server")))]
-pub use server::{METRICS_SERVER_SLOT, server};
+pub use server::{
+    METRICS_SERVER_SLOT, MetricsServerConfig, MetricsServerConfigError, server, server_with_config,
+};
 
 #[cfg(feature = "state")]
 mod state;
@@ -126,4 +127,4 @@ mod state;
 #[cfg_attr(docsrs, doc(cfg(feature = "state")))]
 pub use state::PrometheusCoreStateCollector;
 
-pub use prometheus::Registry;
+pub use prometheus::{Error, Registry};

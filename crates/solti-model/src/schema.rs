@@ -261,6 +261,7 @@ pub(crate) fn task_run(generator: &mut schemars::SchemaGenerator) -> Schema {
     let workload = generator.subschema_for::<crate::WorkloadTypeMeta>();
     let started_at = rfc3339_time(generator);
     let finished_at = optional_rfc3339_time(generator);
+    let diagnostic = task_diagnostic(generator);
     json_schema!({
         "type": "object",
         "additionalProperties": false,
@@ -290,7 +291,7 @@ pub(crate) fn task_run(generator: &mut schemars::SchemaGenerator) -> Schema {
             },
             "startedAt": started_at,
             "finishedAt": finished_at,
-            "error": { "type": ["string", "null"] },
+            "error": diagnostic,
             "exitCode": {
                 "type": ["integer", "null"],
                 "format": "int32"
@@ -329,6 +330,7 @@ pub(crate) fn task_run(generator: &mut schemars::SchemaGenerator) -> Schema {
 
 pub(crate) fn task_status(generator: &mut schemars::SchemaGenerator) -> Schema {
     let conditions = generator.subschema_for::<Vec<crate::TaskCondition>>();
+    let diagnostic = task_diagnostic(generator);
     json_schema!({
         "type": "object",
         "additionalProperties": false,
@@ -360,11 +362,33 @@ pub(crate) fn task_status(generator: &mut schemars::SchemaGenerator) -> Schema {
                 "type": ["integer", "null"],
                 "format": "int32"
             },
-            "error": { "type": ["string", "null"] },
+            "error": diagnostic,
             "conditions": {
                 "allOf": [
                     conditions,
-                    { "minItems": 1 }
+                    { "minItems": 1 },
+                    {
+                        "contains": {
+                            "type": "object",
+                            "required": ["type"],
+                            "properties": {
+                                "type": { "const": "Reconciled" }
+                            }
+                        },
+                        "minContains": 1,
+                        "maxContains": 1
+                    },
+                    {
+                        "contains": {
+                            "type": "object",
+                            "required": ["type", "observedGeneration"],
+                            "properties": {
+                                "type": { "const": "Reconciled" },
+                                "observedGeneration": { "minimum": 1 }
+                            }
+                        },
+                        "minContains": 1
+                    }
                 ]
             }
         },
@@ -382,7 +406,18 @@ pub(crate) fn task_status(generator: &mut schemars::SchemaGenerator) -> Schema {
                     "phase": { "const": "running" },
                     "attempt": { "minimum": 1 },
                     "exitCode": { "type": "null" },
-                    "error": { "type": "null" }
+                    "error": { "type": "null" },
+                    "conditions": {
+                        "contains": {
+                            "type": "object",
+                            "required": ["type", "status"],
+                            "properties": {
+                                "type": { "const": "Reconciled" },
+                                "status": { "const": "True" }
+                            }
+                        },
+                        "minContains": 1
+                    }
                 }
             },
             {
@@ -395,10 +430,29 @@ pub(crate) fn task_status(generator: &mut schemars::SchemaGenerator) -> Schema {
                             "canceled",
                             "exhausted"
                         ]
+                    },
+                    "conditions": {
+                        "contains": {
+                            "type": "object",
+                            "required": ["type", "status"],
+                            "properties": {
+                                "type": { "const": "Reconciled" },
+                                "status": { "const": "True" }
+                            }
+                        },
+                        "minContains": 1
                     }
                 }
             }
         ]
+    })
+}
+
+fn task_diagnostic(_generator: &mut schemars::SchemaGenerator) -> Schema {
+    json_schema!({
+        "type": ["string", "null"],
+        "maxLength": crate::MAX_TASK_DIAGNOSTIC_BYTES,
+        "description": "Runtime values are normalized to the longest UTF-8-safe prefix of at most 32768 bytes. JSON Schema maxLength is the corresponding Unicode code-point ceiling, not a byte measurement."
     })
 }
 
@@ -443,7 +497,7 @@ mod tests {
     use crate::{
         AgentCapabilities, Annotations, ContainerSpec, EmbeddedSpec, ExtensionWorkload, Flag,
         Labels, RunnerCapability, SelectorRequirement, SubprocessMode, SubprocessSpec,
-        TaskConditionType, TaskEnv, TaskManifest, TaskRun, TaskSpec, TaskWorkload,
+        TaskConditionType, TaskEnv, TaskManifest, TaskRun, TaskSpec, TaskStatus, TaskWorkload,
         WORKLOAD_API_VERSION, WasmSpec, WorkloadTypeMeta,
     };
 
@@ -513,6 +567,30 @@ mod tests {
     }
 
     #[test]
+    fn task_manifest_schema_accepts_unicode_wire_paths() {
+        let workloads = [
+            TaskWorkload::Subprocess(SubprocessSpec::new(
+                SubprocessMode::Command {
+                    command: "echo".into(),
+                    args: Vec::new(),
+                },
+                TaskEnv::default(),
+                Some(PathBuf::from("/工作/δ")),
+                Flag::enabled(),
+            )),
+            TaskWorkload::Wasm(WasmSpec::new(
+                PathBuf::from("/модули/报告.wasm"),
+                Vec::new(),
+                TaskEnv::default(),
+            )),
+        ];
+
+        for workload in workloads {
+            assert_valid(&manifest(workload));
+        }
+    }
+
+    #[test]
     fn selector_schema_matches_operator_and_value_rules() {
         let schema = validator::<SelectorRequirement>();
         for valid in [
@@ -553,6 +631,115 @@ mod tests {
         ] {
             assert!(!schema.is_valid(&invalid), "expected invalid: {invalid}");
         }
+    }
+
+    #[test]
+    fn task_status_schema_enforces_reconciled_lifecycle_shape() {
+        let schema = validator::<TaskStatus>();
+        let pending = serde_json::to_value(TaskStatus::pending(1).unwrap()).unwrap();
+        assert!(schema.is_valid(&pending));
+
+        let reconciled = pending["conditions"][0].clone();
+        let mut extension = reconciled.clone();
+        extension["type"] = json!("example.io/Available");
+        extension["status"] = json!("False");
+
+        let mut extended = pending.clone();
+        extended["conditions"] = json!([reconciled.clone(), extension.clone()]);
+        assert!(schema.is_valid(&extended));
+
+        let mut duplicate = reconciled.clone();
+        duplicate["reason"] = json!("Duplicate");
+        duplicate["message"] = json!("duplicate condition");
+
+        let mut zero_generation = reconciled.clone();
+        zero_generation["observedGeneration"] = json!(0);
+
+        let mut running_unknown = pending.clone();
+        running_unknown["phase"] = json!("running");
+        running_unknown["attempt"] = json!(1);
+
+        let mut terminal_false = pending.clone();
+        terminal_false["phase"] = json!("failed");
+        terminal_false["conditions"][0]["status"] = json!("False");
+
+        for invalid in [
+            with_fields(&pending, &[("conditions", json!([extension]))], &[]),
+            with_fields(
+                &pending,
+                &[("conditions", json!([reconciled.clone(), duplicate]))],
+                &[],
+            ),
+            with_fields(&pending, &[("conditions", json!([zero_generation]))], &[]),
+            running_unknown,
+            terminal_false,
+        ] {
+            assert!(!schema.is_valid(&invalid), "expected invalid: {invalid}");
+        }
+
+        let mut task = crate::Task::from_manifest(manifest(TaskWorkload::Embedded(
+            EmbeddedSpec::new("test-v1").unwrap(),
+        )))
+        .unwrap();
+        task.transition_starting(1, 1, "1").unwrap();
+        assert!(schema.is_valid(&serde_json::to_value(task.status()).unwrap()));
+        task.transition_finished(1, 1, crate::TaskPhase::Succeeded, None, Some(0), "2")
+            .unwrap();
+        assert!(schema.is_valid(&serde_json::to_value(task.status()).unwrap()));
+    }
+
+    #[test]
+    fn task_diagnostic_schemas_expose_the_code_point_ceiling() {
+        let exact = "a".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES);
+        let oversized = "a".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES + 1);
+        let multibyte_over_byte_budget = "🙂".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES / 4 + 1);
+
+        let workload = WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").unwrap();
+        let mut run = TaskRun::starting(1, 1, workload).unwrap();
+        run.finish(crate::TaskPhase::Failed, Some("failure".into()), None)
+            .unwrap();
+        let run = serde_json::to_value(run).unwrap();
+        let run_schema = validator::<TaskRun>();
+        assert!(run_schema.is_valid(&with_fields(&run, &[("error", json!(exact))], &[],)));
+        assert!(!run_schema.is_valid(&with_fields(&run, &[("error", json!(oversized))], &[],)));
+        assert!(run_schema.is_valid(&with_fields(
+            &run,
+            &[("error", json!(multibyte_over_byte_budget.clone()))],
+            &[],
+        )));
+
+        let mut task = crate::Task::from_manifest(manifest(TaskWorkload::Embedded(
+            EmbeddedSpec::new("test-v1").unwrap(),
+        )))
+        .unwrap();
+        task.reconcile_finished(
+            1,
+            crate::TaskPhase::Failed,
+            Some("failure".into()),
+            None,
+            "1",
+        )
+        .unwrap();
+        let status = serde_json::to_value(task.status()).unwrap();
+        let status_schema = validator::<TaskStatus>();
+        assert!(status_schema.is_valid(&with_fields(
+            &status,
+            &[("error", json!("a".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES)),)],
+            &[],
+        )));
+        assert!(!status_schema.is_valid(&with_fields(
+            &status,
+            &[(
+                "error",
+                json!("a".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES + 1)),
+            )],
+            &[],
+        )));
+        assert!(status_schema.is_valid(&with_fields(
+            &status,
+            &[("error", json!(multibyte_over_byte_budget))],
+            &[],
+        )));
     }
 
     #[test]

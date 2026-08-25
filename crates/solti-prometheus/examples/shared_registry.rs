@@ -24,9 +24,7 @@ solti-prometheus: shared registry
 
   application
       ├──► Registry::new()
-      │
       └── constant build labels ──► register_build_info()
-                                              │
                                               ▼
                                       shared Registry
                                               │ gather()

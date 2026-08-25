@@ -112,6 +112,41 @@ fn built_in_workload_variants_roundtrip() {
 }
 
 #[test]
+fn wire_paths_preserve_unicode_exactly_in_json() {
+    let cwd = std::path::PathBuf::from("/工作/δ");
+    let subprocess = TaskWorkload::Subprocess(SubprocessSpec::new(
+        SubprocessMode::Command {
+            command: "echo".into(),
+            args: Vec::new(),
+        },
+        TaskEnv::default(),
+        Some(cwd.clone()),
+        Flag::enabled(),
+    ));
+    let json = serde_json::to_value(&subprocess).unwrap();
+    assert_eq!(json["spec"]["cwd"], "/工作/δ");
+    let decoded: TaskWorkload = serde_json::from_value(json).unwrap();
+    assert!(matches!(
+        decoded,
+        TaskWorkload::Subprocess(SubprocessSpec { cwd: Some(actual), .. }) if actual == cwd
+    ));
+
+    let module = std::path::PathBuf::from("/модули/报告.wasm");
+    let wasm = TaskWorkload::Wasm(WasmSpec::new(
+        module.clone(),
+        Vec::new(),
+        TaskEnv::default(),
+    ));
+    let json = serde_json::to_value(&wasm).unwrap();
+    assert_eq!(json["spec"]["module"], "/модули/报告.wasm");
+    let decoded: TaskWorkload = serde_json::from_value(json).unwrap();
+    assert!(matches!(
+        decoded,
+        TaskWorkload::Wasm(WasmSpec { module: actual, .. }) if actual == module
+    ));
+}
+
+#[test]
 fn roundtrip_embedded_bypasses_submit_validation() {
     let spec = TaskSpec::builder("internal-sync", embedded("test-v1"), 1_000u64)
         .build()

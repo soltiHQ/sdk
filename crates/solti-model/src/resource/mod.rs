@@ -28,12 +28,12 @@ mod preconditions;
 pub use preconditions::WritePreconditions;
 
 mod status;
-pub use status::TaskStatus;
+pub use status::{MAX_TASK_DIAGNOSTIC_BYTES, TaskStatus};
 
 mod task;
 pub use task::{
-    DesiredChange, TASK_API_VERSION, TASK_API_VERSION_MAJOR, TASK_KIND, Task, TaskManifest,
-    TaskManifestMeta, TypeMeta,
+    DesiredChange, MAX_TASK_MANIFEST_BYTES, TASK_API_VERSION, TASK_API_VERSION_MAJOR, TASK_KIND,
+    Task, TaskManifest, TaskManifestMeta, TypeMeta,
 };
 
 mod run;

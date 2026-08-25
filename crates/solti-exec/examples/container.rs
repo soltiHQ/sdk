@@ -23,8 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use solti_exec::container::containerd::{ContainerNetwork, ContainerdConfig, ContainerdEngine};
 use solti_exec::container::{
-    ContainerEngine, ContainerProcessPolicy, ContainerRunnerConfig,
-    register_container_runner_with_config,
+    ContainerProcessPolicy, ContainerRunnerConfig, register_container_runner_with_config,
 };
 use solti_exec::isolation::SeccompPolicy;
 use solti_model::{ContainerSpec, OutputEvent, Task, TaskEnv, TaskId, TaskSpec, TaskWorkload};
@@ -148,8 +147,12 @@ async fn main() -> ExampleResult {
     let output = Arc::new(RecordingOutput::default());
     let output_handle: OutputPublisherHandle = output.clone();
     let mut router = RunnerRouter::new().with_output_publisher(output_handle);
-    let engine_handle: Arc<dyn ContainerEngine> = engine;
-    register_container_runner_with_config(&mut router, "containerd", engine_handle, runner_config)?;
+    register_container_runner_with_config(
+        &mut router,
+        "containerd",
+        engine.clone(),
+        runner_config,
+    )?;
 
     let mut env = TaskEnv::new();
     env.push("EXAMPLE_MESSAGE", "hello from solti container");
@@ -164,13 +167,15 @@ printf 'diagnostic=container-stderr\n' >&2"#;
     let spec = TaskSpec::builder("containers", workload, 120_000_u64).build()?;
     let task = Task::new("native-container", spec)?;
 
-    let task_ref = router.build(&task)?;
+    let built = router.build(&task).await?;
     println!(
         "[build] Built {}; no image or container operation occurred during build.",
-        task_ref.name(),
+        built.name(),
     );
-    task_ref.spawn(TaskContext::detached()).await?;
+    built.task().spawn(TaskContext::detached()).await?;
     println!("[attempt] Container exited with code 0 and owned resources were cleaned.");
+    engine.shutdown().await?;
+    println!("[shutdown] Cleanup admission closed and the cleanup worker stopped.");
 
     let events = output
         .events

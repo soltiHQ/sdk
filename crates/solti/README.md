@@ -26,7 +26,9 @@ solti = { version = "0.0.4", features = [
 ] }
 ```
 
-The `model` feature includes JSON Schema support from `solti-model`.
+The `model` feature exposes runtime model types without JSON Schema dependencies.
+Enable `model-schema` when the application generates schemas for those types.
+The `chain-schema` feature adds schemas for Chain and its nested model types.
 
 The `chain` feature exposes `solti::chain`. A Chain is one Task whose nested
 workloads run sequentially, with exactly one active step. The outer Task owns
@@ -36,6 +38,11 @@ Task lifecycles or per-step policies.
 `exec-container` exposes the engine-neutral container runner.
 `exec-containerd` adds the native containerd 2.x engine.
 It does not add CRI or container network provisioning.
+
+`discover-http` and `discover-grpc` select an outbound transport.
+Use `discover-http-tls` or `discover-grpc-tls` when that transport needs custom
+TLS support.
+`discover-tls` remains available as a transport-neutral extension feature.
 
 `full` enables every production component integration. Direct dependencies on
 component crates remain supported.

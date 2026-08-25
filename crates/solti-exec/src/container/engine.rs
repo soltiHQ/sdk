@@ -1,6 +1,6 @@
 //! Container engine boundary.
 
-use std::{error::Error, fmt, pin::Pin};
+use std::{error::Error, fmt, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use tokio::io::AsyncRead;
@@ -137,7 +137,7 @@ impl ContainerEngineInfo {
 }
 
 /// Immutable task data passed to a container engine for one attempt.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ContainerRequest {
     pub(super) attempt_id: String,
     pub(super) task_name: solti_model::TaskId,
@@ -148,6 +148,29 @@ pub struct ContainerRequest {
     pub(super) args: Vec<String>,
     pub(super) env: std::collections::BTreeMap<String, String>,
     pub(super) process_policy: super::ContainerProcessPolicy,
+}
+
+impl fmt::Debug for ContainerRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContainerRequest")
+            .field("attempt_id", &self.attempt_id)
+            .field("task_name", &self.task_name)
+            .field("generation", &self.generation)
+            .field("attempt", &self.attempt)
+            .field("image", &"<redacted>")
+            .field(
+                "command_len",
+                &self.command.as_ref().map(std::vec::Vec::len),
+            )
+            .field("args_len", &self.args.len())
+            .field("env_len", &self.env.len())
+            .field(
+                "process_policy_configured",
+                &!self.process_policy.is_empty(),
+            )
+            .finish()
+    }
 }
 
 impl ContainerRequest {
@@ -235,9 +258,19 @@ impl ContainerExitStatus {
 /// Cleanup may be repeated after a retryable error.
 /// Completed cleanup steps must remain completed across calls.
 ///
-/// Method futures execute inside the Taskvisor-owned attempt future and may be dropped when that attempt times out or is force-aborted.
-/// Implementations must not detach mutating lifecycle work from these futures.
-/// Cooperative cancellation runs `terminate` and `cleanup`, but a force-drop can interrupt either operation before remote cleanup completes.
+/// Method futures execute inside the Taskvisor-owned attempt future.
+/// An attempt timeout drops them. A Taskvisor force-abort requests actor abort;
+/// physical drop follows after any synchronous poll returns control to Tokio.
+/// Forward lifecycle work must remain owned by its method future.
+/// The runner does not spawn or retain these method futures after a force-drop.
+/// Cooperative cancellation runs `terminate` and `cleanup`.
+/// A force-drop may interrupt either operation before remote cleanup completes.
+///
+/// The engine provider declares drop ownership through [`ContainerEngineBinding`].
+/// That declaration covers both in-flight method futures and the attempt value.
+/// The runner ensures the attempt value is dropped when Taskvisor physically
+/// releases the attempt future. It cannot verify what the engine implementation
+/// does during that drop.
 #[async_trait]
 pub trait ContainerAttempt: Send + 'static {
     /// Takes the captured stdout stream.
@@ -263,6 +296,7 @@ pub trait ContainerAttempt: Send + 'static {
 ///
 /// Implementations own engine-specific setup and attempt resources.
 /// They do not own the engine daemon or foreign resources.
+/// Register an implementation through [`ContainerEngineBinding`].
 #[async_trait]
 pub trait ContainerEngine: Send + Sync + 'static {
     /// Checks endpoint availability and compatibility.
@@ -274,10 +308,145 @@ pub trait ContainerEngine: Send + Sync + 'static {
     /// Resolves the image and creates one stopped attempt.
     ///
     /// A returned attempt must have exit observation armed before `start`.
-    /// On failure, the engine must attempt to remove every confirmed owned resource.
-    /// It must report incomplete or unconfirmed rollback as an error.
+    /// On failure, the engine must attempt to remove every confirmed attempt-owned
+    /// resource. It must report incomplete or unconfirmed rollback as an error.
+    ///
+    /// This future may be dropped before it returns.
+    /// From its first poll it must follow the ownership contract declared by the
+    /// [`ContainerEngineBinding`] used to register the engine.
     async fn create_attempt(
         &self,
         request: ContainerRequest,
     ) -> Result<Box<dyn ContainerAttempt>, ContainerEngineError>;
+}
+
+/// A pre-admitted finalizer engine with an awaitable terminal shutdown.
+///
+/// Implementations must reserve bounded finalizer admission before the first
+/// attempt-owned mutation, retain dropped lifecycle ownership, and make
+/// [`shutdown`](Self::shutdown) wait for all accepted ownership. The trait makes
+/// the required shutdown capability available to the application. It cannot
+/// prove the implementation's ownership behavior.
+#[async_trait]
+pub trait ContainerEngineFinalizer: ContainerEngine {
+    /// Closes lifecycle admission and waits for accepted ownership.
+    ///
+    /// The call must be terminal and safe to retry after caller cancellation.
+    async fn shutdown(&self) -> Result<(), ContainerEngineError>;
+}
+
+/// Retained shutdown capability for a typed pre-admitted finalizer binding.
+#[derive(Clone)]
+#[must_use = "retain this handle and call shutdown after every engine user has stopped"]
+pub struct ContainerEngineShutdownHandle {
+    engine: Arc<dyn ContainerEngineFinalizer>,
+}
+
+impl ContainerEngineShutdownHandle {
+    /// Closes lifecycle admission and waits for accepted ownership.
+    pub async fn shutdown(&self) -> Result<(), ContainerEngineError> {
+        self.engine.shutdown().await
+    }
+}
+
+impl fmt::Debug for ContainerEngineShutdownHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContainerEngineShutdownHandle")
+            .field("engine", &"<engine>")
+            .finish()
+    }
+}
+
+/// Declared ownership behavior when a container lifecycle future is dropped.
+///
+/// This value is an integration-time declaration by the engine provider.
+/// [`ContainerRunner`](super::ContainerRunner) cannot inspect an engine implementation
+/// or prove that the declaration is true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ContainerOwnershipContract {
+    /// Dropping lifecycle state releases all accepted ownership synchronously.
+    ///
+    /// Dropping `create_attempt` or the returned attempt must cancel its forward work.
+    /// No owned engine resource or lifecycle task may remain after the drop completes.
+    DropReleases,
+    /// Dropping lifecycle state transfers ownership to a pre-admitted bounded finalizer.
+    ///
+    /// Finalizer admission must be reserved before the first attempt-owned resource
+    /// acquisition or attempt-owned remote mutation. Dropping `create_attempt` or the
+    /// returned attempt must transfer confirmed and uncertain attempt ownership without
+    /// creating unbounded work.
+    /// The engine must define finalizer failure behavior and awaitable shutdown.
+    PreAdmittedFinalizer,
+}
+
+/// Engine plus its explicit dropped-lifecycle ownership declaration.
+///
+/// Custom engines must select one constructor deliberately.
+/// The binding records the declaration but does not verify engine behavior.
+#[derive(Clone)]
+pub struct ContainerEngineBinding {
+    engine: Arc<dyn ContainerEngine>,
+    ownership: ContainerOwnershipContract,
+}
+
+impl ContainerEngineBinding {
+    /// Declares that dropping engine lifecycle state releases all ownership synchronously.
+    pub fn drop_releases(engine: Arc<dyn ContainerEngine>) -> Self {
+        Self {
+            engine,
+            ownership: ContainerOwnershipContract::DropReleases,
+        }
+    }
+
+    /// Declares that dropped lifecycle state uses a pre-admitted bounded finalizer.
+    ///
+    /// The application must retain any concrete engine handle needed to await that
+    /// engine's shutdown after every supervisor using it has stopped.
+    pub fn pre_admitted_finalizer(engine: Arc<dyn ContainerEngine>) -> Self {
+        Self {
+            engine,
+            ownership: ContainerOwnershipContract::PreAdmittedFinalizer,
+        }
+    }
+
+    /// Creates a pre-admitted binding and its typed shutdown capability.
+    ///
+    /// Prefer this constructor for custom finalizer engines. Retain the second
+    /// returned value and call [`ContainerEngineShutdownHandle::shutdown`] after
+    /// every supervisor and task reference using the binding has stopped.
+    pub fn pre_admitted_finalizer_with_shutdown<E>(
+        engine: Arc<E>,
+    ) -> (Self, ContainerEngineShutdownHandle)
+    where
+        E: ContainerEngineFinalizer,
+    {
+        let finalizer: Arc<dyn ContainerEngineFinalizer> = engine;
+        let bound_engine: Arc<dyn ContainerEngine> = finalizer.clone();
+        (
+            Self::pre_admitted_finalizer(bound_engine),
+            ContainerEngineShutdownHandle { engine: finalizer },
+        )
+    }
+
+    /// Returns the declared ownership behavior.
+    pub const fn ownership_contract(&self) -> ContainerOwnershipContract {
+        self.ownership
+    }
+
+    /// Splits the binding for runner construction.
+    pub(super) fn into_parts(self) -> (Arc<dyn ContainerEngine>, ContainerOwnershipContract) {
+        (self.engine, self.ownership)
+    }
+}
+
+impl fmt::Debug for ContainerEngineBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContainerEngineBinding")
+            .field("engine", &"<engine>")
+            .field("ownership", &self.ownership)
+            .finish()
+    }
 }

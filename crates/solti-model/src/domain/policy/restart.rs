@@ -29,7 +29,7 @@ use crate::error::{ModelError, ModelResult};
 ///
 /// let _ = (retry_errors, service, periodic);
 /// ```
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Clone, Copy, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
@@ -44,7 +44,7 @@ pub enum RestartPolicy {
     Always {
         /// Delay between attempts in milliseconds.
         ///
-        /// `None` and `Some(0)` request an immediate restart.
+        /// `None` and `Some(0)` request an immediate restart and compare equal.
         #[serde(skip_serializing_if = "Option::is_none")]
         interval_ms: Option<u64>,
     },
@@ -80,11 +80,29 @@ impl RestartPolicy {
     /// );
     /// ```
     pub const fn periodic(interval_ms: u64) -> Self {
-        RestartPolicy::Always {
-            interval_ms: Some(interval_ms),
+        if interval_ms == 0 {
+            Self::always()
+        } else {
+            RestartPolicy::Always {
+                interval_ms: Some(interval_ms),
+            }
         }
     }
 }
+
+impl PartialEq for RestartPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Never, Self::Never) | (Self::OnFailure, Self::OnFailure) => true,
+            (Self::Always { interval_ms: left }, Self::Always { interval_ms: right }) => {
+                left.filter(|value| *value > 0) == right.filter(|value| *value > 0)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for RestartPolicy {}
 
 impl FromStr for RestartPolicy {
     type Err = ModelError;
@@ -114,7 +132,7 @@ impl FromStr for RestartPolicy {
                             original
                         ))
                     })?;
-                    Some(v)
+                    (v > 0).then_some(v)
                 }
             };
             Ok(RestartPolicy::Always { interval_ms })
@@ -169,5 +187,19 @@ mod tests {
                 Err(ModelError::UnknownRestart(_))
             ));
         }
+    }
+
+    #[test]
+    fn zero_interval_is_canonical_immediate_restart() {
+        let explicit_zero = RestartPolicy::Always {
+            interval_ms: Some(0),
+        };
+
+        assert_eq!(RestartPolicy::periodic(0), RestartPolicy::always());
+        assert_eq!(explicit_zero, RestartPolicy::always());
+        assert_eq!(
+            RestartPolicy::from_str("always:0").unwrap(),
+            RestartPolicy::always()
+        );
     }
 }

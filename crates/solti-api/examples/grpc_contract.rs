@@ -30,8 +30,8 @@ use solti_api::{
 };
 use solti_model::{
     ExtensionWorkload, OutputChunk, OutputEvent, StreamKind, Task, TaskFilter, TaskId,
-    TaskManifest, TaskPage, TaskQuery, TaskRun, TaskSpec, TaskWatchEvent, TaskWorkload, Token,
-    WritePreconditions,
+    TaskManifest, TaskPage, TaskQuery, TaskRunPage, TaskRunQuery, TaskSpec, TaskWatchEvent,
+    TaskWorkload, Token, WritePreconditions,
 };
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -112,12 +112,37 @@ impl ApiHandler for SnapshotHandler {
         Ok(Box::pin(tokio_stream::iter(events)))
     }
 
-    async fn list_task_runs(&self, id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
-        if id == self.task.name() {
-            Ok(Vec::new())
-        } else {
-            Err(ApiError::TaskNotFound(id.to_string()))
+    async fn query_task_runs(
+        &self,
+        id: &TaskId,
+        query: TaskRunQuery,
+    ) -> Result<TaskRunPage, ApiError> {
+        if id != self.task.name() {
+            return Err(ApiError::TaskNotFound(id.to_string()));
         }
+        if query.continuation().is_some() {
+            return Err(ApiError::MethodNotAllowed(
+                "the teaching backend has one fixed run snapshot".into(),
+            ));
+        }
+        Ok(TaskRunPage {
+            items: Vec::new(),
+            task: id.clone(),
+            task_uid: self.task.metadata().uid().clone(),
+            resource_version: "runs-snapshot:1".into(),
+            continuation: None,
+            remaining_item_count: 0,
+        })
+    }
+
+    async fn cancel_task(
+        &self,
+        _id: &TaskId,
+        _preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::MethodNotAllowed(
+            "the teaching backend is read-only".into(),
+        ))
     }
 
     async fn delete_task(
@@ -130,8 +155,12 @@ impl ApiHandler for SnapshotHandler {
         ))
     }
 
-    async fn stream_task_logs(&self, id: &TaskId) -> Result<OutputEventStream, ApiError> {
-        if id != self.task.name() {
+    async fn stream_task_logs(
+        &self,
+        id: &TaskId,
+        task_uid: &solti_model::Uid,
+    ) -> Result<OutputEventStream, ApiError> {
+        if id != self.task.name() || task_uid != self.task.uid() {
             return Err(ApiError::TaskNotFound(id.to_string()));
         }
         let events = vec![
@@ -147,6 +176,7 @@ impl ApiHandler for SnapshotHandler {
                 seq: 0,
                 ts: UNIX_EPOCH + Duration::from_millis(1_100),
                 line: Bytes::from_static(b"resized cover.png"),
+                truncated: false,
             }),
             OutputEvent::RunFinished {
                 generation: 1,
@@ -259,6 +289,7 @@ async fn main() -> ExampleResult {
     let mut logs = client
         .stream_task_logs(authenticated(StreamTaskLogsRequest {
             name: "resize-cover".into(),
+            task_uid: metadata.uid.clone(),
         })?)
         .await?
         .into_inner();

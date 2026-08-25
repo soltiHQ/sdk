@@ -35,7 +35,7 @@ The application owns listener addresses, startup, and shutdown.
 
 ## What it does
 
-- exposes create, apply, get, list, watch, run history, delete, and live output;
+- exposes create, apply, get, list, watch, run history, cancellation, delete, and live output;
 - keeps HTTP and gRPC on one handler contract;
 - validates request fields before handler calls;
 - maps domain errors to Kubernetes-style HTTP `Status` resources and gRPC status codes;
@@ -55,6 +55,13 @@ The application owns listener addresses, startup, and shutdown.
 OpenAPI defines HTTP routes and CRD JSON shapes.
 Protobuf defines gRPC services and DTOs.
 `CONTRACT.md` defines behavior shared by both transports.
+
+The authoritative protobuf tree lives in
+[`soltiHQ/proto`](https://github.com/soltiHQ/proto).
+Release and CI tooling vendor a pinned revision into `proto/`.
+The crate build script generates Rust bindings from that vendored contract into
+Cargo's `OUT_DIR`. Generated bindings are build artifacts and are never committed.
+The build uses a vendored `protoc` binary and does not require a system installation.
 
 `HttpApi::build` generates a standalone OpenAPI 3.1 document.
 It uses JSON Schema draft 2020-12.
@@ -132,6 +139,8 @@ The in-process model keeps it.
 HTTP reads and writes the model-owned CRD JSON representation.
 gRPC reads and writes versioned protobuf DTOs.
 Both are converted to the same domain values before `ApiHandler` is called.
+`Subprocess.cwd` and `Wasm.module` carry exact UTF-8 text in both transports.
+Invalid native `PathBuf` values are rejected instead of converted lossily.
 
 ## Features
 
@@ -157,7 +166,7 @@ HTTP request ── parse CRD JSON ──┐
 gRPC call ── convert v1 DTO ─────┘
 ```
 
-`ApiHandler` has eight operations:
+`ApiHandler` has nine operations:
 
 | Operation          | Input                                             | Output                    |
 |--------------------|---------------------------------------------------|---------------------------|
@@ -166,9 +175,10 @@ gRPC call ── convert v1 DTO ─────┘
 | `get_task`         | `TaskId`                                          | Optional `Task`           |
 | `query_tasks`      | `TaskQuery`                                       | `TaskPage<Task>`          |
 | `watch_tasks`      | `TaskFilter`, optional resource version           | Task watch stream         |
-| `list_task_runs`   | `TaskId`                                          | Oldest-first task runs    |
+| `query_task_runs`  | `TaskId`, `TaskRunQuery`                          | `TaskRunPage`             |
+| `cancel_task`      | `TaskId`, `WritePreconditions`                    | Empty success             |
 | `delete_task`      | `TaskId`, `WritePreconditions`                    | Empty success             |
-| `stream_task_logs` | `TaskId`                                          | Live `OutputEvent` stream |
+| `stream_task_logs` | `TaskId`, exact Task UID                          | UID-pinned live stream    |
 
 Implement the trait directly when the application has another backend.
 Transport validation and public workload visibility still apply.
@@ -185,8 +195,9 @@ The current API root is `/apis/solti.io/v1`.
 | `GET`    | `/apis/solti.io/v1/tasks`                     | List tasks                              |
 | `GET`    | `/apis/solti.io/v1/tasks?watch=true`          | Watch task resources                    |
 | `GET`    | `/apis/solti.io/v1/tasks/{name}/runs`         | List run history                        |
-| `GET`    | `/apis/solti.io/v1/tasks/{name}/logs`         | Stream live output with SSE             |
-| `DELETE` | `/apis/solti.io/v1/tasks/{name}`              | Stop and remove a task; `204`           |
+| `POST`   | `/apis/solti.io/v1/tasks/{name}/cancel`       | Request a terminal logical outcome while retaining desired state and history; `204` |
+| `GET`    | `/apis/solti.io/v1/tasks/{name}/logs?taskUid={uid}` | Stream UID-pinned live output with SSE |
+| `DELETE` | `/apis/solti.io/v1/tasks/{name}`              | Request logical cancellation and remove retained state; `204` |
 
 List one filtered page:
 
@@ -210,6 +221,24 @@ The response is a Kubernetes-shaped collection:
 ```
 
 `continue` and `remainingItemCount` are omitted on the final page.
+`limit` is a count ceiling.
+The bundled adapter first limits compact-JSON Task item payloads to 4 MiB.
+It passes an oversized first Task through alone for native measurement.
+Each HTTP TaskList body is also limited to 4 MiB of compact JSON.
+The response contains the largest complete prefix from that domain page that
+fits the HTTP limit.
+One Task that cannot fit returns HTTP `429` with `reason=TooManyRequests`.
+
+Run history uses the same count defaults and a separate stable snapshot:
+
+```text
+GET /apis/solti.io/v1/tasks/{name}/runs?limit=100&continue={opaque-token}
+```
+
+The response keeps the `runs` array and adds collection `metadata`.
+`metadata.taskUid` identifies the exact Task incarnation captured by the run snapshot.
+Runs are ordered by generation and attempt.
+Each compact-JSON response is limited to 4 MiB at complete-run boundaries.
 
 ## HTTP query parameters
 
@@ -218,12 +247,13 @@ The response is a Kubernetes-shaped collection:
 | `slot`                    | Match one slot                                       |
 | `phase`                   | Match any supplied phase; may be repeated            |
 | `labelSelector`           | Match a Kubernetes-style label selector              |
-| `limit`                   | Page size; default `100`, maximum `1000`             |
-| `continue`                | Resume an existing list snapshot                     |
+| `limit`                   | Task or TaskRun page size; default `100`, maximum `1000` |
+| `continue`                | Resume the matching Task or TaskRun snapshot         |
 | `watch`                   | Select watch mode with `true` or `1`                 |
 | `resourceVersion` (read)  | Start a watch at an opaque collection version        |
-| `uid`                     | Apply or delete precondition                         |
-| `resourceVersion` (write) | Apply or delete version precondition on write routes |
+| `uid`                     | Apply, cancel, or delete precondition                 |
+| `resourceVersion` (write) | Apply, cancel, or delete version precondition         |
+| `taskUid`                 | Required Task UID for a live-output stream            |
 
 Filters are combined with AND.
 Repeated `phase` values are combined with OR.
@@ -232,7 +262,8 @@ Singleton parameters cannot be repeated.
 
 `limit` and `continue` are not accepted in watch mode.
 Read `resourceVersion` is accepted only in watch mode.
-Write `resourceVersion` is accepted only by apply and delete routes.
+Write `resourceVersion` is accepted only by apply, cancel, and delete routes.
+`taskUid` is accepted only by the live-output route.
 
 ## gRPC
 
@@ -246,7 +277,8 @@ Generated public types are available under `solti_api::grpc::wire`.
 | `GetTask`        | Unary            | Get                 |
 | `ListTasks`      | Unary            | List                |
 | `WatchTasks`     | Server streaming | Watch               |
-| `ListTaskRuns`   | Unary            | Run history         |
+| `ListTaskRuns`   | Unary            | Paginated run history |
+| `CancelTask`     | Unary            | Cancel              |
 | `DeleteTask`     | Unary            | Delete              |
 | `StreamTaskLogs` | Server streaming | Live output         |
 
@@ -276,13 +308,15 @@ async fn list_running() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Every encoded and decoded gRPC message is limited to `MAX_REQUEST_BYTES`.
+`ListTasks` and `ListTaskRuns` proactively keep their protobuf responses within that limit.
+One Task or TaskRun that cannot fit returns gRPC `ResourceExhausted`.
 
-## Create and apply
+## Create, apply, cancel, and delete
 
 Create requires a new `metadata.name`.
 Apply is an unconditional upsert when no precondition is supplied.
 
-Apply and delete support two optional preconditions:
+Apply, cancel, and delete support two optional preconditions:
 
 - `uid` checks resource identity;
 - `resourceVersion` checks the current stored version.
@@ -295,9 +329,24 @@ With `SupervisorApiAdapter`, a successful create or apply commits desired state 
 Runtime reconciliation continues in `solti-core`.
 Read `status.conditions[type=Reconciled]` to observe the result for that generation.
 
+The adapter uses core retained Task admission.
+The default limits are 1024 current Tasks and 256 MiB of aggregate retained
+TaskManifest bytes. The byte budget measures only compact canonical
+`TaskManifest` JSON and is independent of the current Task count.
+
+A new name or unchecked missing apply is rejected atomically when either limit
+would be exceeded. Applying an existing Task remains allowed by the count
+limit. A positive-growth apply is rejected when it would exceed the byte
+budget. A shrinking or no-op apply remains allowed. Admission does not evict
+Tasks.
+
+Admission rejection returns HTTP `429` with
+`Status.reason=TooManyRequests`, or gRPC `ResourceExhausted`. The HTTP response
+has no `Retry-After` header.
+
 ## Pagination and watches
 
-Lists use snapshot-consistent continuation pagination.
+Task lists use snapshot-consistent continuation pagination.
 
 1. Send filters and `limit` without a continuation.
 2. Read the returned opaque continuation token.
@@ -305,12 +354,21 @@ Lists use snapshot-consistent continuation pagination.
 4. Continue until no token is returned.
 
 Every page keeps the first page's resource version.
+The count limit is a ceiling. The 4 MiB native response limit can produce a smaller page.
 Changing filters while using a continuation is rejected.
 An expired snapshot returns HTTP `410 Gone` or gRPC `OutOfRange`.
 
 With `SupervisorApiAdapter`, an absent watch resource version or `"0"` emits current matching tasks as `Added`.
 The stream then emits live changes.
 A specific version replays later retained changes before live delivery.
+
+The bundled core admits 256 concurrent Task watches by default. Initial and
+replay buffers share a 64 MiB aggregate compact Task JSON budget. Saturated
+watch admission returns HTTP `429` with `reason=TooManyRequests`, or gRPC
+`ResourceExhausted`. Rejection does not evict or terminate an existing watch.
+Lag recovery waits for replay capacity and retains no replay payload while
+waiting. Live events and events already yielded to the client are outside this
+internal retained-payload budget.
 
 HTTP watch events are newline-delimited JSON documents.
 Abbreviated documents look like this:
@@ -327,6 +385,21 @@ gRPC reports the stream error as a status.
 
 ## Live output
 
+Both transports require the exact Task UID when opening a live-output stream:
+
+```text
+GET /apis/solti.io/v1/tasks/{name}/logs?taskUid={uid}
+
+StreamTaskLogsRequest { name, task_uid }
+```
+
+A missing or invalid UID returns HTTP `400` or gRPC `InvalidArgument`. A valid
+UID that does not identify the current Task returns HTTP `404` or gRPC
+`NotFound`. These failures happen before the stream opens. A successful
+subscription is pinned atomically to that Task UID and to the generation visible
+at subscription time. Deleting and recreating the same name does not retarget an
+existing stream.
+
 HTTP uses Server-Sent Events.
 The event names are:
 
@@ -335,13 +408,21 @@ The event names are:
 - `run-finished`;
 - `lagged`.
 
+Every SSE event payload contains `taskUid`.
+For gRPC, the required request `task_uid` identifies every response in the
+opened stream and is not repeated beside the response oneof.
+
 gRPC uses the matching `StreamTaskLogsResponse` oneof.
 Output lines are raw bytes in protobuf.
 HTTP JSON encodes those bytes as base64.
+`OutputChunk.truncated` is true when `line` is an exact retained prefix and
+source bytes were omitted. False is omitted from the HTTP JSON shape.
 
 The stream is live-only and lossy.
 It does not persist or replay output.
-`Lagged` reports the number of events missed by a slow subscriber.
+`Lagged` reports both the number of events and retained line bytes missed by a
+slow subscriber. Lag metadata never modifies raw `line` bytes.
+Clients identify a run by Task UID, generation, and attempt.
 One subscription can span later attempts of the same task generation.
 `SupervisorApiAdapter` filters an opened stream to the generation visible at subscription time.
 
@@ -352,7 +433,7 @@ They have no public HTTP or gRPC representation.
 
 The transports reject `Embedded` input.
 They also reject an `Embedded` value returned by a custom handler.
-`SupervisorApiAdapter` hides embedded tasks, watches, history, output, apply, and delete operations.
+`SupervisorApiAdapter` hides embedded tasks, watches, history, output, apply, cancel, and delete operations.
 
 Extension workloads remain public.
 Their GVK and JSON object are preserved across both transports.
@@ -389,11 +470,12 @@ fn secured_router<H: ApiHandler>(handler: Arc<H>) -> solti_api::axum::Router {
 HTTP expects `Authorization: Bearer <token>`.
 gRPC expects the same value in `authorization` metadata.
 The scheme is case-insensitive.
-An invalid credential is rejected before the handler.
+An invalid credential is rejected before the handler. HTTP returns the
+`WWW-Authenticate: Bearer` challenge with its `401` Status body.
 
-`with_auth` is the static shared-token convenience path. 
-A valid token creates an authenticated identity without an individual subject. 
-Use`with_authenticator` to validate application credentials and return an `ApiIdentity` with a subject and application-owned attributes.
+`with_auth` is the static shared-token convenience path.
+A valid token creates an authenticated identity without an individual subject.
+Use `with_authenticator` to validate application credentials and return an `ApiIdentity` with a subject and application-owned attributes.
 
 Both transports also accept an `ApiAuthorizer`:
 
@@ -434,15 +516,15 @@ fn read_only_router<H: ApiHandler>(handler: Arc<H>) -> solti_api::axum::Router {
 }
 ```
 
-The authorizer receives the identity, exact `TaskOperation`, and either a validated manifest, one task name, or the Task collection. 
+The authorizer receives the identity, exact `TaskOperation`, and either a validated manifest, one task name, or the Task collection.
 A normal denial uses `ApiError::Forbidden`, which maps to HTTP `403` and gRPC `PermissionDenied`.
 
-List and Watch authorization covers the collection operation. 
-The hook does not filter returned items or watch events. 
+List and Watch authorization covers the collection operation.
+The hook does not filter returned items or watch events.
 Tenant or row-level visibility needs a separate scoped-handler design outside this hook.
 Stream authorization is checked when the stream is opened, not for every event.
 
-If no Task API authenticator is configured, application middleware can insert an `ApiIdentity` into request extensions before the Task API runs. 
+If no Task API authenticator is configured, application middleware can insert an `ApiIdentity` into request extensions before the Task API runs.
 Solti does not define users, roles, tenants, RBAC rules, or policy storage.
 
 ## TLS
@@ -477,6 +559,11 @@ Bearer authentication and TLS are independent.
 
 Both builders accept one `ApiMetricsHandle` through `with_metrics`.
 The default backend does nothing.
+The installed handle has one sticky panic boundary shared by all request paths.
+After the first callback panic, later updates are dropped without invoking the
+backend again.
+Callbacks that already entered the boundary concurrently may still finish or
+panic. The boundary does not serialize healthy metrics updates.
 
 The backend receives:
 
@@ -507,14 +594,20 @@ Streaming requests remain in flight until the body ends, fails, or is dropped.
 | `MethodNotAllowed`        | `405 Method Not Allowed`     | `Unimplemented`     |
 | `UnsupportedMediaType`    | `415 Unsupported Media Type` | `InvalidArgument`   |
 | `PayloadTooLarge`         | `413 Payload Too Large`      | `ResourceExhausted` |
+| `ResourceExhausted`       | `429 Too Many Requests`      | `ResourceExhausted` |
 | `ResourceVersionExpired`  | `410 Gone`                   | `OutOfRange`        |
 | `Unavailable`             | `503 Service Unavailable`    | `Unavailable`       |
 | `Internal`                | `500 Internal Server Error`  | `Internal`          |
 
 HTTP errors use a Kubernetes-style `Status` body.
+`ResourceExhausted` uses the HTTP reason `TooManyRequests` and does not add
+`Retry-After`.
 Write conflicts include machine-readable causes.
-gRPC write conflicts encode `WriteConflictDetails` in status details.
-Internal diagnostic messages are logged and hidden from clients.
+HTTP cause reasons are `UIDMismatch`, `ResourceVersionMismatch`, or
+`PreconditionFailed`. gRPC write conflicts encode `WriteConflictDetails` in
+status details and use the typed `WriteConflictReason` enum.
+Internal failures are logged by stable category and hidden from clients.
+The transport boundary does not write the diagnostic string to logs.
 
 ## Examples
 

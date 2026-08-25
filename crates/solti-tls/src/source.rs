@@ -106,11 +106,11 @@ impl std::fmt::Debug for PemSource {
 ///
 /// ## Rules
 ///
-/// - File paths remain visible in `Debug`.
-/// - In-memory key bytes are redacted.
 /// - In-memory key bytes are zeroized after the last owner is dropped.
 /// - Loaded identities keep key PEM in zeroizing storage.
 /// - A TLS library or adapter may keep its own copy.
+/// - File paths remain visible in `Debug`.
+/// - In-memory key bytes are redacted.
 ///
 /// ## See Also
 ///

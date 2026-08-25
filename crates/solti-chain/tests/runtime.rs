@@ -10,8 +10,8 @@ use solti_model::{
     TaskWorkload, WorkloadTypeMeta,
 };
 use solti_runner::{
-    BuildContext, OutputPublisher, OutputPublisherHandle, OutputSink, RunId, Runner, RunnerError,
-    RunnerRouter,
+    BuildContext, OutputPublisher, OutputPublisherHandle, OutputSink, RouterError, RunId, Runner,
+    RunnerError, RunnerRouter,
 };
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 
@@ -40,6 +40,7 @@ impl LeafRunner {
     }
 }
 
+#[solti_runner::async_trait]
 impl Runner for LeafRunner {
     fn name(&self) -> &str {
         self.name
@@ -52,11 +53,13 @@ impl Runner for LeafRunner {
         ]
     }
 
-    fn build_task(
+    async fn build_task(
         &self,
         task: &Task,
-        run_id: &RunId,
+        _run_id: &RunId,
         ctx: &BuildContext,
+        _cancellation: &solti_runner::BuildCancellation,
+        _scope: &mut solti_runner::BuildScope,
     ) -> Result<TaskRef, RunnerError> {
         let (id, behavior) = leaf_fields(task)?;
         self.builds
@@ -71,41 +74,36 @@ impl Runner for LeafRunner {
         let runner_name = self.name.to_owned();
         let attempts = Arc::new(AtomicU32::new(0));
 
-        Ok(TaskFn::arc(
-            run_id.name().to_owned(),
-            move |_ctx: TaskContext| {
-                let executions = Arc::clone(&executions);
-                let output = Arc::clone(&output);
-                let resource_name = resource_name.clone();
-                let id = id.clone();
-                let behavior = behavior.clone();
-                let runner_name = runner_name.clone();
-                let attempt = attempts.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        Ok(TaskFn::arc(move |_ctx: TaskContext| {
+            let executions = Arc::clone(&executions);
+            let output = Arc::clone(&output);
+            let resource_name = resource_name.clone();
+            let id = id.clone();
+            let behavior = behavior.clone();
+            let runner_name = runner_name.clone();
+            let attempt = attempts.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
 
-                async move {
-                    executions
-                        .lock()
-                        .expect("execution log mutex must not be poisoned")
-                        .push(format!("{runner_name}:{id}"));
+            async move {
+                executions
+                    .lock()
+                    .expect("execution log mutex must not be poisoned")
+                    .push(format!("{runner_name}:{id}"));
 
-                    if let Some(sink) = output.sink_for(&resource_name, generation, attempt) {
-                        sink.stdout_line(Bytes::from(format!("leaf:{id}")));
-                    }
-
-                    match behavior.as_str() {
-                        "ok" => Ok(()),
-                        "fail" => Err(TaskError::fail(format!("{id} failed")).with_exit_code(17)),
-                        "fatal" => {
-                            Err(TaskError::fatal(format!("{id} is fatal")).with_exit_code(73))
-                        }
-                        "cancel" => Err(TaskError::Canceled),
-                        other => Err(TaskError::fatal(format!(
-                            "test leaf '{id}' has unknown behavior '{other}'"
-                        ))),
-                    }
+                if let Some(sink) = output.sink_for(&resource_name, generation, attempt) {
+                    sink.stdout_line(Bytes::from(format!("leaf:{id}")));
                 }
-            },
-        ))
+
+                match behavior.as_str() {
+                    "ok" => Ok(()),
+                    "fail" => Err(TaskError::fail(format!("{id} failed")).with_exit_code(17)),
+                    "fatal" => Err(TaskError::fatal(format!("{id} is fatal")).with_exit_code(73)),
+                    "cancel" => Err(TaskError::Canceled),
+                    other => Err(TaskError::fatal(format!(
+                        "test leaf '{id}' has unknown behavior '{other}'"
+                    ))),
+                }
+            }
+        }))
     }
 }
 
@@ -189,8 +187,12 @@ fn basic_router(
     router
 }
 
-fn build_task(router: &RunnerRouter, task: &Task) -> TaskRef {
-    router.build(task).expect("chain task must build")
+async fn build_task(router: &RunnerRouter, task: &Task) -> TaskRef {
+    router
+        .build(task)
+        .await
+        .expect("chain task must build")
+        .into_task()
 }
 
 fn execution_log(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
@@ -223,6 +225,7 @@ async fn success_path_runs_in_order_and_does_not_run_failure_branch() {
     let task = chain_task("ordered", chain);
 
     build_task(&router, &task)
+        .await
         .spawn(TaskContext::detached())
         .await
         .expect("success path must complete");
@@ -263,6 +266,7 @@ async fn preserve_keeps_failure_while_recover_allows_successful_handler() {
         );
 
         let result = build_task(&router, &task)
+            .await
             .spawn(TaskContext::detached())
             .await;
         if should_recover {
@@ -301,6 +305,7 @@ async fn terminal_failure_preserves_exact_error_category_and_exit_code() {
     let task = chain_task("terminal-error", chain);
 
     let result = build_task(&router, &task)
+        .await
         .spawn(TaskContext::detached())
         .await;
 
@@ -330,7 +335,7 @@ async fn every_spawn_restarts_the_chain_at_entry() {
     )
     .unwrap();
     let task = chain_task("repeatable", chain);
-    let runnable = build_task(&router, &task);
+    let runnable = build_task(&router, &task).await;
 
     runnable
         .spawn(TaskContext::detached())
@@ -366,6 +371,7 @@ async fn cancellation_bypasses_failure_transition() {
     let task = chain_task("canceled", chain);
 
     let result = build_task(&router, &task)
+        .await
         .spawn(TaskContext::detached())
         .await;
 
@@ -373,8 +379,8 @@ async fn cancellation_bypasses_failure_transition() {
     assert_eq!(execution_log(&executions), ["leaf:entry"]);
 }
 
-#[test]
-fn build_compiles_every_branch_and_rejects_an_unroutable_one() {
+#[tokio::test]
+async fn build_compiles_every_branch_and_rejects_an_unroutable_one() {
     let executions = Arc::new(Mutex::new(Vec::new()));
     let builds = Arc::new(Mutex::new(Vec::new()));
     let router = basic_router(executions, Arc::clone(&builds));
@@ -395,7 +401,7 @@ fn build_compiles_every_branch_and_rejects_an_unroutable_one() {
     .unwrap();
     let task = chain_task("invalid-branch", chain);
 
-    let error = match router.build(&task) {
+    let error = match router.build(&task).await {
         Ok(_) => panic!("build unexpectedly accepted an unroutable branch"),
         Err(error) => error,
     };
@@ -403,6 +409,13 @@ fn build_compiles_every_branch_and_rejects_an_unroutable_one() {
     let message = error.to_string();
     assert!(message.contains("unselected-missing"), "{message}");
     assert!(message.contains("no runner"), "{message}");
+    assert!(matches!(
+        error,
+        RouterError::Build {
+            source: RunnerError::NestedBuild { source, .. },
+            ..
+        } if matches!(*source, RouterError::NoRunner { .. })
+    ));
     assert_eq!(execution_log(&builds), ["leaf:entry", "leaf:selected"]);
 }
 
@@ -452,6 +465,7 @@ async fn outer_selector_is_not_inherited_and_each_step_selector_is_local() {
     );
 
     build_task(&router, &task)
+        .await
         .spawn(TaskContext::detached())
         .await
         .expect("selector-isolated chain must complete");
@@ -539,7 +553,7 @@ async fn output_uses_one_upstream_sink_per_outer_attempt_and_one_shared_sequence
     let task = chain_task("output-chain", chain);
     let outer_name = task.name().clone();
     let generation = task.metadata().generation();
-    let runnable = build_task(&router, &task);
+    let runnable = build_task(&router, &task).await;
 
     runnable.spawn(TaskContext::detached()).await.unwrap();
     runnable.spawn(TaskContext::detached()).await.unwrap();
@@ -598,4 +612,156 @@ async fn output_uses_one_upstream_sink_per_outer_attempt_and_one_shared_sequence
             expected_lines
         );
     }
+}
+
+#[derive(Clone)]
+struct CoordinatedForwardingLeafRunner {
+    first_waiting: Arc<tokio::sync::Notify>,
+    release_first: Arc<tokio::sync::Notify>,
+    second_published: Arc<tokio::sync::Notify>,
+    release_second: Arc<tokio::sync::Notify>,
+}
+
+#[solti_runner::async_trait]
+impl Runner for CoordinatedForwardingLeafRunner {
+    fn name(&self) -> &str {
+        "coordinated-leaf"
+    }
+
+    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+        vec![WorkloadTypeMeta::new(TEST_API_VERSION, TEST_KIND).unwrap()]
+    }
+
+    async fn build_task(
+        &self,
+        task: &Task,
+        _run_id: &RunId,
+        ctx: &BuildContext,
+        _cancellation: &solti_runner::BuildCancellation,
+        _scope: &mut solti_runner::BuildScope,
+    ) -> Result<TaskRef, RunnerError> {
+        let output = Arc::clone(ctx.output_publisher());
+        let resource_name = task.name().clone();
+        let generation = task.metadata().generation();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let first_waiting = Arc::clone(&self.first_waiting);
+        let release_first = Arc::clone(&self.release_first);
+        let second_published = Arc::clone(&self.second_published);
+        let release_second = Arc::clone(&self.release_second);
+
+        Ok(TaskFn::arc(move |_ctx: TaskContext| {
+            let output = Arc::clone(&output);
+            let resource_name = resource_name.clone();
+            let attempts = Arc::clone(&attempts);
+            let first_waiting = Arc::clone(&first_waiting);
+            let release_first = Arc::clone(&release_first);
+            let second_published = Arc::clone(&second_published);
+            let release_second = Arc::clone(&release_second);
+
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                let sink = output.sink_for(&resource_name, generation, attempt);
+                let forwarder_sink = sink.clone();
+                let forwarder = tokio::spawn(async move {
+                    if attempt == 1 {
+                        first_waiting.notify_one();
+                        release_first.notified().await;
+                    }
+
+                    if let Some(sink) = forwarder_sink {
+                        sink.stdout_line(Bytes::from(format!("leaf-attempt:{attempt}")));
+                    }
+
+                    if attempt == 2 {
+                        second_published.notify_one();
+                        release_second.notified().await;
+                    }
+                });
+                forwarder
+                    .await
+                    .expect("attempt-owned output forwarder must not panic");
+                Ok(())
+            }
+        }))
+    }
+}
+
+#[tokio::test]
+async fn concurrent_attempts_keep_prebound_spawned_forwarder_output_attempt_local() {
+    let recorder = Arc::new(RecordingOutput::default());
+    let first_waiting = Arc::new(tokio::sync::Notify::new());
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let second_published = Arc::new(tokio::sync::Notify::new());
+    let release_second = Arc::new(tokio::sync::Notify::new());
+    let leaf_runner = CoordinatedForwardingLeafRunner {
+        first_waiting: Arc::clone(&first_waiting),
+        release_first: Arc::clone(&release_first),
+        second_published: Arc::clone(&second_published),
+        release_second: Arc::clone(&release_second),
+    };
+
+    let publisher: OutputPublisherHandle = recorder.clone();
+    let mut router = RunnerRouter::new().with_output_publisher(publisher);
+    router.register(Arc::new(leaf_runner)).unwrap();
+    register_chain_runner(&mut router, "chain").unwrap();
+
+    let chain = ChainSpec::new(
+        "entry",
+        vec![ChainStep::new("entry", leaf("entry", "ok")).unwrap()],
+    )
+    .unwrap();
+    let runnable = build_task(&router, &chain_task("concurrent-output", chain)).await;
+
+    let first = tokio::spawn(runnable.spawn(TaskContext::detached()));
+    tokio::time::timeout(std::time::Duration::from_secs(1), first_waiting.notified())
+        .await
+        .expect("first nested attempt must reach its output barrier");
+
+    let second = tokio::spawn(runnable.spawn(TaskContext::detached()));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        second_published.notified(),
+    )
+    .await
+    .expect("second nested attempt must publish while the first is blocked");
+
+    release_first.notify_one();
+    first
+        .await
+        .expect("first chain attempt must not panic")
+        .expect("first chain attempt must succeed");
+    release_second.notify_one();
+    second
+        .await
+        .expect("second chain attempt must not panic")
+        .expect("second chain attempt must succeed");
+
+    let mut stdout_by_attempt = BTreeMap::<u32, Vec<(u64, Vec<u8>)>>::new();
+    for event in recorder.events() {
+        let OutputEvent::Chunk(chunk) = event else {
+            panic!("recording publisher received a non-chunk event");
+        };
+        assert_eq!(chunk.stream, StreamKind::Stdout);
+        stdout_by_attempt
+            .entry(chunk.attempt)
+            .or_default()
+            .push((chunk.seq, chunk.line.to_vec()));
+    }
+
+    assert_eq!(
+        stdout_by_attempt[&1],
+        [
+            (0, b"[chain] step=entry state=started".to_vec()),
+            (1, b"leaf-attempt:1".to_vec()),
+            (2, b"[chain] step=entry state=succeeded".to_vec()),
+        ]
+    );
+    assert_eq!(
+        stdout_by_attempt[&2],
+        [
+            (0, b"[chain] step=entry state=started".to_vec()),
+            (1, b"leaf-attempt:2".to_vec()),
+            (2, b"[chain] step=entry state=succeeded".to_vec()),
+        ]
+    );
 }

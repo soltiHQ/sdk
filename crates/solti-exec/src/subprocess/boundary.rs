@@ -86,8 +86,8 @@ impl PinnedCwd {
         command.current_dir(&self.path);
     }
 
-    #[cfg(all(test, unix))]
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+    #[cfg(any(all(test, unix), target_os = "macos"))]
+    pub(crate) fn as_raw_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd as _;
         self.fd.as_raw_fd()
     }

@@ -126,7 +126,7 @@ flowchart TB
 Apply preserves UID and creation time.
 A metadata-only change preserves generation and status.
 A spec change advances generation and resets phase, attempt, exit code, and lifecycle error.
-Generation advancement saturates at `u64::MAX`.
+At `u64::MAX`, a spec change returns `ModelError::Invalid` without mutating the resource.
 The previous `status.observedGeneration` is retained until the new generation is processed.
 
 An identical apply is a true no-op.
@@ -154,7 +154,8 @@ flowchart TB
     Scheduled -->|reconciliation fails| FailedReconcile
     FailedReconcile -->|manual retry| Scheduled
     Accepted -->|attempt starts| Running
-    Running -->|attempt ends| Terminal
+    Running -->|terminal outcome| Terminal
+    Terminal -->|strictly newer attempt starts| Running
     Scheduled -->|authoritative final outcome<br/>without an attempt event| Terminal
     Accepted -->|authoritative final outcome<br/>without an attempt event| Terminal
 ```
@@ -162,11 +163,16 @@ flowchart TB
 Generation is checked before every attempt or terminal transition.
 A stale generation returns without mutation.
 Attempt numbers are authoritative inputs.
+An attempt start must be strictly newer than the latest recorded attempt.
 The model does not synthesize a missing attempt number.
+A terminal phase records a logical outcome. It does not by itself prove that
+non-cooperative execution code has exited physically.
 
 `transition_finished` applies attempt-level sticky semantics.
 An identical or older terminal attempt is ignored.
 `Failed` may be refined to `Timeout` or `Exhausted`.
+A terminal phase is sticky for its recorded attempt; a strictly newer attempt
+may move aggregate status back to `Running`.
 
 `reconcile_finished` records an authoritative task-level outcome.
 It may replace a conflicting terminal attempt phase.
@@ -185,6 +191,7 @@ It preserves the latest observed attempt because the task-level outcome has no a
 7. Pending uses attempt zero and has no execution diagnostics.
 8. Running uses a positive attempt and has no terminal diagnostics.
 9. A terminal status may use attempt zero when no attempt event was observed.
+10. `error` is a UTF-8-safe prefix of at most 32 KiB.
 
 `Task::validate` adds the resource-level bounds:
 
@@ -214,10 +221,26 @@ flowchart LR
 
 An active run has no finish fields.
 A terminal run requires `finishedAt`.
+That timestamp records the supervisor's logical outcome. It does not prove
+physical exit after a force-abort.
+`startedAt` is a recorded logical timestamp. The model validates timestamp
+presence but does not establish provenance or require `finishedAt >= startedAt`.
+When `solti-core` receives a terminal attempt without its start event, it
+creates the run at projection time; that fallback `startedAt` is not a recovered
+execution start time.
+Terminal `error` and `exitCode` values are independent optional details. Typed
+runtime outcomes select the phase; diagnostics do not.
 The run snapshots its workload GVK.
+Its `error` uses the same UTF-8-safe 32 KiB prefix contract as
+`TaskStatus.error`.
 
 The model does not retain runs.
 A state store decides whether and how long to keep them.
+
+`TaskRunQuery` applies a default page size of 100 and a hard maximum of 1000.
+`TaskRunContinuation` binds a snapshot to Task name, Task UID, resource
+version, generation, and attempt. `TaskRunPage` carries the same Task identity
+so a transport can shorten a native-encoded prefix without weakening the cursor.
 
 ## Workload type system
 
@@ -304,9 +327,14 @@ Execution layers decide which names and values they support.
 
 The `schema` feature describes serialized structure.
 It also encodes local field constraints and lifecycle branches.
+For `TaskStatus`, schema requires exactly one positive-generation `Reconciled`
+condition and requires `Reconciled=True` for running and terminal phases.
 
-Runtime validation remains authoritative for relationships that standard JSON Schema cannot express exactly.
-These include generation comparisons, uniqueness by condition type, backoff field ordering, and UTF-8 byte budgets.
+Runtime validation and normalization remain authoritative for relationships
+that standard JSON Schema cannot express exactly. These include generation
+comparisons, uniqueness by condition type, backoff field ordering, and UTF-8
+byte budgets. Schema `maxLength` bounds the number of Unicode code points;
+runtime diagnostic truncation bounds encoded UTF-8 bytes.
 
 ## Queries and collections
 
@@ -317,7 +345,7 @@ The state store owns snapshot retention and query execution.
 %%{init: {"flowchart": {"curve": "linear"}}}%%
 flowchart LR
     Filter["TaskFilter<br/>slot + phases + labels"]
-    Query["TaskQuery<br/>filter + limit + continuation"]
+    Query["TaskQuery<br/>filter + count/byte limits + continuation"]
     Store["State store<br/>snapshot execution"]
     Page["TaskPage<br/>items + resourceVersion + continuation"]
     Transport["Transport<br/>opaque wire token"]
@@ -331,6 +359,8 @@ flowchart LR
 Filters run before pagination.
 Multiple phases use OR semantics.
 Slot, phase, and label filters use AND semantics.
+Pages keep a complete-item prefix within both limits.
+An oversized first item is returned alone for native transport measurement.
 
 `TaskContinuation` fixes:
 
@@ -380,7 +410,7 @@ Several public types are shared contracts without an owned runtime:
 
 | Type             | Model owns                                | Higher layer owns                               |
 |------------------|-------------------------------------------|-------------------------------------------------|
-| `OutputEvent`    | Event fields and JSON encoding            | Publication, channels, lag detection, retention |
+| `OutputEvent`    | Binary chunks, truncation and lag byte counts, JSON encoding | Publication, channels, lag detection, retention |
 | `TaskRun`        | One attempt record and invariants         | History storage and retention                   |
 | `TaskQuery`      | Filter and pagination values              | Snapshot execution                              |
 | `TaskWatchEvent` | Added, modified, and deleted values       | Watch lifecycle and delivery                    |

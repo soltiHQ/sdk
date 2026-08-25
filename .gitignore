@@ -32,6 +32,9 @@ target
 # Vendored protobuf contracts: pulled from soltiHQ/proto via `task proto/vendor`.
 crates/*/proto/
 
+# Protobuf bindings are build artifacts generated into Cargo OUT_DIR.
+crates/*/src/generated/
+
 # examples/podium: generated dev PKI (see certs/gen.sh) — never committed.
 examples/podium/certs/*.crt
 examples/podium/certs/*.key

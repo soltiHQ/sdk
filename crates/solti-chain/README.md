@@ -65,7 +65,12 @@ Runners registered later are not available to chain steps.
 | `ChainSpec::into_workload` | `ChainSpec`                           | Solti extension `TaskWorkload` |
 | `ChainSpec::from_workload` | Solti extension `TaskWorkload`        | Validated `ChainSpec`          |
 | `register_chain_runner`    | `RunnerRouter` and runner name        | Registered `ChainRunner`       |
-| `ChainRunner::build_task`  | Outer `Task`, `RunId`, `BuildContext` | One outer `taskvisor::TaskRef` |
+| `ChainRunner::build_task`  | Standard runner build inputs          | One outer `taskvisor::TaskRef` |
+
+The runner build inputs are the outer `Task`, allocated `RunId`, explicit
+`BuildContext`, read-only `BuildCancellation` signal, and inherited
+`BuildScope`. Chain uses scoped catalog builds. Core admission counts every
+leaf runner without reacquiring the outer global slot.
 
 ## Workload contract
 
@@ -211,6 +216,9 @@ Completed side effects are not rolled back.
 ## Output
 
 All steps publish to one outer Task output sink for the current attempt.
+Concurrent attempts of the same built chain keep separate sinks and sequence counters.
+Nested runners must acquire their sink from the attempt future before spawning
+separate output tasks, as required by the `solti-runner` output contract.
 The chain also writes step markers:
 
 ```text
@@ -246,6 +254,9 @@ Disable default features when schema generation is not needed.
 | `Model`              | The shared Solti model rejects a nested value           |
 
 Runner selection and build failures use `solti_runner::RunnerError` and `RouterError`.
+A failed step build becomes `RunnerError::NestedBuild` and retains the original
+`RouterError` as its source. Admission cancellation, wait-cycle, recursion,
+selection, and concrete leaf-runner failures therefore remain distinguishable.
 
 ## Examples
 

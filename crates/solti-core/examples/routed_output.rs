@@ -26,7 +26,7 @@ use serde_json::json;
 use solti_core::{SupervisorApi, TaskWatchSubscription};
 use solti_model::{
     ConditionStatus, ExtensionWorkload, LabelSelector, Labels, OutputEvent, Task, TaskFilter,
-    TaskManifest, TaskPhase, TaskSpec, TaskWorkload, WorkloadTypeMeta,
+    TaskManifest, TaskPhase, TaskRunQuery, TaskSpec, TaskWorkload, WorkloadTypeMeta,
 };
 use solti_runner::{BuildContext, RunId, Runner, RunnerError, RunnerRouter};
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
@@ -67,6 +67,7 @@ struct ImageResizeRunner {
     release: Arc<Notify>,
 }
 
+#[solti_runner::async_trait]
 impl Runner for ImageResizeRunner {
     fn name(&self) -> &str {
         "image-resize"
@@ -76,11 +77,13 @@ impl Runner for ImageResizeRunner {
         vec![WorkloadTypeMeta::new(API_VERSION, KIND).expect("valid extension GVK")]
     }
 
-    fn build_task(
+    async fn build_task(
         &self,
         task: &Task,
-        run_id: &RunId,
+        _run_id: &RunId,
         ctx: &BuildContext,
+        _cancellation: &solti_runner::BuildCancellation,
+        _scope: &mut solti_runner::BuildScope,
     ) -> Result<TaskRef, RunnerError> {
         let TaskWorkload::Extension(workload) = task.spec().workload() else {
             return Err(unsupported_workload(task.spec().workload()));
@@ -109,33 +112,30 @@ impl Runner for ImageResizeRunner {
         let started = Arc::clone(&self.started);
         let release = Arc::clone(&self.release);
 
-        Ok(TaskFn::arc(
-            run_id.name().to_owned(),
-            move |_ctx: TaskContext| {
-                let task_name = task_name.clone();
-                let output = Arc::clone(&output);
-                let started = Arc::clone(&started);
-                let release = Arc::clone(&release);
-                let source = source.clone();
+        Ok(TaskFn::arc(move |_ctx: TaskContext| {
+            let task_name = task_name.clone();
+            let output = Arc::clone(&output);
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let source = source.clone();
 
-                async move {
-                    started.notify_one();
-                    release.notified().await;
+            async move {
+                started.notify_one();
+                release.notified().await;
 
-                    let sink = output
-                        .sink_for(&task_name, generation, 1)
-                        .ok_or_else(|| TaskError::fatal("core output channel is unavailable"))?;
-                    sink.stdout_line(Bytes::from(format!(
-                        "loading {source} for generation {generation}"
-                    )));
-                    sink.stderr_line(Bytes::from_static(
-                        b"example diagnostic: CPU backend selected",
-                    ));
-                    sink.stdout_line(Bytes::from(format!("resized {source} to {width}px")));
-                    Ok::<(), TaskError>(())
-                }
-            },
-        ))
+                let sink = output
+                    .sink_for(&task_name, generation, 1)
+                    .ok_or_else(|| TaskError::fatal("core output channel is unavailable"))?;
+                sink.stdout_line(Bytes::from(format!(
+                    "loading {source} for generation {generation}"
+                )));
+                sink.stderr_line(Bytes::from_static(
+                    b"example diagnostic: CPU backend selected",
+                ));
+                sink.stdout_line(Bytes::from(format!("resized {source} to {width}px")));
+                Ok::<(), TaskError>(())
+            }
+        }))
     }
 }
 
@@ -264,8 +264,11 @@ async fn main() -> ExampleResult {
             } => {
                 println!("[output] RunStarted: generation={generation}, attempt={attempt}.");
             }
-            OutputEvent::Lagged { skipped } => {
-                println!("[output] Lagged: skipped={skipped}.");
+            OutputEvent::Lagged {
+                skipped,
+                skipped_bytes,
+            } => {
+                println!("[output] Lagged: skipped={skipped}, skipped_bytes={skipped_bytes}.");
             }
             _ => {}
         }
@@ -276,10 +279,15 @@ async fn main() -> ExampleResult {
         task.name() == &name && task.phase() == &TaskPhase::Succeeded
     })
     .await?;
+    let retained_runs = api
+        .query_task_runs(&name, &TaskRunQuery::new())?
+        .ok_or_else(|| io::Error::other("task disappeared before run history was read"))?
+        .items
+        .len();
     println!(
         "[complete] Authoritative task phase is {}; retained runs={}.",
         finished.phase(),
-        api.list_task_runs(&name).len(),
+        retained_runs,
     );
 
     api.shutdown().await?;

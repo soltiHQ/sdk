@@ -65,16 +65,23 @@ fn main() -> ExampleResult {
     println!("[installation] The process-global text subscriber is active.");
     println!("[events] Emit trace, debug, and info; the debug filter removes trace.");
 
-    tracing::trace!(target: "example::runner", task = "resize-cover", "not exported");
+    tracing::trace!(
+        target: "example::runner",
+        event = "runner.attempt",
+        task_name = "resize-cover",
+        "not exported"
+    );
     tracing::debug!(
         target: "example::runner",
-        task = "resize-cover",
+        event = "runner.attempt",
+        task_name = "resize-cover",
         attempt = 2,
         "runner attempt started"
     );
     tracing::info!(
         target: "example::runner",
-        task = "resize-cover",
+        event = "runner.attempt",
+        task_name = "resize-cover",
         outcome = "success",
         "runner attempt completed"
     );

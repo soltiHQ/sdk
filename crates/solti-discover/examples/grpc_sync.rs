@@ -83,10 +83,10 @@ async fn main() -> ExampleResult {
         "Agent gRPC 1",
         AgentEndpoint::new("http://127.0.0.1:8085", AgentEndpointType::Http, 1)?,
         ControlPlaneEndpoint::new(endpoint, DiscoveryTransport::Grpc)?,
+        capabilities()?,
         1,
         "grpc-discovery@1",
     )
-    .capabilities(capabilities()?)
     .connect_timeout_ms(5_000)
     .request_timeout_ms(10_000)
     .build()?;
@@ -97,11 +97,10 @@ async fn main() -> ExampleResult {
         return Err("discovery manifest is not Embedded".into());
     };
     println!(
-        "[build] task={}, slot={}, revision={}, taskvisorName={}.",
+        "[build] task={}, slot={}, revision={}.",
         manifest.name(),
         manifest.spec().slot(),
         embedded.revision(),
-        task_ref.name(),
     );
     println!("[build] The gRPC channel has not been created.");
 

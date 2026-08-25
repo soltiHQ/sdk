@@ -3,7 +3,10 @@
 //! Converts create and apply manifests into domain desired state.
 //! Converts stored tasks, list pages, and watch events into protobuf responses.
 
-use solti_model::{Annotations, TASK_API_VERSION, TASK_KIND, Task, TaskManifest};
+use prost::Message as _;
+use solti_model::{
+    Annotations, TASK_API_VERSION, TASK_KIND, Task, TaskFilter, TaskManifest, TaskPage,
+};
 
 use super::spec::{convert_labels, convert_task_spec, spec_to_proto};
 use crate::error::ApiError;
@@ -98,6 +101,79 @@ pub(crate) fn tasks_page_to_proto(
     })
 }
 
+/// Builds protobuf collection metadata for one Task prefix.
+fn proto_metadata_for_prefix(
+    page: &TaskPage<Task>,
+    filter: &TaskFilter,
+    keep: usize,
+) -> Result<proto_api::ListTasksResponse, ApiError> {
+    let (continuation, remaining_item_count) =
+        crate::continuation::prefix_metadata(page, filter, keep)?;
+    let remaining_item_count = u64::try_from(remaining_item_count).map_err(|_| {
+        ApiError::Internal("remaining task count is outside the protobuf range".into())
+    })?;
+    Ok(proto_api::ListTasksResponse {
+        tasks: Vec::new(),
+        resource_version: page.resource_version.clone(),
+        r#continue: continuation
+            .map(crate::continuation::encode)
+            .transpose()?
+            .unwrap_or_default(),
+        remaining_item_count: (remaining_item_count > 0).then_some(remaining_item_count),
+    })
+}
+
+/// Converts the largest complete prefix from one domain page within the protobuf limit.
+pub(crate) fn tasks_page_to_proto_bounded(
+    page: TaskPage<Task>,
+    filter: &TaskFilter,
+) -> Result<proto_api::ListTasksResponse, ApiError> {
+    tasks_page_to_proto_with_limit(page, filter, crate::MAX_TASK_LIST_RESPONSE_BYTES)
+}
+
+/// Converts one Task prefix within an explicit testable protobuf limit.
+fn tasks_page_to_proto_with_limit(
+    page: TaskPage<Task>,
+    filter: &TaskFilter,
+    limit: usize,
+) -> Result<proto_api::ListTasksResponse, ApiError> {
+    if page
+        .items
+        .iter()
+        .any(|task| !crate::visibility::task_is_visible(task))
+    {
+        return Err(ApiError::Internal(
+            "handler returned an Embedded workload through the public gRPC API".into(),
+        ));
+    }
+
+    let mut task_bytes = 0usize;
+    let mut keep = page.items.is_empty().then_some(0);
+    for (index, task) in page.items.iter().enumerate() {
+        let proto = proto_api::Task::try_from(task.clone())?;
+        task_bytes = task_bytes.saturating_add(prost::encoding::message::encoded_len(1, &proto));
+        let candidate = index + 1;
+        let metadata = proto_metadata_for_prefix(&page, filter, candidate)?;
+        if metadata.encoded_len().saturating_add(task_bytes) <= limit {
+            keep = Some(candidate);
+        }
+    }
+
+    let keep = keep.ok_or_else(|| {
+        ApiError::ResourceExhausted(format!(
+            "the first Task exceeds the {limit}-byte list response limit"
+        ))
+    })?;
+    let page = crate::continuation::retain_prefix(page, filter, keep)?;
+    let response = tasks_page_to_proto(page)?;
+    if response.encoded_len() > limit {
+        return Err(ApiError::Internal(
+            "bounded Task list exceeded its encoded response limit".into(),
+        ));
+    }
+    Ok(response)
+}
+
 /// Converts one domain watch event into protobuf.
 pub(crate) fn task_watch_event_to_proto(
     event: solti_model::TaskWatchEvent,
@@ -122,8 +198,8 @@ pub(crate) fn task_watch_event_to_proto(
 mod tests {
     use super::*;
     use solti_model::{
-        EmbeddedSpec, Flag, SubprocessMode, SubprocessSpec, TaskContinuation, TaskEnv, TaskFilter,
-        TaskId, TaskPhase, TaskSpec, TaskWorkload,
+        EmbeddedSpec, ExtensionWorkload, Flag, SubprocessMode, SubprocessSpec, TaskContinuation,
+        TaskEnv, TaskFilter, TaskId, TaskPhase, TaskSpec, TaskWorkload,
     };
     use std::time::UNIX_EPOCH;
 
@@ -210,6 +286,33 @@ mod tests {
     }
 
     #[test]
+    fn taskvisor_intake_pending_condition_converts_exactly() {
+        let spec = TaskSpec::builder("slot", subprocess_workload(), 5_000_u64)
+            .build()
+            .unwrap();
+        let mut task = Task::new("task-intake-pending", spec).unwrap();
+        task.update_reconciliation_pending_diagnostic(
+            "TaskvisorOwnershipAndControllerIntakePending",
+            "waiting for Taskvisor ownership and controller intake capacity",
+            "2",
+        )
+        .unwrap();
+
+        let proto = proto_api::Task::try_from(task).unwrap();
+        let condition = &proto.status.unwrap().conditions[0];
+        assert_eq!(condition.status, proto_api::ConditionStatus::Unknown as i32);
+        assert_eq!(condition.observed_generation, 1);
+        assert_eq!(
+            condition.reason,
+            "TaskvisorOwnershipAndControllerIntakePending"
+        );
+        assert_eq!(
+            condition.message,
+            "waiting for Taskvisor ownership and controller intake capacity"
+        );
+    }
+
+    #[test]
     fn list_response_carries_snapshot_continuation_and_remaining_count() {
         let mk = |id: &str| {
             let spec = TaskSpec::builder("slot", subprocess_workload(), 5_000_u64)
@@ -236,6 +339,85 @@ mod tests {
             crate::continuation::decode(&resp.r#continue).unwrap(),
             continuation
         );
+    }
+
+    #[test]
+    fn list_response_stops_at_the_exact_protobuf_boundary() {
+        let mk = |id: &str| {
+            let spec = TaskSpec::builder("slot", subprocess_workload(), 5_000_u64)
+                .build()
+                .unwrap();
+            Task::new(id, spec).unwrap()
+        };
+        let page = TaskPage {
+            items: vec![mk("task-1"), mk("task-2")],
+            resource_version: "store:9".into(),
+            continuation: None,
+            remaining_item_count: 0,
+        };
+        let filter = TaskFilter::new();
+        let first = proto_api::Task::try_from(page.items[0].clone()).unwrap();
+        let first_limit = proto_metadata_for_prefix(&page, &filter, 1)
+            .unwrap()
+            .encoded_len()
+            + prost::encoding::message::encoded_len(1, &first);
+
+        let response = tasks_page_to_proto_with_limit(page.clone(), &filter, first_limit).unwrap();
+        assert_eq!(response.encoded_len(), first_limit);
+        assert_eq!(response.tasks.len(), 1);
+        assert_eq!(response.remaining_item_count, Some(1));
+        let continuation = crate::continuation::decode(&response.r#continue).unwrap();
+        assert_eq!(continuation.after().as_str(), "task-1");
+
+        assert!(matches!(
+            tasks_page_to_proto_with_limit(page, &filter, first_limit - 1),
+            Err(ApiError::ResourceExhausted(_))
+        ));
+    }
+
+    #[test]
+    fn max_manifest_task_can_fit_one_native_protobuf_page() {
+        let manifest = |padding: usize| {
+            let workload = TaskWorkload::Extension(
+                ExtensionWorkload::new(
+                    "workloads.example.io/v1",
+                    "LargePayload",
+                    serde_json::json!({ "padding": "x".repeat(padding) }),
+                )
+                .unwrap(),
+            );
+            let spec = TaskSpec::builder("large", workload, 5_000_u64)
+                .build()
+                .unwrap();
+            TaskManifest::new("large", spec).unwrap()
+        };
+        let empty = manifest(0);
+        let padding = crate::MAX_TASK_LIST_RESPONSE_BYTES
+            .checked_sub(serde_json::to_vec(&empty).unwrap().len())
+            .unwrap();
+        let manifest = manifest(padding);
+        assert_eq!(
+            serde_json::to_vec(&manifest).unwrap().len(),
+            crate::MAX_TASK_LIST_RESPONSE_BYTES
+        );
+
+        let resource_version = "AAAAAAAAAAAAAAAAAAAAAA:1";
+        let mut task = Task::from_manifest(manifest).unwrap();
+        task.set_resource_version(resource_version).unwrap();
+        assert!(serde_json::to_vec(&task).unwrap().len() > crate::MAX_TASK_LIST_RESPONSE_BYTES);
+        let response = tasks_page_to_proto_bounded(
+            TaskPage {
+                items: vec![task],
+                resource_version: resource_version.into(),
+                continuation: None,
+                remaining_item_count: 0,
+            },
+            &TaskFilter::new(),
+        )
+        .unwrap();
+
+        assert_eq!(response.tasks.len(), 1);
+        assert!(response.encoded_len() <= crate::MAX_TASK_LIST_RESPONSE_BYTES);
     }
 
     #[test]

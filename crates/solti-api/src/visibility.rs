@@ -4,10 +4,12 @@
 //! Embedded tasks remain available through the in-process SDK.
 //! Every other built-in or extension GVK remains visible.
 
+#[cfg(any(feature = "core-adapter", feature = "grpc", feature = "http"))]
+use solti_model::Task;
+#[cfg(any(feature = "core-adapter", feature = "http"))]
+use solti_model::TaskManifest;
 #[cfg(any(feature = "grpc", feature = "http"))]
 use solti_model::TaskRun;
-#[cfg(any(feature = "core-adapter", feature = "http"))]
-use solti_model::{Task, TaskManifest};
 use solti_model::{WORKLOAD_API_VERSION, WorkloadTypeMeta};
 
 const EMBEDDED_KIND: &str = "Embedded";
@@ -24,7 +26,7 @@ pub(crate) fn manifest_is_visible(manifest: &TaskManifest) -> bool {
 }
 
 /// Checks whether a stored task can cross a public transport.
-#[cfg(any(feature = "core-adapter", feature = "http"))]
+#[cfg(any(feature = "core-adapter", feature = "grpc", feature = "http"))]
 pub(crate) fn task_is_visible(task: &Task) -> bool {
     workload_is_visible(&task.spec().workload().type_meta())
 }

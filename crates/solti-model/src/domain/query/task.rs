@@ -4,9 +4,14 @@
 //! [`TaskFilter`] selects task resources.
 //! [`TaskQuery`] adds pagination.
 
+use std::num::NonZeroUsize;
+
 use serde::{Deserialize, Serialize};
 
-use crate::{LabelSelector, Labels, ModelError, ModelResult, Slot, Task, TaskId, TaskPhase};
+use crate::{
+    LabelSelector, Labels, MAX_TASK_MANIFEST_BYTES, ModelError, ModelResult, Slot, Task, TaskId,
+    TaskPhase,
+};
 
 /// Default page size when the caller does not specify one.
 pub const DEFAULT_LIMIT: usize = 100;
@@ -15,6 +20,11 @@ pub const DEFAULT_LIMIT: usize = 100;
 ///
 /// [`TaskQuery::with_limit`] clamps larger values.
 pub const MAX_LIMIT: usize = 1000;
+
+/// Default serialized JSON budget for Task items in one collection page.
+///
+/// Transport envelopes and framing are accounted separately.
+pub const MAX_TASK_PAGE_ITEM_BYTES: usize = MAX_TASK_MANIFEST_BYTES;
 
 /// Filters shared by task list and watch operations.
 ///
@@ -66,11 +76,17 @@ pub struct TaskContinuation {
 /// Query parameters for filtered, snapshot-consistent Task listing.
 ///
 /// Filtering is carried by [`TaskFilter`].
-/// Pagination applies only to list operations.
+/// Pagination has count and serialized-item byte ceilings.
+/// Both apply only to list operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskQuery {
+    /// Filters applied before pagination.
     filter: TaskFilter,
+    /// Maximum item count.
     limit: usize,
+    /// Maximum compact-JSON bytes across complete items.
+    item_byte_limit: NonZeroUsize,
+    /// Cursor into a retained collection snapshot.
     continuation: Option<TaskContinuation>,
 }
 
@@ -81,7 +97,7 @@ impl Default for TaskQuery {
     }
 }
 
-/// One page from a Task collection snapshot.
+/// One complete-item prefix from a Task collection snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskPage<T> {
     /// Items on this page.
@@ -317,6 +333,8 @@ impl TaskQuery {
         Self {
             filter,
             limit: DEFAULT_LIMIT,
+            item_byte_limit: NonZeroUsize::new(MAX_TASK_PAGE_ITEM_BYTES)
+                .expect("the default Task page item byte limit is positive"),
             continuation: None,
         }
     }
@@ -386,6 +404,21 @@ impl TaskQuery {
         self
     }
 
+    /// Limits the serialized JSON bytes carried by page items.
+    ///
+    /// The budget includes commas between items. It does not include the
+    /// surrounding collection document or transport framing. A transport can
+    /// apply a smaller final page after adding its envelope. Values above
+    /// [`MAX_TASK_PAGE_ITEM_BYTES`] are capped. The first complete item is
+    /// returned even when it exceeds this encoding-neutral budget. A transport
+    /// can then measure that item in its native encoding.
+    #[inline]
+    pub fn with_item_byte_limit(mut self, limit: NonZeroUsize) -> Self {
+        self.item_byte_limit = NonZeroUsize::new(limit.get().min(MAX_TASK_PAGE_ITEM_BYTES))
+            .expect("the maximum Task page item byte limit is positive");
+        self
+    }
+
     /// Continue a previously returned collection snapshot.
     #[inline]
     pub fn with_continuation(mut self, continuation: TaskContinuation) -> Self {
@@ -415,6 +448,12 @@ impl TaskQuery {
     #[inline]
     pub fn limit(&self) -> usize {
         self.limit
+    }
+
+    /// Serialized JSON byte limit for page items.
+    #[inline]
+    pub fn item_byte_limit(&self) -> NonZeroUsize {
+        self.item_byte_limit
     }
 
     /// Continuation cursor, when this is not the first page.
@@ -541,10 +580,12 @@ mod tests {
                 .unwrap();
         let query = TaskQuery::from_filter(filter.clone())
             .with_limit(25)
+            .with_item_byte_limit(NonZeroUsize::new(4096).unwrap())
             .with_continuation(continuation.clone());
 
         assert_eq!(query.filter(), &filter);
         assert_eq!(query.limit(), 25);
+        assert_eq!(query.item_byte_limit().get(), 4096);
         assert_eq!(query.continuation(), Some(&continuation));
         assert_eq!(continuation.resource_version(), "store:7");
         assert_eq!(continuation.filter(), &filter);
@@ -554,6 +595,17 @@ mod tests {
     #[test]
     fn zero_limit_uses_default_and_continuation_requires_resource_version() {
         assert_eq!(TaskQuery::new().with_limit(0).limit(), DEFAULT_LIMIT);
+        assert_eq!(
+            TaskQuery::new().item_byte_limit().get(),
+            MAX_TASK_PAGE_ITEM_BYTES
+        );
+        assert_eq!(
+            TaskQuery::new()
+                .with_item_byte_limit(NonZeroUsize::new(usize::MAX).unwrap())
+                .item_byte_limit()
+                .get(),
+            MAX_TASK_PAGE_ITEM_BYTES
+        );
         assert!(matches!(
             TaskContinuation::new("  ", TaskFilter::new(), TaskId::new("build-50").unwrap(),),
             Err(ModelError::Invalid(_))

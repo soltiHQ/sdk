@@ -2,7 +2,7 @@
 
 use crate::metrics::backend::{MetricsBackend, RunnerErrorKind, RunnerType};
 
-/// Zero-sized [`MetricsBackend`](super::MetricsBackend) that discards records.
+/// Zero-sized [`MetricsBackend`] that discards records.
 ///
 /// [`BuildContext`](crate::BuildContext) uses it by default.
 ///

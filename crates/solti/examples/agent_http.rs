@@ -27,7 +27,7 @@
 //!
 //! Run with `cargo run -p solti --example agent_http --features api-core-adapter,api-http,exec-subprocess`.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use solti::{
     api::{
@@ -144,15 +144,17 @@ solti: HTTP task agent
     let listener = TcpListener::bind(ADDRESS).await?;
 
     let mut runner_router = RunnerRouter::new();
-    register_subprocess_runner(&mut runner_router, "default")?;
+    let subprocess_runner = register_subprocess_runner(&mut runner_router, "default")?;
     println!("[runner] Registered the built-in Subprocess GVK as runner=default.");
 
     let supervisor = Arc::new(SupervisorApi::builder(runner_router).start().await?);
     let server_result = serve_http(Arc::clone(&supervisor), listener).await;
     let shutdown_result = supervisor.shutdown().await;
+    let finalizer_result = subprocess_runner.shutdown(Duration::from_secs(5)).await;
 
     server_result?;
     shutdown_result?;
+    finalizer_result?;
     Ok(())
 }
 

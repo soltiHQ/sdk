@@ -25,7 +25,7 @@
 //!
 //! Run with `cargo run -p solti --example agent_grpc --features api-core-adapter,api-grpc,exec-subprocess`.
 
-use std::{env, io, sync::Arc};
+use std::{env, io, sync::Arc, time::Duration};
 
 use solti::{
     api::{
@@ -163,7 +163,7 @@ solti: gRPC task agent
     );
 
     let mut router = RunnerRouter::new();
-    register_subprocess_runner(&mut router, "default")?;
+    let subprocess_runner = register_subprocess_runner(&mut router, "default")?;
     let supervisor = Arc::new(SupervisorApi::builder(router).start().await?);
 
     let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
@@ -244,6 +244,7 @@ solti: gRPC task agent
     let _ = shutdown_tx.send(());
     server.await??;
     supervisor.shutdown().await?;
+    subprocess_runner.shutdown(Duration::from_secs(5)).await?;
     println!(
         "\nResult: the public gRPC contract returned a resource owned and executed by the core supervisor."
     );

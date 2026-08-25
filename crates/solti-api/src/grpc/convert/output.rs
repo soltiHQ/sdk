@@ -38,7 +38,13 @@ pub(crate) fn output_event_to_proto(
             exit_code,
             finished_at: system_time_to_ms(finished_at)?,
         }),
-        OutputEvent::Lagged { skipped } => Kind::Lagged(proto_api::Lagged { skipped }),
+        OutputEvent::Lagged {
+            skipped,
+            skipped_bytes,
+        } => Kind::Lagged(proto_api::Lagged {
+            skipped,
+            skipped_bytes,
+        }),
         _ => {
             return Err(ApiError::Internal(
                 "handler returned an unsupported output event".into(),
@@ -57,6 +63,7 @@ fn output_chunk_to_proto(c: OutputChunk) -> Result<proto_api::OutputChunk, ApiEr
         attempt: c.attempt,
         line: c.line,
         seq: c.seq,
+        truncated: c.truncated,
     })
 }
 
@@ -77,7 +84,7 @@ mod tests {
 
     #[test]
     fn chunk_maps_all_fields() {
-        let line = Bytes::from_static(b"error: boom");
+        let line = Bytes::from_static(&[b'e', b'r', b'r', 0xff, 0xfe]);
         let line_ptr = line.as_ptr();
         let ev = OutputEvent::Chunk(OutputChunk {
             generation: 2,
@@ -86,6 +93,7 @@ mod tests {
             seq: 42,
             ts: UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
             line,
+            truncated: true,
         });
 
         let proto = output_event_to_proto(ev).unwrap();
@@ -99,7 +107,8 @@ mod tests {
         assert_eq!(chunk.stream, proto_api::OutputStreamKind::Stderr as i32);
         assert_eq!(chunk.seq, 42);
         assert_eq!(chunk.ts, 1_700_000_000_000);
-        assert_eq!(&chunk.line[..], b"error: boom");
+        assert_eq!(&chunk.line[..], &[b'e', b'r', b'r', 0xff, 0xfe]);
+        assert!(chunk.truncated);
         assert_eq!(
             chunk.line.as_ptr(),
             line_ptr,
@@ -145,13 +154,17 @@ mod tests {
             other => panic!("expected RunFinished, got {other:?}"),
         }
 
-        match output_event_to_proto(OutputEvent::Lagged { skipped: 1500 })
-            .unwrap()
-            .kind
-            .unwrap()
+        match output_event_to_proto(OutputEvent::Lagged {
+            skipped: 1500,
+            skipped_bytes: 64 * 1024,
+        })
+        .unwrap()
+        .kind
+        .unwrap()
         {
             proto_api::stream_task_logs_response::Kind::Lagged(l) => {
                 assert_eq!(l.skipped, 1500);
+                assert_eq!(l.skipped_bytes, 64 * 1024);
             }
             other => panic!("expected Lagged, got {other:?}"),
         }

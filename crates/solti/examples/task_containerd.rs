@@ -34,14 +34,15 @@ use solti::{
     core::{SupervisorApi, TaskWatchSubscription},
     exec::{
         container::{
-            ContainerEngine, ContainerProcessPolicy, ContainerRunnerConfig,
+            ContainerProcessPolicy, ContainerRunnerConfig,
             containerd::{ContainerNetwork, ContainerdConfig, ContainerdEngine},
             register_container_runner_with_config,
         },
         isolation::SeccompPolicy,
     },
     model::{
-        ContainerSpec, RestartPolicy, Task, TaskEnv, TaskId, TaskManifest, TaskSpec, TaskWorkload,
+        ContainerSpec, RestartPolicy, Task, TaskEnv, TaskId, TaskManifest, TaskRunQuery, TaskSpec,
+        TaskWorkload,
     },
     runner::RunnerRouter,
 };
@@ -123,8 +124,7 @@ solti: supervised containerd workload
     println!("[policy] capabilities=[], noNewPrivileges=true, umask=077, seccomp=DenyHostControl.");
 
     let mut router = RunnerRouter::new();
-    let engine: Arc<dyn ContainerEngine> = engine;
-    register_container_runner_with_config(&mut router, "containerd", engine, config)?;
+    register_container_runner_with_config(&mut router, "containerd", engine.clone(), config)?;
     let supervisor = SupervisorApi::builder(router).start().await?;
     let mut watch = supervisor.watch_tasks(&Default::default(), None)?;
 
@@ -153,8 +153,11 @@ solti: supervised containerd workload
     );
 
     let terminal = wait_for_terminal(&mut watch, &task_name).await?;
-    let runs = supervisor.list_task_runs(&task_name);
+    let runs = supervisor
+        .query_task_runs(&task_name, &TaskRunQuery::new())?
+        .ok_or_else(|| io::Error::other("task disappeared before run history was read"))?;
     let run = runs
+        .items
         .last()
         .ok_or_else(|| io::Error::other("container run history is empty"))?;
     println!(
@@ -165,6 +168,8 @@ solti: supervised containerd workload
     );
 
     supervisor.shutdown().await?;
+    engine.shutdown().await?;
+    println!("[shutdown] Supervisor and containerd cleanup worker stopped.");
     println!(
         "\nResult: core retained the completed resource after containerd removed its attempt-owned resources."
     );

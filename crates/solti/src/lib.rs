@@ -23,7 +23,8 @@
 //! application features
 //!          ▼
 //!        solti
-//!          ├── model ─────────────► solti-model + JSON Schema
+//!          ├── model ─────────────► solti-model
+//!          ├── model-schema ──────► solti-model + JSON Schema
 //!          ├── runner ────────────► solti-runner + model + taskvisor
 //!          ├── chain ─────────────► solti-chain + runner
 //!          ├── core ──────────────► solti-core + runner + taskvisor/controller
@@ -42,9 +43,11 @@
 //!
 //! | Need                         | Feature family          |
 //! |------------------------------|-------------------------|
-//! | Resource types and schemas   | `model`                 |
+//! | Resource types               | `model`                 |
+//! | Resource JSON Schema         | `model-schema`          |
 //! | Runner registration          | `runner`                |
 //! | Conditional workload chain   | `chain`                 |
+//! | Chain JSON Schema            | `chain-schema`          |
 //! | Desired-state supervision    | `core`                  |
 //! | Host process controls        | `exec-host-process`     |
 //! | Subprocess execution         | `exec-subprocess`       |
@@ -57,7 +60,9 @@
 //! | gRPC server TLS              | `api-grpc-tls`          |
 //! | HTTP discovery               | `discover-http`         |
 //! | gRPC discovery               | `discover-grpc`         |
-//! | Discovery TLS                | `discover-tls`          |
+//! | HTTP discovery with TLS      | `discover-http-tls`     |
+//! | gRPC discovery with TLS      | `discover-grpc-tls`     |
+//! | TLS extension for discovery  | `discover-tls`          |
 //! | Logging integrations         | `observe-*`             |
 //! | Prometheus integrations      | `prometheus-*`          |
 //! | Shared TLS types             | `tls`                   |
@@ -73,9 +78,13 @@
 //! Add `api-core-adapter` when the API delegates to `core::SupervisorApi`.
 //!
 //! `discover-http` and `discover-grpc` select the outbound discovery transport.
-//! They do not select the task API exposed by the agent.
+//! Add `discover-http-tls` or `discover-grpc-tls` when that transport needs custom TLS support.
+//! `discover-tls` remains available as a transport-neutral extension feature.
+//! Discovery features do not select the task API exposed by the agent.
 //!
-//! `model` includes the `solti-model/schema` feature.
+//! `model` exposes runtime model types without JSON Schema dependencies.
+//! Add `model-schema` when the application generates model schemas.
+//! `chain-schema` enables schemas for both Chain and the nested model types.
 //! `chain` runs nested workloads sequentially inside one outer Task.
 //!
 //! Exactly one step is active at a time; steps do not receive independent Task lifecycle policies, status, or history.
@@ -117,16 +126,21 @@
 //!
 //! ```rust,no_run
 //! # #[cfg(all(feature = "core", feature = "exec-subprocess"))]
-//! # async fn build() -> Result<solti::core::SupervisorApi, Box<dyn std::error::Error>> {
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::time::Duration;
+//!
 //! use solti::core::SupervisorApi;
 //! use solti::exec::subprocess::register_subprocess_runner;
 //! use solti::runner::RunnerRouter;
 //!
 //! let mut router = RunnerRouter::new();
-//! register_subprocess_runner(&mut router, "default")?;
+//! let subprocess_runner = register_subprocess_runner(&mut router, "default")?;
 //!
 //! let supervisor = SupervisorApi::builder(router).start().await?;
-//! # Ok(supervisor)
+//! // Run application work, then stop task supervision before subprocess cleanup.
+//! supervisor.shutdown().await?;
+//! subprocess_runner.shutdown(Duration::from_secs(5)).await?;
+//! # Ok(())
 //! # }
 //! ```
 

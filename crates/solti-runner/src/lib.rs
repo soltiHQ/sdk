@@ -3,7 +3,8 @@
 //! Runner boundary for Solti workloads.
 //!
 //! A runner converts a [`solti_model::Task`] into a [`taskvisor::TaskRef`].
-//! Taskvisor owns execution after that conversion.
+//! The router returns a [`BuiltTask`] that keeps its [`RunId`] beside that task.
+//! Taskvisor owns execution after construction.
 //!
 //! ## Start Here
 //!
@@ -18,9 +19,9 @@
 //! solti_model::Task
 //!         ▼
 //! RunnerRouter ── GVK + runnerSelector ──▶ Runner
-//!         │ allocates RunId                  │ builds
+//!         │ allocates RunId                  │ builds TaskRef
 //!         │                                  ▼
-//!         └────────────────────────────▶ taskvisor::TaskRef
+//!         └────────────────────────────▶ BuiltTask { RunId, TaskRef }
 //! ```
 //!
 //! The router checks runners in registration order.
@@ -39,11 +40,11 @@
 //! ## Build Contract
 //!
 //! The router allocates a [`RunId`] for each build.
-//! The runner must use [`RunId::name`] as the returned `TaskRef` name.
-//! The router validates that name.
+//! It passes the ID to the selected runner and returns the same ID with the executable task in [`BuiltTask`].
 //!
-//! Building does not start or supervise the task.
-//! The returned `TaskRef` may execute more than one attempt.
+//! Building is asynchronous and cancellation-aware.
+//! It does not start or supervise the task.
+//! The task inside [`BuiltTask`] may execute more than one attempt.
 //!
 //! ## Output and Metrics
 //!
@@ -57,15 +58,18 @@
 //!
 //! ## Main Types
 //!
-//! | Area          | Types                                                  |
-//! |---------------|--------------------------------------------------------|
-//! | Runner plugin | [`Runner`], [`RunnerRouter`], [`RunnerCatalog`]        |
-//! | Build data    | [`BuildContext`]                                       |
-//! | Output        | [`OutputPublisher`], [`OutputSink`]                    |
-//! | Run identity  | [`RunId`], [`make_run_id`]                             |
-//! | Metrics       | [`MetricsBackend`], [`MetricsHandle`], [`NoOpMetrics`] |
-//! | Metric labels | [`RunnerType`], [`RunnerErrorKind`]                    |
-//! | Errors        | [`RouterError`], [`RunnerError`]                       |
+//! | Area          | Types                                                   |
+//! |---------------|---------------------------------------------------------|
+//! | Runner plugin | [`Runner`], [`RunnerRouter`], [`RunnerCatalog`]         |
+//! | Build result  | [`BuiltTask`], [`RunId`]                                |
+//! | Build data    | [`BuildContext`], [`BuildCancellation`], [`BuildScope`] |
+//! | Admission     | [`RunnerBuildAdmission`], [`AdmittedBuild`]             |
+//! | Build owner   | [`BuildCancellationHandle`]                             |
+//! | Output        | [`OutputPublisher`], [`OutputSink`]                     |
+//! | Run allocator | [`make_run_id`]                                         |
+//! | Metrics       | [`MetricsBackend`], [`MetricsHandle`], [`NoOpMetrics`]  |
+//! | Metric labels | [`RunnerType`], [`RunnerErrorKind`]                     |
+//! | Errors        | [`RouterError`], [`RunnerError`]                        |
 //!
 //! ## Quick Start
 //!
@@ -76,24 +80,25 @@
 //! use solti_runner::RunnerRouter;
 //!
 //! # use solti_model::{Task, WorkloadTypeMeta, WORKLOAD_API_VERSION};
-//! # use solti_runner::{BuildContext, RunId, Runner, RunnerError};
+//! # use solti_runner::{BuildContext, BuiltTask, RunId, Runner, RunnerError};
 //! # use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 //! # struct MyRunner;
+//! # #[solti_runner::async_trait]
 //! # impl Runner for MyRunner {
 //! #     fn name(&self) -> &str { "my-runner" }
 //! #     fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
 //! #         vec![WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").expect("built-in workload GVK")]
 //! #     }
-//! #     fn build_task(&self, _task: &Task, run_id: &RunId, _ctx: &BuildContext) -> Result<TaskRef, RunnerError> {
-//! #         Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move { Ok::<(), TaskError>(()) }))
+//! #     async fn build_task(&self, _task: &Task, _run_id: &RunId, _ctx: &BuildContext, _cancellation: &solti_runner::BuildCancellation, _scope: &mut solti_runner::BuildScope) -> Result<TaskRef, RunnerError> {
+//! #         Ok(TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) }))
 //! #     }
 //! # }
-//! # fn demo(resource: &Task) -> Result<TaskRef, Box<dyn std::error::Error>> {
+//! # async fn demo(resource: &Task) -> Result<BuiltTask, Box<dyn std::error::Error>> {
 //! let mut router = RunnerRouter::new();
 //! router.register(Arc::new(MyRunner))?;
 //!
-//! let task = router.build(resource)?;
-//! # Ok(task)
+//! let built = router.build(resource).await?;
+//! # Ok(built)
 //! # }
 //! ```
 
@@ -108,8 +113,19 @@ struct ReadmeDoctests;
 mod runner;
 pub use runner::Runner;
 
+mod cancellation;
+pub use cancellation::{BuildCancellation, BuildCancellationHandle};
+
+mod admission;
+pub use admission::{BuildAdmissionConfigError, BuildScope, RunnerBuildAdmission};
+
+/// Attribute used to implement async SDK traits without an additional dependency.
+pub use async_trait::async_trait;
+
 mod error;
 pub use error::{RouterError, RunnerError};
+
+mod callback;
 
 mod context;
 pub use context::BuildContext;
@@ -118,15 +134,19 @@ mod environment;
 pub use environment::{RunnerEnv, merge_env};
 
 mod router;
-pub use router::{RunnerCatalog, RunnerRouter};
+pub use router::{AdmittedBuild, BuiltTask, RunnerCatalog, RunnerRouter};
 
 mod id;
 pub use id::{RunId, make_run_id};
 
 mod output;
-pub use output::{OutputPublisher, OutputPublisherHandle, OutputSink, noop_output_publisher};
+pub use output::{
+    OutputChunkRef, OutputPublisher, OutputPublisherHandle, OutputSink, noop_output_publisher,
+    request_output_sink,
+};
 
 pub mod metrics;
 pub use metrics::{
     MetricsBackend, MetricsHandle, NoOpMetrics, RunnerErrorKind, RunnerType, noop_metrics,
+    record_runner_error,
 };

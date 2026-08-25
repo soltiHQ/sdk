@@ -170,6 +170,10 @@ impl ObjectMeta {
         &self.annotations
     }
 
+    pub(crate) fn into_manifest_parts(self) -> (TaskId, Labels, Annotations) {
+        (self.name, self.labels, self.annotations)
+    }
+
     /// Assigns an opaque state-store version.
     ///
     /// The value is stored verbatim and is never parsed by the model.
@@ -197,8 +201,15 @@ impl ObjectMeta {
         true
     }
 
-    pub(crate) fn bump_generation(&mut self) {
-        self.generation = self.generation.saturating_add(1);
+    pub(crate) fn checked_next_generation(&self) -> ModelResult<u64> {
+        self.generation
+            .checked_add(1)
+            .ok_or_else(|| ModelError::Invalid("metadata.generation is exhausted".into()))
+    }
+
+    pub(crate) fn set_generation(&mut self, generation: u64) {
+        debug_assert_eq!(self.generation.checked_add(1), Some(generation));
+        self.generation = generation;
     }
 }
 

@@ -14,8 +14,6 @@ version.workspace      = true
 edition.workspace      = true
 license.workspace      = true
 
-exclude = ["ARCHITECTURE.md"]
-
 [features]
 default = []
 
@@ -61,8 +59,10 @@ subprocess   = [
     "dep:thiserror",
     "dep:tokio",
     "tokio/macros",
+    "tokio/net",
     "tokio/process",
     "tokio/signal",
+    "tokio/sync",
     "tokio/time",
 ]
 
@@ -122,6 +122,10 @@ required-features = ["subprocess"]
 [[example]]
 name              = "subprocess_script"
 required-features = ["subprocess"]
+
+[[test]]
+name              = "linux_host_runtime"
+required-features = ["subprocess", "seccomp"]
 
 [package.metadata.docs.rs]
 all-features = true

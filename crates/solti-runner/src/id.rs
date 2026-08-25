@@ -1,6 +1,6 @@
 //! # Run identity
 //!
-//! [`RunId`] names one `TaskRef` built by a runner.
+//! [`RunId`] identifies one task built through a runner router.
 //! It does not identify an individual execution attempt.
 //!
 //! ## Flow
@@ -10,7 +10,7 @@
 //!               ▼
 //!       runner-slot-sequence
 //!               ▼
-//!        taskvisor TaskRef
+//!           BuiltTask
 //! ```
 //!
 //! The slot comes from task desired state.
@@ -21,22 +21,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Process-local sequence for run identifiers.
 ///
 /// The first returned value is `1`.
-/// Atomic addition wraps on overflow.
+/// Zero is the exhausted sentinel and is never returned.
 static RUN_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn advance_seq(current: u64) -> Option<u64> {
+    match current {
+        0 => None,
+        u64::MAX => Some(0),
+        value => Some(value + 1),
+    }
+}
 
 /// Returns the next process-local sequence value.
 fn next_seq() -> u64 {
-    RUN_SEQ.fetch_add(1, Ordering::Relaxed)
+    RUN_SEQ
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, advance_seq)
+        .unwrap_or_else(|_| panic!("run id sequence exhausted; identities cannot wrap safely"))
 }
 
-/// Name allocated for one runner-built `TaskRef`.
+/// Identity allocated for one runner build.
 ///
 /// The format is `{runner}-{slot}-{sequence}`.
 /// The sequence is local to the current process.
-/// It starts at `1` and wraps on `u64` overflow.
+/// It starts at `1` and never wraps.
 ///
 /// The allocator does not persist its counter across process restarts.
-/// It is unique within one process only until the sequence wraps.
+/// It is unique within one process.
 ///
 /// ## Example
 ///
@@ -53,7 +64,9 @@ pub struct RunId {
 }
 
 impl RunId {
-    /// Returns the allocated `TaskRef` name.
+    /// Returns the allocated run name.
+    ///
+    /// Use this name when constructing the surrounding `taskvisor::TaskSpec`.
     #[inline]
     pub fn name(&self) -> &str {
         &self.name
@@ -77,6 +90,11 @@ impl RunId {
 /// This function joins both values with the next process sequence.
 /// It does not validate either input.
 ///
+/// # Panics
+///
+/// Panics after the process-local sequence space is exhausted. This preserves
+/// identity uniqueness instead of wrapping into an earlier allocation.
+///
 /// ## Example
 ///
 /// ```rust
@@ -94,7 +112,15 @@ pub fn make_run_id(runner_name: &str, slot: &str) -> RunId {
 
 #[cfg(test)]
 mod tests {
-    use super::make_run_id;
+    use super::{advance_seq, make_run_id};
+
+    #[test]
+    fn sequence_uses_zero_as_an_exhausted_sentinel() {
+        assert_eq!(advance_seq(1), Some(2));
+        assert_eq!(advance_seq(u64::MAX - 1), Some(u64::MAX));
+        assert_eq!(advance_seq(u64::MAX), Some(0));
+        assert_eq!(advance_seq(0), None);
+    }
 
     #[test]
     fn run_id_preserves_identity_and_exposes_its_sequence() {

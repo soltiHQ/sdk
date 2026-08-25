@@ -17,8 +17,9 @@ license.workspace      = true
 [features]
 default = []
 
-model = ["dep:solti-model", "solti-model/schema"]
-tls   = ["dep:solti-tls"]
+model        = ["dep:solti-model"]
+model-schema = ["model", "solti-model/schema"]
+tls          = ["dep:solti-tls"]
 
 taskvisor                    = ["dep:taskvisor"]
 taskvisor-controller         = ["taskvisor", "taskvisor/controller"]
@@ -26,9 +27,10 @@ taskvisor-logging            = ["taskvisor", "taskvisor/logging"]
 taskvisor-tokio-util-interop = ["taskvisor", "taskvisor/tokio-util-interop"]
 taskvisor-tracing            = ["taskvisor", "taskvisor/tracing"]
 
-runner = ["dep:solti-runner", "model", "taskvisor"]
-chain  = ["dep:solti-chain", "runner", "solti-chain/schema"]
-core   = ["dep:solti-core", "model", "runner", "taskvisor-controller"]
+runner       = ["dep:solti-runner", "model", "taskvisor"]
+chain        = ["dep:solti-chain", "runner"]
+chain-schema = ["chain", "model-schema", "solti-chain/schema"]
+core         = ["dep:solti-core", "model", "runner", "taskvisor-controller"]
 
 exec              = ["dep:solti-exec"]
 exec-container    = ["exec", "model", "runner", "taskvisor", "solti-exec/container"]
@@ -49,10 +51,12 @@ api-grpc         = ["api", "solti-api/grpc"]
 api-grpc-tls     = ["api-grpc", "tls", "solti-api/grpc-tls"]
 api-http         = ["api", "solti-api/http"]
 
-discover      = ["dep:solti-discover"]
-discover-grpc = ["discover", "model", "taskvisor", "solti-discover/grpc"]
-discover-http = ["discover", "model", "taskvisor", "solti-discover/http"]
-discover-tls  = ["discover", "tls", "solti-discover/tls"]
+discover          = ["dep:solti-discover"]
+discover-grpc     = ["discover", "model", "taskvisor", "solti-discover/grpc"]
+discover-grpc-tls = ["discover-grpc", "discover-tls"]
+discover-http     = ["discover", "model", "taskvisor", "solti-discover/http"]
+discover-http-tls = ["discover-http", "discover-tls"]
+discover-tls      = ["discover", "tls", "solti-discover/tls"]
 
 observe               = ["dep:solti-observe"]
 observe-journald      = ["observe", "solti-observe/journald"]
@@ -106,10 +110,9 @@ full = [
     "api-core-adapter",
     "api-grpc-tls",
     "api-http",
-    "chain",
-    "discover-grpc",
-    "discover-http",
-    "discover-tls",
+    "chain-schema",
+    "discover-grpc-tls",
+    "discover-http-tls",
     "exec-containerd",
     "exec-seccomp",
     "exec-subprocess",

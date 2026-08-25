@@ -6,7 +6,7 @@
 //! Collection reads use [`CollectionError`](crate::CollectionError).
 //! Checked configuration uses [`ConfigError`](crate::ConfigError).
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use thiserror::Error;
 
@@ -114,16 +114,40 @@ pub enum CoreError {
     #[error("state initialization failed: {0}")]
     StateInitialization(#[source] solti_model::ModelError),
 
+    /// The core-owned persistence delivery worker could not start.
+    #[error("persistence initialization failed: {0}")]
+    PersistenceInitialization(#[source] std::io::Error),
+
+    /// Taskvisor could not build the stopped supervisor.
+    #[error("supervisor initialization failed: {0}")]
+    SupervisorInitialization(#[source] taskvisor::BuildError),
+
     /// Shutdown has started.
     ///
     /// Desired-state writes are no longer accepted.
     #[error("supervisor is shutting down")]
     ShuttingDown,
 
+    /// The caller-provided shutdown deadline elapsed while SDK-owned work was
+    /// still draining.
+    ///
+    /// The accepted shutdown coordinator remains owned by the SDK and
+    /// continues cleanup after this error is returned.
+    #[error("SDK shutdown did not drain within {timeout:?}")]
+    ShutdownTimedOut {
+        /// Deadline supplied by the caller.
+        timeout: Duration,
+    },
+
+    /// The SDK-owned shutdown coordinator stopped before publishing an
+    /// outcome.
+    #[error("SDK shutdown coordinator stopped unexpectedly")]
+    ShutdownCoordinatorStopped,
+
     /// A Taskvisor operation failed.
     ///
     /// `op` is a stable operation label.
-    /// Known labels are `"prepare"`, `"submit"`, `"cancel"`, and `"shutdown"`.
+    /// Known labels are `"start"`, `"prepare"`, `"submit"`, `"cancel"`, and `"shutdown"`.
     #[error("supervisor {op} failed: {source}")]
     Supervisor {
         /// Stable operation label.
@@ -136,6 +160,26 @@ pub enum CoreError {
     /// A retained task already owns the name.
     #[error("task already exists: {0}")]
     AlreadyExists(String),
+
+    /// The state cannot retain another task.
+    #[error("retained task limit reached: {limit}")]
+    RetainedTaskLimitReached {
+        /// Configured task count limit.
+        limit: usize,
+    },
+
+    /// A desired write would exceed the retained TaskManifest byte budget.
+    #[error(
+        "retained task manifest byte limit exceeded: current {current} bytes, requested {requested} bytes, limit {limit} bytes"
+    )]
+    RetainedTaskManifestByteLimitExceeded {
+        /// Caller-owned manifest bytes retained before this write.
+        current: usize,
+        /// Additional caller-owned manifest bytes required by this write.
+        requested: usize,
+        /// Configured aggregate byte limit.
+        limit: usize,
+    },
 
     /// The task does not exist or is hidden by an adapter predicate.
     #[error("task not found: {0}")]

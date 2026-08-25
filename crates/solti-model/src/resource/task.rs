@@ -18,13 +18,21 @@
 //! Reconciled: Unknown        ── accepted     ────▶ True
 //!             False          ── manual retry ────▶ Unknown
 //!             Unknown | True ── failure      ────▶ False
+//!             Unknown        ── progress     ────▶ Unknown with new diagnostics
 //!
-//! Pending ── attempt starts ──▶ Running ── attempt ends ──▶ terminal phase
+//! Pending ── attempt starts ──▶ Running ── terminal outcome ──▶ terminal phase
+//!                                  ▲                               │
+//!                                  └──── newer attempt starts ─────┘
 //! ```
+//!
+//! A terminal phase records the supervisor's logical outcome. It does not by
+//! itself prove that non-cooperative execution code has exited physically.
 //!
 //! Generation is checked before attempt transitions.
 //! Stale generation updates are ignored.
 //! Repeating an identical update is a no-op.
+
+use std::{io, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +55,77 @@ pub const TASK_API_VERSION: &str = concat!("solti.io/v", task_api_major!());
 
 /// Kind of the built-in Task resource.
 pub const TASK_KIND: &str = "Task";
+
+/// Maximum serialized JSON size of one caller-owned Task manifest.
+///
+/// The numeric 4 MiB boundary is also used by Solti HTTP and gRPC request
+/// transports. Each boundary is measured in its native encoding: canonical
+/// manifest JSON here, the HTTP request body, or the encoded protobuf message.
+pub const MAX_TASK_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Default)]
+struct SerializedSize(usize);
+
+impl io::Write for SerializedSize {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskManifestSizeView<'a> {
+    #[serde(flatten)]
+    type_meta: &'a TypeMeta,
+    metadata: TaskManifestMetaSizeView<'a>,
+    spec: &'a TaskSpec,
+}
+
+#[derive(Serialize)]
+struct TaskManifestMetaSizeView<'a> {
+    name: &'a TaskId,
+    #[serde(skip_serializing_if = "Labels::is_empty")]
+    labels: &'a Labels,
+    #[serde(skip_serializing_if = "Annotations::is_empty")]
+    annotations: &'a Annotations,
+}
+
+fn validate_manifest_size(
+    type_meta: &TypeMeta,
+    name: &TaskId,
+    labels: &Labels,
+    annotations: &Annotations,
+    spec: &TaskSpec,
+) -> ModelResult<()> {
+    let view = TaskManifestSizeView {
+        type_meta,
+        metadata: TaskManifestMetaSizeView {
+            name,
+            labels,
+            annotations,
+        },
+        spec,
+    };
+    let mut size = SerializedSize::default();
+    serde_json::to_writer(&mut size, &view).map_err(|error| {
+        ModelError::Invalid(format!("Task manifest serialization failed: {error}").into())
+    })?;
+    if size.0 > MAX_TASK_MANIFEST_BYTES {
+        return Err(ModelError::Invalid(
+            format!(
+                "Task manifest size {} bytes exceeds max {MAX_TASK_MANIFEST_BYTES}",
+                size.0
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Classification of an apply operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,7 +238,7 @@ pub struct TaskManifest {
     #[serde(flatten)]
     type_meta: TypeMeta,
     metadata: TaskManifestMeta,
-    spec: TaskSpec,
+    spec: Arc<TaskSpec>,
 }
 
 impl TaskManifest {
@@ -167,7 +246,8 @@ impl TaskManifest {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when the name or spec is invalid.
+    /// Returns [`ModelError::Invalid`] when the name or spec is invalid or the
+    /// serialized manifest exceeds [`MAX_TASK_MANIFEST_BYTES`].
     pub fn new(name: impl AsRef<str>, spec: TaskSpec) -> ModelResult<Self> {
         Self::from_parts(TypeMeta::task(), TaskManifestMeta::new(name)?, spec)
     }
@@ -176,7 +256,8 @@ impl TaskManifest {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when GVK, metadata, or spec is invalid.
+    /// Returns [`ModelError::Invalid`] when GVK, metadata, or spec is invalid or
+    /// the serialized manifest exceeds [`MAX_TASK_MANIFEST_BYTES`].
     pub fn from_parts(
         type_meta: TypeMeta,
         metadata: TaskManifestMeta,
@@ -185,7 +266,7 @@ impl TaskManifest {
         let manifest = Self {
             type_meta,
             metadata,
-            spec,
+            spec: Arc::new(spec),
         };
         manifest.validate()?;
         Ok(manifest)
@@ -195,10 +276,11 @@ impl TaskManifest {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when a label is invalid.
+    /// Returns [`ModelError::Invalid`] when a label is invalid or the resulting
+    /// manifest exceeds [`MAX_TASK_MANIFEST_BYTES`].
     pub fn with_labels(mut self, labels: Labels) -> ModelResult<Self> {
-        labels.validate()?;
         self.metadata = self.metadata.with_labels(labels);
+        self.validate()?;
         Ok(self)
     }
 
@@ -206,10 +288,11 @@ impl TaskManifest {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when an annotation is invalid.
+    /// Returns [`ModelError::Invalid`] when an annotation is invalid or the
+    /// resulting manifest exceeds [`MAX_TASK_MANIFEST_BYTES`].
     pub fn with_annotations(mut self, annotations: Annotations) -> ModelResult<Self> {
-        annotations.validate()?;
         self.metadata = self.metadata.with_annotations(annotations);
+        self.validate()?;
         Ok(self)
     }
 
@@ -217,11 +300,19 @@ impl TaskManifest {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when GVK, metadata, or spec is invalid.
+    /// Returns [`ModelError::Invalid`] when GVK, metadata, or spec is invalid or
+    /// the serialized manifest exceeds [`MAX_TASK_MANIFEST_BYTES`].
     pub fn validate(&self) -> ModelResult<()> {
         self.type_meta.validate_task()?;
         self.metadata.validate()?;
-        self.spec.validate()
+        self.spec.validate()?;
+        validate_manifest_size(
+            &self.type_meta,
+            self.metadata.name(),
+            self.metadata.labels(),
+            self.metadata.annotations(),
+            &self.spec,
+        )
     }
 
     /// Resource type metadata.
@@ -256,6 +347,14 @@ impl TaskManifest {
 
     /// Returns the serialized manifest fields.
     pub fn into_parts(self) -> (TypeMeta, TaskManifestMeta, TaskSpec) {
+        (
+            self.type_meta,
+            self.metadata,
+            Arc::try_unwrap(self.spec).unwrap_or_else(|spec| spec.as_ref().clone()),
+        )
+    }
+
+    fn into_shared_parts(self) -> (TypeMeta, TaskManifestMeta, Arc<TaskSpec>) {
         (self.type_meta, self.metadata, self.spec)
     }
 }
@@ -313,7 +412,7 @@ pub struct Task {
     #[serde(flatten)]
     type_meta: TypeMeta,
     metadata: ObjectMeta,
-    spec: TaskSpec,
+    spec: Arc<TaskSpec>,
     status: TaskStatus,
 }
 
@@ -325,7 +424,9 @@ impl Task {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when the name or spec is invalid, or the entropy source is unavailable.
+    /// Returns [`ModelError::Invalid`] when the name or spec is invalid, the
+    /// manifest exceeds [`MAX_TASK_MANIFEST_BYTES`], or the entropy source is
+    /// unavailable.
     pub fn new(name: impl AsRef<str>, spec: TaskSpec) -> ModelResult<Self> {
         Self::from_manifest(TaskManifest::new(name, spec)?)
     }
@@ -334,20 +435,19 @@ impl Task {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when the manifest is invalid or the entropy source is unavailable.
+    /// Returns [`ModelError::Invalid`] when the manifest is invalid or the
+    /// entropy source is unavailable.
     pub fn from_manifest(manifest: TaskManifest) -> ModelResult<Self> {
         manifest.validate()?;
-        let (_, metadata, spec) = manifest.into_parts();
+        let (_, metadata, spec) = manifest.into_shared_parts();
         let mut object_meta = ObjectMeta::new(metadata.name.clone())?;
         object_meta.apply_metadata(metadata.labels, metadata.annotations);
-        let task = Self {
+        Ok(Self {
             type_meta: TypeMeta::task(),
             metadata: object_meta,
             spec,
             status: TaskStatus::pending(1)?,
-        };
-        task.validate()?;
-        Ok(task)
+        })
     }
 
     /// Reconstructs a resource from persisted fields.
@@ -364,7 +464,7 @@ impl Task {
         let task = Self {
             type_meta,
             metadata,
-            spec,
+            spec: Arc::new(spec),
             status,
         };
         task.validate()?;
@@ -375,7 +475,8 @@ impl Task {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when GVK, metadata, spec, status, generation, or conditions are inconsistent.
+    /// Returns [`ModelError::Invalid`] when GVK, metadata, spec, status,
+    /// generation, conditions, or the desired manifest size are invalid.
     pub fn validate(&self) -> ModelResult<()> {
         self.type_meta.validate_task()?;
         self.metadata.name().validate_format()?;
@@ -402,7 +503,14 @@ impl Task {
                 "status.conditions[].observedGeneration cannot exceed metadata.generation".into(),
             ));
         }
-        self.spec.validate()
+        self.spec.validate()?;
+        validate_manifest_size(
+            &self.type_meta,
+            self.metadata.name(),
+            self.metadata.labels(),
+            self.metadata.annotations(),
+            &self.spec,
+        )
     }
 
     /// Resource type metadata.
@@ -431,7 +539,12 @@ impl Task {
 
     /// Returns the serialized resource fields.
     pub fn into_parts(self) -> (TypeMeta, ObjectMeta, TaskSpec, TaskStatus) {
-        (self.type_meta, self.metadata, self.spec, self.status)
+        (
+            self.type_meta,
+            self.metadata,
+            Arc::try_unwrap(self.spec).unwrap_or_else(|spec| spec.as_ref().clone()),
+            self.status,
+        )
     }
 
     /// Stable resource address (`metadata.name`).
@@ -485,7 +598,8 @@ impl Task {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when metadata, spec, or a changed `resource_version` is invalid.
+    /// Returns [`ModelError::Invalid`] when desired state or a changed
+    /// `resource_version` is invalid, or when generation is exhausted.
     pub fn apply_desired(
         &mut self,
         labels: Labels,
@@ -493,24 +607,47 @@ impl Task {
         spec: TaskSpec,
         resource_version: impl Into<String>,
     ) -> ModelResult<DesiredChange> {
-        spec.validate()?;
-        labels.validate()?;
-        annotations.validate()?;
         let metadata_changed =
             self.metadata.labels() != &labels || self.metadata.annotations() != &annotations;
-        let spec_changed = self.spec != spec;
+        let spec_changed = self.spec.as_ref() != &spec;
         if !metadata_changed && !spec_changed {
             return Ok(DesiredChange::None);
         }
 
-        self.metadata.set_resource_version(resource_version)?;
+        let desired = TaskManifest {
+            type_meta: self.type_meta.clone(),
+            metadata: TaskManifestMeta {
+                name: self.name().clone(),
+                labels,
+                annotations,
+            },
+            spec: Arc::new(spec),
+        };
+        desired.validate()?;
+        let TaskManifest {
+            type_meta: _,
+            metadata,
+            spec,
+        } = desired;
+
+        let next_generation = spec_changed
+            .then(|| self.metadata.checked_next_generation())
+            .transpose()?;
+
+        let mut object_metadata = self.metadata.clone();
+        object_metadata.set_resource_version(resource_version)?;
         if metadata_changed {
-            self.metadata.apply_metadata(labels, annotations);
+            object_metadata.apply_metadata(metadata.labels, metadata.annotations);
         }
-        if spec_changed {
+        let status = next_generation.map(|generation| {
+            object_metadata.set_generation(generation);
+            self.status.pending_after(generation)
+        });
+
+        self.metadata = object_metadata;
+        if let Some(status) = status {
             self.spec = spec;
-            self.metadata.bump_generation();
-            self.status = self.status.pending_after(self.metadata.generation());
+            self.status = status;
         }
         Ok(if spec_changed {
             DesiredChange::Spec
@@ -568,6 +705,48 @@ impl Task {
         Ok(true)
     }
 
+    /// Updates diagnostics while reconciliation of the current generation is pending.
+    ///
+    /// This method only changes a pending Task whose `Reconciled` condition is
+    /// already `Unknown` for the current generation. It does not reopen an
+    /// accepted or failed reconciliation. Because the condition status stays
+    /// `Unknown`, its `lastTransitionTime` is preserved.
+    ///
+    /// Returns `false` when reconciliation is not currently pending or the
+    /// diagnostic is unchanged. In those cases, `resource_version` is not
+    /// assigned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when `reason`, `message`, or a changed
+    /// `resource_version` is invalid.
+    pub fn update_reconciliation_pending_diagnostic(
+        &mut self,
+        reason: impl Into<String>,
+        message: impl Into<String>,
+        resource_version: impl Into<String>,
+    ) -> ModelResult<bool> {
+        let reason = reason.into();
+        let message = message.into();
+        TaskCondition::validate_reason_message(&reason, &message)?;
+        let generation = self.metadata.generation();
+        let condition = self.status.reconciled_required();
+        if self.status.phase != TaskPhase::Pending
+            || condition.status() != ConditionStatus::Unknown
+            || condition.observed_generation() != generation
+        {
+            return Ok(false);
+        }
+        if condition.reason() == reason && condition.message() == message {
+            return Ok(false);
+        }
+
+        self.metadata.set_resource_version(resource_version)?;
+        self.status
+            .update_reconciliation_pending_diagnostic(generation, reason, message);
+        Ok(true)
+    }
+
     /// Records a reconciliation failure.
     ///
     /// Desired state is retained.
@@ -614,12 +793,13 @@ impl Task {
     /// Records an authoritative attempt start.
     ///
     /// A stale generation returns `false`.
-    /// An identical transition also returns `false`.
+    /// A non-newer attempt also returns `false`.
     /// Attempt numbers come from the execution source of truth.
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when the current generation has attempt zero or a changed `resource_version` is empty.
+    /// Returns [`ModelError::Invalid`] when `attempt` is zero or a changed
+    /// `resource_version` is empty.
     pub fn transition_starting(
         &mut self,
         generation: u64,
@@ -633,6 +813,9 @@ impl Task {
             return Err(ModelError::Invalid(
                 "attempt must be greater than zero".into(),
             ));
+        }
+        if attempt <= self.status.attempt {
+            return Ok(false);
         }
         let changed = self.status.observed_generation != generation
             || self.status.reconciled_required().status() != ConditionStatus::True
@@ -658,6 +841,8 @@ impl Task {
     /// A stale generation or older attempt returns `false`.
     /// Terminal phases are sticky.
     /// `Failed` may be refined to `Exhausted` or `Timeout`.
+    /// Diagnostics longer than [`MAX_TASK_DIAGNOSTIC_BYTES`](crate::MAX_TASK_DIAGNOSTIC_BYTES)
+    /// are truncated to a UTF-8-safe prefix.
     ///
     /// # Errors
     ///
@@ -710,6 +895,8 @@ impl Task {
     ///
     /// Unlike [`Self::transition_finished`], this may replace a conflicting terminal attempt phase.
     /// A stale generation or identical outcome returns `false`.
+    /// Diagnostics longer than [`MAX_TASK_DIAGNOSTIC_BYTES`](crate::MAX_TASK_DIAGNOSTIC_BYTES)
+    /// are truncated to a UTF-8-safe prefix before change detection.
     ///
     /// # Errors
     ///
@@ -730,6 +917,7 @@ impl Task {
                 format!("reconcile_finished requires a terminal phase, got {phase}").into(),
             ));
         }
+        let error = error.map(super::status::truncate_task_diagnostic);
         let changed = self.status.observed_generation != generation
             || self.status.reconciled_required().status() != ConditionStatus::True
             || self.status.reconciled_required().observed_generation() != generation
@@ -753,7 +941,7 @@ impl Task {
     ) {
         self.status.mark_reconciled(generation);
         self.status.phase = phase;
-        self.status.error = error;
+        self.status.error = error.map(super::status::truncate_task_diagnostic);
         self.status.exit_code = exit_code;
     }
 }
@@ -774,7 +962,22 @@ impl From<&Task> for TaskManifest {
 
 impl From<Task> for TaskManifest {
     fn from(task: Task) -> Self {
-        Self::from(&task)
+        let Task {
+            type_meta,
+            metadata,
+            spec,
+            status: _,
+        } = task;
+        let (name, labels, annotations) = metadata.into_manifest_parts();
+        Self {
+            type_meta,
+            metadata: TaskManifestMeta {
+                name,
+                labels,
+                annotations,
+            },
+            spec,
+        }
     }
 }
 
@@ -910,6 +1113,25 @@ mod tests {
     }
 
     #[test]
+    fn manifest_size_view_matches_serialized_manifest_with_empty_metadata() {
+        let manifest = TaskManifest::new("task-a", spec("slot-a")).unwrap();
+        let expected = serde_json::to_vec(&manifest).unwrap().len();
+        let view = TaskManifestSizeView {
+            type_meta: &manifest.type_meta,
+            metadata: TaskManifestMetaSizeView {
+                name: manifest.metadata.name(),
+                labels: manifest.metadata.labels(),
+                annotations: manifest.metadata.annotations(),
+            },
+            spec: &manifest.spec,
+        };
+        let mut actual = SerializedSize::default();
+        serde_json::to_writer(&mut actual, &view).unwrap();
+
+        assert_eq!(actual.0, expected);
+    }
+
+    #[test]
     fn stored_task_roundtrips_through_its_desired_manifest() {
         let stored = task();
         let manifest = TaskManifest::from(&stored);
@@ -923,6 +1145,17 @@ mod tests {
         );
         assert_ne!(rematerialized.uid(), stored.uid());
         assert_eq!(rematerialized.status().phase(), TaskPhase::Pending);
+    }
+
+    #[test]
+    fn task_and_manifest_clones_share_the_immutable_spec() {
+        let stored = task();
+        let stored_clone = stored.clone();
+        assert!(Arc::ptr_eq(&stored.spec, &stored_clone.spec));
+
+        let manifest = TaskManifest::from(stored);
+        let manifest_clone = manifest.clone();
+        assert!(Arc::ptr_eq(&manifest.spec, &manifest_clone.spec));
     }
 
     #[test]
@@ -943,6 +1176,69 @@ mod tests {
 
         let error = serde_json::from_value::<TaskManifest>(json).unwrap_err();
         assert!(error.to_string().contains("label key"));
+    }
+
+    #[test]
+    fn manifest_rejects_payload_above_the_json_budget() {
+        let workload = TaskWorkload::Extension(
+            crate::ExtensionWorkload::new(
+                "tasks.example.io/v1",
+                "Large",
+                serde_json::json!({ "payload": "x".repeat(MAX_TASK_MANIFEST_BYTES) }),
+            )
+            .unwrap(),
+        );
+        let spec = TaskSpec::builder("slot", workload, 1_000_u64)
+            .build()
+            .unwrap();
+
+        let error = TaskManifest::new("large", spec).unwrap_err();
+        assert!(error.to_string().contains("manifest size"));
+    }
+
+    #[test]
+    fn manifest_setters_preserve_the_json_budget() {
+        let workload = TaskWorkload::Extension(
+            crate::ExtensionWorkload::new(
+                "tasks.example.io/v1",
+                "Large",
+                serde_json::json!({
+                    "payload": "x".repeat(MAX_TASK_MANIFEST_BYTES - 128 * 1024)
+                }),
+            )
+            .unwrap(),
+        );
+        let spec = TaskSpec::builder("slot", workload, 1_000_u64)
+            .build()
+            .unwrap();
+        let manifest = TaskManifest::new("large", spec).unwrap();
+        let mut annotations = Annotations::new();
+        annotations.insert("example.io/data", "x".repeat(192 * 1024));
+
+        let error = manifest.with_annotations(annotations).unwrap_err();
+        assert!(error.to_string().contains("manifest size"));
+    }
+
+    #[test]
+    fn stored_task_parts_enforce_the_desired_manifest_budget() {
+        let stored = task();
+        let oversized = TaskWorkload::Extension(
+            crate::ExtensionWorkload::new(
+                "tasks.example.io/v1",
+                "Large",
+                serde_json::json!({ "payload": "x".repeat(MAX_TASK_MANIFEST_BYTES) }),
+            )
+            .unwrap(),
+        );
+        let oversized = TaskSpec::builder("slot", oversized, 1_000_u64)
+            .build()
+            .unwrap();
+        let (type_meta, metadata, _, status) = stored.clone().into_parts();
+
+        let error = Task::from_parts(type_meta, metadata, oversized, status).unwrap_err();
+        assert!(error.to_string().contains("manifest size"));
+
+        assert!(stored.validate().is_ok());
     }
 
     #[test]
@@ -1021,6 +1317,36 @@ mod tests {
     }
 
     #[test]
+    fn spec_apply_rejects_exhausted_generation_without_mutating_reconstructed_task() {
+        let mut stored = serde_json::to_value(task()).unwrap();
+        stored["metadata"]["generation"] = serde_json::json!(u64::MAX);
+        let mut task: Task = serde_json::from_value(stored).unwrap();
+        let before = serde_json::to_vec(&task).unwrap();
+        let mut labels = Labels::new();
+        labels.insert("tier", "production");
+
+        let error = task
+            .apply_desired(labels, Annotations::new(), spec("slot-b"), "2")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelError::Invalid(message) if message == "metadata.generation is exhausted"
+        ));
+        assert_eq!(serde_json::to_vec(&task).unwrap(), before);
+
+        let unchanged_spec = task.spec().clone();
+        let mut labels = Labels::new();
+        labels.insert("tier", "production");
+        assert_eq!(
+            task.apply_desired(labels, Annotations::new(), unchanged_spec, "2")
+                .unwrap(),
+            DesiredChange::Metadata
+        );
+        assert_eq!(task.metadata().generation(), u64::MAX);
+    }
+
+    #[test]
     fn embedded_revision_change_is_a_spec_change() {
         let mut task = task();
         let transition_time = task.status().reconciled().last_transition_time();
@@ -1056,6 +1382,28 @@ mod tests {
         assert!(task.transition_starting(1, 7, "2").unwrap());
         assert_eq!(task.status().attempt(), 7);
         assert_eq!(task.status().observed_generation(), 1);
+        assert_eq!(*task.phase(), TaskPhase::Running);
+    }
+
+    #[test]
+    fn starting_accepts_only_a_strictly_newer_attempt() {
+        let mut task = task();
+        assert!(task.transition_starting(1, 7, "2").unwrap());
+
+        let running = task.clone();
+        assert!(!task.transition_starting(1, 3, "").unwrap());
+        assert_eq!(task, running);
+
+        assert!(
+            task.transition_finished(1, 7, TaskPhase::Failed, Some("attempt".into()), None, "3",)
+                .unwrap()
+        );
+        let terminal = task.clone();
+        assert!(!task.transition_starting(1, 7, "").unwrap());
+        assert_eq!(task, terminal);
+
+        assert!(task.transition_starting(1, 8, "4").unwrap());
+        assert_eq!(task.status().attempt(), 8);
         assert_eq!(*task.phase(), TaskPhase::Running);
     }
 
@@ -1141,6 +1489,92 @@ mod tests {
     }
 
     #[test]
+    fn pending_reconciliation_diagnostic_is_validated_and_preserves_transition_time() {
+        let mut task = task();
+        let transition_time = task.status().reconciled().last_transition_time();
+
+        assert!(
+            task.update_reconciliation_pending_diagnostic(
+                "TaskvisorOwnershipAndControllerIntakePending",
+                "waiting for Taskvisor ownership and controller intake capacity",
+                "2",
+            )
+            .unwrap()
+        );
+        let reconciled = task.status().reconciled();
+        assert_eq!(reconciled.status(), ConditionStatus::Unknown);
+        assert_eq!(reconciled.observed_generation(), 1);
+        assert_eq!(
+            reconciled.reason(),
+            "TaskvisorOwnershipAndControllerIntakePending"
+        );
+        assert_eq!(
+            reconciled.message(),
+            "waiting for Taskvisor ownership and controller intake capacity"
+        );
+        assert_eq!(reconciled.last_transition_time(), transition_time);
+        assert_eq!(task.metadata().resource_version(), "2");
+
+        assert!(
+            !task
+                .update_reconciliation_pending_diagnostic(
+                    "TaskvisorOwnershipAndControllerIntakePending",
+                    "waiting for Taskvisor ownership and controller intake capacity",
+                    "unused",
+                )
+                .unwrap()
+        );
+        assert_eq!(task.metadata().resource_version(), "2");
+        assert!(
+            task.update_reconciliation_pending_diagnostic("bad reason", "message", "3")
+                .is_err()
+        );
+        assert_eq!(task.metadata().resource_version(), "2");
+        let before_invalid_version = task.clone();
+        assert!(
+            task.update_reconciliation_pending_diagnostic(
+                "TaskvisorOwnershipPending",
+                "waiting for ownership",
+                "",
+            )
+            .is_err()
+        );
+        assert_eq!(task, before_invalid_version);
+
+        task.mark_observed("3").unwrap();
+        assert!(
+            !task
+                .update_reconciliation_pending_diagnostic(
+                    "TaskvisorOwnershipAndControllerIntakePending",
+                    "message",
+                    "unused",
+                )
+                .unwrap()
+        );
+        assert_eq!(task.status().reconciled().status(), ConditionStatus::True);
+        assert_eq!(task.metadata().resource_version(), "3");
+
+        let mut failed = self::task();
+        failed
+            .mark_reconciliation_failed("RunnerBuildFailed", "no runner", "2")
+            .unwrap();
+        assert!(
+            !failed
+                .update_reconciliation_pending_diagnostic(
+                    "TaskvisorOwnershipAndControllerIntakePending",
+                    "message",
+                    "unused",
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            failed.status().reconciled().status(),
+            ConditionStatus::False
+        );
+        assert_eq!(failed.metadata().resource_version(), "2");
+    }
+
+    #[test]
     fn sticky_terminal_can_only_refine_failed() {
         let mut task = task();
         task.transition_starting(1, 1, "2").unwrap();
@@ -1157,5 +1591,46 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(*task.phase(), TaskPhase::Exhausted);
+    }
+
+    #[test]
+    fn terminal_transitions_store_bounded_utf8_diagnostics() {
+        let exact = "a".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES);
+        let ascii_over = "b".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES + 1);
+        let multibyte_over = format!("{}é", "c".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES - 1));
+        let cases = [
+            (exact.clone(), exact),
+            (
+                ascii_over.clone(),
+                ascii_over[..crate::MAX_TASK_DIAGNOSTIC_BYTES].to_owned(),
+            ),
+            (
+                multibyte_over,
+                "c".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES - 1),
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let mut task = task();
+            assert!(
+                task.transition_finished(1, 1, TaskPhase::Failed, Some(input.clone()), None, "2",)
+                    .unwrap()
+            );
+            assert_eq!(task.status().error(), Some(expected.as_str()));
+            assert!(
+                task.status()
+                    .error()
+                    .unwrap()
+                    .is_char_boundary(expected.len())
+            );
+
+            assert!(
+                !task
+                    .reconcile_finished(1, TaskPhase::Failed, Some(input), None, "3")
+                    .unwrap(),
+                "change detection must compare the stored normalized diagnostic"
+            );
+            assert_eq!(task.metadata().resource_version(), "2");
+        }
     }
 }

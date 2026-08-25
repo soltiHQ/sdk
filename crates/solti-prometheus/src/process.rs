@@ -30,7 +30,7 @@ use prometheus::Registry;
 /// ```
 /// use solti_prometheus::{Registry, register_process_collector};
 ///
-/// # fn main() -> Result<(), prometheus::Error> {
+/// # fn main() -> Result<(), solti_prometheus::Error> {
 /// let registry = Registry::new();
 /// register_process_collector(&registry)?;
 /// # Ok(()) }
@@ -56,7 +56,7 @@ pub fn register_process_collector(registry: &Registry) -> Result<(), prometheus:
 /// ```
 /// use solti_prometheus::{Registry, register_process_collector};
 ///
-/// # fn main() -> Result<(), prometheus::Error> {
+/// # fn main() -> Result<(), solti_prometheus::Error> {
 /// let registry = Registry::new();
 /// register_process_collector(&registry)?;
 /// # Ok(()) }

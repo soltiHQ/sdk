@@ -27,7 +27,7 @@
 //!
 //! Run with `cargo run -p solti --example agent_grpc_mtls --features api-core-adapter,api-grpc-tls,exec-subprocess`.
 
-use std::{env, io, sync::Arc};
+use std::{env, io, sync::Arc, time::Duration};
 
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -131,7 +131,7 @@ solti: mutually authenticated gRPC task agent
     println!("[pki] Generated one CA and separate server/client identities.");
 
     let mut router = RunnerRouter::new();
-    register_subprocess_runner(&mut router, "default")?;
+    let subprocess_runner = register_subprocess_runner(&mut router, "default")?;
     let supervisor = Arc::new(SupervisorApi::builder(router).start().await?);
     let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
         SubprocessMode::Command {
@@ -211,6 +211,7 @@ solti: mutually authenticated gRPC task agent
     let _ = shutdown_tx.send(());
     server.await??;
     supervisor.shutdown().await?;
+    subprocess_runner.shutdown(Duration::from_secs(5)).await?;
     println!(
         "\nResult: only the client trusted by the configured CA reached the public task handler."
     );

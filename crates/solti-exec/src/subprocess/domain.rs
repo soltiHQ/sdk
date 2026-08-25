@@ -10,24 +10,25 @@ use std::{
     path::Path,
     process::ExitStatus,
     sync::{
-        Arc, Condvar, Mutex, MutexGuard, OnceLock,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{Receiver, RecvTimeoutError, SendError, Sender, channel},
     },
     time::{Duration, Instant},
 };
 
-use tokio::process::{Child, ChildStderr, ChildStdout};
 use tracing::warn;
 
-use crate::host::{AttemptProcessDomain, DomainTermination};
+use crate::host::{AttemptProcessDomain, DomainTermination, PreparedHostProcessAttempt};
+use crate::subprocess::child::{ChildOutput, ProcessChild};
 
 /// Child process and termination boundary for one active attempt.
 ///
 /// Drop requests termination before scheduling reap and cleanup.
 pub(super) struct ActiveProcessDomain {
-    child: Option<Child>,
+    child: Option<ProcessChild>,
     host: Option<AttemptProcessDomain>,
-    drop_finalizer: DropFinalizerHandle,
+    drop_finalizer: Option<DropFinalizerReservation>,
     #[cfg(unix)]
     group: ProcessGroupState,
     #[cfg(not(unix))]
@@ -61,12 +62,16 @@ type DroppedProcessGroup = ();
 
 impl ActiveProcessDomain {
     /// Arms supervision for a freshly spawned child.
-    pub(super) fn new(
-        child: Child,
+    pub(super) fn new<C>(
+        child: C,
         host: AttemptProcessDomain,
         run_id: Arc<str>,
-        drop_finalizer: DropFinalizerHandle,
-    ) -> Self {
+        drop_finalizer: DropFinalizerReservation,
+    ) -> Self
+    where
+        C: Into<ProcessChild>,
+    {
+        let child = child.into();
         #[cfg(unix)]
         let group = child.id().map_or(ProcessGroupState::Released, |pid| {
             ProcessGroupState::Armed(pid as libc::pid_t)
@@ -75,7 +80,7 @@ impl ActiveProcessDomain {
         Self {
             child: Some(child),
             host: Some(host),
-            drop_finalizer,
+            drop_finalizer: Some(drop_finalizer),
             #[cfg(unix)]
             group,
             #[cfg(not(unix))]
@@ -87,21 +92,19 @@ impl ActiveProcessDomain {
     }
 
     /// Takes the child's stdout pipe.
-    pub(super) fn take_stdout(&mut self) -> Option<ChildStdout> {
+    pub(super) fn take_stdout(&mut self) -> Option<ChildOutput> {
         self.child
             .as_mut()
             .expect("active process domain must own its child")
-            .stdout
-            .take()
+            .take_stdout()
     }
 
     /// Takes the child's stderr pipe.
-    pub(super) fn take_stderr(&mut self) -> Option<ChildStderr> {
+    pub(super) fn take_stderr(&mut self) -> Option<ChildOutput> {
         self.child
             .as_mut()
             .expect("active process domain must own its child")
-            .stderr
-            .take()
+            .take_stderr()
     }
 
     /// Returns the attempt cgroup path when one is configured.
@@ -116,9 +119,13 @@ impl ActiveProcessDomain {
     pub(super) async fn observe_exit(&mut self) -> io::Result<()> {
         use tokio::signal::unix::{SignalKind, signal};
 
-        let pid = self.child.as_ref().and_then(Child::id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "subprocess has no process id")
-        })?;
+        let pid = self
+            .child
+            .as_ref()
+            .and_then(ProcessChild::id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "subprocess has no process id")
+            })?;
         let pid = pid as libc::pid_t;
         let mut sigchld = signal(SignalKind::child())?;
 
@@ -399,7 +406,8 @@ impl Drop for ActiveProcessDomain {
         if let Err(error) = self.terminate() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 warn!(
-                    task = %self.run_id,
+                    event = "subprocess.drop_termination_failed",
+                    run_id = %self.run_id,
                     error = %error,
                     "failed to terminate subprocess domain on drop",
                 );
@@ -418,124 +426,592 @@ impl Drop for ActiveProcessDomain {
         }
 
         self.drop_finalizer
+            .take()
+            .expect("active process domain owns finalizer admission")
             .submit(DroppedProcessDomain::new(child, host, group, self.leader));
     }
 }
 
-/// Handle prepared before a subprocess may be spawned.
-#[derive(Clone)]
-pub(super) struct DropFinalizerHandle {
-    state: Arc<DropFinalizerState>,
+/// Observable state of one subprocess runner's bounded finalizer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubprocessFinalizerStatus {
+    accepting: bool,
+    healthy: bool,
+    owned: usize,
+    capacity: usize,
+    quarantined: usize,
 }
 
-impl DropFinalizerHandle {
-    fn submit(&self, domain: DroppedProcessDomain) {
-        let mut inbox = lock_inbox(&self.state);
-        inbox.push(Arc::new(DroppedProcessJobState {
-            domain: Mutex::new(domain),
-            mode: AtomicU8::new(JOB_NORMAL),
-            completed: AtomicBool::new(false),
-        }));
-        drop(inbox);
-        self.state.wake.notify_one();
+impl SubprocessFinalizerStatus {
+    /// Returns whether new attempt ownership may be reserved.
+    pub fn accepting(self) -> bool {
+        self.accepting
+    }
+
+    /// Returns whether the finalizer has preserved forward progress.
+    pub fn healthy(self) -> bool {
+        self.healthy
+    }
+
+    /// Returns active, queued, finalizing, and quarantined ownership.
+    pub fn owned(self) -> usize {
+        self.owned
+    }
+
+    /// Returns the configured ownership limit.
+    pub fn capacity(self) -> usize {
+        self.capacity
+    }
+
+    /// Returns ownership retained after terminal cleanup failure.
+    pub fn quarantined(self) -> usize {
+        self.quarantined
     }
 }
 
-const JOB_NORMAL: u8 = 0;
-const JOB_RECOVERY: u8 = 1;
-const JOB_TERMINAL: u8 = 2;
+/// Bounded finalizer domain owned by one subprocess runner.
+#[derive(Clone)]
+pub(super) struct DropFinalizerDomain {
+    inner: Arc<DropFinalizerDomainInner>,
+}
+
+struct DropFinalizerDomainInner {
+    state: Arc<DropFinalizerState>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+struct DropFinalizerAdmission {
+    accepting: bool,
+    sender: Option<Sender<DroppedProcessJob>>,
+}
+
+struct DropFinalizerState {
+    admission: Mutex<DropFinalizerAdmission>,
+    active: Mutex<Vec<DroppedProcessJob>>,
+    quarantine: Mutex<Vec<DroppedProcessJob>>,
+    owned: AtomicUsize,
+    capacity: usize,
+    healthy: AtomicBool,
+    quarantined: AtomicUsize,
+    worker_stopped: AtomicBool,
+    shutdown_changed: tokio::sync::Notify,
+    #[cfg(test)]
+    panic_worker_once: AtomicBool,
+    #[cfg(test)]
+    input_closed_active_sleeps: AtomicUsize,
+    #[cfg(test)]
+    unhealthy_before_join_once: AtomicBool,
+}
+
+impl DropFinalizerState {
+    fn close_admission(&self) {
+        let mut admission = lock_admission(self);
+        admission.accepting = false;
+        admission.sender.take();
+    }
+
+    fn status(&self) -> SubprocessFinalizerStatus {
+        let accepting = lock_admission(self).accepting;
+        SubprocessFinalizerStatus {
+            accepting,
+            healthy: self.healthy.load(Ordering::Acquire),
+            owned: self.owned.load(Ordering::Acquire),
+            capacity: self.capacity,
+            quarantined: self.quarantined.load(Ordering::Acquire),
+        }
+    }
+}
+
+impl Drop for DropFinalizerState {
+    fn drop(&mut self) {
+        let active = self
+            .active
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let quarantine = self
+            .quarantine
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for job in active.drain(..).chain(quarantine.drain(..)) {
+            std::mem::forget(job);
+        }
+    }
+}
+
+impl Drop for DropFinalizerDomainInner {
+    fn drop(&mut self) {
+        self.state.close_admission();
+        let worker = self
+            .worker
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(worker);
+    }
+}
+
+impl DropFinalizerDomain {
+    /// Starts a Tokio-independent finalizer with bounded ownership admission.
+    pub(super) fn start(capacity: usize) -> io::Result<Self> {
+        if capacity == 0 || u32::try_from(capacity).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "subprocess cleanup capacity is outside the supported range",
+            ));
+        }
+        let (sender, receiver) = channel();
+        let state = Arc::new(DropFinalizerState {
+            admission: Mutex::new(DropFinalizerAdmission {
+                accepting: true,
+                sender: Some(sender),
+            }),
+            active: Mutex::new(Vec::new()),
+            quarantine: Mutex::new(Vec::new()),
+            owned: AtomicUsize::new(0),
+            capacity,
+            healthy: AtomicBool::new(true),
+            quarantined: AtomicUsize::new(0),
+            worker_stopped: AtomicBool::new(false),
+            shutdown_changed: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            panic_worker_once: AtomicBool::new(false),
+            #[cfg(test)]
+            input_closed_active_sleeps: AtomicUsize::new(0),
+            #[cfg(test)]
+            unhealthy_before_join_once: AtomicBool::new(false),
+        });
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::Builder::new()
+            .name("solti-exec-reaper".into())
+            .spawn(move || run_drop_finalizer(worker_state, &receiver))
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed to start subprocess drop finalizer: {error}"),
+                )
+            })?;
+        Ok(Self {
+            inner: Arc::new(DropFinalizerDomainInner {
+                state,
+                worker: Mutex::new(Some(worker)),
+            }),
+        })
+    }
+
+    /// Reserves one active or deferred ownership slot before resource creation.
+    pub(super) fn try_reserve(&self) -> io::Result<DropFinalizerReservation> {
+        let state = &self.inner.state;
+        let mut admission = lock_admission(state);
+        if !admission.accepting {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "subprocess cleanup admission is closed",
+            ));
+        }
+        if !state.healthy.load(Ordering::Acquire)
+            || state.worker_stopped.load(Ordering::Acquire)
+            || self
+                .inner
+                .worker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
+        {
+            state.healthy.store(false, Ordering::Release);
+            admission.accepting = false;
+            admission.sender.take();
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "subprocess cleanup worker is unavailable",
+            ));
+        }
+        if state.owned.load(Ordering::Acquire) >= state.capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "subprocess cleanup admission is full",
+            ));
+        }
+        let sender = admission
+            .sender
+            .as_ref()
+            .expect("accepting finalizer admission owns its sender")
+            .clone();
+        state.owned.fetch_add(1, Ordering::AcqRel);
+        Ok(DropFinalizerReservation {
+            sender: Some(sender),
+            permit: Some(DropFinalizerPermit {
+                state: Arc::clone(state),
+            }),
+        })
+    }
+
+    /// Returns current admission, health, and ownership counters.
+    pub(super) fn status(&self) -> SubprocessFinalizerStatus {
+        self.inner.state.status()
+    }
+
+    /// Closes admission and waits for accepted ownership and the worker.
+    ///
+    /// Cancellation leaves admission closed and the worker handle retained.
+    pub(super) async fn shutdown(&self, timeout: Duration) -> io::Result<()> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "subprocess cleanup shutdown timeout exceeds the supported range",
+                )
+            })?;
+        self.inner.state.close_admission();
+        loop {
+            // Register before inspecting state. A terminal worker transition
+            // between this check and `.await` then wakes this exact waiter.
+            let changed = self.inner.state.shutdown_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+
+            let status = self.status();
+            if status.quarantined > 0 {
+                return Err(io::Error::other(
+                    "subprocess cleanup ownership is quarantined",
+                ));
+            }
+            if status.owned == 0 && self.inner.state.worker_stopped.load(Ordering::Acquire) {
+                // The worker publishes `worker_stopped` only after all
+                // finalizer work is complete. Join the terminal thread here;
+                // requiring `JoinHandle::is_finished()` would race the last
+                // notification against the thread's return epilogue.
+                #[cfg(test)]
+                if self
+                    .inner
+                    .state
+                    .unhealthy_before_join_once
+                    .swap(false, Ordering::AcqRel)
+                {
+                    self.inner.state.healthy.store(false, Ordering::Release);
+                }
+                join_stopped_worker(&self.inner.worker)?;
+                return if self.inner.state.healthy.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "subprocess cleanup worker lost forward progress",
+                    ))
+                };
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "subprocess cleanup shutdown deadline exceeded",
+                ));
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                // Re-check terminal state once at the deadline. Completion
+                // keeps precedence when it races the timer.
+                continue;
+            }
+        }
+    }
+}
+
+fn join_stopped_worker(worker: &Mutex<Option<std::thread::JoinHandle<()>>>) -> io::Result<()> {
+    let worker = worker
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    match worker {
+        Some(worker) => worker.join().map_err(|payload| {
+            std::mem::forget(payload);
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "subprocess cleanup worker panicked",
+            )
+        }),
+        None => Ok(()),
+    }
+}
+
+/// One ownership unit reserved before attempt resources are created.
+pub(super) struct DropFinalizerReservation {
+    sender: Option<Sender<DroppedProcessJob>>,
+    permit: Option<DropFinalizerPermit>,
+}
+
+impl DropFinalizerReservation {
+    /// Hands resources from an attempt that never spawned to the finalizer.
+    pub(super) fn submit_unspawned(self, host: AttemptProcessDomain) {
+        self.submit(unspawned_process_domain(host));
+    }
+
+    /// Retains one terminal ownership unit when no safe cleanup identity exists.
+    pub(super) fn quarantine_unrecoverable(self) {
+        let state = Arc::clone(
+            &self
+                .permit
+                .as_ref()
+                .expect("finalizer reservation owns its permit")
+                .state,
+        );
+        state.healthy.store(false, Ordering::Release);
+        state.close_admission();
+        #[cfg(unix)]
+        let group = ProcessGroupState::Released;
+        #[cfg(not(unix))]
+        let group = ();
+        let mut domain = DroppedProcessDomain::new(None, None, group, LeaderState::Reaped);
+        domain.quarantined = true;
+        self.submit(domain);
+    }
+
+    fn submit(mut self, domain: DroppedProcessDomain) {
+        let state = Arc::clone(
+            &self
+                .permit
+                .as_ref()
+                .expect("finalizer reservation owns its permit")
+                .state,
+        );
+        let job = Arc::new(DroppedProcessJobState {
+            inner: Mutex::new(Some(DroppedProcessJobInner {
+                domain,
+                _permit: self
+                    .permit
+                    .take()
+                    .expect("finalizer reservation owns its permit until handoff"),
+            })),
+            completed: AtomicBool::new(false),
+        });
+        let sender = self
+            .sender
+            .take()
+            .expect("finalizer reservation owns its sender until handoff");
+        match sender.send(job) {
+            Ok(()) => {}
+            Err(SendError(job)) => {
+                state.healthy.store(false, Ordering::Release);
+                state.close_admission();
+                drop(job);
+            }
+        }
+    }
+}
+
+struct DropFinalizerPermit {
+    state: Arc<DropFinalizerState>,
+}
+
+impl Drop for DropFinalizerPermit {
+    fn drop(&mut self) {
+        self.state.owned.fetch_sub(1, Ordering::AcqRel);
+        self.state.shutdown_changed.notify_waiters();
+    }
+}
 
 type DroppedProcessJob = Arc<DroppedProcessJobState>;
 
 struct DroppedProcessJobState {
-    domain: Mutex<DroppedProcessDomain>,
-    mode: AtomicU8,
+    inner: Mutex<Option<DroppedProcessJobInner>>,
     completed: AtomicBool,
 }
 
-struct DropFinalizerState {
-    inbox: Mutex<Vec<DroppedProcessJob>>,
-    active: Mutex<Vec<DroppedProcessJob>>,
-    wake: Condvar,
-    healthy: AtomicBool,
+struct DroppedProcessJobInner {
+    domain: DroppedProcessDomain,
+    _permit: DropFinalizerPermit,
 }
 
-struct DropFinalizer {
-    state: Arc<DropFinalizerState>,
-    thread: std::thread::JoinHandle<()>,
-}
-
-static DROP_FINALIZER: OnceLock<Mutex<Option<DropFinalizer>>> = OnceLock::new();
-
-/// Starts the Tokio-independent drop finalizer before process creation.
-pub(super) fn prepare_drop_finalizer() -> io::Result<DropFinalizerHandle> {
-    let finalizer = DROP_FINALIZER.get_or_init(|| Mutex::new(None));
-    let mut finalizer = finalizer
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(finalizer) = finalizer.as_ref() {
-        if finalizer.thread.is_finished() || !finalizer.state.healthy.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "subprocess drop finalizer stopped",
-            ));
+impl Drop for DroppedProcessJobState {
+    fn drop(&mut self) {
+        if !self.completed.load(Ordering::Acquire) {
+            let inner = self
+                .inner
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(inner) = inner {
+                std::mem::forget(inner);
+            }
         }
-        return Ok(DropFinalizerHandle {
-            state: Arc::clone(&finalizer.state),
-        });
+    }
+}
+
+/// Prepared host resources and their pre-reserved cleanup ownership.
+pub(super) struct PreparedProcessOwnership {
+    prepared: Option<PreparedHostProcessAttempt>,
+    reservation: Option<DropFinalizerReservation>,
+}
+
+impl PreparedProcessOwnership {
+    pub(super) fn new(
+        prepared: PreparedHostProcessAttempt,
+        reservation: DropFinalizerReservation,
+    ) -> Self {
+        Self {
+            prepared: Some(prepared),
+            reservation: Some(reservation),
+        }
     }
 
-    let started = start_drop_finalizer()?;
-    let state = Arc::clone(&started.state);
-    *finalizer = Some(started);
-    Ok(DropFinalizerHandle { state })
+    pub(super) fn into_parts(mut self) -> (PreparedHostProcessAttempt, DropFinalizerReservation) {
+        (
+            self.prepared
+                .take()
+                .expect("prepared process ownership owns host resources"),
+            self.reservation
+                .take()
+                .expect("prepared process ownership owns finalizer admission"),
+        )
+    }
 }
 
-fn start_drop_finalizer() -> io::Result<DropFinalizer> {
-    let state = Arc::new(DropFinalizerState {
-        inbox: Mutex::new(Vec::new()),
-        active: Mutex::new(Vec::new()),
-        wake: Condvar::new(),
-        healthy: AtomicBool::new(true),
-    });
-    let worker_state = Arc::clone(&state);
-    let thread = std::thread::Builder::new()
-        .name("solti-exec-reaper".into())
-        .spawn(move || run_drop_finalizer(worker_state))
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("failed to start subprocess drop finalizer: {error}"),
-            )
-        })?;
-    Ok(DropFinalizer { state, thread })
+impl Drop for PreparedProcessOwnership {
+    fn drop(&mut self) {
+        let Some(prepared) = self.prepared.take() else {
+            return;
+        };
+        let host = prepared.into_cleanup_domain();
+        self.reservation
+            .take()
+            .expect("prepared process ownership owns finalizer admission")
+            .submit(unspawned_process_domain(host));
+    }
+}
+
+/// Attached host resources retained across process spawn failure.
+pub(super) struct AttachedProcessOwnership {
+    host: Option<AttemptProcessDomain>,
+    reservation: Option<DropFinalizerReservation>,
+}
+
+impl AttachedProcessOwnership {
+    pub(super) fn new(host: AttemptProcessDomain, reservation: DropFinalizerReservation) -> Self {
+        Self {
+            host: Some(host),
+            reservation: Some(reservation),
+        }
+    }
+
+    pub(super) fn into_parts(mut self) -> (AttemptProcessDomain, DropFinalizerReservation) {
+        (
+            self.host
+                .take()
+                .expect("attached process ownership owns its host domain"),
+            self.reservation
+                .take()
+                .expect("attached process ownership owns finalizer admission"),
+        )
+    }
+}
+
+impl Drop for AttachedProcessOwnership {
+    fn drop(&mut self) {
+        let Some(host) = self.host.take() else {
+            return;
+        };
+        self.reservation
+            .take()
+            .expect("attached process ownership owns finalizer admission")
+            .submit(unspawned_process_domain(host));
+    }
+}
+
+fn unspawned_process_domain(host: AttemptProcessDomain) -> DroppedProcessDomain {
+    #[cfg(unix)]
+    let group = ProcessGroupState::Released;
+    #[cfg(not(unix))]
+    let group = ();
+    DroppedProcessDomain::new(None, Some(host), group, LeaderState::Reaped)
 }
 
 struct DroppedProcessDomain {
-    child: Option<Child>,
+    child: Option<ProcessChild>,
     host: Option<AttemptProcessDomain>,
     group: DroppedProcessGroup,
     leader: LeaderState,
     tree_handled: bool,
-    cleanup_attempt: usize,
-    cleanup_after: Instant,
+    os_error_backoffs: DroppedProcessBackoffs,
+    quarantined: bool,
+    #[cfg(test)]
+    poll_gate: Option<Arc<AtomicBool>>,
+}
+
+#[repr(usize)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DroppedProcessOperation {
+    TerminateTree,
+    TerminateGroup,
+    TerminateLeader,
+    TryWait,
+    Cleanup,
+}
+
+impl DroppedProcessOperation {
+    const COUNT: usize = 5;
+}
+
+#[derive(Clone, Copy)]
+struct DroppedProcessBackoff {
+    attempt: usize,
+    retry_after: Instant,
+}
+
+struct DroppedProcessBackoffs {
+    operations: [DroppedProcessBackoff; DroppedProcessOperation::COUNT],
+}
+
+impl DroppedProcessBackoffs {
+    fn new(now: Instant) -> Self {
+        Self {
+            operations: [DroppedProcessBackoff {
+                attempt: 0,
+                retry_after: now,
+            }; DroppedProcessOperation::COUNT],
+        }
+    }
+
+    fn operation(&self, operation: DroppedProcessOperation) -> &DroppedProcessBackoff {
+        &self.operations[operation as usize]
+    }
+
+    fn operation_mut(&mut self, operation: DroppedProcessOperation) -> &mut DroppedProcessBackoff {
+        &mut self.operations[operation as usize]
+    }
+
+    fn is_ready(&self, operation: DroppedProcessOperation, now: Instant) -> bool {
+        now >= self.operation(operation).retry_after
+    }
+
+    fn record_error(&mut self, operation: DroppedProcessOperation, now: Instant) -> bool {
+        let backoff = self.operation_mut(operation);
+        backoff.attempt = backoff.attempt.saturating_add(1);
+        backoff.retry_after = now + finalizer_os_error_retry_delay(backoff.attempt - 1);
+        backoff.attempt >= CLEANUP_ATTEMPTS
+    }
+
+    fn clear(&mut self, operation: DroppedProcessOperation) {
+        self.operation_mut(operation).attempt = 0;
+    }
 }
 
 impl DroppedProcessDomain {
     fn new(
-        child: Option<Child>,
+        child: Option<ProcessChild>,
         host: Option<AttemptProcessDomain>,
         group: DroppedProcessGroup,
         leader: LeaderState,
     ) -> Self {
+        let now = Instant::now();
         Self {
             child,
             host,
             group,
             leader,
             tree_handled: false,
-            cleanup_attempt: 0,
-            cleanup_after: Instant::now(),
+            os_error_backoffs: DroppedProcessBackoffs::new(now),
+            quarantined: false,
+            #[cfg(test)]
+            poll_gate: None,
         }
     }
 
@@ -544,131 +1020,179 @@ impl DroppedProcessDomain {
     /// This path does not emit diagnostics or format errors.
     /// It retains the child until `try_wait` reaps it or reports lost ownership.
     fn poll(&mut self, now: Instant) -> bool {
+        #[cfg(test)]
+        if self
+            .poll_gate
+            .as_ref()
+            .is_some_and(|gate| !gate.load(Ordering::Acquire))
+        {
+            return false;
+        }
+        if self.quarantined {
+            return false;
+        }
+        if !self.advance_termination(now) {
+            return false;
+        }
+        if !self.advance_reap(now) {
+            return false;
+        }
+        self.advance_cleanup(now)
+    }
+
+    fn advance_termination(&mut self, now: Instant) -> bool {
         let mut termination_ready = true;
         if !self.tree_handled {
-            match self.host.as_mut() {
-                Some(host) => match host.terminate_tree() {
-                    Ok(_) => self.tree_handled = true,
-                    Err(_) => termination_ready = false,
-                },
-                None => self.tree_handled = true,
+            if let Some(host) = self.host.as_mut() {
+                if self
+                    .os_error_backoffs
+                    .is_ready(DroppedProcessOperation::TerminateTree, now)
+                {
+                    match host.terminate_tree() {
+                        Ok(_) => {
+                            self.tree_handled = true;
+                            self.os_error_backoffs
+                                .clear(DroppedProcessOperation::TerminateTree);
+                        }
+                        Err(_) => {
+                            self.quarantined |= self
+                                .os_error_backoffs
+                                .record_error(DroppedProcessOperation::TerminateTree, now);
+                            termination_ready = false;
+                        }
+                    }
+                } else {
+                    termination_ready = false;
+                }
+            } else {
+                self.tree_handled = true;
+                self.os_error_backoffs
+                    .clear(DroppedProcessOperation::TerminateTree);
             }
         }
 
         #[cfg(unix)]
-        if terminate_process_group(&mut self.group, self.leader).is_err() {
-            termination_ready = false;
-        }
-
-        if terminate_dropped_leader(&mut self.child, &mut self.leader).is_err() {
-            termination_ready = false;
-        }
-        if !termination_ready {
-            return false;
-        }
-
-        if let Some(child) = self.child.as_mut() {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    self.leader = LeaderState::Reaped;
-                    self.child.take();
+        {
+            if self
+                .os_error_backoffs
+                .is_ready(DroppedProcessOperation::TerminateGroup, now)
+            {
+                match terminate_process_group(&mut self.group, self.leader) {
+                    Ok(()) => self
+                        .os_error_backoffs
+                        .clear(DroppedProcessOperation::TerminateGroup),
+                    Err(_) => {
+                        self.quarantined |= self
+                            .os_error_backoffs
+                            .record_error(DroppedProcessOperation::TerminateGroup, now);
+                        termination_ready = false;
+                    }
                 }
-                Ok(None) => return false,
-                Err(error) if wait_ownership_was_lost(&error) => {
-                    self.leader = LeaderState::WaitOwnershipLost;
-                    self.child.take();
-                }
-                Err(_) => return false,
+            } else {
+                termination_ready = false;
             }
         }
+        #[cfg(not(unix))]
+        self.os_error_backoffs
+            .clear(DroppedProcessOperation::TerminateGroup);
 
-        let Some(host) = self.host.as_mut() else {
+        if self
+            .os_error_backoffs
+            .is_ready(DroppedProcessOperation::TerminateLeader, now)
+        {
+            match terminate_dropped_leader(&mut self.child, &mut self.leader) {
+                Ok(()) => self
+                    .os_error_backoffs
+                    .clear(DroppedProcessOperation::TerminateLeader),
+                Err(_) => {
+                    self.quarantined |= self
+                        .os_error_backoffs
+                        .record_error(DroppedProcessOperation::TerminateLeader, now);
+                    termination_ready = false;
+                }
+            }
+        } else {
+            termination_ready = false;
+        }
+        termination_ready
+    }
+
+    fn advance_reap(&mut self, now: Instant) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            self.os_error_backoffs
+                .clear(DroppedProcessOperation::TryWait);
             return true;
         };
-        if now < self.cleanup_after {
+        if !self
+            .os_error_backoffs
+            .is_ready(DroppedProcessOperation::TryWait, now)
+        {
             return false;
         }
 
-        match host.cleanup() {
-            Ok(()) => {
-                self.host.take();
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                self.os_error_backoffs
+                    .clear(DroppedProcessOperation::TryWait);
+                self.leader = LeaderState::Reaped;
+                self.child.take();
+                true
+            }
+            Ok(None) => {
+                self.os_error_backoffs
+                    .clear(DroppedProcessOperation::TryWait);
+                false
+            }
+            Err(error) if wait_ownership_was_lost(&error) => {
+                self.os_error_backoffs
+                    .clear(DroppedProcessOperation::TryWait);
+                self.leader = LeaderState::WaitOwnershipLost;
+                self.child.take();
                 true
             }
             Err(_) => {
-                self.cleanup_attempt = self.cleanup_attempt.saturating_add(1);
-                self.cleanup_after = now + cleanup_retry_delay(self.cleanup_attempt - 1);
+                self.quarantined |= self
+                    .os_error_backoffs
+                    .record_error(DroppedProcessOperation::TryWait, now);
                 false
             }
         }
     }
 
-    /// Completes ownership after an unexpected panic in the regular poll path.
-    ///
-    /// This terminal path contains no tracing, formatting, callbacks, or unwraps.
-    /// It does not release the child, group, or cgroup before completion.
-    fn finalize_after_panic(&mut self) {
-        const RETRY_DELAY: Duration = Duration::from_millis(10);
+    fn advance_cleanup(&mut self, now: Instant) -> bool {
+        let Some(host) = self.host.as_mut() else {
+            self.os_error_backoffs
+                .clear(DroppedProcessOperation::Cleanup);
+            return true;
+        };
+        if !self
+            .os_error_backoffs
+            .is_ready(DroppedProcessOperation::Cleanup, now)
+        {
+            return false;
+        }
 
-        loop {
-            let mut termination_ready = true;
-            if !self.tree_handled {
-                match self.host.as_mut() {
-                    Some(host) => match host.terminate_tree() {
-                        Ok(_) => self.tree_handled = true,
-                        Err(_) => termination_ready = false,
-                    },
-                    None => self.tree_handled = true,
-                }
+        match host.cleanup() {
+            Ok(()) => {
+                self.os_error_backoffs
+                    .clear(DroppedProcessOperation::Cleanup);
+                self.host.take();
+                true
             }
-
-            #[cfg(unix)]
-            if terminate_process_group(&mut self.group, self.leader).is_err() {
-                termination_ready = false;
-            }
-            if terminate_dropped_leader(&mut self.child, &mut self.leader).is_err() {
-                termination_ready = false;
-            }
-            if !termination_ready {
-                std::thread::sleep(RETRY_DELAY);
-                continue;
-            }
-
-            if let Some(child) = self.child.as_mut() {
-                match child.try_wait() {
-                    Ok(Some(_)) => {
-                        self.leader = LeaderState::Reaped;
-                        self.child.take();
-                    }
-                    Ok(None) => {
-                        std::thread::sleep(RETRY_DELAY);
-                        continue;
-                    }
-                    Err(error) if wait_ownership_was_lost(&error) => {
-                        self.leader = LeaderState::WaitOwnershipLost;
-                        self.child.take();
-                    }
-                    Err(_) => {
-                        std::thread::sleep(RETRY_DELAY);
-                        continue;
-                    }
-                }
-            }
-
-            let Some(host) = self.host.as_mut() else {
-                return;
-            };
-            match host.cleanup() {
-                Ok(()) => {
-                    self.host.take();
-                    return;
-                }
-                Err(_) => std::thread::sleep(RETRY_DELAY),
+            Err(_) => {
+                self.quarantined |= self
+                    .os_error_backoffs
+                    .record_error(DroppedProcessOperation::Cleanup, now);
+                false
             }
         }
     }
 }
 
-fn terminate_dropped_leader(child: &mut Option<Child>, leader: &mut LeaderState) -> io::Result<()> {
+fn terminate_dropped_leader(
+    child: &mut Option<ProcessChild>,
+    leader: &mut LeaderState,
+) -> io::Result<()> {
     match *leader {
         LeaderState::ExitedObserved
         | LeaderState::KillRequested
@@ -685,121 +1209,130 @@ fn terminate_dropped_leader(child: &mut Option<Child>, leader: &mut LeaderState)
     }
 }
 
-fn run_drop_finalizer(state: Arc<DropFinalizerState>) {
+fn run_drop_finalizer(state: Arc<DropFinalizerState>, receiver: &Receiver<DroppedProcessJob>) {
     loop {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_drop_finalizer_loop(&state);
+            run_drop_finalizer_loop(&state, receiver);
         }));
-        if result.is_err() {
-            state.healthy.store(false, Ordering::Release);
-            std::thread::sleep(Duration::from_millis(100));
+        match result {
+            Ok(()) => break,
+            Err(payload) => {
+                state.healthy.store(false, Ordering::Release);
+                state.close_admission();
+                std::mem::forget(payload);
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
+    state.worker_stopped.store(true, Ordering::Release);
+    state.shutdown_changed.notify_waiters();
 }
 
-fn run_drop_finalizer_loop(state: &Arc<DropFinalizerState>) {
-    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const DROP_FINALIZER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+fn run_drop_finalizer_loop(
+    state: &Arc<DropFinalizerState>,
+    receiver: &Receiver<DroppedProcessJob>,
+) {
+    let mut input_closed = false;
 
     loop {
         let active_empty = lock_active(state).is_empty();
-        let mut inbox = lock_inbox(state);
-        if inbox.is_empty() {
-            inbox = if active_empty {
-                match state.wake.wait(inbox) {
-                    Ok(inbox) => inbox,
-                    Err(poisoned) => poisoned.into_inner(),
-                }
+        if !input_closed {
+            let incoming = if active_empty {
+                receiver.recv().map_err(|_| RecvTimeoutError::Disconnected)
             } else {
-                match state.wake.wait_timeout(inbox, POLL_INTERVAL) {
-                    Ok((inbox, _)) => inbox,
-                    Err(poisoned) => poisoned.into_inner().0,
-                }
+                receiver.recv_timeout(DROP_FINALIZER_POLL_INTERVAL)
             };
-        }
-        let incoming = std::mem::take(&mut *inbox);
-        drop(inbox);
-
-        if !incoming.is_empty() {
-            lock_active(state).extend(incoming);
+            match incoming {
+                Ok(job) => {
+                    let mut active = lock_active(state);
+                    active.push(job);
+                    drop(active);
+                    #[cfg(test)]
+                    if state.panic_worker_once.swap(false, Ordering::AcqRel) {
+                        panic!("injected subprocess finalizer worker panic");
+                    }
+                    let mut active = lock_active(state);
+                    active.extend(receiver.try_iter());
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => input_closed = true,
+            }
         }
         let jobs = lock_active(state).clone();
         if jobs.is_empty() {
+            if input_closed {
+                return;
+            }
             continue;
         }
 
         let now = Instant::now();
         let mut completed_jobs = Vec::new();
+        let mut quarantined_jobs = Vec::new();
         for job in jobs {
             if job.completed.load(Ordering::Acquire) {
                 completed_jobs.push(Arc::clone(&job));
                 continue;
             }
-            let mode = job.mode.load(Ordering::Acquire);
-            if mode == JOB_TERMINAL {
+            let mut inner = lock_job(&job);
+            let Some(inner) = inner.as_mut() else {
+                job.completed.store(true, Ordering::Release);
+                completed_jobs.push(Arc::clone(&job));
                 continue;
-            }
-            let mut domain = lock_domain(&job);
+            };
             let completed =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| domain.poll(now)));
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.domain.poll(now)));
             match completed {
-                Ok(true) => completed_jobs.push(Arc::clone(&job)),
-                Ok(false) => {}
-                Err(_) if mode == JOB_NORMAL => {
-                    job.mode.store(JOB_RECOVERY, Ordering::Release);
+                Ok(true) => {
+                    job.completed.store(true, Ordering::Release);
+                    completed_jobs.push(Arc::clone(&job));
                 }
-                Err(_) => {
-                    drop(domain);
-                    start_terminal_recovery(state, &job);
+                Ok(false) if inner.domain.quarantined => {
+                    quarantined_jobs.push(Arc::clone(&job));
+                }
+                Ok(false) => {}
+                Err(payload) => {
+                    std::mem::forget(payload);
+                    quarantined_jobs.push(Arc::clone(&job));
                 }
             }
         }
 
-        if !completed_jobs.is_empty() {
+        if !completed_jobs.is_empty() || !quarantined_jobs.is_empty() {
             lock_active(state).retain(|job| {
                 !completed_jobs
                     .iter()
                     .any(|completed| Arc::ptr_eq(job, completed))
+                    && !quarantined_jobs
+                        .iter()
+                        .any(|quarantined| Arc::ptr_eq(job, quarantined))
             });
+        }
+        if !quarantined_jobs.is_empty() {
+            state.healthy.store(false, Ordering::Release);
+            state.close_admission();
+            state
+                .quarantined
+                .fetch_add(quarantined_jobs.len(), Ordering::AcqRel);
+            lock_quarantine(state).extend(quarantined_jobs);
+            state.shutdown_changed.notify_waiters();
+        }
+        let active_remains = input_closed && !lock_active(state).is_empty();
+        if active_remains {
+            std::thread::sleep(DROP_FINALIZER_POLL_INTERVAL);
+            #[cfg(test)]
+            state
+                .input_closed_active_sleeps
+                .fetch_add(1, Ordering::AcqRel);
         }
     }
 }
 
-fn start_terminal_recovery(state: &Arc<DropFinalizerState>, job: &DroppedProcessJob) {
-    if job
-        .mode
-        .compare_exchange(
-            JOB_RECOVERY,
-            JOB_TERMINAL,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
-        return;
-    }
-    state.healthy.store(false, Ordering::Release);
-
-    let terminal_job = Arc::clone(job);
-    if std::thread::Builder::new()
-        .name("solti-exec-terminal-reaper".into())
-        .spawn(move || {
-            let mut domain = lock_domain(&terminal_job);
-            domain.finalize_after_panic();
-            drop(domain);
-            terminal_job.completed.store(true, Ordering::Release);
-        })
-        .is_err()
-    {
-        let mut domain = lock_domain(job);
-        domain.finalize_after_panic();
-        drop(domain);
-        job.completed.store(true, Ordering::Release);
-    }
-}
-
-fn lock_inbox(state: &DropFinalizerState) -> MutexGuard<'_, Vec<DroppedProcessJob>> {
-    match state.inbox.lock() {
-        Ok(inbox) => inbox,
+fn lock_admission(state: &DropFinalizerState) -> MutexGuard<'_, DropFinalizerAdmission> {
+    match state.admission.lock() {
+        Ok(admission) => admission,
         Err(poisoned) => poisoned.into_inner(),
     }
 }
@@ -811,9 +1344,16 @@ fn lock_active(state: &DropFinalizerState) -> MutexGuard<'_, Vec<DroppedProcessJ
     }
 }
 
-fn lock_domain(job: &DroppedProcessJob) -> MutexGuard<'_, DroppedProcessDomain> {
-    match job.domain.lock() {
-        Ok(domain) => domain,
+fn lock_quarantine(state: &DropFinalizerState) -> MutexGuard<'_, Vec<DroppedProcessJob>> {
+    match state.quarantine.lock() {
+        Ok(quarantine) => quarantine,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn lock_job(job: &DroppedProcessJob) -> MutexGuard<'_, Option<DroppedProcessJobInner>> {
+    match job.inner.lock() {
+        Ok(inner) => inner,
         Err(poisoned) => poisoned.into_inner(),
     }
 }
@@ -852,6 +1392,10 @@ fn cleanup_retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(10)
         .saturating_mul(multiplier)
         .min(MAX_DELAY)
+}
+
+fn finalizer_os_error_retry_delay(attempt: usize) -> Duration {
+    cleanup_retry_delay(attempt)
 }
 
 /// Preserves every failed termination boundary.
@@ -910,361 +1454,4 @@ fn exited_without_reaping(pid: libc::pid_t) -> io::Result<bool> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn successful_tree_termination_still_requires_process_group_defense() {
-        let error = io::Error::other("process group failed");
-        let result = finish_termination(Ok(DomainTermination::Requested), Err(error), Ok(()));
-        assert_eq!(result.unwrap_err().to_string(), "process group failed");
-    }
-
-    #[test]
-    fn tree_and_process_group_termination_can_succeed_together() {
-        assert!(finish_termination(Ok(DomainTermination::Requested), Ok(()), Ok(())).is_ok());
-    }
-
-    #[test]
-    fn unavailable_tree_termination_uses_fallback() {
-        let error = io::Error::other("fallback failed");
-        let result = finish_termination(Ok(DomainTermination::Unavailable), Err(error), Ok(()));
-        assert_eq!(result.unwrap_err().to_string(), "fallback failed");
-    }
-
-    #[test]
-    fn tree_error_is_preserved_after_successful_fallback() {
-        let result = finish_termination(Err(io::Error::other("tree failed")), Ok(()), Ok(()));
-        assert_eq!(result.unwrap_err().to_string(), "tree failed");
-    }
-
-    #[test]
-    fn group_and_leader_errors_are_both_preserved() {
-        let result = finish_termination(
-            Ok(DomainTermination::Unavailable),
-            Err(io::Error::other("group failed")),
-            Err(io::Error::other("leader failed")),
-        );
-
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "process group termination failed: group failed; leader termination failed: leader failed"
-        );
-    }
-
-    #[cfg(unix)]
-    fn empty_host_domain(command: &mut tokio::process::Command) -> AttemptProcessDomain {
-        crate::host::HostProcessPolicy::new()
-            .prepare()
-            .unwrap()
-            .prepare_attempt(None)
-            .unwrap()
-            .apply_to_command(command.as_std_mut())
-    }
-
-    #[cfg(unix)]
-    fn active_domain(child: Child, host: AttemptProcessDomain) -> ActiveProcessDomain {
-        ActiveProcessDomain::new(
-            child,
-            host,
-            Arc::from("test"),
-            prepare_drop_finalizer().unwrap(),
-        )
-    }
-
-    #[cfg(unix)]
-    fn assert_pid_reaped(pid: libc::pid_t) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            // SAFETY: `kill(pid, 0)` only probes process existence.
-            if unsafe { libc::kill(pid, 0) } == -1
-                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "subprocess leader {pid} was not reaped"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn waitid_observation_preserves_exit_status_until_reap() {
-        let mut command = tokio::process::Command::new("sh");
-        command.arg("-c").arg("exit 37").process_group(0);
-        let mut child = command.spawn().unwrap();
-        let pid = child.id().unwrap() as libc::pid_t;
-
-        let mut sigchld =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).unwrap();
-        while !exited_without_reaping(pid).unwrap() {
-            sigchld.recv().await.expect("SIGCHLD listener closed");
-        }
-        let status = child.wait().await.unwrap();
-
-        assert_eq!(status.code(), Some(37));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn external_reap_releases_the_numeric_process_group_identity() {
-        let mut command = tokio::process::Command::new("sh");
-        command.arg("-c").arg("exit 0").process_group(0);
-        let host = empty_host_domain(&mut command);
-        let child = command.spawn().unwrap();
-        let pid = child.id().unwrap() as libc::pid_t;
-        let mut active = active_domain(child, host);
-
-        let mut status = 0;
-        // SAFETY: `pid` names the owned child and `status` is writable.
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-
-        let error = active.observe_exit().await.unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
-        assert_eq!(active.leader, LeaderState::WaitOwnershipLost);
-        assert!(active.process_group_id().is_none());
-        assert_eq!(
-            active.terminate().unwrap_err().kind(),
-            io::ErrorKind::NotFound
-        );
-
-        active.terminated = true;
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn observed_exited_leader_accepts_macos_group_eperm() {
-        let mut command = tokio::process::Command::new("sh");
-        command.arg("-c").arg("exit 0").process_group(0);
-        let host = empty_host_domain(&mut command);
-        let child = command.spawn().unwrap();
-        let mut active = active_domain(child, host);
-
-        active.observe_exit().await.unwrap();
-        assert!(macos_group_contains_only_leader(active.process_group_id().unwrap()).unwrap());
-        active.terminate().unwrap();
-        let status = active.reap().await.unwrap();
-
-        assert!(status.success());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn macos_group_inspection_detects_a_live_descendant() {
-        let directory = tempfile::TempDir::new().unwrap();
-        let marker = directory.path().join("descendant.pid");
-        let mut command = tokio::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg("sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; exit 0")
-            .arg("sh")
-            .arg(&marker)
-            .process_group(0);
-        let host = empty_host_domain(&mut command);
-        let child = command.spawn().unwrap();
-        let mut active = active_domain(child, host);
-
-        active.observe_exit().await.unwrap();
-        let descendant = std::fs::read_to_string(&marker)
-            .unwrap()
-            .trim()
-            .parse::<libc::pid_t>()
-            .unwrap();
-        // SAFETY: `kill(pid, 0)` only probes process existence.
-        assert_eq!(unsafe { libc::kill(descendant, 0) }, 0);
-        assert!(!macos_group_contains_only_leader(active.process_group_id().unwrap()).unwrap());
-
-        active.terminate().unwrap();
-        active.reap().await.unwrap();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn reaped_domain_cannot_signal_a_numeric_process_group() {
-        let mut command = tokio::process::Command::new("sh");
-        command.arg("-c").arg("sleep 30").process_group(0);
-        let host = empty_host_domain(&mut command);
-        let child = command.spawn().unwrap();
-        let mut active = active_domain(child, host);
-
-        active.terminate().unwrap();
-        active.reap().await.unwrap();
-
-        assert!(active.process_group_id().is_none());
-        active.terminate().unwrap();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn armed_process_group_blocks_leader_reap() {
-        let mut command = tokio::process::Command::new("sh");
-        command.arg("-c").arg("sleep 30").process_group(0);
-        let host = empty_host_domain(&mut command);
-        let child = command.spawn().unwrap();
-        let pgid = child.id().unwrap() as libc::pid_t;
-        let mut active = active_domain(child, host);
-
-        active.leader = LeaderState::KillRequested;
-        assert!(!active.leader_can_be_reaped());
-        active.group = ProcessGroupState::Handled;
-        assert!(active.leader_can_be_reaped());
-
-        active.leader = LeaderState::Running;
-        active.group = ProcessGroupState::Armed(pgid);
-        active.terminate().unwrap();
-        active.reap().await.unwrap();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn escaped_leader_is_terminated_separately_from_its_original_group() {
-        // SAFETY: `getpgrp` has no preconditions.
-        let controller_pgid = unsafe { libc::getpgrp() };
-        let mut command = tokio::process::Command::new("sh");
-        command.arg("-c").arg("sleep 30").process_group(0);
-        // SAFETY: the hook calls only the async-signal-safe `setpgid` function.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::setpgid(0, controller_pgid) == 0 {
-                    Ok(())
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            });
-        }
-        let host = empty_host_domain(&mut command);
-        let child = command.spawn().unwrap();
-        let pid = child.id().unwrap() as libc::pid_t;
-        let mut active = active_domain(child, host);
-
-        // SAFETY: `getpgid` only reads process metadata for a numeric pid.
-        assert_ne!(unsafe { libc::getpgid(pid) }, pid);
-
-        active.terminate().unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), active.reap())
-            .await
-            .expect("escaped leader survived termination")
-            .unwrap();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn drop_synchronously_signals_an_active_group_descendant() {
-        let directory = tempfile::TempDir::new().unwrap();
-        let marker = directory.path().join("descendant.pid");
-        let mut command = tokio::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg("sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; wait \"$child\"")
-            .arg("sh")
-            .arg(&marker)
-            .process_group(0);
-        let host = empty_host_domain(&mut command);
-        let child = command.spawn().unwrap();
-        let leader = child.id().unwrap() as libc::pid_t;
-        let active = active_domain(child, host);
-        let descendant = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if let Ok(value) = std::fs::read_to_string(&marker)
-                    && let Ok(pid) = value.trim().parse::<libc::pid_t>()
-                {
-                    break pid;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("descendant did not report its pid");
-
-        // SAFETY: `getpgid` only reads process metadata for a numeric pid.
-        assert_eq!(unsafe { libc::getpgid(descendant) }, leader);
-
-        drop(active);
-
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                // SAFETY: `kill(pid, 0)` only probes process existence.
-                if unsafe { libc::kill(descendant, 0) } != 0
-                    && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("subprocess descendant survived domain drop");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn drop_without_runtime_reaps_the_leader() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (active, leader) = runtime.block_on(async {
-            let mut command = tokio::process::Command::new("sh");
-            command.arg("-c").arg("sleep 30").process_group(0);
-            let host = empty_host_domain(&mut command);
-            let child = command.spawn().unwrap();
-            let leader = child.id().unwrap() as libc::pid_t;
-            (active_domain(child, host), leader)
-        });
-        drop(runtime);
-
-        drop(active);
-
-        assert_pid_reaped(leader);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn drop_before_runtime_shutdown_reaps_the_leader() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let leader = runtime.block_on(async {
-            let mut command = tokio::process::Command::new("sh");
-            command.arg("-c").arg("sleep 30").process_group(0);
-            let host = empty_host_domain(&mut command);
-            let child = command.spawn().unwrap();
-            let leader = child.id().unwrap() as libc::pid_t;
-            drop(active_domain(child, host));
-            leader
-        });
-        drop(runtime);
-
-        assert_pid_reaped(leader);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn drop_finalizer_reaps_multiple_leaders() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let leaders = runtime.block_on(async {
-            let mut leaders = Vec::new();
-            for _ in 0..8 {
-                let mut command = tokio::process::Command::new("sh");
-                command.arg("-c").arg("sleep 30").process_group(0);
-                let host = empty_host_domain(&mut command);
-                let child = command.spawn().unwrap();
-                leaders.push(child.id().unwrap() as libc::pid_t);
-                drop(active_domain(child, host));
-            }
-            leaders
-        });
-        drop(runtime);
-
-        for leader in leaders {
-            assert_pid_reaped(leader);
-        }
-    }
-}
+mod tests;

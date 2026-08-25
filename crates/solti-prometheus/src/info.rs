@@ -23,7 +23,7 @@ use prometheus::{IntGauge, Opts, Registry};
 /// ```rust
 /// use solti_prometheus::{Registry, register_build_info};
 ///
-/// # fn main() -> Result<(), prometheus::Error> {
+/// # fn main() -> Result<(), solti_prometheus::Error> {
 /// let registry = Registry::new();
 /// register_build_info(&registry, &[
 ///     ("version", env!("CARGO_PKG_VERSION")),

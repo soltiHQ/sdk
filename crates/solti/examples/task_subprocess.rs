@@ -42,7 +42,8 @@ use solti::{
     exec::subprocess::register_subprocess_runner,
     model::{
         ConditionStatus, Flag, OutputEvent, RestartPolicy, StreamKind, SubprocessMode,
-        SubprocessSpec, Task, TaskEnv, TaskFilter, TaskId, TaskManifest, TaskSpec, TaskWorkload,
+        SubprocessSpec, Task, TaskEnv, TaskFilter, TaskId, TaskManifest, TaskRunQuery, TaskSpec,
+        TaskWorkload,
     },
     runner::RunnerRouter,
 };
@@ -89,15 +90,17 @@ solti: one supervised subprocess
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "example path is not UTF-8"))?;
 
     let mut router = RunnerRouter::new();
-    register_subprocess_runner(&mut router, "default")?;
+    let subprocess_runner = register_subprocess_runner(&mut router, "default")?;
     println!("[runner] Registered the built-in Subprocess GVK as runner=default.");
 
     let supervisor = SupervisorApi::builder(router).start().await?;
     let run_result = run(&supervisor, listener, child_address.to_string(), command).await;
     let shutdown_result = supervisor.shutdown().await;
+    let finalizer_result = subprocess_runner.shutdown(Duration::from_secs(5)).await;
 
     run_result?;
     shutdown_result?;
+    finalizer_result?;
     println!("[shutdown] Supervisor and SDK-owned workers stopped.");
     println!(
         "\nResult: one routed subprocess completed with live output, terminal state, and retained history."
@@ -164,8 +167,11 @@ async fn run(
     let terminal = wait_for_terminal_phase(&mut watch, &task_name).await?;
     println!("terminal phase={}", terminal.status().phase());
 
-    let runs = supervisor.list_task_runs(&task_name);
+    let runs = supervisor
+        .query_task_runs(&task_name, &TaskRunQuery::new())?
+        .ok_or_else(|| io::Error::other("task disappeared before run history was read"))?;
     let run = runs
+        .items
         .last()
         .ok_or_else(|| io::Error::other("run history is empty"))?;
     println!(
@@ -242,8 +248,14 @@ async fn print_child_output(mut output: OutputSubscription) -> Result<(), Exampl
                 saw_stdout |= chunk.stream == StreamKind::Stdout;
                 saw_stderr |= chunk.stream == StreamKind::Stderr;
             }
-            OutputEvent::Lagged { skipped } => {
-                return Err(io::Error::other(format!("live output lost {skipped} events")).into());
+            OutputEvent::Lagged {
+                skipped,
+                skipped_bytes,
+            } => {
+                return Err(io::Error::other(format!(
+                    "live output lost {skipped} events ({skipped_bytes} bytes)"
+                ))
+                .into());
             }
             OutputEvent::RunStarted { .. } | OutputEvent::RunFinished { .. } => {}
             _ => {}

@@ -6,11 +6,11 @@
 //! ## Flow
 //!
 //! ```text
-//! Task + RunId + BuildContext
-//!              ▼
-//!            Runner
-//!              ▼
-//!       taskvisor::TaskRef
+//! Task + RunId + BuildContext + BuildCancellation + BuildScope
+//!                              ▼
+//!                            Runner
+//!                              ▼
+//!                       taskvisor::TaskRef
 //! ```
 //!
 //! The runner builds the task.
@@ -19,6 +19,10 @@
 use solti_model::{Task, WorkloadTypeMeta};
 use taskvisor::TaskRef;
 
+use async_trait::async_trait;
+
+use crate::BuildScope;
+use crate::cancellation::BuildCancellation;
 use crate::context::BuildContext;
 use crate::error::RunnerError;
 use crate::id::RunId;
@@ -30,16 +34,19 @@ use crate::id::RunId;
 ///
 /// ## Contract
 ///
-/// - [`build_task`](Self::build_task) must use the allocated [`RunId`] as the task name.
+/// - The router returns the allocated [`RunId`] beside the task in a [`BuiltTask`](crate::BuiltTask).
+/// - Implementations must observe [`BuildCancellation`] during interruptible work.
+/// - Building is asynchronous and must remain owned by the returned future.
+/// - Composing runners must pass [`BuildScope`] to scoped catalog builds.
 /// - The router snapshots the name and workload GVKs during registration.
-/// - Building must not start or submit the task.
-/// - Building is synchronous and must finish without unbounded waits.
+/// - The returned task must not retain the build cancellation signal.
 /// - Attempt-scoped resources belong inside the task body.
+/// - Building must not start or submit the task.
 ///
 /// A returned task may execute more than one attempt.
-/// A supervisor may stop awaiting a build during shutdown. Rust cannot forcibly
-/// stop synchronous code that is already running, so implementations must bound
-/// their own blocking work and must not rely on the build result being observed.
+/// A supervisor drops the build future after cancellation or its configured deadline.
+/// Implementations must not detach work from that future.
+/// Inherently blocking work belongs in a runner-owned bounded facility with an explicit cancellation and shutdown contract.
 ///
 /// ## Example
 ///
@@ -50,6 +57,7 @@ use crate::id::RunId;
 ///
 /// struct MyRunner;
 ///
+/// #[solti_runner::async_trait]
 /// impl Runner for MyRunner {
 ///     fn name(&self) -> &str {
 ///         "my-runner"
@@ -62,13 +70,15 @@ use crate::id::RunId;
 ///         ]
 ///     }
 ///
-///     fn build_task(
+///     async fn build_task(
 ///         &self,
 ///         _task: &Task,
-///         run_id: &solti_runner::RunId,
+///         _run_id: &solti_runner::RunId,
 ///         _ctx: &BuildContext,
+///         _cancellation: &solti_runner::BuildCancellation,
+///         _scope: &mut solti_runner::BuildScope,
 ///     ) -> Result<TaskRef, RunnerError> {
-///         Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move {
+///         Ok(TaskFn::arc(|_ctx: TaskContext| async move {
 ///             Ok::<(), TaskError>(())
 ///         }))
 ///     }
@@ -78,8 +88,9 @@ use crate::id::RunId;
 /// ## See Also
 ///
 /// - [`RunnerRouter`](crate::RunnerRouter)
-/// - [`BuildContext`](crate::BuildContext)
-/// - [`RunId`](crate::RunId)
+/// - [`BuildContext`]
+/// - [`RunId`]
+#[async_trait]
 pub trait Runner: Send + Sync {
     /// Returns the runner name.
     ///
@@ -96,15 +107,18 @@ pub trait Runner: Send + Sync {
     /// Builds a [`TaskRef`] for a matching task resource.
     ///
     /// [`BuildContext`] provides environment, metrics, and output publishing.
-    /// The returned task name must equal `run_id.name()`.
+    /// [`BuildScope`] carries admission through nested catalog builds.
+    /// The router returns `run_id` with the executable task in a [`BuiltTask`](crate::BuiltTask).
     ///
     /// # Errors
     ///
     /// Returns [`RunnerError`] when the workload cannot be converted.
-    fn build_task(
+    async fn build_task(
         &self,
         task: &Task,
         run_id: &RunId,
         ctx: &BuildContext,
+        cancellation: &BuildCancellation,
+        scope: &mut BuildScope,
     ) -> Result<TaskRef, RunnerError>;
 }

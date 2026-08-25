@@ -7,7 +7,8 @@
 //! The `container` feature provides an engine-neutral `ContainerRunner`.
 //! The `containerd` feature provides its native containerd 2.x engine.
 //! Both runners convert `solti_model::Task` resources into reusable `taskvisor::TaskRef` values.
-//! Taskvisor owns execution after conversion.
+//! `RunnerRouter` pairs each task with its allocated run identity in a
+//! `solti_runner::BuiltTask`. Taskvisor owns execution after conversion.
 //!
 //! ## Start Here
 //!
@@ -33,12 +34,14 @@
 //!                    process      container task
 //!                       └────┬─────┘
 //!                            ▼
-//!                 tracing + OutputSink
+//!          OutputSink + optional tracing copy
 //!                            ▼
 //!                 terminate, wait, cleanup
 //! ```
 //!
 //! Building performs no process or engine I/O.
+//! An explicit subprocess working directory is resolved and descriptor-pinned
+//! on the runner-owned bounded cwd worker during build.
 //! Runtime resources and output streams are attempt-scoped.
 //!
 //! ## Commands and Scripts
@@ -81,20 +84,24 @@
 //! They signal the process group and a running leader before reap.
 //! Without `cgroup.kill`, only the process-group boundary remains.
 //! That boundary cannot reach descendants that enter another process group or session.
+
+#![deny(clippy::undocumented_unsafe_blocks)]
 //!
 //! ## Subprocess Quick Start
 //!
 //! ```rust,no_run
 //! # #[cfg(feature = "subprocess")]
 //! # {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! use solti_exec::subprocess::register_subprocess_runner;
 //! use solti_model::{
 //!     Flag, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskSpec, TaskWorkload,
 //! };
 //! use solti_runner::RunnerRouter;
+//! use std::time::Duration;
 //!
 //! let mut router = RunnerRouter::new();
-//! register_subprocess_runner(&mut router, "default")?;
+//! let runner = register_subprocess_runner(&mut router, "default")?;
 //!
 //! let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
 //!     SubprocessMode::Command {
@@ -108,8 +115,13 @@
 //! let spec = TaskSpec::builder("jobs", workload, 5_000_u64).build()?;
 //! let resource = Task::new("hello", spec)?;
 //!
-//! let task = router.build(&resource)?;
-//! assert!(task.name().starts_with("default-jobs-"));
+//! let built = router.build(&resource).await?;
+//! assert!(built.name().starts_with("default-jobs-"));
+//! drop(built);
+//! drop(router);
+//! runner.shutdown(Duration::from_secs(5)).await?;
+//! # Ok(())
+//! # }
 //! # }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```

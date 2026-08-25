@@ -1,7 +1,7 @@
 //! # Logger configuration
 //!
 //! [`LoggerConfig`] contains every setting used during logger installation.
-//! Serde fills omitted fields from [`Default`].
+//! Serde fills omitted fields from [`Default`] and rejects unknown fields.
 //!
 //! ```text
 //! serialized config ──► LoggerConfig ──► init_logger
@@ -24,7 +24,8 @@ use crate::logger::object::{LoggerFormat, LoggerLevel, LoggerTimeZone};
 /// | `with_targets` | `true`  | Text and JSON event targets            |
 /// | `use_color`    | `true`  | Text output on an interactive terminal |
 ///
-/// Missing Serde fields use these defaults.
+/// Missing Serde fields use these defaults. Unknown fields are rejected so a
+/// misspelled setting cannot silently retain its default value.
 ///
 /// ## Example
 ///
@@ -38,7 +39,7 @@ use crate::logger::object::{LoggerFormat, LoggerLevel, LoggerTimeZone};
 /// assert_eq!(cfg.level.as_str(), "debug");
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoggerConfig {
     /// Output backend.
     pub format: LoggerFormat,
@@ -123,5 +124,15 @@ mod tests {
         assert_eq!(config.timezone, LoggerTimeZone::Utc);
         assert!(config.with_targets);
         assert!(config.use_color);
+    }
+
+    #[test]
+    fn serde_rejects_unknown_fields() {
+        let error = serde_json::from_str::<LoggerConfig>(r#"{"levle": "debug"}"#)
+            .expect_err("an unknown logger setting must be rejected");
+        let message = error.to_string();
+
+        assert!(message.contains("unknown field `levle`"), "{message}");
+        assert!(message.contains("`level`"), "{message}");
     }
 }

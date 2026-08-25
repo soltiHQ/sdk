@@ -24,22 +24,28 @@
 //! It lets queued attempt events arrive before binding and output cleanup.
 //! Finalization waits for that barrier for at most one second.
 //! Subscriber overflow releases finalizations that are safe without the barrier.
+//! If state persistence admission is closed after authoritative cleanup, the
+//! observer removes exact runtime ownership without synthesizing status or runs.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     num::NonZeroUsize,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
     time::Duration,
 };
 
 use parking_lot::Mutex;
 use taskvisor::{Event, EventKind, Subscribe};
-use tokio::sync::watch;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, watch};
 use tracing::{trace, warn};
 
 use crate::map::phase::{phase_for_outcome, phase_for_outcome_kind, phase_for_rejection};
 use crate::output::OutputHub;
-use crate::state::{ResourceGeneration, RuntimeBinding, TaskState};
+use crate::persistence::{StateAdmissionClosed, block_on_thread};
+use crate::state::{
+    ResourceGeneration, RuntimeBinding, StateMutationEventCapacity, StateWriteAdmission, TaskState,
+};
 use solti_model::{TaskId, TaskPhase};
 
 const RUNTIME_OBSERVER_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(2048).unwrap();
@@ -51,16 +57,58 @@ const EVENT_BARRIER_TIMEOUT: Duration = Duration::from_secs(1);
 /// Event, completion, and management paths share this gate.
 #[derive(Clone, Default)]
 struct LifecycleGate {
-    inner: Arc<Mutex<()>>,
+    inner: Arc<AsyncMutex<()>>,
+    #[cfg(test)]
+    waiters: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl LifecycleGate {
-    fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.inner.lock()
+#[cfg(test)]
+struct LifecycleWaiter {
+    waiters: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl Drop for LifecycleWaiter {
+    fn drop(&mut self) {
+        self.waiters
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
-#[derive(Clone)]
+impl LifecycleGate {
+    #[cfg(test)]
+    fn track_waiter(&self) -> LifecycleWaiter {
+        self.waiters
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        LifecycleWaiter {
+            waiters: Arc::clone(&self.waiters),
+        }
+    }
+
+    async fn lock(&self) -> OwnedMutexGuard<()> {
+        #[cfg(test)]
+        let waiter = self.track_waiter();
+        let guard = Arc::clone(&self.inner).lock_owned().await;
+        #[cfg(test)]
+        drop(waiter);
+        guard
+    }
+
+    fn lock_from_taskvisor_callback(&self) -> OwnedMutexGuard<()> {
+        #[cfg(test)]
+        let waiter = self.track_waiter();
+        let guard = block_on_thread(Arc::clone(&self.inner).lock_owned());
+        #[cfg(test)]
+        drop(waiter);
+        guard
+    }
+
+    #[cfg(test)]
+    fn waiters(&self) -> usize {
+        self.waiters.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 struct Finalization {
     phase: TaskPhase,
     error: Option<String>,
@@ -119,13 +167,96 @@ impl CompletionBarriers {
 ///
 /// ## See Also
 ///
-/// - [`TaskState`](crate::TaskState) stores the projected state.
+/// - [`TaskState`] stores the projected state.
 /// - [`SupervisorApiBuilder`](crate::SupervisorApiBuilder) installs this observer.
 pub(crate) struct RuntimeObserver {
     state: TaskState,
     output_hub: Arc<OutputHub>,
     lifecycle_gate: LifecycleGate,
-    completion_barriers: Mutex<CompletionBarriers>,
+    completion_barriers: Arc<Mutex<CompletionBarriers>>,
+}
+
+/// Owns an exact runtime binding until Taskvisor intake is accepted.
+///
+/// The synchronous fallback is intentionally limited to a pre-intake binding.
+/// Taskvisor cannot publish an event before successful controller intake, and
+/// the reconciliation worker still owns the per-name runtime lock. This lets an
+/// unexpected unwind remove the exact binding without awaiting the lifecycle
+/// gate or inventing a Taskvisor outcome.
+pub(crate) struct ProvisionalBinding {
+    state: TaskState,
+    output_hub: Arc<OutputHub>,
+    completion_barriers: Arc<Mutex<CompletionBarriers>>,
+    binding: Option<RuntimeBinding>,
+}
+
+impl ProvisionalBinding {
+    fn new(
+        state: TaskState,
+        output_hub: Arc<OutputHub>,
+        completion_barriers: Arc<Mutex<CompletionBarriers>>,
+        binding: RuntimeBinding,
+    ) -> Self {
+        Self {
+            state,
+            output_hub,
+            completion_barriers,
+            binding: Some(binding),
+        }
+    }
+
+    pub(crate) fn binding(&self) -> &RuntimeBinding {
+        self.binding
+            .as_ref()
+            .expect("provisional binding is armed until release or Taskvisor handoff")
+    }
+
+    /// Releases the binding through the ordinary serialized observer path.
+    pub(crate) async fn release(mut self, observer: &RuntimeObserver) -> bool {
+        let binding = self.binding().clone();
+        let released = observer.release_unsubmitted_binding(&binding).await;
+        if observer.state.resolve_tv(binding.tv.get()).as_ref() != Some(&binding) {
+            self.binding = None;
+        }
+        released
+    }
+
+    /// Transfers ownership to the authoritative Taskvisor completion worker.
+    pub(crate) fn disarm(mut self) {
+        self.binding = None;
+    }
+
+    fn release_exact_without_await(&mut self) {
+        let Some(binding) = self.binding.take() else {
+            return;
+        };
+        if self.state.resolve_tv(binding.tv.get()).as_ref() != Some(&binding) {
+            return;
+        }
+        if self.state.unbind_exact(&binding) {
+            self.output_hub
+                .evict_if_uid(&binding.resource.name, &binding.resource.uid);
+            let mut barriers = self.completion_barriers.lock();
+            barriers.pending.remove(&binding.tv.get());
+            barriers.take_removed(binding.tv.get());
+            barriers.notify_finalized(binding.tv.get());
+        }
+    }
+}
+
+impl Drop for ProvisionalBinding {
+    fn drop(&mut self) {
+        let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+            self.release_exact_without_await();
+        })) else {
+            return;
+        };
+        if let Err(nested) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+            // A hostile panic payload cannot be destroyed recursively. Retain
+            // this one nested payload and preserve the non-unwinding boundary.
+            std::mem::forget(nested);
+        }
+    }
 }
 
 impl RuntimeObserver {
@@ -135,50 +266,87 @@ impl RuntimeObserver {
             state,
             output_hub,
             lifecycle_gate: LifecycleGate::default(),
-            completion_barriers: Mutex::new(CompletionBarriers::default()),
+            completion_barriers: Arc::new(Mutex::new(CompletionBarriers::default())),
         }
     }
 
     /// Binds a prepared submission before it can publish events.
     ///
-    /// Returns `false` for a stale UID or generation.
-    pub(crate) fn bind(
+    /// Returns `None` for a stale UID or generation.
+    pub(crate) async fn bind(
         &self,
         resource: ResourceGeneration,
         tv: taskvisor::TaskId,
         ensure_output: bool,
-    ) -> bool {
-        let _lifecycle = self.lifecycle_gate.lock();
-        let task_id = resource.name.clone();
-        let task_uid = resource.uid.clone();
+    ) -> Option<ProvisionalBinding> {
+        let _lifecycle = self.lifecycle_gate.lock().await;
+        let binding = RuntimeBinding {
+            resource: resource.clone(),
+            tv,
+        };
         if !self.state.bind_tv(resource, tv) {
+            return None;
+        }
+        let provisional = ProvisionalBinding::new(
+            self.state.clone(),
+            Arc::clone(&self.output_hub),
+            Arc::clone(&self.completion_barriers),
+            binding.clone(),
+        );
+        if ensure_output {
+            self.output_hub.ensure_channel_if_absent(
+                binding.resource.name.clone(),
+                binding.resource.uid.clone(),
+            );
+        }
+        Some(provisional)
+    }
+
+    /// Releases a binding whose prepared submission was cancelled before intake.
+    ///
+    /// No Taskvisor event can exist before controller intake. The desired state
+    /// remains pending for the newer reconciliation instead of recording an
+    /// intake failure for the superseded generation.
+    pub(crate) async fn release_unsubmitted_binding(&self, binding: &RuntimeBinding) -> bool {
+        let _lifecycle = self.lifecycle_gate.lock().await;
+        if !self.state.unbind_exact(binding) {
             return false;
         }
-        if ensure_output {
-            self.output_hub.ensure_channel_if_absent(task_id, task_uid);
-        }
+        self.output_hub
+            .evict_if_uid(&binding.resource.name, &binding.resource.uid);
+        self.mark_completed_locked(binding.tv.get());
         true
     }
 
     /// Releases a failed runtime intake binding.
     ///
     /// The desired resource remains with `Reconciled=False`.
-    pub(crate) fn fail_bound_reconciliation(
+    #[cfg(test)]
+    pub(crate) async fn fail_bound_reconciliation(
         &self,
         binding: &RuntimeBinding,
         reason: &'static str,
         message: String,
     ) -> bool {
-        let _lifecycle = self.lifecycle_gate.lock();
-        if self.state.resolve_tv(binding.tv.get()).as_ref() != Some(binding) {
+        let admission = self
+            .state
+            .admit_state_write(StateMutationEventCapacity::TaskChange)
+            .await;
+        let Ok(admission) = admission else {
+            return false;
+        };
+        let _lifecycle = self.lifecycle_gate.lock().await;
+        if !self.state.unbind_exact(binding) {
             return false;
         }
-
-        self.state.unbind_tv(binding.tv.get());
-        self.output_hub.evict(&binding.resource.name);
-        let changed = self
-            .state
-            .mark_reconciliation_failed(&binding.resource, reason, message);
+        self.output_hub
+            .evict_if_uid(&binding.resource.name, &binding.resource.uid);
+        let changed = self.state.mark_reconciliation_failed_admitted(
+            &binding.resource,
+            reason,
+            message,
+            admission,
+        );
         self.mark_completed_locked(binding.tv.get());
         changed
     }
@@ -228,16 +396,26 @@ impl RuntimeObserver {
         finalization: Finalization,
         wait_for_barrier: bool,
     ) {
-        let notification = {
-            let _lifecycle = self.lifecycle_gate.lock();
+        let (ready, notification) = {
+            let _lifecycle = self.lifecycle_gate.lock().await;
             self.register_finalization_locked(tv_raw, finalization, wait_for_barrier)
         };
+
+        if let Some(finalization) = ready {
+            self.finalize_async(tv_raw, finalization).await;
+            return;
+        }
 
         if let Some(notification) = notification
             && !Self::wait_for_finalization(notification).await
         {
-            let _lifecycle = self.lifecycle_gate.lock();
-            self.force_pending_locked(tv_raw);
+            let pending = {
+                let _lifecycle = self.lifecycle_gate.lock().await;
+                self.take_safe_pending_locked(tv_raw)
+            };
+            if let Some(finalization) = pending {
+                self.finalize_async(tv_raw, finalization).await;
+            }
         }
     }
 
@@ -258,7 +436,7 @@ impl RuntimeObserver {
     }
 
     /// Preserves a waiter failure until `TaskRemoved` proves cleanup.
-    pub(crate) fn finalize_unavailable(&self, tv_raw: u64, error: String) {
+    pub(crate) async fn finalize_unavailable(&self, tv_raw: u64, error: String) {
         let finalization = Finalization {
             phase: TaskPhase::Failed,
             error: Some(error),
@@ -266,8 +444,14 @@ impl RuntimeObserver {
             force: false,
             safe_without_barrier: false,
         };
-        let _lifecycle = self.lifecycle_gate.lock();
-        self.register_finalization_locked(tv_raw, finalization, true);
+        let ready = {
+            let _lifecycle = self.lifecycle_gate.lock().await;
+            self.register_finalization_locked(tv_raw, finalization, true)
+                .0
+        };
+        if let Some(finalization) = ready {
+            self.finalize_async(tv_raw, finalization).await;
+        }
     }
 
     /// Waits for finalization after Taskvisor confirms cleanup.
@@ -278,7 +462,7 @@ impl RuntimeObserver {
     pub(crate) async fn settle_after_confirmed_cleanup(&self, tv: taskvisor::TaskId) {
         let tv_raw = tv.get();
         let mut notification = {
-            let _lifecycle = self.lifecycle_gate.lock();
+            let _lifecycle = self.lifecycle_gate.lock().await;
             if self.state.resolve_tv(tv_raw).is_none() {
                 return;
             }
@@ -293,16 +477,24 @@ impl RuntimeObserver {
     }
 
     /// Deletes local state after Taskvisor cleanup is settled.
-    pub(crate) fn delete_after_cleanup(&self, id: &TaskId, tv: Option<taskvisor::TaskId>) -> bool {
-        let _lifecycle = self.lifecycle_gate.lock();
-        let removed = self.state.delete_task(id);
+    pub(crate) async fn delete_after_cleanup(
+        &self,
+        id: &TaskId,
+        tv: Option<taskvisor::TaskId>,
+    ) -> Result<bool, StateAdmissionClosed> {
+        let admission = self
+            .state
+            .admit_state_write(StateMutationEventCapacity::TaskChange)
+            .await?;
+        let _lifecycle = self.lifecycle_gate.lock().await;
+        let removed = self.state.delete_task_admitted(id, admission);
         if removed || tv.is_some() {
             self.output_hub.evict(id);
         }
         if let Some(tv) = tv {
             self.mark_completed_locked(tv.get());
         }
-        removed
+        Ok(removed)
     }
 
     async fn wait_for_finalization(mut notification: watch::Receiver<bool>) -> bool {
@@ -320,8 +512,10 @@ impl RuntimeObserver {
         tv_raw: u64,
         finalization: Finalization,
         wait_for_barrier: bool,
-    ) -> Option<watch::Receiver<bool>> {
-        self.state.resolve_tv(tv_raw)?;
+    ) -> (Option<Finalization>, Option<watch::Receiver<bool>>) {
+        if self.state.resolve_tv(tv_raw).is_none() {
+            return (None, None);
+        }
 
         let (finalize_now, notification) = {
             let mut barriers = self.completion_barriers.lock();
@@ -342,49 +536,64 @@ impl RuntimeObserver {
                 (None, Some(barriers.notification(tv_raw)))
             }
         };
-
-        if let Some(finalization) = finalize_now {
-            self.finalize_locked(tv_raw, finalization);
-        }
-        notification
+        (finalize_now, notification)
     }
 
-    fn force_pending_locked(&self, tv_raw: u64) {
-        let pending = {
-            let mut barriers = self.completion_barriers.lock();
-            if barriers
-                .pending
-                .get(&tv_raw)
-                .is_some_and(|pending| pending.safe_without_barrier)
-            {
-                barriers.pending.remove(&tv_raw)
-            } else {
-                None
-            }
-        };
-        if let Some(finalization) = pending {
-            self.finalize_locked(tv_raw, finalization);
+    fn take_safe_pending_locked(&self, tv_raw: u64) -> Option<Finalization> {
+        let mut barriers = self.completion_barriers.lock();
+        if barriers
+            .pending
+            .get(&tv_raw)
+            .is_some_and(|pending| pending.safe_without_barrier)
+        {
+            barriers.pending.remove(&tv_raw)
+        } else {
+            None
         }
     }
 
-    fn force_all_safe_pending_locked(&self) {
-        let pending = {
-            let mut barriers = self.completion_barriers.lock();
-            let ids: Vec<u64> = barriers
+    fn force_all_safe_pending_from_taskvisor_callback(&self) {
+        let ids = {
+            let _lifecycle = self.lifecycle_gate.lock_from_taskvisor_callback();
+            self.completion_barriers
+                .lock()
                 .pending
                 .iter()
                 .filter_map(|(id, pending)| pending.safe_without_barrier.then_some(*id))
-                .collect();
-            ids.into_iter()
-                .filter_map(|id| barriers.pending.remove(&id).map(|pending| (id, pending)))
                 .collect::<Vec<_>>()
         };
-        for (tv_raw, finalization) in pending {
-            self.finalize_locked(tv_raw, finalization);
+        for tv_raw in ids {
+            let admission = self.state.admit_state_write_from_taskvisor_callback(
+                StateMutationEventCapacity::TaskAndRunChange,
+            );
+            let _lifecycle = self.lifecycle_gate.lock_from_taskvisor_callback();
+            match admission {
+                Ok(admission) => {
+                    if let Some(finalization) = self.take_safe_pending_locked(tv_raw) {
+                        self.finalize_admitted_locked(tv_raw, finalization, admission);
+                    }
+                }
+                Err(_) => self.cleanup_without_projection_locked(tv_raw),
+            }
         }
     }
 
-    fn task_removed_locked(&self, tv_raw: u64) {
+    /// Releases every deferred outcome after Taskvisor has confirmed global shutdown.
+    ///
+    /// At that point no registered runtime remains. A missing per-task
+    /// `TaskRemoved` event is no longer needed as cleanup evidence.
+    pub(crate) async fn finalize_pending_after_confirmed_shutdown(&self) {
+        let pending = {
+            let _lifecycle = self.lifecycle_gate.lock().await;
+            let mut barriers = self.completion_barriers.lock();
+            barriers.pending.drain().collect::<Vec<_>>()
+        };
+        for (tv_raw, finalization) in pending {
+            self.finalize_async(tv_raw, finalization).await;
+        }
+    }
+
+    fn task_removed_admitted_locked(&self, tv_raw: u64, admission: StateWriteAdmission) {
         let pending = {
             let mut barriers = self.completion_barriers.lock();
             let pending = barriers.pending.remove(&tv_raw);
@@ -394,17 +603,47 @@ impl RuntimeObserver {
             pending
         };
         if let Some(finalization) = pending {
-            self.finalize_locked(tv_raw, finalization);
+            self.finalize_admitted_locked(tv_raw, finalization, admission);
         }
     }
 
-    fn finalize_locked(&self, tv_raw: u64, finalization: Finalization) {
-        if let Some(model_id) = self.state.finalize_if_bound(
+    async fn finalize_async(&self, tv_raw: u64, finalization: Finalization) {
+        let admission = self
+            .state
+            .admit_state_write(StateMutationEventCapacity::TaskAndRunChange)
+            .await;
+        let _lifecycle = self.lifecycle_gate.lock().await;
+        match admission {
+            Ok(admission) => self.finalize_admitted_locked(tv_raw, finalization, admission),
+            Err(_) => self.cleanup_without_projection_locked(tv_raw),
+        }
+    }
+
+    /// Removes runtime ownership after authoritative cleanup when projection
+    /// persistence is unavailable. This does not synthesize status or run data.
+    fn cleanup_without_projection_locked(&self, tv_raw: u64) {
+        if let Some(binding) = self.state.resolve_tv(tv_raw)
+            && self.state.unbind_exact(&binding)
+        {
+            self.output_hub
+                .evict_if_uid(&binding.resource.name, &binding.resource.uid);
+        }
+        self.mark_completed_locked(tv_raw);
+    }
+
+    fn finalize_admitted_locked(
+        &self,
+        tv_raw: u64,
+        finalization: Finalization,
+        admission: StateWriteAdmission,
+    ) {
+        if let Some(model_id) = self.state.finalize_if_bound_admitted(
             tv_raw,
             finalization.phase,
             finalization.error,
             finalization.exit_code,
             finalization.force,
+            admission,
         ) {
             self.output_hub.evict(&model_id);
         }
@@ -425,8 +664,33 @@ impl RuntimeObserver {
 }
 
 impl RuntimeObserver {
-    /// Applies one event while holding the lifecycle gate.
-    fn apply_event_locked(&self, event: &Event) {
+    fn event_state_capacity(event: &Event) -> StateMutationEventCapacity {
+        if event.id.is_none() {
+            return StateMutationEventCapacity::None;
+        }
+        match event.kind {
+            EventKind::AttemptStarting
+            | EventKind::AttemptSucceeded
+            | EventKind::AttemptCanceled
+            | EventKind::AttemptFailed
+            | EventKind::AttemptTimedOut
+                if event.attempt.is_some_and(|attempt| attempt > 0) =>
+            {
+                StateMutationEventCapacity::AttemptTransition
+            }
+            EventKind::TaskFinished if event.outcome_kind.is_some() => {
+                StateMutationEventCapacity::TaskChange
+            }
+            EventKind::ControllerRejected | EventKind::TaskAddFailed => {
+                StateMutationEventCapacity::TaskChange
+            }
+            EventKind::TaskRemoved => StateMutationEventCapacity::TaskAndRunChange,
+            _ => StateMutationEventCapacity::None,
+        }
+    }
+
+    /// Applies one pre-admitted event while holding the lifecycle gate.
+    fn apply_event_admitted_locked(&self, event: &Event, admission: StateWriteAdmission) {
         let Some(tv) = event.id else {
             return;
         };
@@ -436,25 +700,55 @@ impl RuntimeObserver {
             return;
         };
         let task_id = &binding.resource.name;
+        let task_uid = &binding.resource.uid;
+        let generation = binding.resource.generation;
 
         // Output cleanup does not own the retained SDK resource. The
         // direct completion finalizes it; explicit delete removes it eagerly.
         if event.kind == EventKind::TaskRemoved {
-            self.task_removed_locked(tv_raw);
+            self.task_removed_admitted_locked(tv_raw, admission);
             return;
         }
 
         match event.kind {
             EventKind::TaskAdded => {
-                trace!(task = %task_id, "task added event received (already in state)");
+                trace!(
+                    event = "taskvisor.event",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    event_kind = "task_added",
+                    "task event received"
+                );
             }
             EventKind::AttemptStarting => {
                 let Some(attempt) = event.attempt else {
-                    warn!(task = %task_id, "AttemptStarting event has no attempt");
+                    warn!(
+                        event = "taskvisor.event_invalid",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "attempt_starting",
+                        "task event missing attempt"
+                    );
                     return;
                 };
-                trace!(task = %task_id, "task attempt starting");
-                if self.state.transition_attempt_starting(&binding, attempt) {
+                trace!(
+                    event = "task.attempt",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    attempt,
+                    stage = "starting",
+                    "task attempt starting"
+                );
+                if self
+                    .state
+                    .transition_attempt_starting_admitted(&binding, attempt, admission)
+                {
                     self.output_hub.announce_run_started(
                         task_id,
                         &binding.resource.uid,
@@ -462,21 +756,48 @@ impl RuntimeObserver {
                         attempt,
                     );
                 } else {
-                    warn!(task = %task_id, "AttemptStarting event for stale task generation");
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        attempt,
+                        event_kind = "attempt_starting",
+                        "stale task event ignored"
+                    );
                 }
             }
             EventKind::AttemptSucceeded => {
                 let Some(attempt) = event.attempt else {
-                    warn!(task = %task_id, "AttemptSucceeded event has no attempt");
+                    warn!(
+                        event = "taskvisor.event_invalid",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "attempt_succeeded",
+                        "task event missing attempt"
+                    );
                     return;
                 };
-                trace!(task = %task_id, "task attempt succeeded");
-                if self.state.transition_attempt_finished(
+                trace!(
+                    event = "task.attempt",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    attempt,
+                    stage = "succeeded",
+                    "task attempt succeeded"
+                );
+                if self.state.transition_attempt_finished_admitted(
                     &binding,
                     attempt,
                     TaskPhase::Succeeded,
                     None,
                     None,
+                    admission,
                 ) {
                     self.output_hub.announce_run_finished(
                         task_id,
@@ -486,21 +807,48 @@ impl RuntimeObserver {
                         None,
                     );
                 } else {
-                    warn!(task = %task_id, "AttemptSucceeded event for stale task generation");
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        attempt,
+                        event_kind = "attempt_succeeded",
+                        "stale task event ignored"
+                    );
                 }
             }
             EventKind::AttemptCanceled => {
                 let Some(attempt) = event.attempt else {
-                    warn!(task = %task_id, "AttemptCanceled event has no attempt");
+                    warn!(
+                        event = "taskvisor.event_invalid",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "attempt_canceled",
+                        "task event missing attempt"
+                    );
                     return;
                 };
-                trace!(task = %task_id, "task attempt canceled cooperatively");
-                if self.state.transition_attempt_finished(
+                trace!(
+                    event = "task.attempt",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    attempt,
+                    stage = "canceled",
+                    "task attempt canceled"
+                );
+                if self.state.transition_attempt_finished_admitted(
                     &binding,
                     attempt,
                     TaskPhase::Canceled,
                     None,
                     None,
+                    admission,
                 ) {
                     self.output_hub.announce_run_finished(
                         task_id,
@@ -510,12 +858,29 @@ impl RuntimeObserver {
                         None,
                     );
                 } else {
-                    warn!(task = %task_id, "AttemptCanceled event for stale task generation");
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        attempt,
+                        event_kind = "attempt_canceled",
+                        "stale task event ignored"
+                    );
                 }
             }
             EventKind::AttemptFailed => {
                 let Some(attempt) = event.attempt else {
-                    warn!(task = %task_id, "AttemptFailed event has no attempt");
+                    warn!(
+                        event = "taskvisor.event_invalid",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "attempt_failed",
+                        "task event missing attempt"
+                    );
                     return;
                 };
                 let reason = event
@@ -524,17 +889,23 @@ impl RuntimeObserver {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
                 trace!(
-                    task = %task_id,
-                    reason = %reason,
+                    event = "task.attempt",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    attempt,
+                    stage = "failed",
                     exit_code = ?event.exit_code,
                     "task attempt failed",
                 );
-                if self.state.transition_attempt_finished(
+                if self.state.transition_attempt_finished_admitted(
                     &binding,
                     attempt,
                     TaskPhase::Failed,
                     Some(reason),
                     event.exit_code,
+                    admission,
                 ) {
                     self.output_hub.announce_run_finished(
                         task_id,
@@ -544,25 +915,52 @@ impl RuntimeObserver {
                         event.exit_code,
                     );
                 } else {
-                    warn!(task = %task_id, "AttemptFailed event for stale task generation");
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        attempt,
+                        event_kind = "attempt_failed",
+                        "stale task event ignored"
+                    );
                 }
             }
             EventKind::AttemptTimedOut => {
                 let Some(attempt) = event.attempt else {
-                    warn!(task = %task_id, "AttemptTimedOut event has no attempt");
+                    warn!(
+                        event = "taskvisor.event_invalid",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "attempt_timed_out",
+                        "task event missing attempt"
+                    );
                     return;
                 };
                 let error = event.timeout_ms.map_or_else(
                     || "task attempt timed out".to_string(),
                     |timeout_ms| format!("task attempt timed out after {timeout_ms} ms"),
                 );
-                trace!(task = %task_id, "task attempt timed out");
-                if self.state.transition_attempt_finished(
+                trace!(
+                    event = "task.attempt",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    attempt,
+                    stage = "timed_out",
+                    "task attempt timed out"
+                );
+                if self.state.transition_attempt_finished_admitted(
                     &binding,
                     attempt,
                     TaskPhase::Timeout,
                     Some(error),
                     None,
+                    admission,
                 ) {
                     self.output_hub.announce_run_finished(
                         task_id,
@@ -572,27 +970,56 @@ impl RuntimeObserver {
                         None,
                     );
                 } else {
-                    warn!(task = %task_id, "AttemptTimedOut event for stale task generation");
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        attempt,
+                        event_kind = "attempt_timed_out",
+                        "stale task event ignored"
+                    );
                 }
             }
             EventKind::TaskFinished => {
                 let Some(outcome_kind) = event.outcome_kind else {
-                    warn!(task = %task_id, "TaskFinished event has no outcome_kind");
+                    warn!(
+                        event = "taskvisor.event_invalid",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "task_finished",
+                        "task event missing outcome"
+                    );
                     return;
                 };
                 let (phase, error, exit_code) =
                     phase_for_outcome_kind(outcome_kind, event.reason.as_deref(), event.exit_code);
                 trace!(
-                    task = %task_id,
+                    event = "task.finished",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
                     outcome = outcome_kind.as_label(),
                     exit_code = ?exit_code,
                     "task reached final outcome",
                 );
                 if !self
                     .state
-                    .transition_task_finished(&binding, phase, error, exit_code)
+                    .transition_task_finished_admitted(&binding, phase, error, exit_code, admission)
                 {
-                    warn!(task = %task_id, "TaskFinished event for stale task generation");
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "task_finished",
+                        "stale task event ignored"
+                    );
                 }
             }
             EventKind::ControllerRejected => {
@@ -605,11 +1032,31 @@ impl RuntimeObserver {
                     .rejection_kind
                     .map(phase_for_rejection)
                     .unwrap_or(TaskPhase::Failed);
-                if !self
-                    .state
-                    .transition_task_finished(&binding, phase, Some(reason), None)
-                {
-                    warn!(task = %task_id, "rejection event for stale task generation");
+                trace!(
+                    event = "task.finished",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    outcome = "controller_rejected",
+                    "task rejected"
+                );
+                if !self.state.transition_task_finished_admitted(
+                    &binding,
+                    phase,
+                    Some(reason),
+                    None,
+                    admission,
+                ) {
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "controller_rejected",
+                        "stale task event ignored"
+                    );
                 }
             }
             EventKind::TaskAddFailed => {
@@ -622,11 +1069,31 @@ impl RuntimeObserver {
                     .rejection_kind
                     .map(phase_for_rejection)
                     .unwrap_or(TaskPhase::Failed);
-                if !self
-                    .state
-                    .transition_task_finished(&binding, phase, Some(reason), None)
-                {
-                    warn!(task = %task_id, "TaskAddFailed event for stale task generation");
+                trace!(
+                    event = "task.finished",
+                    task_name = %task_id,
+                    task_uid = %task_uid,
+                    generation,
+                    taskvisor_id = tv_raw,
+                    outcome = "task_add_failed",
+                    "task submission failed"
+                );
+                if !self.state.transition_task_finished_admitted(
+                    &binding,
+                    phase,
+                    Some(reason),
+                    None,
+                    admission,
+                ) {
+                    warn!(
+                        event = "taskvisor.event_stale",
+                        task_name = %task_id,
+                        task_uid = %task_uid,
+                        generation,
+                        taskvisor_id = tv_raw,
+                        event_kind = "task_add_failed",
+                        "stale task event ignored"
+                    );
                 }
             }
             _ => {}
@@ -636,18 +1103,24 @@ impl RuntimeObserver {
 
 impl Subscribe for RuntimeObserver {
     fn on_event(&self, event: &Event) {
-        let _lifecycle = self.lifecycle_gate.lock();
         if event.kind == EventKind::SubscriberOverflow {
             if event.task.as_deref().is_some_and(|subscriber| {
                 subscriber != self.name() && subscriber != "subscriber_listener"
             }) {
                 return;
             }
-            self.force_all_safe_pending_locked();
+            self.force_all_safe_pending_from_taskvisor_callback();
             return;
         }
 
-        self.apply_event_locked(event);
+        let Ok(admission) = self
+            .state
+            .admit_state_write_from_taskvisor_callback(Self::event_state_capacity(event))
+        else {
+            return;
+        };
+        let _lifecycle = self.lifecycle_gate.lock_from_taskvisor_callback();
+        self.apply_event_admitted_locked(event, admission);
     }
 
     fn name(&self) -> &'static str {
@@ -670,9 +1143,13 @@ impl RuntimeObserver {
         tv_raw: u64,
         outcome: &taskvisor::TaskOutcome,
     ) {
-        let _lifecycle = self.lifecycle_gate.lock();
+        let admission = self
+            .state
+            .admit_state_write_from_taskvisor_callback(StateMutationEventCapacity::TaskAndRunChange)
+            .expect("test finalization requires open state persistence");
+        let _lifecycle = self.lifecycle_gate.lock_from_taskvisor_callback();
         let (phase, error, exit_code) = phase_for_outcome(outcome);
-        self.finalize_locked(
+        self.finalize_admitted_locked(
             tv_raw,
             Finalization {
                 phase,
@@ -681,1017 +1158,10 @@ impl RuntimeObserver {
                 force: Self::is_known_outcome(outcome),
                 safe_without_barrier: true,
             },
+            admission,
         );
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use taskvisor::TaskOutcomeKind;
-
-    use crate::output::{OutputConfig, OutputHub};
-    use solti_model::{
-        ConditionStatus, EmbeddedSpec, OutputEvent, TaskManifest, TaskSpec, TaskWorkload,
-    };
-    use taskvisor::Event;
-
-    fn test_spec() -> TaskSpec {
-        TaskSpec::builder(
-            "slot",
-            TaskWorkload::Embedded(EmbeddedSpec::new("test-v1").unwrap()),
-            5_000_u64,
-        )
-        .build()
-        .expect("valid spec")
-    }
-
-    fn changed_test_spec() -> TaskSpec {
-        TaskSpec::builder(
-            "slot",
-            TaskWorkload::Embedded(EmbeddedSpec::new("test-v2").unwrap()),
-            6_000_u64,
-        )
-        .build()
-        .expect("valid spec")
-    }
-
-    fn add_test_task(state: &TaskState, task_name: &str) -> TaskId {
-        let id = TaskId::new(task_name).unwrap();
-        state.add_task(TaskManifest::new(id.clone(), test_spec()).expect("valid manifest"));
-        id
-    }
-
-    fn bind_test_task(state: &TaskState, id: &TaskId, tv: taskvisor::TaskId) -> RuntimeBinding {
-        let resource = ResourceGeneration::from_task(&state.get(id).expect("task must exist"));
-        assert!(state.bind_tv(resource.clone(), tv));
-        RuntimeBinding { resource, tv }
-    }
-
-    trait TestTaskStateExt {
-        fn tv_for(&self, id: &TaskId) -> Option<taskvisor::TaskId>;
-    }
-
-    impl TestTaskStateExt for TaskState {
-        fn tv_for(&self, id: &TaskId) -> Option<taskvisor::TaskId> {
-            self.binding_for(id).map(|binding| binding.tv)
-        }
-    }
-
-    fn setup(task_name: &str) -> (RuntimeObserver, TaskState, TaskId) {
-        let state = TaskState::new();
-        let id = add_test_task(&state, task_name);
-        let binding = bind_test_task(&state, &id, taskvisor::TaskId::for_tests());
-        assert!(state.transition_attempt_starting(&binding, 1));
-        let sub = RuntimeObserver::with_output_hub(
-            state.clone(),
-            Arc::new(OutputHub::new(OutputConfig::default())),
-        );
-        (sub, state, id)
-    }
-
-    fn bound_event(state: &TaskState, id: &TaskId, kind: EventKind) -> Event {
-        Event::new(kind).with_id(state.tv_for(id).expect("task must be bound"))
-    }
-
-    #[test]
-    fn prepared_binding_routes_the_first_event_without_replay() {
-        let state = TaskState::new();
-        let id = add_test_task(&state, "prepared-start");
-        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
-        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
-        let tv = taskvisor::TaskId::for_tests();
-        let resource = ResourceGeneration::from_task(&state.get(&id).expect("task must exist"));
-
-        assert!(sub.bind(resource, tv, true));
-        sub.on_event(
-            &Event::new(EventKind::AttemptStarting)
-                .with_id(tv)
-                .with_attempt(1),
-        );
-
-        assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Running);
-        assert_eq!(state.list_runs(&id).len(), 1);
-        assert_eq!(state.list_runs(&id)[0].attempt(), 1);
-        assert!(registry.subscribe_raw(&id).is_some());
-    }
-
-    #[test]
-    fn terminal_event_uses_authoritative_attempt_when_start_was_dropped() {
-        let state = TaskState::new();
-        let id = add_test_task(&state, "dropped-start");
-        let tv = taskvisor::TaskId::for_tests();
-        bind_test_task(&state, &id, tv);
-        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
-        registry.ensure_channel(id.clone());
-        let mut output = registry.subscribe_raw(&id).expect("output channel");
-        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
-
-        sub.on_event(
-            &Event::new(EventKind::AttemptFailed)
-                .with_id(tv)
-                .with_attempt(2)
-                .with_reason("start event was dropped")
-                .with_exit_code(7),
-        );
-
-        let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().attempt(), 2);
-        assert_eq!(task.status().phase(), TaskPhase::Failed);
-        let runs = state.list_runs(&id);
-        assert_eq!(runs.len(), 1);
-        assert_eq!((runs[0].generation(), runs[0].attempt()), (1, 2));
-        assert_eq!(runs[0].phase(), TaskPhase::Failed);
-        assert!(matches!(
-            output.try_recv(),
-            Ok(OutputEvent::RunFinished {
-                generation: 1,
-                attempt: 2,
-                exit_code: Some(7),
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn attempt_event_without_attempt_is_ignored_without_attempt_zero() {
-        let state = TaskState::new();
-        let id = add_test_task(&state, "missing-attempt");
-        let tv = taskvisor::TaskId::for_tests();
-        bind_test_task(&state, &id, tv);
-        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
-        registry.ensure_channel(id.clone());
-        let mut output = registry.subscribe_raw(&id).expect("output channel");
-        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
-
-        sub.on_event(
-            &Event::new(EventKind::AttemptFailed)
-                .with_id(tv)
-                .with_reason("missing authoritative attempt"),
-        );
-
-        let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().phase(), TaskPhase::Pending);
-        assert_eq!(task.status().attempt(), 0);
-        assert!(state.list_runs(&id).is_empty());
-        assert!(output.try_recv().is_err());
-    }
-
-    #[test]
-    fn old_generation_attempt_closes_only_its_run() {
-        let state = TaskState::new();
-        let id = add_test_task(&state, "old-generation");
-        let tv = taskvisor::TaskId::for_tests();
-        let old_binding = bind_test_task(&state, &id, tv);
-        assert!(state.transition_attempt_starting(&old_binding, 1));
-        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
-        registry.ensure_channel(id.clone());
-        let mut output = registry.subscribe_raw(&id).expect("output channel");
-        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
-
-        let desired =
-            TaskManifest::new(id.clone(), changed_test_spec()).expect("valid desired task");
-        let commit = state.apply_desired(&desired).expect("apply must succeed");
-        assert_eq!(commit.task.metadata().generation(), 2);
-        assert_eq!(commit.task.status().phase(), TaskPhase::Pending);
-
-        sub.on_event(
-            &Event::new(EventKind::AttemptFailed)
-                .with_id(tv)
-                .with_attempt(1)
-                .with_reason("old generation stopped")
-                .with_exit_code(9),
-        );
-
-        let current = state.get(&id).expect("current task exists");
-        assert_eq!(current.metadata().generation(), 2);
-        assert_eq!(current.status().phase(), TaskPhase::Pending);
-        assert_eq!(current.status().attempt(), 0);
-        let runs = state.list_runs(&id);
-        assert_eq!(runs.len(), 1);
-        assert_eq!((runs[0].generation(), runs[0].attempt()), (1, 1));
-        assert_eq!(runs[0].phase(), TaskPhase::Failed);
-        assert!(matches!(
-            output.try_recv(),
-            Ok(OutputEvent::RunFinished {
-                generation: 1,
-                attempt: 1,
-                exit_code: Some(9),
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn stale_incarnation_event_cannot_touch_recreated_resource() {
-        let state = TaskState::new();
-        let id = add_test_task(&state, "recreated");
-        let old_task = state.get(&id).expect("old task exists");
-        let old_tv = taskvisor::TaskId::for_tests();
-        bind_test_task(&state, &id, old_tv);
-        assert!(state.delete_task(&id));
-
-        let recreated_id = add_test_task(&state, "recreated");
-        let recreated = state.get(&recreated_id).expect("new task exists");
-        assert_ne!(old_task.uid(), recreated.uid());
-        let new_tv = taskvisor::TaskId::for_tests();
-        bind_test_task(&state, &recreated_id, new_tv);
-        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
-        registry.ensure_channel(recreated_id.clone());
-        let mut output = registry
-            .subscribe_raw(&recreated_id)
-            .expect("output channel");
-        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
-
-        sub.on_event(
-            &Event::new(EventKind::AttemptFailed)
-                .with_id(old_tv)
-                .with_attempt(1)
-                .with_reason("late old incarnation"),
-        );
-
-        let current = state.get(&recreated_id).expect("new task remains");
-        assert_eq!(current.uid(), recreated.uid());
-        assert_eq!(current.status().phase(), TaskPhase::Pending);
-        assert!(state.list_runs(&recreated_id).is_empty());
-        assert_eq!(state.tv_for(&recreated_id), Some(new_tv));
-        assert!(output.try_recv().is_err());
-    }
-
-    #[test]
-    fn failed_intake_cleanup_is_fenced_by_exact_binding() {
-        let state = TaskState::new();
-        let id = add_test_task(&state, "intake-failure");
-        let old_tv = taskvisor::TaskId::for_tests();
-        let stale = bind_test_task(&state, &id, old_tv);
-        let current_tv = taskvisor::TaskId::for_tests();
-        let current = bind_test_task(&state, &id, current_tv);
-        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
-        registry.ensure_channel(id.clone());
-        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
-
-        assert!(!sub.fail_bound_reconciliation(
-            &stale,
-            "RuntimeSubmissionFailed",
-            "stale intake failure".into(),
-        ));
-        assert_eq!(state.tv_for(&id), Some(current_tv));
-        assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Pending);
-        assert!(registry.subscribe_raw(&id).is_some());
-
-        assert!(sub.fail_bound_reconciliation(
-            &current,
-            "RuntimeSubmissionFailed",
-            "controller intake failed".into(),
-        ));
-        assert!(state.tv_for(&id).is_none());
-        let failed = state.get(&id).expect("desired resource is retained");
-        assert_eq!(failed.status().phase(), TaskPhase::Pending);
-        assert_eq!(failed.status().observed_generation(), 1);
-        assert_eq!(failed.status().attempt(), 0);
-        assert!(failed.status().error().is_none());
-        assert_eq!(
-            failed.status().reconciled().status(),
-            ConditionStatus::False
-        );
-        assert_eq!(
-            failed.status().reconciled().reason(),
-            "RuntimeSubmissionFailed"
-        );
-        assert_eq!(
-            failed.status().reconciled().message(),
-            "controller intake failed"
-        );
-        assert!(registry.subscribe_raw(&id).is_none());
-    }
-
-    #[tokio::test]
-    async fn task_removed_barrier_preserves_queued_attempt_events_before_cleanup() {
-        let state = TaskState::new();
-        let id = add_test_task(&state, "fast-attempt");
-        let tv = taskvisor::TaskId::for_tests();
-        bind_test_task(&state, &id, tv);
-        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
-        registry.ensure_channel(id.clone());
-        let mut output = registry.subscribe_raw(&id).expect("output channel");
-        let sub = Arc::new(RuntimeObserver::with_output_hub(
-            state.clone(),
-            Arc::clone(&registry),
-        ));
-
-        let completion = {
-            let sub = Arc::clone(&sub);
-            tokio::spawn(async move {
-                sub.finalize_from_outcome(tv.get(), &taskvisor::TaskOutcome::Completed)
-                    .await;
-            })
-        };
-        tokio::task::yield_now().await;
-
-        sub.on_event(
-            &Event::new(EventKind::AttemptStarting)
-                .with_id(tv)
-                .with_attempt(1),
-        );
-        sub.on_event(
-            &Event::new(EventKind::AttemptSucceeded)
-                .with_id(tv)
-                .with_attempt(1),
-        );
-        sub.on_event(&Event::new(EventKind::TaskRemoved).with_id(tv));
-        completion.await.expect("completion task");
-
-        let task = state.get(&id).expect("retained terminal task");
-        assert_eq!(task.status().phase(), TaskPhase::Succeeded);
-        assert_eq!(state.list_runs(&id).len(), 1);
-        assert_eq!(state.list_runs(&id)[0].phase(), TaskPhase::Succeeded);
-        assert!(state.tv_for(&id).is_none());
-        assert!(registry.subscribe_raw(&id).is_none());
-        assert!(matches!(
-            output.try_recv(),
-            Ok(OutputEvent::RunStarted { attempt: 1, .. })
-        ));
-        assert!(matches!(
-            output.try_recv(),
-            Ok(OutputEvent::RunFinished { attempt: 1, .. })
-        ));
-    }
-
-    #[test]
-    fn late_events_after_completion_are_ignored() {
-        let (sub, state, id) = setup("late-after-complete");
-        let tv = state.tv_for(&id).expect("bound task");
-
-        sub.finalize_outcome_immediately_for_test(tv.get(), &taskvisor::TaskOutcome::Completed);
-        sub.on_event(
-            &Event::new(EventKind::AttemptStarting)
-                .with_id(tv)
-                .with_attempt(2),
-        );
-        sub.on_event(&Event::new(EventKind::TaskRemoved).with_id(tv));
-
-        assert!(state.tv_for(&id).is_none());
-        assert_eq!(
-            state.get(&id).unwrap().status().phase(),
-            TaskPhase::Succeeded
-        );
-    }
-
-    #[tokio::test]
-    async fn late_outcome_after_explicit_delete_skips_the_barrier_wait() {
-        let (sub, state, id) = setup("deleted-before-outcome");
-        let tv = state.tv_for(&id).expect("bound task");
-
-        assert!(sub.delete_after_cleanup(&id, Some(tv)));
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            sub.finalize_from_outcome(tv.get(), &taskvisor::TaskOutcome::Completed),
-        )
-        .await
-        .expect("a completed identity must not create a new barrier");
-
-        assert!(state.get(&id).is_none());
-    }
-
-    #[test]
-    fn idempotent_delete_does_not_evict_an_unknown_external_channel() {
-        let state = TaskState::new();
-        let id = TaskId::new("not-yet-submitted").unwrap();
-        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
-        registry.ensure_channel(id.clone());
-        let sub = RuntimeObserver::with_output_hub(state, Arc::clone(&registry));
-
-        assert!(!sub.delete_after_cleanup(&id, None));
-        assert!(registry.subscribe_raw(&id).is_some());
-    }
-
-    #[test]
-    fn waiter_error_releases_binding_only_after_task_removed_barrier() {
-        let (sub, state, id) = setup("missing-outcome");
-        let tv = state.tv_for(&id).expect("bound task");
-
-        sub.finalize_unavailable(tv.get(), "task outcome unavailable: shutting down".into());
-        assert!(
-            state.tv_for(&id).is_some(),
-            "channel closure alone must fail closed while task cleanup is unproven"
-        );
-
-        sub.on_event(&Event::new(EventKind::TaskRemoved).with_id(tv));
-
-        assert!(state.tv_for(&id).is_none());
-        let task = state.get(&id).expect("retained failed task");
-        assert_eq!(task.status().phase(), TaskPhase::Failed);
-        assert!(
-            task.status()
-                .error()
-                .is_some_and(|error| error.contains("outcome unavailable"))
-        );
-    }
-
-    #[test]
-    fn runtime_failures_are_diagnostic_only() {
-        for (name, reason) in [
-            ("remove-diagnostic", "remove_failed: registry closed"),
-            ("future-diagnostic", "future_controller_diagnostic: detail"),
-        ] {
-            let (sub, state, id) = setup(name);
-            let tv = state.tv_for(&id).expect("bound task");
-
-            sub.on_event(
-                &Event::new(EventKind::RuntimeFailure)
-                    .with_id(tv)
-                    .with_reason(reason),
-            );
-
-            assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Running);
-            assert_eq!(state.tv_for(&id), Some(tv));
-        }
-    }
-
-    #[test]
-    fn typed_controller_rejections_project_state() {
-        for (name, kind, reason, expected) in [
-            (
-                "drop-rejection",
-                taskvisor::RejectionKind::SlotBusy,
-                "slot is busy; this diagnostic text is not schema",
-                TaskPhase::Canceled,
-            ),
-            (
-                "add-rejection",
-                taskvisor::RejectionKind::AdmissionFailed,
-                "add_failed: command queue closed",
-                TaskPhase::Failed,
-            ),
-            (
-                "queue-start-rejection",
-                taskvisor::RejectionKind::AdmissionFailed,
-                "queue_start_failed: shutting down",
-                TaskPhase::Failed,
-            ),
-            (
-                "removed-rejection",
-                taskvisor::RejectionKind::RemovedFromQueue,
-                "removed_from_queue",
-                TaskPhase::Canceled,
-            ),
-        ] {
-            let (sub, state, id) = setup(name);
-            let tv = state.tv_for(&id).expect("bound task");
-
-            sub.on_event(
-                &Event::new(EventKind::ControllerRejected)
-                    .with_id(tv)
-                    .with_rejection_kind(kind)
-                    .with_reason(reason),
-            );
-
-            assert_eq!(state.get(&id).unwrap().status().phase(), expected);
-            assert_eq!(state.tv_for(&id), Some(tv));
-        }
-    }
-
-    #[test]
-    fn task_add_failed_is_always_terminal_for_its_identity() {
-        let (sub, state, id) = setup("registry-add-failed");
-        let tv = state.tv_for(&id).expect("bound task");
-
-        sub.on_event(
-            &Event::new(EventKind::TaskAddFailed)
-                .with_id(tv)
-                .with_rejection_kind(taskvisor::RejectionKind::AdmissionFailed)
-                .with_reason("future_registry_rejection"),
-        );
-
-        assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Failed);
-        assert_eq!(state.tv_for(&id), Some(tv));
-    }
-
-    #[test]
-    fn task_removed_is_observability_only_for_current_and_stale_identities() {
-        let (sub, state, id) = setup("reuse-x");
-        let tvs = [
-            taskvisor::TaskId::for_tests(),
-            taskvisor::TaskId::for_tests(),
-        ];
-        bind_test_task(&state, &id, tvs[0]);
-        bind_test_task(&state, &id, tvs[1]);
-
-        let stale = Event::new(EventKind::TaskRemoved)
-            .with_task("reuse-x")
-            .with_id(tvs[0]);
-        sub.on_event(&stale);
-        assert!(
-            state.get(&id).is_some(),
-            "late TaskRemoved from the previous incarnation must be ignored"
-        );
-
-        let current = Event::new(EventKind::TaskRemoved)
-            .with_task("reuse-x")
-            .with_id(tvs[1]);
-        sub.on_event(&current);
-        assert!(
-            state.get(&id).is_some(),
-            "TaskRemoved must not bypass terminal-state retention"
-        );
-        assert_eq!(
-            state.tv_for(&id).map(|tv| tv.get()),
-            Some(tvs[1].get()),
-            "the direct completion path remains the binding owner"
-        );
-    }
-
-    #[test]
-    fn controller_rejection_projects_phase_but_waiter_owns_cleanup() {
-        let state = TaskState::new();
-        let id = add_test_task(&state, "rejected-task");
-        let tv = taskvisor::TaskId::for_tests();
-        bind_test_task(&state, &id, tv);
-        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
-        registry.ensure_channel(id.clone());
-        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
-
-        let ev = Event::new(EventKind::ControllerRejected)
-            .with_task("some-slot")
-            .with_id(tv)
-            .with_rejection_kind(taskvisor::RejectionKind::QueueFull)
-            .with_reason("queue_full: 3/3");
-        sub.on_event(&ev);
-
-        let task = state.get(&id).expect("entry kept for observability");
-        assert_eq!(task.status().phase(), TaskPhase::Failed);
-        assert!(
-            task.status()
-                .error()
-                .is_some_and(|e| e.contains("queue_full")),
-            "rejection reason must be recorded"
-        );
-        assert!(
-            registry.subscribe_raw(&id).is_some(),
-            "the event path must not race the waiter's output cleanup"
-        );
-        assert!(
-            state.tv_for(&id).is_some(),
-            "the binding stays owned until direct completion resolves"
-        );
-    }
-
-    #[test]
-    fn terminal_events_become_sweepable_only_after_waiter_cleanup() {
-        use crate::StateConfig;
-        use std::time::Duration;
-
-        let config = StateConfig::new()
-            .with_run_ttl(Duration::ZERO)
-            .with_task_ttl(Duration::ZERO);
-
-        for (name, kind, phase, error, force) in [
-            (
-                "rej-reap",
-                EventKind::ControllerRejected,
-                TaskPhase::Failed,
-                Some("queue_full: 3/3".into()),
-                true,
-            ),
-            (
-                "exh-reap",
-                EventKind::TaskFinished,
-                TaskPhase::Exhausted,
-                None,
-                false,
-            ),
-            (
-                "dead-reap",
-                EventKind::TaskFinished,
-                TaskPhase::Failed,
-                None,
-                false,
-            ),
-        ] {
-            let state = TaskState::new();
-            let id = add_test_task(&state, name);
-            let tv = taskvisor::TaskId::for_tests();
-            let binding = bind_test_task(&state, &id, tv);
-            let sub = RuntimeObserver::with_output_hub(
-                state.clone(),
-                Arc::new(OutputHub::new(OutputConfig::default())),
-            );
-            let event = match (kind, phase) {
-                (EventKind::ControllerRejected, _) => Event::new(kind)
-                    .with_id(tv)
-                    .with_rejection_kind(taskvisor::RejectionKind::QueueFull)
-                    .with_reason("queue_full: 3/3"),
-                (_, TaskPhase::Exhausted) => {
-                    assert!(state.transition_attempt_starting(&binding, 1));
-                    Event::new(kind)
-                        .with_id(tv)
-                        .with_outcome_kind(TaskOutcomeKind::Failed)
-                        .with_reason("retry policy stopped after one retry")
-                }
-                (_, TaskPhase::Failed) => {
-                    assert!(state.transition_attempt_starting(&binding, 1));
-                    Event::new(kind)
-                        .with_id(tv)
-                        .with_outcome_kind(TaskOutcomeKind::Fatal)
-                        .with_reason("fatal error (no retry): boom")
-                }
-                _ => unreachable!("test table contains only terminal event cases"),
-            };
-
-            sub.on_event(&event);
-            assert_eq!(state.get(&id).unwrap().status().phase(), phase);
-            assert!(state.tv_for(&id).is_some());
-            assert_eq!(state.sweep(&config).1, 0);
-            assert_eq!(
-                state.finalize_if_bound(tv.get(), phase, error, None, force),
-                Some(id.clone()),
-            );
-            assert_eq!(state.sweep(&config).1, 1);
-            assert!(state.get(&id).is_none());
-        }
-    }
-
-    #[test]
-    fn attempt_canceled_maps_to_canceled_phase() {
-        let (sub, state, id) = setup("graceful");
-
-        let ev = bound_event(&state, &id, EventKind::AttemptCanceled).with_attempt(1);
-        sub.on_event(&ev);
-
-        let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().phase(), TaskPhase::Canceled);
-    }
-
-    #[test]
-    fn task_finished_fatal_preserves_optional_exit_code_and_waiter_cleanup_ownership() {
-        for (name, reason, exit_code) in [
-            ("fatal-task", "fatal error (no retry): boom", Some(137)),
-            (
-                "logical-fatal",
-                "fatal error (no retry): misconfigured",
-                None,
-            ),
-        ] {
-            let (sub, state, registry, id) = setup_with_output_hub(name);
-            let mut event = bound_event(&state, &id, EventKind::TaskFinished)
-                .with_outcome_kind(TaskOutcomeKind::Fatal)
-                .with_reason(reason);
-            if let Some(exit_code) = exit_code {
-                event = event.with_exit_code(exit_code);
-            }
-
-            sub.on_event(&event);
-
-            let task = state.get(&id).expect("task exists");
-            assert_eq!(task.status().phase(), TaskPhase::Failed);
-            assert_eq!(task.status().exit_code(), exit_code);
-            assert_eq!(task.status().error(), Some(reason));
-            assert!(task.status().phase().is_terminal());
-            assert!(
-                registry.subscribe_raw(&id).is_some(),
-                "the direct completion path owns terminal channel eviction"
-            );
-        }
-    }
-
-    #[test]
-    fn runtime_failure_without_identity_does_not_touch_user_task() {
-        let (sub, state, id) = setup("controller");
-
-        let ev = Event::new(EventKind::RuntimeFailure)
-            .with_task("controller")
-            .with_reason("controller_loop_exited: boom");
-
-        sub.on_event(&ev);
-
-        assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Running);
-    }
-
-    #[test]
-    fn attempt_failed_carries_event_exit_code_into_state() {
-        let (sub, state, id) = setup("fail-task");
-
-        let ev = bound_event(&state, &id, EventKind::AttemptFailed)
-            .with_attempt(1)
-            .with_reason("execution failed: non-zero")
-            .with_exit_code(2);
-
-        sub.on_event(&ev);
-
-        let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().phase(), TaskPhase::Failed);
-        assert_eq!(task.status().exit_code(), Some(2));
-    }
-
-    #[test]
-    fn task_finished_failed_carries_event_exit_code_into_state() {
-        let (sub, state, id) = setup("exhausted");
-
-        let ev = bound_event(&state, &id, EventKind::TaskFinished)
-            .with_outcome_kind(TaskOutcomeKind::Failed)
-            .with_reason("retry limit reached after five retries")
-            .with_exit_code(1);
-
-        sub.on_event(&ev);
-
-        let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().phase(), TaskPhase::Exhausted);
-        assert_eq!(task.status().exit_code(), Some(1));
-    }
-
-    fn setup_pending_with_output_hub(
-        task_name: &str,
-    ) -> (RuntimeObserver, TaskState, Arc<OutputHub>, TaskId) {
-        let state = TaskState::new();
-        let id = add_test_task(&state, task_name);
-        bind_test_task(&state, &id, taskvisor::TaskId::for_tests());
-        let registry = Arc::new(OutputHub::new(OutputConfig::try_new(16).unwrap()));
-        registry.ensure_channel(id.clone());
-        let sub = RuntimeObserver::with_output_hub(state.clone(), Arc::clone(&registry));
-        (sub, state, registry, id)
-    }
-
-    fn setup_with_output_hub(
-        task_name: &str,
-    ) -> (RuntimeObserver, TaskState, Arc<OutputHub>, TaskId) {
-        let setup = setup_pending_with_output_hub(task_name);
-        let binding = setup.1.binding_for(&setup.3).expect("task must be bound");
-        assert!(setup.1.transition_attempt_starting(&binding, 1));
-        setup
-    }
-
-    #[test]
-    fn attempt_starting_announces_run_started_into_output_hub() {
-        let (sub, state, registry, id) = setup_pending_with_output_hub("started-1");
-        let mut rx = registry.subscribe_raw(&id).unwrap();
-
-        let ev = bound_event(&state, &id, EventKind::AttemptStarting).with_attempt(1);
-        sub.on_event(&ev);
-
-        match rx.try_recv().unwrap() {
-            OutputEvent::RunStarted {
-                generation,
-                attempt,
-                ..
-            } => {
-                assert_eq!(generation, 1);
-                assert_eq!(attempt, 1);
-            }
-            other => panic!("expected RunStarted, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn attempt_succeeded_announces_run_finished_with_no_exit_code() {
-        let (sub, state, registry, id) = setup_with_output_hub("stopped-1");
-        let mut rx = registry.subscribe_raw(&id).unwrap();
-
-        let ev = bound_event(&state, &id, EventKind::AttemptSucceeded).with_attempt(1);
-        sub.on_event(&ev);
-
-        match rx.try_recv().unwrap() {
-            OutputEvent::RunFinished {
-                generation,
-                attempt,
-                exit_code,
-                ..
-            } => {
-                assert_eq!(generation, 1);
-                assert_eq!(attempt, 1);
-                assert_eq!(exit_code, None);
-            }
-            other => panic!("expected RunFinished, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn duplicate_attempt_succeeded_does_not_announce_a_second_run_finished() {
-        let (sub, state, registry, id) = setup_with_output_hub("stopped-duplicate");
-        let mut rx = registry.subscribe_raw(&id).unwrap();
-        let event = bound_event(&state, &id, EventKind::AttemptSucceeded).with_attempt(1);
-
-        sub.on_event(&event);
-        sub.on_event(&event);
-
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(OutputEvent::RunFinished { attempt: 1, .. })
-        ));
-        assert!(
-            rx.try_recv().is_err(),
-            "a duplicate terminal attempt event must be an exact no-op"
-        );
-    }
-
-    #[test]
-    fn duplicate_old_generation_terminal_does_not_announce_again_after_apply() {
-        let (sub, state, registry, id) = setup_with_output_hub("stopped-old-generation");
-        let mut rx = registry.subscribe_raw(&id).unwrap();
-        let event = bound_event(&state, &id, EventKind::AttemptSucceeded).with_attempt(1);
-
-        sub.on_event(&event);
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(OutputEvent::RunFinished {
-                generation: 1,
-                attempt: 1,
-                ..
-            })
-        ));
-
-        state
-            .apply_desired(&TaskManifest::new(id.clone(), changed_test_spec()).unwrap())
-            .unwrap();
-        sub.on_event(&event);
-
-        assert!(
-            rx.try_recv().is_err(),
-            "a duplicate terminal event from the previous generation must remain a no-op"
-        );
-    }
-
-    #[test]
-    fn attempt_failed_announces_run_finished_with_exit_code() {
-        let (sub, state, registry, id) = setup_with_output_hub("failed-1");
-        let mut rx = registry.subscribe_raw(&id).unwrap();
-
-        let ev = bound_event(&state, &id, EventKind::AttemptFailed)
-            .with_attempt(1)
-            .with_exit_code(17);
-        sub.on_event(&ev);
-
-        match rx.try_recv().unwrap() {
-            OutputEvent::RunFinished {
-                generation,
-                attempt,
-                exit_code,
-                ..
-            } => {
-                assert_eq!(generation, 1);
-                assert_eq!(attempt, 1);
-                assert_eq!(exit_code, Some(17));
-            }
-            other => panic!("expected RunFinished, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn task_finished_refines_state_without_duplicate_run_finished() {
-        let (sub, state, registry, id) = setup_with_output_hub("exh-evict");
-        let mut rx = registry.subscribe_raw(&id).unwrap();
-
-        sub.on_event(
-            &bound_event(&state, &id, EventKind::AttemptFailed)
-                .with_attempt(1)
-                .with_exit_code(1),
-        );
-        sub.on_event(
-            &bound_event(&state, &id, EventKind::TaskFinished)
-                .with_outcome_kind(TaskOutcomeKind::Failed)
-                .with_reason("retry policy stopped")
-                .with_exit_code(1),
-        );
-
-        match rx.try_recv().unwrap() {
-            OutputEvent::RunFinished {
-                generation,
-                attempt,
-                ..
-            } => {
-                assert_eq!(generation, 1);
-                assert_eq!(attempt, 1);
-            }
-            other => panic!("expected RunFinished, got {other:?}"),
-        }
-        assert!(
-            rx.try_recv().is_err(),
-            "TaskFinished is task-level and must not announce a second RunFinished"
-        );
-        assert!(
-            registry.subscribe_raw(&id).is_some(),
-            "the direct completion path owns terminal channel eviction"
-        );
-    }
-
-    #[test]
-    fn attempt_timed_out_is_a_single_terminal_attempt_event() {
-        let (sub, state, registry, id) = setup_with_output_hub("slow-task");
-        let mut rx = registry.subscribe_raw(&id).unwrap();
-
-        sub.on_event(
-            &bound_event(&state, &id, EventKind::AttemptTimedOut)
-                .with_attempt(1)
-                .with_timeout(Duration::from_millis(250)),
-        );
-
-        let task = state.get(&id).expect("task exists");
-        assert_eq!(task.status().phase(), TaskPhase::Timeout);
-        assert_eq!(
-            task.status().error(),
-            Some("task attempt timed out after 250 ms"),
-        );
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(OutputEvent::RunFinished { attempt: 1, .. })
-        ));
-    }
-
-    #[test]
-    fn task_finished_canceled_maps_by_kind_not_reason() {
-        let (sub, state, id) = setup("self-cancel");
-
-        sub.on_event(
-            &bound_event(&state, &id, EventKind::TaskFinished)
-                .with_outcome_kind(TaskOutcomeKind::Canceled)
-                .with_reason("text that must not select a phase"),
-        );
-
-        let task = state.get(&id).expect("task exists");
-        assert_eq!(
-            task.status().phase(),
-            TaskPhase::Canceled,
-            "the typed outcome selects cancellation"
-        );
-        assert!(task.status().error().is_none());
-    }
-
-    #[test]
-    fn task_finished_runtime_failures_use_typed_outcomes() {
-        for (name, kind, expected_phase, expected_error) in [
-            (
-                "force-aborted",
-                TaskOutcomeKind::ForceAborted,
-                TaskPhase::Canceled,
-                crate::map::phase::FORCE_ABORTED_ERROR,
-            ),
-            (
-                "runner-panicked",
-                TaskOutcomeKind::Panicked,
-                TaskPhase::Failed,
-                crate::map::phase::TASK_RUNNER_PANICKED_ERROR,
-            ),
-        ] {
-            let (sub, state, id) = setup(name);
-
-            sub.on_event(
-                &bound_event(&state, &id, EventKind::TaskFinished)
-                    .with_outcome_kind(kind)
-                    .with_reason("diagnostic text that must not select the phase"),
-            );
-
-            let task = state.get(&id).expect("task exists");
-            assert_eq!(task.status().phase(), expected_phase);
-            assert_eq!(task.status().error(), Some(expected_error));
-        }
-    }
-
-    #[test]
-    fn task_finished_completed_after_success_is_not_an_error() {
-        let (sub, state, id) = setup("oneshot");
-
-        sub.on_event(&bound_event(&state, &id, EventKind::AttemptSucceeded).with_attempt(1));
-        sub.on_event(
-            &bound_event(&state, &id, EventKind::TaskFinished)
-                .with_outcome_kind(TaskOutcomeKind::Completed)
-                .with_reason("diagnostic text that looks like a failure"),
-        );
-
-        let task = state.get(&id).expect("task exists");
-        assert_eq!(
-            task.status().phase(),
-            TaskPhase::Succeeded,
-            "normal one-shot completion must stay Succeeded"
-        );
-        assert!(
-            task.status().error().is_none(),
-            "Completed ignores diagnostic reason text"
-        );
-    }
-
-    #[test]
-    fn task_finished_without_outcome_kind_does_not_guess_from_reason() {
-        let (sub, state, id) = setup("missing-kind");
-
-        sub.on_event(
-            &bound_event(&state, &id, EventKind::TaskFinished)
-                .with_reason("fatal-looking diagnostic"),
-        );
-
-        assert_eq!(state.get(&id).unwrap().status().phase(), TaskPhase::Running);
-    }
-
-    #[test]
-    fn task_removed_does_not_bypass_waiter_cleanup_or_retention() {
-        let (sub, state, registry, id) = setup_with_output_hub("remove");
-
-        let ev = bound_event(&state, &id, EventKind::TaskRemoved);
-        sub.on_event(&ev);
-
-        assert!(
-            registry.subscribe_raw(&id).is_some(),
-            "TaskRemoved must not race the waiter's output cleanup"
-        );
-        assert!(state.get(&id).is_some(), "task_ttl retention stays intact");
-        assert!(state.tv_for(&id).is_some(), "waiter still owns the binding");
-    }
-}
+mod tests;

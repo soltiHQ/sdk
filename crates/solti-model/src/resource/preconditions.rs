@@ -1,6 +1,6 @@
 //! # Write preconditions
 //!
-//! [`WritePreconditions`] protects an apply or delete from a stale resource snapshot.
+//! [`WritePreconditions`] protects an apply, cancel, or delete from a stale resource snapshot.
 
 use crate::{ModelError, ModelResult, Task, Uid};
 

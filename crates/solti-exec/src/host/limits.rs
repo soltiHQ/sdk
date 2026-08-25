@@ -94,7 +94,7 @@ impl PreparedRlimits {
         None
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         #[cfg(unix)]
         return self.nofile.is_none() && self.fsize.is_none() && self.core.is_none();
 

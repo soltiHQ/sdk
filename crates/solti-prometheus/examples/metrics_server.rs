@@ -8,7 +8,7 @@
 //! - the inputs accepted by `server`;
 //! - the returned desired-state manifest;
 //! - the matching Taskvisor task;
-//! - the composed revision containing the listen address;
+//! - the composed revision containing the listen address and scrape policy;
 //! - the boundary before binding and serving HTTP.
 //!
 //! Run with `cargo run -p solti-prometheus --example metrics_server --features server`.
@@ -24,7 +24,6 @@ const FLOW: &str = r#"
 solti-prometheus: supervised metrics server
 
   shared Registry + listen address + caller revision
-                            │
                             ▼
                          server()
                             ├──► TaskManifest (desired lifecycle) ─┐
@@ -54,7 +53,7 @@ fn main() -> ExampleResult {
     let caller_revision = "example-agent-v1";
     println!("[input] address={address}, caller revision={caller_revision}.");
 
-    let (manifest, task_ref) = server(Arc::clone(&registry), address, caller_revision)?;
+    let (manifest, _task_ref) = server(Arc::clone(&registry), address, caller_revision)?;
     let TaskWorkload::Embedded(embedded) = manifest.spec().workload() else {
         return Err("metrics server must produce an Embedded workload".into());
     };
@@ -70,12 +69,16 @@ fn main() -> ExampleResult {
         manifest.spec().restart(),
         manifest.spec().admission(),
     );
-    println!("[task] TaskRef name={}.", task_ref.name());
+    println!(
+        "[task] Reusable TaskRef built; Taskvisor assigns its registration name through TaskSpec."
+    );
 
     assert_eq!(manifest.name().as_str(), METRICS_SERVER_SLOT);
     assert_eq!(manifest.slot().as_str(), METRICS_SERVER_SLOT);
-    assert_eq!(task_ref.name(), METRICS_SERVER_SLOT);
-    assert_eq!(embedded.revision(), "example-agent-v1|addr=127.0.0.1:9090");
+    assert_eq!(
+        embedded.revision(),
+        "example-agent-v1|addr=127.0.0.1:9090|max_concurrent_scrapes=2|max_response_bytes=4194304|scrape_timeout_ns=10000000000"
+    );
 
     println!("[runtime] No socket was bound; this example did not submit the TaskRef.");
     println!(

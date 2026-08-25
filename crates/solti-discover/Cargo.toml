@@ -19,6 +19,7 @@ include = [
     "proto/**/*.proto",
     "src/**/*.rs",
     "CONTRACT.md",
+    "LICENSE",
     "README.md",
     "build.rs",
 ]
@@ -27,7 +28,6 @@ include = [
 default = []
 grpc = [
     "dep:prost",
-    "dep:prost-reflect",
     "dep:protoc-bin-vendored",
     "dep:solti-model",
     "dep:taskvisor",
@@ -41,9 +41,9 @@ http = [
     "dep:pbjson",
     "dep:pbjson-build",
     "dep:prost",
-    "dep:prost-reflect",
     "dep:protoc-bin-vendored",
     "dep:reqwest",
+    "dep:rustls",
     "dep:serde",
     "dep:serde_json",
     "dep:solti-model",
@@ -52,7 +52,7 @@ http = [
     "dep:tonic-prost-build",
     "dep:tracing",
 ]
-tls  = ["dep:solti-tls", "reqwest?/rustls-no-provider", "tonic?/tls-native-roots", "tonic?/tls-ring"]
+tls  = ["dep:solti-tls", "tonic?/tls-native-roots", "tonic?/tls-ring"]
 
 [dependencies]
 solti-model = { workspace = true, optional = true }
@@ -60,7 +60,13 @@ solti-tls   = { workspace = true, optional = true }
 
 pbjson      = { workspace = true, optional = true }
 prost       = { workspace = true, optional = true }
-reqwest     = { workspace = true, features = ["json"], optional = true }
+reqwest     = { workspace = true, optional = true, features = [
+    "http2",
+    "json",
+    "rustls-no-provider",
+    "system-proxy",
+] }
+rustls      = { workspace = true, optional = true }
 serde       = { workspace = true, optional = true }
 serde_json  = { workspace = true, optional = true }
 taskvisor   = { workspace = true, optional = true }
@@ -70,15 +76,14 @@ tonic       = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
 tracing     = { workspace = true, optional = true }
 
-[build-dependencies]
-pbjson-build        = { workspace = true, optional = true }
-prost-reflect       = { workspace = true, optional = true }
-protoc-bin-vendored = { workspace = true, optional = true }
-tonic-prost-build   = { workspace = true, optional = true }
-
 [dev-dependencies]
 taskvisor = { workspace = true, features = ["test-util"] }
 tokio     = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
+
+[build-dependencies]
+pbjson-build        = { workspace = true, optional = true }
+protoc-bin-vendored = { workspace = true, optional = true }
+tonic-prost-build   = { workspace = true, optional = true }
 
 [[example]]
 name              = "grpc_sync"

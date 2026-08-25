@@ -58,9 +58,15 @@ fn main() -> ExampleResult {
     println!("[installation] The process-global JSON subscriber is active.");
     println!("[events] A debug event is filtered; the following info event becomes JSON:");
 
-    tracing::debug!(target: "example::api", request_id = 41_u64, "not exported");
+    tracing::debug!(
+        target: "example::api",
+        event = "http.request",
+        request_id = 41_u64,
+        "not exported"
+    );
     tracing::info!(
         target: "example::api",
+        event = "http.request",
         request_id = 42_u64,
         method = "GET",
         path = "/health",

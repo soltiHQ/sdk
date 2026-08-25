@@ -24,7 +24,7 @@ use crate::DISCOVERY_HTTP_SYNC_PATH;
 use crate::config::DiscoverConfig;
 use crate::errors::DiscoverError;
 use crate::proto::{SyncRequest, SyncResponse};
-use crate::tasks::transport::validate_response;
+use crate::tasks::transport::{validate_response, validate_token_transport};
 
 const MAX_BODY_PREVIEW_BYTES: usize = 1_024;
 const MAX_RESPONSE_BODY_BYTES: u64 = 64 * 1_024;
@@ -51,8 +51,11 @@ impl HttpAdapter {
             ));
         }
 
+        let authorization = authorization_header(config.token.as_ref())?;
+        validate_token_transport(config, secure)?;
+
         Ok(Self {
-            authorization: authorization_header(config.token.as_ref())?,
+            authorization,
             client: build_client(config)?,
             secure,
             url,
@@ -137,6 +140,8 @@ fn authorization_header(token: Option<&Token>) -> Result<Option<HeaderValue>, Di
 ///
 /// Redirects are disabled to prevent forwarding credentials to another host.
 fn build_client(config: &DiscoverConfig) -> Result<reqwest::Client, DiscoverError> {
+    ensure_tls_provider()?;
+
     #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
@@ -155,6 +160,25 @@ fn build_client(config: &DiscoverConfig) -> Result<reqwest::Client, DiscoverErro
     }
 
     builder.build().map_err(DiscoverError::from)
+}
+
+/// Installs Solti's ring provider when the process has not selected one.
+fn ensure_tls_provider() -> Result<(), DiscoverError> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+        && rustls::crypto::CryptoProvider::get_default().is_none()
+    {
+        return Err(DiscoverError::InvalidConfig(
+            "failed to select a rustls crypto provider".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Reads a bounded diagnostic body preview.
@@ -247,6 +271,7 @@ mod tests {
             crate::AgentEndpoint::new("http://127.0.0.1:8085", crate::AgentEndpointType::Http, 1)
                 .unwrap(),
             crate::ControlPlaneEndpoint::new(endpoint, crate::DiscoveryTransport::Http).unwrap(),
+            solti_model::AgentCapabilities::default(),
             30_000,
             "test@1",
         )
@@ -296,11 +321,52 @@ mod tests {
     fn token_is_validated_before_task_execution() {
         let config = config_builder("http://control.example")
             .with_token(solti_model::Token::new("first\nsecond").unwrap())
+            .allow_insecure_token_transport()
             .build()
             .unwrap();
 
         let result = HttpAdapter::new(&config);
         assert!(matches!(result, Err(DiscoverError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn plaintext_with_token_is_rejected_by_default() {
+        let config = config_builder("http://control.example")
+            .with_token(solti_model::Token::new("secret").unwrap())
+            .build()
+            .unwrap();
+
+        let result = HttpAdapter::new(&config);
+        let Err(DiscoverError::InvalidConfig(message)) = result else {
+            panic!("expected plaintext token config to be rejected");
+        };
+        assert!(message.contains("allow_insecure_token_transport()"));
+    }
+
+    #[test]
+    fn plaintext_without_token_remains_allowed() {
+        assert!(HttpAdapter::new(&config("http://control.example")).is_ok());
+    }
+
+    #[test]
+    fn explicit_opt_in_allows_plaintext_with_token() {
+        let config = config_builder("http://127.0.0.1:9000")
+            .with_token(solti_model::Token::new("development-secret").unwrap())
+            .allow_insecure_token_transport()
+            .build()
+            .unwrap();
+
+        assert!(HttpAdapter::new(&config).is_ok());
+    }
+
+    #[test]
+    fn https_with_token_is_allowed_by_default() {
+        let config = config_builder("https://control.example")
+            .with_token(solti_model::Token::new("secret").unwrap())
+            .build()
+            .unwrap();
+
+        assert!(HttpAdapter::new(&config).is_ok());
     }
 
     #[cfg(feature = "tls")]

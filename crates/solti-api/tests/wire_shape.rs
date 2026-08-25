@@ -23,8 +23,9 @@ use solti_chain::{ChainSpec, FailureMode};
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, EmbeddedSpec, Flag, JitterPolicy, Labels, OutputChunk,
     OutputEvent, RestartPolicy, StreamKind, SubprocessMode, SubprocessSpec, Task, TaskContinuation,
-    TaskEnv, TaskFilter, TaskId, TaskManifest, TaskPage, TaskPhase, TaskQuery, TaskRun, TaskSpec,
-    TaskWatchEvent, TaskWorkload, WorkloadTypeMeta, WritePreconditions,
+    TaskEnv, TaskFilter, TaskId, TaskManifest, TaskPage, TaskPhase, TaskQuery, TaskRun,
+    TaskRunContinuation, TaskRunPage, TaskRunQuery, TaskSpec, TaskWatchEvent, TaskWorkload, Uid,
+    WorkloadTypeMeta, WritePreconditions,
 };
 
 const CREATE_COMMAND_BODY: &str = r#"{
@@ -267,6 +268,33 @@ const CREATE_EMBEDDED_BODY: &str = r#"{
 }"#;
 
 fn fixture_task() -> Task {
+    fixture_task_named("task-wire-1")
+}
+
+fn taskvisor_intake_pending_task() -> Task {
+    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+        SubprocessMode::Command {
+            command: "echo".into(),
+            args: Vec::new(),
+        },
+        TaskEnv::new(),
+        None,
+        Flag::from(true),
+    ));
+    let spec = TaskSpec::builder("my-job", workload, 30_000_u64)
+        .build()
+        .unwrap();
+    let mut task = Task::new("task-intake-pending", spec).unwrap();
+    task.update_reconciliation_pending_diagnostic(
+        "TaskvisorOwnershipAndControllerIntakePending",
+        "waiting for Taskvisor ownership and controller intake capacity",
+        "2",
+    )
+    .unwrap();
+    task
+}
+
+fn fixture_task_named(name: &str) -> Task {
     let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
         SubprocessMode::Command {
             command: "echo".into(),
@@ -292,7 +320,7 @@ fn fixture_task() -> Task {
     labels
         .insert("environment", "production")
         .insert("tier", "backend");
-    let manifest = TaskManifest::new("task-wire-1", spec)
+    let manifest = TaskManifest::new(name, spec)
         .unwrap()
         .with_labels(labels)
         .unwrap();
@@ -345,12 +373,15 @@ fn fixture_runs() -> Vec<TaskRun> {
 struct WireMock {
     last_admission: Mutex<Option<AdmissionPolicy>>,
     last_query: Mutex<Option<TaskQuery>>,
+    last_run_query: Mutex<Option<TaskRunQuery>>,
+    run_query_tasks: Mutex<Vec<TaskId>>,
     last_watch_filter: Mutex<Option<TaskFilter>>,
     last_watch_resource_version: Mutex<Option<Option<String>>>,
     last_write_preconditions: Mutex<Option<WritePreconditions>>,
     submit_conflicts: bool,
     leak_embedded_task: bool,
     leak_embedded_run: bool,
+    taskvisor_intake_pending: bool,
     non_utf8_output: bool,
     watch_expired: bool,
     watch_error_then_pending: bool,
@@ -403,28 +434,67 @@ impl ApiHandler for WireMock {
     async fn get_task(&self, _id: &TaskId) -> Result<Option<Task>, ApiError> {
         Ok(Some(if self.leak_embedded_task {
             embedded_task()
+        } else if self.taskvisor_intake_pending {
+            taskvisor_intake_pending_task()
         } else {
             fixture_task()
         }))
     }
 
     async fn query_tasks(&self, query: TaskQuery) -> Result<TaskPage<Task>, ApiError> {
-        let item = if self.leak_embedded_task {
-            embedded_task()
+        let candidates = if self.leak_embedded_task {
+            vec![embedded_task()]
         } else {
-            fixture_task()
+            vec![
+                fixture_task(),
+                fixture_task_named("task-wire-2"),
+                fixture_task_named("task-wire-3"),
+            ]
         };
-        let matches = query.matches(&item);
-        let continuation = matches
-            .then(|| TaskContinuation::new("test:5", query.filter().clone(), item.name().clone()))
-            .transpose()
-            .map_err(|error| ApiError::Internal(error.to_string()))?;
+        let matching = candidates
+            .into_iter()
+            .filter(|item| query.matches(item))
+            .collect::<Vec<_>>();
+        let start = query.continuation().map_or(0, |continuation| {
+            matching
+                .iter()
+                .position(|item| item.name() == continuation.after())
+                .map_or(matching.len(), |index| index + 1)
+        });
+        let page_limit = if query.continuation().is_none() {
+            query.limit().min(1)
+        } else {
+            query.limit()
+        };
+        let total = matching.len();
+        let items = matching
+            .into_iter()
+            .skip(start)
+            .take(page_limit)
+            .collect::<Vec<_>>();
+        let remaining_item_count = total.saturating_sub(start + items.len());
+        let resource_version = query
+            .continuation()
+            .map(|continuation| continuation.resource_version().to_owned())
+            .unwrap_or_else(|| "test:5".into());
+        let continuation = if remaining_item_count > 0 {
+            Some(
+                TaskContinuation::new(
+                    resource_version.clone(),
+                    query.filter().clone(),
+                    items.last().unwrap().name().clone(),
+                )
+                .map_err(|error| ApiError::Internal(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         *self.last_query.lock().unwrap() = Some(query);
         Ok(TaskPage {
-            items: matches.then_some(item).into_iter().collect(),
-            resource_version: "test:5".into(),
+            items,
+            resource_version,
             continuation,
-            remaining_item_count: if matches { 2 } else { 0 },
+            remaining_item_count,
         })
     }
 
@@ -466,18 +536,76 @@ impl ApiHandler for WireMock {
         Ok(Box::pin(tokio_stream::iter(events)))
     }
 
-    async fn list_task_runs(&self, _id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
-        if self.leak_embedded_run {
-            return Ok(vec![
+    async fn query_task_runs(
+        &self,
+        id: &TaskId,
+        query: TaskRunQuery,
+    ) -> Result<TaskRunPage, ApiError> {
+        self.run_query_tasks.lock().unwrap().push(id.clone());
+        let runs = if self.leak_embedded_run {
+            vec![
                 TaskRun::starting(
                     1,
                     1,
                     WorkloadTypeMeta::new("solti.io/v1", "Embedded").unwrap(),
                 )
                 .unwrap(),
-            ]);
-        }
-        Ok(fixture_runs())
+            ]
+        } else {
+            fixture_runs()
+        };
+        let task_uid = Uid::new("wire-task-run-uid").unwrap();
+        let start = query.continuation().map_or(0, |continuation| {
+            runs.iter()
+                .position(|run| {
+                    (run.generation(), run.attempt())
+                        == (
+                            continuation.after_generation(),
+                            continuation.after_attempt(),
+                        )
+                })
+                .map_or(runs.len(), |index| index + 1)
+        });
+        let total = runs.len();
+        let items = runs
+            .into_iter()
+            .skip(start)
+            .take(query.limit())
+            .collect::<Vec<_>>();
+        let remaining_item_count = total.saturating_sub(start + items.len());
+        let continuation = if remaining_item_count > 0 {
+            let last = items.last().unwrap();
+            Some(
+                TaskRunContinuation::new(
+                    "runs-test:5",
+                    id.clone(),
+                    task_uid.clone(),
+                    last.generation(),
+                    last.attempt(),
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        *self.last_run_query.lock().unwrap() = Some(query);
+        Ok(TaskRunPage {
+            items,
+            task: id.clone(),
+            task_uid,
+            resource_version: "runs-test:5".into(),
+            continuation,
+            remaining_item_count,
+        })
+    }
+
+    async fn cancel_task(
+        &self,
+        _id: &TaskId,
+        preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
+        *self.last_write_preconditions.lock().unwrap() = Some(preconditions);
+        Ok(())
     }
 
     async fn delete_task(
@@ -489,7 +617,11 @@ impl ApiHandler for WireMock {
         Ok(())
     }
 
-    async fn stream_task_logs(&self, _id: &TaskId) -> Result<OutputEventStream, ApiError> {
+    async fn stream_task_logs(
+        &self,
+        _id: &TaskId,
+        _task_uid: &solti_model::Uid,
+    ) -> Result<OutputEventStream, ApiError> {
         let events = vec![
             OutputEvent::RunStarted {
                 generation: 1,
@@ -507,6 +639,7 @@ impl ApiHandler for WireMock {
                 } else {
                     Bytes::from_static(b"hello world")
                 },
+                truncated: self.non_utf8_output,
             }),
             OutputEvent::RunFinished {
                 generation: 1,
@@ -514,7 +647,10 @@ impl ApiHandler for WireMock {
                 exit_code: Some(0),
                 finished_at: UNIX_EPOCH + Duration::from_millis(1_712_750_400_456),
             },
-            OutputEvent::Lagged { skipped: 42 },
+            OutputEvent::Lagged {
+                skipped: 42,
+                skipped_bytes: 1_024,
+            },
         ];
         Ok(Box::pin(tokio_stream::iter(events)))
     }
@@ -552,6 +688,48 @@ async fn create_command_resource_is_accepted() {
     assert_eq!(body["metadata"]["name"], "task-wire-1");
     assert_eq!(body["apiVersion"], "solti.io/v1");
     assert_eq!(body["kind"], "Task");
+}
+
+#[tokio::test]
+async fn http_wire_paths_round_trip_unicode_without_substitution() {
+    let app = router_with(Arc::new(WireMock::default()));
+
+    let mut subprocess: Value = serde_json::from_str(CREATE_COMMAND_BODY).unwrap();
+    subprocess["metadata"]["name"] = "task-unicode-cwd".into();
+    subprocess["spec"]["workload"]["spec"]["cwd"] = "/工作/δ".into();
+    let response = app
+        .clone()
+        .oneshot(post_json(
+            "/apis/solti.io/v1/tasks",
+            &serde_json::to_string(&subprocess).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = body_json(response).await;
+    assert_eq!(body["spec"]["workload"]["spec"]["cwd"], "/工作/δ");
+
+    let mut wasm: Value = serde_json::from_str(CREATE_COMMAND_BODY).unwrap();
+    wasm["metadata"]["name"] = "task-unicode-wasm".into();
+    wasm["spec"]["workload"]["kind"] = "Wasm".into();
+    wasm["spec"]["workload"]["spec"] = serde_json::json!({
+        "module": "/модули/报告.wasm",
+        "args": [],
+        "env": []
+    });
+    let response = app
+        .oneshot(post_json(
+            "/apis/solti.io/v1/tasks",
+            &serde_json::to_string(&wasm).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = body_json(response).await;
+    assert_eq!(
+        body["spec"]["workload"]["spec"]["module"],
+        "/модули/报告.wasm"
+    );
 }
 
 #[tokio::test]
@@ -835,6 +1013,33 @@ async fn delete_forwards_write_preconditions() {
 }
 
 #[tokio::test]
+async fn cancel_forwards_write_preconditions() {
+    let handler = Arc::new(WireMock::default());
+    let app = router_with(Arc::clone(&handler));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/apis/solti.io/v1/tasks/task-wire-1/cancel?uid=uid-1&resourceVersion=17")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let preconditions = handler
+        .last_write_preconditions
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("handler received preconditions");
+    assert_eq!(preconditions.uid().unwrap().as_str(), "uid-1");
+    assert_eq!(preconditions.resource_version(), Some("17"));
+}
+
+#[tokio::test]
 async fn write_rejects_empty_precondition_before_the_handler() {
     let handler = Arc::new(WireMock::default());
     let app = router_with(Arc::clone(&handler));
@@ -952,6 +1157,39 @@ async fn get_task_response_matches_crd_shape() {
     assert_eq!(reconciled["reason"], "RuntimeAccepted");
     assert_eq!(reconciled["message"], "runtime accepted the desired state");
     assert!(reconciled["lastTransitionTime"].is_string());
+}
+
+#[tokio::test]
+async fn get_preserves_observable_taskvisor_intake_condition() {
+    let app = router_with(Arc::new(WireMock {
+        taskvisor_intake_pending: true,
+        ..WireMock::default()
+    }));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/apis/solti.io/v1/tasks/task-intake-pending")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let condition = &body["status"]["conditions"][0];
+    assert_eq!(condition["status"], "Unknown");
+    assert_eq!(condition["observedGeneration"], 1);
+    assert_eq!(
+        condition["reason"],
+        "TaskvisorOwnershipAndControllerIntakePending"
+    );
+    assert_eq!(
+        condition["message"],
+        "waiting for Taskvisor ownership and controller intake capacity"
+    );
 }
 
 #[tokio::test]
@@ -1375,6 +1613,10 @@ async fn list_task_runs_response_matches_documented_shape() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
+    assert_eq!(body["metadata"]["taskUid"], "wire-task-run-uid");
+    assert_eq!(body["metadata"]["resourceVersion"], "runs-test:5");
+    assert!(body["metadata"].get("continue").is_none());
+    assert!(body["metadata"].get("remainingItemCount").is_none());
     let runs = body["runs"].as_array().expect("runs must be an array");
     assert_eq!(runs.len(), 2);
 
@@ -1396,6 +1638,88 @@ async fn list_task_runs_response_matches_documented_shape() {
     assert_eq!(runs[1]["startedAt"], "2024-04-10T12:00:05Z");
     assert_eq!(runs[1]["finishedAt"], "2024-04-10T12:00:06Z");
     assert_eq!(runs[1]["exitCode"], 0);
+}
+
+#[tokio::test]
+async fn list_task_runs_continues_the_same_snapshot() {
+    let handler = Arc::new(WireMock::default());
+    let app = router_with(Arc::clone(&handler));
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/apis/solti.io/v1/tasks/task-wire-1/runs?limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = body_json(first).await;
+    assert_eq!(first["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(first["metadata"]["taskUid"], "wire-task-run-uid");
+    assert_eq!(first["metadata"]["remainingItemCount"], 1);
+    let token = first["metadata"]["continue"].as_str().unwrap();
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/apis/solti.io/v1/tasks/task-wire-1/runs?limit=1&continue={token}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = body_json(second).await;
+    assert_eq!(second["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(second["runs"][0]["attempt"], 2);
+    assert_eq!(second["metadata"]["taskUid"], "wire-task-run-uid");
+    assert_eq!(second["metadata"]["resourceVersion"], "runs-test:5");
+    assert!(second["metadata"].get("continue").is_none());
+    assert!(second["metadata"].get("remainingItemCount").is_none());
+}
+
+#[tokio::test]
+async fn list_task_runs_rejects_a_cross_task_token_before_the_handler() {
+    let handler = Arc::new(WireMock::default());
+    let app = router_with(Arc::clone(&handler));
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/apis/solti.io/v1/tasks/task-wire-1/runs?limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let first = body_json(first).await;
+    let token = first["metadata"]["continue"].as_str().unwrap();
+    assert_eq!(handler.run_query_tasks.lock().unwrap().len(), 1);
+
+    let mismatched = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/apis/solti.io/v1/tasks/another-task/runs?limit=1&continue={token}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(mismatched.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(handler.run_query_tasks.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1428,7 +1752,7 @@ async fn sse_frames_match_documented_event_names_and_payloads() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/apis/solti.io/v1/tasks/task-wire-1/logs")
+                .uri("/apis/solti.io/v1/tasks/task-wire-1/logs?taskUid=task-uid")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1440,10 +1764,10 @@ async fn sse_frames_match_documented_event_names_and_payloads() {
     let body = std::str::from_utf8(&bytes).unwrap();
 
     for frame in [
-        "event: run-started\ndata: {\"type\":\"runStarted\",\"generation\":1,\"attempt\":1,\"startedAt\":1712750400000}",
-        "event: chunk\ndata: {\"type\":\"chunk\",\"generation\":1,\"attempt\":1,\"stream\":\"stdout\",\"seq\":0,\"ts\":1712750400123,\"line\":\"aGVsbG8gd29ybGQ=\"}",
-        "event: run-finished\ndata: {\"type\":\"runFinished\",\"generation\":1,\"attempt\":1,\"exitCode\":0,\"finishedAt\":1712750400456}",
-        "event: lagged\ndata: {\"type\":\"lagged\",\"skipped\":42}",
+        "event: run-started\ndata: {\"taskUid\":\"task-uid\",\"type\":\"runStarted\",\"generation\":1,\"attempt\":1,\"startedAt\":1712750400000}",
+        "event: chunk\ndata: {\"taskUid\":\"task-uid\",\"type\":\"chunk\",\"generation\":1,\"attempt\":1,\"stream\":\"stdout\",\"seq\":0,\"ts\":1712750400123,\"line\":\"aGVsbG8gd29ybGQ=\"}",
+        "event: run-finished\ndata: {\"taskUid\":\"task-uid\",\"type\":\"runFinished\",\"generation\":1,\"attempt\":1,\"exitCode\":0,\"finishedAt\":1712750400456}",
+        "event: lagged\ndata: {\"taskUid\":\"task-uid\",\"type\":\"lagged\",\"skipped\":42,\"skippedBytes\":1024}",
     ] {
         assert!(
             body.contains(frame),
@@ -1463,7 +1787,7 @@ async fn sse_preserves_non_utf8_output_as_base64() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/apis/solti.io/v1/tasks/task-wire-1/logs")
+                .uri("/apis/solti.io/v1/tasks/task-wire-1/logs?taskUid=task-uid")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1481,6 +1805,7 @@ async fn sse_preserves_non_utf8_output_as_base64() {
     .unwrap();
 
     assert!(body.contains(r#""line":"aGn//g==""#), "{body}");
+    assert!(body.contains(r#""truncated":true"#), "{body}");
     assert!(!body.contains('\u{FFFD}'), "{body}");
 }
 

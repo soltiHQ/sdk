@@ -2,7 +2,8 @@
 
 use thiserror::Error;
 
-/// Errors returned by runner registration and backend configuration.
+/// Errors returned while constructing, registering, and explicitly shutting
+/// down execution backends.
 ///
 /// Match with a wildcard arm because this enum is non-exhaustive.
 #[derive(Debug, Error)]
@@ -16,7 +17,7 @@ pub enum ExecError {
     #[error("invalid runner configuration: {0}")]
     InvalidRunnerConfig(String),
 
-    /// An operating-system resource could not be read or prepared.
+    /// An operating-system resource or backend lifecycle operation failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

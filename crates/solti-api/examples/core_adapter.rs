@@ -58,7 +58,7 @@ async fn main() -> ExampleResult {
     );
 
     let supervisor = Arc::new(SupervisorApi::builder(RunnerRouter::new()).start().await?);
-    let task_ref = TaskFn::arc("internal-cleanup-runtime", |ctx: TaskContext| async move {
+    let task_ref = TaskFn::arc(|ctx: TaskContext| async move {
         ctx.cancelled().await;
         Err::<(), TaskError>(TaskError::Canceled)
     });

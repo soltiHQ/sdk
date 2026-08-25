@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut router = RunnerRouter::new();
-    register_subprocess_runner(&mut router, "default")?;
+    let subprocess_runner = register_subprocess_runner(&mut router, "default")?;
     let supervisor = SupervisorApi::builder(router).start().await?;
 
     let command = env::current_exe()?.to_string_lossy().into_owned();
@@ -123,6 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("finished {name}: {phase}");
     supervisor.shutdown().await?;
+    subprocess_runner.shutdown(Duration::from_secs(5)).await?;
     Ok(())
 }
 ```
@@ -214,14 +215,14 @@ It bypasses runner routing and has no HTTP or gRPC representation.
 ### Conditional chains
 
 The optional `solti-chain` runner represents a Chain as one ordinary Task.
-Its steps are nested workloads, and exactly one step is active at a time. 
+Its steps are nested workloads, and exactly one step is active at a time.
 Each successful or failed step may select one next step.
 
 Chain uses a regular extension workload under `Task.spec.workload`.
 Existing HTTP and gRPC Task operations carry it without a new resource API.
 
-The outer Task owns timeout, restart, backoff, admission, cancellation, status, history, and output. 
-Steps are not child Task resources and do not have independent lifecycle policies. 
+The outer Task owns timeout, restart, backoff, admission, cancellation, status, history, and output.
+Steps are not child Task resources and do not have independent lifecycle policies.
 Restarting the outer Task starts the chain again from its entry step.
 
 ## Reconciliation and execution
@@ -244,6 +245,8 @@ Applying an identical manifest schedules one manual retry only when `Reconciled=
 
 Taskvisor owns attempt restart, backoff, timeout, admission, and cancellation.
 Core retains bounded `TaskRun` history separately from the current Task status.
+Current retained run values have a separate 256 MiB compact JSON budget by
+default. This logical payload bound does not measure allocator overhead or RSS.
 
 ## Public Task API
 
@@ -256,12 +259,17 @@ Core retains bounded `TaskRun` history separately from the current Task status.
 | Get         | Read one Task                                        |
 | List        | Filter and paginate a stable collection snapshot     |
 | Watch       | Stream retained changes and then live changes        |
-| Run history | Read retained attempts                               |
-| Logs        | Stream live stdout and stderr                        |
-| Delete      | Stop the runtime and remove the Task and its history |
+| Run history | Paginate a stable retained-attempt snapshot          |
+| Cancel      | Reach a terminal logical outcome while retaining desired state and history |
+| Logs        | Stream live stdout and stderr for an exact Task UID  |
+| Delete      | Reach a terminal logical outcome, then remove the Task and its history |
 
 HTTP uses the fixed root `/apis/solti.io/v1` in the current `solti-api` release.
 `HttpApi::build` returns the router and its generated OpenAPI 3.1 document.
+
+Opening a live-output stream requires the current Task UID. Every returned event
+repeats that UID, and the stream remains pinned to the same Task incarnation and
+generation even if the name is deleted and recreated.
 
 gRPC uses the `solti.task.v1` protobuf package.
 Generated server and client types are available from the crate.
@@ -269,9 +277,10 @@ Generated server and client types are available from the crate.
 Each SDK binary serves the API version compiled into its selected `solti-api` version.
 A control plane that manages different binary generations must route each advertised version to its matching contract.
 
-Bearer authentication is disabled until the binary calls `with_auth` or `with_authenticator`. 
+Bearer authentication is disabled until the binary calls `with_auth` or `with_authenticator`.
 An optional `with_authorizer` policy runs before each validated Task API operation.
 The HTTP and gRPC boundaries enforce a 4 MiB request or message limit.
+Task and TaskRun list responses also have 4 MiB native-encoding limits.
 
 Read the complete route, message, pagination, watch, and error contract in [`solti-api/CONTRACT.md`](crates/solti-api/CONTRACT.md).
 
@@ -296,9 +305,12 @@ Read the versioned wire contract in [`solti-discover/CONTRACT.md`](crates/solti-
 `solti-model::Token` is a redacted bearer secret with constant-time comparison.
 `solti-api` can verify it on every route and RPC.
 `solti-discover` can send it with every heartbeat.
+Discovery bearer tokens require HTTPS by default.
+An explicit `allow_insecure_token_transport()` escape hatch exists for controlled
+development or loopback endpoints.
 
-The static token is authentication only. 
-`solti-api` also exposes application hooks for bearer authentication and operation-level authorization. 
+The static token is authentication only.
+`solti-api` also exposes application hooks for bearer authentication and operation-level authorization.
 The SDK does not provide users, tenants, RBAC rules, tenant filtering, policy storage, secret rotation, or secret persistence.
 
 `solti-tls` separates server identity, client identity, and trust roots.
@@ -308,7 +320,7 @@ It supports TLS and mandatory client-certificate authentication.
 HTTP server TLS is owned by the server that hosts the axum router.
 `discover-tls` applies custom roots or mTLS to outbound HTTPS connections.
 
-Bearer authentication and TLS are independent.
+The Task API configures bearer authentication and server TLS independently.
 
 ## Execution backends and platform limits
 
@@ -327,17 +339,18 @@ Bearer authentication and TLS are independent.
 The subprocess path always validates configuration before runner registration.
 Configured controls fail closed when the current platform cannot enforce them.
 
-| Control                                         | Platform   |
-|-------------------------------------------------|------------|
-| Session, process group, signal reset, umask     | Unix       |
-| `RLIMIT_NOFILE`, `RLIMIT_FSIZE`, core dumps     | Unix       |
-| Pinned working directory                        | Unix       |
-| Explicit descriptor passlist                    | Linux      |
-| Descriptor snapshot and close-on-exec checks    | Other Unix |
-| cgroup v2 CPU, memory, and process limits       | Linux      |
-| Mount, network, IPC, UTS, and cgroup namespaces | Linux      |
-| UID, GID, supplementary groups, capabilities    | Linux      |
-| `no_new_privs` and seccomp denylist             | Linux      |
+| Control                                           | Platform |
+|---------------------------------------------------|----------|
+| Session, process group, signal reset, umask       | Unix     |
+| `RLIMIT_NOFILE`, `RLIMIT_FSIZE`, core dumps       | Unix     |
+| Pinned working directory                          | Unix     |
+| Explicit descriptor passlist with `close_range`   | Linux    |
+| Atomic `posix_spawn` descriptor passlist          | macOS    |
+| Parent snapshot plus child descriptor-table sweep | macOS fallback; other Unix |
+| cgroup v2 CPU, memory, and process limits         | Linux    |
+| Mount, network, IPC, UTS, and cgroup namespaces   | Linux    |
+| UID, GID, supplementary groups, capabilities      | Linux    |
+| `no_new_privs` and seccomp denylist               | Linux    |
 
 The default subprocess backend does not enable optional resource or security controls.
 It clears the inherited environment, pins the working directory on Unix, restricts descriptor inheritance, and owns child cleanup.
@@ -374,15 +387,34 @@ On other platforms the example prints the prerequisite and exits without contact
 Keep these boundaries explicit:
 
 - Core stores Tasks, runs, watch history, and runtime bindings in memory.
+- Core retains at most 1024 current Task resources by default.
+- Core also retains at most 256 MiB of aggregate TaskManifest bytes by default.
+- Current TaskRun values have a separate 256 MiB aggregate compact JSON budget.
+- Every current Task counts, including embedded, pending, running, and terminal Tasks.
+- Task count, TaskManifest bytes, and current TaskRun bytes are independent limits.
+- The TaskManifest budget measures compact canonical TaskManifest JSON. The
+  TaskRun budget counts each value currently present in query state once.
+- At the count limit, Core rejects new names. At the byte limit, it also rejects
+  existing applies that would increase retained bytes past the budget.
+- Shrinking and no-op applies remain allowed. Admission never evicts a Task.
+- Current-run overflow compacts the globally oldest completed runs. When active
+  values alone exceed a smaller custom budget, lifecycle processing and state
+  persistence continue while the new active value is omitted from query state.
+- `StateConfig` can configure or disable each retained-state limit before startup.
+- Serialized byte budgets are logical payload bounds, not allocator or RSS limits.
 - Process restart loses all core state.
 - Live output is bounded and lossy.
 - Core does not persist or replay output by itself.
 - Optional core hooks can forward task, run, and output events to an
   application-owned store.
+- Lossless state-hook admission has independent event-count and payload-byte
+  bounds. The payload bound defaults to 256 MiB and applies backpressure before
+  the authoritative state or spawn critical section.
 - A slow output subscriber receives `Lagged` after events are dropped.
 - Watch history is bounded by change count and serialized Task bytes.
 - A watch can resume only while its resource version remains retained.
 - Snapshot pagination is consistent only while its continuation remains valid.
+- Task and TaskRun list pages are bounded by count and a 4 MiB native response limit.
 - Reconciliation is latest-wins and has no staged availability guarantee.
 - Discovery registration state is not persisted.
 - Static bearer authentication alone does not provide authorization or tenant isolation.
@@ -494,15 +526,21 @@ task proto/vendor
 ```
 
 The task fetches the revision pinned in [`Taskfile.yml`](Taskfile.yml).
-Generated protobuf trees are ignored by Git and included in published transport crates.
+Vendored Protobuf source trees are ignored by Git and included in published
+transport crates. Each transport crate generates Rust bindings into Cargo's
+`OUT_DIR` at build time; those artifacts are never committed.
 
 Run the workspace checks:
 
 ```bash
 task ci/fmt
+task ci/check
 task ci/clippy
 task ci/test
 task ci/docs
+task ci/audit
+task ci/bench-check
+task ci/package
 task ci/publish-dry-run
 ```
 
@@ -516,6 +554,7 @@ Start with the relevant crate README.
 
 Read the architecture guides before changing the [model](crates/solti-model/ARCHITECTURE.md), [core](crates/solti-core/ARCHITECTURE.md), or [execution](crates/solti-exec/ARCHITECTURE.md) boundaries.
 Read the [Task API contract](crates/solti-api/CONTRACT.md) or [discovery contract](crates/solti-discover/CONTRACT.md) before changing wire behavior.
+Read the [observability guide](crates/solti-observe/README.md) when configuring SDK logging.
 
 Read the [contributing guide](https://github.com/soltiHQ/.github/blob/main/CONTRIBUTING.md) before a large change.
 

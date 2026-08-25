@@ -19,6 +19,7 @@ include = [
     "examples/**/*.rs",
     "proto/**/*.proto",
     "src/**/*.rs",
+    "LICENSE",
     "README.md",
     "build.rs",
 ]
@@ -29,7 +30,6 @@ core-adapter = ["dep:solti-core"]
 grpc         = [
     "dep:base64",
     "dep:prost",
-    "dep:prost-reflect",
     "dep:protoc-bin-vendored",
     "dep:serde",
     "dep:serde_json",
@@ -83,9 +83,14 @@ solti-chain    = { workspace = true }
 solti-model    = { workspace = true, features = ["schema"] }
 solti-runner   = { workspace = true }
 taskvisor      = { workspace = true }
-tokio          = { workspace = true, features = ["macros", "net", "rt", "sync"] }
+tokio          = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-stream   = { workspace = true, features = ["net"] }
 tower          = { workspace = true, features = ["util"] }
+
+[build-dependencies]
+protoc-bin-vendored = { workspace = true, optional = true }
+solti-model         = { workspace = true }
+tonic-prost-build   = { workspace = true, optional = true }
 
 [[example]]
 name              = "core_adapter"
@@ -98,12 +103,6 @@ required-features = ["grpc"]
 [[example]]
 name              = "http_contract"
 required-features = ["http"]
-
-[build-dependencies]
-prost-reflect       = { workspace = true, optional = true }
-protoc-bin-vendored = { workspace = true, optional = true }
-solti-model         = { workspace = true }
-tonic-prost-build   = { workspace = true, optional = true }
 
 [package.metadata.docs.rs]
 all-features = true

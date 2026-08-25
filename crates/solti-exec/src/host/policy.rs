@@ -34,9 +34,9 @@ use super::{
 };
 #[cfg(feature = "host-process")]
 use super::{
-    HostProcessError, PreparedCgroup, PreparedCgroupParent, PreparedProcessConfig, PreparedRlimits,
-    attach_cgroup, attach_process_config, attach_rlimits, attach_security, prepare_cgroup,
-    resolve_cgroup_parent,
+    CgroupPrepareFailure, HostProcessError, PreparedCgroup, PreparedCgroupParent,
+    PreparedProcessConfig, PreparedRlimits, attach_cgroup, attach_process_config, attach_rlimits,
+    attach_security, prepare_cgroup_owned, resolve_cgroup_parent,
 };
 use crate::isolation::validate_cgroup_limits;
 
@@ -265,6 +265,36 @@ pub struct PreparedHostProcessAttempt {
     cgroup: Option<PreparedCgroup>,
 }
 
+/// Internal attempt preparation failure with residual cleanup ownership.
+#[cfg(feature = "host-process")]
+#[derive(Debug)]
+pub(crate) enum AttemptPrepareFailure {
+    /// Preparation failed after complete rollback.
+    Clean(HostProcessError),
+    /// Preparation failed and rollback left owned cgroup state.
+    Residual {
+        /// Original preparation error returned to the caller.
+        error: HostProcessError,
+        /// Safely pinned cleanup ownership, or `None` when no safe identity is available.
+        cleanup: Option<AttemptProcessDomain>,
+    },
+}
+
+#[cfg(feature = "host-process")]
+impl AttemptPrepareFailure {
+    pub(crate) fn into_error(self) -> HostProcessError {
+        match self {
+            Self::Clean(error) => error,
+            Self::Residual { error, cleanup } => {
+                // Dropping retained ownership performs the direct API's
+                // documented best-effort rollback.
+                drop(cleanup);
+                error
+            }
+        }
+    }
+}
+
 /// Owns cgroup resources attached to one host process attempt.
 ///
 /// Keep this value until the attached process scope has stopped.
@@ -345,6 +375,7 @@ impl Drop for AttemptProcessDomain {
         #[cfg(feature = "host-process")]
         if let Err(error) = termination {
             warn!(
+                event = "host_process.termination_failed",
                 cgroup = ?self.cgroup_path(),
                 error = %error,
                 "failed to terminate host process domain",
@@ -357,6 +388,7 @@ impl Drop for AttemptProcessDomain {
         #[cfg(feature = "host-process")]
         if let Err(error) = cleanup {
             warn!(
+                event = "host_process.cleanup_failed",
                 cgroup = ?self.cgroup_path(),
                 error = %error,
                 "failed to clean up host process cgroup",
@@ -395,6 +427,11 @@ impl PreparedHostProcessPolicy {
     /// `cgroup_name` is required when cgroup limits are configured.
     /// It must contain one normal path component.
     ///
+    /// This direct low-level API has no retrying cleanup finalizer. If
+    /// preparation leaves a safely pinned cgroup, error conversion performs
+    /// one best-effort drop cleanup. The subprocess runner uses an internal
+    /// ownership-preserving path and its bounded finalizer instead.
+    ///
     /// # Errors
     ///
     /// Returns [`HostProcessError::InvalidConfig`] for a missing or unsafe cgroup name.
@@ -403,19 +440,48 @@ impl PreparedHostProcessPolicy {
         &self,
         cgroup_name: Option<&str>,
     ) -> Result<PreparedHostProcessAttempt, HostProcessError> {
+        self.prepare_attempt_owned(cgroup_name)
+            .map_err(AttemptPrepareFailure::into_error)
+    }
+
+    /// Prepares attempt resources without erasing residual cleanup ownership.
+    pub(crate) fn prepare_attempt_owned(
+        &self,
+        cgroup_name: Option<&str>,
+    ) -> Result<PreparedHostProcessAttempt, AttemptPrepareFailure> {
         let cgroup = match (&self.cgroups, cgroup_name) {
             (Some(cgroups), Some(name)) => {
-                validate_cgroup_name(name)?;
-                trace!(?cgroups, group = name, "preparing host process cgroup");
+                validate_cgroup_name(name).map_err(AttemptPrepareFailure::Clean)?;
+                trace!(
+                    event = "host_process.cgroup_prepare",
+                    ?cgroups,
+                    group = name,
+                    "preparing host process cgroup"
+                );
                 let parent = self
                     .cgroup_parent
                     .as_ref()
                     .expect("prepared cgroup policy must have a parent");
-                Some(prepare_cgroup(parent, name, cgroups)?)
+                match prepare_cgroup_owned(parent, name, cgroups) {
+                    Ok(cgroup) => Some(cgroup),
+                    Err(CgroupPrepareFailure::Clean(error)) => {
+                        return Err(AttemptPrepareFailure::Clean(error));
+                    }
+                    Err(CgroupPrepareFailure::Residual { source, cleanup }) => {
+                        return Err(AttemptPrepareFailure::Residual {
+                            error: source,
+                            cleanup: cleanup.map(|cgroup| AttemptProcessDomain {
+                                cgroup: Some(cgroup),
+                            }),
+                        });
+                    }
+                }
             }
             (Some(_), None) => {
-                return Err(HostProcessError::InvalidConfig(
-                    "cgroup name is required when cgroup limits are configured".into(),
+                return Err(AttemptPrepareFailure::Clean(
+                    HostProcessError::InvalidConfig(
+                        "cgroup name is required when cgroup limits are configured".into(),
+                    ),
                 ));
             }
             (None, _) => None,
@@ -429,6 +495,61 @@ impl PreparedHostProcessPolicy {
 }
 
 impl PreparedHostProcessAttempt {
+    /// Converts resources prepared for a process that was never spawned into
+    /// the same cleanup domain used after process attachment.
+    #[cfg(feature = "subprocess")]
+    pub(crate) fn into_cleanup_domain(self) -> AttemptProcessDomain {
+        let Self {
+            controls: _,
+            cgroup,
+        } = self;
+        AttemptProcessDomain {
+            cgroup: cgroup.map(PreparedCgroup::into_domain),
+        }
+    }
+
+    /// Returns signal dispositions representable by the native macOS spawn path.
+    ///
+    /// `None` means that the attempt contains a control which requires the
+    /// portable `fork`/`exec` fallback.
+    #[cfg(all(feature = "subprocess", target_os = "macos"))]
+    pub(crate) fn macos_spawn_signals(&self) -> Option<Arc<[libc::c_int]>> {
+        let process = self.controls.process.as_ref();
+        if process.is_some_and(PreparedProcessConfig::has_umask)
+            || self
+                .controls
+                .rlimits
+                .as_ref()
+                .is_some_and(|limits| !limits.is_empty())
+            || self.cgroup.is_some()
+            || self
+                .controls
+                .security
+                .as_ref()
+                .is_some_and(|security| !security.is_empty())
+        {
+            return None;
+        }
+
+        Some(
+            process
+                .map(PreparedProcessConfig::reset_signals)
+                .unwrap_or_else(|| Arc::from([])),
+        )
+    }
+
+    /// Consumes an attempt handled entirely by native macOS spawn attributes.
+    #[cfg(all(feature = "subprocess", target_os = "macos"))]
+    pub(crate) fn into_macos_spawn_domain(self) -> AttemptProcessDomain {
+        debug_assert!(self.macos_spawn_signals().is_some());
+        let Self {
+            controls: _,
+            cgroup,
+        } = self;
+        debug_assert!(cgroup.is_none());
+        AttemptProcessDomain { cgroup: None }
+    }
+
     /// Attaches enabled controls to a process command.
     ///
     /// This token is consumed.
@@ -438,22 +559,44 @@ impl PreparedHostProcessAttempt {
         let mut domain = AttemptProcessDomain { cgroup: None };
 
         if let Some(process) = &controls.process {
-            trace!(?process, "attaching host process state");
+            trace!(
+                event = "host_process.control_attach",
+                control = "process",
+                ?process,
+                "attaching host process control"
+            );
             attach_process_config(command, process);
         }
         if let Some(rlimits) = &controls.rlimits {
-            trace!(?rlimits, "attaching host process rlimits");
+            trace!(
+                event = "host_process.control_attach",
+                control = "rlimits",
+                ?rlimits,
+                "attaching host process control"
+            );
             attach_rlimits(command, rlimits);
         }
         if let Some(prepared) = cgroup {
             trace!(
+                event = "host_process.control_attach",
+                control = "cgroup",
                 cgroup = %prepared.path().display(),
-                "attaching host process cgroup",
+                "attaching host process control",
             );
             domain.cgroup = Some(attach_cgroup(command, prepared));
         }
         if let Some(security) = &controls.security {
-            trace!(?security, "attaching host process security controls");
+            trace!(
+                event = "host_process.control_attach",
+                control = "security",
+                credentials_configured = security.credentials.is_some(),
+                drop_all_caps = security.drop_all_caps,
+                kept_capability_count = security.keep_caps.len(),
+                no_new_privs = security.no_new_privs,
+                namespaces_configured = !security.namespaces.is_empty(),
+                seccomp_configured = security.seccomp != crate::isolation::SeccompPolicy::Disabled,
+                "attaching host process control"
+            );
             attach_security(command, security);
         }
 
@@ -680,6 +823,36 @@ mod tests {
             DomainTermination::Unavailable
         );
         domain.cleanup().unwrap();
+    }
+
+    #[cfg(all(feature = "subprocess", target_os = "macos"))]
+    #[test]
+    fn macos_spawn_accepts_native_controls_and_rejects_hook_only_controls() {
+        let native = HostProcessPolicy::new()
+            .with_process_config(ProcessConfig {
+                reset_signals: true,
+                new_session: true,
+                umask: None,
+            })
+            .prepare()
+            .unwrap()
+            .prepare_attempt(None)
+            .unwrap();
+        assert!(!native.macos_spawn_signals().unwrap().is_empty());
+
+        for fallback in [
+            HostProcessPolicy::new().with_process_config(ProcessConfig {
+                umask: Some(0o027),
+                ..Default::default()
+            }),
+            HostProcessPolicy::new().with_rlimits(RlimitConfig {
+                disable_core_dumps: true,
+                ..Default::default()
+            }),
+        ] {
+            let attempt = fallback.prepare().unwrap().prepare_attempt(None).unwrap();
+            assert!(attempt.macos_spawn_signals().is_none());
+        }
     }
 
     #[test]

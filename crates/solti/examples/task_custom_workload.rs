@@ -35,8 +35,8 @@ use serde_json::json;
 use solti::{
     core::{SupervisorApi, TaskWatchSubscription},
     model::{
-        ExtensionWorkload, RestartPolicy, Task, TaskId, TaskManifest, TaskSpec, TaskWorkload,
-        WorkloadTypeMeta,
+        ExtensionWorkload, RestartPolicy, Task, TaskId, TaskManifest, TaskRunQuery, TaskSpec,
+        TaskWorkload, WorkloadTypeMeta,
     },
     runner::{BuildContext, RunId, Runner, RunnerError, RunnerRouter},
     taskvisor::{TaskContext, TaskError, TaskFn, TaskRef},
@@ -63,6 +63,7 @@ struct TcpProbeSpec {
 
 struct TcpProbeRunner;
 
+#[solti_runner::async_trait]
 impl Runner for TcpProbeRunner {
     fn name(&self) -> &str {
         "tcp-probe"
@@ -72,11 +73,13 @@ impl Runner for TcpProbeRunner {
         vec![WorkloadTypeMeta::new(API_VERSION, KIND).expect("valid custom GVK")]
     }
 
-    fn build_task(
+    async fn build_task(
         &self,
         task: &Task,
-        run_id: &RunId,
+        _run_id: &RunId,
         _ctx: &BuildContext,
+        _cancellation: &solti_runner::BuildCancellation,
+        _scope: &mut solti_runner::BuildScope,
     ) -> Result<TaskRef, RunnerError> {
         let workload = task.spec().workload();
         let TaskWorkload::Extension(extension) = workload else {
@@ -94,22 +97,20 @@ impl Runner for TcpProbeRunner {
 
         let address: Arc<str> = spec.address.into();
         let payload: Arc<[u8]> = spec.payload.into_bytes().into();
-        Ok(TaskFn::arc(
-            run_id.name().to_owned(),
-            move |_ctx: TaskContext| {
-                let address = Arc::clone(&address);
-                let payload = Arc::clone(&payload);
-                async move {
-                    let mut stream = TcpStream::connect(address.as_ref())
-                        .await
-                        .map_err(|error| TaskError::fail(format!("connect {address}: {error}")))?;
-                    stream.write_all(&payload).await.map_err(|error| {
-                        TaskError::fail(format!("write probe payload: {error}"))
-                    })?;
-                    Ok(())
-                }
-            },
-        ))
+        Ok(TaskFn::arc(move |_ctx: TaskContext| {
+            let address = Arc::clone(&address);
+            let payload = Arc::clone(&payload);
+            async move {
+                let mut stream = TcpStream::connect(address.as_ref())
+                    .await
+                    .map_err(|error| TaskError::fail(format!("connect {address}: {error}")))?;
+                stream
+                    .write_all(&payload)
+                    .await
+                    .map_err(|error| TaskError::fail(format!("write probe payload: {error}")))?;
+                Ok(())
+            }
+        }))
     }
 }
 
@@ -189,13 +190,15 @@ solti: application-owned workload
     assert_eq!(&payload, b"PING");
 
     let terminal = wait_for_terminal(&mut watch, &task_name).await?;
-    let runs = supervisor.list_task_runs(&task_name);
+    let runs = supervisor
+        .query_task_runs(&task_name, &TaskRunQuery::new())?
+        .ok_or_else(|| io::Error::other("task disappeared before run history was read"))?;
     println!(
         "[result] phase={}, retainedRuns={}.",
         terminal.status().phase(),
-        runs.len(),
+        runs.items.len(),
     );
-    assert_eq!(runs.len(), 1);
+    assert_eq!(runs.items.len(), 1);
 
     supervisor.shutdown().await?;
     println!(

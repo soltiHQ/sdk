@@ -39,12 +39,17 @@
 //! Clients observe reconciliation through `status.conditions[type=Reconciled]`.
 //!
 //! Apply is an upsert without write preconditions.
-//! Apply and delete can check `uid` and `resourceVersion`.
+//! Apply, cancel, and delete can check `uid` and `resourceVersion`.
+//! The core adapter maps retained Task count and TaskManifest byte admission
+//! failures to [`ApiError::ResourceExhausted`].
 //!
 //! ## Collections and Streams
 //!
 //! Lists use opaque continuation tokens.
 //! The bundled adapter provides snapshot-consistent pagination.
+//! Task list bodies are limited to 4 MiB in each transport's native encoding.
+//! Live-log subscriptions require the exact Task UID and never retarget across recreation.
+//! TaskRun lists use a separate snapshot and the same native response limit.
 //! Watches can resume from a retained resource version.
 //!
 //! Task output is live-only and lossy.
@@ -118,10 +123,21 @@
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
+macro_rules! task_api_major {
+    () => {
+        1
+    };
+}
+
+const _: () = assert!(
+    solti_model::TASK_API_VERSION_MAJOR == task_api_major!(),
+    "Task model and API transport major versions must match",
+);
+
 /// Compose a compile-time Kubernetes named-group URL rooted at `/apis/solti.io/v<API_MAJOR>`.
 macro_rules! api_url {
     ($path:literal) => {
-        concat!("/apis/solti.io/v", env!("SOLTI_API_MAJOR"), $path)
+        concat!("/apis/solti.io/v", task_api_major!(), $path)
     };
 }
 
@@ -129,13 +145,13 @@ macro_rules! api_url {
 pub const API_VERSION: u32 = solti_model::TASK_API_VERSION_MAJOR;
 
 /// Current public API version name.
-pub const API_VERSION_NAME: &str = concat!("v", env!("SOLTI_API_MAJOR"));
+pub const API_VERSION_NAME: &str = concat!("v", task_api_major!());
 
 /// Current gRPC package exposed by the agent.
-pub const GRPC_API_PACKAGE: &str = concat!("solti.task.v", env!("SOLTI_API_MAJOR"));
+pub const GRPC_API_PACKAGE: &str = concat!("solti.task.v", task_api_major!());
 
 /// Current gRPC service exposed by the agent.
-pub const GRPC_API_SERVICE: &str = concat!("solti.task.v", env!("SOLTI_API_MAJOR"), ".TaskService");
+pub const GRPC_API_SERVICE: &str = concat!("solti.task.v", task_api_major!(), ".TaskService");
 
 /// Root path of the HTTP Kubernetes API group.
 pub const HTTP_API_ROOT: &str = api_url!("");
@@ -143,10 +159,22 @@ pub const HTTP_API_ROOT: &str = api_url!("");
 /// Maximum HTTP request body and gRPC message size.
 ///
 /// The limit is 4 MiB.
-pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_REQUEST_BYTES: usize = solti_model::MAX_TASK_MANIFEST_BYTES;
+
+/// Maximum encoded body of one Task list response.
+///
+/// HTTP measures compact JSON without headers. gRPC measures the protobuf
+/// message without its frame header.
+pub const MAX_TASK_LIST_RESPONSE_BYTES: usize = solti_model::MAX_TASK_PAGE_ITEM_BYTES;
+
+/// Maximum encoded body of one TaskRun list response.
+///
+/// HTTP measures compact JSON without headers. gRPC measures the protobuf
+/// message without its frame header.
+pub const MAX_TASK_RUN_LIST_RESPONSE_BYTES: usize = solti_model::MAX_TASK_RUN_PAGE_ITEM_BYTES;
 
 mod error;
-pub use error::{ApiConflict, ApiError, ApiErrorCause};
+pub use error::{ApiConflict, ApiConflictReason, ApiError, ApiErrorCause};
 
 mod auth;
 pub use auth::{
@@ -221,7 +249,6 @@ pub use tls::to_tonic_server_tls;
 mod contract_identity_guard {
     #[test]
     fn task_contract_identity_is_consistent() {
-        assert_eq!(super::API_VERSION.to_string(), env!("SOLTI_API_MAJOR"));
         assert_eq!(super::API_VERSION_NAME, format!("v{}", super::API_VERSION));
         assert_eq!(
             super::GRPC_API_PACKAGE,

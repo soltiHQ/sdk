@@ -10,8 +10,11 @@ use containerd_client::tonic::metadata::{Ascii, MetadataValue};
 use crate::container::ContainerEngineError;
 
 const DEFAULT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CLEANUP_CAPACITY: usize = 1_024;
 const DEFAULT_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const GRPC_TIMEOUT_MAX_VALUE: u64 = 99_999_999;
+pub(super) const MAX_GRPC_TIMEOUT: Duration = Duration::from_secs(GRPC_TIMEOUT_MAX_VALUE * 60 * 60);
 
 /// Network namespace used by a containerd runner.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -33,8 +36,11 @@ pub enum ContainerNetwork {
 /// OCI platform selected for image pull and execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerPlatform {
+    /// Normalized operating-system name.
     os: String,
+    /// Normalized architecture name.
     architecture: String,
+    /// Normalized architecture variant.
     variant: String,
 }
 
@@ -76,6 +82,7 @@ impl ContainerPlatform {
         &self.variant
     }
 
+    /// Converts the platform to the containerd API representation.
     pub(super) fn as_containerd(&self) -> containerd_client::types::Platform {
         containerd_client::types::Platform {
             os: self.os.clone(),
@@ -86,6 +93,7 @@ impl ContainerPlatform {
     }
 }
 
+/// Normalizes an operating-system name for containerd.
 pub(super) fn normalize_os(os: &str) -> String {
     match os.to_ascii_lowercase().as_str() {
         "macos" => "darwin".to_owned(),
@@ -93,6 +101,7 @@ pub(super) fn normalize_os(os: &str) -> String {
     }
 }
 
+/// Normalizes an architecture and its variant for containerd.
 pub(super) fn normalize_architecture(architecture: &str, variant: &str) -> (String, String) {
     let architecture = architecture.to_ascii_lowercase();
     let variant = variant.to_ascii_lowercase();
@@ -134,22 +143,44 @@ pub(super) fn normalize_architecture(architecture: &str, variant: &str) -> (Stri
 /// The adapter never scans for daemons or starts containerd.
 /// Control operations default to a 30-second deadline.
 /// Image transfer defaults to a 10-minute deadline.
-/// Cleanup retries share one 30-second window.
+/// Accepted I/O preparation and retained mutations settle before each cleanup retry window.
+/// Each cleanup retry window then uses 30 seconds.
+/// Deferred cleanup repeats passes after retryable failures.
+/// The same duration bounds `ContainerdEngine::shutdown`.
+/// A cleanup duration beyond Tokio's representable `Instant` range waits
+/// without a local deadline and remains cancellation-safe.
+/// Lifecycle and local I/O admission default to 1024 entries per engine.
+/// Lifecycle admission precedes shared image resolution and unpack.
 /// Workload wait has no deadline.
 /// Zero-duration timeouts are rejected during connection validation.
+/// Control and transfer timeouts above the eight-digit gRPC wire maximum are
+/// also rejected.
 #[derive(Debug, Clone)]
 pub struct ContainerdConfig {
+    /// Explicit Unix socket used for every containerd connection.
     socket: PathBuf,
+    /// Namespace attached to every containerd request.
     namespace: String,
+    /// Snapshotter used for image roots and attempt snapshots.
     snapshotter: String,
+    /// OCI runtime name validated during connection.
     runtime: String,
+    /// Image and execution platform.
     platform: ContainerPlatform,
+    /// Network namespace policy for generated OCI specifications.
     network: ContainerNetwork,
+    /// Optional containerd registry hosts directory.
     registry_host_dir: Option<String>,
+    /// Parent directory for private attempt output pipes.
     io_root: PathBuf,
+    /// Deadline for one control operation.
     control_timeout: Duration,
+    /// Deadline for one image pull or unpack operation.
     transfer_timeout: Duration,
+    /// Duration of one cleanup retry window and engine shutdown.
     cleanup_timeout: Duration,
+    /// Maximum cleanup-owned attempts and local I/O owners per engine.
+    cleanup_capacity: usize,
 }
 
 impl ContainerdConfig {
@@ -172,6 +203,7 @@ impl ContainerdConfig {
             control_timeout: DEFAULT_CONTROL_TIMEOUT,
             transfer_timeout: DEFAULT_TRANSFER_TIMEOUT,
             cleanup_timeout: DEFAULT_CLEANUP_TIMEOUT,
+            cleanup_capacity: DEFAULT_CLEANUP_CAPACITY,
         }
     }
 
@@ -207,20 +239,41 @@ impl ContainerdConfig {
     /// Sets the client-side deadline for connect, probe, metadata, and lifecycle operations.
     ///
     /// This deadline does not apply to image transfer or workload wait.
+    /// Values must not exceed the eight-digit gRPC maximum of 99,999,999 hours.
     pub fn with_control_timeout(mut self, timeout: Duration) -> Self {
         self.control_timeout = timeout;
         self
     }
 
     /// Sets the client-side deadline for image pull and unpack.
+    ///
+    /// Values must not exceed the eight-digit gRPC maximum of 99,999,999 hours.
     pub fn with_transfer_timeout(mut self, timeout: Duration) -> Self {
         self.transfer_timeout = timeout;
         self
     }
 
-    /// Sets the total retry window for attempt cleanup.
+    /// Sets one cleanup retry window and `ContainerdEngine::shutdown`.
+    ///
+    /// Accepted I/O preparation and a retained mutation settle before this
+    /// window starts.
+    /// Deferred cleanup starts another window after a retryable failure.
+    /// A duration beyond Tokio's representable `Instant` range waits without a
+    /// local deadline and remains cancellation-safe.
     pub fn with_cleanup_timeout(mut self, timeout: Duration) -> Self {
         self.cleanup_timeout = timeout;
+        self
+    }
+
+    /// Sets the lifecycle and local I/O ownership limit.
+    ///
+    /// This value bounds client-side image resolution, active attempts, and
+    /// deferred cleanup jobs within the lifecycle domain. It separately bounds
+    /// local I/O owners. Lifecycle admission fails before image resolution when
+    /// the limit is full. Connection validation rejects zero and values that
+    /// exceed the supported counter range.
+    pub fn with_cleanup_capacity(mut self, capacity: usize) -> Self {
+        self.cleanup_capacity = capacity;
         self
     }
 
@@ -274,11 +327,24 @@ impl ContainerdConfig {
         self.transfer_timeout
     }
 
-    /// Returns the total cleanup retry window.
+    /// Returns one cleanup retry window and `ContainerdEngine::shutdown`.
+    ///
+    /// Deferred cleanup may run more than one pass after retryable failures.
     pub fn cleanup_timeout(&self) -> Duration {
         self.cleanup_timeout
     }
 
+    /// Returns the cleanup and local I/O ownership limit.
+    pub fn cleanup_capacity(&self) -> usize {
+        self.cleanup_capacity
+    }
+
+    /// Validates native adapter settings and returns namespace metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid paths, names, platform values, timeouts,
+    /// cleanup capacity, or registry settings.
     pub(super) fn validate(&self) -> Result<MetadataValue<Ascii>, ContainerEngineError> {
         if !self.socket.is_absolute() {
             return Err(ContainerEngineError::permanent(
@@ -336,6 +402,28 @@ impl ContainerdConfig {
                 )));
             }
         }
+        for (field, timeout) in [
+            ("control timeout", self.control_timeout),
+            ("transfer timeout", self.transfer_timeout),
+        ] {
+            if timeout > MAX_GRPC_TIMEOUT {
+                return Err(ContainerEngineError::permanent(format!(
+                    "containerd {field} exceeds the maximum gRPC wire timeout"
+                )));
+            }
+        }
+        if self.cleanup_capacity == 0 {
+            return Err(ContainerEngineError::permanent(
+                "containerd cleanup capacity cannot be zero",
+            ));
+        }
+        if self.cleanup_capacity > tokio::sync::Semaphore::MAX_PERMITS
+            || u32::try_from(self.cleanup_capacity).is_err()
+        {
+            return Err(ContainerEngineError::permanent(
+                "containerd cleanup capacity exceeds the supported maximum",
+            ));
+        }
         Ok(namespace)
     }
 }
@@ -382,6 +470,7 @@ mod tests {
         assert_eq!(config.control_timeout(), Duration::from_secs(30));
         assert_eq!(config.transfer_timeout(), Duration::from_secs(10 * 60));
         assert_eq!(config.cleanup_timeout(), Duration::from_secs(30));
+        assert_eq!(config.cleanup_capacity(), DEFAULT_CLEANUP_CAPACITY);
         assert!(config.validate().is_ok());
     }
 
@@ -447,5 +536,54 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn grpc_timeouts_enforce_the_exact_wire_limit() {
+        let above_maximum = MAX_GRPC_TIMEOUT + Duration::from_nanos(1);
+
+        assert!(
+            config()
+                .with_control_timeout(MAX_GRPC_TIMEOUT)
+                .with_transfer_timeout(MAX_GRPC_TIMEOUT)
+                .with_cleanup_timeout(Duration::MAX)
+                .validate()
+                .is_ok()
+        );
+
+        let control = config()
+            .with_control_timeout(above_maximum)
+            .validate()
+            .expect_err("control timeout above the gRPC wire limit must fail");
+        assert_eq!(
+            control.reason(),
+            "containerd control timeout exceeds the maximum gRPC wire timeout"
+        );
+
+        let transfer = config()
+            .with_transfer_timeout(above_maximum)
+            .validate()
+            .expect_err("transfer timeout above the gRPC wire limit must fail");
+        assert_eq!(
+            transfer.reason(),
+            "containerd transfer timeout exceeds the maximum gRPC wire timeout"
+        );
+    }
+
+    #[test]
+    fn cleanup_capacity_must_fit_the_admission_semaphore() {
+        assert!(config().with_cleanup_capacity(0).validate().is_err());
+        assert!(
+            config()
+                .with_cleanup_capacity(tokio::sync::Semaphore::MAX_PERMITS + 1)
+                .validate()
+                .is_err()
+        );
+        if let Ok(capacity) = usize::try_from(u64::from(u32::MAX) + 1) {
+            assert!(config().with_cleanup_capacity(capacity).validate().is_err());
+        }
+        let maximum = tokio::sync::Semaphore::MAX_PERMITS
+            .min(usize::try_from(u32::MAX).expect("supported targets can represent u32 capacity"));
+        assert!(config().with_cleanup_capacity(maximum).validate().is_ok());
     }
 }

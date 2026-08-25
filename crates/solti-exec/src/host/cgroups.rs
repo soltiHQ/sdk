@@ -79,6 +79,34 @@ pub(crate) struct PreparedCgroup {
     cleanup_on_drop: bool,
 }
 
+/// Internal cgroup preparation failure with residual ownership classification.
+#[cfg(feature = "host-process")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum CgroupPrepareFailure {
+    /// Preparation failed and rollback removed every created resource.
+    Clean(HostProcessError),
+    /// Rollback failed after cgroup creation.
+    Residual {
+        /// Original preparation error returned to the caller.
+        source: HostProcessError,
+        /// Safely pinned cleanup ownership, or `None` when child identity could
+        /// not be pinned after creation.
+        cleanup: Option<CgroupDomain>,
+    },
+}
+
+#[cfg(all(feature = "host-process", any(target_os = "linux", test)))]
+fn classify_prepare_rollback(
+    source: HostProcessError,
+    rollback: std::io::Result<()>,
+    cleanup: Option<CgroupDomain>,
+) -> CgroupPrepareFailure {
+    match rollback {
+        Ok(()) => CgroupPrepareFailure::Clean(source),
+        Err(_) => CgroupPrepareFailure::Residual { source, cleanup },
+    }
+}
+
 #[cfg(feature = "host-process")]
 impl PreparedCgroup {
     /// Returns the cgroup directory.
@@ -105,9 +133,11 @@ impl PreparedCgroup {
         (procs, domain)
     }
 
-    #[cfg(not(target_os = "linux"))]
-    fn into_domain(mut self) -> CgroupDomain {
+    #[cfg(any(feature = "subprocess", not(target_os = "linux"), test))]
+    pub(super) fn into_domain(mut self) -> CgroupDomain {
         self.cleanup_on_drop = false;
+        #[cfg(target_os = "linux")]
+        self.procs.take();
         CgroupDomain {
             path: Some(std::mem::take(&mut self.path)),
             #[cfg(target_os = "linux")]
@@ -344,6 +374,7 @@ impl Drop for PreparedCgroup {
             && error.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(
+                event = "host_process.cgroup_cleanup_failed",
                 cgroup = %self.path.display(),
                 error = %error,
                 "failed to clean up unused prepared cgroup",
@@ -371,13 +402,13 @@ pub(crate) fn resolve_cgroup_parent(
     }
 }
 
-/// Creates an attempt cgroup and applies its limits.
+/// Creates an attempt cgroup and applies its limits while preserving residual ownership.
 #[cfg(feature = "host-process")]
-pub(crate) fn prepare_cgroup(
+pub(crate) fn prepare_cgroup_owned(
     parent: &PreparedCgroupParent,
     name: &str,
     limits: &CgroupLimits,
-) -> Result<PreparedCgroup, HostProcessError> {
+) -> Result<PreparedCgroup, CgroupPrepareFailure> {
     #[cfg(target_os = "linux")]
     {
         linux_impl::prepare(parent, name, limits)
@@ -385,10 +416,12 @@ pub(crate) fn prepare_cgroup(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (parent, name, limits);
-        Err(HostProcessError::InvalidConfig(format!(
-            "cgroup v2 is not supported on {}",
-            std::env::consts::OS
-        )))
+        Err(CgroupPrepareFailure::Clean(
+            HostProcessError::InvalidConfig(format!(
+                "cgroup v2 is not supported on {}",
+                std::env::consts::OS
+            )),
+        ))
     }
 }
 
@@ -536,7 +569,10 @@ mod linux_impl {
     use std::process::Command;
 
     use super::super::HostProcessError;
-    use super::{CgroupLimits, CpuMax, PreparedCgroup, PreparedCgroupParent};
+    use super::{
+        CgroupDomain, CgroupLimits, CgroupPrepareFailure, CpuMax, PreparedCgroup,
+        PreparedCgroupParent, classify_prepare_rollback,
+    };
     use crate::host::log::{pre_exec_log, pre_exec_log_errno};
 
     const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
@@ -688,63 +724,100 @@ mod linux_impl {
         parent: &PreparedCgroupParent,
         name: &str,
         limits: &CgroupLimits,
-    ) -> Result<PreparedCgroup, HostProcessError> {
+    ) -> Result<PreparedCgroup, CgroupPrepareFailure> {
         let name = CString::new(name).map_err(|_| {
-            HostProcessError::InvalidConfig("cgroup name contains an interior NUL byte".into())
+            CgroupPrepareFailure::Clean(HostProcessError::InvalidConfig(
+                "cgroup name contains an interior NUL byte".into(),
+            ))
         })?;
         let path = parent
             .path
             .join(std::ffi::OsStr::from_bytes(name.to_bytes()));
-        create_directory_at(&parent.directory, &name).map_err(HostProcessError::Io)?;
+        let cleanup_parent = parent
+            .directory
+            .try_clone()
+            .map_err(|error| CgroupPrepareFailure::Clean(HostProcessError::Io(error)))?;
+        create_directory_at(&parent.directory, &name)
+            .map_err(|error| CgroupPrepareFailure::Clean(HostProcessError::Io(error)))?;
         let directory = match open_directory_at(&parent.directory, &name) {
             Ok(directory) => directory,
             Err(source) => {
-                if let Err(cleanup) = remove_directory_at(&parent.directory, &name) {
+                let rollback = remove_directory_at(&parent.directory, &name);
+                if let Err(cleanup) = &rollback {
                     tracing::warn!(
+                        event = "host_process.cgroup_rollback_failed",
                         cgroup = %path.display(),
+                        stage = "open",
                         error = %cleanup,
                         "failed to roll back unopened cgroup",
                     );
                 }
-                return Err(HostProcessError::Io(source));
+                return Err(classify_prepare_rollback(
+                    HostProcessError::Io(source),
+                    rollback,
+                    None,
+                ));
             }
         };
 
-        let prepared = (|| -> io::Result<PreparedCgroup> {
-            set_max_depth(&directory)?;
-            apply_limits(&directory, limits)?;
-            let procs = open_file_at(&directory, c"cgroup.procs", libc::O_WRONLY)?;
+        let mut cleanup_domain = CgroupDomain {
+            path: Some(path.clone()),
+            directory: Some(directory),
+            events: None,
+            parent: Some(cleanup_parent),
+            name: Some(name.clone()),
+            kill: None,
+            termination_requested: false,
+        };
+
+        let prepared = (|| -> io::Result<(File, File, Option<File>)> {
+            let directory = cleanup_domain
+                .directory
+                .as_ref()
+                .expect("created cgroup cleanup domain owns its directory");
+            set_max_depth(directory)?;
+            apply_limits(directory, limits)?;
+            let procs = open_file_at(directory, c"cgroup.procs", libc::O_WRONLY)?;
             let procs = duplicate_child_fd(procs)?;
-            let events = open_file_at(&directory, c"cgroup.events", libc::O_RDONLY)?;
-            let kill = open_optional_file_at(&directory, c"cgroup.kill", libc::O_WRONLY)?;
-            Ok(PreparedCgroup {
-                path: path.clone(),
-                procs: Some(procs),
-                directory: Some(directory.try_clone()?),
-                events: Some(events),
-                parent: Some(parent.directory.try_clone()?),
-                name: Some(name.clone()),
-                kill,
-                cleanup_on_drop: true,
-            })
+            let events = open_file_at(directory, c"cgroup.events", libc::O_RDONLY)?;
+            let kill = open_optional_file_at(directory, c"cgroup.kill", libc::O_WRONLY)?;
+            Ok((procs, events, kill))
         })();
 
         match prepared {
-            Ok(prepared) => Ok(prepared),
+            Ok((procs, events, kill)) => Ok(PreparedCgroup {
+                path: cleanup_domain
+                    .path
+                    .take()
+                    .expect("created cgroup cleanup domain owns its path"),
+                procs: Some(procs),
+                directory: cleanup_domain.directory.take(),
+                events: Some(events),
+                parent: cleanup_domain.parent.take(),
+                name: cleanup_domain.name.take(),
+                kill,
+                cleanup_on_drop: true,
+            }),
             Err(source) => {
-                if let Err(cleanup) =
-                    super::cleanup_owned_cgroup(&parent.directory, &name, &directory, &path)
-                {
+                let source = HostProcessError::Io(io::Error::new(
+                    source.kind(),
+                    format!("failed to prepare cgroup {}: {source}", path.display()),
+                ));
+                let rollback = cleanup_domain.cleanup();
+                if let Err(cleanup) = &rollback {
                     tracing::warn!(
+                        event = "host_process.cgroup_rollback_failed",
                         cgroup = %path.display(),
+                        stage = "prepare",
                         error = %cleanup,
                         "failed to roll back cgroup setup",
                     );
                 }
-                Err(HostProcessError::Io(io::Error::new(
-                    source.kind(),
-                    format!("failed to prepare cgroup {}: {source}", path.display()),
-                )))
+                Err(classify_prepare_rollback(
+                    source,
+                    rollback,
+                    Some(cleanup_domain),
+                ))
             }
         }
     }
@@ -886,6 +959,7 @@ mod linux_impl {
 
         // SAFETY: fd refers to cgroup.procs and pid is a valid byte slice.
         let written = loop {
+            // SAFETY: `fd` refers to cgroup.procs and `pid` is a valid byte slice.
             let written = unsafe { libc::write(fd, pid.as_ptr().cast(), pid.len()) };
             if written >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                 break written;
@@ -947,6 +1021,8 @@ mod linux_impl {
             let duplicated = duplicate_child_fd(file).unwrap();
 
             assert!(duplicated.as_raw_fd() >= 3);
+            // SAFETY: `duplicated` owns a valid live descriptor and `F_GETFD`
+            // does not dereference process memory.
             let flags = unsafe { libc::fcntl(duplicated.as_raw_fd(), libc::F_GETFD) };
             assert!(flags >= 0);
             assert_ne!(flags & libc::FD_CLOEXEC, 0);
@@ -1030,6 +1106,92 @@ mod tests {
 
         drop(prepared);
         assert!(!path.exists());
+    }
+
+    #[test]
+    #[cfg(feature = "host-process")]
+    fn prepared_cgroup_can_transfer_into_post_spawn_cleanup_ownership() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let path = parent.path().join("attempt-transfer");
+        std::fs::create_dir(&path).unwrap();
+        let prepared = PreparedCgroup {
+            path: path.clone(),
+            #[cfg(target_os = "linux")]
+            procs: None,
+            #[cfg(target_os = "linux")]
+            directory: None,
+            #[cfg(target_os = "linux")]
+            events: None,
+            #[cfg(target_os = "linux")]
+            parent: None,
+            #[cfg(target_os = "linux")]
+            name: None,
+            #[cfg(unix)]
+            kill: None,
+            cleanup_on_drop: true,
+        };
+
+        let mut domain = prepared.into_domain();
+        assert!(path.exists());
+        domain.cleanup().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[cfg(feature = "host-process")]
+    fn injected_prepare_error() -> HostProcessError {
+        HostProcessError::Io(std::io::Error::other("injected cgroup preparation failure"))
+    }
+
+    #[test]
+    #[cfg(feature = "host-process")]
+    fn successful_setup_rollback_is_classified_as_clean() {
+        let cleanup = CgroupDomain::for_test(PathBuf::from("unused-clean-rollback"));
+        let failure = classify_prepare_rollback(injected_prepare_error(), Ok(()), Some(cleanup));
+
+        let CgroupPrepareFailure::Clean(source) = failure else {
+            panic!("successful rollback must not retain residual ownership");
+        };
+        assert_eq!(source.to_string(), "injected cgroup preparation failure");
+    }
+
+    #[test]
+    #[cfg(feature = "host-process")]
+    fn failed_setup_rollback_preserves_pinned_cleanup_identity() {
+        let cleanup = CgroupDomain::for_test(PathBuf::from("unused-pinned-rollback"));
+        let failure = classify_prepare_rollback(
+            injected_prepare_error(),
+            Err(std::io::Error::other("injected rollback failure")),
+            Some(cleanup),
+        );
+
+        let CgroupPrepareFailure::Residual {
+            source,
+            cleanup: Some(cleanup),
+        } = failure
+        else {
+            panic!("failed setup rollback must preserve pinned cleanup ownership");
+        };
+        assert_eq!(source.to_string(), "injected cgroup preparation failure");
+        assert_eq!(cleanup.path(), Some(Path::new("unused-pinned-rollback")));
+    }
+
+    #[test]
+    #[cfg(feature = "host-process")]
+    fn failed_open_rollback_is_classified_as_unpinned_residual() {
+        let failure = classify_prepare_rollback(
+            injected_prepare_error(),
+            Err(std::io::Error::other("injected rollback failure")),
+            None,
+        );
+
+        let CgroupPrepareFailure::Residual {
+            source,
+            cleanup: None,
+        } = failure
+        else {
+            panic!("failed open rollback must not synthesize an unpinned identity");
+        };
+        assert_eq!(source.to_string(), "injected cgroup preparation failure");
     }
 
     #[cfg(feature = "host-process")]

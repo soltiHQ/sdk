@@ -326,7 +326,7 @@ async fn read_content(
     control_timeout: Duration,
 ) -> Result<Vec<u8>, ContainerEngineError> {
     let expected_size = checked_size(descriptor.size)?;
-    let deadline = tokio::time::Instant::now() + control_timeout;
+    let deadline = tokio::time::Instant::now().checked_add(control_timeout);
     let mut stream = rpc_until(
         deadline,
         "containerd content read failed",
@@ -534,17 +534,20 @@ where
 }
 
 async fn rpc_until<T, F>(
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
     reason: &'static str,
     future: F,
 ) -> Result<T, ContainerEngineError>
 where
     F: Future<Output = Result<T, Status>>,
 {
-    tokio::time::timeout_at(deadline, future)
-        .await
-        .map_err(|error| ContainerEngineError::retryable_from(reason, error))?
-        .map_err(|status| rpc_error(reason, status))
+    let result = match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|error| ContainerEngineError::retryable_from(reason, error))?,
+        None => future.await,
+    };
+    result.map_err(|status| rpc_error(reason, status))
 }
 
 pub(super) fn rpc_error(reason: &'static str, status: Status) -> ContainerEngineError {
@@ -603,6 +606,7 @@ impl TryFrom<&OciDescriptor> for ContentDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::container::containerd::config::MAX_GRPC_TIMEOUT;
 
     const SHA256_A: &str =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -727,6 +731,25 @@ mod tests {
             chain_id(&[SHA256_A.to_owned(), SHA256_B.to_owned()]).unwrap(),
             "sha256:ccd722928bd92476ba1745586fed6e45a102504185ad88cd89e01ff116fd146c"
         );
+    }
+
+    #[test]
+    fn maximum_supported_grpc_timeout_is_encoded_without_panic() {
+        let namespace = "solti".parse::<MetadataValue<Ascii>>().unwrap();
+        let namespaced = namespaced_with_timeout((), &namespace, MAX_GRPC_TIMEOUT);
+        let plain = with_timeout((), MAX_GRPC_TIMEOUT);
+
+        for request in [namespaced, plain] {
+            assert_eq!(
+                request
+                    .metadata()
+                    .get("grpc-timeout")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "99999999H"
+            );
+        }
     }
 
     #[test]

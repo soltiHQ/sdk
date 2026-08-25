@@ -25,6 +25,24 @@ pub enum RunnerError {
     #[error("invalid specification: {0}")]
     InvalidSpec(String),
 
+    /// Build cancellation won during interruptible runner-owned work.
+    #[error("runner build was cancelled")]
+    BuildCancelled,
+
+    /// A composing runner could not build one nested workload.
+    ///
+    /// The original router error remains available as the error source. This
+    /// preserves selection, admission, recursion, cancellation, and concrete
+    /// runner failure taxonomy across a composition boundary.
+    #[error("{context} could not be built: {source}")]
+    NestedBuild {
+        /// Composition-specific location of the nested workload.
+        context: String,
+        /// Original nested router failure.
+        #[source]
+        source: Box<RouterError>,
+    },
+
     /// The runner could not build the task because of an internal failure.
     #[error("internal error: {0}")]
     Internal(String),
@@ -77,6 +95,27 @@ pub enum RouterError {
         kind: String,
     },
 
+    /// Cancellation won while a selected runner waited for build admission.
+    #[error("runner '{runner}' build admission was cancelled")]
+    BuildCancelled {
+        /// Selected runner name.
+        runner: String,
+    },
+
+    /// A composing runner selected a runner already active in this build path.
+    #[error("recursive build through runner '{runner}' is not allowed")]
+    RecursiveBuild {
+        /// Re-entered runner name.
+        runner: String,
+    },
+
+    /// A nested admission wait would deadlock with other active root builds.
+    #[error("runner '{runner}' build admission would create a wait cycle")]
+    AdmissionCycle {
+        /// Selected runner name.
+        runner: String,
+    },
+
     /// The selected runner failed to build the task.
     #[error("runner '{runner}' failed to build task: {source}")]
     Build {
@@ -85,18 +124,5 @@ pub enum RouterError {
         /// Concrete runner failure.
         #[source]
         source: RunnerError,
-    },
-
-    /// The runner returned a task with a name different from the allocated run id.
-    #[error(
-        "runner '{runner}' returned task name '{actual}', expected allocated run id '{expected}'"
-    )]
-    RunIdMismatch {
-        /// Selected runner name.
-        runner: String,
-        /// Run id allocated by the router.
-        expected: String,
-        /// Task name returned by the runner.
-        actual: String,
     },
 }

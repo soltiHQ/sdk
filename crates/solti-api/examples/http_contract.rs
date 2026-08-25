@@ -30,7 +30,8 @@ use solti_api::{
 };
 use solti_model::{
     ExtensionWorkload, OutputChunk, OutputEvent, StreamKind, Task, TaskFilter, TaskId,
-    TaskManifest, TaskPage, TaskQuery, TaskRun, TaskSpec, TaskWorkload, Token, WritePreconditions,
+    TaskManifest, TaskPage, TaskQuery, TaskRunPage, TaskRunQuery, TaskSpec, TaskWorkload, Token,
+    WritePreconditions,
 };
 use tower::ServiceExt;
 
@@ -133,12 +134,39 @@ impl ApiHandler for MemoryHandler {
         Ok(Box::pin(tokio_stream::empty()))
     }
 
-    async fn list_task_runs(&self, id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
-        if self.lock_tasks()?.contains_key(id.as_str()) {
-            Ok(Vec::new())
-        } else {
-            Err(ApiError::TaskNotFound(id.to_string()))
+    async fn query_task_runs(
+        &self,
+        id: &TaskId,
+        query: TaskRunQuery,
+    ) -> Result<TaskRunPage, ApiError> {
+        if query.continuation().is_some() {
+            return Err(ApiError::MethodNotAllowed(
+                "the teaching backend does not retain run snapshots".into(),
+            ));
         }
+        let task = self
+            .lock_tasks()?
+            .get(id.as_str())
+            .cloned()
+            .ok_or_else(|| ApiError::TaskNotFound(id.to_string()))?;
+        Ok(TaskRunPage {
+            items: Vec::new(),
+            task: id.clone(),
+            task_uid: task.metadata().uid().clone(),
+            resource_version: "runs-memory:1".into(),
+            continuation: None,
+            remaining_item_count: 0,
+        })
+    }
+
+    async fn cancel_task(
+        &self,
+        _id: &TaskId,
+        _preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::MethodNotAllowed(
+            "the teaching backend does not execute tasks".into(),
+        ))
     }
 
     async fn delete_task(
@@ -157,8 +185,16 @@ impl ApiHandler for MemoryHandler {
             .ok_or_else(|| ApiError::TaskNotFound(id.to_string()))
     }
 
-    async fn stream_task_logs(&self, id: &TaskId) -> Result<OutputEventStream, ApiError> {
-        if !self.lock_tasks()?.contains_key(id.as_str()) {
+    async fn stream_task_logs(
+        &self,
+        id: &TaskId,
+        task_uid: &solti_model::Uid,
+    ) -> Result<OutputEventStream, ApiError> {
+        if self
+            .lock_tasks()?
+            .get(id.as_str())
+            .is_none_or(|task| task.uid() != task_uid)
+        {
             return Err(ApiError::TaskNotFound(id.to_string()));
         }
         let events = vec![
@@ -174,6 +210,7 @@ impl ApiHandler for MemoryHandler {
                 seq: 0,
                 ts: UNIX_EPOCH + Duration::from_millis(1_100),
                 line: Bytes::from_static(b"resized cover.png"),
+                truncated: false,
             }),
             OutputEvent::RunFinished {
                 generation: 1,
@@ -284,7 +321,10 @@ async fn main() -> ExampleResult {
     assert_eq!(created_status, StatusCode::CREATED);
     assert_eq!(created_body["metadata"]["name"], "resize-cover");
 
-    let logs_uri = format!("{HTTP_API_ROOT}/tasks/resize-cover/logs");
+    let task_uid = created_body["metadata"]["uid"]
+        .as_str()
+        .ok_or("created Task has no UID")?;
+    let logs_uri = format!("{HTTP_API_ROOT}/tasks/resize-cover/logs?taskUid={task_uid}");
     let logs = parts
         .router
         .oneshot(request(

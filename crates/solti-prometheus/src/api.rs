@@ -46,8 +46,8 @@ use crate::register::{MetricGroup, ms_to_secs};
 ///
 /// - Construction registers all three collectors as one group.
 /// - Request durations enter the backend in milliseconds.
-/// - Histograms export those durations in seconds.
 /// - In-flight changes are applied as signed deltas.
+/// - Histograms export those durations in seconds.
 ///
 /// ## Example
 ///
@@ -55,7 +55,7 @@ use crate::register::{MetricGroup, ms_to_secs};
 /// use solti_api::{ApiMetricsBackend, Transport};
 /// use solti_prometheus::{PrometheusApiMetrics, Registry};
 ///
-/// # fn main() -> Result<(), prometheus::Error> {
+/// # fn main() -> Result<(), solti_prometheus::Error> {
 /// let registry = Registry::new();
 /// let metrics = PrometheusApiMetrics::new(&registry)?;
 ///

@@ -19,40 +19,77 @@
 //! Normal writes belong to [`SupervisorApi`](crate::SupervisorApi).
 //! Public `TaskState` methods provide shared read access.
 //!
-//! Each store has its own resource-version epoch.
-//! List continuations use retained change history.
-//! Watches use the same history.
-//! They can resume only while that history remains available.
-//! Retention limits that history by both count and serialized bytes.
-//! An oversized change is broadcast live but is not retained.
+//! Each store has distinct Task and TaskRun resource-version epochs.
+//! Task list continuations and watches share retained Task changes.
+//! TaskRun continuations use a separate reversible mutation journal.
+//! Retained runs and run-journal deltas share immutable [`Arc<TaskRun>`] snapshots.
+//! Run mutations use copy-on-write. Queries clone handles under the state lock
+//! and clone model values only when admitting them to a page.
+//! Each continuation can resume only while its journal position remains available.
+//! Both journals are limited by count and serialized bytes.
+//! Task watch admission is limited by concurrent subscription count and the
+//! aggregate compact Task JSON retained by initial and replay buffers.
+//! Live delivery keeps only a coalesced revision notification. Subscribers read
+//! payload lazily from the same count- and byte-bounded journal used by snapshots.
+//! A subscriber expires deterministically when its next required revision is
+//! compacted. An oversized Task change expires existing subscribers because it
+//! cannot be retained within the configured byte budget.
+//! An oversized TaskRun journal batch updates current run state but is not retained
+//! in the reversible journal.
+//! [`StateConfig::max_retained_tasks`] limits retained task resources.
+//! [`StateConfig::max_retained_task_manifest_bytes`] limits their aggregate
+//! caller-owned manifest bytes.
+//! [`StateConfig::max_retained_task_run_bytes`] limits compact JSON bytes for
+//! TaskRun values in current query state. It is independent of the reversible
+//! journal budget. Completed runs are compacted globally by completion time.
+//! If active values alone cannot fit, attempt execution and lifecycle delivery
+//! continue while the new active value is omitted from retained query state.
+//! A lifecycle-only active handle survives that omission. Direct completion
+//! still publishes the authoritative terminal RunChanged value.
+//! These serialized-byte budgets are logical payload bounds, not allocator or
+//! resident-set-size measurements.
+//! Admission never evicts a task to admit another task.
+//! Task query pages keep complete-item prefixes within a 4 MiB serialized JSON budget.
+//! TaskRun query pages use the same complete-item budget.
+//! An oversized first item is returned alone for native transport measurement.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     future::Future,
     io::{self, Write},
+    ops::{Deref, DerefMut},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::SystemTime,
 };
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use thiserror::Error;
-use tokio::sync::broadcast;
-use tokio_stream::{
-    Stream,
-    wrappers::{BroadcastStream, errors::BroadcastStreamRecvError},
-};
+use tokio_stream::{Stream, wrappers::WatchStream};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use solti_model::{
-    DesiredChange, Slot, Task, TaskContinuation, TaskFilter, TaskId, TaskManifest, TaskPage,
-    TaskPhase, TaskQuery, TaskRun, TaskWatchEvent, Uid, WorkloadTypeMeta, WritePreconditions,
+    ConditionStatus, DesiredChange, Slot, Task, TaskContinuation, TaskFilter, TaskId, TaskManifest,
+    TaskPage, TaskPhase, TaskQuery, TaskRun, TaskRunContinuation, TaskRunPage, TaskRunQuery,
+    TaskWatchEvent, Uid, WorkloadTypeMeta, WritePreconditions,
 };
 
-use crate::persistence::{TaskStateEvent, TaskStateSinkHandle, publish_state_event};
+use crate::persistence::{
+    MAX_STATE_EVENTS_PER_COMMIT, PersistenceConfig, RUN_CHANGE_BYTE_RESERVATION,
+    StateAdmissionClosed, StateDispatchEvent, StateDispatcherAdmission, StateEventDispatcher,
+    TASK_CHANGE_BYTE_RESERVATION, TaskStateEvent, TaskStateSinkHandle, TaskStateSinkStatus,
+};
 use crate::{StateConfig, WriteConflict, WritePreconditionViolation, error::CoreError};
+
+pub(crate) const TASKVISOR_INTAKE_PENDING_REASON: &str =
+    "TaskvisorOwnershipAndControllerIntakePending";
+pub(crate) const TASKVISOR_INTAKE_PENDING_MESSAGE: &str =
+    "waiting for Taskvisor ownership and controller intake capacity";
 
 /// Shared in-memory task state.
 ///
@@ -74,16 +111,445 @@ use crate::{StateConfig, WriteConflict, WritePreconditionViolation, error::CoreE
 pub struct TaskState {
     inner: Arc<RwLock<TaskStateInner>>,
     watch_stop: CancellationToken,
-    event_sink: Option<TaskStateSinkHandle>,
+    watch_admission: Arc<WatchAdmission>,
+    event_publisher: Arc<StateEventPublisher>,
+}
+
+struct StateEventPublisher {
+    dispatcher: Option<Arc<StateEventDispatcher>>,
+    admission_fence: Arc<StateAdmissionFence>,
+    inner: Mutex<StateEventPublisherInner>,
+}
+
+struct StateAdmissionFence {
+    inner: Mutex<StateAdmissionFenceInner>,
+    drained: tokio::sync::watch::Sender<bool>,
+}
+
+struct StateAdmissionFenceInner {
+    open: bool,
+    active: usize,
+}
+
+struct StateAdmissionLease {
+    fence: Arc<StateAdmissionFence>,
+}
+
+impl StateAdmissionFence {
+    fn new() -> Arc<Self> {
+        let (drained, _) = tokio::sync::watch::channel(false);
+        Arc::new(Self {
+            inner: Mutex::new(StateAdmissionFenceInner {
+                open: true,
+                active: 0,
+            }),
+            drained,
+        })
+    }
+
+    fn admit(self: &Arc<Self>) -> Result<StateAdmissionLease, StateAdmissionClosed> {
+        let mut inner = self.inner.lock();
+        if !inner.open {
+            return Err(StateAdmissionClosed);
+        }
+        inner.active = inner
+            .active
+            .checked_add(1)
+            .expect("active state admission lease count must not overflow");
+        Ok(StateAdmissionLease {
+            fence: Arc::clone(self),
+        })
+    }
+
+    async fn close_and_wait(&self) {
+        let mut drained = self.drained.subscribe();
+        let is_drained = {
+            let mut inner = self.inner.lock();
+            inner.open = false;
+            inner.active == 0
+        };
+        if is_drained {
+            self.drained.send_replace(true);
+        }
+        while !*drained.borrow_and_update() {
+            drained
+                .changed()
+                .await
+                .expect("state admission drain outcome remains available");
+        }
+    }
+
+    #[cfg(test)]
+    fn status(&self) -> (bool, usize) {
+        let inner = self.inner.lock();
+        (inner.open, inner.active)
+    }
+}
+
+impl Drop for StateAdmissionLease {
+    fn drop(&mut self) {
+        let drained = {
+            let mut inner = self.fence.inner.lock();
+            inner.active = inner
+                .active
+                .checked_sub(1)
+                .expect("state admission lease count must not underflow");
+            !inner.open && inner.active == 0
+        };
+        if drained {
+            self.fence.drained.send_replace(true);
+        }
+    }
+}
+
+#[derive(Default)]
+struct StateEventPublisherInner {
+    pending: VecDeque<Arc<PendingStateEventBatch>>,
+    publishing: bool,
+}
+
+struct PendingStateEventBatch {
+    inner: Mutex<PendingStateEventBatchInner>,
+    ready: AtomicBool,
+}
+
+struct PendingStateEventBatchInner {
+    events: VecDeque<StateDispatchEvent>,
+    admission: Option<StateDispatcherAdmission>,
+    serialized_bytes: usize,
+}
+
+impl PendingStateEventBatch {
+    fn new(admission: StateDispatcherAdmission) -> Self {
+        Self {
+            inner: Mutex::new(PendingStateEventBatchInner {
+                events: VecDeque::new(),
+                admission: Some(admission),
+                serialized_bytes: 0,
+            }),
+            ready: AtomicBool::new(false),
+        }
+    }
+
+    fn enqueue(&self, event: TaskStateEvent, serialized_bytes: usize) {
+        let mut inner = self.inner.lock();
+        let permit = inner
+            .admission
+            .as_mut()
+            .expect("state persistence admission remains owned until dispatch")
+            .take_permit();
+        inner.serialized_bytes = inner
+            .serialized_bytes
+            .checked_add(serialized_bytes)
+            .expect("state persistence payload accounting must not overflow");
+        inner
+            .events
+            .push_back(StateDispatchEvent::new(event, permit));
+    }
+
+    fn release_unused_permits(&self) {
+        let mut inner = self.inner.lock();
+        let serialized_bytes = inner.serialized_bytes;
+        let admission = inner
+            .admission
+            .as_mut()
+            .expect("state persistence admission remains owned until dispatch");
+        admission.release_unused_permits();
+        admission.shrink_byte_reservation(serialized_bytes);
+    }
+}
+
+impl StateEventPublisher {
+    fn new(
+        sink: Option<TaskStateSinkHandle>,
+        config: PersistenceConfig,
+    ) -> Result<Self, io::Error> {
+        let dispatcher = sink
+            .map(|sink| {
+                StateEventDispatcher::start_with_byte_capacity(
+                    sink,
+                    config.state_queue_capacity(),
+                    config.state_queue_byte_capacity(),
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            dispatcher,
+            admission_fence: StateAdmissionFence::new(),
+            inner: Mutex::new(StateEventPublisherInner::default()),
+        })
+    }
+
+    async fn reserve(
+        &self,
+        event_capacity: usize,
+        byte_capacity: usize,
+    ) -> Result<StateWriteAdmission, StateAdmissionClosed> {
+        if event_capacity == 0 {
+            return Ok(StateWriteAdmission {
+                lease: None,
+                dispatcher: None,
+            });
+        }
+        let lease = self.admission_fence.admit()?;
+        let dispatcher = match self.dispatcher.as_ref() {
+            Some(dispatcher) => Some(
+                dispatcher
+                    .reserve_with_bytes(event_capacity, byte_capacity)
+                    .await?,
+            ),
+            None => None,
+        };
+        Ok(StateWriteAdmission {
+            lease: Some(lease),
+            dispatcher,
+        })
+    }
+
+    fn reserve_blocking(
+        &self,
+        event_capacity: usize,
+        byte_capacity: usize,
+    ) -> Result<StateWriteAdmission, StateAdmissionClosed> {
+        if event_capacity == 0 {
+            return Ok(StateWriteAdmission {
+                lease: None,
+                dispatcher: None,
+            });
+        }
+        let lease = self.admission_fence.admit()?;
+        let dispatcher = match self.dispatcher.as_ref() {
+            Some(dispatcher) => {
+                Some(dispatcher.reserve_blocking_with_bytes(event_capacity, byte_capacity)?)
+            }
+            None => None,
+        };
+        Ok(StateWriteAdmission {
+            lease: Some(lease),
+            dispatcher,
+        })
+    }
+
+    fn begin_batch(
+        &self,
+        admission: Option<StateDispatcherAdmission>,
+    ) -> Option<Arc<PendingStateEventBatch>> {
+        let admission = admission?;
+        let batch = Arc::new(PendingStateEventBatch::new(admission));
+        self.inner.lock().pending.push_back(Arc::clone(&batch));
+        Some(batch)
+    }
+
+    fn mark_ready_and_publish(&self, batch: Arc<PendingStateEventBatch>) {
+        batch.ready.store(true, Ordering::Release);
+        self.publish_pending();
+    }
+
+    fn publish_pending(&self) {
+        let Some(dispatcher) = self.dispatcher.as_ref() else {
+            return;
+        };
+        {
+            let mut inner = self.inner.lock();
+            if inner.publishing || inner.pending.is_empty() {
+                return;
+            }
+            inner.publishing = true;
+        }
+
+        loop {
+            let (batch, admission, events) = {
+                let mut inner = self.inner.lock();
+                let Some(batch) = inner.pending.front().cloned() else {
+                    inner.publishing = false;
+                    return;
+                };
+                if !batch.ready.load(Ordering::Acquire) {
+                    inner.publishing = false;
+                    return;
+                }
+                let (admission, events) = {
+                    let mut batch_inner = batch.inner.lock();
+                    let admission = batch_inner
+                        .admission
+                        .take()
+                        .expect("a ready state batch retains its dispatcher admission");
+                    let events = batch_inner.events.drain(..).collect::<Vec<_>>();
+                    (admission, events)
+                };
+                inner.pending.pop_front();
+                (batch, admission, events)
+            };
+            dispatcher.dispatch(admission, events);
+            drop(batch);
+        }
+    }
+
+    async fn shutdown(&self) {
+        self.admission_fence.close_and_wait().await;
+        if let Some(dispatcher) = self.dispatcher.as_ref() {
+            dispatcher.shutdown().await;
+        }
+    }
+
+    fn status(&self) -> Option<TaskStateSinkStatus> {
+        self.dispatcher
+            .as_ref()
+            .map(|dispatcher| dispatcher.status())
+    }
+
+    #[cfg(test)]
+    fn admission_waiters(&self) -> usize {
+        self.dispatcher
+            .as_ref()
+            .map_or(0, |dispatcher| dispatcher.admission_waiters())
+    }
+
+    #[cfg(test)]
+    fn admission_closed(&self) -> bool {
+        !self.admission_fence.status().0
+    }
+
+    #[cfg(test)]
+    fn active_admissions(&self) -> usize {
+        self.admission_fence.status().1
+    }
+
+    #[cfg(test)]
+    fn inject_worker_panic(&self) {
+        self.dispatcher
+            .as_ref()
+            .expect("the test state must have a persistence dispatcher")
+            .inject_worker_panic();
+    }
+}
+
+struct TaskStateWriteGuard<'a> {
+    inner: Option<RwLockWriteGuard<'a, TaskStateInner>>,
+    publisher: &'a StateEventPublisher,
+    batch: Option<Arc<PendingStateEventBatch>>,
+    lease: Option<StateAdmissionLease>,
+}
+
+pub(crate) struct StateWriteAdmission {
+    lease: Option<StateAdmissionLease>,
+    dispatcher: Option<StateDispatcherAdmission>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum StateMutationEventCapacity {
+    None,
+    TaskChange,
+    TaskAndRunChange,
+    AttemptTransition,
+}
+
+struct PlannedResourceVersion {
+    epoch: Arc<str>,
+    revision: u64,
+    value: String,
+    rolls_epoch: bool,
+}
+
+impl StateMutationEventCapacity {
+    const fn get(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::TaskChange => 1,
+            Self::TaskAndRunChange => 2,
+            Self::AttemptTransition => MAX_STATE_EVENTS_PER_COMMIT,
+        }
+    }
+
+    const fn byte_reservation(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::TaskChange => TASK_CHANGE_BYTE_RESERVATION,
+            Self::TaskAndRunChange => TASK_CHANGE_BYTE_RESERVATION + RUN_CHANGE_BYTE_RESERVATION,
+            Self::AttemptTransition => {
+                TASK_CHANGE_BYTE_RESERVATION + 2 * RUN_CHANGE_BYTE_RESERVATION
+            }
+        }
+    }
+}
+
+impl TaskStateWriteGuard<'_> {
+    fn enqueue(&self, event: TaskStateEvent, serialized_bytes: usize) {
+        if let Some(batch) = self.batch.as_ref() {
+            batch.enqueue(event, serialized_bytes);
+        }
+    }
+}
+
+impl Deref for TaskStateWriteGuard<'_> {
+    type Target = TaskStateInner;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner
+            .as_deref()
+            .expect("TaskState write guard is present until drop")
+    }
+}
+
+impl DerefMut for TaskStateWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+            .as_deref_mut()
+            .expect("TaskState write guard is present until drop")
+    }
+}
+
+impl Drop for TaskStateWriteGuard<'_> {
+    fn drop(&mut self) {
+        let batch = self.batch.take();
+        let lease = self.lease.take();
+        // Readiness must become visible only after the authoritative state lock is released.
+        drop(self.inner.take());
+        if let Some(batch) = batch {
+            batch.release_unused_permits();
+            self.publisher.mark_ready_and_publish(batch);
+        }
+        drop(lease);
+    }
 }
 
 struct TaskStateInner {
     /// Tasks indexed by model task name.
-    tasks: HashMap<TaskId, Task>,
+    ///
+    /// Stored snapshots are immutable and shared with watch history, persistence,
+    /// and pagination. A state transition clones the resource only when it
+    /// prepares a mutation for commit.
+    tasks: HashMap<TaskId, Arc<Task>>,
+    /// Task names in stable pagination and watch-snapshot order.
+    ordered_tasks: BTreeSet<TaskId>,
     /// Task names indexed by slot.
-    by_slot: HashMap<Slot, Vec<TaskId>>,
-    /// Run history indexed by task name.
-    runs: HashMap<TaskId, VecDeque<TaskRun>>,
+    by_slot: HashMap<Slot, BTreeSet<TaskId>>,
+    /// Immutable run snapshots indexed by task name.
+    ///
+    /// Pagination and the reversible journal share these allocations.
+    runs: HashMap<TaskId, VecDeque<Arc<TaskRun>>>,
+    /// Compact JSON bytes for TaskRun values currently present in `runs`.
+    retained_task_run_bytes: usize,
+    /// Exact current TaskRun charge indexed by run identity.
+    retained_task_run_bytes_by_identity: HashMap<RetainedRunIdentity, usize>,
+    /// Completed TaskRuns ordered for deterministic global byte compaction.
+    completed_runs_by_age: BTreeSet<CompletedRetainedRun>,
+    /// Maximum aggregate current TaskRun bytes.
+    max_retained_task_run_bytes: Option<std::num::NonZeroUsize>,
+    /// Store identity embedded in each TaskRun collection version.
+    run_resource_version_epoch: String,
+    /// Latest committed TaskRun mutation-batch counter.
+    run_resource_version: u64,
+    /// Reversible TaskRun mutation batches retained for list snapshots.
+    run_history: VecDeque<RawRunChangeBatch>,
+    /// Serialized bytes retained in the TaskRun journal.
+    run_history_bytes: usize,
+    /// Maximum serialized TaskRun journal bytes.
+    run_history_byte_budget: usize,
+    /// Highest compacted TaskRun revision.
+    run_compacted_through: u64,
+    /// Maximum retained TaskRun mutation-batch count.
+    run_history_capacity: usize,
     /// Taskvisor identity to exact resource generation.
     by_tv: HashMap<u64, RuntimeBinding>,
     /// Resource name to current Taskvisor binding.
@@ -93,8 +559,14 @@ struct TaskStateInner {
     /// This survives visible run eviction.
     /// Duplicate terminal events therefore remain idempotent.
     finished_attempt_by_tv: HashMap<u64, u32>,
+    /// Active attempt lifecycle retained independently from query visibility.
+    ///
+    /// The value shares the query allocation while visible. If the current-run
+    /// byte budget omits it, direct completion can still emit the authoritative
+    /// terminal RunChanged value without inventing an attempt.
+    active_run_by_tv: HashMap<u64, Arc<TaskRun>>,
     /// Store identity embedded in each resource version.
-    resource_version_epoch: String,
+    resource_version_epoch: Arc<str>,
     /// Latest committed resource-version counter.
     resource_version: u64,
     /// Changes retained for watches and list snapshots.
@@ -107,19 +579,64 @@ struct TaskStateInner {
     compacted_through: u64,
     /// Maximum retained change count.
     watch_history_capacity: usize,
-    /// Live Task change broadcast.
-    watch_tx: broadcast::Sender<Arc<RawTaskChange>>,
+    /// Coalesced latest-revision notification for lazy live Task watch delivery.
+    watch_tx: tokio::sync::watch::Sender<u64>,
     /// Terminal transition time used by retention.
     terminal_since: HashMap<TaskId, SystemTime>,
     /// Per-task completed run cap.
     max_runs_per_task: usize,
+    /// Maximum retained task count.
+    max_retained_tasks: Option<std::num::NonZeroUsize>,
+    /// Canonical compact JSON bytes for every retained caller-owned manifest.
+    retained_task_manifest_bytes: usize,
+    /// Retained caller-owned manifest bytes indexed by task name.
+    retained_task_manifest_bytes_by_name: HashMap<TaskId, usize>,
+    /// Maximum aggregate retained caller-owned manifest bytes.
+    max_retained_task_manifest_bytes: Option<std::num::NonZeroUsize>,
 }
 
 struct RawTaskChange {
+    /// Store epoch that committed this change.
+    epoch: Arc<str>,
     revision: u64,
-    previous: Option<Task>,
-    current: Option<Task>,
+    previous: Option<Arc<Task>>,
+    current: Option<Arc<Task>>,
     serialized_bytes: usize,
+}
+
+/// One atomically committed TaskRun revision and its reversible changes.
+struct RawRunChangeBatch {
+    /// Revision assigned to the complete mutation batch.
+    revision: u64,
+    /// Ordered changes committed by this mutation.
+    changes: Vec<RawRunChange>,
+    /// Compact JSON bytes charged to the run journal.
+    serialized_bytes: usize,
+}
+
+/// One reversible TaskRun value change for an exact task identity.
+struct RawRunChange {
+    /// Task name owning the run.
+    task: TaskId,
+    /// Task UID owning the run at this revision.
+    task_uid: Uid,
+    /// Shared immutable value before the mutation.
+    previous: Option<Arc<TaskRun>>,
+    /// Shared immutable value after the mutation.
+    current: Option<Arc<TaskRun>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct RetainedRunIdentity {
+    task: TaskId,
+    generation: u64,
+    attempt: u32,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CompletedRetainedRun {
+    finished_at: SystemTime,
+    identity: RetainedRunIdentity,
 }
 
 #[derive(Default)]
@@ -140,10 +657,194 @@ type WatchPredicate = Arc<dyn Fn(&Task) -> bool + Send + Sync>;
 
 const WATCH_POLL_BUDGET: usize = 128;
 
+struct WatchAdmission {
+    max_count: Option<usize>,
+    max_bytes: Option<usize>,
+    inner: Mutex<WatchAdmissionInner>,
+}
+
+struct WatchAdmissionInner {
+    closed: bool,
+    next_lease_id: u64,
+    retained_bytes: usize,
+    leases: HashMap<u64, usize>,
+}
+
+enum WatchAdmissionFailure {
+    Closed,
+    Rejected(CollectionError),
+}
+
+struct WatchAdmissionLease {
+    admission: Arc<WatchAdmission>,
+    id: u64,
+}
+
+impl WatchAdmission {
+    fn new(config: StateConfig) -> Arc<Self> {
+        Arc::new(Self {
+            max_count: config
+                .max_concurrent_task_watches()
+                .map(|limit| limit.get()),
+            max_bytes: config
+                .max_task_watch_initial_replay_bytes()
+                .map(|limit| limit.get()),
+            inner: Mutex::new(WatchAdmissionInner {
+                closed: false,
+                next_lease_id: 1,
+                retained_bytes: 0,
+                leases: HashMap::new(),
+            }),
+        })
+    }
+
+    fn try_reserve_count(self: &Arc<Self>) -> Result<WatchAdmissionLease, WatchAdmissionFailure> {
+        let mut inner = self.inner.lock();
+        if inner.closed {
+            return Err(WatchAdmissionFailure::Closed);
+        }
+        if let Some(limit) = self.max_count
+            && inner.leases.len() >= limit
+        {
+            return Err(WatchAdmissionFailure::Rejected(
+                CollectionError::ConcurrentTaskWatchLimitReached { limit },
+            ));
+        }
+
+        let id = loop {
+            let candidate = inner.next_lease_id;
+            inner.next_lease_id = inner.next_lease_id.wrapping_add(1).max(1);
+            if !inner.leases.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        inner.leases.insert(id, 0);
+        Ok(WatchAdmissionLease {
+            admission: Arc::clone(self),
+            id,
+        })
+    }
+
+    fn try_charge_bytes(
+        &self,
+        id: u64,
+        requested_bytes: usize,
+    ) -> Result<(), WatchAdmissionFailure> {
+        let mut inner = self.inner.lock();
+        if inner.closed || !inner.leases.contains_key(&id) {
+            return Err(WatchAdmissionFailure::Closed);
+        }
+        if let Some(limit) = self.max_bytes
+            && requested_bytes > limit - inner.retained_bytes
+        {
+            return Err(WatchAdmissionFailure::Rejected(
+                CollectionError::TaskWatchInitialReplayByteLimitExceeded {
+                    current: inner.retained_bytes,
+                    requested: requested_bytes,
+                    limit,
+                },
+            ));
+        }
+        let charged_bytes = self.max_bytes.map_or(0, |_| requested_bytes);
+        let previous = inner
+            .leases
+            .insert(id, charged_bytes)
+            .expect("a provisional watch admission must remain registered");
+        assert_eq!(previous, 0, "watch bytes must be charged exactly once");
+        inner.retained_bytes = inner
+            .retained_bytes
+            .checked_add(charged_bytes)
+            .expect("watch admission bytes must remain within the configured limit");
+        Ok(())
+    }
+
+    fn release_bytes(&self, id: u64, released_bytes: usize) {
+        if self.max_bytes.is_none() || released_bytes == 0 {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        let Some(lease_bytes) = inner.leases.get_mut(&id) else {
+            return;
+        };
+        *lease_bytes = lease_bytes
+            .checked_sub(released_bytes)
+            .expect("watch lease byte accounting must not underflow");
+        inner.retained_bytes = inner
+            .retained_bytes
+            .checked_sub(released_bytes)
+            .expect("aggregate watch byte accounting must not underflow");
+    }
+
+    fn release_lease(&self, id: u64) {
+        let mut inner = self.inner.lock();
+        let Some(released_bytes) = inner.leases.remove(&id) else {
+            return;
+        };
+        inner.retained_bytes = inner
+            .retained_bytes
+            .checked_sub(released_bytes)
+            .expect("aggregate watch lease accounting must not underflow");
+    }
+
+    fn close(&self) {
+        let mut inner = self.inner.lock();
+        if inner.closed {
+            return;
+        }
+        inner.closed = true;
+        inner.retained_bytes = 0;
+        inner.leases.clear();
+    }
+
+    #[cfg(test)]
+    fn usage(&self) -> (usize, usize, usize) {
+        let inner = self.inner.lock();
+        (inner.leases.len(), inner.retained_bytes, 0)
+    }
+}
+
+impl WatchAdmissionLease {
+    fn is_active(&self) -> bool {
+        self.admission.inner.lock().leases.contains_key(&self.id)
+    }
+
+    fn release_bytes(&self, released_bytes: usize) {
+        self.admission.release_bytes(self.id, released_bytes);
+    }
+
+    fn try_charge_bytes(&self, requested_bytes: usize) -> Result<(), WatchAdmissionFailure> {
+        self.admission.try_charge_bytes(self.id, requested_bytes)
+    }
+}
+
+impl Drop for WatchAdmissionLease {
+    fn drop(&mut self) {
+        self.admission.release_lease(self.id);
+    }
+}
+
 /// Error from a task collection snapshot.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum CollectionError {
+    /// The state cannot admit another concurrent Task watch.
+    #[error("concurrent Task watch limit reached: {limit}")]
+    ConcurrentTaskWatchLimitReached {
+        /// Configured concurrent Task watch limit.
+        limit: usize,
+    },
+    /// A new Task watch would exceed the aggregate initial and replay byte budget.
+    #[error(
+        "Task watch initial and replay byte limit exceeded: current {current} bytes, requested {requested} bytes, limit {limit} bytes"
+    )]
+    TaskWatchInitialReplayByteLimitExceeded {
+        /// Serialized bytes retained by admitted Task watches.
+        current: usize,
+        /// Serialized bytes required by the new Task watch.
+        requested: usize,
+        /// Configured aggregate byte limit.
+        limit: usize,
+    },
     /// The resource version is malformed or ahead of this store.
     #[error("invalid resourceVersion `{resource_version}`")]
     InvalidResourceVersion {
@@ -165,6 +866,28 @@ pub enum CollectionError {
         /// Missing task name.
         name: TaskId,
     },
+    /// A TaskRun continuation belongs to another task name.
+    #[error(
+        "TaskRun continuation belongs to task `{continuation_task}`, not requested task `{task}`"
+    )]
+    TaskRunContinuationTaskMismatch {
+        /// Requested task name.
+        task: TaskId,
+        /// Task name fixed by the continuation.
+        continuation_task: TaskId,
+    },
+    /// The TaskRun continuation cursor is absent from its retained snapshot.
+    #[error(
+        "TaskRun continuation cursor `{task}` generation {generation} attempt {attempt} is not part of the retained snapshot"
+    )]
+    TaskRunContinuationCursorNotFound {
+        /// Task name fixed by the continuation.
+        task: TaskId,
+        /// Missing run generation.
+        generation: u64,
+        /// Missing run attempt.
+        attempt: u32,
+    },
 }
 
 /// Stream of filtered task changes.
@@ -175,19 +898,83 @@ pub enum CollectionError {
 /// A compacted resume point produces [`CollectionError::ResourceVersionExpired`].
 /// That error is terminal.
 /// The stream ends after returning it.
+///
+/// Initial and exact-resume events retain an aggregate byte lease until each
+/// event is yielded. Live delivery retains no per-subscriber payload: a
+/// coalesced revision notification drives lazy reads from the shared journal.
+/// Compaction of the next required revision terminates the subscription with
+/// [`CollectionError::ResourceVersionExpired`].
 #[must_use = "streams do nothing unless polled"]
 pub struct TaskWatchSubscription {
     inner: Arc<RwLock<TaskStateInner>>,
-    receiver: BroadcastStream<Arc<RawTaskChange>>,
-    initial: VecDeque<TaskWatchEvent>,
+    receiver: WatchStream<u64>,
+    initial: VecDeque<BufferedWatchEvent>,
     initial_revision: Option<u64>,
-    replay: VecDeque<Arc<RawTaskChange>>,
+    replay: VecDeque<PreparedReplayChange>,
+    permit: Option<WatchAdmissionLease>,
     filter: TaskFilter,
     predicate: WatchPredicate,
-    epoch: String,
+    epoch: Arc<str>,
     last_revision: u64,
+    target_revision: u64,
     stop: Pin<Box<dyn Future<Output = ()> + Send>>,
     terminal: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PreparedWatchEventKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+struct WatchEventDescriptor {
+    kind: PreparedWatchEventKind,
+    task: Arc<Task>,
+    resource_version: Option<String>,
+    serialized_bytes: usize,
+}
+
+fn first_after_revision<T>(
+    history: &VecDeque<T>,
+    revision: u64,
+    mut revision_of: impl FnMut(&T) -> u64,
+) -> Option<&T> {
+    let index = history.partition_point(|change| revision_of(change) <= revision);
+    history.get(index)
+}
+
+impl WatchEventDescriptor {
+    fn materialize(self) -> TaskWatchEvent {
+        let mut task = self.task.as_ref().clone();
+        if let Some(resource_version) = self.resource_version {
+            task.set_resource_version(resource_version)
+                .expect("store resource version must be valid");
+        }
+        match self.kind {
+            PreparedWatchEventKind::Added => TaskWatchEvent::Added(task),
+            PreparedWatchEventKind::Modified => TaskWatchEvent::Modified(task),
+            PreparedWatchEventKind::Deleted => TaskWatchEvent::Deleted(task),
+        }
+    }
+
+    fn into_buffered(self) -> BufferedWatchEvent {
+        let serialized_bytes = self.serialized_bytes;
+        BufferedWatchEvent {
+            event: self.materialize(),
+            serialized_bytes,
+        }
+    }
+}
+
+struct BufferedWatchEvent {
+    event: TaskWatchEvent,
+    serialized_bytes: usize,
+}
+
+struct PreparedReplayChange {
+    revision: u64,
+    event: Option<BufferedWatchEvent>,
 }
 
 impl TaskWatchSubscription {
@@ -195,7 +982,7 @@ impl TaskWatchSubscription {
         self.filter.matches(task) && (self.predicate)(task)
     }
 
-    fn event_for(&self, change: &RawTaskChange) -> Option<TaskWatchEvent> {
+    fn descriptor_for(&self, change: &RawTaskChange) -> Option<WatchEventDescriptor> {
         let previous_matches = change
             .previous
             .as_ref()
@@ -206,39 +993,105 @@ impl TaskWatchSubscription {
             .is_some_and(|task| self.matches(task));
 
         match (previous_matches, current_matches) {
-            (false, true) => change.current.clone().map(TaskWatchEvent::Added),
-            (true, true) => change.current.clone().map(TaskWatchEvent::Modified),
+            (false, true) => change.current.as_ref().map(|task| WatchEventDescriptor {
+                kind: PreparedWatchEventKind::Added,
+                task: Arc::clone(task),
+                resource_version: None,
+                serialized_bytes: TaskState::serialized_task_payload_bytes(
+                    None,
+                    Some(task.as_ref()),
+                ),
+            }),
+            (true, true) => change.current.as_ref().map(|task| WatchEventDescriptor {
+                kind: PreparedWatchEventKind::Modified,
+                task: Arc::clone(task),
+                resource_version: None,
+                serialized_bytes: TaskState::serialized_task_payload_bytes(
+                    None,
+                    Some(task.as_ref()),
+                ),
+            }),
             (true, false) => {
-                let mut task = change.previous.clone()?;
-                task.set_resource_version(TaskState::format_resource_version(
-                    &self.epoch,
-                    change.revision,
-                ))
-                .expect("store resource version must be valid");
-                Some(TaskWatchEvent::Deleted(task))
+                let task = change.previous.as_ref()?;
+                let resource_version =
+                    TaskState::format_resource_version(change.epoch.as_ref(), change.revision);
+                Some(WatchEventDescriptor {
+                    kind: PreparedWatchEventKind::Deleted,
+                    task: Arc::clone(task),
+                    serialized_bytes: TaskState::serialized_task_with_resource_version_bytes(
+                        task.as_ref(),
+                        &resource_version,
+                    ),
+                    resource_version: Some(resource_version),
+                })
             }
             (false, false) => None,
         }
     }
 
-    fn recover_after_lag(&mut self) -> Result<(), CollectionError> {
+    fn next_live_change(
+        &self,
+        target_revision: u64,
+    ) -> Result<Option<Arc<RawTaskChange>>, CollectionError> {
         let inner = self.inner.read();
-        if self.last_revision < inner.compacted_through {
+        if self.live_position_expired(&inner) {
             return Err(CollectionError::ResourceVersionExpired {
                 resource_version: TaskState::format_resource_version(
-                    &self.epoch,
+                    self.epoch.as_ref(),
                     self.last_revision,
                 ),
             });
         }
-        self.replay.extend(
-            inner
-                .watch_history
-                .iter()
-                .filter(|change| change.revision > self.last_revision)
-                .cloned(),
-        );
+        if self.last_revision >= target_revision {
+            return Ok(None);
+        }
+        Ok(
+            first_after_revision(&inner.watch_history, self.last_revision, |change| {
+                change.revision
+            })
+            .filter(|change| change.revision <= target_revision)
+            .cloned(),
+        )
+    }
+
+    fn live_position_expired(&self, inner: &TaskStateInner) -> bool {
+        inner.resource_version_epoch.as_ref() != self.epoch.as_ref()
+            || self.last_revision < inner.compacted_through
+    }
+
+    fn validate_live_position(&self) -> Result<(), CollectionError> {
+        let inner = self.inner.read();
+        if self.live_position_expired(&inner) {
+            return Err(CollectionError::ResourceVersionExpired {
+                resource_version: TaskState::format_resource_version(
+                    self.epoch.as_ref(),
+                    self.last_revision,
+                ),
+            });
+        }
         Ok(())
+    }
+
+    fn take_buffered_event(&self, buffered: BufferedWatchEvent) -> TaskWatchEvent {
+        if let Some(permit) = self.permit.as_ref() {
+            permit.release_bytes(buffered.serialized_bytes);
+        }
+        buffered.event
+    }
+
+    fn finish_terminal(&mut self) {
+        self.terminal = true;
+        self.initial.clear();
+        self.replay.clear();
+        self.permit.take();
+    }
+
+    fn terminal_error(
+        &mut self,
+        error: CollectionError,
+    ) -> Poll<Option<Result<TaskWatchEvent, CollectionError>>> {
+        self.finish_terminal();
+        Poll::Ready(Some(Err(error)))
     }
 }
 
@@ -250,7 +1103,7 @@ impl Stream for TaskWatchSubscription {
             return Poll::Ready(None);
         }
         if self.stop.as_mut().poll(cx).is_ready() {
-            self.terminal = true;
+            self.finish_terminal();
             return Poll::Ready(None);
         }
 
@@ -260,6 +1113,7 @@ impl Stream for TaskWatchSubscription {
             {
                 self.last_revision = revision;
             }
+            let event = self.take_buffered_event(event);
             return Poll::Ready(Some(Ok(event)));
         }
         if let Some(revision) = self.initial_revision.take() {
@@ -270,7 +1124,7 @@ impl Stream for TaskWatchSubscription {
         loop {
             if processed == WATCH_POLL_BUDGET {
                 if self.stop.as_mut().poll(cx).is_ready() {
-                    self.terminal = true;
+                    self.finish_terminal();
                     return Poll::Ready(None);
                 }
                 cx.waker().wake_by_ref();
@@ -280,32 +1134,43 @@ impl Stream for TaskWatchSubscription {
             if let Some(change) = self.replay.pop_front() {
                 processed += 1;
                 self.last_revision = change.revision;
-                if let Some(event) = self.event_for(&change) {
+                if let Some(event) = change.event {
+                    let event = self.take_buffered_event(event);
                     return Poll::Ready(Some(Ok(event)));
                 }
                 continue;
             }
 
-            match Pin::new(&mut self.receiver).poll_next(cx) {
-                Poll::Ready(Some(Ok(change))) => {
-                    processed += 1;
-                    if change.revision <= self.last_revision {
+            if self.last_revision != self.target_revision {
+                let change = match self.next_live_change(self.target_revision) {
+                    Ok(Some(change)) => change,
+                    Ok(None) => {
+                        self.last_revision = self.target_revision;
                         continue;
                     }
-                    self.last_revision = change.revision;
-                    if let Some(event) = self.event_for(&change) {
-                        return Poll::Ready(Some(Ok(event)));
-                    }
-                }
-                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => {
+                    Err(error) => return self.terminal_error(error),
+                };
+                processed += 1;
+                let revision = change.revision;
+                let Some(descriptor) = self.descriptor_for(&change) else {
+                    self.last_revision = revision;
+                    continue;
+                };
+                self.last_revision = revision;
+                return Poll::Ready(Some(Ok(descriptor.materialize())));
+            }
+
+            if let Err(error) = self.validate_live_position() {
+                return self.terminal_error(error);
+            }
+
+            match Pin::new(&mut self.receiver).poll_next(cx) {
+                Poll::Ready(Some(target_revision)) => {
                     processed += 1;
-                    if let Err(error) = self.recover_after_lag() {
-                        self.terminal = true;
-                        return Poll::Ready(Some(Err(error)));
-                    }
+                    self.target_revision = target_revision;
                 }
                 Poll::Ready(None) => {
-                    self.terminal = true;
+                    self.finish_terminal();
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
@@ -349,7 +1214,7 @@ pub(crate) struct DesiredCommit {
 }
 
 impl TaskState {
-    /// Creates empty state with default retention settings.
+    /// Creates empty state with default admission and retention settings.
     ///
     /// Most applications use [`SupervisorApi::state`](crate::SupervisorApi::state).
     /// Use [`try_new`](Self::try_new) when initialization failure must be handled.
@@ -371,7 +1236,7 @@ impl TaskState {
             .expect("OS entropy is required to create a TaskState resource-version epoch")
     }
 
-    /// Tries to create empty state with default retention settings.
+    /// Tries to create empty state with default admission and retention settings.
     ///
     /// # Errors
     ///
@@ -388,10 +1253,18 @@ impl TaskState {
         config: StateConfig,
         event_sink: Option<TaskStateSinkHandle>,
     ) -> Result<Self, CoreError> {
+        Self::try_with_config_sink_and_persistence(config, event_sink, PersistenceConfig::default())
+    }
+
+    pub(crate) fn try_with_config_sink_and_persistence(
+        config: StateConfig,
+        event_sink: Option<TaskStateSinkHandle>,
+        persistence_config: PersistenceConfig,
+    ) -> Result<Self, CoreError> {
         let epoch = Uid::generate()
             .map_err(CoreError::StateInitialization)?
             .to_string();
-        Ok(Self::with_epoch_and_sink(config, epoch, event_sink))
+        Self::try_with_epoch_and_sink(config, epoch, event_sink, persistence_config)
     }
 
     #[cfg(test)]
@@ -399,21 +1272,47 @@ impl TaskState {
         Self::with_epoch_and_sink(config, epoch, None)
     }
 
+    #[cfg(test)]
     fn with_epoch_and_sink(
         config: StateConfig,
         epoch: String,
         event_sink: Option<TaskStateSinkHandle>,
     ) -> Self {
-        let (watch_tx, _) = broadcast::channel(config.watch_history_capacity());
-        Self {
+        Self::try_with_epoch_and_sink(config, epoch, event_sink, PersistenceConfig::default())
+            .expect("test persistence worker must start")
+    }
+
+    fn try_with_epoch_and_sink(
+        config: StateConfig,
+        epoch: String,
+        event_sink: Option<TaskStateSinkHandle>,
+        persistence_config: PersistenceConfig,
+    ) -> Result<Self, CoreError> {
+        let (watch_tx, _) = tokio::sync::watch::channel(0);
+        let watch_admission = WatchAdmission::new(config);
+        let run_resource_version_epoch = format!("runs-{epoch}");
+        Ok(Self {
             inner: Arc::new(RwLock::new(TaskStateInner {
                 by_slot: HashMap::new(),
                 tasks: HashMap::new(),
+                ordered_tasks: BTreeSet::new(),
                 runs: HashMap::new(),
+                retained_task_run_bytes: 0,
+                retained_task_run_bytes_by_identity: HashMap::new(),
+                completed_runs_by_age: BTreeSet::new(),
+                max_retained_task_run_bytes: config.max_retained_task_run_bytes(),
+                run_resource_version_epoch,
+                run_resource_version: 0,
+                run_history: VecDeque::new(),
+                run_history_bytes: 0,
+                run_history_byte_budget: config.run_history_byte_budget(),
+                run_compacted_through: 0,
+                run_history_capacity: config.run_history_capacity(),
                 by_tv: HashMap::new(),
                 tv_of: HashMap::new(),
                 finished_attempt_by_tv: HashMap::new(),
-                resource_version_epoch: epoch,
+                active_run_by_tv: HashMap::new(),
+                resource_version_epoch: Arc::from(epoch),
                 resource_version: 0,
                 watch_history: VecDeque::new(),
                 watch_history_bytes: 0,
@@ -423,15 +1322,72 @@ impl TaskState {
                 watch_tx,
                 terminal_since: HashMap::new(),
                 max_runs_per_task: config.max_runs_per_task(),
+                max_retained_tasks: config.max_retained_tasks(),
+                retained_task_manifest_bytes: 0,
+                retained_task_manifest_bytes_by_name: HashMap::new(),
+                max_retained_task_manifest_bytes: config.max_retained_task_manifest_bytes(),
             })),
             watch_stop: CancellationToken::new(),
-            event_sink,
+            watch_admission,
+            event_publisher: Arc::new(
+                StateEventPublisher::new(event_sink, persistence_config)
+                    .map_err(CoreError::PersistenceInitialization)?,
+            ),
+        })
+    }
+
+    pub(crate) async fn admit_state_write(
+        &self,
+        event_capacity: StateMutationEventCapacity,
+    ) -> Result<StateWriteAdmission, StateAdmissionClosed> {
+        self.event_publisher
+            .reserve(event_capacity.get(), event_capacity.byte_reservation())
+            .await
+    }
+
+    fn admit_state_write_blocking(
+        &self,
+        event_capacity: StateMutationEventCapacity,
+    ) -> Result<StateWriteAdmission, StateAdmissionClosed> {
+        self.event_publisher
+            .reserve_blocking(event_capacity.get(), event_capacity.byte_reservation())
+    }
+
+    pub(crate) fn admit_state_write_from_taskvisor_callback(
+        &self,
+        event_capacity: StateMutationEventCapacity,
+    ) -> Result<StateWriteAdmission, StateAdmissionClosed> {
+        // Taskvisor invokes subscribers on dedicated callback workers. This
+        // adapter polls the same fair semaphore future as Tokio-owned writes.
+        self.admit_state_write_blocking(event_capacity)
+    }
+
+    fn write_admitted(&self, admission: StateWriteAdmission) -> TaskStateWriteGuard<'_> {
+        let StateWriteAdmission { lease, dispatcher } = admission;
+        let inner = self.inner.write();
+        let batch = self.event_publisher.begin_batch(dispatcher);
+        TaskStateWriteGuard {
+            inner: Some(inner),
+            publisher: &self.event_publisher,
+            batch,
+            lease,
         }
+    }
+
+    fn write(&self, event_capacity: StateMutationEventCapacity) -> TaskStateWriteGuard<'_> {
+        // Synchronous writes are limited to test helpers and Taskvisor's
+        // dedicated subscriber callback threads. Tokio-owned paths reserve
+        // asynchronously before entering their state or lifecycle gates.
+        let admission = self
+            .admit_state_write_blocking(event_capacity)
+            .expect("state persistence remains open while internal writes are accepted");
+        self.write_admitted(admission)
     }
 
     #[cfg(test)]
     fn set_max_runs_per_task(&self, max: usize) {
-        self.inner.write().max_runs_per_task = max;
+        self.write(StateMutationEventCapacity::None)
+            .max_runs_per_task = max;
     }
 
     fn format_resource_version(epoch: &str, revision: u64) -> String {
@@ -439,15 +1395,62 @@ impl TaskState {
     }
 
     fn current_resource_version(inner: &TaskStateInner) -> String {
-        Self::format_resource_version(&inner.resource_version_epoch, inner.resource_version)
+        Self::format_resource_version(
+            inner.resource_version_epoch.as_ref(),
+            inner.resource_version,
+        )
     }
 
-    fn next_resource_version(inner: &mut TaskStateInner) -> (u64, String) {
-        inner.resource_version = inner.resource_version.saturating_add(1);
-        (
-            inner.resource_version,
-            Self::current_resource_version(inner),
+    fn current_run_resource_version(inner: &TaskStateInner) -> String {
+        Self::format_resource_version(
+            &inner.run_resource_version_epoch,
+            inner.run_resource_version,
         )
+    }
+
+    fn plan_resource_version(inner: &TaskStateInner) -> PlannedResourceVersion {
+        let (epoch, revision, rolls_epoch) = match inner.resource_version.checked_add(1) {
+            Some(revision) => (Arc::clone(&inner.resource_version_epoch), revision, false),
+            None => (
+                Arc::from(Self::next_resource_version_epoch(
+                    inner.resource_version_epoch.as_ref(),
+                )),
+                1,
+                true,
+            ),
+        };
+        let value = Self::format_resource_version(epoch.as_ref(), revision);
+        PlannedResourceVersion {
+            epoch,
+            revision,
+            value,
+            rolls_epoch,
+        }
+    }
+
+    fn commit_resource_version(
+        inner: &mut TaskStateWriteGuard<'_>,
+        planned: PlannedResourceVersion,
+    ) -> (u64, String) {
+        if planned.rolls_epoch {
+            inner.resource_version_epoch = planned.epoch;
+            inner.watch_history.clear();
+            inner.watch_history_bytes = 0;
+            inner.compacted_through = 0;
+        }
+        inner.resource_version = planned.revision;
+        inner.watch_tx.send_replace(inner.resource_version);
+        (planned.revision, planned.value)
+    }
+
+    fn next_resource_version(inner: &mut TaskStateWriteGuard<'_>) -> (u64, String) {
+        let planned = Self::plan_resource_version(inner);
+        Self::commit_resource_version(inner, planned)
+    }
+
+    /// Advances an opaque store epoch without depending on entropy.
+    fn next_resource_version_epoch(epoch: &str) -> String {
+        format!("next-{epoch}")
     }
 
     fn serialized_task_payload_bytes(previous: Option<&Task>, current: Option<&Task>) -> usize {
@@ -459,27 +1462,323 @@ impl TaskState {
         counter.0
     }
 
+    fn serialized_json_string_bytes(value: &str) -> usize {
+        let mut counter = SerializedSizeCounter::default();
+        serde_json::to_writer(&mut counter, value)
+            .expect("validated resource versions must serialize as JSON strings");
+        counter.0
+    }
+
+    fn serialized_task_with_resource_version_bytes(task: &Task, resource_version: &str) -> usize {
+        let task_bytes = Self::serialized_task_payload_bytes(None, Some(task));
+        let previous_version_bytes =
+            Self::serialized_json_string_bytes(task.metadata().resource_version());
+        let next_version_bytes = Self::serialized_json_string_bytes(resource_version);
+        task_bytes
+            .checked_sub(previous_version_bytes)
+            .and_then(|bytes| bytes.checked_add(next_version_bytes))
+            .expect("Task JSON must contain its serialized resource version exactly once")
+    }
+
+    /// Returns the compact JSON size of one TaskRun page item.
+    fn serialized_run_payload_bytes(run: &TaskRun) -> usize {
+        let mut counter = SerializedSizeCounter::default();
+        serde_json::to_writer(&mut counter, run).expect("TaskRun values must serialize as JSON");
+        counter.0
+    }
+
+    /// Returns the journal charge for one TaskRun mutation batch.
+    fn serialized_run_change_bytes(changes: &[RawRunChange]) -> usize {
+        let mut counter = SerializedSizeCounter::default();
+        for change in changes {
+            serde_json::to_writer(&mut counter, &change.task)
+                .expect("TaskId values must serialize as JSON");
+            serde_json::to_writer(&mut counter, &change.task_uid)
+                .expect("Uid values must serialize as JSON");
+            for run in [change.previous.as_ref(), change.current.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                serde_json::to_writer(&mut counter, run.as_ref())
+                    .expect("TaskRun values must serialize as JSON");
+            }
+        }
+        counter.0
+    }
+
+    /// Returns the compact JSON payload charge of one persisted RunChanged event.
+    fn serialized_run_persistence_bytes(task: &TaskId, task_uid: &Uid, run: &TaskRun) -> usize {
+        let mut counter = SerializedSizeCounter::default();
+        serde_json::to_writer(&mut counter, task).expect("TaskId values must serialize as JSON");
+        serde_json::to_writer(&mut counter, task_uid).expect("Uid values must serialize as JSON");
+        serde_json::to_writer(&mut counter, run).expect("TaskRun values must serialize as JSON");
+        counter.0
+    }
+
+    fn retained_run_identity(task: &TaskId, run: &TaskRun) -> RetainedRunIdentity {
+        RetainedRunIdentity {
+            task: task.clone(),
+            generation: run.generation(),
+            attempt: run.attempt(),
+        }
+    }
+
+    fn completed_retained_run(
+        identity: RetainedRunIdentity,
+        run: &TaskRun,
+    ) -> Option<CompletedRetainedRun> {
+        run.finished_at().map(|finished_at| CompletedRetainedRun {
+            finished_at,
+            identity,
+        })
+    }
+
+    fn apply_retained_run_accounting_change(inner: &mut TaskStateInner, change: &RawRunChange) {
+        if let Some(previous) = change.previous.as_ref() {
+            let identity = Self::retained_run_identity(&change.task, previous);
+            let expected = Self::serialized_run_payload_bytes(previous);
+            let removed = inner
+                .retained_task_run_bytes_by_identity
+                .remove(&identity)
+                .expect("every retained TaskRun must have byte accounting");
+            assert_eq!(
+                removed, expected,
+                "retained TaskRun byte accounting must match its current value"
+            );
+            inner.retained_task_run_bytes = inner
+                .retained_task_run_bytes
+                .checked_sub(removed)
+                .expect("retained TaskRun byte accounting must not underflow");
+            if let Some(completed) = Self::completed_retained_run(identity, previous) {
+                assert!(
+                    inner.completed_runs_by_age.remove(&completed),
+                    "every completed retained TaskRun must have an age index entry"
+                );
+            }
+        }
+
+        if let Some(current) = change.current.as_ref() {
+            let identity = Self::retained_run_identity(&change.task, current);
+            let bytes = Self::serialized_run_payload_bytes(current);
+            assert!(
+                inner
+                    .retained_task_run_bytes_by_identity
+                    .insert(identity.clone(), bytes)
+                    .is_none(),
+                "one current TaskRun identity must be retained at most once"
+            );
+            inner.retained_task_run_bytes = inner
+                .retained_task_run_bytes
+                .checked_add(bytes)
+                .expect("retained TaskRun byte accounting must not overflow");
+            if let Some(completed) = Self::completed_retained_run(identity, current) {
+                assert!(
+                    inner.completed_runs_by_age.insert(completed),
+                    "one completed TaskRun identity must be indexed at most once"
+                );
+            }
+        }
+    }
+
+    fn remove_retained_run(
+        inner: &mut TaskStateInner,
+        identity: &RetainedRunIdentity,
+    ) -> Option<RawRunChange> {
+        let task_uid = inner.tasks.get(&identity.task)?.uid().clone();
+        let (removed, empty) = {
+            let runs = inner.runs.get_mut(&identity.task)?;
+            let index = runs.iter().position(|run| {
+                run.generation() == identity.generation && run.attempt() == identity.attempt
+            })?;
+            let removed = runs
+                .remove(index)
+                .expect("the selected retained TaskRun index must exist");
+            (removed, runs.is_empty())
+        };
+        if empty {
+            inner.runs.remove(&identity.task);
+        }
+        Some(Self::run_snapshot_change(
+            &identity.task,
+            &task_uid,
+            Some(removed),
+            None,
+        ))
+    }
+
+    fn enforce_retained_run_byte_budget(
+        inner: &mut TaskStateInner,
+        changes: &mut Vec<RawRunChange>,
+    ) {
+        for change in changes.iter() {
+            Self::apply_retained_run_accounting_change(inner, change);
+        }
+
+        let Some(limit) = inner.max_retained_task_run_bytes.map(|limit| limit.get()) else {
+            return;
+        };
+        let mut completed_evictions = 0usize;
+        while inner.retained_task_run_bytes > limit {
+            let Some(oldest) = inner.completed_runs_by_age.iter().next().cloned() else {
+                break;
+            };
+            let change = Self::remove_retained_run(inner, &oldest.identity)
+                .expect("the completed-run age index must reference current retained state");
+            Self::apply_retained_run_accounting_change(inner, &change);
+            changes.push(change);
+            completed_evictions += 1;
+        }
+
+        let active_candidates = changes
+            .iter()
+            .rev()
+            .filter_map(|change| {
+                change.current.as_ref().and_then(|run| {
+                    run.is_active()
+                        .then(|| Self::retained_run_identity(&change.task, run))
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut active_omissions = 0usize;
+        for identity in active_candidates {
+            if inner.retained_task_run_bytes <= limit {
+                break;
+            }
+            if !inner
+                .retained_task_run_bytes_by_identity
+                .contains_key(&identity)
+            {
+                continue;
+            }
+            let change = Self::remove_retained_run(inner, &identity)
+                .expect("a retained active-run identity must resolve to current state");
+            Self::apply_retained_run_accounting_change(inner, &change);
+            changes.push(change);
+            active_omissions += 1;
+        }
+        assert!(
+            inner.retained_task_run_bytes <= limit,
+            "retained TaskRun bytes must not exceed the configured limit"
+        );
+        if completed_evictions > 0 || active_omissions > 0 {
+            tracing::warn!(
+                event = "state.run_byte_budget_compacted",
+                completed_evictions,
+                active_omissions,
+                retained_bytes = inner.retained_task_run_bytes,
+                limit,
+                "TaskRun retention compacted to its aggregate byte budget"
+            );
+        }
+    }
+
+    /// Applies current-store accounting before committing one reversible revision.
+    fn record_run_snapshot_changes(inner: &mut TaskStateInner, mut changes: Vec<RawRunChange>) {
+        changes.retain(|change| change.previous != change.current);
+        if changes.is_empty() {
+            return;
+        }
+
+        Self::enforce_retained_run_byte_budget(inner, &mut changes);
+        Self::record_run_journal_changes(inner, changes);
+    }
+
+    /// Commits one reversible TaskRun revision and enforces journal limits.
+    fn record_run_journal_changes(inner: &mut TaskStateInner, mut changes: Vec<RawRunChange>) {
+        changes.retain(|change| change.previous != change.current);
+        if changes.is_empty() {
+            return;
+        }
+
+        if inner.run_resource_version == u64::MAX {
+            inner.run_resource_version_epoch =
+                Self::next_resource_version_epoch(&inner.run_resource_version_epoch);
+            inner.run_resource_version = 0;
+            inner.run_history.clear();
+            inner.run_history_bytes = 0;
+            inner.run_compacted_through = 0;
+        }
+        inner.run_resource_version += 1;
+        let revision = inner.run_resource_version;
+        let serialized_bytes = Self::serialized_run_change_bytes(&changes);
+        let batch = RawRunChangeBatch {
+            revision,
+            changes,
+            serialized_bytes,
+        };
+
+        if serialized_bytes > inner.run_history_byte_budget {
+            inner.run_history.clear();
+            inner.run_history_bytes = 0;
+            inner.run_compacted_through = revision;
+            return;
+        }
+
+        while inner.run_history.len() >= inner.run_history_capacity
+            || inner.run_history_bytes > inner.run_history_byte_budget - serialized_bytes
+        {
+            let compacted = inner
+                .run_history
+                .pop_front()
+                .expect("a non-empty TaskRun journal must satisfy its configured limits");
+            inner.run_history_bytes = inner
+                .run_history_bytes
+                .checked_sub(compacted.serialized_bytes)
+                .expect("TaskRun journal byte accounting must not underflow");
+            inner.run_compacted_through = compacted.revision;
+        }
+        inner.run_history_bytes = inner
+            .run_history_bytes
+            .checked_add(serialized_bytes)
+            .expect("TaskRun journal byte accounting must not overflow");
+        inner.run_history.push_back(batch);
+    }
+
+    /// Creates one reversible TaskRun change for a task identity.
+    fn run_snapshot_change(
+        task: &TaskId,
+        task_uid: &Uid,
+        previous: Option<Arc<TaskRun>>,
+        current: Option<Arc<TaskRun>>,
+    ) -> RawRunChange {
+        RawRunChange {
+            task: task.clone(),
+            task_uid: task_uid.clone(),
+            previous,
+            current,
+        }
+    }
+
+    /// Returns the canonical compact JSON bytes of one caller-owned manifest.
+    fn serialized_task_manifest_bytes(manifest: &TaskManifest) -> usize {
+        let mut counter = SerializedSizeCounter::default();
+        serde_json::to_writer(&mut counter, manifest)
+            .expect("validated TaskManifest resources must serialize as JSON");
+        counter.0
+    }
+
     fn record_change(
         &self,
-        inner: &mut TaskStateInner,
+        inner: &mut TaskStateWriteGuard<'_>,
         revision: u64,
-        previous: Option<Task>,
-        current: Option<Task>,
+        previous: Option<Arc<Task>>,
+        current: Option<Arc<Task>>,
     ) {
         if previous == current {
             return;
         }
         let persistence_event = TaskStateEvent::TaskChanged {
             resource_version: Self::format_resource_version(
-                &inner.resource_version_epoch,
+                inner.resource_version_epoch.as_ref(),
                 revision,
             ),
-            previous: previous.clone().map(Arc::new),
-            current: current.clone().map(Arc::new),
+            previous: previous.clone(),
+            current: current.clone(),
         };
         let serialized_bytes =
-            Self::serialized_task_payload_bytes(previous.as_ref(), current.as_ref());
+            Self::serialized_task_payload_bytes(previous.as_deref(), current.as_deref());
         let change = Arc::new(RawTaskChange {
+            epoch: Arc::clone(&inner.resource_version_epoch),
             revision,
             previous,
             current,
@@ -510,80 +1809,191 @@ impl TaskState {
                 .expect("watch history byte accounting must not overflow");
             inner.watch_history.push_back(Arc::clone(&change));
         }
-
-        let _ = inner.watch_tx.send(change);
-        publish_state_event(self.event_sink.as_ref(), persistence_event);
+        inner.enqueue(persistence_event, serialized_bytes);
     }
 
-    fn record_run_change(&self, task: &TaskId, task_uid: &Uid, run: &TaskRun) {
-        publish_state_event(
-            self.event_sink.as_ref(),
+    fn record_run_change(
+        &self,
+        inner: &TaskStateWriteGuard<'_>,
+        task: &TaskId,
+        task_uid: &Uid,
+        run: &TaskRun,
+    ) {
+        let serialized_bytes = Self::serialized_run_persistence_bytes(task, task_uid, run);
+        inner.enqueue(
             TaskStateEvent::RunChanged {
                 task: task.clone(),
                 task_uid: task_uid.clone(),
                 run: run.clone(),
             },
+            serialized_bytes,
         );
     }
 
     fn index_task(inner: &mut TaskStateInner, task: &Task) {
+        inner.ordered_tasks.insert(task.name().clone());
         let ids = inner.by_slot.entry(task.slot().clone()).or_default();
-        if !ids.contains(task.name()) {
-            ids.push(task.name().clone());
-        }
+        ids.insert(task.name().clone());
     }
 
     fn unindex_task(inner: &mut TaskStateInner, task: &Task) {
+        inner.ordered_tasks.remove(task.name());
         if let Some(ids) = inner.by_slot.get_mut(task.slot()) {
-            ids.retain(|name| name != task.name());
+            ids.remove(task.name());
             if ids.is_empty() {
                 inner.by_slot.remove(task.slot());
             }
         }
     }
 
+    /// Replaces one task's manifest-byte contribution.
+    fn set_retained_task_manifest_bytes(
+        inner: &mut TaskStateInner,
+        name: &TaskId,
+        manifest_bytes: usize,
+    ) {
+        let previous = inner
+            .retained_task_manifest_bytes_by_name
+            .insert(name.clone(), manifest_bytes)
+            .unwrap_or(0);
+        inner.retained_task_manifest_bytes = inner
+            .retained_task_manifest_bytes
+            .checked_sub(previous)
+            .and_then(|current| current.checked_add(manifest_bytes))
+            .expect("retained TaskManifest byte accounting must remain exact");
+    }
+
+    /// Removes one task's manifest-byte contribution.
+    fn remove_retained_task_manifest_bytes(inner: &mut TaskStateInner, name: &TaskId) {
+        let removed = inner
+            .retained_task_manifest_bytes_by_name
+            .remove(name)
+            .expect("every retained task must have manifest byte accounting");
+        inner.retained_task_manifest_bytes = inner
+            .retained_task_manifest_bytes
+            .checked_sub(removed)
+            .expect("retained TaskManifest byte accounting must not underflow");
+    }
+
+    /// Verifies that one new task fits in the configured state limit.
+    fn ensure_retained_task_capacity(inner: &TaskStateInner) -> Result<(), CoreError> {
+        if let Some(limit) = inner.max_retained_tasks
+            && inner.tasks.len() >= limit.get()
+        {
+            return Err(CoreError::RetainedTaskLimitReached { limit: limit.get() });
+        }
+        Ok(())
+    }
+
+    /// Verifies that one positive manifest-byte addition fits the state budget.
+    fn ensure_retained_task_manifest_byte_capacity(
+        inner: &TaskStateInner,
+        requested: usize,
+    ) -> Result<(), CoreError> {
+        debug_assert!(requested > 0);
+        if let Some(limit) = inner.max_retained_task_manifest_bytes
+            && requested
+                > limit
+                    .get()
+                    .saturating_sub(inner.retained_task_manifest_bytes)
+        {
+            return Err(CoreError::RetainedTaskManifestByteLimitExceeded {
+                current: inner.retained_task_manifest_bytes,
+                requested,
+                limit: limit.get(),
+            });
+        }
+        Ok(())
+    }
+
     /// Inserts a manifest for tests.
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn add_task(&self, manifest: TaskManifest) {
-        let mut inner = self.inner.write();
+        let manifest_bytes = Self::serialized_task_manifest_bytes(&manifest);
         let name = manifest.name().clone();
+        let mut task = Task::from_manifest(manifest).expect("test manifest must be valid");
+        let mut inner = self.write(StateMutationEventCapacity::TaskChange);
         let previous = inner.tasks.remove(&name);
         if let Some(previous) = previous.as_ref() {
             Self::unindex_task(&mut inner, previous);
+            if let Some(runs) = inner.runs.remove(&name) {
+                let changes = runs
+                    .into_iter()
+                    .map(|run| Self::run_snapshot_change(&name, previous.uid(), Some(run), None))
+                    .collect();
+                Self::record_run_snapshot_changes(&mut inner, changes);
+            }
         }
-        let mut task = Task::from_manifest(manifest).expect("test manifest must be valid");
         let (revision, resource_version) = Self::next_resource_version(&mut inner);
         task.set_resource_version(resource_version)
             .expect("store resource version must be valid");
         Self::index_task(&mut inner, &task);
-        inner.tasks.insert(name, task.clone());
+        let task = Arc::new(task);
+        inner.tasks.insert(name, Arc::clone(&task));
+        Self::set_retained_task_manifest_bytes(&mut inner, task.name(), manifest_bytes);
         self.record_change(&mut inner, revision, previous, Some(task));
     }
 
     /// Creates one desired resource.
     ///
     /// Every retained name conflicts.
+    /// A new name is rejected when the retained task limit is full.
+    /// The task-count limit is checked before the manifest byte budget.
+    /// No task is evicted or changed by a rejection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::AlreadyExists`] when the name is retained.
+    /// Returns [`CoreError::RetainedTaskLimitReached`] when no task slot remains.
+    /// Returns [`CoreError::RetainedTaskManifestByteLimitExceeded`] when the
+    /// caller-owned manifest would exceed the aggregate byte budget.
+    #[cfg(test)]
     pub(crate) fn create_desired(
         &self,
         manifest: &TaskManifest,
     ) -> Result<DesiredCommit, CoreError> {
-        let mut inner = self.inner.write();
-        let name = manifest.name().clone();
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+            .expect("test state persistence remains open");
+        self.create_desired_admitted(manifest, admission)
+    }
+
+    pub(crate) fn create_desired_admitted(
+        &self,
+        manifest: &TaskManifest,
+        admission: StateWriteAdmission,
+    ) -> Result<DesiredCommit, CoreError> {
+        let manifest_bytes = Self::serialized_task_manifest_bytes(manifest);
+        let task = Task::from_manifest(manifest.clone())?;
+        let mut inner = self.write_admitted(admission);
+        self.create_desired_locked(&mut inner, task, manifest_bytes)
+    }
+
+    fn create_desired_locked(
+        &self,
+        inner: &mut TaskStateWriteGuard<'_>,
+        mut task: Task,
+        manifest_bytes: usize,
+    ) -> Result<DesiredCommit, CoreError> {
+        let name = task.name().clone();
         if inner.tasks.contains_key(&name) {
             return Err(CoreError::AlreadyExists(format!(
                 "Task resource '{name}' already exists"
             )));
         }
+        Self::ensure_retained_task_capacity(inner)?;
+        Self::ensure_retained_task_manifest_byte_capacity(inner, manifest_bytes)?;
 
-        let mut task = Task::from_manifest(manifest.clone())?;
-        let (revision, resource_version) = Self::next_resource_version(&mut inner);
+        let (revision, resource_version) = Self::next_resource_version(inner);
         task.set_resource_version(resource_version)?;
-        Self::index_task(&mut inner, &task);
+        Self::index_task(inner, &task);
         inner.terminal_since.remove(&name);
-        inner.tasks.insert(name, task.clone());
-        self.record_change(&mut inner, revision, None, Some(task.clone()));
+        let task = Arc::new(task);
+        inner.tasks.insert(name, Arc::clone(&task));
+        Self::set_retained_task_manifest_bytes(inner, task.name(), manifest_bytes);
+        self.record_change(inner, revision, None, Some(Arc::clone(&task)));
         Ok(DesiredCommit {
-            task,
+            task: task.as_ref().clone(),
             reconcile: true,
         })
     }
@@ -600,60 +2010,95 @@ impl TaskState {
     }
 
     /// Applies a manifest after checking write preconditions.
+    ///
+    /// Existing state can change when the retained task limit is full.
+    /// Positive manifest growth is rejected when it exceeds the aggregate byte
+    /// budget. Shrinks and equal-size writes remain allowed.
+    /// An unchecked missing name uses create admission.
+    /// A checked missing name remains not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotFound`] for checked missing state.
+    /// Returns [`CoreError::RetainedTaskLimitReached`] when an unchecked missing
+    /// name cannot be retained.
+    /// Returns [`CoreError::RetainedTaskManifestByteLimitExceeded`] when a new
+    /// manifest or positive existing-manifest growth exceeds the byte budget.
+    #[cfg(test)]
     pub(crate) fn apply_desired_with_preconditions(
         &self,
         manifest: &TaskManifest,
         preconditions: &WritePreconditions,
     ) -> Result<DesiredCommit, CoreError> {
-        manifest.name().validate_format()?;
-        manifest.spec().validate()?;
-        let mut inner = self.inner.write();
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+            .expect("test state persistence remains open");
+        self.apply_desired_with_preconditions_admitted(manifest, preconditions, admission)
+    }
+
+    pub(crate) fn apply_desired_with_preconditions_admitted(
+        &self,
+        manifest: &TaskManifest,
+        preconditions: &WritePreconditions,
+        admission: StateWriteAdmission,
+    ) -> Result<DesiredCommit, CoreError> {
+        let desired_manifest_bytes = Self::serialized_task_manifest_bytes(manifest);
+        let desired_labels = manifest.metadata().labels().clone();
+        let desired_annotations = manifest.metadata().annotations().clone();
+        let desired_spec = manifest.spec().clone();
         let name = manifest.name().clone();
+        let mut inner = self.write_admitted(admission);
         let Some(current) = inner.tasks.get(&name) else {
             if !preconditions.is_empty() {
                 return Err(CoreError::NotFound(name.to_string()));
             }
-            drop(inner);
-            return self.create_desired(manifest);
+            let task = Task::from_manifest(manifest.clone())?;
+            return self.create_desired_locked(&mut inner, task, desired_manifest_bytes);
         };
         Self::check_write_preconditions(current, preconditions)?;
+        let current_manifest_bytes = *inner
+            .retained_task_manifest_bytes_by_name
+            .get(&name)
+            .expect("every retained task must have manifest byte accounting");
 
-        let metadata_changed = current.metadata().labels() != manifest.metadata().labels()
-            || current.metadata().annotations() != manifest.metadata().annotations();
-        let spec_changed = current.spec() != manifest.spec();
+        let metadata_changed = current.metadata().labels() != &desired_labels
+            || current.metadata().annotations() != &desired_annotations;
+        let spec_changed = current.spec() != &desired_spec;
         let retry = !metadata_changed && !spec_changed && current.status().reconciliation_failed();
         if !metadata_changed && !spec_changed && !retry {
             return Ok(DesiredCommit {
-                task: current.clone(),
+                task: current.as_ref().clone(),
                 reconcile: false,
             });
         }
+        if desired_manifest_bytes > current_manifest_bytes {
+            Self::ensure_retained_task_manifest_byte_capacity(
+                &inner,
+                desired_manifest_bytes - current_manifest_bytes,
+            )?;
+        }
 
-        let previous = current.clone();
+        let previous = Arc::clone(current);
         let previous_slot = previous.slot().clone();
-        let (revision, resource_version) = Self::next_resource_version(&mut inner);
-        let task = inner
-            .tasks
-            .get_mut(&name)
-            .expect("resource was checked under the same write lock");
+        let planned_resource_version = Self::plan_resource_version(&inner);
+        let resource_version = planned_resource_version.value.clone();
+        let mut task = previous.as_ref().clone();
         let change = task.apply_desired(
-            manifest.metadata().labels().clone(),
-            manifest.metadata().annotations().clone(),
-            manifest.spec().clone(),
+            desired_labels,
+            desired_annotations,
+            desired_spec,
             resource_version.clone(),
         )?;
         if retry {
-            task.mark_reconciliation_pending(resource_version)?;
+            task.mark_reconciliation_pending(resource_version.clone())?;
         }
+        let (revision, _) = Self::commit_resource_version(&mut inner, planned_resource_version);
+        let task = Arc::new(task);
+        inner.tasks.insert(name.clone(), Arc::clone(&task));
 
-        let task = inner
-            .tasks
-            .get(&name)
-            .expect("applied resource must remain stored")
-            .clone();
         if task.slot() != &previous_slot {
             if let Some(ids) = inner.by_slot.get_mut(&previous_slot) {
-                ids.retain(|task_name| task_name != &name);
+                ids.remove(&name);
                 if ids.is_empty() {
                     inner.by_slot.remove(&previous_slot);
                 }
@@ -663,9 +2108,15 @@ impl TaskState {
         if change == DesiredChange::Spec || retry {
             inner.terminal_since.remove(&name);
         }
-        self.record_change(&mut inner, revision, Some(previous), Some(task.clone()));
+        Self::set_retained_task_manifest_bytes(&mut inner, &name, desired_manifest_bytes);
+        self.record_change(
+            &mut inner,
+            revision,
+            Some(previous),
+            Some(Arc::clone(&task)),
+        );
         Ok(DesiredCommit {
-            task,
+            task: task.as_ref().clone(),
             reconcile: change == DesiredChange::Spec || retry,
         })
     }
@@ -703,7 +2154,7 @@ impl TaskState {
 
     /// Binds a Taskvisor submission to one resource generation.
     pub(crate) fn bind_tv(&self, resource: ResourceGeneration, tv: taskvisor::TaskId) -> bool {
-        let mut inner = self.inner.write();
+        let mut inner = self.write(StateMutationEventCapacity::None);
         let current = inner.tasks.get(&resource.name).is_some_and(|task| {
             task.uid() == &resource.uid && task.metadata().generation() == resource.generation
         });
@@ -713,6 +2164,7 @@ impl TaskState {
         if let Some(old) = inner.tv_of.remove(&resource.name) {
             inner.by_tv.remove(&old.tv.get());
             inner.finished_attempt_by_tv.remove(&old.tv.get());
+            inner.active_run_by_tv.remove(&old.tv.get());
         }
         let binding = RuntimeBinding { resource, tv };
         inner
@@ -747,36 +2199,54 @@ impl TaskState {
         if let Some(binding) = inner.tv_of.remove(name) {
             inner.by_tv.remove(&binding.tv.get());
             inner.finished_attempt_by_tv.remove(&binding.tv.get());
+            inner.active_run_by_tv.remove(&binding.tv.get());
         }
     }
 
-    pub(crate) fn unbind_tv(&self, tv_raw: u64) -> Option<RuntimeBinding> {
-        let mut inner = self.inner.write();
-        let binding = inner.by_tv.get(&tv_raw)?.clone();
-        if inner
-            .tv_of
-            .get(&binding.resource.name)
-            .is_some_and(|current| current == &binding)
+    /// Removes one binding only when both runtime indexes still identify it.
+    pub(crate) fn unbind_exact(&self, binding: &RuntimeBinding) -> bool {
+        let mut inner = self.write(StateMutationEventCapacity::None);
+        if inner.by_tv.get(&binding.tv.get()) != Some(binding)
+            || inner.tv_of.get(&binding.resource.name) != Some(binding)
         {
-            inner.tv_of.remove(&binding.resource.name);
+            return false;
         }
-        inner.by_tv.remove(&tv_raw);
-        inner.finished_attempt_by_tv.remove(&tv_raw);
-        Some(binding)
+        inner.by_tv.remove(&binding.tv.get());
+        inner.tv_of.remove(&binding.resource.name);
+        inner.finished_attempt_by_tv.remove(&binding.tv.get());
+        inner.active_run_by_tv.remove(&binding.tv.get());
+        true
     }
 
     /// Deletes a task and its run history.
     ///
     /// Returns `true` when the task existed.
     /// Reconciliation failures do not use this path.
+    #[cfg(test)]
     pub(crate) fn delete_task(&self, id: &TaskId) -> bool {
-        let mut inner = self.inner.write();
-        inner.runs.remove(id);
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+            .expect("test state persistence remains open");
+        self.delete_task_admitted(id, admission)
+    }
+
+    pub(crate) fn delete_task_admitted(&self, id: &TaskId, admission: StateWriteAdmission) -> bool {
+        let mut inner = self.write_admitted(admission);
+        let task_uid = inner.tasks.get(id).map(|task| task.uid().clone());
+        let removed_runs = inner.runs.remove(id);
+        if let (Some(task_uid), Some(removed_runs)) = (task_uid.as_ref(), removed_runs) {
+            let changes = removed_runs
+                .into_iter()
+                .map(|run| Self::run_snapshot_change(id, task_uid, Some(run), None))
+                .collect();
+            Self::record_run_snapshot_changes(&mut inner, changes);
+        }
         inner.terminal_since.remove(id);
 
         Self::unbind_locked(&mut inner, id);
         if let Some(task) = inner.tasks.remove(id) {
             Self::unindex_task(&mut inner, &task);
+            Self::remove_retained_task_manifest_bytes(&mut inner, id);
             let (revision, _) = Self::next_resource_version(&mut inner);
             self.record_change(&mut inner, revision, Some(task), None);
             true
@@ -789,25 +2259,46 @@ impl TaskState {
         task.name() == &resource.name && task.uid() == &resource.uid
     }
 
-    fn enforce_run_cap(runs: &mut VecDeque<TaskRun>, max: usize) {
-        while runs.len() > max {
+    /// Removes the oldest completed runs above the configured completed-run cap.
+    fn enforce_run_cap(runs: &mut VecDeque<Arc<TaskRun>>, max: usize) -> Vec<Arc<TaskRun>> {
+        let mut removed = Vec::new();
+        let mut completed = runs.iter().filter(|run| !run.is_active()).count();
+        while completed > max {
             let Some(oldest_finished) = runs.iter().position(|run| !run.is_active()) else {
                 break;
             };
-            runs.remove(oldest_finished);
+            removed.push(
+                runs.remove(oldest_finished)
+                    .expect("the selected TaskRun index must exist"),
+            );
+            completed -= 1;
         }
+        removed
     }
 
     /// Records an authoritative attempt start.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn transition_attempt_starting(
         &self,
         binding: &RuntimeBinding,
         attempt: u32,
     ) -> bool {
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::AttemptTransition)
+            .expect("test state persistence remains open");
+        self.transition_attempt_starting_admitted(binding, attempt, admission)
+    }
+
+    pub(crate) fn transition_attempt_starting_admitted(
+        &self,
+        binding: &RuntimeBinding,
+        attempt: u32,
+        admission: StateWriteAdmission,
+    ) -> bool {
         if attempt == 0 {
             return false;
         }
-        let mut inner = self.inner.write();
+        let mut inner = self.write_admitted(admission);
         let name = &binding.resource.name;
         let Some(task) = inner.tasks.get(name) else {
             return false;
@@ -821,6 +2312,11 @@ impl TaskState {
             .get(&tv_raw)
             .is_some_and(|finished| attempt <= *finished)
         {
+            return false;
+        }
+        if inner.active_run_by_tv.get(&tv_raw).is_some_and(|run| {
+            run.generation() == binding.resource.generation && run.attempt() >= attempt
+        }) {
             return false;
         }
         if inner.runs.get(name).is_some_and(|runs| {
@@ -847,53 +2343,141 @@ impl TaskState {
                 .tasks
                 .get_mut(name)
                 .expect("resource was checked under the same write lock");
+            let task = Arc::make_mut(task);
             match task.transition_starting(binding.resource.generation, attempt, resource_version) {
-                Ok(true) => task_change = Some((revision, previous, task.clone())),
+                Ok(true) => {
+                    let current = inner
+                        .tasks
+                        .get(name)
+                        .expect("resource was checked under the same write lock")
+                        .clone();
+                    task_change = Some((revision, previous, current));
+                }
                 Ok(false) => {}
                 Err(error) => {
-                    tracing::warn!(task = %name, %error, "ignoring illegal attempt start");
+                    tracing::warn!(
+                        event = "task.state_transition_rejected",
+                        task_name = %name,
+                        task_uid = %binding.resource.uid,
+                        generation = binding.resource.generation,
+                        taskvisor_id = tv_raw,
+                        attempt,
+                        operation = "attempt_start",
+                        %error,
+                        "illegal state transition ignored"
+                    );
                     return false;
                 }
             }
             inner.terminal_since.remove(name);
-        };
+        }
+
+        let previous_lifecycle = inner.active_run_by_tv.remove(&tv_raw);
+        let run = Arc::new(
+            TaskRun::starting(
+                binding.resource.generation,
+                attempt,
+                binding.resource.workload.clone(),
+            )
+            .expect("validated resource generation and attempt create a run"),
+        );
+        inner.active_run_by_tv.insert(tv_raw, Arc::clone(&run));
 
         let max_runs = inner.max_runs_per_task;
         let runs = inner.runs.entry(name.clone()).or_default();
         let mut run_changes = Vec::new();
+        let mut run_snapshot_changes = Vec::new();
         for run in runs.iter_mut().filter(|run| {
             run.is_active()
                 && run.generation() == binding.resource.generation
                 && run.attempt() < attempt
         }) {
-            run.finish(
-                TaskPhase::Failed,
-                Some("run outcome not observed (a later attempt started first)".to_string()),
-                None,
-            )
-            .expect("an active run accepts a terminal phase");
-            run_changes.push(run.clone());
+            let previous = Arc::clone(run);
+            Arc::make_mut(run)
+                .finish(
+                    TaskPhase::Failed,
+                    Some("run outcome not observed (a later attempt started first)".to_string()),
+                    None,
+                )
+                .expect("an active run accepts a terminal phase");
+            run_changes.push(Arc::clone(run));
+            run_snapshot_changes.push(Self::run_snapshot_change(
+                name,
+                &binding.resource.uid,
+                Some(previous),
+                Some(Arc::clone(run)),
+            ));
         }
-        let run = TaskRun::starting(
-            binding.resource.generation,
-            attempt,
-            binding.resource.workload.clone(),
-        )
-        .expect("validated resource generation and attempt create a run");
-        run_changes.push(run.clone());
+        assert!(
+            run_changes.len() <= 1,
+            "TaskState must retain at most one active run for one generation"
+        );
+        if let Some(previous_lifecycle) = previous_lifecycle.filter(|previous| {
+            previous.generation() == binding.resource.generation
+                && previous.attempt() < attempt
+                && !run_changes
+                    .iter()
+                    .any(|changed| changed.attempt() == previous.attempt())
+        }) {
+            let mut terminal = previous_lifecycle.as_ref().clone();
+            terminal
+                .finish(
+                    TaskPhase::Failed,
+                    Some("run outcome not observed (a later attempt started first)".to_string()),
+                    None,
+                )
+                .expect("an active lifecycle run accepts a terminal phase");
+            let terminal = Arc::new(terminal);
+            run_changes.push(Arc::clone(&terminal));
+            run_snapshot_changes.push(Self::run_snapshot_change(
+                name,
+                &binding.resource.uid,
+                None,
+                Some(Arc::clone(&terminal)),
+            ));
+            runs.push_back(terminal);
+        }
+        run_changes.push(Arc::clone(&run));
+        run_snapshot_changes.push(Self::run_snapshot_change(
+            name,
+            &binding.resource.uid,
+            None,
+            Some(Arc::clone(&run)),
+        ));
         runs.push_back(run);
 
-        Self::enforce_run_cap(runs, max_runs);
+        for removed in Self::enforce_run_cap(runs, max_runs) {
+            run_snapshot_changes.push(Self::run_snapshot_change(
+                name,
+                &binding.resource.uid,
+                Some(removed),
+                None,
+            ));
+        }
+        Self::record_run_snapshot_changes(&mut inner, run_snapshot_changes);
+        if let Some(finished) = run_changes
+            .iter()
+            .filter(|run| !run.is_active())
+            .map(|run| run.attempt())
+            .max()
+        {
+            inner
+                .finished_attempt_by_tv
+                .entry(tv_raw)
+                .and_modify(|current| *current = (*current).max(finished))
+                .or_insert(finished);
+        }
         if let Some((revision, previous, current)) = task_change {
             self.record_change(&mut inner, revision, Some(previous), Some(current));
         }
         for run in &run_changes {
-            self.record_run_change(name, &binding.resource.uid, run);
+            self.record_run_change(&inner, name, &binding.resource.uid, run.as_ref());
         }
         true
     }
 
     /// Closes the attempt described by a Taskvisor event.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn transition_attempt_finished(
         &self,
         binding: &RuntimeBinding,
@@ -902,10 +2486,27 @@ impl TaskState {
         error: Option<String>,
         exit_code: Option<i32>,
     ) -> bool {
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::AttemptTransition)
+            .expect("test state persistence remains open");
+        self.transition_attempt_finished_admitted(
+            binding, attempt, phase, error, exit_code, admission,
+        )
+    }
+
+    pub(crate) fn transition_attempt_finished_admitted(
+        &self,
+        binding: &RuntimeBinding,
+        attempt: u32,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+        admission: StateWriteAdmission,
+    ) -> bool {
         if attempt == 0 || !phase.is_terminal() {
             return false;
         }
-        let mut inner = self.inner.write();
+        let mut inner = self.write_admitted(admission);
         let name = &binding.resource.name;
         let Some(task) = inner.tasks.get(name) else {
             return false;
@@ -923,17 +2524,25 @@ impl TaskState {
         }
         let updates_current_status = task.metadata().generation() == binding.resource.generation
             && attempt >= task.status().attempt();
+        let consumes_active_lifecycle = inner.active_run_by_tv.get(&tv_raw).is_some_and(|run| {
+            run.generation() == binding.resource.generation && run.attempt() <= attempt
+        });
+        let active_lifecycle = consumes_active_lifecycle
+            .then(|| inner.active_run_by_tv.remove(&tv_raw))
+            .flatten();
 
         let max_runs = inner.max_runs_per_task;
-        let (run_error, run_exit_code, run_changed, run_changes) = {
+        let (run_error, run_exit_code, run_changed, run_changes, run_snapshot_changes) = {
             let runs = inner.runs.entry(name.clone()).or_default();
             let mut run_changes = Vec::new();
+            let mut run_snapshot_changes = Vec::new();
             for previous in runs.iter_mut().filter(|run| {
                 run.is_active()
                     && run.generation() == binding.resource.generation
                     && run.attempt() < attempt
             }) {
-                previous
+                let active = Arc::clone(previous);
+                Arc::make_mut(previous)
                     .finish(
                         TaskPhase::Failed,
                         Some(
@@ -942,38 +2551,106 @@ impl TaskState {
                         None,
                     )
                     .expect("an active run accepts a terminal phase");
-                run_changes.push(previous.clone());
+                run_changes.push(Arc::clone(previous));
+                run_snapshot_changes.push(Self::run_snapshot_change(
+                    name,
+                    &binding.resource.uid,
+                    Some(active),
+                    Some(Arc::clone(previous)),
+                ));
             }
-            let run = if let Some(index) = runs.iter().position(|run| {
-                run.generation() == binding.resource.generation && run.attempt() == attempt
+            assert!(
+                run_changes.len() <= 1,
+                "TaskState must retain at most one active run for one generation"
+            );
+            if let Some(active) = active_lifecycle.as_ref().filter(|active| {
+                active.generation() == binding.resource.generation
+                    && active.attempt() < attempt
+                    && !run_changes
+                        .iter()
+                        .any(|changed| changed.attempt() == active.attempt())
             }) {
+                let mut terminal = active.as_ref().clone();
+                terminal
+                    .finish(
+                        TaskPhase::Failed,
+                        Some(
+                            "run outcome not observed (a later attempt finished first)".to_string(),
+                        ),
+                        None,
+                    )
+                    .expect("an active lifecycle run accepts a terminal phase");
+                let terminal = Arc::new(terminal);
+                run_changes.push(Arc::clone(&terminal));
+                run_snapshot_changes.push(Self::run_snapshot_change(
+                    name,
+                    &binding.resource.uid,
+                    None,
+                    Some(Arc::clone(&terminal)),
+                ));
+                runs.push_back(terminal);
+            }
+            let index = runs.iter().position(|run| {
+                run.generation() == binding.resource.generation && run.attempt() == attempt
+            });
+            let previous = index.map(|index| Arc::clone(&runs[index]));
+            let run = if let Some(index) = index {
                 &mut runs[index]
             } else {
-                runs.push_back(
-                    TaskRun::starting(
-                        binding.resource.generation,
-                        attempt,
-                        binding.resource.workload.clone(),
-                    )
-                    .expect("validated resource generation and attempt create a run"),
-                );
+                let starting = active_lifecycle
+                    .as_ref()
+                    .filter(|active| {
+                        active.generation() == binding.resource.generation
+                            && active.attempt() == attempt
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        // The start event was not retained. Record local projection
+                        // time rather than claiming to recover execution start time.
+                        Arc::new(
+                            TaskRun::starting(
+                                binding.resource.generation,
+                                attempt,
+                                binding.resource.workload.clone(),
+                            )
+                            .expect("validated resource generation and attempt create a run"),
+                        )
+                    });
+                runs.push_back(starting);
                 runs.back_mut().expect("the run was just appended")
             };
             let run_changed = run.is_active();
             if run_changed {
-                run.finish(phase, error, exit_code)
+                Arc::make_mut(run)
+                    .finish(phase, error, exit_code)
                     .expect("terminal phase closes an active run");
-                run_changes.push(run.clone());
+                run_changes.push(Arc::clone(run));
+                run_snapshot_changes.push(Self::run_snapshot_change(
+                    name,
+                    &binding.resource.uid,
+                    previous,
+                    Some(Arc::clone(run)),
+                ));
             }
-            let diagnostics = (
-                run.error().map(str::to_owned),
-                run.exit_code(),
+            let run_error = run.error().map(str::to_owned);
+            let run_exit_code = run.exit_code();
+            for removed in Self::enforce_run_cap(runs, max_runs) {
+                run_snapshot_changes.push(Self::run_snapshot_change(
+                    name,
+                    &binding.resource.uid,
+                    Some(removed),
+                    None,
+                ));
+            }
+            (
+                run_error,
+                run_exit_code,
                 run_changed,
                 run_changes,
-            );
-            Self::enforce_run_cap(runs, max_runs);
-            diagnostics
+                run_snapshot_changes,
+            )
         };
+        Self::record_run_snapshot_changes(&mut inner, run_snapshot_changes);
 
         let mut status_changed = false;
         let mut task_change = None;
@@ -988,6 +2665,7 @@ impl TaskState {
                 .tasks
                 .get_mut(name)
                 .expect("resource was checked under the same write lock");
+            let task = Arc::make_mut(task);
             status_changed = match task.transition_finished(
                 binding.resource.generation,
                 attempt,
@@ -998,12 +2676,27 @@ impl TaskState {
             ) {
                 Ok(changed) => changed,
                 Err(error) => {
-                    tracing::warn!(task = %name, %error, "ignoring illegal attempt finish");
+                    tracing::warn!(
+                        event = "task.state_transition_rejected",
+                        task_name = %name,
+                        task_uid = %binding.resource.uid,
+                        generation = binding.resource.generation,
+                        taskvisor_id = tv_raw,
+                        attempt,
+                        operation = "attempt_finish",
+                        %error,
+                        "illegal state transition ignored"
+                    );
                     return false;
                 }
             };
             if status_changed {
-                task_change = Some((revision, previous, task.clone()));
+                let current = inner
+                    .tasks
+                    .get(name)
+                    .expect("resource was checked under the same write lock")
+                    .clone();
+                task_change = Some((revision, previous, current));
             }
             if status_changed
                 && inner
@@ -1022,7 +2715,7 @@ impl TaskState {
             self.record_change(&mut inner, revision, Some(previous), Some(current));
         }
         for run in &run_changes {
-            self.record_run_change(name, &binding.resource.uid, run);
+            self.record_run_change(&inner, name, &binding.resource.uid, run.as_ref());
         }
         changed
     }
@@ -1030,6 +2723,7 @@ impl TaskState {
     /// Projects a task-level final event.
     ///
     /// No attempt number is invented.
+    #[cfg(test)]
     pub(crate) fn transition_task_finished(
         &self,
         binding: &RuntimeBinding,
@@ -1037,13 +2731,109 @@ impl TaskState {
         error: Option<String>,
         exit_code: Option<i32>,
     ) -> bool {
-        let mut inner = self.inner.write();
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+            .expect("test state persistence remains open");
+        self.transition_task_finished_admitted(binding, phase, error, exit_code, admission)
+    }
+
+    pub(crate) fn transition_task_finished_admitted(
+        &self,
+        binding: &RuntimeBinding,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+        admission: StateWriteAdmission,
+    ) -> bool {
+        let mut inner = self.write_admitted(admission);
         self.transition_task_finished_locked(&mut inner, binding, phase, error, exit_code, false)
     }
 
+    /// Makes the combined Taskvisor ownership and controller-intake wait
+    /// observable through the current generation's reconciliation condition.
+    ///
+    /// Returns `true` only when the exact pending condition already existed or
+    /// was committed by this call. A stale or non-pending resource returns
+    /// `false`, which prevents Taskvisor submission.
+    pub(crate) fn ensure_taskvisor_intake_pending_admitted(
+        &self,
+        resource: &ResourceGeneration,
+        admission: StateWriteAdmission,
+    ) -> bool {
+        let mut inner = self.write_admitted(admission);
+        let Some(task) = inner.tasks.get(&resource.name) else {
+            return false;
+        };
+        if !Self::resource_matches(task, resource)
+            || task.metadata().generation() != resource.generation
+        {
+            return false;
+        }
+        let reconciled = task.status().reconciled();
+        if task.status().phase() != TaskPhase::Pending
+            || reconciled.status() != ConditionStatus::Unknown
+            || reconciled.observed_generation() != resource.generation
+        {
+            return false;
+        }
+        if reconciled.reason() == TASKVISOR_INTAKE_PENDING_REASON
+            && reconciled.message() == TASKVISOR_INTAKE_PENDING_MESSAGE
+        {
+            return true;
+        }
+
+        let previous = task.clone();
+        let (revision, resource_version) = Self::next_resource_version(&mut inner);
+        let changed = inner
+            .tasks
+            .get_mut(&resource.name)
+            .map(Arc::make_mut)
+            .expect("resource was checked under the same write lock");
+        let changed = changed
+            .update_reconciliation_pending_diagnostic(
+                TASKVISOR_INTAKE_PENDING_REASON,
+                TASKVISOR_INTAKE_PENDING_MESSAGE,
+                resource_version,
+            )
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    event = "task.state_transition_rejected",
+                    task_name = %resource.name,
+                    task_uid = %resource.uid,
+                    generation = resource.generation,
+                    operation = "ensure_taskvisor_intake_pending",
+                    %error,
+                    "state transition rejected"
+                );
+                false
+            });
+
+        if changed {
+            let current = inner
+                .tasks
+                .get(&resource.name)
+                .expect("resource was checked under the same write lock")
+                .clone();
+            self.record_change(&mut inner, revision, Some(previous), Some(current));
+        }
+        changed
+    }
+
     /// Marks a generation as accepted by Taskvisor intake.
+    #[cfg(test)]
     pub(crate) fn mark_observed(&self, resource: &ResourceGeneration) -> bool {
-        let mut inner = self.inner.write();
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+            .expect("test state persistence remains open");
+        self.mark_observed_admitted(resource, admission)
+    }
+
+    pub(crate) fn mark_observed_admitted(
+        &self,
+        resource: &ResourceGeneration,
+        admission: StateWriteAdmission,
+    ) -> bool {
+        let mut inner = self.write_admitted(admission);
         let Some(task) = inner.tasks.get(&resource.name) else {
             return false;
         };
@@ -1057,10 +2847,19 @@ impl TaskState {
         let changed = inner
             .tasks
             .get_mut(&resource.name)
+            .map(Arc::make_mut)
             .expect("resource was checked under the same write lock")
             .mark_observed(resource_version)
             .unwrap_or_else(|error| {
-                tracing::warn!(task = %resource.name, %error, "could not mark generation observed");
+                tracing::warn!(
+                    event = "task.state_transition_rejected",
+                    task_name = %resource.name,
+                    task_uid = %resource.uid,
+                    generation = resource.generation,
+                    operation = "mark_observed",
+                    %error,
+                    "state transition rejected"
+                );
                 false
             });
         if changed {
@@ -1077,13 +2876,27 @@ impl TaskState {
     /// Records a reconciliation failure.
     ///
     /// Desired state remains retained.
+    #[cfg(test)]
     pub(crate) fn mark_reconciliation_failed(
         &self,
         resource: &ResourceGeneration,
         reason: &'static str,
         message: String,
     ) -> bool {
-        let mut inner = self.inner.write();
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+            .expect("test state persistence remains open");
+        self.mark_reconciliation_failed_admitted(resource, reason, message, admission)
+    }
+
+    pub(crate) fn mark_reconciliation_failed_admitted(
+        &self,
+        resource: &ResourceGeneration,
+        reason: &'static str,
+        message: String,
+        admission: StateWriteAdmission,
+    ) -> bool {
+        let mut inner = self.write_admitted(admission);
         let Some(task) = inner.tasks.get(&resource.name) else {
             return false;
         };
@@ -1097,10 +2910,20 @@ impl TaskState {
         let changed = inner
             .tasks
             .get_mut(&resource.name)
+            .map(Arc::make_mut)
             .expect("resource was checked under the same write lock")
             .mark_reconciliation_failed(reason, message, resource_version)
             .unwrap_or_else(|error| {
-                tracing::warn!(task = %resource.name, %error, "could not record reconciliation failure");
+                tracing::warn!(
+                    event = "task.state_transition_rejected",
+                    task_name = %resource.name,
+                    task_uid = %resource.uid,
+                    generation = resource.generation,
+                    operation = "record_reconciliation_failure",
+                    reason,
+                    %error,
+                    "state transition rejected"
+                );
                 false
             });
         if changed {
@@ -1116,7 +2939,7 @@ impl TaskState {
 
     fn transition_task_finished_locked(
         &self,
-        inner: &mut TaskStateInner,
+        inner: &mut TaskStateWriteGuard<'_>,
         binding: &RuntimeBinding,
         phase: TaskPhase,
         error: Option<String>,
@@ -1148,7 +2971,7 @@ impl TaskState {
             .tasks
             .get_mut(name)
             .expect("resource was checked under the same write lock");
-        let result = task.reconcile_finished(
+        let result = Arc::make_mut(task).reconcile_finished(
             binding.resource.generation,
             phase,
             error.clone(),
@@ -1169,7 +2992,16 @@ impl TaskState {
                 true
             }
             Err(error) => {
-                tracing::warn!(task = %name, %error, "ignoring illegal task finalization");
+                tracing::warn!(
+                    event = "task.state_transition_rejected",
+                    task_name = %name,
+                    task_uid = %binding.resource.uid,
+                    generation = binding.resource.generation,
+                    taskvisor_id = binding.tv.get(),
+                    operation = "task_finalize",
+                    %error,
+                    "illegal state transition ignored"
+                );
                 false
             }
         }
@@ -1187,6 +3019,7 @@ impl TaskState {
     ///
     /// Returns the bound task name.
     /// Returns `None` for a stale binding.
+    #[cfg(test)]
     pub(crate) fn finalize_if_bound(
         &self,
         tv_raw: u64,
@@ -1195,10 +3028,25 @@ impl TaskState {
         exit_code: Option<i32>,
         force: bool,
     ) -> Option<TaskId> {
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::TaskAndRunChange)
+            .expect("test state persistence remains open");
+        self.finalize_if_bound_admitted(tv_raw, phase, error, exit_code, force, admission)
+    }
+
+    pub(crate) fn finalize_if_bound_admitted(
+        &self,
+        tv_raw: u64,
+        phase: TaskPhase,
+        error: Option<String>,
+        exit_code: Option<i32>,
+        force: bool,
+        admission: StateWriteAdmission,
+    ) -> Option<TaskId> {
         if !phase.is_terminal() {
             return None;
         }
-        let mut inner = self.inner.write();
+        let mut inner = self.write_admitted(admission);
 
         let binding = inner.by_tv.get(&tv_raw)?.clone();
         if inner
@@ -1211,38 +3059,347 @@ impl TaskState {
         inner.tv_of.remove(&binding.resource.name);
         inner.by_tv.remove(&tv_raw);
         inner.finished_attempt_by_tv.remove(&tv_raw);
+        let active_lifecycle = inner.active_run_by_tv.remove(&tv_raw);
 
+        let max_runs = inner.max_runs_per_task;
         let mut run_change = None;
-        if let Some(runs) = inner.runs.get_mut(&binding.resource.name)
-            && let Some(run) = runs
+        let mut run_snapshot_changes = Vec::new();
+        if inner.runs.contains_key(&binding.resource.name) || active_lifecycle.is_some() {
+            let runs = inner.runs.entry(binding.resource.name.clone()).or_default();
+            if let Some(run) = runs
                 .iter_mut()
                 .rev()
                 .find(|run| run.generation() == binding.resource.generation && run.is_active())
-        {
-            run.finish(phase, error.clone(), exit_code)
-                .expect("terminal phase closes an active run");
-            run_change = Some(run.clone());
+            {
+                let previous = Arc::clone(run);
+                Arc::make_mut(run)
+                    .finish(phase, error.clone(), exit_code)
+                    .expect("terminal phase closes an active run");
+                run_change = Some(Arc::clone(run));
+                run_snapshot_changes.push(Self::run_snapshot_change(
+                    &binding.resource.name,
+                    &binding.resource.uid,
+                    Some(previous),
+                    Some(Arc::clone(run)),
+                ));
+            } else if let Some(active) = active_lifecycle.filter(|active| {
+                active.generation() == binding.resource.generation && active.is_active()
+            }) {
+                let mut terminal = active.as_ref().clone();
+                terminal
+                    .finish(phase, error.clone(), exit_code)
+                    .expect("terminal phase closes an active lifecycle run");
+                let terminal = Arc::new(terminal);
+                run_change = Some(Arc::clone(&terminal));
+                run_snapshot_changes.push(Self::run_snapshot_change(
+                    &binding.resource.name,
+                    &binding.resource.uid,
+                    None,
+                    Some(Arc::clone(&terminal)),
+                ));
+                runs.push_back(terminal);
+            }
+            for removed in Self::enforce_run_cap(runs, max_runs) {
+                run_snapshot_changes.push(Self::run_snapshot_change(
+                    &binding.resource.name,
+                    &binding.resource.uid,
+                    Some(removed),
+                    None,
+                ));
+            }
         }
         self.transition_task_finished_locked(&mut inner, &binding, phase, error, exit_code, force);
+        Self::record_run_snapshot_changes(&mut inner, run_snapshot_changes);
         if let Some(run) = run_change.as_ref() {
-            self.record_run_change(&binding.resource.name, &binding.resource.uid, run);
+            self.record_run_change(
+                &inner,
+                &binding.resource.name,
+                &binding.resource.uid,
+                run.as_ref(),
+            );
         }
-        Some(binding.resource.name)
+        let name = binding.resource.name;
+        Some(name)
     }
 
     /// Lists retained runs for a task.
     ///
     /// Results are ordered by generation and attempt.
     /// Unknown or swept history returns an empty list.
-    pub fn list_runs(&self, id: &TaskId) -> Vec<TaskRun> {
+    #[cfg(test)]
+    pub(crate) fn list_runs(&self, id: &TaskId) -> Vec<TaskRun> {
         let inner = self.inner.read();
         let mut runs: Vec<TaskRun> = inner
             .runs
             .get(id)
-            .map(|runs| runs.iter().cloned().collect())
+            .map(|runs| runs.iter().map(|run| run.as_ref().clone()).collect())
             .unwrap_or_default();
         runs.sort_by_key(|run| (run.generation(), run.attempt()));
         runs
+    }
+
+    /// Queries one task's runs with snapshot-consistent pagination.
+    ///
+    /// The first page returns `None` when the current task is absent.
+    /// A continuation remains bound to the original Task name and UID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] for an invalid or unavailable continuation snapshot.
+    pub fn query_runs(
+        &self,
+        id: &TaskId,
+        query: &TaskRunQuery,
+    ) -> Result<Option<TaskRunPage>, CollectionError> {
+        self.query_runs_where(id, query, |_| true)
+    }
+
+    /// Queries one task's runs through a caller predicate.
+    ///
+    /// The predicate runs before pagination and must stay stable across one
+    /// continuation chain. A first-page query returns `None` when the current
+    /// task is absent. Continuations reconstruct the original UID snapshot
+    /// without requiring a current task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] for an invalid or unavailable continuation snapshot.
+    pub fn query_runs_where<F>(
+        &self,
+        id: &TaskId,
+        query: &TaskRunQuery,
+        predicate: F,
+    ) -> Result<Option<TaskRunPage>, CollectionError>
+    where
+        F: Fn(&TaskRun) -> bool,
+    {
+        self.query_runs_where_visible(id, query, |_| true, predicate)
+    }
+
+    /// Queries runs with separate current-task and historical-run predicates.
+    ///
+    /// The current-task predicate is evaluated only for a first page.
+    /// Both predicates run after the state lock is released.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] for an invalid or unavailable continuation snapshot.
+    pub(crate) fn query_runs_where_visible<F, G>(
+        &self,
+        id: &TaskId,
+        query: &TaskRunQuery,
+        task_predicate: F,
+        run_predicate: G,
+    ) -> Result<Option<TaskRunPage>, CollectionError>
+    where
+        F: Fn(&Task) -> bool,
+        G: Fn(&TaskRun) -> bool,
+    {
+        let inner = self.inner.read();
+        let continuation = query.continuation();
+        if let Some(cursor) = continuation
+            && cursor.task() != id
+        {
+            return Err(CollectionError::TaskRunContinuationTaskMismatch {
+                task: id.clone(),
+                continuation_task: cursor.task().clone(),
+            });
+        }
+
+        let (task_uid, resource_version, mut candidates, current_task) = match continuation {
+            Some(cursor) => (
+                cursor.task_uid().clone(),
+                cursor.resource_version().to_owned(),
+                Self::run_snapshot_at_resource_version(
+                    &inner,
+                    cursor.resource_version(),
+                    cursor.task(),
+                    cursor.task_uid(),
+                )?
+                .into_values()
+                .collect::<Vec<_>>(),
+                None,
+            ),
+            None => {
+                let Some(task) = inner.tasks.get(id) else {
+                    return Ok(None);
+                };
+                let runs = inner
+                    .runs
+                    .get(id)
+                    .map(|runs| runs.iter().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                (
+                    task.uid().clone(),
+                    Self::current_run_resource_version(&inner),
+                    runs,
+                    Some(Arc::clone(task)),
+                )
+            }
+        };
+        drop(inner);
+        candidates.sort_by_key(|run| (run.generation(), run.attempt()));
+        if current_task.is_some_and(|task| !task_predicate(&task)) {
+            return Ok(None);
+        }
+
+        let after = continuation.map(|cursor| (cursor.after_generation(), cursor.after_attempt()));
+        let mut cursor_seen = after.is_none();
+        let mut items = Vec::with_capacity(query.limit().min(candidates.len()));
+        let mut item_bytes = 0usize;
+        let mut page_closed = false;
+        let mut remaining_item_count = 0usize;
+
+        for run in candidates {
+            if !run_predicate(run.as_ref()) {
+                continue;
+            }
+            let key = (run.generation(), run.attempt());
+            if let Some(after) = after
+                && !cursor_seen
+            {
+                match key.cmp(&after) {
+                    std::cmp::Ordering::Less => continue,
+                    std::cmp::Ordering::Equal => {
+                        cursor_seen = true;
+                        continue;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        return Err(CollectionError::TaskRunContinuationCursorNotFound {
+                            task: id.clone(),
+                            generation: after.0,
+                            attempt: after.1,
+                        });
+                    }
+                }
+            }
+            if page_closed || items.len() >= query.limit() {
+                remaining_item_count = remaining_item_count.saturating_add(1);
+                continue;
+            }
+
+            let limit = query.item_byte_limit();
+            let run_bytes = Self::serialized_run_payload_bytes(run.as_ref());
+            if run_bytes > limit.get() && items.is_empty() {
+                page_closed = true;
+                items.push(run.as_ref().clone());
+                continue;
+            }
+            let separator_bytes = usize::from(!items.is_empty());
+            let projected = item_bytes
+                .saturating_add(separator_bytes)
+                .saturating_add(run_bytes);
+            if projected > limit.get() {
+                page_closed = true;
+                remaining_item_count = remaining_item_count.saturating_add(1);
+                continue;
+            }
+            item_bytes = projected;
+            items.push(run.as_ref().clone());
+        }
+
+        if !cursor_seen {
+            let (generation, attempt) =
+                after.expect("a missing TaskRun cursor is seen before iteration");
+            return Err(CollectionError::TaskRunContinuationCursorNotFound {
+                task: id.clone(),
+                generation,
+                attempt,
+            });
+        }
+
+        let next = if remaining_item_count > 0 {
+            let after = items
+                .last()
+                .expect("positive TaskRun page limits return an item before remaining items");
+            Some(
+                TaskRunContinuation::new(
+                    resource_version.clone(),
+                    id.clone(),
+                    task_uid.clone(),
+                    after.generation(),
+                    after.attempt(),
+                )
+                .expect("state-generated TaskRun continuations are valid"),
+            )
+        } else {
+            None
+        };
+
+        Ok(Some(TaskRunPage {
+            items,
+            task: id.clone(),
+            task_uid,
+            resource_version,
+            continuation: next,
+            remaining_item_count,
+        }))
+    }
+
+    /// Reconstructs one task UID's runs at a retained run revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError`] when the version is malformed, foreign,
+    /// ahead of this store, or compacted.
+    fn run_snapshot_at_resource_version(
+        inner: &TaskStateInner,
+        resource_version: &str,
+        task: &TaskId,
+        task_uid: &Uid,
+    ) -> Result<BTreeMap<(u64, u32), Arc<TaskRun>>, CollectionError> {
+        let (requested_epoch, requested_revision) = Self::parse_resource_version(resource_version)?;
+        if requested_epoch != inner.run_resource_version_epoch {
+            return Err(CollectionError::ResourceVersionExpired {
+                resource_version: resource_version.to_owned(),
+            });
+        }
+        if requested_revision > inner.run_resource_version {
+            return Err(CollectionError::InvalidResourceVersion {
+                resource_version: resource_version.to_owned(),
+            });
+        }
+        if requested_revision < inner.run_compacted_through {
+            return Err(CollectionError::ResourceVersionExpired {
+                resource_version: resource_version.to_owned(),
+            });
+        }
+
+        let mut snapshot = BTreeMap::new();
+        if inner
+            .tasks
+            .get(task)
+            .is_some_and(|current| current.uid() == task_uid)
+            && let Some(runs) = inner.runs.get(task)
+        {
+            for run in runs {
+                snapshot.insert((run.generation(), run.attempt()), run.clone());
+            }
+        }
+
+        for batch in inner
+            .run_history
+            .iter()
+            .rev()
+            .take_while(|batch| batch.revision > requested_revision)
+        {
+            for change in batch
+                .changes
+                .iter()
+                .rev()
+                .filter(|change| &change.task == task && &change.task_uid == task_uid)
+            {
+                if let Some(previous) = change.previous.as_ref() {
+                    snapshot.insert(
+                        (previous.generation(), previous.attempt()),
+                        previous.clone(),
+                    );
+                } else if let Some(current) = change.current.as_ref() {
+                    snapshot.remove(&(current.generation(), current.attempt()));
+                }
+            }
+        }
+        Ok(snapshot)
     }
 
     /// Returns one retained task by name.
@@ -1253,7 +3410,7 @@ impl TaskState {
     /// Returns one retained task for internal use.
     pub(crate) fn get_retained(&self, id: &TaskId) -> Option<Task> {
         let inner = self.inner.read();
-        inner.tasks.get(id).cloned()
+        inner.tasks.get(id).map(|task| task.as_ref().clone())
     }
 
     /// Returns whether a task exists.
@@ -1265,34 +3422,63 @@ impl TaskState {
     }
 
     /// Lists tasks in one slot.
+    ///
+    /// The state read lock is released before owned [`Task`] values are cloned.
+    /// Use [`Self::query`] when the response itself must have a byte ceiling.
     pub fn list_by_slot(&self, slot: &str) -> Vec<Task> {
-        let inner = self.inner.read();
-
-        inner
-            .by_slot
-            .get(slot)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| inner.tasks.get(id).cloned())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let tasks = {
+            let inner = self.inner.read();
+            inner
+                .by_slot
+                .get(slot)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| inner.tasks.get(id))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        tasks
+            .into_iter()
+            .map(|task: Arc<Task>| task.as_ref().clone())
+            .collect()
     }
 
     /// Lists all retained tasks.
+    ///
+    /// The state read lock is released before owned [`Task`] values are cloned.
+    /// Use [`Self::query`] when the response itself must have a byte ceiling.
     pub fn list_all(&self) -> Vec<Task> {
-        let inner = self.inner.read();
-        inner.tasks.values().cloned().collect()
+        let tasks = self
+            .inner
+            .read()
+            .tasks
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        tasks
+            .into_iter()
+            .map(|task| task.as_ref().clone())
+            .collect()
     }
 
     /// Lists tasks in one phase.
+    ///
+    /// The state read lock is released before owned [`Task`] values are cloned.
+    /// Use [`Self::query`] when the response itself must have a byte ceiling.
     pub fn list_by_status(&self, phase: TaskPhase) -> Vec<Task> {
-        let inner = self.inner.read();
-        inner
+        let tasks = self
+            .inner
+            .read()
             .tasks
             .values()
             .filter(|task| task.status().phase() == phase)
             .cloned()
+            .collect::<Vec<_>>();
+        tasks
+            .into_iter()
+            .map(|task| task.as_ref().clone())
             .collect()
     }
 
@@ -1321,71 +3507,172 @@ impl TaskState {
 
     /// Runs one retention sweep.
     ///
-    /// The sweep removes expired finished runs.
-    /// It also removes expired unfinished runs without a binding.
-    /// Bound unfinished runs remain.
+    /// The sweep removes expired terminal runs.
+    /// It also removes expired nonterminal runs without a binding.
+    /// Bound nonterminal runs remain.
     ///
     /// A terminal task is removed after its run history is empty and its task TTL expires.
     ///
     /// Returns `(runs_removed, tasks_removed)` for observability.
-    pub(crate) fn sweep(&self, config: &StateConfig) -> (usize, usize) {
-        let mut inner = self.inner.write();
-        let now = SystemTime::now();
-        let mut runs_removed = 0usize;
-        let mut tasks_removed = 0usize;
-
-        let bound: std::collections::HashSet<TaskId> = inner.tv_of.keys().cloned().collect();
-        for (id, runs) in inner.runs.iter_mut() {
-            let before = runs.len();
-            let task_bound = bound.contains(id);
-            runs.retain(|run| match run.finished_at() {
-                Some(finished) => now
-                    .duration_since(finished)
-                    .map(|age| age < config.run_ttl())
-                    .unwrap_or(true),
-                None => {
-                    task_bound
-                        || now
-                            .duration_since(run.started_at())
-                            .map(|age| age < config.run_ttl())
-                            .unwrap_or(true)
-                }
-            });
-            runs_removed += before - runs.len();
-        }
-        inner.runs.retain(|_, runs| !runs.is_empty());
-
-        let expired_tasks: Vec<TaskId> = inner
-            .tasks
+    fn scan_retention(&self, config: &StateConfig, now: SystemTime) -> (usize, Vec<(TaskId, Uid)>) {
+        let task_ids = self
+            .inner
+            .read()
+            .ordered_tasks
             .iter()
-            .filter(|(id, task)| {
-                !inner.tv_of.contains_key(*id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut runs_removed = 0usize;
+        let mut expired_tasks = Vec::new();
+
+        // Process one task per write-lock section and scan that task's run deque
+        // once. The sweep no longer scans and serializes every retained task in
+        // one stop-the-world section.
+        for id in task_ids {
+            let mut inner = self.write(StateMutationEventCapacity::None);
+            let Some(task_uid) = inner.tasks.get(&id).map(|task| task.uid().clone()) else {
+                continue;
+            };
+            let task_bound = inner.tv_of.contains_key(&id);
+            let mut run_snapshot_changes = Vec::new();
+            let mut remove_empty_history = false;
+            if let Some(runs) = inner.runs.get_mut(&id) {
+                runs.retain(|run| {
+                    let expired = match run.finished_at() {
+                        Some(finished) => now
+                            .duration_since(finished)
+                            .map(|age| age >= config.run_ttl())
+                            .unwrap_or(false),
+                        None => {
+                            !task_bound
+                                && now
+                                    .duration_since(run.started_at())
+                                    .map(|age| age >= config.run_ttl())
+                                    .unwrap_or(false)
+                        }
+                    };
+                    if expired {
+                        run_snapshot_changes.push(Self::run_snapshot_change(
+                            &id,
+                            &task_uid,
+                            Some(Arc::clone(run)),
+                            None,
+                        ));
+                    }
+                    !expired
+                });
+                remove_empty_history = runs.is_empty();
+            }
+            if remove_empty_history {
+                inner.runs.remove(&id);
+            }
+            runs_removed += run_snapshot_changes.len();
+            Self::record_run_snapshot_changes(&mut inner, run_snapshot_changes);
+
+            let task_expired = inner.tasks.get(&id).is_some_and(|task| {
+                task.uid() == &task_uid
+                    && !inner.tv_of.contains_key(&id)
                     && task.status().phase().is_terminal()
-                    && inner.runs.get(*id).is_none_or(|runs| runs.is_empty())
-                    && inner.terminal_since.get(*id).is_some_and(|finished| {
+                    && inner.runs.get(&id).is_none_or(|runs| runs.is_empty())
+                    && inner.terminal_since.get(&id).is_some_and(|finished| {
                         now.duration_since(*finished)
                             .map(|age| age >= config.task_ttl())
                             .unwrap_or(false)
                     })
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        for id in &expired_tasks {
-            Self::unbind_locked(&mut inner, id);
-            if let Some(task) = inner.tasks.remove(id) {
-                Self::unindex_task(&mut inner, &task);
-                inner.terminal_since.remove(id);
-                let (revision, _) = Self::next_resource_version(&mut inner);
-                self.record_change(&mut inner, revision, Some(task), None);
-                tasks_removed += 1;
+            });
+            if task_expired {
+                expired_tasks.push((id, task_uid));
             }
         }
-        if runs_removed > 0 || tasks_removed > 0 {
-            debug!(runs_removed, tasks_removed, "state sweep completed");
-        }
+        (runs_removed, expired_tasks)
+    }
 
+    fn remove_expired_task_admitted(
+        &self,
+        config: &StateConfig,
+        now: SystemTime,
+        id: &TaskId,
+        expected_uid: &Uid,
+        admission: StateWriteAdmission,
+    ) -> bool {
+        let mut inner = self.write_admitted(admission);
+        let remains_expired = inner.tasks.get(id).is_some_and(|task| {
+            task.uid() == expected_uid
+                && !inner.tv_of.contains_key(id)
+                && task.status().phase().is_terminal()
+                && inner.runs.get(id).is_none_or(|runs| runs.is_empty())
+                && inner.terminal_since.get(id).is_some_and(|finished| {
+                    now.duration_since(*finished)
+                        .map(|age| age >= config.task_ttl())
+                        .unwrap_or(false)
+                })
+        });
+        if !remains_expired {
+            return false;
+        }
+        Self::unbind_locked(&mut inner, id);
+        let Some(task) = inner.tasks.remove(id) else {
+            return false;
+        };
+        Self::unindex_task(&mut inner, &task);
+        Self::remove_retained_task_manifest_bytes(&mut inner, id);
+        inner.terminal_since.remove(id);
+        let (revision, _) = Self::next_resource_version(&mut inner);
+        self.record_change(&mut inner, revision, Some(task), None);
+        true
+    }
+
+    fn report_sweep(runs_removed: usize, tasks_removed: usize) -> (usize, usize) {
+        if runs_removed > 0 || tasks_removed > 0 {
+            debug!(
+                event = "state.sweep",
+                runs_removed, tasks_removed, "state sweep completed"
+            );
+        }
         (runs_removed, tasks_removed)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn sweep_retention_for_test(&self, config: &StateConfig) -> (usize, usize) {
+        let now = SystemTime::now();
+        let (runs_removed, expired_tasks) = self.scan_retention(config, now);
+        let mut tasks_removed = 0;
+        for (id, expected_uid) in expired_tasks {
+            let admission = self
+                .admit_state_write_blocking(StateMutationEventCapacity::TaskChange)
+                .expect("test state persistence remains open");
+            tasks_removed += usize::from(self.remove_expired_task_admitted(
+                config,
+                now,
+                &id,
+                &expected_uid,
+                admission,
+            ));
+        }
+        Self::report_sweep(runs_removed, tasks_removed)
+    }
+
+    pub(crate) async fn sweep_async(&self, config: &StateConfig) -> (usize, usize) {
+        let now = SystemTime::now();
+        let (runs_removed, expired_tasks) = self.scan_retention(config, now);
+        let mut tasks_removed = 0;
+        for (id, expected_uid) in expired_tasks {
+            let admission = self
+                .admit_state_write(StateMutationEventCapacity::TaskChange)
+                .await;
+            let Ok(admission) = admission else {
+                break;
+            };
+            tasks_removed += usize::from(self.remove_expired_task_admitted(
+                config,
+                now,
+                &id,
+                &expected_uid,
+                admission,
+            ));
+        }
+        Self::report_sweep(runs_removed, tasks_removed)
     }
 
     /// Queries tasks with snapshot-consistent pagination.
@@ -1439,7 +3726,7 @@ impl TaskState {
             return Err(CollectionError::ContinuationFilterMismatch);
         }
 
-        let (resource_version, candidates) = match continuation {
+        let (resource_version, candidates): (String, Vec<Arc<Task>>) = match continuation {
             Some(cursor) => (
                 cursor.resource_version().to_owned(),
                 Self::snapshot_at_resource_version(&inner, cursor.resource_version())?
@@ -1460,8 +3747,9 @@ impl TaskState {
                         .cloned()
                         .collect(),
                     None => inner
-                        .tasks
-                        .values()
+                        .ordered_tasks
+                        .iter()
+                        .filter_map(|name| inner.tasks.get(name))
                         .filter(|task| q.matches(task))
                         .cloned()
                         .collect(),
@@ -1470,20 +3758,65 @@ impl TaskState {
         };
         drop(inner);
 
-        let mut filtered: Vec<Task> = candidates.into_iter().filter(predicate).collect();
-        filtered.sort_by(|left, right| left.name().cmp(right.name()));
-        let start = match continuation {
-            Some(cursor) => filtered
-                .binary_search_by(|task| task.name().cmp(cursor.after()))
-                .map(|index| index + 1)
-                .map_err(|_| CollectionError::ContinuationCursorNotFound {
-                    name: cursor.after().clone(),
-                })?,
-            None => 0,
-        };
-        let end = start.saturating_add(q.limit()).min(filtered.len());
-        let items = filtered[start..end].to_vec();
-        let remaining_item_count = filtered.len().saturating_sub(end);
+        let after = continuation.map(TaskContinuation::after);
+        let mut cursor_seen = after.is_none();
+        let mut items = Vec::with_capacity(q.limit().min(candidates.len()));
+        let mut item_bytes = 0usize;
+        let mut page_closed = false;
+        let mut remaining_item_count = 0usize;
+
+        for task in candidates {
+            if !predicate(&task) {
+                continue;
+            }
+            if let Some(after) = after
+                && !cursor_seen
+            {
+                match task.name().cmp(after) {
+                    std::cmp::Ordering::Less => continue,
+                    std::cmp::Ordering::Equal => {
+                        cursor_seen = true;
+                        continue;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        return Err(CollectionError::ContinuationCursorNotFound {
+                            name: after.clone(),
+                        });
+                    }
+                }
+            }
+            if page_closed || items.len() >= q.limit() {
+                remaining_item_count = remaining_item_count.saturating_add(1);
+                continue;
+            }
+
+            let limit = q.item_byte_limit();
+            let task_bytes = Self::serialized_task_payload_bytes(None, Some(&task));
+            if task_bytes > limit.get() && items.is_empty() {
+                page_closed = true;
+                items.push(task.as_ref().clone());
+                continue;
+            }
+            let separator_bytes = usize::from(!items.is_empty());
+            let projected = item_bytes
+                .saturating_add(separator_bytes)
+                .saturating_add(task_bytes);
+            if projected > limit.get() {
+                page_closed = true;
+                remaining_item_count = remaining_item_count.saturating_add(1);
+                continue;
+            }
+            item_bytes = projected;
+
+            items.push(task.as_ref().clone());
+        }
+        if !cursor_seen {
+            return Err(CollectionError::ContinuationCursorNotFound {
+                name: after
+                    .expect("a missing cursor is seen before iteration")
+                    .clone(),
+            });
+        }
         let continuation = if remaining_item_count > 0 {
             let after = items
                 .last()
@@ -1509,9 +3842,9 @@ impl TaskState {
     fn snapshot_at_resource_version(
         inner: &TaskStateInner,
         resource_version: &str,
-    ) -> Result<HashMap<TaskId, Task>, CollectionError> {
+    ) -> Result<BTreeMap<TaskId, Arc<Task>>, CollectionError> {
         let (requested_epoch, requested_revision) = Self::parse_resource_version(resource_version)?;
-        if requested_epoch != inner.resource_version_epoch {
+        if requested_epoch != inner.resource_version_epoch.as_ref() {
             return Err(CollectionError::ResourceVersionExpired {
                 resource_version: resource_version.to_owned(),
             });
@@ -1527,7 +3860,16 @@ impl TaskState {
             });
         }
 
-        let mut snapshot = inner.tasks.clone();
+        let mut snapshot = inner
+            .ordered_tasks
+            .iter()
+            .filter_map(|name| {
+                inner
+                    .tasks
+                    .get(name)
+                    .map(|task| (name.clone(), Arc::clone(task)))
+            })
+            .collect::<BTreeMap<_, _>>();
         for change in inner
             .watch_history
             .iter()
@@ -1536,7 +3878,7 @@ impl TaskState {
         {
             match (&change.previous, &change.current) {
                 (Some(previous), _) => {
-                    snapshot.insert(previous.name().clone(), previous.clone());
+                    snapshot.insert(previous.name().clone(), Arc::clone(previous));
                 }
                 (None, Some(current)) => {
                     snapshot.remove(current.name());
@@ -1555,7 +3897,8 @@ impl TaskState {
     ///
     /// # Errors
     ///
-    /// Returns [`CollectionError`] when the supplied resource version cannot be resumed.
+    /// Returns [`CollectionError`] when the supplied resource version cannot be
+    /// resumed or Task watch admission is full.
     pub fn watch(
         &self,
         filter: &TaskFilter,
@@ -1572,7 +3915,8 @@ impl TaskState {
     ///
     /// # Errors
     ///
-    /// Returns [`CollectionError`] when the supplied resource version cannot be resumed.
+    /// Returns [`CollectionError`] when the supplied resource version cannot be
+    /// resumed or Task watch admission is full.
     pub fn watch_where<F>(
         &self,
         filter: &TaskFilter,
@@ -1584,29 +3928,14 @@ impl TaskState {
     {
         let predicate: WatchPredicate = Arc::new(predicate);
         let inner = self.inner.read();
-        let receiver = BroadcastStream::new(inner.watch_tx.subscribe());
+        let receiver = WatchStream::from_changes(inner.watch_tx.subscribe());
         let epoch = inner.resource_version_epoch.clone();
-        let mut initial = VecDeque::new();
-        let mut initial_revision = None;
-        let mut replay = VecDeque::new();
-        let last_revision;
-
-        match resource_version {
-            None | Some("0") => {
-                let mut tasks: Vec<Task> = inner
-                    .tasks
-                    .values()
-                    .filter(|task| filter.matches(task) && predicate(task))
-                    .cloned()
-                    .collect();
-                tasks.sort_by(|left, right| left.name().cmp(right.name()));
-                initial.extend(tasks.into_iter().map(TaskWatchEvent::Added));
-                initial_revision = Some(inner.resource_version);
-                last_revision = 0;
-            }
+        let target_revision = inner.resource_version;
+        let (snapshot_requested, initial_revision, last_revision) = match resource_version {
+            None | Some("0") => (true, Some(inner.resource_version), 0),
             Some(value) => {
                 let (requested_epoch, requested_revision) = Self::parse_resource_version(value)?;
-                if requested_epoch != epoch {
+                if requested_epoch != epoch.as_ref() {
                     return Err(CollectionError::ResourceVersionExpired {
                         resource_version: value.to_string(),
                     });
@@ -1621,17 +3950,176 @@ impl TaskState {
                         resource_version: value.to_string(),
                     });
                 }
-                replay.extend(
-                    inner
-                        .watch_history
-                        .iter()
-                        .filter(|change| change.revision > requested_revision)
-                        .cloned(),
-                );
-                last_revision = requested_revision;
+                (false, None, requested_revision)
+            }
+        };
+
+        let permit = match self.watch_admission.try_reserve_count() {
+            Ok(permit) => permit,
+            Err(WatchAdmissionFailure::Rejected(error)) => return Err(error),
+            Err(WatchAdmissionFailure::Closed) => {
+                drop(inner);
+                return Ok(TaskWatchSubscription {
+                    inner: Arc::clone(&self.inner),
+                    receiver,
+                    initial: VecDeque::new(),
+                    initial_revision: None,
+                    replay: VecDeque::new(),
+                    permit: None,
+                    filter: filter.clone(),
+                    predicate,
+                    epoch,
+                    last_revision,
+                    target_revision,
+                    stop: Box::pin(self.watch_stop.clone().cancelled_owned()),
+                    terminal: false,
+                });
+            }
+        };
+
+        let initial_candidates = snapshot_requested.then(|| {
+            inner
+                .ordered_tasks
+                .iter()
+                .filter_map(|name| inner.tasks.get(name))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        let replay_candidates = if snapshot_requested {
+            Vec::new()
+        } else {
+            inner
+                .watch_history
+                .iter()
+                .filter(|change| change.revision > last_revision)
+                .cloned()
+                .collect()
+        };
+        drop(inner);
+
+        let initial_descriptors = initial_candidates
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|task| filter.matches(task) && predicate(task))
+            .map(|task| WatchEventDescriptor {
+                kind: PreparedWatchEventKind::Added,
+                serialized_bytes: Self::serialized_task_payload_bytes(None, Some(task.as_ref())),
+                task,
+                resource_version: None,
+            })
+            .collect::<Vec<_>>();
+        let replay_descriptors = replay_candidates
+            .into_iter()
+            .map(|change| {
+                let revision = change.revision;
+                let event = {
+                    let previous_matches = change
+                        .previous
+                        .as_ref()
+                        .is_some_and(|task| filter.matches(task) && predicate(task));
+                    let current_matches = change
+                        .current
+                        .as_ref()
+                        .is_some_and(|task| filter.matches(task) && predicate(task));
+                    match (previous_matches, current_matches) {
+                        (false, true) => change.current.as_ref().map(|task| WatchEventDescriptor {
+                            kind: PreparedWatchEventKind::Added,
+                            serialized_bytes: Self::serialized_task_payload_bytes(
+                                None,
+                                Some(task.as_ref()),
+                            ),
+                            task: Arc::clone(task),
+                            resource_version: None,
+                        }),
+                        (true, true) => change.current.as_ref().map(|task| WatchEventDescriptor {
+                            kind: PreparedWatchEventKind::Modified,
+                            serialized_bytes: Self::serialized_task_payload_bytes(
+                                None,
+                                Some(task.as_ref()),
+                            ),
+                            task: Arc::clone(task),
+                            resource_version: None,
+                        }),
+                        (true, false) => change.previous.as_ref().map(|task| {
+                            let resource_version = Self::format_resource_version(
+                                change.epoch.as_ref(),
+                                change.revision,
+                            );
+                            WatchEventDescriptor {
+                                kind: PreparedWatchEventKind::Deleted,
+                                serialized_bytes: Self::serialized_task_with_resource_version_bytes(
+                                    task.as_ref(),
+                                    &resource_version,
+                                ),
+                                task: Arc::clone(task),
+                                resource_version: Some(resource_version),
+                            }
+                        }),
+                        (false, false) => None,
+                    }
+                };
+                (revision, event)
+            })
+            .collect::<Vec<_>>();
+        let requested_bytes = initial_descriptors
+            .iter()
+            .map(|event| event.serialized_bytes)
+            .chain(
+                replay_descriptors
+                    .iter()
+                    .filter_map(|(_, event)| event.as_ref().map(|event| event.serialized_bytes)),
+            )
+            .fold(0_usize, usize::saturating_add);
+        match permit.try_charge_bytes(requested_bytes) {
+            Ok(()) => {}
+            Err(WatchAdmissionFailure::Rejected(error)) => return Err(error),
+            Err(WatchAdmissionFailure::Closed) => {
+                return Ok(TaskWatchSubscription {
+                    inner: Arc::clone(&self.inner),
+                    receiver,
+                    initial: VecDeque::new(),
+                    initial_revision: None,
+                    replay: VecDeque::new(),
+                    permit: None,
+                    filter: filter.clone(),
+                    predicate,
+                    epoch,
+                    last_revision,
+                    target_revision,
+                    stop: Box::pin(self.watch_stop.clone().cancelled_owned()),
+                    terminal: false,
+                });
             }
         }
-        drop(inner);
+        let initial = initial_descriptors
+            .into_iter()
+            .map(WatchEventDescriptor::into_buffered)
+            .collect();
+        let replay = replay_descriptors
+            .into_iter()
+            .map(|(revision, event)| PreparedReplayChange {
+                revision,
+                event: event.map(WatchEventDescriptor::into_buffered),
+            })
+            .collect();
+
+        if !permit.is_active() || self.watch_stop.is_cancelled() {
+            return Ok(TaskWatchSubscription {
+                inner: Arc::clone(&self.inner),
+                receiver,
+                initial: VecDeque::new(),
+                initial_revision: None,
+                replay: VecDeque::new(),
+                permit: None,
+                filter: filter.clone(),
+                predicate,
+                epoch,
+                last_revision,
+                target_revision,
+                stop: Box::pin(self.watch_stop.clone().cancelled_owned()),
+                terminal: false,
+            });
+        }
 
         Ok(TaskWatchSubscription {
             inner: Arc::clone(&self.inner),
@@ -1639,10 +4127,12 @@ impl TaskState {
             initial,
             initial_revision,
             replay,
+            permit: Some(permit),
             filter: filter.clone(),
             predicate,
             epoch,
             last_revision,
+            target_revision,
             stop: Box::pin(self.watch_stop.clone().cancelled_owned()),
             terminal: false,
         })
@@ -1665,6 +4155,35 @@ impl TaskState {
 
     pub(crate) fn close_watches(&self) {
         self.watch_stop.cancel();
+        self.watch_admission.close();
+    }
+
+    pub(crate) async fn shutdown_persistence(&self) {
+        self.event_publisher.shutdown().await;
+    }
+
+    pub(crate) fn persistence_status(&self) -> Option<TaskStateSinkStatus> {
+        self.event_publisher.status()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persistence_admission_waiters(&self) -> usize {
+        self.event_publisher.admission_waiters()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persistence_admission_closed(&self) -> bool {
+        self.event_publisher.admission_closed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_persistence_admissions(&self) -> usize {
+        self.event_publisher.active_admissions()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_persistence_worker_panic(&self) {
+        self.event_publisher.inject_worker_panic();
     }
 }
 
@@ -1724,1429 +4243,4 @@ impl TaskState {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        pin::Pin,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-        task::{Context, Poll, Wake, Waker},
-        time::Duration,
-    };
-
-    use solti_model::{
-        Annotations, ConditionStatus, EmbeddedSpec, Flag, LabelSelector, Labels, SubprocessMode,
-        SubprocessSpec, TaskEnv, TaskManifest, TaskSpec, TaskWorkload,
-    };
-    use tokio_stream::StreamExt;
-
-    use super::*;
-
-    fn spec(slot: &str, timeout_ms: u64) -> TaskSpec {
-        TaskSpec::builder(
-            slot,
-            TaskWorkload::Embedded(EmbeddedSpec::new("test-v1").unwrap()),
-            timeout_ms,
-        )
-        .build()
-        .expect("valid test spec")
-    }
-
-    fn manifest(name: &str, slot: &str, timeout_ms: u64) -> TaskManifest {
-        TaskManifest::new(name, spec(slot, timeout_ms)).expect("valid test Task manifest")
-    }
-
-    fn create(state: &TaskState, name: &str) -> Task {
-        state
-            .create_desired(&manifest(name, "slot", 1_000))
-            .expect("create")
-            .task
-    }
-
-    fn journal_task(name: &str, revision: u64, annotation_bytes: usize) -> Task {
-        let mut task_manifest = manifest(name, "slot", 1_000);
-        if annotation_bytes > 0 {
-            let mut annotations = Annotations::new();
-            annotations.insert("example.io/payload", "x".repeat(annotation_bytes));
-            task_manifest = task_manifest.with_annotations(annotations).unwrap();
-        }
-        let mut task = Task::from_manifest(task_manifest).unwrap();
-        task.set_resource_version(format!("epoch:{revision}"))
-            .unwrap();
-        task
-    }
-
-    fn record_current_change(state: &TaskState, task: Task) {
-        let mut inner = state.inner.write();
-        let (revision, resource_version) = TaskState::next_resource_version(&mut inner);
-        assert_eq!(task.metadata().resource_version(), resource_version);
-        state.record_change(&mut inner, revision, None, Some(task));
-    }
-
-    fn bind(state: &TaskState, name: &TaskId) -> RuntimeBinding {
-        let resource =
-            ResourceGeneration::from_task(&state.get(name).expect("resource must exist"));
-        let tv = taskvisor::TaskId::for_tests();
-        assert!(state.bind_tv(resource.clone(), tv));
-        RuntimeBinding { resource, tv }
-    }
-
-    #[test]
-    fn try_new_creates_empty_state() {
-        let state = TaskState::try_new().expect("OS entropy is available");
-
-        assert!(state.list_all().is_empty());
-    }
-
-    #[derive(Default)]
-    struct RecordingStateSink {
-        events: std::sync::Mutex<Vec<TaskStateEvent>>,
-    }
-
-    impl crate::TaskStateSink for RecordingStateSink {
-        fn on_event(&self, event: &TaskStateEvent) {
-            self.events.lock().unwrap().push(event.clone());
-        }
-    }
-
-    #[test]
-    fn state_sink_receives_task_and_run_lifecycle() {
-        let recording = Arc::new(RecordingStateSink::default());
-        let sink: crate::TaskStateSinkHandle = recording.clone();
-        let state = TaskState::with_epoch_and_sink(
-            StateConfig::default(),
-            "sink-epoch".to_string(),
-            Some(sink),
-        );
-
-        let created = create(&state, "sink-task");
-        let name = created.name().clone();
-
-        let mut desired = manifest("sink-task", "slot", 2_000);
-        let mut annotations = Annotations::new();
-        annotations.insert("example.io/revision", "two");
-        desired = desired.with_annotations(annotations).unwrap();
-        state.apply_desired(&desired).expect("apply");
-
-        let binding = bind(&state, &name);
-        assert!(state.mark_observed(&binding.resource));
-        assert!(state.transition_attempt_starting(&binding, 1));
-        assert!(state.transition_attempt_finished(
-            &binding,
-            1,
-            TaskPhase::Succeeded,
-            None,
-            Some(0),
-        ));
-        assert!(state.delete_task(&name));
-
-        let events = recording.events.lock().unwrap();
-        let task_changes = events
-            .iter()
-            .filter(|event| matches!(event, TaskStateEvent::TaskChanged { .. }))
-            .count();
-        let runs: Vec<&TaskRun> = events
-            .iter()
-            .filter_map(|event| match event {
-                TaskStateEvent::RunChanged {
-                    task,
-                    task_uid,
-                    run,
-                } if task == &name && task_uid == created.uid() => Some(run),
-                _ => None,
-            })
-            .collect();
-
-        assert_eq!(task_changes, 6);
-        assert_eq!(runs.len(), 2);
-        assert!(runs[0].is_active());
-        assert_eq!(runs[1].phase(), TaskPhase::Succeeded);
-        assert!(matches!(
-            events.last(),
-            Some(TaskStateEvent::TaskChanged {
-                previous: Some(task),
-                current: None,
-                ..
-            }) if task.name() == &name
-        ));
-    }
-
-    #[test]
-    fn create_materializes_server_owned_fields_and_preserves_user_owned_fields() {
-        let state = TaskState::new();
-        let mut labels = Labels::new();
-        labels.insert("team", "runtime");
-        let mut annotations = Annotations::new();
-        annotations.insert("example.io/note", "kept");
-
-        let incoming = manifest("server-owned", "slot", 1_000)
-            .with_labels(labels.clone())
-            .unwrap()
-            .with_annotations(annotations.clone())
-            .unwrap();
-
-        let stored = state.create_desired(&incoming).unwrap().task;
-        assert!(!stored.uid().as_str().is_empty());
-        assert!(!stored.metadata().resource_version().is_empty());
-        assert_eq!(stored.metadata().generation(), 1);
-        assert_eq!(stored.status().phase(), TaskPhase::Pending);
-        assert_eq!(stored.status().attempt(), 0);
-        assert_eq!(stored.metadata().labels(), &labels);
-        assert_eq!(stored.metadata().annotations(), &annotations);
-    }
-
-    #[test]
-    fn create_conflicts_with_every_retained_name_including_terminal() {
-        let state = TaskState::new();
-        let task = create(&state, "retained");
-        let binding = bind(&state, task.name());
-        assert_eq!(
-            state.finalize_if_bound(
-                binding.tv.get(),
-                TaskPhase::Canceled,
-                Some("canceled".into()),
-                None,
-                true,
-            ),
-            Some(task.name().clone())
-        );
-
-        let error = state
-            .create_desired(&manifest("retained", "slot", 1_000))
-            .unwrap_err();
-        assert!(matches!(error, CoreError::AlreadyExists(_)));
-    }
-
-    #[test]
-    fn delete_then_create_assigns_a_new_uid() {
-        let state = TaskState::new();
-        let first = create(&state, "recreated");
-        assert!(state.delete_task(first.name()));
-        let second = create(&state, "recreated");
-
-        assert_ne!(first.uid(), second.uid());
-        assert_eq!(first.name(), second.name());
-    }
-
-    #[test]
-    fn exact_apply_is_a_true_noop() {
-        let state = TaskState::new();
-        let first = create(&state, "noop");
-        let result = state.apply_desired(&TaskManifest::from(&first)).unwrap();
-
-        assert!(!result.reconcile);
-        assert_eq!(result.task, first);
-    }
-
-    #[test]
-    fn checked_apply_accepts_matching_uid_and_resource_version() {
-        let state = TaskState::new();
-        let first = create(&state, "checked");
-        let preconditions = WritePreconditions::from_task(&first).unwrap();
-
-        let result = state
-            .apply_desired_with_preconditions(&TaskManifest::from(&first), &preconditions)
-            .unwrap();
-
-        assert!(!result.reconcile);
-        assert_eq!(result.task, first);
-    }
-
-    #[test]
-    fn checked_apply_rejects_every_mismatch_without_consuming_a_version() {
-        let state = TaskState::new();
-        let first = create(&state, "stale");
-        let preconditions = WritePreconditions::new()
-            .with_uid(Uid::new("stale-uid").unwrap())
-            .with_resource_version("stale-version")
-            .unwrap();
-
-        let error = state
-            .apply_desired_with_preconditions(&TaskManifest::from(&first), &preconditions)
-            .unwrap_err();
-        let CoreError::Conflict(conflict) = error else {
-            panic!("expected conflict");
-        };
-        assert_eq!(conflict.name(), first.name());
-        assert_eq!(conflict.violations().len(), 2);
-        assert_eq!(state.get(first.name()), Some(first.clone()));
-
-        let mut labels = Labels::new();
-        labels.insert("changed", "true");
-        let changed = TaskManifest::from(&first).with_labels(labels).unwrap();
-        let applied = state.apply_desired(&changed).unwrap().task;
-        assert_eq!(
-            TaskState::parse_resource_version(applied.metadata().resource_version())
-                .unwrap()
-                .1,
-            2
-        );
-    }
-
-    #[test]
-    fn checked_apply_does_not_create_a_missing_resource() {
-        let state = TaskState::new();
-        let desired = manifest("missing-checked", "slot", 1_000);
-        let preconditions = WritePreconditions::new()
-            .with_resource_version("1")
-            .unwrap();
-
-        let error = state
-            .apply_desired_with_preconditions(&desired, &preconditions)
-            .unwrap_err();
-
-        assert!(matches!(error, CoreError::NotFound(_)));
-        assert!(state.get(desired.name()).is_none());
-    }
-
-    #[test]
-    fn stale_uid_cannot_update_a_recreated_resource() {
-        let state = TaskState::new();
-        let first = create(&state, "recreated-checked");
-        let stale = WritePreconditions::from_task(&first).unwrap();
-        assert!(state.delete_task(first.name()));
-        let replacement = create(&state, "recreated-checked");
-
-        let error = state
-            .apply_desired_with_preconditions(&TaskManifest::from(&replacement), &stale)
-            .unwrap_err();
-
-        assert!(matches!(error, CoreError::Conflict(_)));
-        assert_eq!(state.get(replacement.name()), Some(replacement));
-    }
-
-    #[test]
-    fn metadata_only_apply_changes_only_resource_version_and_metadata() {
-        let state = TaskState::new();
-        let first = create(&state, "metadata");
-        let binding = bind(&state, first.name());
-        assert!(state.transition_attempt_starting(&binding, 3));
-        let before = state.get(first.name()).unwrap();
-
-        let mut labels = Labels::new();
-        labels.insert("team", "platform");
-        let desired = manifest("metadata", "slot", 1_000)
-            .with_labels(labels.clone())
-            .unwrap();
-        let result = state.apply_desired(&desired).unwrap();
-
-        assert!(!result.reconcile);
-        assert_eq!(result.task.uid(), before.uid());
-        assert_eq!(
-            result.task.metadata().generation(),
-            before.metadata().generation()
-        );
-        assert_ne!(
-            result.task.metadata().resource_version(),
-            before.metadata().resource_version()
-        );
-        assert_eq!(result.task.status(), before.status());
-        assert_eq!(result.task.metadata().labels(), &labels);
-        assert_eq!(state.binding_for(first.name()), Some(binding));
-    }
-
-    #[test]
-    fn spec_apply_commits_a_new_pending_generation_without_rollback() {
-        let state = TaskState::new();
-        let first = create(&state, "changed");
-        let old_binding = bind(&state, first.name());
-        assert!(state.mark_observed(&old_binding.resource));
-        let observed = state.get(first.name()).unwrap();
-
-        let result = state
-            .apply_desired(&manifest("changed", "other-slot", 2_000))
-            .unwrap();
-
-        assert!(result.reconcile);
-        assert_eq!(result.task.uid(), observed.uid());
-        assert_eq!(
-            result.task.metadata().generation(),
-            observed.metadata().generation() + 1
-        );
-        assert_eq!(
-            result.task.status().observed_generation(),
-            observed.metadata().generation()
-        );
-        assert_eq!(result.task.status().phase(), TaskPhase::Pending);
-        assert_eq!(result.task.status().attempt(), 0);
-        assert_eq!(state.binding_for(first.name()), Some(old_binding));
-        assert!(state.list_by_slot("slot").is_empty());
-        assert_eq!(state.list_by_slot("other-slot").len(), 1);
-    }
-
-    #[test]
-    fn apply_missing_creates_a_resource() {
-        let state = TaskState::new();
-        let result = state
-            .apply_desired(&manifest("missing", "slot", 1_000))
-            .unwrap();
-
-        assert!(result.reconcile);
-        assert!(state.contains_task(result.task.name()));
-    }
-
-    #[test]
-    fn reconciliation_failure_retains_desired_generation_in_condition() {
-        let state = TaskState::new();
-        let first = create(&state, "failure");
-        let applied = state
-            .apply_desired(&manifest("failure", "slot", 2_000))
-            .unwrap()
-            .task;
-        let target = ResourceGeneration::from_task(&applied);
-
-        assert!(state.mark_reconciliation_failed(
-            &target,
-            "RunnerBuildFailed",
-            "runner unavailable".into(),
-        ));
-        let stored = state.get(applied.name()).unwrap();
-        assert_eq!(stored.spec(), applied.spec());
-        assert_eq!(stored.metadata().generation(), target.generation);
-        assert_eq!(stored.status().observed_generation(), target.generation);
-        assert_eq!(stored.status().phase(), TaskPhase::Pending);
-        assert_eq!(stored.status().attempt(), 0);
-        assert!(stored.status().error().is_none());
-        assert_eq!(
-            stored.status().reconciled().status(),
-            ConditionStatus::False
-        );
-        assert_eq!(stored.status().reconciled().reason(), "RunnerBuildFailed");
-        assert_eq!(stored.status().reconciled().message(), "runner unavailable");
-        assert_eq!(stored.uid(), first.uid());
-    }
-
-    #[test]
-    fn identical_apply_reschedules_only_a_failed_reconciliation() {
-        let state = TaskState::new();
-        let task = create(&state, "retry");
-        let target = ResourceGeneration::from_task(&task);
-        assert!(state.mark_reconciliation_failed(
-            &target,
-            "RunnerBuildFailed",
-            "runner unavailable".into(),
-        ));
-
-        let retry = state.apply_desired(&TaskManifest::from(&task)).unwrap();
-        assert!(retry.reconcile);
-        assert_eq!(retry.task.metadata().generation(), target.generation);
-        assert_eq!(
-            retry.task.status().reconciled().status(),
-            ConditionStatus::Unknown
-        );
-
-        let duplicate = state.apply_desired(&TaskManifest::from(&task)).unwrap();
-        assert!(!duplicate.reconcile);
-    }
-
-    #[test]
-    fn authoritative_attempt_and_generation_are_recorded_in_status_and_run() {
-        let state = TaskState::new();
-        let task = create(&state, "attempt");
-        let binding = bind(&state, task.name());
-
-        assert!(state.transition_attempt_starting(&binding, 4));
-        assert!(state.transition_attempt_finished(
-            &binding,
-            4,
-            TaskPhase::Failed,
-            Some("exit".into()),
-            Some(17),
-        ));
-
-        let stored = state.get(task.name()).unwrap();
-        assert_eq!(stored.status().attempt(), 4);
-        assert_eq!(
-            stored.status().observed_generation(),
-            binding.resource.generation
-        );
-        let runs = state.list_runs(task.name());
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].generation(), binding.resource.generation);
-        assert_eq!(runs[0].attempt(), 4);
-        assert_eq!(runs[0].exit_code(), Some(17));
-    }
-
-    #[test]
-    fn each_run_snapshots_the_workload_gvk_of_its_generation() {
-        let state = TaskState::new();
-        let first = create(&state, "workload-history");
-        let old_binding = bind(&state, first.name());
-        assert!(state.transition_attempt_finished(
-            &old_binding,
-            1,
-            TaskPhase::Succeeded,
-            None,
-            Some(0),
-        ));
-
-        let routed_workload = TaskWorkload::Subprocess(SubprocessSpec::new(
-            SubprocessMode::Command {
-                command: "true".into(),
-                args: vec![],
-            },
-            TaskEnv::default(),
-            None,
-            Flag::enabled(),
-        ));
-        let desired = TaskManifest::new(
-            first.name().clone(),
-            TaskSpec::builder("slot", routed_workload, 1_000_u64)
-                .build()
-                .unwrap(),
-        )
-        .unwrap();
-        let applied = state.apply_desired(&desired).unwrap().task;
-        let new_binding = bind(&state, applied.name());
-        assert!(state.transition_attempt_starting(&new_binding, 1));
-
-        let runs = state.list_runs(applied.name());
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].generation(), 1);
-        assert_eq!(runs[0].workload().api_version(), "solti.io/v1");
-        assert_eq!(runs[0].workload().kind(), "Embedded");
-        assert_eq!(runs[1].generation(), 2);
-        assert_eq!(runs[1].workload().api_version(), "solti.io/v1");
-        assert_eq!(runs[1].workload().kind(), "Subprocess");
-    }
-
-    #[test]
-    fn duplicate_terminal_attempt_is_an_exact_noop() {
-        let state = TaskState::new();
-        let task = create(&state, "duplicate-finish");
-        let binding = bind(&state, task.name());
-
-        assert!(state.transition_attempt_starting(&binding, 1));
-        assert!(state.transition_attempt_finished(
-            &binding,
-            1,
-            TaskPhase::Succeeded,
-            None,
-            Some(0),
-        ));
-
-        let before_task = state.get(task.name()).unwrap();
-        let before_runs = state.list_runs(task.name());
-        let terminal_marker = SystemTime::UNIX_EPOCH + Duration::from_secs(17);
-        state
-            .inner
-            .write()
-            .terminal_since
-            .insert(task.name().clone(), terminal_marker);
-
-        assert!(!state.transition_attempt_finished(
-            &binding,
-            1,
-            TaskPhase::Succeeded,
-            None,
-            Some(0),
-        ));
-
-        assert_eq!(state.get(task.name()).unwrap(), before_task);
-        assert_eq!(state.list_runs(task.name()), before_runs);
-        assert_eq!(
-            state.inner.read().terminal_since.get(task.name()),
-            Some(&terminal_marker)
-        );
-    }
-
-    #[test]
-    fn duplicate_terminal_attempt_stays_a_noop_after_run_eviction() {
-        let state = TaskState::new();
-        state.set_max_runs_per_task(0);
-        let task = create(&state, "duplicate-evicted-finish");
-        let binding = bind(&state, task.name());
-
-        assert!(state.transition_attempt_starting(&binding, 1));
-        assert!(state.transition_attempt_finished(
-            &binding,
-            1,
-            TaskPhase::Succeeded,
-            None,
-            Some(0),
-        ));
-        assert!(state.list_runs(task.name()).is_empty());
-
-        let before_task = state.get(task.name()).unwrap();
-        assert!(!state.transition_attempt_finished(
-            &binding,
-            1,
-            TaskPhase::Succeeded,
-            None,
-            Some(0),
-        ));
-        assert_eq!(state.get(task.name()).unwrap(), before_task);
-        assert!(state.list_runs(task.name()).is_empty());
-    }
-
-    #[test]
-    fn terminal_event_without_start_creates_the_exact_authoritative_run() {
-        let state = TaskState::new();
-        let task = create(&state, "lost-start");
-        let binding = bind(&state, task.name());
-
-        assert!(state.transition_attempt_finished(
-            &binding,
-            5,
-            TaskPhase::Succeeded,
-            None,
-            Some(0),
-        ));
-
-        let stored = state.get(task.name()).unwrap();
-        assert_eq!(stored.status().attempt(), 5);
-        let runs = state.list_runs(task.name());
-        assert_eq!(runs.len(), 1);
-        assert_eq!((runs[0].generation(), runs[0].attempt()), (1, 5));
-    }
-
-    #[test]
-    fn later_terminal_attempt_closes_an_unresolved_earlier_run() {
-        let state = TaskState::new();
-        let task = create(&state, "lost-terminal");
-        let binding = bind(&state, task.name());
-        assert!(state.transition_attempt_starting(&binding, 1));
-
-        assert!(state.transition_attempt_finished(&binding, 2, TaskPhase::Succeeded, None, None,));
-
-        let runs = state.list_runs(task.name());
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].attempt(), 1);
-        assert_eq!(runs[0].phase(), TaskPhase::Failed);
-        assert!(
-            runs[0]
-                .error()
-                .is_some_and(|error| error.contains("later attempt finished"))
-        );
-        assert_eq!(runs[1].attempt(), 2);
-        assert_eq!(runs[1].phase(), TaskPhase::Succeeded);
-    }
-
-    #[test]
-    fn authoritative_terminals_without_start_remain_bounded() {
-        let state = TaskState::new();
-        state.set_max_runs_per_task(2);
-        let task = create(&state, "bounded-terminal");
-        let binding = bind(&state, task.name());
-        for attempt in 1..=3 {
-            assert!(state.transition_attempt_finished(
-                &binding,
-                attempt,
-                TaskPhase::Failed,
-                Some(format!("attempt {attempt}")),
-                None,
-            ));
-        }
-
-        let runs = state.list_runs(task.name());
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].attempt(), 2);
-        assert_eq!(runs[1].attempt(), 3);
-    }
-
-    #[test]
-    fn zero_run_cap_keeps_only_active_runs() {
-        let state = TaskState::new();
-        state.set_max_runs_per_task(0);
-        let task = create(&state, "no-history");
-        let binding = bind(&state, task.name());
-
-        assert!(state.transition_attempt_starting(&binding, 1));
-        assert_eq!(state.list_runs(task.name()).len(), 1);
-
-        assert!(state.transition_attempt_finished(&binding, 1, TaskPhase::Succeeded, None, None,));
-        assert!(state.list_runs(task.name()).is_empty());
-    }
-
-    #[test]
-    fn old_generation_event_can_close_its_run_but_cannot_mutate_current_status() {
-        let state = TaskState::new();
-        let first = create(&state, "generation-fence");
-        let old = bind(&state, first.name());
-        assert!(state.transition_attempt_starting(&old, 1));
-
-        let current = state
-            .apply_desired(&manifest("generation-fence", "slot", 2_000))
-            .unwrap()
-            .task;
-        assert_eq!(current.status().phase(), TaskPhase::Pending);
-
-        assert!(state.transition_attempt_finished(
-            &old,
-            1,
-            TaskPhase::Failed,
-            Some("late".into()),
-            Some(1),
-        ));
-
-        let stored = state.get(first.name()).unwrap();
-        assert_eq!(stored.metadata().generation(), 2);
-        assert_eq!(stored.status().phase(), TaskPhase::Pending);
-        assert_eq!(stored.status().attempt(), 0);
-        let old_run = &state.list_runs(first.name())[0];
-        assert_eq!(old_run.generation(), 1);
-        assert_eq!(old_run.phase(), TaskPhase::Failed);
-
-        let before_task = stored;
-        let before_runs = state.list_runs(first.name());
-        assert!(!state.transition_attempt_finished(
-            &old,
-            1,
-            TaskPhase::Failed,
-            Some("late".into()),
-            Some(1),
-        ));
-        assert_eq!(state.get(first.name()).unwrap(), before_task);
-        assert_eq!(state.list_runs(first.name()), before_runs);
-    }
-
-    #[test]
-    fn stale_uid_cannot_mutate_a_recreated_resource() {
-        let state = TaskState::new();
-        let first = create(&state, "uid-fence");
-        let stale = bind(&state, first.name());
-        assert!(state.delete_task(first.name()));
-        let replacement = create(&state, "uid-fence");
-
-        assert!(!state.transition_attempt_finished(
-            &stale,
-            1,
-            TaskPhase::Failed,
-            Some("stale".into()),
-            None,
-        ));
-        let stored = state.get(replacement.name()).unwrap();
-        assert_eq!(stored.uid(), replacement.uid());
-        assert_eq!(stored.status().phase(), TaskPhase::Pending);
-        assert!(state.list_runs(replacement.name()).is_empty());
-    }
-
-    #[test]
-    fn lower_attempt_cannot_regress_current_status() {
-        let state = TaskState::new();
-        let task = create(&state, "attempt-fence");
-        let binding = bind(&state, task.name());
-        assert!(state.transition_attempt_starting(&binding, 3));
-
-        assert!(state.transition_attempt_finished(
-            &binding,
-            2,
-            TaskPhase::Failed,
-            Some("late attempt".into()),
-            None,
-        ));
-
-        let stored = state.get(task.name()).unwrap();
-        assert_eq!(stored.status().phase(), TaskPhase::Running);
-        assert_eq!(stored.status().attempt(), 3);
-        assert_eq!(
-            state
-                .list_runs(task.name())
-                .iter()
-                .find(|run| run.attempt() == 2)
-                .unwrap()
-                .phase(),
-            TaskPhase::Failed
-        );
-    }
-
-    #[test]
-    fn late_or_duplicate_start_cannot_reopen_attempt_history() {
-        let state = TaskState::new();
-        let task = create(&state, "start-fence");
-        let binding = bind(&state, task.name());
-        assert!(state.transition_attempt_starting(&binding, 1));
-        assert!(state.transition_attempt_finished(&binding, 1, TaskPhase::Succeeded, None, None,));
-
-        assert!(!state.transition_attempt_starting(&binding, 1));
-        assert!(state.transition_attempt_starting(&binding, 3));
-        assert!(!state.transition_attempt_starting(&binding, 2));
-
-        let stored = state.get(task.name()).unwrap();
-        assert_eq!(stored.status().phase(), TaskPhase::Running);
-        assert_eq!(stored.status().attempt(), 3);
-        let runs = state.list_runs(task.name());
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].phase(), TaskPhase::Succeeded);
-        assert_eq!(runs[1].attempt(), 3);
-    }
-
-    #[test]
-    fn every_embedded_resource_name_and_slot_is_public() {
-        let state = TaskState::new();
-        create(&state, "embedded-public");
-        state
-            .create_desired(&manifest("solti-state-sweep", "solti-state-sweep", 1_000))
-            .unwrap();
-        state
-            .create_desired(&manifest("user-in-sweep-slot", "solti-state-sweep", 1_000))
-            .unwrap();
-
-        assert_eq!(state.list_all().len(), 3);
-        assert_eq!(state.query(&TaskQuery::new()).unwrap().items.len(), 3);
-        assert_eq!(state.list_by_slot("slot").len(), 1);
-        assert_eq!(state.list_by_slot("solti-state-sweep").len(), 2);
-        assert!(
-            state
-                .get(&TaskId::new("solti-state-sweep").unwrap())
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn adapter_predicate_runs_before_pagination() {
-        let state = TaskState::new();
-        create(&state, "a-visible");
-        create(&state, "b-hidden");
-        create(&state, "c-visible");
-        let query = TaskQuery::new().with_limit(1);
-
-        let first = state
-            .query_where(&query, |task| task.name().as_str() != "b-hidden")
-            .unwrap();
-        assert_eq!(first.items.len(), 1);
-        assert_eq!(first.items[0].name().as_str(), "a-visible");
-        assert_eq!(first.remaining_item_count, 1);
-
-        let second = state
-            .query_where(
-                &query.with_continuation(first.continuation.unwrap()),
-                |task| task.name().as_str() != "b-hidden",
-            )
-            .unwrap();
-        assert_eq!(second.items.len(), 1);
-        assert_eq!(second.items[0].name().as_str(), "c-visible");
-        assert_eq!(second.remaining_item_count, 0);
-        assert!(second.continuation.is_none());
-    }
-
-    #[test]
-    fn slot_labels_and_multiple_phases_filter_before_pagination() {
-        let state = TaskState::new();
-        for (name, environment, tier) in [
-            ("a-match", "production", "frontend"),
-            ("b-no-match", "development", "frontend"),
-            ("c-match", "production", "backend"),
-        ] {
-            let mut labels = Labels::new();
-            labels
-                .insert("environment", environment)
-                .insert("tier", tier);
-            state
-                .create_desired(
-                    &manifest(name, "primary", 1_000)
-                        .with_labels(labels)
-                        .unwrap(),
-                )
-                .unwrap();
-        }
-        let running = state.get(&TaskId::new("c-match").unwrap()).unwrap();
-        let binding = bind(&state, running.name());
-        assert!(state.transition_attempt_starting(&binding, 1));
-
-        let selector: LabelSelector = "environment=production,tier in (frontend,backend)"
-            .parse()
-            .unwrap();
-        let query = TaskQuery::new()
-            .with_slot(Slot::new("primary").unwrap())
-            .with_phases([TaskPhase::Pending, TaskPhase::Running])
-            .with_label_selector(selector)
-            .unwrap()
-            .with_limit(1);
-
-        let first = state.query(&query).unwrap();
-        assert_eq!(first.items.len(), 1);
-        assert_eq!(first.items[0].name().as_str(), "a-match");
-        assert_eq!(first.remaining_item_count, 1);
-
-        let second = state
-            .query(&query.with_continuation(first.continuation.unwrap()))
-            .unwrap();
-        assert_eq!(second.items.len(), 1);
-        assert_eq!(second.items[0].name().as_str(), "c-match");
-        assert_eq!(second.remaining_item_count, 0);
-    }
-
-    #[test]
-    fn metadata_apply_changes_label_query_membership_immediately() {
-        let state = TaskState::new();
-        let first = create(&state, "label-change");
-        let query = TaskQuery::new()
-            .with_label_selector("environment=production".parse().unwrap())
-            .unwrap();
-        assert!(state.query(&query).unwrap().items.is_empty());
-
-        let mut labels = Labels::new();
-        labels.insert("environment", "production");
-        let applied = state
-            .apply_desired(&TaskManifest::from(&first).with_labels(labels).unwrap())
-            .unwrap()
-            .task;
-
-        assert_eq!(
-            applied.metadata().generation(),
-            first.metadata().generation()
-        );
-        assert_ne!(
-            applied.metadata().resource_version(),
-            first.metadata().resource_version()
-        );
-        assert_eq!(state.query(&query).unwrap().items.len(), 1);
-    }
-
-    #[test]
-    fn retention_uses_internal_terminal_timestamp() {
-        let state = TaskState::new();
-        let terminal = create(&state, "expired");
-        let binding = bind(&state, terminal.name());
-        assert_eq!(
-            state.finalize_if_bound(
-                binding.tv.get(),
-                TaskPhase::Canceled,
-                Some("canceled".into()),
-                None,
-                true,
-            ),
-            Some(terminal.name().clone())
-        );
-        create(&state, "pending");
-
-        let config = StateConfig::new()
-            .with_run_ttl(Duration::ZERO)
-            .with_task_ttl(Duration::ZERO);
-        assert_eq!(state.sweep(&config), (0, 1));
-        assert!(!state.contains_task(&TaskId::new("expired").unwrap()));
-        assert!(state.contains_task(&TaskId::new("pending").unwrap()));
-    }
-
-    #[test]
-    fn task_level_completion_preserves_authoritative_attempt() {
-        let state = TaskState::new();
-        let task = create(&state, "final");
-        let binding = bind(&state, task.name());
-        assert!(state.transition_attempt_starting(&binding, 8));
-
-        assert!(state.transition_task_finished(
-            &binding,
-            TaskPhase::Canceled,
-            Some("controller stopped".into()),
-            None,
-        ));
-
-        let stored = state.get(task.name()).unwrap();
-        assert_eq!(stored.status().attempt(), 8);
-        assert_eq!(stored.status().phase(), TaskPhase::Canceled);
-    }
-
-    #[test]
-    fn watch_history_retains_a_change_at_the_exact_byte_budget() {
-        let task = journal_task("exact-budget", 1, 0);
-        let serialized_bytes = TaskState::serialized_task_payload_bytes(None, Some(&task));
-        let config = StateConfig::new()
-            .try_with_watch_history_byte_budget(serialized_bytes)
-            .unwrap();
-        let state = TaskState::with_epoch(config, "epoch".to_string());
-
-        record_current_change(&state, task);
-
-        let inner = state.inner.read();
-        assert_eq!(inner.watch_history.len(), 1);
-        assert_eq!(inner.watch_history_bytes, serialized_bytes);
-        assert_eq!(
-            inner.watch_history.front().unwrap().serialized_bytes,
-            serialized_bytes
-        );
-        assert_eq!(inner.compacted_through, 0);
-    }
-
-    #[test]
-    fn watch_history_byte_budget_can_evict_multiple_changes() {
-        let first = journal_task("small-first", 1, 0);
-        let second = journal_task("small-second", 2, 0);
-        let third = journal_task("large-third", 3, 4 * 1024);
-        let first_bytes = TaskState::serialized_task_payload_bytes(None, Some(&first));
-        let second_bytes = TaskState::serialized_task_payload_bytes(None, Some(&second));
-        let third_bytes = TaskState::serialized_task_payload_bytes(None, Some(&third));
-        assert!(first_bytes + second_bytes <= third_bytes);
-        let config = StateConfig::new()
-            .try_with_watch_history_byte_budget(third_bytes)
-            .unwrap();
-        let state = TaskState::with_epoch(config, "epoch".to_string());
-
-        record_current_change(&state, first);
-        record_current_change(&state, second);
-        record_current_change(&state, third);
-
-        let inner = state.inner.read();
-        assert_eq!(inner.watch_history.len(), 1);
-        assert_eq!(inner.watch_history.front().unwrap().revision, 3);
-        assert_eq!(inner.watch_history_bytes, third_bytes);
-        assert_eq!(inner.compacted_through, 2);
-    }
-
-    #[tokio::test]
-    async fn oversized_change_is_live_but_not_retained() {
-        let first = journal_task("retained-before-oversized", 1, 0);
-        let task = journal_task("oversized-live", 2, 4 * 1024);
-        let serialized_bytes = TaskState::serialized_task_payload_bytes(None, Some(&task));
-        let config = StateConfig::new()
-            .try_with_watch_history_byte_budget(serialized_bytes - 1)
-            .unwrap();
-        let state = TaskState::with_epoch(config, "epoch".to_string());
-        record_current_change(&state, first);
-        let mut watch = state.watch(&TaskFilter::new(), Some("epoch:1")).unwrap();
-
-        record_current_change(&state, task.clone());
-
-        {
-            let inner = state.inner.read();
-            assert!(inner.watch_history.is_empty());
-            assert_eq!(inner.watch_history_bytes, 0);
-            assert_eq!(inner.compacted_through, 2);
-        }
-        assert_eq!(
-            watch.next().await.unwrap().unwrap(),
-            TaskWatchEvent::Added(task)
-        );
-        assert!(matches!(
-            state.watch(&TaskFilter::new(), Some("epoch:1")),
-            Err(CollectionError::ResourceVersionExpired { .. })
-        ));
-    }
-
-    #[test]
-    fn continuation_expires_after_byte_budget_compaction() {
-        let config = StateConfig::new()
-            .try_with_watch_history_byte_budget(1)
-            .unwrap();
-        let state = TaskState::with_epoch(config, "epoch".to_string());
-        create(&state, "a-first");
-        create(&state, "b-second");
-        let query = TaskQuery::new().with_limit(1);
-        let first_page = state.query(&query).unwrap();
-        let resource_version = first_page.resource_version.clone();
-        let continuation = first_page.continuation.unwrap();
-
-        create(&state, "c-third");
-
-        assert_eq!(
-            state
-                .query(&query.with_continuation(continuation))
-                .unwrap_err(),
-            CollectionError::ResourceVersionExpired { resource_version }
-        );
-    }
-
-    #[test]
-    fn list_snapshot_carries_the_atomic_collection_version() {
-        let state = TaskState::new();
-        let empty = state.query(&TaskQuery::new()).unwrap();
-        let (epoch, revision) = TaskState::parse_resource_version(&empty.resource_version).unwrap();
-        assert!(!epoch.is_empty());
-        assert_eq!(revision, 0);
-
-        let task = create(&state, "versioned-list");
-        let page = state.query(&TaskQuery::new()).unwrap();
-        assert_eq!(page.resource_version, task.metadata().resource_version());
-        assert_eq!(page.items, vec![task]);
-    }
-
-    #[test]
-    fn continuation_reads_the_first_page_snapshot_after_live_changes() {
-        let state = TaskState::new();
-        let first_task = create(&state, "b-first");
-        let second_task = create(&state, "c-second");
-        let query = TaskQuery::new().with_limit(1);
-
-        let first_page = state.query(&query).unwrap();
-        assert_eq!(first_page.items, vec![first_task]);
-        assert_eq!(first_page.remaining_item_count, 1);
-        let continuation = first_page.continuation.unwrap();
-
-        create(&state, "a-added-later");
-        state
-            .apply_desired(&manifest("c-second", "changed", 2_000))
-            .unwrap();
-        assert!(state.delete_task(second_task.name()));
-
-        let second_page = state.query(&query.with_continuation(continuation)).unwrap();
-        assert_eq!(second_page.resource_version, first_page.resource_version);
-        assert_eq!(second_page.items, vec![second_task]);
-        assert_eq!(second_page.remaining_item_count, 0);
-        assert!(second_page.continuation.is_none());
-    }
-
-    #[test]
-    fn continuation_is_bound_to_its_filter_and_last_returned_name() {
-        let state = TaskState::new();
-        create(&state, "a-first");
-        create(&state, "b-second");
-        let query = TaskQuery::new().with_limit(1);
-        let first_page = state.query(&query).unwrap();
-        let continuation = first_page.continuation.unwrap();
-
-        let mismatch = query
-            .clone()
-            .with_phase(TaskPhase::Running)
-            .with_continuation(continuation.clone());
-        assert_eq!(
-            state.query(&mismatch).unwrap_err(),
-            CollectionError::ContinuationFilterMismatch
-        );
-
-        let missing = TaskContinuation::new(
-            continuation.resource_version(),
-            query.filter().clone(),
-            TaskId::new("missing-cursor").unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            state.query(&query.with_continuation(missing)).unwrap_err(),
-            CollectionError::ContinuationCursorNotFound {
-                name: TaskId::new("missing-cursor").unwrap(),
-            }
-        );
-    }
-
-    #[test]
-    fn continuation_reports_invalid_and_expired_snapshots() {
-        let config = StateConfig::new()
-            .try_with_watch_history_capacity(1)
-            .unwrap();
-        let state = TaskState::with_epoch(config, "epoch".to_string());
-        create(&state, "a-first");
-        create(&state, "b-second");
-        let query = TaskQuery::new().with_limit(1);
-        let first_page = state.query(&query).unwrap();
-        let continuation = first_page.continuation.unwrap();
-
-        let invalid = TaskContinuation::new(
-            "epoch:99",
-            query.filter().clone(),
-            continuation.after().clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            state
-                .query(&query.clone().with_continuation(invalid))
-                .unwrap_err(),
-            CollectionError::InvalidResourceVersion {
-                resource_version: "epoch:99".to_string(),
-            }
-        );
-
-        create(&state, "c-third");
-        create(&state, "d-fourth");
-        assert_eq!(
-            state
-                .query(&query.with_continuation(continuation))
-                .unwrap_err(),
-            CollectionError::ResourceVersionExpired {
-                resource_version: first_page.resource_version,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn list_then_watch_replays_every_change_after_the_snapshot() {
-        let state = TaskState::new();
-        let listed = state.query(&TaskQuery::new()).unwrap();
-        let created = create(&state, "created-in-gap");
-
-        let mut watch = state
-            .watch(&TaskFilter::new(), Some(listed.resource_version.as_str()))
-            .unwrap();
-        let event = watch.next().await.unwrap().unwrap();
-
-        assert_eq!(event, TaskWatchEvent::Added(created));
-    }
-
-    #[tokio::test]
-    async fn watch_without_version_emits_sorted_snapshot_then_live_changes() {
-        let state = TaskState::new();
-        let second = create(&state, "b-snapshot");
-        let first = create(&state, "a-snapshot");
-        let mut watch = state.watch(&TaskFilter::new(), None).unwrap();
-
-        assert_eq!(
-            watch.next().await.unwrap().unwrap(),
-            TaskWatchEvent::Added(first)
-        );
-        assert_eq!(
-            watch.next().await.unwrap().unwrap(),
-            TaskWatchEvent::Added(second)
-        );
-
-        let live = create(&state, "c-live");
-        assert_eq!(
-            watch.next().await.unwrap().unwrap(),
-            TaskWatchEvent::Added(live)
-        );
-    }
-
-    #[test]
-    fn watch_rejects_expired_invalid_and_foreign_versions() {
-        let config = StateConfig::new()
-            .try_with_watch_history_capacity(1)
-            .unwrap();
-        let state = TaskState::with_epoch(config, "epoch".to_string());
-        create(&state, "first");
-        create(&state, "second");
-
-        assert!(matches!(
-            state.watch(&TaskFilter::new(), Some("epoch:0")),
-            Err(CollectionError::ResourceVersionExpired { .. })
-        ));
-        assert!(matches!(
-            state.watch(&TaskFilter::new(), Some("another:2")),
-            Err(CollectionError::ResourceVersionExpired { .. })
-        ));
-        assert!(matches!(
-            state.watch(&TaskFilter::new(), Some("")),
-            Err(CollectionError::InvalidResourceVersion { .. })
-        ));
-        assert!(matches!(
-            state.watch(&TaskFilter::new(), Some("epoch:not-a-number")),
-            Err(CollectionError::InvalidResourceVersion { .. })
-        ));
-        assert!(matches!(
-            state.watch(&TaskFilter::new(), Some("epoch:3")),
-            Err(CollectionError::InvalidResourceVersion { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn selector_membership_changes_map_to_added_modified_and_deleted() {
-        let state = TaskState::new();
-        let first = create(&state, "selector-transition");
-        let filter = TaskFilter::new()
-            .with_label_selector("environment=production".parse().unwrap())
-            .unwrap();
-        let listed = state.query(&TaskQuery::new()).unwrap();
-        let mut watch = state
-            .watch(&filter, Some(listed.resource_version.as_str()))
-            .unwrap();
-
-        let mut labels = Labels::new();
-        labels.insert("environment", "production");
-        let added = state
-            .apply_desired(&TaskManifest::from(&first).with_labels(labels).unwrap())
-            .unwrap()
-            .task;
-        assert_eq!(
-            watch.next().await.unwrap().unwrap(),
-            TaskWatchEvent::Added(added.clone())
-        );
-
-        let mut annotations = Annotations::new();
-        annotations.insert("example.io/revision", "2");
-        let modified = state
-            .apply_desired(
-                &TaskManifest::from(&added)
-                    .with_annotations(annotations)
-                    .unwrap(),
-            )
-            .unwrap()
-            .task;
-        assert_eq!(
-            watch.next().await.unwrap().unwrap(),
-            TaskWatchEvent::Modified(modified.clone())
-        );
-
-        let current = state
-            .apply_desired(
-                &TaskManifest::from(&modified)
-                    .with_labels(Labels::new())
-                    .unwrap(),
-            )
-            .unwrap()
-            .task;
-        let deleted = watch.next().await.unwrap().unwrap();
-        let TaskWatchEvent::Deleted(deleted) = deleted else {
-            panic!("selector exit must be Deleted");
-        };
-        assert_eq!(deleted.name(), current.name());
-        assert_eq!(deleted.metadata().labels(), modified.metadata().labels());
-        assert_eq!(
-            deleted.metadata().resource_version(),
-            current.metadata().resource_version()
-        );
-    }
-
-    #[tokio::test]
-    async fn adapter_predicate_participates_in_watch_transitions() {
-        let state = TaskState::new();
-        let first = create(&state, "visibility-transition");
-        let listed = state.query(&TaskQuery::new()).unwrap();
-        let mut watch = state
-            .watch_where(
-                &TaskFilter::new(),
-                Some(listed.resource_version.as_str()),
-                |task| task.spec().timeout().as_millis() <= 1_000,
-            )
-            .unwrap();
-
-        let hidden = state
-            .apply_desired(&TaskManifest::new(first.name().as_str(), spec("slot", 2_000)).unwrap())
-            .unwrap()
-            .task;
-        let TaskWatchEvent::Deleted(deleted) = watch.next().await.unwrap().unwrap() else {
-            panic!("leaving adapter visibility must be Deleted");
-        };
-        assert_eq!(deleted.name(), hidden.name());
-        assert_eq!(
-            deleted.metadata().resource_version(),
-            hidden.metadata().resource_version()
-        );
-
-        let visible = state
-            .apply_desired(&TaskManifest::new(first.name().as_str(), spec("slot", 1_000)).unwrap())
-            .unwrap()
-            .task;
-        assert_eq!(
-            watch.next().await.unwrap().unwrap(),
-            TaskWatchEvent::Added(visible)
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_and_sweep_each_publish_one_deleted_event() {
-        let state = TaskState::new();
-        let deleted = create(&state, "api-deleted");
-        let listed = state.query(&TaskQuery::new()).unwrap();
-        let mut watch = state
-            .watch(&TaskFilter::new(), Some(listed.resource_version.as_str()))
-            .unwrap();
-        assert!(state.delete_task(deleted.name()));
-        let TaskWatchEvent::Deleted(event) = watch.next().await.unwrap().unwrap() else {
-            panic!("delete must emit Deleted");
-        };
-        assert_eq!(event.name(), deleted.name());
-        assert_ne!(
-            event.metadata().resource_version(),
-            deleted.metadata().resource_version()
-        );
-
-        let expired = create(&state, "sweep-deleted");
-        let binding = bind(&state, expired.name());
-        assert_eq!(
-            state.finalize_if_bound(
-                binding.tv.get(),
-                TaskPhase::Canceled,
-                Some("canceled".into()),
-                None,
-                true,
-            ),
-            Some(expired.name().clone())
-        );
-        let listed = state.query(&TaskQuery::new()).unwrap();
-        let mut watch = state
-            .watch(&TaskFilter::new(), Some(listed.resource_version.as_str()))
-            .unwrap();
-        let config = StateConfig::new()
-            .with_run_ttl(Duration::ZERO)
-            .with_task_ttl(Duration::ZERO);
-        assert_eq!(state.sweep(&config), (0, 1));
-        let TaskWatchEvent::Deleted(event) = watch.next().await.unwrap().unwrap() else {
-            panic!("sweep must emit Deleted");
-        };
-        assert_eq!(event.name(), expired.name());
-    }
-
-    #[tokio::test]
-    async fn no_op_apply_and_run_only_change_publish_nothing() {
-        let state = TaskState::new();
-        let first = create(&state, "no-watch-noop");
-        let binding = bind(&state, first.name());
-        assert!(state.transition_attempt_starting(&binding, 1));
-
-        let changed = TaskManifest::new(first.name().as_str(), spec("slot", 2_000)).unwrap();
-        let current = state.apply_desired(&changed).unwrap().task;
-        let listed = state.query(&TaskQuery::new()).unwrap();
-        let mut watch = state
-            .watch(&TaskFilter::new(), Some(listed.resource_version.as_str()))
-            .unwrap();
-
-        let noop = state.apply_desired(&TaskManifest::from(&current)).unwrap();
-        assert!(!noop.reconcile);
-        assert!(state.transition_attempt_finished(&binding, 1, TaskPhase::Succeeded, None, None,));
-        assert_eq!(
-            state.query(&TaskQuery::new()).unwrap().resource_version,
-            listed.resource_version
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), watch.next())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn lag_is_terminal_once_the_resume_point_is_compacted() {
-        let config = StateConfig::new()
-            .try_with_watch_history_capacity(1)
-            .unwrap();
-        let state = TaskState::with_epoch(config, "epoch".to_string());
-        let mut watch = state.watch(&TaskFilter::new(), Some("epoch:0")).unwrap();
-
-        create(&state, "first");
-        create(&state, "second");
-
-        assert!(matches!(
-            watch.next().await,
-            Some(Err(CollectionError::ResourceVersionExpired { .. }))
-        ));
-        assert!(watch.next().await.is_none());
-    }
-
-    #[test]
-    fn irrelevant_live_events_yield_after_the_poll_budget() {
-        struct CountingWake(AtomicUsize);
-
-        impl Wake for CountingWake {
-            fn wake(self: Arc<Self>) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-
-            fn wake_by_ref(self: &Arc<Self>) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        let state = TaskState::new();
-        let listed = state.query(&TaskQuery::new()).unwrap();
-        let filter = TaskFilter::new()
-            .with_label_selector("watched=true".parse().unwrap())
-            .unwrap();
-        let mut watch = state
-            .watch(&filter, Some(listed.resource_version.as_str()))
-            .unwrap();
-        for index in 0..=WATCH_POLL_BUDGET {
-            create(&state, &format!("irrelevant-{index}"));
-        }
-
-        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
-        let waker = Waker::from(Arc::clone(&wake));
-        let mut context = Context::from_waker(&waker);
-        assert!(matches!(
-            Pin::new(&mut watch).poll_next(&mut context),
-            Poll::Pending
-        ));
-        assert_eq!(wake.0.load(Ordering::Relaxed), 1);
-
-        state.close_watches();
-        assert!(matches!(
-            Pin::new(&mut watch).poll_next(&mut context),
-            Poll::Ready(None)
-        ));
-    }
-
-    #[tokio::test]
-    async fn closing_state_watches_ends_the_stream() {
-        let state = TaskState::new();
-        let mut watch = state.watch(&TaskFilter::new(), Some("0")).unwrap();
-        state.close_watches();
-        assert!(watch.next().await.is_none());
-    }
-}
+mod tests;

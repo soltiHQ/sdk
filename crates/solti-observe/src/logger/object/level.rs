@@ -21,7 +21,7 @@ use crate::logger::LoggerError;
 ///
 /// ## Syntax
 ///
-/// Any expression accepted by [`EnvFilter`](tracing_subscriber::EnvFilter) can be used.
+/// Any expression accepted by [`EnvFilter`] can be used.
 ///
 /// | Expression                                 | Meaning                                          |
 /// |--------------------------------------------|--------------------------------------------------|

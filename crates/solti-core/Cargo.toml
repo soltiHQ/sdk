@@ -14,13 +14,12 @@ version.workspace      = true
 edition.workspace      = true
 license.workspace      = true
 
-exclude = ["ARCHITECTURE.md"]
-
 [features]
 default   = []
 test-util = ["taskvisor/test-util"]
 
 [dependencies]
+bytes        = { workspace = true }
 solti-model  = { workspace = true }
 solti-runner = { workspace = true }
 
@@ -34,8 +33,15 @@ tokio-stream = { workspace = true, features = ["sync"] }
 tokio-util   = { workspace = true }
 
 [dev-dependencies]
-bytes     = { workspace = true }
-taskvisor = { workspace = true, features = ["test-util"] }
+criterion   = { workspace = true }
+proptest    = { workspace = true }
+solti-chain = { workspace = true, default-features = false }
+taskvisor   = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name              = "state_collections"
+harness           = false
+required-features = ["test-util"]
 
 [package.metadata.docs.rs]
 all-features = true

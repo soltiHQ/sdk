@@ -58,7 +58,7 @@ pub use tasks::timezone_sync;
 /// };
 ///
 /// init_logger(&config)?;
-/// tracing::info!("logger ready");
+/// tracing::info!(event = "service.logger_ready", "logger ready");
 /// # Ok(()) }
 /// ```
 ///

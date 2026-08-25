@@ -19,7 +19,9 @@ use std::collections::HashMap;
 use solti_model::{AgentCapabilities, AgentId, BackoffPolicy, Token};
 
 use crate::errors::DiscoverError;
-use crate::metrics::{DiscoverMetricsHandle, noop_discover_metrics};
+use crate::metrics::{
+    DiscoverMetricsHandle, noop_discover_metrics, panic_contained_discover_metrics,
+};
 use crate::proto::EndpointType;
 
 /// Default connect timeout in milliseconds.
@@ -175,6 +177,7 @@ pub struct DiscoverConfig {
     pub(crate) metadata: HashMap<String, String>,
     pub(crate) capabilities: AgentCapabilities,
     pub(crate) token: Option<Token>,
+    pub(crate) allow_insecure_token_transport: bool,
     pub(crate) backoff: Option<BackoffPolicy>,
     pub(crate) connect_timeout_ms: u64,
     pub(crate) request_timeout_ms: u64,
@@ -187,13 +190,18 @@ pub struct DiscoverConfig {
 impl DiscoverConfig {
     /// Starts a discovery config builder.
     ///
+    /// `capabilities` is an explicit snapshot of the runners served by the agent.
     /// `task_revision` identifies the captured runtime intent.
     /// Change it whenever a setting used by the embedded task changes.
+    /// This includes opaque settings such as credentials, TLS material, and
+    /// the metrics backend. Change it when the [`UptimeSource`](crate::UptimeSource)
+    /// passed to [`sync`](crate::sync) changes too.
     pub fn builder(
         agent_id: AgentId,
         name: impl Into<String>,
         agent_endpoint: AgentEndpoint,
         control_plane: ControlPlaneEndpoint,
+        capabilities: AgentCapabilities,
         delay_ms: u64,
         task_revision: impl Into<String>,
     ) -> DiscoverConfigBuilder {
@@ -204,8 +212,9 @@ impl DiscoverConfig {
             control_plane,
             delay_ms,
             metadata: HashMap::new(),
-            capabilities: AgentCapabilities::default(),
+            capabilities,
             token: None,
+            allow_insecure_token_transport: false,
             backoff: None,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
@@ -219,16 +228,16 @@ impl DiscoverConfig {
 
 /// Builder for [`DiscoverConfig`].
 ///
-/// | Setting              | Default                       |
-/// |----------------------|-------------------------------|
-/// | Metadata             | Empty                         |
-/// | Capabilities         | No runners                    |
-/// | Backoff              | Derived from `delay_ms`       |
-/// | Connect timeout      | 5 seconds                     |
-/// | Request timeout      | 30 seconds                    |
-/// | Metrics              | No-op backend                 |
-/// | Bearer token         | None                          |
-/// | Custom TLS           | None                          |
+/// | Setting                  | Default                 |
+/// |--------------------------|-------------------------|
+/// | Metadata                 | Empty                   |
+/// | Backoff                  | Derived from `delay_ms` |
+/// | Connect timeout          | 5 seconds               |
+/// | Request timeout          | 30 seconds              |
+/// | Metrics                  | No-op backend           |
+/// | Bearer token             | None                    |
+/// | Insecure token transport | Disabled                |
+/// | Custom TLS               | None                    |
 #[derive(Debug, Clone)]
 pub struct DiscoverConfigBuilder {
     agent_id: AgentId,
@@ -239,6 +248,7 @@ pub struct DiscoverConfigBuilder {
     metadata: HashMap<String, String>,
     capabilities: AgentCapabilities,
     token: Option<Token>,
+    allow_insecure_token_transport: bool,
     backoff: Option<BackoffPolicy>,
     connect_timeout_ms: u64,
     request_timeout_ms: u64,
@@ -252,12 +262,6 @@ impl DiscoverConfigBuilder {
     /// Sets metadata sent with every sync.
     pub fn metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = metadata;
-        self
-    }
-
-    /// Sets the registered runner capabilities sent with every sync.
-    pub fn capabilities(mut self, capabilities: AgentCapabilities) -> Self {
-        self.capabilities = capabilities;
         self
     }
 
@@ -280,14 +284,31 @@ impl DiscoverConfigBuilder {
     }
 
     /// Sets the metrics backend.
+    ///
+    /// [`Self::build`] installs a sticky panic boundary shared by every task
+    /// attempt using the resulting configuration.
     pub fn with_metrics(mut self, metrics: DiscoverMetricsHandle) -> Self {
         self.metrics = metrics;
         self
     }
 
     /// Sets the bearer token sent with every sync.
+    ///
+    /// The selected control-plane endpoint must use HTTPS by default.
+    /// [`Self::allow_insecure_token_transport`] provides an explicit development
+    /// or loopback opt-in for plaintext transport.
     pub fn with_token(mut self, token: Token) -> Self {
         self.token = Some(token);
+        self
+    }
+
+    /// Allows a bearer token over a plaintext control-plane connection.
+    ///
+    /// This opt-in weakens the default credential transport policy.
+    /// Use it only for an explicitly controlled development or loopback endpoint.
+    /// Plaintext discovery without a token does not require this opt-in.
+    pub fn allow_insecure_token_transport(mut self) -> Self {
+        self.allow_insecure_token_transport = true;
         self
     }
 
@@ -351,11 +372,12 @@ impl DiscoverConfigBuilder {
             metadata: self.metadata,
             capabilities: self.capabilities,
             token: self.token,
+            allow_insecure_token_transport: self.allow_insecure_token_transport,
             backoff: self.backoff,
             connect_timeout_ms: self.connect_timeout_ms,
             request_timeout_ms: self.request_timeout_ms,
             task_revision,
-            metrics: self.metrics,
+            metrics: panic_contained_discover_metrics(self.metrics),
             #[cfg(feature = "tls")]
             tls: self.tls,
         })
@@ -373,6 +395,7 @@ mod tests {
             "agent-1",
             AgentEndpoint::new("http://127.0.0.1:8085", AgentEndpointType::Http, 1)?,
             ControlPlaneEndpoint::new("http://127.0.0.1:9000", DiscoveryTransport::Http)?,
+            AgentCapabilities::default(),
             delay_ms,
             "test@1",
         )
@@ -417,11 +440,33 @@ mod tests {
             "agent-1",
             AgentEndpoint::new("127.0.0.1:8085", AgentEndpointType::Http, 1).unwrap(),
             ControlPlaneEndpoint::new("http://127.0.0.1:9000", DiscoveryTransport::Http).unwrap(),
+            AgentCapabilities::default(),
             1_000,
             " ",
         )
         .build();
 
         assert!(matches!(result, Err(DiscoverError::InvalidConfig(_))));
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn insecure_token_transport_requires_explicit_opt_in() {
+        let default = config(1_000).unwrap();
+        assert!(!default.allow_insecure_token_transport);
+
+        let opted_in = DiscoverConfig::builder(
+            AgentId::new("agent-1").unwrap(),
+            "agent-1",
+            AgentEndpoint::new("http://127.0.0.1:8085", AgentEndpointType::Http, 1).unwrap(),
+            ControlPlaneEndpoint::new("http://127.0.0.1:9000", DiscoveryTransport::Http).unwrap(),
+            AgentCapabilities::default(),
+            1_000,
+            "test@1",
+        )
+        .allow_insecure_token_transport()
+        .build()
+        .unwrap();
+        assert!(opted_in.allow_insecure_token_transport);
     }
 }

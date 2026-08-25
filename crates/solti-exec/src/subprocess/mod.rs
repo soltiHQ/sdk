@@ -9,6 +9,8 @@
 //! Task ──► SubprocessRunner ──► TaskRef
 //!                                  │ each attempt
 //!                                  ▼
+//!                        reserve cleanup ownership
+//!                                  ▼
 //!                          prepare backend
 //!                                  ▼
 //!                          spawn process
@@ -16,11 +18,13 @@
 //!                           └──► exit/cancel
 //! ```
 //!
-//! Each attempt owns its process and output readers.
+//! Each attempt owns its process and output-reader task handles.
+//! Dropping the attempt aborts both readers and releases their pipe endpoints.
 //! Script attempts also own an anonymous script descriptor.
 //! A configured cgroup is attempt-scoped.
 //! Unix attempts use a dedicated process group.
 //! The runner removes attempt-scoped resources after completion.
+//! Registration returns the concrete runner used for finalizer status and shutdown.
 //!
 //! ## Registration
 //!
@@ -28,11 +32,24 @@
 //! [`register_subprocess_runner_with_backend`] accepts explicit settings.
 //! Both helpers add [`LABEL_RUNNER_NAME`] to the registered runner labels.
 mod backend;
-pub use backend::{CwdPolicy, EnvPolicy, SubprocessBackendConfig};
+pub use backend::{
+    CwdPolicy, DEFAULT_SUBPROCESS_CLEANUP_CAPACITY, EnvPolicy, SubprocessBackendConfig,
+};
 
 mod boundary;
 
+mod child;
+
+mod cwd_domain;
+
 mod domain;
+pub use domain::SubprocessFinalizerStatus;
+
+#[cfg(unix)]
+mod exec_unix;
+
+#[cfg(target_os = "macos")]
+mod spawn_macos;
 
 mod task;
 
@@ -55,15 +72,17 @@ pub use crate::registration::LABEL_RUNNER_NAME;
 ///
 /// The default uses an empty [`crate::host::HostProcessPolicy`].
 /// The runner receives label `solti.io/runner-name=<name>`.
+/// The returned handle exposes finalizer status and terminal shutdown.
 ///
 /// # Errors
 ///
 /// Returns [`ExecError::InvalidRunnerConfig`] when `name` is invalid.
 /// Returns [`ExecError::Router`] when the router rejects registration.
+/// Returns [`ExecError::Io`] when the cleanup or cwd worker cannot start.
 pub fn register_subprocess_runner(
     router: &mut RunnerRouter,
     name: impl Into<String>,
-) -> Result<(), ExecError> {
+) -> Result<Arc<SubprocessRunner>, ExecError> {
     register_runner_inner(router, Arc::new(SubprocessRunner::new(name)?))
 }
 
@@ -71,17 +90,19 @@ pub fn register_subprocess_runner(
 ///
 /// The backend is validated before registration.
 /// The runner receives label `solti.io/runner-name=<name>`.
+/// The returned handle exposes finalizer status and terminal shutdown.
 ///
 /// # Errors
 ///
 /// Returns [`ExecError::InvalidRunnerConfig`] when `name` or `backend` is invalid.
 /// Returns [`ExecError::Router`] when the router rejects registration.
-/// Returns [`ExecError::Io`] when host resource preparation fails.
+/// Returns [`ExecError::Io`] when backend preparation fails or the cleanup or
+/// cwd worker cannot start.
 pub fn register_subprocess_runner_with_backend(
     router: &mut RunnerRouter,
     name: impl Into<String>,
     backend: SubprocessBackendConfig,
-) -> Result<(), ExecError> {
+) -> Result<Arc<SubprocessRunner>, ExecError> {
     register_runner_inner(
         router,
         Arc::new(SubprocessRunner::with_config(name, backend)?),
@@ -91,9 +112,9 @@ pub fn register_subprocess_runner_with_backend(
 fn register_runner_inner(
     router: &mut RunnerRouter,
     runner: Arc<SubprocessRunner>,
-) -> Result<(), ExecError> {
+) -> Result<Arc<SubprocessRunner>, ExecError> {
     let mut labels = Labels::new();
     labels.insert(LABEL_RUNNER_NAME, runner.name());
-    router.register_with_labels(runner, labels)?;
-    Ok(())
+    router.register_with_labels(runner.clone(), labels)?;
+    Ok(runner)
 }

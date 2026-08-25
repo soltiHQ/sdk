@@ -21,12 +21,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use solti_core::{CollectionError, CoreError, SupervisorApi, WritePreconditionViolation};
 use solti_model::{
-    OutputEvent, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun,
-    WritePreconditions,
+    OutputEvent, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRunPage,
+    TaskRunQuery, Uid, WritePreconditions,
 };
 use tokio_stream::StreamExt;
 
-use crate::error::{ApiConflict, ApiError, ApiErrorCause};
+use crate::error::{ApiConflict, ApiConflictReason, ApiError, ApiErrorCause};
 use crate::handler::{ApiHandler, OutputEventStream, TaskWatchEventStream};
 use crate::visibility::{manifest_is_visible, task_is_visible, workload_is_visible};
 
@@ -127,11 +127,27 @@ impl ApiHandler for SupervisorApiAdapter {
         ))
     }
 
-    async fn list_task_runs(&self, id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
+    async fn query_task_runs(
+        &self,
+        id: &TaskId,
+        query: TaskRunQuery,
+    ) -> Result<TaskRunPage, ApiError> {
         self.supervisor
-            .list_task_runs_where(id, workload_is_visible)
+            .query_task_runs_where(id, &query, workload_is_visible)
             .await
+            .map_err(map_collection_error)?
             .ok_or_else(|| ApiError::TaskNotFound(id.to_string()))
+    }
+
+    async fn cancel_task(
+        &self,
+        id: &TaskId,
+        preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
+        self.supervisor
+            .cancel_task_where(id, preconditions, task_is_visible)
+            .await
+            .map_err(map_core_error)
     }
 
     async fn delete_task(
@@ -145,10 +161,14 @@ impl ApiHandler for SupervisorApiAdapter {
             .map_err(map_core_error)
     }
 
-    async fn stream_task_logs(&self, id: &TaskId) -> Result<OutputEventStream, ApiError> {
+    async fn stream_task_logs(
+        &self,
+        id: &TaskId,
+        task_uid: &Uid,
+    ) -> Result<OutputEventStream, ApiError> {
         let (generation, stream) = self
             .supervisor
-            .subscribe_output_where(id, task_is_visible)
+            .subscribe_output_where(id, task_uid, task_is_visible)
             .await
             .ok_or_else(|| ApiError::TaskNotFound(id.to_string()))?;
         Ok(Box::pin(stream.filter(move |event| {
@@ -162,20 +182,30 @@ fn map_core_error(error: CoreError) -> ApiError {
         CoreError::InvalidSpec(inner) => ApiError::InvalidRequest(inner.to_string()),
         CoreError::AlreadyExists(message) => ApiError::AlreadyExists(message),
         CoreError::NotFound(message) => ApiError::TaskNotFound(message),
+        error @ CoreError::RetainedTaskLimitReached { .. } => {
+            ApiError::ResourceExhausted(error.to_string())
+        }
+        error @ CoreError::RetainedTaskManifestByteLimitExceeded { .. } => {
+            ApiError::ResourceExhausted(error.to_string())
+        }
         CoreError::Conflict(conflict) => {
             let causes = conflict
                 .violations()
                 .iter()
                 .map(|violation| match violation {
                     WritePreconditionViolation::Uid { .. } => {
-                        ApiErrorCause::new("UIDMismatch", violation.to_string())
+                        ApiErrorCause::new(ApiConflictReason::UidMismatch, violation.to_string())
                             .with_field("preconditions.uid")
                     }
-                    WritePreconditionViolation::ResourceVersion { .. } => {
-                        ApiErrorCause::new("ResourceVersionMismatch", violation.to_string())
-                            .with_field("preconditions.resourceVersion")
-                    }
-                    _ => ApiErrorCause::new("PreconditionFailed", violation.to_string()),
+                    WritePreconditionViolation::ResourceVersion { .. } => ApiErrorCause::new(
+                        ApiConflictReason::ResourceVersionMismatch,
+                        violation.to_string(),
+                    )
+                    .with_field("preconditions.resourceVersion"),
+                    _ => ApiErrorCause::new(
+                        ApiConflictReason::PreconditionFailed,
+                        violation.to_string(),
+                    ),
                 })
                 .collect();
             ApiError::Conflict(ApiConflict::new(conflict.name().to_string(), causes))
@@ -187,9 +217,15 @@ fn map_core_error(error: CoreError) -> ApiError {
 
 fn map_collection_error(error: CollectionError) -> ApiError {
     match &error {
+        CollectionError::ConcurrentTaskWatchLimitReached { .. }
+        | CollectionError::TaskWatchInitialReplayByteLimitExceeded { .. } => {
+            ApiError::ResourceExhausted(error.to_string())
+        }
         CollectionError::InvalidResourceVersion { .. }
         | CollectionError::ContinuationFilterMismatch
-        | CollectionError::ContinuationCursorNotFound { .. } => {
+        | CollectionError::ContinuationCursorNotFound { .. }
+        | CollectionError::TaskRunContinuationTaskMismatch { .. }
+        | CollectionError::TaskRunContinuationCursorNotFound { .. } => {
             ApiError::InvalidRequest(error.to_string())
         }
         CollectionError::ResourceVersionExpired { .. } => {
@@ -215,6 +251,7 @@ mod tests {
 
     struct TestRunner;
 
+    #[solti_runner::async_trait]
     impl Runner for TestRunner {
         fn name(&self) -> &str {
             "adapter-test"
@@ -229,13 +266,15 @@ mod tests {
             ]
         }
 
-        fn build_task(
+        async fn build_task(
             &self,
             _task: &Task,
-            run_id: &RunId,
+            _run_id: &RunId,
             _context: &BuildContext,
+            _cancellation: &solti_runner::BuildCancellation,
+            _scope: &mut solti_runner::BuildScope,
         ) -> Result<TaskRef, RunnerError> {
-            Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move {
+            Ok(TaskFn::arc(|_ctx: TaskContext| async move {
                 Ok::<(), TaskError>(())
             }))
         }
@@ -257,9 +296,7 @@ mod tests {
         // Embedded tasks enter state through the prebuilt-task SDK path; the
         // wire path can never create them, but a point GET by name
         // used to reach them via `state.get` and fail the proto conversion.
-        let task: TaskRef = TaskFn::arc("embedded-probe", |_ctx: TaskContext| async move {
-            Ok::<(), TaskError>(())
-        });
+        let task: TaskRef = TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) });
         let spec = TaskSpec::builder(
             "slot-embedded",
             TaskWorkload::Embedded(EmbeddedSpec::new("adapter-test-v1").unwrap()),
@@ -294,9 +331,7 @@ mod tests {
     async fn embedded_tasks_are_absent_for_all_per_id_operations() {
         let api = supervisor().await;
 
-        let task: TaskRef = TaskFn::arc("embedded-guard", |_ctx: TaskContext| async move {
-            Ok::<(), TaskError>(())
-        });
+        let task: TaskRef = TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) });
         let spec = solti_model::TaskSpec::builder(
             "slot-embedded-guard",
             TaskWorkload::Embedded(EmbeddedSpec::new("adapter-test-v1").unwrap()),
@@ -313,10 +348,20 @@ mod tests {
 
         let adapter = SupervisorApiAdapter::new(Arc::new(api));
 
-        let runs = adapter.list_task_runs(&name).await;
+        let runs = adapter.query_task_runs(&name, TaskRunQuery::new()).await;
         assert!(
             matches!(runs, Err(ApiError::TaskNotFound(_))),
             "embedded run history must look like an unknown id, got {runs:?}"
+        );
+
+        let canceled = adapter.cancel_task(&name, WritePreconditions::new()).await;
+        assert!(
+            matches!(canceled, Err(ApiError::TaskNotFound(_))),
+            "canceling an embedded task must look like an unknown id, got {canceled:?}"
+        );
+        assert!(
+            adapter.supervisor.get_task(&name).is_some(),
+            "the embedded task must survive the cancel attempt"
         );
 
         let deleted = adapter.delete_task(&name, WritePreconditions::new()).await;
@@ -329,7 +374,7 @@ mod tests {
             "the embedded task must survive the delete attempt"
         );
 
-        let stream = adapter.stream_task_logs(&name).await;
+        let stream = adapter.stream_task_logs(&name, created.uid()).await;
         assert!(
             matches!(stream, Err(ApiError::TaskNotFound(_))),
             "embedded log streams must look like an unknown id"
@@ -353,9 +398,8 @@ mod tests {
         };
 
         let api = supervisor().await;
-        let hidden_ref: TaskRef = TaskFn::arc("hidden-runtime", |_ctx: TaskContext| async move {
-            Ok::<(), TaskError>(())
-        });
+        let hidden_ref: TaskRef =
+            TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) });
         let hidden_spec = solti_model::TaskSpec::builder(
             "hidden-slot",
             TaskWorkload::Embedded(EmbeddedSpec::new("adapter-test-v1").unwrap()),
@@ -422,9 +466,8 @@ mod tests {
         use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv};
 
         let api = supervisor().await;
-        let hidden_ref: TaskRef = TaskFn::arc("hidden-runtime", |_ctx: TaskContext| async move {
-            Ok::<(), TaskError>(())
-        });
+        let hidden_ref: TaskRef =
+            TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) });
         let hidden_spec = TaskSpec::builder(
             "hidden-slot",
             TaskWorkload::Embedded(EmbeddedSpec::new("adapter-test-v1").unwrap()),
@@ -522,6 +565,24 @@ mod tests {
         let missing = map_core_error(CoreError::NotFound("missing".into()));
         assert!(matches!(missing, ApiError::TaskNotFound(message) if message == "missing"));
 
+        let exhausted = map_core_error(CoreError::RetainedTaskLimitReached { limit: 1_024 });
+        assert!(
+            matches!(exhausted, ApiError::ResourceExhausted(message) if message.contains("1024"))
+        );
+
+        let exhausted = map_core_error(CoreError::RetainedTaskManifestByteLimitExceeded {
+            current: 128,
+            requested: 64,
+            limit: 160,
+        });
+        assert!(matches!(
+            exhausted,
+            ApiError::ResourceExhausted(message)
+                if message.contains("128")
+                    && message.contains("64")
+                    && message.contains("160")
+        ));
+
         let shutting_down = map_core_error(CoreError::ShuttingDown);
         assert!(matches!(shutting_down, ApiError::Unavailable(_)));
 
@@ -544,10 +605,62 @@ mod tests {
         });
         assert!(matches!(missing_cursor, ApiError::InvalidRequest(_)));
 
+        let run_task_mismatch =
+            map_collection_error(CollectionError::TaskRunContinuationTaskMismatch {
+                task: TaskId::new("requested").unwrap(),
+                continuation_task: TaskId::new("other").unwrap(),
+            });
+        assert!(matches!(run_task_mismatch, ApiError::InvalidRequest(_)));
+
+        let missing_run_cursor =
+            map_collection_error(CollectionError::TaskRunContinuationCursorNotFound {
+                task: TaskId::new("requested").unwrap(),
+                generation: 2,
+                attempt: 1,
+            });
+        assert!(matches!(missing_run_cursor, ApiError::InvalidRequest(_)));
+
         let expired = map_collection_error(CollectionError::ResourceVersionExpired {
             resource_version: "old:1".into(),
         });
         assert!(matches!(expired, ApiError::ResourceVersionExpired(_)));
+
+        let count_limit =
+            map_collection_error(CollectionError::ConcurrentTaskWatchLimitReached { limit: 256 });
+        assert!(matches!(count_limit, ApiError::ResourceExhausted(_)));
+
+        let byte_limit =
+            map_collection_error(CollectionError::TaskWatchInitialReplayByteLimitExceeded {
+                current: 64,
+                requested: 32,
+                limit: 64,
+            });
+        assert!(matches!(byte_limit, ApiError::ResourceExhausted(_)));
+
+        #[cfg(feature = "http")]
+        {
+            let error = map_collection_error(CollectionError::ConcurrentTaskWatchLimitReached {
+                limit: 256,
+            });
+            assert_eq!(
+                error.into_http_status().0,
+                axum::http::StatusCode::TOO_MANY_REQUESTS
+            );
+        }
+
+        #[cfg(feature = "grpc")]
+        {
+            let error =
+                map_collection_error(CollectionError::TaskWatchInitialReplayByteLimitExceeded {
+                    current: 64,
+                    requested: 32,
+                    limit: 64,
+                });
+            assert_eq!(
+                tonic::Status::from(error).code(),
+                tonic::Code::ResourceExhausted
+            );
+        }
     }
 
     #[test]
@@ -559,6 +672,7 @@ mod tests {
             seq: 0,
             ts: UNIX_EPOCH,
             line: Bytes::from_static(b"current"),
+            truncated: false,
         });
         let stale = OutputEvent::RunStarted {
             generation: 6,
@@ -571,7 +685,10 @@ mod tests {
             exit_code: Some(0),
             finished_at: UNIX_EPOCH,
         };
-        let lagged = OutputEvent::Lagged { skipped: 2 };
+        let lagged = OutputEvent::Lagged {
+            skipped: 2,
+            skipped_bytes: 128,
+        };
 
         assert!(SupervisorApiAdapter::event_is_from_generation(&current, 7));
         assert!(!SupervisorApiAdapter::event_is_from_generation(&stale, 7));

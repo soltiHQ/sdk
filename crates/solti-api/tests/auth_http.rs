@@ -17,7 +17,8 @@ use solti_api::{
     AuthorizationRequest, HttpApi, TaskOperation, TaskTarget, TaskWatchEventStream, Transport,
 };
 use solti_model::{
-    Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRun, Token, WritePreconditions,
+    Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRunPage, TaskRunQuery, Token,
+    Uid, WritePreconditions,
 };
 
 const SECRET: &str = "sekret-token-1";
@@ -67,9 +68,29 @@ impl ApiHandler for MockHandler {
         Ok(Box::pin(tokio_stream::empty()))
     }
 
-    async fn list_task_runs(&self, _id: &TaskId) -> Result<Vec<TaskRun>, ApiError> {
+    async fn query_task_runs(
+        &self,
+        id: &TaskId,
+        _query: TaskRunQuery,
+    ) -> Result<TaskRunPage, ApiError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(Vec::new())
+        Ok(TaskRunPage {
+            items: Vec::new(),
+            task: id.clone(),
+            task_uid: Uid::new("auth-http-run-uid").unwrap(),
+            resource_version: "runs-test:1".into(),
+            continuation: None,
+            remaining_item_count: 0,
+        })
+    }
+
+    async fn cancel_task(
+        &self,
+        _id: &TaskId,
+        _preconditions: WritePreconditions,
+    ) -> Result<(), ApiError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn delete_task(
@@ -84,6 +105,7 @@ impl ApiHandler for MockHandler {
     async fn stream_task_logs(
         &self,
         _id: &TaskId,
+        _task_uid: &solti_model::Uid,
     ) -> Result<solti_api::OutputEventStream, ApiError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(Box::pin(tokio_stream::empty()))
@@ -121,6 +143,15 @@ fn get_with_authorization(uri: &str, value: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn post_with_authorization(uri: &str, value: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::AUTHORIZATION, value)
+        .body(Body::empty())
+        .unwrap()
+}
+
 #[tokio::test]
 async fn invalid_credentials_are_rejected_before_the_handler() {
     for authorization in [
@@ -138,6 +169,7 @@ async fn invalid_credentials_are_rejected_before_the_handler() {
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
         let body = body_json(response).await;
         assert_eq!(body["apiVersion"], "v1");
         assert_eq!(body["kind"], "Status");
@@ -190,11 +222,12 @@ async fn sse_logs_route_without_token_is_rejected_with_401() {
     let app = secured_router(Arc::clone(&handler));
 
     let resp = app
-        .oneshot(get("/apis/solti.io/v1/tasks/task-1/logs"))
+        .oneshot(get("/apis/solti.io/v1/tasks/task-1/logs?taskUid=task-uid"))
         .await
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.headers()[header::WWW_AUTHENTICATE], "Bearer");
     let body = body_json(resp).await;
     assert_eq!(body["reason"], "Unauthorized");
     assert_eq!(
@@ -211,7 +244,7 @@ async fn sse_logs_route_with_valid_token_streams() {
 
     let resp = app
         .oneshot(get_with_authorization(
-            "/apis/solti.io/v1/tasks/task-1/logs",
+            "/apis/solti.io/v1/tasks/task-1/logs?taskUid=task-uid",
             &format!("Bearer {SECRET}"),
         ))
         .await
@@ -298,9 +331,20 @@ async fn custom_access_hooks_propagate_identity_and_return_forbidden() {
     assert_eq!(listed.status(), StatusCode::OK);
     assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
 
+    let canceled = app
+        .clone()
+        .oneshot(post_with_authorization(
+            "/apis/solti.io/v1/tasks/task-a/cancel",
+            "Bearer subject-token",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(canceled.status(), StatusCode::NO_CONTENT);
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 2);
+
     let denied = app
         .oneshot(get_with_authorization(
-            "/apis/solti.io/v1/tasks/task-a/logs",
+            "/apis/solti.io/v1/tasks/task-a/logs?taskUid=task-uid",
             "Bearer subject-token",
         ))
         .await
@@ -309,7 +353,7 @@ async fn custom_access_hooks_propagate_identity_and_return_forbidden() {
     let body = body_json(denied).await;
     assert_eq!(body["reason"], "Forbidden");
     assert_eq!(body["code"], 403);
-    assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 2);
 
     assert_eq!(
         *recording.checks.lock().unwrap(),
@@ -318,6 +362,11 @@ async fn custom_access_hooks_propagate_identity_and_return_forbidden() {
                 Some("user-7".to_owned()),
                 TaskOperation::List,
                 "collection".to_owned(),
+            ),
+            (
+                Some("user-7".to_owned()),
+                TaskOperation::Cancel,
+                "task-a".to_owned(),
             ),
             (
                 Some("user-7".to_owned()),

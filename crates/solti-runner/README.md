@@ -2,7 +2,8 @@
 
 `solti-runner` is the plugin boundary between execution backends and the supervisor.
 
-Implement `Runner` for a backend and register it in a `RunnerRouter`; the router routes each `Task` by workload GVK and optional labels, then builds a `taskvisor::TaskRef`.
+Implement `Runner` for a backend and register it in a `RunnerRouter`; the router routes each `Task` by workload GVK and optional labels,
+then returns a `BuiltTask` containing the allocated `RunId` and executable `taskvisor::TaskRef`.
 `solti-exec` implements `Runner` for subprocesses; `solti-core` consumes the router.
 
 The crate does not execute or supervise tasks; Taskvisor owns execution and lifecycle.
@@ -16,11 +17,12 @@ Implement `Runner`, register it, and build a Taskvisor task:
 use std::sync::Arc;
 
 use solti_model::{Task, WorkloadTypeMeta, WORKLOAD_API_VERSION};
-use solti_runner::{BuildContext, RunId, Runner, RunnerError, RunnerRouter};
+use solti_runner::{BuildCancellation, BuildContext, BuildScope, BuiltTask, RunId, Runner, RunnerError, RunnerRouter};
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 
 struct EchoRunner;
 
+#[solti_runner::async_trait]
 impl Runner for EchoRunner {
     fn name(&self) -> &str {
         "echo"
@@ -33,22 +35,24 @@ impl Runner for EchoRunner {
         ]
     }
 
-    fn build_task(
+    async fn build_task(
         &self,
         _task: &Task,
-        run_id: &RunId,
+        _run_id: &RunId,
         _ctx: &BuildContext,
+        _cancellation: &BuildCancellation,
+        _scope: &mut BuildScope,
     ) -> Result<TaskRef, RunnerError> {
-        Ok(TaskFn::arc(run_id.name(), |_ctx: TaskContext| async move {
+        Ok(TaskFn::arc(|_ctx: TaskContext| async move {
             Ok::<(), TaskError>(())
         }))
     }
 }
 
-fn build(resource: &Task) -> Result<TaskRef, Box<dyn std::error::Error>> {
+async fn build(resource: &Task) -> Result<BuiltTask, Box<dyn std::error::Error>> {
     let mut router = RunnerRouter::new();
     router.register(Arc::new(EchoRunner))?;
-    Ok(router.build(resource)?)
+    Ok(router.build(resource).await?)
 }
 ```
 
@@ -64,18 +68,19 @@ The example declares the built-in `Subprocess` GVK.
 
 ## Inputs and outputs
 
-| API                                   | Input                               | Output                                  |
-|---------------------------------------|-------------------------------------|-----------------------------------------|
-| `register`                            | `Arc<dyn Runner>`                   | Validated runner entry                  |
-| `register_with_labels`                | Runner and static `Labels`          | Labeled runner entry                    |
-| `catalog`                             | Current runner registrations        | Immutable, cloneable `RunnerCatalog`    |
-| `RunnerCatalog::build`                | `Task` and explicit `BuildContext`  | `taskvisor::TaskRef`                    |
-| `pick`                                | `Task`                              | First matching `Runner`                 |
-| `build`                               | `Task`                              | `taskvisor::TaskRef`                    |
-| `capabilities`                        | Registered entries                  | Owned `AgentCapabilities` snapshot      |
-| `merge_env`                           | `TaskEnv` and `RunnerEnv`           | Sorted process environment              |
-| `OutputSink::stdout_line`             | `Bytes`                             | `OutputEvent::Chunk`                    |
-| `MetricsBackend::record_runner_error` | Runner and error labels             | Backend-specific metric update          |
+| API                                             | Input                                                | Output                               |
+|-------------------------------------------------|------------------------------------------------------|--------------------------------------|
+| `register`                                      | `Arc<dyn Runner>`                                    | Validated runner entry               |
+| `register_with_labels`                          | Runner and static `Labels`                           | Labeled runner entry                 |
+| `catalog`                                       | Current runner registrations                         | Immutable, cloneable `RunnerCatalog` |
+| `RunnerCatalog::build`                          | `Task` and explicit `BuildContext`                   | `BuiltTask`                          |
+| `RunnerCatalog::build_scoped_with_cancellation` | Nested task, context, cancellation, and `BuildScope` | Admitted nested `BuiltTask`          |
+| `pick`                                          | `Task`                                               | First matching `Runner`              |
+| `build`                                         | `Task`                                               | `BuiltTask`                          |
+| `capabilities`                                  | Registered entries                                   | Owned `AgentCapabilities` snapshot   |
+| `merge_env`                                     | `TaskEnv` and `RunnerEnv`                            | Sorted process environment           |
+| `OutputSink::stdout_line`                       | Raw `Bytes`, optionally LF-framed                    | Delimiter-free `OutputEvent::Chunk`  |
+| `MetricsBackend::record_runner_error`           | Runner and error labels                              | Backend-specific metric update       |
 
 ## Routing
 
@@ -88,10 +93,12 @@ Task
                     RunnerRouter
                           │ first match in registration order
                           ▼
-        Runner::build_task(Task, RunId, BuildContext)
-                          │
+    Runner::build_task(Task, RunId, BuildContext, BuildCancellation, BuildScope)
                           ▼
                  taskvisor::TaskRef
+                          │ router pairs it with RunId
+                          ▼
+                      BuiltTask
 ```
 
 Routing uses only workload GVK and `runnerSelector`.
@@ -115,12 +122,12 @@ The router applies these rules in order:
 
 Registration validates and snapshots the runner declaration.
 
-- Runner names are unique.
 - Runner names use Kubernetes label-value rules.
 - Static labels use Kubernetes label rules.
+- The built-in `Embedded` GVK is rejected.
 - At least one workload GVK is required.
 - Duplicate workload GVKs are rejected.
-- The built-in `Embedded` GVK is rejected.
+- Runner names are unique.
 
 `RunnerRouter::capabilities()` returns an owned snapshot.
 Runner entries remain in routing priority order.
@@ -128,8 +135,8 @@ Workload GVKs inside each entry use canonical order.
 
 ## Runner composition
 
-`RunnerRouter::catalog()` captures the current registrations, including their labels and routing priority. 
-The catalog is immutable and cheap to clone. 
+`RunnerRouter::catalog()` captures the current registrations, including their labels and routing priority.
+The catalog is immutable and cheap to clone.
 Later registrations do not change it.
 
 Take the catalog before registering a composing runner such as `ChainRunner`:
@@ -139,26 +146,50 @@ let inner_runners = router.catalog();
 router.register(Arc::new(ChainRunner::new("chain", inner_runners)))?;
 ```
 
-The composing runner calls `RunnerCatalog::build` for each inner task and provides the `BuildContext` explicitly. 
-Catalog builds use the same exact GVK and selector routing, registration order, `RunId` allocation, and returned-name validation as `RunnerRouter::build`.
+The composing runner calls `RunnerCatalog::build_scoped_with_cancellation` for each inner task and passes its inherited `BuildScope`.
+This reuses the outer global admission slot and applies the selected inner runner's per-runner limit.
+Catalog builds use the same exact GVK and selector routing, registration order, and `RunId` allocation as `RunnerRouter::build`.
+
+Direct `RunnerRouter::build` and `RunnerCatalog::build` calls are unmanaged: no core admission limits apply.
+A scoped catalog build returns `RouterError::RecursiveBuild` before admission when it selects a runner already present in the active build path.
+It returns `RouterError::AdmissionCycle` when its nested admission wait would deadlock with other active root builds.
 
 ## Build contract
 
 `RunnerRouter::build` allocates a `RunId`.
 Its format is `{runner}-{slot}-{seq}`.
 The sequence comes from one process-global counter initialized to `1`.
+It never wraps; allocation panics after the sequence space is exhausted so an
+earlier run identity cannot be reused within the process.
 
-The router passes the resource, run ID, and `BuildContext` to `Runner::build_task`.
-The returned `TaskRef` must use the allocated run ID as its name.
-A mismatch returns `RouterError::RunIdMismatch`.
+The router passes the resource, run ID, `BuildContext`, a read-only `BuildCancellation` signal, and an opaque `BuildScope` to `Runner::build_task`.
+It returns a `BuiltTask` that keeps the same run ID beside the executable `TaskRef`.
+Use `BuiltTask::name` when constructing the surrounding `taskvisor::TaskSpec`.
 
 `build_task` constructs a task but does not start it.
-It is synchronous and must finish without unbounded waits.
-The supervisor may stop awaiting it during shutdown, but Rust cannot forcibly stop
-an already-running synchronous call; runners must bound their own blocking work.
+It is asynchronous and receives a cancellation signal for obsolete generations, shutdown, and supervisor-enforced deadlines.
+All build work must remain owned by the returned future.
+Dropping that future must not leave background work running.
+A runner that delegates inherently blocking work must own a bounded facility with explicit cancellation and shutdown behavior.
+The returned `TaskRef` must not retain the build cancellation signal.
 Submission can still be rejected after construction.
 A returned task can run more than once under its Taskvisor restart policy.
 Attempt-scoped resources belong inside the task body.
+
+## Migrating async builds
+
+Implementations written for the synchronous runner contract require three changes:
+
+1. Add `#[solti_runner::async_trait]` to the `Runner` implementation.
+2. Change `build_task` to `async fn` and accept `&BuildCancellation` and `&mut BuildScope`.
+3. Await `RunnerRouter::build`; composing runners use `RunnerCatalog::build_scoped_with_cancellation`.
+
+Use `cancellation.cancelled()` in waits and pass clones to child futures that are owned by the build.
+Do not migrate synchronous blocking calls by placing them in an unbounded or detached `spawn_blocking` task.
+
+Callers that need to cancel a direct router or catalog build create an owner and signal with `BuildCancellation::pair()`,
+retain the `BuildCancellationHandle`, and pass the signal to `build_with_cancellation`.
+A runner receives only the read-only signal and cannot request cancellation itself.
 
 ## Build context
 
@@ -170,6 +201,11 @@ Attempt-scoped resources belong inside the task body.
 
 `RunnerRouter::with_context` installs one context for all registered runners.
 `RunnerRouter::with_output_publisher` replaces only the output producer.
+Installed metrics and output publisher handles have independent sticky panic
+boundaries. After a callback panic, every later call through the same context
+boundary is dropped without invoking that callback again.
+Calls that already entered the same boundary concurrently may still finish or
+panic. The boundary does not serialize healthy callbacks.
 
 ## Environment
 
@@ -199,15 +235,17 @@ The returned map is sorted by key.
 
 ```text
 runner attempt
-      │
       ▼
 OutputPublisher::sink_for(task, generation, attempt)
-      │
       ├── None ──► output disabled
       └── OutputSink ──► stdout / stderr chunks ──► composition layer
 ```
 
 `OutputSink` is a write-only producer:
+
+Request it from the task attempt future before starting separate output tasks.
+Composition runners may use execution-local routing that a separately spawned task does not inherit.
+Clone the returned sink into reader or forwarding tasks.
 
 ```rust
 use std::sync::mpsc;
@@ -228,10 +266,21 @@ assert!(matches!(receiver.recv().unwrap(), OutputEvent::Chunk(_)));
 - A sink belongs to one generation and attempt.
 - Stdout and stderr have independent sequences starting at `0`.
 - Clones share both sequence counters.
-- `Bytes` payloads are forwarded without conversion.
+- Sequences never wrap. After a stream emits `u64::MAX`, its next emission
+  panics before invoking the callback instead of reusing an earlier value.
+- LF and CRLF delimiters split input into chunks and are not included in payloads.
+- Every emitted chunk receives the next sequence number for its stream.
+- Truncated multi-line input marks only its final emitted chunk as truncated.
+- All non-delimiter bytes, including invalid UTF-8 and a lone CR, remain exact.
+- Delimiter-free `Bytes` passed to `OutputSink::new` are forwarded without a payload copy.
+- Borrowed callbacks let bounded composition layers detach input with one copy.
 - Publishing is synchronous.
 - The callback must not block runner execution.
+- `OutputSink::callback_panicked()` exposes the sticky state to the owner.
 - Runners cannot subscribe to output or publish lifecycle markers.
+- An unwinding callback panic is caught, reported once through structured tracing without its payload, and permanently disables
+  new calls on that attempt sink. Calls already in progress may still complete or panic. The process panic hook still runs before
+  the unwind is caught and remains application-controlled. A `panic = "abort"` process cannot isolate it.
 
 ## Metrics
 
@@ -250,6 +299,8 @@ metrics.record_runner_error(
 `NoOpMetrics` is the default backend.
 `solti-prometheus` provides a Prometheus implementation.
 Task lifecycle metrics come from Taskvisor events.
+An installed metrics backend is disabled after its first callback panic.
+Metrics calls that were already in progress may still finish or panic.
 
 Built-in metric variants use stable labels.
 `Custom` variants use the application-provided string unchanged.
@@ -266,8 +317,10 @@ The application controls cardinality for custom labels.
 | `InvalidCapability` | Runner name or workload declaration invalid    |
 | `EmbeddedWorkload`  | Embedded workload sent to the router           |
 | `NoRunner`          | No runner matched the GVK and selector         |
+| `BuildCancelled`    | Build admission cancellation won               |
+| `RecursiveBuild`    | Composition re-entered an active runner        |
+| `AdmissionCycle`    | Nested admission would create a wait cycle     |
 | `Build`             | Selected runner returned `RunnerError`         |
-| `RunIdMismatch`     | Returned task used a different name            |
 
 `RunnerError` is returned by a concrete runner:
 
@@ -275,6 +328,8 @@ The application controls cardinality for custom labels.
 |-----------------------|--------------------------------------------|
 | `UnsupportedWorkload` | Runner received an unsupported GVK         |
 | `InvalidSpec`         | Workload desired state is invalid          |
+| `BuildCancelled`      | Cancellation won during runner-owned work  |
+| `NestedBuild`         | Original nested `RouterError` is preserved |
 | `Internal`            | Runner could not construct the task        |
 
 ## Examples

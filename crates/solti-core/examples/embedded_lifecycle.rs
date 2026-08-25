@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use solti_core::{SupervisorApi, TaskWatchSubscription};
 use solti_model::{
-    ConditionStatus, EmbeddedSpec, Task, TaskFilter, TaskManifest, TaskPhase, TaskSpec,
-    TaskWorkload,
+    ConditionStatus, EmbeddedSpec, Task, TaskFilter, TaskManifest, TaskPhase, TaskRunQuery,
+    TaskSpec, TaskWorkload,
 };
 use solti_runner::RunnerRouter;
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
@@ -71,13 +71,8 @@ fn manifest(revision: &str) -> ExampleResult<TaskManifest> {
 }
 
 /// Creates a task that finishes on release and reports cooperative cancellation.
-fn controlled_task(
-    name: &'static str,
-    started: Arc<Notify>,
-    release: Arc<Notify>,
-    cancelled: Arc<Notify>,
-) -> TaskRef {
-    TaskFn::arc(name, move |ctx: TaskContext| {
+fn controlled_task(started: Arc<Notify>, release: Arc<Notify>, cancelled: Arc<Notify>) -> TaskRef {
+    TaskFn::arc(move |ctx: TaskContext| {
         let started = Arc::clone(&started);
         let release = Arc::clone(&release);
         let cancelled = Arc::clone(&cancelled);
@@ -128,7 +123,6 @@ async fn main() -> ExampleResult {
         .create_embedded_task(
             manifest("implementation-v1")?,
             controlled_task(
-                "cache-refresh-v1",
                 Arc::clone(&v1_started),
                 v1_release,
                 Arc::clone(&v1_cancelled),
@@ -170,7 +164,6 @@ async fn main() -> ExampleResult {
         .apply_embedded_task(
             manifest("implementation-v2")?,
             controlled_task(
-                "cache-refresh-v2",
                 Arc::clone(&v2_started),
                 Arc::clone(&v2_release),
                 v2_cancelled,
@@ -222,7 +215,10 @@ async fn main() -> ExampleResult {
     );
 
     println!("[history] Retained attempts, ordered by generation and attempt:");
-    for run in api.list_task_runs(&name) {
+    let runs = api
+        .query_task_runs(&name, &TaskRunQuery::new())?
+        .ok_or_else(|| io::Error::other("task disappeared before run history was read"))?;
+    for run in runs.items {
         println!(
             "      generation={} attempt={} phase={}",
             run.generation(),

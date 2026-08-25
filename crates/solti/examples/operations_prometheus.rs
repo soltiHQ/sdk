@@ -94,7 +94,7 @@ solti: supervised Prometheus endpoint
     let runner_metrics: MetricsHandle = Arc::new(PrometheusRunnerMetrics::new(&registry)?);
     let context = BuildContext::default().with_metrics(runner_metrics);
     let mut router = RunnerRouter::new().with_context(context);
-    register_subprocess_runner(&mut router, "default")?;
+    let subprocess_runner = register_subprocess_runner(&mut router, "default")?;
 
     let taskvisor_metrics: Arc<dyn Subscribe> =
         Arc::new(PrometheusTaskvisorSubscriber::new(&registry)?);
@@ -187,6 +187,7 @@ solti: supervised Prometheus endpoint
 
     println!("[shutdown] Stopping the metrics endpoint and remaining supervised work.");
     supervisor.shutdown().await?;
+    subprocess_runner.shutdown(Duration::from_secs(5)).await?;
     println!("Result: real runtime metrics were available through a supervised /metrics endpoint.");
     Ok(())
 }

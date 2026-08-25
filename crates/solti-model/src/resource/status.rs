@@ -8,6 +8,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ConditionStatus, ModelError, ModelResult, TaskCondition, TaskPhase};
 
+/// Maximum UTF-8 byte length of a Task or TaskRun execution diagnostic.
+///
+/// Longer diagnostics are stored as the longest prefix that fits this budget
+/// without splitting a UTF-8 code point. This limit does not apply to
+/// [`TaskCondition::message`](crate::TaskCondition::message).
+pub const MAX_TASK_DIAGNOSTIC_BYTES: usize = 32 * 1024;
+
+pub(crate) fn truncate_task_diagnostic(diagnostic: String) -> String {
+    if diagnostic.len() <= MAX_TASK_DIAGNOSTIC_BYTES {
+        return diagnostic;
+    }
+
+    let mut end = MAX_TASK_DIAGNOSTIC_BYTES;
+    while !diagnostic.is_char_boundary(end) {
+        end -= 1;
+    }
+    diagnostic[..end].to_owned()
+}
+
 /// Observed runtime state of a task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", try_from = "raw::TaskStatusRaw")]
@@ -60,6 +79,9 @@ impl TaskStatus {
 
     /// Reconstructs status from serialized fields.
     ///
+    /// Diagnostics longer than [`MAX_TASK_DIAGNOSTIC_BYTES`] are truncated to
+    /// a UTF-8-safe prefix.
+    ///
     /// # Errors
     ///
     /// Returns [`ModelError::Invalid`] when status fields are inconsistent.
@@ -77,7 +99,7 @@ impl TaskStatus {
             phase,
             attempt,
             exit_code,
-            error,
+            error: error.map(truncate_task_diagnostic),
             conditions,
         };
         status.validate()?;
@@ -115,11 +137,16 @@ impl TaskStatus {
     }
 
     /// Process exit code, when available.
+    ///
+    /// This detail does not determine the terminal phase.
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
     }
 
     /// Current lifecycle diagnostic, when available.
+    ///
+    /// This detail does not determine the terminal phase.
+    /// The value is at most [`MAX_TASK_DIAGNOSTIC_BYTES`] UTF-8 bytes.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -282,6 +309,16 @@ impl TaskStatus {
             "ReconciliationScheduled",
             "runtime reconciliation is scheduled",
         )
+    }
+
+    pub(crate) fn update_reconciliation_pending_diagnostic(
+        &mut self,
+        generation: u64,
+        reason: impl Into<String>,
+        message: impl Into<String>,
+    ) -> bool {
+        self.reconciled_mut()
+            .transition(ConditionStatus::Unknown, generation, reason, message)
     }
 
     pub(crate) fn mark_reconciled(&mut self, generation: u64) -> bool {
@@ -534,5 +571,42 @@ mod tests {
         let mut status = serde_json::to_value(TaskStatus::pending(1).unwrap()).unwrap();
         status["conditions"][0]["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<TaskStatus>(status).is_err());
+    }
+
+    #[test]
+    fn status_diagnostic_is_bounded_across_construction_and_deserialization() {
+        let terminal_status = |error| {
+            TaskStatus::from_parts(
+                1,
+                TaskPhase::Failed,
+                1,
+                None,
+                Some(error),
+                vec![condition(
+                    TaskConditionType::reconciled(),
+                    ConditionStatus::True,
+                )],
+            )
+            .unwrap()
+        };
+
+        let exact = "a".repeat(MAX_TASK_DIAGNOSTIC_BYTES);
+        assert_eq!(terminal_status(exact.clone()).error(), Some(exact.as_str()));
+
+        let ascii_over = "b".repeat(MAX_TASK_DIAGNOSTIC_BYTES + 1);
+        let normalized = terminal_status(ascii_over.clone());
+        assert_eq!(
+            normalized.error(),
+            Some(&ascii_over[..MAX_TASK_DIAGNOSTIC_BYTES])
+        );
+
+        let multibyte_over = format!("{}é", "c".repeat(MAX_TASK_DIAGNOSTIC_BYTES - 1));
+        let mut serialized = serde_json::to_value(terminal_status("old".into())).unwrap();
+        serialized["error"] = serde_json::json!(multibyte_over);
+        let deserialized: TaskStatus = serde_json::from_value(serialized).unwrap();
+        let error = deserialized.error().unwrap();
+        assert_eq!(error, "c".repeat(MAX_TASK_DIAGNOSTIC_BYTES - 1));
+        assert!(error.is_char_boundary(error.len()));
+        assert!(error.len() <= MAX_TASK_DIAGNOSTIC_BYTES);
     }
 }

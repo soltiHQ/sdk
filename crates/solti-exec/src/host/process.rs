@@ -111,6 +111,16 @@ impl PreparedProcessConfig {
             false
         }
     }
+
+    #[cfg(all(feature = "subprocess", target_os = "macos"))]
+    pub(crate) fn reset_signals(&self) -> Arc<[libc::c_int]> {
+        Arc::clone(&self.reset_signals)
+    }
+
+    #[cfg(all(feature = "subprocess", target_os = "macos"))]
+    pub(crate) fn has_umask(&self) -> bool {
+        self.umask.is_some()
+    }
 }
 
 /// Attaches prepared inherited-state controls to a command.
@@ -188,6 +198,7 @@ mod unix_impl {
         // a zeroed action with SIG_DFL and an empty mask is a valid default disposition on supported Unix targets.
         let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
         action.sa_sigaction = libc::SIG_DFL;
+        // SAFETY: `action.sa_mask` is writable signal-set storage.
         if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
             return logged_last_error(b"solti-exec: sigemptyset failed: ");
         }
@@ -202,7 +213,10 @@ mod unix_impl {
         }
 
         // Reset dispositions before unblocking inherited pending signals.
+        // SAFETY: an all-zero `sigset_t` is valid storage for `sigemptyset` on
+        // supported Unix targets.
         let mut empty = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        // SAFETY: `empty` is writable signal-set storage.
         if unsafe { libc::sigemptyset(&mut empty) } != 0 {
             return logged_last_error(b"solti-exec: sigemptyset failed: ");
         }
@@ -316,6 +330,8 @@ mod tests {
         let mut command = Command::new("sh");
         command.arg("-c").arg("kill -TERM $$; exit 97");
 
+        // SAFETY: this test hook uses async-signal-safe libc calls only and
+        // captures no parent-owned storage.
         unsafe {
             command.pre_exec(|| {
                 let mut action = std::mem::zeroed::<libc::sigaction>();

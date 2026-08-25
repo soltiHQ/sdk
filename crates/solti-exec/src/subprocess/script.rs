@@ -94,11 +94,15 @@ fn normalize_unix_fd(file: std::fs::File) -> io::Result<std::fs::File> {
     if fd >= 3 {
         return Ok(file);
     }
+    // SAFETY: `fd` is owned by `file`; `fcntl` duplicates it without borrowing
+    // memory and requests a descriptor outside the standard range.
     let normalized = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
     if normalized < 0 {
         return Err(io::Error::last_os_error());
     }
     drop(file);
+    // SAFETY: `normalized` is a fresh descriptor returned by `fcntl` and is
+    // transferred exactly once into `File`.
     Ok(unsafe { std::fs::File::from_raw_fd(normalized) })
 }
 
@@ -108,12 +112,16 @@ mod linux {
 
     pub(super) fn create_sealable_memfd() -> io::Result<File> {
         let name = CString::new("solti-script").expect("static memfd name");
+        // SAFETY: `name` is a valid NUL-terminated string and the flags are
+        // accepted by `memfd_create`.
         let fd = unsafe {
             libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
         };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: `fd` is a fresh descriptor returned by `memfd_create` and is
+        // transferred exactly once into `File`.
         super::normalize_unix_fd(unsafe { File::from_raw_fd(fd) })
     }
 
@@ -122,6 +130,8 @@ mod linux {
 
         let seals =
             libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        // SAFETY: the descriptor is owned by `file`; `F_ADD_SEALS` does not
+        // dereference process memory.
         if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -170,10 +180,14 @@ mod tests {
 
         let expected =
             libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        // SAFETY: `fd` is owned by the live script file; `F_GET_SEALS` does not
+        // dereference process memory.
         let actual = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
         assert_eq!(actual & expected, expected);
 
         let byte = b"x";
+        // SAFETY: `fd` is valid and `byte` provides a readable buffer of the
+        // exact length passed to `pwrite`.
         let written = unsafe { libc::pwrite(fd, byte.as_ptr().cast(), byte.len(), 0) };
         assert_eq!(written, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));

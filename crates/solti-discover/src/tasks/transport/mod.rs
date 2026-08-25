@@ -16,6 +16,7 @@
 //! ```
 //!
 //! Adapter construction validates transport-specific URI and authentication data.
+//! A bearer token requires TLS unless the config explicitly opts into plaintext transport.
 //! The transport client is reused across task attempts.
 
 #[cfg(feature = "grpc")]
@@ -72,6 +73,18 @@ impl TransportAdapter {
     }
 }
 
+/// Enforces the bearer credential transport policy after URI validation.
+fn validate_token_transport(config: &DiscoverConfig, secure: bool) -> Result<(), DiscoverError> {
+    if config.token.is_some() && !secure && !config.allow_insecure_token_transport {
+        return Err(DiscoverError::InvalidConfig(
+            "bearer token over plaintext discovery is disabled; use an https control-plane endpoint or explicitly call allow_insecure_token_transport() for development or loopback use"
+                .into(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Converts `success = false` into [`DiscoverError::Rejected`].
 ///
 /// The rejection reason remains untrusted server text.
@@ -108,6 +121,7 @@ mod tests {
             crate::AgentEndpoint::new("http://127.0.0.1:8085", crate::AgentEndpointType::Http, 1)
                 .unwrap(),
             crate::ControlPlaneEndpoint::new("http://127.0.0.1:9000", transport).unwrap(),
+            solti_model::AgentCapabilities::default(),
             30_000,
             "test@1",
         )

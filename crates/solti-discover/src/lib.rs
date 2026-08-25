@@ -30,6 +30,13 @@
 //! An HTTP agent can sync through gRPC.
 //! A gRPC agent can sync through HTTP.
 //!
+//! ## Credential Transport
+//!
+//! A configured bearer token requires an HTTPS control-plane endpoint by default.
+//! Plaintext HTTP and gRPC remain available when no token is configured.
+//! `DiscoverConfigBuilder::allow_insecure_token_transport` is an explicit
+//! development or loopback escape hatch.
+//!
 //! ## Retry Model
 //!
 //! [`DiscoverError::retryability`] classifies every failure.
@@ -94,6 +101,7 @@
 //!         "https://control.example",
 //!         DiscoveryTransport::Http,
 //!     )?,
+//!     solti_model::AgentCapabilities::default(),
 //!     30_000,
 //!     "discovery-config@1",
 //! )
@@ -192,10 +200,6 @@ pub(crate) use generated::solti::discover::wire as proto;
 mod contract_identity_guard {
     #[test]
     fn discovery_contract_identity_is_consistent() {
-        assert_eq!(
-            super::DISCOVERY_PROTOCOL_VERSION.to_string(),
-            env!("SOLTI_DISCOVERY_PROTOCOL_MAJOR"),
-        );
         assert_eq!(
             super::DISCOVERY_GRPC_PACKAGE,
             format!("solti.discover.v{}", super::DISCOVERY_PROTOCOL_VERSION),

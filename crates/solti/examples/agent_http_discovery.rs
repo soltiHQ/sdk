@@ -27,7 +27,7 @@
 //!
 //! Run with `cargo run -p solti --example agent_http_discovery --features api-core-adapter,api-http,discover-http,exec-subprocess`.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use solti::{
     api::{API_VERSION, HTTP_API_ROOT, HttpApi, SupervisorApiAdapter, axum::serve},
@@ -65,15 +65,15 @@ solti: discovered HTTP agent
 
     let listener = TcpListener::bind(API_ADDRESS).await?;
     let mut router = RunnerRouter::new();
-    register_subprocess_runner(&mut router, "default")?;
-    let capabilities = router.capabilities();
+    let subprocess_runner = register_subprocess_runner(&mut router, "default")?;
+    let supervisor = Arc::new(SupervisorApi::builder(router).start().await?);
+    let capabilities = supervisor.runner_capabilities();
     println!(
         "[runner] Registered {} runner capability with {} workload GVK.",
         capabilities.runners().len(),
         capabilities.runners()[0].workload_types().len(),
     );
 
-    let supervisor = Arc::new(SupervisorApi::builder(router).start().await?);
     let control_plane =
         std::env::var("SOLTI_CONTROL_PLANE").unwrap_or_else(|_| DEFAULT_CONTROL_PLANE.into());
     let advertised = format!("http://{API_ADDRESS}");
@@ -86,10 +86,10 @@ solti: discovered HTTP agent
         "Umbrella example agent",
         AgentEndpoint::new(&advertised, AgentEndpointType::Http, API_VERSION)?,
         ControlPlaneEndpoint::new(&control_plane, DiscoveryTransport::Http)?,
+        capabilities,
         10_000,
         revision,
     )
-    .capabilities(capabilities)
     .build()?;
     let (manifest, task_ref) = sync(config, Arc::new(MonotonicUptime::new()))?;
     let discovery_name = manifest.name().clone();
@@ -109,8 +109,10 @@ solti: discovered HTTP agent
         .with_graceful_shutdown(shutdown_signal())
         .await;
     let shutdown_result = supervisor.shutdown().await;
+    let finalizer_result = subprocess_runner.shutdown(Duration::from_secs(5)).await;
     server_result?;
     shutdown_result?;
+    finalizer_result?;
     Ok(())
 }
 
