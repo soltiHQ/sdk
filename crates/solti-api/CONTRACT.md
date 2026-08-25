@@ -662,8 +662,8 @@ required and has the same current-incarnation check as HTTP `taskUid`. A missing
 or invalid value returns `InvalidArgument`; a valid non-current UID returns
 `NotFound`. Both failures happen before streaming starts.
 It carries the same four event variants in a protobuf `oneof`.
-Every `StreamTaskLogsResponse.task_uid` contains the supplied Task UID and remains
-constant for the lifetime of the stream.
+The request UID identifies the Task incarnation for every event in the opened
+stream; it is not repeated in each response message.
 Protobuf carries `line` as raw bytes.
 `OutputChunk.truncated` distinguishes a retained prefix from a complete line.
 `Lagged.skipped_bytes` reports retained line bytes lost before the next event.

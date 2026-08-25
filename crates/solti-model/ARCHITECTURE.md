@@ -155,6 +155,7 @@ flowchart TB
     FailedReconcile -->|manual retry| Scheduled
     Accepted -->|attempt starts| Running
     Running -->|terminal outcome| Terminal
+    Terminal -->|strictly newer attempt starts| Running
     Scheduled -->|authoritative final outcome<br/>without an attempt event| Terminal
     Accepted -->|authoritative final outcome<br/>without an attempt event| Terminal
 ```
@@ -162,6 +163,7 @@ flowchart TB
 Generation is checked before every attempt or terminal transition.
 A stale generation returns without mutation.
 Attempt numbers are authoritative inputs.
+An attempt start must be strictly newer than the latest recorded attempt.
 The model does not synthesize a missing attempt number.
 A terminal phase records a logical outcome. It does not by itself prove that
 non-cooperative execution code has exited physically.
@@ -169,6 +171,8 @@ non-cooperative execution code has exited physically.
 `transition_finished` applies attempt-level sticky semantics.
 An identical or older terminal attempt is ignored.
 `Failed` may be refined to `Timeout` or `Exhausted`.
+A terminal phase is sticky for its recorded attempt; a strictly newer attempt
+may move aggregate status back to `Running`.
 
 `reconcile_finished` records an authoritative task-level outcome.
 It may replace a conflicting terminal attempt phase.
@@ -219,6 +223,13 @@ An active run has no finish fields.
 A terminal run requires `finishedAt`.
 That timestamp records the supervisor's logical outcome. It does not prove
 physical exit after a force-abort.
+`startedAt` is a recorded logical timestamp. The model validates timestamp
+presence but does not establish provenance or require `finishedAt >= startedAt`.
+When `solti-core` receives a terminal attempt without its start event, it
+creates the run at projection time; that fallback `startedAt` is not a recovered
+execution start time.
+Terminal `error` and `exitCode` values are independent optional details. Typed
+runtime outcomes select the phase; diagnostics do not.
 The run snapshots its workload GVK.
 Its `error` uses the same UTF-8-safe 32 KiB prefix contract as
 `TaskStatus.error`.
@@ -316,6 +327,8 @@ Execution layers decide which names and values they support.
 
 The `schema` feature describes serialized structure.
 It also encodes local field constraints and lifecycle branches.
+For `TaskStatus`, schema requires exactly one positive-generation `Reconciled`
+condition and requires `Reconciled=True` for running and terminal phases.
 
 Runtime validation and normalization remain authoritative for relationships
 that standard JSON Schema cannot express exactly. These include generation

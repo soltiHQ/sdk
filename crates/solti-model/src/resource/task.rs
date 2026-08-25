@@ -21,6 +21,8 @@
 //!             Unknown        ── progress     ────▶ Unknown with new diagnostics
 //!
 //! Pending ── attempt starts ──▶ Running ── terminal outcome ──▶ terminal phase
+//!                                  ▲                               │
+//!                                  └──── newer attempt starts ─────┘
 //! ```
 //!
 //! A terminal phase records the supervisor's logical outcome. It does not by
@@ -791,12 +793,13 @@ impl Task {
     /// Records an authoritative attempt start.
     ///
     /// A stale generation returns `false`.
-    /// An identical transition also returns `false`.
+    /// A non-newer attempt also returns `false`.
     /// Attempt numbers come from the execution source of truth.
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when the current generation has attempt zero or a changed `resource_version` is empty.
+    /// Returns [`ModelError::Invalid`] when `attempt` is zero or a changed
+    /// `resource_version` is empty.
     pub fn transition_starting(
         &mut self,
         generation: u64,
@@ -810,6 +813,9 @@ impl Task {
             return Err(ModelError::Invalid(
                 "attempt must be greater than zero".into(),
             ));
+        }
+        if attempt <= self.status.attempt {
+            return Ok(false);
         }
         let changed = self.status.observed_generation != generation
             || self.status.reconciled_required().status() != ConditionStatus::True
@@ -1376,6 +1382,28 @@ mod tests {
         assert!(task.transition_starting(1, 7, "2").unwrap());
         assert_eq!(task.status().attempt(), 7);
         assert_eq!(task.status().observed_generation(), 1);
+        assert_eq!(*task.phase(), TaskPhase::Running);
+    }
+
+    #[test]
+    fn starting_accepts_only_a_strictly_newer_attempt() {
+        let mut task = task();
+        assert!(task.transition_starting(1, 7, "2").unwrap());
+
+        let running = task.clone();
+        assert!(!task.transition_starting(1, 3, "").unwrap());
+        assert_eq!(task, running);
+
+        assert!(
+            task.transition_finished(1, 7, TaskPhase::Failed, Some("attempt".into()), None, "3",)
+                .unwrap()
+        );
+        let terminal = task.clone();
+        assert!(!task.transition_starting(1, 7, "").unwrap());
+        assert_eq!(task, terminal);
+
+        assert!(task.transition_starting(1, 8, "4").unwrap());
+        assert_eq!(task.status().attempt(), 8);
         assert_eq!(*task.phase(), TaskPhase::Running);
     }
 

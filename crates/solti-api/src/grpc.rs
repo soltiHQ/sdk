@@ -819,8 +819,8 @@ where
                 .await
                 .map_err(Status::from)?;
 
-            let proto_stream = domain_stream
-                .map(move |event| output_event_to_proto(event, &task_uid).map_err(Status::from));
+            let proto_stream =
+                domain_stream.map(|event| output_event_to_proto(event).map_err(Status::from));
             let stream: Self::StreamTaskLogsStream = Box::pin(proto_stream);
             Ok(stream)
         })

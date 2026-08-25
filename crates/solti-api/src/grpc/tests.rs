@@ -724,7 +724,6 @@ async fn stream_task_logs_returns_three_proto_events_in_order() {
     let mut stream = response.into_inner();
 
     let event = stream.next().await.unwrap().unwrap();
-    assert_eq!(event.task_uid, "task-1-uid");
     match event.kind.unwrap() {
         proto_api::stream_task_logs_response::Kind::RunStarted(r) => {
             assert_eq!(r.generation, 2);
@@ -735,7 +734,6 @@ async fn stream_task_logs_returns_three_proto_events_in_order() {
     }
 
     let event = stream.next().await.unwrap().unwrap();
-    assert_eq!(event.task_uid, "task-1-uid");
     match event.kind.unwrap() {
         proto_api::stream_task_logs_response::Kind::Chunk(c) => {
             assert_eq!(c.generation, 2);
@@ -749,7 +747,6 @@ async fn stream_task_logs_returns_three_proto_events_in_order() {
     }
 
     let event = stream.next().await.unwrap().unwrap();
-    assert_eq!(event.task_uid, "task-1-uid");
     match event.kind.unwrap() {
         proto_api::stream_task_logs_response::Kind::RunFinished(r) => {
             assert_eq!(r.generation, 2);

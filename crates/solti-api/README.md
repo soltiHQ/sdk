@@ -409,8 +409,8 @@ The event names are:
 - `lagged`.
 
 Every SSE event payload contains `taskUid`.
-Every gRPC `StreamTaskLogsResponse` contains the matching `task_uid` beside its oneof.
-The value is constant for the lifetime of the stream, including `lagged` events.
+For gRPC, the required request `task_uid` identifies every response in the
+opened stream and is not repeated beside the response oneof.
 
 gRPC uses the matching `StreamTaskLogsResponse` oneof.
 Output lines are raw bytes in protobuf.

@@ -3,7 +3,7 @@
 //! Converts live domain output into `StreamTaskLogsResponse`.
 //! Raw line bytes move directly into the protobuf message.
 
-use solti_model::{OutputChunk, OutputEvent, StreamKind, Uid};
+use solti_model::{OutputChunk, OutputEvent, StreamKind};
 
 use crate::error::ApiError;
 use crate::proto_api;
@@ -13,7 +13,6 @@ use super::time::system_time_to_ms;
 /// Converts one domain output event into protobuf.
 pub(crate) fn output_event_to_proto(
     ev: OutputEvent,
-    task_uid: &Uid,
 ) -> Result<proto_api::StreamTaskLogsResponse, ApiError> {
     use proto_api::stream_task_logs_response::Kind;
 
@@ -53,10 +52,7 @@ pub(crate) fn output_event_to_proto(
         }
     };
 
-    Ok(proto_api::StreamTaskLogsResponse {
-        kind: Some(kind),
-        task_uid: task_uid.as_str().to_owned(),
-    })
+    Ok(proto_api::StreamTaskLogsResponse { kind: Some(kind) })
 }
 
 fn output_chunk_to_proto(c: OutputChunk) -> Result<proto_api::OutputChunk, ApiError> {
@@ -86,10 +82,6 @@ mod tests {
 
     use bytes::Bytes;
 
-    fn to_proto(event: OutputEvent) -> proto_api::StreamTaskLogsResponse {
-        output_event_to_proto(event, &Uid::new("task-uid").unwrap()).unwrap()
-    }
-
     #[test]
     fn chunk_maps_all_fields() {
         let line = Bytes::from_static(&[b'e', b'r', b'r', 0xff, 0xfe]);
@@ -104,8 +96,7 @@ mod tests {
             truncated: true,
         });
 
-        let proto = to_proto(ev);
-        assert_eq!(proto.task_uid, "task-uid");
+        let proto = output_event_to_proto(ev).unwrap();
         let kind = proto.kind.expect("kind must be set");
         let chunk = match kind {
             proto_api::stream_task_logs_response::Kind::Chunk(c) => c,
@@ -127,11 +118,12 @@ mod tests {
 
     #[test]
     fn lifecycle_events_map_all_fields() {
-        match to_proto(OutputEvent::RunStarted {
+        match output_event_to_proto(OutputEvent::RunStarted {
             generation: 4,
             attempt: 3,
             started_at: UNIX_EPOCH + Duration::from_millis(1234),
         })
+        .unwrap()
         .kind
         .unwrap()
         {
@@ -143,12 +135,13 @@ mod tests {
             other => panic!("expected RunStarted, got {other:?}"),
         }
 
-        match to_proto(OutputEvent::RunFinished {
+        match output_event_to_proto(OutputEvent::RunFinished {
             generation: 5,
             attempt: 2,
             exit_code: Some(0),
             finished_at: UNIX_EPOCH + Duration::from_millis(2222),
         })
+        .unwrap()
         .kind
         .unwrap()
         {
@@ -161,10 +154,11 @@ mod tests {
             other => panic!("expected RunFinished, got {other:?}"),
         }
 
-        match to_proto(OutputEvent::Lagged {
+        match output_event_to_proto(OutputEvent::Lagged {
             skipped: 1500,
             skipped_bytes: 64 * 1024,
         })
+        .unwrap()
         .kind
         .unwrap()
         {

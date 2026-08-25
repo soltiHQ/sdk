@@ -12,8 +12,10 @@ use crate::{ModelError, ModelResult, TaskPhase, WorkloadTypeMeta};
 ///
 /// An active run has phase `Running` and no terminal fields.
 /// A terminal run has a terminal phase and `finishedAt`.
-/// The timestamp records the supervisor's logical outcome. It does not prove
-/// physical exit after a force-abort.
+/// Terminal `error` and `exitCode` values are optional details and do not
+/// determine the phase.
+/// The finish timestamp records the supervisor's logical outcome. It does not
+/// prove physical exit after a force-abort.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", try_from = "raw::TaskRunRaw")]
 pub struct TaskRun {
@@ -76,7 +78,8 @@ impl TaskRun {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when identity fields, phase, timestamps, or terminal diagnostics are inconsistent.
+    /// Returns [`ModelError::Invalid`] when identity fields, phase, timestamp
+    /// presence, or terminal diagnostics are inconsistent.
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         workload: WorkloadTypeMeta,
@@ -151,7 +154,10 @@ impl TaskRun {
         self.phase
     }
 
-    /// Time when the run started.
+    /// Recorded logical start timestamp.
+    ///
+    /// The model does not establish the timestamp's provenance or compare it
+    /// with `finishedAt`.
     pub fn started_at(&self) -> SystemTime {
         self.started_at
     }
@@ -163,6 +169,7 @@ impl TaskRun {
 
     /// Terminal diagnostic, when available.
     ///
+    /// This detail does not determine the terminal phase.
     /// The value is at most [`MAX_TASK_DIAGNOSTIC_BYTES`](crate::MAX_TASK_DIAGNOSTIC_BYTES)
     /// UTF-8 bytes.
     pub fn error(&self) -> Option<&str> {
@@ -170,6 +177,8 @@ impl TaskRun {
     }
 
     /// Process exit code, when available.
+    ///
+    /// This detail does not determine the terminal phase.
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
     }

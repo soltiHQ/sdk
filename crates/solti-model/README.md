@@ -233,6 +233,8 @@ Invalid desired state is rejected before mutation.
 Execution status transitions take an authoritative generation.
 Stale generations are ignored.
 Attempt numbers come from the execution source of truth.
+A start transition must carry an attempt strictly newer than the latest one
+recorded in status.
 
 ## Read status
 
@@ -257,6 +259,14 @@ Inspect the `Reconciled` condition to distinguish these states.
 
 Terminal phases are `Succeeded`, `Failed`, `Timeout`, `Canceled`, and `Exhausted`.
 A terminal status can have attempt zero when no attempt event was observed.
+A strictly newer attempt may move terminal aggregate status back to `Running`.
+Terminal `error` and `exitCode` values are optional details; they do not select
+the phase.
+
+`TaskRun.startedAt` is a recorded logical timestamp. The model validates
+timestamp presence but does not require `finishedAt >= startedAt`. If
+`solti-core` receives a terminal attempt without its start event, the fallback
+run uses local projection time for `startedAt`, not a recovered execution start.
 
 ## Select labels
 

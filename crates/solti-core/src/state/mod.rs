@@ -2605,6 +2605,8 @@ impl TaskState {
                     })
                     .cloned()
                     .unwrap_or_else(|| {
+                        // The start event was not retained. Record local projection
+                        // time rather than claiming to recover execution start time.
                         Arc::new(
                             TaskRun::starting(
                                 binding.resource.generation,

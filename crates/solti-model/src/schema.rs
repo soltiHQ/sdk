@@ -366,7 +366,29 @@ pub(crate) fn task_status(generator: &mut schemars::SchemaGenerator) -> Schema {
             "conditions": {
                 "allOf": [
                     conditions,
-                    { "minItems": 1 }
+                    { "minItems": 1 },
+                    {
+                        "contains": {
+                            "type": "object",
+                            "required": ["type"],
+                            "properties": {
+                                "type": { "const": "Reconciled" }
+                            }
+                        },
+                        "minContains": 1,
+                        "maxContains": 1
+                    },
+                    {
+                        "contains": {
+                            "type": "object",
+                            "required": ["type", "observedGeneration"],
+                            "properties": {
+                                "type": { "const": "Reconciled" },
+                                "observedGeneration": { "minimum": 1 }
+                            }
+                        },
+                        "minContains": 1
+                    }
                 ]
             }
         },
@@ -384,7 +406,18 @@ pub(crate) fn task_status(generator: &mut schemars::SchemaGenerator) -> Schema {
                     "phase": { "const": "running" },
                     "attempt": { "minimum": 1 },
                     "exitCode": { "type": "null" },
-                    "error": { "type": "null" }
+                    "error": { "type": "null" },
+                    "conditions": {
+                        "contains": {
+                            "type": "object",
+                            "required": ["type", "status"],
+                            "properties": {
+                                "type": { "const": "Reconciled" },
+                                "status": { "const": "True" }
+                            }
+                        },
+                        "minContains": 1
+                    }
                 }
             },
             {
@@ -397,6 +430,17 @@ pub(crate) fn task_status(generator: &mut schemars::SchemaGenerator) -> Schema {
                             "canceled",
                             "exhausted"
                         ]
+                    },
+                    "conditions": {
+                        "contains": {
+                            "type": "object",
+                            "required": ["type", "status"],
+                            "properties": {
+                                "type": { "const": "Reconciled" },
+                                "status": { "const": "True" }
+                            }
+                        },
+                        "minContains": 1
                     }
                 }
             }
@@ -587,6 +631,61 @@ mod tests {
         ] {
             assert!(!schema.is_valid(&invalid), "expected invalid: {invalid}");
         }
+    }
+
+    #[test]
+    fn task_status_schema_enforces_reconciled_lifecycle_shape() {
+        let schema = validator::<TaskStatus>();
+        let pending = serde_json::to_value(TaskStatus::pending(1).unwrap()).unwrap();
+        assert!(schema.is_valid(&pending));
+
+        let reconciled = pending["conditions"][0].clone();
+        let mut extension = reconciled.clone();
+        extension["type"] = json!("example.io/Available");
+        extension["status"] = json!("False");
+
+        let mut extended = pending.clone();
+        extended["conditions"] = json!([reconciled.clone(), extension.clone()]);
+        assert!(schema.is_valid(&extended));
+
+        let mut duplicate = reconciled.clone();
+        duplicate["reason"] = json!("Duplicate");
+        duplicate["message"] = json!("duplicate condition");
+
+        let mut zero_generation = reconciled.clone();
+        zero_generation["observedGeneration"] = json!(0);
+
+        let mut running_unknown = pending.clone();
+        running_unknown["phase"] = json!("running");
+        running_unknown["attempt"] = json!(1);
+
+        let mut terminal_false = pending.clone();
+        terminal_false["phase"] = json!("failed");
+        terminal_false["conditions"][0]["status"] = json!("False");
+
+        for invalid in [
+            with_fields(&pending, &[("conditions", json!([extension]))], &[]),
+            with_fields(
+                &pending,
+                &[("conditions", json!([reconciled.clone(), duplicate]))],
+                &[],
+            ),
+            with_fields(&pending, &[("conditions", json!([zero_generation]))], &[]),
+            running_unknown,
+            terminal_false,
+        ] {
+            assert!(!schema.is_valid(&invalid), "expected invalid: {invalid}");
+        }
+
+        let mut task = crate::Task::from_manifest(manifest(TaskWorkload::Embedded(
+            EmbeddedSpec::new("test-v1").unwrap(),
+        )))
+        .unwrap();
+        task.transition_starting(1, 1, "1").unwrap();
+        assert!(schema.is_valid(&serde_json::to_value(task.status()).unwrap()));
+        task.transition_finished(1, 1, crate::TaskPhase::Succeeded, None, Some(0), "2")
+            .unwrap();
+        assert!(schema.is_valid(&serde_json::to_value(task.status()).unwrap()));
     }
 
     #[test]

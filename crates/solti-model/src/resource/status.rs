@@ -137,12 +137,15 @@ impl TaskStatus {
     }
 
     /// Process exit code, when available.
+    ///
+    /// This detail does not determine the terminal phase.
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
     }
 
     /// Current lifecycle diagnostic, when available.
     ///
+    /// This detail does not determine the terminal phase.
     /// The value is at most [`MAX_TASK_DIAGNOSTIC_BYTES`] UTF-8 bytes.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
