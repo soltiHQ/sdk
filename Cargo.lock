@@ -2740,6 +2740,7 @@ dependencies = [
  "solti-api",
  "solti-core",
  "solti-discover",
+ "solti-exec",
  "solti-model",
  "solti-runner",
  "taskvisor",

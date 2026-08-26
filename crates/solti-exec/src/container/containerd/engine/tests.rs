@@ -3,6 +3,23 @@ use containerd_client::tonic::Code;
 use super::*;
 use crate::container::ContainerErrorClass;
 
+#[test]
+fn runtime_status_aggregates_both_local_domains() {
+    let healthy = ContainerdWorkerStatus::new(true, true, 1, 4, false);
+    let closed = ContainerdWorkerStatus::new(false, true, 0, 4, false);
+    let unhealthy = ContainerdWorkerStatus::new(true, false, 2, 4, true);
+
+    let closing = ContainerdRuntimeStatus::new(healthy, closed);
+    assert!(!closing.accepting());
+    assert!(closing.healthy());
+    assert_eq!(closing.cleanup(), healthy);
+    assert_eq!(closing.io(), closed);
+
+    let failed = ContainerdRuntimeStatus::new(healthy, unhealthy);
+    assert!(failed.accepting());
+    assert!(!failed.healthy());
+}
+
 #[derive(Default)]
 struct RetryCleanupState {
     calls: Vec<tokio::time::Instant>,

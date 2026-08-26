@@ -18,6 +18,7 @@ license.workspace      = true
 default = []
 
 api                  = ["dep:itoa", "dep:solti-api"]
+containerd           = ["dep:solti-exec", "solti-exec/containerd"]
 discover             = ["dep:solti-discover"]
 process              = ["prometheus/process"]
 runner               = ["dep:solti-runner"]
@@ -30,16 +31,19 @@ server               = [
     "dep:tracing",
 ]
 state                = ["dep:solti-core", "dep:solti-model"]
+subprocess           = ["dep:solti-exec", "solti-exec/subprocess"]
 taskvisor            = ["dep:taskvisor"]
 taskvisor-controller = ["taskvisor", "taskvisor/controller"]
 
 full = [
     "api",
+    "containerd",
     "discover",
     "process",
     "runner",
     "server",
     "state",
+    "subprocess",
     "taskvisor-controller",
 ]
 
@@ -47,6 +51,7 @@ full = [
 solti-api      = { workspace = true, optional = true }
 solti-core     = { workspace = true, optional = true }
 solti-discover = { workspace = true, optional = true }
+solti-exec     = { workspace = true, optional = true }
 solti-model    = { workspace = true, optional = true }
 solti-runner   = { workspace = true, optional = true }
 

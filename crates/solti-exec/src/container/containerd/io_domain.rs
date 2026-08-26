@@ -24,7 +24,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, SendError, Sender},
     },
     thread,
@@ -34,7 +34,7 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tracing::error;
 
-use super::io::AttemptIo;
+use super::{engine::ContainerdWorkerStatus, io::AttemptIo};
 use crate::container::{ContainerEngineError, ContainerOutput};
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -56,6 +56,8 @@ struct IoDomainInner {
     capacity: Arc<Semaphore>,
     /// Configured capacity used to wait for every permit.
     capacity_limit: u32,
+    /// Exact attempt I/O ownership, excluding the shutdown drain barrier.
+    owned: Arc<AtomicUsize>,
     /// Worker handle joined only by explicit shutdown.
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     /// Worker and ownership health shared with accepted jobs.
@@ -159,11 +161,33 @@ impl IoDomain {
                 queue,
                 capacity: Arc::new(Semaphore::new(capacity)),
                 capacity_limit,
+                owned: Arc::new(AtomicUsize::new(0)),
                 worker: Mutex::new(Some(worker)),
                 health,
                 shutdown: tokio::sync::Mutex::new(()),
             }),
         })
+    }
+
+    /// Returns one synchronous snapshot of I/O admission and ownership.
+    pub(super) fn status(&self) -> ContainerdWorkerStatus {
+        let accepting = self
+            .inner
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accepting;
+        let capacity = usize::try_from(self.inner.capacity_limit)
+            .expect("validated I/O capacity must fit usize");
+        let owned = self.inner.owned.load(Ordering::Acquire);
+        let quarantined = self.inner.health.quarantined.load(Ordering::Acquire);
+        ContainerdWorkerStatus::new(
+            accepting,
+            !health_failed(&self.inner.health),
+            owned,
+            capacity,
+            quarantined,
+        )
     }
 
     /// Reserves capacity and queues one blocking preparation.
@@ -201,6 +225,7 @@ impl IoDomain {
                     ContainerEngineError::retryable("containerd I/O admission is closed")
                 }
             })?;
+        let permit = IoOwnershipPermit::new(permit, Arc::clone(&self.inner.owned));
         let (result_sender, result_receiver) = oneshot::channel();
         let job = IoJob::prepare(
             root,
@@ -437,7 +462,7 @@ impl ManagedAttemptIo {
         Self {
             state: ManagedIoState::Ready(ManagedAttemptIoInner::new(
                 io,
-                permit,
+                IoOwnershipPermit::for_test(permit),
                 Arc::clone(&health),
             )),
             queue: Arc::clone(&queue),
@@ -623,14 +648,14 @@ struct ManagedAttemptIoInner {
     /// Local output resources removed only by the I/O worker.
     io: Option<AttemptIo>,
     /// Capacity released only after confirmed local removal.
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<IoOwnershipPermit>,
     /// Health marked if armed ownership is dropped without transfer.
     health: Arc<IoHealth>,
 }
 
 impl ManagedAttemptIoInner {
     /// Creates armed local ownership.
-    fn new(io: AttemptIo, permit: OwnedSemaphorePermit, health: Arc<IoHealth>) -> Self {
+    fn new(io: AttemptIo, permit: IoOwnershipPermit, health: Arc<IoHealth>) -> Self {
         Self {
             io: Some(io),
             permit: Some(permit),
@@ -679,6 +704,39 @@ impl ManagedAttemptIoInner {
             .expect("managed I/O retains capacity until quarantine");
         quarantine_io(io);
         mem::forget(permit);
+    }
+}
+
+/// One exact I/O owner layered over the semaphore capacity permit.
+struct IoOwnershipPermit {
+    /// Semaphore capacity released with this owner.
+    _permit: OwnedSemaphorePermit,
+    /// Exact ownership count unaffected by shutdown's all-permits barrier.
+    owned: Arc<AtomicUsize>,
+}
+
+impl IoOwnershipPermit {
+    fn new(permit: OwnedSemaphorePermit, owned: Arc<AtomicUsize>) -> Self {
+        owned.fetch_add(1, Ordering::AcqRel);
+        Self {
+            _permit: permit,
+            owned,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(permit: OwnedSemaphorePermit) -> Self {
+        Self::new(permit, Arc::new(AtomicUsize::new(0)))
+    }
+}
+
+impl Drop for IoOwnershipPermit {
+    fn drop(&mut self) {
+        self.owned
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |owned| {
+                owned.checked_sub(1)
+            })
+            .expect("containerd I/O ownership must not underflow");
     }
 }
 
@@ -751,7 +809,7 @@ impl IoJob {
     fn prepare(
         root: PathBuf,
         attempt_id: String,
-        permit: OwnedSemaphorePermit,
+        permit: IoOwnershipPermit,
         queue: Arc<IoQueue>,
         result: oneshot::Sender<PrepareResult>,
         health: Arc<IoHealth>,
@@ -856,7 +914,7 @@ struct PrepareJob {
     /// Opaque attempt identifier used only by I/O naming policy.
     attempt_id: String,
     /// Capacity retained until preparation becomes managed ownership.
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<IoOwnershipPermit>,
     /// Shared queue owner transferred to prepared managed ownership.
     queue: Arc<IoQueue>,
     /// Result channel returned to the preparation owner.
