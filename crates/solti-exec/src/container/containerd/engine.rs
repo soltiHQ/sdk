@@ -577,7 +577,7 @@ enum AttemptIoState {
     /// Blocking preparation is running or has a result to collect.
     Preparing(IoPreparation),
     /// Prepared local resources belong to the active attempt.
-    Ready(ManagedAttemptIo),
+    Ready(Box<ManagedAttemptIo>),
     /// No local resources remain owned.
     Absent,
     /// The I/O worker lost safe ownership progress.
@@ -737,7 +737,7 @@ impl AttemptState {
 
         match result {
             Ok(io) => {
-                self.io = AttemptIoState::Ready(io);
+                self.io = AttemptIoState::Ready(Box::new(io));
                 Ok(())
             }
             Err(error) => {
