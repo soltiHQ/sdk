@@ -48,6 +48,22 @@ pub enum RunnerError {
     Internal(String),
 }
 
+impl RunnerError {
+    /// Returns a stable, low-cardinality label for metrics and structured logs.
+    ///
+    /// [`Display`](std::fmt::Display) is a human-readable diagnostic and may
+    /// include workload data. Use this label for classification.
+    pub const fn as_label(&self) -> &'static str {
+        match self {
+            Self::UnsupportedWorkload { .. } => "unsupported_workload",
+            Self::InvalidSpec(_) => "invalid_spec",
+            Self::BuildCancelled => "build_cancelled",
+            Self::NestedBuild { .. } => "nested_build",
+            Self::Internal(_) => "internal",
+        }
+    }
+}
+
 /// Error returned by [`RunnerRouter`](crate::RunnerRouter).
 ///
 /// Registration errors preserve the rejected runner name.
@@ -125,4 +141,126 @@ pub enum RouterError {
         #[source]
         source: RunnerError,
     },
+}
+
+impl RouterError {
+    /// Returns a stable, low-cardinality label for metrics and structured logs.
+    ///
+    /// [`Display`](std::fmt::Display) is a human-readable diagnostic and may
+    /// include workload data. Use this label for classification.
+    pub const fn as_label(&self) -> &'static str {
+        match self {
+            Self::DuplicateRunner { .. } => "duplicate_runner",
+            Self::InvalidLabels { .. } => "invalid_labels",
+            Self::InvalidCapability { .. } => "invalid_capability",
+            Self::EmbeddedWorkload => "embedded_workload",
+            Self::NoRunner { .. } => "no_runner",
+            Self::BuildCancelled { .. } => "build_cancelled",
+            Self::RecursiveBuild { .. } => "recursive_build",
+            Self::AdmissionCycle { .. } => "admission_cycle",
+            Self::Build { .. } => "build",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use solti_model::ModelError;
+
+    use super::{RouterError, RunnerError};
+
+    #[test]
+    fn runner_labels_are_stable_and_low_cardinality() {
+        let nested = RouterError::NoRunner {
+            api_version: "example.io/v1".into(),
+            kind: "Example".into(),
+        };
+        let cases = [
+            (
+                RunnerError::UnsupportedWorkload {
+                    runner: "runner".into(),
+                    api_version: "example.io/v1".into(),
+                    kind: "Example".into(),
+                },
+                "unsupported_workload",
+            ),
+            (RunnerError::InvalidSpec("value".into()), "invalid_spec"),
+            (RunnerError::BuildCancelled, "build_cancelled"),
+            (
+                RunnerError::NestedBuild {
+                    context: "nested".into(),
+                    source: Box::new(nested),
+                },
+                "nested_build",
+            ),
+            (RunnerError::Internal("value".into()), "internal"),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.as_label(), expected);
+        }
+    }
+
+    #[test]
+    fn router_labels_are_stable_and_low_cardinality() {
+        let cases = [
+            (
+                RouterError::DuplicateRunner {
+                    name: "runner".into(),
+                },
+                "duplicate_runner",
+            ),
+            (
+                RouterError::InvalidLabels {
+                    runner: "runner".into(),
+                    source: ModelError::Invalid("labels".into()),
+                },
+                "invalid_labels",
+            ),
+            (
+                RouterError::InvalidCapability {
+                    runner: "runner".into(),
+                    source: ModelError::Invalid("capability".into()),
+                },
+                "invalid_capability",
+            ),
+            (RouterError::EmbeddedWorkload, "embedded_workload"),
+            (
+                RouterError::NoRunner {
+                    api_version: "example.io/v1".into(),
+                    kind: "Example".into(),
+                },
+                "no_runner",
+            ),
+            (
+                RouterError::BuildCancelled {
+                    runner: "runner".into(),
+                },
+                "build_cancelled",
+            ),
+            (
+                RouterError::RecursiveBuild {
+                    runner: "runner".into(),
+                },
+                "recursive_build",
+            ),
+            (
+                RouterError::AdmissionCycle {
+                    runner: "runner".into(),
+                },
+                "admission_cycle",
+            ),
+            (
+                RouterError::Build {
+                    runner: "runner".into(),
+                    source: RunnerError::Internal("value".into()),
+                },
+                "build",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.as_label(), expected);
+        }
+    }
 }

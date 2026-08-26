@@ -673,7 +673,7 @@ fn test_state(rpc: Arc<FakeRpc>) -> AttemptState {
         SNAPSHOTTER.to_owned(),
         RESOURCE_ID.to_owned(),
         test_labels(),
-        AttemptIoState::Ready(ManagedAttemptIo::for_test(AttemptIo::for_test())),
+        AttemptIoState::Ready(Box::new(ManagedAttemptIo::for_test(AttemptIo::for_test()))),
         AttemptTimeouts {
             control: Duration::from_millis(20),
             cleanup: Duration::from_secs(1),

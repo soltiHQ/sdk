@@ -11,9 +11,9 @@ use std::{
 use tokio::sync::{Semaphore, oneshot};
 
 use super::{
-    IoAdmission, IoDomain, IoDomainInner, IoHealth, IoJob, IoJobInner, IoPreparation, IoQueue,
-    ManagedAttemptIo, ManagedAttemptIoInner, ManagedIoState, PrepareJob, PrepareResult,
-    RemovalOwner, RemoveResult, WorkerProgress, finish_failed_partial_prepare,
+    IoAdmission, IoDomain, IoDomainInner, IoHealth, IoJob, IoJobInner, IoOwnershipPermit,
+    IoPreparation, IoQueue, ManagedAttemptIo, ManagedAttemptIoInner, ManagedIoState, PrepareJob,
+    PrepareResult, RemovalOwner, RemoveResult, WorkerProgress, finish_failed_partial_prepare,
     remove_or_quarantine_managed,
 };
 use crate::container::containerd::io::AttemptIo;
@@ -41,6 +41,7 @@ impl ObservedDomain {
                 queue,
                 capacity: Arc::new(Semaphore::new(capacity)),
                 capacity_limit,
+                owned: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 worker: Mutex::new(None),
                 health: Arc::new(IoHealth::default()),
                 shutdown: tokio::sync::Mutex::new(()),
@@ -56,6 +57,55 @@ impl ObservedDomain {
             .expect("one preparation must be queued")
             .release_unstarted_prepare();
     }
+}
+
+#[test]
+fn status_tracks_exact_io_ownership_and_health() {
+    let observed = ObservedDomain::new(2);
+    let initial = observed.domain.status();
+    assert!(initial.accepting());
+    assert!(initial.healthy());
+    assert_eq!(initial.owned(), 0);
+    assert_eq!(initial.capacity(), 2);
+    assert!(!initial.quarantined());
+
+    let preparation = observed
+        .domain
+        .try_prepare(PathBuf::from("queued"), "status".to_owned())
+        .expect("one I/O owner must be admitted");
+    assert_eq!(observed.domain.status().owned(), 1);
+
+    observed.release_prepare();
+    drop(preparation);
+    assert_eq!(observed.domain.status().owned(), 0);
+
+    observed
+        .domain
+        .inner
+        .health
+        .quarantined
+        .store(true, std::sync::atomic::Ordering::Release);
+    observed
+        .domain
+        .inner
+        .admission
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .accepting = false;
+    let quarantined = observed.domain.status();
+    assert!(!quarantined.accepting());
+    assert!(!quarantined.healthy());
+    assert!(quarantined.quarantined());
+}
+
+#[test]
+fn shutdown_permit_barrier_does_not_count_as_io_ownership() {
+    let observed = ObservedDomain::new(2);
+    let _barrier = Arc::clone(&observed.domain.inner.capacity)
+        .try_acquire_many_owned(2)
+        .expect("idle domain must expose every semaphore permit");
+
+    assert_eq!(observed.domain.status().owned(), 0);
 }
 
 /// Polls one future exactly once and requires a pending result.
@@ -84,7 +134,7 @@ fn observed_managed_io() -> (ManagedAttemptIo, mpsc::Receiver<IoJob>, Arc<Semaph
     let managed = ManagedAttemptIo {
         state: ManagedIoState::Ready(ManagedAttemptIoInner::new(
             AttemptIo::for_test(),
-            permit,
+            IoOwnershipPermit::for_test(permit),
             Arc::clone(&health),
         )),
         queue,
@@ -437,7 +487,7 @@ async fn lost_worker_job_retains_capacity_and_fails_shutdown() {
     let job = IoJob::remove(
         ManagedAttemptIoInner::new(
             AttemptIo::for_test(),
-            permit,
+            IoOwnershipPermit::for_test(permit),
             Arc::clone(&observed.domain.inner.health),
         ),
         result,
@@ -470,7 +520,11 @@ async fn buffered_failed_removal_marks_quarantine_when_owner_drops() {
         .try_acquire_owned()
         .unwrap();
     let health = Arc::clone(&observed.domain.inner.health);
-    let inner = ManagedAttemptIoInner::new(AttemptIo::for_test(), permit, Arc::clone(&health));
+    let inner = ManagedAttemptIoInner::new(
+        AttemptIo::for_test(),
+        IoOwnershipPermit::for_test(permit),
+        Arc::clone(&health),
+    );
     let (result, receiver) = oneshot::channel();
     let managed = ManagedAttemptIo {
         state: ManagedIoState::Removing(RemovalOwner { receiver }),
@@ -515,7 +569,7 @@ fn partial_prepare_failure_releases_capacity_after_successful_rollback() {
     let mut job = PrepareJob {
         root: PathBuf::from("unused"),
         attempt_id: "partial".to_owned(),
-        permit: Some(permit),
+        permit: Some(IoOwnershipPermit::for_test(permit)),
         queue: Arc::clone(&observed.domain.inner.queue),
         result: Some(result),
     };
@@ -548,7 +602,7 @@ fn partial_prepare_rollback_failure_quarantines_ownership() {
     let mut job = PrepareJob {
         root: PathBuf::from("unused"),
         attempt_id: "partial".to_owned(),
-        permit: Some(permit),
+        permit: Some(IoOwnershipPermit::for_test(permit)),
         queue: Arc::clone(&observed.domain.inner.queue),
         result: Some(result),
     };
@@ -584,7 +638,7 @@ fn orphan_prepared_owner_cleanup_failure_quarantines_ownership() {
     let mut managed = ManagedAttemptIo {
         state: ManagedIoState::Ready(ManagedAttemptIoInner::new(
             AttemptIo::for_test_with_cleanup_error(std::io::ErrorKind::PermissionDenied),
-            permit,
+            IoOwnershipPermit::for_test(permit),
             Arc::clone(&health),
         )),
         queue: Arc::clone(&observed.domain.inner.queue),
@@ -614,7 +668,7 @@ async fn worker_panic_quarantines_capacity_and_fails_closed() {
         inner: Some(IoJobInner::Prepare(PrepareJob {
             root: PathBuf::from("/solti-io-domain-missing-test-root"),
             attempt_id: "panic".to_owned(),
-            permit: Some(permit),
+            permit: Some(IoOwnershipPermit::for_test(permit)),
             queue: Arc::clone(&domain.inner.queue),
             result: None,
         })),
@@ -651,7 +705,7 @@ async fn explicit_quarantine_retains_capacity_and_fails_shutdown() {
     let job = IoJob::remove(
         ManagedAttemptIoInner::new(
             AttemptIo::for_test(),
-            permit,
+            IoOwnershipPermit::for_test(permit),
             Arc::clone(&observed.domain.inner.health),
         ),
         result,

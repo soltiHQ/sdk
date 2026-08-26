@@ -9,7 +9,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use solti_exec::container::containerd::{ContainerNetwork, ContainerdConfig, ContainerdEngine};
+use solti_exec::container::containerd::{
+    ContainerNetwork, ContainerdConfig, ContainerdEngine, ContainerdRuntimeStatus,
+};
 use solti_exec::container::register_container_runner;
 use solti_model::{ContainerSpec, OutputEvent, Task, TaskEnv, TaskId, TaskSpec, TaskWorkload};
 use solti_runner::{OutputPublisher, OutputPublisherHandle, OutputSink, RunnerRouter};
@@ -36,6 +38,18 @@ impl OutputPublisher for RecordingOutput {
 
 fn setting(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_owned())
+}
+
+fn assert_idle_runtime(status: ContainerdRuntimeStatus, accepting: bool) {
+    assert_eq!(status.accepting(), accepting);
+    assert!(status.healthy());
+    for worker in [status.cleanup(), status.io()] {
+        assert_eq!(worker.accepting(), accepting);
+        assert!(worker.healthy());
+        assert_eq!(worker.owned(), 0);
+        assert!(worker.capacity() > 0);
+        assert!(!worker.quarantined());
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -66,6 +80,7 @@ async fn public_container_runner_completes_one_real_containerd_attempt() -> Test
         .with_network(ContainerNetwork::Host)
         .with_io_root(io_root);
     let engine = Arc::new(ContainerdEngine::connect(config).await?);
+    assert_idle_runtime(engine.runtime_status(), true);
 
     let attempt = async {
         let info = engine.probe().await?;
@@ -109,11 +124,15 @@ async fn public_container_runner_completes_one_real_containerd_attempt() -> Test
         if !observed {
             return Err("container output did not contain the integration marker".into());
         }
+        assert_idle_runtime(engine.runtime_status(), true);
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
 
     let shutdown = engine.shutdown().await;
+    if shutdown.is_ok() {
+        assert_idle_runtime(engine.runtime_status(), false);
+    }
     match (attempt, shutdown) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),

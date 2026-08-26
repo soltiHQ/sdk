@@ -423,6 +423,8 @@ Important limits:
 Constructors and validation return `ModelResult<T>`.
 `ModelError::Invalid` covers structural and invariant failures.
 Dedicated variants cover unknown admission, restart, jitter, and phase names.
+Use `ModelError::as_label()` for stable metrics and structured-log
+classification. `Display` text is a human diagnostic and may contain input.
 
 `ModelError` and most public enums are non-exhaustive.
 Use a fallback match arm.

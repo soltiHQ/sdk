@@ -70,6 +70,11 @@ observe-timezone-sync = [
 
 prometheus-api                  = ["prometheus-base", "api", "solti-prometheus/api"]
 prometheus-base                 = ["dep:solti-prometheus"]
+prometheus-containerd           = [
+    "prometheus-base",
+    "exec-containerd",
+    "solti-prometheus/containerd",
+]
 prometheus-discover             = ["prometheus-base", "discover", "solti-prometheus/discover"]
 prometheus-process              = ["prometheus-base", "solti-prometheus/process"]
 prometheus-runner               = ["prometheus-base", "runner", "solti-prometheus/runner"]
@@ -80,6 +85,11 @@ prometheus-server               = [
     "solti-prometheus/server",
 ]
 prometheus-state                = ["prometheus-base", "core", "model", "solti-prometheus/state"]
+prometheus-subprocess           = [
+    "prometheus-base",
+    "exec-subprocess",
+    "solti-prometheus/subprocess",
+]
 prometheus-taskvisor            = [
     "prometheus-base",
     "taskvisor",
@@ -98,11 +108,13 @@ prometheus = [
 ]
 prometheus-full = [
     "prometheus-api",
+    "prometheus-containerd",
     "prometheus-discover",
     "prometheus-process",
     "prometheus-runner",
     "prometheus-server",
     "prometheus-state",
+    "prometheus-subprocess",
     "prometheus-taskvisor-controller",
 ]
 

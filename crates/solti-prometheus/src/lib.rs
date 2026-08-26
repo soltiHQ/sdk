@@ -1,8 +1,9 @@
 //! # solti-prometheus
 //!
-//! `solti-prometheus` connects Solti metrics contracts to one Prometheus [`Registry`].
-//! It does not define those contracts.
-//! Each adapter implements a trait from the crate that owns the observed behavior.
+//! `solti-prometheus` connects Solti metrics contracts and public runtime
+//! snapshots to one Prometheus [`Registry`]. It does not define those
+//! contracts. Event adapters implement traits from the crates that own the
+//! observed behavior; pull collectors read public snapshots during gathering.
 //!
 //! All integrations are disabled by default.
 //! [`Registry`], [`Error`], and [`register_build_info`] are always available.
@@ -13,6 +14,8 @@
 //! solti-runner ─────► PrometheusRunnerMetrics ───────────┐
 //! solti-api ────────► PrometheusApiMetrics ──────────────┤
 //! solti-discover ───► PrometheusDiscoverMetrics ─────────┤
+//! subprocess runner ► finalizer status collector ────────┤
+//! containerd engine ► local worker status collector ─────┤
 //! Taskvisor events ─► PrometheusTaskvisorSubscriber ─────┤
 //! solti-core state ─► PrometheusCoreStateCollector ──────┤
 //! build / process ──► registration functions ────────────┤
@@ -28,10 +31,12 @@
 //! |------------------------|--------------------|----------------------------------|
 //! | `api`                  | API metrics trait  | `PrometheusApiMetrics`           |
 //! | `discover`             | Discovery metrics  | `PrometheusDiscoverMetrics`      |
+//! | `containerd`           | Containerd engine  | `PrometheusContainerdCollector`  |
 //! | `process`              | Current process    | `register_process_collector`     |
 //! | `runner`               | Runner metrics     | `PrometheusRunnerMetrics`        |
 //! | `server`               | Shared registry    | `server`, `server_with_config`   |
 //! | `state`                | `TaskState`        | `PrometheusCoreStateCollector`   |
+//! | `subprocess`           | Subprocess runner  | `PrometheusSubprocessFinalizerCollector` |
 //! | `taskvisor`            | Taskvisor events   | `PrometheusTaskvisorSubscriber`  |
 //! | `taskvisor-controller` | Controller events  | Controller subscriber metrics    |
 //!
@@ -39,12 +44,13 @@
 //!
 //! ## Registration
 //!
-//! Metrics adapters register their collectors as one group.
-//! A descriptor conflict rejects the complete group.
-//! It does not leave part of that group in the registry.
+//! Push adapters register their collectors as one group. A descriptor conflict
+//! rejects the complete group without leaving part of that group in the
+//! registry.
 //!
-//! The state collector is different.
-//! Construct it first, then register it as a [`prometheus::core::Collector`].
+//! Pull-based state, subprocess, and containerd collectors are returned
+//! unregistered. Construct them first, then register each one as a
+//! [`prometheus::core::Collector`].
 //!
 //! ## Quick Start
 //!
@@ -128,3 +134,15 @@ mod state;
 pub use state::PrometheusCoreStateCollector;
 
 pub use prometheus::{Error, Registry};
+
+#[cfg(feature = "subprocess")]
+mod subprocess;
+#[cfg(feature = "subprocess")]
+#[cfg_attr(docsrs, doc(cfg(feature = "subprocess")))]
+pub use subprocess::PrometheusSubprocessFinalizerCollector;
+
+#[cfg(feature = "containerd")]
+mod containerd;
+#[cfg(feature = "containerd")]
+#[cfg_attr(docsrs, doc(cfg(feature = "containerd")))]
+pub use containerd::PrometheusContainerdCollector;

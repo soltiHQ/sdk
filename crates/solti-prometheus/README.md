@@ -1,8 +1,9 @@
 # solti-prometheus
 
 `solti-prometheus` is the metrics backend for the Solti SDK.
-Other crates (`solti-runner`, `solti-api`, `solti-discover`, `solti-core`) define metrics traits;
-this crate implements them against one shared Prometheus `Registry` and can expose it over `/metrics`.
+Other crates define metrics traits or public runtime snapshots. This crate
+connects them to one shared Prometheus `Registry` and can expose it over
+`/metrics`.
 
 ## Quick start
 
@@ -23,7 +24,8 @@ fn main() -> Result<(), Error> {
 ```
 
 All integrations are disabled by default.
-Enable one feature per adapter you use; the source crate then calls it during normal handling.
+Enable one feature per integration. Event adapters are called during normal
+handling; pull collectors read their source when Prometheus gathers the registry.
 
 ## What it does
 
@@ -31,6 +33,7 @@ Enable one feature per adapter you use; the source crate then calls it during no
 - implements metrics traits from other Solti crates;
 - converts Taskvisor events into supervision metrics;
 - exposes current task phases from `TaskState`;
+- exposes subprocess finalizer and containerd local-worker runtime snapshots;
 - registers build and process metrics;
 - builds a supervised task for the `/metrics` endpoint;
 - keeps adapter dependencies behind features.
@@ -45,22 +48,27 @@ Enable one feature per adapter you use; the source crate then calls it during no
 | `PrometheusApiMetrics::new`              | Registry                                   | `solti_api_*` collector                                 |
 | `PrometheusDiscoverMetrics::new`         | Registry                                   | `solti_discover_*` collector                            |
 | `PrometheusCoreStateCollector::new`      | `TaskState`                                | Pull-based `solti_core_tasks_by_phase` collector        |
+| `PrometheusSubprocessFinalizerCollector::new` | subprocess runner                    | Pull-based finalizer status collector                   |
+| `PrometheusContainerdCollector::new`     | native containerd engine                  | Pull-based local worker status collector                |
 | `register_process_collector`             | Registry                                   | Standard `process_*` collectors on Linux                |
 | `server` / `server_with_config`          | Shared registry, address, revision, limits | `TaskManifest` and embedded `TaskRef`                   |
 
 Metrics adapter and subscriber constructors register their groups immediately.
-`PrometheusCoreStateCollector` is returned unregistered because it implements `prometheus::core::Collector`.
+The state, subprocess, and containerd pull collectors are returned unregistered
+because they implement `prometheus::core::Collector`.
 
 ## Features
 
 | Feature                 | Public integration                         |
 |-------------------------|--------------------------------------------|
 | `api`                   | `PrometheusApiMetrics`                     |
+| `containerd`            | `PrometheusContainerdCollector`            |
 | `discover`              | `PrometheusDiscoverMetrics`                |
 | `process`               | `register_process_collector`               |
 | `runner`                | `PrometheusRunnerMetrics`                  |
 | `server`                | supervised `/metrics` task                 |
 | `state`                 | `PrometheusCoreStateCollector`             |
+| `subprocess`            | `PrometheusSubprocessFinalizerCollector`   |
 | `taskvisor`             | `PrometheusTaskvisorSubscriber`            |
 | `taskvisor-controller`  | controller metrics on the subscriber       |
 | `full`                  | every integration above                    |
@@ -81,12 +89,15 @@ prometheus::Registry
   ├─ solti_api_*
   ├─ solti_discover_*
   ├─ solti_core_tasks_by_phase
+  ├─ solti_exec_subprocess_finalizer_*
+  ├─ solti_exec_containerd_worker_*
   └─ process_*
           └─ GET /metrics
 ```
 
-Each adapter registers its collectors as one group.
-A name conflict rejects the complete group without leaving part of it in the registry.
+Push adapters register their collectors as one group. A name conflict rejects
+the complete group without leaving part of it in the registry. Pull collectors
+are registered by the application.
 
 ## API and discovery adapters
 

@@ -83,4 +83,4 @@ mod config;
 pub use config::{ContainerNetwork, ContainerPlatform, ContainerdConfig};
 
 mod engine;
-pub use engine::ContainerdEngine;
+pub use engine::{ContainerdEngine, ContainerdRuntimeStatus, ContainerdWorkerStatus};

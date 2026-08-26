@@ -31,7 +31,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -41,7 +41,7 @@ use containerd_client::Client;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tracing::{error, warn};
 
-use super::engine::AttemptState;
+use super::engine::{AttemptState, ContainerdWorkerStatus};
 use crate::container::{ContainerEngineError, ContainerErrorClass};
 
 const RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(100);
@@ -62,6 +62,8 @@ struct CleanupDomainInner {
     capacity: Arc<Semaphore>,
     /// Configured capacity needed to wait for every owner.
     capacity_limit: u32,
+    /// Exact attempt ownership, excluding the shutdown drain barrier.
+    owned: Arc<AtomicUsize>,
     /// Worker handle joined only by explicit shutdown.
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     /// Whether the worker ended with a panic.
@@ -114,6 +116,7 @@ impl CleanupDomain {
         let (startup_tx, startup_rx) = oneshot::channel();
         let cleanup_failed = Arc::new(AtomicBool::new(false));
         let cleanup_quarantined = Arc::new(AtomicBool::new(false));
+        let owned = Arc::new(AtomicUsize::new(0));
         let worker_failure = Arc::clone(&cleanup_failed);
         let worker_quarantine = Arc::clone(&cleanup_quarantined);
 
@@ -169,6 +172,7 @@ impl CleanupDomain {
                 }),
                 capacity: admission,
                 capacity_limit,
+                owned,
                 worker: Mutex::new(Some(worker)),
                 worker_panicked: AtomicBool::new(false),
                 cleanup_failed,
@@ -177,6 +181,24 @@ impl CleanupDomain {
             }),
         };
         Ok((client, executor, domain))
+    }
+
+    /// Returns one synchronous snapshot of cleanup admission and ownership.
+    pub(super) fn status(&self) -> ContainerdWorkerStatus {
+        let accepting = self
+            .inner
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accepting;
+        let capacity = usize::try_from(self.inner.capacity_limit)
+            .expect("validated cleanup capacity must fit usize");
+        let owned = self.inner.owned.load(Ordering::Acquire);
+        let quarantined = self.inner.cleanup_quarantined.load(Ordering::Acquire);
+        let healthy = !self.inner.cleanup_failed.load(Ordering::Acquire)
+            && !quarantined
+            && !self.inner.worker_panicked.load(Ordering::Acquire);
+        ContainerdWorkerStatus::new(accepting, healthy, owned, capacity, quarantined)
     }
 
     /// Reserves one lifecycle slot before image resolution starts.
@@ -230,7 +252,10 @@ impl CleanupDomain {
             })?;
         Ok(CleanupReservation {
             sender,
-            permit: Some(permit),
+            permit: Some(CleanupOwnershipPermit::new(
+                permit,
+                Arc::clone(&self.inner.owned),
+            )),
         })
     }
 
@@ -308,7 +333,35 @@ pub(super) struct CleanupReservation {
     /// Queue sender retained until explicit release or deferred handoff.
     sender: mpsc::UnboundedSender<CleanupJob>,
     /// Capacity unit transferred with the cleanup state.
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<CleanupOwnershipPermit>,
+}
+
+/// One exact lifecycle owner layered over the semaphore capacity permit.
+struct CleanupOwnershipPermit {
+    /// Semaphore capacity released with this owner.
+    _permit: OwnedSemaphorePermit,
+    /// Exact ownership count unaffected by shutdown's all-permits barrier.
+    owned: Arc<AtomicUsize>,
+}
+
+impl CleanupOwnershipPermit {
+    fn new(permit: OwnedSemaphorePermit, owned: Arc<AtomicUsize>) -> Self {
+        owned.fetch_add(1, Ordering::AcqRel);
+        Self {
+            _permit: permit,
+            owned,
+        }
+    }
+}
+
+impl Drop for CleanupOwnershipPermit {
+    fn drop(&mut self) {
+        self.owned
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |owned| {
+                owned.checked_sub(1)
+            })
+            .expect("containerd cleanup ownership must not underflow");
+    }
 }
 
 impl CleanupReservation {
@@ -353,7 +406,7 @@ struct CleanupJobInner {
     /// Mutable attempt ownership state.
     state: AttemptState,
     /// Admission unit released only after clean completion.
-    _permit: OwnedSemaphorePermit,
+    _permit: CleanupOwnershipPermit,
 }
 
 impl CleanupJob {
@@ -745,6 +798,7 @@ pub(super) mod tests {
                 }),
                 capacity: Arc::new(Semaphore::new(capacity)),
                 capacity_limit: u32::try_from(capacity).expect("test capacity must fit u32"),
+                owned: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 worker: std::sync::Mutex::new(None),
                 worker_panicked: std::sync::atomic::AtomicBool::new(false),
                 cleanup_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -759,6 +813,49 @@ pub(super) mod tests {
     ) -> ObservedDomain {
         let (domain, receiver) = observed_domain(capacity);
         ObservedDomain { domain, receiver }
+    }
+
+    #[test]
+    fn status_tracks_exact_cleanup_ownership_and_health() {
+        let domain = isolated_domain(2);
+        let initial = domain.status();
+        assert!(initial.accepting());
+        assert!(initial.healthy());
+        assert_eq!(initial.owned(), 0);
+        assert_eq!(initial.capacity(), 2);
+        assert!(!initial.quarantined());
+
+        let reservation = domain.try_reserve().expect("one owner must be admitted");
+        assert_eq!(domain.status().owned(), 1);
+
+        domain
+            .inner
+            .cleanup_quarantined
+            .store(true, std::sync::atomic::Ordering::Release);
+        let quarantined = domain.status();
+        assert!(!quarantined.healthy());
+        assert!(quarantined.quarantined());
+
+        domain
+            .inner
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accepting = false;
+        assert!(!domain.status().accepting());
+
+        drop(reservation);
+        assert_eq!(domain.status().owned(), 0);
+    }
+
+    #[test]
+    fn shutdown_permit_barrier_does_not_count_as_cleanup_ownership() {
+        let domain = isolated_domain(2);
+        let _barrier = Arc::clone(&domain.inner.capacity)
+            .try_acquire_many_owned(2)
+            .expect("idle domain must expose every semaphore permit");
+
+        assert_eq!(domain.status().owned(), 0);
     }
 
     #[test]

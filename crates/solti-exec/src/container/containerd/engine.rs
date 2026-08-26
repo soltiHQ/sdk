@@ -140,6 +140,98 @@ enum MutationOwner {
     Lost,
 }
 
+/// Observable state of one containerd-owned background worker domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerdWorkerStatus {
+    accepting: bool,
+    healthy: bool,
+    owned: usize,
+    capacity: usize,
+    quarantined: bool,
+}
+
+impl ContainerdWorkerStatus {
+    pub(in crate::container::containerd) const fn new(
+        accepting: bool,
+        healthy: bool,
+        owned: usize,
+        capacity: usize,
+        quarantined: bool,
+    ) -> Self {
+        Self {
+            accepting,
+            healthy,
+            owned,
+            capacity,
+            quarantined,
+        }
+    }
+
+    /// Returns whether the domain's admission gate is open.
+    pub const fn accepting(self) -> bool {
+        self.accepting
+    }
+
+    /// Returns whether the domain has preserved forward progress.
+    pub const fn healthy(self) -> bool {
+        self.healthy
+    }
+
+    /// Returns active, queued, and quarantined ownership.
+    pub const fn owned(self) -> usize {
+        self.owned
+    }
+
+    /// Returns the configured ownership limit.
+    pub const fn capacity(self) -> usize {
+        self.capacity
+    }
+
+    /// Returns whether this domain explicitly recorded terminal quarantine.
+    ///
+    /// Other terminal worker failures are reported by [`Self::healthy`] and
+    /// can retain non-zero ownership without setting this narrower flag.
+    pub const fn quarantined(self) -> bool {
+        self.quarantined
+    }
+}
+
+/// Observable state of one native containerd engine's local worker domains.
+///
+/// The two domain snapshots are sampled sequentially and may already be stale
+/// when returned. This status does not probe the containerd daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerdRuntimeStatus {
+    cleanup: ContainerdWorkerStatus,
+    io: ContainerdWorkerStatus,
+}
+
+impl ContainerdRuntimeStatus {
+    const fn new(cleanup: ContainerdWorkerStatus, io: ContainerdWorkerStatus) -> Self {
+        Self { cleanup, io }
+    }
+
+    /// Returns whether both local worker-domain admission gates are open.
+    pub const fn accepting(self) -> bool {
+        self.cleanup.accepting() && self.io.accepting()
+    }
+
+    /// Returns whether both local worker domains have preserved forward progress.
+    pub const fn healthy(self) -> bool {
+        self.cleanup.healthy() && self.io.healthy()
+    }
+
+    /// Returns remote lifecycle and deferred-cleanup worker status.
+    pub const fn cleanup(self) -> ContainerdWorkerStatus {
+        self.cleanup
+    }
+
+    /// Returns local blocking-I/O worker status.
+    pub const fn io(self) -> ContainerdWorkerStatus {
+        self.io
+    }
+}
+
 /// Native adapter for a configured containerd 2.x endpoint.
 ///
 /// Construction validates the endpoint major version, snapshotter, platform, and OCI runtime.
@@ -197,6 +289,11 @@ impl ContainerdEngine {
         };
         engine.probe().await?;
         Ok(engine)
+    }
+
+    /// Returns local cleanup and blocking-I/O worker status without probing containerd.
+    pub fn runtime_status(&self) -> ContainerdRuntimeStatus {
+        ContainerdRuntimeStatus::new(self.cleanup.status(), self.io_domain.status())
     }
 
     /// Checks major version 2 and the configured snapshotter, platform, and OCI runtime.
@@ -480,7 +577,7 @@ enum AttemptIoState {
     /// Blocking preparation is running or has a result to collect.
     Preparing(IoPreparation),
     /// Prepared local resources belong to the active attempt.
-    Ready(ManagedAttemptIo),
+    Ready(Box<ManagedAttemptIo>),
     /// No local resources remain owned.
     Absent,
     /// The I/O worker lost safe ownership progress.
@@ -640,7 +737,7 @@ impl AttemptState {
 
         match result {
             Ok(io) => {
-                self.io = AttemptIoState::Ready(io);
+                self.io = AttemptIoState::Ready(Box::new(io));
                 Ok(())
             }
             Err(error) => {

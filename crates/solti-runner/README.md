@@ -332,6 +332,10 @@ The application controls cardinality for custom labels.
 | `NestedBuild`         | Original nested `RouterError` is preserved |
 | `Internal`            | Runner could not construct the task        |
 
+Use `RouterError::as_label()` and `RunnerError::as_label()` for stable,
+low-cardinality classification. `Display` text is a human diagnostic and may
+contain workload or runner data.
+
 ## Examples
 
 ### Internal examples
