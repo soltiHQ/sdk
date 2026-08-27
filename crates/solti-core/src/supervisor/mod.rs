@@ -867,10 +867,9 @@ impl SupervisorApi {
         };
         let claimed = reconciler
             .handle
-            .cancel_with_timeout(
-                binding.tv,
-                reconciler.grace.saturating_add(Duration::from_secs(1)),
-            )
+            .cancel(binding.tv)
+            .termination_timeout(reconciler.grace.saturating_add(Duration::from_secs(1)))
+            .execute()
             .await
             .map_err(|error| CoreError::supervisor("cancel", error))?;
         Ok(Some((binding, claimed)))

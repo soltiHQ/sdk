@@ -15,7 +15,18 @@ Your binary still owns configuration, deployment, and the final security boundar
 
 Solti uses [Taskvisor](https://github.com/soltiHQ/taskvisor) for supervised attempt lifecycles.
 
-| [Quick start](#quick-start) | [Architecture](#architecture) | [Platform limits](#execution-backends-and-platform-limits) | [Examples](#examples) |
+| [Documentation](docs/index.md) | [Quick start](#quick-start) | [Architecture](#architecture) | [Platform limits](#execution-backends-and-platform-limits) | [Examples](#examples) | [Benchmarks](#benchmarks) |
+
+## Documentation
+
+The [SDK guides](docs/index.md) follow processes across crates: building an
+agent, managing desired work, executing workloads, exposing APIs, and operating
+the runtime. Each guide identifies the participants, ownership, and guarantees.
+
+Start with the [mental model](docs/mental-model.md), use the
+[architecture map](docs/architecture.md) to locate a responsibility, or choose
+a runnable program from the [complete example catalog](docs/example-catalog.md).
+The [API reference map](docs/api-reference.md) links all product crates.
 
 ## The stack you stop wiring
 
@@ -140,7 +151,8 @@ Higher-level features enable their required lower layers.
 
 | Binary requirement                 | Start with                                                              |
 |------------------------------------|-------------------------------------------------------------------------|
-| Resource types and JSON Schema     | `model`                                                                 |
+| Resource types                     | `model`                                                                 |
+| Resource types and JSON Schema     | `model-schema`                                                          |
 | Custom runner registration         | `runner`                                                                |
 | Conditional sequential workloads   | `chain`                                                                 |
 | In-process desired-state runtime   | `core`                                                                  |
@@ -439,7 +451,8 @@ All umbrella features are off by default.
 
 | Feature or family                | Adds                                                                  |
 |----------------------------------|-----------------------------------------------------------------------|
-| `model`                          | `solti-model` with JSON Schema support                                |
+| `model`                          | Runtime model types without JSON Schema support                      |
+| `model-schema`                   | Model types with JSON Schema support                                 |
 | `runner`                         | Runner contract, model, and Taskvisor                                 |
 | `core`                           | Desired-state supervisor and Taskvisor controller                     |
 | `exec`                           | Base `solti-exec` namespace                                           |
@@ -551,6 +564,20 @@ task ci/publish-dry-run
 
 The release order is declared in [`.github/crates.txt`](.github/crates.txt).
 Component crates are published before the `solti` umbrella crate.
+
+## Benchmarks
+
+Process benchmarks live in the root [`benches/`](benches/README.md) workspace
+package, outside product crates. They cover lifecycle, reconciliation,
+execution, collections, API boundaries, and shutdown.
+
+```bash
+task rust:benchmark
+```
+
+The suite uses Taskvisor-style reports with named units and explicit timing
+boundaries. See the [scenario map and run options](benches/README.md), including
+the separately gated Linux containerd and host-policy cases.
 
 ## Contributing
 

@@ -163,7 +163,7 @@ Reconciliation failures do not use the execution `phase`, `error`, or `exitCode`
 `ReconciliationScheduled` means the generation has not reached Taskvisor intake.
 `TaskvisorOwnershipAndControllerIntakePending` means core is waiting on
 Taskvisor's combined ownership and controller command-intake path. Taskvisor
-0.8 exposes that path as one future. This condition therefore does not claim
+0.9 exposes that path as one future. This condition therefore does not claim
 which of those two capacities is currently blocking.
 `task.taskvisor_intake_wait_started` and
 `task.taskvisor_intake_wait_finished` tracing events carry the same scope,
@@ -540,7 +540,7 @@ async fn configured() -> Result<(), Box<dyn std::error::Error>> {
 
 The builder also accepts Taskvisor runtime configuration, controller configuration, and external Taskvisor subscribers.
 The core state observer is always installed.
-Taskvisor 0.8 charges configured subscribers and task values retained through
+Taskvisor 0.9 charges configured subscribers and task values retained through
 intake, queuing, physical execution, and isolated destruction against the same
 `SupervisorConfig::ownership_capacity`. The core observer consumes one slot,
 and every external subscriber consumes one more. This limit is separate from
@@ -704,7 +704,7 @@ destructor, are contained and reported as worker failure rather than leaving
 shutdown pending. A sink destructor must eventually return; a caller deadline
 can observe a blocked destructor but does not terminate it.
 
-Taskvisor 0.8 reports `ForceAborted` as a logical outcome. Task code that does
+Taskvisor 0.9 reports `ForceAborted` as a logical outcome. Task code that does
 not cooperate with cancellation can remain physically active after shutdown
 returns. The controller keeps its slot until that task ownership is physically
 released.
@@ -793,12 +793,5 @@ They combine core with concrete execution runners, discovery, observability, and
 
 See the [solti-core source guide](https://github.com/soltiHQ/sdk/blob/main/crates/solti-core/ARCHITECTURE.md) for module ownership, runtime flows, concurrency, and invariants.
 
-Run the bounded collection baseline in release mode:
-
-```bash
-cargo bench -p solti-core --all-features --bench state_collections --locked
-```
-
-The benchmark reports Task query and watch-snapshot capture time for 1024
-retained Tasks. It records measurements without enforcing a machine-specific
-latency threshold.
+Process benchmarks live in the workspace-level [benchmark suite](../../benches/README.md).
+They cover lifecycle, reconciliation, collections, output, and composed SDK processes.

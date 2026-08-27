@@ -749,6 +749,9 @@ impl Write for BoundedWriter {
 }
 
 #[cfg(test)]
+mod ownership_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{
         env,
@@ -1031,6 +1034,8 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
 
+        // The next wait observes a real blocking thread, not virtual time.
+        tokio::time::resume();
         control.release();
         wait_for_available_slots(&state, 1).await;
         assert_eq!(metrics_handler(State(state)).await.status(), StatusCode::OK);
@@ -1059,6 +1064,32 @@ mod tests {
 
         control.release();
         wait_for_available_slots(&state, 1).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_requests_release_every_slot_without_followup_requests() {
+        for cycle in 0..128 {
+            let registry = Arc::new(Registry::new());
+            let (collector, mut control) = blocking_collector("cancelled_release_total");
+            registry.register(Box::new(collector)).unwrap();
+            let state = Arc::new(MetricsServerState::new(
+                registry,
+                MetricsServerConfig::new()
+                    .try_with_max_concurrent_scrapes(1)
+                    .unwrap(),
+            ));
+            let request = tokio::spawn(metrics_handler(State(Arc::clone(&state))));
+            tokio::time::timeout(Duration::from_secs(5), control.wait_until_entered())
+                .await
+                .expect("physical collector did not enter");
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            assert_eq!(state.gather_slots.available_permits(), 0);
+            control.release();
+            // No new handler call or HTTP request drives this release.
+            wait_for_available_slots(&state, 1).await;
+            assert_eq!(state.gather_slots.available_permits(), 1, "cycle {cycle}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1318,13 +1349,18 @@ mod tests {
     }
 
     async fn wait_for_available_slots(state: &MetricsServerState, expected: usize) {
-        for _ in 0..1_000 {
-            if state.gather_slots.available_permits() == expected {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("blocking gather did not return its semaphore slot");
+        // A fixed yield count is not a blocking-pool completion barrier.
+        // Acquire the actual released slots without another handler/HTTP call.
+        let permit = tokio::time::timeout(
+            Duration::from_secs(5),
+            state
+                .gather_slots
+                .acquire_many(expected.try_into().unwrap()),
+        )
+        .await
+        .expect("physical gather output did not release its semaphore permit")
+        .expect("gather semaphore unexpectedly closed");
+        drop(permit);
     }
 
     struct BlockingCollector {

@@ -172,15 +172,18 @@ async fn cancellation_during_a_mandatory_post_exit_wait_is_latched() {
 
     let supervisor = taskvisor::Supervisor::new(taskvisor::SupervisorConfig::default(), Vec::new());
     let handle = supervisor.serve().unwrap();
-    let (id, waiter) = handle
-        .add_and_watch(taskvisor::TaskSpec::once("post-exit-cancellation", task))
+    let waiter = handle
+        .add(taskvisor::TaskSpec::once("post-exit-cancellation", task))
+        .watch()
+        .execute()
         .await
         .unwrap();
+    let id = waiter.id();
     entered_rx
         .await
         .expect("attempt must enter its mandatory post-exit wait");
 
-    assert!(handle.remove(id).await.unwrap());
+    assert!(handle.remove(id).execute().await.unwrap());
     release_tx
         .send(())
         .expect("mandatory operation must remain owned after cancellation");
@@ -1430,13 +1433,16 @@ fn cancellation_after_awaited_script_prepare_prevents_spawn() {
             let supervisor =
                 taskvisor::Supervisor::new(taskvisor::SupervisorConfig::default(), Vec::new());
             let handle = supervisor.serve().unwrap();
-            let (id, waiter) = handle
-                .add_and_watch(taskvisor::TaskSpec::once(
+            let waiter = handle
+                .add(taskvisor::TaskSpec::once(
                     "prepare-cancel-attempt",
                     task_ref,
                 ))
+                .watch()
+                .execute()
                 .await
                 .unwrap();
+            let id = waiter.id();
 
             tokio::time::timeout(StdDuration::from_secs(2), async {
                 while calls.lock().unwrap().is_empty() {
@@ -1446,7 +1452,7 @@ fn cancellation_after_awaited_script_prepare_prevents_spawn() {
             .await
             .expect("attempt did not reach script preparation");
             assert_eq!(runner.finalizer_status().owned(), 1);
-            assert!(handle.remove(id).await.unwrap());
+            assert!(handle.remove(id).execute().await.unwrap());
 
             release.send(()).unwrap();
             blocker.await.unwrap();
@@ -1743,13 +1749,16 @@ async fn script_task_runs_after_exact_credential_change() {
         .unwrap();
     let supervisor = taskvisor::Supervisor::new(taskvisor::SupervisorConfig::default(), Vec::new());
     let handle = supervisor.serve().unwrap();
-    let (id, waiter) = handle
-        .add_and_watch(taskvisor::TaskSpec::once(
+    let waiter = handle
+        .add(taskvisor::TaskSpec::once(
             "credential-changing-attempt",
             script_ref,
         ))
+        .watch()
+        .execute()
         .await
         .unwrap();
+    let id = waiter.id();
 
     let descendant_pid = wait_for_credential_descendant(&marker)
         .await
@@ -1762,7 +1771,7 @@ async fn script_task_runs_after_exact_credential_change() {
         "credential-changing descendant must be alive before cancellation"
     );
 
-    assert!(handle.remove(id).await.unwrap());
+    assert!(handle.remove(id).execute().await.unwrap());
     let outcome = tokio::time::timeout(StdDuration::from_secs(5), waiter.wait())
         .await
         .expect("credential-changing attempt must stop within its cleanup deadline")

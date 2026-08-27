@@ -11,6 +11,14 @@ vars:
     sh: grep -vE '^\s*(#|$)' .github/crates.txt
 
 tasks:
+  rust:benchmark:
+    desc: Run the SDK process benchmarks with the colorized performance report.
+    cmds:
+      - task: rust:bench
+        vars:
+          BENCH_ARGS: >-
+            --package solti-benches --benches --locked -- --quiet --color always
+
   proto/vendor:
     desc: Re-vendor .proto from soltiHQ/proto.
     silent: true

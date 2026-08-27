@@ -1,0 +1,140 @@
+[package]
+name = "solti-benches"
+description = "Process benchmarks and reporting for the Solti SDK workspace."
+publish = false
+autobenches = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+bench = false
+
+[features]
+default = ["portable"]
+portable = ["fixtures", "subprocess", "container", "http", "discovery", "tls", "observability"]
+fixtures = ["solti-core/test-util"]
+subprocess = ["dep:solti-exec", "solti-exec/subprocess"]
+container = ["dep:solti-exec", "solti-exec/container"]
+containerd = ["container", "solti-exec/containerd"]
+host-policy = ["subprocess", "solti-exec/seccomp"]
+http = ["dep:solti-api", "solti-api/http", "solti-api/core-adapter", "dep:axum", "dep:tower", "dep:http-body-util", "dep:reqwest", "dep:rustls"]
+discovery = ["dep:solti-discover", "solti-discover/http", "dep:axum", "dep:reqwest"]
+tls = ["dep:solti-tls", "dep:tokio-rustls", "dep:rcgen"]
+observability = ["dep:solti-observe", "dep:solti-prometheus", "dep:prometheus", "dep:tracing", "dep:reqwest", "dep:rustls"]
+
+[dependencies]
+anstream = "1.0.0"
+anstyle = "1.0.14"
+base64 = { workspace = true }
+bytes = { workspace = true }
+criterion = { workspace = true, features = ["async_tokio", "html_reports"] }
+futures-util = { version = "0.3.33", default-features = false, features = ["std", "async-await"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+solti-chain = { workspace = true }
+solti-core = { workspace = true }
+solti-model = { workspace = true }
+solti-runner = { workspace = true }
+taskvisor = { workspace = true, features = ["controller", "test-util"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { workspace = true, features = ["net"] }
+
+axum = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+prometheus = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, features = ["http2", "json", "query", "stream", "rustls-no-provider"] }
+rustls = { workspace = true, optional = true }
+solti-api = { workspace = true, optional = true }
+solti-discover = { workspace = true, optional = true }
+solti-exec = { workspace = true, optional = true }
+solti-observe = { workspace = true, optional = true }
+solti-prometheus = { workspace = true, optional = true, features = ["server", "state", "runner", "taskvisor-controller"] }
+solti-tls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+tower = { workspace = true, optional = true, features = ["util"] }
+tracing = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[[bench]]
+name = "lifecycle"
+path = "scenarios/lifecycle.rs"
+harness = false
+
+[[bench]]
+name = "reconciliation"
+path = "scenarios/reconciliation.rs"
+harness = false
+
+[[bench]]
+name = "collections"
+path = "scenarios/collections.rs"
+harness = false
+
+[[bench]]
+name = "chain"
+path = "scenarios/chain.rs"
+harness = false
+
+[[bench]]
+name = "persistence"
+path = "scenarios/persistence.rs"
+harness = false
+
+[[bench]]
+name = "shutdown"
+path = "scenarios/shutdown.rs"
+harness = false
+
+[[bench]]
+name = "execution"
+path = "scenarios/execution.rs"
+harness = false
+required-features = ["subprocess"]
+
+[[bench]]
+name = "output"
+path = "scenarios/output.rs"
+harness = false
+required-features = ["subprocess"]
+
+[[bench]]
+name = "container"
+path = "scenarios/container.rs"
+harness = false
+required-features = ["container"]
+
+[[bench]]
+name = "host_policy"
+path = "scenarios/host_policy.rs"
+harness = false
+required-features = ["host-policy"]
+
+[[bench]]
+name = "http"
+path = "scenarios/http.rs"
+harness = false
+required-features = ["http"]
+
+[[bench]]
+name = "discovery"
+path = "scenarios/discovery.rs"
+harness = false
+required-features = ["discovery"]
+
+[[bench]]
+name = "tls"
+path = "scenarios/tls.rs"
+harness = false
+required-features = ["tls"]
+
+[[bench]]
+name = "observability"
+path = "scenarios/observability.rs"
+harness = false
+required-features = ["observability"]

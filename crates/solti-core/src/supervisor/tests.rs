@@ -1877,12 +1877,15 @@ async fn newer_apply_cancels_stale_submission_waiting_for_taskvisor_ownership() 
         .await
         .unwrap();
 
-    let (held_id, held_waiter) = api
+    let held_waiter = api
         .reconciler
         .handle
-        .add_and_watch(TvTaskSpec::once("ownership-filler", cancellable_task()))
+        .add(TvTaskSpec::once("ownership-filler", cancellable_task()))
+        .watch()
+        .execute()
         .await
         .unwrap();
+    let held_id = held_waiter.id();
     let name = TaskId::new("cancel-ownership-intake").unwrap();
 
     let first = api
@@ -1990,7 +1993,9 @@ async fn newer_apply_cancels_stale_submission_waiting_for_taskvisor_ownership() 
 
     api.reconciler
         .handle
-        .cancel_with_timeout(held_id, Duration::from_secs(1))
+        .cancel(held_id)
+        .termination_timeout(Duration::from_secs(1))
+        .execute()
         .await
         .unwrap();
     let held_outcome = tokio::time::timeout(Duration::from_secs(1), held_waiter.wait())
@@ -2019,15 +2024,18 @@ async fn cancel_task_releases_saturated_taskvisor_intake_and_allows_exact_retry(
         .await
         .unwrap();
 
-    let (held_id, held_waiter) = api
+    let held_waiter = api
         .reconciler
         .handle
-        .add_and_watch(TvTaskSpec::once(
+        .add(TvTaskSpec::once(
             "cancel-task-ownership-filler",
             cancellable_task(),
         ))
+        .watch()
+        .execute()
         .await
         .unwrap();
+    let held_id = held_waiter.id();
     let name = TaskId::new("cancel-task-saturated-intake").unwrap();
     let manifest = embedded(name.as_str(), 10_000);
     let created = api
@@ -2105,7 +2113,9 @@ async fn cancel_task_releases_saturated_taskvisor_intake_and_allows_exact_retry(
 
     api.reconciler
         .handle
-        .cancel_with_timeout(held_id, Duration::from_secs(1))
+        .cancel(held_id)
+        .termination_timeout(Duration::from_secs(1))
+        .execute()
         .await
         .unwrap();
     let held_outcome = tokio::time::timeout(Duration::from_secs(1), held_waiter.wait())
@@ -2127,15 +2137,18 @@ async fn panicking_last_owner_during_saturated_intake_cannot_strand_cancel_or_sh
         .start()
         .await
         .unwrap();
-    let (held_id, held_waiter) = api
+    let held_waiter = api
         .reconciler
         .handle
-        .add_and_watch(TvTaskSpec::once(
+        .add(TvTaskSpec::once(
             "panic-drop-ownership-filler",
             cancellable_task(),
         ))
+        .watch()
+        .execute()
         .await
         .unwrap();
+    let held_id = held_waiter.id();
 
     let name = TaskId::new("panic-drop-saturated-intake").unwrap();
     let dropped = Arc::new(AtomicBool::new(false));
@@ -2185,7 +2198,9 @@ async fn panicking_last_owner_during_saturated_intake_cannot_strand_cancel_or_sh
 
     api.reconciler
         .handle
-        .cancel_with_timeout(held_id, Duration::from_secs(1))
+        .cancel(held_id)
+        .termination_timeout(Duration::from_secs(1))
+        .execute()
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(1), held_waiter.wait())
@@ -2525,15 +2540,18 @@ async fn aborted_cancel_task_before_intake_releases_ownership_before_status_admi
             .unwrap(),
     );
 
-    let (held_id, held_waiter) = api
+    let held_waiter = api
         .reconciler
         .handle
-        .add_and_watch(TvTaskSpec::once(
+        .add(TvTaskSpec::once(
             "aborted-cancel-ownership-filler",
             cancellable_task(),
         ))
+        .watch()
+        .execute()
         .await
         .unwrap();
+    let held_id = held_waiter.id();
     let name = TaskId::new("aborted-cancel-before-intake").unwrap();
     api.create_embedded_task(embedded(name.as_str(), 10_000), cancellable_task())
         .await
@@ -2608,10 +2626,12 @@ async fn aborted_cancel_task_before_intake_releases_ownership_before_status_admi
     let handle = api.reconciler.handle.clone();
     let probe = tokio::spawn(async move {
         handle
-            .add_and_watch(TvTaskSpec::once(
+            .add(TvTaskSpec::once(
                 "aborted-cancel-ownership-probe",
                 cancellable_task(),
             ))
+            .watch()
+            .execute()
             .await
     });
     tokio::task::yield_now().await;
@@ -2622,7 +2642,9 @@ async fn aborted_cancel_task_before_intake_releases_ownership_before_status_admi
 
     api.reconciler
         .handle
-        .cancel_with_timeout(held_id, Duration::from_secs(1))
+        .cancel(held_id)
+        .termination_timeout(Duration::from_secs(1))
+        .execute()
         .await
         .unwrap();
     let held_outcome = tokio::time::timeout(Duration::from_secs(1), held_waiter.wait())
@@ -2630,11 +2652,12 @@ async fn aborted_cancel_task_before_intake_releases_ownership_before_status_admi
         .expect("ownership filler did not finish")
         .expect("ownership filler outcome channel closed");
     assert_eq!(held_outcome.kind(), TaskOutcomeKind::Canceled);
-    let (probe_id, probe_waiter) = tokio::time::timeout(Duration::from_secs(1), probe)
+    let probe_waiter = tokio::time::timeout(Duration::from_secs(1), probe)
         .await
         .expect("released ownership must admit the independent probe")
         .unwrap()
         .unwrap();
+    let probe_id = probe_waiter.id();
     assert!(
         api.reconciler.state.persistence_admission_waiters() >= 1,
         "status persistence must still have a blocked admission after ownership is released"
@@ -2673,7 +2696,9 @@ async fn aborted_cancel_task_before_intake_releases_ownership_before_status_admi
 
     api.reconciler
         .handle
-        .cancel_with_timeout(probe_id, Duration::from_secs(1))
+        .cancel(probe_id)
+        .termination_timeout(Duration::from_secs(1))
+        .execute()
         .await
         .unwrap();
     let probe_outcome = tokio::time::timeout(Duration::from_secs(1), probe_waiter.wait())
@@ -2759,15 +2784,18 @@ async fn accepted_runtime_reaches_exact_id_cancel_while_observed_persistence_is_
             .await
             .unwrap(),
     );
-    let (held_id, held_waiter) = api
+    let held_waiter = api
         .reconciler
         .handle
-        .add_and_watch(TvTaskSpec::once(
+        .add(TvTaskSpec::once(
             "accepted-persistence-ownership-filler",
             cancellable_task(),
         ))
+        .watch()
+        .execute()
         .await
         .unwrap();
+    let held_id = held_waiter.id();
     let name = TaskId::new("accepted-persistence-cancel").unwrap();
     let scheduled = api
         .write(
@@ -2812,7 +2840,9 @@ async fn accepted_runtime_reaches_exact_id_cancel_while_observed_persistence_is_
 
     api.reconciler
         .handle
-        .cancel_with_timeout(held_id, Duration::from_secs(1))
+        .cancel(held_id)
+        .termination_timeout(Duration::from_secs(1))
+        .execute()
         .await
         .unwrap();
     let held_outcome = tokio::time::timeout(Duration::from_secs(1), held_waiter.wait())
@@ -3012,15 +3042,18 @@ async fn aborted_cancel_task_after_intake_still_cancels_the_bound_taskvisor_id()
     })
     .await
     .expect("reconciliation must hand off to the retention and completion workers");
-    let (unrelated_id, unrelated_waiter) = api
+    let unrelated_waiter = api
         .reconciler
         .handle
-        .add_and_watch(TvTaskSpec::once(
+        .add(TvTaskSpec::once(
             "aborted-cancel-unrelated-taskvisor",
             cancellable_task(),
         ))
+        .watch()
+        .execute()
         .await
         .unwrap();
+    let unrelated_id = unrelated_waiter.id();
 
     let operation = api.task_operations.lock(&name).await;
     let tracked_before = api.reconciler.tasks.len();
@@ -3073,7 +3106,9 @@ async fn aborted_cancel_task_after_intake_still_cancels_the_bound_taskvisor_id()
 
     api.reconciler
         .handle
-        .cancel_with_timeout(unrelated_id, Duration::from_secs(1))
+        .cancel(unrelated_id)
+        .termination_timeout(Duration::from_secs(1))
+        .execute()
         .await
         .unwrap();
     let unrelated_outcome = tokio::time::timeout(Duration::from_secs(1), unrelated_waiter.wait())
@@ -3094,15 +3129,18 @@ async fn cancel_task_and_apply_serialize_without_losing_the_new_generation() {
             .await
             .unwrap(),
     );
-    let (held_id, held_waiter) = api
+    let held_waiter = api
         .reconciler
         .handle
-        .add_and_watch(TvTaskSpec::once(
+        .add(TvTaskSpec::once(
             "cancel-apply-ownership-filler",
             cancellable_task(),
         ))
+        .watch()
+        .execute()
         .await
         .unwrap();
+    let held_id = held_waiter.id();
     let name = TaskId::new("cancel-apply-race").unwrap();
     api.create_embedded_task(embedded(name.as_str(), 10_000), cancellable_task())
         .await
@@ -3152,7 +3190,9 @@ async fn cancel_task_and_apply_serialize_without_losing_the_new_generation() {
 
     api.reconciler
         .handle
-        .cancel_with_timeout(held_id, Duration::from_secs(1))
+        .cancel(held_id)
+        .termination_timeout(Duration::from_secs(1))
+        .execute()
         .await
         .unwrap();
     held_waiter.wait().await.unwrap();
@@ -3227,13 +3267,15 @@ async fn cancel_task_and_shutdown_settle_saturated_intake_without_a_lock_leak() 
             .await
             .unwrap(),
     );
-    let (_held_id, _held_waiter) = api
+    let _held_waiter = api
         .reconciler
         .handle
-        .add_and_watch(TvTaskSpec::once(
+        .add(TvTaskSpec::once(
             "cancel-shutdown-ownership-filler",
             cancellable_task(),
         ))
+        .watch()
+        .execute()
         .await
         .unwrap();
     let name = TaskId::new("cancel-shutdown-race").unwrap();
@@ -3412,13 +3454,15 @@ async fn shutdown_cancellation_preserves_observable_taskvisor_intake_state() {
         .await
         .unwrap();
 
-    let (_held_id, _held_waiter) = api
+    let _held_waiter = api
         .reconciler
         .handle
-        .add_and_watch(TvTaskSpec::once(
+        .add(TvTaskSpec::once(
             "shutdown-ownership-filler",
             cancellable_task(),
         ))
+        .watch()
+        .execute()
         .await
         .unwrap();
     let name = TaskId::new("shutdown-ownership-intake").unwrap();
@@ -4311,15 +4355,18 @@ async fn aborted_delete_before_runtime_lock_still_cancels_only_the_bound_taskvis
         .unwrap();
     let binding = wait_for_binding(&api, &name, 1).await;
     wait_for_observed(&api, &name, 1).await;
-    let (unrelated_id, unrelated_waiter) = api
+    let unrelated_waiter = api
         .reconciler
         .handle
-        .add_and_watch(TvTaskSpec::once(
+        .add(TvTaskSpec::once(
             "aborted-delete-unrelated-taskvisor",
             cancellable_task(),
         ))
+        .watch()
+        .execute()
         .await
         .unwrap();
+    let unrelated_id = unrelated_waiter.id();
     let runtime_operation = api.reconciler.runtime_operations.lock(&name).await;
     let deletion = spawn_registered_delete(&api, &name).await;
     deletion.abort();
@@ -4352,7 +4399,9 @@ async fn aborted_delete_before_runtime_lock_still_cancels_only_the_bound_taskvis
 
     api.reconciler
         .handle
-        .cancel_with_timeout(unrelated_id, Duration::from_secs(1))
+        .cancel(unrelated_id)
+        .termination_timeout(Duration::from_secs(1))
+        .execute()
         .await
         .unwrap();
     assert_eq!(

@@ -119,10 +119,13 @@ async fn completed_waiter_and_event_share_the_typed_outcome() {
     let handle = supervisor.serve().expect("runtime startup");
 
     let task: TaskRef = TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) });
-    let (id, waiter) = handle
-        .add_and_watch(task_spec("contract-completed", task))
+    let waiter = handle
+        .add(task_spec("contract-completed", task))
+        .watch()
+        .execute()
         .await
         .expect("add watched task");
+    let id = waiter.id();
 
     assert!(matches!(wait_outcome(waiter).await, TaskOutcome::Completed));
     let event = capture
@@ -147,10 +150,13 @@ async fn canceled_attempt_and_task_have_typed_events() {
 
     let task: TaskRef =
         TaskFn::arc(|_ctx: TaskContext| async move { Err::<(), TaskError>(TaskError::Canceled) });
-    let (id, waiter) = handle
-        .add_and_watch(task_spec("contract-canceled", task))
+    let waiter = handle
+        .add(task_spec("contract-canceled", task))
+        .watch()
+        .execute()
         .await
         .expect("add watched task");
+    let id = waiter.id();
 
     assert!(matches!(wait_outcome(waiter).await, TaskOutcome::Canceled));
     capture
@@ -187,7 +193,13 @@ async fn configured_timeout_has_one_typed_terminal_attempt_event() {
         backoff(),
         Some(Duration::from_millis(10)),
     );
-    let (id, waiter) = handle.add_and_watch(spec).await.expect("add watched task");
+    let waiter = handle
+        .add(spec)
+        .watch()
+        .execute()
+        .await
+        .expect("add watched task");
+    let id = waiter.id();
 
     assert!(matches!(
         wait_outcome(waiter).await,
@@ -241,28 +253,33 @@ async fn drop_if_running_is_classified_by_rejection_kind() {
     });
     let dropped: TaskRef = TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) });
 
-    let (_busy_id, _busy_waiter) = handle
-        .submit_and_watch(controller_spec(
+    let _busy_waiter = handle
+        .submit(controller_spec(
             AdmissionPolicy::DropIfRunning,
             "contract-drop-slot",
             "contract-busy",
             busy,
         ))
+        .watch()
+        .execute()
         .await
         .expect("submit running task");
     tokio::time::timeout(TEST_TIMEOUT, started.notified())
         .await
         .expect("running task did not start");
 
-    let (dropped_id, dropped_waiter) = handle
-        .submit_and_watch(controller_spec(
+    let dropped_waiter = handle
+        .submit(controller_spec(
             AdmissionPolicy::DropIfRunning,
             "contract-drop-slot",
             "contract-dropped",
             dropped,
         ))
+        .watch()
+        .execute()
         .await
         .expect("submit conflicting task");
+    let dropped_id = dropped_waiter.id();
 
     match wait_outcome(dropped_waiter).await {
         TaskOutcome::Rejected {
@@ -309,15 +326,18 @@ async fn force_aborted_owner_keeps_its_controller_slot_until_physical_release() 
             Ok(())
         }
     });
-    let (owner_id, owner_waiter) = handle
-        .submit_and_watch(controller_spec(
+    let owner_waiter = handle
+        .submit(controller_spec(
             AdmissionPolicy::Queue,
             "physical-release-slot",
             "physical-release-owner",
             owner,
         ))
+        .watch()
+        .execute()
         .await
         .expect("submit blocking owner");
+    let owner_id = owner_waiter.id();
     tokio::time::timeout(TEST_TIMEOUT, started.notified())
         .await
         .expect("blocking owner did not start");
@@ -331,17 +351,25 @@ async fn force_aborted_owner_keeps_its_controller_slot_until_physical_release() 
             Ok(())
         }
     });
-    let (_next_id, next_waiter) = handle
-        .submit_and_watch(controller_spec(
+    let next_waiter = handle
+        .submit(controller_spec(
             AdmissionPolicy::Queue,
             "physical-release-slot",
             "physical-release-next",
             next,
         ))
+        .watch()
+        .execute()
         .await
         .expect("queue next task");
 
-    assert!(handle.cancel(owner_id).await.expect("cancel owner"));
+    assert!(
+        handle
+            .cancel(owner_id)
+            .execute()
+            .await
+            .expect("cancel owner")
+    );
     assert!(matches!(
         wait_outcome(owner_waiter).await,
         TaskOutcome::ForceAborted
@@ -396,35 +424,42 @@ async fn replace_supersedes_the_queued_submission_by_typed_kind() {
         Ok::<(), TaskError>(())
     });
 
-    let (_head_id, _head_waiter) = handle
-        .submit_and_watch(controller_spec(
+    let _head_waiter = handle
+        .submit(controller_spec(
             AdmissionPolicy::Replace,
             "contract-replace-slot",
             "contract-head",
             head,
         ))
+        .watch()
+        .execute()
         .await
         .expect("submit running head");
     tokio::time::timeout(TEST_TIMEOUT, started.notified())
         .await
         .expect("running head did not start");
 
-    let (queued_id, queued_waiter) = handle
-        .submit_and_watch(controller_spec(
+    let queued_waiter = handle
+        .submit(controller_spec(
             AdmissionPolicy::Replace,
             "contract-replace-slot",
             "contract-queued",
             queued,
         ))
+        .watch()
+        .execute()
         .await
         .expect("queue first replacement");
-    let (_replacement_id, _replacement_waiter) = handle
-        .submit_and_watch(controller_spec(
+    let queued_id = queued_waiter.id();
+    let _replacement_waiter = handle
+        .submit(controller_spec(
             AdmissionPolicy::Replace,
             "contract-replace-slot",
             "contract-replacement",
             replacement,
         ))
+        .watch()
+        .execute()
         .await
         .expect("queue newer replacement");
 

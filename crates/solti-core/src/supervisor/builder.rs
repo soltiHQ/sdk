@@ -76,7 +76,7 @@ impl SupervisorApiBuilder {
 
     /// Replaces Taskvisor runtime settings.
     ///
-    /// Taskvisor 0.8 shares `ownership_capacity` between configured subscribers
+    /// Taskvisor 0.9 shares `ownership_capacity` between configured subscribers
     /// and task values retained through intake, queuing, physical execution,
     /// and isolated destruction. Core always installs one subscriber for its
     /// state observer; each external subscriber consumes another slot.
