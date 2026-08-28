@@ -1342,10 +1342,9 @@ impl Reconciler {
         {
             match self
                 .handle
-                .cancel_with_timeout(
-                    previous.tv,
-                    self.grace.saturating_add(Duration::from_secs(1)),
-                )
+                .cancel(previous.tv)
+                .termination_timeout(self.grace.saturating_add(Duration::from_secs(1)))
+                .execute()
                 .await
             {
                 Ok(_) => {
@@ -1472,7 +1471,7 @@ impl Reconciler {
             );
         });
 
-        let submission = Box::pin(prepared.into_inner().submit_and_watch());
+        let submission = Box::pin(prepared.into_inner().submit().watch().execute());
         let mut submission = NonUnwindingDrop::new(
             submission,
             UnsubmittedDisposalContext::new(
@@ -1528,7 +1527,8 @@ impl Reconciler {
         submission.dispose_at("taskvisor_intake_completed");
         task_anchor.dispose_at("taskvisor_intake_completed");
         match submission_result {
-            Ok((submitted, waiter)) => {
+            Ok(waiter) => {
+                let submitted = waiter.id();
                 let accepted_binding = RuntimeBinding {
                     resource: target.clone(),
                     tv,
@@ -1776,7 +1776,9 @@ impl Reconciler {
                         );
                         let unavailable = format!("task outcome unavailable: {error}");
                         match cleanup_handle
-                            .cancel_with_timeout(tv, cleanup_timeout)
+                            .cancel(tv)
+                            .termination_timeout(cleanup_timeout)
+                            .execute()
                             .await
                         {
                             Ok(_) => {

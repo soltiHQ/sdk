@@ -2,7 +2,7 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```text
 //! arc_str_newtype! {
 //!     /// Docs for the type, rendered verbatim.
 //!     #[doc = "..."]

@@ -76,7 +76,7 @@ impl SupervisorApiBuilder {
 
     /// Replaces Taskvisor runtime settings.
     ///
-    /// Taskvisor 0.8 shares `ownership_capacity` between configured subscribers
+    /// Taskvisor 0.9 shares `ownership_capacity` between configured subscribers
     /// and task values retained through intake, queuing, physical execution,
     /// and isolated destruction. Core always installs one subscriber for its
     /// state observer; each external subscriber consumes another slot.
@@ -272,7 +272,13 @@ mod tests {
             .unwrap();
         assert!(api.state_persistence_status().is_none());
         assert!(api.output_persistence_status().is_none());
+        let ownership = api.ownership_snapshot();
+        assert_eq!(ownership.configured_limit, ownership.effective_limit);
+        assert_eq!(ownership.in_use(), Some(1));
+        assert_eq!(ownership.waiters, 0);
+        assert!(ownership.admission_open);
         api.shutdown().await.unwrap();
+        assert!(!api.ownership_snapshot().admission_open);
     }
 
     #[tokio::test]

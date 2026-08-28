@@ -1,16 +1,33 @@
 version: '3'
 
 includes:
+  docs:
+    taskfile: https://raw.githubusercontent.com/soltiHQ/actions/v1/taskfiles/docs/Taskfile.yml
   rust:
     taskfile: https://raw.githubusercontent.com/soltiHQ/actions/v1/taskfiles/rust/Taskfile.yml
   helpers:
     taskfile: https://raw.githubusercontent.com/soltiHQ/actions/v1/taskfiles/helpers/Taskfile.yml
 
 vars:
+  docs_version:
+    sh: sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' Cargo.toml | head -n 1
   publish_crates:
     sh: grep -vE '^\s*(#|$)' .github/crates.txt
 
 tasks:
+  ci:
+    desc: List the repository CI tasks.
+    cmds:
+      - task -l | grep "ci/"
+
+  rust:benchmark:
+    desc: Run the SDK process benchmarks with the colorized performance report.
+    cmds:
+      - task: rust:bench
+        vars:
+          BENCH_ARGS: >-
+            --package solti-benches --benches --locked -- --quiet --color always
+
   proto/vendor:
     desc: Re-vendor .proto from soltiHQ/proto.
     silent: true
@@ -64,25 +81,27 @@ tasks:
       - task: rust:test
         vars: { TEST_ARGS: '--workspace --no-default-features --locked' }
 
-  ci/test-unit:
+  ci/test/unit:
     desc: Run unit tests and doctests in both workspace feature configurations.
     deps: [proto/vendor]
     cmds:
       - task: rust:test
         vars: { TEST_ARGS: '--workspace --lib --all-features --locked' }
       - task: rust:test
-        vars: { TEST_ARGS: '--workspace --doc --all-features --locked' }
+        vars: { TEST_ARGS: '--workspace --exclude solti-docs-tests --doc --all-features --locked' }
       - task: rust:test
         vars: { TEST_ARGS: '--workspace --lib --no-default-features --locked' }
       - task: rust:test
-        vars: { TEST_ARGS: '--workspace --doc --no-default-features --locked' }
+        vars: { TEST_ARGS: '--workspace --exclude solti-docs-tests --doc --no-default-features --locked' }
+      - task: rust:test
+        vars: { TEST_ARGS: '-p solti-docs-tests --doc --features guides --locked' }
 
-  ci/test-integration:
+  ci/test/integration:
     desc: Run integration tests in both workspace feature configurations.
     deps: [proto/vendor]
     cmds:
       - task: rust:test
-        vars: { TEST_ARGS: '--workspace --test "*" --all-features --locked' }
+        vars: { TEST_ARGS: '--workspace --tests --all-features --locked' }
       - task: rust:test
         vars: { TEST_ARGS: '--workspace --tests --no-default-features --locked' }
 
@@ -119,30 +138,144 @@ tasks:
           CRATE: '{{.ITEM}}'
           PACKAGE_ARGS: '--allow-dirty --locked'
 
-  ci/publish-dry-run:
-    desc: Simulate 'cargo publish' for publishable workspace crates.
+  ci/publish/dry-run:
+    desc: Verify publishable workspace crates as one coordinated dry run.
     deps: [proto/vendor]
     cmds:
-      - for:
-          var: publish_crates
-        task: rust:publish-dry-run
+      - task: rust:_cargo/tool
         vars:
-          CRATE: '{{.ITEM}}'
-          PUBLISH_ARGS: '--all-features --allow-dirty --locked'
+          CMD: 'publish --workspace --dry-run --all-features --allow-dirty --locked'
 
   ci/docs:
-    desc: Run strict public and private rustdoc for both workspace feature configurations.
+    desc: Validate API docs and the SDK user guide.
     deps: [proto/vendor]
     env:
       RUSTDOCFLAGS: '-D warnings'
     cmds:
-      - task: rust:doc
+      - task: rust:doc/build
         vars: { DOC_ARGS: '--workspace --locked --no-deps --no-default-features --document-private-items' }
-      - task: rust:doc
+      - task: rust:doc/build
         vars: { DOC_ARGS: '--workspace --locked --no-deps --all-features --document-private-items' }
       - for:
           var: publish_crates
-        task: rust:docs
+        task: rust:doc/build-nightly
         vars:
           CRATE: '{{.ITEM}}'
           DOCS_ARGS: '--all-features --locked'
+      - task: docs:validate
+        vars:
+          VERSION: '{{.docs_version}}'
+          PRODUCT: sdk
+          TITLE: Solti SDK
+          REPOSITORY: https://github.com/soltiHQ/sdk
+          VERSION_PROVIDER: cargo
+          VERSION_PACKAGE: solti
+          REFERENCE_LABEL: API reference
+          REFERENCE_URL: https://docs.rs/solti/{version}/solti/
+          CARGO_SNIPPET_SOURCES: README.md docs/installation.md docs/quick-start.md crates/solti/README.md
+          LINK_SOURCES: >-
+            docs README.md DEPLOY.md benches/README.md
+            crates/solti/README.md crates/solti/src/lib.rs
+            crates/solti-api/README.md crates/solti-api/CONTRACT.md crates/solti-api/src/lib.rs
+            crates/solti-chain/README.md crates/solti-chain/src/lib.rs
+            crates/solti-core/README.md crates/solti-core/ARCHITECTURE.md crates/solti-core/src/lib.rs
+            crates/solti-discover/README.md crates/solti-discover/CONTRACT.md crates/solti-discover/src/lib.rs
+            crates/solti-exec/README.md crates/solti-exec/ARCHITECTURE.md crates/solti-exec/src/lib.rs
+            crates/solti-model/README.md crates/solti-model/ARCHITECTURE.md crates/solti-model/src/lib.rs
+            crates/solti-observe/README.md crates/solti-observe/src/lib.rs
+            crates/solti-prometheus/README.md crates/solti-prometheus/src/lib.rs
+            crates/solti-runner/README.md crates/solti-runner/src/lib.rs
+            crates/solti-tls/README.md crates/solti-tls/src/lib.rs
+      - cmd: |
+          set -eu
+          source=docs/installation.md
+          expected=$(sed -nE 's/^compatibility_line:[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' docs/site.yml)
+          if [ -z "$expected" ]; then
+            echo "::error file=docs/site.yml::cannot resolve compatibility_line"
+            exit 1
+          fi
+          awk -v expected="$expected" -v source="$source" '
+            BEGIN {
+              single_quote = sprintf("%c", 39)
+              while ((getline crate < ".github/crates.txt") > 0) {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", crate)
+                if (crate != "" && crate !~ /^#/) published[crate] = 1
+              }
+              close(".github/crates.txt")
+            }
+            /^[[:space:]]*solti-[a-z0-9-]+[[:space:]]*=/ {
+              seen++
+              name = $0
+              sub(/^[[:space:]]*/, "", name)
+              sub(/[[:space:]]*=.*$/, "", name)
+              if (!(name in published)) {
+                printf "::error file=%s,line=%d::documented component %s is not publishable\n", source, FNR, name
+                failed = 1
+                next
+              }
+
+              raw = $0
+              sub(/^[^=]*=[[:space:]]*/, "", raw)
+              if (raw ~ /^\{/) {
+                if (raw !~ /version[[:space:]]*=/) {
+                  printf "::error file=%s,line=%d::%s must declare a version on the same line\n", source, FNR, name
+                  failed = 1
+                  next
+                }
+                sub(/^.*version[[:space:]]*=[[:space:]]*/, "", raw)
+              }
+
+              quote = substr(raw, 1, 1)
+              if (quote != "\"" && quote != single_quote) {
+                printf "::error file=%s,line=%d::%s must use a quoted version\n", source, FNR, name
+                failed = 1
+                next
+              }
+              raw = substr(raw, 2)
+              closing = index(raw, quote)
+              if (closing == 0) {
+                printf "::error file=%s,line=%d::%s has an unterminated version\n", source, FNR, name
+                failed = 1
+                next
+              }
+              declared = substr(raw, 1, closing - 1)
+              if (declared != expected) {
+                printf "::error file=%s,line=%d::%s version %s must equal compatibility line %s\n", source, FNR, name, declared, expected
+                failed = 1
+              }
+            }
+            END {
+              if (seen == 0) {
+                printf "::error file=%s::no public component install snippets found\n", source
+                failed = 1
+              }
+              if (!failed) printf "validated public component snippets for compatibility line %s\n", expected
+              exit failed
+            }
+          ' "$source"
+      - task: docs:links/external
+        vars:
+          LINK_SOURCES: >-
+            docs README.md DEPLOY.md benches/README.md
+            crates/solti/README.md crates/solti/src/lib.rs
+            crates/solti-api/README.md crates/solti-api/CONTRACT.md crates/solti-api/src/lib.rs
+            crates/solti-chain/README.md crates/solti-chain/src/lib.rs
+            crates/solti-core/README.md crates/solti-core/ARCHITECTURE.md crates/solti-core/src/lib.rs
+            crates/solti-discover/README.md crates/solti-discover/CONTRACT.md crates/solti-discover/src/lib.rs
+            crates/solti-exec/README.md crates/solti-exec/ARCHITECTURE.md crates/solti-exec/src/lib.rs
+            crates/solti-model/README.md crates/solti-model/ARCHITECTURE.md crates/solti-model/src/lib.rs
+            crates/solti-observe/README.md crates/solti-observe/src/lib.rs
+            crates/solti-prometheus/README.md crates/solti-prometheus/src/lib.rs
+            crates/solti-runner/README.md crates/solti-runner/src/lib.rs
+            crates/solti-tls/README.md crates/solti-tls/src/lib.rs
+      - task: rust:test
+        vars: { TEST_ARGS: '--workspace --exclude solti-docs-tests --doc --all-features --locked' }
+      - task: rust:test
+        vars: { TEST_ARGS: '--workspace --exclude solti-docs-tests --doc --no-default-features --locked' }
+      - task: rust:test
+        vars: { TEST_ARGS: '-p solti-docs-tests --doc --features guides --locked' }
+
+  rust:
+    desc: List the repository Rust tasks.
+    cmds:
+      - task -l | grep "rust:"

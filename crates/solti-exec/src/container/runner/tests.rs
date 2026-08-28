@@ -1115,11 +1115,13 @@ async fn taskvisor_force_abort_reports_outcome_and_releases_yielding_create() {
     let runner = ContainerRunner::new("containerd", drop_releasing_engine(engine)).unwrap();
     let supervisor = Supervisor::new(SupervisorConfig::new().with_grace(Duration::ZERO), vec![]);
     let supervisor_handle = supervisor.serve().unwrap();
-    let (_, waiter) = supervisor_handle
-        .add_and_watch(TaskvisorTaskSpec::once(
+    let waiter = supervisor_handle
+        .add(TaskvisorTaskSpec::once(
             "container-force-abort",
             build(&runner).await,
         ))
+        .watch()
+        .execute()
         .await
         .unwrap();
 
@@ -1131,7 +1133,7 @@ async fn taskvisor_force_abort_reports_outcome_and_releases_yielding_create() {
     let outcome = waiter.wait().await.unwrap();
     assert_eq!(outcome.kind(), TaskOutcomeKind::ForceAborted);
 
-    // ForceAborted is a bounded logical outcome in Taskvisor 0.8. Physical
+    // ForceAborted is a bounded logical outcome in Taskvisor 0.9. Physical
     // release can happen later when task code is synchronously blocking. This
     // engine future yields to Tokio and must still be released without detach.
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -1156,11 +1158,13 @@ async fn taskvisor_timeout_drops_lifecycle_before_outcome() {
     let runner = ContainerRunner::new("containerd", drop_releasing_engine(engine)).unwrap();
     let supervisor = Supervisor::new(SupervisorConfig::new(), vec![]);
     let supervisor_handle = supervisor.serve().unwrap();
-    let (_, waiter) = supervisor_handle
-        .add_and_watch(
+    let waiter = supervisor_handle
+        .add(
             TaskvisorTaskSpec::once("container-timeout", build(&runner).await)
                 .with_timeout(Duration::from_millis(20)),
         )
+        .watch()
+        .execute()
         .await
         .unwrap();
 

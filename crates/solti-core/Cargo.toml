@@ -33,15 +33,9 @@ tokio-stream = { workspace = true, features = ["sync"] }
 tokio-util   = { workspace = true }
 
 [dev-dependencies]
-criterion   = { workspace = true }
 proptest    = { workspace = true }
 solti-chain = { workspace = true, default-features = false }
 taskvisor   = { workspace = true, features = ["test-util"] }
-
-[[bench]]
-name              = "state_collections"
-harness           = false
-required-features = ["test-util"]
 
 [package.metadata.docs.rs]
 all-features = true

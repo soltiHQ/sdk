@@ -1,0 +1,59 @@
+schema: 1
+product: sdk
+title: Solti SDK
+compatibility_line: "0.0"
+repository: https://github.com/soltiHQ/sdk
+
+version:
+  provider: cargo
+  package: solti
+
+reference:
+  label: API reference
+  url: https://docs.rs/solti/{version}/solti/
+
+navigation:
+  - title: Start
+    pages:
+      - index
+      - quick-start
+      - mental-model
+      - installation
+      - architecture
+
+  - title: Build an agent
+    pages:
+      - building-an-agent
+      - routing-and-custom-runners
+      - subprocesses
+      - containers-and-isolation
+      - chains
+
+  - title: Manage work
+    pages:
+      - task-resources
+      - managing-tasks
+      - reconciliation
+      - lifecycle-and-admission
+      - collections-and-watches
+      - output-and-history
+      - cancellation-and-shutdown
+
+  - title: Expose and connect
+    pages:
+      - serving-api
+      - discovery
+      - tls-and-authentication
+
+  - title: Operate
+    pages:
+      - configuration
+      - observability
+      - persistence
+      - production-boundaries
+      - common-mistakes
+
+  - title: Reference
+    pages:
+      - example-catalog
+      - api-reference

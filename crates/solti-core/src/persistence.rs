@@ -797,8 +797,8 @@ impl StateEventDispatcher {
                                 saturating_increment(&worker_metrics.delivered);
                             }
                             PersistenceCallbackOutcome::Panicked => {
-                                worker_metrics.healthy.store(false, Ordering::Release);
                                 saturating_increment(&worker_metrics.failed);
+                                worker_metrics.healthy.store(false, Ordering::Release);
                             }
                             PersistenceCallbackOutcome::BoundaryFailed => {
                                 saturating_increment(&worker_metrics.failed);

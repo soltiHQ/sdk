@@ -228,7 +228,7 @@ flowchart TB
     Current3{"Still current?"}
     Bind["Bind Taskvisor ID<br/>create output channel"]
     IntakePending["Reconciled=Unknown<br/>TaskvisorOwnershipAndControllerIntakePending"]
-    Submit["submit_and_watch"]
+    Submit["submit().watch().execute()"]
     Accepted["Reconciled=True<br/>completion waiter"]
     Failed["Reconciled=False"]
     Stale["Return current state"]
@@ -315,7 +315,7 @@ A bound generation can submit while a newer apply commits.
 A later successful reconciliation replaces that runtime.
 Accepted side effects are not rolled back.
 
-Before `submit_and_watch` is polled, core publishes
+Before `submit().watch().execute()` is polled, core publishes
 `Reconciled=Unknown/TaskvisorOwnershipAndControllerIntakePending`. It describes
 Taskvisor's combined ownership and controller command-intake wait; Taskvisor
 does not expose those sub-stages separately. Structured start and finish events
@@ -338,7 +338,7 @@ branch, the existing
 Neither pre-intake path creates a `TaskRun`.
 
 If Taskvisor command intake wins the race, the coordinator settles with its
-binding intact. `cancel_task` then uses `cancel_with_timeout` for that exact
+binding intact. `cancel_task` then uses `cancel().termination_timeout().execute()` for that exact
 Taskvisor ID. Taskvisor owns queued removal, runtime cancellation, and the
 authoritative final outcome. Core registers the returned `TaskWaiter` in its task
 tracker before it disarms the provisional guard, emits tracing, or waits for the
