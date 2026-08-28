@@ -6,8 +6,8 @@ description: Select the SDK components, feature gates, toolchain, and platform p
 # Installation and features
 
 The workspace requires Rust 1.90 or newer and uses edition 2024.
-The examples below select SDK `0.0.5`, the version in the workspace
-[Cargo manifest](../Cargo.toml).
+The examples below select the SDK `0.0` compatibility line declared by this
+documentation set.
 
 ## Choose the facade or a component
 
@@ -15,7 +15,7 @@ Use `solti` when a binary combines several components:
 
 ```toml
 [dependencies]
-solti = { version = "0.0.5", default-features = false, features = ["core", "exec-subprocess"] }
+solti = { version = "0.0", default-features = false, features = ["core", "exec-subprocess"] }
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 ```
 
@@ -27,8 +27,8 @@ Use a component directly when its boundary is enough:
 
 ```toml
 [dependencies]
-solti-model = { version = "0.0.5", default-features = false }
-solti-tls = "0.0.5"
+solti-model = { version = "0.0", default-features = false }
+solti-tls = "0.0"
 ```
 
 Direct `solti-model` and `solti-chain` dependencies enable their `schema` feature

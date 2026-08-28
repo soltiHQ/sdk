@@ -2785,6 +2785,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "solti-docs-tests"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "solti",
+ "solti-api",
+ "solti-chain",
+ "solti-core",
+ "solti-discover",
+ "solti-exec",
+ "solti-model",
+ "solti-observe",
+ "solti-prometheus",
+ "solti-runner",
+ "solti-tls",
+ "taskvisor",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "solti-exec"
 version = "0.0.5"
 dependencies = [

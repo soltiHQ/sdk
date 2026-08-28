@@ -5,7 +5,7 @@ Thin façade over the modular Solti SDK.
 `solti` contains no runtime logic. It forwards features to component crates and
 exposes each crate through its canonical namespace:
 
-```rust,ignore
+```rust
 use solti::chain::ChainSpec;
 use solti::core::SupervisorApi;
 use solti::model::TaskSpec;
@@ -17,13 +17,7 @@ Default features are empty. Enable only the capabilities used by the binary:
 
 ```toml
 [dependencies]
-solti = { version = "0.0.5", features = [
-    "api-core-adapter",
-    "api-http",
-    "chain",
-    "core",
-    "exec-subprocess",
-] }
+solti = { version = "0.0", features = ["api-core-adapter", "api-http", "chain", "core", "exec-subprocess"] }
 ```
 
 The `model` feature exposes runtime model types without JSON Schema dependencies.

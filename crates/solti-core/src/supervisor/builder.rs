@@ -272,7 +272,13 @@ mod tests {
             .unwrap();
         assert!(api.state_persistence_status().is_none());
         assert!(api.output_persistence_status().is_none());
+        let ownership = api.ownership_snapshot();
+        assert_eq!(ownership.configured_limit, ownership.effective_limit);
+        assert_eq!(ownership.in_use(), Some(1));
+        assert_eq!(ownership.waiters, 0);
+        assert!(ownership.admission_open);
         api.shutdown().await.unwrap();
+        assert!(!api.ownership_snapshot().admission_open);
     }
 
     #[tokio::test]

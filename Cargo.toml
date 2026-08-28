@@ -12,6 +12,7 @@ members = [
     "crates/solti-prometheus",
     "crates/solti-runner",
     "crates/solti-tls",
+    "tools/docs-tests",
 ]
 resolver = "2"
 

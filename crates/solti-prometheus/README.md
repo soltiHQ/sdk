@@ -50,6 +50,11 @@ Enable one feature per adapter you use; the source crate then calls it during no
 
 Metrics adapter and subscriber constructors register their groups immediately.
 `PrometheusCoreStateCollector` is returned unregistered because it implements `prometheus::core::Collector`.
+The Taskvisor subscriber counts delivered permanent ownership-capacity
+retirements and their reported units. Use
+`solti_core::SupervisorApi::ownership_snapshot` for authoritative current
+capacity, waiter, and deferred-cleanup state because subscriber events are
+best-effort.
 
 ## Features
 

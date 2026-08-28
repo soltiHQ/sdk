@@ -2159,7 +2159,18 @@ fn authoritative_terminals_without_start_remain_bounded() {
 #[test]
 fn retained_run_fits_at_the_exact_aggregate_byte_budget() {
     let task_manifest = manifest("run-byte-exact", "slot", 1_000);
-    let expected = TaskRun::starting(1, 1, task_manifest.spec().workload().type_meta()).unwrap();
+    let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    let expected = TaskRun::from_parts(
+        task_manifest.spec().workload().type_meta(),
+        1,
+        1,
+        TaskPhase::Running,
+        started_at,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     let expected_bytes = TaskState::serialized_run_payload_bytes(&expected);
     let config = StateConfig::new()
         .try_with_max_retained_task_run_bytes(expected_bytes)
@@ -2168,7 +2179,7 @@ fn retained_run_fits_at_the_exact_aggregate_byte_budget() {
     let task = state.create_desired(&task_manifest).unwrap().task;
     let binding = bind(&state, task.name());
 
-    assert!(state.transition_attempt_starting(&binding, 1));
+    assert!(state.transition_attempt_starting_at(&binding, 1, started_at));
 
     let inner = state.inner.read();
     assert_eq!(inner.retained_task_run_bytes, expected_bytes);
@@ -2179,7 +2190,18 @@ fn retained_run_fits_at_the_exact_aggregate_byte_budget() {
 #[test]
 fn one_byte_short_run_budget_omits_detail_but_keeps_lifecycle_state() {
     let task_manifest = manifest("run-byte-short", "slot", 1_000);
-    let expected = TaskRun::starting(1, 1, task_manifest.spec().workload().type_meta()).unwrap();
+    let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    let expected = TaskRun::from_parts(
+        task_manifest.spec().workload().type_meta(),
+        1,
+        1,
+        TaskPhase::Running,
+        started_at,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     let expected_bytes = TaskState::serialized_run_payload_bytes(&expected);
     let config = StateConfig::new()
         .try_with_max_retained_task_run_bytes(expected_bytes - 1)
@@ -2188,7 +2210,7 @@ fn one_byte_short_run_budget_omits_detail_but_keeps_lifecycle_state() {
     let task = state.create_desired(&task_manifest).unwrap().task;
     let binding = bind(&state, task.name());
 
-    assert!(state.transition_attempt_starting(&binding, 1));
+    assert!(state.transition_attempt_starting_at(&binding, 1, started_at));
     assert!(state.list_runs(task.name()).is_empty());
     assert_eq!(
         state.get(task.name()).unwrap().status().phase(),

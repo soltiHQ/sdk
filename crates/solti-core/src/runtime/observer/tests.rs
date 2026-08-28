@@ -460,6 +460,12 @@ async fn confirmed_shutdown_cleans_pending_binding_when_state_admission_is_close
     assert_eq!(state.tv_for(&id), Some(tv));
     assert!(registry.subscribe_raw(&id).is_some());
 
+    wait_for_condition("initial state event did not drain", || {
+        state.persistence_status().is_some_and(|status| {
+            status.healthy() && status.queued() == 0 && status.delivered() == 1
+        })
+    })
+    .await;
     state.inject_persistence_worker_panic();
     state.add_task(TaskManifest::new("shutdown-pending-panic-trigger", test_spec()).unwrap());
     wait_for_condition("state persistence admission did not close", || {

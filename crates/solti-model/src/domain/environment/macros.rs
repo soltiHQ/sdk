@@ -1,6 +1,6 @@
 //! Shared macro for `Vec<KeyValue>` backed environment newtypes.
 //!
-//! ```ignore
+//! ```text
 //! env_newtype! {
 //!     /// Type-specific docs go here, rendered verbatim.
 //!     pub struct TaskEnv;

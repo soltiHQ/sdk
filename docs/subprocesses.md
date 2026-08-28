@@ -26,7 +26,8 @@ See [containers and isolation](containers-and-isolation.md) for host policy and 
 
 ## Register the backend and keep its handle
 
-```rust
+```rust,no_run
+# fn register_backend() -> Result<(), Box<dyn std::error::Error>> {
 use solti_exec::subprocess::{
     EnvPolicy, SubprocessBackendConfig, register_subprocess_runner_with_backend,
 };
@@ -42,6 +43,9 @@ let subprocess = register_subprocess_runner_with_backend(
     "local",
     backend,
 )?;
+# let _ = subprocess;
+# Ok(())
+# }
 ```
 
 This is setup inside a fallible application function.
@@ -217,11 +221,20 @@ Persistent OS cleanup failures eventually quarantine the ownership, keep its cap
 
 Stop all users of the runner, shut down core, then await the runner itself:
 
-```rust
+```rust,no_run
+# use std::sync::Arc;
+# use solti_core::SupervisorApi;
+# use solti_exec::subprocess::SubprocessRunner;
+# async fn shutdown(
+#     supervisor: &SupervisorApi,
+#     subprocess: &Arc<SubprocessRunner>,
+# ) -> Result<(), Box<dyn std::error::Error>> {
 let core_result = supervisor.shutdown().await;
 let runner_result = subprocess.shutdown(std::time::Duration::from_secs(5)).await;
 core_result?;
 runner_result?;
+# Ok(())
+# }
 ```
 
 The runner call closes cleanup and cwd admission and joins its workers.

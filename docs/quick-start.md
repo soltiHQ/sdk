@@ -15,7 +15,7 @@ Create a Rust binary project and use these dependencies:
 
 ```toml
 [dependencies]
-solti = { version = "0.0.5", default-features = false, features = ["core"] }
+solti = { version = "0.0", default-features = false, features = ["core"] }
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 tokio-stream = "0.1"
 ```

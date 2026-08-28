@@ -15,6 +15,7 @@ Neither replaces task state, direct task outcomes, or an output store.
 | What did application or SDK code report? | `tracing` records through the logger installed by `solti-observe`. |
 | How many operations, failures, or observed lifecycle events occurred? | Source-crate callbacks or Taskvisor events through Prometheus adapters. |
 | Which logical phases are retained now? | `PrometheusCoreStateCollector` reads `solti-core::TaskState` on collection. |
+| Is Taskvisor ownership or deferred cleanup saturated now? | `SupervisorApi::ownership_snapshot()` reads Taskvisor's current point-in-time state. |
 | What did a workload write to stdout or stderr? | SDK [task output and history](output-and-history.md), not the logger configuration. |
 | Did shutdown and cleanup finish? | The owned [shutdown operation](cancellation-and-shutdown.md), not a log message or metric. |
 
@@ -211,6 +212,7 @@ PrometheusDiscoverMetrics::new(&registry)
 - API streams remain in flight until completion, failure, or drop. An early drop still decrements in-flight state, but does not record a completed request or duration.
 - Discovery duration covers the transport attempt, not startup jitter or a preceding retry hold. Failure labels come from `DiscoverFailReason`, not remote diagnostic text.
 - Taskvisor counters and histograms describe delivered best-effort events. They are not a durable audit log or direct final-outcome channel.
+- `solti_taskvisor_ownership_retirements_total` and `solti_taskvisor_ownership_retired_units_total` count delivered permanent-capacity retirement events. Use `SupervisorApi::ownership_snapshot()` for current configured, effective, available, waiter, and cleanup values because the event path is best-effort.
 - `solti_core_tasks_by_phase` reads current retained SDK state at collection time, including retained terminal tasks and internal Embedded tasks. It is not a physical-process count.
 - `register_process_collector` registers current-process metrics on Linux and is a no-op elsewhere.
 

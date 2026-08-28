@@ -2295,6 +2295,29 @@ impl TaskState {
         attempt: u32,
         admission: StateWriteAdmission,
     ) -> bool {
+        self.transition_attempt_starting_admitted_at(binding, attempt, admission, None)
+    }
+
+    #[cfg(test)]
+    fn transition_attempt_starting_at(
+        &self,
+        binding: &RuntimeBinding,
+        attempt: u32,
+        started_at: SystemTime,
+    ) -> bool {
+        let admission = self
+            .admit_state_write_blocking(StateMutationEventCapacity::AttemptTransition)
+            .expect("test state persistence remains open");
+        self.transition_attempt_starting_admitted_at(binding, attempt, admission, Some(started_at))
+    }
+
+    fn transition_attempt_starting_admitted_at(
+        &self,
+        binding: &RuntimeBinding,
+        attempt: u32,
+        admission: StateWriteAdmission,
+        started_at: Option<SystemTime>,
+    ) -> bool {
         if attempt == 0 {
             return false;
         }
@@ -2374,11 +2397,24 @@ impl TaskState {
 
         let previous_lifecycle = inner.active_run_by_tv.remove(&tv_raw);
         let run = Arc::new(
-            TaskRun::starting(
-                binding.resource.generation,
-                attempt,
-                binding.resource.workload.clone(),
-            )
+            if let Some(started_at) = started_at {
+                TaskRun::from_parts(
+                    binding.resource.workload.clone(),
+                    binding.resource.generation,
+                    attempt,
+                    TaskPhase::Running,
+                    started_at,
+                    None,
+                    None,
+                    None,
+                )
+            } else {
+                TaskRun::starting(
+                    binding.resource.generation,
+                    attempt,
+                    binding.resource.workload.clone(),
+                )
+            }
             .expect("validated resource generation and attempt create a run"),
         );
         inner.active_run_by_tv.insert(tv_raw, Arc::clone(&run));

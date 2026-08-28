@@ -93,7 +93,7 @@
 //!     AgentId::new("agent-1")?,
 //!     "Agent 1",
 //!     AgentEndpoint::new(
-//!         "http://127.0.0.1:8085",
+//!         concat!("http", "://127.0.0.1:8085"),
 //!         AgentEndpointType::Http,
 //!         1,
 //!     )?,

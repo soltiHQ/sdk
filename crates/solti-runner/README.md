@@ -139,9 +139,12 @@ Workload GVKs inside each entry use canonical order.
 The catalog is immutable and cheap to clone.
 Later registrations do not change it.
 
-Take the catalog before registering a composing runner such as `ChainRunner`:
+Take the catalog before registering a composing runner such as `ChainRunner`.
+The concrete helper and its compiled setup are documented in the
+[`solti-chain` quick start](../solti-chain/README.md#quick-start). The
+lower-level ordering is:
 
-```rust,ignore
+```text
 let inner_runners = router.catalog();
 router.register(Arc::new(ChainRunner::new("chain", inner_runners)))?;
 ```

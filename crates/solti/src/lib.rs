@@ -115,7 +115,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! solti = { version = "0.0.5", features = [
+//! solti = { version = "0.0", features = [
 //!     "api-core-adapter",
 //!     "api-http",
 //!     "exec-subprocess",
@@ -148,10 +148,10 @@
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-/// Compiles the runnable Rust code blocks in `README.md` as doctests.
-#[cfg(doctest)]
+/// Compiles the runnable Rust code blocks in the facade README as doctests.
+#[cfg(all(doctest, feature = "full"))]
 #[doc = include_str!("../README.md")]
-struct ReadmeDoctests;
+struct FacadeReadmeDoctests;
 
 /// Task API types from `solti-api`.
 #[cfg(feature = "api")]

@@ -105,7 +105,7 @@
 //!
 //! | Area           | Types                                                  |
 //! |----------------|--------------------------------------------------------|
-//! | Runtime API    | [`SupervisorApi`], [`SupervisorApiBuilder`]            |
+//! | Runtime API    | [`SupervisorApi`], [`SupervisorApiBuilder`], [`OwnershipSnapshot`] |
 //! | State          | [`TaskState`], [`TaskWatchSubscription`]               |
 //! | Output         | [`OutputConfig`], [`OutputSubscription`]               |
 //! | Persistence    | [`TaskStateSink`], [`TaskOutputSink`], [`TaskStateSinkStatus`], [`TaskOutputSinkStatus`] |
@@ -168,6 +168,7 @@ mod runtime;
 
 mod supervisor;
 pub use supervisor::{SupervisorApi, SupervisorApiBuilder};
+pub use taskvisor::OwnershipSnapshot;
 
 mod state;
 pub use state::{CollectionError, TaskState, TaskWatchSubscription};

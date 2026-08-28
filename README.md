@@ -66,7 +66,7 @@ Add the umbrella crate with only the required capabilities:
 
 ```toml
 [dependencies]
-solti = { version = "0.0.5", features = ["core", "exec-subprocess"] }
+solti = { version = "0.0", features = ["core", "exec-subprocess"] }
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 ```
 
@@ -559,11 +559,15 @@ task ci/docs
 task ci/audit
 task ci/bench-check
 task ci/package
-task ci/publish-dry-run
 ```
+
+`task ci/publish/dry-run` is a separate, non-gating registry diagnostic. It
+verifies each archive against the internal crate versions currently available
+on crates.io; it does not stage the complete workspace release.
 
 The release order is declared in [`.github/crates.txt`](.github/crates.txt).
 Component crates are published before the `solti` umbrella crate.
+Use the [release checklist](DEPLOY.md) before creating a version tag.
 
 ## Benchmarks
 

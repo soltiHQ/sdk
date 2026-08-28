@@ -844,6 +844,17 @@ impl SupervisorApi {
         self.reconciler.state.clone()
     }
 
+    /// Returns Taskvisor's point-in-time ownership and deferred-cleanup state.
+    ///
+    /// The finite capacity is shared by the core observer, external Taskvisor
+    /// subscribers, accepted task values, and values awaiting isolated
+    /// destruction. A destructor failure can permanently reduce the effective
+    /// limit. The returned snapshot can become stale immediately.
+    #[must_use = "inspect the returned Taskvisor ownership state"]
+    pub fn ownership_snapshot(&self) -> crate::OwnershipSnapshot {
+        self.reconciler.handle.ownership_snapshot()
+    }
+
     /// Returns task-state persistence worker health and delivery counters.
     ///
     /// Returns `None` when no [`crate::TaskStateSink`] is installed.

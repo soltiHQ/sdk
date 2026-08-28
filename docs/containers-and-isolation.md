@@ -68,7 +68,7 @@ Register a custom engine through an explicit `ContainerEngineBinding`:
 These constructors record the provider's declaration; they cannot verify its truth.
 For a custom finalizer engine, implement `ContainerEngineFinalizer` and retain the handle returned by `pre_admitted_finalizer_with_shutdown`:
 
-```rust
+```rust,no_run
 use std::sync::Arc;
 use solti_exec::container::{
     ContainerEngineBinding, ContainerEngineFinalizer, ContainerEngineShutdownHandle,
@@ -120,7 +120,9 @@ Startup validates containerd major version 2 and the configured snapshotter, ima
 
 This setup fragment belongs inside an async, fallible application function on a prepared Linux host:
 
-```rust
+```rust,no_run
+# #[cfg(target_os = "linux")]
+# async fn configure_containerd() -> Result<(), Box<dyn std::error::Error>> {
 use std::sync::Arc;
 use solti_exec::container::containerd::{
     ContainerNetwork, ContainerdConfig, ContainerdEngine,
@@ -152,6 +154,9 @@ register_container_runner_with_config(
     engine.clone(),
     ContainerRunnerConfig::new().with_process_policy(policy),
 )?;
+# let _ = (router, engine);
+# Ok(())
+# }
 ```
 
 The paths and plugin names are explicit example settings, not discovered host facts.

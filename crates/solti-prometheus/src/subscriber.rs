@@ -48,6 +48,8 @@ const TASKVISOR_SUBSCRIBER_LISTENER: &str = "subscriber_listener";
 /// | `solti_taskvisor_subscriber_overflows_total`    | Counter   | -         |
 /// | `solti_taskvisor_subscriber_panics_total`       | Counter   | -         |
 /// | `solti_taskvisor_runtime_failures_total`        | Counter   | -         |
+/// | `solti_taskvisor_ownership_retirements_total`   | Counter   | -         |
+/// | `solti_taskvisor_ownership_retired_units_total` | Counter   | -         |
 ///
 /// The `taskvisor-controller` feature adds:
 ///
@@ -75,6 +77,7 @@ const TASKVISOR_SUBSCRIBER_LISTENER: &str = "subscriber_listener";
 /// SubscriberOverflow ───────────► subscriber_overflows + dropped count
 /// SubscriberPanicked ───────────► subscriber_panics
 /// RuntimeFailure ───────────────► runtime_failures
+/// OwnershipCapacityRetired ─────► ownership_retirements + retired units
 /// SubscriberOverflow from this subscriber or subscriber_listener also clears
 /// attempt tracking and sets in_flight to NaN.
 ///
@@ -149,6 +152,8 @@ pub struct PrometheusTaskvisorSubscriber {
     subscriber_overflows: Counter,
     subscriber_panics: Counter,
     runtime_failures: Counter,
+    ownership_retirements: Counter,
+    ownership_retired_units: Counter,
     #[cfg(feature = "taskvisor-controller")]
     controller_submitted_events: Counter,
     #[cfg(feature = "taskvisor-controller")]
@@ -389,6 +394,16 @@ impl PrometheusTaskvisorSubscriber {
             "runtime_failures_total",
             "Total internal taskvisor runtime failure events",
         )?;
+        let ownership_retirements = metrics.counter(
+            "taskvisor",
+            "ownership_retirements_total",
+            "Total delivered Taskvisor ownership-capacity retirement events",
+        )?;
+        let ownership_retired_units = metrics.counter(
+            "taskvisor",
+            "ownership_retired_units_total",
+            "Total ownership-capacity units reported permanently retired by delivered Taskvisor events",
+        )?;
 
         #[cfg(feature = "taskvisor-controller")]
         let controller_submitted_events = metrics.counter(
@@ -416,6 +431,8 @@ impl PrometheusTaskvisorSubscriber {
             subscriber_overflows,
             subscriber_panics,
             runtime_failures,
+            ownership_retirements,
+            ownership_retired_units,
             #[cfg(feature = "taskvisor-controller")]
             controller_submitted_events,
             #[cfg(feature = "taskvisor-controller")]
@@ -460,6 +477,12 @@ impl Subscribe for PrometheusTaskvisorSubscriber {
             }
             EventKind::RuntimeFailure => {
                 self.runtime_failures.inc();
+            }
+            EventKind::OwnershipCapacityRetired => {
+                self.ownership_retirements.inc();
+                if let Some(retired_units) = event.retired_units {
+                    self.ownership_retired_units.inc_by(retired_units as f64);
+                }
             }
             EventKind::BackoffScheduled => {
                 let source = event
@@ -752,7 +775,8 @@ mod tests {
 
     #[test]
     fn internal_events_increment_separate_counters() {
-        let sub = new_subscriber();
+        let registry = Registry::new();
+        let sub = PrometheusTaskvisorSubscriber::new(&registry).unwrap();
 
         sub.on_event(
             &Event::new(EventKind::SubscriberOverflow)
@@ -770,10 +794,23 @@ mod tests {
                 .with_task("registry")
                 .with_reason("listener join failed"),
         );
+        sub.on_event(&Event::ownership_capacity_retired(16, 13, 3));
 
         assert_eq!(sub.subscriber_overflows.get(), 1.0);
         assert_eq!(sub.subscriber_panics.get(), 1.0);
         assert_eq!(sub.runtime_failures.get(), 1.0);
+        assert_eq!(sub.ownership_retirements.get(), 1.0);
+        assert_eq!(sub.ownership_retired_units.get(), 3.0);
+
+        let text = metrics_text(&registry);
+        assert!(
+            text.lines()
+                .any(|line| line == "solti_taskvisor_ownership_retirements_total 1")
+        );
+        assert!(
+            text.lines()
+                .any(|line| line == "solti_taskvisor_ownership_retired_units_total 3")
+        );
     }
 
     #[test]
