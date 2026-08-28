@@ -561,9 +561,9 @@ task ci/bench-check
 task ci/package
 ```
 
-`task ci/publish/dry-run` is a separate, non-gating registry diagnostic. It
-verifies each archive against the internal crate versions currently available
-on crates.io; it does not stage the complete workspace release.
+`task ci/publish/dry-run` is a separate, non-gating workspace archive check.
+Cargo stages the publishable workspace archives in a temporary registry and
+verifies them together without uploading them.
 
 The release order is declared in [`.github/crates.txt`](.github/crates.txt).
 Component crates are published before the `solti` umbrella crate.

@@ -28,10 +28,10 @@
    their explicitly provisioned Linux hosts. A skipped lane is not a successful
    certification of that integration.
 
-   Run `task ci/publish/dry-run` separately as a registry diagnostic. The shared
-   Rust workflow marks it `continue-on-error`: each archive resolves internal
-   dependencies from crates.io, without staging the complete workspace release.
-   It is not a transactional release gate.
+   Run `task ci/publish/dry-run` separately as a coordinated workspace archive
+   check. Cargo stages the publishable workspace archives in a temporary
+   registry and verifies them together without uploading them. The shared Rust
+   workflow marks this check `continue-on-error`, so it is not a release gate.
 
 4. **Check the crate order.** [`.github/crates.txt`](.github/crates.txt) must list
    every publishable workspace crate once, in dependency order, with `solti`

@@ -139,15 +139,12 @@ tasks:
           PACKAGE_ARGS: '--allow-dirty --locked'
 
   ci/publish/dry-run:
-    desc: Simulate 'cargo publish' for publishable workspace crates.
+    desc: Verify publishable workspace crates as one coordinated dry run.
     deps: [proto/vendor]
     cmds:
-      - for:
-          var: publish_crates
-        task: rust:publish-dry-run
+      - task: rust:_cargo/tool
         vars:
-          CRATE: '{{.ITEM}}'
-          PUBLISH_ARGS: '--all-features --allow-dirty --locked'
+          CMD: 'publish --workspace --dry-run --all-features --allow-dirty --locked'
 
   ci/docs:
     desc: Validate API docs and the SDK user guide.
