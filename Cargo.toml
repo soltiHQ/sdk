@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "benches",
     "crates/solti",
     "crates/solti-api",
     "crates/solti-chain",
