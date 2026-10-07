@@ -65,6 +65,7 @@ The snippet also needs the application's `tracing` dependency.
 | `timezone` | UTC | UTC or cached local offset for text and JSON timestamps. |
 | `with_targets` | `true` | Include event targets in text and JSON. |
 | `use_color` | `true` | ANSI only for text when stdout is an interactive terminal. |
+| `journald_field_prefix` | `"F"` | Prefix of journald field names, such as `F_REQUEST_ID`; `null` or `""` writes `REQUEST_ID`. |
 
 Serde fills missing fields from these defaults and rejects unknown fields.
 JSON never uses ANSI colors. Text and JSON timestamps are RFC 3339.
