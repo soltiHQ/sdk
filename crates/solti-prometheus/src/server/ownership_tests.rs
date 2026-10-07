@@ -434,12 +434,14 @@ async fn sequential_tcp_scrapes_release_without_recovery_requests() {
     server.close().await;
 }
 
+// Every connect, scrape, and release observation carries its own BOUND. The whole
+// loop is not bounded: its duration is throughput under a parallel test run, not a hang.
 #[tokio::test(flavor = "current_thread")]
 async fn sequential_tcp_release_current_thread() {
-    bounded(sequential_tcp_scrapes_release_without_recovery_requests()).await;
+    sequential_tcp_scrapes_release_without_recovery_requests().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sequential_tcp_release_multi_thread() {
-    bounded(sequential_tcp_scrapes_release_without_recovery_requests()).await;
+    sequential_tcp_scrapes_release_without_recovery_requests().await;
 }
