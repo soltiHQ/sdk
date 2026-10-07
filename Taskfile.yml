@@ -166,7 +166,7 @@ tasks:
           REFERENCE_URL: https://docs.rs/solti/{version}/solti/
           CARGO_SNIPPET_SOURCES: README.md docs/installation.md docs/quick-start.md crates/solti/README.md
           LINK_SOURCES: >-
-            docs README.md DEPLOY.md
+            docs README.md
             crates/solti/README.md crates/solti/src/lib.rs
             crates/solti-api/README.md crates/solti-api/CONTRACT.md crates/solti-api/src/lib.rs
             crates/solti-chain/README.md crates/solti-chain/src/lib.rs
@@ -249,7 +249,7 @@ tasks:
       - task: docs:links/external
         vars:
           LINK_SOURCES: >-
-            docs README.md DEPLOY.md
+            docs README.md
             crates/solti/README.md crates/solti/src/lib.rs
             crates/solti-api/README.md crates/solti-api/CONTRACT.md crates/solti-api/src/lib.rs
             crates/solti-chain/README.md crates/solti-chain/src/lib.rs

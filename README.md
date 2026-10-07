@@ -575,7 +575,6 @@ verifies them together without uploading them.
 
 The release order is declared in [`.github/crates.txt`](.github/crates.txt).
 Component crates are published before the `solti` umbrella crate.
-Use the [release checklist](DEPLOY.md) before creating a version tag.
 
 ## Contributing
 
