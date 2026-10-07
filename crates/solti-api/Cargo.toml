@@ -30,6 +30,7 @@ core-adapter = ["dep:solti-core"]
 grpc         = [
     "dep:base64",
     "dep:prost",
+    "dep:prost-types",
     "dep:protoc-bin-vendored",
     "dep:serde",
     "dep:serde_json",
@@ -64,6 +65,7 @@ axum            = { workspace = true, optional = true }
 base64          = { workspace = true, optional = true }
 form_urlencoded = { workspace = true, optional = true }
 prost           = { workspace = true, optional = true }
+prost-types     = { workspace = true, optional = true }
 schemars        = { workspace = true, optional = true }
 serde           = { workspace = true, features = ["derive"], optional = true }
 serde_json      = { workspace = true, optional = true }

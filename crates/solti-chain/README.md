@@ -176,7 +176,11 @@ If any step cannot be routed or built, reconciliation fails even when that step 
 `Preserve` is the default wire value when `mode` is not present.
 If its handler path otherwise ends successfully, the preserved failure becomes the chain result.
 
-Cancellation stops the active step and does not select `onFailure`.
+Cancellation reaches the active step through its child `TaskContext`.
+The chain waits for that step's cooperative cleanup, then returns `Canceled`
+without selecting either success or failure transitions, even if the step
+returns another result after cancellation. Taskvisor owns the outer
+cancellation grace and forced-abort boundary for a non-cooperative step.
 An outer Taskvisor timeout or panic is handled outside the chain future and also does not select `onFailure`.
 
 ## Runner composition

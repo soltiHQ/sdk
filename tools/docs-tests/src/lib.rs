@@ -21,6 +21,7 @@ markdown_doctest!(RoutingGuide, "../../../docs/routing-and-custom-runners.md");
 markdown_doctest!(SubprocessGuide, "../../../docs/subprocesses.md");
 markdown_doctest!(ContainersGuide, "../../../docs/containers-and-isolation.md");
 markdown_doctest!(ChainsGuide, "../../../docs/chains.md");
+markdown_doctest!(CronGuide, "../../../docs/cron-scheduling.md");
 markdown_doctest!(TaskResourcesGuide, "../../../docs/task-resources.md");
 markdown_doctest!(ManagingTasksGuide, "../../../docs/managing-tasks.md");
 markdown_doctest!(ReconciliationGuide, "../../../docs/reconciliation.md");

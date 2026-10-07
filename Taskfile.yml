@@ -178,6 +178,7 @@ tasks:
             crates/solti/README.md crates/solti/src/lib.rs
             crates/solti-api/README.md crates/solti-api/CONTRACT.md crates/solti-api/src/lib.rs
             crates/solti-chain/README.md crates/solti-chain/src/lib.rs
+            crates/solti-cron/README.md crates/solti-cron/src/lib.rs
             crates/solti-core/README.md crates/solti-core/ARCHITECTURE.md crates/solti-core/src/lib.rs
             crates/solti-discover/README.md crates/solti-discover/CONTRACT.md crates/solti-discover/src/lib.rs
             crates/solti-exec/README.md crates/solti-exec/ARCHITECTURE.md crates/solti-exec/src/lib.rs
@@ -260,6 +261,7 @@ tasks:
             crates/solti/README.md crates/solti/src/lib.rs
             crates/solti-api/README.md crates/solti-api/CONTRACT.md crates/solti-api/src/lib.rs
             crates/solti-chain/README.md crates/solti-chain/src/lib.rs
+            crates/solti-cron/README.md crates/solti-cron/src/lib.rs
             crates/solti-core/README.md crates/solti-core/ARCHITECTURE.md crates/solti-core/src/lib.rs
             crates/solti-discover/README.md crates/solti-discover/CONTRACT.md crates/solti-discover/src/lib.rs
             crates/solti-exec/README.md crates/solti-exec/ARCHITECTURE.md crates/solti-exec/src/lib.rs

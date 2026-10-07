@@ -1,0 +1,29 @@
+[package]
+name = "solti-cron"
+description = "IANA timezone cron schedules and recurring Taskvisor tasks for the Solti SDK."
+keywords = ["cron", "task", "scheduler", "timezone", "tokio"]
+categories = ["asynchronous", "concurrency", "date-and-time"]
+documentation = "https://docs.rs/solti-cron"
+readme = "README.md"
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+croner = { workspace = true }
+taskvisor = { workspace = true, features = ["tokio-util-interop"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+taskvisor = { workspace = true, features = ["test-util", "tokio-util-interop"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util", "time"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

@@ -437,6 +437,20 @@ fn http_status_task_kind(_generator: &mut schemars::SchemaGenerator) -> schemars
     })
 }
 
+// Standard google.rpc.Status envelope for grpc-status-details-bin. This is
+// transport framing, not another definition of the Solti conflict schema.
+// Matching code/message lets grpc-go validate trailers and unpack typed Any.
+#[cfg(feature = "grpc")]
+#[derive(Clone, PartialEq, prost::Message)]
+struct GrpcStatusDetails {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<prost_types::Any>,
+}
+
 #[cfg(feature = "grpc")]
 impl From<ApiError> for tonic::Status {
     fn from(err: ApiError) -> Self {
@@ -462,11 +476,18 @@ impl From<ApiError> for tonic::Status {
                         })
                         .collect(),
                 };
-                tonic::Status::with_details(
-                    tonic::Code::Aborted,
-                    conflict.to_string(),
-                    details.encode_to_vec().into(),
-                )
+                let code = tonic::Code::Aborted;
+                let message = conflict.to_string();
+                let envelope = GrpcStatusDetails {
+                    code: code as i32,
+                    message: message.clone(),
+                    details: vec![prost_types::Any {
+                        type_url: "type.googleapis.com/solti.task.v1.WriteConflictDetails"
+                            .to_owned(),
+                        value: details.encode_to_vec(),
+                    }],
+                };
+                tonic::Status::with_details(code, message, envelope.encode_to_vec().into())
             }
             ApiError::TaskNotFound(msg) => tonic::Status::not_found(msg),
             ApiError::NotFound(msg) => tonic::Status::not_found(msg),
@@ -675,7 +696,17 @@ mod tests {
 
         let status = tonic::Status::from(ApiError::Conflict(conflict()));
         assert_eq!(status.code(), Code::Aborted);
-        let details = crate::proto_api::WriteConflictDetails::decode(status.details()).unwrap();
+        let envelope = GrpcStatusDetails::decode(status.details()).unwrap();
+        assert_eq!(envelope.code, status.code() as i32);
+        assert_eq!(envelope.message, status.message());
+        assert_eq!(envelope.details.len(), 1);
+        assert_eq!(
+            envelope.details[0].type_url,
+            "type.googleapis.com/solti.task.v1.WriteConflictDetails"
+        );
+        let details =
+            crate::proto_api::WriteConflictDetails::decode(envelope.details[0].value.as_slice())
+                .unwrap();
         assert_eq!(details.name, "task-1");
         assert_eq!(details.causes.len(), 1);
         assert_eq!(

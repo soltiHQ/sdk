@@ -604,8 +604,11 @@ HTTP errors use a Kubernetes-style `Status` body.
 `Retry-After`.
 Write conflicts include machine-readable causes.
 HTTP cause reasons are `UIDMismatch`, `ResourceVersionMismatch`, or
-`PreconditionFailed`. gRPC write conflicts encode `WriteConflictDetails` in
-status details and use the typed `WriteConflictReason` enum.
+`PreconditionFailed`. gRPC write conflicts pack `WriteConflictDetails` as a
+typed `Any` inside the standard `google.rpc.Status` rich-error envelope and
+use the typed `WriteConflictReason` enum. The envelope code/message match the
+gRPC trailers, so clients such as grpc-go can preserve `Aborted` and decode
+structured details.
 Internal failures are logged by stable category and hidden from clients.
 The transport boundary does not write the diagnostic string to logs.
 

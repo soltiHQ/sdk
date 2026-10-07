@@ -140,10 +140,15 @@ A later `Recover` does not clear an error already stored by an earlier `Preserve
 If a later step fails without its own failure transition, that later error is returned.
 Failure transitions can handle both retryable and fatal task errors; they do not handle cancellation.
 
-Cancellation of the outer context stops the active step.
+Cancellation of the outer context reaches the active step's child `TaskContext`.
+The chain waits for the step to finish cooperative cleanup, then returns `Canceled`
+without selecting a successor, including when cleanup returns another result.
+Taskvisor owns the outer cancellation grace and forced-abort boundary when a
+step does not cooperate.
 An outer timeout or task panic is handled outside the chain future and does not enter `onFailure`.
 A rollback edge is therefore not an unconditional finalizer.
-Backend resource cleanup must work when the active future is dropped.
+Backend resource cleanup must also work when the active future is dropped by a
+timeout or force-abort; that boundary cannot await asynchronous cleanup.
 See [cancellation and shutdown](cancellation-and-shutdown.md).
 
 ## Retry the whole attempt

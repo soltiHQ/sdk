@@ -28,6 +28,7 @@ navigation:
       - subprocesses
       - containers-and-isolation
       - chains
+      - cron-scheduling
 
   - title: Manage work
     pages:

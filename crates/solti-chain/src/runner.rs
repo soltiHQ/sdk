@@ -230,9 +230,14 @@ async fn execute(
             "chain step started"
         );
         marker(output, &step.name, "started", false);
-        let result = match ctx.run_until_cancelled(step.task.spawn(ctx.child())).await {
-            Ok(result) => result,
-            Err(canceled) => Err(canceled),
+        // Let the leaf observe its inherited signal and finish cooperative cleanup.
+        // Taskvisor owns the outer cancellation grace and forced-abort boundary.
+        let result = step.task.spawn(ctx.child()).await;
+        let result = if ctx.is_cancelled() {
+            // Cancellation never selects a successor, even if cleanup returns an error.
+            Err(TaskError::Canceled)
+        } else {
+            result
         };
 
         match result {

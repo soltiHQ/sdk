@@ -5,7 +5,7 @@ description: Choose among all SDK example programs by process, package, required
 
 # Example catalog
 
-This catalog covers all 40 Rust examples in the workspace. Start with a
+This catalog covers all 42 Rust examples in the workspace. Start with a
 cross-crate program when learning how to assemble an agent; use a component
 example to examine a smaller contract.
 
@@ -35,16 +35,18 @@ process, or creates container resources.
 
 ## Start with a cross-crate process
 
-These ten programs use package `solti`.
+These twelve programs use package `solti`.
 
 | Example | Required features | Process and prerequisites |
 |---|---|---|
 | [`task_subprocess`](../crates/solti/examples/task_subprocess.rs) | `core,exec-subprocess` | Router → core → real child process → output/status/history → cleanup. Runs its own binary; needs a supported subprocess platform, not a shell. |
 | [`task_custom_workload`](../crates/solti/examples/task_custom_workload.rs) | `core` | Custom `TcpProbe` GVK → payload validation → core reconciliation → real local TCP connection. Binds a local test service. |
+| [`task_cron`](../crates/solti/examples/task_cron.rs) | `cron,core` | UTC calendar → Embedded Task → two real invocations → cancellation, no subsequent invocation, and joined shutdown. |
 | [`task_chain`](../crates/solti/examples/task_chain.rs) | `chain,core,exec-subprocess` | Four subprocess steps with a failure/recovery path, one outer resource, and shared output. Runs its own binary. |
 | [`task_containerd`](../crates/solti/examples/task_containerd.rs) | `core,exec-containerd` | Native containerd → runner → desired-state lifecycle and cleanup. Requires Linux, containerd 2.x, runtime/snapshotter plugins, and an available image. |
 | [`agent_http`](../crates/solti/examples/agent_http.rs) | `api-core-adapter,api-http,exec-subprocess` | Subprocess agent with HTTP Task API and application-mounted OpenAPI at `127.0.0.1:8085`. Runs until shutdown; no authentication or TLS. |
 | [`agent_http_discovery`](../crates/solti/examples/agent_http_discovery.rs) | `api-core-adapter,api-http,discover-http,exec-subprocess` | Inbound HTTP API plus outbound supervised discovery. Needs a compatible control plane at `SOLTI_CONTROL_PLANE`; default `http://127.0.0.1:8090`. |
+| [`agent_podium`](../crates/solti/examples/agent_podium.rs) | `api-core-adapter,api-http,discover-http,exec-subprocess` | Podium UI → saved spec → discovered HTTP agent → real 30-second subprocess → live output and observed history. [Local walkthrough and config](../crates/solti/examples/podium/README.md); no shell or external runtime. |
 | [`agent_grpc`](../crates/solti/examples/agent_grpc.rs) | `api-core-adapter,api-grpc,exec-subprocess` | Subprocess/core resource read through a local gRPC server and generated client with bearer metadata. |
 | [`agent_grpc_mtls`](../crates/solti/examples/agent_grpc_mtls.rs) | `api-core-adapter,api-grpc-tls,exec-subprocess` | Local gRPC/core integration with mandatory client certificates and a teaching CA. Generated credentials are for the example, not deployment. |
 | [`operations_observe`](../crates/solti/examples/operations_observe.rs) | `core,exec-subprocess,observe-timezone-sync` | Global logging plus supervised timezone maintenance and real subprocess work. Local-time offset detection can fail in the host environment. |

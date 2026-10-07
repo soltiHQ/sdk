@@ -24,6 +24,9 @@ The `model` feature exposes runtime model types without JSON Schema dependencies
 Enable `model-schema` when the application generates schemas for those types.
 The `chain-schema` feature adds schemas for Chain and its nested model types.
 
+The `cron` feature exposes `solti::cron` for IANA timezone schedules and recurring Taskvisor tasks.
+Its invocation timeout is separate from the outer registration lifetime; see the [calendar guide](../../docs/cron-scheduling.md).
+
 The `chain` feature exposes `solti::chain`. A Chain is one Task whose nested
 workloads run sequentially, with exactly one active step. The outer Task owns
 restart, timeout, cancellation, status, and history; steps do not have separate
@@ -44,7 +47,9 @@ component crates remain supported.
 ## Full Examples
 
 These examples compose multiple component crates through the `solti` façade.
-Every example is one compilable Rust file.
+Each example has a Rust entry file.
+`agent_http_discovery` and `agent_podium` share HTTP composition in
+[`examples/support/http_agent.rs`](examples/support/http_agent.rs).
 Each file starts with a flow diagram and explains its runtime result.
 
 Names identify the example boundary:
@@ -60,6 +65,7 @@ They do not expose an HTTP or gRPC server.
 
 | Example                                                         | Composition                               | Result                                                    |
 |-----------------------------------------------------------------|-------------------------------------------|-----------------------------------------------------------|
+| [`task_cron.rs`](examples/task_cron.rs)                         | cron + core + Taskvisor                    | Runs calendar invocations and cancels the supervised task |
 | [`task_chain.rs`](examples/task_chain.rs)                       | model + runner + chain + core + exec      | Runs conditional steps and recovers a failed path         |
 | [`task_subprocess.rs`](examples/task_subprocess.rs)             | model + runner + core + exec              | Runs a subprocess and observes output, state, and history |
 | [`task_custom_workload.rs`](examples/task_custom_workload.rs)   | model + runner + core + Taskvisor         | Adds and executes an application-owned `TcpProbe` GVK     |
@@ -104,6 +110,7 @@ Environment variables select the socket, namespace, snapshotter, runtime, image,
 | [`agent_grpc.rs`](examples/agent_grpc.rs)                     | gRPC API + core + subprocess             | Serves the protobuf contract with bearer auth        |
 | [`agent_grpc_mtls.rs`](examples/agent_grpc_mtls.rs)           | TLS + gRPC API + core + subprocess       | Rejects an anonymous peer and accepts an mTLS client |
 | [`agent_http_discovery.rs`](examples/agent_http_discovery.rs) | discovery + HTTP API + core + subprocess | Advertises the capabilities of a live HTTP agent     |
+| [`agent_podium.rs`](examples/agent_podium.rs)                 | Podium + discovery + HTTP API + subprocess | Deploys a real task from Podium; [walkthrough](examples/podium/README.md) |
 
 Run the public API agents:
 
@@ -136,6 +143,10 @@ cargo run -p solti --example agent_http_discovery \
 
 The configured control plane must implement discovery HTTP v1.
 The agent continues running until Ctrl-C.
+
+For a complete Podium workflow, use [`agent_podium`](examples/podium/README.md).
+It includes an isolated Podium configuration, browser deployment, live output,
+run history, and a safe 30-second subprocess demo.
 
 ### Operations
 
