@@ -71,7 +71,6 @@ delivery contracts. They are not a durable execution log.
 - [Cancellation and shutdown](cancellation-and-shutdown.md) separates logical completion from physical cleanup.
 - [Configuration](configuration.md) identifies independent resource budgets and deadlines.
 - [Example catalog](example-catalog.md) links the complete programs and smaller component examples.
-- [Process benchmarks](../benches/README.md) describe measured boundaries, not deployment capacity guarantees.
 
 ## All guide pages
 

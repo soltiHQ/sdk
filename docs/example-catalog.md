@@ -130,5 +130,4 @@ between constructing a reusable task and actually executing it, and between a
 teaching adapter and a real external backend.
 
 The [API reference map](api-reference.md) links each component's public entry
-points. [Process benchmarks](../benches/README.md) have a separate purpose:
-they measure explicit process boundaries rather than serve as application examples.
+points.

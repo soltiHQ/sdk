@@ -69,6 +69,7 @@ solti: logging and supervised maintenance
         timezone: LoggerTimeZone::Local,
         with_targets: true,
         use_color: false,
+        ..LoggerConfig::default()
     })?;
     tracing::info!(
         target: "example::operations",

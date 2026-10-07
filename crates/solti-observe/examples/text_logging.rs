@@ -53,6 +53,7 @@ fn main() -> ExampleResult {
         timezone: LoggerTimeZone::Utc,
         with_targets: true,
         use_color: false,
+        ..LoggerConfig::default()
     };
     println!(
         "[config] format={}, level={}, timezone={}, targets=true, color=false.",

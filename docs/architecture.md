@@ -29,8 +29,7 @@ The `solti` facade forwards features and namespaces. It owns no runtime logic.
 
 [Taskvisor](https://github.com/soltiHQ/taskvisor) is an external dependency, not
 another SDK workspace crate. It owns supervised attempt execution and keyed
-admission. [`solti-benches`](../benches/README.md) is unpublished development
-tooling, not a product layer.
+admission.
 
 ## Distinguish dependency direction from runtime flow
 

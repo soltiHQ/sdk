@@ -15,7 +15,7 @@ Your binary still owns configuration, deployment, and the final security boundar
 
 Solti uses [Taskvisor](https://github.com/soltiHQ/taskvisor) for supervised attempt lifecycles.
 
-| [Documentation](docs/index.md) | [Quick start](#quick-start) | [Architecture](#architecture) | [Platform limits](#execution-backends-and-platform-limits) | [Examples](#examples) | [Benchmarks](#benchmarks) |
+| [Documentation](docs/index.md) | [Quick start](#quick-start) | [Architecture](#architecture) | [Platform limits](#execution-backends-and-platform-limits) | [Examples](#examples) |
 
 ## Documentation
 
@@ -576,20 +576,6 @@ verifies them together without uploading them.
 The release order is declared in [`.github/crates.txt`](.github/crates.txt).
 Component crates are published before the `solti` umbrella crate.
 Use the [release checklist](DEPLOY.md) before creating a version tag.
-
-## Benchmarks
-
-Process benchmarks live in the root [`benches/`](benches/README.md) workspace
-package, outside product crates. They cover lifecycle, reconciliation,
-execution, collections, API boundaries, and shutdown.
-
-```bash
-task rust:benchmark
-```
-
-The suite uses Taskvisor-style reports with named units and explicit timing
-boundaries. See the [scenario map and run options](benches/README.md), including
-the separately gated Linux containerd and host-policy cases.
 
 ## Contributing
 

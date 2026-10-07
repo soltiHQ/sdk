@@ -50,12 +50,14 @@ pub(super) fn logger_json(cfg: &LoggerConfig) -> Result<(), LoggerError> {
 
 /// Initializes the journald logger on Linux.
 ///
-/// Journald uses the configured level filter.
+/// Journald uses the configured level filter and field prefix.
 /// Its native layer owns record formatting.
 #[cfg(all(feature = "journald", target_os = "linux"))]
 pub(super) fn logger_journald(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     let filter = cfg.level.to_env_filter();
-    let journald = tracing_journald::layer().map_err(LoggerError::JournaldInitFailed)?;
+    let journald = tracing_journald::layer()
+        .map_err(LoggerError::JournaldInitFailed)?
+        .with_field_prefix(cfg.journald_field_prefix.clone());
 
     let subscriber = tracing_subscriber::registry().with(filter).with(journald);
     init_subscriber(subscriber)

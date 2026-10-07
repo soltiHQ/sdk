@@ -20,14 +20,6 @@ tasks:
     cmds:
       - task -l | grep "ci/"
 
-  rust:benchmark:
-    desc: Run the SDK process benchmarks with the colorized performance report.
-    cmds:
-      - task: rust:bench
-        vars:
-          BENCH_ARGS: >-
-            --package solti-benches --benches --locked -- --quiet --color always
-
   proto/vendor:
     desc: Re-vendor .proto from soltiHQ/proto.
     silent: true
@@ -174,7 +166,7 @@ tasks:
           REFERENCE_URL: https://docs.rs/solti/{version}/solti/
           CARGO_SNIPPET_SOURCES: README.md docs/installation.md docs/quick-start.md crates/solti/README.md
           LINK_SOURCES: >-
-            docs README.md DEPLOY.md benches/README.md
+            docs README.md DEPLOY.md
             crates/solti/README.md crates/solti/src/lib.rs
             crates/solti-api/README.md crates/solti-api/CONTRACT.md crates/solti-api/src/lib.rs
             crates/solti-chain/README.md crates/solti-chain/src/lib.rs
@@ -257,7 +249,7 @@ tasks:
       - task: docs:links/external
         vars:
           LINK_SOURCES: >-
-            docs README.md DEPLOY.md benches/README.md
+            docs README.md DEPLOY.md
             crates/solti/README.md crates/solti/src/lib.rs
             crates/solti-api/README.md crates/solti-api/CONTRACT.md crates/solti-api/src/lib.rs
             crates/solti-chain/README.md crates/solti-chain/src/lib.rs
