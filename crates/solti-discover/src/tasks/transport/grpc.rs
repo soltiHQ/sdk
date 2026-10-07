@@ -30,6 +30,7 @@ pub(in crate::tasks) struct GrpcAdapter {
     authorization: Option<MetadataValue<Ascii>>,
     client: tokio::sync::OnceCell<DiscoverServiceClient<Channel>>,
     endpoint: Endpoint,
+    request_timeout: Duration,
     secure: bool,
 }
 
@@ -86,6 +87,7 @@ impl GrpcAdapter {
             authorization,
             client: tokio::sync::OnceCell::new(),
             endpoint,
+            request_timeout: Duration::from_millis(config.request_timeout_ms),
             secure,
         })
     }
@@ -108,7 +110,11 @@ impl GrpcAdapter {
                 .insert("authorization", value.clone());
         }
 
-        match client.sync(request).await {
+        request.set_timeout(self.request_timeout);
+        let response = tokio::time::timeout(self.request_timeout, client.sync(request))
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("discovery response deadline elapsed"))?;
+        match response {
             Ok(response) => validate_response(response.into_inner()),
             Err(status) if is_auth_status(status.code()) => Err(DiscoverError::AuthFailed {
                 reason: format!("grpc {:?}: {}", status.code(), status.message()),
@@ -418,6 +424,78 @@ mod tests {
         assert!(reason.contains("Unauthenticated"), "{reason}");
         assert!(reason.contains("invalid bearer token"), "{reason}");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        stop_test_server(shutdown_tx, server).await;
+    }
+
+    #[derive(Clone)]
+    struct StalledDiscoverServer;
+
+    impl<B> Service<http::Request<B>> for StalledDiscoverServer
+    where
+        B: Body + Send + 'static,
+        B::Error: Into<StdError> + Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: http::Request<B>) -> Self::Future {
+            Box::pin(async {
+                let body = http_body_util::StreamBody::new(tokio_stream::pending::<
+                    Result<_, std::io::Error>,
+                >());
+                let mut response = http::Response::new(tonic::body::Body::new(body));
+                response.headers_mut().insert(
+                    http::header::CONTENT_TYPE,
+                    tonic::metadata::GRPC_CONTENT_TYPE,
+                );
+                Ok(response)
+            })
+        }
+    }
+
+    impl NamedService for StalledDiscoverServer {
+        const NAME: &'static str = "solti.discover.v1.DiscoverService";
+    }
+
+    #[tokio::test]
+    async fn request_deadline_covers_a_stalled_grpc_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(StalledDiscoverServer)
+                .serve_with_incoming_shutdown(TcpIncoming::from(listener), async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        let config = config_builder(format!("http://{address}"))
+            .request_timeout_ms(50)
+            .build()
+            .unwrap();
+        let adapter = GrpcAdapter::new(&config).unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_millis(500),
+            adapter.sync(SyncRequest {
+                id: "agent-1".into(),
+                ..SyncRequest::default()
+            }),
+        )
+        .await
+        .expect("whole response must obey the configured 50ms deadline")
+        .expect_err("stalled body must time out");
+        assert_eq!(error.retryability(), crate::Retryability::Retryable);
+        let DiscoverError::GrpcStatus(status) = error else {
+            panic!("expected gRPC deadline")
+        };
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        drop(adapter);
         stop_test_server(shutdown_tx, server).await;
     }
 

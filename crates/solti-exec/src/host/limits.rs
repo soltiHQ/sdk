@@ -235,11 +235,11 @@ mod unix_impl {
 
     /// Resource identifier accepted by `getrlimit` and `setrlimit`.
     ///
-    /// Linux and Android use `__rlimit_resource_t`.
-    /// Other Unix platforms use `c_int`.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    /// glibc and uClibc on Linux use `__rlimit_resource_t`.
+    /// musl, Android and other Unix platforms use `c_int`.
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "uclibc")))]
     type RlimitResource = libc::__rlimit_resource_t;
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(all(target_os = "linux", any(target_env = "gnu", target_env = "uclibc"))))]
     type RlimitResource = libc::c_int;
 
     const NOFILE: RlimitResource = libc::RLIMIT_NOFILE as RlimitResource;

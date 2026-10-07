@@ -8,14 +8,14 @@
 > Build task-execution agents from Kubernetes-shaped resources, pluggable runners, and optional HTTP or gRPC boundaries.
 
 Solti is a modular Rust SDK.
-It provides the resource model, routing, reconciliation, execution backends, APIs, discovery, TLS, logging, and metrics used by an agent binary.
+It provides the resource model, routing, reconciliation, execution backends, calendar scheduling, APIs, discovery, TLS, logging, and metrics used by an agent binary.
 
 Your binary selects the required crates or enables them through the `solti` umbrella crate.
 Your binary still owns configuration, deployment, and the final security boundary.
 
 Solti uses [Taskvisor](https://github.com/soltiHQ/taskvisor) for supervised attempt lifecycles.
 
-| [Documentation](docs/index.md) | [Quick start](#quick-start) | [Architecture](#architecture) | [Platform limits](#execution-backends-and-platform-limits) | [Examples](#examples) | [Benchmarks](#benchmarks) |
+| [Documentation](docs/index.md) | [Quick start](#quick-start) | [Architecture](#architecture) | [Platform limits](#execution-backends-and-platform-limits) | [Examples](#examples) |
 
 ## Documentation
 
@@ -155,6 +155,7 @@ Higher-level features enable their required lower layers.
 | Resource types and JSON Schema     | `model-schema`                                                          |
 | Custom runner registration         | `runner`                                                                |
 | Conditional sequential workloads   | `chain`                                                                 |
+| Calendar-based async work          | `cron`                                                                  |
 | In-process desired-state runtime   | `core`                                                                  |
 | Subprocess task runtime            | `core`, `exec-subprocess`                                               |
 | Native containerd task runtime     | `core`, `exec-containerd`                                               |
@@ -454,6 +455,7 @@ All umbrella features are off by default.
 | `model`                          | Runtime model types without JSON Schema support                      |
 | `model-schema`                   | Model types with JSON Schema support                                 |
 | `runner`                         | Runner contract, model, and Taskvisor                                 |
+| `cron`                           | IANA timezone calendars and recurring Taskvisor tasks                 |
 | `core`                           | Desired-state supervisor and Taskvisor controller                     |
 | `exec`                           | Base `solti-exec` namespace                                           |
 | `exec-host-process`              | Low-level host-process policy                                         |
@@ -506,6 +508,7 @@ Names identify the boundary:
 
 | Example                                                                  | Features                       | Result                                                |
 |--------------------------------------------------------------------------|--------------------------------|-------------------------------------------------------|
+| [task_cron.rs](crates/solti/examples/task_cron.rs)                       | `cron,core`                   | Calendar invocations, explicit cancellation, and shutdown |
 | [task_chain.rs](crates/solti/examples/task_chain.rs)                     | `chain,core,exec-subprocess`   | Conditional steps with failure recovery               |
 | [task_subprocess.rs](crates/solti/examples/task_subprocess.rs)           | `core,exec-subprocess`         | Output, reconciliation, terminal status, and history  |
 | [task_custom_workload.rs](crates/solti/examples/task_custom_workload.rs) | `core`                         | Application-owned `TcpProbe` GVK and runner           |
@@ -519,6 +522,11 @@ Names identify the boundary:
 | [agent_grpc.rs](crates/solti/examples/agent_grpc.rs)                     | `api-core-adapter,api-grpc,exec-subprocess`               | gRPC Task API, bearer auth, and `grpcurl` calls   |
 | [agent_grpc_mtls.rs](crates/solti/examples/agent_grpc_mtls.rs)           | `api-core-adapter,api-grpc-tls,exec-subprocess`           | Anonymous rejection and authenticated mTLS client |
 | [agent_http_discovery.rs](crates/solti/examples/agent_http_discovery.rs) | `api-core-adapter,api-http,discover-http,exec-subprocess` | Inbound Task API and outbound discovery heartbeat |
+| [agent_podium.rs](crates/solti/examples/agent_podium.rs)                 | `api-core-adapter,api-http,discover-http,exec-subprocess` | Podium deployment, real subprocess, and live output |
+
+The [Podium walkthrough](crates/solti/examples/podium/README.md) starts a local
+control plane and agent, creates a task in the browser, and explains placement,
+deployment, live logs, and observed run history.
 
 ### Operations
 
@@ -567,21 +575,6 @@ verifies them together without uploading them.
 
 The release order is declared in [`.github/crates.txt`](.github/crates.txt).
 Component crates are published before the `solti` umbrella crate.
-Use the [release checklist](DEPLOY.md) before creating a version tag.
-
-## Benchmarks
-
-Process benchmarks live in the root [`benches/`](benches/README.md) workspace
-package, outside product crates. They cover lifecycle, reconciliation,
-execution, collections, API boundaries, and shutdown.
-
-```bash
-task rust:benchmark
-```
-
-The suite uses Taskvisor-style reports with named units and explicit timing
-boundaries. See the [scenario map and run options](benches/README.md), including
-the separately gated Linux containerd and host-policy cases.
 
 ## Contributing
 

@@ -4355,6 +4355,8 @@ async fn aborted_delete_before_runtime_lock_still_cancels_only_the_bound_taskvis
         .unwrap();
     let binding = wait_for_binding(&api, &name, 1).await;
     wait_for_observed(&api, &name, 1).await;
+    // Controller intake confirms only the command; registry membership follows later.
+    wait_for_taskvisor_name(&api, binding.tv).await;
     let unrelated_waiter = api
         .reconciler
         .handle

@@ -7,6 +7,7 @@
 # Dependency layout - required + optional (because publish runs with `--all-features`):
 #   solti-model       - no internal deps
 #   solti-tls         - no internal deps
+#   solti-cron        - taskvisor; no internal SDK deps
 #   solti-observe     - optional: solti-model, taskvisor
 #   solti-runner      - solti-model, taskvisor (base)
 #   solti-chain       - solti-model, solti-runner, taskvisor
@@ -25,6 +26,7 @@
 
 solti-model
 solti-tls
+solti-cron
 solti-observe
 solti-runner
 solti-chain

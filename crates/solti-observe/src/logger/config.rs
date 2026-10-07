@@ -16,13 +16,14 @@ use crate::logger::object::{LoggerFormat, LoggerLevel, LoggerTimeZone};
 ///
 /// ## Defaults
 ///
-/// | Field          | Default | Used by                                |
-/// |----------------|---------|----------------------------------------|
-/// | `format`       | `Text`  | Backend selection                      |
-/// | `level`        | `info`  | Every backend                          |
-/// | `timezone`     | `Utc`   | Text and JSON timestamps               |
-/// | `with_targets` | `true`  | Text and JSON event targets            |
-/// | `use_color`    | `true`  | Text output on an interactive terminal |
+/// | Field                   | Default     | Used by                                |
+/// |-------------------------|-------------|----------------------------------------|
+/// | `format`                | `Text`      | Backend selection                      |
+/// | `level`                 | `info`      | Every backend                          |
+/// | `timezone`              | `Utc`       | Text and JSON timestamps               |
+/// | `with_targets`          | `true`      | Text and JSON event targets            |
+/// | `use_color`             | `true`      | Text output on an interactive terminal |
+/// | `journald_field_prefix` | `Some("F")` | Journald field names                   |
 ///
 /// Missing Serde fields use these defaults. Unknown fields are rejected so a
 /// misspelled setting cannot silently retain its default value.
@@ -55,6 +56,12 @@ pub struct LoggerConfig {
     ///
     /// Colors are used only for text written to an interactive terminal.
     pub use_color: bool,
+    /// Prefix of the journald names of event and span fields; `None` writes the field names alone.
+    ///
+    /// Journald fields are uppercase, so the field `request_id` becomes `F_REQUEST_ID` with the
+    /// default prefix and `REQUEST_ID` without one. A service whose operators filter the journal by
+    /// its own fields, such as `journalctl REQUEST_ID=…`, can drop the prefix.
+    pub journald_field_prefix: Option<String>,
 }
 
 impl Default for LoggerConfig {
@@ -65,6 +72,7 @@ impl Default for LoggerConfig {
             timezone: LoggerTimeZone::default(),
             with_targets: true,
             use_color: true,
+            journald_field_prefix: Some("F".into()),
         }
     }
 }
@@ -92,6 +100,7 @@ mod tests {
         assert_eq!(config.level.as_str(), "info");
         assert!(config.with_targets);
         assert!(config.use_color);
+        assert_eq!(config.journald_field_prefix.as_deref(), Some("F"));
     }
 
     #[test]
@@ -102,6 +111,7 @@ mod tests {
             level: "debug".parse().unwrap(),
             with_targets: false,
             use_color: false,
+            journald_field_prefix: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -112,6 +122,7 @@ mod tests {
         assert_eq!(config.use_color, parsed.use_color);
         assert_eq!(config.format, parsed.format);
         assert_eq!(config.timezone, parsed.timezone);
+        assert_eq!(parsed.journald_field_prefix, None);
     }
 
     #[test]

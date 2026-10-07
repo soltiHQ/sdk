@@ -111,9 +111,15 @@ JSON
   "$ADDRESS" solti.task.v1.TaskService/CreateTask \
   <"$REQUEST"
 
+# Resolve the current incarnation before opening its output stream.
+# This recipe uses Python 3's standard-library JSON parser.
+TASK_UID="$("${GRPCURL[@]}" -d '{"name":"grpc-demo"}' \
+  "$ADDRESS" solti.task.v1.TaskService/GetTask | \
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["task"]["metadata"]["uid"])')"
+
 # Stream live output while the one-minute task is running.
 # OutputChunk.line is protobuf bytes and appears as base64 in JSON.
-"${GRPCURL[@]}" -d '{"name":"grpc-demo"}' \
+"${GRPCURL[@]}" -d "{\"name\":\"grpc-demo\",\"taskUid\":\"${TASK_UID}\"}" \
   "$ADDRESS" solti.task.v1.TaskService/StreamTaskLogs
 
 # Read the resource and a filtered collection page.
@@ -242,9 +248,16 @@ solti: gRPC task agent
     tokio::signal::ctrl_c().await?;
 
     let _ = shutdown_tx.send(());
-    server.await??;
-    supervisor.shutdown().await?;
-    subprocess_runner.shutdown(Duration::from_secs(5)).await?;
+    // Stop intake and close core watches concurrently so a live stream cannot
+    // prevent graceful server draining. Both waits are explicitly bounded.
+    let (server_result, shutdown_result) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(15), server),
+        supervisor.shutdown_with_timeout(Duration::from_secs(10)),
+    );
+    let finalizer_result = subprocess_runner.shutdown(Duration::from_secs(5)).await;
+    server_result???;
+    shutdown_result?;
+    finalizer_result?;
     println!(
         "\nResult: the public gRPC contract returned a resource owned and executed by the core supervisor."
     );

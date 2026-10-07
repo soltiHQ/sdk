@@ -46,6 +46,7 @@ enable JSON Schema. Select `model-schema` or `chain-schema` explicitly.
 | Execute subprocess Tasks through core | `core,exec-subprocess` | [Subprocesses](subprocesses.md) |
 | Execute through an application container engine | `core,exec-container` | [Containers](containers-and-isolation.md) |
 | Execute native containerd Tasks | `core,exec-containerd` | [Containers](containers-and-isolation.md) |
+| Run calendar-based async work | `cron` or `cron,core` for Embedded integration | [Calendars](cron-scheduling.md) |
 | Compose subprocess steps in a Chain | `chain,core,exec-subprocess` | [Chains](chains.md) |
 | Serve the HTTP API with core and subprocess execution | `api-core-adapter,api-http,exec-subprocess` | [Task API](serving-api.md) |
 | Serve the gRPC API with core and subprocess execution | `api-core-adapter,api-grpc,exec-subprocess` | [Task API](serving-api.md) |
@@ -66,6 +67,7 @@ The [facade manifest](../crates/solti/Cargo.toml) is the exact forwarding contra
 | Family | Features and purpose |
 |---|---|
 | Data and construction | `model`, `model-schema`, `runner`, `chain`, `chain-schema`, `core`. |
+| Calendar scheduling | `cron` exposes IANA calendars and a sequential Taskvisor task wrapper; the application submits the task explicitly. |
 | Execution | `exec` exposes the base namespace; `exec-host-process` exposes host policy; `exec-subprocess` adds the subprocess runner; `exec-container` adds the engine-neutral container runner; `exec-containerd` adds the native adapter. |
 | Seccomp | `exec-seccomp` enables the low-level host-process filter. Combine it with `exec-subprocess` to apply it to subprocess attempts. |
 | API | `api` exposes the handler/auth/metrics contracts; `api-core-adapter` adds core integration; `api-http`, `api-grpc`, and `api-grpc-tls` select transport support. |

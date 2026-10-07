@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "benches",
     "crates/solti",
     "crates/solti-api",
     "crates/solti-chain",
     "crates/solti-core",
+    "crates/solti-cron",
     "crates/solti-discover",
     "crates/solti-exec",
     "crates/solti-model",
@@ -21,6 +21,7 @@ clippy-matrix = [
     { package = "solti", features = ["model"] },
     { package = "solti", features = ["model-schema"] },
     { package = "solti", features = ["chain"] },
+    { package = "solti", features = ["cron"] },
     { package = "solti", features = ["chain-schema"] },
     { package = "solti", features = ["api-core-adapter", "api-grpc-tls", "exec-subprocess"] },
     { package = "solti", features = ["api-core-adapter", "api-http", "discover-http", "exec-subprocess"] },
@@ -46,7 +47,7 @@ clippy-matrix = [
 ]
 
 [workspace.package]
-version      = "0.0.6"
+version      = "0.0.7"
 edition      = "2024"
 rust-version = "1.90.0"
 license      = "Apache-2.0"
@@ -64,6 +65,9 @@ async-trait         = "0.1.92"
 axum                = "0.8.9"
 base64              = "0.23.1"
 bytes               = "1.12.1"
+chrono              = { version = "0.4.45", default-features = false, features = ["std"] }
+chrono-tz           = "0.10.4"
+croner              = { version = "4.0.0", default-features = false, features = ["chrono"] }
 containerd-client   = { version = "0.9.0", default-features = false, features = ["connect"] }
 criterion           = "0.8.2"
 form_urlencoded     = "1.2.2"
@@ -83,23 +87,24 @@ proptest            = { version = "1.11.0", default-features = false, features =
 protoc-bin-vendored = { version = "3.2.0" }
 rcgen               = "0.14.8"
 reqwest             = { version = "0.13.4", default-features = false }
-rustls              = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls              = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 schemars            = "1.2.2"
 seccompiler         = "0.5.0"
 serde               = { version = "1.0.229", features = ["derive"] }
 serde_json          = "1.0.151"
 sha2                = "0.11.0"
-solti               = { path = "crates/solti",            version = "0.0.6", default-features = false }
-solti-api           = { path = "crates/solti-api",        version = "0.0.6", default-features = false }
-solti-chain         = { path = "crates/solti-chain",      version = "0.0.6", default-features = false }
-solti-core          = { path = "crates/solti-core",       version = "0.0.6", default-features = false }
-solti-discover      = { path = "crates/solti-discover",   version = "0.0.6", default-features = false }
-solti-exec          = { path = "crates/solti-exec",       version = "0.0.6", default-features = false }
-solti-model         = { path = "crates/solti-model",      version = "0.0.6", default-features = false }
-solti-observe       = { path = "crates/solti-observe",    version = "0.0.6", default-features = false }
-solti-prometheus    = { path = "crates/solti-prometheus", version = "0.0.6", default-features = false }
-solti-runner        = { path = "crates/solti-runner",     version = "0.0.6", default-features = false }
-solti-tls           = { path = "crates/solti-tls",        version = "0.0.6", default-features = false }
+solti               = { path = "crates/solti",            version = "0.0.7", default-features = false }
+solti-api           = { path = "crates/solti-api",        version = "0.0.7", default-features = false }
+solti-chain         = { path = "crates/solti-chain",      version = "0.0.7", default-features = false }
+solti-core          = { path = "crates/solti-core",       version = "0.0.7", default-features = false }
+solti-cron          = { path = "crates/solti-cron",       version = "0.0.7", default-features = false }
+solti-discover      = { path = "crates/solti-discover",   version = "0.0.7", default-features = false }
+solti-exec          = { path = "crates/solti-exec",       version = "0.0.7", default-features = false }
+solti-model         = { path = "crates/solti-model",      version = "0.0.7", default-features = false }
+solti-observe       = { path = "crates/solti-observe",    version = "0.0.7", default-features = false }
+solti-prometheus    = { path = "crates/solti-prometheus", version = "0.0.7", default-features = false }
+solti-runner        = { path = "crates/solti-runner",     version = "0.0.7", default-features = false }
+solti-tls           = { path = "crates/solti-tls",        version = "0.0.7", default-features = false }
 subtle              = "2.6.1"
 taskvisor           = { version = "0.9.0", default-features = false }
 tempfile            = "3.27.0"

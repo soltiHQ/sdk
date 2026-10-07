@@ -29,6 +29,7 @@ taskvisor-tracing            = ["taskvisor", "taskvisor/tracing"]
 
 runner       = ["dep:solti-runner", "model", "taskvisor"]
 chain        = ["dep:solti-chain", "runner"]
+cron         = ["dep:solti-cron", "taskvisor"]
 chain-schema = ["chain", "model-schema", "solti-chain/schema"]
 core         = ["dep:solti-core", "model", "runner", "taskvisor-controller"]
 
@@ -111,6 +112,7 @@ full = [
     "api-grpc-tls",
     "api-http",
     "chain-schema",
+    "cron",
     "discover-grpc-tls",
     "discover-http-tls",
     "exec-containerd",
@@ -129,6 +131,7 @@ full = [
 solti-api        = { workspace = true, optional = true }
 solti-chain      = { workspace = true, optional = true }
 solti-core       = { workspace = true, optional = true }
+solti-cron       = { workspace = true, optional = true }
 solti-discover   = { workspace = true, optional = true }
 solti-exec       = { workspace = true, optional = true }
 solti-model      = { workspace = true, optional = true }
@@ -160,6 +163,10 @@ name              = "agent_http"
 required-features = ["api-core-adapter", "api-http", "exec-subprocess"]
 
 [[example]]
+name              = "agent_podium"
+required-features = ["api-core-adapter", "api-http", "discover-http", "exec-subprocess"]
+
+[[example]]
 name              = "agent_http_discovery"
 required-features = ["api-core-adapter", "api-http", "discover-http", "exec-subprocess"]
 
@@ -176,6 +183,10 @@ required-features = [
     "prometheus-server",
     "prometheus-state",
 ]
+
+[[example]]
+name              = "task_cron"
+required-features = ["cron", "core"]
 
 [[example]]
 name              = "task_chain"

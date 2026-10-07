@@ -24,28 +24,17 @@
 //!
 //! The control plane must implement discovery HTTP v1.
 //! `SOLTI_CONTROL_PLANE` defaults to `http://127.0.0.1:8090`.
+//! `SOLTI_AGENT_ADDR` defaults to `127.0.0.1:8085`; port `0` selects a free port.
+//! `SOLTI_AGENT_ID` and `SOLTI_AGENT_NAME` override the example identity.
+//! `SOLTI_AGENT_ADVERTISE_URL` overrides the reachable HTTP base URL; wildcard
+//! binds require this value. See `agent_podium` for a complete Podium walkthrough.
 //!
 //! Run with `cargo run -p solti --example agent_http_discovery --features api-core-adapter,api-http,discover-http,exec-subprocess`.
 
-use std::{sync::Arc, time::Duration};
+#[path = "support/http_agent.rs"]
+mod http_agent;
 
-use solti::{
-    api::{API_VERSION, HTTP_API_ROOT, HttpApi, SupervisorApiAdapter, axum::serve},
-    core::SupervisorApi,
-    discover::{
-        AgentEndpoint, AgentEndpointType, ControlPlaneEndpoint, DISCOVERY_HTTP_SYNC_PATH,
-        DiscoverConfig, DiscoveryTransport, MonotonicUptime, sync,
-    },
-    exec::subprocess::register_subprocess_runner,
-    model::AgentId,
-    runner::RunnerRouter,
-};
-use tokio::net::TcpListener;
-
-const API_ADDRESS: &str = "127.0.0.1:8085";
-const DEFAULT_CONTROL_PLANE: &str = "http://127.0.0.1:8090";
-
-type ExampleResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+use http_agent::{Defaults, ExampleResult, Settings};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExampleResult {
@@ -53,71 +42,19 @@ async fn main() -> ExampleResult {
         r#"
 solti: discovered HTTP agent
 
-  control plane ◄── discovery heartbeat ── embedded task ──┐
-  API clients ──► HTTP Task API ──► adapter ──► core ◄─────┤
-                                                  ▼        │
-                                            runner router ─┘ capabilities
+  control plane <- discovery heartbeat <- embedded task
+  API clients -> HTTP Task API -> adapter -> core -> subprocess runner
 "#
     );
     println!(
         "[purpose] Advertise the exact runner capabilities served by one live HTTP task agent."
     );
-
-    let listener = TcpListener::bind(API_ADDRESS).await?;
-    let mut router = RunnerRouter::new();
-    let subprocess_runner = register_subprocess_runner(&mut router, "default")?;
-    let supervisor = Arc::new(SupervisorApi::builder(router).start().await?);
-    let capabilities = supervisor.runner_capabilities();
-    println!(
-        "[runner] Registered {} runner capability with {} workload GVK.",
-        capabilities.runners().len(),
-        capabilities.runners()[0].workload_types().len(),
-    );
-
-    let control_plane =
-        std::env::var("SOLTI_CONTROL_PLANE").unwrap_or_else(|_| DEFAULT_CONTROL_PLANE.into());
-    let advertised = format!("http://{API_ADDRESS}");
-    let revision = format!(
-        "discovered-agent@{}|control-plane={control_plane}",
-        env!("CARGO_PKG_VERSION")
-    );
-    let config = DiscoverConfig::builder(
-        AgentId::new("umbrella-example-agent")?,
-        "Umbrella example agent",
-        AgentEndpoint::new(&advertised, AgentEndpointType::Http, API_VERSION)?,
-        ControlPlaneEndpoint::new(&control_plane, DiscoveryTransport::Http)?,
-        capabilities,
-        10_000,
-        revision,
-    )
-    .build()?;
-    let (manifest, task_ref) = sync(config, Arc::new(MonotonicUptime::new()))?;
-    let discovery_name = manifest.name().clone();
-    supervisor.create_embedded_task(manifest, task_ref).await?;
-    println!("[discovery] Supervised embedded task={discovery_name}.");
-    println!(
-        "[discovery] controlPlane={control_plane}, path={DISCOVERY_HTTP_SYNC_PATH}, interval=10s."
-    );
-
-    let handler = Arc::new(SupervisorApiAdapter::new(Arc::clone(&supervisor)));
-    let app = HttpApi::new(handler).router();
-    println!("[api] Task API: {advertised}{HTTP_API_ROOT}");
-    println!("[api] Embedded discovery state is hidden by the public adapter.");
-    println!("[shutdown] Press Ctrl-C to stop intake and supervised tasks.");
-
-    let server_result = serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
-    let shutdown_result = supervisor.shutdown().await;
-    let finalizer_result = subprocess_runner.shutdown(Duration::from_secs(5)).await;
-    server_result?;
-    shutdown_result?;
-    finalizer_result?;
-    Ok(())
-}
-
-async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        eprintln!("failed to install Ctrl-C handler: {error}");
-    }
+    http_agent::run(Settings::from_env(Defaults {
+        agent_id: "umbrella-example-agent",
+        agent_name: "Umbrella example agent",
+        control_plane: "http://127.0.0.1:8090",
+        api_address: "127.0.0.1:8085",
+        interval_ms: 10_000,
+    })?)
+    .await
 }

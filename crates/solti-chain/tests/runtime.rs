@@ -74,7 +74,7 @@ impl Runner for LeafRunner {
         let runner_name = self.name.to_owned();
         let attempts = Arc::new(AtomicU32::new(0));
 
-        Ok(TaskFn::arc(move |_ctx: TaskContext| {
+        Ok(TaskFn::arc(move |ctx: TaskContext| {
             let executions = Arc::clone(&executions);
             let output = Arc::clone(&output);
             let resource_name = resource_name.clone();
@@ -98,6 +98,16 @@ impl Runner for LeafRunner {
                     "fail" => Err(TaskError::fail(format!("{id} failed")).with_exit_code(17)),
                     "fatal" => Err(TaskError::fatal(format!("{id} is fatal")).with_exit_code(73)),
                     "cancel" => Err(TaskError::Canceled),
+                    "cancel-after-cleanup" => {
+                        ctx.cancelled().await;
+                        // A cooperative backend can need async cleanup before returning.
+                        tokio::task::yield_now().await;
+                        executions
+                            .lock()
+                            .expect("execution log mutex must not be poisoned")
+                            .push(format!("{runner_name}:{id}:cleanup"));
+                        Err(TaskError::fatal("cleanup finished after cancellation"))
+                    }
                     other => Err(TaskError::fatal(format!(
                         "test leaf '{id}' has unknown behavior '{other}'"
                     ))),
@@ -377,6 +387,51 @@ async fn cancellation_bypasses_failure_transition() {
 
     assert!(matches!(result, Err(TaskError::Canceled)));
     assert_eq!(execution_log(&executions), ["leaf:entry"]);
+}
+
+#[tokio::test]
+async fn external_cancellation_waits_for_active_leaf_cleanup_without_transitions() {
+    let executions = Arc::new(Mutex::new(Vec::new()));
+    let router = basic_router(Arc::clone(&executions), Arc::new(Mutex::new(Vec::new())));
+    let entry = ChainStep::new("entry", leaf("entry", "cancel-after-cleanup"))
+        .unwrap()
+        .with_on_success("next")
+        .unwrap()
+        .with_on_failure("handler", FailureMode::Recover)
+        .unwrap();
+    let chain = ChainSpec::new(
+        "entry",
+        vec![
+            entry,
+            ChainStep::new("next", leaf("next", "ok")).unwrap(),
+            ChainStep::new("handler", leaf("handler", "ok")).unwrap(),
+        ],
+    )
+    .unwrap();
+    let task = chain_task("cooperative-cancel", chain);
+    let runnable = build_task(&router, &task).await;
+    let ctx = TaskContext::detached();
+    let cancellation = ctx.cancellation_token();
+    let run = tokio::spawn(runnable.spawn(ctx));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while execution_log(&executions).is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("active leaf must start before cancellation");
+    cancellation.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), run)
+        .await
+        .expect("cooperative cancellation must settle")
+        .expect("chain attempt must not panic");
+
+    assert!(matches!(result, Err(TaskError::Canceled)));
+    assert_eq!(
+        execution_log(&executions),
+        ["leaf:entry", "leaf:entry:cleanup"]
+    );
 }
 
 #[tokio::test]

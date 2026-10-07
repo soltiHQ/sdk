@@ -27,6 +27,7 @@
 //!          ├── model-schema ──────► solti-model + JSON Schema
 //!          ├── runner ────────────► solti-runner + model + taskvisor
 //!          ├── chain ─────────────► solti-chain + runner
+//!          ├── cron ──────────────► solti-cron + taskvisor
 //!          ├── core ──────────────► solti-core + runner + taskvisor/controller
 //!          ├── exec-* ────────────► solti-exec integrations
 //!          ├── api-* ─────────────► solti-api transports and adapters
@@ -48,6 +49,7 @@
 //! | Runner registration          | `runner`                |
 //! | Conditional workload chain   | `chain`                 |
 //! | Chain JSON Schema            | `chain-schema`          |
+//! | Calendar scheduling          | `cron`                  |
 //! | Desired-state supervision    | `core`                  |
 //! | Host process controls        | `exec-host-process`     |
 //! | Subprocess execution         | `exec-subprocess`       |
@@ -96,6 +98,7 @@
 //! |----------------|-----------------------|
 //! | `api`          | `solti-api`           |
 //! | `chain`        | `solti-chain`         |
+//! | `cron`         | `solti-cron`          |
 //! | `core`         | `solti-core`          |
 //! | `discover`     | `solti-discover`      |
 //! | `exec`         | `solti-exec`          |
@@ -162,6 +165,11 @@ pub use solti_api as api;
 #[cfg(feature = "chain")]
 #[cfg_attr(docsrs, doc(cfg(feature = "chain")))]
 pub use solti_chain as chain;
+
+/// Calendar schedules and supervised recurring tasks from `solti-cron`.
+#[cfg(feature = "cron")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cron")))]
+pub use solti_cron as cron;
 
 /// Desired-state supervisor types from `solti-core`.
 #[cfg(feature = "core")]

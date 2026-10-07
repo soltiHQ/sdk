@@ -55,6 +55,17 @@ macro_rules! define_deny_host_control_syscalls {
     };
 }
 
+/// `kexec_file_load` syscall number on aarch64.
+///
+/// `libc` does not define it for musl targets.
+#[cfg(all(
+    feature = "seccomp",
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_env = "musl"
+))]
+const SYS_KEXEC_FILE_LOAD: libc::c_long = 294;
+
 #[cfg(any(feature = "containerd", all(feature = "seccomp", target_os = "linux")))]
 define_deny_host_control_syscalls! {
     "ptrace" => libc::SYS_ptrace,
@@ -78,7 +89,10 @@ define_deny_host_control_syscalls! {
     "quotactl" => libc::SYS_quotactl,
     "quotactl_fd" => libc::SYS_quotactl_fd,
     "kexec_load" => libc::SYS_kexec_load,
+    #[cfg(not(all(target_arch = "aarch64", target_env = "musl")))]
     "kexec_file_load" => libc::SYS_kexec_file_load,
+    #[cfg(all(target_arch = "aarch64", target_env = "musl"))]
+    "kexec_file_load" => SYS_KEXEC_FILE_LOAD,
     "init_module" => libc::SYS_init_module,
     "finit_module" => libc::SYS_finit_module,
     "delete_module" => libc::SYS_delete_module,

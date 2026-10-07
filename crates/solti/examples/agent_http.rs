@@ -10,7 +10,7 @@
 //! The OpenAPI endpoint is owned by this binary.
 //! It is not included in the Task API document that it serves.
 //! This example has no authentication, TLS, discovery, metrics, or tracing.
-//! Ctrl-C stops HTTP intake and then joins the supervisor shutdown.
+//! Ctrl-C stops HTTP intake and drains transport and supervisor concurrently.
 //!
 //! ```text
 //! HTTP client
@@ -27,7 +27,7 @@
 //!
 //! Run with `cargo run -p solti --example agent_http --features api-core-adapter,api-http,exec-subprocess`.
 
-use std::{sync::Arc, time::Duration};
+use std::{future::IntoFuture, sync::Arc, time::Duration};
 
 use solti::{
     api::{
@@ -98,9 +98,12 @@ curl -sS -X POST \
   --data-binary @"$MANIFEST" \
   "$TASKS"
 
+# Get the exact incarnation UID (requires Python 3).
+TASK_UID=$(curl -sS "$TASKS/http-demo" | python3 -c 'import json,sys; print(json.load(sys.stdin)["metadata"]["uid"])')
+
 # Stream live output while the one-minute task is running.
 curl -sS -N -H 'accept: text/event-stream' \
-  "$TASKS/http-demo/logs"
+  "$TASKS/http-demo/logs?taskUid=$TASK_UID"
 
 # Read the resource and a filtered collection page.
 curl -sS "$TASKS/http-demo"
@@ -162,7 +165,7 @@ async fn serve_http(
     supervisor: Arc<SupervisorApi>,
     listener: TcpListener,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let handler = Arc::new(SupervisorApiAdapter::new(supervisor));
+    let handler = Arc::new(SupervisorApiAdapter::new(Arc::clone(&supervisor)));
     let HttpApiParts { router, openapi } = HttpApi::new(handler).build();
 
     let openapi = serde_json::to_string_pretty(&openapi)?;
@@ -179,9 +182,26 @@ async fn serve_http(
     print_http_commands();
     println!("[shutdown] Press Ctrl-C in the agent terminal to stop.");
 
-    serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = shutdown_rx.await;
+        })
+        .into_future();
+    tokio::pin!(server);
+    let server_result = tokio::select! {
+        result = &mut server => result,
+        () = shutdown_signal() => {
+            let _ = shutdown_tx.send(());
+            let (drained, core) = tokio::join!(
+                tokio::time::timeout(Duration::from_secs(15), &mut server),
+                supervisor.shutdown_with_timeout(Duration::from_secs(10)),
+            );
+            core?;
+            drained.map_err(|error| std::io::Error::new(std::io::ErrorKind::TimedOut, error))?
+        }
+    };
+    server_result?;
     Ok(())
 }
 

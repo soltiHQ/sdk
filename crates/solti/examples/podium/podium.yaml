@@ -1,0 +1,13 @@
+# Local Podium + SDK agent_podium walkthrough.
+# Run from the sibling Podium checkout; supply SOLTI_AUTH_JWT_SECRET externally.
+# Agent transport is plaintext/unauthenticated on loopback for this example.
+http:
+  addr: 127.0.0.1:9080
+http_discovery:
+  addr: 127.0.0.1:9082
+grpc:
+  addr: 127.0.0.1:50061
+cluster:
+  backend: standalone
+  standalone:
+    data_dir: data/podium-example

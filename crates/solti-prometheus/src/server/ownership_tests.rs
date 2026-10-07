@@ -70,6 +70,10 @@ fn observed_state() -> (Arc<MetricsServerState>, Arc<AtomicUsize>) {
 /// Pauses inside a successful write, after delivery but before Hyper can advance
 /// its owning buffer. Returning Pending after writing would violate AsyncWrite;
 /// this bounded synchronous gate instead models preemption of that worker.
+///
+/// The wait runs under `block_in_place`: a plain blocking wait can leave Tokio's
+/// shared I/O and timer driver unattended when the held worker was the last one
+/// driving it, which stalls the client and every bound until the gate times out.
 #[derive(Default)]
 struct WriteGate {
     entered: Notify,
@@ -80,18 +84,20 @@ struct WriteGate {
 impl WriteGate {
     fn hold(&self) {
         self.entered.notify_one();
-        let released = self
-            .released
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (released, wait) = self
-            .changed
-            .wait_timeout_while(released, BOUND, |released| !*released)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            *released && !wait.timed_out(),
-            "transport gate was not released"
-        );
+        tokio::task::block_in_place(|| {
+            let released = self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (released, wait) = self
+                .changed
+                .wait_timeout_while(released, BOUND, |released| !*released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                *released && !wait.timed_out(),
+                "transport gate was not released"
+            );
+        });
     }
 
     fn release(&self) {
@@ -428,12 +434,14 @@ async fn sequential_tcp_scrapes_release_without_recovery_requests() {
     server.close().await;
 }
 
+// Every connect, scrape, and release observation carries its own BOUND. The whole
+// loop is not bounded: its duration is throughput under a parallel test run, not a hang.
 #[tokio::test(flavor = "current_thread")]
 async fn sequential_tcp_release_current_thread() {
-    bounded(sequential_tcp_scrapes_release_without_recovery_requests()).await;
+    sequential_tcp_scrapes_release_without_recovery_requests().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sequential_tcp_release_multi_thread() {
-    bounded(sequential_tcp_scrapes_release_without_recovery_requests()).await;
+    sequential_tcp_scrapes_release_without_recovery_requests().await;
 }

@@ -5,7 +5,7 @@ description: Locate every SDK crate by its responsibility and follow the contrac
 
 # Architecture and ownership
 
-The SDK is an acyclic workspace of eleven product crates.
+The SDK is an acyclic workspace of twelve product crates.
 The application is the composition root: it selects features, registers
 implementations, supplies configuration, starts services, and joins shutdown.
 The `solti` facade forwards features and namespaces. It owns no runtime logic.
@@ -19,6 +19,7 @@ The `solti` facade forwards features and namespaces. It owns no runtime logic.
 | [`solti-runner`](../crates/solti-runner/src/lib.rs) | Runner trait, routing, build context, build admission, output and metrics interfaces | Core can construct work without depending on an execution backend. | [Custom runners](routing-and-custom-runners.md), [reconciliation](reconciliation.md) |
 | [`solti-core`](../crates/solti-core/src/lib.rs) | Desired state, reconciliation, status projection, retained runs, watches, output, persistence dispatch | Resource lifecycle stays separate from operating-system execution and network serving. | [Management](managing-tasks.md), [reconciliation](reconciliation.md), [persistence](persistence.md) |
 | [`solti-exec`](../crates/solti-exec/src/lib.rs) | Subprocess, container-engine, native containerd, and host-process implementations | A binary chooses execution and platform policy without coupling them to core. | [Subprocesses](subprocesses.md), [containers and isolation](containers-and-isolation.md) |
+| [`solti-cron`](../crates/solti-cron/src/lib.rs) | IANA timezone calendars and sequential scheduled TaskRef invocations | Scheduling composes with the Taskvisor task contract without depending on core or execution backends. | [Calendars](cron-scheduling.md) |
 | [`solti-chain`](../crates/solti-chain/src/lib.rs) | Conditional sequential composition inside one outer Task | Existing workload runners can be combined without adding child Task resources or a new transport API. | [Chains](chains.md) |
 | [`solti-api`](../crates/solti-api/src/lib.rs) | Handler contract, HTTP/gRPC boundaries, authentication and authorization hooks, optional core adapter | Transports can serve core or an application-owned handler. | [Task API](serving-api.md), [authentication](tls-and-authentication.md) |
 | [`solti-discover`](../crates/solti-discover/src/lib.rs) | Outbound registration and supervised heartbeat construction | Advertising an agent is independent of how its inbound API is served. | [Discovery](discovery.md) |
@@ -28,8 +29,7 @@ The `solti` facade forwards features and namespaces. It owns no runtime logic.
 
 [Taskvisor](https://github.com/soltiHQ/taskvisor) is an external dependency, not
 another SDK workspace crate. It owns supervised attempt execution and keyed
-admission. [`solti-benches`](../benches/README.md) is unpublished development
-tooling, not a product layer.
+admission.
 
 ## Distinguish dependency direction from runtime flow
 
@@ -47,6 +47,8 @@ App["Application binary"] --> API["API: handler and transport"]
 App --> Core["Core: resource runtime"]
 App --> Exec["Exec or application runner"]
 App --> Chain["Chain runner"]
+App --> Cron["Cron calendar wrapper"]
+Cron --> TV["Taskvisor task contract"]
 App --> Discovery["Discovery client"]
 App --> Ops["Logging, TLS, metrics"]
 API -->|"optional core adapter"| Core

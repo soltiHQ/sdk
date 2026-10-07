@@ -242,7 +242,10 @@ A mismatch returns `409` or gRPC `Aborted`.
 HTTP conflicts contain `Status.details.causes`.
 Their `reason` is one of `UIDMismatch`, `ResourceVersionMismatch`, or
 `PreconditionFailed`.
-gRPC conflicts contain encoded `WriteConflictDetails` status details. Each
+gRPC conflicts carry a standard `google.rpc.Status` envelope in
+`grpc-status-details-bin`. Its code and message match the gRPC status; its
+`details` contains an `Any` with type URL
+`type.googleapis.com/solti.task.v1.WriteConflictDetails`. Each
 `WriteConflictCause.reason` is a `WriteConflictReason` enum value; clients must
 not branch on the readable cause message.
 

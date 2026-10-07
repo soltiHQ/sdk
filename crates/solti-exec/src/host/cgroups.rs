@@ -624,7 +624,9 @@ mod linux_impl {
         }
         // SAFETY: `statfs` initialized `filesystem` after returning success.
         let filesystem = unsafe { filesystem.assume_init() };
-        if filesystem.f_type as u64 != CGROUP2_SUPER_MAGIC {
+        #[allow(clippy::unnecessary_cast)]
+        let filesystem_type = filesystem.f_type as u64;
+        if filesystem_type != CGROUP2_SUPER_MAGIC {
             return Err(HostProcessError::InvalidConfig(format!(
                 "{} is not on a cgroup v2 filesystem",
                 parent.display()

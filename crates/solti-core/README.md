@@ -792,6 +792,3 @@ They combine core with concrete execution runners, discovery, observability, and
 ## Contributor guide
 
 See the [solti-core source guide](https://github.com/soltiHQ/sdk/blob/main/crates/solti-core/ARCHITECTURE.md) for module ownership, runtime flows, concurrency, and invariants.
-
-Process benchmarks live in the workspace-level [benchmark suite](../../benches/README.md).
-They cover lifecycle, reconciliation, collections, output, and composed SDK processes.

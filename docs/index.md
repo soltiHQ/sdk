@@ -25,6 +25,7 @@ Use the [architecture map](architecture.md) to locate a responsibility and the
 | Run a command or script | [Subprocesses](subprocesses.md) | Model, runner, exec, core |
 | Supply a custom workload or execution backend | [Routing and custom runners](routing-and-custom-runners.md) | Model, runner, application |
 | Run a native container or configure host controls | [Containers and isolation](containers-and-isolation.md) | Model, exec, external runtime or host |
+| Run work on an IANA timezone calendar | [Calendar scheduling](cron-scheduling.md) | Cron, Taskvisor, optional core |
 | Compose conditional sequential work | [Chains](chains.md) | Chain, runner catalog, execution backends, core |
 | Expose an agent to clients | [Task API](serving-api.md), [TLS and authentication](tls-and-authentication.md) | API, handler or core adapter, application server |
 | Advertise an agent to a control plane | [Discovery](discovery.md) | Discover, model, supervised Embedded work |
@@ -70,7 +71,6 @@ delivery contracts. They are not a durable execution log.
 - [Cancellation and shutdown](cancellation-and-shutdown.md) separates logical completion from physical cleanup.
 - [Configuration](configuration.md) identifies independent resource budgets and deadlines.
 - [Example catalog](example-catalog.md) links the complete programs and smaller component examples.
-- [Process benchmarks](../benches/README.md) describe measured boundaries, not deployment capacity guarantees.
 
 ## All guide pages
 
