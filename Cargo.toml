@@ -22,7 +22,6 @@ clippy-matrix = [
     { package = "solti", features = ["model-schema"] },
     { package = "solti", features = ["chain"] },
     { package = "solti", features = ["cron"] },
-    { package = "solti-cron", features = [] },
     { package = "solti", features = ["chain-schema"] },
     { package = "solti", features = ["api-core-adapter", "api-grpc-tls", "exec-subprocess"] },
     { package = "solti", features = ["api-core-adapter", "api-http", "discover-http", "exec-subprocess"] },
