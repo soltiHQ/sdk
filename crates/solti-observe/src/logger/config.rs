@@ -56,7 +56,8 @@ pub struct LoggerConfig {
     ///
     /// Colors are used only for text written to an interactive terminal.
     pub use_color: bool,
-    /// Prefix of the journald names of event and span fields; `None` writes the field names alone.
+    /// Prefix of the journald names of event and span fields; `None` or an empty prefix writes the
+    /// field names alone.
     ///
     /// Journald fields are uppercase, so the field `request_id` becomes `F_REQUEST_ID` with the
     /// default prefix and `REQUEST_ID` without one. A service whose operators filter the journal by

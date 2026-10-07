@@ -55,9 +55,14 @@ pub(super) fn logger_json(cfg: &LoggerConfig) -> Result<(), LoggerError> {
 #[cfg(all(feature = "journald", target_os = "linux"))]
 pub(super) fn logger_journald(cfg: &LoggerConfig) -> Result<(), LoggerError> {
     let filter = cfg.level.to_env_filter();
+    // An empty prefix would start every field with `_`, which journald drops; it means no prefix.
+    let prefix = cfg
+        .journald_field_prefix
+        .clone()
+        .filter(|prefix| !prefix.is_empty());
     let journald = tracing_journald::layer()
         .map_err(LoggerError::JournaldInitFailed)?
-        .with_field_prefix(cfg.journald_field_prefix.clone());
+        .with_field_prefix(prefix);
 
     let subscriber = tracing_subscriber::registry().with(filter).with(journald);
     init_subscriber(subscriber)

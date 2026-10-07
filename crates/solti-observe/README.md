@@ -50,13 +50,14 @@ For local text or JSON timestamps, `init_logger` detects the offset before globa
 
 ## Configuration
 
-| Field          | Default | Used by                                  |
-|----------------|---------|------------------------------------------|
-| `format`       | `Text`  | Backend selection                        |
-| `level`        | `info`  | Every backend                            |
-| `timezone`     | `Utc`   | Text and JSON timestamps                 |
-| `with_targets` | `true`  | Text and JSON event targets              |
-| `use_color`    | `true`  | Text output on an interactive terminal   |
+| Field                   | Default     | Used by                                               |
+|-------------------------|-------------|-------------------------------------------------------|
+| `format`                | `Text`      | Backend selection                                     |
+| `level`                 | `info`      | Every backend                                         |
+| `timezone`              | `Utc`       | Text and JSON timestamps                              |
+| `with_targets`          | `true`      | Text and JSON event targets                           |
+| `use_color`             | `true`      | Text output on an interactive terminal                |
+| `journald_field_prefix` | `Some("F")` | Journald field names; `None` or `""` drops the prefix |
 
 Missing Serde fields use these defaults. Unknown fields are rejected, including
 misspelled setting names.
