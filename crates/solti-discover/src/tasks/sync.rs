@@ -358,6 +358,7 @@ fn build_base_request(cfg: &DiscoverConfig) -> SyncRequest {
         api_version: cfg.agent_endpoint.api_version,
         heartbeat_interval_s: cfg.heartbeat_interval_s,
         capabilities: Some(capabilities_to_proto(&cfg.capabilities)),
+        schemas: Vec::new(),
     }
 }
 
@@ -379,6 +380,7 @@ fn capabilities_to_proto(capabilities: &AgentCapabilities) -> ProtoAgentCapabili
                     .map(|workload| ProtoWorkloadType {
                         api_version: workload.api_version().to_owned(),
                         kind: workload.kind().to_owned(),
+                        schema_fingerprint: String::new(),
                     })
                     .collect(),
             })

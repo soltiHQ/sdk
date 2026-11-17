@@ -148,6 +148,7 @@ mod tests {
                 success: true,
                 reason: String::new(),
                 retry_after_s: 0,
+                want_schemas: Vec::new(),
             })
             .is_ok()
         );
@@ -161,6 +162,7 @@ mod tests {
                 success: false,
                 reason: reason.into(),
                 retry_after_s,
+                want_schemas: Vec::new(),
             });
             match result {
                 Err(DiscoverError::Rejected {

@@ -293,6 +293,7 @@ mod tests {
                             success: true,
                             reason: String::new(),
                             retry_after_s: 0,
+                            want_schemas: Vec::new(),
                         }))
                     })
                 }
