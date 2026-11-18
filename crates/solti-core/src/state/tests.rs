@@ -10,8 +10,8 @@ use std::{
 };
 
 use solti_model::{
-    Annotations, ConditionStatus, EmbeddedSpec, Flag, LabelSelector, Labels, SubprocessMode,
-    SubprocessSpec, TaskEnv, TaskManifest, TaskSpec, TaskWorkload,
+    Annotations, ConditionStatus, EmbeddedSpec, LabelSelector, Labels, TaskManifest, TaskSpec,
+    TaskWorkload, Workload,
 };
 use tokio_stream::StreamExt;
 
@@ -2022,15 +2022,14 @@ fn each_run_snapshots_the_workload_gvk_of_its_generation() {
         Some(0),
     ));
 
-    let routed_workload = TaskWorkload::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Command {
-            command: "true".into(),
-            args: vec![],
-        },
-        TaskEnv::default(),
-        None,
-        Flag::enabled(),
-    ));
+    let routed_workload = TaskWorkload::Routed(
+        Workload::new(
+            "exec.solti.io/v1",
+            "Subprocess",
+            serde_json::json!({ "command": "true", "args": [] }),
+        )
+        .unwrap(),
+    );
     let desired = TaskManifest::new(
         first.name().clone(),
         TaskSpec::builder("slot", routed_workload, 1_000_u64)
@@ -2048,7 +2047,7 @@ fn each_run_snapshots_the_workload_gvk_of_its_generation() {
     assert_eq!(runs[0].workload().api_version(), "solti.io/v1");
     assert_eq!(runs[0].workload().kind(), "Embedded");
     assert_eq!(runs[1].generation(), 2);
-    assert_eq!(runs[1].workload().api_version(), "solti.io/v1");
+    assert_eq!(runs[1].workload().api_version(), "exec.solti.io/v1");
     assert_eq!(runs[1].workload().kind(), "Subprocess");
 }
 

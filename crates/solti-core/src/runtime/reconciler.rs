@@ -523,6 +523,14 @@ pub(crate) struct Reconciler {
 }
 
 impl Reconciler {
+    /// Checks a routed spec with the runner routing would pick for it.
+    pub(crate) fn validate_workload(
+        &self,
+        spec: &solti_model::TaskSpec,
+    ) -> Result<(), solti_runner::RouterError> {
+        self.router.validate(spec)
+    }
+
     pub(crate) fn new(
         output_hub: Arc<OutputHub>,
         handle: SupervisorHandle,

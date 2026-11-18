@@ -25,8 +25,8 @@ use bytes::Bytes;
 use serde_json::json;
 use solti_core::{SupervisorApi, TaskWatchSubscription};
 use solti_model::{
-    ConditionStatus, ExtensionWorkload, LabelSelector, Labels, OutputEvent, Task, TaskFilter,
-    TaskManifest, TaskPhase, TaskRunQuery, TaskSpec, TaskWorkload, WorkloadTypeMeta,
+    ConditionStatus, LabelSelector, Labels, OutputEvent, Task, TaskFilter, TaskManifest, TaskPhase,
+    TaskRunQuery, TaskSpec, TaskWorkload, WORKLOAD_SCHEMA_DIALECT, Workload, WorkloadDecl,
 };
 use solti_runner::{BuildContext, RunId, Runner, RunnerError, RunnerRouter};
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
@@ -41,7 +41,7 @@ const KIND: &str = "ImageResize";
 const FLOW: &str = r#"
 solti-core: routed workload and live output
 
-  ExtensionWorkload(media.example.io/v1, ImageResize)
+  Workload(media.example.io/v1, ImageResize)
                   + runnerSelector: accelerator=cpu
                                    │ create_task
                                    ▼
@@ -73,8 +73,19 @@ impl Runner for ImageResizeRunner {
         "image-resize"
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-        vec![WorkloadTypeMeta::new(API_VERSION, KIND).expect("valid extension GVK")]
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
+        let schema = json!({
+            "$schema": WORKLOAD_SCHEMA_DIALECT,
+            "type": "object",
+            "properties": {
+                "source": { "type": "string", "minLength": 1 },
+                "width": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["source", "width"]
+        });
+        vec![WorkloadDecl::new(API_VERSION, KIND, &schema, |workload| {
+            parse_resize(workload).map(|_| ())
+        })]
     }
 
     async fn build_task(
@@ -85,26 +96,10 @@ impl Runner for ImageResizeRunner {
         _cancellation: &solti_runner::BuildCancellation,
         _scope: &mut solti_runner::BuildScope,
     ) -> Result<TaskRef, RunnerError> {
-        let TaskWorkload::Extension(workload) = task.spec().workload() else {
+        let TaskWorkload::Routed(workload) = task.spec().workload() else {
             return Err(unsupported_workload(task.spec().workload()));
         };
-        if workload.api_version() != API_VERSION || workload.kind() != KIND {
-            return Err(unsupported_workload(task.spec().workload()));
-        }
-
-        let source = workload
-            .spec()
-            .get("source")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| RunnerError::InvalidSpec("source must be a non-empty string".into()))?
-            .to_owned();
-        let width = workload
-            .spec()
-            .get("width")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|value| *value > 0)
-            .ok_or_else(|| RunnerError::InvalidSpec("width must be greater than zero".into()))?;
+        let (source, width) = parse_resize(workload).map_err(RunnerError::InvalidSpec)?;
 
         let task_name = task.name().clone();
         let generation = task.metadata().generation();
@@ -139,6 +134,24 @@ impl Runner for ImageResizeRunner {
     }
 }
 
+/// The admission check and the build read the body the same way.
+fn parse_resize(workload: &Workload) -> Result<(String, u64), String> {
+    let source = workload
+        .body()
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("spec.source: must be a non-empty string")?
+        .to_owned();
+    let width = workload
+        .body()
+        .get("width")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or("spec.width: must be greater than zero")?;
+    Ok((source, width))
+}
+
 fn unsupported_workload(workload: &TaskWorkload) -> RunnerError {
     RunnerError::UnsupportedWorkload {
         runner: "image-resize".into(),
@@ -154,7 +167,7 @@ fn runner_labels() -> Labels {
 }
 
 fn manifest() -> ExampleResult<TaskManifest> {
-    let workload = TaskWorkload::Extension(ExtensionWorkload::new(
+    let workload = TaskWorkload::Routed(Workload::new(
         API_VERSION,
         KIND,
         json!({
