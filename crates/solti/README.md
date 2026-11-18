@@ -17,7 +17,7 @@ Default features are empty. Enable only the capabilities used by the binary:
 
 ```toml
 [dependencies]
-solti = { version = "0.0", features = ["api-core-adapter", "api-http", "chain", "core", "exec-subprocess"] }
+solti = { version = "0.1", features = ["api-core-adapter", "api-http", "chain", "core", "exec-subprocess"] }
 ```
 
 The `model` feature exposes runtime model types without JSON Schema dependencies.

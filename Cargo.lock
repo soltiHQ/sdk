@@ -2398,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "solti"
-version = "0.0.8"
+version = "0.1.0"
 dependencies = [
  "rcgen",
  "schemars",
@@ -2423,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "solti-api"
-version = "0.0.8"
+version = "0.1.0"
 dependencies = [
  "aide",
  "async-trait",
@@ -2458,7 +2458,7 @@ dependencies = [
 
 [[package]]
 name = "solti-chain"
-version = "0.0.8"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "jsonschema",
@@ -2475,7 +2475,7 @@ dependencies = [
 
 [[package]]
 name = "solti-core"
-version = "0.0.8"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "parking_lot",
@@ -2494,7 +2494,7 @@ dependencies = [
 
 [[package]]
 name = "solti-cron"
-version = "0.0.8"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2506,7 +2506,7 @@ dependencies = [
 
 [[package]]
 name = "solti-discover"
-version = "0.0.8"
+version = "0.1.0"
 dependencies = [
  "axum",
  "http-body-util",
@@ -2558,7 +2558,7 @@ dependencies = [
 
 [[package]]
 name = "solti-exec"
-version = "0.0.8"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2586,7 +2586,7 @@ dependencies = [
 
 [[package]]
 name = "solti-model"
-version = "0.0.8"
+version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2606,7 +2606,7 @@ dependencies = [
 
 [[package]]
 name = "solti-observe"
-version = "0.0.8"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2622,7 +2622,7 @@ dependencies = [
 
 [[package]]
 name = "solti-prometheus"
-version = "0.0.8"
+version = "0.1.0"
 dependencies = [
  "axum",
  "itoa",
@@ -2641,7 +2641,7 @@ dependencies = [
 
 [[package]]
 name = "solti-runner"
-version = "0.0.8"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2659,7 +2659,7 @@ dependencies = [
 
 [[package]]
 name = "solti-tls"
-version = "0.0.8"
+version = "0.1.0"
 dependencies = [
  "rcgen",
  "rustls",

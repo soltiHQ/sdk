@@ -1,7 +1,7 @@
 schema: 1
 product: sdk
 title: Solti SDK
-compatibility_line: "0.0"
+compatibility_line: "0.1"
 repository: https://github.com/soltiHQ/sdk
 
 version:
