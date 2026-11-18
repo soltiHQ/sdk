@@ -55,7 +55,7 @@ pub const MAX_SCHEMA_REGEX_SOURCE_BYTES: usize = 1024;
 /// Most bytes of source the regexes of one workload schema may take together.
 pub const MAX_SCHEMA_REGEX_SOURCE_BYTES_TOTAL: usize = 16 * 1024;
 
-/// Most times one regex may write `\p` or `\P`.
+/// Most times one regex may write `\p` or `\P`: Podium's `maxUnicodeClasses`.
 ///
 /// Podium counts each occurrence in the raw text as a Unicode class, even one
 /// that is not, such as the `\p` of `\\p`.
@@ -63,7 +63,10 @@ pub const MAX_SCHEMA_REGEX_UNICODE_ESCAPES: usize = 15;
 
 /// Most times the regexes of one workload schema may write `\p` or `\P`
 /// together.
-pub const MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL: usize = 62;
+///
+/// Podium charges each 833 ranges of parse work, within 128 000 for a schema:
+/// 153 fit, 154 do not.
+pub const MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL: usize = 153;
 
 /// Most instructions and class ranges the program of one regex may take, as
 /// Podium measures it.

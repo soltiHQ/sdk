@@ -2,21 +2,23 @@
 //!
 //! Podium compiles each `pattern` and each `patternProperties` key with Go's
 //! RE2 parser, after bounding it (`internal/workloadschema/regex.go` at commit
-//! 222f2b0). A regex is checked here in Podium's order, and refused if any of
+//! a1b7ee4). A regex is checked here in Podium's order, and refused if any of
 //! these refuse it:
 //!
 //! 1. **Its source:** at most [`MAX_SCHEMA_REGEX_SOURCE_BYTES`] bytes, and
 //!    [`MAX_SCHEMA_REGEX_SOURCE_BYTES_TOTAL`] for all the regexes of a schema.
-//! 2. **Podium's raw-text scans:**
-//!    - every `\p` or `\P` in the source counts as a Unicode class, even one
-//!      that is not: at most [`MAX_SCHEMA_REGEX_UNICODE_ESCAPES`] for a regex
-//!      and [`MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL`] for a schema. Podium
-//!      counts each as 2 048 ranges of parse work, within 32 000 for a regex
-//!      and 128 000 for a schema;
+//! 2. **Podium's raw-text scans** (its `scanPattern`), in its order:
 //!    - `(?` followed by `i`, `m`, `s`, `U` or `-` anywhere is refused, as an
 //!      inline flag group, even where it is none, such as in `[(?i)]` or
-//!      `\(?id`. So no regex here folds case, and Podium's estimate of
-//!      case-folding work never applies.
+//!      `\(?id`. So Go never folds case for a regex Podium accepts;
+//!    - every `\p` or `\P` in the source counts as a Unicode class, even one
+//!      that is not, such as the `\p` of `\\p`. Podium counts the larger of
+//!      this raw count and its structural scan's, which is always the raw one:
+//!      every class the scan finds starts with a raw `\p` or `\P`. At most
+//!      [`MAX_SCHEMA_REGEX_UNICODE_ESCAPES`] for a regex (`maxUnicodeClasses`),
+//!      and [`MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL`] for a schema: Podium
+//!      charges each class 833 ranges of parse work (`unicodeClassWork`),
+//!      within 128 000 for all (`maxSchemaPatternWork`).
 //! 3. **Its syntax:** it must parse with `regex-syntax` and be read the same way
 //!    by Go. Look-around, back-references, `\u`, `\Z`, flags, counts over
 //!    1 000 and stacked repetitions are refused, as Go refuses them; the
@@ -44,17 +46,15 @@ use super::{
     WorkloadSchemaErrorReason as Reason,
 };
 
-/// The parse work Podium counts for each `\p` or `\P` (`unicodeClassWork`).
-const UNICODE_CLASS_WORK: usize = 2_048;
-/// Podium's bound on the parse work of one regex (`maxPatternWork`).
-const MAX_PATTERN_WORK: usize = 32_000;
+/// The parse work Podium charges for each Unicode class (`unicodeClassWork`):
+/// the most ranges Go 1.27's parser appends for one `\p` or `\P`.
+const UNICODE_CLASS_WORK: usize = 833;
 /// Podium's bound on the parse work of a schema's regexes (`maxSchemaPatternWork`).
 const MAX_SCHEMA_PATTERN_WORK: usize = 128_000;
 
-// The escape limits are Podium's work bounds divided by the work of one escape.
+// The schema's limit on classes is Podium's work bound divided by the work of
+// one class: 153 × 833 = 127 449, and 154 × 833 = 128 282.
 const _: () = {
-    assert!(MAX_SCHEMA_REGEX_UNICODE_ESCAPES * UNICODE_CLASS_WORK <= MAX_PATTERN_WORK);
-    assert!((MAX_SCHEMA_REGEX_UNICODE_ESCAPES + 1) * UNICODE_CLASS_WORK > MAX_PATTERN_WORK);
     assert!(MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL * UNICODE_CLASS_WORK <= MAX_SCHEMA_PATTERN_WORK);
     assert!(
         (MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL + 1) * UNICODE_CLASS_WORK > MAX_SCHEMA_PATTERN_WORK
@@ -107,6 +107,11 @@ impl RegexBudget {
             });
         }
 
+        // Podium's raw-text scans: an inline flag group first, then the
+        // Unicode classes.
+        if has_inline_flags(pattern) {
+            return Err(invalid(pattern, INLINE_FLAGS));
+        }
         let escapes = pattern.matches("\\p").count() + pattern.matches("\\P").count();
         if escapes > MAX_SCHEMA_REGEX_UNICODE_ESCAPES {
             return Err(Reason::RegexTooManyUnicodeEscapes {
@@ -121,10 +126,6 @@ impl RegexBudget {
                 count: self.unicode_escapes,
                 limit: MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL,
             });
-        }
-
-        if has_inline_flags(pattern) {
-            return Err(invalid(pattern, INLINE_FLAGS));
         }
 
         let size = instructions(pattern)?;
@@ -1802,7 +1803,7 @@ mod tests {
     #[test]
     fn podium_counts_every_backslash_p_of_the_source() {
         assert_eq!(MAX_SCHEMA_REGEX_UNICODE_ESCAPES, 15);
-        assert_eq!(MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL, 62);
+        assert_eq!(MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL, 153);
 
         // `\\p` is a backslash and a `p`, which Podium still counts as a
         // Unicode class escape.
@@ -1817,13 +1818,24 @@ mod tests {
             }
         );
 
-        WorkloadSchema::from_value(&patterns(4, &escapes(15))).unwrap();
-        let err = WorkloadSchema::from_value(&patterns(5, &escapes(15))).unwrap_err();
+        // Podium charges 833 ranges for each, within 128 000 for a schema.
+        WorkloadSchema::from_value(&patterns(5, &escapes(15))).unwrap();
+        // Ten patterns of 15, then `q` with the rest: 153 fit, 154 do not.
+        let schema = |last: usize| {
+            let mut properties: Map<String, Value> = (0..10)
+                .map(|i| (format!("p{i}"), json!({ "pattern": escapes(15) })))
+                .collect();
+            properties.insert("q".to_owned(), json!({ "pattern": escapes(last) }));
+            json!({ "properties": properties })
+        };
+        WorkloadSchema::from_value(&schema(3)).unwrap();
+        let err = WorkloadSchema::from_value(&schema(4)).unwrap_err();
+        assert_eq!(err.location, "#/properties/q");
         assert_eq!(
             err.reason,
             Reason::SchemaRegexesTooManyUnicodeEscapes {
-                count: 75,
-                limit: 62
+                count: 154,
+                limit: 153
             }
         );
     }
