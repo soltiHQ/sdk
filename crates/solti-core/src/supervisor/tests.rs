@@ -4764,9 +4764,16 @@ async fn a_refused_write_commits_nothing() {
     };
     let api = api_with_one_runner(decl, &builds).await;
     let accepted = api.create_task(routed("kept", 1_000)).await.unwrap();
+    // The first write keeps progressing (starting, running, finished) after it is observed.
+    // Snapshot only once the immediate task has finished, so the comparison below sees what
+    // a refused write could change, not the earlier write's runtime progress.
     wait_for_observed(&api, accepted.name(), 1).await;
-    let before = api.get_task(accepted.name()).unwrap();
+    let before = wait_for_task(&api, accepted.name(), |task| {
+        task.status().phase() == TaskPhase::Succeeded
+    })
+    .await;
     let builds_before = builds.load(Ordering::Acquire);
+    assert_eq!(builds_before, 1);
     reject.store(true, Ordering::Release);
 
     api.apply_task(routed("kept", 2_000)).await.unwrap_err();
