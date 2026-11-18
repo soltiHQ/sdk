@@ -1231,5 +1231,12 @@ async fn apply_task_refuses_a_typed_workload_from_an_old_client_as_a_missing_bod
         "the status must name the body field: {}",
         status.message()
     );
+    assert!(
+        status
+            .message()
+            .contains("removed in Task API contract 0.2"),
+        "the status must say that the typed fields were removed: {}",
+        status.message()
+    );
     assert!(handler.last_preconditions.lock().unwrap().is_none());
 }

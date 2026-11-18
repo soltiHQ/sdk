@@ -79,18 +79,18 @@ The `spec` must be a JSON object, nested at most 128 levels deep.
 The transports do not interpret the body.
 The runner that declares the GVK checks it against its schema at admission.
 
-The typed gRPC `subprocess`, `wasm` and `container` variants were removed in Task API contract 0.2.
-A request that still sets one is refused with `InvalidArgument`:
-`typed workload `<name>` was removed in Task API contract 0.2; send the body in TaskWorkload.extension.spec.raw`.
-A gRPC workload with no `extension.spec.raw` is refused with
-`missing workload body: set TaskWorkload.extension.spec.raw`.
+The typed gRPC `subprocess`, `wasm` and `container` fields were removed in Task API contract 0.2; their field numbers and names are reserved.
+An old client that still sets one sends a field this contract does not know: it is skipped, and the workload arrives without a body.
+A gRPC workload with no `extension.spec.raw`, an old client's included, is refused with `InvalidArgument`:
+`missing workload body: set TaskWorkload.extension.spec.raw (the typed subprocess, wasm and container fields were removed in Task API contract 0.2)`.
 
 `chain.solti.io/v1alpha1`, kind `Chain`, uses this extension boundary.
 HTTP places the Chain object directly in `Task.spec.workload.spec`.
 gRPC places the UTF-8 JSON bytes of that same Chain spec in `extension.spec.raw`.
 
 The transports validate the GVK and require an object payload.
-The Chain runner validates its entry, steps, transitions, reachability, and acyclicity when core reconciles the Task.
+Through `SupervisorApiAdapter`, core admits the Task before it stores anything: the Chain runner validates its entry, steps, transitions, reachability, and acyclicity, and checks each step's workload with the runner that would run it.
+A refusal is `InvalidArgument` over gRPC and `400` over HTTP, and nothing is stored.
 Chain remains one outer Task, existing Task status, run history, and output messages require no extra fields.
 
 The built-in `solti.io/v1` `Embedded` workload is SDK-only.

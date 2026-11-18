@@ -7,7 +7,12 @@ use solti_model::{TaskWorkload, Workload};
 
 use crate::{error::ApiError, proto_api};
 
-const MISSING_BODY: &str = "missing workload body: set TaskWorkload.extension.spec.raw";
+/// Also what an old client gets for a typed workload: its field is unknown here, so the
+/// workload arrives without a body.
+const MISSING_BODY: &str = concat!(
+    "missing workload body: set TaskWorkload.extension.spec.raw (the typed subprocess, ",
+    "wasm and container fields were removed in Task API contract 0.2)"
+);
 
 pub(super) fn workload_to_proto(
     workload: &TaskWorkload,
@@ -148,11 +153,18 @@ mod tests {
             message.contains("extension.spec.raw"),
             "the refusal must name the body field: {message}"
         );
+        assert!(
+            message.contains("removed in Task API contract 0.2"),
+            "the refusal must say that the typed fields were removed: {message}"
+        );
     }
 
     #[test]
     fn grpc_refuses_a_missing_or_non_object_body() {
-        let missing = "missing workload body: set TaskWorkload.extension.spec.raw";
+        let missing = concat!(
+            "missing workload body: set TaskWorkload.extension.spec.raw (the typed subprocess, ",
+            "wasm and container fields were removed in Task API contract 0.2)"
+        );
 
         let no_oneof = proto_api::TaskWorkload {
             api_version: "tasks.example.io/v1".into(),
