@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use solti_model::{Flag, ModelError, ModelResult, TaskEnv, WorkloadBody};
 
 use crate::EXEC_API_VERSION;
+use crate::registration::at_field as at;
+use crate::subprocess::backend::validate_env_name;
+use crate::subprocess::task::{reject_nul, validate_env_value};
 
 /// Kind of the subprocess workload under [`EXEC_API_VERSION`].
 pub const SUBPROCESS_KIND: &str = "Subprocess";
@@ -290,13 +293,49 @@ impl WorkloadBody for SubprocessSpec {
     const API_VERSION: &'static str = EXEC_API_VERSION;
     const KIND: &'static str = SUBPROCESS_KIND;
 
-    /// Validates the subprocess mode and the wire-facing cwd.
+    /// Validates the subprocess mode, the wire-facing cwd, and what the runner hands to the
+    /// operating system.
     ///
     /// The mode must be valid. `cwd` must be valid UTF-8, since it travels as JSON text.
+    /// The command or interpreter, the arguments, `cwd` and the environment values must hold
+    /// no NUL byte, and each environment name must be non-empty and hold no `=` or NUL: the
+    /// rules the runner applies when it builds the task, so admission refuses what the build
+    /// would. These refusals name the field, as `spec.env[0].key: …`.
     fn validate(&self) -> Result<(), String> {
         self.mode.validate().map_err(|error| error.to_string())?;
+        let (program_path, program, args_path, args) = match &self.mode {
+            SubprocessMode::Command { command, args } => {
+                ("mode.command.command", command, "mode.command.args", args)
+            }
+            SubprocessMode::Script {
+                interpreter, args, ..
+            } => (
+                "mode.script.interpreter",
+                interpreter,
+                "mode.script.args",
+                args,
+            ),
+        };
+        at(program_path, reject_nul("subprocess command", program))?;
+        for (index, arg) in args.iter().enumerate() {
+            at(
+                format_args!("{args_path}[{index}]"),
+                reject_nul("subprocess argument", arg),
+            )?;
+        }
         if let Some(cwd) = &self.cwd {
             validate_wire_path("subprocess cwd", cwd)?;
+            at("cwd", reject_nul("subprocess cwd", &cwd.to_string_lossy()))?;
+        }
+        for (index, entry) in self.env.iter().enumerate() {
+            at(
+                format_args!("env[{index}].key"),
+                validate_env_name(entry.key()),
+            )?;
+            at(
+                format_args!("env[{index}].value"),
+                validate_env_value(entry.key(), entry.value()),
+            )?;
         }
         Ok(())
     }
@@ -506,6 +545,80 @@ mod tests {
             error.message().contains("command cannot be empty"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn spec_validation_refuses_process_input_the_build_refuses() {
+        for (body, expected) in [
+            (
+                serde_json::json!({
+                    "mode": {"command": {"command": "echo"}},
+                    "env": [{"key": "A=B", "value": "1"}],
+                }),
+                "spec.env[0].key: invalid environment variable name \"A=B\"",
+            ),
+            (
+                serde_json::json!({
+                    "mode": {"command": {"command": "echo"}},
+                    "env": [{"key": "A", "value": "1"}, {"key": "", "value": "1"}],
+                }),
+                "spec.env[1].key: environment variable name cannot be empty",
+            ),
+            (
+                serde_json::json!({
+                    "mode": {"command": {"command": "echo"}},
+                    "env": [{"key": "A", "value": "1\u{0}"}],
+                }),
+                "spec.env[0].value: environment variable \"A\" contains a NUL value",
+            ),
+            (
+                serde_json::json!({"mode": {"command": {"command": "echo", "args": ["a", "b\u{0}"]}}}),
+                "spec.mode.command.args[1]: subprocess argument contains NUL",
+            ),
+            (
+                serde_json::json!({"mode": {"command": {"command": "ec\u{0}ho"}}}),
+                "spec.mode.command.command: subprocess command contains NUL",
+            ),
+            (
+                serde_json::json!({
+                    "mode": {"script": {"interpreter": "bash", "body": "ZWNobyBoaQ==", "args": ["\u{0}"]}},
+                }),
+                "spec.mode.script.args[0]: subprocess argument contains NUL",
+            ),
+            (
+                serde_json::json!({"mode": {"script": {"interpreter": "ba\u{0}sh", "body": "ZWNobyBoaQ=="}}}),
+                "spec.mode.script.interpreter: subprocess command contains NUL",
+            ),
+            (
+                serde_json::json!({"mode": {"command": {"command": "echo"}}, "cwd": "/work\u{0}"}),
+                "spec.cwd: subprocess cwd contains NUL",
+            ),
+        ] {
+            let error = routed_body(body.clone())
+                .decode::<SubprocessSpec>()
+                .unwrap_err();
+            assert_eq!(error.kind(), &WorkloadBodyErrorKind::Invalid, "{body}");
+            assert!(error.message().starts_with(expected), "{body}: {error}");
+        }
+    }
+
+    #[test]
+    fn spec_validation_accepts_process_input_the_build_accepts() {
+        for body in [
+            serde_json::json!({
+                "mode": {"command": {"command": "echo", "args": ["a=b", ""]}},
+                "env": [{"key": "A_B", "value": "x=y"}, {"key": "EMPTY", "value": ""}],
+                "cwd": "/work",
+            }),
+            serde_json::json!({
+                "mode": {"script": {"interpreter": "bash", "body": "ZWNobyBoaQ==", "args": ["x"]}},
+                "env": [{"key": "PATH", "value": "/usr/bin:/bin"}],
+            }),
+        ] {
+            routed_body(body.clone())
+                .decode::<SubprocessSpec>()
+                .unwrap_or_else(|error| panic!("{body}: {error}"));
+        }
     }
 
     #[cfg(unix)]

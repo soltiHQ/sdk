@@ -21,6 +21,7 @@ use super::{
     ContainerAttempt, ContainerEngine, ContainerEngineBinding, ContainerEngineError,
     ContainerErrorClass, ContainerExitStatus, ContainerOwnershipContract, ContainerRequest,
     ContainerRunnerConfig, ContainerSpec,
+    spec::{validate_env_name, validate_env_value, validate_process_word},
 };
 use crate::{
     output::{LogConfig, OutputDrain, OutputTasks, StreamKind, log_stream},
@@ -177,24 +178,22 @@ impl Runner for ContainerRunner {
     }
 }
 
+/// Applies [`ContainerSpec`]'s process-input rules to the task's input and the runner's
+/// environment, which admission does not see.
 fn validate_process_input(
     command: Option<&[String]>,
     args: &[String],
     task_env: &solti_model::TaskEnv,
     build: &BuildContext,
 ) -> Result<(), RunnerError> {
-    if command
+    command
         .into_iter()
         .flatten()
         .chain(args)
-        .any(|value| value.contains('\0'))
-    {
-        return Err(RunnerError::InvalidSpec(
-            "container command and arguments cannot contain NUL".into(),
-        ));
-    }
+        .try_for_each(|value| validate_process_word(value))
+        .map_err(RunnerError::InvalidSpec)?;
 
-    for entry in task_env
+    for (name, value) in task_env
         .into_iter()
         .map(|entry| (entry.key(), entry.value()))
         .chain(
@@ -204,17 +203,8 @@ fn validate_process_input(
                 .map(|entry| (entry.key(), entry.value())),
         )
     {
-        let (name, value) = entry;
-        if name.is_empty() || name.contains(['=', '\0']) {
-            return Err(RunnerError::InvalidSpec(format!(
-                "invalid container environment variable name {name:?}"
-            )));
-        }
-        if value.contains('\0') {
-            return Err(RunnerError::InvalidSpec(format!(
-                "container environment variable {name:?} contains NUL"
-            )));
-        }
+        validate_env_name(name).map_err(RunnerError::InvalidSpec)?;
+        validate_env_value(name, value).map_err(RunnerError::InvalidSpec)?;
     }
     Ok(())
 }

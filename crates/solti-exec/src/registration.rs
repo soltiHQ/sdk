@@ -25,6 +25,15 @@ pub(crate) fn validate_runner_name(name: &str) -> Result<(), crate::ExecError> {
     }
 }
 
+/// Prefixes a body check's refusal with the path of the offending field below `spec`, as
+/// `spec.<path>: <reason>`.
+pub(crate) fn at_field(
+    path: impl std::fmt::Display,
+    result: Result<(), String>,
+) -> Result<(), String> {
+    result.map_err(|reason| format!("spec.{path}: {reason}"))
+}
+
 /// Decodes the body of the workload a runner is asked to build.
 ///
 /// A workload of another type, or an embedded one, is [`solti_runner::RunnerError::UnsupportedWorkload`].

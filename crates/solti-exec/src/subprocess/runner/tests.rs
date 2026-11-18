@@ -1680,6 +1680,61 @@ fn subprocess_check_refuses_a_script_over_the_runner_limit() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn subprocess_check_refuses_the_process_input_the_build_refuses() {
+    let runner = SubprocessRunner::new("test").unwrap();
+    let declared = runner.workload_types().remove(0);
+    for (body, path) in [
+        (
+            serde_json::json!({
+                "mode": {"command": {"command": "echo"}},
+                "env": [{"key": "A=B", "value": "1"}],
+            }),
+            "spec.env[0].key: ",
+        ),
+        (
+            serde_json::json!({
+                "mode": {"command": {"command": "echo"}},
+                "env": [{"key": "", "value": "1"}],
+            }),
+            "spec.env[0].key: ",
+        ),
+        (
+            serde_json::json!({"mode": {"command": {"command": "echo", "args": ["a\u{0}b"]}}}),
+            "spec.mode.command.args[0]: ",
+        ),
+    ] {
+        let workload =
+            solti_model::Workload::new(crate::EXEC_API_VERSION, "Subprocess", body.clone())
+                .unwrap();
+        let reason = declared.check(&workload).unwrap_err();
+        assert!(reason.starts_with(path), "{body}: {reason}");
+        assert!(!reason.contains("exec.solti.io"), "{reason}");
+
+        let task = task_with_workload("refused", TaskWorkload::Routed(workload));
+        match build_with_run_id(&runner, &task, &BuildContext::default()).await {
+            Err(RunnerError::InvalidSpec(message)) => {
+                assert!(message.contains(path), "{body}: {message}");
+            }
+            Err(other) => panic!("expected InvalidSpec, got {other:?}"),
+            Ok(_) => panic!("{body}: the build accepted it"),
+        }
+    }
+
+    let valid = solti_model::Workload::new(
+        crate::EXEC_API_VERSION,
+        "Subprocess",
+        serde_json::json!({
+            "mode": {"command": {"command": "echo", "args": ["a=b"]}},
+            "env": [{"key": "A_B", "value": "x=y"}],
+        }),
+    )
+    .unwrap();
+    declared
+        .check(&valid)
+        .expect("a valid body passes the check");
+}
+
 #[test]
 fn subprocess_check_reports_a_decode_failure_without_the_gvk() {
     let declared = SubprocessRunner::new("test")

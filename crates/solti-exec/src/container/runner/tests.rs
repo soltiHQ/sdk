@@ -1431,6 +1431,96 @@ fn container_runner_declares_exec_container_with_a_schema_inside_the_subset() {
     assert!(reason.contains("container image"), "{reason}");
 }
 
+#[tokio::test]
+async fn container_check_refuses_the_process_input_the_build_refuses() {
+    let (engine, _) = FakeEngine::new(0);
+    let runner = ContainerRunner::new("input", drop_releasing_engine(engine)).unwrap();
+    let declared = runner.workload_types().remove(0);
+    for (body, expected) in [
+        (
+            serde_json::json!({"image": "x", "env": [{"key": "A=B", "value": "1"}]}),
+            "spec.env[0].key: invalid container environment variable name \"A=B\"",
+        ),
+        (
+            serde_json::json!({"image": "x", "env": [{"key": "A", "value": "1"}, {"key": "", "value": "1"}]}),
+            "spec.env[1].key: invalid container environment variable name \"\"",
+        ),
+        (
+            serde_json::json!({"image": "x", "env": [{"key": "A", "value": "1\u{0}"}]}),
+            "spec.env[0].value: container environment variable \"A\" contains NUL",
+        ),
+        (
+            serde_json::json!({"image": "x", "args": ["ok", "a\u{0}b"]}),
+            "spec.args[1]: container command and arguments cannot contain NUL",
+        ),
+        (
+            serde_json::json!({"image": "x", "command": ["s\u{0}h"]}),
+            "spec.command[0]: container command and arguments cannot contain NUL",
+        ),
+    ] {
+        let workload = Workload::new(EXEC_API_VERSION, "Container", body.clone()).unwrap();
+        let reason = declared.check(&workload).unwrap_err();
+        assert!(reason.starts_with(expected), "{body}: {reason}");
+
+        let resource = task_with_body(body.clone(), EXEC_API_VERSION, "Container");
+        match build_result(&runner, &resource).await {
+            Err(RunnerError::InvalidSpec(message)) => {
+                assert!(message.contains(expected), "{body}: {message}");
+            }
+            Err(other) => panic!("expected InvalidSpec, got {other:?}"),
+            Ok(_) => panic!("{body}: the build accepted it"),
+        }
+    }
+
+    let valid = Workload::new(
+        EXEC_API_VERSION,
+        "Container",
+        serde_json::json!({
+            "image": "x",
+            "command": ["sh"],
+            "args": ["-c", "a=b"],
+            "env": [{"key": "A_B", "value": "x=y"}, {"key": "EMPTY", "value": ""}],
+        }),
+    )
+    .unwrap();
+    declared
+        .check(&valid)
+        .expect("a valid body passes the check");
+}
+
+#[tokio::test]
+async fn container_build_still_refuses_an_invalid_runner_environment() {
+    let (engine, _) = FakeEngine::new(0);
+    let runner = ContainerRunner::new("runner-env", drop_releasing_engine(engine)).unwrap();
+    let resource = task_with_body(
+        serde_json::json!({"image": "x", "env": [{"key": "A", "value": "1"}]}),
+        EXEC_API_VERSION,
+        "Container",
+    );
+    let mut env = solti_runner::RunnerEnv::new();
+    env.push("B=C", "1");
+    let context = BuildContext::default().with_env(env);
+    let run_id = solti_runner::make_run_id(runner.name(), resource.slot().as_str());
+    let mut scope = solti_runner::BuildScope::unmanaged(runner.name());
+    match runner
+        .build_task(
+            &resource,
+            &run_id,
+            &context,
+            &solti_runner::BuildCancellation::new(),
+            &mut scope,
+        )
+        .await
+    {
+        Err(RunnerError::InvalidSpec(message)) => assert_eq!(
+            message,
+            "invalid container environment variable name \"B=C\""
+        ),
+        Err(other) => panic!("expected InvalidSpec, got {other:?}"),
+        Ok(_) => panic!("the build accepted a runner environment name with '='"),
+    }
+}
+
 fn task_with_body(body: serde_json::Value, api_version: &str, kind: &str) -> Task {
     let workload = TaskWorkload::Routed(Workload::new(api_version, kind, body).unwrap());
     let spec = TaskSpec::builder("container-slot", workload, 5_000_u64)
