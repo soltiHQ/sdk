@@ -14,14 +14,12 @@ use std::{
     time::Duration,
 };
 
+use solti_exec::subprocess::{SubprocessMode, SubprocessSpec};
 use solti_exec::{
     host::{CgroupLimits, HostProcessPolicy, SeccompPolicy, SecurityConfig},
     subprocess::{SubprocessBackendConfig, register_subprocess_runner_with_backend},
 };
-use solti_model::{
-    Flag, OutputEvent, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskId, TaskSpec,
-    TaskWorkload,
-};
+use solti_model::{Flag, OutputEvent, Task, TaskEnv, TaskId, TaskSpec, TaskWorkload};
 use solti_runner::{OutputPublisher, OutputPublisherHandle, OutputSink, RunnerRouter};
 use taskvisor::TaskContext;
 
@@ -120,7 +118,7 @@ async fn public_linux_host_policy_is_enforced() -> TestResult {
                 .to_str()
                 .ok_or("SOLTI_TEST_CGROUP_PARENT must be valid UTF-8")?,
         );
-        let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+        let workload = TaskWorkload::from_body(&SubprocessSpec::new(
             SubprocessMode::Command {
                 command: child_command.clone(),
                 args: vec![
@@ -134,7 +132,8 @@ async fn public_linux_host_policy_is_enforced() -> TestResult {
             env,
             None,
             Flag::enabled(),
-        ));
+        ))
+        .unwrap();
         let spec = TaskSpec::builder("linux-host-runtime", workload, 30_000_u64).build()?;
         let task = Task::new("linux-host-runtime", spec)?;
         let built = router.build(&task).await?;

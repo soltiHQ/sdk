@@ -1,5 +1,6 @@
 use super::*;
 use crate::output::OutputReaderFailure;
+use solti_model::TaskWorkload;
 use std::{
     pin::Pin,
     sync::Mutex,
@@ -641,15 +642,16 @@ fn mk_command_spec(
 ) -> Task {
     let spec = solti_model::TaskSpec::builder(
         slot,
-        TaskWorkload::Subprocess(SubprocessSpec::new(
-            solti_model::SubprocessMode::Command {
+        TaskWorkload::from_body(&SubprocessSpec::new(
+            SubprocessMode::Command {
                 command: command.into(),
                 args: args.iter().map(|s| s.to_string()).collect(),
             },
             env,
             cwd,
             Default::default(),
-        )),
+        ))
+        .unwrap(),
         5_000u64,
     )
     .restart(solti_model::RestartPolicy::Never)
@@ -675,8 +677,8 @@ fn mk_script_spec_with_interpreter(
 
     let spec = solti_model::TaskSpec::builder(
         slot,
-        TaskWorkload::Subprocess(SubprocessSpec::new(
-            solti_model::SubprocessMode::Script {
+        TaskWorkload::from_body(&SubprocessSpec::new(
+            SubprocessMode::Script {
                 interpreter: interpreter.into(),
                 body: BASE64.encode(body),
                 args: args.iter().map(|s| s.to_string()).collect(),
@@ -684,7 +686,8 @@ fn mk_script_spec_with_interpreter(
             Default::default(),
             None,
             Default::default(),
-        )),
+        ))
+        .unwrap(),
         5_000u64,
     )
     .restart(solti_model::RestartPolicy::Never)
@@ -738,15 +741,16 @@ fn cwd_pinning_does_not_use_tokio_blocking_workers() {
             let directory = tempfile::TempDir::new().unwrap();
             let spec = solti_model::TaskSpec::builder(
                 "dedicated-cwd",
-                TaskWorkload::Subprocess(SubprocessSpec::new(
-                    solti_model::SubprocessMode::Command {
+                TaskWorkload::from_body(&SubprocessSpec::new(
+                    SubprocessMode::Command {
                         command: "true".into(),
                         args: Vec::new(),
                     },
                     Default::default(),
                     Some(directory.path().to_path_buf()),
                     Default::default(),
-                )),
+                ))
+                .unwrap(),
                 5_000_u64,
             )
             .build()
@@ -1494,15 +1498,16 @@ async fn tracing_does_not_record_subprocess_process_inputs() {
 
     let spec = solti_model::TaskSpec::builder(
         "trace-secret",
-        TaskWorkload::Subprocess(SubprocessSpec::new(
-            solti_model::SubprocessMode::Command {
+        TaskWorkload::from_body(&SubprocessSpec::new(
+            SubprocessMode::Command {
                 command: format!("https://user:{COMMAND_SECRET}@host.invalid/tool\n{FORGED}"),
                 args: vec![format!("--token={ARG_SECRET}")],
             },
             solti_model::TaskEnv::single("SECRET_TOKEN", ENV_SECRET),
             None,
             Default::default(),
-        )),
+        ))
+        .unwrap(),
         5_000u64,
     )
     .restart(solti_model::RestartPolicy::Never)
@@ -1554,13 +1559,142 @@ async fn build_task_rejects_non_subprocess_kind() {
 }
 
 #[test]
-fn workload_types_declares_subprocess() {
+fn subprocess_runner_declares_exec_subprocess_with_a_schema_inside_the_subset() {
     let runner = SubprocessRunner::new("test").unwrap();
-    let task = mk_subprocess_spec("s", "echo");
-    assert_eq!(
-        runner.workload_types(),
-        vec![task.spec().workload().type_meta()]
+    let declared = runner.workload_types();
+    assert_eq!(declared.len(), 1);
+    assert_eq!(declared[0].api_version(), crate::EXEC_API_VERSION);
+    assert_eq!(declared[0].api_version(), "exec.solti.io/v1");
+    assert_eq!(declared[0].kind(), "Subprocess");
+    declared[0]
+        .workload_type()
+        .expect("the generated schema is inside Podium's subset");
+}
+
+fn routed_json(body: serde_json::Value) -> TaskWorkload {
+    TaskWorkload::Routed(
+        solti_model::Workload::new(crate::EXEC_API_VERSION, "Subprocess", body).unwrap(),
+    )
+}
+
+fn task_with_workload(slot: &str, workload: TaskWorkload) -> Task {
+    let spec = solti_model::TaskSpec::builder(slot, workload, 5_000u64)
+        .restart(solti_model::RestartPolicy::Never)
+        .backoff(mk_backoff())
+        .admission(solti_model::AdmissionPolicy::DropIfRunning)
+        .build()
+        .unwrap();
+    Task::new(format!("task-{slot}"), spec).unwrap()
+}
+
+#[tokio::test]
+async fn subprocess_runner_builds_from_a_routed_body() {
+    let runner = SubprocessRunner::new("test").unwrap();
+    let task = task_with_workload(
+        "routed",
+        routed_json(serde_json::json!({
+            "mode": {"command": {"command": "echo", "args": ["hi"]}},
+            "failOnNonZero": false,
+        })),
     );
+    build_with_run_id(&runner, &task, &BuildContext::default())
+        .await
+        .expect("a routed exec.solti.io/v1 Subprocess body builds");
+}
+
+#[tokio::test]
+async fn subprocess_runner_refuses_another_type() {
+    let runner = SubprocessRunner::new("test").unwrap();
+    for (api_version, kind) in [
+        ("exec.solti.io/v1", "Container"),
+        ("exec.solti.io/v2", "Subprocess"),
+        ("example.com/v1", "Subprocess"),
+    ] {
+        let workload = TaskWorkload::Routed(
+            solti_model::Workload::new(api_version, kind, serde_json::json!({})).unwrap(),
+        );
+        let task = task_with_workload("other", workload);
+        match build_with_run_id(&runner, &task, &BuildContext::default()).await {
+            Err(RunnerError::UnsupportedWorkload {
+                api_version: got_version,
+                kind: got_kind,
+                ..
+            }) => {
+                assert_eq!(got_version, api_version);
+                assert_eq!(got_kind, kind);
+            }
+            Err(other) => panic!("expected UnsupportedWorkload, got {other:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn subprocess_runner_reports_a_body_that_bypassed_admission_as_invalid_spec() {
+    let runner = SubprocessRunner::new("test").unwrap();
+    for body in [
+        serde_json::json!({"mode": {"command": {"command": " "}}}),
+        serde_json::json!({"mode": {"command": {"command": "x"}}, "extra": true}),
+    ] {
+        let task = task_with_workload("invalid", routed_json(body));
+        match build_with_run_id(&runner, &task, &BuildContext::default()).await {
+            Err(RunnerError::InvalidSpec(message)) => assert!(!message.is_empty()),
+            Err(other) => panic!("expected InvalidSpec, got {other:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+}
+
+#[test]
+fn subprocess_check_refuses_a_script_over_the_runner_limit() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let runner = SubprocessRunner::with_config(
+        "limited",
+        SubprocessBackendConfig::new().with_max_script_body_bytes(4),
+    )
+    .unwrap();
+    let declared = runner.workload_types().remove(0);
+    let script = |text: &str| {
+        solti_model::Workload::new(
+            crate::EXEC_API_VERSION,
+            "Subprocess",
+            serde_json::json!({
+                "mode": {"script": {"interpreter": "bash", "body": BASE64.encode(text)}}
+            }),
+        )
+        .unwrap()
+    };
+
+    declared.check(&script("1234")).expect("at the limit");
+    let reason = declared.check(&script("12345")).unwrap_err();
+    assert!(reason.contains("maximum allowed is 4 bytes"), "{reason}");
+
+    // The default limit is the type's own cap: a runner without a lower limit accepts a small script.
+    let default_runner = SubprocessRunner::new("default").unwrap();
+    default_runner
+        .workload_types()
+        .remove(0)
+        .check(&script("12345"))
+        .unwrap();
+}
+
+#[test]
+fn subprocess_check_reports_a_decode_failure_without_the_gvk() {
+    let declared = SubprocessRunner::new("test")
+        .unwrap()
+        .workload_types()
+        .remove(0);
+    let workload = solti_model::Workload::new(
+        crate::EXEC_API_VERSION,
+        "Subprocess",
+        serde_json::json!({"mode": {"command": {"command": "x"}}, "extra": true}),
+    )
+    .unwrap();
+    let reason = declared.check(&workload).unwrap_err();
+    assert!(reason.starts_with("spec"), "{reason}");
+    assert!(!reason.contains("exec.solti.io"), "{reason}");
 }
 
 #[tokio::test]
@@ -1873,11 +2007,12 @@ async fn script_task_can_be_spawned_repeatedly() {
 
 #[test]
 fn resolve_mode_command() {
-    let mode = solti_model::SubprocessMode::Command {
+    let mode = SubprocessMode::Command {
         command: "ls".into(),
         args: vec!["-la".into()],
     };
-    let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap();
+    let r =
+        SubprocessRunner::resolve_mode(&mode, crate::subprocess::MAX_SCRIPT_BODY_BYTES).unwrap();
     assert_eq!(r.command, "ls");
     assert_eq!(r.args, vec!["-la"]);
     assert!(r.script_body.is_none(), "Command mode carries no script");
@@ -1888,12 +2023,13 @@ fn resolve_mode_script_defers_transport_to_run_time() {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
 
-    let mode = solti_model::SubprocessMode::Script {
+    let mode = SubprocessMode::Script {
         interpreter: "bash".into(),
         body: BASE64.encode(b"echo hello"),
         args: vec!["extra".into()],
     };
-    let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap();
+    let r =
+        SubprocessRunner::resolve_mode(&mode, crate::subprocess::MAX_SCRIPT_BODY_BYTES).unwrap();
     assert_eq!(r.command, "bash");
     assert_eq!(
         r.args,
@@ -1910,12 +2046,13 @@ fn resolve_mode_script_uses_explicit_interpreter() {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
 
-    let mode = solti_model::SubprocessMode::Script {
+    let mode = SubprocessMode::Script {
         interpreter: "ruby".into(),
         body: BASE64.encode(b"puts 'hi'"),
         args: vec![],
     };
-    let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap();
+    let r =
+        SubprocessRunner::resolve_mode(&mode, crate::subprocess::MAX_SCRIPT_BODY_BYTES).unwrap();
     assert_eq!(r.command, "ruby");
     assert!(r.args.is_empty());
     assert!(r.script_body.is_some());
@@ -2107,13 +2244,13 @@ async fn force_aborting_outer_attempt_aborts_blocked_readers_and_closes_pipe_end
 
 #[test]
 fn resolve_mode_invalid_base64() {
-    let mode = solti_model::SubprocessMode::Script {
+    let mode = SubprocessMode::Script {
         interpreter: "bash".into(),
         body: "not-valid!!!".into(),
         args: vec![],
     };
-    let err =
-        SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap_err();
+    let err = SubprocessRunner::resolve_mode(&mode, crate::subprocess::MAX_SCRIPT_BODY_BYTES)
+        .unwrap_err();
     assert!(matches!(err, RunnerError::InvalidSpec(_)));
 }
 
@@ -2247,12 +2384,12 @@ fn resolve_mode_script_accepts_large_body() {
         .copied()
         .chain(std::iter::repeat_n(b'x', 200 * 1024))
         .collect();
-    let mode = solti_model::SubprocessMode::Script {
+    let mode = SubprocessMode::Script {
         interpreter: "bash".into(),
         body: BASE64.encode(&payload),
         args: vec![],
     };
-    let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES)
+    let r = SubprocessRunner::resolve_mode(&mode, crate::subprocess::MAX_SCRIPT_BODY_BYTES)
         .expect("200 KiB script must resolve via descriptor transport");
     assert_eq!(r.command, "bash");
     assert!(r.args.is_empty());
@@ -2267,7 +2404,7 @@ fn resolve_mode_rejects_body_over_configured_limit() {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
 
-    let mode = solti_model::SubprocessMode::Script {
+    let mode = SubprocessMode::Script {
         interpreter: "bash".into(),
         body: BASE64.encode("a".repeat(100).as_bytes()),
         args: vec![],

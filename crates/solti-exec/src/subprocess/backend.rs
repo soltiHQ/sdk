@@ -30,7 +30,7 @@ use std::{
 #[cfg(unix)]
 use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 
-use solti_model::MAX_SCRIPT_BODY_BYTES;
+use super::MAX_SCRIPT_BODY_BYTES;
 use tokio::process::Command;
 
 use crate::ExecError::InvalidRunnerConfig;

@@ -1,6 +1,6 @@
 //! # Subprocess runner
 //!
-//! [`SubprocessRunner`] executes [`TaskWorkload::Subprocess`](solti_model::TaskWorkload::Subprocess) resources.
+//! [`SubprocessRunner`] executes `exec.solti.io/v1` `Subprocess` workloads, decoded as [`SubprocessSpec`].
 //! It supports command and script modes.
 //!
 //! ## Flow
@@ -56,6 +56,9 @@ mod task;
 pub use crate::output::LogConfig;
 
 mod script;
+
+mod spec;
+pub use spec::{MAX_SCRIPT_BODY_BYTES, SUBPROCESS_KIND, SubprocessMode, SubprocessSpec};
 
 mod runner;
 pub use runner::SubprocessRunner;

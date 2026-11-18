@@ -9,9 +9,10 @@
 
 use std::sync::{Arc, Mutex};
 
+use solti_exec::container::ContainerSpec;
 use solti_exec::container::containerd::{ContainerNetwork, ContainerdConfig, ContainerdEngine};
 use solti_exec::container::register_container_runner;
-use solti_model::{ContainerSpec, OutputEvent, Task, TaskEnv, TaskId, TaskSpec, TaskWorkload};
+use solti_model::{OutputEvent, Task, TaskEnv, TaskId, TaskSpec, TaskWorkload};
 use solti_runner::{OutputPublisher, OutputPublisherHandle, OutputSink, RunnerRouter};
 use taskvisor::TaskContext;
 
@@ -80,12 +81,13 @@ async fn public_container_runner_completes_one_real_containerd_attempt() -> Test
 
         let mut env = TaskEnv::new();
         env.push("SOLTI_TEST_MESSAGE", "containerd-public-lifecycle");
-        let workload = TaskWorkload::Container(ContainerSpec::new(
+        let workload = TaskWorkload::from_body(&ContainerSpec::new(
             image,
             Some(vec!["/bin/sh".into()]),
             vec!["-c".into(), "printf '%s\\n' \"$SOLTI_TEST_MESSAGE\"".into()],
             env,
-        ));
+        ))
+        .unwrap();
         let spec = TaskSpec::builder("containerd-integration", workload, 120_000_u64).build()?;
         let task = Task::new("containerd-integration", spec)?;
         let attempt_timeout = std::time::Duration::from_millis(task.spec().timeout().as_millis());

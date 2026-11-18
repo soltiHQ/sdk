@@ -6,6 +6,7 @@
 //! The `subprocess` feature provides `SubprocessRunner`.
 //! The `container` feature provides an engine-neutral `ContainerRunner`.
 //! The `containerd` feature provides its native containerd 2.x engine.
+//! Both declare their workload types under [`EXEC_API_VERSION`] (`Subprocess` and `Container`).
 //! Both runners convert `solti_model::Task` resources into reusable `taskvisor::TaskRef` values.
 //! `RunnerRouter` pairs each task with its allocated run identity in a
 //! `solti_runner::BuiltTask`. Taskvisor owns execution after conversion.
@@ -46,8 +47,8 @@
 //!
 //! ## Commands and Scripts
 //!
-//! `solti_model::SubprocessMode::Command` starts an executable directly.
-//! `solti_model::SubprocessMode::Script` uses an explicit interpreter and a base64 body.
+//! `subprocess::SubprocessMode::Command` starts an executable directly.
+//! `subprocess::SubprocessMode::Script` uses an explicit interpreter and a base64 body.
 //! Each attempt transports the script through fresh backing storage.
 //! Unix uses an anonymous descriptor.
 //! Linux seals that descriptor before process creation.
@@ -93,17 +94,15 @@
 //! # #[cfg(feature = "subprocess")]
 //! # {
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! use solti_exec::subprocess::register_subprocess_runner;
-//! use solti_model::{
-//!     Flag, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskSpec, TaskWorkload,
-//! };
+//! use solti_exec::subprocess::{SubprocessMode, SubprocessSpec, register_subprocess_runner};
+//! use solti_model::{Flag, Task, TaskEnv, TaskSpec, TaskWorkload};
 //! use solti_runner::RunnerRouter;
 //! use std::time::Duration;
 //!
 //! let mut router = RunnerRouter::new();
 //! let runner = register_subprocess_runner(&mut router, "default")?;
 //!
-//! let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+//! let workload = TaskWorkload::from_body(&SubprocessSpec::new(
 //!     SubprocessMode::Command {
 //!         command: "echo".into(),
 //!         args: vec!["hello".into()],
@@ -111,7 +110,7 @@
 //!     TaskEnv::new(),
 //!     None,
 //!     Flag::enabled(),
-//! ));
+//! ))?;
 //! let spec = TaskSpec::builder("jobs", workload, 5_000_u64).build()?;
 //! let resource = Task::new("hello", spec)?;
 //!
@@ -176,6 +175,13 @@ pub use error::ExecError;
 mod output;
 #[cfg(any(feature = "subprocess", feature = "container"))]
 mod registration;
+#[cfg(any(feature = "subprocess", feature = "container"))]
+mod schema;
+
+/// API group and version of the built-in workloads: `Subprocess` and `Container`.
+#[cfg(any(feature = "subprocess", feature = "container"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "subprocess", feature = "container"))))]
+pub const EXEC_API_VERSION: &str = "exec.solti.io/v1";
 
 #[cfg(feature = "container")]
 #[cfg_attr(docsrs, doc(cfg(feature = "container")))]

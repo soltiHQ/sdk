@@ -2,6 +2,7 @@
 //!
 //! [`SubprocessMode`] selects a command or an interpreter-backed script.
 //! [`SubprocessSpec`] adds environment, working directory, and exit-code policy.
+//! It is the body of the `exec.solti.io/v1` `Subprocess` workload.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -9,7 +10,12 @@ use serde::{Deserialize, Serialize};
 
 use std::path::{Path, PathBuf};
 
-use solti_model::{Flag, ModelError, ModelResult, TaskEnv};
+use solti_model::{Flag, ModelError, ModelResult, TaskEnv, WorkloadBody};
+
+use crate::EXEC_API_VERSION;
+
+/// Kind of the subprocess workload under [`EXEC_API_VERSION`].
+pub const SUBPROCESS_KIND: &str = "Subprocess";
 
 /// Maximum decoded script body size.
 pub const MAX_SCRIPT_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -65,7 +71,7 @@ fn decode_script_body(body: &str, max_bytes: usize) -> ModelResult<Vec<u8>> {
 /// ```
 /// use base64::Engine;
 /// use base64::engine::general_purpose::STANDARD as BASE64;
-/// use solti_model::SubprocessMode;
+/// use solti_exec::subprocess::SubprocessMode;
 ///
 /// let mode = SubprocessMode::Script {
 ///     interpreter: "bash".into(),
@@ -75,18 +81,14 @@ fn decode_script_body(body: &str, max_bytes: usize) -> ModelResult<Vec<u8>> {
 ///
 /// assert_eq!(mode.decode_body().unwrap(), "echo hello");
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SubprocessMode {
     /// Direct binary execution.
     Command {
         /// Executable name or path.
-        #[cfg_attr(
-            feature = "schema",
-            schemars(schema_with = "crate::schema::non_empty_string")
-        )]
+        #[schemars(schema_with = "crate::schema::non_empty_string")]
         command: String,
         /// Command-line arguments.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -95,16 +97,10 @@ pub enum SubprocessMode {
     /// Script execution via an explicit interpreter.
     Script {
         /// Interpreter executable name or path.
-        #[cfg_attr(
-            feature = "schema",
-            schemars(schema_with = "crate::schema::non_empty_string")
-        )]
+        #[schemars(schema_with = "crate::schema::non_empty_string")]
         interpreter: String,
         /// Standard padded base64 script body.
-        #[cfg_attr(
-            feature = "schema",
-            schemars(schema_with = "crate::schema::script_body")
-        )]
+        #[schemars(schema_with = "crate::schema::script_body")]
         body: String,
         /// Additional arguments passed after the script body.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -126,7 +122,7 @@ impl SubprocessMode {
     /// ```
     /// use base64::Engine;
     /// use base64::engine::general_purpose::STANDARD as BASE64;
-    /// use solti_model::SubprocessMode;
+    /// use solti_exec::subprocess::SubprocessMode;
     ///
     /// let mode = SubprocessMode::Script {
     ///     interpreter: "bash".into(),
@@ -153,7 +149,7 @@ impl SubprocessMode {
     /// ```
     /// use base64::Engine;
     /// use base64::engine::general_purpose::STANDARD as BASE64;
-    /// use solti_model::SubprocessMode;
+    /// use solti_exec::subprocess::SubprocessMode;
     ///
     /// let mode = SubprocessMode::Script {
     ///     interpreter: "bash".into(),
@@ -186,7 +182,7 @@ impl SubprocessMode {
     /// ## Example
     ///
     /// ```
-    /// use solti_model::SubprocessMode;
+    /// use solti_exec::subprocess::SubprocessMode;
     ///
     /// let mode = SubprocessMode::Command {
     ///     command: "echo".into(),
@@ -229,8 +225,7 @@ impl SubprocessMode {
 /// - script: script body passed to an explicit interpreter.
 ///
 /// Common fields (`env`, `cwd`, `fail_on_non_zero`) apply to both modes.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SubprocessSpec {
@@ -256,12 +251,13 @@ impl SubprocessSpec {
     ///
     /// `SubprocessSpec` is `#[non_exhaustive]`.
     /// Use this constructor outside the crate.
-    /// Validation occurs when the workload enters a [`crate::TaskSpec`].
+    /// Validation occurs when the runner decodes the workload body.
     ///
     /// ## Example
     ///
     /// ```
-    /// use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv};
+    /// use solti_exec::subprocess::{SubprocessMode, SubprocessSpec};
+    /// use solti_model::{Flag, TaskEnv};
     ///
     /// let spec = SubprocessSpec::new(
     ///     SubprocessMode::Command {
@@ -288,15 +284,17 @@ impl SubprocessSpec {
             fail_on_non_zero,
         }
     }
+}
 
-    /// Validates the subprocess mode and wire-facing path fields.
+impl WorkloadBody for SubprocessSpec {
+    const API_VERSION: &'static str = EXEC_API_VERSION;
+    const KIND: &'static str = SUBPROCESS_KIND;
+
+    /// Validates the subprocess mode and the wire-facing cwd.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ModelError::Invalid`] when the mode is invalid or `cwd`
-    /// cannot be represented as UTF-8 on the HTTP and gRPC wire.
-    pub fn validate(&self) -> ModelResult<()> {
-        self.mode.validate()?;
+    /// The mode must be valid. `cwd` must be valid UTF-8, since it travels as JSON text.
+    fn validate(&self) -> Result<(), String> {
+        self.mode.validate().map_err(|error| error.to_string())?;
         if let Some(cwd) = &self.cwd {
             validate_wire_path("subprocess cwd", cwd)?;
         }
@@ -304,11 +302,9 @@ impl SubprocessSpec {
     }
 }
 
-fn validate_wire_path(field: &str, path: &Path) -> ModelResult<()> {
+fn validate_wire_path(field: &str, path: &Path) -> Result<(), String> {
     if path.to_str().is_none() {
-        return Err(ModelError::Invalid(
-            format!("{field} must contain valid UTF-8").into(),
-        ));
+        return Err(format!("{field} must contain valid UTF-8"));
     }
     Ok(())
 }
@@ -316,6 +312,8 @@ fn validate_wire_path(field: &str, path: &Path) -> ModelResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EXEC_API_VERSION;
+    use solti_model::{TaskWorkload, Workload, WorkloadBodyErrorKind, workload_schema_for};
 
     fn encode(s: &str) -> String {
         BASE64.encode(s.as_bytes())
@@ -480,5 +478,141 @@ mod tests {
         };
         let json = serde_json::to_string(&mode).unwrap();
         assert!(!json.contains("args"));
+    }
+
+    fn routed_body(body: serde_json::Value) -> Workload {
+        Workload::new(EXEC_API_VERSION, SUBPROCESS_KIND, body).unwrap()
+    }
+
+    #[test]
+    fn spec_validation_accepts_valid_values_and_rejects_empty_fields() {
+        // `cwd` remains optional text; UTF-8 validity does not make it non-empty.
+        WorkloadBody::validate(&SubprocessSpec::new(
+            SubprocessMode::Command {
+                command: "echo".into(),
+                args: Vec::new(),
+            },
+            TaskEnv::default(),
+            Some(PathBuf::new()),
+            Flag::enabled(),
+        ))
+        .unwrap();
+
+        let error = routed_body(serde_json::json!({"mode": {"command": {"command": "  "}}}))
+            .decode::<SubprocessSpec>()
+            .unwrap_err();
+        assert_eq!(error.kind(), &WorkloadBodyErrorKind::Invalid);
+        assert!(
+            error.message().contains("command cannot be empty"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_wire_paths_are_refused_without_lossy_conversion() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let invalid_path = PathBuf::from(OsString::from_vec(vec![b'/', 0xff]));
+        let spec = SubprocessSpec::new(
+            SubprocessMode::Command {
+                command: "echo".into(),
+                args: Vec::new(),
+            },
+            TaskEnv::default(),
+            Some(invalid_path),
+            Flag::enabled(),
+        );
+        let error = WorkloadBody::validate(&spec).unwrap_err();
+        assert!(error.contains("subprocess cwd"), "{error}");
+        assert!(error.contains("UTF-8"), "{error}");
+        assert!(serde_json::to_value(&spec).is_err());
+        assert!(TaskWorkload::from_body(&spec).is_err());
+    }
+
+    #[test]
+    fn constructor_builds_a_spec_with_the_expected_fields() {
+        let spec = SubprocessSpec::new(
+            SubprocessMode::Command {
+                command: "ls".into(),
+                args: vec!["-l".into()],
+            },
+            TaskEnv::default(),
+            Some(PathBuf::from("/tmp")),
+            Flag::enabled(),
+        );
+        assert!(matches!(spec.mode, SubprocessMode::Command { .. }));
+        assert_eq!(spec.cwd, Some(PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn body_declares_exec_subprocess() {
+        assert_eq!(SubprocessSpec::API_VERSION, "exec.solti.io/v1");
+        assert_eq!(SubprocessSpec::KIND, "Subprocess");
+        assert_eq!(SUBPROCESS_KIND, "Subprocess");
+    }
+
+    #[test]
+    fn subprocess_body_json_shape_is_unchanged() {
+        let command = serde_json::json!({
+            "mode": {"command": {"command": "echo", "args": ["a", "b"]}},
+            "env": [{"key": "A", "value": "1"}],
+            "cwd": "/work",
+            "failOnNonZero": false,
+        });
+        let decoded = routed_body(command.clone())
+            .decode::<SubprocessSpec>()
+            .unwrap();
+        assert_eq!(
+            decoded.mode,
+            SubprocessMode::Command {
+                command: "echo".into(),
+                args: vec!["a".into(), "b".into()],
+            }
+        );
+        assert_eq!(decoded.env, TaskEnv::single("A", "1"));
+        assert_eq!(decoded.cwd, Some(PathBuf::from("/work")));
+        assert!(decoded.fail_on_non_zero.is_disabled());
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), command);
+
+        let script = serde_json::json!({
+            "mode": {"script": {"interpreter": "bash", "body": "ZWNobyBoaQ==", "args": ["x"]}},
+        });
+        let decoded = routed_body(script).decode::<SubprocessSpec>().unwrap();
+        assert_eq!(decoded.mode.decode_body().unwrap(), "echo hi");
+        assert!(decoded.fail_on_non_zero.is_enabled());
+        // Defaults and empty collections are omitted on the way out.
+        let out = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "mode": {"script": {"interpreter": "bash", "body": "ZWNobyBoaQ==", "args": ["x"]}},
+                "failOnNonZero": true,
+            })
+        );
+    }
+
+    #[test]
+    fn subprocess_body_refuses_unknown_fields_at_every_level() {
+        for body in [
+            serde_json::json!({"mode": {"command": {"command": "x"}}, "extra": 1}),
+            serde_json::json!({"mode": {"command": {"command": "x", "extra": 1}}}),
+            serde_json::json!({"mode": {"command": {"command": "x"}, "extra": {}}}),
+        ] {
+            let error = routed_body(body).decode::<SubprocessSpec>().unwrap_err();
+            assert!(
+                matches!(error.kind(), WorkloadBodyErrorKind::Decode { .. }),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_body_schema_has_no_unbounded_64_bit_integers() {
+        let schema = workload_schema_for::<SubprocessSpec>();
+        assert_eq!(
+            crate::schema::testing::unbounded_integers(&schema),
+            Vec::<String>::new()
+        );
     }
 }

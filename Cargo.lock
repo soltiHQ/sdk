@@ -2565,6 +2565,7 @@ dependencies = [
  "oci-spec",
  "prost",
  "prost-types",
+ "schemars",
  "seccompiler",
  "serde",
  "serde_json",

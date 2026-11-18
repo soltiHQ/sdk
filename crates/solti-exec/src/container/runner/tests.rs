@@ -8,7 +8,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use solti_model::{ContainerSpec, TaskEnv, TaskSpec};
+use solti_model::{TaskEnv, TaskSpec, TaskWorkload, Workload};
+
+use crate::EXEC_API_VERSION;
 use taskvisor::{
     RuntimeError, Supervisor, SupervisorConfig, TaskOutcomeKind, TaskSpec as TaskvisorTaskSpec,
 };
@@ -21,7 +23,7 @@ use tracing::{
 };
 
 use super::*;
-use crate::container::{ContainerEngineInfo, ContainerOutput};
+use crate::container::{ContainerEngineInfo, ContainerOutput, ContainerSpec};
 
 #[derive(Default)]
 struct TraceCapture {
@@ -614,9 +616,12 @@ fn worker_context(engine: Arc<dyn ContainerEngine>) -> Arc<TaskExecContext> {
     let resource = task();
     let run_id = solti_runner::make_run_id("containerd", resource.slot().as_str());
     let build = BuildContext::default();
-    let TaskWorkload::Container(spec) = resource.spec().workload() else {
-        unreachable!("test task is a container workload");
+    let TaskWorkload::Routed(workload) = resource.spec().workload() else {
+        unreachable!("test task is a routed workload");
     };
+    let spec = workload
+        .decode::<ContainerSpec>()
+        .expect("test task is a container workload");
     Arc::new(TaskExecContext {
         engine,
         metrics: build.metrics().clone(),
@@ -637,12 +642,13 @@ fn worker_context(engine: Arc<dyn ContainerEngine>) -> Arc<TaskExecContext> {
 }
 
 fn task_with_image(image: impl Into<String>) -> Task {
-    let workload = TaskWorkload::Container(ContainerSpec::new(
+    let workload = TaskWorkload::from_body(&ContainerSpec::new(
         image.into(),
         Some(vec!["echo".into()]),
         vec!["hello".into()],
         TaskEnv::new(),
-    ));
+    ))
+    .unwrap();
     let spec = TaskSpec::builder("container-slot", workload, 5_000_u64)
         .build()
         .unwrap();
@@ -819,12 +825,13 @@ async fn tracing_does_not_record_container_process_inputs() {
     tracing::dispatcher::with_default(&dispatch, tracing::callsite::rebuild_interest_cache);
     capture.fields.lock().unwrap().clear();
 
-    let workload = TaskWorkload::Container(ContainerSpec::new(
+    let workload = TaskWorkload::from_body(&ContainerSpec::new(
         format!("https://user:{IMAGE_SECRET}@registry.invalid/private\n{FORGED}"),
         Some(vec![COMMAND_SECRET.to_owned()]),
         vec![ARG_SECRET.to_owned()],
         TaskEnv::single("ACCESS_TOKEN", ENV_SECRET),
-    ));
+    ))
+    .unwrap();
     let spec = TaskSpec::builder("container-slot", workload, 5_000_u64)
         .build()
         .unwrap();
@@ -1394,4 +1401,111 @@ fn attempt_counter_rejects_after_identity_limit() {
     assert_eq!(next_attempt(&attempts), Some(u32::MAX));
     assert_eq!(next_attempt(&attempts), None);
     assert_eq!(attempts.load(Ordering::Relaxed), u32::MAX);
+}
+
+#[test]
+fn container_runner_declares_exec_container_with_a_schema_inside_the_subset() {
+    let (engine, _) = FakeEngine::new(0);
+    let runner = ContainerRunner::new("declares", drop_releasing_engine(engine)).unwrap();
+    let declared = runner.workload_types();
+    assert_eq!(declared.len(), 1);
+    assert_eq!(declared[0].api_version(), EXEC_API_VERSION);
+    assert_eq!(declared[0].api_version(), "exec.solti.io/v1");
+    assert_eq!(declared[0].kind(), "Container");
+    declared[0]
+        .workload_type()
+        .expect("the generated schema is inside Podium's subset");
+
+    let ok = Workload::new(
+        EXEC_API_VERSION,
+        "Container",
+        serde_json::json!({"image": "x"}),
+    );
+    declared[0].check(&ok.unwrap()).unwrap();
+    let empty = Workload::new(
+        EXEC_API_VERSION,
+        "Container",
+        serde_json::json!({"image": " "}),
+    );
+    let reason = declared[0].check(&empty.unwrap()).unwrap_err();
+    assert!(reason.contains("container image"), "{reason}");
+}
+
+fn task_with_body(body: serde_json::Value, api_version: &str, kind: &str) -> Task {
+    let workload = TaskWorkload::Routed(Workload::new(api_version, kind, body).unwrap());
+    let spec = TaskSpec::builder("container-slot", workload, 5_000_u64)
+        .build()
+        .unwrap();
+    Task::new("container-task", spec).unwrap()
+}
+
+async fn build_result(runner: &ContainerRunner, resource: &Task) -> Result<TaskRef, RunnerError> {
+    let run_id = solti_runner::make_run_id(runner.name(), resource.slot().as_str());
+    let mut scope = solti_runner::BuildScope::unmanaged(runner.name());
+    runner
+        .build_task(
+            resource,
+            &run_id,
+            &BuildContext::default(),
+            &solti_runner::BuildCancellation::new(),
+            &mut scope,
+        )
+        .await
+}
+
+#[tokio::test]
+async fn container_runner_builds_from_a_routed_body() {
+    let (engine, calls) = FakeEngine::new(0);
+    let runner = ContainerRunner::new("routed", drop_releasing_engine(engine)).unwrap();
+    let resource = task_with_body(
+        serde_json::json!({"image": "redis:7", "command": ["sh"], "args": ["-c", "true"]}),
+        EXEC_API_VERSION,
+        "Container",
+    );
+    let task = build_result(&runner, &resource)
+        .await
+        .expect("routed body builds");
+    task.spawn(TaskContext::detached()).await.unwrap();
+    assert!(matches!(
+        calls.lock().unwrap().first(),
+        Some(Call::Create { image, .. }) if image == "redis:7"
+    ));
+}
+
+#[tokio::test]
+async fn container_runner_refuses_another_type_and_an_invalid_body() {
+    let (engine, _) = FakeEngine::new(0);
+    let runner = ContainerRunner::new("refuses", drop_releasing_engine(engine)).unwrap();
+
+    for (api_version, kind) in [
+        ("exec.solti.io/v1", "Subprocess"),
+        ("exec.solti.io/v2", "Container"),
+        ("example.com/v1", "Container"),
+    ] {
+        let resource = task_with_body(serde_json::json!({"image": "x"}), api_version, kind);
+        match build_result(&runner, &resource).await {
+            Err(RunnerError::UnsupportedWorkload {
+                api_version: got_version,
+                kind: got_kind,
+                ..
+            }) => {
+                assert_eq!(got_version, api_version);
+                assert_eq!(got_kind, kind);
+            }
+            Err(other) => panic!("expected UnsupportedWorkload, got {other:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    for body in [
+        serde_json::json!({"image": " "}),
+        serde_json::json!({"image": "x", "extra": true}),
+    ] {
+        let resource = task_with_body(body, EXEC_API_VERSION, "Container");
+        match build_result(&runner, &resource).await {
+            Err(RunnerError::InvalidSpec(message)) => assert!(!message.is_empty()),
+            Err(other) => panic!("expected InvalidSpec, got {other:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
 }

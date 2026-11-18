@@ -20,12 +20,16 @@ default = []
 container    = [
     "dep:async-trait",
     "dep:bytes",
+    "dep:schemars",
+    "dep:serde",
+    "dep:serde_json",
     "dep:solti-model",
     "dep:solti-runner",
     "dep:taskvisor",
     "dep:thiserror",
     "dep:tokio",
     "dep:tracing",
+    "solti-model/schema",
     "tokio/macros",
     "tokio/rt",
     "tokio/sync",
@@ -39,8 +43,6 @@ containerd   = [
     "dep:oci-spec",
     "dep:prost",
     "dep:prost-types",
-    "dep:serde",
-    "dep:serde_json",
     "dep:sha2",
     "dep:tempfile",
     "dep:tonic-prost",
@@ -51,13 +53,18 @@ host-process = ["dep:libc", "dep:tracing"]
 seccomp      = ["host-process", "dep:seccompiler"]
 subprocess   = [
     "host-process",
+    "dep:base64",
     "dep:bytes",
+    "dep:schemars",
+    "dep:serde",
+    "dep:serde_json",
     "dep:solti-model",
     "dep:solti-runner",
     "dep:taskvisor",
     "dep:tempfile",
     "dep:thiserror",
     "dep:tokio",
+    "solti-model/schema",
     "tokio/macros",
     "tokio/net",
     "tokio/process",
@@ -71,12 +78,14 @@ solti-model  = { workspace = true, optional = true }
 solti-runner = { workspace = true, optional = true }
 
 async-trait       = { workspace = true, optional = true }
+base64            = { workspace = true, optional = true }
 bytes             = { workspace = true, optional = true }
 containerd-client = { workspace = true, optional = true }
 getrandom         = { workspace = true, optional = true }
 oci-spec          = { workspace = true, optional = true }
 prost             = { workspace = true, optional = true }
 prost-types       = { workspace = true, optional = true }
+schemars          = { workspace = true, optional = true }
 serde             = { workspace = true, optional = true }
 serde_json        = { workspace = true, optional = true }
 sha2              = { workspace = true, optional = true }
@@ -94,7 +103,6 @@ libc = { workspace = true, optional = true }
 seccompiler = { workspace = true, optional = true }
 
 [dev-dependencies]
-base64    = { workspace = true }
 taskvisor = { workspace = true, features = ["test-util"] }
 tempfile  = { workspace = true }
 tokio     = { workspace = true, features = ["rt", "macros", "test-util"] }
