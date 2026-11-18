@@ -21,11 +21,10 @@ use tower::ServiceExt;
 use solti_api::{ApiError, ApiHandler, HttpApi, OutputEventStream, TaskWatchEventStream};
 use solti_chain::{ChainSpec, FailureMode};
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, EmbeddedSpec, Flag, JitterPolicy, Labels, OutputChunk,
-    OutputEvent, RestartPolicy, StreamKind, SubprocessMode, SubprocessSpec, Task, TaskContinuation,
-    TaskEnv, TaskFilter, TaskId, TaskManifest, TaskPage, TaskPhase, TaskQuery, TaskRun,
-    TaskRunContinuation, TaskRunPage, TaskRunQuery, TaskSpec, TaskWatchEvent, TaskWorkload, Uid,
-    WorkloadTypeMeta, WritePreconditions,
+    AdmissionPolicy, BackoffPolicy, EmbeddedSpec, JitterPolicy, Labels, OutputChunk, OutputEvent,
+    RestartPolicy, StreamKind, Task, TaskContinuation, TaskFilter, TaskId, TaskManifest, TaskPage,
+    TaskPhase, TaskQuery, TaskRun, TaskRunContinuation, TaskRunPage, TaskRunQuery, TaskSpec,
+    TaskWatchEvent, TaskWorkload, Uid, Workload, WorkloadTypeMeta, WritePreconditions,
 };
 
 const CREATE_COMMAND_BODY: &str = r#"{
@@ -35,83 +34,11 @@ const CREATE_COMMAND_BODY: &str = r#"{
   "spec": {
     "slot": "my-job",
     "workload": {
-      "apiVersion": "solti.io/v1",
-      "kind": "Subprocess",
+      "apiVersion": "tasks.example.io/v1",
+      "kind": "Echo",
       "spec": {
-        "mode": {
-          "command": {
-            "command": "echo",
-            "args": ["hello world"]
-          }
-        },
-        "env": [],
-        "failOnNonZero": true
-      }
-    },
-    "timeout": 30000,
-    "restart": { "type": "never" },
-    "backoff": {
-      "jitter": "full",
-      "firstMs": 1000,
-      "maxMs": 10000,
-      "factor": 2.0
-    },
-    "admission": "dropIfRunning"
-  }
-}"#;
-
-const CREATE_SCRIPT_BODY: &str = r#"{
-  "apiVersion": "solti.io/v1",
-  "kind": "Task",
-  "metadata": { "name": "task-script-1" },
-  "spec": {
-    "slot": "my-script",
-    "workload": {
-      "apiVersion": "solti.io/v1",
-      "kind": "Subprocess",
-      "spec": {
-        "mode": {
-          "script": {
-            "interpreter": "bash",
-            "body": "ZWNobyAiaGVsbG8gZnJvbSBzY3JpcHQiCg==",
-            "args": []
-          }
-        },
-        "env": [
-          { "key": "ENV", "value": "production" }
-        ],
-        "failOnNonZero": true
-      }
-    },
-    "timeout": 60000,
-    "restart": { "type": "onFailure" },
-    "backoff": {
-      "jitter": "equal",
-      "firstMs": 2000,
-      "maxMs": 30000,
-      "factor": 2.0
-    },
-    "admission": "replace"
-  }
-}"#;
-
-const CREATE_CUSTOM_INTERPRETER_BODY: &str = r#"{
-  "apiVersion": "solti.io/v1",
-  "kind": "Task",
-  "metadata": { "name": "task-ruby-1" },
-  "spec": {
-    "slot": "my-script",
-    "workload": {
-      "apiVersion": "solti.io/v1",
-      "kind": "Subprocess",
-      "spec": {
-        "mode": {
-          "script": {
-            "interpreter": "ruby",
-            "body": "cHV0cyAnaGVsbG8n",
-            "args": []
-          }
-        },
+        "command": "echo",
+        "args": ["hello world"],
         "failOnNonZero": true
       }
     },
@@ -134,12 +61,11 @@ const APPLY_BODY: &str = r#"{
   "spec": {
     "slot": "my-job",
     "workload": {
-      "apiVersion": "solti.io/v1",
-      "kind": "Subprocess",
+      "apiVersion": "tasks.example.io/v1",
+      "kind": "Echo",
       "spec": {
-        "mode": {
-          "command": { "command": "echo", "args": ["v2"] }
-        },
+        "command": "echo",
+        "args": ["v2"],
         "failOnNonZero": true
       }
     },
@@ -272,15 +198,14 @@ fn fixture_task() -> Task {
 }
 
 fn taskvisor_intake_pending_task() -> Task {
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Command {
-            command: "echo".into(),
-            args: Vec::new(),
-        },
-        TaskEnv::new(),
-        None,
-        Flag::from(true),
-    ));
+    let workload = TaskWorkload::Routed(
+        Workload::new(
+            "tasks.example.io/v1",
+            "Echo",
+            serde_json::json!({ "command": "echo", "args": [], "failOnNonZero": true }),
+        )
+        .unwrap(),
+    );
     let spec = TaskSpec::builder("my-job", workload, 30_000_u64)
         .build()
         .unwrap();
@@ -295,15 +220,18 @@ fn taskvisor_intake_pending_task() -> Task {
 }
 
 fn fixture_task_named(name: &str) -> Task {
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Command {
-            command: "echo".into(),
-            args: vec!["hello world".into()],
-        },
-        TaskEnv::new(),
-        None,
-        Flag::from(true),
-    ));
+    let workload = TaskWorkload::Routed(
+        Workload::new(
+            "tasks.example.io/v1",
+            "Echo",
+            serde_json::json!({
+                "command": "echo",
+                "args": ["hello world"],
+                "failOnNonZero": true
+            }),
+        )
+        .unwrap(),
+    );
     let spec = TaskSpec::builder("my-job", workload, 30_000_u64)
         .restart(RestartPolicy::Never)
         .backoff(BackoffPolicy {
@@ -341,7 +269,7 @@ fn embedded_task() -> Task {
 }
 
 fn fixture_runs() -> Vec<TaskRun> {
-    let workload = WorkloadTypeMeta::new("solti.io/v1", "Subprocess").unwrap();
+    let workload = WorkloadTypeMeta::new("tasks.example.io/v1", "Echo").unwrap();
     let failed = TaskRun::from_parts(
         workload.clone(),
         1,
@@ -691,74 +619,27 @@ async fn create_command_resource_is_accepted() {
 }
 
 #[tokio::test]
-async fn http_wire_paths_round_trip_unicode_without_substitution() {
+async fn http_workload_body_round_trips_unicode_without_substitution() {
     let app = router_with(Arc::new(WireMock::default()));
 
-    let mut subprocess: Value = serde_json::from_str(CREATE_COMMAND_BODY).unwrap();
-    subprocess["metadata"]["name"] = "task-unicode-cwd".into();
-    subprocess["spec"]["workload"]["spec"]["cwd"] = "/工作/δ".into();
+    let mut request: Value = serde_json::from_str(CREATE_COMMAND_BODY).unwrap();
+    request["metadata"]["name"] = "task-unicode-cwd".into();
+    request["spec"]["workload"]["spec"]["cwd"] = "/工作/δ".into();
+    request["spec"]["workload"]["spec"]["module"] = "/модули/报告.wasm".into();
     let response = app
-        .clone()
         .oneshot(post_json(
             "/apis/solti.io/v1/tasks",
-            &serde_json::to_string(&subprocess).unwrap(),
+            &serde_json::to_string(&request).unwrap(),
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
     let body = body_json(response).await;
     assert_eq!(body["spec"]["workload"]["spec"]["cwd"], "/工作/δ");
-
-    let mut wasm: Value = serde_json::from_str(CREATE_COMMAND_BODY).unwrap();
-    wasm["metadata"]["name"] = "task-unicode-wasm".into();
-    wasm["spec"]["workload"]["kind"] = "Wasm".into();
-    wasm["spec"]["workload"]["spec"] = serde_json::json!({
-        "module": "/модули/报告.wasm",
-        "args": [],
-        "env": []
-    });
-    let response = app
-        .oneshot(post_json(
-            "/apis/solti.io/v1/tasks",
-            &serde_json::to_string(&wasm).unwrap(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let body = body_json(response).await;
     assert_eq!(
         body["spec"]["workload"]["spec"]["module"],
         "/модули/报告.wasm"
     );
-}
-
-#[tokio::test]
-async fn create_script_resource_is_accepted() {
-    let app = router_with(Arc::new(WireMock::default()));
-
-    let resp = app
-        .oneshot(post_json("/apis/solti.io/v1/tasks", CREATE_SCRIPT_BODY))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let body = body_json(resp).await;
-    assert_eq!(body["metadata"]["name"], "task-script-1");
-}
-
-#[tokio::test]
-async fn create_custom_interpreter_resource_is_accepted() {
-    let app = router_with(Arc::new(WireMock::default()));
-
-    let resp = app
-        .oneshot(post_json(
-            "/apis/solti.io/v1/tasks",
-            CREATE_CUSTOM_INTERPRETER_BODY,
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::CREATED);
 }
 
 #[tokio::test]
@@ -803,13 +684,76 @@ async fn create_chain_workload_is_accepted_and_returned_unchanged() {
     );
 
     let workload: TaskWorkload = serde_json::from_value(body["spec"]["workload"].clone()).unwrap();
-    let chain = ChainSpec::from_workload(&workload).unwrap();
+    let TaskWorkload::Routed(routed) = &workload else {
+        panic!("expected a routed Chain workload");
+    };
+    let chain = routed.decode::<ChainSpec>().unwrap();
     assert_eq!(chain.entry().as_str(), "task1");
     assert_eq!(chain.steps().len(), 4);
     assert_eq!(
         chain.step("task3").unwrap().on_failure().unwrap().mode(),
         FailureMode::Recover
     );
+}
+
+#[tokio::test]
+async fn http_accepts_the_manifest_podium_sends() {
+    // Exact bytes of Podium `TaskManifestJSON` (internal/proxy/convert.go).
+    let podium = include_str!("data/podium-task-manifest.json");
+    let sent: Value = serde_json::from_str(podium).unwrap();
+
+    let manifest: TaskManifest = serde_json::from_str(podium).unwrap();
+    let TaskWorkload::Routed(workload) = manifest.spec().workload() else {
+        panic!("Podium sends a routed workload");
+    };
+    assert_eq!(workload.api_version(), "e2e.solti.io/v1");
+    assert_eq!(workload.kind(), "Echo");
+    assert_eq!(workload.body(), &serde_json::json!({ "message": "hi" }));
+    assert_eq!(
+        manifest
+            .metadata()
+            .annotations()
+            .get("podium.solti.io/spec-id"),
+        Some("spec-1")
+    );
+
+    let handler = Arc::new(WireMock::default());
+    let response = router_with(Arc::clone(&handler))
+        .oneshot(post_json("/apis/solti.io/v1/tasks", podium))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created = body_json(response).await;
+    assert_eq!(created["spec"]["workload"], sent["spec"]["workload"]);
+    assert_eq!(
+        *handler.last_admission.lock().unwrap(),
+        Some(AdmissionPolicy::Replace)
+    );
+}
+
+#[tokio::test]
+async fn embedded_stays_refused_on_both_transports_http() {
+    let handler = Arc::new(WireMock::default());
+    let response = router_with(Arc::clone(&handler))
+        .oneshot(post_json("/apis/solti.io/v1/tasks", CREATE_EMBEDDED_BODY))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(*handler.last_admission.lock().unwrap(), None);
+
+    // The routed envelope refuses the reserved group as well.
+    let routed_as_solti = CREATE_COMMAND_BODY.replacen(
+        r#""apiVersion": "tasks.example.io/v1""#,
+        r#""apiVersion": "solti.io/v1""#,
+        1,
+    );
+    assert_ne!(routed_as_solti, CREATE_COMMAND_BODY, "replacement must hit");
+    let response = router_with(Arc::clone(&handler))
+        .oneshot(post_json("/apis/solti.io/v1/tasks", &routed_as_solti))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(*handler.last_admission.lock().unwrap(), None);
 }
 
 #[tokio::test]
@@ -893,40 +837,6 @@ async fn create_rejects_unknown_crd_fields_before_the_handler() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(body_json(resp).await["reason"], "BadRequest");
     assert_eq!(*handler.last_admission.lock().unwrap(), None);
-}
-
-#[tokio::test]
-async fn create_rejects_unknown_script_field() {
-    let app = router_with(Arc::new(WireMock::default()));
-    let body = CREATE_CUSTOM_INTERPRETER_BODY.replace(
-        r#""interpreter": "ruby""#,
-        r#""interpreter": "ruby", "flag": "-e""#,
-    );
-    assert_ne!(body, CREATE_CUSTOM_INTERPRETER_BODY, "replacement must hit");
-
-    let resp = app
-        .oneshot(post_json("/apis/solti.io/v1/tasks", &body))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(body_json(resp).await["reason"], "BadRequest");
-}
-
-#[tokio::test]
-async fn create_rejects_workload_kind_and_spec_mismatch() {
-    let app = router_with(Arc::new(WireMock::default()));
-    let body = CREATE_COMMAND_BODY.replacen(r#""kind": "Subprocess""#, r#""kind": "Container""#, 1);
-    assert_ne!(body, CREATE_COMMAND_BODY, "replacement must hit");
-
-    let resp = app
-        .oneshot(post_json("/apis/solti.io/v1/tasks", &body))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = body_json(resp).await;
-    assert_eq!(body["reason"], "BadRequest");
 }
 
 #[tokio::test]
@@ -1128,19 +1038,16 @@ async fn get_task_response_matches_crd_shape() {
     assert_eq!(backoff["factor"], 2.0);
 
     let workload = &spec["workload"];
-    assert_eq!(workload["apiVersion"], "solti.io/v1");
-    assert_eq!(workload["kind"], "Subprocess");
-    let sub = &workload["spec"];
-    assert_eq!(sub["mode"]["command"]["command"], "echo");
-    assert_eq!(sub["mode"]["command"]["args"][0], "hello world");
-    assert_eq!(sub["failOnNonZero"], true);
-    assert!(
-        sub.get("env").is_none(),
-        "empty env must be omitted exactly as in solti-model serde: {sub:?}"
-    );
-    assert!(
-        sub.get("subprocess").is_none(),
-        "workload spec must be direct: no `subprocess` discriminator, got {sub:?}"
+    assert_eq!(workload["apiVersion"], "tasks.example.io/v1");
+    assert_eq!(workload["kind"], "Echo");
+    assert_eq!(
+        workload["spec"],
+        serde_json::json!({
+            "command": "echo",
+            "args": ["hello world"],
+            "failOnNonZero": true
+        }),
+        "the body must be returned exactly as stored"
     );
 
     let status = &task["status"];
@@ -1622,7 +1529,7 @@ async fn list_task_runs_response_matches_documented_shape() {
 
     assert_eq!(
         runs[0]["workload"],
-        serde_json::json!({ "apiVersion": "solti.io/v1", "kind": "Subprocess" })
+        serde_json::json!({ "apiVersion": "tasks.example.io/v1", "kind": "Echo" })
     );
     assert_eq!(runs[0]["generation"], 1);
     assert_eq!(runs[0]["attempt"], 1);

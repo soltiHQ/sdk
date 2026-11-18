@@ -17,8 +17,8 @@ use solti_api::{
     ApiError, ApiHandler, GrpcApi, MAX_REQUEST_BYTES, OutputEventStream, TaskWatchEventStream,
 };
 use solti_model::{
-    ExtensionWorkload, Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRunPage,
-    TaskRunQuery, TaskSpec, TaskWatchEvent, TaskWorkload, Token, WritePreconditions,
+    Task, TaskFilter, TaskId, TaskManifest, TaskPage, TaskQuery, TaskRunPage, TaskRunQuery,
+    TaskSpec, TaskWatchEvent, TaskWorkload, Token, Workload, WritePreconditions,
 };
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -107,8 +107,8 @@ impl ApiHandler for SocketHandler {
 }
 
 fn fixture_task() -> Task {
-    let workload = TaskWorkload::Extension(
-        ExtensionWorkload::new(
+    let workload = TaskWorkload::Routed(
+        Workload::new(
             "workloads.example.io/v1",
             "SocketTest",
             json!({ "value": 1 }),

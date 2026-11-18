@@ -75,11 +75,10 @@ use axum::{
 use schemars::{JsonSchema, Schema, generate::SchemaSettings};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, ContainerSpec, ExtensionWorkload, LabelSelector, ObjectMeta,
-    OutputEvent, RestartPolicy, Slot, SubprocessSpec, TASK_API_VERSION, Task, TaskFilter, TaskId,
-    TaskManifest, TaskManifestMeta, TaskPhase, TaskQuery, TaskRun, TaskRunPage, TaskRunQuery,
-    TaskStatus, TaskWatchEvent, Timeout, Token, TypeMeta, Uid, WORKLOAD_API_VERSION, WasmSpec,
-    WritePreconditions,
+    AdmissionPolicy, BackoffPolicy, LabelSelector, ObjectMeta, OutputEvent, RestartPolicy, Slot,
+    TASK_API_VERSION, Task, TaskFilter, TaskId, TaskManifest, TaskManifestMeta, TaskPhase,
+    TaskQuery, TaskRun, TaskRunPage, TaskRunQuery, TaskStatus, TaskWatchEvent, Timeout, Token,
+    TypeMeta, Uid, Workload, WritePreconditions,
 };
 use tokio_stream::{Stream, StreamExt};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -927,39 +926,13 @@ impl JsonSchema for HttpTaskWorkloadSchema {
     }
 
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> Schema {
-        let subprocess = http_workload_envelope_schema(
-            "Subprocess",
-            generator.subschema_for::<SubprocessSpec>(),
+        let mut schema = generator.subschema_for::<Workload>();
+        schema.insert(
+            "description".into(),
+            "Public workload GVK and its JSON body. Embedded is in-process only.".into(),
         );
-        let wasm = http_workload_envelope_schema("Wasm", generator.subschema_for::<WasmSpec>());
-        let container =
-            http_workload_envelope_schema("Container", generator.subschema_for::<ContainerSpec>());
-        let extension = generator.subschema_for::<ExtensionWorkload>();
-
-        schemars::json_schema!({
-            "description": "Public workload GVK and desired state. Embedded is in-process only.",
-            "oneOf": [subprocess, wasm, container, extension]
-        })
+        schema
     }
-}
-
-fn http_workload_envelope_schema(kind: &'static str, spec: Schema) -> Schema {
-    schemars::json_schema!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["apiVersion", "kind", "spec"],
-        "properties": {
-            "apiVersion": {
-                "type": "string",
-                "const": WORKLOAD_API_VERSION
-            },
-            "kind": {
-                "type": "string",
-                "const": kind
-            },
-            "spec": spec
-        }
-    })
 }
 
 #[allow(dead_code)]
@@ -2098,20 +2071,17 @@ mod tests {
     use super::*;
 
     use http_body_util::BodyExt as _;
-    use solti_model::{
-        Flag, SubprocessMode, TaskEnv, TaskPage, TaskSpec, TaskWorkload, WorkloadTypeMeta,
-    };
+    use solti_model::{TaskPage, TaskSpec, TaskWorkload, WorkloadTypeMeta};
 
     fn task(name: &str) -> Task {
-        let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
-            SubprocessMode::Command {
-                command: "true".into(),
-                args: Vec::new(),
-            },
-            TaskEnv::new(),
-            None,
-            Flag::enabled(),
-        ));
+        let workload = TaskWorkload::Routed(
+            Workload::new(
+                "tasks.example.io/v1",
+                "Echo",
+                serde_json::json!({ "command": "true" }),
+            )
+            .unwrap(),
+        );
         let spec = TaskSpec::builder("slot", workload, 1_000_u64)
             .build()
             .unwrap();
@@ -2128,7 +2098,7 @@ mod tests {
     }
 
     fn run_page() -> TaskRunPage {
-        let workload = WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").unwrap();
+        let workload = WorkloadTypeMeta::new("tasks.example.io/v1", "Echo").unwrap();
         TaskRunPage {
             items: vec![
                 TaskRun::starting(1, 1, workload.clone()).unwrap(),

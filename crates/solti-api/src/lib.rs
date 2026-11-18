@@ -60,7 +60,7 @@
 //!
 //! The built-in `Embedded` workload is available only through the in-process SDK.
 //! HTTP and gRPC reject it.
-//! Extension workloads remain visible.
+//! Every other workload is routed by its GVK and stays visible.
 //!
 //! ## Feature Flags
 //!

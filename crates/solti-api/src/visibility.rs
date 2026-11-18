@@ -2,7 +2,7 @@
 //!
 //! Public transports hide only the built-in `solti.io/v1` `Embedded` GVK.
 //! Embedded tasks remain available through the in-process SDK.
-//! Every other built-in or extension GVK remains visible.
+//! Every other GVK remains visible.
 
 #[cfg(any(feature = "core-adapter", feature = "grpc", feature = "http"))]
 use solti_model::Task;
@@ -10,13 +10,12 @@ use solti_model::Task;
 use solti_model::TaskManifest;
 #[cfg(any(feature = "grpc", feature = "http"))]
 use solti_model::TaskRun;
-use solti_model::{WORKLOAD_API_VERSION, WorkloadTypeMeta};
-
-const EMBEDDED_KIND: &str = "Embedded";
+use solti_model::{EMBEDDED_WORKLOAD_API_VERSION, EMBEDDED_WORKLOAD_KIND, WorkloadTypeMeta};
 
 /// Checks whether a workload GVK can cross a public transport.
 pub(crate) fn workload_is_visible(workload: &WorkloadTypeMeta) -> bool {
-    workload.api_version() != WORKLOAD_API_VERSION || workload.kind() != EMBEDDED_KIND
+    workload.api_version() != EMBEDDED_WORKLOAD_API_VERSION
+        || workload.kind() != EMBEDDED_WORKLOAD_KIND
 }
 
 /// Checks whether a manifest can cross a public transport.
@@ -43,8 +42,9 @@ mod tests {
 
     #[test]
     fn only_the_builtin_embedded_gvk_is_hidden() {
-        let embedded = WorkloadTypeMeta::new(WORKLOAD_API_VERSION, EMBEDDED_KIND).unwrap();
-        let subprocess = WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").unwrap();
+        let embedded =
+            WorkloadTypeMeta::new(EMBEDDED_WORKLOAD_API_VERSION, EMBEDDED_WORKLOAD_KIND).unwrap();
+        let subprocess = WorkloadTypeMeta::new("exec.solti.io/v1", "Subprocess").unwrap();
         let extension = WorkloadTypeMeta::new("example.io/v1", "Custom").unwrap();
 
         assert!(!workload_is_visible(&embedded));

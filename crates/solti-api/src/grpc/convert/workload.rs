@@ -1,88 +1,23 @@
 //! # Workload Conversion
 //!
-//! Converts built-in and extension workloads in both directions.
+//! Every workload travels as its JSON body in `TaskWorkload.extension.spec.raw`.
 //! Embedded workloads have no public protobuf representation.
 
-use std::path::Path;
-
-use solti_model::{
-    ContainerSpec, ExtensionWorkload, Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskWorkload,
-    WORKLOAD_API_VERSION, WasmSpec,
-};
+use solti_model::{TaskWorkload, Workload};
 
 use crate::{error::ApiError, proto_api};
+
+const MISSING_BODY: &str = "missing workload body: set TaskWorkload.extension.spec.raw";
 
 pub(super) fn workload_to_proto(
     workload: &TaskWorkload,
 ) -> Result<proto_api::TaskWorkload, ApiError> {
-    let spec = match workload {
-        TaskWorkload::Subprocess(subprocess) => {
-            let mode = match &subprocess.mode {
-                SubprocessMode::Command { command, args } => {
-                    proto_api::subprocess_mode::Mode::Command(proto_api::CommandMode {
-                        command: command.clone(),
-                        args: args.clone(),
-                    })
-                }
-                SubprocessMode::Script {
-                    interpreter,
-                    body,
-                    args,
-                } => proto_api::subprocess_mode::Mode::Script(proto_api::ScriptMode {
-                    interpreter: interpreter.clone(),
-                    body: body.clone(),
-                    args: args.clone(),
-                }),
-                _ => {
-                    return Err(ApiError::Internal(
-                        "unsupported subprocess mode variant".into(),
-                    ));
-                }
-            };
-            proto_api::task_workload::Spec::Subprocess(proto_api::SubprocessTask {
-                mode: Some(proto_api::SubprocessMode { mode: Some(mode) }),
-                env: env_to_proto(&subprocess.env),
-                cwd: subprocess
-                    .cwd
-                    .as_deref()
-                    .map(|path| wire_path_to_proto("subprocess cwd", path))
-                    .transpose()?,
-                fail_on_non_zero: subprocess.fail_on_non_zero.into(),
-            })
-        }
-        TaskWorkload::Wasm(wasm) => proto_api::task_workload::Spec::Wasm(proto_api::WasmTask {
-            module: wire_path_to_proto("wasm module path", &wasm.module)?,
-            env: env_to_proto(&wasm.env),
-            args: wasm.args.clone(),
-        }),
-        TaskWorkload::Container(container) => {
-            proto_api::task_workload::Spec::Container(proto_api::ContainerTask {
-                command: container
-                    .command
-                    .as_ref()
-                    .map(|items| proto_api::ContainerCommand {
-                        items: items.clone(),
-                    }),
-                env: env_to_proto(&container.env),
-                image: container.image.clone(),
-                args: container.args.clone(),
-            })
-        }
+    let routed = match workload {
+        TaskWorkload::Routed(routed) => routed,
         TaskWorkload::Embedded(_) => {
             return Err(ApiError::Internal(
                 "handler returned an Embedded workload with no wire representation".into(),
             ));
-        }
-        TaskWorkload::Extension(extension) => {
-            proto_api::task_workload::Spec::Extension(proto_api::ExtensionTask {
-                spec: Some(proto_api::RawExtension {
-                    raw: serde_json::to_vec(extension.spec()).map_err(|error| {
-                        ApiError::Internal(format!(
-                            "failed to encode extension workload spec: {error}"
-                        ))
-                    })?,
-                }),
-            })
         }
         _ => {
             return Err(ApiError::Internal(
@@ -90,10 +25,16 @@ pub(super) fn workload_to_proto(
             ));
         }
     };
+    let raw = serde_json::to_vec(routed.body())
+        .map_err(|error| ApiError::Internal(format!("failed to encode workload body: {error}")))?;
     Ok(proto_api::TaskWorkload {
-        api_version: workload.api_version().to_owned(),
-        kind: workload.kind().to_owned(),
-        spec: Some(spec),
+        api_version: routed.api_version().to_owned(),
+        kind: routed.kind().to_owned(),
+        spec: Some(proto_api::task_workload::Spec::Extension(
+            proto_api::ExtensionTask {
+                spec: Some(proto_api::RawExtension { raw }),
+            },
+        )),
     })
 }
 
@@ -102,118 +43,175 @@ pub(super) fn convert_task_workload(
 ) -> Result<TaskWorkload, ApiError> {
     let api_version = workload.api_version;
     let kind = workload.kind;
-    let spec = workload
+
+    let extension = match workload.spec {
+        Some(proto_api::task_workload::Spec::Extension(extension)) => extension,
+        Some(proto_api::task_workload::Spec::Subprocess(_)) => return Err(removed("Subprocess")),
+        Some(proto_api::task_workload::Spec::Wasm(_)) => return Err(removed("Wasm")),
+        Some(proto_api::task_workload::Spec::Container(_)) => return Err(removed("Container")),
+        None => return Err(ApiError::InvalidRequest(MISSING_BODY.into())),
+    };
+    let raw = extension
         .spec
-        .ok_or_else(|| ApiError::InvalidRequest("missing workload spec".into()))?;
-
-    match spec {
-        proto_api::task_workload::Spec::Subprocess(subprocess) => {
-            validate_builtin_workload_gvk(&api_version, &kind, "Subprocess")?;
-            let mode = subprocess
-                .mode
-                .ok_or_else(|| ApiError::InvalidRequest("missing subprocess mode".into()))?
-                .mode
-                .ok_or_else(|| ApiError::InvalidRequest("missing typed subprocess mode".into()))?;
-
-            let mode = match mode {
-                proto_api::subprocess_mode::Mode::Command(command) => SubprocessMode::Command {
-                    command: command.command,
-                    args: command.args,
-                },
-                proto_api::subprocess_mode::Mode::Script(script) => SubprocessMode::Script {
-                    interpreter: script.interpreter,
-                    body: script.body,
-                    args: script.args,
-                },
-            };
-
-            mode.validate()
-                .map_err(|error| ApiError::InvalidRequest(error.to_string()))?;
-            Ok(TaskWorkload::Subprocess(SubprocessSpec::new(
-                mode,
-                convert_env(subprocess.env),
-                subprocess.cwd.map(std::path::PathBuf::from),
-                Flag::from(subprocess.fail_on_non_zero),
-            )))
-        }
-        proto_api::task_workload::Spec::Wasm(wasm) => {
-            validate_builtin_workload_gvk(&api_version, &kind, "Wasm")?;
-            if wasm.module.trim().is_empty() {
-                return Err(ApiError::InvalidRequest("wasm module path is empty".into()));
-            }
-            Ok(TaskWorkload::Wasm(WasmSpec::new(
-                std::path::PathBuf::from(wasm.module),
-                wasm.args,
-                convert_env(wasm.env),
-            )))
-        }
-        proto_api::task_workload::Spec::Container(container) => {
-            validate_builtin_workload_gvk(&api_version, &kind, "Container")?;
-            if container.image.trim().is_empty() {
-                return Err(ApiError::InvalidRequest("container image is empty".into()));
-            }
-            Ok(TaskWorkload::Container(ContainerSpec::new(
-                container.image,
-                container.command.map(|command| command.items),
-                container.args,
-                convert_env(container.env),
-            )))
-        }
-        proto_api::task_workload::Spec::Extension(extension) => {
-            let spec = extension.spec.ok_or_else(|| {
-                ApiError::InvalidRequest("missing extension workload spec".into())
-            })?;
-            let spec = serde_json::from_slice(&spec.raw).map_err(|error| {
-                ApiError::InvalidRequest(format!(
-                    "extension workload spec is not valid UTF-8 JSON: {error}"
-                ))
-            })?;
-            ExtensionWorkload::new(api_version, kind, spec)
-                .map(TaskWorkload::Extension)
-                .map_err(|error| ApiError::InvalidRequest(error.to_string()))
-        }
-    }
-}
-
-fn wire_path_to_proto(field: &str, path: &Path) -> Result<String, ApiError> {
-    path.to_str().map(str::to_owned).ok_or_else(|| {
-        ApiError::Internal(format!(
-            "handler returned a {field} that is not valid UTF-8"
+        .ok_or_else(|| ApiError::InvalidRequest(MISSING_BODY.into()))?
+        .raw;
+    let body = serde_json::from_slice(&raw).map_err(|error| {
+        ApiError::InvalidRequest(format!(
+            "workload body in extension.spec.raw is not valid UTF-8 JSON: {error}"
         ))
-    })
+    })?;
+    Workload::new(api_version, kind, body)
+        .map(TaskWorkload::Routed)
+        .map_err(|error| ApiError::InvalidRequest(error.to_string()))
 }
 
-fn validate_builtin_workload_gvk(
-    api_version: &str,
-    kind: &str,
-    expected_kind: &str,
-) -> Result<(), ApiError> {
-    if api_version != WORKLOAD_API_VERSION {
-        return Err(ApiError::InvalidRequest(format!(
-            "unsupported built-in workload apiVersion `{api_version}`"
-        )));
-    }
-    if kind != expected_kind {
-        return Err(ApiError::InvalidRequest(format!(
-            "workload kind `{kind}` does not match `{expected_kind}` spec"
-        )));
-    }
-    Ok(())
+fn removed(name: &str) -> ApiError {
+    ApiError::InvalidRequest(format!(
+        "typed workload `{name}` was removed in Task API contract 0.2; \
+         send the body in TaskWorkload.extension.spec.raw"
+    ))
 }
 
-fn env_to_proto(env: &TaskEnv) -> Vec<proto_api::KeyValue> {
-    env.iter()
-        .map(|value| proto_api::KeyValue {
-            key: value.key().to_string(),
-            value: value.value().to_string(),
-        })
-        .collect()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solti_model::EmbeddedSpec;
 
-fn convert_env(values: Vec<proto_api::KeyValue>) -> TaskEnv {
-    let mut env = TaskEnv::new();
-    for value in values {
-        env.push(value.key, value.value);
+    fn extension(api_version: &str, kind: &str, raw: &[u8]) -> proto_api::TaskWorkload {
+        proto_api::TaskWorkload {
+            api_version: api_version.into(),
+            kind: kind.into(),
+            spec: Some(proto_api::task_workload::Spec::Extension(
+                proto_api::ExtensionTask {
+                    spec: Some(proto_api::RawExtension { raw: raw.to_vec() }),
+                },
+            )),
+        }
     }
-    env
+
+    fn invalid_request(error: ApiError) -> String {
+        match error {
+            ApiError::InvalidRequest(message) => message,
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grpc_extension_round_trips_a_routed_workload() {
+        let expected = serde_json::json!({
+            "enabled": true,
+            "exactInteger": 9_007_199_254_740_993_u64,
+            "limits": { "cpu": 2.5, "memory": null },
+            "names": ["primary", "replica"]
+        });
+        let workload = TaskWorkload::Routed(
+            Workload::new("tasks.example.io/v1", "Echo", expected.clone()).unwrap(),
+        );
+
+        let proto = workload_to_proto(&workload).unwrap();
+        assert_eq!(proto.api_version, "tasks.example.io/v1");
+        assert_eq!(proto.kind, "Echo");
+        let Some(proto_api::task_workload::Spec::Extension(extension)) = &proto.spec else {
+            panic!("a routed workload must travel as an extension");
+        };
+        let raw = &extension.spec.as_ref().unwrap().raw;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(raw).unwrap(),
+            expected
+        );
+        assert!(
+            std::str::from_utf8(raw)
+                .unwrap()
+                .contains("9007199254740993"),
+            "the exact integer digits must reach the wire"
+        );
+
+        assert_eq!(convert_task_workload(proto).unwrap(), workload);
+    }
+
+    #[test]
+    fn grpc_refuses_a_typed_workload_with_a_contract_message() {
+        let typed = [
+            (
+                "Subprocess",
+                proto_api::task_workload::Spec::Subprocess(proto_api::SubprocessTask::default()),
+            ),
+            (
+                "Wasm",
+                proto_api::task_workload::Spec::Wasm(proto_api::WasmTask::default()),
+            ),
+            (
+                "Container",
+                proto_api::task_workload::Spec::Container(proto_api::ContainerTask::default()),
+            ),
+        ];
+        for (name, spec) in typed {
+            let workload = proto_api::TaskWorkload {
+                api_version: "exec.solti.io/v1".into(),
+                kind: name.into(),
+                spec: Some(spec),
+            };
+            assert_eq!(
+                invalid_request(convert_task_workload(workload).unwrap_err()),
+                format!(
+                    "typed workload `{name}` was removed in Task API contract 0.2; \
+                     send the body in TaskWorkload.extension.spec.raw"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_refuses_a_missing_or_non_object_body() {
+        let missing = "missing workload body: set TaskWorkload.extension.spec.raw";
+
+        let no_oneof = proto_api::TaskWorkload {
+            api_version: "tasks.example.io/v1".into(),
+            kind: "Echo".into(),
+            spec: None,
+        };
+        assert_eq!(
+            invalid_request(convert_task_workload(no_oneof).unwrap_err()),
+            missing
+        );
+
+        let no_raw_message = proto_api::TaskWorkload {
+            api_version: "tasks.example.io/v1".into(),
+            kind: "Echo".into(),
+            spec: Some(proto_api::task_workload::Spec::Extension(
+                proto_api::ExtensionTask { spec: None },
+            )),
+        };
+        assert_eq!(
+            invalid_request(convert_task_workload(no_raw_message).unwrap_err()),
+            missing
+        );
+
+        for raw in [&b""[..], b"not json", b"[1, 2]", b"\"text\"", b"null", b"7"] {
+            let message = invalid_request(
+                convert_task_workload(extension("tasks.example.io/v1", "Echo", raw)).unwrap_err(),
+            );
+            assert!(
+                message.contains("workload body") || message.contains("JSON object"),
+                "{raw:?} was refused with an unrelated message: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_stays_refused_on_both_transports_grpc() {
+        let error = convert_task_workload(extension(
+            "solti.io/v1",
+            "Embedded",
+            br#"{"revision":"test-v1"}"#,
+        ))
+        .unwrap_err();
+        assert!(invalid_request(error).contains("reserved"));
+
+        let embedded = TaskWorkload::Embedded(EmbeddedSpec::new("test-v1").unwrap());
+        assert!(matches!(
+            workload_to_proto(&embedded),
+            Err(ApiError::Internal(message)) if message.contains("Embedded")
+        ));
+    }
 }

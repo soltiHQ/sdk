@@ -243,8 +243,7 @@ mod tests {
 
     use bytes::Bytes;
     use solti_model::{
-        EmbeddedSpec, ExtensionWorkload, OutputChunk, StreamKind, TaskSpec, TaskWorkload,
-        WORKLOAD_API_VERSION, WorkloadTypeMeta,
+        EmbeddedSpec, OutputChunk, StreamKind, TaskSpec, TaskWorkload, Workload, WorkloadDecl,
     };
     use solti_runner::{BuildContext, RunId, Runner, RunnerError, RunnerRouter};
     use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
@@ -257,12 +256,10 @@ mod tests {
             "adapter-test"
         }
 
-        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+        fn workload_types(&self) -> Vec<WorkloadDecl> {
             vec![
-                WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess")
-                    .expect("built-in workload GVK"),
-                WorkloadTypeMeta::new("workloads.example.io/v1", "ExampleJob")
-                    .expect("extension workload GVK"),
+                WorkloadDecl::object("exec.solti.io/v1", "Subprocess"),
+                WorkloadDecl::object("workloads.example.io/v1", "ExampleJob"),
             ]
         }
 
@@ -393,9 +390,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_filters_sdk_only_workloads_before_pagination() {
-        use solti_model::{
-            Flag, LabelSelector, Labels, SubprocessMode, SubprocessSpec, TaskEnv, TaskQuery,
-        };
+        use solti_model::{LabelSelector, Labels, TaskQuery};
 
         let api = supervisor().await;
         let hidden_ref: TaskRef =
@@ -419,15 +414,14 @@ mod tests {
         .await
         .unwrap();
 
-        let visible_workload = TaskWorkload::Subprocess(SubprocessSpec::new(
-            SubprocessMode::Command {
-                command: "true".into(),
-                args: Vec::new(),
-            },
-            TaskEnv::new(),
-            None,
-            Flag::from(true),
-        ));
+        let visible_workload = TaskWorkload::Routed(
+            Workload::new(
+                "exec.solti.io/v1",
+                "Subprocess",
+                serde_json::json!({ "mode": { "command": { "command": "true" } } }),
+            )
+            .unwrap(),
+        );
         let visible_spec =
             solti_model::TaskSpec::builder("visible-slot", visible_workload, 5_000_u64)
                 .build()
@@ -463,8 +457,6 @@ mod tests {
 
     #[tokio::test]
     async fn apply_cannot_replace_an_embedded_task_through_the_public_api() {
-        use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv};
-
         let api = supervisor().await;
         let hidden_ref: TaskRef =
             TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) });
@@ -484,15 +476,14 @@ mod tests {
 
         let visible_spec = TaskSpec::builder(
             "visible-slot",
-            TaskWorkload::Subprocess(SubprocessSpec::new(
-                SubprocessMode::Command {
-                    command: "true".into(),
-                    args: Vec::new(),
-                },
-                TaskEnv::new(),
-                None,
-                Flag::from(true),
-            )),
+            TaskWorkload::Routed(
+                Workload::new(
+                    "exec.solti.io/v1",
+                    "Subprocess",
+                    serde_json::json!({ "mode": { "command": { "command": "true" } } }),
+                )
+                .unwrap(),
+            ),
             5_000_u64,
         )
         .build()
@@ -520,8 +511,8 @@ mod tests {
     async fn extension_workloads_are_public_and_routable() {
         let api = supervisor().await;
         let adapter = SupervisorApiAdapter::new(Arc::new(api));
-        let workload = TaskWorkload::Extension(
-            ExtensionWorkload::new(
+        let workload = TaskWorkload::Routed(
+            Workload::new(
                 "workloads.example.io/v1",
                 "ExampleJob",
                 serde_json::json!({"value": 9_007_199_254_740_993_u64}),
@@ -544,10 +535,7 @@ mod tests {
             .expect("get succeeds")
             .expect("extension task remains visible");
 
-        assert!(matches!(
-            fetched.spec().workload(),
-            TaskWorkload::Extension(_)
-        ));
+        assert!(matches!(fetched.spec().workload(), TaskWorkload::Routed(_)));
     }
 
     #[test]

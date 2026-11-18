@@ -29,8 +29,8 @@ use solti_api::{
     ApiError, ApiHandler, HTTP_API_ROOT, HttpApi, OutputEventStream, TaskWatchEventStream,
 };
 use solti_model::{
-    ExtensionWorkload, OutputChunk, OutputEvent, StreamKind, Task, TaskFilter, TaskId,
-    TaskManifest, TaskPage, TaskQuery, TaskRunPage, TaskRunQuery, TaskSpec, TaskWorkload, Token,
+    OutputChunk, OutputEvent, StreamKind, Task, TaskFilter, TaskId, TaskManifest, TaskPage,
+    TaskQuery, TaskRunPage, TaskRunQuery, TaskSpec, TaskWorkload, Token, Workload,
     WritePreconditions,
 };
 use tower::ServiceExt;
@@ -224,7 +224,7 @@ impl ApiHandler for MemoryHandler {
 }
 
 fn manifest() -> ExampleResult<TaskManifest> {
-    let workload = TaskWorkload::Extension(ExtensionWorkload::new(
+    let workload = TaskWorkload::Routed(Workload::new(
         "media.example.io/v1",
         "ImageResize",
         json!({

@@ -139,8 +139,9 @@ The in-process model keeps it.
 HTTP reads and writes the model-owned CRD JSON representation.
 gRPC reads and writes versioned protobuf DTOs.
 Both are converted to the same domain values before `ApiHandler` is called.
-`Subprocess.cwd` and `Wasm.module` carry exact UTF-8 text in both transports.
-Invalid native `PathBuf` values are rejected instead of converted lossily.
+Every workload is a `{apiVersion, kind, spec}` envelope whose `spec` is a JSON object.
+HTTP uses that shape directly.
+gRPC carries the same object as UTF-8 JSON bytes in `TaskWorkload.extension.spec.raw`.
 
 ## Features
 
@@ -435,15 +436,17 @@ The transports reject `Embedded` input.
 They also reject an `Embedded` value returned by a custom handler.
 `SupervisorApiAdapter` hides embedded tasks, watches, history, output, apply, cancel, and delete operations.
 
-Extension workloads remain public.
-Their GVK and JSON object are preserved across both transports.
+Every other workload is public and routed by its GVK.
+Its GVK and JSON object are preserved across both transports.
+The typed gRPC `subprocess`, `wasm` and `container` variants were removed in Task API contract 0.2.
+A request that still sets one is refused with `InvalidArgument` and a message that names `extension.spec.raw`.
 
-Chain is transported through this extension contract:
+Chain is transported through the same contract:
 
 | Transport | Chain encoding |
 |-----------|----------------|
 | HTTP | `Task.spec.workload` uses `apiVersion: chain.solti.io/v1alpha1`, `kind: Chain`, and the Chain object in `spec` |
-| gRPC | `TaskWorkload` uses the same GVK and carries the serialized Chain spec in `ExtensionTask.spec.raw` |
+| gRPC | `TaskWorkload` uses the same GVK and carries the serialized Chain spec in `extension.spec.raw` |
 
 The API does not create separate resources for Chain steps. Status, run
 history, and live output continue to describe the one outer Task. Chain graph

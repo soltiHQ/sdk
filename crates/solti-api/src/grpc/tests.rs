@@ -5,9 +5,9 @@ use std::time::{Duration, UNIX_EPOCH};
 use async_trait::async_trait;
 use bytes::Bytes;
 use solti_model::{
-    ExtensionWorkload, OutputChunk, OutputEvent, StreamKind as ModelStreamKind, Task,
+    EMBEDDED_WORKLOAD_API_VERSION, OutputChunk, OutputEvent, StreamKind as ModelStreamKind, Task,
     TaskContinuation, TaskFilter, TaskId, TaskManifest, TaskPage, TaskPhase, TaskQuery, TaskRun,
-    TaskRunPage, TaskRunQuery, TaskSpec, TaskWatchEvent, TaskWorkload, Uid, WORKLOAD_API_VERSION,
+    TaskRunPage, TaskRunQuery, TaskSpec, TaskWatchEvent, TaskWorkload, Uid, Workload,
     WorkloadTypeMeta, WritePreconditions,
 };
 
@@ -93,7 +93,7 @@ impl ApiHandler for StreamMock {
     ) -> Result<TaskRunPage, ApiError> {
         *self.last_run_query.lock().unwrap() = Some(query);
         let workload = if id.as_str() == "embedded-run" {
-            WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Embedded").unwrap()
+            WorkloadTypeMeta::new(EMBEDDED_WORKLOAD_API_VERSION, "Embedded").unwrap()
         } else {
             WorkloadTypeMeta::new("workloads.example.io/v1", "DatabaseBackup").unwrap()
         };
@@ -164,8 +164,8 @@ fn service() -> TaskApiService<StreamMock> {
 }
 
 fn watch_task() -> Task {
-    let workload = TaskWorkload::Extension(
-        ExtensionWorkload::new(
+    let workload = TaskWorkload::Routed(
+        Workload::new(
             "workloads.example.io/v1",
             "ExampleJob",
             serde_json::json!({"value": 1}),
@@ -182,8 +182,8 @@ fn watch_task() -> Task {
 
 fn native_oversized_task() -> Task {
     let manifest = |padding: usize| {
-        let workload = TaskWorkload::Extension(
-            ExtensionWorkload::new(
+        let workload = TaskWorkload::Routed(
+            Workload::new(
                 "workloads.example.io/v1",
                 "LargePayload",
                 serde_json::json!({ "padding": "x".repeat(padding) }),
