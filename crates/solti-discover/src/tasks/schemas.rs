@@ -13,10 +13,17 @@
 //! next follow-up ◄── schemas, sorted, within the budget ── attach
 //! ```
 //!
-//! A wanted schema is *due* when it was never sent, or was last sent at least
-//! [`SCHEMA_RESEND_INTERVAL`] ago, and it is *sendable* when it is due and the
-//! current attempt has not sent it yet. An attempt sends each schema at most
-//! once, however long its follow-ups take.
+//! The exchange records a send when an accepted request carries a schema, and
+//! forgets it when an accepted response does not request the schema: the
+//! control plane stored it, or refused it. A wanted schema is *due* when it has
+//! no recorded send, or its recorded send is at least
+//! [`SCHEMA_RESEND_INTERVAL`] old. So a schema that the control plane requests
+//! again after it stopped, because it lost the schema, as after a restart of an
+//! in-memory catalog, goes out at once. Only a schema still requested right
+//! after it was sent, a store error or a fingerprint mismatch, waits for the
+//! interval. A schema is *sendable* when it is due and the current attempt has
+//! not sent it yet. An attempt sends each schema at most once, however long its
+//! follow-ups take.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -46,7 +53,7 @@ pub(super) const SCHEMA_RESEND_INTERVAL: Duration = Duration::from_secs(300);
 pub(super) struct Observation {
     /// Fingerprints the response wants although the same request carried them:
     /// a store error or a fingerprint mismatch on Podium's side. Each is
-    /// reported once in the life of the exchange.
+    /// reported once, and again only after a response stopped requesting it.
     pub(super) still_requested: Vec<SchemaFingerprint>,
     /// Wanted entries the agent does not declare, as received; they are
     /// ignored.
@@ -79,9 +86,11 @@ pub(super) struct SchemaExchange {
     /// Declared fingerprints the last accepted response wanted, sorted as
     /// Podium sorts them.
     wanted: BTreeSet<SchemaFingerprint>,
-    /// When each schema was last carried by an accepted request.
+    /// When each schema was last carried by an accepted request, kept while
+    /// every accepted response since then still requests it.
     last_sent: HashMap<SchemaFingerprint, Instant>,
-    /// Fingerprints already reported as still requested.
+    /// Fingerprints reported as still requested, kept while every accepted
+    /// response since then still requests them.
     warned: HashSet<SchemaFingerprint>,
 }
 
@@ -150,8 +159,9 @@ impl SchemaExchange {
     /// Takes in an accepted response to a request that carried `sent`.
     ///
     /// It records `sent` as sent at `now` and adds it to `sent_this_attempt`,
-    /// replaces the wanted set with the declared fingerprints of `want`, and
-    /// reports what [`Observation`] describes.
+    /// replaces the wanted set with the declared fingerprints of `want`,
+    /// forgets the recorded send and the report of every schema `want` does not
+    /// request, and reports what [`Observation`] describes.
     pub(super) fn observe(
         &mut self,
         sent: &[SchemaFingerprint],
@@ -174,6 +184,12 @@ impl SchemaExchange {
                 _ => unknown.push(entry.clone()),
             }
         }
+        // The control plane stored or refused a schema it no longer requests. If
+        // it requests the schema again, it lost it, so the schema is due at once.
+        self.last_sent
+            .retain(|fingerprint, _| self.wanted.contains(fingerprint));
+        self.warned
+            .retain(|fingerprint| self.wanted.contains(fingerprint));
 
         let still_requested = sent
             .iter()
@@ -512,6 +528,104 @@ mod tests {
         assert_eq!(attached, vec![fingerprint.clone()]);
         let observation = exchange.observe(&attached, &want, now, &mut attempt);
         assert!(observation.still_requested.is_empty(), "warned once");
+    }
+
+    #[test]
+    fn a_schema_requested_again_after_it_was_stored_goes_out_at_once() {
+        let capabilities = agent(vec![runner(
+            "one",
+            vec![workload("a.example.io/v1", "A", small_schema("a"))],
+        )]);
+        let fingerprint = capabilities.schemas()[0].fingerprint().clone();
+        let want = vec![fingerprint.as_str().to_owned()];
+
+        for seconds in [10, 120, 299] {
+            let mut exchange = SchemaExchange::new(&capabilities);
+            let sent_at = Instant::now();
+
+            // Sent, then stored: the answer to the request that carried it no
+            // longer wants it.
+            let mut attempt = HashSet::new();
+            assert!(
+                exchange
+                    .observe(&[], &want, sent_at, &mut attempt)
+                    .follow_up
+            );
+            let attached = exchange.attach(&mut SyncRequest::default(), sent_at, |_| 0, &attempt);
+            assert_eq!(attached, vec![fingerprint.clone()]);
+            let observation = exchange.observe(&attached, &[], sent_at, &mut attempt);
+            assert!(!observation.follow_up);
+            assert!(observation.still_requested.is_empty());
+
+            // The control plane lost it, as on a restart of an in-memory catalog,
+            // and requests it again: the next attempt sends it at once.
+            let now = sent_at + Duration::from_secs(seconds);
+            let mut attempt = HashSet::new();
+            let observation = exchange.observe(&[], &want, now, &mut attempt);
+            assert!(
+                observation.follow_up,
+                "requested again {seconds} s after it was sent and stored"
+            );
+            assert!(observation.still_requested.is_empty());
+            let mut request = SyncRequest::default();
+            assert_eq!(
+                exchange.attach(&mut request, now, |_| 0, &attempt),
+                vec![fingerprint.clone()],
+                "attachable {seconds} s after it was sent and stored"
+            );
+            assert_eq!(request.schemas.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_schema_lost_again_after_a_store_failure_starts_a_new_resend_window() {
+        let capabilities = agent(vec![runner(
+            "one",
+            vec![workload("a.example.io/v1", "A", small_schema("a"))],
+        )]);
+        let fingerprint = capabilities.schemas()[0].fingerprint().clone();
+        let want = vec![fingerprint.as_str().to_owned()];
+        let mut exchange = SchemaExchange::new(&capabilities);
+        let sent_at = Instant::now();
+
+        // Still requested right after its send: reported and held back.
+        let mut attempt = HashSet::new();
+        exchange.observe(&[], &want, sent_at, &mut attempt);
+        let attached = exchange.attach(&mut SyncRequest::default(), sent_at, |_| 0, &attempt);
+        let observation = exchange.observe(&attached, &want, sent_at, &mut attempt);
+        assert_eq!(observation.still_requested, vec![fingerprint.clone()]);
+        assert!(!observation.follow_up);
+
+        // A later answer no longer wants it: the control plane has it now, sent by
+        // another agent that declares the same schema, say.
+        let stored_at = sent_at + Duration::from_secs(30);
+        let observation = exchange.observe(&[], &[], stored_at, &mut HashSet::new());
+        assert!(!observation.follow_up);
+
+        // Lost again: due at once, not 300 s after the first send.
+        let now = stored_at + Duration::from_secs(10);
+        let mut attempt = HashSet::new();
+        assert!(exchange.observe(&[], &want, now, &mut attempt).follow_up);
+        let attached = exchange.attach(&mut SyncRequest::default(), now, |_| 0, &attempt);
+        assert_eq!(attached, vec![fingerprint.clone()]);
+
+        // Still requested right after this send: reported again, and held back
+        // from this send on.
+        let observation = exchange.observe(&attached, &want, now, &mut attempt);
+        assert_eq!(observation.still_requested, vec![fingerprint.clone()]);
+        assert!(!observation.follow_up);
+        let held = now + SCHEMA_RESEND_INTERVAL - Duration::from_secs(1);
+        assert!(
+            !exchange
+                .observe(&[], &want, held, &mut HashSet::new())
+                .follow_up
+        );
+        let due = now + SCHEMA_RESEND_INTERVAL;
+        assert!(
+            exchange
+                .observe(&[], &want, due, &mut HashSet::new())
+                .follow_up
+        );
     }
 
     #[test]

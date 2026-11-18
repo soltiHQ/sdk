@@ -243,6 +243,12 @@ pub(in crate::tasks) mod fake {
             self.lock().catalog.clone()
         }
 
+        /// Loses every stored schema, as Podium's memory backend does when it
+        /// restarts.
+        pub(in crate::tasks) fn restart(&self) {
+            self.lock().catalog.clear();
+        }
+
         fn lock(&self) -> std::sync::MutexGuard<'_, State> {
             self.state.lock().expect("fake control plane lock")
         }

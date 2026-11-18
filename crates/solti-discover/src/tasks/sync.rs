@@ -1322,6 +1322,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schemas_a_restarted_control_plane_lost_go_out_in_the_next_attempt() {
+        // A control plane that keeps its catalog in memory requests every schema
+        // again after a restart: the agent sends them at once, not five minutes
+        // after it last sent them.
+        let capabilities = agent(vec![runner(
+            "r",
+            vec![
+                workload("a.example.io/v1", "A", small_schema("a")),
+                workload("b.example.io/v1", "B", small_schema("b")),
+            ],
+        )]);
+        for transport in transports() {
+            let log = EventLog::default();
+            let _logging = tracing::subscriber::set_default(log.clone());
+            let control = Arc::new(FakeControlPlane::default());
+            let server = fake::serve(transport, Arc::clone(&control)).await;
+            let config = builder(transport, server.endpoint(), capabilities.clone(), 1)
+                .build()
+                .unwrap();
+            let (_, task) = sync(config, Arc::new(|| 7)).expect("sync builds");
+
+            task.spawn(TaskContext::detached())
+                .await
+                .expect("the first attempt succeeds");
+            assert_eq!(control.catalog().len(), 2, "{transport:?}");
+            control.restart();
+            task.spawn(TaskContext::detached())
+                .await
+                .expect("the second attempt succeeds");
+
+            // Each attempt: a bare heartbeat that learns both are wanted, and one
+            // follow-up that carries both.
+            let seen = control.seen();
+            assert_eq!(
+                seen.len(),
+                4,
+                "{transport:?}: the lost schemas go out in the next attempt"
+            );
+            for heartbeat in [&seen[0], &seen[2]] {
+                assert!(heartbeat.schemas.is_empty(), "{transport:?}");
+                assert!(
+                    matches!(&heartbeat.outcome, Outcome::Accepted(want) if want.len() == 2),
+                    "{transport:?}: {:?}",
+                    heartbeat.outcome
+                );
+            }
+            for follow_up in [&seen[1], &seen[3]] {
+                assert_eq!(follow_up.schemas.len(), 2, "{transport:?}");
+                assert_eq!(
+                    follow_up.outcome,
+                    Outcome::Accepted(Vec::new()),
+                    "{transport:?}"
+                );
+            }
+            assert_eq!(control.catalog().len(), 2, "{transport:?}");
+            assert!(
+                log.events(Level::WARN, "discovery.schema_still_requested")
+                    .is_empty(),
+                "{transport:?}"
+            );
+
+            drop(task);
+            server.stop().await;
+        }
+    }
+
+    #[tokio::test]
     async fn heartbeats_stay_bare_when_every_schema_request_is_refused() {
         // A proxy in front of the control plane refuses bodies over 128 KiB, so
         // every follow-up with two or three 64 KiB schemas is refused: HTTP 413,

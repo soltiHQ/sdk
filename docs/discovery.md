@@ -179,7 +179,8 @@ Podium answers an accepted heartbeat with `want_schemas`, the fingerprints it la
 | Follow-ups per attempt | At most 6; each schema once per attempt |
 | One follow-up over HTTP | About two 64 KiB schemas: the JSON body carries schema bytes as base64 |
 | One follow-up over gRPC | About three 64 KiB schemas: protobuf carries raw bytes |
-| Resend of a schema Podium still requests | At most every 5 minutes |
+| Resend of a schema Podium still requests right after it was sent | At most every 5 minutes |
+| A schema Podium requests again after it stopped requesting it | Sent in the next follow-up, without waiting |
 
 The size is measured with the encoder of the transport in use.
 Five requested schemas of 64 KiB therefore go out in two follow-ups over gRPC and three over HTTP.
@@ -190,9 +191,13 @@ That holds for a refusal too, an HTTP 413 included.
 A schema too large to fit beside a bare heartbeat can never be sent: `sync` logs `discovery.schema_over_request_budget` at WARN for it and the others still go out.
 A capability set whose bare heartbeat is over budget is refused by `sync` with `DiscoverError::InvalidConfig`.
 
-A fingerprint that Podium keeps requesting right after the follow-up that carried it is logged once, at WARN as `discovery.schema_still_requested`, for each fingerprint in each discovery task, not once per process.
-The schema is resent at most every 5 minutes.
+A fingerprint that Podium keeps requesting right after the follow-up that carried it is logged at WARN as `discovery.schema_still_requested`, once per fingerprint in each discovery task until a response stops requesting it.
+The schema is resent at most every 5 minutes while Podium keeps requesting it.
 Still being requested means that Podium's store failed or that its hash of the bytes differs; it is not a refusal.
+
+When a response stops requesting a schema, Podium stored it, or refused it, and the agent forgets when it sent it.
+If a later response requests it again, Podium lost it, as after a restart with the memory backend, a fresh raft cluster or a restored database: the agent sends it in the next follow-up, without waiting the 5 minutes.
+A refused schema is therefore sent once more each time a restarted Podium requests it, and refused again.
 
 Podium's refusal of a schema is silent to the agent.
 Podium stops requesting a schema outside its subset or over its limits, and the agent cannot tell that from success.

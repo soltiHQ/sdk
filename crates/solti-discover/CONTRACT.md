@@ -225,7 +225,7 @@ follow-up carries one only when the control plane asked for its fingerprint in
 | `SYNC_REQUEST_HEADROOM_BYTES` | 1 024       | Bytes kept free below that cap                  |
 | Request budget                | 261 120     | The cap minus the headroom                      |
 | `MAX_SCHEMA_FOLLOW_UPS`       | 6           | Follow-up requests per attempt, after the heartbeat |
-| `SCHEMA_RESEND_INTERVAL`      | 300 seconds | Least time between two sends of one schema      |
+| `SCHEMA_RESEND_INTERVAL`      | 300 seconds | Least time between two sends of one schema that stays requested |
 
 These constants are crate-private.
 
@@ -235,9 +235,20 @@ The `want_schemas` of each accepted response replaces the set of requested
 schemas. Only fingerprints the agent declares count. Any other entry is logged
 at DEBUG and ignored.
 
-A requested schema is *due* when no accepted request has carried it yet, or
-the last one did at least 300 seconds ago. It is *sendable* when it is due and
-the current attempt has not sent it. An attempt sends each schema at most once.
+The agent records a send when an accepted request carries a schema. It forgets
+that record, and any `discovery.schema_still_requested` report of the schema,
+when an accepted response does not request the schema: the control plane
+stored it or refused it. A requested schema is *due* when it has no record, or
+its record is at least 300 seconds old. It is *sendable* when it is due and the
+current attempt has not sent it. An attempt sends each schema at most once.
+
+So a schema goes out at once when it was never sent, and when the control plane
+requests it again after a response stopped requesting it: the control plane
+lost it, as when Podium restarts with its memory backend, a fresh raft cluster
+or a restored database. Only a schema that the response to the request that
+carried it still requests, and every response since, waits 300 seconds between
+sends. A schema that the control plane refuses is sent once more each time a
+restarted control plane requests it again, and refused again.
 
 The heartbeat's response restates `want_schemas`, so keeping the heartbeat
 bare adds no round trip: the follow-ups start right after it.
@@ -292,12 +303,14 @@ the server hold.
 
 | Situation                                                           | Agent behavior |
 |---------------------------------------------------------------------|----------------|
-| The response to a follow-up still asks for a schema that follow-up carried | WARN `discovery.schema_still_requested`, once per fingerprint for the task, with its workload types and size; the schema is resent at most every 300 seconds |
+| The response to a follow-up still asks for a schema that follow-up carried | WARN `discovery.schema_still_requested`, with its workload types and size, once per fingerprint for the task until a response stops requesting it; the schema is resent at most every 300 seconds while it stays requested |
+| A response asks again for a schema that an earlier response stopped requesting | The schema is due at once, and the next follow-up carries it; INFO `discovery.schemas_sent` records the send |
 | The response asks for a fingerprint the agent does not declare      | DEBUG `discovery.schema_unknown_request`; ignored |
 | The control plane refuses a schema                                  | Podium stops asking for it, which the agent cannot tell apart from success. Podium's catalog shows it as `refused`, and placement shows `schema_incompatible` with the reason |
 
 A schema still requested right after it was sent means a store error or a
-fingerprint mismatch on the control plane's side.
+fingerprint mismatch on the control plane's side. A schema requested again
+after a response stopped requesting it means the control plane lost it.
 
 ### Logs
 

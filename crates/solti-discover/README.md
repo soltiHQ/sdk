@@ -172,8 +172,11 @@ exactly those canonical bytes in follow-up requests of the same attempt:
 - each follow-up carries the requested schemas, in sorted order, as many as fit
   the encoded request budget of the transport in use;
 - at most six follow-ups run per attempt;
-- a schema is sent once per attempt, and resent at most every five minutes
-  while the control plane still requests it.
+- a schema is sent once per attempt;
+- a schema the control plane still requests right after it was sent is resent
+  at most every five minutes, while it stays requested;
+- a schema the control plane requests again after it stopped requesting it,
+  because it lost it, goes out in the next follow-up, without waiting.
 
 The heartbeat itself never carries a schema, so a schema request refused for
 its size, or too slow for the link, can never fail the heartbeat. Its response
@@ -195,7 +198,7 @@ catalog, where the schema is `refused`, and at placement, which reports
 |----------------------------------------|-------|---------|
 | `discovery.workload_types`             | INFO  | Once per task: each `apiVersion/kind` with its fingerprint |
 | `discovery.schemas_sent`               | INFO  | An accepted follow-up: fingerprints and encoded request size |
-| `discovery.schema_still_requested`     | WARN  | Requested again by the response to the follow-up that carried it; once per fingerprint for each discovery task, not per process |
+| `discovery.schema_still_requested`     | WARN  | Requested again by the response to the follow-up that carried it; once per fingerprint for each discovery task until a response stops requesting it |
 | `discovery.schema_unknown_request`     | DEBUG | A requested fingerprint the agent does not declare; ignored |
 | `discovery.schema_follow_up_failed`    | WARN  | A follow-up failed; the attempt still succeeds |
 | `discovery.schema_over_request_budget` | WARN  | A schema cannot fit in a follow-up even alone and is never sent |
