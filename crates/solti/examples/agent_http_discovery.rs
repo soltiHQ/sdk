@@ -28,6 +28,8 @@
 //! `SOLTI_AGENT_ID` and `SOLTI_AGENT_NAME` override the example identity.
 //! `SOLTI_AGENT_ADVERTISE_URL` overrides the reachable HTTP base URL; wildcard
 //! binds require this value. See `agent_podium` for a complete Podium walkthrough.
+//! The agent logs to stderr, INFO and above by default; `RUST_LOG` takes an
+//! `EnvFilter` expression, such as `info,solti_discover=debug`.
 //!
 //! Run with `cargo run -p solti --example agent_http_discovery --features api-core-adapter,api-http,discover-http,exec-subprocess`.
 
@@ -38,6 +40,7 @@ use http_agent::{Defaults, ExampleResult, Settings};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExampleResult {
+    http_agent::init_logging()?;
     println!(
         r#"
 solti: discovered HTTP agent

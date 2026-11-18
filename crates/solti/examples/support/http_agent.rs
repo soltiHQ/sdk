@@ -14,8 +14,28 @@ use solti::{
     runner::RunnerRouter,
 };
 use tokio::net::TcpListener;
+use tracing_subscriber::EnvFilter;
 
 pub type ExampleResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+/// Prints the agent's `tracing` events, the `discovery.*` ones included, as text on stderr.
+///
+/// `RUST_LOG` sets the filter, an `EnvFilter` expression such as `debug` or
+/// `info,solti_discover=debug`. Without it, INFO and above are printed.
+pub fn init_logging() -> ExampleResult {
+    let filter = match env::var("RUST_LOG") {
+        Ok(directives) => EnvFilter::try_new(directives)?,
+        Err(env::VarError::NotPresent) => EnvFilter::new("info"),
+        Err(error) => return Err(error.into()),
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .with_ansi(false)
+        .try_init()
+        .map_err(io::Error::other)?;
+    Ok(())
+}
 
 pub struct Defaults {
     pub agent_id: &'static str,

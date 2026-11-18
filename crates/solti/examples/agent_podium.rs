@@ -11,6 +11,7 @@
 //! `--print-podium-spec` emits the exact Podium REST request for this executable:
 //! an `exec.solti.io/v1` `Subprocess` workload bound to the schema fingerprint the agent advertises.
 //! `--demo-task` is the child mode; it does not start an agent.
+//! The agent logs to stderr, INFO and above by default; `RUST_LOG` takes an `EnvFilter` expression.
 
 #[path = "support/http_agent.rs"]
 mod http_agent;
@@ -109,7 +110,7 @@ async fn main() -> ExampleResult {
                 "agent_podium [--print-podium-spec | --demo-task]\n\
                  No arguments: serve an HTTP agent and register with Podium.\n\
                  Environment: SOLTI_CONTROL_PLANE, SOLTI_AGENT_ADDR, SOLTI_AGENT_ID,\n\
-                 SOLTI_AGENT_NAME, SOLTI_AGENT_ADVERTISE_URL.\n\
+                 SOLTI_AGENT_NAME, SOLTI_AGENT_ADVERTISE_URL; RUST_LOG for the stderr log.\n\
                  Walkthrough: crates/solti/examples/podium/README.md"
             );
             return Ok(());
@@ -123,6 +124,7 @@ async fn main() -> ExampleResult {
             .into());
         }
     }
+    http_agent::init_logging()?;
     let settings = settings()?;
     println!(
         "solti: Podium-connected agent\n\

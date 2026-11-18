@@ -75,6 +75,17 @@ absolute executable path and the schema fingerprint of the type the agent
 declares. The command runs on the agent host, so keep that binary available while
 its specification is deployed.
 
+The agent writes its log to stderr, INFO and above by default: for example
+`discovery.workload_types`, which lists each declared type with its schema
+fingerprint, and every discovery WARN. `RUST_LOG` takes an `EnvFilter`
+expression to change the level: `RUST_LOG=info,solti_discover=debug` adds
+discovery's DEBUG events, such as each heartbeat and a sync that failed and
+will be retried, and `RUST_LOG=debug` raises every crate:
+
+```sh
+RUST_LOG=info,solti_discover=debug ./target/debug/examples/agent_podium
+```
+
 ## The schema exchange
 
 The heartbeat carries only the type's GVK and the schema's fingerprint, the
@@ -85,7 +96,7 @@ heartbeat. Podium refuses a schema it cannot compile without telling the agent;
 look for it in Podium's workload catalog, where it shows as `refused`, and in a
 spec's placement detail, which reports `schema_incompatible`. If the type does
 not appear in Podium's **Workload type** list after a few heartbeats, check the
-agent's log for `discovery.schema_follow_up_failed`.
+agent's stderr log for `discovery.schema_follow_up_failed` at WARN.
 
 ## Deploy from the browser
 
@@ -161,6 +172,7 @@ the agent's declared check refuses.
 | `SOLTI_AGENT_ID` | `podium-example-agent` | Discovery identity and printed spec's explicit target |
 | `SOLTI_AGENT_NAME` | `Podium example agent` | Name displayed in Podium |
 | `SOLTI_AGENT_ADVERTISE_URL` | Bound listen address as an HTTP URL | Reachable agent base URL; required for a wildcard bind |
+| `RUST_LOG` | `info` | Filter of the agent's stderr log, an `EnvFilter` expression such as `debug` or `info,solti_discover=debug` |
 
 Apply the same custom `SOLTI_AGENT_ID` when printing the request and serving the
 agent. URL settings are base URLs without credentials, query strings, or
@@ -184,7 +196,10 @@ start begins empty with a new administrator password.
 ## Troubleshooting
 
 - **Agent missing:** use the discovery base URL `http://127.0.0.1:9082`, while
-  `9080` serves the browser UI. Check the agent's discovery output for errors.
+  `9080` serves the browser UI. Check the agent's log: a sync the control plane
+  refuses logs `discovery.sync_failed` at WARN, but one that will be retried,
+  such as a refused connection to a wrong port, logs it at DEBUG; run the agent
+  with `RUST_LOG=info,solti_discover=debug` to see it.
 - **Address already in use:** choose unused ports in the YAML and matching agent
   environment variables. Leave unrelated services running.
 - **Logs are empty after completion:** output is live-only. Open the drawer while
@@ -193,7 +208,7 @@ start begins empty with a new administrator password.
   prefix `ephemeral mode:` at each start. Search the log of the current run.
 - **The workload type is missing or has no schema:** the schema arrives in a
   follow-up after the heartbeat. Wait a few heartbeats, then check the agent's
-  log for `discovery.schema_follow_up_failed` and Podium's catalog for a
+  stderr log for `discovery.schema_follow_up_failed` and Podium's catalog for a
   `refused` fingerprint.
 - **Podium refuses the body:** the body must match the agent's schema. Copy
   `workload.body` from `--print-podium-spec` and edit only the command path.
