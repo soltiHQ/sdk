@@ -1,26 +1,29 @@
-//! # Custom extension runner
+//! # Custom workload runner
 //!
 //! This example routes one application-defined workload.
 //!
 //! It shows how to:
-//! - define an `ExtensionWorkload` with a custom GVK;
+//! - define a body type with `#[derive(Deserialize, JsonSchema)]` and `WorkloadBody`;
+//! - declare it with `WorkloadDecl::of`, which derives the schema and the body check;
 //! - register two runners for the same GVK;
 //! - select one runner through `runnerSelector`;
-//! - inspect the registered capability snapshot;
+//! - check a body with the runner that would build it;
+//! - inspect the registered capability snapshot, with schema fingerprints;
 //! - inspect the allocated `RunId` returned beside the executable task.
 //!
 //! Routing uses only the workload GVK and static runner labels.
-//! The selected runner validates the application-owned `spec`.
+//! The first matching runner validates the body and then builds the task.
 //! `RunnerRouter::build` constructs the task but does not start it.
 //!
-//! Run with `cargo run -p solti-runner --example custom_extension`.
+//! Run with `cargo run -p solti-runner --example custom_workload`.
 
 use std::sync::Arc;
 
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 use solti_model::{
-    ExtensionWorkload, LabelSelector, Labels, Task, TaskSpec, TaskWorkload, WorkloadTypeMeta,
+    LabelSelector, Labels, Task, TaskSpec, TaskWorkload, Workload, WorkloadBody, WorkloadDecl,
 };
 use solti_runner::{BuildContext, RunId, Runner, RunnerError, RunnerRouter};
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
@@ -44,7 +47,7 @@ solti-runner: custom workload routing
                                                       │ Task + RunId + BuildContext + cancellation
                                                       ▼
                                             Runner::build_task
-                                                      │ validate application spec
+                                                      │ decode application spec
                                                       ▼
                                              taskvisor::TaskRef
                                                       │ router pairs it with RunId
@@ -52,14 +55,30 @@ solti-runner: custom workload routing
                                                   BuiltTask
 
   Routing reads only the GVK and selector.
-  Building validates the payload and creates a task; it does not start it.
+  Validation runs the first matching runner's declared check on the body.
+  Building creates a task; it does not start it.
 "#;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ImageResizeSpec {
     source: String,
     width: u32,
+}
+
+impl WorkloadBody for ImageResizeSpec {
+    const API_VERSION: &'static str = "media.example.io/v1";
+    const KIND: &'static str = "ImageResize";
+
+    fn validate(&self) -> Result<(), String> {
+        if self.source.trim().is_empty() {
+            return Err("source must not be empty".into());
+        }
+        if self.width == 0 {
+            return Err("width must be greater than zero".into());
+        }
+        Ok(())
+    }
 }
 
 struct ImageResizeRunner {
@@ -73,8 +92,8 @@ impl Runner for ImageResizeRunner {
         self.name
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-        vec![WorkloadTypeMeta::new(API_VERSION, KIND).expect("valid extension GVK")]
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
+        vec![WorkloadDecl::of::<ImageResizeSpec>()]
     }
 
     async fn build_task(
@@ -86,23 +105,17 @@ impl Runner for ImageResizeRunner {
         _scope: &mut solti_runner::BuildScope,
     ) -> Result<TaskRef, RunnerError> {
         let workload = task.spec().workload();
-        let TaskWorkload::Extension(extension) = workload else {
+        let TaskWorkload::Routed(routed) = workload else {
             return Err(unsupported_workload(self.name, workload));
         };
-        if extension.api_version() != API_VERSION || extension.kind() != KIND {
-            return Err(unsupported_workload(self.name, workload));
-        }
-
-        let spec: ImageResizeSpec = serde_json::from_value(extension.spec().clone())
-            .map_err(|error| RunnerError::InvalidSpec(error.to_string()))?;
-        if spec.source.trim().is_empty() {
-            return Err(RunnerError::InvalidSpec("source must not be empty".into()));
-        }
-        if spec.width == 0 {
-            return Err(RunnerError::InvalidSpec(
-                "width must be greater than zero".into(),
-            ));
-        }
+        let spec = routed
+            .decode::<ImageResizeSpec>()
+            .map_err(|error| match error.kind() {
+                solti_model::WorkloadBodyErrorKind::TypeMismatch { .. } => {
+                    unsupported_workload(self.name, workload)
+                }
+                _ => RunnerError::InvalidSpec(error.detail()),
+            })?;
 
         let accelerator = self.accelerator;
         let source: Arc<str> = spec.source.into();
@@ -139,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     println!("[registration] Register CPU and GPU runners for the same custom GVK.");
-    println!("[registration] Runner names, labels, and GVK declarations are validated here.");
+    println!("[registration] Runner names, labels, and workload declarations are validated here.");
     let mut router = RunnerRouter::new();
     router.register_with_labels(
         Arc::new(ImageResizeRunner {
@@ -162,21 +175,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let workload = &runner.workload_types()[0];
         let accelerator = runner.labels().get("accelerator").unwrap_or("unknown");
         println!(
-            "      runner={} apiVersion={} kind={} accelerator={accelerator}",
+            "      runner={} apiVersion={} kind={} fingerprint={} accelerator={accelerator}",
             runner.name(),
             workload.api_version(),
             workload.kind(),
+            workload.fingerprint().as_str(),
         );
     }
 
-    let workload = TaskWorkload::Extension(ExtensionWorkload::new(
+    let body = Workload::new(
         API_VERSION,
         KIND,
         json!({
             "source": "cover.png",
             "width": 1280
         }),
-    )?);
+    )?;
+    let workload = TaskWorkload::Routed(body);
     let spec = TaskSpec::builder("image-resize", workload, 30_000_u64)
         .runner_selector(LabelSelector::from_labels(labels("gpu")))
         .build()?;
@@ -192,8 +207,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert_eq!(selected.name(), "resize-gpu");
 
+    println!("[validation] The first matching runner checks the body before it is stored.");
+    router.validate(task.spec())?;
+    let refused = Workload::new(
+        API_VERSION,
+        KIND,
+        json!({ "source": "cover.png", "width": 0 }),
+    )?;
+    let error = router
+        .validate_workload(&refused, Some(&LabelSelector::from_labels(labels("gpu"))))
+        .expect_err("width 0 is refused");
+    println!("[validation] A bad body is refused: {error}.");
+
     let built = router.build(&task).await?;
-    println!("[build] The runner validates source and width.");
+    println!("[build] The runner decodes the body again and builds the task.");
     println!(
         "[build] BuiltTask keeps the allocated RunId beside the executable task: {}.",
         built.name(),

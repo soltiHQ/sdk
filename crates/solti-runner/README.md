@@ -16,7 +16,7 @@ Implement `Runner`, register it, and build a Taskvisor task:
 ```rust,no_run
 use std::sync::Arc;
 
-use solti_model::{Task, WorkloadTypeMeta, WORKLOAD_API_VERSION};
+use solti_model::{Task, WorkloadDecl};
 use solti_runner::{BuildCancellation, BuildContext, BuildScope, BuiltTask, RunId, Runner, RunnerError, RunnerRouter};
 use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 
@@ -28,11 +28,8 @@ impl Runner for EchoRunner {
         "echo"
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-        vec![
-            WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess")
-                .expect("built-in workload GVK"),
-        ]
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
+        vec![WorkloadDecl::object("tasks.example.io/v1", "Echo")]
     }
 
     async fn build_task(
@@ -56,15 +53,17 @@ async fn build(resource: &Task) -> Result<BuiltTask, Box<dyn std::error::Error>>
 }
 ```
 
-The example declares the built-in `Subprocess` GVK.
-`solti-exec` provides its production implementation.
+The example declares `tasks.example.io/v1` `Echo` with `WorkloadDecl::object`: any JSON object, no body check.
+`WorkloadDecl::of::<B>()` derives the schema and the check from a Rust body type.
+`solti-exec` provides the production implementations.
 
 ## What it does
 
 - shared environment, metrics, and output dependencies for every runner;
 - one plugin contract for built-in and application-defined backends;
 - deterministic routing by GVK, selector, and registration order;
-- validated capability metadata for control-plane discovery.
+- admission checks of a workload body by the runner that would build it;
+- validated capability metadata, with schema fingerprints, for control-plane discovery.
 
 ## Inputs and outputs
 
@@ -103,6 +102,8 @@ Task
 
 Routing uses only workload GVK and `runnerSelector`.
 It does not inspect the workload payload.
+`validate` and `validate_workload` pick the runner the same way and run its declared check on the body.
+The first matching runner checks, and the same runner builds.
 
 The router applies these rules in order:
 
@@ -114,7 +115,7 @@ The router applies these rules in order:
 | Workload variation | Routing behavior                                         |
 |--------------------|----------------------------------------------------------|
 | Built-in workload  | A runner declares its built-in GVK                       |
-| Custom workload    | An `ExtensionWorkload` and runner share a custom GVK     |
+| Custom workload    | A routed `Workload` and a runner declaration share a GVK |
 | Alternate backend  | Several runners share a GVK and labels select one        |
 | Embedded workload  | Bypasses the router because its `TaskRef` already exists |
 
@@ -124,14 +125,16 @@ Registration validates and snapshots the runner declaration.
 
 - Runner names use Kubernetes label-value rules.
 - Static labels use Kubernetes label rules.
-- The built-in `Embedded` GVK is rejected.
-- At least one workload GVK is required.
+- The reserved `solti.io` group is rejected.
+- At least one workload type is required.
 - Duplicate workload GVKs are rejected.
+- A declaration with a refused GVK or a schema outside the supported subset is rejected, naming the runner and GVK.
+- At most 64 runners and 256 distinct schema fingerprints per agent.
 - Runner names are unique.
 
 `RunnerRouter::capabilities()` returns an owned snapshot.
 Runner entries remain in routing priority order.
-Workload GVKs inside each entry use canonical order.
+Workload types inside each entry use canonical GVK order and carry their schema fingerprints.
 
 ## Runner composition
 
@@ -313,17 +316,19 @@ The application controls cardinality for custom labels.
 
 `RouterError` describes registration, selection, and construction failures:
 
-| Variant             | Cause                                          |
-|---------------------|------------------------------------------------|
-| `DuplicateRunner`   | Runner name already registered                 |
-| `InvalidLabels`     | Static labels failed model validation          |
-| `InvalidCapability` | Runner name or workload declaration invalid    |
-| `EmbeddedWorkload`  | Embedded workload sent to the router           |
-| `NoRunner`          | No runner matched the GVK and selector         |
-| `BuildCancelled`    | Build admission cancellation won               |
-| `RecursiveBuild`    | Composition re-entered an active runner        |
-| `AdmissionCycle`    | Nested admission would create a wait cycle     |
-| `Build`             | Selected runner returned `RunnerError`         |
+| Variant               | Cause                                            |
+|-----------------------|--------------------------------------------------|
+| `DuplicateRunner`     | Runner name already registered                   |
+| `InvalidLabels`       | Static labels failed model validation            |
+| `InvalidWorkloadType` | A runner declaration is unusable                 |
+| `InvalidCapability`   | Capability invalid or an agent-wide cap exceeded |
+| `EmbeddedWorkload`    | Embedded workload sent to the router             |
+| `NoRunner`            | No runner matched the GVK and selector           |
+| `InvalidWorkload`     | The matching runner's check refused the body     |
+| `BuildCancelled`      | Build admission cancellation won                 |
+| `RecursiveBuild`      | Composition re-entered an active runner          |
+| `AdmissionCycle`      | Nested admission would create a wait cycle       |
+| `Build`               | Selected runner returned `RunnerError`           |
 
 `RunnerError` is returned by a concrete runner:
 
@@ -347,12 +352,12 @@ Each example starts with a text flow diagram, then explains its inputs, decision
 Start with a custom runner and application-owned workload:
 
 ```bash
-cargo run -p solti-runner --example custom_extension
+cargo run -p solti-runner --example custom_workload
 ```
 
 | Example                                             | What it shows                                                      |
 |-----------------------------------------------------|--------------------------------------------------------------------|
-| [custom_extension.rs](examples/custom_extension.rs) | Custom GVK, runner selection, capabilities, and allocated `RunId`. |
+| [custom_workload.rs](examples/custom_workload.rs)   | Derived schema, runner selection, validation, and allocated `RunId`. |
 | [build_context.rs](examples/build_context.rs)       | Environment merge, metrics port, and attempt-scoped output events. |
 
 `solti-runner` has no optional features.

@@ -2641,6 +2641,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "proptest",
+ "schemars",
  "serde",
  "serde_json",
  "solti-model",

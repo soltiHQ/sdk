@@ -16,7 +16,7 @@
 //! The runner builds the task.
 //! Taskvisor supervises its execution.
 
-use solti_model::{Task, WorkloadTypeMeta};
+use solti_model::{Task, WorkloadDecl};
 use taskvisor::TaskRef;
 
 use async_trait::async_trait;
@@ -29,7 +29,7 @@ use crate::id::RunId;
 
 /// Plugin trait for task execution backends.
 ///
-/// A runner declares a finite set of workload GVKs.
+/// A runner declares a finite set of workload types: a GVK, the JSON Schema of its `spec` and a body check.
 /// It converts matching task resources into [`TaskRef`] values.
 ///
 /// ## Contract
@@ -38,7 +38,7 @@ use crate::id::RunId;
 /// - Implementations must observe [`BuildCancellation`] during interruptible work.
 /// - Building is asynchronous and must remain owned by the returned future.
 /// - Composing runners must pass [`BuildScope`] to scoped catalog builds.
-/// - The router snapshots the name and workload GVKs during registration.
+/// - The router snapshots the name and workload declarations during registration.
 /// - The returned task must not retain the build cancellation signal.
 /// - Attempt-scoped resources belong inside the task body.
 /// - Building must not start or submit the task.
@@ -51,9 +51,22 @@ use crate::id::RunId;
 /// ## Example
 ///
 /// ```rust,no_run
-/// use solti_model::{Task, WorkloadTypeMeta, WORKLOAD_API_VERSION};
+/// use serde::Deserialize;
+/// use schemars::JsonSchema;
+/// use solti_model::{Task, WorkloadBody, WorkloadDecl};
 /// use solti_runner::{BuildContext, Runner, RunnerError};
 /// use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
+///
+/// #[derive(Deserialize, JsonSchema)]
+/// #[serde(deny_unknown_fields)]
+/// struct Echo {
+///     message: String,
+/// }
+///
+/// impl WorkloadBody for Echo {
+///     const API_VERSION: &'static str = "tasks.example.io/v1";
+///     const KIND: &'static str = "Echo";
+/// }
 ///
 /// struct MyRunner;
 ///
@@ -63,11 +76,8 @@ use crate::id::RunId;
 ///         "my-runner"
 ///     }
 ///
-///     fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-///         vec![
-///             WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess")
-///                 .expect("built-in workload GVK"),
-///         ]
+///     fn workload_types(&self) -> Vec<WorkloadDecl> {
+///         vec![WorkloadDecl::of::<Echo>()]
 ///     }
 ///
 ///     async fn build_task(
@@ -98,11 +108,11 @@ pub trait Runner: Send + Sync {
     /// The snapshot is used for capabilities and run ids.
     fn name(&self) -> &str;
 
-    /// Returns the workload GVKs handled by this runner.
+    /// Returns the workload types handled by this runner.
     ///
-    /// The router snapshots and validates this declaration during registration.
-    /// Routing and capability introspection use the same snapshot.
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta>;
+    /// The router reads this once during registration, refuses an unusable declaration and snapshots the rest.
+    /// Routing, admission checks and capability introspection use the same snapshot.
+    fn workload_types(&self) -> Vec<WorkloadDecl>;
 
     /// Builds a [`TaskRef`] for a matching task resource.
     ///

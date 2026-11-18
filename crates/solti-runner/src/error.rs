@@ -72,7 +72,23 @@ pub enum RouterError {
         source: ModelError,
     },
 
-    /// A runner's declared capability is invalid.
+    /// A runner declares a workload type that cannot be used: a refused GVK, a reserved group or
+    /// a schema outside the supported subset.
+    #[error(
+        "runner '{runner}' declares {api_version}/{kind} with an unusable declaration: {reason}"
+    )]
+    InvalidWorkloadType {
+        /// Runner name.
+        runner: String,
+        /// Declared workload API group and version, as written.
+        api_version: String,
+        /// Declared workload kind, as written.
+        kind: String,
+        /// What is wrong with the declaration.
+        reason: String,
+    },
+
+    /// A runner's declared capability is invalid, or registering it exceeds an agent-wide cap.
     #[error("invalid capability for runner '{runner}': {source}")]
     InvalidCapability {
         /// Runner name.
@@ -93,6 +109,21 @@ pub enum RouterError {
         api_version: String,
         /// Workload kind.
         kind: String,
+    },
+
+    /// The selected runner's declaration refuses the workload body.
+    ///
+    /// The runner is the first one that matches the GVK and selector, the one that would build the task.
+    #[error("workload {api_version}/{kind} rejected by runner '{runner}': {reason}")]
+    InvalidWorkload {
+        /// Selected runner name.
+        runner: String,
+        /// Workload API group and version.
+        api_version: String,
+        /// Workload kind.
+        kind: String,
+        /// Why the body is refused, without the GVK.
+        reason: String,
     },
 
     /// Cancellation won while a selected runner waited for build admission.
