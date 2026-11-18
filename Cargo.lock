@@ -2565,6 +2565,7 @@ dependencies = [
  "bytes",
  "containerd-client",
  "getrandom 0.4.3",
+ "jsonschema",
  "libc",
  "oci-spec",
  "prost",

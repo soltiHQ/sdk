@@ -181,6 +181,48 @@ fn snapshots_equal_the_generated_schemas_and_podium_accepts_them() {
     }
 }
 
+/// A body serde accepts for each `flatten` sample validates against the schema the type emits:
+/// a schema that refused it would make Podium refuse a body the agent decodes.
+#[test]
+fn flatten_bodies_validate_against_their_emitted_schemas() {
+    let common = || Common {
+        id: "c-1".into(),
+        tags: vec!["a".into(), "b".into()],
+    };
+    let flattened = serde_json::to_value(Flattened {
+        own: 7,
+        common: common(),
+    })
+    .unwrap();
+    let strict = serde_json::to_value(FlattenedStrict {
+        own: 7,
+        common: common(),
+    })
+    .unwrap();
+    serde_json::from_value::<Flattened>(flattened.clone()).expect("serde reads it back");
+    serde_json::from_value::<FlattenedStrict>(strict.clone()).expect("serde reads it back");
+
+    for (name, schema, body) in [
+        ("flatten", workload_schema_for::<Flattened>(), flattened),
+        (
+            "flatten-deny",
+            workload_schema_for::<FlattenedStrict>(),
+            strict,
+        ),
+    ] {
+        jsonschema::meta::validate(&schema).expect("a draft 2020-12 schema");
+        let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+        let errors: Vec<String> = validator
+            .iter_errors(&body)
+            .map(|error| format!("{} at '{}'", error, error.instance_path()))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "{name}: {body} fails its emitted schema: {errors:?}"
+        );
+    }
+}
+
 /// Integer bounds reach a nested type, which schemars puts under `$defs`.
 #[test]
 fn a_nested_u64_is_bounded_in_defs() {

@@ -103,9 +103,10 @@ libc = { workspace = true, optional = true }
 seccompiler = { workspace = true, optional = true }
 
 [dev-dependencies]
-taskvisor = { workspace = true, features = ["test-util"] }
-tempfile  = { workspace = true }
-tokio     = { workspace = true, features = ["rt", "macros", "test-util"] }
+jsonschema = { workspace = true }
+taskvisor  = { workspace = true, features = ["test-util"] }
+tempfile   = { workspace = true }
+tokio      = { workspace = true, features = ["rt", "macros", "test-util"] }
 
 [[example]]
 name              = "container"
