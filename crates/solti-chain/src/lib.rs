@@ -5,8 +5,9 @@
 //! [`ChainSpec::validate`] requires every declared step to be reachable from `entry` and rejects cycles.
 //! The model is an outcome-directed acyclic chain rather than a parallel DAG scheduler.
 //!
-//! The chain is carried through [`solti_model::TaskWorkload::Extension`] with [`CHAIN_API_VERSION`] and [`CHAIN_KIND`].
-//! [`ChainRunner`] builds every nested workload through a snapshotted [`solti_runner::RunnerCatalog`] and returns one outer [`taskvisor::TaskRef`].
+//! The chain is a declared workload type: a routed [`solti_model::Workload`] with [`CHAIN_API_VERSION`] and [`CHAIN_KIND`].
+//! [`ChainRunner`] declares it with a JSON Schema and a check that validates every nested step against the runner that would run that step.
+//! It builds every nested workload through a snapshotted [`solti_runner::RunnerCatalog`] and returns one outer [`taskvisor::TaskRef`].
 //!
 //! Taskvisor therefore applies timeout, restart, backoff, admission, cancellation, status, and history to the whole chain attempt.
 //!
@@ -35,5 +36,4 @@ mod output;
 mod runner;
 pub use runner::{ChainRunner, register_chain_runner};
 
-#[cfg(feature = "schema")]
 mod schema;

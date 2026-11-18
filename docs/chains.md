@@ -14,16 +14,15 @@ It is not a parallel DAG scheduler, transaction engine, or durable workflow stor
 
 | Component | Role and reason to use it |
 |---|---|
-| `solti-chain` | Defines and validates the graph, builds its steps, follows transitions, and combines output. Its default `schema` feature adds JSON Schema support. |
-| `solti-model` | Carries the chain as an `ExtensionWorkload` inside the outer Task. |
+| `solti-chain` | Defines and validates the graph, builds its steps, follows transitions, and combines output. |
+| `solti-model` | Carries the chain as a routed `Workload` inside the outer Task. |
 | `solti-runner` | Selects leaf backends through a captured catalog and carries shared build admission and cancellation. |
 | Leaf runners | Implement each step's actual work and resource cleanup. They may come from `solti-exec` or the application. |
 | `solti-core` and Taskvisor | Reconcile, admit, supervise, and report the outer Task. Steps are not independently submitted Tasks. |
 
 With the facade crate, enable `solti/chain` and the features required by the leaf backends.
 The complete subprocess example also needs `core` and `exec-subprocess`.
-Use `chain-schema` for the facade's JSON Schema support.
-Schema support describes the model; runtime graph validation still applies.
+Chain declares its own workload type and JSON Schema; the agent publishes it with the runner, and runtime graph validation still applies.
 
 ## Register leaf runners first
 

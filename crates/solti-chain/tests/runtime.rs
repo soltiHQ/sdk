@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use serde_json::{Value, json};
 use solti_chain::{ChainRunner, ChainSpec, ChainStep, FailureMode, register_chain_runner};
+use solti_model::WorkloadBody as _;
 use solti_model::{
-    ExtensionWorkload, LabelSelector, Labels, OutputEvent, StreamKind, Task, TaskId, TaskSpec,
-    TaskWorkload, WorkloadTypeMeta,
+    LabelSelector, Labels, OutputEvent, StreamKind, Task, TaskId, TaskSpec, TaskWorkload, Workload,
+    WorkloadDecl,
 };
 use solti_runner::{
     BuildContext, OutputPublisher, OutputPublisherHandle, OutputSink, RouterError, RunId, Runner,
@@ -46,11 +47,8 @@ impl Runner for LeafRunner {
         self.name
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-        vec![
-            WorkloadTypeMeta::new(TEST_API_VERSION, TEST_KIND)
-                .expect("test workload GVK must be valid"),
-        ]
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
+        vec![WorkloadDecl::object(TEST_API_VERSION, TEST_KIND)]
     }
 
     async fn build_task(
@@ -118,15 +116,15 @@ impl Runner for LeafRunner {
 }
 
 fn leaf_fields(task: &Task) -> Result<(String, String), RunnerError> {
-    let TaskWorkload::Extension(workload) = task.spec().workload() else {
+    let TaskWorkload::Routed(workload) = task.spec().workload() else {
         return Err(RunnerError::UnsupportedWorkload {
             runner: "test-leaf".to_owned(),
             api_version: task.spec().workload().api_version().to_owned(),
             kind: task.spec().workload().kind().to_owned(),
         });
     };
-    let id = string_field(workload.spec(), "id")?;
-    let behavior = string_field(workload.spec(), "behavior")?;
+    let id = string_field(workload.body(), "id")?;
+    let behavior = string_field(workload.body(), "behavior")?;
     Ok((id, behavior))
 }
 
@@ -137,27 +135,22 @@ fn string_field(spec: &Value, field: &str) -> Result<String, RunnerError> {
         .ok_or_else(|| RunnerError::InvalidSpec(format!("missing string field '{field}'")))
 }
 
-fn leaf(id: &str, behavior: &str) -> TaskWorkload {
+fn leaf(id: &str, behavior: &str) -> Workload {
     extension(TEST_KIND, json!({ "id": id, "behavior": behavior }))
 }
 
-fn missing_leaf(id: &str) -> TaskWorkload {
+fn missing_leaf(id: &str) -> Workload {
     extension(MISSING_KIND, json!({ "id": id, "behavior": "ok" }))
 }
 
-fn extension(kind: &str, spec: Value) -> TaskWorkload {
-    TaskWorkload::Extension(
-        ExtensionWorkload::new(TEST_API_VERSION, kind, spec)
-            .expect("test extension workload must be valid"),
-    )
+fn extension(kind: &str, spec: Value) -> Workload {
+    Workload::new(TEST_API_VERSION, kind, spec).expect("test workload must be valid")
 }
 
 fn chain_task(name: &str, chain: ChainSpec) -> Task {
     let spec = TaskSpec::builder(
         format!("{name}-slot"),
-        chain
-            .into_workload()
-            .expect("test chain workload must serialize"),
+        TaskWorkload::from_body(&chain).expect("test chain workload must serialize"),
         10_000_u64,
     )
     .build()
@@ -168,9 +161,7 @@ fn chain_task(name: &str, chain: ChainSpec) -> Task {
 fn chain_task_with_selector(name: &str, chain: ChainSpec, selector: LabelSelector) -> Task {
     let spec = TaskSpec::builder(
         format!("{name}-slot"),
-        chain
-            .into_workload()
-            .expect("test chain workload must serialize"),
+        TaskWorkload::from_body(&chain).expect("test chain workload must serialize"),
         10_000_u64,
     )
     .runner_selector(selector)
@@ -683,8 +674,8 @@ impl Runner for CoordinatedForwardingLeafRunner {
         "coordinated-leaf"
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-        vec![WorkloadTypeMeta::new(TEST_API_VERSION, TEST_KIND).unwrap()]
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
+        vec![WorkloadDecl::object(TEST_API_VERSION, TEST_KIND)]
     }
 
     async fn build_task(
@@ -818,5 +809,145 @@ async fn concurrent_attempts_keep_prebound_spawned_forwarder_output_attempt_loca
             (1, b"leaf-attempt:2".to_vec()),
             (2, b"[chain] step=entry state=succeeded".to_vec()),
         ]
+    );
+}
+
+fn chain_decl(router: &RunnerRouter) -> WorkloadDecl {
+    let runner = ChainRunner::new("chain", router.catalog());
+    let mut decls = runner.workload_types();
+    assert_eq!(decls.len(), 1);
+    decls.remove(0)
+}
+
+fn collect_patterns(value: &Value, found: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if key == "pattern"
+                    && let Some(pattern) = value.as_str()
+                {
+                    found.push(pattern.to_owned());
+                }
+                collect_patterns(value, found);
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|item| collect_patterns(item, found)),
+        _ => {}
+    }
+}
+
+#[test]
+fn chain_declares_its_type_with_a_schema_inside_the_subset() {
+    let router = basic_router(Default::default(), Default::default());
+    let decl = chain_decl(&router);
+
+    assert_eq!(decl.api_version(), solti_chain::CHAIN_API_VERSION);
+    assert_eq!(decl.kind(), solti_chain::CHAIN_KIND);
+    let declared = decl
+        .workload_type()
+        .expect("chain declaration must resolve");
+    let mut patterns = Vec::new();
+    collect_patterns(&declared.schema().to_value(), &mut patterns);
+    assert!(
+        !patterns.is_empty(),
+        "the nested workload schema carries patterns"
+    );
+    for pattern in patterns {
+        for lookaround in ["(?=", "(?!", "(?<=", "(?<!"] {
+            assert!(!pattern.contains(lookaround), "{lookaround} in {pattern}");
+        }
+    }
+}
+
+fn check(router: &RunnerRouter, chain: &ChainSpec) -> Result<(), String> {
+    let workload = Workload::from_body(chain).unwrap();
+    chain_decl(router).check(&workload)
+}
+
+#[test]
+fn chain_check_refuses_an_unknown_nested_type_naming_the_step() {
+    let router = basic_router(Default::default(), Default::default());
+    let chain = ChainSpec::new(
+        "ok",
+        vec![
+            ChainStep::new("ok", leaf("ok", "ok"))
+                .unwrap()
+                .with_on_success("lost")
+                .unwrap(),
+            ChainStep::new("lost", missing_leaf("lost")).unwrap(),
+        ],
+    )
+    .unwrap();
+
+    let reason = check(&router, &chain).unwrap_err();
+    assert!(reason.starts_with("step 'lost': "), "{reason}");
+    assert!(
+        reason.contains(&format!(
+            "no runner matches {TEST_API_VERSION}/{MISSING_KIND}"
+        )),
+        "{reason}"
+    );
+    assert_eq!(reason.matches(TEST_API_VERSION).count(), 1, "{reason}");
+}
+
+#[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TypedLeaf {
+    #[allow(dead_code)]
+    count: u32,
+}
+
+impl solti_model::WorkloadBody for TypedLeaf {
+    const API_VERSION: &'static str = "typed.tests.example/v1";
+    const KIND: &'static str = "TypedLeaf";
+}
+
+struct TypedLeafRunner;
+
+#[solti_runner::async_trait]
+impl Runner for TypedLeafRunner {
+    fn name(&self) -> &str {
+        "typed-leaf"
+    }
+
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
+        vec![WorkloadDecl::of::<TypedLeaf>()]
+    }
+
+    async fn build_task(
+        &self,
+        _task: &Task,
+        _run_id: &RunId,
+        _ctx: &BuildContext,
+        _cancellation: &solti_runner::BuildCancellation,
+        _scope: &mut solti_runner::BuildScope,
+    ) -> Result<TaskRef, RunnerError> {
+        Ok(TaskFn::arc(|_ctx: TaskContext| async { Ok(()) }))
+    }
+}
+
+#[test]
+fn chain_check_refuses_an_invalid_nested_body_with_its_path() {
+    let mut router = RunnerRouter::new();
+    router.register(Arc::new(TypedLeafRunner)).unwrap();
+    let step = |count: Value| {
+        let workload = Workload::new(
+            TypedLeaf::API_VERSION,
+            TypedLeaf::KIND,
+            json!({ "count": count }),
+        )
+        .unwrap();
+        ChainSpec::new("typed", vec![ChainStep::new("typed", workload).unwrap()]).unwrap()
+    };
+
+    check(&router, &step(json!(3))).unwrap();
+
+    let reason = check(&router, &step(json!("three"))).unwrap_err();
+    assert!(reason.starts_with("step 'typed': "), "{reason}");
+    assert!(reason.contains("spec.count"), "{reason}");
+    assert_eq!(
+        reason.matches(TypedLeaf::API_VERSION).count(),
+        1,
+        "{reason}"
     );
 }

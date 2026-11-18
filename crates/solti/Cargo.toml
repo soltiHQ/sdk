@@ -30,7 +30,6 @@ taskvisor-tracing            = ["taskvisor", "taskvisor/tracing"]
 runner       = ["dep:solti-runner", "model", "taskvisor"]
 chain        = ["dep:solti-chain", "runner"]
 cron         = ["dep:solti-cron", "taskvisor"]
-chain-schema = ["chain", "model-schema", "solti-chain/schema"]
 core         = ["dep:solti-core", "model", "runner", "taskvisor-controller"]
 
 exec              = ["dep:solti-exec"]
@@ -111,7 +110,6 @@ full = [
     "api-core-adapter",
     "api-grpc-tls",
     "api-http",
-    "chain-schema",
     "cron",
     "discover-grpc-tls",
     "discover-http-tls",

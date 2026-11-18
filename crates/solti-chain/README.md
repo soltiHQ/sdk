@@ -15,10 +15,10 @@ Register leaf runners first, then register the chain runner:
 
 ```rust,no_run
 use solti_chain::{ChainSpec, ChainStep, FailureMode, register_chain_runner};
-use solti_model::TaskWorkload;
+use solti_model::{TaskWorkload, Workload};
 use solti_runner::RunnerRouter;
 
-# fn workload() -> TaskWorkload { unimplemented!() }
+# fn workload() -> Workload { unimplemented!() }
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mut router = RunnerRouter::new();
 // Register Subprocess, Container, and custom leaf runners first.
@@ -34,8 +34,7 @@ let chain = ChainSpec::new(
         ChainStep::new("rollback", workload())?,
     ],
 )?;
-let workload = chain.into_workload()?;
-# let _: TaskWorkload = workload;
+let workload = TaskWorkload::from_body(&chain)?;
 # let _ = router;
 # Ok(())
 # }
@@ -46,7 +45,8 @@ Runners registered later are not available to chain steps.
 
 ## What it does
 
-- provides a typed model for the `chain.solti.io/v1alpha1/Chain` extension workload;
+- declares `chain.solti.io/v1alpha1/Chain` as a workload type, with a JSON Schema and a body check;
+- checks every nested step against the runner that would run it, before the Task is admitted;
 - routes every nested workload through a snapshot of registered leaf runners;
 - validates step names, transitions, reachability, and cycles;
 - sends all step output through the outer Task output stream;
@@ -57,13 +57,13 @@ Runners registered later are not available to chain steps.
 
 | API                        | Input                                 | Output                         |
 |----------------------------|---------------------------------------|--------------------------------|
-| `ChainStep::new`           | Step name and `TaskWorkload`          | Validated step                 |
+| `ChainStep::new`           | Step name and routed `Workload`       | Validated step                 |
 | `with_on_success`          | Next step name                        | Success transition             |
 | `with_on_failure`          | Next step name and `FailureMode`      | Failure transition             |
 | `with_runner_selector`     | `LabelSelector`                       | Step-specific runner selection |
 | `ChainSpec::new`           | Entry name and steps                  | Validated acyclic chain        |
-| `ChainSpec::into_workload` | `ChainSpec`                           | Solti extension `TaskWorkload` |
-| `ChainSpec::from_workload` | Solti extension `TaskWorkload`        | Validated `ChainSpec`          |
+| `Workload::from_body`      | `ChainSpec`                           | Routed Chain `Workload`        |
+| `Workload::decode`         | Routed Chain `Workload`               | Validated `ChainSpec`          |
 | `register_chain_runner`    | `RunnerRouter` and runner name        | Registered `ChainRunner`       |
 | `ChainRunner::build_task`  | Standard runner build inputs          | One outer `taskvisor::TaskRef` |
 
@@ -79,7 +79,7 @@ leaf runner without reacquiring the outer global slot.
 | `apiVersion` | `chain.solti.io/v1alpha1`   |
 | `kind`       | `Chain`                     |
 
-The outer Task carries the chain as a regular extension workload.
+The outer Task carries the chain as a routed workload of the declared type.
 For HTTP, place this object at `Task.spec.workload`:
 
 ```json
@@ -124,11 +124,12 @@ For HTTP, place this object at `Task.spec.workload`:
 ```
 
 For gRPC, use `TaskWorkload` with the same `api_version` and `kind`.
-Select the `extension` field and put the UTF-8 JSON bytes of the inner chain `spec` object in `ExtensionTask.spec.raw`.
+Put the UTF-8 JSON bytes of the inner chain `spec` object in `extension.spec.raw`.
 Protobuf JSON represents these bytes as base64.
 
-HTTP and gRPC carry Chain through the existing generic extension boundary.
-The chain graph is validated when `ChainRunner` builds the Task during reconciliation.
+`ChainRunner` declares the type with `WorkloadDecl`: the schema describes the graph, and the check decodes it and runs the graph validation.
+The check then asks the runner catalog to validate each step's workload with the runner that would run it, honoring the step's `runnerSelector`.
+A refusal reads `step '<name>': workload <apiVersion>/<kind> rejected by runner '<runner>': <reason>`, or `step '<name>': no runner matches <apiVersion>/<kind>`.
 
 ## Execution flow
 
@@ -160,10 +161,11 @@ It is not a parallel DAG scheduler.
 - every step is reachable from `entry`;
 - the transition graph has no cycles;
 - every `runnerSelector` is valid;
-- `Embedded` workloads are rejected;
+- a step is a routed `Workload`, so `Embedded` workloads cannot be steps;
 - nested `chain.solti.io/v1alpha1/Chain` workloads are rejected.
 
-`ChainRunner` builds every declared step before the chain starts.
+Admission refuses a chain with a step no runner accepts.
+`ChainRunner` also builds every declared step before the chain starts.
 If any step cannot be routed or built, reconciliation fails even when that step would not be selected in the current run.
 
 ## Failure transitions
@@ -238,24 +240,13 @@ Step output and markers share the outer generation, attempt, and per-stream sequ
 The API output model has no separate step field.
 The marker text provides step context in the combined stream.
 
-## Features
-
-| Feature  | Default | Effect                                                |
-|----------|---------|-------------------------------------------------------|
-| `schema` | yes     | Implements JSON Schema support for Chain model types. |
-
-Disable default features when schema generation is not needed.
-
 ## Errors
 
-`ChainError` describes model construction, validation, and conversion failures:
+`ChainError` describes model construction and validation failures:
 
 | Variant              | Cause                                                   |
 |----------------------|---------------------------------------------------------|
 | `Invalid`            | A field, workload, transition, or graph rule is invalid |
-| `UnexpectedWorkload` | A workload does not use the Chain extension GVK         |
-| `Json`               | The extension `spec` cannot be encoded or decoded       |
-| `Model`              | The shared Solti model rejects a nested value           |
 
 Runner selection and build failures use `solti_runner::RunnerError` and `RouterError`.
 A failed step build becomes `RunnerError::NestedBuild` and retains the original

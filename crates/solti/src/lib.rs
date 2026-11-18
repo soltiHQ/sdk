@@ -48,7 +48,6 @@
 //! | Resource JSON Schema         | `model-schema`          |
 //! | Runner registration          | `runner`                |
 //! | Conditional workload chain   | `chain`                 |
-//! | Chain JSON Schema            | `chain-schema`          |
 //! | Calendar scheduling          | `cron`                  |
 //! | Desired-state supervision    | `core`                  |
 //! | Host process controls        | `exec-host-process`     |
@@ -86,7 +85,6 @@
 //!
 //! `model` exposes runtime model types without JSON Schema dependencies.
 //! Add `model-schema` when the application generates model schemas.
-//! `chain-schema` enables schemas for both Chain and the nested model types.
 //! `chain` runs nested workloads sequentially inside one outer Task.
 //!
 //! Exactly one step is active at a time; steps do not receive independent Task lifecycle policies, status, or history.

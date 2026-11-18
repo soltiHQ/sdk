@@ -31,9 +31,10 @@ solti-model = { version = "0.0", default-features = false }
 solti-tls = "0.0"
 ```
 
-Direct `solti-model` and `solti-chain` dependencies enable their `schema` feature
-by default. The facade disables component defaults: `solti/model` does **not**
-enable JSON Schema. Select `model-schema` or `chain-schema` explicitly.
+A direct `solti-model` dependency enables its `schema` feature by default.
+The facade disables component defaults: `solti/model` does **not**
+enable JSON Schema. Select `model-schema` explicitly.
+`solti-chain` always derives its own schema, because it declares a workload type.
 
 ## Select a process
 
@@ -66,7 +67,7 @@ The [facade manifest](../crates/solti/Cargo.toml) is the exact forwarding contra
 
 | Family | Features and purpose |
 |---|---|
-| Data and construction | `model`, `model-schema`, `runner`, `chain`, `chain-schema`, `core`. |
+| Data and construction | `model`, `model-schema`, `runner`, `chain`, `core`. |
 | Calendar scheduling | `cron` exposes IANA calendars and a sequential Taskvisor task wrapper; the application submits the task explicitly. |
 | Execution | `exec` exposes the base namespace; `exec-host-process` exposes host policy; `exec-subprocess` adds the subprocess runner; `exec-container` adds the engine-neutral container runner; `exec-containerd` adds the native adapter. |
 | Seccomp | `exec-seccomp` enables the low-level host-process filter. Combine it with `exec-subprocess` to apply it to subprocess attempts. |
@@ -119,6 +120,5 @@ required features. Use the [quick start](quick-start.md) for a standalone main
 program with explicit observation and shutdown.
 
 Source: [workspace versions](../Cargo.toml), [facade features](../crates/solti/Cargo.toml),
-[model defaults](../crates/solti-model/Cargo.toml),
-[chain defaults](../crates/solti-chain/Cargo.toml), and
+[model defaults](../crates/solti-model/Cargo.toml), and
 [execution platforms](../crates/solti-exec/README.md).

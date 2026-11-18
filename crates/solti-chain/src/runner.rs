@@ -1,4 +1,4 @@
-//! Runner implementation for the chain extension workload.
+//! Runner implementation for the chain workload type.
 
 use std::collections::HashMap;
 use std::sync::{
@@ -7,7 +7,7 @@ use std::sync::{
 };
 
 use bytes::Bytes;
-use solti_model::{Task, TaskId, WorkloadTypeMeta};
+use solti_model::{Task, TaskId, TaskWorkload, Workload, WorkloadDecl, workload_schema_for};
 use solti_runner::{
     BuildCancellation, BuildContext, BuildScope, RouterError, RunId, Runner, RunnerCatalog,
     RunnerError, RunnerRouter,
@@ -43,11 +43,14 @@ impl Runner for ChainRunner {
         &self.name
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-        vec![
-            WorkloadTypeMeta::new(CHAIN_API_VERSION, CHAIN_KIND)
-                .expect("chain workload GVK is valid"),
-        ]
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
+        let catalog = self.catalog.clone();
+        vec![WorkloadDecl::new(
+            CHAIN_API_VERSION,
+            CHAIN_KIND,
+            &workload_schema_for::<ChainSpec>(),
+            move |workload| check_chain(&catalog, workload),
+        )]
     }
 
     #[instrument(
@@ -67,7 +70,15 @@ impl Runner for ChainRunner {
         cancellation: &BuildCancellation,
         scope: &mut BuildScope,
     ) -> Result<TaskRef, RunnerError> {
-        let spec = ChainSpec::from_workload(task.spec().workload())
+        let TaskWorkload::Routed(workload) = task.spec().workload() else {
+            return Err(RunnerError::UnsupportedWorkload {
+                runner: self.name.clone(),
+                api_version: task.spec().workload().api_version().to_owned(),
+                kind: task.spec().workload().kind().to_owned(),
+            });
+        };
+        let spec = workload
+            .decode::<ChainSpec>()
             .map_err(|error| RunnerError::InvalidSpec(error.to_string()))?;
         let output = ChainOutput::new(
             Arc::clone(ctx.output_publisher()),
@@ -115,6 +126,21 @@ impl Runner for ChainRunner {
             .instrument(span)
         }))
     }
+}
+
+/// Decodes the chain and checks each step with the runner that would run it.
+///
+/// The step error names the step; the router error already names the step's GVK.
+fn check_chain(catalog: &RunnerCatalog, workload: &Workload) -> Result<(), String> {
+    let spec = workload
+        .decode::<ChainSpec>()
+        .map_err(|error| error.detail())?;
+    for step in spec.steps() {
+        catalog
+            .validate_workload(step.workload(), step.runner_selector())
+            .map_err(|error| format!("step '{}': {error}", step.name()))?;
+    }
+    Ok(())
 }
 
 impl ChainRunner {
@@ -178,7 +204,7 @@ fn next_attempt(attempts: &AtomicU32) -> Option<u32> {
 fn derive_task(outer: &Task, step: &crate::ChainStep) -> Result<Task, RunnerError> {
     let mut step_spec = outer
         .spec()
-        .derive_with_workload(step.workload().clone())
+        .derive_with_workload(TaskWorkload::Routed(step.workload().clone()))
         .without_runner_selector();
     if let Some(selector) = step.runner_selector() {
         step_spec = step_spec.with_runner_selector(selector.clone());
