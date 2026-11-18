@@ -129,16 +129,6 @@ pub(crate) fn label_value(_generator: &mut schemars::SchemaGenerator) -> Schema 
     })
 }
 
-pub(crate) fn runner_name(generator: &mut schemars::SchemaGenerator) -> Schema {
-    let value = label_value(generator);
-    json_schema!({
-        "allOf": [
-            value,
-            { "minLength": 1 }
-        ]
-    })
-}
-
 pub(crate) fn json_object(_generator: &mut schemars::SchemaGenerator) -> Schema {
     json_schema!({
         "type": "object",
@@ -213,30 +203,6 @@ pub(crate) fn selector_requirement(generator: &mut schemars::SchemaGenerator) ->
                 }
             }
         ]
-    })
-}
-
-pub(crate) fn runner_workload_types(generator: &mut schemars::SchemaGenerator) -> Schema {
-    let workload = generator.subschema_for::<crate::WorkloadTypeMeta>();
-    json_schema!({
-        "type": "array",
-        "minItems": 1,
-        "uniqueItems": true,
-        "items": {
-            "allOf": [
-                workload,
-                {
-                    "not": {
-                        "type": "object",
-                        "required": ["apiVersion", "kind"],
-                        "properties": {
-                            "apiVersion": { "const": crate::EMBEDDED_WORKLOAD_API_VERSION },
-                            "kind": { "const": crate::EMBEDDED_WORKLOAD_KIND }
-                        }
-                    }
-                }
-            ]
-        }
     })
 }
 
@@ -476,9 +442,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::{
-        AgentCapabilities, Annotations, EMBEDDED_WORKLOAD_API_VERSION, EmbeddedSpec, Labels,
-        RunnerCapability, SelectorRequirement, Task, TaskConditionType, TaskManifest, TaskRun,
-        TaskSpec, TaskStatus, TaskWorkload, Workload, WorkloadSchema, WorkloadTypeMeta,
+        Annotations, EMBEDDED_WORKLOAD_API_VERSION, EmbeddedSpec, Labels, SelectorRequirement,
+        Task, TaskConditionType, TaskManifest, TaskRun, TaskSpec, TaskStatus, TaskWorkload,
+        Workload, WorkloadSchema, WorkloadTypeMeta,
     };
 
     fn validator<T: JsonSchema>() -> Validator {
@@ -749,33 +715,6 @@ mod tests {
             &[("error", json!(multibyte_over_byte_budget))],
             &[],
         )));
-    }
-
-    #[test]
-    fn capability_schema_rejects_empty_and_embedded_runner_contracts() {
-        let capability = RunnerCapability::new(
-            "subprocess",
-            Labels::new(),
-            vec![WorkloadTypeMeta::new("exec.solti.io/v1", "Subprocess").unwrap()],
-        )
-        .unwrap();
-        assert_valid(&capability);
-        assert_valid(&AgentCapabilities::new(vec![capability]).unwrap());
-
-        let schema = validator::<RunnerCapability>();
-        assert!(!schema.is_valid(&json!({
-            "name": "runner",
-            "labels": {},
-            "workloadTypes": []
-        })));
-        assert!(!schema.is_valid(&json!({
-            "name": "runner",
-            "labels": {},
-            "workloadTypes": [{
-                "apiVersion": EMBEDDED_WORKLOAD_API_VERSION,
-                "kind": "Embedded"
-            }]
-        })));
     }
 
     #[test]

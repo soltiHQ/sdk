@@ -31,6 +31,15 @@ pub const MAX_WORKLOAD_BODY_DEPTH: usize = 128;
 
 const RESERVED_GROUP: &str = "solti.io";
 
+/// The refusal text for a workload type in the reserved `solti.io` group.
+pub(crate) const RESERVED_GROUP_REASON: &str =
+    "API group solti.io is reserved for SDK-internal workloads";
+
+/// Whether `api_version` (`<group>/<version>`) is in the reserved `solti.io` group.
+pub(crate) fn in_reserved_group(api_version: &str) -> bool {
+    api_version.split('/').next() == Some(RESERVED_GROUP)
+}
+
 /// Desired state of an embedded task implementation.
 ///
 /// The revision participates in desired-state comparison.
@@ -169,10 +178,7 @@ impl Workload {
         validation::validate_crd_kind("workload kind", &kind)?;
         if group == RESERVED_GROUP {
             return Err(ModelError::Invalid(
-                format!(
-                    "workload {api_version}/{kind}: API group {RESERVED_GROUP} is reserved for SDK-internal workloads"
-                )
-                .into(),
+                format!("workload {api_version}/{kind}: {RESERVED_GROUP_REASON}").into(),
             ));
         }
         if !body.is_object() {

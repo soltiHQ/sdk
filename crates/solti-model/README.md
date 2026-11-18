@@ -5,7 +5,9 @@
 It defines task resources, workloads, policies, selectors, capabilities, queries, output events, identities, and bearer tokens.
 It validates data but does not store, route, or execute tasks.
 
-The default `schema` feature implements `schemars::JsonSchema` for resource, workload, selector, capability, and output types.
+The default `schema` feature implements `schemars::JsonSchema` for resource, workload, selector, and output types.
+Capabilities are built by the agent and serialized, never read back, so they carry no schema.
+`workload_schema_for::<T>()` derives the draft 2020-12 schema of a workload body type.
 Disable default features when schema generation is not needed.
 
 ## Choose an entry point
@@ -20,6 +22,7 @@ Disable default features when schema generation is not needed.
 | Filter or paginate tasks          | `TaskFilter`, `TaskQuery`, `TaskContinuation`   |
 | Paginate one task's runs          | `TaskRunQuery`, `TaskRunContinuation`           |
 | Match runner labels               | `LabelSelector`                                 |
+| Declare a workload type           | `WorkloadDecl`, `WorkloadType`                  |
 | Advertise agent capabilities      | `RunnerCapability`, `AgentCapabilities`         |
 | Read live output                  | `OutputEvent`                                   |
 | Load or verify a bearer secret    | `Token`                                         |
@@ -340,19 +343,30 @@ The transport then measures that item in its native encoding.
 It is a domain value.
 Transport layers encode it into their own opaque wire token.
 
+## Declare workload types
+
+`WorkloadDecl` declares one workload type: a GVK, the JSON Schema of its `spec`, and the check that admits a body.
+`WorkloadDecl::of::<B>()` derives all three from a Rust type that implements `WorkloadBody` and `schemars::JsonSchema`.
+`WorkloadDecl::new` takes a hand-written schema and check; `WorkloadDecl::object` accepts any object.
+A refused GVK, a reserved group, or a refused schema is kept and reported by `workload_type()`, at registration.
+
+The derived schema is draft 2020-12.
+`unevaluatedProperties` is rewritten, and every 64-bit-or-wider integer is bounded to `MAX_JSON_SAFE_INTEGER` (2^53 - 1), so Podium refuses values no JSON peer reads back.
+
 ## Advertise capabilities
 
 `RunnerCapability` contains:
 
 - the registered runner name;
 - static labels used by `runnerSelector`;
-- supported workload GVKs.
+- supported `WorkloadType`s: a GVK and the fingerprint of its schema.
 
-Construction rejects empty declarations, duplicate GVKs, and the built-in `Embedded` GVK.
-Workload GVKs are stored in canonical order.
+Construction rejects empty declarations, more than `MAX_RUNNER_WORKLOAD_TYPES` types, duplicate GVKs, and the reserved `solti.io` group.
+Workload types are stored in canonical GVK order.
 
 `AgentCapabilities` preserves runner registration order.
-It rejects duplicate runner names.
+It rejects duplicate runner names, more than `MAX_AGENT_RUNNERS` runners, and more than `MAX_AGENT_WORKLOAD_SCHEMAS` distinct schema fingerprints.
+`schemas()` lists each distinct schema once, in first-declaration order; `types_for(fingerprint)` lists the GVKs that share one.
 
 ## Consume output
 
@@ -400,7 +414,7 @@ It does not persist or rotate secrets.
 ## Validation and serde
 
 Top-level constructors and deserializers validate their completed values.
-Unknown fields are rejected by resource, spec, capability, condition, run, query, and built-in workload shapes.
+Unknown fields are rejected by resource, spec, condition, run, query, and workload shapes.
 
 Some collection types allow temporary invalid states during construction:
 
@@ -416,7 +430,7 @@ Validated top-level APIs call these checks when the values enter a resource, que
 `TaskEnv` stores key-value pairs without validating application-specific names or values.
 
 JSON Schema describes the serialized structure.
-It covers resource GVKs, workload envelopes, selector rules, run lifecycle shapes, and capability shapes.
+It covers resource GVKs, workload envelopes, selector rules, and run lifecycle shapes.
 
 Runtime validation remains authoritative for semantic rules that JSON Schema cannot express exactly.
 These include generation relationships, unique condition types, `maxMs >= firstMs`, and UTF-8 byte budgets.

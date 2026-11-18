@@ -19,6 +19,15 @@ pub use task_workload::{
     EMBEDDED_WORKLOAD_API_VERSION, EMBEDDED_WORKLOAD_KIND, EmbeddedSpec, MAX_WORKLOAD_BODY_DEPTH,
     TaskWorkload, Workload,
 };
+pub(crate) use task_workload::{RESERVED_GROUP_REASON, in_reserved_group};
+
+mod decl;
+pub use decl::{MAX_JSON_SAFE_INTEGER, WorkloadDecl, WorkloadDeclError, WorkloadType};
+
+#[cfg(feature = "schema")]
+mod generate;
+#[cfg(feature = "schema")]
+pub use generate::{BoundJsonSafeIntegers, workload_schema_for};
 
 mod schema;
 pub use schema::{

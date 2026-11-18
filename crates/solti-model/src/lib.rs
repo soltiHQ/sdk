@@ -35,7 +35,7 @@
 //!
 //! ## Features
 //!
-//! The default `schema` feature implements `schemars::JsonSchema` for resource, workload, selector, capability, and output types.
+//! The default `schema` feature implements `schemars::JsonSchema` for resource, workload, selector, and output types.
 //! Disable default features when schema generation is not needed.
 //! Runtime validation remains authoritative for cross-field and byte-budget rules.
 //!
@@ -172,7 +172,7 @@
 //! | Workload     | [`TaskWorkload`], [`Workload`], [`WorkloadBody`], [`EmbeddedSpec`]                                |
 //! | Policies     | [`RestartPolicy`], [`BackoffPolicy`], [`JitterPolicy`], [`AdmissionPolicy`], [`Timeout`]       |
 //! | Selection    | [`Labels`], [`LabelSelector`], [`SelectorRequirement`], [`SelectorOperator`]                   |
-//! | Capabilities | [`AgentCapabilities`], [`RunnerCapability`], [`WorkloadTypeMeta`]                              |
+//! | Capabilities | [`AgentCapabilities`], [`RunnerCapability`], [`WorkloadType`], [`WorkloadDecl`], [`WorkloadTypeMeta`] |
 //! | Schemas      | [`WorkloadSchema`], [`SchemaFingerprint`], [`WorkloadSchemaError`], [`canonical_json`]         |
 //! | Query        | [`TaskQuery`], [`TaskRunQuery`], continuations, pages, [`TaskWatchEvent`]                      |
 //! | Output       | [`OutputEvent`], [`OutputChunk`], [`StreamKind`]                                               |
@@ -197,7 +197,8 @@ mod domain;
 pub use domain::{
     AGENT_ID_MAX_LEN, AdmissionPolicy, AgentCapabilities, AgentId, BackoffPolicy, DEFAULT_LIMIT,
     DEFAULT_TASK_RUN_LIMIT, EMBEDDED_WORKLOAD_API_VERSION, EMBEDDED_WORKLOAD_KIND, EmbeddedSpec,
-    Flag, JitterPolicy, KeyValue, LabelSelector, Labels, LabelsIter, MAX_LIMIT,
+    Flag, JitterPolicy, KeyValue, LabelSelector, Labels, LabelsIter, MAX_AGENT_RUNNERS,
+    MAX_AGENT_WORKLOAD_SCHEMAS, MAX_JSON_SAFE_INTEGER, MAX_LIMIT, MAX_RUNNER_WORKLOAD_TYPES,
     MAX_SCHEMA_REGEX_INSTRUCTIONS, MAX_SCHEMA_REGEX_INSTRUCTIONS_TOTAL,
     MAX_SCHEMA_REGEX_SOURCE_BYTES, MAX_SCHEMA_REGEX_SOURCE_BYTES_TOTAL,
     MAX_SCHEMA_REGEX_UNICODE_ESCAPES, MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL,
@@ -208,9 +209,11 @@ pub use domain::{
     Slot, StreamKind, TASK_ID_MAX_LEN, TaskContinuation, TaskEnv, TaskFilter, TaskId, TaskPage,
     TaskPhase, TaskQuery, TaskRunContinuation, TaskRunPage, TaskRunQuery, TaskWatchEvent,
     TaskWorkload, Timeout, WORKLOAD_SCHEMA_DIALECT, Workload, WorkloadBody, WorkloadBodyError,
-    WorkloadBodyErrorKind, WorkloadSchema, WorkloadSchemaError, WorkloadSchemaErrorReason,
-    WorkloadTypeMeta, canonical_json,
+    WorkloadBodyErrorKind, WorkloadDecl, WorkloadDeclError, WorkloadSchema, WorkloadSchemaError,
+    WorkloadSchemaErrorReason, WorkloadType, WorkloadTypeMeta, canonical_json,
 };
+#[cfg(feature = "schema")]
+pub use domain::{BoundJsonSafeIntegers, workload_schema_for};
 
 mod resource;
 pub use resource::{
