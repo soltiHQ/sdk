@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","anyOf":[{"format":"uint32","minimum":0,"type":"integer"},{"type":"string"},{"properties":{"name":{"type":"string"}},"required":["name"],"type":"object"}],"title":"Untagged"}
