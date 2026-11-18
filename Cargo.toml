@@ -86,12 +86,15 @@ prost-types         = "0.14.4"
 proptest            = { version = "1.11.0", default-features = false, features = ["std"] }
 protoc-bin-vendored = { version = "3.2.0" }
 rcgen               = "0.14.8"
+regex-syntax        = "0.8.11"
 reqwest             = { version = "0.13.4", default-features = false }
 rustls              = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 schemars            = "1.2.2"
 seccompiler         = "0.5.0"
 serde               = { version = "1.0.229", features = ["derive"] }
 serde_json          = "1.0.151"
+serde_json_canonicalizer = "0.4.1"
+serde_path_to_error = "0.1.20"
 sha2                = "0.11.0"
 solti               = { path = "crates/solti",            version = "0.0.8", default-features = false }
 solti-api           = { path = "crates/solti-api",        version = "0.0.8", default-features = false }

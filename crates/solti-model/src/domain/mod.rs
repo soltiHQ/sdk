@@ -16,6 +16,7 @@
 //! | `phase`         | [`TaskPhase`]                                                     | Task lifecycle state                        |
 //! | `timeout`       | [`Timeout`]                                                       | Milliseconds                                |
 //! | `capability`    | [`AgentCapabilities`], [`RunnerCapability`]                       | Agent execution capabilities                |
+//! | `workload/`     | [`WorkloadSchema`], [`SchemaFingerprint`]                         | Workload schemas inside Podium's subset     |
 
 mod capability;
 pub use capability::{AgentCapabilities, RunnerCapability};
@@ -24,6 +25,16 @@ mod kind;
 pub use kind::{
     ContainerSpec, EmbeddedSpec, ExtensionWorkload, MAX_SCRIPT_BODY_BYTES, SubprocessMode,
     SubprocessSpec, TaskWorkload, WORKLOAD_API_VERSION, WasmSpec, WorkloadTypeMeta,
+};
+
+mod workload;
+pub use workload::{
+    MAX_SCHEMA_REGEX_INSTRUCTIONS, MAX_SCHEMA_REGEX_INSTRUCTIONS_TOTAL,
+    MAX_SCHEMA_REGEX_SOURCE_BYTES, MAX_SCHEMA_REGEX_SOURCE_BYTES_TOTAL,
+    MAX_SCHEMA_REGEX_UNICODE_ESCAPES, MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL,
+    MAX_WORKLOAD_SCHEMA_BYTES, MAX_WORKLOAD_SCHEMA_DEPTH, MAX_WORKLOAD_SCHEMA_VALUES,
+    SchemaFingerprint, SdkStrictRegexRule, WORKLOAD_SCHEMA_DIALECT, WorkloadSchema,
+    WorkloadSchemaError, WorkloadSchemaErrorReason, canonical_json,
 };
 
 mod identity;
