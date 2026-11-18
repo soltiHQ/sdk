@@ -6,8 +6,8 @@ description: Build Command and Script workloads, own their process resources, an
 # Run subprocesses
 
 A subprocess workload runs a program on the agent host.
-Use `Command` for an executable and an argument vector.
-Use `Script` for a base64-encoded body and an explicit interpreter.
+Use `SubprocessMode::Command` for an executable and an argument vector.
+Use `SubprocessMode::Script` for a base64-encoded body and an explicit interpreter.
 Neither mode provides a filesystem or security sandbox by itself.
 
 ## Participants
@@ -16,7 +16,7 @@ Neither mode provides a filesystem or security sandbox by itself.
 |---|---|
 | `solti-model` | Defines the routed workload envelope, task environment, and the outer execution policy. |
 | `solti-runner` | Selects the backend and supplies build cancellation, environment overrides, metrics, and output. |
-| `solti-exec/subprocess` | Defines `SubprocessSpec`, `Command` and `Script`, declares the `Subprocess` type with its schema, validates the workload, spawns attempts, reads pipes, terminates owned process scopes, and owns deferred cleanup. This feature also enables `host-process`. |
+| `solti-exec/subprocess` | Defines `SubprocessSpec` and `SubprocessMode` (`Command` and `Script`), declares the `Subprocess` type with its schema, validates the workload, spawns attempts, reads pipes, terminates owned process scopes, and owns deferred cleanup. This feature also enables `host-process`. |
 | `solti-exec/host-process` | Provides reusable host controls for the subprocess runner or an application-owned process backend. Linux host seccomp also needs `seccomp`. |
 | `solti-core` and Taskvisor | Reconcile and supervise the Task, including admission, timeout, restart, cancellation, output subscriptions, and history. |
 

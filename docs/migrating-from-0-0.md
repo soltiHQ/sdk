@@ -23,9 +23,10 @@ Read [declare workload types](routing-and-custom-runners.md#declare-workload-typ
 | `ExtensionWorkload` | `Workload`. `ExtensionWorkload::new` is `Workload::new`, and `spec()` is `body()` |
 | `WORKLOAD_API_VERSION` (`solti.io/v1`) | `solti_exec::EXEC_API_VERSION` (`exec.solti.io/v1`), with the `subprocess` or `container` feature |
 | `solti_model::SubprocessSpec`, `SubprocessMode` | `solti_exec::subprocess::{SubprocessSpec, SubprocessMode}` |
+| `solti_model::MAX_SCRIPT_BODY_BYTES` | `solti_exec::subprocess::MAX_SCRIPT_BODY_BYTES` |
 | `solti_model::ContainerSpec` | `solti_exec::container::ContainerSpec` |
 | `ChainSpec::into_workload`, `TryFrom<ChainSpec>` for `TaskWorkload` and `ExtensionWorkload` | `TaskWorkload::from_body(&chain)` or `Workload::from_body(&chain)` |
-| `ChainSpec::from_workload`, `TryFrom<&TaskWorkload>` and `TryFrom<&ExtensionWorkload>` for `ChainSpec` | `workload.decode::<ChainSpec>()` on the routed `Workload` |
+| `ChainSpec::from_workload`, `TryFrom<&TaskWorkload>` and `TryFrom<&ExtensionWorkload>` for `ChainSpec` | Match `TaskWorkload::Routed(w)` first, then `w.decode::<ChainSpec>()` on the routed `Workload` |
 | The `chain-schema` facade feature and `solti-chain`'s `schema` feature | Nothing to enable: a chain publishes a schema, so `solti-chain` always derives it. `chain` is enough |
 | `Runner::workload_types() -> Vec<WorkloadTypeMeta>` | `Runner::workload_types() -> Vec<WorkloadDecl>`; see below |
 | `RunnerCapability::new(name, labels, Vec<WorkloadTypeMeta>)` | `RunnerCapability::new(name, labels, Vec<WorkloadType>)`: a GVK with its schema fingerprint. `RunnerRouter::capabilities()` builds it for you |

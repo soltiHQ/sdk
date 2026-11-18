@@ -381,6 +381,7 @@ The SDK is stricter than Podium for regexes it cannot prove both parsers read al
 syntax whose meaning differs between Rust's `regex-syntax` and Go's RE2 (`\<`, `\b{start}`, set operations in brackets, a nested `[`, `a{ 2}`);
 and Go-only syntax that `regex-syntax` cannot parse (`\Q...\E`, `x{,5}`, octal escapes).
 Case-insensitive matching never arises, because inline flags are refused.
+Near the instruction limits the SDK may also refuse a pattern Podium accepts: it counts a class of two non-ASCII fold-equivalent characters, such as `[Δδ]`, as a class, where Go rewrites it as a case-folded literal, so the SDK's count is higher. Write the literal form instead.
 
 Body types should avoid `#[serde(flatten)]` combined with `deny_unknown_fields`, which serde does not support.
 The [routing guide](https://github.com/soltiHQ/sdk/blob/main/docs/routing-and-custom-runners.md) has the full rules.

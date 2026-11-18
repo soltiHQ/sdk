@@ -270,6 +270,7 @@ Some rules are therefore stricter in the SDK than in Podium, and a pattern Podiu
   Go may accept them, but the SDK cannot parse them to check them, so it refuses them (`SdkStrictRegexRule::GoOnlySyntax`).
 
 Both sides refuse look-around, back-references, `\u`, `\Z` and counts over 1 000.
+Near the instruction limits the SDK may also refuse a pattern Podium accepts: it counts a class of two non-ASCII fold-equivalent characters, such as `[Δδ]`, as a class, where Go rewrites it as a case-folded literal, so the SDK's count is higher. Write the literal form instead.
 Case-insensitive matching is not available: Podium refuses `(?` followed by `i`, `m`, `s`, `U` or `-` anywhere in a pattern's text, whether or not it is a flag group.
 That also refuses a pattern that only wants an optional parenthesis, such as `^\(?-?\d+\)?$`, because it contains `(?-`.
 Write the optional parentheses as classes instead:
