@@ -82,15 +82,33 @@ impl WorkloadBodyError {
     }
 }
 
+impl WorkloadBodyError {
+    /// The reason without the GVK: `spec.<path>: <message>`, `spec: <message>` at the root,
+    /// or the bare message when no field is at fault.
+    ///
+    /// A caller that names the GVK itself uses this instead of [`Display`](fmt::Display).
+    pub fn detail(&self) -> String {
+        match &self.reason {
+            WorkloadBodyErrorKind::TypeMismatch { .. } | WorkloadBodyErrorKind::Invalid => {
+                self.message.clone()
+            }
+            WorkloadBodyErrorKind::Decode { path } if path.is_empty() => {
+                format!("spec: {}", self.message)
+            }
+            WorkloadBodyErrorKind::Decode { path } => format!("spec.{path}: {}", self.message),
+        }
+    }
+}
+
 impl fmt::Display for WorkloadBodyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "workload {}/{}: ", self.api_version, self.kind)?;
-        match &self.reason {
-            WorkloadBodyErrorKind::TypeMismatch { .. } | WorkloadBodyErrorKind::Invalid => {}
-            WorkloadBodyErrorKind::Decode { path } if path.is_empty() => f.write_str("spec: ")?,
-            WorkloadBodyErrorKind::Decode { path } => write!(f, "spec.{path}: ")?,
-        }
-        f.write_str(&self.message)
+        write!(
+            f,
+            "workload {}/{}: {}",
+            self.api_version,
+            self.kind,
+            self.detail()
+        )
     }
 }
 

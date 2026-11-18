@@ -146,7 +146,8 @@ pub struct WorkloadDecl {
 
 impl WorkloadDecl {
     /// Declares the type of a Rust body: its GVK, a schema derived from the type, and a check
-    /// that decodes the body with it.
+    /// that decodes the body with it. The check's reason omits the GVK:
+    /// `spec.<path>: <message>`, or `spec: <message>` at the root.
     ///
     /// The schema is draft 2020-12, with 64-bit integers bounded to the JSON-safe range.
     #[cfg(feature = "schema")]
@@ -159,7 +160,7 @@ impl WorkloadDecl {
                 workload
                     .decode::<B>()
                     .map(|_| ())
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.detail())
             },
         )
     }
@@ -448,7 +449,18 @@ mod tests {
         )
         .unwrap();
         let reason = decl.check(&bad).unwrap_err();
-        assert!(reason.contains("name"), "{reason}");
+        assert!(reason.starts_with("spec.name: "), "{reason}");
+        assert!(!reason.contains("tasks.example.io"), "{reason}");
+        assert!(!reason.contains("workload "), "{reason}");
+
+        let missing = Workload::new(
+            "tasks.example.io/v1",
+            "Sample",
+            json!({"mode": "Fast", "items": []}),
+        )
+        .unwrap();
+        let reason = decl.check(&missing).unwrap_err();
+        assert_eq!(reason, "spec.name: missing field `name`");
     }
 
     #[test]
