@@ -9,32 +9,28 @@
 //! | `environment/`  | [`TaskEnv`]                                                       | Task-provided environment variables         |
 //! | `query/`        | [`TaskQuery`], [`TaskRunQuery`], continuations and pages          | Task filtering and collections              |
 //! | `identity/`     | [`AgentId`], [`Slot`], [`TaskId`]                                 | Resource identity (`Arc<str>`)              |
-//! | `kind/`         | [`TaskWorkload`]                                                  | Typed and extensible workload model         |
 //! | `label`         | [`Labels`]                                                        | Key-value metadata (`BTreeMap`)             |
 //! | `flag`          | [`Flag`]                                                          | Boolean toggle                              |
 //! | `kv`            | [`KeyValue`]                                                      | Generic key-value pair                      |
 //! | `phase`         | [`TaskPhase`]                                                     | Task lifecycle state                        |
 //! | `timeout`       | [`Timeout`]                                                       | Milliseconds                                |
 //! | `capability`    | [`AgentCapabilities`], [`RunnerCapability`]                       | Agent execution capabilities                |
-//! | `workload/`     | [`WorkloadSchema`], [`SchemaFingerprint`]                         | Workload schemas inside Podium's subset     |
+//! | `workload/`     | [`TaskWorkload`], [`Workload`], [`WorkloadBody`], [`WorkloadSchema`] | Routed workloads and their schemas       |
 
 mod capability;
 pub use capability::{AgentCapabilities, RunnerCapability};
 
-mod kind;
-pub use kind::{
-    ContainerSpec, EmbeddedSpec, ExtensionWorkload, MAX_SCRIPT_BODY_BYTES, SubprocessMode,
-    SubprocessSpec, TaskWorkload, WORKLOAD_API_VERSION, WasmSpec, WorkloadTypeMeta,
-};
-
 mod workload;
 pub use workload::{
+    EMBEDDED_WORKLOAD_API_VERSION, EMBEDDED_WORKLOAD_KIND, EmbeddedSpec,
     MAX_SCHEMA_REGEX_INSTRUCTIONS, MAX_SCHEMA_REGEX_INSTRUCTIONS_TOTAL,
     MAX_SCHEMA_REGEX_SOURCE_BYTES, MAX_SCHEMA_REGEX_SOURCE_BYTES_TOTAL,
     MAX_SCHEMA_REGEX_UNICODE_ESCAPES, MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL,
-    MAX_WORKLOAD_SCHEMA_BYTES, MAX_WORKLOAD_SCHEMA_DEPTH, MAX_WORKLOAD_SCHEMA_VALUES,
-    SchemaFingerprint, SdkStrictRegexRule, WORKLOAD_SCHEMA_DIALECT, WorkloadSchema,
-    WorkloadSchemaError, WorkloadSchemaErrorReason, canonical_json,
+    MAX_WORKLOAD_BODY_DEPTH, MAX_WORKLOAD_SCHEMA_BYTES, MAX_WORKLOAD_SCHEMA_DEPTH,
+    MAX_WORKLOAD_SCHEMA_VALUES, SchemaFingerprint, SdkStrictRegexRule, TaskWorkload,
+    WORKLOAD_SCHEMA_DIALECT, Workload, WorkloadBody, WorkloadBodyError, WorkloadBodyErrorKind,
+    WorkloadSchema, WorkloadSchemaError, WorkloadSchemaErrorReason, WorkloadTypeMeta,
+    canonical_json,
 };
 
 mod identity;

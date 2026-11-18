@@ -11,7 +11,7 @@
 //! Use [`TaskManifest`] for caller-owned desired state.
 //! Use [`Task`] for a stored resource with server metadata and status.
 //! Use [`TaskSpec`] to describe execution.
-//! Use [`TaskWorkload`] to select a built-in or extension workload.
+//! Use [`TaskWorkload`] to select a routed or embedded workload.
 //!
 //! ## Resource Flow
 //!
@@ -44,19 +44,16 @@
 //! Build a task spec:
 //!
 //! ```rust
-//! use solti_model::{
-//!     Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskSpec, TaskWorkload,
-//! };
+//! use solti_model::{TaskSpec, TaskWorkload, Workload};
 //!
-//! let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
-//!     SubprocessMode::Command {
-//!         command: "echo".into(),
-//!         args: vec!["hello".into()],
-//!     },
-//!     TaskEnv::default(),
-//!     None,
-//!     Flag::enabled(),
-//! ));
+//! let workload = TaskWorkload::from(
+//!     Workload::new(
+//!         "exec.solti.io/v1",
+//!         "Subprocess",
+//!         serde_json::json!({ "mode": { "command": "echo", "args": ["hello"] } }),
+//!     )
+//!     .unwrap(),
+//! );
 //!
 //! let spec = TaskSpec::builder("hello", workload, 5_000u64)
 //!     .build()
@@ -126,15 +123,15 @@
 //!
 //! [`TaskWorkload`] describes what a task runs:
 //!
-//! | Kind         | Meaning                | Routed by runner |
-//! |--------------|------------------------|------------------|
-//! | `Subprocess` | Host command or script | yes              |
-//! | `Container`  | OCI image              | yes              |
-//! | `Wasm`       | WASI module            | yes              |
-//! | `Embedded`   | In-process task        | no               |
-//! | `Extension`  | Application-defined    | yes              |
+//! | Variant    | Meaning                                       | Routed by runner |
+//! |------------|-----------------------------------------------|------------------|
+//! | `Routed`   | Any declared GVK with an application-owned body | yes            |
+//! | `Embedded` | In-process task                               | no               |
 //!
-//! Routable variants are consumed by `solti-runner`.
+//! A routed [`Workload`] is matched to a runner by exact GVK.
+//! Its `spec` is validated against the schema the agent declared for that GVK
+//! and decoded with [`WorkloadBody`].
+//! The group `solti.io` is reserved: only `solti.io/v1` `Embedded` uses it.
 //! Embedded workloads bypass runner routing.
 //!
 //! ## Selectors
@@ -172,7 +169,7 @@
 //! |--------------|------------------------------------------------------------------------------------------------|
 //! | Resource     | [`Task`], [`TaskManifest`], [`TaskSpec`], [`TaskStatus`], [`ObjectMeta`], [`TaskRun`]          |
 //! | Identity     | [`Slot`], [`TaskId`], [`AgentId`], [`Uid`]                                                     |
-//! | Workload     | [`TaskWorkload`], [`ExtensionWorkload`], [`SubprocessSpec`], [`WasmSpec`], [`ContainerSpec`]   |
+//! | Workload     | [`TaskWorkload`], [`Workload`], [`WorkloadBody`], [`EmbeddedSpec`]                                |
 //! | Policies     | [`RestartPolicy`], [`BackoffPolicy`], [`JitterPolicy`], [`AdmissionPolicy`], [`Timeout`]       |
 //! | Selection    | [`Labels`], [`LabelSelector`], [`SelectorRequirement`], [`SelectorOperator`]                   |
 //! | Capabilities | [`AgentCapabilities`], [`RunnerCapability`], [`WorkloadTypeMeta`]                              |
@@ -198,20 +195,21 @@ struct ReadmeDoctests;
 
 mod domain;
 pub use domain::{
-    AGENT_ID_MAX_LEN, AdmissionPolicy, AgentCapabilities, AgentId, BackoffPolicy, ContainerSpec,
-    DEFAULT_LIMIT, DEFAULT_TASK_RUN_LIMIT, EmbeddedSpec, ExtensionWorkload, Flag, JitterPolicy,
-    KeyValue, LabelSelector, Labels, LabelsIter, MAX_LIMIT, MAX_SCHEMA_REGEX_INSTRUCTIONS,
-    MAX_SCHEMA_REGEX_INSTRUCTIONS_TOTAL, MAX_SCHEMA_REGEX_SOURCE_BYTES,
-    MAX_SCHEMA_REGEX_SOURCE_BYTES_TOTAL, MAX_SCHEMA_REGEX_UNICODE_ESCAPES,
-    MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL, MAX_SCRIPT_BODY_BYTES, MAX_TASK_PAGE_ITEM_BYTES,
-    MAX_TASK_RUN_LIMIT, MAX_TASK_RUN_PAGE_ITEM_BYTES, MAX_WORKLOAD_SCHEMA_BYTES,
-    MAX_WORKLOAD_SCHEMA_DEPTH, MAX_WORKLOAD_SCHEMA_VALUES, OutputChunk, OutputEvent, RestartPolicy,
-    RunnerCapability, SLOT_MAX_LEN, SchemaFingerprint, SdkStrictRegexRule, SelectorOperator,
-    SelectorRequirement, Slot, StreamKind, SubprocessMode, SubprocessSpec, TASK_ID_MAX_LEN,
-    TaskContinuation, TaskEnv, TaskFilter, TaskId, TaskPage, TaskPhase, TaskQuery,
-    TaskRunContinuation, TaskRunPage, TaskRunQuery, TaskWatchEvent, TaskWorkload, Timeout,
-    WORKLOAD_API_VERSION, WORKLOAD_SCHEMA_DIALECT, WasmSpec, WorkloadSchema, WorkloadSchemaError,
-    WorkloadSchemaErrorReason, WorkloadTypeMeta, canonical_json,
+    AGENT_ID_MAX_LEN, AdmissionPolicy, AgentCapabilities, AgentId, BackoffPolicy, DEFAULT_LIMIT,
+    DEFAULT_TASK_RUN_LIMIT, EMBEDDED_WORKLOAD_API_VERSION, EMBEDDED_WORKLOAD_KIND, EmbeddedSpec,
+    Flag, JitterPolicy, KeyValue, LabelSelector, Labels, LabelsIter, MAX_LIMIT,
+    MAX_SCHEMA_REGEX_INSTRUCTIONS, MAX_SCHEMA_REGEX_INSTRUCTIONS_TOTAL,
+    MAX_SCHEMA_REGEX_SOURCE_BYTES, MAX_SCHEMA_REGEX_SOURCE_BYTES_TOTAL,
+    MAX_SCHEMA_REGEX_UNICODE_ESCAPES, MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL,
+    MAX_TASK_PAGE_ITEM_BYTES, MAX_TASK_RUN_LIMIT, MAX_TASK_RUN_PAGE_ITEM_BYTES,
+    MAX_WORKLOAD_BODY_DEPTH, MAX_WORKLOAD_SCHEMA_BYTES, MAX_WORKLOAD_SCHEMA_DEPTH,
+    MAX_WORKLOAD_SCHEMA_VALUES, OutputChunk, OutputEvent, RestartPolicy, RunnerCapability,
+    SLOT_MAX_LEN, SchemaFingerprint, SdkStrictRegexRule, SelectorOperator, SelectorRequirement,
+    Slot, StreamKind, TASK_ID_MAX_LEN, TaskContinuation, TaskEnv, TaskFilter, TaskId, TaskPage,
+    TaskPhase, TaskQuery, TaskRunContinuation, TaskRunPage, TaskRunQuery, TaskWatchEvent,
+    TaskWorkload, Timeout, WORKLOAD_SCHEMA_DIALECT, Workload, WorkloadBody, WorkloadBodyError,
+    WorkloadBodyErrorKind, WorkloadSchema, WorkloadSchemaError, WorkloadSchemaErrorReason,
+    WorkloadTypeMeta, canonical_json,
 };
 
 mod resource;

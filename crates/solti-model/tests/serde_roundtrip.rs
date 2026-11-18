@@ -1,8 +1,6 @@
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, ContainerSpec, EmbeddedSpec, Flag, JitterPolicy, LabelSelector,
-    Labels, RestartPolicy, SelectorRequirement, SubprocessMode, SubprocessSpec, Task, TaskEnv,
-    TaskPhase, TaskRun, TaskSpec, TaskWorkload, WasmSpec,
+    AdmissionPolicy, BackoffPolicy, EmbeddedSpec, JitterPolicy, LabelSelector, Labels,
+    RestartPolicy, SelectorRequirement, Task, TaskPhase, TaskRun, TaskSpec, TaskWorkload, Workload,
 };
 
 fn embedded(revision: &str) -> TaskWorkload {
@@ -42,22 +40,22 @@ fn roundtrip(task: &Task) {
     assert_eq!(json1, json2, "roundtrip drift");
 }
 
+fn routed(api_version: &str, kind: &str, body: serde_json::Value) -> TaskWorkload {
+    TaskWorkload::Routed(Workload::new(api_version, kind, body).unwrap())
+}
+
 #[test]
-fn built_in_workload_variants_roundtrip() {
-    let spec = fully_populated_spec(TaskWorkload::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Command {
-            command: "/usr/bin/make".into(),
-            args: vec!["-j4".into(), "test".into()],
-        },
-        {
-            let mut e = TaskEnv::new();
-            e.push("LANG", "C.UTF-8");
-            e.push("BUILD_ID", "42");
-            e
-        },
-        Some(std::path::PathBuf::from("/workspace")),
-        Flag::enabled(),
-    )));
+fn routed_workload_variants_roundtrip() {
+    let spec = fully_populated_spec(routed(
+        "exec.solti.io/v1",
+        "Subprocess",
+        serde_json::json!({
+            "mode": {"command": "/usr/bin/make", "args": ["-j4", "test"]},
+            "env": [{"key": "LANG", "value": "C.UTF-8"}],
+            "cwd": "/workspace",
+            "failOnNonZero": true
+        }),
+    ));
     let mut task = Task::new("task-sub-cmd", spec).unwrap();
     task.transition_starting(1, 1, "1").unwrap();
     task.transition_finished(1, 1, TaskPhase::Failed, Some("retry".into()), None, "2")
@@ -68,31 +66,22 @@ fn built_in_workload_variants_roundtrip() {
     task.transition_starting(1, 3, "5").unwrap();
     let command = task;
 
-    let spec = fully_populated_spec(TaskWorkload::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Script {
-            interpreter: "ruby".into(),
-            body: BASE64.encode(b"puts 'ok'"),
-            args: vec![],
-        },
-        TaskEnv::new(),
-        None,
-        Flag::disabled(),
-    )));
-    let script = Task::new("task-script", spec).unwrap();
+    let spec = fully_populated_spec(routed(
+        "chain.solti.io/v1alpha1",
+        "Chain",
+        serde_json::json!({"steps": [{"name": "a"}, {"name": "b"}]}),
+    ));
+    let chain = Task::new("task-chain", spec).unwrap();
 
-    let spec = fully_populated_spec(TaskWorkload::Wasm(WasmSpec::new(
-        std::path::PathBuf::from("/modules/report.wasm"),
-        vec!["--format=json".into()],
-        TaskEnv::new(),
-    )));
-    let wasm = Task::new("task-wasm", spec).unwrap();
-
-    let spec = fully_populated_spec(TaskWorkload::Container(ContainerSpec::new(
-        "registry.example.com/build:v1.2.3".into(),
-        Some(vec!["sh".into(), "-c".into()]),
-        vec!["echo hi".into()],
-        TaskEnv::new(),
-    )));
+    let spec = fully_populated_spec(routed(
+        "exec.solti.io/v1",
+        "Container",
+        serde_json::json!({
+            "image": "registry.example.com/build:v1.2.3",
+            "command": ["sh", "-c"],
+            "args": ["echo hi"]
+        }),
+    ));
     let mut task = Task::new("task-ctr", spec).unwrap();
     task.transition_starting(1, 1, "1").unwrap();
     task.transition_finished(
@@ -106,44 +95,26 @@ fn built_in_workload_variants_roundtrip() {
     .unwrap();
     let container = task;
 
-    for task in [&command, &script, &wasm, &container] {
+    let embedded = Task::new("task-embedded", fully_populated_spec(embedded("test-v1"))).unwrap();
+
+    for task in [&command, &chain, &container, &embedded] {
         roundtrip(task);
     }
 }
 
 #[test]
-fn wire_paths_preserve_unicode_exactly_in_json() {
-    let cwd = std::path::PathBuf::from("/工作/δ");
-    let subprocess = TaskWorkload::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Command {
-            command: "echo".into(),
-            args: Vec::new(),
-        },
-        TaskEnv::default(),
-        Some(cwd.clone()),
-        Flag::enabled(),
-    ));
-    let json = serde_json::to_value(&subprocess).unwrap();
+fn routed_body_preserves_unicode_exactly_in_json() {
+    let workload = routed(
+        "tasks.example.io/v1",
+        "Report",
+        serde_json::json!({"cwd": "/工作/δ", "module": "/модули/报告.wasm"}),
+    );
+    let json = serde_json::to_value(&workload).unwrap();
     assert_eq!(json["spec"]["cwd"], "/工作/δ");
-    let decoded: TaskWorkload = serde_json::from_value(json).unwrap();
-    assert!(matches!(
-        decoded,
-        TaskWorkload::Subprocess(SubprocessSpec { cwd: Some(actual), .. }) if actual == cwd
-    ));
-
-    let module = std::path::PathBuf::from("/модули/报告.wasm");
-    let wasm = TaskWorkload::Wasm(WasmSpec::new(
-        module.clone(),
-        Vec::new(),
-        TaskEnv::default(),
-    ));
-    let json = serde_json::to_value(&wasm).unwrap();
     assert_eq!(json["spec"]["module"], "/модули/报告.wasm");
+
     let decoded: TaskWorkload = serde_json::from_value(json).unwrap();
-    assert!(matches!(
-        decoded,
-        TaskWorkload::Wasm(WasmSpec { module: actual, .. }) if actual == module
-    ));
+    assert_eq!(decoded, workload);
 }
 
 #[test]

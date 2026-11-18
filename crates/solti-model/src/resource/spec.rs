@@ -107,19 +107,18 @@ impl TaskSpec {
     /// Creates a builder with the required fields.
     ///
     /// ```rust
-    /// use solti_model::{TaskSpec, TaskWorkload, SubprocessSpec, SubprocessMode, RestartPolicy};
+    /// use solti_model::{TaskSpec, TaskWorkload, Workload, RestartPolicy};
     ///
     /// let spec = TaskSpec::builder(
     ///     "my-slot",
-    ///     TaskWorkload::Subprocess(SubprocessSpec::new(
-    ///         SubprocessMode::Command {
-    ///             command: "echo".into(),
-    ///             args: vec!["hello".into()],
-    ///         },
-    ///         Default::default(),
-    ///         None,
-    ///         Default::default(),
-    ///     )),
+    ///     TaskWorkload::from(
+    ///         Workload::new(
+    ///             "exec.solti.io/v1",
+    ///             "Subprocess",
+    ///             serde_json::json!({ "mode": { "command": "echo", "args": ["hello"] } }),
+    ///         )
+    ///         .unwrap(),
+    ///     ),
     ///     5_000u64,
     /// )
     /// .restart(RestartPolicy::OnFailure)
@@ -235,21 +234,18 @@ impl TaskSpec {
     /// ## Example
     ///
     /// ```
-    /// use solti_model::{
-    ///     Flag, SubprocessMode, SubprocessSpec, TaskEnv, TaskSpec, TaskWorkload,
-    /// };
+    /// use solti_model::{TaskSpec, TaskWorkload, Workload};
     ///
     /// let spec = TaskSpec::builder(
     ///     "hello",
-    ///     TaskWorkload::Subprocess(SubprocessSpec::new(
-    ///         SubprocessMode::Command {
-    ///             command: "echo".into(),
-    ///             args: vec!["hello".into()],
-    ///         },
-    ///         TaskEnv::default(),
-    ///         None,
-    ///         Flag::enabled(),
-    ///     )),
+    ///     TaskWorkload::from(
+    ///         Workload::new(
+    ///             "exec.solti.io/v1",
+    ///             "Subprocess",
+    ///             serde_json::json!({ "mode": { "command": "echo", "args": ["hello"] } }),
+    ///         )
+    ///         .unwrap(),
+    ///     ),
     ///     1_000u64,
     /// )
     /// .build()
@@ -474,7 +470,7 @@ mod raw {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EmbeddedSpec, Flag, SubprocessMode, SubprocessSpec, TaskEnv};
+    use crate::{EmbeddedSpec, Workload};
 
     fn embedded() -> TaskWorkload {
         TaskWorkload::Embedded(EmbeddedSpec::new("test-v1").unwrap())
@@ -483,15 +479,14 @@ mod tests {
     fn valid_spec() -> TaskSpec {
         TaskSpec::builder(
             "test",
-            TaskWorkload::Subprocess(SubprocessSpec {
-                mode: SubprocessMode::Command {
-                    command: "echo".into(),
-                    args: vec![],
-                },
-                env: TaskEnv::default(),
-                cwd: None,
-                fail_on_non_zero: Flag::enabled(),
-            }),
+            TaskWorkload::Routed(
+                Workload::new(
+                    "exec.solti.io/v1",
+                    "Subprocess",
+                    serde_json::json!({ "mode": { "command": "echo" } }),
+                )
+                .unwrap(),
+            ),
             5_000u64,
         )
         .build()

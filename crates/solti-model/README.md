@@ -29,20 +29,16 @@ Disable default features when schema generation is not needed.
 Build caller-owned desired state:
 
 ```rust
-use solti_model::{
-    Flag, Labels, SubprocessMode, SubprocessSpec, TaskEnv, TaskManifest,
-    TaskSpec, TaskWorkload,
-};
+use solti_model::{Labels, TaskManifest, TaskSpec, TaskWorkload, Workload};
 
-let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
-    SubprocessMode::Command {
-        command: "echo".into(),
-        args: vec!["hello".into()],
-    },
-    TaskEnv::default(),
-    None,
-    Flag::enabled(),
-));
+let workload = TaskWorkload::from(
+    Workload::new(
+        "exec.solti.io/v1",
+        "Subprocess",
+        serde_json::json!({ "mode": { "command": "echo", "args": ["hello"] } }),
+    )
+    .unwrap(),
+);
 
 let spec = TaskSpec::builder("jobs", workload, 5_000_u64)
     .build()
@@ -173,28 +169,21 @@ Omit the field for an unlimited retry budget.
 
 ## Workloads
 
-| Variant       | Input                                               | Runner-routed |
-|---------------|-----------------------------------------------------|---------------|
-| `Subprocess`  | Command or explicit interpreter and base64 script   | Yes           |
-| `Container`   | OCI image, optional command, args, environment      | Yes           |
-| `Wasm`        | WASM module path, args, environment                 | Yes           |
-| `Embedded`    | In-process implementation revision                  | No            |
-| `Extension`   | Application GVK and JSON object spec                | Yes           |
+| Variant    | Input                                                | Runner-routed |
+|------------|------------------------------------------------------|---------------|
+| `Routed`   | Any declared GVK and a JSON object `spec`            | Yes           |
+| `Embedded` | In-process implementation revision (`solti.io/v1`)   | No            |
 
-Built-in workloads use `apiVersion: solti.io/v1`.
-Their envelope and spec reject unknown fields.
-`Subprocess.cwd` and `Wasm.module` are wire-facing paths. A validated
-`TaskSpec` requires both to be valid UTF-8. Their Unicode text is preserved
-exactly by JSON and protobuf transports; the model never substitutes invalid
-native path bytes.
-
-Use `ExtensionWorkload` for an application-defined runner:
+A `Workload` is the routed envelope: `apiVersion`, `kind` and a `spec` object
+owned by the application. The agent declares a JSON Schema per GVK, and the
+control plane validates `spec` against it.
+The envelope rejects unknown fields; the `spec` keeps whatever the schema allows.
 
 ```rust
-use solti_model::{ExtensionWorkload, TaskWorkload};
+use solti_model::{TaskWorkload, Workload};
 
-let workload = TaskWorkload::Extension(
-    ExtensionWorkload::new(
+let workload = TaskWorkload::from(
+    Workload::new(
         "media.example.io/v1",
         "ImageResize",
         serde_json::json!({
@@ -209,13 +198,39 @@ assert_eq!(workload.api_version(), "media.example.io/v1");
 assert_eq!(workload.kind(), "ImageResize");
 ```
 
-Extension `spec` must be a JSON object.
-The `solti.io` API group is reserved for built-in workloads.
-`solti-runner` owns runner selection and runner-specific validation.
+`spec` must be a JSON object nested at most 128 levels.
+The `solti.io` API group is reserved for SDK-internal workloads;
+only `solti.io/v1` `Embedded` uses it, and it is never routed.
 
-Subprocess script bodies use standard base64.
-Decoded content must be UTF-8.
-The decoded limit is `MAX_SCRIPT_BODY_BYTES` (`2 MiB`).
+Implement `WorkloadBody` to decode a routed `spec` into a Rust type.
+`Workload::decode` checks the GVK, names the path of a bad field, and runs the
+body's own `validate`:
+
+```rust
+use serde::Deserialize;
+use solti_model::{Workload, WorkloadBody};
+
+#[derive(Deserialize)]
+struct ImageResize {
+    width: u32,
+}
+
+impl WorkloadBody for ImageResize {
+    const API_VERSION: &'static str = "media.example.io/v1";
+    const KIND: &'static str = "ImageResize";
+}
+
+let workload = Workload::new(
+    "media.example.io/v1",
+    "ImageResize",
+    serde_json::json!({ "width": 1280 }),
+)
+.unwrap();
+
+assert_eq!(workload.decode::<ImageResize>().unwrap().width, 1280);
+```
+
+`solti-runner` owns runner selection.
 
 ## Apply desired state
 

@@ -5,19 +5,19 @@
 //!
 //! This example shows:
 //!
-//! - subprocess desired state;
-//! - labels, annotations, environment, policies, and runner selection;
+//! - routed workload desired state;
+//! - labels, annotations, policies, and runner selection;
 //! - validation at the manifest boundary;
 //! - the serialized API shape;
 //! - strict rejection of unknown fields.
 //!
 //! Run with `cargo run -p solti-model --example task_manifest`.
 
-use std::{num::NonZeroU32, path::PathBuf};
+use std::num::NonZeroU32;
 
 use solti_model::{
-    AdmissionPolicy, Annotations, BackoffPolicy, Flag, JitterPolicy, LabelSelector, Labels,
-    RestartPolicy, SubprocessMode, SubprocessSpec, TaskEnv, TaskManifest, TaskSpec, TaskWorkload,
+    AdmissionPolicy, Annotations, BackoffPolicy, JitterPolicy, LabelSelector, Labels,
+    RestartPolicy, TaskManifest, TaskSpec, TaskWorkload, Workload,
 };
 
 type ExampleResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -50,18 +50,21 @@ fn main() -> ExampleResult {
         "[purpose] Build the complete desired-state document that an API client creates or applies."
     );
 
-    let mut env = TaskEnv::new();
-    env.push("SOURCE", "cover.png");
-    env.push("OUTPUT", "cover.webp");
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Command {
-            command: "thumbnail-worker".into(),
-            args: vec!["--width".into(), "1280".into()],
-        },
-        env,
-        Some(PathBuf::from("/srv/media")),
-        Flag::enabled(),
-    ));
+    let workload = TaskWorkload::from(Workload::new(
+        "exec.solti.io/v1",
+        "Subprocess",
+        serde_json::json!({
+            "mode": {
+                "command": "thumbnail-worker",
+                "args": ["--width", "1280"]
+            },
+            "env": [
+                { "key": "SOURCE", "value": "cover.png" },
+                { "key": "OUTPUT", "value": "cover.webp" }
+            ],
+            "cwd": "/srv/media"
+        }),
+    )?);
 
     let backoff = BackoffPolicy {
         jitter: JitterPolicy::Equal,

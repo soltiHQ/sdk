@@ -2592,6 +2592,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
+ "serde_path_to_error",
  "sha2",
  "subtle",
  "thiserror 2.0.20",

@@ -254,33 +254,22 @@ Every workload uses a Kubernetes-style envelope:
 %%{init: {"flowchart": {"curve": "linear"}}}%%
 flowchart TB
     Workload["TaskWorkload"]
-    Subprocess["Subprocess<br/>solti.io/v1"]
-    Container["Container<br/>solti.io/v1"]
-    Wasm["Wasm<br/>solti.io/v1"]
+    Routed["Routed<br/>application GVK"]
     Embedded["Embedded<br/>solti.io/v1"]
-    Extension["Extension<br/>application GVK"]
     Runner["solti-runner routing"]
     Binding["Higher-layer in-process binding"]
 
-    Workload --> Subprocess
-    Workload --> Container
-    Workload --> Wasm
+    Workload --> Routed
     Workload --> Embedded
-    Workload --> Extension
 
-    Subprocess --> Runner
-    Container --> Runner
-    Wasm --> Runner
-    Extension --> Runner
+    Routed --> Runner
     Embedded --> Binding
 ```
 
-Built-in variants have fixed kinds and strict specs.
-Unknown built-in fields are rejected.
-
-`ExtensionWorkload` preserves an application-owned JSON object.
-Its GVK must use a grouped CRD-style API version.
-The `solti.io` group is reserved for built-in workloads.
+`Workload` preserves an application-owned JSON object under a grouped CRD-style GVK.
+The agent declares a JSON Schema per GVK; the control plane validates `spec` against it.
+`WorkloadBody` decodes the object into a typed value.
+The `solti.io` group is reserved for SDK-internal workloads.
 
 `EmbeddedSpec` contains only the caller-owned implementation revision.
 A higher layer binds that revision to an in-process task handle.
@@ -453,8 +442,8 @@ Before changing a shared contract, check these constraints in the owning module 
 7. Attempt numbers come from the execution source of truth.
 8. Reconciliation errors stay in the `Reconciled` condition.
 9. Execution errors stay in terminal status or run diagnostics.
-10. Built-in workload shapes are strict.
-11. Extension workload fields remain application-owned.
+10. The routed workload envelope is strict.
+11. Routed workload fields remain application-owned.
 12. Embedded remains valid in the model and absent from runner capabilities.
 13. Filters run before pagination.
 14. Continuations remain bound to one filter and snapshot version.

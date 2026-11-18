@@ -10,9 +10,10 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{Labels, ModelError, ModelResult, WORKLOAD_API_VERSION, WorkloadTypeMeta, validation};
-
-const EMBEDDED_WORKLOAD_KIND: &str = "Embedded";
+use crate::{
+    EMBEDDED_WORKLOAD_API_VERSION, EMBEDDED_WORKLOAD_KIND, Labels, ModelError, ModelResult,
+    WorkloadTypeMeta, validation,
+};
 
 /// One registered runner and the workload GVKs it can execute.
 ///
@@ -81,7 +82,7 @@ impl RunnerCapability {
             ));
         }
         if workload_types.iter().any(|workload| {
-            workload.api_version() == WORKLOAD_API_VERSION
+            workload.api_version() == EMBEDDED_WORKLOAD_API_VERSION
                 && workload.kind() == EMBEDDED_WORKLOAD_KIND
         }) {
             return Err(ModelError::Invalid(
@@ -193,7 +194,7 @@ mod tests {
             Labels::new(),
             vec![
                 workload("tasks.example.io/v1", "Resize"),
-                workload(WORKLOAD_API_VERSION, "Subprocess"),
+                workload("exec.solti.io/v1", "Subprocess"),
             ],
         )
         .unwrap();
@@ -205,7 +206,7 @@ mod tests {
                 .map(|workload| (workload.api_version(), workload.kind()))
                 .collect::<Vec<_>>(),
             vec![
-                ("solti.io/v1", "Subprocess"),
+                ("exec.solti.io/v1", "Subprocess"),
                 ("tasks.example.io/v1", "Resize"),
             ]
         );
@@ -217,7 +218,7 @@ mod tests {
             RunnerCapability::new(
                 "",
                 Labels::new(),
-                vec![workload("solti.io/v1", "Subprocess")]
+                vec![workload("exec.solti.io/v1", "Subprocess")]
             )
             .is_err()
         );
@@ -225,7 +226,7 @@ mod tests {
             RunnerCapability::new(
                 "invalid/name",
                 Labels::new(),
-                vec![workload("solti.io/v1", "Subprocess")],
+                vec![workload("exec.solti.io/v1", "Subprocess")],
             )
             .is_err()
         );
@@ -235,8 +236,8 @@ mod tests {
                 "runner",
                 Labels::new(),
                 vec![
-                    workload("solti.io/v1", "Subprocess"),
-                    workload("solti.io/v1", "Subprocess"),
+                    workload("exec.solti.io/v1", "Subprocess"),
+                    workload("exec.solti.io/v1", "Subprocess"),
                 ],
             )
             .is_err()
@@ -245,7 +246,10 @@ mod tests {
             RunnerCapability::new(
                 "runner",
                 Labels::new(),
-                vec![workload(WORKLOAD_API_VERSION, EMBEDDED_WORKLOAD_KIND)],
+                vec![workload(
+                    EMBEDDED_WORKLOAD_API_VERSION,
+                    EMBEDDED_WORKLOAD_KIND
+                )],
             )
             .is_err()
         );
@@ -257,7 +261,7 @@ mod tests {
             RunnerCapability::new(
                 name,
                 Labels::new(),
-                vec![workload(WORKLOAD_API_VERSION, "Subprocess")],
+                vec![workload("exec.solti.io/v1", "Subprocess")],
             )
         };
 
@@ -278,7 +282,7 @@ mod tests {
         let first = RunnerCapability::new(
             "runner",
             Labels::new(),
-            vec![workload(WORKLOAD_API_VERSION, "Subprocess")],
+            vec![workload("exec.solti.io/v1", "Subprocess")],
         )
         .unwrap();
         let second = RunnerCapability::new(
@@ -298,7 +302,7 @@ mod tests {
                 "name": "runner",
                 "labels": {"zone": "eu"},
                 "workloadTypes": [{
-                    "apiVersion": "solti.io/v1",
+                    "apiVersion": "exec.solti.io/v1",
                     "kind": "Subprocess"
                 }]
             }]

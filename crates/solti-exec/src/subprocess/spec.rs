@@ -1,13 +1,15 @@
 //! # Subprocess workload
 //!
 //! [`SubprocessMode`] selects a command or an interpreter-backed script.
-//! [`SubprocessSpec`](super::SubprocessSpec) adds environment, working directory, and exit-code policy.
+//! [`SubprocessSpec`] adds environment, working directory, and exit-code policy.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{ModelError, ModelResult};
+use std::path::{Path, PathBuf};
+
+use solti_model::{Flag, ModelError, ModelResult, TaskEnv};
 
 /// Maximum decoded script body size.
 pub const MAX_SCRIPT_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -218,6 +220,97 @@ impl SubprocessMode {
         }
         Ok(())
     }
+}
+
+/// Specification for subprocess execution on the host.
+///
+/// Supports two execution strategies via [`SubprocessMode`]:
+/// - command: direct binary execution;
+/// - script: script body passed to an explicit interpreter.
+///
+/// Common fields (`env`, `cwd`, `fail_on_non_zero`) apply to both modes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[non_exhaustive]
+pub struct SubprocessSpec {
+    /// Execution strategy (command or script).
+    pub mode: SubprocessMode,
+    /// Environment variables for the process.
+    #[serde(default, skip_serializing_if = "TaskEnv::is_empty")]
+    pub env: TaskEnv,
+    /// Working directory.
+    ///
+    /// A validated task spec requires this wire-facing path to be valid UTF-8.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    /// Whether to treat non-zero exit codes as task failure.
+    ///
+    /// When enabled (default), any non-zero exit code will be reported as a failure.
+    #[serde(default)]
+    pub fail_on_non_zero: Flag,
+}
+
+impl SubprocessSpec {
+    /// Creates a subprocess spec.
+    ///
+    /// `SubprocessSpec` is `#[non_exhaustive]`.
+    /// Use this constructor outside the crate.
+    /// Validation occurs when the workload enters a [`crate::TaskSpec`].
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_model::{Flag, SubprocessMode, SubprocessSpec, TaskEnv};
+    ///
+    /// let spec = SubprocessSpec::new(
+    ///     SubprocessMode::Command {
+    ///         command: "echo".into(),
+    ///         args: vec!["hello".into()],
+    ///     },
+    ///     TaskEnv::default(),
+    ///     None,
+    ///     Flag::enabled(),
+    /// );
+    ///
+    /// assert!(spec.fail_on_non_zero.is_enabled());
+    /// ```
+    pub fn new(
+        mode: SubprocessMode,
+        env: TaskEnv,
+        cwd: Option<PathBuf>,
+        fail_on_non_zero: Flag,
+    ) -> Self {
+        Self {
+            mode,
+            env,
+            cwd,
+            fail_on_non_zero,
+        }
+    }
+
+    /// Validates the subprocess mode and wire-facing path fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::Invalid`] when the mode is invalid or `cwd`
+    /// cannot be represented as UTF-8 on the HTTP and gRPC wire.
+    pub fn validate(&self) -> ModelResult<()> {
+        self.mode.validate()?;
+        if let Some(cwd) = &self.cwd {
+            validate_wire_path("subprocess cwd", cwd)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_wire_path(field: &str, path: &Path) -> ModelResult<()> {
+    if path.to_str().is_none() {
+        return Err(ModelError::Invalid(
+            format!("{field} must contain valid UTF-8").into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

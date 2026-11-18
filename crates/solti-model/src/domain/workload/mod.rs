@@ -3,6 +3,22 @@
 //! [`WorkloadSchema`] is the JSON Schema a runner publishes for one workload
 //! type: RFC 8785 canonical bytes, their [`SchemaFingerprint`], and the check
 //! that keeps the schema inside the draft 2020-12 subset Podium compiles.
+//!
+//! [`TaskWorkload`] is the desired state a task runs: a [`Workload`] routed by
+//! its GVK, or the SDK-internal [`EmbeddedSpec`]. [`WorkloadBody`] decodes a
+//! routed body into a typed Rust value.
+
+mod gvk;
+pub use gvk::WorkloadTypeMeta;
+
+mod body;
+pub use body::{WorkloadBody, WorkloadBodyError, WorkloadBodyErrorKind};
+
+mod task_workload;
+pub use task_workload::{
+    EMBEDDED_WORKLOAD_API_VERSION, EMBEDDED_WORKLOAD_KIND, EmbeddedSpec, MAX_WORKLOAD_BODY_DEPTH,
+    TaskWorkload, Workload,
+};
 
 mod schema;
 pub use schema::{
