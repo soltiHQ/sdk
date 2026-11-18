@@ -10,6 +10,8 @@
 //!             └──► taskvisor::TaskRef
 //! ```
 
+mod schemas;
+
 mod sync;
 pub use sync::sync;
 

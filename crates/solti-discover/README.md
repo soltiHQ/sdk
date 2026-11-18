@@ -58,6 +58,9 @@ Use `apply_embedded_task` when the desired config changes.
 - separates the advertised agent API from the outbound control-plane connection;
 - builds one reusable HTTP or gRPC transport client;
 - sends agent identity, endpoint, metadata, capabilities, platform, and liveness;
+- advertises each workload type's schema fingerprint, and sends the schemas the
+  control plane requests within the encoded request budget, with follow-up
+  requests in the same attempt;
 - classifies failures as retryable or permanent;
 - applies server-advised retry holds;
 - records discovery attempts through an optional metrics backend;
@@ -70,7 +73,7 @@ Use `apply_embedded_task` when the desired config changes.
 | `AgentEndpoint::new`          | Address, endpoint type, API version           | Advertised agent endpoint                 |
 | `ControlPlaneEndpoint::new`   | Control-plane address and discovery transport | Outbound discovery endpoint               |
 | `DiscoverConfig::builder`     | Identity, endpoints, interval, task revision  | Config builder                            |
-| `capabilities`                | `AgentCapabilities` snapshot                  | Runner capabilities sent with every sync  |
+| `capabilities`                | `AgentCapabilities` snapshot                  | Runner capabilities and schema fingerprints sent with every sync; schemas on request |
 | `with_token`                  | `Token`                                       | Bearer authentication                     |
 | `allow_insecure_token_transport` | No value                                   | Explicit development/loopback opt-in      |
 | `with_tls`                    | `solti_tls::ClientTlsConfig`                  | Custom roots and optional client identity |
@@ -147,13 +150,53 @@ Each runner contributes:
 
 - its unique name;
 - static routing labels;
-- exact workload `apiVersion` and `kind` values.
+- exact workload `apiVersion` and `kind` values, each with its schema fingerprint.
 
 Runner order preserves routing priority.
 Workload GVKs use canonical order.
 Embedded workloads are absent because they bypass runner routing.
 
 An agent with no routed runners passes `AgentCapabilities::default()` explicitly.
+
+The snapshot must keep the heartbeat, without schemas, within the request
+budget of 256 KiB minus 1 KiB. `sync` returns `DiscoverError::InvalidConfig`
+for a snapshot that does not.
+
+## Workload schemas
+
+Every heartbeat advertises the fingerprint of each declared workload type:
+the SHA-256 of the RFC 8785 canonical JSON of its schema. The control plane
+answers with `want_schemas`, the fingerprints it lacks. The task then sends
+exactly those canonical bytes:
+
+- the next request carries the requested schemas, in sorted order, as many as
+  fit the encoded request budget of the transport in use;
+- follow-up requests in the same attempt carry the rest, at most six per attempt;
+- a schema is sent once per attempt, and resent at most every five minutes
+  while the control plane still requests it.
+
+The budget counts the bytes on the wire. HTTP carries schema bytes as base64,
+so a request holds about two 64 KiB schemas over HTTP and about three over gRPC.
+
+The first heartbeat of a task carries no schema. A failed follow-up is logged
+at WARN and does not fail the attempt: the next attempt sends what is still
+requested.
+
+The control plane refuses a schema outside its subset silently: it stops
+requesting it. The agent cannot see that. Look at the control plane's workload
+catalog, where the schema is `refused`, and at placement, which reports
+`schema_incompatible` with the reason.
+
+| Log event                              | Level | Meaning |
+|----------------------------------------|-------|---------|
+| `discovery.workload_types`             | INFO  | Once per task: each `apiVersion/kind` with its fingerprint |
+| `discovery.schemas_sent`               | INFO  | An accepted request carried schemas: fingerprints and encoded request size |
+| `discovery.schema_still_requested`     | WARN  | Requested again by the response to the request that carried it; once per fingerprint |
+| `discovery.schema_unknown_request`     | DEBUG | A requested fingerprint the agent does not declare; ignored |
+| `discovery.schema_follow_up_failed`    | WARN  | A follow-up failed; the attempt still succeeds |
+| `discovery.schema_over_request_budget` | WARN  | A schema cannot fit beside the heartbeat and is never sent |
+
+[`CONTRACT.md`](CONTRACT.md#schema-exchange) gives the exact rules.
 
 ## Authentication and TLS
 
@@ -218,7 +261,7 @@ Permanent failures become `TaskError::Fatal`.
 | Restart         | Periodic with `delay_ms`                                 |
 | Admission       | `AdmissionPolicy::Replace`                               |
 | Backoff         | Configured value or the derived default                  |
-| Attempt timeout | Jitter, retry hold, connect timeout, and request timeout |
+| Attempt timeout | Jitter, retry hold, and seven requests                   |
 
 The first attempt waits for startup jitter below `delay_ms`.
 Later attempts do not repeat startup jitter.
@@ -227,8 +270,8 @@ The attempt timeout includes:
 
 - one discovery interval;
 - the maximum one-hour server hold;
-- connect timeout;
-- request timeout;
+- connect timeout plus request timeout for the heartbeat and each of up to six
+  schema follow-ups;
 - one second of overhead.
 
 ## Uptime
@@ -263,6 +306,8 @@ failure does not record a transport attempt or transport failure metric.
 | `record_failure` | Duration and bounded failure reason    |
 | `record_hold`    | Clamped server hold in seconds         |
 
+Schema follow-ups are transport requests too, so each records its own attempt
+and outcome.
 `NoOpDiscoverMetrics` is the default.
 `DiscoverFailReason` keeps failure labels bounded.
 `build` installs one sticky panic boundary around the selected backend. After
@@ -273,7 +318,9 @@ panic. The boundary does not serialize healthy metrics updates.
 
 ## Specific behavior
 
-- Every attempt sends a fresh Unix timestamp and uptime value.
+- Every request sends a fresh Unix timestamp and uptime value.
+- Every request stays within the encoded request budget of 256 KiB minus 1 KiB.
+- A schema is sent only when the control plane requests it, as its canonical bytes.
 - HTTP and gRPC clients are reused across task attempts.
 - HTTP redirects are disabled to avoid forwarding credentials to another host.
 - Bearer tokens require TLS unless insecure token transport is explicitly enabled.
@@ -288,7 +335,7 @@ panic. The boundary does not serialize healthy metrics updates.
 
 | Error             | Cause                                               | Retryability |
 |-------------------|-----------------------------------------------------|--------------|
-| `InvalidConfig`   | Invalid endpoint, duration, auth data, or TLS setup | Permanent    |
+| `InvalidConfig`   | Invalid endpoint, duration, auth data, or TLS setup; a heartbeat over the request budget | Permanent    |
 | `SpecBuild`       | Embedded task manifest could not be built           | Permanent    |
 | `GrpcTransport`   | gRPC connection failed                              | Retryable    |
 | `GrpcStatus`      | Control plane returned a gRPC status                | Code-based   |
@@ -318,7 +365,7 @@ cargo run -p solti-discover --example http_sync --features http
 
 | Example                                     | Features       | What it shows                                                         |
 |---------------------------------------------|----------------|-----------------------------------------------------------------------|
-| [http_sync.rs](examples/http_sync.rs)       | `http`         | Full HTTP request, capabilities, authentication, uptime, and metrics. |
+| [http_sync.rs](examples/http_sync.rs)       | `http`         | Full HTTP requests, capabilities with fingerprints, a requested schema sent in a follow-up, authentication, uptime, and metrics. |
 | [grpc_sync.rs](examples/grpc_sync.rs)       | `grpc`         | gRPC task construction, lazy connection, and optional real sync.      |
 | [retryability.rs](examples/retryability.rs) | `http`, `grpc` | Retryable and permanent HTTP, gRPC, and protocol failures.            |
 

@@ -2507,6 +2507,7 @@ dependencies = [
 name = "solti-discover"
 version = "0.0.8"
 dependencies = [
+ "axum",
  "http-body-util",
  "pbjson",
  "pbjson-build",
@@ -2516,6 +2517,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "solti-model",
  "solti-tls",
  "taskvisor",

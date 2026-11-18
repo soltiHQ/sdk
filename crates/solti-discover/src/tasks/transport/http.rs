@@ -63,7 +63,7 @@ impl HttpAdapter {
     }
 
     /// Sends one discovery request.
-    pub(super) async fn sync(&self, request: SyncRequest) -> Result<(), DiscoverError> {
+    pub(super) async fn sync(&self, request: SyncRequest) -> Result<SyncResponse, DiscoverError> {
         let mut request = self.client.post(self.url.clone()).json(&request);
         if let Some(value) = &self.authorization {
             request = request.header(AUTHORIZATION, value.clone());
@@ -93,6 +93,16 @@ impl HttpAdapter {
         })?;
 
         validate_response(response)
+    }
+
+    /// Returns the size of the JSON body `sync` sends for `request`.
+    ///
+    /// `reqwest` sends `serde_json::to_vec(&request)` as the body, so this is
+    /// the length of that same encoding. Bytes fields are base64 in it. A
+    /// request that cannot be encoded, which the SDK never builds, measures
+    /// `usize::MAX` and fits no budget.
+    pub(super) fn encoded_len(&self, request: &SyncRequest) -> usize {
+        serde_json::to_vec(request).map_or(usize::MAX, |body| body.len())
     }
 
     /// Returns whether the endpoint uses HTTPS.
@@ -258,6 +268,77 @@ fn truncate_body(body: &str) -> String {
         end -= 1;
     }
     format!("{}... [truncated]", &body[..end])
+}
+
+/// The HTTP front of the test control plane.
+#[cfg(test)]
+pub(super) mod fake {
+    use std::sync::Arc;
+
+    use axum::Router;
+    use axum::body::Bytes;
+    use axum::extract::{DefaultBodyLimit, State};
+    use axum::http::{StatusCode, header};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::post;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    use crate::DISCOVERY_HTTP_SYNC_PATH;
+    use crate::proto::{SyncRequest, SyncResponse};
+    use crate::tasks::transport::fake::{FakeControlPlane, FakeServer, Outcome};
+
+    /// Serves `control` over HTTP on an ephemeral loopback port.
+    ///
+    /// The whole body is read before its size is judged, so a refused request
+    /// gets its 413 rather than a reset connection.
+    pub(in crate::tasks) async fn serve(control: Arc<FakeControlPlane>) -> FakeServer {
+        let app = Router::new()
+            .route(DISCOVERY_HTTP_SYNC_PATH, post(sync))
+            .layer(DefaultBodyLimit::disable())
+            .with_state(control);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake control plane");
+        let address = listener.local_addr().expect("fake control plane address");
+        let (shutdown, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("fake control plane serves");
+        });
+        FakeServer::new(address, shutdown, task)
+    }
+
+    async fn sync(State(control): State<Arc<FakeControlPlane>>, body: Bytes) -> Response {
+        let Ok(request) = serde_json::from_slice::<SyncRequest>(&body) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        match control.answer(&request, body.len()) {
+            Outcome::Accepted(want_schemas) => {
+                let response = SyncResponse {
+                    success: true,
+                    reason: String::new(),
+                    retry_after_s: 0,
+                    want_schemas,
+                };
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_vec(&response).expect("encode the response"),
+                )
+                    .into_response()
+            }
+            Outcome::TooLarge => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "discovery request too large").into_response()
+            }
+            Outcome::Unavailable => {
+                (StatusCode::SERVICE_UNAVAILABLE, "control plane unavailable").into_response()
+            }
+        }
+    }
 }
 
 #[cfg(test)]

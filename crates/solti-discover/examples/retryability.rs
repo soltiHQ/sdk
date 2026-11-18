@@ -12,6 +12,10 @@
 //! - gRPC client and transient statuses;
 //! - the stable `Retryability` decision consumed by the embedded task.
 //!
+//! The decision applies to the heartbeat that starts each attempt. A schema
+//! follow-up that fails afterwards is logged at WARN and leaves the attempt
+//! successful; the next attempt sends the schemas still requested.
+//!
 //! Run with `cargo run -p solti-discover --example retryability --features http,grpc`.
 
 use solti_discover::{DiscoverError, Retryability};
@@ -33,6 +37,7 @@ solti-discover: failure classification
 
   A rejected response is retryable.
   Authentication and permanent client mistakes stop the task.
+  A failed schema follow-up after an accepted heartbeat is logged, not returned.
 "#;
 
 fn main() {

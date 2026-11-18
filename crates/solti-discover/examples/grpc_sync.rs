@@ -7,9 +7,11 @@
 //!
 //! - independent advertised and discovery transports;
 //! - a complete gRPC discovery task;
+//! - a declared workload type and its schema fingerprint;
 //! - the fixed discovery v1 service identity;
 //! - lazy connection behavior;
-//! - an optional real sync against an external control plane.
+//! - an optional real sync against an external control plane, which also
+//!   sends any schema that control plane requests.
 //!
 //! The default run builds and inspects the task without contacting a server.
 //! Pass `--send` when the configured endpoint implements discovery gRPC v1.
@@ -24,8 +26,8 @@ use solti_discover::{
     DISCOVERY_PROTOCOL_VERSION, DiscoverConfig, DiscoveryTransport, MonotonicUptime, sync,
 };
 use solti_model::{
-    AgentCapabilities, AgentId, Labels, RunnerCapability, TaskWorkload, WORKLOAD_API_VERSION,
-    WorkloadTypeMeta,
+    AgentCapabilities, AgentId, Labels, RunnerCapability, TaskWorkload, WorkloadSchema,
+    WorkloadType, WorkloadTypeMeta,
 };
 use taskvisor::TaskContext;
 
@@ -37,7 +39,8 @@ solti-discover: lazy gRPC discovery client
   advertised AgentEndpoint
   HTTP Task API v1 ───────────────────────────┐
                                               │ inside SyncRequest
-  identity + capabilities + uptime ───────────┤
+  identity + capabilities (GVK + fingerprint) │
+  + uptime ───────────────────────────────────┤
                                               ▼
                                         DiscoverConfig
                                               │ sync()
@@ -55,11 +58,19 @@ solti-discover: lazy gRPC discovery client
 
 fn capabilities() -> Result<AgentCapabilities, solti_model::ModelError> {
     let mut labels = Labels::new();
-    labels.insert("solti.io/runner-name", "containerd");
+    labels.insert("solti.io/runner-name", "backup");
+    let schema = WorkloadSchema::from_value(&serde_json::json!({
+        "type": "object",
+        "properties": {"database": {"type": "string"}},
+        "required": ["database"]
+    }))?;
     AgentCapabilities::new(vec![RunnerCapability::new(
-        "containerd",
+        "backup",
         labels,
-        vec![WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Container")?],
+        vec![WorkloadType::new(
+            WorkloadTypeMeta::new("jobs.example.io/v1", "DatabaseBackup")?,
+            schema,
+        )],
     )?])
 }
 
@@ -78,12 +89,29 @@ async fn main() -> ExampleResult {
     println!("[settings] controlPlane={endpoint}.");
     println!("[settings] Override it with SOLTI_DISCOVERY_GRPC_ENDPOINT.");
 
+    let capabilities = capabilities()?;
+    for schema in capabilities.schemas() {
+        println!(
+            "[capabilities] schema {} ({} canonical bytes) for {:?}.",
+            schema.fingerprint(),
+            schema.canonical_json().len(),
+            capabilities
+                .types_for(schema.fingerprint())
+                .iter()
+                .map(|meta| format!("{}/{}", meta.api_version(), meta.kind()))
+                .collect::<Vec<_>>(),
+        );
+    }
+    println!(
+        "[capabilities] Heartbeats carry the fingerprint; the schema goes out only when requested."
+    );
+
     let config = DiscoverConfig::builder(
         AgentId::new("agent-grpc-1")?,
         "Agent gRPC 1",
         AgentEndpoint::new("http://127.0.0.1:8085", AgentEndpointType::Http, 1)?,
         ControlPlaneEndpoint::new(endpoint, DiscoveryTransport::Grpc)?,
-        capabilities()?,
+        capabilities,
         1,
         "grpc-discovery@1",
     )
