@@ -1758,7 +1758,7 @@ mod tests {
 
     use serde_json::{Map, Value, json};
 
-    use super::{go_may_parse, instructions};
+    use super::{RegexBudget, go_may_parse, instructions};
     use crate::{
         MAX_SCHEMA_REGEX_INSTRUCTIONS, MAX_SCHEMA_REGEX_INSTRUCTIONS_TOTAL,
         MAX_SCHEMA_REGEX_SOURCE_BYTES, MAX_SCHEMA_REGEX_SOURCE_BYTES_TOTAL,
@@ -2217,6 +2217,67 @@ mod tests {
                 count: 154,
                 limit: 153
             }
+        );
+    }
+
+    /// Podium's verdict and Go's size for each pattern of
+    /// `tests/data/podium/in/regex.json`, generated from Podium's Go code
+    /// (`tests/podium_vectors.rs` says how).
+    const PODIUM_REGEX_VECTORS: &str = include_str!("../../../../tests/data/podium/out/regex.json");
+
+    #[test]
+    fn regex_estimate_covers_podiums_size() {
+        let vectors: Vec<Value> = serde_json::from_str(PODIUM_REGEX_VECTORS).unwrap();
+        assert!(vectors.len() >= 60, "{} regex vectors", vectors.len());
+        let mut failures = Vec::new();
+        for vector in &vectors {
+            let pattern = vector["pattern"].as_str().unwrap();
+            let parsed = vector["parsed"].as_bool().unwrap();
+            let size = usize::try_from(vector["size"].as_u64().unwrap()).unwrap();
+            let accepted = vector["accepted"].as_bool().unwrap();
+            let podium = vector["error"].as_str().unwrap_or_default();
+            // The replay may accept what Go refuses only for a Unicode class
+            // name, which it cannot check.
+            let replay = go_may_parse(pattern);
+            if replay != parsed && !(replay && (pattern.contains("\\p") || pattern.contains("\\P")))
+            {
+                failures.push(format!(
+                    "{pattern:?}: the replay of Go's parse loop says {replay}, Go's parser {parsed}"
+                ));
+            }
+            match RegexBudget::default().charge(pattern) {
+                Ok(()) if !accepted => failures.push(format!(
+                    "{pattern:?}: the SDK accepts it, Podium refuses it: {podium}"
+                )),
+                // At least Go's size, and exactly it unless the regex holds
+                // runes past ASCII, written out or as `\x` escapes: a class of
+                // two that fold to each other stays a class here, where Go
+                // makes a case-folded literal of it.
+                Ok(()) => match instructions(pattern) {
+                    Ok(estimate)
+                        if parsed
+                            && (estimate == size
+                                || (estimate > size
+                                    && (!pattern.is_ascii() || pattern.contains("\\x")))) => {}
+                    estimate => failures.push(format!(
+                        "{pattern:?}: the SDK estimates {estimate:?}, Go's size is {size}"
+                    )),
+                },
+                Err(reason) if accepted && !matches!(reason, Reason::SdkStrictRegex { .. }) => {
+                    failures.push(format!(
+                        "{pattern:?}: Podium accepts it, the SDK refuses it by no SDK-strict \
+                         rule: {reason}"
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {} regex vectors diverge:\n{}",
+            failures.len(),
+            vectors.len(),
+            failures.join("\n")
         );
     }
 

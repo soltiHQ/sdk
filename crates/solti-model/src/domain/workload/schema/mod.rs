@@ -2,7 +2,7 @@
 //!
 //! A runner publishes one JSON Schema for each workload type it runs. Podium
 //! names a schema by its fingerprint and compiles it with its own draft 2020-12
-//! subset (`internal/workloadschema` at commit 222f2b0). Podium refuses a
+//! subset (`internal/workloadschema` at commit a1b7ee4). Podium refuses a
 //! schema outside that subset without telling the agent, so
 //! [`WorkloadSchema::from_value`] refuses, when the runner registers,
 //! everything Podium's compiler refuses. It runs, in order:

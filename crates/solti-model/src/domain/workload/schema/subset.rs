@@ -1,7 +1,7 @@
 //! # Podium's draft 2020-12 subset
 //!
 //! The walk mirrors Podium's compiler (`internal/workloadschema/compile.go` at
-//! commit 222f2b0), position for position and keyword for keyword:
+//! commit a1b7ee4), position for position and keyword for keyword:
 //!
 //! - It compiles the tree of subschemas first, from the root through `$defs`,
 //!   `properties`, `patternProperties` and `dependentSchemas` values, the items

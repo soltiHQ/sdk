@@ -1,0 +1,8 @@
+{
+  "x-defs": {
+    "a": {
+      "$dynamicRef": "#x"
+    }
+  },
+  "$ref": "#/x-defs/a"
+}

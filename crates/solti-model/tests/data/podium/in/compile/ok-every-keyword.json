@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/deploy.json",
+  "$anchor": "root",
+  "$comment": "every keyword of the subset",
+  "title": "t",
+  "description": "d",
+  "default": {
+    "a": 1
+  },
+  "deprecated": false,
+  "readOnly": false,
+  "writeOnly": false,
+  "examples": [
+    {
+      "a": 1
+    }
+  ],
+  "format": "uri",
+  "contentEncoding": "base64",
+  "contentMediaType": "application/json",
+  "contentSchema": {
+    "type": "object"
+  },
+  "type": [
+    "object",
+    "null"
+  ],
+  "$defs": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "pattern": "^[a-z]+$",
+      "enum": [
+        "a",
+        "b"
+      ],
+      "const": "a"
+    }
+  },
+  "properties": {
+    "n": {
+      "type": "number",
+      "multipleOf": 0.5,
+      "maximum": 10,
+      "exclusiveMaximum": 11,
+      "minimum": 0,
+      "exclusiveMinimum": -1
+    },
+    "l": {
+      "type": "array",
+      "maxItems": 3,
+      "minItems": 1,
+      "uniqueItems": true,
+      "maxContains": 2,
+      "minContains": 1,
+      "contains": {
+        "type": "string"
+      },
+      "prefixItems": [
+        {
+          "type": "string"
+        }
+      ],
+      "items": {
+        "$ref": "#/$defs/name"
+      }
+    },
+    "o": {
+      "type": "object",
+      "maxProperties": 4,
+      "minProperties": 1,
+      "required": [
+        "a"
+      ],
+      "dependentRequired": {
+        "a": [
+          "b"
+        ]
+      },
+      "dependentSchemas": {
+        "b": {
+          "required": [
+            "c"
+          ]
+        }
+      },
+      "patternProperties": {
+        "^x-": true
+      },
+      "additionalProperties": false,
+      "propertyNames": {
+        "maxLength": 8
+      }
+    },
+    "c": {
+      "allOf": [
+        {
+          "type": "string"
+        }
+      ],
+      "anyOf": [
+        {
+          "minLength": 1
+        },
+        {
+          "maxLength": 0
+        }
+      ],
+      "oneOf": [
+        {
+          "const": "a"
+        },
+        {
+          "const": "b"
+        }
+      ],
+      "not": {
+        "const": "c"
+      },
+      "if": {
+        "const": "a"
+      },
+      "then": {
+        "maxLength": 1
+      },
+      "else": {
+        "minLength": 1
+      }
+    },
+    "r": {
+      "$ref": "#root"
+    }
+  },
+  "x-extension": {
+    "anything": true
+  }
+}

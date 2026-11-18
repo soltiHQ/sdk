@@ -1,0 +1,13 @@
+{
+  "properties": {
+    "p0": {
+      "pattern": "\\(?x"
+    },
+    "p1": {
+      "pattern": "[(?u]"
+    },
+    "p2": {
+      "pattern": "\\(?R"
+    }
+  }
+}

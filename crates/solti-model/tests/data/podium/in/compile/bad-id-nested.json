@@ -1,0 +1,8 @@
+{
+  "$defs": {
+    "a": {
+      "$id": "a.json",
+      "type": "string"
+    }
+  }
+}

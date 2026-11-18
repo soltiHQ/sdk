@@ -1,0 +1,1851 @@
+[
+  {
+    "pattern": "\\S",
+    "parsed": true,
+    "size": 6,
+    "accepted": true
+  },
+  {
+    "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*$",
+    "parsed": true,
+    "size": 39,
+    "accepted": true
+  },
+  {
+    "pattern": "^[A-Za-z0-9._-]+$",
+    "parsed": true,
+    "size": 13,
+    "accepted": true
+  },
+  {
+    "pattern": "^(?:[A-Za-z0-9](?:[-A-Za-z0-9_.]*[A-Za-z0-9])?)?$",
+    "parsed": true,
+    "size": 26,
+    "accepted": true
+  },
+  {
+    "pattern": "^[A-Za-z](?:[A-Za-z0-9_,:]*[A-Za-z0-9_])?$",
+    "parsed": true,
+    "size": 24,
+    "accepted": true
+  },
+  {
+    "pattern": "^[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$",
+    "parsed": true,
+    "size": 383,
+    "accepted": true
+  },
+  {
+    "pattern": "^(?:[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?$",
+    "parsed": true,
+    "size": 385,
+    "accepted": true
+  },
+  {
+    "pattern": "^solti\\.io/",
+    "parsed": true,
+    "size": 14,
+    "accepted": true
+  },
+  {
+    "pattern": "^[A-Za-z](?:[-A-Za-z0-9]*[A-Za-z0-9])?$",
+    "parsed": true,
+    "size": 22,
+    "accepted": true
+  },
+  {
+    "pattern": "^(?=.{1,253}/)[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*/[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid or unsupported Perl syntax: `(?=`"
+  },
+  {
+    "pattern": "^(?=.{1,253}/)[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)+/[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid or unsupported Perl syntax: `(?=`"
+  },
+  {
+    "pattern": "a",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "abcdefghij",
+    "parsed": true,
+    "size": 12,
+    "accepted": true
+  },
+  {
+    "pattern": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "parsed": true,
+    "size": 1002,
+    "accepted": true
+  },
+  {
+    "pattern": "é",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "éééééééééé",
+    "parsed": true,
+    "size": 12,
+    "accepted": true
+  },
+  {
+    "pattern": "[a-z]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "[^a-z]",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "(?i)[a-z]",
+    "parsed": true,
+    "size": 6,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?i': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "[a-cx-zA-C]",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "[^a-cx-zA-C]",
+    "parsed": true,
+    "size": 6,
+    "accepted": true
+  },
+  {
+    "pattern": "(?i)[a-cx-zA-C]",
+    "parsed": true,
+    "size": 6,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?i': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "[\\x{100}\\x{102}\\x{104}\\x{106}\\x{108}\\x{10A}\\x{10C}\\x{10E}\\x{110}\\x{112}\\x{114}\\x{116}\\x{118}\\x{11A}\\x{11C}\\x{11E}\\x{120}\\x{122}\\x{124}\\x{126}\\x{128}\\x{12A}\\x{12C}\\x{12E}\\x{130}\\x{132}\\x{134}\\x{136}\\x{138}\\x{13A}\\x{13C}\\x{13E}\\x{140}\\x{142}\\x{144}\\x{146}\\x{148}\\x{14A}\\x{14C}\\x{14E}\\x{150}\\x{152}\\x{154}\\x{156}\\x{158}\\x{15A}\\x{15C}\\x{15E}\\x{160}\\x{162}]",
+    "parsed": true,
+    "size": 52,
+    "accepted": true
+  },
+  {
+    "pattern": "[^\\x{100}\\x{102}\\x{104}\\x{106}\\x{108}\\x{10A}\\x{10C}\\x{10E}\\x{110}\\x{112}\\x{114}\\x{116}\\x{118}\\x{11A}\\x{11C}\\x{11E}\\x{120}\\x{122}\\x{124}\\x{126}\\x{128}\\x{12A}\\x{12C}\\x{12E}\\x{130}\\x{132}\\x{134}\\x{136}\\x{138}\\x{13A}\\x{13C}\\x{13E}\\x{140}\\x{142}\\x{144}\\x{146}\\x{148}\\x{14A}\\x{14C}\\x{14E}\\x{150}\\x{152}\\x{154}\\x{156}\\x{158}\\x{15A}\\x{15C}\\x{15E}\\x{160}\\x{162}]",
+    "parsed": true,
+    "size": 53,
+    "accepted": true
+  },
+  {
+    "pattern": "(?i)[\\x{100}\\x{102}\\x{104}\\x{106}\\x{108}\\x{10A}\\x{10C}\\x{10E}\\x{110}\\x{112}\\x{114}\\x{116}\\x{118}\\x{11A}\\x{11C}\\x{11E}\\x{120}\\x{122}\\x{124}\\x{126}\\x{128}\\x{12A}\\x{12C}\\x{12E}\\x{130}\\x{132}\\x{134}\\x{136}\\x{138}\\x{13A}\\x{13C}\\x{13E}\\x{140}\\x{142}\\x{144}\\x{146}\\x{148}\\x{14A}\\x{14C}\\x{14E}\\x{150}\\x{152}\\x{154}\\x{156}\\x{158}\\x{15A}\\x{15C}\\x{15E}\\x{160}\\x{162}]",
+    "parsed": true,
+    "size": 5,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?i': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "\\d",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\w",
+    "parsed": true,
+    "size": 6,
+    "accepted": true
+  },
+  {
+    "pattern": "\\s",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "\\D",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "\\W",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "[\\d\\s]",
+    "parsed": true,
+    "size": 6,
+    "accepted": true
+  },
+  {
+    "pattern": "[^\\d\\s]",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "[[:alpha:]]",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "[[:alpha:][:digit:]_]",
+    "parsed": true,
+    "size": 6,
+    "accepted": true
+  },
+  {
+    "pattern": "[[:^space:]]",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "[[:foo:]]",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid character class range: `[:foo:]`"
+  },
+  {
+    "pattern": "a{1000}",
+    "parsed": true,
+    "size": 1002,
+    "accepted": true
+  },
+  {
+    "pattern": "a{1001}",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid repeat count: `{1001}`"
+  },
+  {
+    "pattern": "a{999,1000}",
+    "parsed": true,
+    "size": 1003,
+    "accepted": true
+  },
+  {
+    "pattern": "a{1000,}",
+    "parsed": true,
+    "size": 1003,
+    "accepted": true
+  },
+  {
+    "pattern": "a{1001,}",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid repeat count: `{1001,}`"
+  },
+  {
+    "pattern": "a{0,999}",
+    "parsed": true,
+    "size": 2000,
+    "accepted": true
+  },
+  {
+    "pattern": "a{0,1000}",
+    "parsed": true,
+    "size": 2002,
+    "accepted": false,
+    "error": "is a regular expression of 2002 instructions and ranges, over the limit of 2000"
+  },
+  {
+    "pattern": "a{2,1}",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid repeat count: `{2,1}`"
+  },
+  {
+    "pattern": "a{99999999999}",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid repeat count: `{99999999999}`"
+  },
+  {
+    "pattern": "(?:ab){500}",
+    "parsed": true,
+    "size": 1002,
+    "accepted": true
+  },
+  {
+    "pattern": "(?:ab){1000}",
+    "parsed": true,
+    "size": 2002,
+    "accepted": false,
+    "error": "is a regular expression of 2002 instructions and ranges, over the limit of 2000"
+  },
+  {
+    "pattern": "(a){1000}",
+    "parsed": true,
+    "size": 3002,
+    "accepted": false,
+    "error": "is a regular expression of 3002 instructions and ranges, over the limit of 2000"
+  },
+  {
+    "pattern": "(a{10}){100}",
+    "parsed": true,
+    "size": 1202,
+    "accepted": true
+  },
+  {
+    "pattern": "(a{10}){101}",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid repeat count: `{101}`"
+  },
+  {
+    "pattern": "((a{10}){10}){10}",
+    "parsed": true,
+    "size": 1222,
+    "accepted": true
+  },
+  {
+    "pattern": "((a{10}){10}){11}",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid repeat count: `{11}`"
+  },
+  {
+    "pattern": "((a{100}){0}){100}",
+    "parsed": true,
+    "size": 302,
+    "accepted": true
+  },
+  {
+    "pattern": "(a{3}){333}",
+    "parsed": true,
+    "size": 1667,
+    "accepted": true
+  },
+  {
+    "pattern": "(a{4}){333}",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid repeat count: `{333}`"
+  },
+  {
+    "pattern": "a{998}b{998}",
+    "parsed": true,
+    "size": 2000,
+    "accepted": true
+  },
+  {
+    "pattern": "a{998}b{999}",
+    "parsed": true,
+    "size": 2001,
+    "accepted": false,
+    "error": "is a regular expression of 2001 instructions and ranges, over the limit of 2000"
+  },
+  {
+    "pattern": "a{1000}a{1000}",
+    "parsed": true,
+    "size": 2004,
+    "accepted": false,
+    "error": "is a regular expression of 2004 instructions and ranges, over the limit of 2000"
+  },
+  {
+    "pattern": "a{950}b{948}",
+    "parsed": true,
+    "size": 1902,
+    "accepted": true
+  },
+  {
+    "pattern": "x{0}",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "x{2,5}",
+    "parsed": true,
+    "size": 10,
+    "accepted": true
+  },
+  {
+    "pattern": "x{2,}",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "x{1,}",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "x{0,}",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "a*",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "a+",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "a?",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "a*?",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "a+?",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "a??",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "a{2}?",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "a**",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid nested repetition operator: `**`"
+  },
+  {
+    "pattern": "a*??",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid nested repetition operator: `*??`"
+  },
+  {
+    "pattern": "a{2}{3}",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid nested repetition operator: `{2}{3}`"
+  },
+  {
+    "pattern": "a{2}*",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid nested repetition operator: `{2}*`"
+  },
+  {
+    "pattern": "(?:a*)*",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "(?:a+)+",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "(?:a?)?",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "(?:a{2}){3}",
+    "parsed": true,
+    "size": 8,
+    "accepted": true
+  },
+  {
+    "pattern": "^*",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "\\b+",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "$+",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "(?:)+",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "(a)",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "(a)(b)",
+    "parsed": true,
+    "size": 10,
+    "accepted": true
+  },
+  {
+    "pattern": "(?P\u003cname\u003ea)",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "(?\u003cname\u003ea)",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "(?:a)",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "()",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "(?:)",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "a(?:)b",
+    "parsed": true,
+    "size": 8,
+    "accepted": true
+  },
+  {
+    "pattern": "a(?:b)c",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "a(?:bc*)d",
+    "parsed": true,
+    "size": 12,
+    "accepted": true
+  },
+  {
+    "pattern": "abc*d",
+    "parsed": true,
+    "size": 11,
+    "accepted": true
+  },
+  {
+    "pattern": "a|b",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "a|b|c",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "abc|abd",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "a|ab",
+    "parsed": true,
+    "size": 9,
+    "accepted": true
+  },
+  {
+    "pattern": "axx|ayy",
+    "parsed": true,
+    "size": 11,
+    "accepted": true
+  },
+  {
+    "pattern": "ab|a|b",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "a\\dx|a\\dy",
+    "parsed": true,
+    "size": 9,
+    "accepted": true
+  },
+  {
+    "pattern": "(a|b)*",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "a|",
+    "parsed": true,
+    "size": 6,
+    "accepted": true
+  },
+  {
+    "pattern": "|a",
+    "parsed": true,
+    "size": 6,
+    "accepted": true
+  },
+  {
+    "pattern": "(|a)",
+    "parsed": true,
+    "size": 8,
+    "accepted": true
+  },
+  {
+    "pattern": "a||b",
+    "parsed": true,
+    "size": 8,
+    "accepted": true
+  },
+  {
+    "pattern": "foo|foobar|foobaz",
+    "parsed": true,
+    "size": 16,
+    "accepted": true
+  },
+  {
+    "pattern": "[a-c]|[b-d]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "a|.",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\n|.",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "x|[^x]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "(?:a|b)(?:c|d)",
+    "parsed": true,
+    "size": 6,
+    "accepted": true
+  },
+  {
+    "pattern": "a*|b*",
+    "parsed": true,
+    "size": 10,
+    "accepted": true
+  },
+  {
+    "pattern": "[Aa]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "[Kk]",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "[Ss]",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "[Aa][Bb]",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "(?:A|a)b",
+    "parsed": true,
+    "size": 6,
+    "accepted": true
+  },
+  {
+    "pattern": "[a]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "a[b]c",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "[^\\n]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "a[^\\n]",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "[\\x00-\\x{10FFFF}]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "[^\\x00-\\x{10FFFF}]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "a[^\\x00-\\x{10FFFF}]",
+    "parsed": true,
+    "size": 6,
+    "accepted": true
+  },
+  {
+    "pattern": "[\\x00-\\t\\x0B-\\x{10FFFF}]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "[Δδ]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "[Δδ]|[Δδ]b",
+    "parsed": true,
+    "size": 9,
+    "accepted": true
+  },
+  {
+    "pattern": "[α-ω]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\A",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\z",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\Aabc\\z",
+    "parsed": true,
+    "size": 10,
+    "accepted": true
+  },
+  {
+    "pattern": "\\bword\\B",
+    "parsed": true,
+    "size": 11,
+    "accepted": true
+  },
+  {
+    "pattern": "^",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "$",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": ".",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "[.]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\.",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\\\",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\x41",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\x{41}",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\x{10FFFF}",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\x{110000}",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid escape sequence: `\\x{110000`"
+  },
+  {
+    "pattern": "\\a\\f\\t\\n\\r\\v",
+    "parsed": true,
+    "size": 8,
+    "accepted": true
+  },
+  {
+    "pattern": "\\_",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\ ",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\8",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid escape sequence: `\\8`"
+  },
+  {
+    "pattern": "\\1",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid escape sequence: `\\1`"
+  },
+  {
+    "pattern": "\\C",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid escape sequence: `\\C`"
+  },
+  {
+    "pattern": "\\e",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid escape sequence: `\\e`"
+  },
+  {
+    "pattern": "\\E",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid escape sequence: `\\E`"
+  },
+  {
+    "pattern": "\\Z",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid escape sequence: `\\Z`"
+  },
+  {
+    "pattern": "\\u0041",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid escape sequence: `\\u`"
+  },
+  {
+    "pattern": "[\\A]",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid escape sequence: `\\A`"
+  },
+  {
+    "pattern": "[\\b]",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid escape sequence: `\\b`"
+  },
+  {
+    "pattern": "[a-\\d]",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid escape sequence: `\\d`"
+  },
+  {
+    "pattern": "[]a]",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "[^]a]",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "[a-]",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "[-a]",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "[\\]]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "[a-b-c]",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "[.$^|(]",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "[a[b]]",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "[--a]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "[z-a]",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid character class range: `z-a`"
+  },
+  {
+    "pattern": "[a--]",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid character class range: `a--`"
+  },
+  {
+    "pattern": "[a\u0026\u0026b]",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "[a-z--b]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "[a~~b]",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "[a-z\u0026\u0026[^aeiou]]",
+    "parsed": true,
+    "size": 9,
+    "accepted": true
+  },
+  {
+    "pattern": "\\\u003c",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\\u003e",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\b{start}",
+    "parsed": true,
+    "size": 12,
+    "accepted": true
+  },
+  {
+    "pattern": "\\b{end-half}",
+    "parsed": true,
+    "size": 15,
+    "accepted": true
+  },
+  {
+    "pattern": "a{ 2}",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "a{01}",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "a{2 ,3}",
+    "parsed": true,
+    "size": 9,
+    "accepted": true
+  },
+  {
+    "pattern": "\\pL",
+    "parsed": true,
+    "size": 686,
+    "accepted": true
+  },
+  {
+    "pattern": "\\p{L}",
+    "parsed": true,
+    "size": 686,
+    "accepted": true
+  },
+  {
+    "pattern": "\\PL",
+    "parsed": true,
+    "size": 687,
+    "accepted": true
+  },
+  {
+    "pattern": "\\p{^L}",
+    "parsed": true,
+    "size": 687,
+    "accepted": true
+  },
+  {
+    "pattern": "\\p{Greek}",
+    "parsed": true,
+    "size": 38,
+    "accepted": true
+  },
+  {
+    "pattern": "\\P{Han}",
+    "parsed": true,
+    "size": 24,
+    "accepted": true
+  },
+  {
+    "pattern": "[\\p{Greek}a]",
+    "parsed": true,
+    "size": 39,
+    "accepted": true
+  },
+  {
+    "pattern": "\\p{Foo}",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid character class range: `\\p{Foo}`"
+  },
+  {
+    "pattern": "\\\\p",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p",
+    "parsed": true,
+    "size": 32,
+    "accepted": true
+  },
+  {
+    "pattern": "\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p\\\\p",
+    "parsed": true,
+    "size": 34,
+    "accepted": false,
+    "error": "is a regular expression of 16 Unicode classes, over the limit of 15"
+  },
+  {
+    "pattern": "(?i)a",
+    "parsed": true,
+    "size": 3,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?i': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "(?m)^a$",
+    "parsed": true,
+    "size": 8,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?m': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "(?s).",
+    "parsed": true,
+    "size": 3,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?s': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "(?U)a*",
+    "parsed": true,
+    "size": 5,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?U': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "(?-i)a",
+    "parsed": true,
+    "size": 3,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?-': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "(?i:a)",
+    "parsed": true,
+    "size": 3,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?i': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "(?im)a",
+    "parsed": true,
+    "size": 3,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?i': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "(?-s:.)",
+    "parsed": true,
+    "size": 3,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?-': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "[(?i)]",
+    "parsed": true,
+    "size": 5,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?i': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "\\(?id",
+    "parsed": true,
+    "size": 8,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?i': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "^\\(?-?\\d+\\)?$",
+    "parsed": true,
+    "size": 18,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?-': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "\\Q(?i)\\E",
+    "parsed": true,
+    "size": 6,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?i': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "(?i)é",
+    "parsed": true,
+    "size": 3,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?i': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "(?x)a b",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid or unsupported Perl syntax: `(?x`"
+  },
+  {
+    "pattern": "(?u)a",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid or unsupported Perl syntax: `(?u`"
+  },
+  {
+    "pattern": "(?R)",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid or unsupported Perl syntax: `(?R`"
+  },
+  {
+    "pattern": "\\(?x",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "[(?u]",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "\\(?R",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "(?=a)",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid or unsupported Perl syntax: `(?=`"
+  },
+  {
+    "pattern": "(?!a)",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid or unsupported Perl syntax: `(?!`"
+  },
+  {
+    "pattern": "(?\u003c=a)b",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid named capture: `(?\u003c=a)b`"
+  },
+  {
+    "pattern": "(?\u003c!a)b",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid named capture: `(?\u003c!a)b`"
+  },
+  {
+    "pattern": "(a)\\1",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid escape sequence: `\\1`"
+  },
+  {
+    "pattern": "(?P\u003ca.b\u003ex)",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid named capture: `(?P\u003ca.b\u003e`"
+  },
+  {
+    "pattern": "(?P\u003cé\u003ex)",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid named capture: `(?P\u003cé\u003e`"
+  },
+  {
+    "pattern": "(?P=n)",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid or unsupported Perl syntax: `(?P`"
+  },
+  {
+    "pattern": "(*)",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: missing argument to repetition operator: `*`"
+  },
+  {
+    "pattern": "|*",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: missing argument to repetition operator: `*`"
+  },
+  {
+    "pattern": "a|*",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: missing argument to repetition operator: `*`"
+  },
+  {
+    "pattern": "*a",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: missing argument to repetition operator: `*`"
+  },
+  {
+    "pattern": "(a",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: missing closing ): `(a`"
+  },
+  {
+    "pattern": "a)",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: unexpected ): `a)`"
+  },
+  {
+    "pattern": "[a",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is a regular expression that Compile cannot read"
+  },
+  {
+    "pattern": "a\\",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is a regular expression that Compile cannot read"
+  },
+  {
+    "pattern": "\\Q.\\E",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\Qab\\E+",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "\\Q\\E",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\Qa",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\0",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\012",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\12",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\08",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "x{,5}",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "a{,}",
+    "parsed": true,
+    "size": 6,
+    "accepted": true
+  },
+  {
+    "pattern": "{",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "a{",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "a{1",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "{}",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "[\\d-z]",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "(?)",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "a(?)b",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "a(?)*",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "(?)*",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: missing argument to repetition operator: `*`"
+  },
+  {
+    "pattern": "\\x{D800}",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "(?P\u003c1a\u003ex)",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "(?\u003c1\u003ex)",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "(?P\u003ca\u003ex)(?P\u003ca\u003ey)",
+    "parsed": true,
+    "size": 10,
+    "accepted": true
+  },
+  {
+    "pattern": "[[]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "[\\0-\\7]",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid escape sequence: `\\7`"
+  },
+  {
+    "pattern": "[\\00-\\07]",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "\\b{2}",
+    "parsed": true,
+    "size": 4,
+    "accepted": true
+  },
+  {
+    "pattern": "[\\w-\\pL]",
+    "parsed": true,
+    "size": 689,
+    "accepted": false,
+    "error": "is a regular expression that Compile cannot read"
+  },
+  {
+    "pattern": "^[\\w-\\p{L}\\p{N}]+$",
+    "parsed": true,
+    "size": 788,
+    "accepted": false,
+    "error": "is a regular expression that Compile cannot read"
+  },
+  {
+    "pattern": "[\\d-[:alpha:][]",
+    "parsed": true,
+    "size": 6,
+    "accepted": false,
+    "error": "is a regular expression that Compile cannot read"
+  },
+  {
+    "pattern": "[\\s-[:digit:]x[]",
+    "parsed": true,
+    "size": 9,
+    "accepted": false,
+    "error": "is a regular expression that Compile cannot read"
+  },
+  {
+    "pattern": "[\\d-[:alpha:]]",
+    "parsed": true,
+    "size": 6,
+    "accepted": true
+  },
+  {
+    "pattern": "a\\Q\\E*",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "\\Q\\E*",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: missing argument to repetition operator: `*`"
+  },
+  {
+    "pattern": "\\Q\\E+",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: missing argument to repetition operator: `+`"
+  },
+  {
+    "pattern": "(?:)*",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "a*?*",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid nested repetition operator: `*?*`"
+  },
+  {
+    "pattern": "a*(?)*",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "a{2}{",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "((a{2}){1}){600}",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid repeat count: `{600}`"
+  },
+  {
+    "pattern": "(a{1}){1000}",
+    "parsed": true,
+    "size": 3002,
+    "accepted": false,
+    "error": "is a regular expression of 3002 instructions and ranges, over the limit of 2000"
+  },
+  {
+    "pattern": "(?P\u003ca1_\u003ex)",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "(?P\u003c\u003ex)",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid named capture: `(?P\u003c\u003e`"
+  },
+  {
+    "pattern": "(?P\u003ca",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid named capture: `(?P\u003ca`"
+  },
+  {
+    "pattern": "(?P\u003ca-b\u003ex)",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid named capture: `(?P\u003ca-b\u003e`"
+  },
+  {
+    "pattern": "(?i)a(?-s:b)",
+    "parsed": true,
+    "size": 4,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?i': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "(?-)",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is a regular expression with an inline flag group, '(?-': JSON Schema's patterns have no inline flags"
+  },
+  {
+    "pattern": "(?x)",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid or unsupported Perl syntax: `(?x`"
+  },
+  {
+    "pattern": "(\\Q)\\E",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: missing closing ): `(\\Q)\\E`"
+  },
+  {
+    "pattern": "(\\Q)\\E)",
+    "parsed": true,
+    "size": 5,
+    "accepted": true
+  },
+  {
+    "pattern": "[a-\\pL]",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is a regular expression that Compile cannot read"
+  },
+  {
+    "pattern": "[\\p{}]",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid character class range: `\\p{}`"
+  },
+  {
+    "pattern": "\\p{^}",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid character class range: `\\p{^}`"
+  },
+  {
+    "pattern": "\\p",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is a regular expression that Compile cannot read"
+  },
+  {
+    "pattern": "[\\pL-a]",
+    "parsed": true,
+    "size": 687,
+    "accepted": true
+  },
+  {
+    "pattern": "\\Q[\\E",
+    "parsed": true,
+    "size": 3,
+    "accepted": true
+  },
+  {
+    "pattern": "(?P\u003ca\u003ex)(?P\u003cb\u003ey)",
+    "parsed": true,
+    "size": 10,
+    "accepted": true
+  },
+  {
+    "pattern": "a{1,}{",
+    "parsed": true,
+    "size": 8,
+    "accepted": true
+  },
+  {
+    "pattern": "\\x{}",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid escape sequence: `\\x{}`"
+  },
+  {
+    "pattern": "\\x4",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid escape sequence: `\\x4`"
+  },
+  {
+    "pattern": "[\\x{41}-\\x{40}]",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is not a valid regular expression: error parsing regexp: invalid character class range: `\\x{41}-\\x{40}`"
+  },
+  {
+    "pattern": "[]",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is a regular expression that Compile cannot read"
+  },
+  {
+    "pattern": "[^]",
+    "parsed": false,
+    "size": 0,
+    "accepted": false,
+    "error": "is a regular expression that Compile cannot read"
+  },
+  {
+    "pattern": "a(?:)?",
+    "parsed": true,
+    "size": 7,
+    "accepted": true
+  },
+  {
+    "pattern": "(?\u003ca\u003ex)(?P\u003ca\u003ey)",
+    "parsed": true,
+    "size": 10,
+    "accepted": true
+  },
+  {
+    "pattern": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "parsed": true,
+    "size": 1026,
+    "accepted": true
+  },
+  {
+    "pattern": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "parsed": true,
+    "size": 1027,
+    "accepted": false,
+    "error": "is a regular expression of 1025 bytes, over the limit of 1024"
+  },
+  {
+    "pattern": "(((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((a)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))",
+    "parsed": true,
+    "size": 1025,
+    "accepted": true
+  }
+]

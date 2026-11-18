@@ -1,0 +1,33 @@
+{
+  "anyOf": [
+    {
+      "type": [
+        "null",
+        "boolean",
+        "number",
+        "string"
+      ]
+    },
+    {
+      "type": "array",
+      "items": {
+        "$ref": "#"
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#"
+      }
+    }
+  ],
+  "propertyNames": {
+    "$ref": "#"
+  },
+  "contains": {
+    "$ref": "#"
+  },
+  "then": {
+    "$ref": "#"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "properties": {
+    "p0": {
+      "pattern": "[Aa]"
+    },
+    "p1": {
+      "pattern": "[Kk]"
+    },
+    "p2": {
+      "pattern": "(?:A|a)b"
+    },
+    "p3": {
+      "pattern": "[^\\n]"
+    },
+    "p4": {
+      "pattern": "a|ab"
+    },
+    "p5": {
+      "pattern": "axx|ayy"
+    },
+    "p6": {
+      "pattern": "ab|a|b"
+    }
+  }
+}

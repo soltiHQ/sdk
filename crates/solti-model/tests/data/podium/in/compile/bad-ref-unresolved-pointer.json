@@ -1,0 +1,7 @@
+{
+  "properties": {
+    "a": {
+      "$ref": "#/$defs/missing"
+    }
+  }
+}

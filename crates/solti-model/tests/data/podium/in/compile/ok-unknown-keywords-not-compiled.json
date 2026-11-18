@@ -1,0 +1,29 @@
+{
+  "foo": {
+    "unevaluatedItems": false
+  },
+  "default": {
+    "$dynamicRef": "#n",
+    "$id": "x"
+  },
+  "examples": [
+    {
+      "$ref": "https://example.com/s.json"
+    }
+  ],
+  "contentSchema": {
+    "unevaluatedProperties": false
+  },
+  "enum": [
+    {
+      "$id": "x",
+      "$schema": "y"
+    }
+  ],
+  "const": {
+    "pattern": "(?=a)"
+  },
+  "x-pattern": {
+    "pattern": "(?=a)"
+  }
+}

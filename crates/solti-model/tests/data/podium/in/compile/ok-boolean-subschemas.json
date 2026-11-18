@@ -1,0 +1,9 @@
+{
+  "properties": {
+    "a": true,
+    "b": false
+  },
+  "items": false,
+  "additionalProperties": false,
+  "not": false
+}

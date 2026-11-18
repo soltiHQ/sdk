@@ -1,0 +1,15 @@
+{
+  "$defs": {
+    "a": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/a"
+        }
+      ]
+    }
+  },
+  "$ref": "#/$defs/a"
+}

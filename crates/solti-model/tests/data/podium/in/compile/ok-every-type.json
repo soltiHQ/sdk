@@ -1,0 +1,11 @@
+{
+  "type": [
+    "null",
+    "boolean",
+    "object",
+    "array",
+    "number",
+    "string",
+    "integer"
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "x-defs": {
+    "a": {
+      "$anchor": "a"
+    }
+  },
+  "$ref": "#/x-defs/a"
+}
