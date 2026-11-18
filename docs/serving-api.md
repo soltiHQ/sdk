@@ -239,6 +239,8 @@ Embedded workloads are in-process only: transports reject their input and the co
 Custom `ApiHandler` implementations must preserve public visibility and the documented query/continuation contract.
 The transports reject inconsistent pages or an Embedded value returned by a handler.
 Core-specific reconciliation and snapshot behavior comes from `SupervisorApiAdapter`, not from the trait alone.
+So does body admission: the transports check only the GVK and that the body is a JSON object, and a handler that does not go through `SupervisorApi` gets no admission at all.
+Such a handler must call `RunnerRouter::validate` on the task's spec itself before it stores the task, and answer a refusal with `ApiError::InvalidRequest`, which clients receive as HTTP `400` or gRPC `InvalidArgument`.
 
 Source: [handler contract](../crates/solti-api/src/handler.rs), [core adapter](../crates/solti-api/src/adapter.rs), [HTTP implementation](../crates/solti-api/src/http.rs), and [public behavior](../crates/solti-api/CONTRACT.md).
 

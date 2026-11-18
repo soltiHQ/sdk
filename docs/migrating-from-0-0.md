@@ -105,7 +105,9 @@ Rewrite the stored `apiVersion` before loading:
 "apiVersion": "solti.io/v1", "kind": "Container"    ->   "apiVersion": "exec.solti.io/v1", "kind": "Container"
 ```
 
-Embedded workloads and chains need no change.
+A chain keeps its own `apiVersion`, `chain.solti.io/v1alpha1`, but its steps need the same rewrite: every step whose workload is `solti.io/v1` `Subprocess` or `Container` must have `spec.steps[].workload.apiVersion` changed to `exec.solti.io/v1`.
+Without it the chain still loads, but every admission and every build of it is refused, for example with `spec.steps[0].workload: invalid model: workload solti.io/v1/Subprocess: API group solti.io is reserved for SDK-internal workloads`.
+Embedded workloads need no change.
 A stored `Wasm` workload cannot be migrated; delete it or give it a type of your own.
 Core persists nothing by itself, so only data that your persistence sinks wrote is affected.
 

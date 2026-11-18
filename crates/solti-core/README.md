@@ -85,7 +85,7 @@ The router selects a registered runner by workload GVK and optional labels.
 Before the write commits, that same runner's declared check admits the body:
 the first runner, in registration order, whose exact GVK and labels match.
 The check runs under the task's write lock and a state-write admission permit, so it must be fast and non-blocking.
-A refused body returns `CoreError::InvalidSpec` and commits nothing; an unmatched workload reads `no runner matches <apiVersion>/<kind>`.
+A refused body returns `CoreError::InvalidSpec` and commits nothing; for an unmatched workload its Display reads `invalid spec: invalid model: no runner matches <apiVersion>/<kind>`.
 Runner construction happens in the reconciliation worker.
 It is asynchronous, cancellation-aware, deadline-bound, and admitted through
 global and per-runner concurrency limits.

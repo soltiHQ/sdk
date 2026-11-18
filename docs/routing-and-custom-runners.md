@@ -295,15 +295,18 @@ It picks the runner exactly as the router does, the first match of GVK and selec
 The runner that checks a body is the runner that would build it.
 With two runners for one GVK, the first runner's check decides unless the task's selector picks the second.
 
-Admission refuses with `CoreError::InvalidSpec`, which the Task API maps to HTTP 400 and gRPC `InvalidArgument`:
+Admission refuses with `CoreError::InvalidSpec(ModelError::Invalid(..))`.
+The message is the `ModelError`'s Display, so it starts with `invalid model: `; the Task API sends it as the HTTP 400 or gRPC `InvalidArgument` message.
+A Rust caller of `SupervisorApi` gets the `CoreError` itself, whose Display adds `invalid spec: ` in front, as in `invalid spec: invalid model: no runner matches <apiVersion>/<kind>`.
 
 | Case | Message |
 |---|---|
-| No runner declares the GVK, or none matches the selector | `no runner matches <apiVersion>/<kind>` |
-| The first matching runner's check refuses the body | `workload <apiVersion>/<kind> rejected by runner '<name>': spec.<path>: <reason>` |
-| An `Embedded` workload on a routed write, or a routed one on an embedded write | `spec.workload kind Embedded requires create_embedded_task() or apply_embedded_task()`, or `a caller-supplied TaskRef requires spec.workload kind Embedded` |
+| No runner declares the GVK, or none matches the selector | `invalid model: no runner matches <apiVersion>/<kind>` |
+| The first matching runner's check refuses the body | `invalid model: workload <apiVersion>/<kind> rejected by runner '<name>': spec.<path>: <reason>` |
+| An `Embedded` workload on a routed write, or a routed one on an embedded write; only a Rust caller can make these, since the transports refuse `Embedded` first | `invalid model: spec.workload kind Embedded requires create_embedded_task() or apply_embedded_task()`, or `invalid model: a caller-supplied TaskRef requires spec.workload kind Embedded` |
 
 `spec.<path>` names the offending field, below `spec`; a bad value at the root reads `spec: <reason>`.
+A `<reason>` that quotes a model error carries `invalid model: ` again, in the middle, as a chain step that still uses the reserved group does: `invalid model: workload chain.solti.io/v1alpha1/Chain rejected by runner '<name>': spec.steps[0].workload: invalid model: workload solti.io/v1/Subprocess: API group solti.io is reserved for SDK-internal workloads`.
 Nothing is committed when admission refuses.
 
 Podium re-checks compatibility before every push.
