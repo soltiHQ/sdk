@@ -4,7 +4,7 @@
 //! first attempt
 //!      │ startup jitter
 //!      ▼
-//! server hold ──► stamp time and uptime ──► heartbeat, with the requested schemas that fit
+//! server hold ──► stamp time and uptime ──► heartbeat, never with a schema
 //!                    ┌──────────────────────────────┴──────────────────────────────┐
 //!                    ▼                                                             ▼
 //!                 success                                                  discovery error
@@ -20,10 +20,11 @@
 //! Each request receives a fresh timestamp and uptime value.
 //! Taskvisor schedules retry backoff between task attempts.
 //!
-//! Each request carries the schemas the control plane asked for that fit the
-//! encoded request budget; [`SchemaExchange`] chooses them. After an accepted
-//! request, the attempt sends follow-ups while requested schemas are left to
-//! send. A failed follow-up is logged and leaves the attempt successful.
+//! The heartbeat decides the attempt and never carries a schema, so schema
+//! delivery can never fail it. Its response restates which schemas the control
+//! plane wants. Follow-ups then carry the ones that fit the encoded request
+//! budget; [`SchemaExchange`] chooses them. A failed follow-up is logged and
+//! leaves the attempt successful.
 //!
 //! The returned manifest uses slot `solti-discover-sync`.
 //! It uses `AdmissionPolicy::Replace` and a periodic restart policy.
@@ -80,8 +81,8 @@ const SLOT: &str = "solti-discover-sync";
 ///
 /// Returns [`DiscoverError::InvalidConfig`] when the selected transport cannot use the config.
 /// This includes a bearer token over plaintext transport without the explicit insecure opt-in.
-/// It also includes a heartbeat that, without any schema, encodes over the request budget
-/// for the selected transport: 256 KiB minus 1 KiB of headroom.
+/// It also includes a heartbeat, which never carries a schema, that encodes over the request
+/// budget for the selected transport: 256 KiB minus 1 KiB of headroom.
 /// Returns [`DiscoverError::SpecBuild`] when the manifest cannot be built.
 /// With HTTP, returns a transport error when the client cannot be built.
 pub fn sync(
@@ -175,8 +176,8 @@ struct Failed {
 }
 
 impl SyncContext {
-    /// Runs one attempt: the heartbeat, then follow-ups while requested schemas
-    /// are left to send.
+    /// Runs one attempt: the bare heartbeat, then follow-ups that carry the
+    /// requested schemas while any are left to send.
     async fn attempt(&self, cancel: &TaskContext) -> Result<(), TaskError> {
         if !self.startup_jitter_applied.swap(true, Ordering::Relaxed) {
             let jitter = Duration::from_millis(startup_jitter_ms(self.delay_ms));
@@ -199,13 +200,15 @@ impl SyncContext {
             cancel.run_until_cancelled(tokio::time::sleep(wait)).await?;
         }
 
+        // The heartbeat never carries a schema, so a schema the control plane
+        // or a proxy refuses, or a link too slow for it, never fails the
+        // heartbeat. Its response restates what is requested.
         let mut sent = HashSet::new();
-        let mut request = stamp_request(&self.base_request, self.uptime.as_ref())
+        let heartbeat = stamp_request(&self.base_request, self.uptime.as_ref())
             .map_err(TaskError::fatal_from)?;
         let now = Instant::now();
-        let attached = self.attach(&mut request, now, &sent);
-        let mut follow_up = match self.send(cancel, request, &attached, 0).await? {
-            Ok(response) => self.take_in(&attached, &response, now, &mut sent),
+        let mut follow_up = match self.send(cancel, heartbeat, &[], 0).await? {
+            Ok(response) => self.take_in(&[], &response, now, &mut sent),
             Err(failed) => return Err(heartbeat_failed(failed)),
         };
 
@@ -230,7 +233,8 @@ impl SyncContext {
             let now = Instant::now();
             let attached = self.attach(&mut request, now, &sent);
             if attached.is_empty() {
-                // Nothing left fits beside the heartbeat: no empty follow-up.
+                // No requested schema fits in a request even alone: no empty
+                // follow-up.
                 break;
             }
             follow_up = match self.send(cancel, request, &attached, round).await? {
@@ -244,7 +248,7 @@ impl SyncContext {
         Ok(())
     }
 
-    /// Adds the sendable requested schemas that fit to `request`.
+    /// Adds the sendable requested schemas that fit to a follow-up `request`.
     fn attach(
         &self,
         request: &mut SyncRequest,
@@ -449,11 +453,12 @@ fn follow_up_failed(round: usize, failed: &Failed) {
     );
 }
 
-/// Refuses a heartbeat that, without schemas, encodes over the request
-/// budget, and warns about each declared schema that cannot fit beside it.
+/// Refuses a heartbeat that encodes over the request budget, and warns about
+/// each declared schema that a follow-up cannot carry even alone: a follow-up
+/// is the heartbeat's request plus its schemas.
 ///
 /// The heartbeat is measured with the largest timestamp and uptime the wire
-/// carries, so no later heartbeat is larger.
+/// carries, so no later request is larger before its schemas.
 fn check_request_budget(
     base: &SyncRequest,
     exchange: &SchemaExchange,
@@ -481,7 +486,7 @@ fn check_request_budget(
             workload_types = %exchange.gvks(&fingerprint),
             schema_bytes = exchange.schema_bytes(&fingerprint),
             budget_bytes = SYNC_REQUEST_BUDGET,
-            "workload schema cannot fit in a discovery request beside the heartbeat; the control plane never receives it"
+            "workload schema cannot fit in a discovery follow-up even alone; the control plane never receives it"
         );
     }
     Ok(())
@@ -779,6 +784,32 @@ mod tests {
         )
     }
 
+    /// Metadata that fills the widest heartbeat, the one with the largest
+    /// timestamp and uptime the wire carries, to about `free` bytes below the
+    /// request budget.
+    fn fill_heartbeat(
+        transport: DiscoveryTransport,
+        capabilities: &AgentCapabilities,
+        free: usize,
+    ) -> HashMap<String, String> {
+        let config = builder(
+            transport,
+            "http://127.0.0.1:9",
+            capabilities.clone(),
+            30_000,
+        )
+        .build()
+        .unwrap();
+        let adapter = TransportAdapter::from_config(&config).unwrap();
+        let widest = adapter.encoded_len(&SyncRequest {
+            ts: i64::MAX,
+            uptime_seconds: i64::MAX,
+            ..build_base_request(&config)
+        });
+        let pad = MAX_SYNC_REQUEST_BYTES - SYNC_REQUEST_HEADROOM_BYTES - free - widest;
+        HashMap::from([("pad".to_owned(), "x".repeat(pad))])
+    }
+
     /// The fields of one log event, by name.
     type EventFields = BTreeMap<&'static str, String>;
 
@@ -1043,6 +1074,7 @@ mod tests {
     #[test]
     fn http_fits_two_and_grpc_three_64_kib_schemas() {
         // Exactly 65 536 canonical bytes each (F2): HTTP carries them as base64.
+        // Each loop turn is one follow-up: heartbeats carry no schema.
         let capabilities = big_agent(5, MAX_WORKLOAD_SCHEMA_BYTES);
         for transport in transports() {
             let expected: &[usize] = match transport {
@@ -1102,7 +1134,8 @@ mod tests {
 
     #[tokio::test]
     async fn follow_ups_send_every_wanted_schema_in_one_attempt() {
-        // Five schemas of exactly 65 536 canonical bytes (F2).
+        // Five schemas of exactly 65 536 canonical bytes (F2): a bare heartbeat,
+        // then three follow-ups over HTTP (2, 2, 1) or two over gRPC (3, 2).
         let capabilities = big_agent(5, MAX_WORKLOAD_SCHEMA_BYTES);
         for transport in transports() {
             let (per_request, requests) = match transport {
@@ -1132,7 +1165,7 @@ mod tests {
             );
             assert!(
                 seen[0].schemas.is_empty(),
-                "the first heartbeat carries no schema"
+                "the heartbeat carries no schema"
             );
             for request in &seen {
                 assert!(
@@ -1215,13 +1248,22 @@ mod tests {
             );
             assert_eq!(metrics.counts(), (2, 1, 1), "{transport:?}");
 
-            // The next attempt sends what is still wanted, from its heartbeat on.
+            // The next attempt sends what is still wanted: a bare heartbeat, then
+            // the same follow-ups as a first attempt (3 over HTTP, 2 over gRPC).
             task.spawn(TaskContext::detached())
                 .await
                 .expect("the next attempt succeeds");
             let seen = control.seen();
+            let follow_ups = match transport {
+                #[cfg(feature = "http")]
+                DiscoveryTransport::Http => 3,
+                #[cfg(feature = "grpc")]
+                DiscoveryTransport::Grpc => 2,
+            };
+            assert_eq!(seen.len(), 2 + 1 + follow_ups, "{transport:?}");
+            assert!(seen[2].schemas.is_empty(), "the heartbeat stays bare");
             assert!(
-                !seen[2].schemas.is_empty(),
+                seen[3..].iter().all(|request| !request.schemas.is_empty()),
                 "schemas that never arrived are due at once"
             );
             assert_eq!(control.catalog().len(), 5);
@@ -1257,15 +1299,131 @@ mod tests {
                     .expect("the attempt succeeds");
             }
 
+            // Attempt 1: a bare heartbeat and one follow-up with both schemas.
+            // Attempt 2: a bare heartbeat and no follow-up, because the lost
+            // schema is not due again for five minutes.
             let seen = control.seen();
-            assert_eq!(seen.len(), 3, "{transport:?}");
+            assert_eq!(
+                seen.len(),
+                3,
+                "{transport:?}: not resent within five minutes"
+            );
             assert_eq!(seen[1].schemas.len(), 2);
-            assert!(seen[2].schemas.is_empty(), "not resent within five minutes");
+            assert!(seen[2].schemas.is_empty(), "the heartbeat stays bare");
             assert_eq!(control.catalog().len(), 1);
             let warnings = log.events(Level::WARN, "discovery.schema_still_requested");
             assert_eq!(warnings.len(), 1, "{transport:?}");
             assert_eq!(warnings[0]["fingerprint"], lost.fingerprint().as_str());
             assert_eq!(warnings[0]["workload_types"], "lost.example.io/v1/Lost");
+
+            drop(task);
+            server.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeats_stay_bare_when_every_schema_request_is_refused() {
+        // A proxy in front of the control plane refuses bodies over 128 KiB, so
+        // every follow-up with two or three 64 KiB schemas is refused: HTTP 413,
+        // which is permanent, or gRPC ResourceExhausted. A heartbeat that carried
+        // them would fail the attempt; a bare one passes.
+        let capabilities = big_agent(5, MAX_WORKLOAD_SCHEMA_BYTES);
+        for transport in transports() {
+            let log = EventLog::default();
+            let _logging = tracing::subscriber::set_default(log.clone());
+            let control = Arc::new(FakeControlPlane::limited(128 * 1024));
+            let server = fake::serve(transport, Arc::clone(&control)).await;
+            let config = builder(transport, server.endpoint(), capabilities.clone(), 1)
+                .build()
+                .unwrap();
+            let (_, task) = sync(config, Arc::new(|| 7)).expect("sync builds");
+
+            for attempt in 1..=2 {
+                if let Err(error) = task.spawn(TaskContext::detached()).await {
+                    panic!("{transport:?}: attempt {attempt} failed: {error}");
+                }
+            }
+
+            let seen = control.seen();
+            assert_eq!(
+                seen.len(),
+                4,
+                "{transport:?}: per attempt, a heartbeat and one refused follow-up"
+            );
+            for heartbeat in [&seen[0], &seen[2]] {
+                assert!(heartbeat.schemas.is_empty(), "{transport:?}");
+                assert!(
+                    matches!(&heartbeat.outcome, Outcome::Accepted(want) if want.len() == 5),
+                    "{transport:?}: {:?}",
+                    heartbeat.outcome
+                );
+            }
+            for follow_up in [&seen[1], &seen[3]] {
+                assert!(!follow_up.schemas.is_empty(), "{transport:?}");
+                assert_eq!(follow_up.outcome, Outcome::TooLarge, "{transport:?}");
+            }
+            let failures = log.events(Level::WARN, "discovery.schema_follow_up_failed");
+            assert_eq!(failures.len(), 2, "{transport:?}");
+            let retryable = match transport {
+                #[cfg(feature = "http")]
+                DiscoveryTransport::Http => "false",
+                #[cfg(feature = "grpc")]
+                DiscoveryTransport::Grpc => "true",
+            };
+            assert!(
+                failures.iter().all(|event| event["retryable"] == retryable),
+                "{transport:?}: {failures:?}"
+            );
+            assert!(control.catalog().is_empty());
+
+            drop(task);
+            server.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_with_no_schema_that_fits_is_not_sent() {
+        // `big` cannot fit beside the bare request; `small` can. The control plane
+        // keeps asking for `big`, so a follow-up stays due after `small` goes out,
+        // but it would carry nothing and is not sent.
+        let big = sized_schema("big", 60_000);
+        let small = small_schema("small");
+        let capabilities = agent(vec![runner(
+            "r",
+            vec![
+                workload("r.example.io/v1", "Big", big.clone()),
+                workload("r.example.io/v1", "Small", small.clone()),
+            ],
+        )]);
+        for transport in transports() {
+            let control = Arc::new(FakeControlPlane::default());
+            let server = fake::serve(transport, Arc::clone(&control)).await;
+            let config = builder(transport, server.endpoint(), capabilities.clone(), 1)
+                .metadata(fill_heartbeat(transport, &capabilities, 10_000))
+                .build()
+                .unwrap();
+            let (_, task) = sync(config, Arc::new(|| 7)).expect("sync builds");
+
+            task.spawn(TaskContext::detached())
+                .await
+                .expect("the attempt succeeds");
+
+            let seen = control.seen();
+            assert_eq!(
+                seen.len(),
+                2,
+                "{transport:?}: the heartbeat and the follow-up with `small`, no empty follow-up"
+            );
+            assert!(seen[0].schemas.is_empty());
+            assert_eq!(
+                seen[1].schemas,
+                vec![small.fingerprint().as_str().to_owned()]
+            );
+            assert_eq!(
+                seen[1].outcome,
+                Outcome::Accepted(vec![big.fingerprint().as_str().to_owned()]),
+                "{transport:?}: the control plane still asks for `big`"
+            );
 
             drop(task);
             server.stop().await;

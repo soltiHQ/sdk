@@ -2,14 +2,15 @@
 //!
 //! Podium names each declared schema by its fingerprint and asks, in
 //! `want_schemas`, for the ones it lacks. [`SchemaExchange`] decides which
-//! schemas a request carries and reads what each accepted response asks for.
-//! It does no I/O: the caller measures requests with the transport's encoder,
-//! sends them, and logs what [`Observation`] reports.
+//! schemas a follow-up request carries and reads what each accepted response
+//! asks for. The heartbeat never carries schemas. The exchange does no I/O:
+//! the caller measures requests with the transport's encoder, sends them, and
+//! logs what [`Observation`] reports.
 //!
 //! ```text
 //! accepted response ── want_schemas ──► observe ──► wanted, follow_up
 //!                                                       │
-//! next request ◄── schemas, sorted, within the budget ── attach
+//! next follow-up ◄── schemas, sorted, within the budget ── attach
 //! ```
 //!
 //! A wanted schema is *due* when it was never sent, or was last sent at least
@@ -86,7 +87,7 @@ pub(super) struct SchemaExchange {
 
 impl SchemaExchange {
     /// Starts an exchange for the schemas of `capabilities`; nothing is wanted
-    /// yet, so the first heartbeat carries no schema.
+    /// until an accepted response asks.
     pub(super) fn new(capabilities: &AgentCapabilities) -> Self {
         let schemas = capabilities
             .schemas()

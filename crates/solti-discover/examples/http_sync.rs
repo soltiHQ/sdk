@@ -9,8 +9,9 @@
 //! - metadata and runner capability advertisement, with schema fingerprints;
 //! - bearer authentication;
 //! - the generated embedded task manifest;
-//! - one real HTTP/JSON discovery v1 attempt: a heartbeat, then a follow-up
-//!   that carries the schema the control plane asked for;
+//! - one real HTTP/JSON discovery v1 attempt: a heartbeat, which never carries
+//!   a schema, then a follow-up that carries the schema the control plane
+//!   asked for;
 //! - protobuf JSON field encoding;
 //! - custom uptime and metrics ports.
 //!
@@ -347,7 +348,7 @@ async fn main() -> ExampleResult {
     );
     assert!(
         heartbeat.body.get("schemas").is_none(),
-        "the first heartbeat carries no schema"
+        "a heartbeat never carries a schema"
     );
 
     let sent = &follow_up.body["schemas"][0];

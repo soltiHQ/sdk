@@ -54,11 +54,12 @@
 //!
 //! Capabilities carry the schema fingerprint of each workload type.
 //! The control plane lists the schemas it lacks in `want_schemas`.
-//! The next request, and follow-ups in the same attempt, carry them.
-//! Each request takes as many as fit the encoded request budget of the
+//! Follow-up requests in the same attempt carry them; the heartbeat never
+//! does, so schema delivery can never fail it.
+//! Each follow-up takes as many as fit the encoded request budget of the
 //! transport in use: 256 KiB minus 1 KiB of headroom.
-//! A heartbeat that is over that budget without any schema is refused by
-//! `sync` with [`DiscoverError::InvalidConfig`].
+//! A heartbeat that is over that budget is refused by `sync` with
+//! [`DiscoverError::InvalidConfig`].
 //! `CONTRACT.md` describes the exchange.
 //!
 //! ## Time Units

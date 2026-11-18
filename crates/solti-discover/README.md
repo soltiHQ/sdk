@@ -59,8 +59,8 @@ Use `apply_embedded_task` when the desired config changes.
 - builds one reusable HTTP or gRPC transport client;
 - sends agent identity, endpoint, metadata, capabilities, platform, and liveness;
 - advertises each workload type's schema fingerprint, and sends the schemas the
-  control plane requests within the encoded request budget, with follow-up
-  requests in the same attempt;
+  control plane requests in follow-up requests after the heartbeat, within the
+  encoded request budget;
 - classifies failures as retryable or permanent;
 - applies server-advised retry holds;
 - records discovery attempts through an optional metrics backend;
@@ -158,29 +158,33 @@ Embedded workloads are absent because they bypass runner routing.
 
 An agent with no routed runners passes `AgentCapabilities::default()` explicitly.
 
-The snapshot must keep the heartbeat, without schemas, within the request
-budget of 256 KiB minus 1 KiB. `sync` returns `DiscoverError::InvalidConfig`
-for a snapshot that does not.
+The snapshot must keep the heartbeat within the request budget of 256 KiB
+minus 1 KiB. `sync` returns `DiscoverError::InvalidConfig` for a snapshot that
+does not.
 
 ## Workload schemas
 
 Every heartbeat advertises the fingerprint of each declared workload type:
 the SHA-256 of the RFC 8785 canonical JSON of its schema. The control plane
 answers with `want_schemas`, the fingerprints it lacks. The task then sends
-exactly those canonical bytes:
+exactly those canonical bytes in follow-up requests of the same attempt:
 
-- the next request carries the requested schemas, in sorted order, as many as
-  fit the encoded request budget of the transport in use;
-- follow-up requests in the same attempt carry the rest, at most six per attempt;
+- each follow-up carries the requested schemas, in sorted order, as many as fit
+  the encoded request budget of the transport in use;
+- at most six follow-ups run per attempt;
 - a schema is sent once per attempt, and resent at most every five minutes
   while the control plane still requests it.
 
-The budget counts the bytes on the wire. HTTP carries schema bytes as base64,
-so a request holds about two 64 KiB schemas over HTTP and about three over gRPC.
+The heartbeat itself never carries a schema, so a schema request refused for
+its size, or too slow for the link, can never fail the heartbeat. Its response
+restates `want_schemas`, so the follow-ups start right after it.
 
-The first heartbeat of a task carries no schema. A failed follow-up is logged
-at WARN and does not fail the attempt: the next attempt sends what is still
-requested.
+The budget counts the bytes on the wire. HTTP carries schema bytes as base64,
+so a follow-up holds about two 64 KiB schemas over HTTP and about three over
+gRPC.
+
+A failed follow-up is logged at WARN and does not fail the attempt, whatever
+the error: the next attempt's follow-ups send what is still requested.
 
 The control plane refuses a schema outside its subset silently: it stops
 requesting it. The agent cannot see that. Look at the control plane's workload
@@ -190,11 +194,11 @@ catalog, where the schema is `refused`, and at placement, which reports
 | Log event                              | Level | Meaning |
 |----------------------------------------|-------|---------|
 | `discovery.workload_types`             | INFO  | Once per task: each `apiVersion/kind` with its fingerprint |
-| `discovery.schemas_sent`               | INFO  | An accepted request carried schemas: fingerprints and encoded request size |
-| `discovery.schema_still_requested`     | WARN  | Requested again by the response to the request that carried it; once per fingerprint |
+| `discovery.schemas_sent`               | INFO  | An accepted follow-up: fingerprints and encoded request size |
+| `discovery.schema_still_requested`     | WARN  | Requested again by the response to the follow-up that carried it; once per fingerprint |
 | `discovery.schema_unknown_request`     | DEBUG | A requested fingerprint the agent does not declare; ignored |
 | `discovery.schema_follow_up_failed`    | WARN  | A follow-up failed; the attempt still succeeds |
-| `discovery.schema_over_request_budget` | WARN  | A schema cannot fit beside the heartbeat and is never sent |
+| `discovery.schema_over_request_budget` | WARN  | A schema cannot fit in a follow-up even alone and is never sent |
 
 [`CONTRACT.md`](CONTRACT.md#schema-exchange) gives the exact rules.
 
@@ -320,7 +324,9 @@ panic. The boundary does not serialize healthy metrics updates.
 
 - Every request sends a fresh Unix timestamp and uptime value.
 - Every request stays within the encoded request budget of 256 KiB minus 1 KiB.
-- A schema is sent only when the control plane requests it, as its canonical bytes.
+- The heartbeat never carries a schema.
+- A schema is sent only in a follow-up, only when the control plane requests it,
+  as its canonical bytes.
 - HTTP and gRPC clients are reused across task attempts.
 - HTTP redirects are disabled to avoid forwarding credentials to another host.
 - Bearer tokens require TLS unless insecure token transport is explicitly enabled.

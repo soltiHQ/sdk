@@ -46,7 +46,7 @@ Taskvisor starts an attempt
             ├── first attempt ──► startup jitter below delay_ms
             ├── wait for any remaining server hold
             ├── stamp ts and uptime_seconds
-            └── send the heartbeat SyncRequest, with the requested schemas that fit
+            └── send the heartbeat SyncRequest, never with a schema
                        ├── success ──► requested schemas left to send?
                        │                 ├── yes ──► follow-up SyncRequest, at most 6 per attempt
                        │                 │             ├── success ──► ask again
@@ -69,6 +69,9 @@ Retryable failures use the configured Taskvisor backoff.
 Every sleep and transport request observes task cancellation.
 
 The heartbeat decides the outcome of the attempt.
+It never carries a schema, so schema delivery can never fail it: a schema
+request refused for its size, or too slow for the link, fails only its
+follow-up.
 Follow-ups exist only for the [schema exchange](#schema-exchange).
 
 ## Request construction
@@ -77,7 +80,7 @@ Follow-ups exist only for the [schema exchange](#schema-exchange).
 It builds one base request from that snapshot.
 
 Every request, heartbeat or follow-up, clones the base request.
-Only `ts`, `uptime_seconds` and `schemas` change.
+Only `ts`, `uptime_seconds` and, in a follow-up, `schemas` change.
 `ts` and `uptime_seconds` are converted to the signed 64-bit discovery v1 wire
 fields with checked conversions. For the heartbeat, an out-of-range uptime is
 `InvalidConfig`, does not reach the transport, does not record transport
@@ -109,14 +112,14 @@ The request contract is defined in
 | `api_version`          | `int32`              | Version of the API exposed by the agent            |
 | `heartbeat_interval_s` | `int32`              | `ceil(delay_ms / 1000)`                            |
 | `capabilities`         | `AgentCapabilities`  | Captured runner capability snapshot                |
-| `schemas`              | `repeated WorkloadSchema` | Requested schemas that fit the request budget |
+| `schemas`              | `repeated WorkloadSchema` | Follow-ups only: requested schemas that fit the request budget; always empty in a heartbeat |
 
 The caller owns `AgentId` assignment and uniqueness.
 The SDK validates its format.
 
 Podium caps one encoded request at 256 KiB, the HTTP body or the gRPC message.
 The SDK keeps every request within a budget below that cap.
-`sync` refuses a capability snapshot whose heartbeat alone is over the budget;
+`sync` refuses a capability snapshot whose heartbeat is over the budget;
 see [Schema exchange](#schema-exchange).
 
 `AgentEndpoint` accepts `api_version` values from `1` through `i32::MAX`.
@@ -212,9 +215,9 @@ The next request starts only after both constraints have elapsed.
 ## Schema exchange
 
 Each heartbeat advertises the schema fingerprint of every declared workload
-type. A request carries a schema only when the control plane asked for its
-fingerprint in `want_schemas`, and only for a fingerprint the same request
-declares.
+type, and never carries a schema itself. Only follow-ups carry schemas, and a
+follow-up carries one only when the control plane asked for its fingerprint in
+`want_schemas`, and only for a fingerprint the same request declares.
 
 | Constant                      | Value       | Meaning                                         |
 |-------------------------------|-------------|-------------------------------------------------|
@@ -236,17 +239,18 @@ A requested schema is *due* when no accepted request has carried it yet, or
 the last one did at least 300 seconds ago. It is *sendable* when it is due and
 the current attempt has not sent it. An attempt sends each schema at most once.
 
-The first heartbeat of a task carries no schema: nothing is requested yet.
+The heartbeat's response restates `want_schemas`, so keeping the heartbeat
+bare adds no round trip: the follow-ups start right after it.
 
-### Packing a request
+### Packing a follow-up
 
-Every request, the heartbeat included, carries sendable schemas:
+Every follow-up carries sendable schemas:
 
 - in sorted fingerprint order, the order of `want_schemas`;
 - as `WorkloadSchema { fingerprint, schema }`, where `schema` is exactly the
   canonical JSON whose SHA-256 is `fingerprint`;
 - while the encoded request stays within the request budget. The first schema
-  that does not fit ends the packing and goes in a later request.
+  that does not fit ends the packing and goes in a later follow-up.
 
 The size is measured with the encoder of the transport in use:
 
@@ -255,38 +259,40 @@ The size is measured with the encoder of the transport in use:
 | gRPC      | `prost::Message::encoded_len` of the request                          |
 | HTTP      | Length of the JSON body, `serde_json::to_vec`; bytes are standard base64 |
 
-A request therefore carries about three 64 KiB schemas over gRPC and about two
-over HTTP. On the first attempt of a task, the heartbeat learns that five
-schemas of exactly 65 536 bytes are requested; they then go out in two
-follow-ups over gRPC (three, then two) and in three over HTTP (two, two, then
-one).
+A follow-up therefore carries about three 64 KiB schemas over gRPC and about
+two over HTTP. When the heartbeat learns that five schemas of exactly 65 536
+bytes are requested, they go out in two follow-ups over gRPC (three, then two)
+and in three over HTTP (two, two, then one).
 
-A schema that cannot fit beside the bare heartbeat can never be sent.
-`sync` logs `discovery.schema_over_request_budget` at WARN for each such
-schema, and packing skips it, so that it holds back no other schema.
+A follow-up is the heartbeat's request plus its schemas, so a schema that
+cannot fit beside the bare heartbeat can never be sent. `sync` logs
+`discovery.schema_over_request_budget` at WARN for each such schema, and
+packing skips it, so that it holds back no other schema.
 
-`sync` returns `DiscoverError::InvalidConfig` when the heartbeat, without any
-schema, encodes over the request budget. It measures that heartbeat with the
-largest `ts` and `uptime_seconds` the wire carries, so no later heartbeat is
-larger.
+`sync` returns `DiscoverError::InvalidConfig` when the heartbeat encodes over
+the request budget. It measures that heartbeat with the largest `ts` and
+`uptime_seconds` the wire carries, so no later heartbeat is larger.
 
 ### Follow-ups
 
-After an accepted request, the attempt sends another request at once while a
-requested schema is sendable, up to six follow-ups. A follow-up in which no
-sendable schema fits is not sent. Each follow-up gets a fresh `ts` and
-`uptime_seconds`, and records the same metrics as the heartbeat.
+After the accepted heartbeat, and after each accepted follow-up, the attempt
+sends a follow-up at once while a requested schema is sendable, up to six
+follow-ups. A follow-up in which no sendable schema fits is not sent. Each
+follow-up gets a fresh `ts` and `uptime_seconds`, and records the same metrics
+as the heartbeat.
 
 A failed follow-up is logged at WARN as `discovery.schema_follow_up_failed`,
-and the attempt returns `Ok`, because the heartbeat already succeeded. The
-schemas it carried are still due, so the next attempt sends them from its
-heartbeat on. A rejection with `retry_after_s` still sets the server hold.
+and the attempt returns `Ok`, because the heartbeat already succeeded. That
+holds for every failure, a permanent one such as HTTP 413 included. The
+schemas it carried are still due, so the next attempt's follow-ups send them
+again, after its bare heartbeat. A rejection with `retry_after_s` still sets
+the server hold.
 
 ### What the agent can and cannot see
 
 | Situation                                                           | Agent behavior |
 |---------------------------------------------------------------------|----------------|
-| The response to a request still asks for a schema that request carried | WARN `discovery.schema_still_requested`, once per fingerprint for the task, with its workload types and size; the schema is resent at most every 300 seconds |
+| The response to a follow-up still asks for a schema that follow-up carried | WARN `discovery.schema_still_requested`, once per fingerprint for the task, with its workload types and size; the schema is resent at most every 300 seconds |
 | The response asks for a fingerprint the agent does not declare      | DEBUG `discovery.schema_unknown_request`; ignored |
 | The control plane refuses a schema                                  | Podium stops asking for it, which the agent cannot tell apart from success. Podium's catalog shows it as `refused`, and placement shows `schema_incompatible` with the reason |
 
@@ -298,11 +304,11 @@ fingerprint mismatch on the control plane's side.
 | Event                                  | Level | When |
 |----------------------------------------|-------|------|
 | `discovery.workload_types`             | INFO  | Once per task, from `sync`: each `apiVersion/kind` with its schema fingerprint |
-| `discovery.schemas_sent`               | INFO  | After each accepted request that carried schemas: the fingerprints and the encoded request size |
+| `discovery.schemas_sent`               | INFO  | After each accepted follow-up: the fingerprints and the encoded request size |
 | `discovery.schema_still_requested`     | WARN  | See the table above |
 | `discovery.schema_unknown_request`     | DEBUG | See the table above |
 | `discovery.schema_follow_up_failed`    | WARN  | A follow-up failed; the attempt still succeeds |
-| `discovery.schema_over_request_budget` | WARN  | From `sync`, for each schema that cannot fit beside the heartbeat |
+| `discovery.schema_over_request_budget` | WARN  | From `sync`, for each schema that cannot fit in a follow-up even alone |
 
 ## HTTP binding
 

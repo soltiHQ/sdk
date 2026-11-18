@@ -181,9 +181,19 @@ pub(in crate::tasks) mod fake {
         seen: Vec<Seen>,
         unavailable: BTreeSet<usize>,
         never_stored: BTreeSet<String>,
+        /// A cap below Podium's, as a proxy in front of it may set.
+        max_bytes: Option<usize>,
     }
 
     impl FakeControlPlane {
+        /// A control plane behind a proxy that refuses requests over
+        /// `max_bytes`, with the answers Podium gives over its own cap.
+        pub(in crate::tasks) fn limited(max_bytes: usize) -> Self {
+            let control = Self::default();
+            control.lock().max_bytes = Some(max_bytes);
+            control
+        }
+
         /// A control plane that fails the requests numbered in `requests`,
         /// counting from 1.
         pub(in crate::tasks) fn failing(requests: impl IntoIterator<Item = usize>) -> Self {
@@ -204,7 +214,7 @@ pub(in crate::tasks) mod fake {
         pub(in crate::tasks) fn answer(&self, request: &SyncRequest, bytes: usize) -> Outcome {
             let mut state = self.lock();
             let number = state.seen.len() + 1;
-            let outcome = if bytes > PODIUM_MAX_SYNC_BYTES {
+            let outcome = if bytes > state.max_bytes.unwrap_or(PODIUM_MAX_SYNC_BYTES) {
                 Outcome::TooLarge
             } else if state.unavailable.contains(&number) {
                 Outcome::Unavailable

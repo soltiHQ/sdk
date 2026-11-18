@@ -192,10 +192,10 @@ impl DiscoverConfig {
     ///
     /// `capabilities` is an explicit snapshot of the runners served by the agent.
     /// It holds each workload type's schema: every heartbeat advertises the
-    /// fingerprints, and the task sends a schema only when the control plane
-    /// requests it. Without schemas, a heartbeat must encode within the request
-    /// budget of 256 KiB minus 1 KiB; [`sync`](crate::sync) refuses the snapshot
-    /// otherwise.
+    /// fingerprints, and the task sends a schema, in a follow-up request, only
+    /// when the control plane requests it. The heartbeat, which never carries a
+    /// schema, must encode within the request budget of 256 KiB minus 1 KiB;
+    /// [`sync`](crate::sync) refuses the snapshot otherwise.
     /// `task_revision` identifies the captured runtime intent.
     /// Change it whenever a setting used by the embedded task changes.
     /// This includes opaque settings such as credentials, TLS material, and
