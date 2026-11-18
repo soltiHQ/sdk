@@ -374,7 +374,9 @@ pub enum WorkloadSchemaErrorReason {
     ReferenceCycle,
 
     /// A regex that Podium refuses: Go cannot parse it, or Podium refuses its
-    /// syntax. Rust's `regex-syntax` failing to parse it lands here too.
+    /// syntax. A regex that Rust's `regex-syntax` cannot parse lands here only
+    /// when Go's parser refuses it too; otherwise it is
+    /// [`SdkStrictRegexRule::GoOnlySyntax`].
     #[error("regex {pattern:?} is refused: {why}")]
     InvalidRegex {
         /// The regex.
@@ -482,11 +484,6 @@ pub enum WorkloadSchemaErrorReason {
 ///
 /// Case-insensitive matching never reaches them: every inline flag group,
 /// `(?i)` among them, is refused first, as Podium refuses it.
-///
-/// Rust's `regex-syntax` also fails to parse some syntax that Go accepts, such
-/// as `\Q…\E`, octal escapes like `\0`, `x{,5}`, a bare `{`, `[\d-z]`, `(?)`,
-/// `\x{D800}` or a capture name that starts with a digit. Those are refused as
-/// [`WorkloadSchemaErrorReason::InvalidRegex`], with the parser's message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SdkStrictRegexRule {
@@ -506,6 +503,12 @@ pub enum SdkStrictRegexRule {
     /// A counted repetition that Go reads as literal text: a space inside the
     /// braces, as in `a{ 2}`, or a count with a leading zero, as in `a{01}`.
     RepetitionReadAsLiteral,
+    /// Syntax that Go's parser reads and Rust's `regex-syntax` cannot parse:
+    /// `\Q…\E`, an octal escape such as `\0`, a `{` that starts no repetition
+    /// (`{`, `x{,5}`), `(?)`, `\x{D800}`, a capture name that starts with a
+    /// digit or names two groups, or, inside brackets, an unescaped `[` or a
+    /// class escape before `-`, as in `[\d-z]`.
+    GoOnlySyntax,
 }
 
 impl SdkStrictRegexRule {
@@ -516,6 +519,7 @@ impl SdkStrictRegexRule {
         Self::ClassSetOperation,
         Self::ClassReadDifferently,
         Self::RepetitionReadAsLiteral,
+        Self::GoOnlySyntax,
     ];
 }
 
@@ -540,6 +544,11 @@ impl fmt::Display for SdkStrictRegexRule {
             Self::RepetitionReadAsLiteral => {
                 "Go reads this counted repetition as literal text; write {n}, {n,} or \
                  {n,m} with no spaces and no leading zeros"
+            }
+            Self::GoOnlySyntax => {
+                "the SDK cannot parse this syntax, although Go may accept it; write it as \
+                 both read it: escapes instead of octal and \\Q…\\E, a backslash before a \
+                 literal {, [ or -, and capture names that start with a letter and differ"
             }
         })
     }

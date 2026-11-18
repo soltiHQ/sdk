@@ -24,7 +24,9 @@
 //!    1 000 and stacked repetitions are refused, as Go refuses them; the
 //!    syntax Rust and Go read differently is refused as SDK-strict
 //!    ([`SdkStrictRegexRule`]), and so is every Unicode property class, which
-//!    only Go's Unicode tables can size.
+//!    only Go's Unicode tables can size. A regex that `regex-syntax` cannot
+//!    parse goes through Go's parse loop on its raw text: SDK-strict where Go
+//!    may read it, refused as invalid where Go cannot.
 //! 4. **Its size:** Go's parse tree, rebuilt here from the syntax tree as Go's
 //!    parser builds it (literal merging, the classes Go rewrites as literals,
 //!    the factoring of alternations), measured as Podium's `regexSize`
@@ -158,11 +160,20 @@ fn has_inline_flags(pattern: &str) -> bool {
 /// Parses a regex, checks its syntax, and measures Go's program for it as
 /// Podium's `regexSize` does, stopped past [`MAX_SCHEMA_REGEX_INSTRUCTIONS_TOTAL`].
 pub(super) fn instructions(pattern: &str) -> Result<usize, Reason> {
-    let ast = ast::parse::ParserBuilder::new()
+    let parsed = ast::parse::ParserBuilder::new()
         .nest_limit(NEST_LIMIT)
         .build()
-        .parse(pattern)
-        .map_err(|err| invalid(pattern, err.kind().to_string()))?;
+        .parse(pattern);
+    let ast = match parsed {
+        Ok(ast) => ast,
+        Err(_) if go_may_parse(pattern) => {
+            return Err(Reason::SdkStrictRegex {
+                pattern: pattern.to_owned(),
+                rule: SdkStrictRegexRule::GoOnlySyntax,
+            });
+        }
+        Err(err) => return Err(invalid(pattern, err.kind().to_string())),
+    };
     let mut parser = GoParser {
         pattern,
         stack: Vec::new(),
@@ -489,12 +500,12 @@ impl GoParser<'_> {
     /// The ranges of a bracketed class, as Go's `parseClass` reads it, if Go
     /// reads it as `regex-syntax` does.
     fn bracketed(&self, class: &ast::ClassBracketed) -> Result<Vec<u32>, Reason> {
-        if set_has_unicode(&class.kind) {
-            return Err(self.strict(SdkStrictRegexRule::UnicodeClass));
-        }
         let Some(go) = go_class(self.pattern, class.span.start.offset) else {
             return Err(self.invalid("Go's RE2 parser refuses this bracketed class"));
         };
+        if go.unicode || set_has_unicode(&class.kind) {
+            return Err(self.strict(SdkStrictRegexRule::UnicodeClass));
+        }
         if set_has_operation(&class.kind) {
             return Err(self.strict(SdkStrictRegexRule::ClassSetOperation));
         }
@@ -1100,6 +1111,8 @@ struct GoClass {
     items: Vec<ClassItem>,
     /// The offset in the pattern just past the class.
     end: usize,
+    /// Whether it holds a Unicode class, which `items` and `runes` leave out.
+    unicode: bool,
     runes: Vec<u32>,
 }
 
@@ -1132,8 +1145,8 @@ fn ascii_name(kind: &ast::ClassAsciiKind) -> &'static str {
 }
 
 /// Go's `parseClass` on the pattern from the `[` at `start`: `None` where Go
-/// refuses the class, or where it would read a Unicode class, which the caller
-/// has refused already.
+/// refuses the class. A Unicode class is read for its syntax alone, as
+/// [`go_unicode_class`] reads it.
 fn go_class(pattern: &str, start: usize) -> Option<GoClass> {
     let mut t = pattern.get(start + 1..)?;
     let mut negated = false;
@@ -1143,6 +1156,7 @@ fn go_class(pattern: &str, start: usize) -> Option<GoClass> {
     }
     let mut runes = Vec::new();
     let mut items = Vec::new();
+    let mut unicode = false;
     // `]` is a literal as the first character.
     let mut first = true;
     while t.is_empty() || !t.starts_with(']') || first {
@@ -1167,7 +1181,9 @@ fn go_class(pattern: &str, start: usize) -> Option<GoClass> {
         let bytes = t.as_bytes();
         if bytes.len() >= 2 && bytes[0] == b'\\' {
             if matches!(bytes[1], b'p' | b'P') {
-                return None;
+                t = go_unicode_class(t)?;
+                unicode = true;
+                continue;
             }
             let perl = match bytes[1] {
                 b'd' | b'D' => Some((PERL_DIGIT, b'd')),
@@ -1207,6 +1223,7 @@ fn go_class(pattern: &str, start: usize) -> Option<GoClass> {
         negated,
         items,
         end: pattern.len() - t.len(),
+        unicode,
         runes,
     })
 }
@@ -1276,6 +1293,272 @@ fn go_escape(s: &str) -> Option<(u32, &str)> {
         c if c.is_ascii() && !c.is_ascii_alphanumeric() => Some((u32::from(c), t)),
         _ => None,
     }
+}
+
+/// Go's `parseUnicodeClass` on text that starts with `\p` or `\P`, but for the
+/// name, which only Go's Unicode tables can check: any name that is not empty
+/// passes.
+fn go_unicode_class(t: &str) -> Option<&str> {
+    let (name, rest) = match t[2..].chars().next()? {
+        // The name runs to the first `}` of the rest of the pattern.
+        '{' => {
+            let end = t.find('}')?;
+            (&t[3..end], &t[end + 1..])
+        }
+        c => t[2..].split_at(c.len_utf8()),
+    };
+    let name = name.strip_prefix('^').unwrap_or(name);
+    (!name.is_empty()).then_some(rest)
+}
+
+// Go's parse loop on the raw text, for a regex that `regex-syntax` cannot
+// parse: it decides whether Go may read the regex, and builds nothing.
+
+/// Reports whether Go 1.27's `syntax.Parse(pattern, syntax.Perl)` may accept
+/// a regex: its parse loop, replayed on the raw text, keeping only what
+/// decides acceptance.
+///
+/// It never refuses what Go accepts. It accepts what Go refuses in one place:
+/// a Unicode class name, which only Go's tables can check. Go's bounds on the
+/// size and the height of a parse tree lie beyond any regex within
+/// [`MAX_SCHEMA_REGEX_SOURCE_BYTES`].
+fn go_may_parse(pattern: &str) -> bool {
+    go_parse(pattern).is_some()
+}
+
+fn go_parse(pattern: &str) -> Option<()> {
+    // The top level, then each group still open.
+    let mut groups = vec![GoBranches::default()];
+    let mut after_repeat = false;
+    let mut t = pattern;
+    while let Some(c) = t.chars().next() {
+        let top = groups.len() - 1;
+        let mut repeat = false;
+        t = match c {
+            '(' if t.starts_with("(?") => go_perl_group(t, &mut groups)?,
+            '(' => {
+                groups.push(GoBranches::default());
+                &t[1..]
+            }
+            ')' => {
+                if top == 0 {
+                    return None;
+                }
+                let group = groups.pop()?;
+                groups[top - 1].operand(group.copies());
+                &t[1..]
+            }
+            '|' => {
+                groups[top].bar();
+                &t[1..]
+            }
+            '[' => {
+                let class = go_class(pattern, pattern.len() - t.len())?;
+                groups[top].operand(0);
+                &pattern[class.end..]
+            }
+            '*' | '+' | '?' => {
+                groups[top].repeat(None, after_repeat)?;
+                repeat = true;
+                non_greedy(&t[1..])
+            }
+            '{' => match go_repeat_count(t) {
+                // Go reads a `{` that starts no repetition as itself.
+                None => {
+                    groups[top].operand(0);
+                    &t[1..]
+                }
+                Some((min, max, rest)) => {
+                    let limit = i64::from(MAX_REPEAT);
+                    if min < 0 || min > limit || max > limit || (max >= 0 && min > max) {
+                        return None;
+                    }
+                    groups[top].repeat(Some((min, max)), after_repeat)?;
+                    repeat = true;
+                    non_greedy(rest)
+                }
+            },
+            '\\' => go_escape_item(t, &mut groups[top])?,
+            _ => {
+                groups[top].operand(0);
+                &t[c.len_utf8()..]
+            }
+        };
+        after_repeat = repeat;
+    }
+    (groups.len() == 1).then_some(())
+}
+
+/// The `?` that makes a repetition lazy, which Go reads with it.
+fn non_greedy(rest: &str) -> &str {
+    rest.strip_prefix('?').unwrap_or(rest)
+}
+
+/// What Go's parse stack holds of the group being read: whether a repetition
+/// has an argument, and how many copies of the innermost thing the group's
+/// repetitions make, which Go's `repeatIsValid` bounds at 1 000.
+#[derive(Default)]
+struct GoBranches {
+    /// The most copies made by any operand read before the last.
+    earlier: u32,
+    /// The copies made by the last operand of the branch being read; `None`
+    /// before its first, where Go's stack has `(`, `|` or nothing on top, and
+    /// a repetition misses its argument.
+    last: Option<u32>,
+}
+
+impl GoBranches {
+    fn operand(&mut self, copies: u32) {
+        self.earlier = self.copies();
+        self.last = Some(copies);
+    }
+
+    /// Go's `parseVerticalBar`.
+    fn bar(&mut self) {
+        self.earlier = self.copies();
+        self.last = None;
+    }
+
+    /// The most copies made by any operand of the group.
+    fn copies(&self) -> u32 {
+        self.earlier.max(self.last.unwrap_or(0))
+    }
+
+    /// Go's `repeat` on the last operand: `x{min,max}`, with `max` -1 for no
+    /// bound, or `*`, `+` or `?` for `None`.
+    fn repeat(&mut self, count: Option<(i64, i64)>, after_repeat: bool) -> Option<()> {
+        // Two repetition operators in a row, as in `a**`.
+        if after_repeat {
+            return None;
+        }
+        let sub = self.last?;
+        let copies = match count {
+            None | Some((0, -1)) => sub,
+            Some((_, 0)) => 0,
+            Some((min, max)) => {
+                let times = u32::try_from(if max < 0 { min } else { max }).ok()?;
+                let copies = times.saturating_mul(sub.max(1));
+                if (min >= 2 || max >= 2) && copies > MAX_REPEAT {
+                    return None;
+                }
+                copies
+            }
+        };
+        self.last = Some(copies);
+        Some(())
+    }
+}
+
+/// Go's `parsePerlFlags` on text that starts with `(?`: a named group, flags,
+/// `(?:`, or `(?)`, which sets no flag.
+fn go_perl_group<'p>(t: &'p str, groups: &mut Vec<GoBranches>) -> Option<&'p str> {
+    let name_at = if t.len() > 4 && t[2..].starts_with("P<") {
+        Some(4)
+    } else if t.len() > 3 && t[2..].starts_with('<') {
+        Some(3)
+    } else {
+        None
+    };
+    if let Some(start) = name_at {
+        // The name runs to the first `>` of the rest of the pattern.
+        let end = t.find('>')?;
+        let name = &t[start..end];
+        let valid = !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric());
+        if !valid {
+            return None;
+        }
+        groups.push(GoBranches::default());
+        return Some(&t[end + 1..]);
+    }
+    let mut negated = false;
+    let mut saw_flag = false;
+    for (i, c) in t[2..].char_indices() {
+        match c {
+            'i' | 'm' | 's' | 'U' => saw_flag = true,
+            '-' if !negated => {
+                negated = true;
+                saw_flag = false;
+            }
+            ':' | ')' if !negated || saw_flag => {
+                if c == ':' {
+                    groups.push(GoBranches::default());
+                }
+                return Some(&t[2 + i + 1..]);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Go's escapes outside brackets: an assertion, `\Q…\E`, a Unicode or a Perl
+/// class, or one rune.
+fn go_escape_item<'p>(t: &'p str, group: &mut GoBranches) -> Option<&'p str> {
+    match t.as_bytes().get(1) {
+        Some(b'C') => None,
+        Some(b'A' | b'b' | b'B' | b'z' | b'd' | b'D' | b's' | b'S' | b'w' | b'W') => {
+            group.operand(0);
+            Some(&t[2..])
+        }
+        // Literal text up to `\E`, or to the end: one literal for each rune.
+        Some(b'Q') => {
+            let (text, rest) = t[2..].split_once("\\E").unwrap_or((&t[2..], ""));
+            for _ in text.chars() {
+                group.operand(0);
+            }
+            Some(rest)
+        }
+        Some(b'p' | b'P') => {
+            let rest = go_unicode_class(t)?;
+            group.operand(0);
+            Some(rest)
+        }
+        _ => {
+            let (_, rest) = go_escape(t)?;
+            group.operand(0);
+            Some(rest)
+        }
+    }
+}
+
+/// Go's `parseRepeat`: `{n}`, `{n,}` or `{n,m}` at the start of `t`, as
+/// `(min, max, rest)`, with `max` -1 for `{n,}` and `min` -1 for a count Go
+/// finds too big; `None` where the text is no repetition.
+fn go_repeat_count(t: &str) -> Option<(i64, i64, &str)> {
+    let (mut min, s) = go_count(t.strip_prefix('{')?)?;
+    let (max, s) = match s.strip_prefix(',') {
+        None => (min, s),
+        Some(s) if s.starts_with('}') => (-1, s),
+        Some(s) => {
+            let (max, s) = go_count(s)?;
+            if max < 0 {
+                min = -1;
+            }
+            (max, s)
+        }
+    };
+    Some((min, max, s.strip_prefix('}')?))
+}
+
+/// Go's `parseInt`: decimal digits with no leading zero, -1 for a number that
+/// reaches 10⁸ before its last digit.
+fn go_count(s: &str) -> Option<(i64, &str)> {
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || (digits >= 2 && s.starts_with('0')) {
+        return None;
+    }
+    let mut n = 0_i64;
+    for digit in s[..digits].bytes() {
+        if n >= 100_000_000 {
+            n = -1;
+            break;
+        }
+        n = n * 10 + i64::from(digit - b'0');
+    }
+    Some((n, &s[digits..]))
 }
 
 fn set_has_unicode(set: &ast::ClassSet) -> bool {
@@ -1475,7 +1758,7 @@ mod tests {
 
     use serde_json::{Map, Value, json};
 
-    use super::instructions;
+    use super::{go_may_parse, instructions};
     use crate::{
         MAX_SCHEMA_REGEX_INSTRUCTIONS, MAX_SCHEMA_REGEX_INSTRUCTIONS_TOTAL,
         MAX_SCHEMA_REGEX_SOURCE_BYTES, MAX_SCHEMA_REGEX_SOURCE_BYTES_TOTAL,
@@ -1599,6 +1882,8 @@ mod tests {
             ("a{ 2}", Rule::RepetitionReadAsLiteral),
             ("a{01}", Rule::RepetitionReadAsLiteral),
             ("a{2 ,3}", Rule::RepetitionReadAsLiteral),
+            ("\\Q.\\E", Rule::GoOnlySyntax),
+            ("[[]", Rule::GoOnlySyntax),
         ] {
             assert_eq!(
                 refused(pattern),
@@ -1655,13 +1940,108 @@ mod tests {
     }
 
     #[test]
-    fn some_go_syntax_is_refused_because_rust_cannot_parse_it() {
+    fn go_syntax_rust_cannot_parse_is_sdk_strict_and_the_rest_invalid() {
         // Go accepts each of these; regex-syntax does not parse them.
-        for pattern in ["\\Q.\\E", "\\0", "x{,5}", "[\\d-z]", "(?)"] {
+        for pattern in [
+            "\\Q.\\E",
+            "\\0",
+            "\\12",
+            "x{,5}",
+            "{",
+            "a{1",
+            "[\\d-z]",
+            "(?)",
+            "\\x{D800}",
+            "(?P<1a>x)",
+            "(?P<a>x)(?P<a>y)",
+            "[[]",
+            "[\\w-\\p{L}]",
+        ] {
+            assert_eq!(
+                refused(pattern),
+                Reason::SdkStrictRegex {
+                    pattern: pattern.to_owned(),
+                    rule: Rule::GoOnlySyntax
+                },
+                "{pattern:?}"
+            );
+        }
+        // Neither parses these.
+        for pattern in [
+            "(?)*",
+            "\\Q\\E+",
+            "[\\0-\\7]",
+            "(?P<a-b>x)",
+            "a{2,1}",
+            "(?<=a)b",
+        ] {
             assert!(
                 matches!(refused(pattern), Reason::InvalidRegex { .. }),
                 "{pattern:?}"
             );
+        }
+    }
+
+    #[test]
+    fn the_replay_of_gos_parse_loop_decides_as_go_does() {
+        for (pattern, go) in [
+            // A repetition needs an argument: Go's stack has none at the
+            // start, after `(` and after `|`; `(?)` and `\Q\E` push nothing.
+            ("a(?)*", true),
+            ("(?)*", false),
+            ("a\\Q\\E*", true),
+            ("\\Q\\E*", false),
+            ("(*)", false),
+            ("a|*", false),
+            ("(?:)*", true),
+            ("\\Qab\\E+", true),
+            // Two repetition operators in a row, but not across `(?)`.
+            ("a**", false),
+            ("a*?*", false),
+            ("a*(?)*", true),
+            ("a{2}{", true),
+            // At most 1 000 copies of the innermost thing.
+            ("(a{3}){333}", true),
+            ("(a{4}){333}", false),
+            ("((a{100}){0}){100}", true),
+            ("((a{2}){1}){600}", false),
+            ("(a{1}){1000}", true),
+            ("a{1001}", false),
+            ("a{99999999999}", false),
+            ("a{2,1}", false),
+            // Groups.
+            ("(?P<a1_>x)", true),
+            ("(?<1>x)", true),
+            ("(?P<>x)", false),
+            ("(?P<a", false),
+            ("(?P<a-b>x)", false),
+            ("(?i)a(?-s:b)", true),
+            ("(?-)", false),
+            ("(?x)", false),
+            ("(?=a)", false),
+            ("(?<=a)b", false),
+            ("(a", false),
+            ("a)", false),
+            ("(\\Q)\\E", false),
+            ("(\\Q)\\E)", true),
+            // Escapes and classes.
+            ("\\x{D800}", true),
+            ("\\x{110000}", false),
+            ("\\1", false),
+            ("\\8", false),
+            ("\\C", false),
+            ("a\\", false),
+            ("[\\00-\\07]", true),
+            ("[\\0-\\7]", false),
+            ("[\\w-\\pL]", true),
+            ("[a-\\pL]", false),
+            ("[\\p{}]", false),
+            ("\\p{^}", false),
+            ("\\p", false),
+            ("[[:foo:]]", false),
+            ("[a", false),
+        ] {
+            assert_eq!(go_may_parse(pattern), go, "{pattern:?}");
         }
     }
 
