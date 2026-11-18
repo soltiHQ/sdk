@@ -1163,3 +1163,73 @@ fn in_flight_gauge_recovers_when_rpc_future_is_dropped() {
         "a cancelled RPC must not be recorded as completed"
     );
 }
+
+#[tokio::test]
+async fn apply_task_refuses_a_typed_workload_from_an_old_client_as_a_missing_body() {
+    use prost::Message as _;
+
+    // A TaskWorkload as an old client encodes it: `subprocess` is field 3, which the
+    // contract no longer has, so the decoder skips it and no `extension` is set.
+    let mut workload = proto_api::TaskWorkload {
+        api_version: "exec.solti.io/v1".into(),
+        kind: "Subprocess".into(),
+        spec: None,
+    }
+    .encode_to_vec();
+    workload.extend_from_slice(&[0x1A, 0x04, 0x0A, 0x02, b'l', b's']);
+
+    // The TaskSpec is valid except for that workload, which is spliced in as field 2.
+    let mut spec = proto_api::TaskSpec {
+        slot: "slot".into(),
+        workload: None,
+        timeout_ms: 5_000,
+        restart: proto_api::RestartPolicy::Never as i32,
+        backoff: Some(proto_api::BackoffPolicy {
+            jitter: proto_api::JitterPolicy::None as i32,
+            first_ms: 100,
+            max_ms: 1_000,
+            factor: 2.0,
+        }),
+        admission: proto_api::AdmissionPolicy::DropIfRunning as i32,
+        ..Default::default()
+    }
+    .encode_to_vec();
+    spec.push(0x12);
+    prost::encoding::encode_varint(workload.len() as u64, &mut spec);
+    spec.extend_from_slice(&workload);
+
+    // The TaskManifest takes that spec as field 4.
+    let mut manifest = proto_api::TaskManifest {
+        api_version: "solti.io/v1".into(),
+        kind: "Task".into(),
+        metadata: Some(proto_api::TaskManifestMeta {
+            name: "old-client".into(),
+            ..Default::default()
+        }),
+        spec: None,
+    }
+    .encode_to_vec();
+    manifest.push(0x22);
+    prost::encoding::encode_varint(spec.len() as u64, &mut manifest);
+    manifest.extend_from_slice(&spec);
+    let manifest = proto_api::TaskManifest::decode(manifest.as_slice())
+        .expect("the unknown field is skipped, not an error");
+
+    let handler = Arc::new(StreamMock::default());
+    let service = TaskApiService::new(Arc::clone(&handler));
+    let status = service
+        .apply_task(Request::new(proto_api::ApplyTaskRequest {
+            manifest: Some(manifest),
+            preconditions: None,
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("extension.spec.raw"),
+        "the status must name the body field: {}",
+        status.message()
+    );
+    assert!(handler.last_preconditions.lock().unwrap().is_none());
+}

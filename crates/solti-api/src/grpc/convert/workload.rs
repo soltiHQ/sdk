@@ -46,9 +46,6 @@ pub(super) fn convert_task_workload(
 
     let extension = match workload.spec {
         Some(proto_api::task_workload::Spec::Extension(extension)) => extension,
-        Some(proto_api::task_workload::Spec::Subprocess(_)) => return Err(removed("Subprocess")),
-        Some(proto_api::task_workload::Spec::Wasm(_)) => return Err(removed("Wasm")),
-        Some(proto_api::task_workload::Spec::Container(_)) => return Err(removed("Container")),
         None => return Err(ApiError::InvalidRequest(MISSING_BODY.into())),
     };
     let raw = extension
@@ -63,13 +60,6 @@ pub(super) fn convert_task_workload(
     Workload::new(api_version, kind, body)
         .map(TaskWorkload::Routed)
         .map_err(|error| ApiError::InvalidRequest(error.to_string()))
-}
-
-fn removed(name: &str) -> ApiError {
-    ApiError::InvalidRequest(format!(
-        "typed workload `{name}` was removed in Task API contract 0.2; \
-         send the body in TaskWorkload.extension.spec.raw"
-    ))
 }
 
 #[cfg(test)]
@@ -129,36 +119,35 @@ mod tests {
         assert_eq!(convert_task_workload(proto).unwrap(), workload);
     }
 
-    #[test]
-    fn grpc_refuses_a_typed_workload_with_a_contract_message() {
-        let typed = [
-            (
-                "Subprocess",
-                proto_api::task_workload::Spec::Subprocess(proto_api::SubprocessTask::default()),
-            ),
-            (
-                "Wasm",
-                proto_api::task_workload::Spec::Wasm(proto_api::WasmTask::default()),
-            ),
-            (
-                "Container",
-                proto_api::task_workload::Spec::Container(proto_api::ContainerTask::default()),
-            ),
-        ];
-        for (name, spec) in typed {
-            let workload = proto_api::TaskWorkload {
-                api_version: "exec.solti.io/v1".into(),
-                kind: name.into(),
-                spec: Some(spec),
-            };
-            assert_eq!(
-                invalid_request(convert_task_workload(workload).unwrap_err()),
-                format!(
-                    "typed workload `{name}` was removed in Task API contract 0.2; \
-                     send the body in TaskWorkload.extension.spec.raw"
-                )
-            );
+    /// The bytes of a `TaskWorkload` as an old client sends them: `subprocess`
+    /// (field 3) set, no `extension`. The field no longer exists, so it is unknown.
+    fn old_client_workload_bytes() -> Vec<u8> {
+        use prost::Message as _;
+
+        let mut bytes = proto_api::TaskWorkload {
+            api_version: "exec.solti.io/v1".into(),
+            kind: "Subprocess".into(),
+            spec: None,
         }
+        .encode_to_vec();
+        // Field 3, wire type 2 (length-delimited), holding a short message.
+        bytes.extend_from_slice(&[0x1A, 0x04, 0x0A, 0x02, b'l', b's']);
+        bytes
+    }
+
+    #[test]
+    fn grpc_typed_fields_from_an_old_client_are_refused_as_a_missing_body() {
+        use prost::Message as _;
+
+        let workload = proto_api::TaskWorkload::decode(old_client_workload_bytes().as_slice())
+            .expect("an unknown field is skipped, not an error");
+        assert!(workload.spec.is_none(), "field 3 must not select a variant");
+
+        let message = invalid_request(convert_task_workload(workload).unwrap_err());
+        assert!(
+            message.contains("extension.spec.raw"),
+            "the refusal must name the body field: {message}"
+        );
     }
 
     #[test]
