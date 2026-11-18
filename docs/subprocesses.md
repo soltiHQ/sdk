@@ -63,21 +63,19 @@ The built-in GVK is `solti.io/v1`, kind `Subprocess`.
 This factory accepts an executable and arguments chosen by the application:
 
 ```rust
-use solti_model::{
-    Flag, RestartPolicy, SubprocessMode, SubprocessSpec, TaskEnv,
-    TaskManifest, TaskSpec, TaskWorkload,
-};
+use solti_exec::subprocess::{SubprocessMode, SubprocessSpec};
+use solti_model::{Flag, RestartPolicy, TaskEnv, TaskManifest, TaskSpec, TaskWorkload};
 
 fn command_manifest(
     program: String,
     args: Vec<String>,
 ) -> Result<TaskManifest, Box<dyn std::error::Error>> {
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+    let workload = TaskWorkload::from_body(&SubprocessSpec::new(
         SubprocessMode::Command { command: program, args },
         TaskEnv::new(),
         None,
         Flag::enabled(),
-    ));
+    ))?;
     let spec = TaskSpec::builder("commands", workload, 30_000_u64)
         .restart(RestartPolicy::Never)
         .build()?;

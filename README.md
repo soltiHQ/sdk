@@ -78,11 +78,8 @@ use std::{env, io, time::Duration};
 
 use solti::{
     core::SupervisorApi,
-    exec::subprocess::register_subprocess_runner,
-    model::{
-        Flag, RestartPolicy, SubprocessMode, SubprocessSpec, TaskEnv, TaskManifest, TaskSpec,
-        TaskWorkload,
-    },
+    exec::subprocess::{SubprocessMode, SubprocessSpec, register_subprocess_runner},
+    model::{Flag, RestartPolicy, TaskEnv, TaskManifest, TaskSpec, TaskWorkload},
     runner::RunnerRouter,
 };
 
@@ -100,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let supervisor = SupervisorApi::builder(router).start().await?;
 
     let command = env::current_exe()?.to_string_lossy().into_owned();
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+    let workload = TaskWorkload::from_body(&SubprocessSpec::new(
         SubprocessMode::Command {
             command,
             args: vec![CHILD_MODE.into()],
@@ -108,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         TaskEnv::new(),
         None,
         Flag::enabled(),
-    ));
+    ))?;
     let spec = TaskSpec::builder("quick-start", workload, 30_000_u64)
         .restart(RestartPolicy::Never)
         .build()?;

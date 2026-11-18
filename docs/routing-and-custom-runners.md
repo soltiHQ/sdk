@@ -110,7 +110,7 @@ The [custom extension example](../crates/solti-runner/examples/custom_extension.
 
 ```rust
 use serde::Deserialize;
-use solti_model::ExtensionWorkload;
+use solti_model::{Workload, WorkloadBody};
 use solti_runner::RunnerError;
 
 #[derive(Deserialize)]
@@ -120,13 +120,22 @@ struct ImageResizeSpec {
     width: u32,
 }
 
-fn decode_spec(extension: &ExtensionWorkload) -> Result<ImageResizeSpec, RunnerError> {
-    let spec: ImageResizeSpec = serde_json::from_value(extension.spec().clone())
-        .map_err(|error| RunnerError::InvalidSpec(error.to_string()))?;
-    if spec.source.trim().is_empty() || spec.width == 0 {
-        return Err(RunnerError::InvalidSpec("source and positive width are required".into()));
+impl WorkloadBody for ImageResizeSpec {
+    const API_VERSION: &'static str = "media.example.io/v1";
+    const KIND: &'static str = "ImageResize";
+
+    fn validate(&self) -> Result<(), String> {
+        if self.source.trim().is_empty() || self.width == 0 {
+            return Err("source and positive width are required".into());
+        }
+        Ok(())
     }
-    Ok(spec)
+}
+
+fn decode_spec(workload: &Workload) -> Result<ImageResizeSpec, RunnerError> {
+    workload
+        .decode::<ImageResizeSpec>()
+        .map_err(|error| RunnerError::InvalidSpec(error.detail()))
 }
 ```
 

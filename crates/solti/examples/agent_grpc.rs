@@ -34,11 +34,8 @@ use solti::{
         tonic::{Request, transport::Server},
     },
     core::SupervisorApi,
-    exec::subprocess::register_subprocess_runner,
-    model::{
-        Flag, RestartPolicy, SubprocessMode, SubprocessSpec, TaskEnv, TaskManifest, TaskSpec,
-        TaskWorkload, Token,
-    },
+    exec::subprocess::{SubprocessMode, SubprocessSpec, register_subprocess_runner},
+    model::{Flag, RestartPolicy, TaskEnv, TaskManifest, TaskSpec, TaskWorkload, Token},
     runner::RunnerRouter,
 };
 use tokio::{net::TcpListener, sync::oneshot};
@@ -63,7 +60,10 @@ GRPCURL=(
 )
 
 # Prepare one protobuf-JSON CreateTask or ApplyTask request.
-cat >"$REQUEST" <<'JSON'
+# The workload body is one JSON object, sent base64-encoded in extension.spec.raw.
+BODY='{"mode":{"command":{"command":"/bin/sh","args":["-c","for i in $(seq 1 30); do sleep 2; echo tick=$i; done"]}},"failOnNonZero":true}'
+RAW="$(printf '%s' "$BODY" | base64 | tr -d '\n')"
+cat >"$REQUEST" <<JSON
 {
   "manifest": {
     "apiVersion": "solti.io/v1",
@@ -77,19 +77,12 @@ cat >"$REQUEST" <<'JSON'
     "spec": {
       "slot": "grpc-shell",
       "workload": {
-        "apiVersion": "solti.io/v1",
+        "apiVersion": "exec.solti.io/v1",
         "kind": "Subprocess",
-        "subprocess": {
-          "mode": {
-            "command": {
-              "command": "/bin/sh",
-              "args": [
-                "-c",
-                "for i in $(seq 1 30); do sleep 2; echo tick=$i; done"
-              ]
-            }
-          },
-          "failOnNonZero": true
+        "extension": {
+          "spec": {
+            "raw": "${RAW}"
+          }
         }
       },
       "timeoutMs": "90000",
@@ -172,7 +165,7 @@ solti: gRPC task agent
     let subprocess_runner = register_subprocess_runner(&mut router, "default")?;
     let supervisor = Arc::new(SupervisorApi::builder(router).start().await?);
 
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+    let workload = TaskWorkload::from_body(&SubprocessSpec::new(
         SubprocessMode::Command {
             command: current_executable()?,
             args: vec![CHILD_MODE.into()],
@@ -180,7 +173,7 @@ solti: gRPC task agent
         TaskEnv::new(),
         None,
         Flag::enabled(),
-    ));
+    ))?;
     let spec = TaskSpec::builder("grpc-example", workload, 30_000_u64)
         .restart(RestartPolicy::Never)
         .build()?;

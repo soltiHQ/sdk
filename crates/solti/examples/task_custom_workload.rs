@@ -1,42 +1,43 @@
 //! # Custom workload task: extend the SDK
 //!
-//! A binary can add its own workload GVK and runner.
-//! Core then supervises it through the same desired-state lifecycle as built-in workloads.
+//! A binary can add its own workload type and runner.
+//! Core then admits and supervises it through the same desired-state lifecycle as built-in workloads.
 //!
 //! This example shows:
 //!
-//! - an application-owned `network.example.io/v1` `TcpProbe` workload;
-//! - strict payload decoding inside the runner;
-//! - runner capability introspection;
+//! - an application-owned `network.example.io/v1` `TcpProbe` workload type;
+//! - one body type that gives the schema, the admission check and the runner's decoder;
+//! - runner capability introspection, with the schema fingerprint;
 //! - routing and reconciliation through `solti-core`;
 //! - one real TCP connection made by the supervised task;
 //! - terminal state and retained run history.
 //!
 //! ```text
-//! ExtensionWorkload { TcpProbe }
+//! Workload { network.example.io/v1, TcpProbe, body }
 //!              │ exact GVK
 //!              ▼
 //!        RunnerRouter ──► TcpProbeRunner
-//!                              │ validate JSON payload
-//!                              ▼
-//!                         Taskvisor task
-//!                              │ connect
-//!                              ▼
-//!                       local TCP service
-//!                              └──► terminal Task + TaskRun in core
+//!              │ admission: WorkloadDecl::of::<TcpProbeSpec>() decodes the body
+//!              ▼
+//!         Taskvisor task
+//!              │ connect
+//!              ▼
+//!       local TCP service
+//!              └──► terminal Task + TaskRun in core
 //! ```
 //!
-//! Run with `cargo run -p solti --example task_custom_workload --features core`.
+//! Run with `cargo run -p solti --example task_custom_workload --features core,model-schema`.
 
 use std::{io, sync::Arc, time::Duration};
 
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 use solti::{
     core::{SupervisorApi, TaskWatchSubscription},
     model::{
-        ExtensionWorkload, RestartPolicy, Task, TaskId, TaskManifest, TaskRunQuery, TaskSpec,
-        TaskWorkload, WorkloadTypeMeta,
+        RestartPolicy, Task, TaskId, TaskManifest, TaskRunQuery, TaskSpec, TaskWorkload, Workload,
+        WorkloadBody, WorkloadBodyErrorKind, WorkloadDecl,
     },
     runner::{BuildContext, RunId, Runner, RunnerError, RunnerRouter},
     taskvisor::{TaskContext, TaskError, TaskFn, TaskRef},
@@ -48,17 +49,27 @@ use tokio::{
 };
 use tokio_stream::StreamExt;
 
-const API_VERSION: &str = "network.example.io/v1";
-const KIND: &str = "TcpProbe";
 const WAIT_BOUND: Duration = Duration::from_secs(10);
 
 type ExampleResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TcpProbeSpec {
     address: String,
     payload: String,
+}
+
+impl WorkloadBody for TcpProbeSpec {
+    const API_VERSION: &'static str = "network.example.io/v1";
+    const KIND: &'static str = "TcpProbe";
+
+    fn validate(&self) -> Result<(), String> {
+        if self.payload.is_empty() {
+            return Err("payload must not be empty".into());
+        }
+        Ok(())
+    }
 }
 
 struct TcpProbeRunner;
@@ -69,8 +80,8 @@ impl Runner for TcpProbeRunner {
         "tcp-probe"
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-        vec![WorkloadTypeMeta::new(API_VERSION, KIND).expect("valid custom GVK")]
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
+        vec![WorkloadDecl::of::<TcpProbeSpec>()]
     }
 
     async fn build_task(
@@ -82,18 +93,15 @@ impl Runner for TcpProbeRunner {
         _scope: &mut solti_runner::BuildScope,
     ) -> Result<TaskRef, RunnerError> {
         let workload = task.spec().workload();
-        let TaskWorkload::Extension(extension) = workload else {
+        let TaskWorkload::Routed(routed) = workload else {
             return Err(unsupported_workload(workload));
         };
-        if extension.api_version() != API_VERSION || extension.kind() != KIND {
-            return Err(unsupported_workload(workload));
-        }
-
-        let spec: TcpProbeSpec = serde_json::from_value(extension.spec().clone())
-            .map_err(|error| RunnerError::InvalidSpec(error.to_string()))?;
-        if spec.payload.is_empty() {
-            return Err(RunnerError::InvalidSpec("payload must not be empty".into()));
-        }
+        let spec = routed
+            .decode::<TcpProbeSpec>()
+            .map_err(|error| match error.kind() {
+                WorkloadBodyErrorKind::TypeMismatch { .. } => unsupported_workload(workload),
+                _ => RunnerError::InvalidSpec(error.detail()),
+            })?;
 
         let address: Arc<str> = spec.address.into();
         let payload: Arc<[u8]> = spec.payload.into_bytes().into();
@@ -152,18 +160,20 @@ solti: application-owned workload
     router.register(Arc::new(TcpProbeRunner))?;
     let capabilities = router.capabilities();
     let capability = &capabilities.runners()[0];
+    let workload_type = &capability.workload_types()[0];
     println!(
-        "[capability] runner={} workload={}/{}.",
+        "[capability] runner={} workload={}/{} schemaFingerprint={}.",
         capability.name(),
-        capability.workload_types()[0].api_version(),
-        capability.workload_types()[0].kind(),
+        workload_type.api_version(),
+        workload_type.kind(),
+        workload_type.fingerprint(),
     );
 
     let supervisor = SupervisorApi::builder(router).start().await?;
     let mut watch = supervisor.watch_tasks(&Default::default(), None)?;
-    let workload = TaskWorkload::Extension(ExtensionWorkload::new(
-        API_VERSION,
-        KIND,
+    let workload = TaskWorkload::Routed(Workload::new(
+        TcpProbeSpec::API_VERSION,
+        TcpProbeSpec::KIND,
         json!({
             "address": address.to_string(),
             "payload": "PING"

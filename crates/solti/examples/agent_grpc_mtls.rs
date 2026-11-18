@@ -43,11 +43,8 @@ use solti::{
         },
     },
     core::SupervisorApi,
-    exec::subprocess::register_subprocess_runner,
-    model::{
-        Flag, RestartPolicy, SubprocessMode, SubprocessSpec, TaskEnv, TaskManifest, TaskSpec,
-        TaskWorkload,
-    },
+    exec::subprocess::{SubprocessMode, SubprocessSpec, register_subprocess_runner},
+    model::{Flag, RestartPolicy, TaskEnv, TaskManifest, TaskSpec, TaskWorkload},
     runner::RunnerRouter,
     tls::{ServerTlsConfig, TlsIdentity, TrustRoots},
 };
@@ -133,7 +130,7 @@ solti: mutually authenticated gRPC task agent
     let mut router = RunnerRouter::new();
     let subprocess_runner = register_subprocess_runner(&mut router, "default")?;
     let supervisor = Arc::new(SupervisorApi::builder(router).start().await?);
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+    let workload = TaskWorkload::from_body(&SubprocessSpec::new(
         SubprocessMode::Command {
             command: current_executable()?,
             args: vec![CHILD_MODE.into()],
@@ -141,7 +138,7 @@ solti: mutually authenticated gRPC task agent
         TaskEnv::new(),
         None,
         Flag::enabled(),
-    ));
+    ))?;
     let spec = TaskSpec::builder("mtls-example", workload, 30_000_u64)
         .restart(RestartPolicy::Never)
         .build()?;

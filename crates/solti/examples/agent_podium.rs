@@ -8,7 +8,8 @@
 //! Run from the SDK root:
 //! `cargo run --locked -p solti --example agent_podium --features api-core-adapter,api-http,discover-http,exec-subprocess`.
 //! See `examples/podium/README.md` next to this file for the complete walkthrough.
-//! `--print-podium-spec` emits the exact Podium REST request for this executable.
+//! `--print-podium-spec` emits the exact Podium REST request for this executable:
+//! an `exec.solti.io/v1` `Subprocess` workload bound to the schema fingerprint the agent advertises.
 //! `--demo-task` is the child mode; it does not start an agent.
 
 #[path = "support/http_agent.rs"]
@@ -17,6 +18,11 @@ mod http_agent;
 use std::{env, io, io::Write, time::Duration};
 
 use http_agent::{Defaults, ExampleResult, Settings};
+use solti::{
+    exec::subprocess::{SubprocessMode, SubprocessSpec},
+    model::{AgentCapabilities, Flag, TaskEnv, Workload},
+    runner::RunnerRouter,
+};
 
 const DEMO_MODE: &str = "--demo-task";
 
@@ -39,15 +45,45 @@ fn executable() -> ExampleResult<String> {
         })
 }
 
-fn podium_spec(settings: &Settings) -> ExampleResult<serde_json::Value> {
+/// The Podium create request: the spec envelope and its workload, bound to the schema
+/// fingerprint of the first registered runner that declares the body's type.
+/// Podium's placement evaluates that same runner.
+fn podium_spec(
+    settings: &Settings,
+    capabilities: &AgentCapabilities,
+) -> ExampleResult<serde_json::Value> {
+    let workload = Workload::from_body(&SubprocessSpec::new(
+        SubprocessMode::Command {
+            command: executable()?,
+            args: vec![DEMO_MODE.into()],
+        },
+        TaskEnv::new(),
+        None,
+        Flag::enabled(),
+    ))?;
+    let fingerprint = capabilities
+        .runners()
+        .iter()
+        .flat_map(|runner| runner.workload_types())
+        .find(|declared| {
+            declared.api_version() == workload.api_version() && declared.kind() == workload.kind()
+        })
+        .map(|declared| declared.fingerprint().clone())
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "no registered runner declares {}/{}",
+                workload.api_version(),
+                workload.kind(),
+            ))
+        })?;
     Ok(serde_json::json!({
         "name": "SDK Podium demo",
         "slot": "podium-example",
-        "kind_type": "subprocess",
-        "kind_config": {
-            "mode": {"command": {"command": executable()?, "args": [DEMO_MODE]}},
-            "failOnNonZero": true,
-            "env": []
+        "workload": {
+            "api_version": workload.api_version(),
+            "kind": workload.kind(),
+            "schema_fingerprint": fingerprint,
+            "body": workload.body()
         },
         "timeout_ms": 60000,
         "restart_type": "never",
@@ -67,13 +103,7 @@ async fn main() -> ExampleResult {
     let args: Vec<_> = env::args().skip(1).collect();
     match args.as_slice() {
         [mode] if mode == DEMO_MODE => return demo_task().await,
-        [mode] if mode == "--print-podium-spec" => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&podium_spec(&settings()?)?)?
-            );
-            return Ok(());
-        }
+        [mode] if mode == "--print-podium-spec" => return print_podium_spec().await,
         [mode] if mode == "--help" || mode == "-h" => {
             println!(
                 "agent_podium [--print-podium-spec | --demo-task]\n\
@@ -104,6 +134,18 @@ async fn main() -> ExampleResult {
         serde_json::to_string(&executable()?)?,
     );
     http_agent::run(settings).await
+}
+
+async fn print_podium_spec() -> ExampleResult {
+    let settings = settings()?;
+    let mut router = RunnerRouter::new();
+    let runner = http_agent::register_runners(&mut router)?;
+    let spec = podium_spec(&settings, &router.capabilities());
+    // Registration starts runner-owned workers; stop them before the process exits.
+    let finalizer = runner.shutdown(Duration::from_secs(5)).await;
+    println!("{}", serde_json::to_string_pretty(&spec?)?);
+    finalizer?;
+    Ok(())
 }
 
 async fn demo_task() -> ExampleResult {

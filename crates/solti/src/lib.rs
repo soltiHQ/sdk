@@ -45,7 +45,7 @@
 //! | Need                         | Feature family          |
 //! |------------------------------|-------------------------|
 //! | Resource types               | `model`                 |
-//! | Resource JSON Schema         | `model-schema`          |
+//! | Resource and workload schema | `model-schema`          |
 //! | Runner registration          | `runner`                |
 //! | Conditional workload chain   | `chain`                 |
 //! | Calendar scheduling          | `cron`                  |
@@ -84,7 +84,8 @@
 //! Discovery features do not select the task API exposed by the agent.
 //!
 //! `model` exposes runtime model types without JSON Schema dependencies.
-//! Add `model-schema` when the application generates model schemas.
+//! Add `model-schema` when the application generates model schemas or derives a workload type
+//! declaration with `WorkloadDecl::of`.
 //! `chain` runs nested workloads sequentially inside one outer Task.
 //!
 //! Exactly one step is active at a time; steps do not receive independent Task lifecycle policies, status, or history.

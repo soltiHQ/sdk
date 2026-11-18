@@ -2401,6 +2401,7 @@ name = "solti"
 version = "0.0.8"
 dependencies = [
  "rcgen",
+ "schemars",
  "serde",
  "serde_json",
  "solti-api",

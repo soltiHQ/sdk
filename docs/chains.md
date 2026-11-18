@@ -57,15 +57,15 @@ The chain workload identity is `chain.solti.io/v1alpha1`, kind `Chain`.
 The following function composes three caller-provided workloads without starting them:
 
 ```rust
-use solti_chain::{ChainError, ChainSpec, ChainStep, FailureMode};
-use solti_model::TaskWorkload;
+use solti_chain::{ChainSpec, ChainStep, FailureMode};
+use solti_model::{TaskWorkload, Workload};
 
 fn deployment(
-    deploy: TaskWorkload,
-    verify: TaskWorkload,
-    rollback: TaskWorkload,
-) -> Result<TaskWorkload, ChainError> {
-    ChainSpec::new(
+    deploy: Workload,
+    verify: Workload,
+    rollback: Workload,
+) -> Result<TaskWorkload, Box<dyn std::error::Error>> {
+    let chain = ChainSpec::new(
         "deploy",
         vec![
             ChainStep::new("deploy", deploy)?.with_on_success("verify")?,
@@ -73,8 +73,8 @@ fn deployment(
                 .with_on_failure("rollback", FailureMode::Preserve)?,
             ChainStep::new("rollback", rollback)?,
         ],
-    )?
-    .into_workload()
+    )?;
+    Ok(TaskWorkload::from_body(&chain)?)
 }
 ```
 

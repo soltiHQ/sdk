@@ -31,10 +31,10 @@ use std::{env, io, time::Duration};
 use solti::{
     chain::{ChainSpec, ChainStep, FailureMode, register_chain_runner},
     core::{OutputSubscription, SupervisorApi, TaskWatchSubscription},
-    exec::subprocess::register_subprocess_runner,
+    exec::subprocess::{SubprocessMode, SubprocessSpec, register_subprocess_runner},
     model::{
-        ConditionStatus, Flag, OutputEvent, RestartPolicy, SubprocessMode, SubprocessSpec, Task,
-        TaskEnv, TaskFilter, TaskId, TaskManifest, TaskPhase, TaskRunQuery, TaskSpec, TaskWorkload,
+        ConditionStatus, Flag, OutputEvent, RestartPolicy, Task, TaskEnv, TaskFilter, TaskId,
+        TaskManifest, TaskPhase, TaskRunQuery, TaskSpec, TaskWorkload, Workload,
     },
     runner::RunnerRouter,
 };
@@ -138,23 +138,26 @@ async fn run(
         vec![
             ChainStep::new(
                 "task1",
-                subprocess(&command, &child_address, "task1", false),
+                subprocess(&command, &child_address, "task1", false)?,
             )?
             .with_on_success("task2")?,
             ChainStep::new(
                 "task2",
-                subprocess(&command, &child_address, "task2", false),
+                subprocess(&command, &child_address, "task2", false)?,
             )?
             .with_on_success("task3")?,
-            ChainStep::new("task3", subprocess(&command, &child_address, "task3", true))?
-                .with_on_failure("task4", FailureMode::Recover)?,
+            ChainStep::new(
+                "task3",
+                subprocess(&command, &child_address, "task3", true)?,
+            )?
+            .with_on_failure("task4", FailureMode::Recover)?,
             ChainStep::new(
                 "task4",
-                subprocess(&command, &child_address, "task4", false),
+                subprocess(&command, &child_address, "task4", false)?,
             )?,
         ],
     )?;
-    let spec = TaskSpec::builder("example", chain.into_workload()?, 30_000_u64)
+    let spec = TaskSpec::builder("example", TaskWorkload::from_body(&chain)?, 30_000_u64)
         .restart(RestartPolicy::Never)
         .build()?;
     let manifest = TaskManifest::new("chain-example", spec)?;
@@ -212,8 +215,13 @@ async fn run(
     Ok(())
 }
 
-fn subprocess(command: &str, address: &str, step: &str, fail: bool) -> TaskWorkload {
-    TaskWorkload::Subprocess(SubprocessSpec::new(
+fn subprocess(
+    command: &str,
+    address: &str,
+    step: &str,
+    fail: bool,
+) -> Result<Workload, ExampleError> {
+    Ok(Workload::from_body(&SubprocessSpec::new(
         SubprocessMode::Command {
             command: command.into(),
             args: vec![
@@ -226,7 +234,7 @@ fn subprocess(command: &str, address: &str, step: &str, fail: bool) -> TaskWorkl
         TaskEnv::new(),
         None,
         Flag::enabled(),
-    ))
+    ))?)
 }
 
 async fn release_children(listener: TcpListener) -> Result<(), ExampleError> {

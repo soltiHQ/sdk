@@ -39,11 +39,10 @@ use std::{env, io, time::Duration};
 
 use solti::{
     core::{OutputSubscription, SupervisorApi, TaskWatchSubscription},
-    exec::subprocess::register_subprocess_runner,
+    exec::subprocess::{SubprocessMode, SubprocessSpec, register_subprocess_runner},
     model::{
-        ConditionStatus, Flag, OutputEvent, RestartPolicy, StreamKind, SubprocessMode,
-        SubprocessSpec, Task, TaskEnv, TaskFilter, TaskId, TaskManifest, TaskRunQuery, TaskSpec,
-        TaskWorkload,
+        ConditionStatus, Flag, OutputEvent, RestartPolicy, StreamKind, Task, TaskEnv, TaskFilter,
+        TaskId, TaskManifest, TaskRunQuery, TaskSpec, TaskWorkload,
     },
     runner::RunnerRouter,
 };
@@ -125,7 +124,7 @@ async fn run(
     command: String,
 ) -> Result<(), ExampleError> {
     let mut watch = supervisor.watch_tasks(&TaskFilter::new(), None)?;
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+    let workload = TaskWorkload::from_body(&SubprocessSpec::new(
         SubprocessMode::Command {
             command,
             args: vec![CHILD_MODE.into(), child_address],
@@ -133,7 +132,7 @@ async fn run(
         TaskEnv::new(),
         None,
         Flag::enabled(),
-    ));
+    ))?;
     let spec = TaskSpec::builder("example", workload, 30_000_u64)
         .restart(RestartPolicy::Never)
         .build()?;

@@ -110,12 +110,14 @@ full = [
     "api-core-adapter",
     "api-grpc-tls",
     "api-http",
+    "chain",
     "cron",
     "discover-grpc-tls",
     "discover-http-tls",
     "exec-containerd",
     "exec-seccomp",
     "exec-subprocess",
+    "model-schema",
     "observe-journald",
     "observe-log-compat",
     "observe-timezone-sync",
@@ -142,6 +144,7 @@ taskvisor = { workspace = true, optional = true }
 
 [dev-dependencies]
 rcgen       = { workspace = true }
+schemars    = { workspace = true }
 serde       = { workspace = true, features = ["derive"] }
 serde_json   = { workspace = true }
 tokio        = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
@@ -196,7 +199,7 @@ required-features = ["core", "exec-containerd"]
 
 [[example]]
 name              = "task_custom_workload"
-required-features = ["core"]
+required-features = ["core", "model-schema"]
 
 [[example]]
 name              = "task_subprocess"
