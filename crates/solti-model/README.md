@@ -348,10 +348,44 @@ Transport layers encode it into their own opaque wire token.
 `WorkloadDecl` declares one workload type: a GVK, the JSON Schema of its `spec`, and the check that admits a body.
 `WorkloadDecl::of::<B>()` derives all three from a Rust type that implements `WorkloadBody` and `schemars::JsonSchema`.
 `WorkloadDecl::new` takes a hand-written schema and check; `WorkloadDecl::object` accepts any object.
+A runner returns several declarations from `Runner::workload_types`, and an agent registers several runners.
+Two types with the same schema share one fingerprint, and are sent once.
 A refused GVK, a reserved group, or a refused schema is kept and reported by `workload_type()`, at registration.
+
+The check runs synchronously on every create and apply of a task of the type, under the task's write lock and a state-write admission permit.
+It must be fast and non-blocking: decode and compare, no I/O.
+`WorkloadBody::validate` runs inside it and has the same rule.
+
+Routing is first-match: the first runner, in registration order, whose exact GVK and labels match.
+Podium evaluates that runner.
+There is no schema-aware routing.
+
+### The schema and its fingerprint
 
 The derived schema is draft 2020-12.
 `unevaluatedProperties` is rewritten, and every 64-bit-or-wider integer is bounded to `MAX_JSON_SAFE_INTEGER` (2^53 - 1), so Podium refuses values no JSON peer reads back.
+
+A schema is identified by its fingerprint: the lowercase hex SHA-256 of its RFC 8785 canonical JSON.
+`WorkloadSchema::canonical_json` returns those bytes, and they are exactly what the agent sends to Podium.
+The root `title` (the Rust type's name), the names of nested types (the keys of `$defs`) and doc comments (`description`) are all in those bytes: renaming a body type changes its fingerprint.
+Pin a name with `#[schemars(rename = "...")]`.
+
+`WorkloadSchema::from_value` refuses at registration everything Podium refuses without telling the agent:
+
+- the subset: draft 2020-12 minus `$dynamicRef`, `$dynamicAnchor`, `$recursiveRef`, `$recursiveAnchor`, `$vocabulary`, `unevaluatedProperties` and `unevaluatedItems`; `$ref` only inside the document; no `$ref` cycle at one location of a body;
+- the limits: 64 KiB of canonical JSON, 32 levels of nesting, 512 objects and booleans, a regex of at most 1 024 bytes and 2 000 instructions, 20 000 instructions and 16 KiB of regex source per schema, at most 15 raw `\p` or `\P` per regex and 153 per schema (each is charged 833 units of Podium's 128 000);
+- Podium's refusal of `(?` followed by `i`, `m`, `s`, `U` or `-` anywhere in a pattern, which also refuses `^\(?-?\d+\)?$`; write `^[(]?-?\d+[)]?$`.
+
+The SDK is stricter than Podium for regexes it cannot prove both parsers read alike (`SdkStrictRegexRule`):
+`\p{...}` classes, which Podium sizes from Go's Unicode tables;
+syntax whose meaning differs between Rust's `regex-syntax` and Go's RE2 (`\<`, `\b{start}`, set operations in brackets, a nested `[`, `a{ 2}`);
+and Go-only syntax that `regex-syntax` cannot parse (`\Q...\E`, `x{,5}`, octal escapes).
+Case-insensitive matching never arises, because inline flags are refused.
+
+Body types should avoid `#[serde(flatten)]` combined with `deny_unknown_fields`, which serde does not support.
+The [routing guide](https://github.com/soltiHQ/sdk/blob/main/docs/routing-and-custom-runners.md) has the full rules.
+
+Both canonical-JSON crates enable `serde_json/float_roundtrip`; Cargo feature unification makes float parsing correctly rounded, and slightly slower, for every `serde_json` user in the build.
 
 ## Advertise capabilities
 

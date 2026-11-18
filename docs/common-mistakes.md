@@ -51,12 +51,30 @@ Start from [installation](installation.md), then follow [agent assembly](buildin
 ## Assuming router registration validates every future workload
 
 Capabilities are declarations captured at registration. Routing chooses the
-first matching registration by workload GVK and optional runner labels. Two
-matching runners do not produce an automatic ambiguity error.
+first matching registration by workload GVK and optional runner labels: the
+first runner, in registration order, whose exact GVK and labels match. Podium
+evaluates that runner; there is no schema-aware routing. Two matching runners
+do not produce an automatic ambiguity error, and the second never sees the
+GVK unless a selector picks it.
 
 Model validation does not check runner availability or platform authority.
-Custom runner build and runtime validation remain separate steps. The model's
-WASM workload representation does not provide a built-in WASM executor.
+Custom runner build and runtime validation remain separate steps. There is no
+`Wasm` workload type; an application that embeds an engine declares its own.
+
+## Writing a slow declaration check
+
+A declared check runs synchronously at admission, under the Task's write lock
+and a state-write admission permit. A check that does I/O or waits stalls every
+write to that Task. Decode and compare only.
+
+## Trusting that a schema Podium cannot compile will be reported
+
+Podium refuses a schema outside its subset without telling the agent; the agent
+sees nothing and the type shows as `refused` in Podium's catalog. The SDK
+refuses the same schemas at registration, so a registration error is the
+warning. Renaming a body type changes its schema fingerprint, and `(?` followed
+by `i`, `m`, `s`, `U` or `-` anywhere in a pattern is refused, even in
+`^\(?-?\d+\)?$`. See [declare workload types](routing-and-custom-runners.md#declare-workload-types).
 
 See [routing and custom runners](routing-and-custom-runners.md) and
 [containers and isolation](containers-and-isolation.md).

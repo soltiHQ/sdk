@@ -6,7 +6,7 @@
 //! The `subprocess` feature provides `SubprocessRunner`.
 //! The `container` feature provides an engine-neutral `ContainerRunner`.
 //! The `containerd` feature provides its native containerd 2.x engine.
-//! Both declare their workload types under [`EXEC_API_VERSION`] (`Subprocess` and `Container`).
+//! They declare their workload types, `Subprocess` and `Container`, under `exec.solti.io/v1` (`EXEC_API_VERSION`).
 //! Both runners convert `solti_model::Task` resources into reusable `taskvisor::TaskRef` values.
 //! `RunnerRouter` pairs each task with its allocated run identity in a
 //! `solti_runner::BuiltTask`. Taskvisor owns execution after conversion.

@@ -88,7 +88,7 @@ Then inspect an application-defined workload:
 
 ```bash
 cargo run -p solti --example task_custom_workload \
-  --features core
+  --features core,model-schema
 ```
 
 Run the native containerd 2.x path on Linux:

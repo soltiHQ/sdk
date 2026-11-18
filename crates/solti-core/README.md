@@ -82,6 +82,10 @@ Read the `Reconciled` condition to observe its result.
 
 Routed submission requires a non-embedded workload.
 The router selects a registered runner by workload GVK and optional labels.
+Before the write commits, that same runner's declared check admits the body:
+the first runner, in registration order, whose exact GVK and labels match.
+The check runs under the task's write lock and a state-write admission permit, so it must be fast and non-blocking.
+A refused body returns `CoreError::InvalidSpec` and commits nothing; an unmatched workload reads `no runner matches <apiVersion>/<kind>`.
 Runner construction happens in the reconciliation worker.
 It is asynchronous, cancellation-aware, deadline-bound, and admitted through
 global and per-runner concurrency limits.
@@ -721,7 +725,7 @@ only explicit shutdown observes lossless drain completion.
 - `TaskState` clones share the same in-memory store.
 - Core does not persist tasks, runs, output, or watch history by itself.
 - Optional persistence hooks can forward task, run, and output events to an application-owned store.
-- Core does not hide embedded or extension workloads.
+- Core does not hide embedded or routed workloads.
 - Adapter predicates run before pagination and watch event classification.
 - Retention never removes a task with a runtime binding.
 - The built-in output subscription is live-only and may report `OutputEvent::Lagged`.

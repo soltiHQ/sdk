@@ -22,7 +22,7 @@ It is not a parallel DAG scheduler, transaction engine, or durable workflow stor
 
 With the facade crate, enable `solti/chain` and the features required by the leaf backends.
 The complete subprocess example also needs `core` and `exec-subprocess`.
-Chain declares its own workload type and JSON Schema; the agent publishes it with the runner, and runtime graph validation still applies.
+Chain declares its own workload type and JSON Schema; the agent publishes it with the runner. Admission decodes the graph and checks each step's nested workload against the leaf catalog, under the step's selector, so a bad nested body is refused when the Task is written. The schema types a nested `spec` only as an object; runtime graph validation still applies.
 
 ## Register leaf runners first
 

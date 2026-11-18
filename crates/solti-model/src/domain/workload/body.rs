@@ -15,6 +15,10 @@ pub trait WorkloadBody: serde::de::DeserializeOwned + 'static {
 
     /// Checks what the schema cannot express.
     ///
+    /// A derived [`WorkloadDecl`](crate::WorkloadDecl) runs this inside its admission check,
+    /// under the task's write lock and a state-write admission permit: keep it fast and
+    /// non-blocking.
+    ///
     /// # Errors
     ///
     /// Returns the reason the decoded body is refused.

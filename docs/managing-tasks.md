@@ -27,7 +27,7 @@ Start core with `SupervisorApi::builder(router).start().await`. Register the run
 | `create_embedded_task` | Embedded manifest and `TaskRef` | `AlreadyExists`. |
 | `apply_embedded_task` | Embedded manifest and `TaskRef` | Compare and update desired state. Missing names are created. |
 
-Routed APIs reject an Embedded manifest. Embedded APIs reject a routed workload. Validation happens before desired-state commit.
+Routed APIs reject an Embedded manifest. Embedded APIs reject a routed workload. Validation happens before desired-state commit, and for a routed workload it includes the first matching runner's declared body check; a refusal is `CoreError::InvalidSpec` and commits nothing.
 
 After a write commits, core owns its reconciliation work. Dropping the caller's future does not undo the commit or cancel reconciliation already scheduled by that write. Read the resource again when a caller loses its response; do not infer whether a commit happened from the caller's timeout alone.
 

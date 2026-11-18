@@ -112,6 +112,10 @@ pub trait Runner: Send + Sync {
     ///
     /// The router reads this once during registration, refuses an unusable declaration and snapshots the rest.
     /// Routing, admission checks and capability introspection use the same snapshot.
+    /// Declaration order is not routing order; registration order of the runners is.
+    ///
+    /// Each declaration's check runs under the task's write lock and a state-write admission
+    /// permit, so it must be fast and non-blocking.
     fn workload_types(&self) -> Vec<WorkloadDecl>;
 
     /// Builds a [`TaskRef`] for a matching task resource.

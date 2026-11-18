@@ -27,8 +27,8 @@ pub(crate) fn validate_runner_name(name: &str) -> Result<(), crate::ExecError> {
 
 /// Decodes the body of the workload a runner is asked to build.
 ///
-/// A workload of another type, or an embedded one, is [`RunnerError::UnsupportedWorkload`].
-/// A body of this runner's type that does not decode or validate is [`RunnerError::InvalidSpec`].
+/// A workload of another type, or an embedded one, is [`solti_runner::RunnerError::UnsupportedWorkload`].
+/// A body of this runner's type that does not decode or validate is [`solti_runner::RunnerError::InvalidSpec`].
 pub(crate) fn decode_workload<B: solti_model::WorkloadBody>(
     runner: &str,
     workload: &solti_model::TaskWorkload,

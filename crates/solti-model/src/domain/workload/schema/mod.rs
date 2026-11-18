@@ -173,7 +173,7 @@ pub struct WorkloadSchema {
 impl WorkloadSchema {
     /// Checks a schema and canonicalizes it.
     ///
-    /// See the [module docs](self) for the checks, in the order they run.
+    /// The module documentation lists the checks, in the order they run.
     ///
     /// # Errors
     ///

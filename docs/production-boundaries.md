@@ -106,6 +106,8 @@ Names, runner labels, and workload GVKs select implementations. They are not
 security boundaries. Shell and container workloads execute with the authority
 provided by the agent and backend. Grant that authority according to the
 workloads the application accepts.
+A declared workload schema and check validate the shape of a body, not who may submit it
+or what it may do.
 
 See [subprocesses](subprocesses.md), [containers and isolation](containers-and-isolation.md),
 and [routing](routing-and-custom-runners.md).

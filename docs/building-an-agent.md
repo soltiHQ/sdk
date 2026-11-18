@@ -17,7 +17,7 @@ Choose the process you need, then retain the handles that own its lifetime.
 | Runner and exec or a custom runner | Routing and executable TaskRef construction | Registration order, backend configuration, platform authority, and backend cleanup handles. |
 | Core | Resource storage, reconciliation, observation, and supervised work | When to start it, which limits/sinks/subscribers to install, and when to join shutdown. |
 | API | Router/service and a handler contract; optional core adapter | Listener, server task, TLS placement, authorization policy, intake shutdown, and active-connection drain. |
-| Discovery | Outbound heartbeat manifest and TaskRef | Actual advertised address, control-plane address, identity, capabilities, revision, and submission of the task. |
+| Discovery | Outbound heartbeat manifest and TaskRef; sends requested workload schemas in follow-ups | Actual advertised address, control-plane address, identity, capabilities, revision, and submission of the task. |
 | Observe and Prometheus | Logger, producer adapters, collectors, exporter/maintenance tasks | Global initialization, shared registry, injection points, endpoint access, and service supervision. |
 | TLS | Loaded identity and trust configuration | Certificate distribution, listener/client installation, and rotation/reload policy. |
 
@@ -103,7 +103,7 @@ See [discovery](discovery.md).
 |---|---|
 | Listener bind succeeded | The local address was acquired. |
 | `SupervisorApiBuilder::start` returned | Core and its owned runtime workers started. |
-| Runner capabilities were read | Registered workload/label declarations are available. |
+| Runner capabilities were read | Registered workload types, with schema fingerprints, and labels are available. |
 | Maintenance manifest was committed | Desired state exists; its attempt may not have started. |
 | API request completed | That request reached its handler/transport result boundary. |
 | Heartbeat completed successfully | That discovery attempt received an accepted response. |

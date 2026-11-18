@@ -7,6 +7,11 @@
 - `container` feature implements an engine-neutral runner for `exec.solti.io/v1`, kind `Container`.
 - `containerd` feature provides its native containerd 2.x engine.
 
+Each runner declares its type with a JSON Schema derived from `SubprocessSpec` or `ContainerSpec`, which live here.
+The registered capabilities carry the schemas' fingerprints, and the agent sends the schemas to Podium on request.
+Podium validates a spec against the schema before it deploys it; core checks the body again at admission.
+Unknown fields are refused in both specs.
+
 Use this crate when an agent executes host processes or OCI containers.
 The crate does not schedule tasks, store resources, or expose a network API.
 

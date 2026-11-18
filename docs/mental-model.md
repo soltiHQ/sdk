@@ -15,7 +15,8 @@ Taskvisor can run more than one attempt of that work under the selected policy.
 |---|---|
 | `TaskManifest` | Caller-owned name, labels, annotations, and desired spec. It is the write input. |
 | `Task` | Core-owned resource combining desired fields, server metadata, and observed status. |
-| `TaskWorkload` | Model envelope naming the work's GVK and payload. It is not an installed runner. |
+| `TaskWorkload` | Model envelope naming the work's GVK and payload: a routed `Workload` or an `Embedded` revision. It is not an installed runner. |
+| `WorkloadDecl` | A runner's declaration of one workload type: GVK, JSON Schema of its `spec`, and the check that admits a body. |
 | `Runner` | Converts a routed Task into reusable executable work through `build_task`. |
 | `BuiltTask` | Runner build result containing a `RunId` and Taskvisor `TaskRef`. |
 | `TaskRef` | In-process implementation that creates a fresh future for each attempt. |

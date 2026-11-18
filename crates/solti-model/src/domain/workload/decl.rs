@@ -134,6 +134,12 @@ type Check = dyn Fn(&Workload) -> Result<(), String> + Send + Sync;
 
 /// A workload type a runner declares: GVK, schema and the admission check of its body.
 ///
+/// The check must be fast and non-blocking: no I/O, no locks held across a wait, no
+/// heavy computation. Core calls it synchronously on every create and apply of a task of
+/// this type, while it holds the task's write lock and a state-write admission permit, so a
+/// slow check stalls every write to that task and takes a permit that other writes need.
+/// Decode and compare; do not look anything up.
+///
 /// A refused GVK, a reserved group or a refused schema does not fail the constructor:
 /// it is kept and reported by [`workload_type`](Self::workload_type) when the runner is registered.
 #[derive(Clone)]
@@ -150,6 +156,11 @@ impl WorkloadDecl {
     /// `spec.<path>: <message>`, or `spec: <message>` at the root.
     ///
     /// The schema is draft 2020-12, with 64-bit integers bounded to the JSON-safe range.
+    /// The schema carries the Rust type's name as its root `title`, the names of nested types
+    /// as `$defs` keys and the doc comments as `description`s, all part of the fingerprint.
+    ///
+    /// The check decodes the body, so it is fast; a [`validate`](crate::WorkloadBody::validate) that does more
+    /// must stay fast and non-blocking too.
     #[cfg(feature = "schema")]
     pub fn of<B: crate::WorkloadBody + schemars::JsonSchema>() -> Self {
         Self::new(
@@ -167,7 +178,8 @@ impl WorkloadDecl {
 
     /// Declares a type from a hand-written schema and an admission check.
     ///
-    /// `check` runs on every routed workload of this GVK before the runner sees it.
+    /// `check` runs on every routed workload of this GVK before the runner sees it, under the
+    /// task's write lock and a state-write admission permit. It must be fast and non-blocking.
     pub fn new(
         api_version: impl Into<String>,
         kind: impl Into<String>,
@@ -216,6 +228,9 @@ impl WorkloadDecl {
     }
 
     /// Runs the admission check on a routed workload.
+    ///
+    /// Core runs it under the task's write lock and a state-write admission permit, so it
+    /// must be fast and non-blocking.
     ///
     /// # Errors
     ///

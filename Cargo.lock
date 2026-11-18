@@ -2536,6 +2536,7 @@ name = "solti-docs-tests"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "schemars",
  "serde",
  "serde_json",
  "solti",

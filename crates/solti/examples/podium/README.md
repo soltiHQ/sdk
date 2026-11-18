@@ -4,6 +4,11 @@ Run a real SDK agent, deploy a task from Podium, and inspect its execution and
 live output. Podium owns the saved specification and desired-state deployment;
 the agent's core, runner, and Taskvisor own execution.
 
+The agent declares its workload types: `exec.solti.io/v1` `Subprocess`, with a
+JSON Schema of its body. It advertises the schema's fingerprint in every
+heartbeat and sends the schema when Podium asks. Podium validates a spec's body
+against that schema before it deploys it.
+
 The demo runs this same executable in `--demo-task` mode. It writes 30 small
 stdout ticks, writes start/finish messages to stderr, and exits successfully
 after about 30 seconds. It uses no shell or external services.
@@ -11,8 +16,8 @@ after about 30 seconds. It uses no shell or external services.
 ## Start Podium
 
 These commands assume sibling `podium/` and `sdk/` checkouts. Start both
-terminals in their parent directory. Use Go 1.26.4 or a compatible toolchain
-and the Rust toolchain required by the SDK workspace.
+terminals in their parent directory. Use the Go toolchain that Podium's `go.mod`
+requires and the Rust toolchain required by the SDK workspace.
 
 In the first terminal:
 
@@ -25,11 +30,12 @@ export SOLTI_AUTH_JWT_SECRET="$(openssl rand -hex 32)"
   --config ../sdk/crates/solti/examples/podium/podium.yaml
 ```
 
-Open <http://127.0.0.1:9080>. Sign in as `admin` with the password generated in
-Podium's first-start log. Existing credentials are preserved on restart; the
-password is not regenerated each time. Keep the same JWT secret across restarts.
-The configuration contains no secret. `SOLTI_*` environment overrides take
-precedence over the YAML; use the example values below for this local instance.
+Open <http://127.0.0.1:9080>. Sign in as `admin` with the password that Podium
+logs once, at WARN with the prefix `ephemeral mode:`, at every start: the memory
+backend keeps no data directory, so each start seeds a new administrator
+password. The configuration contains no secret. `SOLTI_*` environment overrides
+take precedence over the YAML; use the example values below for this local
+instance.
 
 | Boundary | Address |
 |---|---|
@@ -38,10 +44,10 @@ precedence over the YAML; use the example values below for this local instance.
 | Podium gRPC discovery | `127.0.0.1:50061` |
 | SDK agent HTTP Task API | `127.0.0.1:9085` |
 
-Podium stores this example's state in `data/podium-example`, relative to the
-Podium working directory. This configuration uses a separate directory from
-`data/podium`. It binds to loopback and uses plaintext, unauthenticated agent
-transport; it is a local example, not a network deployment configuration.
+This configuration uses `cluster.backend: memory`: Podium keeps its state in
+memory and loses it, specifications and history included, when it stops. It binds
+to loopback and uses plaintext, unauthenticated agent transport; it is a local
+example, not a network deployment configuration.
 
 ## Start the SDK agent
 
@@ -60,30 +66,53 @@ export SOLTI_AGENT_ADDR=127.0.0.1:9085
 If `CARGO_TARGET_DIR` is set, use its example-binary path instead. The print mode
 exits after producing JSON; the normal mode serves the agent until Ctrl-C.
 It advertises `Podium example agent` with ID `podium-example-agent`, the
-registered `default` subprocess runner, and a discovery heartbeat every two
-seconds. In Podium, open **Agents** and select this agent.
+registered `default` subprocess runner with its `exec.solti.io/v1` `Subprocess`
+type, and a discovery heartbeat every two seconds. In Podium, open **Agents** and
+select this agent.
 
 `--print-podium-spec` prints the exact Podium create-spec request, including the
-absolute executable path. The command runs on the agent host, so keep that
-binary available while its specification is deployed.
+absolute executable path and the schema fingerprint of the type the agent
+declares. The command runs on the agent host, so keep that binary available while
+its specification is deployed.
+
+## The schema exchange
+
+The heartbeat carries only the type's GVK and the schema's fingerprint, the
+SHA-256 of the schema's canonical JSON. Podium answers with the fingerprints it
+lacks, and the agent sends those schemas in follow-up requests of the same
+attempt. A follow-up that fails is logged at WARN and does not fail the
+heartbeat. Podium refuses a schema it cannot compile without telling the agent;
+look for it in Podium's workload catalog, where it shows as `refused`, and in a
+spec's placement detail, which reports `schema_incompatible`. If the type does
+not appear in Podium's **Workload type** list after a few heartbeats, check the
+agent's log for `discovery.schema_follow_up_failed`.
 
 ## Deploy from the browser
 
-Open **Tasks → Add** and fill these fields:
+Open **Tasks → Add**. The builder is type-first: choose the workload type, then
+one of the schemas Podium received for it, and write the body as JSON.
 
 | Field | Value |
 |---|---|
 | Name | `SDK Podium demo` |
 | Slot | `podium-example` |
-| Type / Mode | `Subprocess` / `Command` |
-| Command | The path value from `kind_config.mode.command.command`, without surrounding JSON quotes |
-| Arguments (JSON array) | `["--demo-task"]` |
+| Workload type | `exec.solti.io/v1` `Subprocess` |
+| Schema | The fingerprint of the agent's schema, the only one in this walkthrough |
+| Body (JSON object) | The `workload.body` object from `--print-podium-spec`, with its absolute command path |
 | Timeout (ms) | `60000` |
 | Restart | `Never` |
 | Target agent | `podium-example-agent` (the selector shows agent IDs) |
 
-Leave environment, working directory, and label selectors empty. Keep the
-remaining defaults. Click **Create Spec**, open the saved task, review its
+For the body, copy the printed `workload.body`. It has this shape, with the path
+of your executable:
+
+```json
+{"mode": {"command": {"command": "/path/to/agent_podium", "args": ["--demo-task"]}}, "failOnNonZero": true}
+```
+
+Leave label selectors empty. Keep the remaining defaults. If the body
+fails validation, Podium refuses it and lists the problems. Click
+**Create Spec**, open the saved task, review its
 placement preview, then click **Deploy** and confirm. Placement should select
 this agent's `default` runner. Deployment is reconciled on Podium's next sync
 cycle.
@@ -115,10 +144,13 @@ printf '%s\n' "$PODIUM_SPEC"
 ```
 
 Use this JSON as the body for Podium's `POST /api/v1/specs` with an authenticated
-session. That call saves the spec and returns `204`; obtain its ID from
+session. Its `workload` object is `{api_version, kind, schema_fingerprint, body}`.
+That call saves the spec and returns `204`; obtain its ID from
 `GET /api/v1/specs`, then deploy with `POST /api/v1/specs/{id}/deploy`. The body
 is a Podium request, not an SDK Task manifest. The agent's
-`/apis/solti.io/v1/tasks` API is a separate contract.
+`/apis/solti.io/v1/tasks` API is a separate contract: it takes
+`exec.solti.io/v1` `Subprocess` as a routed workload, and rejects a body that
+the agent's declared check refuses.
 
 ## Options and shutdown
 
@@ -146,9 +178,8 @@ setup for this walkthrough.
 When finished, keep the agent running, use Podium's **Delete** action for the
 demo specification, and wait for reconciliation to remove its agent task.
 Then stop the agent and Podium with Ctrl-C. Agent shutdown stops intake and
-supervised tasks; Podium's observed archive remains in its example data
-directory. If reusing this example later, keep that directory and its existing
-credentials.
+supervised tasks; Podium's memory state is gone with its process, so the next
+start begins empty with a new administrator password.
 
 ## Troubleshooting
 
@@ -158,8 +189,14 @@ credentials.
   environment variables. Leave unrelated services running.
 - **Logs are empty after completion:** output is live-only. Open the drawer while
   the child runs; use a changed runtime generation for another execution.
-- **No new admin password on restart:** the example data directory retains
-  credentials. Use the original first-start password or your updated password.
+- **No admin password in the log:** the password is logged at WARN with the
+  prefix `ephemeral mode:` at each start. Search the log of the current run.
+- **The workload type is missing or has no schema:** the schema arrives in a
+  follow-up after the heartbeat. Wait a few heartbeats, then check the agent's
+  log for `discovery.schema_follow_up_failed` and Podium's catalog for a
+  `refused` fingerprint.
+- **Podium refuses the body:** the body must match the agent's schema. Copy
+  `workload.body` from `--print-podium-spec` and edit only the command path.
 - **Old or missing demo executable:** rebuild the example with the listed
   features, check `CARGO_TARGET_DIR`, and print the request again. Update the
   saved command if its absolute executable path changed.

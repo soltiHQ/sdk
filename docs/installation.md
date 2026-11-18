@@ -43,6 +43,7 @@ enable JSON Schema. Select `model-schema` explicitly.
 | Construct and validate resource values | `model` | [Task resources](task-resources.md) |
 | Generate model JSON Schema | `model-schema` | [Task resources](task-resources.md) |
 | Define and route custom execution backends | `runner` | [Custom runners](routing-and-custom-runners.md) |
+| Derive workload schemas from Rust body types | `runner,model-schema` | [Declare workload types](routing-and-custom-runners.md#declare-workload-types) |
 | Reconcile resources or supervise Embedded work | `core` | [Quick start](quick-start.md), [management](managing-tasks.md) |
 | Execute subprocess Tasks through core | `core,exec-subprocess` | [Subprocesses](subprocesses.md) |
 | Execute through an application container engine | `core,exec-container` | [Containers](containers-and-isolation.md) |

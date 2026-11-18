@@ -105,6 +105,11 @@ It does not inspect the workload payload.
 `validate` and `validate_workload` pick the runner the same way and run its declared check on the body.
 The first matching runner checks, and the same runner builds.
 
+Routing is first-match: the first runner, in registration order, whose exact GVK and labels match.
+Podium evaluates that runner.
+There is no schema-aware routing: a second runner is never tried because the first one's check refused the body.
+Core runs the check synchronously, under the task's write lock and a state-write admission permit, so a declared check must be fast and non-blocking.
+
 The router applies these rules in order:
 
 1. Reject `TaskWorkload::Embedded`.
@@ -114,7 +119,7 @@ The router applies these rules in order:
 
 | Workload variation | Routing behavior                                         |
 |--------------------|----------------------------------------------------------|
-| Built-in workload  | A runner declares its built-in GVK                       |
+| Built-in workload  | A runner declares its GVK, such as `exec.solti.io/v1` `Subprocess` |
 | Custom workload    | A routed `Workload` and a runner declaration share a GVK |
 | Alternate backend  | Several runners share a GVK and labels select one        |
 | Embedded workload  | Bypasses the router because its `TaskRef` already exists |

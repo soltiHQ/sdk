@@ -20,6 +20,7 @@ bench = false
 default = []
 guides = [
     "dep:async-trait",
+    "dep:schemars",
     "dep:serde",
     "dep:serde_json",
     "dep:solti",
@@ -41,6 +42,7 @@ guides = [
 
 [dependencies]
 async-trait = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
 solti = { workspace = true, optional = true, features = ["full"] }
