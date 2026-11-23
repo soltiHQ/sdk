@@ -66,7 +66,7 @@ Add the umbrella crate with only the required capabilities:
 
 ```toml
 [dependencies]
-solti = { version = "0.1", features = ["core", "exec-subprocess"] }
+solti = { version = "0.0", features = ["core", "exec-subprocess"] }
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 ```
 
@@ -229,7 +229,7 @@ Routing is first-match: the first runner, in registration order, whose exact GVK
 Podium evaluates that runner, and there is no schema-aware routing.
 Core runs that runner's check at admission, before a write commits.
 There is no WASM type; an application that embeds an engine declares its own.
-See [routing and custom runners](docs/routing-and-custom-runners.md) and, for an upgrade, [migrating from 0.0 to 0.1](docs/migrating-from-0-0.md).
+See [routing and custom runners](docs/routing-and-custom-runners.md) and, for an upgrade, [migrating from 0.0.8 to 0.0.9](docs/migrating-from-0-0.md).
 
 `Embedded` carries an in-process `TaskRef` supplied by the binary.
 It bypasses runner routing and has no HTTP or gRPC representation.

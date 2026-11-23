@@ -1,20 +1,20 @@
 ---
-title: Migrate from 0.0 to 0.1
-description: Replace the typed built-in workloads of 0.0.x with declared workload types, and update persisted data, runners and the task proto.
+title: Migrate from 0.0.8 to 0.0.9
+description: Replace the typed built-in workloads of 0.0.8 with declared workload types, and update persisted data, runners and the task proto.
 ---
 
-# Migrate from 0.0 to 0.1
+# Migrate from 0.0.8 to 0.0.9
 
-0.1.0 moves the SDK from typed built-in workloads to workload types that each runner declares.
+0.0.9 moves the SDK from typed built-in workloads to workload types that each runner declares.
 A workload is one routed shape, `{apiVersion, kind, spec}`.
 A runner declares each type it runs with a GVK, a JSON Schema of the `spec`, and a check of the body; the agent advertises the schemas' fingerprints and sends the schemas to the control plane on request.
-There is no compatibility layer: the 0.0.x names are gone, and a 0.0.x value that uses them no longer compiles or deserializes.
+There is no compatibility layer: the 0.0.8 names are gone, and a 0.0.8 value that uses them no longer compiles or deserializes.
 
 Read [declare workload types](routing-and-custom-runners.md#declare-workload-types) first; this page only maps the old names to the new ones.
 
 ## Removed items
 
-| 0.0.x | 0.1.0 |
+| 0.0.8 | 0.0.9 |
 |---|---|
 | `TaskWorkload::Subprocess(spec)` | `TaskWorkload::from_body(&spec)`, a `TaskWorkload::Routed` under `exec.solti.io/v1` `Subprocess` |
 | `TaskWorkload::Container(spec)` | `TaskWorkload::from_body(&spec)`, a `TaskWorkload::Routed` under `exec.solti.io/v1` `Container` |
@@ -73,7 +73,7 @@ Admission is new: core runs that runner's check before a write commits.
 
 The built-in workloads moved from `solti.io/v1` to `exec.solti.io/v1`:
 
-| 0.0.x | 0.1.0 |
+| 0.0.8 | 0.0.9 |
 |---|---|
 | `solti.io/v1` `Subprocess` | `exec.solti.io/v1` `Subprocess` |
 | `solti.io/v1` `Container` | `exec.solti.io/v1` `Container` |
@@ -96,7 +96,7 @@ Generated clients must be regenerated from the 0.2 proto, and send the body of `
 
 ## Persisted data
 
-A 0.0.x JSON document that holds a typed workload no longer deserializes.
+A 0.0.8 JSON document that holds a typed workload no longer deserializes.
 `TaskWorkload` reads `{"apiVersion": "solti.io/v1", "kind": "Subprocess", ...}` as a routed workload in the reserved group and refuses it.
 Rewrite the stored `apiVersion` before loading:
 

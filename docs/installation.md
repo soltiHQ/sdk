@@ -15,7 +15,7 @@ Use `solti` when a binary combines several components:
 
 ```toml
 [dependencies]
-solti = { version = "0.1", default-features = false, features = ["core", "exec-subprocess"] }
+solti = { version = "0.0", default-features = false, features = ["core", "exec-subprocess"] }
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 ```
 
@@ -27,8 +27,8 @@ Use a component directly when its boundary is enough:
 
 ```toml
 [dependencies]
-solti-model = { version = "0.1", default-features = false }
-solti-tls = "0.1"
+solti-model = { version = "0.0", default-features = false }
+solti-tls = "0.0"
 ```
 
 A direct `solti-model` dependency enables its `schema` feature by default.

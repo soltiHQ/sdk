@@ -233,7 +233,7 @@ Every routed workload travels as its JSON body under its GVK: `Task.spec.workloa
 `exec.solti.io/v1` `Subprocess` and `Container`, `chain.solti.io/v1alpha1` `Chain` and application-declared types are all public in this form.
 The transports do not interpret the body: core admits it with the first matching runner's declared check, and a refusal is HTTP `400` or gRPC `InvalidArgument`.
 That a body is accepted does not mean that a compatible runner is installed on every agent.
-The typed gRPC workload messages of 0.0.x are gone; see [migrating from 0.0 to 0.1](migrating-from-0-0.md).
+The typed gRPC workload messages of 0.0.8 are gone; see [migrating from 0.0.8 to 0.0.9](migrating-from-0-0.md).
 Embedded workloads are in-process only: transports reject their input and the core adapter hides their resources, runs, and output.
 
 Custom `ApiHandler` implementations must preserve public visibility and the documented query/continuation contract.
